@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates } from '../tasks/index'
+import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
 import {
   persistGateWakeNotice,
   loadGateWakeNotices,
@@ -1844,11 +1845,58 @@ export async function wakeGateOwnerOnReview(
 // programmatically over MCP — without it a review task can only be verdicted
 // from the browser dashboard. cap: member+ on the task's squad AND the gate
 // capability named by task.gate_owner.
+const HUMAN_ORIGIN_SCHEMA = {
+  type: 'object',
+  properties: {
+    channel: STRING_SCHEMA,
+    user_id: STRING_SCHEMA,
+    chat_id: STRING_SCHEMA,
+    message_id: STRING_SCHEMA,
+    // message_at is REQUIRED, not optional (mupot#1424 addendum): freshness
+    // cannot be checked against a timestamp the caller may omit. See
+    // src/im/origin-verdict.ts's FRESHNESS_MAX_AGE_MS/FRESHNESS_MAX_FUTURE_MS.
+    message_at: STRING_SCHEMA,
+    // text is REQUIRED (round 4 addendum, plugin gate P2-1): the human's own
+    // message, so mupot can bind the origin's INTENT server-side — the
+    // target task id must appear in it (full id, or an 8+ hex-char prefix of
+    // its own leading hex characters) or the stamp does not apply to this
+    // task at all (`task_not_named`). See taskNamedInText in
+    // src/im/origin-verdict.ts.
+    text: STRING_SCHEMA,
+  },
+  required: ['channel', 'user_id', 'chat_id', 'message_id', 'message_at', 'text'],
+  additionalProperties: false,
+}
+
+function humanOriginResponsePayload(outcome: HumanOriginResolution): Record<string, unknown> {
+  if (outcome.replayed) return { applied: false, reason: 'origin_replayed' }
+  if (outcome.applied) return { applied: true, bound_now: outcome.boundNow }
+  return { applied: false, reason: outcome.reason }
+}
+
 const toolTaskVerdict: ToolSpec = {
   name: 'task_verdict',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean }',
+  args:
+    '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean,' +
+    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named) } }' +
+    ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
+    ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
+    ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +
+    ' chat shape, freshness, chat match or first-bind, conflict of interest, replay, rate limit) is re-checked' +
+    ' at call time. message_at must be within 10 minutes in the past or 60 seconds in the future of the server' +
+    ' clock (origin_stale otherwise) — mupot cannot tell a harness-stamped origin from a model-typed one, so a' +
+    ' stale or reused stamp is refused server-side regardless of what stamped it. At most one APPLIED' +
+    ' human_origin verdict per resolved MEMBER per 30 seconds (origin_rate_limited otherwise; keyed on the' +
+    ' member, not the calling agent — owning several agents does not raise this budget). Any conjunct' +
+    ' false falls back to the calling agent\'s own authority, unchanged from omitting human_origin — see the' +
+    ' human_origin field on the response. A non-agent-bound caller supplying human_origin gets' +
+    ' 400 human_origin_not_applicable; a replayed origin message gets 409 origin_replayed (the whole call' +
+    ' refused in both cases, no fallback). For an agent-bound caller, the outcome is ALWAYS visible in the' +
+    ' response: human_origin: {applied:false, reason:"<conjunct>"} when one was supplied and refused,' +
+    ' human_origin: {applied:false, reason:"absent"} when none was supplied at all — never silently omitted' +
+    ' the way an ordinary pre-feature agent-seat verdict would be. Non-agent-bound callers never see the field.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1857,6 +1905,7 @@ const toolTaskVerdict: ToolSpec = {
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
       override_self_verdict: { type: 'boolean' },
+      human_origin: HUMAN_ORIGIN_SCHEMA,
     },
     required: ['task_id', 'verdict'],
     additionalProperties: false,
@@ -1873,20 +1922,87 @@ const toolTaskVerdict: ToolSpec = {
     if (!taskRes.ok) return taskRes
     const task = taskRes.task
 
-    // Base guard: member+ on the task's squad (same floor as every task mutation).
+    // mupot#1425 P0-2 fix (kasra-review + Athena): task-state checks moved
+    // BEFORE origin resolution — a task with no gate or not in review can
+    // never be decided regardless of auth, so resolveHarnessAttestedOrigin
+    // must never even be reached (let alone mint a reservation or a
+    // Telegram bind) for one. These two checks read only `task` fields, not
+    // `auth`, so moving them earlier changes nothing about what they gate.
+    if (!task.gate_owner) return fail(409, 'no_gate')
+    if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
+    const gateOwner = task.gate_owner
+
+    const note: string | null = typeof args.note === 'string'
+      ? args.note
+      : (typeof args.reason === 'string' ? args.reason : null)
+
+    // ── mupot#1424/#1425: harness-attested human origin ────────────────────
+    // See src/im/origin-verdict.ts for the full trust model, the fix-round
+    // history, and every conjunct. Two HARD failures refuse the whole call
+    // (never a silent fallback): a non-agent-bound caller supplying
+    // human_origin at all (nonsensical — there is no harness in that seat to
+    // have stamped anything), and a replayed origin message. Every OTHER
+    // failure mode falls back to the calling agent's own authority, exactly
+    // as if human_origin had been omitted — "no origin, or origin that does
+    // not resolve, runs under the agent seat only" (Hadi, 2026-09-16).
+    //
+    // mupot#1425 P0-B (round 2 fix): resolveHarnessAttestedOrigin now commits
+    // the reservation, the first-bind (if needed), AND the verdict write
+    // itself in ONE atomic D1 batch, reached only after a read-only dry run
+    // proves the exact task+verdict authorized — there is no exit between a
+    // commit and a verdict left for a later refusal to land in. On
+    // `applied: true` the decision is ALREADY durable; this handler returns
+    // it directly rather than calling writeVerdict a second time.
+    let originFailure: HumanOriginResolution | null = null
+    if (args.human_origin !== undefined) {
+      if (!auth.boundAgentId) {
+        return fail(400, 'human_origin_not_applicable')
+      }
+      try {
+        const originOutcome = await resolveHarnessAttestedOrigin(
+          env, auth.boundAgentId, args.human_origin, task, gateOwner, verdict, note,
+        )
+        if (originOutcome.replayed) {
+          return fail(409, 'origin_replayed')
+        }
+        if (originOutcome.applied) {
+          if (task.workflow_instance_id && env.TASK_WORKFLOW) {
+            try {
+              const inst = await env.TASK_WORKFLOW.get(task.workflow_instance_id)
+              await inst.sendEvent({ type: 'gate-verdict', payload: { verdict } })
+            } catch {
+              // non-fatal
+            }
+          }
+          return done({
+            task: originOutcome.task,
+            verdict: originOutcome.verdict,
+            human_origin: humanOriginResponsePayload(originOutcome),
+          })
+        }
+        // applied: false — fall through to the agent's own authority below,
+        // carrying the reason for the response's human_origin field.
+        originFailure = originOutcome
+      } catch (err) {
+        if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
+        throw err
+      }
+    }
+
+    // ── fallback: the calling agent's own authority (origin omitted, or
+    // every dry-run conjunct refused) — UNCHANGED from before human_origin
+    // existed, using `auth` directly, never `originFailure.auth` (there is
+    // no such field on a non-applied outcome). ─────────────────────────────
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
-    if (!task.gate_owner) return fail(409, 'no_gate')
-    if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
 
     // RBAC: gate ownership, the gate:loops surface cap, and self-verdict — the
     // ONE shared predicate (mupot#1080/#1081, src/tasks/index.ts) also used by
     // the HTTP twin (POST /:id/verdict) and the dashboard's read-side
     // can_verdict/can_approve/can_reject. A sixth gate cannot drift the two
     // write surfaces apart because there is only one place it can be added.
-    const gateOwner = task.gate_owner
     const gateResult = await evaluateVerdictGates(
       env,
       auth,
@@ -1894,10 +2010,7 @@ const toolTaskVerdict: ToolSpec = {
       verdict,
     )
     const principal = gateResult.principal
-
-    let note: string | null = typeof args.note === 'string'
-      ? args.note
-      : (typeof args.reason === 'string' ? args.reason : null)
+    let fallbackNote = note
 
     if (!gateResult.allowed) {
       if (gateResult.code === 'no_gate_capability') {
@@ -1920,13 +2033,13 @@ const toolTaskVerdict: ToolSpec = {
         })
       }
       const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
-      note = note ? `${overrideNote} ${note}` : overrideNote
+      fallbackNote = fallbackNote ? `${overrideNote} ${fallbackNote}` : overrideNote
     }
 
     try {
       const result = await writeVerdict(
         env,
-        { task, verdict, note, decidedBy: principal.id },
+        { task, verdict, note: fallbackNote, decidedBy: principal.id },
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
@@ -1938,7 +2051,22 @@ const toolTaskVerdict: ToolSpec = {
           // non-fatal
         }
       }
-      return done(result)
+      // mupot#1425 round 3 addendum (Athena's plugin r4 gate): an agent-bound
+      // caller that never received a human_origin at all (e.g. the harness
+      // burned the stamp client-side before relaying) used to get a response
+      // indistinguishable from an ordinary, pre-feature agent-seat verdict —
+      // `human_origin` was simply absent from the body either way. Make the
+      // outcome always visible for an agent-bound caller: `reason: 'absent'`
+      // when none was supplied at all, vs. the real conjunct-specific reason
+      // when one was supplied and failed. Non-agent-bound principals are
+      // unchanged — human_origin was never applicable to them, so the field
+      // stays omitted, exactly as before this addendum.
+      const humanOriginField = originFailure
+        ? { human_origin: humanOriginResponsePayload(originFailure) }
+        : auth.boundAgentId
+          ? { human_origin: { applied: false, reason: 'absent' } }
+          : {}
+      return done({ ...result, ...humanOriginField })
     } catch (err) {
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
       if (err instanceof TaskEvidenceFenceError) {

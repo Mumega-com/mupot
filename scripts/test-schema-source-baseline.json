@@ -149,7 +149,6 @@
     "tests/tasks-dispatch.test.ts",
     "tests/tasks-done-when.test.ts",
     "tests/tasks-gate-required-for-review.test.ts",
-    "tests/tasks-gate.test.ts",
     "tests/tasks-list-rbac.test.ts",
     "tests/tasks-local-smoke.test.ts",
     "tests/tasks-service.test.ts",

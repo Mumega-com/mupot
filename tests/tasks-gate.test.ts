@@ -14,6 +14,9 @@ import { verdictPrincipal } from '../src/tasks'
 import type { TaskStatus } from '../src/tasks/service'
 import type { Task, TaskVerdict, Env, AuthContext } from '../src/types'
 import { writeVerdict } from '../src/tasks/service'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // ── 1. Transition matrix ─────────────────────────────────────────────────────
 
@@ -111,7 +114,18 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   }
 }
 
-// ── Helper: minimal Env for writeVerdict (K5: now uses standalone run(), not batch) ──
+// ── Helper: minimal Env for writeVerdict ──────────────────────────────────────
+//
+// mupot#1425 round 3 (P0-B, "the verdict must be in the batch or nothing
+// is"): writeVerdict now issues its two statements via ONE `env.DB.batch()`
+// call instead of two separate `.run()` calls — the K5 conditional-UPDATE
+// race guard moved from JS-level "check meta.changes, maybe skip the second
+// call" to a SQL-level landed-PROOF EXISTS clause on the INSERT itself (see
+// buildVerdictStatements' own doc comment, src/tasks/service.ts). The mock
+// below executes each prepared+bound statement's OWN embedded WHERE/EXISTS
+// logic against a tiny in-memory `tasks` row, so `batch()` behaves like a
+// real (if minimal) SQL engine for exactly the two statements this function
+// issues — not a hand-rolled shortcut that assumes the JS-level outcome.
 
 interface RunCall {
   sql: string
@@ -122,11 +136,31 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
   const runs: RunCall[] = []
   const events: unknown[] = []
 
-  // K5: writeVerdict now:
-  //  1. prepare/bind/run → conditional UPDATE (returns meta.changes)
-  //  2. prepare/bind/run → INSERT verdict
-  // The mock returns meta.changes=1 for the UPDATE (default) or 0 for race simulation.
+  // updateChanges: 1 = the conditional UPDATE lands (task still 'review');
+  // 0 = simulates a lost K5 race (task no longer 'review') — the mock's
+  // batch() then also fails the INSERT's own EXISTS guard, exactly as real
+  // SQLite would, so both statements report changes=0 together.
   const updateChanges = opts.updateChanges ?? 1
+
+  function makeStatement(sql: string, args: unknown[]) {
+    return {
+      sql,
+      args,
+      async run() {
+        runs.push({ sql, args })
+        if (sql.includes('UPDATE tasks')) {
+          return { success: true, meta: { changes: updateChanges }, results: [] }
+        }
+        // INSERT INTO task_verdicts ... WHERE EXISTS (...) — the EXISTS
+        // guard's landed-proof can only be satisfied when the paired UPDATE
+        // actually changed a row (updateChanges === 1); this mock enforces
+        // that dependency explicitly rather than always returning success,
+        // so a test flipping updateChanges to 0 sees BOTH statements no-op,
+        // matching what the real EXISTS clause would do.
+        return { success: true, meta: { changes: updateChanges }, results: [] }
+      },
+    }
+  }
 
   const env = {
     TENANT_SLUG: 'test-tenant',
@@ -139,18 +173,16 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
       prepare(sql: string) {
         return {
           bind(...args: unknown[]) {
-            return {
-              async run() {
-                runs.push({ sql, args })
-                // UPDATE returns changes; INSERT returns 1 success
-                if (sql.includes('UPDATE tasks')) {
-                  return { success: true, meta: { changes: updateChanges }, results: [] }
-                }
-                return { success: true, meta: { changes: 1 }, results: [] }
-              },
-            }
+            return makeStatement(sql, args)
           },
         }
+      },
+      async batch(statements: ReturnType<typeof makeStatement>[]) {
+        const results = []
+        for (const statement of statements) {
+          results.push(await statement.run())
+        }
+        return results
       },
     },
   }
@@ -158,12 +190,12 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
   return { env: env as unknown as Env, runs, events }
 }
 
-// ── 2. Verdict write — K5 conditional UPDATE pattern ────────────────────────
+// ── 2. Verdict write — K5 conditional UPDATE pattern, now IN a D1 batch ─────
 
 import { VerdictRaceError } from '../src/tasks/service'
 
-describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
-  it('runs UPDATE first (conditional on status=review) then INSERT, returns {task, verdict}', async () => {
+describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)', () => {
+  it('batches UPDATE then INSERT (one call), returns {task, verdict}', async () => {
     const { env, runs } = makeVerdictEnv()
     const task = makeTask()
 
@@ -173,16 +205,21 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
       { kind: 'member', id: 'member-42' },
     )
 
-    // K5: two separate run() calls — UPDATE then INSERT (not batch)
+    // Two statements, executed via ONE env.DB.batch() call (not two
+    // independent .run() calls) — both still visible in `runs` because the
+    // mock's batch() drives each statement's own .run() in order.
     expect(runs).toHaveLength(2)
 
-    // First run: conditional UPDATE tasks WHERE status='review'
+    // First statement: conditional UPDATE tasks WHERE status='review'
     expect(runs[0].sql).toMatch(/UPDATE tasks SET status/)
     expect(runs[0].sql).toMatch(/AND status = 'review'/)
     expect(runs[0].args).toEqual(['approved', result.task.updated_at, task.id])
 
-    // Second run: INSERT task_verdicts
+    // Second statement: INSERT task_verdicts, gated on the UPDATE's own
+    // landed-proof (id/status/updated_at EXISTS on `tasks`) — not a bare
+    // unconditional INSERT.
     expect(runs[1].sql).toMatch(/INSERT INTO task_verdicts/)
+    expect(runs[1].sql).toMatch(/WHERE EXISTS \(SELECT 1 FROM tasks WHERE id = \? AND status = \? AND updated_at = \?\)/)
     expect(runs[1].args).toEqual([
       result.verdict.id,
       task.id,
@@ -190,6 +227,15 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
       'LGTM',
       'member-42',
       result.verdict.decided_at,
+      // decided_via / origin_agent_id (0155, mupot#1424): both NULL — this
+      // caller omitted decidedVia/originAgentId, the ordinary (non-harness-
+      // attested) verdict shape, unchanged from before those fields existed.
+      null,
+      null,
+      // the landed-proof EXISTS params: task.id, newStatus, now
+      task.id,
+      'approved',
+      result.task.updated_at,
     ])
 
     // Return shape
@@ -213,11 +259,11 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
     expect(result.task.status).toBe('rejected')
     expect(result.verdict.verdict).toBe('rejected')
     expect(result.verdict.note).toBeNull()
-    // K5: note is null in the INSERT args
+    // note is null in the INSERT args
     expect(runs[1].args[3]).toBeNull()
   })
 
-  it('K5 race: throws VerdictRaceError when UPDATE changes=0 (concurrent verdict won)', async () => {
+  it('K5 race: throws VerdictRaceError when the batch\'s UPDATE changes=0 (concurrent verdict won)', async () => {
     // Simulate a race: meta.changes=0 means another verdict already flipped the status
     const { env } = makeVerdictEnv({ updateChanges: 0 })
     const task = makeTask()
@@ -234,6 +280,113 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
     await expect(
       writeVerdict(env, { task, verdict: 'rejected', note: null, decidedBy: 'member-2' }),
     ).rejects.toThrow('task-race-test')
+  })
+})
+
+// ── K5 race, real SQLite (mupot#1425 round 4) ────────────────────────────────
+//
+// The tests above pin the STATEMENT SHAPE against a hand-mocked DB. This
+// describe block proves the actual outcome against real SQLite + the full
+// committed migration chain: on a lost race, the row count for
+// `task_verdicts` is exactly 0 for the loser — not merely "the mock's
+// changes=0 knob was set and a throw was observed," which could stay green
+// even if the real EXISTS landed-proof guard were broken.
+describe('writeVerdict — K5 race, real SQLite, 0 verdict rows for the loser (mupot#1425 round 4)', () => {
+  let harness: SqliteD1Harness
+  let realEnv: Env
+
+  function seed(): void {
+    harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept-1', 'Dept One')`).run()
+    harness.sqlite
+      .prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-1', 'Squad One')`)
+      .run()
+    harness.sqlite
+      .prepare(
+        `INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, result, created_at, updated_at)
+         VALUES ('task-race-real', 'squad-1', 'T', '', 'done', 'review', 'gate:outreach', NULL, datetime('now'), datetime('now'))`,
+      )
+      .run()
+  }
+
+  function race(): Env {
+    const realBatch = realEnv.DB.batch.bind(realEnv.DB)
+    return {
+      ...realEnv,
+      DB: {
+        ...realEnv.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          // Simulate a concurrent verdict winning the race in the instant
+          // between this call's own read and its commit batch.
+          harness.sqlite.prepare("UPDATE tasks SET status = 'approved' WHERE id = 'task-race-real'").run()
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+  }
+
+  it('a lost race throws VerdictRaceError AND leaves 0 rows in task_verdicts', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    realEnv = { TENANT_SLUG: 'test-tenant', DB: harness.db } as unknown as Env
+    seed()
+
+    const task = makeTask({ id: 'task-race-real' })
+    await expect(
+      writeVerdict(race(), { task, verdict: 'approved', note: null, decidedBy: 'member-1' }),
+    ).rejects.toThrow(VerdictRaceError)
+
+    const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
+    expect(count.n).toBe(0)
+
+    // The task itself was NOT reverted to the loser's intended status —
+    // the concurrent winner's 'approved' still stands, untouched by the
+    // loser's no-op UPDATE.
+    const row = harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get('task-race-real') as { status: string }
+    expect(row.status).toBe('approved')
+
+    harness.close()
+  })
+
+  // mupot#1425 round 4 (kasra-review P0-2, independently reproduced by
+  // Athena via her own frozen-clock probe): a BARE `new Date().toISOString()`
+  // landed-proof value collides across two DIFFERENT calls that land in the
+  // SAME millisecond. Freezing the clock makes this deterministic instead of
+  // relying on real-world timing luck: call A wins normally; call B loses
+  // its own conditional UPDATE (task no longer 'review') but, before the
+  // claimTimestamp() nonce fix, its INSERT's own EXISTS guard could still
+  // accidentally match call A's ALREADY-COMMITTED row, because B's own
+  // (bare, unmodified) "now" value is BYTE-IDENTICAL to A's — landing a
+  // phantom SECOND task_verdicts row even though writeVerdict still throws
+  // VerdictRaceError back to B's caller (the throw depends only on the
+  // UPDATE's own changes=0, never on the INSERT). The row count is the only
+  // thing that can catch this — a throw alone cannot.
+  it('P0-2 (frozen clock): two approvals on the SAME task in the SAME millisecond — the loser throws AND inserts nothing (not merely "throws")', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-16T12:00:00.000Z'))
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      realEnv = { TENANT_SLUG: 'test-tenant', DB: harness.db } as unknown as Env
+      seed()
+
+      const task = makeTask({ id: 'task-race-real' })
+      await writeVerdict(realEnv, { task, verdict: 'approved', note: null, decidedBy: 'member-A' })
+
+      await expect(
+        writeVerdict(realEnv, { task, verdict: 'approved', note: null, decidedBy: 'member-B' }),
+      ).rejects.toThrow(VerdictRaceError)
+
+      // The decisive assertion: exactly ONE row, not two. A phantom insert
+      // from the loser would still let the call throw (the throw is keyed
+      // on the UPDATE's own changes=0) while silently doubling this count.
+      const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
+      expect(count.n).toBe(1)
+      const decidedBy = harness.sqlite.prepare('SELECT decided_by FROM task_verdicts').get() as { decided_by: string }
+      expect(decidedBy.decided_by).toBe('member-A') // the winner's row, not the loser's
+    } finally {
+      vi.useRealTimers()
+      harness.close()
+    }
   })
 })
 

@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -66,6 +66,7 @@ import {
 } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
+import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import {
   GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
   addSquadMember,
@@ -1739,6 +1740,13 @@ export const SELF_FORBIDDEN_FIELDS = [
   // is the load-bearing entry: it must land here, in SELF_FORBIDDEN_FIELDS,
   // so the per-field self-lane block above refuses it BEFORE any write.
   'autonomy',
+  // owner_member_id (0155, mupot#1424 slice): the column
+  // resolveHarnessAttestedOrigin (src/im/origin-verdict.ts) trusts to decide
+  // whose member identity this agent's harness may carry into a task_verdict.
+  // An agent-bound caller setting its OWN owner_member_id would be a
+  // self-grant of exactly that authority — admin-only even on the caller's
+  // own row, same reasoning as capabilities/autonomy above.
+  'owner_member_id',
 ] as const
 // The admin-path patch surface. Hoisted out of run() (it used to be an inline
 // literal) so tests can assert the partition invariant: every field here is
@@ -1758,20 +1766,29 @@ export const ADMIN_PATCHABLE_FIELDS = [
   'budget_cap_cents',
   'budget_window',
   'autonomy',
+  'owner_member_id',
 ] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
   scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
   min: 'authenticated',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, owner_member_id?: string|null, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
     ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
     ' but may only patch model/model_fallback/purpose/skills.' +
-    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
-    ' even on your own row -- name/role are interpolated into your own system prompt, and autonomy' +
-    ' governs whether an agent may ship/send/publish/merge, so both are' +
-    ' deliberately excluded from the self lane. Every non-self call (a different agent-bound' +
-    ' target, or a non-bound member) needs admin on the target agent squad or org.',
+    ' name/role/slug/owner/owner_member_id/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
+    ' even on your own row -- name/role are interpolated into your own system prompt, autonomy' +
+    ' governs whether an agent may ship/send/publish/merge, and owner_member_id is the member whose' +
+    ' identity a harness-attested human_origin on task_verdict may carry (a self-write would be a' +
+    ' self-grant), so all three are deliberately excluded from the self lane. Every non-self call' +
+    ' (a different agent-bound target, or a non-bound member) needs admin on the target agent squad or org.' +
+    ' owner_member_id: null clears it (squad-admin suffices, same as any other admin-lane field); a' +
+    ' non-null value must be an existing member id in this tenant with no leading/trailing/inner' +
+    ' whitespace (invalid_args otherwise), and the caller must ALSO hold admin on the ORG scope' +
+    ' specifically (squad-admin alone is not enough for this one field — 403 forbidden need=admin' +
+    ' scope=org otherwise) and must not name a member who outranks the caller anywhere' +
+    ' (403 target_rank_exceeds_ceiling otherwise) — both waived when the target IS the caller\'s own' +
+    ' member id. owner_member_not_found when the (normalized) id names no real member.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1783,6 +1800,10 @@ const toolUpdateAgent: ToolSpec = {
       model_fallback: STRING_SCHEMA,
       purpose: STRING_SCHEMA,
       owner: STRING_SCHEMA,
+      // owner_member_id (0155): admin-only, see SELF_FORBIDDEN_FIELDS above and
+      // UPDATABLE_MEMBER_REF_COLUMNS in src/org/service.ts for the referential
+      // validation (must name a real member in this tenant, or null to clear).
+      owner_member_id: STRING_SCHEMA,
       // parent_agent_id is NOT patchable here. additionalProperties:false makes a
       // caller that still sends it fail loudly at the schema instead of silently
       // dropping the field. See UPDATABLE_TEXT_COLUMNS in src/org/service.ts.
@@ -1880,6 +1901,60 @@ const toolUpdateAgent: ToolSpec = {
       return fail(400, 'invalid_args', 'at least one field to update is required')
     }
 
+    // mupot#1425 adversarial gate — owner_member_id is a CREDENTIAL-CONFERRING
+    // field: it decides whose member identity an agent's harness may carry
+    // into a task_verdict (src/im/origin-verdict.ts). Setting it to member M
+    // is granting THIS agent M's future standing, the exact shape
+    // POST /members/:id/tokens already fences with org-admin PLUS a
+    // target-rank ceiling ("Minting a token FOR a member yields a credential
+    // that authenticates AS that member... vertical privilege escalation",
+    // src/members/index.ts). Self-writing is refused by SELF_FORBIDDEN_FIELDS
+    // above, before `patch` is even built, so `isSelf` is always false here;
+    // clearing (owner_member_id: null) is NOT gated by any of this — it
+    // revokes, confers nothing, carries none of the escalation risk.
+    //
+    // Round 1 (kasra-review K1/K1b): the ADMIN lane above only proved
+    // squad-admin on the AGENT's squad — a squad admin with zero org standing
+    // could point an agent at the org OWNER.
+    // Round 2 (kasra-review P0-A): the ceiling checked the RAW string while
+    // org/service.ts's updateAgentProfile validated and wrote the TRIMMED
+    // string — a single leading/trailing/inner whitespace character made
+    // `targetMaxRankAcrossScopes(" victim-owner")` resolve to rank 0 (no
+    // matching capabilities row, no email bridge), bypassing the ceiling for
+    // ANY actor while the write still stored the un-whitespaced id. Fixed by
+    // rejecting ANY whitespace outright, here, before either check — never
+    // by normalizing at two independent sites (round 2's own root cause).
+    // Round 2 (Athena): exceedsTargetRankCeiling alone is a ceiling with no
+    // FLOOR — an actor with (say) squad-admin plus some unrelated org-scope
+    // 'member'/'lead' grant, but no org-scope ADMIN, could still pass the
+    // ceiling against a target who happens to rank BELOW them, with no
+    // org-scope standing at all. Every other authenticate-as-X door in this
+    // codebase pairs the ceiling with an org-scope floor
+    // (MEMBER_BIND_MINT_FLOOR='admin' + exceedsTargetRankCeiling,
+    // src/members/project-invites.ts:29,575-578,609; requireCapability
+    // (orgScope,'admin') + targetRankCeiling, src/members/index.ts:742,763).
+    // This field now requires the SAME floor: org-scope 'admin', re-derived
+    // fresh via actorRankOnScopeFor(env, auth, 'org', null) — squad-admin is
+    // not enough to mint this specific credential, only to reach the rest of
+    // the admin lane. Self-target (actor pointing an agent at their OWN
+    // member id) is exempt from BOTH the floor and the ceiling — a principal
+    // granting themselves nothing is not the mint this guards.
+    if (typeof patch.owner_member_id === 'string' && patch.owner_member_id.length > 0) {
+      if (/\s/.test(patch.owner_member_id)) {
+        return fail(400, 'invalid_args', 'owner_member_id must not contain whitespace')
+      }
+      const isSelfTarget = auth.memberId != null && auth.memberId === patch.owner_member_id
+      if (!isSelfTarget) {
+        const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
+        if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
+          return fail(403, 'forbidden', { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' })
+        }
+        if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
+          return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })
+        }
+      }
+    }
+
     // Audit actor: a self-correction is attributed to the agent itself (0086's
     // CHECK already permits actor_type 'agent'), not to the human whose bearer
     // token happens to be bound to it — the agent made this call, not them.
@@ -1901,6 +1976,9 @@ const toolUpdateAgent: ToolSpec = {
     if (!result.ok) {
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
+      if (result.error === 'owner_member_not_found') {
+        return fail(404, 'owner_member_not_found', { owner_member_id: args.owner_member_id })
+      }
       return fail(400, 'invalid_args', { reason: result.error })
     }
 

@@ -17,6 +17,7 @@
 // end-to-end via the real authenticateMember/MCP path.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -169,5 +170,59 @@ describe('POST /:id/verdict — gate:agent-self-completion, real route + real D1
     authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
     const res = await postVerdict('task-6', { verdict: 'approved' }, envFor(harness))
     expect(res.status).toBe(201)
+  })
+})
+
+// ── mupot#1425 round 4 (kasra-review round-3 BLOCK): "a lost-race repro on
+// the plain HTTP path with 0 verdict rows." This is the SAME K5 conditional-
+// UPDATE guard the unit-level tests in tests/tasks-gate.test.ts exercise
+// against a hand-mocked DB, but driven here through the REAL wire route
+// (tasksApp.fetch → writeVerdict → env.DB.batch) against real SQLite —
+// closing the gap between "the predicate is correct in isolation" and "the
+// actual endpoint refuses to leave a verdict row for the race loser." ─────
+describe('POST /:id/verdict — K5 lost race, real route + real D1, 0 verdict rows for the loser (mupot#1425 round 4)', () => {
+  let harness: SqliteD1Harness
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedBase(harness.sqlite)
+    // Org owner: passes RBAC unconditionally (see the legacy-escape test
+    // above) so the only thing left to fail is the K5 guard itself.
+    authState.current = { userId: 'owner-1', email: null, role: 'owner', tenant: TENANT, memberId: 'owner-1' }
+  })
+  afterEach(() => {
+    harness.close()
+    authState.current = null
+  })
+
+  it('a concurrent verdict flips task status between the RBAC check and the write — 409 verdict_conflict, 0 task_verdicts rows for the loser', async () => {
+    seedReviewTask(harness.sqlite, 'task-race-http', 'gate:agent-self-completion')
+
+    const realBatch = harness.db.batch.bind(harness.db)
+    // Wraps the ONE seam writeVerdict uses to commit anything (env.DB.batch)
+    // to flip the task's status the instant before the batch actually runs —
+    // simulating a genuine concurrent verdict winning the race, the same
+    // interleaving kasra-review drove directly against the production
+    // statement (round 3 BLOCK, P0-1).
+    const raceEnv: Env = {
+      ...envFor(harness),
+      DB: {
+        ...harness.db,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          harness.sqlite.prepare("UPDATE tasks SET status = 'approved' WHERE id = ?").run('task-race-http')
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+
+    const res = await postVerdict('task-race-http', { verdict: 'approved' }, raceEnv)
+    expect(res.status).toBe(409)
+    const body = (await res.json()) as { error: string }
+    expect(body.error).toBe('verdict_conflict')
+
+    const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
+    expect(count.n).toBe(0) // the race LOSER's INSERT landed nothing over the real wire route (this asserts the
+    // task-status EXISTS guard, not the nonce specifically — the nonce-collision proof lives in
+    // tests/tasks-gate.test.ts's frozen-clock "P0-2 (frozen clock)" test)
   })
 })

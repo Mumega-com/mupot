@@ -4,7 +4,9 @@
 // (dashboard/API, MCP, IM, channels, agents) should call createTask() instead of
 // hand-writing rows. `task.created` is a post-persistence notification event.
 
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
+import { claimTimestamp } from '../lib/claim-timestamp'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
@@ -43,7 +45,7 @@ export function isTaskStatus(v: unknown): v is TaskStatus {
   return typeof v === 'string' && (ALL_TASK_STATUSES as readonly string[]).includes(v)
 }
 
-type TaskActor = NonNullable<BusEvent['actor']>
+export type TaskActor = NonNullable<BusEvent['actor']>
 
 // Task rows are durable before mirroring begins. Bound the best-effort GitHub
 // mirror so a slow upstream cannot indefinitely hold the operator's POST open.
@@ -1196,35 +1198,64 @@ export async function createTask(
 //
 // Flips the task status and appends a verdict receipt.
 //
-// K5 TOCTOU fix — chosen pattern: conditional UPDATE first, then INSERT verdict.
+// K5 TOCTOU fix, current shape (mupot#1425 round 3+4 — this comment
+// previously described a two-`.run()`-call design and said "we cannot use
+// batch for the race-guard," which is the OPPOSITE of what the code below
+// now does; kept the correct D1 fact below and rewrote the rest, rather than
+// deleting the explanation of WHY a bare batch is not enough on its own).
 //
-// Why not a D1 batch?
-// D1 batch is transactional (all-or-neither) but it cannot *conditionally* abort
-// in the middle: `UPDATE ... WHERE status='review'` inside a batch with 0 changes
-// still "succeeds" as a statement — D1 cannot abort-on-zero-changes mid-batch.
-// So we cannot use batch for the race-guard.
+// The D1 fact, still true and still the reason this needs a guard at all:
+// a D1 batch is one transaction (all-or-neither on a statement THROW), but
+// it does NOT conditionally abort mid-batch on a statement that merely
+// changes 0 rows — `UPDATE ... WHERE status='review'` inside a batch, with
+// 0 rows matching, still "succeeds" as a statement, and every later
+// statement in that same batch still executes. A batch containing the
+// status-flip UPDATE and the verdict INSERT as two INDEPENDENT statements
+// would therefore let a race-losing caller's INSERT land anyway — proven
+// live in round 4 (P0-2) against exactly this pair, the same defect class
+// round 2's P3-G fix had already closed one statement away (the Telegram-
+// bind guard) but left open here.
 //
-// Chosen pattern:
-//   1. Standalone `UPDATE tasks SET status=? WHERE id=? AND status='review'`
-//      → check meta.changes. If 0 → 409 (race lost: another verdict already
-//      flipped the row). The 409 is surfaced to the caller.
-//   2. On changes=1: INSERT task_verdicts.
-//      If INSERT fails (DB error), the status flip stands but the audit receipt
-//      is missing. We emit a `task.verdict_orphan` bus event and re-throw so the
-//      caller gets a 500. Operators can reconcile from the bus event log.
-//      This is a narrow window (step-2 failure after step-1 success) that requires
-//      a DB write error on a simple INSERT — acceptable given D1's durability model.
+// Fixed WITHOUT reintroducing two separate `.run()` calls (buildVerdictStatements
+// below returns both statements for the batch a caller executes, unexecuted;
+// mupot#1425 P0-B needed this so a caller like src/im/origin-verdict.ts's
+// commitOriginDecision can put the verdict itself INSIDE a larger atomic
+// batch, not as a trailing, separately-refusable step): the INSERT's own
+// WHERE carries a landed-PROOF `EXISTS` clause naming the UPDATE's own
+// per-call-unique `updated_at` stamp (`claimTimestamp()`, NOT a bare
+// `new Date().toISOString()` — round 4's P0-2 finding — two different calls
+// CAN and did land in the same millisecond). If the UPDATE changed 0 rows
+// (race lost), no row exists with THAT exact stamp, so the INSERT's EXISTS
+// is false and it is ALSO a no-op in the same transaction — a SQL-level
+// conditional dependency between two statements in one batch, not a JS-level
+// "check then maybe run the second one." `writeVerdict` below still reads
+// `results[0].meta.changes` afterward, but only to decide which OUTCOME to
+// report (`VerdictRaceError`) — by the time it does, the INSERT has already
+// either landed or not, correctly, inside the SAME transaction. An INSERT
+// throw (a real DB error, not a 0-row guard) now aborts the WHOLE batch,
+// rolling the status flip back too — strictly fewer failure modes than the
+// old two-call design, which could leave a bare status flip with no receipt
+// (the `task.verdict_orphan` bus event this design retires — there is no
+// longer an orphan state for it to report).
 //
 // Multiple verdicts per task ARE legitimate (rework loop: rejected → in_progress →
 // review → approved). No UNIQUE constraint on task_verdicts(task_id).
 //
-// Called exclusively from POST /api/tasks/:id/verdict after all pre-checks pass.
+// Called exclusively from POST /api/tasks/:id/verdict (and every other
+// verdict surface — MCP task_verdict, IM /approve, the harness-attested-
+// origin path) after all pre-checks pass.
 
 export interface WriteVerdictInput {
   task: Task
   verdict: 'approved' | 'rejected'
   note: string | null
   decidedBy: string // principal id (memberId or userId)
+  // decidedVia/originAgentId (0155, mupot#1424): set ONLY when this verdict
+  // was cast under a member's identity resolved from a harness-attested
+  // human_origin (src/im/origin-verdict.ts). Every other caller omits both —
+  // both columns stay NULL, unchanged from before this fields existed.
+  decidedVia?: 'agent_attested_origin'
+  originAgentId?: string | null
 }
 
 export class VerdictRaceError extends Error {
@@ -1234,39 +1265,76 @@ export class VerdictRaceError extends Error {
   }
 }
 
-export async function writeVerdict(
-  env: Env,
-  input: WriteVerdictInput,
-  actor?: TaskActor,
-): Promise<{ task: Task; verdict: TaskVerdict }> {
-  const now = new Date().toISOString()
-  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
-
-  // #399: like the UPDATEs below, this write's SET/INSERT never touches
+// mupot#1425 round-2 adversarial gate (kasra-review P0-B): the project-evidence
+// fence used to run INSIDE writeVerdict, after any prior write in the same
+// call (e.g. a harness-attested-origin Telegram bind, src/im/origin-verdict.ts)
+// had already landed — "a failure reserves nothing" was false for exactly
+// this refusal, proven live (K6b: 403 forbidden {need:'project_write'}, task
+// still 'review', task_verdicts 0 rows, but a durable Telegram identity bind
+// HAD landed). Split out so a caller that mints OTHER side effects first
+// (origin-verdict.ts's dryRunAuthorize) can run this SAME check, read-only,
+// before committing anything at all — not just before writeVerdict's own
+// two statements.
+export async function assertVerdictWritable(env: Env, task: Task): Promise<void> {
+  // #399: like the UPDATE/INSERT below, this write's SET/INSERT never touches
   // squad_id/project_id, so 0061's narrowed trigger never fires for it. Re-check
   // before writing the verdict note (evidence-bearing, feeds
   // idx_task_verdicts_evidence_keyset) onto a project-attached task whose owning
   // squad may no longer hold write/admin on that project.
-  if (!(await squadCanWriteProjectEvidence(env, input.task.project_id, input.task.squad_id))) {
-    throw new TaskEvidenceFenceError(input.task.id)
+  if (!(await squadCanWriteProjectEvidence(env, task.project_id, task.squad_id))) {
+    throw new TaskEvidenceFenceError(task.id)
   }
+}
 
-  // K5 step 1: conditional UPDATE — only succeeds while the task is still 'review'.
-  // meta.changes === 0 means another concurrent verdict already won the race.
-  const flipResult = await env.DB.prepare(
-    `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'`,
-  )
-    .bind(newStatus, now, input.task.id)
-    .run()
+export interface VerdictStatementsResult {
+  statements: D1PreparedStatement[]
+  verdictRow: TaskVerdict
+  newStatus: TaskStatus
+  now: string
+}
 
-  if (!flipResult.meta.changes || flipResult.meta.changes === 0) {
-    // Race lost: the task is no longer in 'review'. Surface as a typed error so
-    // the route can return 409 with a clear message.
-    throw new VerdictRaceError(input.task.id)
-  }
-
-  // K5 step 2: status flipped — now insert the receipt. If this fails, the status
-  // flip stands but we have no receipt. Emit an orphan event for reconciliation.
+/**
+ * Builds the two-statement write (conditional status flip + verdict receipt)
+ * WITHOUT executing it, so a caller that needs to batch OTHER statements
+ * alongside it (origin-verdict.ts's commitOriginDecision, mupot#1425 P0-B)
+ * can append these to its OWN `env.DB.batch([...])` — one atomic unit, no
+ * write landing before a later refusal can undo it.
+ *
+ * The K5 conditional-UPDATE race guard (mupot#1080-era: "D1 batch cannot
+ * conditionally abort in the middle") is preserved WITHOUT two separate
+ * `.run()` calls, using the same landed-PROOF pattern this codebase already
+ * uses elsewhere (`MEMBER_BIND_LANDED_GUARD_SQL`, src/members/project-invites.ts;
+ * the bind statements in src/im/origin-verdict.ts): the verdict INSERT's own
+ * WHERE clause requires `EXISTS` proof that the UPDATE, in the SAME batch,
+ * already wrote THIS exact `(id, status, updated_at)` triple — a value unique
+ * to this one call. If the UPDATE changes 0 rows (task no longer 'review'),
+ * that EXISTS is false and the INSERT is a no-op in the SAME transaction —
+ * no JS-level "check then maybe run the second statement" needed, and
+ * therefore no orphan state possible: unlike the two-call version this
+ * replaces, an INSERT failure now aborts the WHOLE batch (D1 batch is one
+ * transaction), rolling the status flip back too — strictly fewer failure
+ * modes than before, not more. `extraGuard`, when supplied, is ANDed into
+ * the UPDATE's WHERE clause — used by commitOriginDecision to additionally
+ * require ITS OWN reservation to have landed in the SAME batch, so a lost
+ * reservation race can never still flip the task's status.
+ */
+export function buildVerdictStatements(
+  env: Env,
+  input: WriteVerdictInput,
+  extraGuard?: { sql: string; params: unknown[] },
+): VerdictStatementsResult {
+  // mupot#1425 round 4 (kasra-review P0-2): a bare `new Date().toISOString()`
+  // used as the landed-proof value for the verdict INSERT's own `EXISTS`
+  // guard DOES collide across two different calls landing in the same
+  // millisecond — proven live, on this exact statement, by the adversarial
+  // gate (a losing racer's verdict landed anyway, on every one of the four
+  // surfaces that reach this function: HTTP, MCP, IM, and the harness-
+  // attested-origin path). `claimTimestamp()` is the SAME per-call-unique
+  // stamp round 2's P3-G fix already proved necessary for the Telegram-bind
+  // landed-proof one statement away — reused here, not re-derived, closing
+  // the class on the branch it was left on.
+  const now = claimTimestamp()
+  const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
   const verdictRow: TaskVerdict = {
     id: crypto.randomUUID(),
     task_id: input.task.id,
@@ -1274,63 +1342,56 @@ export async function writeVerdict(
     note: input.note,
     decided_by: input.decidedBy,
     decided_at: now,
+    decided_via: input.decidedVia ?? null,
+    origin_agent_id: input.originAgentId ?? null,
   }
 
-  try {
-    await env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(
-        verdictRow.id,
-        verdictRow.task_id,
-        verdictRow.verdict,
-        verdictRow.note,
-        verdictRow.decided_by,
-        verdictRow.decided_at,
-      )
-      .run()
-  } catch (insertErr) {
-    // Status is already flipped — there is no safe rollback path in D1 without a
-    // transaction API. Emit an orphan event so operators can detect and reconcile.
-    try {
-      await createBus(env).emit({
-        type: 'task.verdict_orphan' as 'task.verdict', // narrow cast for bus compat
-        tenant: env.TENANT_SLUG,
-        squad_id: input.task.squad_id,
-        agent_id: input.task.assignee_agent_id ?? undefined,
-        actor,
-        payload: {
-          task_id: input.task.id,
-          verdict: input.verdict,
-          new_status: newStatus,
-          decided_by: input.decidedBy,
-          error: insertErr instanceof Error ? insertErr.message : 'insert_failed',
-        },
-        ts: now,
-      })
-    } catch {
-      // bus emit is best-effort
-    }
-    throw insertErr // propagate so the route returns 500
-  }
+  const guardSql = extraGuard ? ` AND ${extraGuard.sql}` : ''
+  const guardParams = extraGuard ? extraGuard.params : []
 
-  const updatedTask: Task = {
-    ...input.task,
-    status: newStatus,
-    updated_at: now,
-  }
+  const statements: D1PreparedStatement[] = [
+    env.DB.prepare(
+      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'${guardSql}`,
+    ).bind(newStatus, now, input.task.id, ...guardParams),
+    env.DB.prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ?)`,
+    ).bind(
+      verdictRow.id,
+      verdictRow.task_id,
+      verdictRow.verdict,
+      verdictRow.note,
+      verdictRow.decided_by,
+      verdictRow.decided_at,
+      verdictRow.decided_via,
+      verdictRow.origin_agent_id,
+      input.task.id,
+      newStatus,
+      now,
+    ),
+  ]
 
-  // Emit verdict event (non-fatal — the verdict is already written).
+  return { statements, verdictRow, newStatus, now }
+}
+
+export async function emitVerdictBusEvent(
+  env: Env,
+  task: Task,
+  input: WriteVerdictInput,
+  newStatus: TaskStatus,
+  now: string,
+  actor?: TaskActor,
+): Promise<void> {
   try {
     await createBus(env).emit({
       type: 'task.verdict',
       tenant: env.TENANT_SLUG,
-      squad_id: input.task.squad_id,
-      agent_id: input.task.assignee_agent_id ?? undefined,
+      squad_id: task.squad_id,
+      agent_id: task.assignee_agent_id ?? undefined,
       actor,
       payload: {
-        task_id: input.task.id,
+        task_id: task.id,
         verdict: input.verdict,
         new_status: newStatus,
         decided_by: input.decidedBy,
@@ -1340,6 +1401,30 @@ export async function writeVerdict(
   } catch {
     // Bus emit failures must never roll back an already-written verdict.
   }
+}
+
+export async function writeVerdict(
+  env: Env,
+  input: WriteVerdictInput,
+  actor?: TaskActor,
+): Promise<{ task: Task; verdict: TaskVerdict }> {
+  await assertVerdictWritable(env, input.task)
+
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, input)
+  const results = await env.DB.batch(statements)
+
+  if (!results[0]?.meta?.changes) {
+    // Race lost: the task is no longer in 'review'. Surface as a typed error so
+    // the route can return 409 with a clear message. The INSERT in the same
+    // batch is, by construction, also a no-op here (its EXISTS guard cannot
+    // be satisfied) — nothing to roll back.
+    throw new VerdictRaceError(input.task.id)
+  }
+
+  const updatedTask: Task = { ...input.task, status: newStatus, updated_at: now }
+
+  // Emit verdict event (non-fatal — the verdict is already written).
+  await emitVerdictBusEvent(env, input.task, input, newStatus, now, actor)
 
   return { task: updatedTask, verdict: verdictRow }
 }

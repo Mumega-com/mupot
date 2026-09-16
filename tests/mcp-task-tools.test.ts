@@ -167,6 +167,18 @@ function makeEnv(
           },
         }
       },
+      // mupot#1425 P0-B: writeVerdict now issues its two statements (the
+      // conditional status UPDATE and the landed-proof-gated verdict INSERT,
+      // src/tasks/service.ts's buildVerdictStatements) via ONE env.DB.batch()
+      // call instead of two separate .run() calls. This mock's own .run()
+      // above is unconditional (always changes:1, no WHERE-clause
+      // simulation), so batch() can simply drive each statement's .run() in
+      // order — the SAME shape every other call site here already exercises.
+      async batch(statements: { run: () => Promise<unknown> }[]) {
+        const results = []
+        for (const statement of statements) results.push(await statement.run())
+        return results
+      },
     },
   } as unknown as Env
 

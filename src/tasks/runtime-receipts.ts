@@ -596,6 +596,16 @@ export interface TaskDispatchReceiptTimeline {
     note: string | null
     decided_by_display: string
     decided_at: string
+    // decided_via / origin_agent_display (0155, mupot#1425 P2-7,
+    // kasra-review: "decided_via/origin_agent_id have no reader... an
+    // operator reviewing history sees the member approved it, with nothing
+    // saying an agent's harness asserted it"). Both null for every ordinary
+    // verdict; set only for a harness-attested-origin decision
+    // (src/im/origin-verdict.ts) — decided_via names the write path,
+    // origin_agent_display names the CALLING agent whose harness vouched
+    // for the origin (which may differ from decided_by, the member).
+    decided_via: 'agent_attested_origin' | null
+    origin_agent_display: string | null
   }>
   task_status: string
 }
@@ -636,10 +646,13 @@ export async function listTaskDispatchReceiptTimeline(
     SELECT verdict.verdict, verdict.note,
            COALESCE(NULLIF(agent.name, ''), NULLIF(member.display_name, ''), 'Independent gate')
              AS decided_by_display,
-           verdict.decided_at
+           verdict.decided_at,
+           verdict.decided_via,
+           NULLIF(origin_agent.name, '') AS origin_agent_display
       FROM task_verdicts verdict
       LEFT JOIN agents agent ON agent.id = verdict.decided_by
       LEFT JOIN members member ON member.id = verdict.decided_by
+      LEFT JOIN agents origin_agent ON origin_agent.id = verdict.origin_agent_id
      WHERE verdict.task_id = ?1
      ORDER BY verdict.decided_at, verdict.id
      LIMIT ?2
@@ -648,6 +661,8 @@ export async function listTaskDispatchReceiptTimeline(
     note: string | null
     decided_by_display: string
     decided_at: string
+    decided_via: 'agent_attested_origin' | null
+    origin_agent_display: string | null
   }>()
   return {
     transport: transport.results ?? [],
@@ -656,6 +671,7 @@ export async function listTaskDispatchReceiptTimeline(
       ...row,
       note: row.note === null ? null : sanitizeReceiptText(row.note),
       decided_by_display: sanitizeReceiptText(row.decided_by_display),
+      origin_agent_display: row.origin_agent_display === null ? null : sanitizeReceiptText(row.origin_agent_display),
     })),
     task_status: task.status,
   }
