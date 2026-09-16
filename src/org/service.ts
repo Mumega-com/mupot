@@ -481,6 +481,9 @@ export async function prepareAgentCreate(
     parent_agent_id,
     qnft_ref,
     death_condition,
+    // owner_member_id is never set at creation — an agent starts unowned and
+    // is attached to a member only via update_agent (admin-only), see 0155.
+    owner_member_id: null,
   }
 
   // Prepare the agent AND its neutral home routing membership. The caller may
@@ -567,6 +570,9 @@ export interface AgentProfileSummary {
   death_condition: string | null
   budget_cap_cents: number | null
   budget_window: string
+  // owner_member_id (0155): who mupot says owns this agent's harness — see
+  // the field comment on Agent.owner_member_id in src/types.ts.
+  owner_member_id: string | null
 }
 
 interface AgentProfileRow {
@@ -587,6 +593,7 @@ interface AgentProfileRow {
   death_condition: string | null
   budget_cap_cents: number | null
   budget_window: string
+  owner_member_id: string | null
 }
 
 // JSON-array text column → string[]; tolerate a corrupt/legacy value by returning null
@@ -620,11 +627,12 @@ function rowToProfileSummary(r: AgentProfileRow): AgentProfileSummary {
     death_condition: r.death_condition,
     budget_cap_cents: r.budget_cap_cents,
     budget_window: r.budget_window,
+    owner_member_id: r.owner_member_id,
   }
 }
 
 const PROFILE_COLUMNS =
-  'id, squad_id, slug, name, role, status, model, model_fallback, purpose, owner, capabilities, skills, parent_agent_id, qnft_ref, death_condition, budget_cap_cents, budget_window'
+  'id, squad_id, slug, name, role, status, model, model_fallback, purpose, owner, capabilities, skills, parent_agent_id, qnft_ref, death_condition, budget_cap_cents, budget_window, owner_member_id'
 
 // Read one agent's profile by id. null when the agent does not exist.
 export async function getAgentProfile(env: Env, agentId: string): Promise<AgentProfileSummary | null> {
@@ -823,7 +831,7 @@ export async function setAgentStatus(
 
 export type UpdateAgentProfileResult =
   | { ok: true; value: AgentProfileSummary; auditId: string }
-  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' }
+  | { ok: false; error: 'not_found' | 'slug_taken' | 'no_fields' | 'invalid_field' | 'owner_member_not_found' }
 
 /** Who made a correction. `actor_type` is constrained by 0086's CHECK; a member
  *  acting through the MCP tool is a 'user'. */
@@ -845,7 +853,8 @@ const AGENT_SNAPSHOT_JSON = `json_object(
   'squad_id', squad_id, 'slug', slug, 'name', name, 'role', role, 'status', status,
   'model', model, 'model_fallback', model_fallback, 'purpose', purpose, 'owner', owner,
   'capabilities', capabilities, 'skills', skills, 'parent_agent_id', parent_agent_id,
-  'qnft_ref', qnft_ref, 'budget_cap_cents', budget_cap_cents, 'budget_window', budget_window
+  'qnft_ref', qnft_ref, 'budget_cap_cents', budget_cap_cents, 'budget_window', budget_window,
+  'owner_member_id', owner_member_id
 )`
 
 // Fields an admin may correct on an existing agent. `status` is deliberately
@@ -952,12 +961,24 @@ const UPDATABLE_ENUM_COLUMNS = ['budget_window'] as const
 // value against the other's predicate.
 const UPDATABLE_AUTONOMY_COLUMNS = ['autonomy'] as const
 
+// owner_member_id (0155, mupot#1424 slice): admin-only on EVERY path — never
+// added to SELF_PATCHABLE_FIELDS (src/mcp/provision.ts) — because it is the
+// column resolveHarnessAttestedOrigin (src/im/origin-verdict.ts) trusts to
+// decide whose member identity an agent's harness may carry into a verdict.
+// An agent-bound token setting its OWN owner_member_id would be a self-grant
+// of exactly that authority, which is why it gets its own category (not
+// UPDATABLE_TEXT_COLUMNS): the value must reference a REAL member in this
+// tenant, or be null to clear — a free-text write, unlike `owner`, is not
+// merely cosmetically wrong here, it is a security-relevant lie.
+const UPDATABLE_MEMBER_REF_COLUMNS = ['owner_member_id'] as const
+
 export type UpdatableAgentField =
   | (typeof UPDATABLE_TEXT_COLUMNS)[number]
   | (typeof UPDATABLE_ARRAY_COLUMNS)[number]
   | (typeof UPDATABLE_NUMERIC_COLUMNS)[number]
   | (typeof UPDATABLE_ENUM_COLUMNS)[number]
   | (typeof UPDATABLE_AUTONOMY_COLUMNS)[number]
+  | (typeof UPDATABLE_MEMBER_REF_COLUMNS)[number]
 
 export type AgentProfilePatch = Partial<Record<UpdatableAgentField, unknown>>
 
@@ -1024,6 +1045,29 @@ export async function updateAgentProfile(
       if (!isAutonomy(raw)) return { ok: false, error: 'invalid_field' }
       sets.push(`${key} = ?`)
       binds.push(raw)
+      continue
+    }
+
+    if ((UPDATABLE_MEMBER_REF_COLUMNS as readonly string[]).includes(key)) {
+      // null clears the owner (a legitimate admin action — detach the harness
+      // from any member, e.g. before re-provisioning). A non-null value must
+      // reference a REAL member in THIS tenant — checked here, not merely
+      // shaped like an id, because a member that does not exist would make
+      // resolveHarnessAttestedOrigin's ownership conjunct permanently false
+      // for an owner_member_id nobody can ever satisfy, silently bricking the
+      // harness-attested path for that agent with no error at write time.
+      if (raw === null) {
+        sets.push(`${key} = ?`)
+        binds.push(null)
+        continue
+      }
+      if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid_field' }
+      const memberRow = await env.DB.prepare('SELECT 1 FROM members WHERE id = ? AND tenant = ?')
+        .bind(raw.trim(), env.TENANT_SLUG)
+        .first<{ 1: number }>()
+      if (!memberRow) return { ok: false, error: 'owner_member_not_found' }
+      sets.push(`${key} = ?`)
+      binds.push(raw.trim())
       continue
     }
 

@@ -90,7 +90,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // The ONLY way an IM principal is identified. Normalised to a string because a
 // Telegram chat id arrives as a number; member_tokens/members store it as TEXT.
 // A suspended member resolves to null here — their messages are inert.
-async function memberForChat(env: Env, chatId: string): Promise<Member | null> {
+export async function memberForChat(env: Env, chatId: string): Promise<Member | null> {
   const row = await env.DB.prepare(
     `SELECT id, email, display_name, telegram_chat_id, status, created_at
        FROM members
@@ -397,7 +397,7 @@ function joinedReply(projectId: string): string {
 
 // IM resolves an ordinary human member, just like member HTTP/MCP auth. A
 // capability row never synthesizes a legacy owner/admin role or agent identity.
-function memberAuth(env: Env, member: Member, grants: CapabilityGrant[]): AuthContext {
+export function memberAuth(env: Env, member: Member, grants: CapabilityGrant[]): AuthContext {
   return { userId: member.id, email: member.email, role: 'member', tenant: env.TENANT_SLUG,
     memberId: member.id, channel: 'im', capabilities: grants, boundAgentId: null }
 }
@@ -580,7 +580,7 @@ async function fleetReply(
 // plus the special case these two never had. See verdictReply's own comment
 // for the exploit this closed.
 
-async function memberOwnsAssigneeAgent(
+export async function memberOwnsAssigneeAgent(
   env: Env,
   memberId: string,
   assigneeAgentId: string | null,
@@ -848,7 +848,7 @@ interface TelegramUpdate {
   }
 }
 
-function telegramId(raw: unknown, allowZero = false): string | null {
+export function telegramId(raw: unknown, allowZero = false): string | null {
   const value = typeof raw === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(raw)
     ? Number(raw) : typeof raw === 'number' ? raw : NaN
   return Number.isSafeInteger(value) && value >= (allowZero ? 0 : 1) ? String(value) : null

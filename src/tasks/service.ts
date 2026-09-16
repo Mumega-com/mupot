@@ -1225,6 +1225,12 @@ export interface WriteVerdictInput {
   verdict: 'approved' | 'rejected'
   note: string | null
   decidedBy: string // principal id (memberId or userId)
+  // decidedVia/originAgentId (0155, mupot#1424): set ONLY when this verdict
+  // was cast under a member's identity resolved from a harness-attested
+  // human_origin (src/im/origin-verdict.ts). Every other caller omits both —
+  // both columns stay NULL, unchanged from before this fields existed.
+  decidedVia?: 'agent_attested_origin'
+  originAgentId?: string | null
 }
 
 export class VerdictRaceError extends Error {
@@ -1274,12 +1280,14 @@ export async function writeVerdict(
     note: input.note,
     decided_by: input.decidedBy,
     decided_at: now,
+    decided_via: input.decidedVia ?? null,
+    origin_agent_id: input.originAgentId ?? null,
   }
 
   try {
     await env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         verdictRow.id,
@@ -1288,6 +1296,8 @@ export async function writeVerdict(
         verdictRow.note,
         verdictRow.decided_by,
         verdictRow.decided_at,
+        verdictRow.decided_via,
+        verdictRow.origin_agent_id,
       )
       .run()
   } catch (insertErr) {

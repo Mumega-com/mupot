@@ -372,6 +372,13 @@ export interface Agent {
   parent_agent_id: string | null
   qnft_ref: string | null
   death_condition: string | null
+  // owner_member_id (0155_agent_owner_member_and_origin_verdict.sql) — the
+  // member mupot says owns this agent's harness, for the sole purpose of
+  // carrying that member's decisions through a harness-attested human_origin
+  // (src/im/origin-verdict.ts). Deliberately distinct from `owner` (a free-text
+  // display label) and from agent_keys (memberOwnsAssigneeAgent's conflict-of-
+  // interest table) — do not conflate the three.
+  owner_member_id: string | null
 }
 
 export interface Membership {
@@ -532,6 +539,14 @@ export interface TaskVerdict {
   note: string | null
   decided_by: string // agent id or member id of the principal
   decided_at: string // ISO-8601
+  // decided_via / origin_agent_id (0155_agent_owner_member_and_origin_verdict.sql):
+  // both NULL for every ordinary verdict. Set only when the verdict was cast
+  // under a member's identity resolved from a harness-attested human_origin
+  // (src/im/origin-verdict.ts) — decided_via = 'agent_attested_origin',
+  // origin_agent_id = the CALLING agent whose harness vouched for the origin
+  // (which may differ from decided_by, always a member id in that case).
+  decided_via: 'agent_attested_origin' | null
+  origin_agent_id: string | null
 }
 
 // ── Auth (app-layer RBAC; AuthN delegated to the perimeter/OAuth) ──

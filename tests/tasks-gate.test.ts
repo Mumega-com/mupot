@@ -190,6 +190,11 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
       'LGTM',
       'member-42',
       result.verdict.decided_at,
+      // decided_via / origin_agent_id (0155, mupot#1424): both NULL — this
+      // caller omitted decidedVia/originAgentId, the ordinary (non-harness-
+      // attested) verdict shape, unchanged from before those fields existed.
+      null,
+      null,
     ])
 
     // Return shape

@@ -272,6 +272,50 @@ verdicts on the dashboard (HTTP) as an owner or admin instead. Extending IM to c
 (by consulting real capability grants the way HTTP does, rather than the coarse role check) is
 future work, not part of this PR.
 
+## Natural-language decisions through the member's OWN agent (mupot#1424)
+
+The flow above (`/approve`, `/reject` typed literally, relayed by `/im/webhook`) is one
+shape of decision channel. A second shape needs no slash command at all: the member
+talks to their OWN agent (e.g. KayHermes) in ordinary language over the SAME Telegram
+chat, and that agent's own `task_verdict` MCP/actions call carries a `human_origin`
+field the HARNESS (never the model) stamps from the real Telegram message. See
+`docs/architecture/human-decision-channel-contract.md`, "Harness-attested origin", for
+the full trust model, freshness window, replay, and rate-limit rules — this section is
+the operator-facing setup only.
+
+**One-time setup, admin only:**
+
+1. Attach the agent's harness to its owning member with `update_agent`:
+
+   ```bash
+   curl --fail-with-body --silent --show-error \
+     -H "Authorization: Bearer ${MUPOT_OPERATOR_TOKEN:?}" \
+     -H 'Content-Type: application/json' \
+     -d '{"agent":"kayhermes","owner_member_id":"'"${MEMBER_ID:?}"'"}' \
+     "${MUPOT_BASE_URL:?}/actions/update_agent"
+   ```
+
+   Admin-only, and admin-only even for the agent's own bound token — an agent may never
+   set its own `owner_member_id` (that would be a self-grant of exactly the authority
+   this field carries). Pass `"owner_member_id":null` to detach.
+
+2. **No invite, no button.** If the owning member has no Telegram identity bound yet
+   (`members.telegram_chat_id IS NULL`), the FIRST natural-language message that reaches
+   `task_verdict` with a valid `human_origin` binds it automatically, in the same
+   request, before the verdict resolves — recorded in `telegram_origin_bind_receipts`
+   (append-only). If the member is already bound to a DIFFERENT chat, the origin is
+   refused (`origin_member_mismatch`) rather than silently rebinding; if another member
+   already holds that exact chat, it is refused (`chat_already_bound`).
+
+**What the operator sees day to day:** nothing new. The member talks to their agent as
+usual; when that conversation reaches a decision, the agent's `task_verdict` call either
+carries the member's own authority (visible in the dashboard/audit as `decided_by` =
+the member, `decided_via` = `agent_attested_origin`, `origin_agent_id` = the agent) or,
+if any conjunct fails, the SAME call proceeds under the agent's own seat exactly as
+before this feature existed — never a hard failure the member has to notice or retry,
+except the two cases that refuse the whole call: a non-agent-bound caller sending
+`human_origin` at all, and a replayed origin message.
+
 ## Authority and credential boundaries
 
 - Only an authenticated operator with the required department, project, and squad authority

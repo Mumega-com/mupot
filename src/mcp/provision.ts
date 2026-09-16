@@ -1739,6 +1739,13 @@ export const SELF_FORBIDDEN_FIELDS = [
   // is the load-bearing entry: it must land here, in SELF_FORBIDDEN_FIELDS,
   // so the per-field self-lane block above refuses it BEFORE any write.
   'autonomy',
+  // owner_member_id (0155, mupot#1424 slice): the column
+  // resolveHarnessAttestedOrigin (src/im/origin-verdict.ts) trusts to decide
+  // whose member identity this agent's harness may carry into a task_verdict.
+  // An agent-bound caller setting its OWN owner_member_id would be a
+  // self-grant of exactly that authority — admin-only even on the caller's
+  // own row, same reasoning as capabilities/autonomy above.
+  'owner_member_id',
 ] as const
 // The admin-path patch surface. Hoisted out of run() (it used to be an inline
 // literal) so tests can assert the partition invariant: every field here is
@@ -1758,20 +1765,24 @@ export const ADMIN_PATCHABLE_FIELDS = [
   'budget_cap_cents',
   'budget_window',
   'autonomy',
+  'owner_member_id',
 ] as const
 const toolUpdateAgent: ToolSpec = {
   name: 'update_agent',
   scope: "agent's squad or org admin; or an agent's own row for 4 non-identity fields (self lane — see args)",
   min: 'authenticated',
   args:
-    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
+    '{ agent: string (id|slug), slug?, name?, role?, model?, model_fallback?, purpose?, owner?, owner_member_id?: string|null, qnft_ref?, capabilities?: string[], skills?: string[], budget_cap_cents?: number|null, budget_window?: "day"|"week", autonomy?: "suggest"|"draft"|"execute"|"execute_with_approval", reason?: string }' +
     ' -- SELF LANE: an agent-bound caller correcting its OWN row (agent === its own id/slug) needs no admin,' +
     ' but may only patch model/model_fallback/purpose/skills.' +
-    ' name/role/slug/owner/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
-    ' even on your own row -- name/role are interpolated into your own system prompt, and autonomy' +
-    ' governs whether an agent may ship/send/publish/merge, so both are' +
-    ' deliberately excluded from the self lane. Every non-self call (a different agent-bound' +
-    ' target, or a non-bound member) needs admin on the target agent squad or org.',
+    ' name/role/slug/owner/owner_member_id/qnft_ref/capabilities/budget_cap_cents/budget_window/autonomy still require admin,' +
+    ' even on your own row -- name/role are interpolated into your own system prompt, autonomy' +
+    ' governs whether an agent may ship/send/publish/merge, and owner_member_id is the member whose' +
+    ' identity a harness-attested human_origin on task_verdict may carry (a self-write would be a' +
+    ' self-grant), so all three are deliberately excluded from the self lane. Every non-self call' +
+    ' (a different agent-bound target, or a non-bound member) needs admin on the target agent squad or org.' +
+    ' owner_member_id: null clears it; a non-null value must be an existing member id in this tenant' +
+    ' (owner_member_not_found otherwise).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1783,6 +1794,10 @@ const toolUpdateAgent: ToolSpec = {
       model_fallback: STRING_SCHEMA,
       purpose: STRING_SCHEMA,
       owner: STRING_SCHEMA,
+      // owner_member_id (0155): admin-only, see SELF_FORBIDDEN_FIELDS above and
+      // UPDATABLE_MEMBER_REF_COLUMNS in src/org/service.ts for the referential
+      // validation (must name a real member in this tenant, or null to clear).
+      owner_member_id: STRING_SCHEMA,
       // parent_agent_id is NOT patchable here. additionalProperties:false makes a
       // caller that still sends it fail loudly at the schema instead of silently
       // dropping the field. See UPDATABLE_TEXT_COLUMNS in src/org/service.ts.
@@ -1901,6 +1916,9 @@ const toolUpdateAgent: ToolSpec = {
     if (!result.ok) {
       if (result.error === 'slug_taken') return fail(409, 'slug_taken', { slug: str(args.slug) })
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
+      if (result.error === 'owner_member_not_found') {
+        return fail(404, 'owner_member_not_found', { owner_member_id: args.owner_member_id })
+      }
       return fail(400, 'invalid_args', { reason: result.error })
     }
 
