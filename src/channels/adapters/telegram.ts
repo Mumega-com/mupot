@@ -17,11 +17,22 @@ import { timingSafeEqual } from '../../lib/crypto'
 interface TelegramSecrets {
   // adapter-local: the Bot API token (wrangler secret), not on the shared Env.
   TELEGRAM_BOT_TOKEN?: string
+  // Inbound pairing bot only — the token whose setWebhook is POST /im/webhook.
+  // Never the legacy SOS / outbound notify token.
+  TELEGRAM_PAIRING_BOT_TOKEN?: string
 }
 function telegramSecrets(env: Env): TelegramSecrets {
   // documented adapter-local secret seam (same pattern as the Google Chat adapter);
   // widens nothing for the core and never escapes this module.
   return env as unknown as TelegramSecrets
+}
+
+/** Legacy SOS long-poll bot. Connect deep links must never target it. */
+const QUARANTINED_CONNECT_BOT_USERNAMES = new Set(['sos_mumega_bot'])
+
+function pairingBotToken(env: Env): string | undefined {
+  const token = telegramSecrets(env).TELEGRAM_PAIRING_BOT_TOKEN
+  return typeof token === 'string' && token.length > 0 ? token : undefined
 }
 
 const API = 'https://api.telegram.org'
@@ -69,9 +80,14 @@ async function shortFingerprint(secret: string): Promise<string> {
  * weaker one sets the level"), because it powered the old
  * `/api/integrations/telegram` allowlist. This is a DIFFERENT, display-only
  * use with no bearing on authorization — createProjectInvite/redeemTelegram-
- * ProjectInvite never read it — so rather than reintroduce that key, the
- * username is derived live from the Bot API via `getMe`, using the SAME
- * `TELEGRAM_BOT_TOKEN` secret every other call in this file already uses.
+ * ProjectInvite never read it.
+ *
+ * Production incident (task daa5aec5, telegram:765204057:1047): deriving
+ * the username from generic `TELEGRAM_BOT_TOKEN` resolved to `Sos_mumega_bot`,
+ * whose local SOS long-poll is not `/im/webhook` and does not redeem
+ * `/start`. Connect therefore uses `TELEGRAM_PAIRING_BOT_TOKEN` only — the
+ * token of the bot whose webhook is the Mupot pairing ingress. Unset or
+ * unverifiable identity fails closed (null). `Sos_mumega_bot` is quarantined.
  * Cached in SESSIONS KV (the same general-purpose short-TTL cache other
  * dashboard reads already use, e.g. src/dashboard/brain.ts's PHYSICS_KV_KEY)
  * so a page loaded by many members doesn't call `getMe` on every render.
@@ -93,7 +109,7 @@ async function shortFingerprint(secret: string): Promise<string> {
  * "not configured" state, never fabricate a link.
  */
 export async function getTelegramBotUsername(env: Env): Promise<string | null> {
-  const token = telegramSecrets(env).TELEGRAM_BOT_TOKEN
+  const token = pairingBotToken(env)
   if (!token) return null
   const cacheKey = `${BOT_USERNAME_CACHE_PREFIX}:${await shortFingerprint(token)}`
   if (env.SESSIONS) {
@@ -106,6 +122,7 @@ export async function getTelegramBotUsername(env: Env): Promise<string | null> {
     const data = (await res.json()) as { ok?: boolean; result?: { username?: unknown } }
     const username = typeof data.result?.username === 'string' ? data.result.username.trim() : ''
     if (!TELEGRAM_USERNAME_RE.test(username)) return null
+    if (QUARANTINED_CONNECT_BOT_USERNAMES.has(username.toLowerCase())) return null
     if (env.SESSIONS) {
       await env.SESSIONS.put(cacheKey, username, { expirationTtl: BOT_USERNAME_CACHE_TTL_SECONDS })
     }

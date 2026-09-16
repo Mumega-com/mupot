@@ -13,7 +13,7 @@
 // a crash or a button wired to a guaranteed-403) and the read-only
 // loadConnectableSquads helper.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { membersApp } from '../src/members'
@@ -127,8 +127,10 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
   })
 
   it('an org-admin member sees the Connect form with a project/squad picker (multiple eligible squads)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { username: 'MupotPairingBot' } }), { status: 200 })))
     const env = makeEnv('admin@x.test')
     env.DB = harness.db
+    ;(env as Env & { TELEGRAM_PAIRING_BOT_TOKEN: string }).TELEGRAM_PAIRING_BOT_TOKEN = 'pairing-tok'
     const cookie = await devLogin(env)
     const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
     expect(res.status).toBe(200)
@@ -140,6 +142,25 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).toContain('Project A / Squad Alpha')
     expect(body).toContain('Project B / Squad Bravo')
     expect(body).not.toContain('Archived Project')
+    expect(body).toContain('data-bot-username="MupotPairingBot"')
+    expect(body).not.toContain('Sos_mumega_bot')
+    vi.unstubAllGlobals()
+  })
+
+  it('INCIDENT: outbound SOS token alone never renders a Connect deep-link target or Connect button', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { username: 'Sos_mumega_bot' } }), { status: 200 })))
+    const env = makeEnv('admin@x.test')
+    env.DB = harness.db
+    env.TELEGRAM_BOT_TOKEN = 'sos-outbound-token'
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).not.toContain('id="tg-connect"')
+    expect(body).not.toContain('Sos_mumega_bot')
+    expect(body).not.toContain('t.me/')
+    expect(body).toContain('pairing bot identity')
+    vi.unstubAllGlobals()
   })
 
   it('an org-admin sees a "no active project" explain state when nothing is eligible, not the Connect form', async () => {
@@ -267,8 +288,10 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       value: { member_id: 'member-admin', project_id: 'project-a', squad_id: 'squad-a', capability: 'admin' },
     })
 
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, result: { username: 'MupotPairingBot' } }), { status: 200 })))
     const dashEnv = makeEnv('admin@x.test')
     dashEnv.DB = harness.db
+    dashEnv.TELEGRAM_PAIRING_BOT_TOKEN = 'pairing-tok'
     const cookie = await devLogin(dashEnv)
     const boundRes = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, dashEnv)
     const boundBody = await boundRes.text()
@@ -302,6 +325,8 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     const unboundBody = await unboundRes.text()
     expect(unboundBody).toContain('Not connected')
     expect(unboundBody).not.toContain('id="tg-disconnect"')
+    expect(unboundBody).toContain('id="tg-connect"')
+    vi.unstubAllGlobals()
   })
 
   // ── kasra-review AMBER P1 (2026-09-16): the offboarding chain, not the

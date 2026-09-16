@@ -333,6 +333,13 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   }
 
   const botUsername = await getTelegramBotUsername(env)
+  if (!botUsername) {
+    return emptyState({
+      title: 'Telegram not connected',
+      detail: 'Connect is unavailable until the Mupot pairing bot identity is proven.',
+      hint: 'Operator: set TELEGRAM_PAIRING_BOT_TOKEN to the bot whose webhook is POST /im/webhook. Do not use the legacy SOS notification token.',
+    })
+  }
   const scopePicker =
     squads.length > 1
       ? html`

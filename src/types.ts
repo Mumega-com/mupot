@@ -188,14 +188,16 @@ export interface Env {
   // GONE — /channels resolves the caller to a member (member_identities) and applies
   // their capabilities, which the allowlist could not do. Do not reintroduce them:
   // a second authorisation model on one surface means the weaker one sets the level.
-  // (mupot#1412: the dashboard's Connect Telegram page needs the bot's @username for
-  // a t.me deep link — display only, no authority. It calls getMe live via
-  // TELEGRAM_BOT_TOKEN, src/channels/adapters/telegram.ts's getTelegramBotUsername,
-  // rather than reintroducing a static TELEGRAM_BOT_USERNAME key.)
-  // Telegram notification bridge — PRIMARY delivery path (direct to Bot API).
+  // (mupot#1412 / daa5aec5: Connect Telegram deep links call getMe via
+  // TELEGRAM_PAIRING_BOT_TOKEN only — the inbound pairing bot whose webhook
+  // is POST /im/webhook. TELEGRAM_BOT_TOKEN stays outbound/notify and must
+  // never author a t.me/?start= link. Do not reintroduce TELEGRAM_BOT_USERNAME.)
+  // Telegram notification bridge — PRIMARY outbound delivery path (Bot API).
   // Set via: npx wrangler secret put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
   TELEGRAM_BOT_TOKEN?: string
   TELEGRAM_CHAT_ID?: string
+  // Inbound pairing bot token (operator-only). Distinct from TELEGRAM_BOT_TOKEN.
+  TELEGRAM_PAIRING_BOT_TOKEN?: string
   HERMES_WEBHOOK_SECRET?: string
   TELEGRAM_BRIDGE_URL?: string
   // Delivery target for the message.created push seam (mumega-com#970) — the bus
