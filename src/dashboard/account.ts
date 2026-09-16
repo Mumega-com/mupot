@@ -99,6 +99,36 @@ export async function loadSelfMember(env: Env, memberId: string): Promise<SelfMe
   return row ?? null
 }
 
+interface OriginBindReceiptRow {
+  agent_id: string
+  agent_name: string | null
+  message_id: string
+  created_at: string
+}
+
+/**
+ * mupot#1425 round 3 (Athena): `telegram_origin_bind_receipts` (0155) was
+ * write-only — a first-bind-by-origin (src/im/origin-verdict.ts, no invite,
+ * no button) landed a real credential with nothing surfacing it to the
+ * member it happened to. Minimal, display-only reader: the most recent
+ * receipt for this member, if any, so a silent bind is visible on the SAME
+ * page that already shows "Telegram is connected". Org-admin members (who
+ * can view another member's row through the admin surfaces this file does
+ * NOT touch) are unaffected — this reads only the VIEWER's own member id,
+ * same self-scoping as loadSelfMember above.
+ */
+export async function loadLatestOriginBindReceipt(env: Env, memberId: string): Promise<OriginBindReceiptRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT r.agent_id, a.name AS agent_name, r.message_id, r.created_at
+       FROM telegram_origin_bind_receipts r
+       LEFT JOIN agents a ON a.id = r.agent_id
+      WHERE r.tenant = ?1 AND r.member_id = ?2
+      ORDER BY r.created_at DESC
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, memberId).first<OriginBindReceiptRow>()
+  return row ?? null
+}
+
 export interface ConnectableSquad {
   project_id: string
   project_name: string
@@ -310,12 +340,21 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   }
 
   if (member.telegram_chat_id) {
+    const originReceipt = await loadLatestOriginBindReceipt(env, member.id)
     return html`
       <div data-state="bound">
         ${pill('Connected', 'ok')}
         <p class="ui-sub" style="margin-top:8px;">
           Telegram is connected${member.telegram_bound_at ? html` · bound ${formatWhen(member.telegram_bound_at)}` : ''}.
         </p>
+        ${originReceipt
+          ? html`
+            <p class="ui-sub" style="margin-top:4px;">
+              Bound via agent ${originReceipt.agent_name ?? originReceipt.agent_id} on
+              ${formatWhen(originReceipt.created_at)}, from message ${originReceipt.message_id}.
+            </p>
+          `
+          : ''}
         <button class="btn danger" id="tg-disconnect" data-member="${member.id}">Disconnect</button>
         <div class="status-line" id="tg-status"></div>
       </div>

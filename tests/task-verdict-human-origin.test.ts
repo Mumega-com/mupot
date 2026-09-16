@@ -16,6 +16,7 @@
 // fallback): a non-agent-bound caller supplying human_origin, and a replayed
 // origin message.
 
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
 import { listTaskDispatchReceiptTimeline } from '../src/tasks/runtime-receipts'
@@ -85,13 +86,14 @@ function seedReviewTask(
   sqlite: SqliteD1Harness['sqlite'],
   id: string,
   assigneeAgentId: string | null = null,
+  projectId: string | null = null,
 ): void {
   sqlite
     .prepare(
-      `INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, result, created_at, updated_at)
-       VALUES (?, ?, 'T', 'body', 'done', 'review', ?, ?, NULL, datetime('now'), datetime('now'))`,
+      `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, gate_owner, assignee_agent_id, result, created_at, updated_at)
+       VALUES (?, ?, ?, 'T', 'body', 'done', 'review', ?, ?, NULL, datetime('now'), datetime('now'))`,
     )
-    .run(id, SQUAD, GATE, assigneeAgentId)
+    .run(id, SQUAD, projectId, GATE, assigneeAgentId)
 }
 
 function seedAssigneeConflict(sqlite: SqliteD1Harness['sqlite'], assigneeAgentId: string, memberId: string): void {
@@ -717,11 +719,113 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(second.verdict.decided_by).toBe('member-victim')
   })
 
-  // ── full chain: the P0-1 ceiling fix, proven to also close the
-  // downstream task_verdict path — an owner_member_id set that the ceiling
-  // BLOCKED means the field is still NULL, so a subsequent human_origin
-  // call from that agent falls back exactly like any other unowned agent. ─
-  it('full chain: a ceiling-BLOCKED owner_member_id set means task_verdict human_origin still falls back to agent_not_owned — no verdict as the intended victim, no binding, ever', async () => {
+  // ── mupot#1425 round 2 P0-B (kasra-review K6b): writeVerdict's own
+  // project-evidence fence used to fire AFTER the bind had already landed —
+  // proven live: 403, task still 'review', zero task_verdicts, but a
+  // durable Telegram bind HAD landed. assertVerdictWritable is now called
+  // inside dryRunAuthorize, before ANY write. ─────────────────────────────
+  it('P0-B: the project-write fence refuses BEFORE any write — telegram_chat_id stays NULL, zero receipts, zero verdicts', async () => {
+    seedAgent(harness.sqlite, 'agent-fence')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-fence')
+    seedMember(harness.sqlite, 'member-fence', { telegramChatId: null })
+    setAgentOwner(harness.sqlite, 'agent-fence', 'member-fence')
+    seedSquadMemberCapability(harness.sqlite, 'member-fence')
+    seedGateGrant(harness.sqlite, 'member', 'member-fence')
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name) VALUES ('proj-fence', 'proj-fence', 'Fenced Project');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+        VALUES ('proj-fence', '${SQUAD}', 'write');
+    `)
+    seedReviewTask(harness.sqlite, 'task-fence', null, 'proj-fence')
+    // The exact #399 scenario: the squad's write access to the project is
+    // revoked AFTER the task was created — squadCanWriteProjectEvidence /
+    // assertVerdictWritable exists to fence exactly this.
+    harness.sqlite.exec(`DELETE FROM project_squad_access WHERE project_id = 'proj-fence' AND squad_id = '${SQUAD}'`)
+    const auth = harnessAuth('agent-fence')
+
+    const result = await invokeVerdict(env, auth, {
+      task_id: 'task-fence', verdict: 'approved', human_origin: origin({ chat_id: '515151', user_id: '515151' }),
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected refusal')
+    expect(result.status).toBe(403)
+    expect(result.error).toBe('forbidden')
+    expect(result.detail).toEqual({ need: 'project_write' })
+
+    const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind('task-fence').first<{ status: string }>()
+    expect(task?.status).toBe('review') // nothing decided
+
+    const verdictCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM task_verdicts').first<{ n: number }>()
+    expect(verdictCount?.n).toBe(0)
+
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-fence').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBeNull() // CREDENTIAL NOT MINTED
+
+    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_origin_bind_receipts').first<{ n: number }>()
+    expect(receiptCount?.n).toBe(0)
+
+    const reservationCount = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM telegram_webhook_receipts WHERE update_id = ?',
+    ).bind('origin:telegram:515151:9001').first<{ n: number }>()
+    expect(reservationCount?.n).toBe(0) // "a failure reserves nothing"
+  })
+
+  // ── mupot#1425 round 2 P1-C (kasra-review T1): agent ownership was read
+  // once in the dry run and never re-asserted at commit — an operator
+  // revoking ownership in the instant between still minted a bind and a
+  // verdict. Reproduced here by wrapping env.DB.batch to clear
+  // owner_member_id the instant before the batch actually runs — the same
+  // interleaving the reviewer drove directly against the production
+  // statement. ─────────────────────────────────────────────────────────────
+  it('P1-C: agent ownership cleared in the instant between the dry run and the commit batch — no bind, no verdict', async () => {
+    seedAgent(harness.sqlite, 'agent-race-ownership')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-race-ownership')
+    seedMember(harness.sqlite, 'member-race-ownership', { telegramChatId: null })
+    setAgentOwner(harness.sqlite, 'agent-race-ownership', 'member-race-ownership')
+    seedSquadMemberCapability(harness.sqlite, 'member-race-ownership')
+    seedGateGrant(harness.sqlite, 'member', 'member-race-ownership')
+    seedReviewTask(harness.sqlite, 'task-race-ownership')
+
+    const realBatch = env.DB.batch.bind(env.DB)
+    // Wraps the ONE seam commitOriginDecision uses to write anything
+    // (env.DB.batch) so the ownership row is cleared in the exact instant
+    // between dryRunAuthorize's last read and the batch actually executing —
+    // simulating a real concurrent admin revocation, not a contrived
+    // internal hook.
+    const raceEnv: Env = {
+      ...env,
+      DB: {
+        ...env.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          harness.sqlite.prepare('UPDATE agents SET owner_member_id = NULL WHERE id = ?').run('agent-race-ownership')
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+
+    const result = expectApplied(await invokeVerdict(raceEnv, harnessAuth('agent-race-ownership'), {
+      task_id: 'task-race-ownership', verdict: 'approved', human_origin: origin(),
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'agent_not_owned' })
+    expect(result.verdict.decided_by).toBe('agent-race-ownership') // fell back to the agent
+
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-race-ownership').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBeNull() // no bind
+
+    const memberVerdictCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM task_verdicts WHERE decided_by = ? AND decided_via = 'agent_attested_origin'`,
+    ).bind('member-race-ownership').first<{ n: number }>()
+    expect(memberVerdictCount?.n).toBe(0) // no verdict AS the member
+  })
+
+  // ── full chain: the P0-1 floor+ceiling fix, proven to also close the
+  // downstream task_verdict path — an owner_member_id set that was BLOCKED
+  // (here: at the org-scope FLOOR, since this actor is squad-admin only)
+  // means the field is still NULL, so a subsequent human_origin call from
+  // that agent falls back exactly like any other unowned agent. ──────────
+  it('full chain: a floor-BLOCKED owner_member_id set means task_verdict human_origin still falls back to agent_not_owned — no verdict as the intended victim, no binding, ever', async () => {
     seedAgent(harness.sqlite, 'agent-chain')
     seedGateGrant(harness.sqlite, 'agent', 'agent-chain')
     seedMember(harness.sqlite, 'member-org-owner-chain', { telegramChatId: null })
@@ -741,7 +845,10 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(setOwner.ok).toBe(false)
     if (setOwner.ok) throw new Error('expected refusal')
     expect(setOwner.status).toBe(403)
-    expect(setOwner.error).toBe('target_rank_exceeds_ceiling')
+    // Squad-admin-only actor: refused at the org-scope FLOOR (Athena, round
+    // 2), before the ceiling is even evaluated.
+    expect(setOwner.error).toBe('forbidden')
+    expect(setOwner.detail).toEqual({ need: 'admin', scope: 'org' })
 
     const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-chain'), {
       task_id: 'task-chain', verdict: 'approved', human_origin: origin(),
@@ -779,5 +886,36 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       decided_via: 'agent_attested_origin',
       origin_agent_display: 'agent-audit-visible', // which agent's harness vouched
     })
+  })
+
+  // ── mupot#1425 round 3 addendum (Athena's plugin r4 gate): an agent-bound
+  // caller that supplies NO human_origin at all (e.g. the harness burned the
+  // stamp client-side before relaying, or simply never attached one) used to
+  // get a response body indistinguishable from an ordinary, pre-feature
+  // agent-seat verdict — human_origin was absent from the body either way,
+  // whether omitted outright or refused inside the resolver. Make the
+  // outcome always visible for an agent-bound caller. ─────────────────────
+  it('addendum: an agent-bound caller supplying NO human_origin at all still sees human_origin: {applied:false, reason:"absent"}', async () => {
+    seedAgent(harness.sqlite, 'agent-no-origin')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-no-origin')
+    seedReviewTask(harness.sqlite, 'task-no-origin')
+    const auth = harnessAuth('agent-no-origin')
+
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-no-origin', verdict: 'approved' }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'absent' })
+    expect(result.verdict.decided_by).toBe('agent-no-origin')
+  })
+
+  it('addendum: a NON-agent-bound principal supplying no human_origin sees NO human_origin field at all (unchanged)', async () => {
+    seedMember(harness.sqlite, 'member-plain-no-origin')
+    seedSquadMemberCapability(harness.sqlite, 'member-plain-no-origin')
+    seedGateGrant(harness.sqlite, 'member', 'member-plain-no-origin')
+    seedReviewTask(harness.sqlite, 'task-no-origin-2')
+
+    const result = expectApplied(await invokeVerdict(env, nonBoundAuth('member-plain-no-origin'), {
+      task_id: 'task-no-origin-2', verdict: 'approved',
+    }))
+    expect(result.human_origin).toBeUndefined()
+    expect(result.verdict.decided_by).toBe('member-plain-no-origin')
   })
 })

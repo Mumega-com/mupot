@@ -14,44 +14,50 @@
 // per call site, same discipline as evaluateVerdictGates
 // (src/tasks/index.ts) being the one shared verdict-gate predicate.
 //
-// mupot#1425 adversarial gate (kasra-review BLOCK + Athena, 2026-09-16) found
-// the defect CLASS this file's first version shipped with: side effects
-// (the Telegram-identity bind, the replay reservation) ran BEFORE the
-// authorization they were supposed to depend on, and the new ownership
-// column (agents.owner_member_id) had no target-rank ceiling. Both are fixed
-// here by RE-ORDERING, not by adding more checks on top: every read-only
-// conjunct (ownership, member active, chat fence, conflict of interest, rate
-// limit, squad membership, the real evaluateVerdictGates predicate) runs
-// FIRST, against the member's REAL fresh capabilities, with zero writes. Only
-// when that dry run says "this exact task+verdict would be authorized for
-// this member" does this module reserve the replay slot and (if needed)
-// mint the Telegram identity bind — and those two writes land in ONE D1
-// batch (see commitOriginDecision) so a thrown exception mid-commit rolls
-// BOTH back atomically: "a failure reserves nothing."
+// mupot#1425 fix-round history (all adversarial, all executed-not-inferred):
+//
+//   Round 1 (kasra-review BLOCK): side effects (the Telegram-identity bind,
+//   the replay reservation) ran BEFORE the authorization they were supposed
+//   to depend on, and agents.owner_member_id had no target-rank ceiling.
+//   Fixed by splitting into dryRunAuthorize (read-only) → commitOriginDecision
+//   (writes), reached only when the dry run says authorized.
+//
+//   Round 2 (kasra-review BLOCK + Athena): the round-1 reorder enumerated 2
+//   of 3 refusals that could still land AFTER a commit — writeVerdict's own
+//   project-evidence fence fired after the bind had already landed (P0-B),
+//   agents.owner_member_id's ceiling compared the RAW string while the write
+//   stored the TRIMMED one, a one-space id bypassed it entirely (P0-A), the
+//   ceiling had no ORG-SCOPE FLOOR paired with it the way every sibling
+//   authenticate-as-X door has (Athena), agent ownership and member-active
+//   were read in the dry run and never re-asserted at commit (P1-C), and the
+//   bind's "landed proof" guard used a timestamp coincidence instead of the
+//   digest already sitting on that same row (P3-G). This revision fixes all
+//   of them by putting the VERDICT WRITE itself inside the SAME atomic batch
+//   as the reservation and the bind — "authorize once, commit once" — so
+//   there is no exit between commit and verdict left to enumerate, and by
+//   re-asserting, in SQL, every fact the dry run read.
 //
 // Trust boundary, stated plainly (also see docs/architecture/
 // human-decision-channel-contract.md, "Harness-attested origin"): the HARNESS
 // is the attestation boundary. mupot trusts a stamp only because (a) the
-// agent seat is owned by the resolved member (agents.owner_member_id — now
-// itself gated by an org-scope-local target-rank ceiling on WHO may set it,
-// see src/mcp/provision.ts), (b) the member is bound to that exact chat (or
-// this exact request first-binds it, only AFTER the verdict is proven
-// authorized), and (c) the message is FRESH and UNREPLAYED. mupot cannot
-// itself distinguish a harness-stamped human_origin from one a model typed
-// into its own tool call — it never sees the raw Telegram update, only the
-// stamp — so every defense that IS server-checkable is enforced here, not
-// merely assumed of the harness. Freshness alone is NOT proof the harness
-// told the truth about *when* the human spoke (message_at is caller-
-// supplied — an injected model can stamp `new Date().toISOString()` just as
-// easily as a real harness); what freshness actually buys is a short shelf
-// life for a captured (chat_id, message_id) pair, so a stamp scraped from
-// old context cannot be replayed indefinitely — the replay reservation and
-// the per-member rate limit are what actually bound repetition. The honest
-// blast radius: a caller that already holds a legitimately-`owner_member_id`
-// -owned agent seat can cast, per fresh/unreplayed origin message, exactly
-// the verdicts that member's OWN real capabilities would allow — no more,
-// no wider, and never for a member the ceiling above would have refused to
-// point that agent at in the first place.
+// agent seat is owned by the resolved member (agents.owner_member_id — set
+// only by an org-scope admin who does not fail the target-rank ceiling, see
+// src/mcp/provision.ts, and re-asserted again at commit, not merely at dry
+// run), (b) the member is bound to that exact chat (or this exact request
+// first-binds it, only AFTER the ENTIRE decision — bind, reservation, and
+// verdict together — is proven authorized), and (c) the message is FRESH and
+// UNREPLAYED. mupot cannot itself distinguish a harness-stamped human_origin
+// from one a model typed into its own tool call — it never sees the raw
+// Telegram update, only the stamp — so every defense that IS server-checkable
+// is enforced here, not merely assumed of the harness. Freshness alone is NOT
+// proof the harness told the truth about *when* the human spoke (message_at
+// is caller-supplied); what freshness buys is a short shelf life for a
+// captured (chat_id, message_id) pair. Residual, stated honestly and not
+// fixed here (P1-D, kasra-review round 2): the target-rank ceiling on
+// owner_member_id is evaluated ONCE, at set time — a member promoted to
+// higher standing AFTER being pointed at by a lower-ranked actor keeps the
+// binding, unre-checked, for as long as the column stays set. Tracked as a
+// follow-up issue, not fixed in this slice.
 //
 // Every conjunct below is re-checked at call time (no caching across calls):
 // caller is agent-bound; the agent has an owner; the owner is active; the
@@ -61,24 +67,45 @@
 // task's assignee, OR the assignee agent's OWN owner_member_id is this same
 // member — the load-bearing check now that agent_keys is empty in prod for
 // the pilot agent; agent_keys' memberOwnsAssigneeAgent is kept as an
-// additional, cheap, non-load-bearing check); this (member) has not already
-// applied a decision within the rate window; and the member's fresh
-// capabilities actually authorize this exact task+verdict
-// (evaluateVerdictGates, the SAME predicate every other verdict surface
-// uses). ANY conjunct false falls back to the calling agent's own
-// authority — this module never raises for that; the ONLY hard failures are
-// the two the caller (task_verdict) must itself refuse the whole request
-// for: a non-agent-bound caller supplying human_origin at all, and a
-// replayed origin message.
+// additional, cheap, non-load-bearing check); this member has not already
+// applied a decision within the rate window; the member's fresh capabilities
+// actually authorize this exact task+verdict (evaluateVerdictGates, the SAME
+// predicate every other verdict surface uses); and the task's own
+// project-evidence fence (assertVerdictWritable) still holds. ANY conjunct
+// false falls back to the calling agent's own authority — this module never
+// raises for that; the ONLY hard failures are the two the caller
+// (task_verdict) must itself refuse the whole request for: a non-agent-bound
+// caller supplying human_origin at all, and a replayed origin message (plus
+// the pre-existing, shared VerdictRaceError for a genuine post-dry-run race
+// on the task's own status, propagated exactly as the non-origin path does).
+//
+// Known residual, not fixed here (documented, not silently assumed away):
+// member CAPABILITIES cannot be re-asserted as a SQL condition inside the
+// commit batch — `evaluateVerdictGates` is a multi-table, multi-branch JS
+// predicate, not a single EXISTS clause. The window between the dry run's
+// capability read and the commit is therefore real, but bounded to a single
+// request's own async gap (milliseconds, same-process) — not a
+// cross-request race an attacker can widen. Agent ownership and member-active
+// ARE re-asserted in SQL (see commitOriginDecision) precisely because both
+// ARE single-row EXISTS-expressible facts.
 
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
-import type { AuthContext, Env, Member } from '../types'
+import type { AuthContext, Env, Member, Task } from '../types'
 import { resolveCapabilities, canOnSquad } from '../auth/capability'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { MEMBER_BIND_ELIGIBLE_SQL } from '../members/project-invites'
 import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from './index'
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 import { evaluateVerdictGates } from '../tasks/index'
+import {
+  assertVerdictWritable,
+  buildVerdictStatements,
+  emitVerdictBusEvent,
+  TaskEvidenceFenceError,
+  VerdictRaceError,
+  type TaskActor,
+} from '../tasks/service'
+import type { TaskVerdict } from '../types'
 
 export interface HumanOriginInput {
   channel: 'telegram'
@@ -99,17 +126,12 @@ export type HumanOriginFailureReason =
   | 'assignee_conflict'
   | 'origin_rate_limited'
   | 'origin_not_gate_authorized'
+  | 'project_write_forbidden'
 
 export type HumanOriginResolution =
   | { replayed: true }
-  | { replayed: false; applied: true; member: Member; auth: AuthContext; boundNow: boolean }
+  | { replayed: false; applied: true; member: Member; auth: AuthContext; boundNow: boolean; task: Task; verdict: TaskVerdict }
   | { replayed: false; applied: false; reason: HumanOriginFailureReason }
-
-interface OriginTaskRef {
-  squad_id: string
-  gate_owner: string
-  assignee_agent_id: string | null
-}
 
 // Freshness window — a short shelf life for a captured (chat_id, message_id,
 // message_at) triple, so a stale stamp scraped from earlier context cannot
@@ -201,6 +223,14 @@ async function recentAppliedOriginExists(env: Env, memberId: string, nowMs: numb
  * — the same ownership fact this module already trusts for the calling
  * agent, applied to the assignee side too. agent_keys is kept as an
  * additional, cheap, non-load-bearing check for the day it is populated.
+ *
+ * Known gap, not fixed here (round 2, kasra-review P2-E): `task.assignee_
+ * member_id` (0150, the HUMAN-owner column) is never consulted — a member
+ * who owns a task directly (no assignee agent at all) can still approve it
+ * via a harness-attested origin. This mirrors a PRE-EXISTING gap in
+ * `evaluateVerdictGates` itself (its self-verdict check also only compares
+ * against `assignee_agent_id`), not something this module introduced or can
+ * fix in isolation — tracked as a follow-up, not silently assumed closed.
  */
 async function hasConflictOfInterest(
   env: Env,
@@ -224,25 +254,28 @@ type DryRunResult =
 /**
  * Every conjunct EXCEPT replay, entirely READ-ONLY. Returns whether this
  * exact (member, task, verdict) triple would be authorized — used to decide
- * whether to commit ANY write at all. mupot#1425 P0-2 (kasra-review): the
- * previous version minted the Telegram bind and the replay reservation
- * before this check ever ran, so an agent owned by a member with ZERO
- * capabilities could still durably bind a caller-supplied chat_id to that
- * member — a credential mint that did not require the ability to cast a
- * verdict. Nothing below writes to D1.
+ * whether to commit ANY write at all. mupot#1425 P0-2 (kasra-review round 1):
+ * a previous version minted the Telegram bind and the replay reservation
+ * before this check ever ran. mupot#1425 P0-B (round 2): a LATER version
+ * still let `writeVerdict`'s own project-evidence fence fire AFTER the
+ * commit — `assertVerdictWritable` is now called here too, so that refusal
+ * is also proven BEFORE any write, not just gate ownership and squad
+ * membership. Nothing below writes to D1.
  */
 async function dryRunAuthorize(
   env: Env,
   boundAgentId: string,
   origin: HumanOriginInput,
   verdict: 'approved' | 'rejected',
-  task: OriginTaskRef,
+  task: Task,
+  gateOwner: string,
 ): Promise<DryRunResult> {
   // (1) the calling agent must be OWNED by a member — agents.owner_member_id
   // (0155), re-read fresh every call, never cached across a session. Setting
-  // this column is itself now rank-ceilinged (src/mcp/provision.ts) — an
-  // actor without standing over the target member can never make this row
-  // true for that member, closing the K1/K1b escalation chain at its source.
+  // this column is itself now rank-ceilinged AND org-scope-floored
+  // (src/mcp/provision.ts) — an actor without standing over the target
+  // member, or without org-scope admin at all, can never make this row true
+  // for that member, closing the K1/K1b escalation chain at its source.
   const agentRow = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?')
     .bind(boundAgentId)
     .first<{ owner_member_id: string | null }>()
@@ -293,11 +326,24 @@ async function dryRunAuthorize(
   const gateResult = await evaluateVerdictGates(
     env,
     candidateAuth,
-    { squad_id: task.squad_id, gate_owner: task.gate_owner, assignee_agent_id: task.assignee_agent_id },
+    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
     verdict,
   )
   if (!gateResult.allowed) {
     return { ok: false, reason: 'origin_not_gate_authorized' }
+  }
+
+  // (9) mupot#1425 P0-B (kasra-review round 2): the project-evidence fence
+  // `writeVerdict` itself enforces — proven, live, to fire AFTER a bind had
+  // already landed when it lived only inside `writeVerdict`. Checked here,
+  // read-only, before ANY write in this module.
+  try {
+    await assertVerdictWritable(env, task)
+  } catch (err) {
+    if (err instanceof TaskEvidenceFenceError) {
+      return { ok: false, reason: 'project_write_forbidden' }
+    }
+    throw err
   }
 
   return { ok: true, owner, needsFirstBind, auth: candidateAuth }
@@ -305,31 +351,46 @@ async function dryRunAuthorize(
 
 /**
  * Commit phase — reached ONLY after dryRunAuthorize proves this exact
- * decision would be authorized. Reserves the replay slot and (if needed)
- * mints the Telegram identity bind in ONE D1 batch (mupot#1425 P0-2/P1-4
- * fix round, kasra-review + Athena): the bind UPDATE and its audit INSERT
- * are gated, in SQL, on THIS call's own reservation having actually landed
- * (a unique per-call stamp, `reservedAt` — the same "landed PROOF" pattern
- * `MEMBER_BIND_LANDED_GUARD_SQL` uses in src/members/project-invites.ts, not
- * a re-derivation of it). A UNIQUE-constraint throw (another member already
- * holds this exact chat_id) aborts the WHOLE batch — D1 batch is one
- * transaction — so the reservation itself is never left committed either:
- * "a failure reserves nothing." `writeVerdict` itself stays a SEPARATE call
- * in the caller (src/mcp/index.ts), unchanged — its own K5 conditional-
- * UPDATE race guard is documented (src/tasks/service.ts) as deliberately
- * NOT batchable ("D1 batch cannot conditionally abort in the middle"); a
- * verdict-write race lost AFTER this commit is a narrow, already-handled
- * `verdict_race` outcome, not a privilege escalation, and is accepted as
- * the cost of not forcing two independently-designed race guards into one
- * transaction.
+ * decision would be authorized. mupot#1425 P0-B (kasra-review round 2, the
+ * "verdict must be in the batch or nothing is" fix): the replay reservation,
+ * the first-bind UPDATE + its audit INSERT, AND the verdict write itself
+ * (buildVerdictStatements, src/tasks/service.ts) now land in ONE D1 batch —
+ * there is no exit AFTER this function starts writing that can leave a bind
+ * or a reservation committed with no verdict to show for it. A
+ * UNIQUE-constraint throw (another member already holds this exact chat_id)
+ * aborts the WHOLE batch — D1 batch is one transaction — so the reservation
+ * itself is never left committed either: "a failure reserves nothing."
+ *
+ * mupot#1425 P1-C (kasra-review round 2): agent ownership and member-active
+ * were read once in dryRunAuthorize and never re-asserted — a revocation
+ * racing the call (this exact interleaving was proven live) still minted a
+ * bind and a verdict. Both facts are now re-asserted, IN SQL, on every
+ * statement that depends on them (the bind UPDATE and the verdict's own
+ * tasks-status UPDATE), via the same landed-PROOF EXISTS pattern this
+ * codebase already uses (`MEMBER_BIND_LANDED_GUARD_SQL`,
+ * src/members/project-invites.ts) — task status='review' is already such a
+ * condition on the verdict statement by construction
+ * (buildVerdictStatements' own WHERE clause). Member CAPABILITIES cannot be
+ * re-asserted this way (see the module's top-of-file residual note).
+ *
+ * mupot#1425 P3-G (kasra-review round 2): the bind's own "did OUR reservation
+ * land" guard used to compare `created_at` alone — `claimTimestamp()` splices
+ * only 6 random digits before the trailing `Z`, so two calls landing within
+ * the same millisecond had a real, PROVEN (not merely theoretical) chance of
+ * collision, letting a losing call's bind ride a winning call's timestamp.
+ * The guard now ALSO requires `request_digest` to match — a value already
+ * computed and already stored on that exact reservation row — closing the
+ * gap with the field that was already sitting there unused, not a new
+ * nonce column.
  */
 async function commitOriginDecision(
   env: Env,
   owner: Member,
   boundAgentId: string,
   origin: HumanOriginInput,
-  taskId: string,
+  task: Task,
   verdict: 'approved' | 'rejected',
+  note: string | null,
   needsFirstBind: boolean,
   auth: AuthContext,
 ): Promise<HumanOriginResolution> {
@@ -338,12 +399,16 @@ async function commitOriginDecision(
     chat_id: origin.chat_id,
     user_id: origin.user_id,
     message_id: origin.message_id,
-    task_id: taskId,
+    task_id: task.id,
     verdict,
   })
   const identity: TelegramUpdateIdentity = { update_id: updateId, telegram_user_id: origin.user_id, request_digest: digest }
   const reservedAt = claimTimestamp()
   const boundAt = needsFirstBind ? claimTimestamp() : null
+
+  // Re-asserted, in SQL, at commit — see this function's own doc comment.
+  const ownershipGuardSql = 'EXISTS (SELECT 1 FROM agents WHERE id = ? AND owner_member_id = ?)'
+  const memberActiveGuardSql = "EXISTS (SELECT 1 FROM members WHERE id = ? AND status = 'active')"
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
@@ -354,13 +419,12 @@ async function commitOriginDecision(
   ]
 
   if (needsFirstBind) {
-    // Gated on THIS call's own reservation stamp existing in state
-    // 'processing' — if our INSERT above lost the ON CONFLICT race (someone
-    // else's reservation already occupies this key), this EXISTS is false
-    // and the bind cannot land even though both statements are in the same
-    // batch (D1 batch runs every statement; it cannot skip one based on a
-    // sibling's row count, only on a WHERE clause referencing durable state
-    // — same reasoning as CLAIM_INVITE_SQL's own receipt-processing conjunct).
+    // Gated on THIS call's own reservation stamp (created_at AND
+    // request_digest, P3-G) existing in state 'processing' — if our INSERT
+    // above lost the ON CONFLICT race, this EXISTS is false and the bind
+    // cannot land even though both statements are in the same batch (D1
+    // batch runs every statement; it cannot skip one based on a sibling's
+    // row count, only on a WHERE clause referencing durable state).
     statements.push(
       env.DB.prepare(
         `UPDATE members
@@ -368,9 +432,14 @@ async function commitOriginDecision(
           WHERE ${MEMBER_BIND_ELIGIBLE_SQL}
             AND EXISTS (
               SELECT 1 FROM telegram_webhook_receipts
-               WHERE tenant = ? AND update_id = ? AND created_at = ? AND state = 'processing'
-            )`,
-      ).bind(origin.chat_id, boundAt, owner.id, env.TENANT_SLUG, origin.chat_id, env.TENANT_SLUG, updateId, reservedAt),
+               WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing'
+            )
+            AND ${ownershipGuardSql}`,
+      ).bind(
+        origin.chat_id, boundAt, owner.id, env.TENANT_SLUG, origin.chat_id,
+        env.TENANT_SLUG, updateId, reservedAt, digest,
+        boundAgentId, owner.id,
+      ),
     )
     statements.push(
       env.DB.prepare(
@@ -381,13 +450,34 @@ async function commitOriginDecision(
     )
   }
 
+  // The verdict write is ALSO gated on OUR OWN reservation having landed —
+  // without this, a reservation that lost the ON CONFLICT race (genuine
+  // replay) would still let the verdict statements through, since ownership
+  // and member-active are facts INDEPENDENT of the reservation. Proven live
+  // by this module's own test suite before this guard existed: a colliding
+  // pre-existing reservation correctly refused the call (`replayed: true`)
+  // while the verdict INSERT landed anyway. Same landed-PROOF EXISTS pattern
+  // as the bind statement above, including the P3-G digest guard.
+  const reservationLandedGuardSql =
+    "EXISTS (SELECT 1 FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing')"
+  const verdictBuild = buildVerdictStatements(
+    env,
+    { task, verdict, note, decidedBy: owner.id, decidedVia: 'agent_attested_origin', originAgentId: boundAgentId },
+    {
+      sql: `${ownershipGuardSql} AND ${memberActiveGuardSql} AND ${reservationLandedGuardSql}`,
+      params: [boundAgentId, owner.id, owner.id, env.TENANT_SLUG, updateId, reservedAt, digest],
+    },
+  )
+  const verdictStatusIndex = statements.length
+  statements.push(...verdictBuild.statements)
+
   let results: D1Result[]
   try {
     results = await env.DB.batch(statements)
   } catch (err) {
     if (isUniqueViolationOn(err, 'telegram_chat_id')) {
-      // Whole batch rolled back atomically — the reservation was never
-      // committed either. Never overwrite someone else's binding.
+      // Whole batch rolled back atomically — the reservation and the verdict
+      // were never committed either. Never overwrite someone else's binding.
       return { replayed: false, applied: false, reason: 'chat_already_bound' }
     }
     throw err
@@ -401,20 +491,46 @@ async function commitOriginDecision(
     return { replayed: true }
   }
 
-  if (needsFirstBind && rowsChanged(results[1]) !== 1) {
-    // Our reservation landed but the bind did not — a race lost between the
-    // dry run and this commit (e.g. the member went inactive, or something
-    // else bound them to a DIFFERENT chat, in the interim). Disambiguate
-    // with a read-only follow-up; complete the reservation with the real
-    // outcome so this exact origin message stays spent.
-    const fresh = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
-      .bind(owner.id).first<{ telegram_chat_id: string | null }>()
-    const reason: HumanOriginFailureReason =
-      fresh?.telegram_chat_id && fresh.telegram_chat_id !== origin.chat_id
-        ? 'origin_member_mismatch'
-        : 'member_not_eligible'
-    await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason }))
-    return { replayed: false, applied: false, reason }
+  const bindLanded = !needsFirstBind || rowsChanged(results[1]) === 1
+  const verdictLanded = rowsChanged(results[verdictStatusIndex]) === 1
+
+  if (!bindLanded || !verdictLanded) {
+    // Our reservation landed but the bind and/or the verdict did not — a
+    // race lost between the dry run and this commit. Disambiguate with
+    // READ-ONLY follow-ups (diagnostic only — the atomic guards above already
+    // decided the outcome; these reads only choose which message to report)
+    // and complete the reservation so this exact origin message stays spent.
+    const stillOwned = await env.DB.prepare('SELECT 1 FROM agents WHERE id = ? AND owner_member_id = ?')
+      .bind(boundAgentId, owner.id).first()
+    if (!stillOwned) {
+      await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'agent_not_owned' }))
+      return { replayed: false, applied: false, reason: 'agent_not_owned' }
+    }
+    const stillActive = await env.DB.prepare("SELECT 1 FROM members WHERE id = ? AND status = 'active'")
+      .bind(owner.id).first()
+    if (!stillActive) {
+      await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'member_inactive' }))
+      return { replayed: false, applied: false, reason: 'member_inactive' }
+    }
+    if (!bindLanded) {
+      const fresh = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+        .bind(owner.id).first<{ telegram_chat_id: string | null }>()
+      const reason: HumanOriginFailureReason =
+        fresh?.telegram_chat_id && fresh.telegram_chat_id !== origin.chat_id
+          ? 'origin_member_mismatch'
+          : 'member_not_eligible'
+      await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason }))
+      return { replayed: false, applied: false, reason }
+    }
+    // Ownership and member-active both still hold, and the bind (if any)
+    // landed — the ONLY remaining explanation is the verdict's own
+    // task-status='review' guard: a genuine, pre-existing K5 race (another
+    // verdict won concurrently). Same shared outcome the non-origin path
+    // already surfaces — propagate it identically rather than inventing a
+    // second race code, so the caller (src/mcp/index.ts) handles both with
+    // the SAME catch block.
+    await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'verdict_race' }))
+    throw new VerdictRaceError(task.id)
   }
 
   // Real defence in depth (confirmed live by Athena's own probe on this PR):
@@ -429,36 +545,53 @@ async function commitOriginDecision(
     return { replayed: false, applied: false, reason: 'origin_member_mismatch' }
   }
 
-  const outcome: HumanOriginResolution = { replayed: false, applied: true, member: resolved, auth, boundNow: needsFirstBind }
+  const updatedTask: Task = { ...task, status: verdictBuild.newStatus, updated_at: verdictBuild.now }
+  const actor: TaskActor = { kind: 'member', id: owner.id }
+  await emitVerdictBusEvent(env, task, { task, verdict, note, decidedBy: owner.id }, verdictBuild.newStatus, verdictBuild.now, actor)
+
   await completeTelegramUpdate(env, identity, JSON.stringify({ applied: true, member_id: resolved.id, bound_now: needsFirstBind }))
-  return outcome
+  return {
+    replayed: false,
+    applied: true,
+    member: resolved,
+    auth,
+    boundNow: needsFirstBind,
+    task: updatedTask,
+    verdict: verdictBuild.verdictRow,
+  }
 }
 
 /**
- * Resolve a harness-attested `human_origin` into the member's own AuthContext,
- * or a named reason it does not apply. `boundAgentId` is the CALLING agent
- * (auth.boundAgentId) — the caller (task_verdict) must have already confirmed
- * this is set before calling here; a null/undefined boundAgentId is a caller
- * bug, not a resolvable outcome of this function.
+ * Resolve a harness-attested `human_origin` into the member's own AuthContext
+ * PLUS the already-committed verdict, or a named reason it does not apply.
+ * `boundAgentId` is the CALLING agent (auth.boundAgentId) — the caller
+ * (task_verdict) must have already confirmed this is set, and that
+ * `task.gate_owner` is non-null and `task.status === 'review'`, before
+ * calling here; those are caller-shape invariants, not resolvable outcomes
+ * of this function.
  *
- * Order, load-bearing (mupot#1425 fix round): parse + freshness (no reads) →
- * dryRunAuthorize (every conjunct, ALL reads, zero writes) → ONLY IF
- * authorized → commitOriginDecision (reserve + first-bind, one D1 batch).
+ * Order, load-bearing (mupot#1425 fix round 1+2): parse + freshness (no
+ * reads) → dryRunAuthorize (every conjunct including the project-evidence
+ * fence, ALL reads, zero writes) → ONLY IF authorized →
+ * commitOriginDecision (reserve + first-bind + THE VERDICT ITSELF, one D1
+ * batch). May throw VerdictRaceError — propagate it exactly as the
+ * non-origin path does (src/mcp/index.ts).
  */
 export async function resolveHarnessAttestedOrigin(
   env: Env,
   boundAgentId: string,
   rawOrigin: unknown,
-  taskId: string,
+  task: Task,
+  gateOwner: string,
   verdict: 'approved' | 'rejected',
-  task: OriginTaskRef,
+  note: string | null,
 ): Promise<HumanOriginResolution> {
   const parsed = parseHumanOrigin(rawOrigin)
   if (!parsed.ok) return { replayed: false, applied: false, reason: parsed.reason }
   const origin = parsed.value
 
-  const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task)
+  const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task, gateOwner)
   if (!dryRun.ok) return { replayed: false, applied: false, reason: dryRun.reason }
 
-  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, taskId, verdict, dryRun.needsFirstBind, dryRun.auth)
+  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.needsFirstBind, dryRun.auth)
 }

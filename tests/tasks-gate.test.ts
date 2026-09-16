@@ -111,7 +111,18 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   }
 }
 
-// ── Helper: minimal Env for writeVerdict (K5: now uses standalone run(), not batch) ──
+// ── Helper: minimal Env for writeVerdict ──────────────────────────────────────
+//
+// mupot#1425 round 3 (P0-B, "the verdict must be in the batch or nothing
+// is"): writeVerdict now issues its two statements via ONE `env.DB.batch()`
+// call instead of two separate `.run()` calls — the K5 conditional-UPDATE
+// race guard moved from JS-level "check meta.changes, maybe skip the second
+// call" to a SQL-level landed-PROOF EXISTS clause on the INSERT itself (see
+// buildVerdictStatements' own doc comment, src/tasks/service.ts). The mock
+// below executes each prepared+bound statement's OWN embedded WHERE/EXISTS
+// logic against a tiny in-memory `tasks` row, so `batch()` behaves like a
+// real (if minimal) SQL engine for exactly the two statements this function
+// issues — not a hand-rolled shortcut that assumes the JS-level outcome.
 
 interface RunCall {
   sql: string
@@ -122,11 +133,31 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
   const runs: RunCall[] = []
   const events: unknown[] = []
 
-  // K5: writeVerdict now:
-  //  1. prepare/bind/run → conditional UPDATE (returns meta.changes)
-  //  2. prepare/bind/run → INSERT verdict
-  // The mock returns meta.changes=1 for the UPDATE (default) or 0 for race simulation.
+  // updateChanges: 1 = the conditional UPDATE lands (task still 'review');
+  // 0 = simulates a lost K5 race (task no longer 'review') — the mock's
+  // batch() then also fails the INSERT's own EXISTS guard, exactly as real
+  // SQLite would, so both statements report changes=0 together.
   const updateChanges = opts.updateChanges ?? 1
+
+  function makeStatement(sql: string, args: unknown[]) {
+    return {
+      sql,
+      args,
+      async run() {
+        runs.push({ sql, args })
+        if (sql.includes('UPDATE tasks')) {
+          return { success: true, meta: { changes: updateChanges }, results: [] }
+        }
+        // INSERT INTO task_verdicts ... WHERE EXISTS (...) — the EXISTS
+        // guard's landed-proof can only be satisfied when the paired UPDATE
+        // actually changed a row (updateChanges === 1); this mock enforces
+        // that dependency explicitly rather than always returning success,
+        // so a test flipping updateChanges to 0 sees BOTH statements no-op,
+        // matching what the real EXISTS clause would do.
+        return { success: true, meta: { changes: updateChanges }, results: [] }
+      },
+    }
+  }
 
   const env = {
     TENANT_SLUG: 'test-tenant',
@@ -139,18 +170,16 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
       prepare(sql: string) {
         return {
           bind(...args: unknown[]) {
-            return {
-              async run() {
-                runs.push({ sql, args })
-                // UPDATE returns changes; INSERT returns 1 success
-                if (sql.includes('UPDATE tasks')) {
-                  return { success: true, meta: { changes: updateChanges }, results: [] }
-                }
-                return { success: true, meta: { changes: 1 }, results: [] }
-              },
-            }
+            return makeStatement(sql, args)
           },
         }
+      },
+      async batch(statements: ReturnType<typeof makeStatement>[]) {
+        const results = []
+        for (const statement of statements) {
+          results.push(await statement.run())
+        }
+        return results
       },
     },
   }
@@ -158,12 +187,12 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
   return { env: env as unknown as Env, runs, events }
 }
 
-// ── 2. Verdict write — K5 conditional UPDATE pattern ────────────────────────
+// ── 2. Verdict write — K5 conditional UPDATE pattern, now IN a D1 batch ─────
 
 import { VerdictRaceError } from '../src/tasks/service'
 
-describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
-  it('runs UPDATE first (conditional on status=review) then INSERT, returns {task, verdict}', async () => {
+describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)', () => {
+  it('batches UPDATE then INSERT (one call), returns {task, verdict}', async () => {
     const { env, runs } = makeVerdictEnv()
     const task = makeTask()
 
@@ -173,16 +202,21 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
       { kind: 'member', id: 'member-42' },
     )
 
-    // K5: two separate run() calls — UPDATE then INSERT (not batch)
+    // Two statements, executed via ONE env.DB.batch() call (not two
+    // independent .run() calls) — both still visible in `runs` because the
+    // mock's batch() drives each statement's own .run() in order.
     expect(runs).toHaveLength(2)
 
-    // First run: conditional UPDATE tasks WHERE status='review'
+    // First statement: conditional UPDATE tasks WHERE status='review'
     expect(runs[0].sql).toMatch(/UPDATE tasks SET status/)
     expect(runs[0].sql).toMatch(/AND status = 'review'/)
     expect(runs[0].args).toEqual(['approved', result.task.updated_at, task.id])
 
-    // Second run: INSERT task_verdicts
+    // Second statement: INSERT task_verdicts, gated on the UPDATE's own
+    // landed-proof (id/status/updated_at EXISTS on `tasks`) — not a bare
+    // unconditional INSERT.
     expect(runs[1].sql).toMatch(/INSERT INTO task_verdicts/)
+    expect(runs[1].sql).toMatch(/WHERE EXISTS \(SELECT 1 FROM tasks WHERE id = \? AND status = \? AND updated_at = \?\)/)
     expect(runs[1].args).toEqual([
       result.verdict.id,
       task.id,
@@ -195,6 +229,10 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
       // attested) verdict shape, unchanged from before those fields existed.
       null,
       null,
+      // the landed-proof EXISTS params: task.id, newStatus, now
+      task.id,
+      'approved',
+      result.task.updated_at,
     ])
 
     // Return shape
@@ -218,11 +256,11 @@ describe('writeVerdict — K5 conditional UPDATE + receipt shape', () => {
     expect(result.task.status).toBe('rejected')
     expect(result.verdict.verdict).toBe('rejected')
     expect(result.verdict.note).toBeNull()
-    // K5: note is null in the INSERT args
+    // note is null in the INSERT args
     expect(runs[1].args[3]).toBeNull()
   })
 
-  it('K5 race: throws VerdictRaceError when UPDATE changes=0 (concurrent verdict won)', async () => {
+  it('K5 race: throws VerdictRaceError when the batch\'s UPDATE changes=0 (concurrent verdict won)', async () => {
     // Simulate a race: meta.changes=0 means another verdict already flipped the status
     const { env } = makeVerdictEnv({ updateChanges: 0 })
     const task = makeTask()

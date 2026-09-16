@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -1781,8 +1781,13 @@ const toolUpdateAgent: ToolSpec = {
     ' identity a harness-attested human_origin on task_verdict may carry (a self-write would be a' +
     ' self-grant), so all three are deliberately excluded from the self lane. Every non-self call' +
     ' (a different agent-bound target, or a non-bound member) needs admin on the target agent squad or org.' +
-    ' owner_member_id: null clears it; a non-null value must be an existing member id in this tenant' +
-    ' (owner_member_not_found otherwise).',
+    ' owner_member_id: null clears it (squad-admin suffices, same as any other admin-lane field); a' +
+    ' non-null value must be an existing member id in this tenant with no leading/trailing/inner' +
+    ' whitespace (invalid_args otherwise), and the caller must ALSO hold admin on the ORG scope' +
+    ' specifically (squad-admin alone is not enough for this one field — 403 forbidden need=admin' +
+    ' scope=org otherwise) and must not name a member who outranks the caller anywhere' +
+    ' (403 target_rank_exceeds_ceiling otherwise) — both waived when the target IS the caller\'s own' +
+    ' member id. owner_member_not_found when the (normalized) id names no real member.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1895,37 +1900,57 @@ const toolUpdateAgent: ToolSpec = {
       return fail(400, 'invalid_args', 'at least one field to update is required')
     }
 
-    // mupot#1425 adversarial gate P0-1 (kasra-review + Athena, 2026-09-16):
-    // owner_member_id is a CREDENTIAL-CONFERRING field — it decides whose
-    // member identity an agent's harness may carry into a task_verdict
-    // (src/im/origin-verdict.ts). Setting it to member M is granting THIS
-    // agent M's future standing, the exact shape POST /members/:id/tokens
-    // already fences with org-admin PLUS a target-rank ceiling ("Minting a
-    // token FOR a member yields a credential that authenticates AS that
-    // member... vertical privilege escalation", src/members/index.ts). Before
-    // this fix, the ADMIN lane above only proved squad-admin on the AGENT's
-    // squad — a squad admin with zero org standing could point an agent at
-    // the org OWNER (proved by kasra-review's K1/K1b probe: that agent's
-    // Telegram DM then resolves, via memberForChat, to the owner's full
-    // grant set for the entire IM surface). Not checked on the self lane
-    // at all — self-writing owner_member_id is refused by SELF_FORBIDDEN_
-    // FIELDS above, before `patch` is even built, so `isSelf` is always
-    // false here.
+    // mupot#1425 adversarial gate — owner_member_id is a CREDENTIAL-CONFERRING
+    // field: it decides whose member identity an agent's harness may carry
+    // into a task_verdict (src/im/origin-verdict.ts). Setting it to member M
+    // is granting THIS agent M's future standing, the exact shape
+    // POST /members/:id/tokens already fences with org-admin PLUS a
+    // target-rank ceiling ("Minting a token FOR a member yields a credential
+    // that authenticates AS that member... vertical privilege escalation",
+    // src/members/index.ts). Self-writing is refused by SELF_FORBIDDEN_FIELDS
+    // above, before `patch` is even built, so `isSelf` is always false here;
+    // clearing (owner_member_id: null) is NOT gated by any of this — it
+    // revokes, confers nothing, carries none of the escalation risk.
     //
-    // exceedsTargetRankCeiling (src/auth/capability.ts) is the SAME
-    // predicate #1411's member-bind-invite path uses for the identical
-    // class of credential mint: the actor's ORG-SCOPE-LOCAL rank must be >=
-    // the target's GLOBAL rank across every scope + the role-plane bridge;
-    // self-exempt only when the actor IS the target. Reused verbatim, not
-    // re-derived — see that function's own docstring for why the two sides
-    // are deliberately asymmetric (actor scope-local, target global).
-    //
-    // Clearing (owner_member_id: null) is NOT ceiling-checked: it revokes an
-    // agent's ability to carry someone's identity, it confers nothing to
-    // anyone, so it carries none of the escalation risk minting does.
+    // Round 1 (kasra-review K1/K1b): the ADMIN lane above only proved
+    // squad-admin on the AGENT's squad — a squad admin with zero org standing
+    // could point an agent at the org OWNER.
+    // Round 2 (kasra-review P0-A): the ceiling checked the RAW string while
+    // org/service.ts's updateAgentProfile validated and wrote the TRIMMED
+    // string — a single leading/trailing/inner whitespace character made
+    // `targetMaxRankAcrossScopes(" victim-owner")` resolve to rank 0 (no
+    // matching capabilities row, no email bridge), bypassing the ceiling for
+    // ANY actor while the write still stored the un-whitespaced id. Fixed by
+    // rejecting ANY whitespace outright, here, before either check — never
+    // by normalizing at two independent sites (round 2's own root cause).
+    // Round 2 (Athena): exceedsTargetRankCeiling alone is a ceiling with no
+    // FLOOR — an actor with (say) squad-admin plus some unrelated org-scope
+    // 'member'/'lead' grant, but no org-scope ADMIN, could still pass the
+    // ceiling against a target who happens to rank BELOW them, with no
+    // org-scope standing at all. Every other authenticate-as-X door in this
+    // codebase pairs the ceiling with an org-scope floor
+    // (MEMBER_BIND_MINT_FLOOR='admin' + exceedsTargetRankCeiling,
+    // src/members/project-invites.ts:29,575-578,609; requireCapability
+    // (orgScope,'admin') + targetRankCeiling, src/members/index.ts:742,763).
+    // This field now requires the SAME floor: org-scope 'admin', re-derived
+    // fresh via actorRankOnScopeFor(env, auth, 'org', null) — squad-admin is
+    // not enough to mint this specific credential, only to reach the rest of
+    // the admin lane. Self-target (actor pointing an agent at their OWN
+    // member id) is exempt from BOTH the floor and the ceiling — a principal
+    // granting themselves nothing is not the mint this guards.
     if (typeof patch.owner_member_id === 'string' && patch.owner_member_id.length > 0) {
-      if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
-        return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })
+      if (/\s/.test(patch.owner_member_id)) {
+        return fail(400, 'invalid_args', 'owner_member_id must not contain whitespace')
+      }
+      const isSelfTarget = auth.memberId != null && auth.memberId === patch.owner_member_id
+      if (!isSelfTarget) {
+        const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
+        if (actorOrgRank < capabilityRank('admin')) {
+          return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+        }
+        if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
+          return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })
+        }
       }
     }
 

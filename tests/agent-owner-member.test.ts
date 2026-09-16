@@ -165,17 +165,50 @@ describe('update_agent — owner_member_id (mupot#1424, migration 0155)', () => 
   // (src/auth/capability.ts), reused verbatim from #1411's member-bind-
   // invite path, closes it. ─────────────────────────────────────────────
   describe('mupot#1425 P0-1 — target-rank ceiling on owner_member_id', () => {
-    it('a squad admin with NO org standing pointing an agent at the ORG OWNER: 403 target_rank_exceeds_ceiling, no write (Athena\'s proof-of-exploit)', async () => {
+    // mupot#1425 round 2 (Athena): exceedsTargetRankCeiling alone has no
+    // ORG-SCOPE FLOOR — every other authenticate-as-X door in this codebase
+    // pairs the ceiling with a floor (MEMBER_BIND_MINT_FLOOR='admin',
+    // src/members/project-invites.ts; requireCapability(orgScope,'admin'),
+    // src/members/index.ts). A squad admin who does not ALSO hold org-scope
+    // admin is refused at the FLOOR now, before the ceiling is even
+    // evaluated — this is Athena's own proof-of-exploit shape.
+    it('a squad admin with NO org standing pointing an agent at ANY member (even one who outranks nobody): 403 forbidden need=admin scope=org (the FLOOR, Athena\'s proof-of-exploit) — no write', async () => {
       harness.sqlite.exec(`
-        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-owner', 'owner@test.com', 'Owner', 'active', '${TENANT}');
-        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-owner', 'member-org-owner', 'org', NULL, 'owner');
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-ordinary', 'ordinary@test.com', 'Ordinary', 'active', '${TENANT}');
+        INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+          VALUES ('gg-ordinary', 'gate:outreach', 'member', 'member-ordinary', 'test', datetime('now'));
         INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-squad-admin', 'sqadmin@test.com', 'SqAdmin', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-sqadmin-org-member', 'member-squad-admin', 'org', NULL, 'member');
       `)
       const squadAdminGrant: CapabilityGrant[] = [
         { member_id: 'member-squad-admin', scope_type: 'squad', scope_id: squadId, capability: 'admin' },
+        { member_id: 'member-squad-admin', scope_type: 'org', scope_id: null, capability: 'member' },
       ]
       const result = await invoke(
         auth({ memberId: 'member-squad-admin', capabilities: squadAdminGrant }),
+        { agent: agentId, owner_member_id: 'member-ordinary' },
+      )
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.status).toBe(403)
+      expect(result.error).toBe('forbidden')
+      expect(result.detail).toEqual({ need: 'admin', scope: 'org' })
+
+      const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string | null }>()
+      expect(row?.owner_member_id).toBeNull()
+    })
+
+    it('an ORG ADMIN (floor satisfied) pointing an agent at the ORG OWNER: 403 target_rank_exceeds_ceiling (the CEILING, distinct from the floor above), no write', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-owner', 'owner@test.com', 'Owner', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-owner', 'member-org-owner', 'org', NULL, 'owner');
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-admin', 'orgadmin@test.com', 'OrgAdmin', 'active', '${TENANT}');
+      `)
+      const orgAdminGrant: CapabilityGrant[] = [
+        { member_id: 'member-org-admin', scope_type: 'org', scope_id: null, capability: 'admin' },
+      ]
+      const result = await invoke(
+        auth({ memberId: 'member-org-admin', capabilities: orgAdminGrant }),
         { agent: agentId, owner_member_id: 'member-org-owner' },
       )
       expect(result.ok).toBe(false)
@@ -210,6 +243,44 @@ describe('update_agent — owner_member_id (mupot#1424, migration 0155)', () => 
       if (!result.ok) return
       const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string }>()
       expect(row?.owner_member_id).toBe('member-org-owner-2')
+    })
+
+    // mupot#1425 round 2 (kasra-review P0-A): the ceiling used to check the
+    // RAW string while org/service.ts's updateAgentProfile validated and
+    // wrote the TRIMMED string — a single leading/trailing/inner whitespace
+    // character (including a unicode space) made `targetMaxRankAcrossScopes`
+    // resolve to rank 0 for ANY target id, bypassing the ceiling entirely
+    // while the write still stored the un-whitespaced id (K1-WS, proven live
+    // with all four forms: leading, trailing, tab, newline). Fixed by
+    // rejecting ANY whitespace outright, at the boundary, before either the
+    // floor or the ceiling ever sees the value.
+    it.each([
+      [' member-org-owner', 'leading space'],
+      ['member-org-owner ', 'trailing space'],
+      ['\tmember-org-owner', 'leading tab'],
+      ['member-org-owner\n', 'trailing newline'],
+      ['member-org- owner', 'inner unicode NBSP (U+00A0)'],
+      ['mem ber-org-owner', 'inner ASCII space'],
+    ])('owner_member_id with %s (%s) is refused 400 invalid_args, no write, no ceiling bypass', async (whitespaced: string) => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-owner', 'owner3@test.com', 'Owner3', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-owner-3', 'member-org-owner', 'org', NULL, 'owner');
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-admin-ws', 'orgadminws@test.com', 'OrgAdminWs', 'active', '${TENANT}');
+      `)
+      const orgAdminGrant: CapabilityGrant[] = [
+        { member_id: 'member-org-admin-ws', scope_type: 'org', scope_id: null, capability: 'admin' },
+      ]
+      const result = await invoke(
+        auth({ memberId: 'member-org-admin-ws', capabilities: orgAdminGrant }),
+        { agent: agentId, owner_member_id: whitespaced },
+      )
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.status).toBe(400)
+      expect(result.error).toBe('invalid_args')
+
+      const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string | null }>()
+      expect(row?.owner_member_id).toBeNull()
     })
 
     it('a squad admin pointing an agent at THEMSELVES: ok — self-exempt regardless of rank', async () => {

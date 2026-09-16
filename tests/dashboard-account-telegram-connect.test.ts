@@ -194,6 +194,46 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).not.toContain('id="tg-connect"')
   })
 
+  // mupot#1425 round 3 (Athena): telegram_origin_bind_receipts (0155) was
+  // write-only — a first-bind-by-origin (src/im/origin-verdict.ts) landed a
+  // real credential with no reader anywhere. loadLatestOriginBindReceipt
+  // (src/dashboard/account.ts) now surfaces it on the SAME page that already
+  // shows "Telegram is connected", so a silent bind is visible to the member
+  // it happened to.
+  it('a member bound via harness-attested origin sees WHICH agent bound them and from which message, on the same Connected view', async () => {
+    harness.sqlite.exec(`
+      UPDATE members SET telegram_chat_id = '555000111', telegram_bound_at = '2026-09-15T00:00:00000000Z'
+       WHERE id = 'member-bound';
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status)
+        VALUES ('agent-kayhermes-bound', 'squad-a', 'kayhermes', 'KayHermes', 'member', 'test', 'active');
+      INSERT INTO telegram_origin_bind_receipts (id, tenant, member_id, agent_id, chat_id, message_id, created_at)
+        VALUES ('receipt-1', '${TENANT}', 'member-bound', 'agent-kayhermes-bound', '555000111', '9001', '2026-09-15T00:00:00000000Z');
+    `)
+    const env = makeEnv('bound@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('Bound via agent KayHermes')
+    expect(body).toContain('9001')
+  })
+
+  it('a member bound WITHOUT any origin receipt (the ordinary invite/button path) shows no origin-bind line at all', async () => {
+    harness.sqlite.exec(`
+      UPDATE members SET telegram_chat_id = '555000222', telegram_bound_at = '2026-09-15T00:00:00000000Z'
+       WHERE id = 'member-bound';
+    `)
+    const env = makeEnv('bound@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('Connected')
+    expect(body).not.toContain('Bound via agent')
+  })
+
   it('a member with zero capability anywhere never reaches /account — the pre-existing dashboard-wide floor gate refuses first', async () => {
     const env = makeEnv('nobody@x.test')
     env.DB = harness.db

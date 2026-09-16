@@ -1881,8 +1881,8 @@ const toolTaskVerdict: ToolSpec = {
     ' at call time. message_at must be within 10 minutes in the past or 60 seconds in the future of the server' +
     ' clock (origin_stale otherwise) — mupot cannot tell a harness-stamped origin from a model-typed one, so a' +
     ' stale or reused stamp is refused server-side regardless of what stamped it. At most one APPLIED' +
-    ' human_origin verdict per (agent, chat) per 30 seconds (origin_rate_limited otherwise), bounding a' +
-    ' compromised harness to one forged verdict per fresh message from its owner\'s own chat. Any conjunct' +
+    ' human_origin verdict per resolved MEMBER per 30 seconds (origin_rate_limited otherwise; keyed on the' +
+    ' member, not the calling agent — owning several agents does not raise this budget). Any conjunct' +
     ' false falls back to the calling agent\'s own authority, unchanged from omitting human_origin — see the' +
     ' human_origin field on the response. A non-agent-bound caller supplying human_origin gets' +
     ' 400 human_origin_not_applicable; a replayed origin message gets 409 origin_replayed (the whole call' +
@@ -1920,6 +1920,11 @@ const toolTaskVerdict: ToolSpec = {
     // `auth`, so moving them earlier changes nothing about what they gate.
     if (!task.gate_owner) return fail(409, 'no_gate')
     if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
+    const gateOwner = task.gate_owner
+
+    const note: string | null = typeof args.note === 'string'
+      ? args.note
+      : (typeof args.reason === 'string' ? args.reason : null)
 
     // ── mupot#1424/#1425: harness-attested human origin ────────────────────
     // See src/im/origin-verdict.ts for the full trust model, the fix-round
@@ -1930,30 +1935,55 @@ const toolTaskVerdict: ToolSpec = {
     // failure mode falls back to the calling agent's own authority, exactly
     // as if human_origin had been omitted — "no origin, or origin that does
     // not resolve, runs under the agent seat only" (Hadi, 2026-09-16).
-    // resolveHarnessAttestedOrigin itself does not write ANYTHING (bind,
-    // reservation) until it has independently proven, via a read-only dry
-    // run of the SAME evaluateVerdictGates predicate below, that this exact
-    // task+verdict would be authorized for the resolved member.
-    let originOutcome: HumanOriginResolution | null = null
+    //
+    // mupot#1425 P0-B (round 2 fix): resolveHarnessAttestedOrigin now commits
+    // the reservation, the first-bind (if needed), AND the verdict write
+    // itself in ONE atomic D1 batch, reached only after a read-only dry run
+    // proves the exact task+verdict authorized — there is no exit between a
+    // commit and a verdict left for a later refusal to land in. On
+    // `applied: true` the decision is ALREADY durable; this handler returns
+    // it directly rather than calling writeVerdict a second time.
+    let originFailure: HumanOriginResolution | null = null
     if (args.human_origin !== undefined) {
       if (!auth.boundAgentId) {
         return fail(400, 'human_origin_not_applicable')
       }
-      originOutcome = await resolveHarnessAttestedOrigin(env, auth.boundAgentId, args.human_origin, task.id, verdict, {
-        squad_id: task.squad_id,
-        gate_owner: task.gate_owner,
-        assignee_agent_id: task.assignee_agent_id,
-      })
-      if (originOutcome.replayed) {
-        return fail(409, 'origin_replayed')
+      try {
+        const originOutcome = await resolveHarnessAttestedOrigin(
+          env, auth.boundAgentId, args.human_origin, task, gateOwner, verdict, note,
+        )
+        if (originOutcome.replayed) {
+          return fail(409, 'origin_replayed')
+        }
+        if (originOutcome.applied) {
+          if (task.workflow_instance_id && env.TASK_WORKFLOW) {
+            try {
+              const inst = await env.TASK_WORKFLOW.get(task.workflow_instance_id)
+              await inst.sendEvent({ type: 'gate-verdict', payload: { verdict } })
+            } catch {
+              // non-fatal
+            }
+          }
+          return done({
+            task: originOutcome.task,
+            verdict: originOutcome.verdict,
+            human_origin: humanOriginResponsePayload(originOutcome),
+          })
+        }
+        // applied: false — fall through to the agent's own authority below,
+        // carrying the reason for the response's human_origin field.
+        originFailure = originOutcome
+      } catch (err) {
+        if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
+        throw err
       }
     }
-    const effectiveAuth = originOutcome && !originOutcome.replayed && originOutcome.applied
-      ? originOutcome.auth
-      : auth
 
-    // Base guard: member+ on the task's squad (same floor as every task mutation).
-    const grants = effectiveAuth.capabilities ?? []
+    // ── fallback: the calling agent's own authority (origin omitted, or
+    // every dry-run conjunct refused) — UNCHANGED from before human_origin
+    // existed, using `auth` directly, never `originFailure.auth` (there is
+    // no such field on a non-applied outcome). ─────────────────────────────
+    const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
@@ -1963,20 +1993,14 @@ const toolTaskVerdict: ToolSpec = {
     // the HTTP twin (POST /:id/verdict) and the dashboard's read-side
     // can_verdict/can_approve/can_reject. A sixth gate cannot drift the two
     // write surfaces apart because there is only one place it can be added.
-    // Evaluated against effectiveAuth so a resolved human_origin decides with
-    // the MEMBER's own standing, never the calling agent's.
-    const gateOwner = task.gate_owner
     const gateResult = await evaluateVerdictGates(
       env,
-      effectiveAuth,
+      auth,
       { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
       verdict,
     )
     const principal = gateResult.principal
-
-    let note: string | null = typeof args.note === 'string'
-      ? args.note
-      : (typeof args.reason === 'string' ? args.reason : null)
+    let fallbackNote = note
 
     if (!gateResult.allowed) {
       if (gateResult.code === 'no_gate_capability') {
@@ -1990,11 +2014,8 @@ const toolTaskVerdict: ToolSpec = {
       // (audited in the note). evaluateVerdictGates never grants this itself — a
       // default caller never sends the flag — so it is applied here, at the one
       // write-time call site that owns request-arg-shaped exceptions. Mirrors
-      // the HTTP twin in src/tasks/index.ts. effectiveAuth.role is always
-      // 'member' when human_origin resolved (memberAuth hardcodes it, same as
-      // the IM channel) — a harness-attested verdict can never invoke this
-      // override, matching IM's own documented limitation.
-      const isOrgOwner = effectiveAuth.role === 'owner'
+      // the HTTP twin in src/tasks/index.ts.
+      const isOrgOwner = auth.role === 'owner'
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {
         return fail(409, 'self_verdict', {
@@ -2002,21 +2023,13 @@ const toolTaskVerdict: ToolSpec = {
         })
       }
       const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
-      note = note ? `${overrideNote} ${note}` : overrideNote
+      fallbackNote = fallbackNote ? `${overrideNote} ${fallbackNote}` : overrideNote
     }
 
     try {
       const result = await writeVerdict(
         env,
-        {
-          task,
-          verdict,
-          note,
-          decidedBy: principal.id,
-          ...(originOutcome && !originOutcome.replayed && originOutcome.applied
-            ? { decidedVia: 'agent_attested_origin' as const, originAgentId: auth.boundAgentId }
-            : {}),
-        },
+        { task, verdict, note: fallbackNote, decidedBy: principal.id },
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
@@ -2028,10 +2041,22 @@ const toolTaskVerdict: ToolSpec = {
           // non-fatal
         }
       }
-      return done({
-        ...result,
-        ...(originOutcome ? { human_origin: humanOriginResponsePayload(originOutcome) } : {}),
-      })
+      // mupot#1425 round 3 addendum (Athena's plugin r4 gate): an agent-bound
+      // caller that never received a human_origin at all (e.g. the harness
+      // burned the stamp client-side before relaying) used to get a response
+      // indistinguishable from an ordinary, pre-feature agent-seat verdict —
+      // `human_origin` was simply absent from the body either way. Make the
+      // outcome always visible for an agent-bound caller: `reason: 'absent'`
+      // when none was supplied at all, vs. the real conjunct-specific reason
+      // when one was supplied and failed. Non-agent-bound principals are
+      // unchanged — human_origin was never applicable to them, so the field
+      // stays omitted, exactly as before this addendum.
+      const humanOriginField = originFailure
+        ? { human_origin: humanOriginResponsePayload(originFailure) }
+        : auth.boundAgentId
+          ? { human_origin: { applied: false, reason: 'absent' } }
+          : {}
+      return done({ ...result, ...humanOriginField })
     } catch (err) {
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
       if (err instanceof TaskEvidenceFenceError) {
