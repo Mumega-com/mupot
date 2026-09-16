@@ -907,6 +907,22 @@ async function postAccountConnectTelegramUpdate(text) {
 // tests/im-bot-username.test.ts's unconfigured-setting cases).
 const SEEDED_DECISION_BOT_USERNAME = 'kayhermes_mubot'
 async function runAccountTelegramConnectWorkflow() {
+  // Owner's path starts at /admin/im-settings: once the decision bot is set the
+  // page must hand them to /account (the only thing left to do there).
+  await page.goto(`${baseUrl}/admin/im-settings`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const nextStep = page.locator('#im-settings-next-step')
+  if (await nextStep.count() !== 1) {
+    fail('IM settings did not render the "Next: connect your Telegram" step with a bot configured', {
+      body: await textSnippet(page.locator('body'), 1500),
+    })
+  }
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10_000 }),
+    nextStep.click(),
+  ])
+  if (new URL(page.url()).pathname !== '/account') {
+    fail('IM settings next-step button did not land on /account', { url: page.url() })
+  }
   await page.goto(`${baseUrl}/account`, { waitUntil: 'networkidle', timeout: 20_000 })
   const initialText = await textSnippet(page.locator('body'), 4000)
   if (!initialText.includes('Not connected') || !(await page.locator('#tg-connect').count())) {
@@ -956,6 +972,9 @@ async function runAccountTelegramConnectWorkflow() {
   const deepLinkText = await textSnippet(page.locator('#tg-result a'), 100)
   if (!deepLinkText.includes('Open in Telegram')) {
     fail('Connect Telegram deep link anchor did not render the expected label', { deepLinkText })
+  }
+  if (!pairingText.includes('send /needs')) {
+    fail('Connect Telegram result did not tell the member what to type after tapping the link', { pairingText })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'account-pairing-code.png'), fullPage: true })
 

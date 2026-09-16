@@ -329,6 +329,9 @@ describe('org_settings.im_bot_username — wizard write, im-settings write, acco
       expect(res.status).toBe(200)
       const body = await res.text()
       expect(body).toContain('kayhermes_mubot')
+      // Next-step affordance: the owner's only job here is to point members at
+      // /account, so the page must hand them there once a value is set.
+      expect(body).toContain('id="im-settings-next-step" href="/account"')
     })
 
     it('GET renders an honest "Not set" empty state when unconfigured', async () => {
@@ -339,6 +342,9 @@ describe('org_settings.im_bot_username — wizard write, im-settings write, acco
       expect(res.status).toBe(200)
       const body = await res.text()
       expect(body).toContain('Not set')
+      // No next-step button before a value exists: sending someone to /account
+      // with no bot configured yields a pairing-code-only page.
+      expect(body).not.toContain('id="im-settings-next-step" href="/account"')
     })
 
     it('GET refuses a non-owner with an honest 403 explain page (not a crash)', async () => {

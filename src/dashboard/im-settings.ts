@@ -59,8 +59,14 @@ function saveScript(): Html {
           });
           var data = await res.json().catch(function () { return {}; });
           if (res.ok) {
-            status.textContent = 'Saved.';
+            status.textContent = value ? 'Saved. ' : 'Cleared.';
             status.className = 'status-line ok';
+            if (value) {
+              var next = document.createElement('a');
+              next.href = '/account'; next.className = 'btn'; next.id = 'im-settings-next-step';
+              next.textContent = 'Next: connect your Telegram on My Account →';
+              status.appendChild(next);
+            }
           } else {
             status.textContent = 'Failed: ' + (data.error || res.status);
             status.className = 'status-line err';
@@ -105,7 +111,8 @@ export async function imSettingsBody(env: Env): Promise<Html> {
         </form>
         <div class="status-line" id="im-bot-username-status"></div>
         ${current
-          ? html`<p class="ui-sub" style="margin-top:8px;">Currently set to <code>@${current}</code>.</p>`
+          ? html`<p class="ui-sub" style="margin-top:8px;">Currently set to <code>@${current}</code>.</p>
+              <p style="margin-top:8px;"><a class="btn" id="im-settings-next-step" href="/account">Next: connect your Telegram on My Account →</a></p>`
           : emptyState({
               title: 'Not set',
               detail: 'Members see a plain pairing code with no deep link until this is configured.',

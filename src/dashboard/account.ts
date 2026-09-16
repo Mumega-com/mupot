@@ -248,6 +248,10 @@ function connectScript(): Html {
                   var a = document.createElement('a');
                   a.href = link; a.textContent = 'Open in Telegram →'; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.className = 'btn';
                   result.appendChild(a);
+                  var then = document.createElement('p');
+                  then.className = 'ui-sub';
+                  then.textContent = 'Tap Start in Telegram. Once the bot confirms the link, send /needs to see what is waiting for you, then /approve <task id> or /reject <task id>.';
+                  result.appendChild(then);
                 } else {
                   var manual = document.createElement('p');
                   manual.textContent = 'Message the bot and send: /start ' + data.pairing_code;
