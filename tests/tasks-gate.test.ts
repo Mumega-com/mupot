@@ -14,6 +14,9 @@ import { verdictPrincipal } from '../src/tasks'
 import type { TaskStatus } from '../src/tasks/service'
 import type { Task, TaskVerdict, Env, AuthContext } from '../src/types'
 import { writeVerdict } from '../src/tasks/service'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 // ── 1. Transition matrix ─────────────────────────────────────────────────────
 
@@ -277,6 +280,113 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
     await expect(
       writeVerdict(env, { task, verdict: 'rejected', note: null, decidedBy: 'member-2' }),
     ).rejects.toThrow('task-race-test')
+  })
+})
+
+// ── K5 race, real SQLite (mupot#1425 round 4) ────────────────────────────────
+//
+// The tests above pin the STATEMENT SHAPE against a hand-mocked DB. This
+// describe block proves the actual outcome against real SQLite + the full
+// committed migration chain: on a lost race, the row count for
+// `task_verdicts` is exactly 0 for the loser — not merely "the mock's
+// changes=0 knob was set and a throw was observed," which could stay green
+// even if the real EXISTS landed-proof guard were broken.
+describe('writeVerdict — K5 race, real SQLite, 0 verdict rows for the loser (mupot#1425 round 4)', () => {
+  let harness: SqliteD1Harness
+  let realEnv: Env
+
+  function seed(): void {
+    harness.sqlite.prepare(`INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept-1', 'Dept One')`).run()
+    harness.sqlite
+      .prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-1', 'Squad One')`)
+      .run()
+    harness.sqlite
+      .prepare(
+        `INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, result, created_at, updated_at)
+         VALUES ('task-race-real', 'squad-1', 'T', '', 'done', 'review', 'gate:outreach', NULL, datetime('now'), datetime('now'))`,
+      )
+      .run()
+  }
+
+  function race(): Env {
+    const realBatch = realEnv.DB.batch.bind(realEnv.DB)
+    return {
+      ...realEnv,
+      DB: {
+        ...realEnv.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          // Simulate a concurrent verdict winning the race in the instant
+          // between this call's own read and its commit batch.
+          harness.sqlite.prepare("UPDATE tasks SET status = 'approved' WHERE id = 'task-race-real'").run()
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+  }
+
+  it('a lost race throws VerdictRaceError AND leaves 0 rows in task_verdicts', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    realEnv = { TENANT_SLUG: 'test-tenant', DB: harness.db } as unknown as Env
+    seed()
+
+    const task = makeTask({ id: 'task-race-real' })
+    await expect(
+      writeVerdict(race(), { task, verdict: 'approved', note: null, decidedBy: 'member-1' }),
+    ).rejects.toThrow(VerdictRaceError)
+
+    const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
+    expect(count.n).toBe(0)
+
+    // The task itself was NOT reverted to the loser's intended status —
+    // the concurrent winner's 'approved' still stands, untouched by the
+    // loser's no-op UPDATE.
+    const row = harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get('task-race-real') as { status: string }
+    expect(row.status).toBe('approved')
+
+    harness.close()
+  })
+
+  // mupot#1425 round 4 (kasra-review P0-2, independently reproduced by
+  // Athena via her own frozen-clock probe): a BARE `new Date().toISOString()`
+  // landed-proof value collides across two DIFFERENT calls that land in the
+  // SAME millisecond. Freezing the clock makes this deterministic instead of
+  // relying on real-world timing luck: call A wins normally; call B loses
+  // its own conditional UPDATE (task no longer 'review') but, before the
+  // claimTimestamp() nonce fix, its INSERT's own EXISTS guard could still
+  // accidentally match call A's ALREADY-COMMITTED row, because B's own
+  // (bare, unmodified) "now" value is BYTE-IDENTICAL to A's — landing a
+  // phantom SECOND task_verdicts row even though writeVerdict still throws
+  // VerdictRaceError back to B's caller (the throw depends only on the
+  // UPDATE's own changes=0, never on the INSERT). The row count is the only
+  // thing that can catch this — a throw alone cannot.
+  it('P0-2 (frozen clock): two approvals on the SAME task in the SAME millisecond — the loser throws AND inserts nothing (not merely "throws")', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-16T12:00:00.000Z'))
+      harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      realEnv = { TENANT_SLUG: 'test-tenant', DB: harness.db } as unknown as Env
+      seed()
+
+      const task = makeTask({ id: 'task-race-real' })
+      await writeVerdict(realEnv, { task, verdict: 'approved', note: null, decidedBy: 'member-A' })
+
+      await expect(
+        writeVerdict(realEnv, { task, verdict: 'approved', note: null, decidedBy: 'member-B' }),
+      ).rejects.toThrow(VerdictRaceError)
+
+      // The decisive assertion: exactly ONE row, not two. A phantom insert
+      // from the loser would still let the call throw (the throw is keyed
+      // on the UPDATE's own changes=0) while silently doubling this count.
+      const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
+      expect(count.n).toBe(1)
+      const decidedBy = harness.sqlite.prepare('SELECT decided_by FROM task_verdicts').get() as { decided_by: string }
+      expect(decidedBy.decided_by).toBe('member-A') // the winner's row, not the loser's
+    } finally {
+      vi.useRealTimers()
+      harness.close()
+    }
   })
 })
 

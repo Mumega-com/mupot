@@ -66,6 +66,7 @@ import {
 } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
+import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import {
   GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
   addSquadMember,
@@ -1945,8 +1946,8 @@ const toolUpdateAgent: ToolSpec = {
       const isSelfTarget = auth.memberId != null && auth.memberId === patch.owner_member_id
       if (!isSelfTarget) {
         const actorOrgRank = await actorRankOnScopeFor(env, auth, 'org', null)
-        if (actorOrgRank < capabilityRank('admin')) {
-          return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+        if (actorOrgRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) {
+          return fail(403, 'forbidden', { need: MEMBER_BIND_MINT_FLOOR, scope: 'org' })
         }
         if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
           return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })

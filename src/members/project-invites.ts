@@ -10,6 +10,7 @@ import {
   targetMaxRankAcrossScopes,
 } from '../auth/capability'
 import { sha256Hex } from './service'
+import { claimTimestamp } from '../lib/claim-timestamp'
 
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -449,14 +450,6 @@ export const MEMBER_BIND_UPDATE_SQL = `
        SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
      )
 `
-
-function claimTimestamp(): string {
-  const iso = new Date().toISOString()
-  const random = new Uint32Array(1)
-  crypto.getRandomValues(random)
-  const suffix = String(random[0] % 1_000_000).padStart(6, '0')
-  return iso.replace('Z', `${suffix}Z`)
-}
 
 function parseStoredRedemption(text: string | null): RedeemedProjectInvite | null {
   if (!text || text.length > 1000) return null

@@ -178,6 +178,11 @@ function origin(overrides: Partial<Record<string, unknown>> = {}): Record<string
     chat_id: '5551234',
     message_id: '9001',
     message_at: new Date().toISOString(), // fresh by default
+    // text (round 4 addendum): generic fallback for a call site that does
+    // not name a specific task — deliberately vague, so a test asserting
+    // task_not_named or a specific task-naming behavior must pass its OWN
+    // `text` override naming that exact task, not rely on this default.
+    text: 'approve',
     ...overrides,
   }
 }
@@ -201,7 +206,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const res = await invokeVerdict(env, nonBoundAuth('member-plain'), {
       task_id: 'task-1',
       verdict: 'approved',
-      human_origin: origin(),
+      human_origin: origin({ text: 'approve task-1' }),
     })
     expect(res.ok).toBe(false)
     if (res.ok) throw new Error('expected refusal')
@@ -219,7 +224,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-2')
     const auth = harnessAuth('agent-unowned', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-2', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-2', verdict: 'approved', human_origin: origin({ text: 'approve task-2' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'agent_not_owned' })
     expect(result.verdict.decided_by).toBe('agent-unowned')
     expect(result.verdict.decided_via ?? null).toBeNull()
@@ -234,7 +239,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-3')
     const auth = harnessAuth('agent-susp-owner', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-3', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-3', verdict: 'approved', human_origin: origin({ text: 'approve task-3' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'member_inactive' })
     expect(result.verdict.decided_by).toBe('agent-susp-owner')
   })
@@ -251,7 +256,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(env, auth, {
       task_id: 'task-4',
       verdict: 'approved',
-      human_origin: origin({ chat_id: '9999999' }), // != user_id
+      human_origin: origin({ text: 'approve task-4', chat_id: '9999999' }), // != user_id
     }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'invalid_origin_shape' })
     expect(result.verdict.decided_by).toBe('agent-shape')
@@ -266,7 +271,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-5')
     const auth = harnessAuth('agent-mismatch', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-5', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-5', verdict: 'approved', human_origin: origin({ text: 'approve task-5' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'origin_member_mismatch' })
     expect(result.verdict.decided_by).toBe('agent-mismatch')
 
@@ -291,7 +296,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-6')
     const auth = harnessAuth('agent-taken', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6', verdict: 'approved', human_origin: origin({ text: 'approve task-6' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'chat_already_bound' })
     expect(result.verdict.decided_by).toBe('agent-taken')
 
@@ -320,7 +325,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-6b')
     const auth = harnessAuth('agent-oracle', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6b', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6b', verdict: 'approved', human_origin: origin({ text: 'approve task-6b' }) }))
     // Refused at the dry-run gate, NOT with chat_already_bound — an
     // unauthorized caller learns nothing about whether the target chat_id
     // is already bound to someone else.
@@ -341,7 +346,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-7', 'agent-conflict-assignee')
     const auth = harnessAuth('agent-conflict-harness', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-7', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-7', verdict: 'approved', human_origin: origin({ text: 'approve task-7' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'assignee_conflict' })
     expect(result.verdict.decided_by).toBe('agent-conflict-harness')
   })
@@ -356,7 +361,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-8')
     const auth = harnessAuth('agent-firstbind')
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-8', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-8', verdict: 'approved', human_origin: origin({ text: 'approve task-8' }) }))
     expect(result.human_origin).toEqual({ applied: true, bound_now: true })
     expect(result.verdict.decided_by).toBe('member-firstbind')
     expect(result.verdict.decided_via).toBe('agent_attested_origin')
@@ -389,7 +394,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-9')
     const auth = harnessAuth('agent-prebound')
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-9', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-9', verdict: 'approved', human_origin: origin({ text: 'approve task-9' }) }))
     expect(result.human_origin).toEqual({ applied: true, bound_now: false })
     expect(result.verdict.decided_by).toBe('member-prebound')
   })
@@ -430,7 +435,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       )
       .run(TENANT, 'origin:telegram:5551234:9001', '5551234', 'a'.repeat(64), new Date().toISOString())
 
-    const result = await invokeVerdict(env, auth, { task_id: 'task-10', verdict: 'approved', human_origin: origin() })
+    const result = await invokeVerdict(env, auth, { task_id: 'task-10', verdict: 'approved', human_origin: origin({ text: 'approve task-10' }) })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected refusal')
     expect(result.status).toBe(409)
@@ -464,11 +469,11 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-12')
 
     const first = expectApplied(await invokeVerdict(env, harnessAuth('agent-replay2a'), {
-      task_id: 'task-11', verdict: 'approved', human_origin: origin({ chat_id: '5551234', user_id: '5551234', message_id: '1' }),
+      task_id: 'task-11', verdict: 'approved', human_origin: origin({ text: 'approve task-11', chat_id: '5551234', user_id: '5551234', message_id: '1' }),
     }))
     expect(first.human_origin?.applied).toBe(true)
     const second = expectApplied(await invokeVerdict(env, harnessAuth('agent-replay2b'), {
-      task_id: 'task-12', verdict: 'approved', human_origin: origin({ chat_id: '7778888', user_id: '7778888', message_id: '2' }),
+      task_id: 'task-12', verdict: 'approved', human_origin: origin({ text: 'approve task-12', chat_id: '7778888', user_id: '7778888', message_id: '2' }),
     }))
     expect(second.human_origin?.applied).toBe(true)
 
@@ -487,7 +492,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const elevenMinutesAgo = new Date(Date.now() - 11 * 60 * 1000).toISOString()
     const result = expectApplied(await invokeVerdict(env, auth, {
-      task_id: 'task-13', verdict: 'approved', human_origin: origin({ message_at: elevenMinutesAgo }),
+      task_id: 'task-13', verdict: 'approved', human_origin: origin({ text: 'approve task-13', message_at: elevenMinutesAgo }),
     }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale' })
     expect(result.verdict.decided_by).toBe('agent-stale-old')
@@ -503,7 +508,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const twoMinutesFromNow = new Date(Date.now() + 2 * 60 * 1000).toISOString()
     const result = expectApplied(await invokeVerdict(env, auth, {
-      task_id: 'task-14', verdict: 'approved', human_origin: origin({ message_at: twoMinutesFromNow }),
+      task_id: 'task-14', verdict: 'approved', human_origin: origin({ text: 'approve task-14', message_at: twoMinutesFromNow }),
     }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'origin_stale' })
     expect(result.verdict.decided_by).toBe('agent-stale-future')
@@ -520,7 +525,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const nineMinutesAgo = new Date(Date.now() - 9 * 60 * 1000).toISOString()
     const result = expectApplied(await invokeVerdict(env, auth, {
-      task_id: 'task-15', verdict: 'approved', human_origin: origin({ message_at: nineMinutesAgo }),
+      task_id: 'task-15', verdict: 'approved', human_origin: origin({ text: 'approve task-15', message_at: nineMinutesAgo }),
     }))
     expect(result.human_origin?.applied).toBe(true)
   })
@@ -538,7 +543,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const auth = harnessAuth('agent-rate', [{ member_id: 'floor-only', scope_type: 'squad', scope_id: SQUAD, capability: 'member' }])
 
     const first = expectApplied(await invokeVerdict(env, auth, {
-      task_id: 'task-16', verdict: 'approved', human_origin: origin({ message_id: '9101' }),
+      task_id: 'task-16', verdict: 'approved', human_origin: origin({ text: 'approve task-16', message_id: '9101' }),
     }))
     expect(first.human_origin).toEqual({ applied: true, bound_now: false })
 
@@ -546,7 +551,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     // deciding a DIFFERENT task — the replay reservation does not catch this
     // (different digest), only the rate limit does.
     const second = expectApplied(await invokeVerdict(env, auth, {
-      task_id: 'task-17', verdict: 'approved', human_origin: origin({ message_id: '9102' }),
+      task_id: 'task-17', verdict: 'approved', human_origin: origin({ text: 'approve task-17', message_id: '9102' }),
     }))
     expect(second.human_origin).toEqual({ applied: false, reason: 'origin_rate_limited' })
     expect(second.verdict.decided_by).toBe('agent-rate') // fell back to the agent, task-17 still decided
@@ -574,12 +579,12 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-19')
 
     const first = expectApplied(await invokeVerdict(env, harnessAuth('agent-rate-a'), {
-      task_id: 'task-18', verdict: 'approved', human_origin: origin({ chat_id: '5551234', user_id: '5551234', message_id: '9201' }),
+      task_id: 'task-18', verdict: 'approved', human_origin: origin({ text: 'approve task-18', chat_id: '5551234', user_id: '5551234', message_id: '9201' }),
     }))
     expect(first.human_origin?.applied).toBe(true)
 
     const second = expectApplied(await invokeVerdict(env, harnessAuth('agent-rate-b'), {
-      task_id: 'task-19', verdict: 'approved', human_origin: origin({ chat_id: '7778888', user_id: '7778888', message_id: '9202' }),
+      task_id: 'task-19', verdict: 'approved', human_origin: origin({ text: 'approve task-19', chat_id: '7778888', user_id: '7778888', message_id: '9202' }),
     }))
     expect(second.human_origin?.applied).toBe(true)
   })
@@ -600,7 +605,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-ratem2')
 
     const first = expectApplied(await invokeVerdict(env, harnessAuth('agent-rate-m1'), {
-      task_id: 'task-ratem1', verdict: 'approved', human_origin: origin({ message_id: '9301' }),
+      task_id: 'task-ratem1', verdict: 'approved', human_origin: origin({ text: 'approve task-ratem1', message_id: '9301' }),
     }))
     expect(first.human_origin?.applied).toBe(true)
 
@@ -608,7 +613,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     // would have applied (keyed on origin_agent_id), letting one member
     // rotate agents to bypass the rate limit entirely.
     const second = expectApplied(await invokeVerdict(env, harnessAuth('agent-rate-m2'), {
-      task_id: 'task-ratem2', verdict: 'approved', human_origin: origin({ message_id: '9302' }),
+      task_id: 'task-ratem2', verdict: 'approved', human_origin: origin({ text: 'approve task-ratem2', message_id: '9302' }),
     }))
     expect(second.human_origin).toEqual({ applied: false, reason: 'origin_rate_limited' })
   })
@@ -636,7 +641,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     // Task is still 'review' (the refusal above never wrote anything) — the
     // SAME origin message can now be tried against the same task.
-    const withOrigin = await invokeVerdict(env, auth, { task_id: 'task-self', verdict: 'approved', human_origin: origin() })
+    const withOrigin = await invokeVerdict(env, auth, { task_id: 'task-self', verdict: 'approved', human_origin: origin({ text: 'approve task-self' }) })
     expect(withOrigin.ok).toBe(false)
     if (withOrigin.ok) throw new Error('expected refusal')
     expect(withOrigin.status).toBe(409)
@@ -655,7 +660,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-conflict-2', 'agent-conflict-assignee-2')
     const auth = harnessAuth('agent-conflict-harness-2', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' }])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-conflict-2', verdict: 'approved', human_origin: origin() }))
+    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-conflict-2', verdict: 'approved', human_origin: origin({ text: 'approve task-conflict-2' }) }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'assignee_conflict' })
   })
 
@@ -671,7 +676,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     // Deliberately NO squad capability, NO gate grant for member-zero-caps.
     seedReviewTask(harness.sqlite, 'task-unauth')
     const auth = harnessAuth('agent-unauthorized', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' }])
-    const attemptedOrigin = origin({ chat_id: '424242', user_id: '424242' })
+    const attemptedOrigin = origin({ chat_id: '424242', user_id: '424242', text: 'approve task-unauth' })
 
     const result = await invokeVerdict(env, auth, { task_id: 'task-unauth', verdict: 'approved', human_origin: attemptedOrigin })
     expect(result.ok).toBe(false)
@@ -705,7 +710,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedSquadMemberCapability(harness.sqlite, 'member-victim')
     seedGateGrant(harness.sqlite, 'member', 'member-victim')
     seedReviewTask(harness.sqlite, 'task-p14')
-    const sharedOrigin = origin({ chat_id: '909090', user_id: '909090', message_id: '4242' })
+    const sharedOrigin = origin({ chat_id: '909090', user_id: '909090', message_id: '4242', text: 'approve task-p14' })
 
     const first = await invokeVerdict(env, harnessAuth('agent-unowned-first', [{ member_id: 'x', scope_type: 'squad', scope_id: SQUAD, capability: 'member' }]), {
       task_id: 'task-p14', verdict: 'approved', human_origin: sharedOrigin,
@@ -744,7 +749,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const auth = harnessAuth('agent-fence')
 
     const result = await invokeVerdict(env, auth, {
-      task_id: 'task-fence', verdict: 'approved', human_origin: origin({ chat_id: '515151', user_id: '515151' }),
+      task_id: 'task-fence', verdict: 'approved', human_origin: origin({ text: 'approve task-fence', chat_id: '515151', user_id: '515151' }),
     })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected refusal')
@@ -805,7 +810,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     }
 
     const result = expectApplied(await invokeVerdict(raceEnv, harnessAuth('agent-race-ownership'), {
-      task_id: 'task-race-ownership', verdict: 'approved', human_origin: origin(),
+      task_id: 'task-race-ownership', verdict: 'approved', human_origin: origin({ text: 'approve task-race-ownership' }),
     }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'agent_not_owned' })
     expect(result.verdict.decided_by).toBe('agent-race-ownership') // fell back to the agent
@@ -851,7 +856,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(setOwner.detail).toEqual({ need: 'admin', scope: 'org' })
 
     const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-chain'), {
-      task_id: 'task-chain', verdict: 'approved', human_origin: origin(),
+      task_id: 'task-chain', verdict: 'approved', human_origin: origin({ text: 'approve task-chain' }),
     }))
     expect(result.human_origin).toEqual({ applied: false, reason: 'agent_not_owned' })
     expect(result.verdict.decided_by).toBe('agent-chain') // fell back to the agent, never the intended victim
@@ -874,7 +879,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedReviewTask(harness.sqlite, 'task-audit-visible')
 
     const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-audit-visible'), {
-      task_id: 'task-audit-visible', verdict: 'approved', human_origin: origin(),
+      task_id: 'task-audit-visible', verdict: 'approved', human_origin: origin({ text: 'approve task-audit-visible' }),
     }))
     expect(result.human_origin?.applied).toBe(true)
 
@@ -917,5 +922,221 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     }))
     expect(result.human_origin).toBeUndefined()
     expect(result.verdict.decided_by).toBe('member-plain-no-origin')
+  })
+
+  // ── mupot#1425 round 4 (Athena's round-3 gate): "nothing pins the batch-
+  // membership change." Athena mutated commitOriginDecision to pull the
+  // task_verdicts INSERT out of the atomic env.DB.batch() call into its own
+  // separate batch — the fence check untouched — and the full 518-test
+  // suite stayed green, because no test asserted the verdict write and the
+  // bind UPDATE ever have to share ONE transaction. Structural: capture
+  // every statement list passed to env.DB.batch() and assert there is
+  // EXACTLY ONE call, and that call's own statement list contains BOTH the
+  // verdict INSERT and the bind UPDATE, verdict first. ─────────────────────
+  it('round 4: the verdict INSERT and the first-bind UPDATE share ONE env.DB.batch() call — structural pin (Athena r3)', async () => {
+    seedAgent(harness.sqlite, 'agent-batch-pin')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-batch-pin')
+    seedMember(harness.sqlite, 'member-batch-pin', { telegramChatId: null }) // triggers needsFirstBind
+    setAgentOwner(harness.sqlite, 'agent-batch-pin', 'member-batch-pin')
+    seedSquadMemberCapability(harness.sqlite, 'member-batch-pin')
+    seedGateGrant(harness.sqlite, 'member', 'member-batch-pin')
+    seedReviewTask(harness.sqlite, 'task-batch-pin')
+
+    const realBatch = env.DB.batch.bind(env.DB)
+    const batchCalls: D1PreparedStatement[][] = []
+    const pinEnv: Env = {
+      ...env,
+      DB: {
+        ...env.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          batchCalls.push(statements)
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+
+    const result = expectApplied(await invokeVerdict(pinEnv, harnessAuth('agent-batch-pin'), {
+      task_id: 'task-batch-pin', verdict: 'approved', human_origin: origin({ text: 'approve task-batch-pin' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: true, bound_now: true })
+
+    // Exactly ONE env.DB.batch() call for the whole commit — reservation,
+    // task-status flip, verdict INSERT, bind UPDATE, and bind-receipt INSERT
+    // all share ONE atomic transaction. A mutation pulling the verdict
+    // statement into its own SEPARATE batch() call (Athena's b2) changes
+    // this shape and must fail HERE, structurally — not merely leave a
+    // downstream functional test green.
+    expect(batchCalls).toHaveLength(1)
+    const sqls = batchCalls[0].map((s) => (s as unknown as { sql: string }).sql)
+    const verdictIdx = sqls.findIndex((sql) => sql.includes('INSERT INTO task_verdicts'))
+    const bindIdx = sqls.findIndex((sql) => sql.includes('UPDATE members') && sql.includes('telegram_chat_id'))
+    expect(verdictIdx).toBeGreaterThanOrEqual(0)
+    expect(bindIdx).toBeGreaterThan(verdictIdx) // bind is gated on the verdict's own EXISTS, so it must be later in the same array
+  })
+
+  // ── same Athena ask, behavioral half: force the batch to fail EXACTLY on
+  // the verdict statement (a real SQLite error, not a skipped call) and
+  // prove the reservation and the first-bind — which share this same
+  // statement array — roll back with it. Real D1 batch semantics: any
+  // statement THROW aborts the whole transaction; this proves the
+  // production code actually relies on that, rather than merely asserting
+  // it in a comment. ─────────────────────────────────────────────────────
+  it('round 4: forcing a real SQLite failure on the verdict statement rolls back the reservation and the bind together', async () => {
+    seedAgent(harness.sqlite, 'agent-batch-throw')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-batch-throw')
+    seedMember(harness.sqlite, 'member-batch-throw', { telegramChatId: null })
+    setAgentOwner(harness.sqlite, 'agent-batch-throw', 'member-batch-throw')
+    seedSquadMemberCapability(harness.sqlite, 'member-batch-throw')
+    seedGateGrant(harness.sqlite, 'member', 'member-batch-throw')
+    seedReviewTask(harness.sqlite, 'task-batch-throw')
+
+    const realBatch = env.DB.batch.bind(env.DB)
+    const throwEnv: Env = {
+      ...env,
+      DB: {
+        ...env.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          const patched = statements.map((s) => {
+            const sql = (s as unknown as { sql: string }).sql
+            // Swap in a statement referencing a nonexistent table exactly
+            // where the verdict INSERT would run — a genuine SQLite error
+            // raised inside the SAME transaction the reservation and the
+            // bind statements are also part of.
+            return sql.includes('INSERT INTO task_verdicts')
+              ? (env.DB.prepare('INSERT INTO __no_such_table_xyz__ (x) VALUES (1)') as unknown as D1PreparedStatement)
+              : s
+          })
+          return realBatch(patched)
+        },
+      } as unknown as Env['DB'],
+    }
+
+    // invokeTool's own outer catch converts an unexpected thrown error into
+    // a 500 response rather than propagating the rejection — assert THAT
+    // shape rather than a raw throw.
+    const res = await invokeVerdict(throwEnv, harnessAuth('agent-batch-throw'), {
+      task_id: 'task-batch-throw', verdict: 'approved', human_origin: origin({ text: 'approve task-batch-throw' }),
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.status).toBe(500)
+
+    const verdictCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM task_verdicts').first<{ n: number }>()
+    expect(verdictCount?.n).toBe(0)
+    const reservationCount = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM telegram_webhook_receipts WHERE update_id = ?',
+    ).bind('origin:telegram:5551234:9001').first<{ n: number }>()
+    expect(reservationCount?.n).toBe(0) // rolled back together, not "reserved then abandoned"
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-batch-throw').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBeNull() // no bind either
+  })
+
+  // ── mupot#1425 round 4 (kasra-review round-3 BLOCK): the reviewer's exact
+  // repro — "the bind must not land when the verdict doesn't." A concurrent
+  // verdict flips the task's status in the instant between dryRunAuthorize's
+  // last read and this commit batch; under the round-4 anchor design the
+  // bind's ONLY guard is EXISTS(task_verdicts WHERE id=<this call's UUID>),
+  // so if the verdict statement's own (now-identical) guard set refuses,
+  // the bind cannot land either — by construction, not by a second,
+  // separately-maintained guard. ─────────────────────────────────────────
+  it('round 4 P0-1 exact repro: a concurrent verdict flips task status before the commit batch — no bind, no verdict, 409 verdict_race', async () => {
+    seedAgent(harness.sqlite, 'agent-p0-1')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-p0-1')
+    seedMember(harness.sqlite, 'member-p0-1', { telegramChatId: null })
+    setAgentOwner(harness.sqlite, 'agent-p0-1', 'member-p0-1')
+    seedSquadMemberCapability(harness.sqlite, 'member-p0-1')
+    seedGateGrant(harness.sqlite, 'member', 'member-p0-1')
+    seedReviewTask(harness.sqlite, 'task-p0-1')
+
+    const realBatch = env.DB.batch.bind(env.DB)
+    const raceEnv: Env = {
+      ...env,
+      DB: {
+        ...env.DB,
+        batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+          harness.sqlite.prepare("UPDATE tasks SET status = 'approved' WHERE id = ?").run('task-p0-1')
+          return realBatch(statements)
+        },
+      } as unknown as Env['DB'],
+    }
+
+    const res = await invokeVerdict(raceEnv, harnessAuth('agent-p0-1'), {
+      task_id: 'task-p0-1', verdict: 'approved', human_origin: origin({ text: 'approve task-p0-1' }),
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.status).toBe(409)
+    expect(res.error).toBe('verdict_race')
+
+    const verdictCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM task_verdicts').first<{ n: number }>()
+    expect(verdictCount?.n).toBe(0) // the loser inserted NOTHING
+
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-p0-1').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBeNull() // no bind landed for the loser — guard sets are now EQUAL
+  })
+
+  // ── mupot#1425 round 4 addendum (plugin gate P2-1): bind INTENT server-
+  // side — the target task id must be NAMED in `text`, or refuse with
+  // task_not_named. Three cases: named in full, absent entirely, and naming
+  // a DIFFERENT task. ────────────────────────────────────────────────────
+  it('addendum: text names the task by an 8+ hex-char prefix of its id — applied', async () => {
+    seedAgent(harness.sqlite, 'agent-named-ok')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-named-ok')
+    seedMember(harness.sqlite, 'member-named-ok', { telegramChatId: '5551234' })
+    setAgentOwner(harness.sqlite, 'agent-named-ok', 'member-named-ok')
+    seedSquadMemberCapability(harness.sqlite, 'member-named-ok')
+    seedGateGrant(harness.sqlite, 'member', 'member-named-ok')
+    seedReviewTask(harness.sqlite, 'f9408956-aaaa-bbbb-cccc-000000000001')
+
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-named-ok'), {
+      task_id: 'f9408956-aaaa-bbbb-cccc-000000000001',
+      verdict: 'approved',
+      human_origin: origin({ text: 'approve f9408956' }),
+    }))
+    expect(result.human_origin?.applied).toBe(true)
+    expect(result.verdict.decided_by).toBe('member-named-ok')
+  })
+
+  it('addendum: text says only "approve" with no task reference — task_not_named, falls back to agent authority', async () => {
+    seedAgent(harness.sqlite, 'agent-named-absent')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-named-absent')
+    seedMember(harness.sqlite, 'member-named-absent', { telegramChatId: '5559999' })
+    setAgentOwner(harness.sqlite, 'agent-named-absent', 'member-named-absent')
+    seedSquadMemberCapability(harness.sqlite, 'member-named-absent')
+    seedGateGrant(harness.sqlite, 'member', 'member-named-absent')
+    seedReviewTask(harness.sqlite, 'ab12cd34-aaaa-bbbb-cccc-000000000002')
+
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-named-absent'), {
+      task_id: 'ab12cd34-aaaa-bbbb-cccc-000000000002',
+      verdict: 'approved',
+      human_origin: origin({ text: 'approve', chat_id: '5559999', user_id: '5559999' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named' })
+    expect(result.verdict.decided_by).toBe('agent-named-absent') // fell back to the agent
+
+    const verdictCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM task_verdicts WHERE decided_via = 'agent_attested_origin'`,
+    ).first<{ n: number }>()
+    expect(verdictCount?.n).toBe(0) // never landed AS the member
+  })
+
+  it('addendum: text names a DIFFERENT task than the one being decided — task_not_named, falls back to agent authority', async () => {
+    seedAgent(harness.sqlite, 'agent-named-wrong')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-named-wrong')
+    seedMember(harness.sqlite, 'member-named-wrong', { telegramChatId: '5558888' })
+    setAgentOwner(harness.sqlite, 'agent-named-wrong', 'member-named-wrong')
+    seedSquadMemberCapability(harness.sqlite, 'member-named-wrong')
+    seedGateGrant(harness.sqlite, 'member', 'member-named-wrong')
+    seedReviewTask(harness.sqlite, 'ab12cd34-aaaa-bbbb-cccc-000000000003')
+
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-named-wrong'), {
+      task_id: 'ab12cd34-aaaa-bbbb-cccc-000000000003',
+      verdict: 'approved',
+      human_origin: origin({ text: 'approve f9408956', chat_id: '5558888', user_id: '5558888' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named' })
+    expect(result.verdict.decided_by).toBe('agent-named-wrong')
   })
 })

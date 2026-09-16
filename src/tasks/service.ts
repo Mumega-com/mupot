@@ -6,6 +6,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Task, TaskPriority, TaskVerdict, BusEvent } from '../types'
+import { claimTimestamp } from '../lib/claim-timestamp'
 import { createBus } from '../bus'
 import { assertWritten } from '../lib/receipt'
 import { resolveOutboundGitHubToken } from '../integrations/github-app'
@@ -1197,29 +1198,52 @@ export async function createTask(
 //
 // Flips the task status and appends a verdict receipt.
 //
-// K5 TOCTOU fix — chosen pattern: conditional UPDATE first, then INSERT verdict.
+// K5 TOCTOU fix, current shape (mupot#1425 round 3+4 — this comment
+// previously described a two-`.run()`-call design and said "we cannot use
+// batch for the race-guard," which is the OPPOSITE of what the code below
+// now does; kept the correct D1 fact below and rewrote the rest, rather than
+// deleting the explanation of WHY a bare batch is not enough on its own).
 //
-// Why not a D1 batch?
-// D1 batch is transactional (all-or-neither) but it cannot *conditionally* abort
-// in the middle: `UPDATE ... WHERE status='review'` inside a batch with 0 changes
-// still "succeeds" as a statement — D1 cannot abort-on-zero-changes mid-batch.
-// So we cannot use batch for the race-guard.
+// The D1 fact, still true and still the reason this needs a guard at all:
+// a D1 batch is one transaction (all-or-neither on a statement THROW), but
+// it does NOT conditionally abort mid-batch on a statement that merely
+// changes 0 rows — `UPDATE ... WHERE status='review'` inside a batch, with
+// 0 rows matching, still "succeeds" as a statement, and every later
+// statement in that same batch still executes. A batch containing the
+// status-flip UPDATE and the verdict INSERT as two INDEPENDENT statements
+// would therefore let a race-losing caller's INSERT land anyway — proven
+// live in round 4 (P0-2) against exactly this pair, the same defect class
+// round 2's P3-G fix had already closed one statement away (the Telegram-
+// bind guard) but left open here.
 //
-// Chosen pattern:
-//   1. Standalone `UPDATE tasks SET status=? WHERE id=? AND status='review'`
-//      → check meta.changes. If 0 → 409 (race lost: another verdict already
-//      flipped the row). The 409 is surfaced to the caller.
-//   2. On changes=1: INSERT task_verdicts.
-//      If INSERT fails (DB error), the status flip stands but the audit receipt
-//      is missing. We emit a `task.verdict_orphan` bus event and re-throw so the
-//      caller gets a 500. Operators can reconcile from the bus event log.
-//      This is a narrow window (step-2 failure after step-1 success) that requires
-//      a DB write error on a simple INSERT — acceptable given D1's durability model.
+// Fixed WITHOUT reintroducing two separate `.run()` calls (buildVerdictStatements
+// below returns both statements for the batch a caller executes, unexecuted;
+// mupot#1425 P0-B needed this so a caller like src/im/origin-verdict.ts's
+// commitOriginDecision can put the verdict itself INSIDE a larger atomic
+// batch, not as a trailing, separately-refusable step): the INSERT's own
+// WHERE carries a landed-PROOF `EXISTS` clause naming the UPDATE's own
+// per-call-unique `updated_at` stamp (`claimTimestamp()`, NOT a bare
+// `new Date().toISOString()` — round 4's P0-2 finding — two different calls
+// CAN and did land in the same millisecond). If the UPDATE changed 0 rows
+// (race lost), no row exists with THAT exact stamp, so the INSERT's EXISTS
+// is false and it is ALSO a no-op in the same transaction — a SQL-level
+// conditional dependency between two statements in one batch, not a JS-level
+// "check then maybe run the second one." `writeVerdict` below still reads
+// `results[0].meta.changes` afterward, but only to decide which OUTCOME to
+// report (`VerdictRaceError`) — by the time it does, the INSERT has already
+// either landed or not, correctly, inside the SAME transaction. An INSERT
+// throw (a real DB error, not a 0-row guard) now aborts the WHOLE batch,
+// rolling the status flip back too — strictly fewer failure modes than the
+// old two-call design, which could leave a bare status flip with no receipt
+// (the `task.verdict_orphan` bus event this design retires — there is no
+// longer an orphan state for it to report).
 //
 // Multiple verdicts per task ARE legitimate (rework loop: rejected → in_progress →
 // review → approved). No UNIQUE constraint on task_verdicts(task_id).
 //
-// Called exclusively from POST /api/tasks/:id/verdict after all pre-checks pass.
+// Called exclusively from POST /api/tasks/:id/verdict (and every other
+// verdict surface — MCP task_verdict, IM /approve, the harness-attested-
+// origin path) after all pre-checks pass.
 
 export interface WriteVerdictInput {
   task: Task
@@ -1299,7 +1323,17 @@ export function buildVerdictStatements(
   input: WriteVerdictInput,
   extraGuard?: { sql: string; params: unknown[] },
 ): VerdictStatementsResult {
-  const now = new Date().toISOString()
+  // mupot#1425 round 4 (kasra-review P0-2): a bare `new Date().toISOString()`
+  // used as the landed-proof value for the verdict INSERT's own `EXISTS`
+  // guard DOES collide across two different calls landing in the same
+  // millisecond — proven live, on this exact statement, by the adversarial
+  // gate (a losing racer's verdict landed anyway, on every one of the four
+  // surfaces that reach this function: HTTP, MCP, IM, and the harness-
+  // attested-origin path). `claimTimestamp()` is the SAME per-call-unique
+  // stamp round 2's P3-G fix already proved necessary for the Telegram-bind
+  // landed-proof one statement away — reused here, not re-derived, closing
+  // the class on the branch it was left on.
+  const now = claimTimestamp()
   const newStatus: TaskStatus = input.verdict === 'approved' ? 'approved' : 'rejected'
   const verdictRow: TaskVerdict = {
     id: crypto.randomUUID(),

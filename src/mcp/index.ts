@@ -1856,8 +1856,15 @@ const HUMAN_ORIGIN_SCHEMA = {
     // cannot be checked against a timestamp the caller may omit. See
     // src/im/origin-verdict.ts's FRESHNESS_MAX_AGE_MS/FRESHNESS_MAX_FUTURE_MS.
     message_at: STRING_SCHEMA,
+    // text is REQUIRED (round 4 addendum, plugin gate P2-1): the human's own
+    // message, so mupot can bind the origin's INTENT server-side — the
+    // target task id must appear in it (full id, or an 8+ hex-char prefix of
+    // its own leading hex characters) or the stamp does not apply to this
+    // task at all (`task_not_named`). See taskNamedInText in
+    // src/im/origin-verdict.ts.
+    text: STRING_SCHEMA,
   },
-  required: ['channel', 'user_id', 'chat_id', 'message_id', 'message_at'],
+  required: ['channel', 'user_id', 'chat_id', 'message_id', 'message_at', 'text'],
   additionalProperties: false,
 }
 
@@ -1873,7 +1880,7 @@ const toolTaskVerdict: ToolSpec = {
   min: 'member',
   args:
     '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean,' +
-    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required) } }' +
+    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required, <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named) } }' +
     ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
     ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
     ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +
@@ -1886,7 +1893,10 @@ const toolTaskVerdict: ToolSpec = {
     ' false falls back to the calling agent\'s own authority, unchanged from omitting human_origin — see the' +
     ' human_origin field on the response. A non-agent-bound caller supplying human_origin gets' +
     ' 400 human_origin_not_applicable; a replayed origin message gets 409 origin_replayed (the whole call' +
-    ' refused in both cases, no fallback).',
+    ' refused in both cases, no fallback). For an agent-bound caller, the outcome is ALWAYS visible in the' +
+    ' response: human_origin: {applied:false, reason:"<conjunct>"} when one was supplied and refused,' +
+    ' human_origin: {applied:false, reason:"absent"} when none was supplied at all — never silently omitted' +
+    ' the way an ordinary pre-feature agent-seat verdict would be. Non-agent-bound callers never see the field.',
   inputSchema: {
     type: 'object',
     properties: {
