@@ -42,6 +42,6 @@ export interface BrainPort { decide(ctx: BrainContext): Promise<BrainDecision> }
 - **Swappable:** the ranking logic. Default adapter = current `metabolism` + `runGoalCycle` (next S3 task: refactor to emit `BrainDecision` proposals the core gates — behaviour-preserving).
 
 ## Remaining S3 work (gated)
-1. Brain **default adapter** — refactor `metabolism`/`runGoalCycle` to emit `BrainDecision` (proposals), core consumes + gates. No behaviour change.
+1. Brain **default adapter** — started as pure `src/brain/ranking-policy.ts` (SOS perceive→rank→rest; see [sos-brain-ranking-policy-path.md](./sos-brain-ranking-policy-path.md)). Next: refactor `metabolism`/`runGoalCycle` to consume `BrainDecision` through gates (or retire the act path per mupot-core). No behaviour change until wired.
 2. **One real swap** to prove the seam (e.g. a trivial alternate ModelPort or BrainPort behind the same interface).
 3. Codex diverse-gate (sensitive surface) before merge.
