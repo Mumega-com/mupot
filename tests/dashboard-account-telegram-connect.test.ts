@@ -18,6 +18,7 @@ import { authApp } from '../src/auth'
 import { dashboardApp } from '../src/dashboard/index'
 import { membersApp } from '../src/members'
 import {
+  capabilityAtRank,
   loadConnectableSquads,
   loadSelfMember,
   telegramSectionBody,
@@ -131,6 +132,18 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).toContain('Project A / Squad Alpha')
     expect(body).toContain('Project B / Squad Bravo')
     expect(body).not.toContain('Archived Project')
+  })
+
+  it('an org-admin sees a "no active project" explain state when nothing is eligible, not the Connect form', async () => {
+    harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE status = 'active';`)
+    const env = makeEnv('admin@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).not.toContain('id="tg-connect"')
+    expect(body).toContain('No active project is linked to a squad yet')
   })
 
   it('a plain member (no org-scope grant) sees the "ask an admin" explain state, not a button wired to a guaranteed refusal', async () => {
@@ -289,11 +302,50 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     for (const s of squads) expect(s.capability).toBe('admin')
   })
 
+  it('capabilityAtRank maps every ladder boundary exactly (owner=5..observer=1, and below)', () => {
+    expect(capabilityAtRank(5)).toBe('owner')
+    expect(capabilityAtRank(6)).toBe('owner')
+    expect(capabilityAtRank(4)).toBe('admin')
+    expect(capabilityAtRank(3)).toBe('lead')
+    expect(capabilityAtRank(2)).toBe('member')
+    expect(capabilityAtRank(1)).toBe('observer')
+    expect(capabilityAtRank(0)).toBe('observer')
+  })
+
   it('loadSelfMember returns null for a nonexistent member and the row for a real one', async () => {
     const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
     expect(await loadSelfMember(env, 'does-not-exist')).toBeNull()
     const row = await loadSelfMember(env, 'member-admin')
     expect(row?.id).toBe('member-admin')
+  })
+
+  it('a suspended member (row exists, status != active) renders the account-not-active explain state, not the Connect form', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-suspended', 'suspended@x.test', 'Suspended Member', 'suspended', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-suspended-org', 'member-suspended', 'org', NULL, 'admin');
+    `)
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    const auth: AuthContext = {
+      userId: 'suspended-user', email: 'suspended@x.test', role: 'member', tenant: TENANT, memberId: 'member-suspended',
+      capabilities: [{ member_id: 'member-suspended', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const rendered = String(await telegramSectionBody(env, auth))
+    expect(rendered).toContain('Account not active')
+    expect(rendered).not.toContain('id="tg-connect"')
+  })
+
+  it('a memberId that resolves to no row (e.g. a deleted/cross-tenant member) renders the account-not-active explain state, not a crash', async () => {
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+    const auth: AuthContext = {
+      userId: 'ghost-user', email: 'ghost@x.test', role: 'member', tenant: TENANT, memberId: 'member-does-not-exist',
+    }
+    const body = await telegramSectionBody(env, auth)
+    const rendered = String(body)
+    expect(rendered).toContain('Account not active')
+    expect(rendered).not.toContain('id="tg-connect"')
+    expect(rendered).not.toContain('id="tg-disconnect"')
   })
 
   it('telegramSectionBody never throws for any of the reachable states', async () => {

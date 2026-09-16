@@ -63,7 +63,7 @@ const CONNECT_INVITE_EXPIRES_SECONDS = 24 * 60 * 60
 // sends — see the module header. Mirrors auth/capability.ts's RANK ladder
 // (owner=5 > admin=4 > lead=3 > member=2 > observer=1), which is not exported
 // in reverse (rank -> name) form.
-function capabilityAtRank(rank: number): Capability {
+export function capabilityAtRank(rank: number): Capability {
   if (rank >= capabilityRank('owner')) return 'owner'
   if (rank >= capabilityRank('admin')) return 'admin'
   if (rank >= capabilityRank('lead')) return 'lead'
