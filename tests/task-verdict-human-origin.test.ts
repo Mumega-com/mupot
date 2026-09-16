@@ -262,6 +262,30 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.verdict.decided_by).toBe('agent-shape')
   })
 
+  // ── P3 (kasra-review r4): a MISSING `text` gets its own reason, distinct
+  // from the generic shape bucket — an older harness build that has not
+  // picked up the round-4 addendum yet is a common, actionable case, not a
+  // malformed payload. ─────────────────────────────────────────────────────
+  it('text_required — human_origin supplied with no text field at all: falls back to agent auth, distinct from invalid_origin_shape', async () => {
+    seedAgent(harness.sqlite, 'agent-no-text')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-no-text')
+    seedMember(harness.sqlite, 'member-no-text')
+    setAgentOwner(harness.sqlite, 'agent-no-text', 'member-no-text')
+    seedReviewTask(harness.sqlite, 'task-no-text')
+    const auth = harnessAuth('agent-no-text', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
+
+    const noTextOrigin = origin()
+    delete noTextOrigin.text
+
+    const result = expectApplied(await invokeVerdict(env, auth, {
+      task_id: 'task-no-text',
+      verdict: 'approved',
+      human_origin: noTextOrigin,
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'text_required' })
+    expect(result.verdict.decided_by).toBe('agent-no-text')
+  })
+
   // ── conjunct: never rebind an already-bound member to a different chat ──
   it('origin_member_mismatch — owner already bound to a DIFFERENT chat_id: falls back to agent auth, no write', async () => {
     seedAgent(harness.sqlite, 'agent-mismatch')

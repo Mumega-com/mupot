@@ -143,6 +143,7 @@ export interface HumanOriginInput {
 
 export type HumanOriginFailureReason =
   | 'invalid_origin_shape'
+  | 'text_required'
   | 'origin_stale'
   | 'task_not_named'
   | 'agent_not_owned'
@@ -182,7 +183,7 @@ const RATE_LIMIT_WINDOW_MS = 30 * 1000
 // cannot be checked against a timestamp the caller may omit.
 type ParsedOrigin =
   | { ok: true; value: HumanOriginInput }
-  | { ok: false; reason: 'invalid_origin_shape' | 'origin_stale' }
+  | { ok: false; reason: 'invalid_origin_shape' | 'text_required' | 'origin_stale' }
 
 // text (round 4 addendum): required whenever human_origin is supplied at
 // all, capped well under Telegram's own 4096-char message limit — this is
@@ -204,6 +205,14 @@ function parseHumanOrigin(raw: unknown, now: number = Date.now()): ParsedOrigin 
   if (typeof obj.message_at !== 'string') return { ok: false, reason: 'invalid_origin_shape' }
   const messageAtMs = new Date(obj.message_at).getTime()
   if (Number.isNaN(messageAtMs)) return { ok: false, reason: 'invalid_origin_shape' }
+  // P3 (kasra-review r4): a missing `text` is common and actionable (an
+  // older harness build that has not picked up the round-4 addendum yet) —
+  // give it its OWN reason rather than folding it into the generic shape
+  // bucket. A `text` that IS present but malformed (wrong type, empty, or
+  // over the cap) is a genuine shape violation, unchanged.
+  if (obj.text === undefined) {
+    return { ok: false, reason: 'text_required' }
+  }
   if (typeof obj.text !== 'string' || obj.text.length === 0 || obj.text.length > TEXT_MAX_LEN) {
     return { ok: false, reason: 'invalid_origin_shape' }
   }

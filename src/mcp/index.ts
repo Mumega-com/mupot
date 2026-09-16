@@ -1880,7 +1880,7 @@ const toolTaskVerdict: ToolSpec = {
   min: 'member',
   args:
     '{ task_id: string, verdict: "approved"|"rejected", note?: string, reason?: string, override_self_verdict?: boolean,' +
-    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required, <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named) } }' +
+    ' human_origin?: { channel: "telegram", user_id: string, chat_id: string, message_id: string, message_at: string (ISO 8601, required), text: string (required — missing entirely gets reason:text_required, distinct from a malformed field\'s invalid_origin_shape; <=2048 chars — the human\'s own message; the target task_id must be named in it, full or an 8+ hex-char prefix, or task_not_named) } }' +
     ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
     ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
     ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +

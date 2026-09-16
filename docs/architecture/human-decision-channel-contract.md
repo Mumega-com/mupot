@@ -205,8 +205,14 @@ Three distinct events are recorded **separately**, each idempotent on its own ke
    `docs/operations/telegram-project-onboarding.md`'s SQL block).
 2. **Decision** — the domain receipt for the decision itself: `task_verdicts` (append-only,
    `writeVerdict`) for `/approve`/`/reject`, or the Routine answer receipt for `/answer`.
-   This write is **not atomic with** the webhook reservation's `completed` stamp — see gap
-   below.
+   This write is **not atomic with** the webhook reservation's `completed` stamp — a crash
+   between the two leaves the reservation `processing` while the decision is already
+   durably recorded; see (c) above ("a row in `processing` ... is not permission to retry
+   or delete; it stays fenced until an operator reconciles"). This is a SEPARATE fact from
+   `writeVerdict`'s own internal atomicity (the `tasks.status` flip and the
+   `task_verdicts` INSERT landing in one D1 batch, mupot#1425 round 4, below) — that gap
+   is closed; this one (the reservation's OWN `completed` stamp being a second, later
+   write) is not, and is not this channel's to fix here.
 3. **Notification** — a Routine entering a human wait separately attempts one delivery
    (`notifyHumanWait`, `src/routines/actions.ts:391-428`) keyed by the stable
    `request_id = routine-human:<run-id>:<action-key>` (`humanWaitRequestId`,
@@ -538,6 +544,15 @@ gates every write:
   `message_id`) to try again. The task's true current state is never hidden — the
   human's next message resolves against fresh state — but the original message itself
   is a one-shot, by design, not a bug to route around.
+- **(e) Intent is bound to the task; DIRECTION is not (round 4, Athena's gate,
+  accepted for the pilot).** `taskNamedInText` proves the human's message named THIS
+  task — a full-UUID substring or an 8+ hex-char prefix of its own leading hex
+  characters — but it does not, and cannot, parse or bind the human's intended
+  verdict DIRECTION out of free text. A message reading "reject f9408956" paired
+  with a tool call carrying `verdict: 'approved'` still satisfies `taskNamedInText`
+  and applies as an approval: the task is named correctly, the outcome is not the one
+  the words describe. mupot verifies that the human named this task. That the human
+  wanted this outcome on it remains the harness's attestation, not the server's.
 
 **The resulting blast radius, stated precisely:** a caller holding an agent-bound seat
 can cast, per fresh and unreplayed origin message from a chat the resolved member is

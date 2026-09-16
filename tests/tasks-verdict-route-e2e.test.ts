@@ -221,6 +221,8 @@ describe('POST /:id/verdict — K5 lost race, real route + real D1, 0 verdict ro
     expect(body.error).toBe('verdict_conflict')
 
     const count = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts').get() as { n: number }
-    expect(count.n).toBe(0) // the race LOSER's INSERT landed nothing — P0-2's nonce landed-proof, verified over the wire
+    expect(count.n).toBe(0) // the race LOSER's INSERT landed nothing over the real wire route (this asserts the
+    // task-status EXISTS guard, not the nonce specifically — the nonce-collision proof lives in
+    // tests/tasks-gate.test.ts's frozen-clock "P0-2 (frozen clock)" test)
   })
 })
