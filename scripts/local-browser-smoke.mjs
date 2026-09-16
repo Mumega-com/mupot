@@ -21,6 +21,10 @@ const hermesApprovalTaskTitle = `Hermes approval smoke ${smokeRunId}`
 const hermesTaskTitle = `Hermes dashboard refresh ${smokeRunId}`
 const hermesDirectiveText = `Hold all outbound automation until local browser smoke ${smokeRunId} is complete.`
 const hermesTelegramUserId = 123456789
+// A distinct, never-before-bound Telegram identity for the dashboard Connect
+// Telegram workflow (mupot#1412) — must not collide with hermesTelegramUserId
+// (already bound to mbr-hermes-user in the seed) or any other seeded identity.
+const accountConnectTelegramUserId = 700111222
 const ownerProjectName = `Browser Project ${smokeRunId}`
 const ownerProjectSlug = `browser-project-${Date.now()}`
 const ownerProjectInitialGoal = 'Create a governed nested project through the dashboard.'
@@ -62,6 +66,7 @@ const pages = [
   '/admin/github/status',
   '/members',
   '/setup',
+  '/account',
 ]
 
 const hermesMessages = [
@@ -858,6 +863,109 @@ async function runHermesDirectiveWorkflow(hermes) {
   })
 }
 
+let accountConnectUpdateCounter = 0
+
+// Same webhook shape postHermesMessage/nextHermesUpdate already exercise
+// (X-Telegram-Bot-Api-Secret-Token + a private-chat update whose from.id ==
+// chat.id), against a DIFFERENT, never-before-bound Telegram identity so this
+// workflow cannot collide with the Hermes fixtures above.
+async function postAccountConnectTelegramUpdate(text) {
+  accountConnectUpdateCounter += 1
+  const res = await context.request.post(`${baseUrl}/im/webhook`, {
+    headers: {
+      'content-type': 'application/json',
+      'X-Telegram-Bot-Api-Secret-Token': 'local-im-secret',
+    },
+    data: {
+      update_id: 900000000 + accountConnectUpdateCounter,
+      message: {
+        chat: { id: accountConnectTelegramUserId, type: 'private' },
+        from: { id: accountConnectTelegramUserId },
+        text,
+      },
+    },
+    timeout: 20_000,
+  })
+  return res
+}
+
+// Dashboard "My Account" Connect/Disconnect Telegram (mupot#1412) — the last
+// blocker of the Telegram decision pilot. Exercises the REAL UI end to end:
+// mint via the rendered Connect button, redeem via a real (simulated)
+// Telegram /start against the SAME webhook route production uses, observe
+// the page flip to Connected, then Disconnect and observe it flip back.
+//
+// wrangler-local-test.toml deliberately leaves TELEGRAM_BOT_TOKEN unset (no
+// real bot, no live network call in CI) — getTelegramBotUsername therefore
+// returns null and the page renders its documented no-deep-link fallback
+// ("Message the bot and send: /start <code>"). That fallback is exactly what
+// this workflow exercises; it is the honest, network-independent path, not a
+// weaker substitute for the deep-link one (unit-tested separately in
+// tests/telegram-adapter.test.ts with a mocked Bot API).
+async function runAccountTelegramConnectWorkflow() {
+  await page.goto(`${baseUrl}/account`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const initialText = await textSnippet(page.locator('body'), 4000)
+  if (!initialText.includes('Not connected') || !(await page.locator('#tg-connect').count())) {
+    fail('My Account did not render the not-connected Telegram Connect form', { initialText })
+  }
+
+  // Multiple project/squad pairs are eligible for the seeded local-owner
+  // (org-owner rank bubbles to every squad) — pin the selection to a known
+  // pair rather than relying on whichever option happens to render first.
+  const scopeSelect = page.locator('#tg-scope')
+  if (await scopeSelect.count() > 0) {
+    const mupotOption = scopeSelect.locator('option[data-project="project-mupot"][data-squad="sq-growth"]')
+    if (await mupotOption.count() === 1) {
+      const value = await mupotOption.getAttribute('value')
+      if (value !== null) await scopeSelect.selectOption(value)
+    }
+  }
+  await assertNoDocumentOverflow('My Account (not connected)')
+  await page.screenshot({ path: path.join(artifactsDir, 'account-not-connected.png'), fullPage: true })
+
+  await page.locator('#tg-connect').click()
+  await page.waitForSelector('#tg-result:not([hidden])', { timeout: 10_000 })
+  const pairingText = await textSnippet(page.locator('#tg-result'), 500)
+  const codeMatch = /Pairing code: (\S+)/.exec(pairingText)
+  if (!codeMatch) fail('Connect Telegram did not render a pairing code', { pairingText })
+  const pairingCode = codeMatch[1]
+  if (!pairingText.includes('/start ' + pairingCode)) {
+    fail('Connect Telegram result did not render the no-bot-configured fallback instructions', { pairingText })
+  }
+  await page.screenshot({ path: path.join(artifactsDir, 'account-pairing-code.png'), fullPage: true })
+
+  const redeemRes = await postAccountConnectTelegramUpdate(`/start ${pairingCode}`)
+  const redeemJson = await redeemRes.json().catch(() => null)
+  if (redeemRes.status() !== 200 || !redeemJson?.ok || !String(redeemJson.reply ?? '').includes('Joined project')) {
+    fail('Telegram /start redemption for the dashboard-minted invite failed', { status: redeemRes.status(), redeemJson })
+  }
+
+  await page.goto(`${baseUrl}/account`, { waitUntil: 'networkidle', timeout: 20_000 })
+  const boundText = await textSnippet(page.locator('body'), 4000)
+  if (!boundText.includes('Connected') || !(await page.locator('#tg-disconnect').count())) {
+    fail('My Account did not render the connected Telegram state after redemption', { boundText })
+  }
+  await page.screenshot({ path: path.join(artifactsDir, 'account-connected.png'), fullPage: true })
+
+  page.once('dialog', (dialog) => dialog.accept())
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10_000 }),
+    page.locator('#tg-disconnect').click(),
+  ])
+  const afterDisconnectText = await textSnippet(page.locator('body'), 4000)
+  if (!afterDisconnectText.includes('Not connected') || await page.locator('#tg-disconnect').count()) {
+    fail('My Account did not return to the not-connected Telegram state after Disconnect', { afterDisconnectText })
+  }
+  await page.screenshot({ path: path.join(artifactsDir, 'account-disconnected.png'), fullPage: true })
+
+  workflows.push({
+    name: 'Dashboard Connect Telegram (My Account)',
+    status: 'passed',
+    pairingCodeLength: pairingCode.length,
+    redeemReply: redeemJson.reply,
+  })
+}
+
 export async function runLocalBrowserSmoke() {
   await mkdir(artifactsDir, { recursive: true })
 
@@ -912,6 +1020,8 @@ export async function runLocalBrowserSmoke() {
     for (const msg of hermesMessages) {
       await postHermesMessage(hermes, msg)
     }
+
+    await runAccountTelegramConnectWorkflow()
 
     await page.goto(`${baseUrl}/squads/sq-growth`, { waitUntil: 'networkidle', timeout: 20_000 })
     const squadText = await textSnippet(page.locator('body'), 2000)

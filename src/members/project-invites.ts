@@ -16,6 +16,19 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const REQUEST_DIGEST_RE = /^[0-9a-fA-F]{64}$/
 
 /**
+ * The minimum rank createProjectInvite requires an actor to hold — on
+ * whichever scope applies to the path they're taking (org-scope for a
+ * member-bind invite, squad-scope for a net-new one; see the actorRank
+ * computation below) — before an invite can be minted at all. kasra-review
+ * AMBER P2 (2026-09-16): exported so callers that need to render UI
+ * consistent with this floor (e.g. src/dashboard/account.ts's Connect
+ * Telegram page) import the SAME constant rather than a second literal
+ * `capabilityRank('admin')` that could silently drift from this one if this
+ * floor is ever changed here without updating every reader.
+ */
+export const MEMBER_BIND_MINT_FLOOR: Capability = 'admin'
+
+/**
  * mupot#1411 P2-E round 4 (kasra-review, 2026-09-15): the capabilities INSERT
  * below used to be a bare INSERT — any PRE-EXISTING grant on the invited
  * squad (even a lowly 'observer', the MOST common shape for a member-bind
@@ -561,7 +574,7 @@ export async function createProjectInvite(
   const actorRank = hasMemberId
     ? await actorRankOnScopeFor(env, auth, 'org', null)
     : await actorRankOnSquad(env, auth, squadId, edge.department_id)
-  if (actorRank < capabilityRank('admin')) return { ok: false, error: 'forbidden' }
+  if (actorRank < capabilityRank(MEMBER_BIND_MINT_FLOOR)) return { ok: false, error: 'forbidden' }
 
   if (hasMemberId) {
     // mupot#1411 N4 round 4 (Athena, 2026-09-15): deliberately EXACT tenant

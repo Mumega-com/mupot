@@ -188,6 +188,10 @@ export interface Env {
   // GONE — /channels resolves the caller to a member (member_identities) and applies
   // their capabilities, which the allowlist could not do. Do not reintroduce them:
   // a second authorisation model on one surface means the weaker one sets the level.
+  // (mupot#1412: the dashboard's Connect Telegram page needs the bot's @username for
+  // a t.me deep link — display only, no authority. It calls getMe live via
+  // TELEGRAM_BOT_TOKEN, src/channels/adapters/telegram.ts's getTelegramBotUsername,
+  // rather than reintroducing a static TELEGRAM_BOT_USERNAME key.)
   // Telegram notification bridge — PRIMARY delivery path (direct to Bot API).
   // Set via: npx wrangler secret put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
   TELEGRAM_BOT_TOKEN?: string
