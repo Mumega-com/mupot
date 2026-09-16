@@ -43,7 +43,7 @@ import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Capability, Env } from '../types'
 import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
-import { getTelegramBotUsername } from '../channels/adapters/telegram'
+import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 
 type ShellFn = (
@@ -252,6 +252,10 @@ function connectScript(): Html {
                   var manual = document.createElement('p');
                   manual.textContent = 'Message the bot and send: /start ' + data.pairing_code;
                   result.appendChild(manual);
+                  var askOwner = document.createElement('p');
+                  askOwner.className = 'ui-sub';
+                  askOwner.textContent = 'Ask your owner to set the decision bot username so this page can link you straight there.';
+                  result.appendChild(askOwner);
                 }
                 var expiresAt = data.invite && data.invite.pairing_expires_at;
                 var expiryP = document.createElement('p');
@@ -332,7 +336,21 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
     })
   }
 
-  const botUsername = await getTelegramBotUsername(env)
+  // im_bot_username (org_settings) is the DECISION-CHANNEL bot's @username —
+  // an explicit, non-secret, owner-configured display value (see
+  // SETTINGS_KEYS.imBotUsername's docstring in ./settings.ts and the
+  // src/types.ts TELEGRAM_BOT_TOKEN incident note). It is NEVER derived from
+  // TELEGRAM_BOT_TOKEN or any getMe call: that token authenticates a
+  // DIFFERENT bot (the notification bridge, src/telegram-bridge/bus_notify.ts)
+  // and deriving a username from it once rendered a deep link to the wrong
+  // bot in production (mupot#1420). Absent setting -> no link, ever; the
+  // fallback below is the only honest rendering.
+  // Re-validated on read, not just trusted from the write path (defense in
+  // depth — see SETTINGS_KEYS.imBotUsername): a malformed stored value
+  // degrades to the same "not configured" fallback as an unset setting,
+  // never a broken or unsafe link.
+  const rawBotUsername = await getSetting(env, SETTINGS_KEYS.imBotUsername)
+  const botUsername = isValidBotUsername(rawBotUsername) ? rawBotUsername : null
   const scopePicker =
     squads.length > 1
       ? html`

@@ -188,10 +188,26 @@ export interface Env {
   // GONE — /channels resolves the caller to a member (member_identities) and applies
   // their capabilities, which the allowlist could not do. Do not reintroduce them:
   // a second authorisation model on one surface means the weaker one sets the level.
-  // (mupot#1412: the dashboard's Connect Telegram page needs the bot's @username for
-  // a t.me deep link — display only, no authority. It calls getMe live via
-  // TELEGRAM_BOT_TOKEN, src/channels/adapters/telegram.ts's getTelegramBotUsername,
-  // rather than reintroducing a static TELEGRAM_BOT_USERNAME key.)
+  //
+  // INCIDENT (mupot#1420, 2026-09-16): a LATER attempt to build the dashboard's
+  // Connect Telegram deep link derived a bot @username live via getMe using
+  // TELEGRAM_BOT_TOKEN below — but that token belongs to the NOTIFICATION
+  // BRIDGE bot (src/telegram-bridge/bus_notify.ts's outbound Bot API leg),
+  // never to the DECISION-CHANNEL bot a human actually talks to (the Hermes
+  // gateway's own bot, e.g. @kayhermes_mubot — polling mode, no webhook; see
+  // docs/operations/telegram-project-onboarding.md). mupot never holds that
+  // bot's token, so its username CANNOT be derived here at all, from any
+  // secret on this Env — the getMe call above was silently deriving the WRONG
+  // bot's name and rendering a deep link to it. Fixed by making the decision
+  // bot's @username an explicit, non-secret, display-only org setting instead
+  // (org_settings.im_bot_username — SETTINGS_KEYS.imBotUsername in
+  // src/dashboard/settings.ts, written by the wizard's IM step and by
+  // src/dashboard/im-settings.ts post-setup, read only by
+  // src/dashboard/account.ts's deep link). It carries no authority: nothing in
+  // the bind/redeem/authz path reads it, same as this comment's own prior
+  // rule for the Env keys above. Do not reintroduce a getMe-derived username
+  // for this purpose — a bot's own Bot-API token can only ever authenticate
+  // ITS OWN identity, never another bot's.
   // Telegram notification bridge — PRIMARY delivery path (direct to Bot API).
   // Set via: npx wrangler secret put TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
   TELEGRAM_BOT_TOKEN?: string

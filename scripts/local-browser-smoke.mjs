@@ -889,19 +889,23 @@ async function postAccountConnectTelegramUpdate(text) {
   return res
 }
 
-// Dashboard "My Account" Connect/Disconnect Telegram (mupot#1412) — the last
-// blocker of the Telegram decision pilot. Exercises the REAL UI end to end:
-// mint via the rendered Connect button, redeem via a real (simulated)
-// Telegram /start against the SAME webhook route production uses, observe
-// the page flip to Connected, then Disconnect and observe it flip back.
+// Dashboard "My Account" Connect/Disconnect Telegram (mupot#1412, deep-link
+// source corrected by the mupot#1420 incident fix) — the last blocker of the
+// Telegram decision pilot. Exercises the REAL UI end to end: mint via the
+// rendered Connect button, redeem via a real (simulated) Telegram /start
+// against the SAME webhook route production uses, observe the page flip to
+// Connected, then Disconnect and observe it flip back.
 //
 // wrangler-local-test.toml deliberately leaves TELEGRAM_BOT_TOKEN unset (no
-// real bot, no live network call in CI) — getTelegramBotUsername therefore
-// returns null and the page renders its documented no-deep-link fallback
-// ("Message the bot and send: /start <code>"). That fallback is exactly what
-// this workflow exercises; it is the honest, network-independent path, not a
-// weaker substitute for the deep-link one (unit-tested separately in
-// tests/telegram-adapter.test.ts with a mocked Bot API).
+// real bot, no live network call in CI) — that secret is the NOTIFICATION
+// bridge bot's token (src/telegram-bridge/bus_notify.ts) and, since the
+// mupot#1420 fix, has no bearing on this page at all. The deep link is driven
+// instead by org_settings.im_bot_username, an explicit non-secret setting —
+// scripts/local-test-seed.sql seeds it to 'kayhermes_mubot' precisely so this
+// workflow exercises the REAL "Open in Telegram" deep-link branch, not only
+// the no-bot-configured fallback (that fallback is covered separately by
+// tests/im-bot-username.test.ts's unconfigured-setting cases).
+const SEEDED_DECISION_BOT_USERNAME = 'kayhermes_mubot'
 async function runAccountTelegramConnectWorkflow() {
   await page.goto(`${baseUrl}/account`, { waitUntil: 'networkidle', timeout: 20_000 })
   const initialText = await textSnippet(page.locator('body'), 4000)
@@ -923,14 +927,35 @@ async function runAccountTelegramConnectWorkflow() {
   await assertNoDocumentOverflow('My Account (not connected)')
   await page.screenshot({ path: path.join(artifactsDir, 'account-not-connected.png'), fullPage: true })
 
+  // The seeded org_settings.im_bot_username (scripts/local-test-seed.sql) is
+  // what the Connect button carries into the pairing result — proves this
+  // page's deep link is driven by the setting, never by TELEGRAM_BOT_TOKEN
+  // (unset here; mupot#1420's incident cause).
+  const connectBotUsername = await page.locator('#tg-connect').getAttribute('data-bot-username')
+  if (connectBotUsername !== SEEDED_DECISION_BOT_USERNAME) {
+    fail('Connect Telegram button did not carry the seeded decision bot username', { connectBotUsername })
+  }
+
   await page.locator('#tg-connect').click()
   await page.waitForSelector('#tg-result:not([hidden])', { timeout: 10_000 })
   const pairingText = await textSnippet(page.locator('#tg-result'), 500)
   const codeMatch = /Pairing code: (\S+)/.exec(pairingText)
   if (!codeMatch) fail('Connect Telegram did not render a pairing code', { pairingText })
   const pairingCode = codeMatch[1]
-  if (!pairingText.includes('/start ' + pairingCode)) {
-    fail('Connect Telegram result did not render the no-bot-configured fallback instructions', { pairingText })
+  // With im_bot_username configured, the result renders a REAL "Open in
+  // Telegram" deep link to the seeded bot — never the no-bot-configured
+  // fallback text (that branch is covered separately, over a mocked env, by
+  // tests/im-bot-username.test.ts's unconfigured-setting cases).
+  const deepLinkHref = await page.locator('#tg-result a').getAttribute('href')
+  const expectedHref = `https://t.me/${SEEDED_DECISION_BOT_USERNAME}?start=${encodeURIComponent(pairingCode)}`
+  if (deepLinkHref !== expectedHref) {
+    fail('Connect Telegram result did not render the expected "Open in Telegram" deep link', {
+      deepLinkHref, expectedHref, pairingText,
+    })
+  }
+  const deepLinkText = await textSnippet(page.locator('#tg-result a'), 100)
+  if (!deepLinkText.includes('Open in Telegram')) {
+    fail('Connect Telegram deep link anchor did not render the expected label', { deepLinkText })
   }
   await page.screenshot({ path: path.join(artifactsDir, 'account-pairing-code.png'), fullPage: true })
 
@@ -963,6 +988,8 @@ async function runAccountTelegramConnectWorkflow() {
     status: 'passed',
     pairingCodeLength: pairingCode.length,
     redeemReply: redeemJson.reply,
+    decisionBotUsername: SEEDED_DECISION_BOT_USERNAME,
+    deepLinkHref,
   })
 }
 

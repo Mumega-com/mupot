@@ -61,15 +61,52 @@ account row) wraps the exact same `POST /api/members/invites` and `DELETE
   (`member_id` is always the viewer's own server-rendered id, never client-suppliable) against
   a project/squad the viewer already has access to (one picked automatically when only one is
   eligible), at a capability equal to the viewer's own existing rank on that squad — never
-  higher. The response renders the pairing code and, when the bot's `@username` is available
-  (derived live via `getMe`, cached — see `getTelegramBotUsername`), a `https://t.me/<bot>?
-  start=<code>` deep link plus the expiry; otherwise it shows the code with plain instructions
-  to message the bot directly.
+  higher. The response renders the pairing code and, when the decision bot's `@username` has
+  been configured (see "Two bots, two purposes — configuring the decision bot username"
+  below), a `https://t.me/<bot>?start=<code>` deep link plus the expiry; otherwise it shows the
+  code with plain instructions to message the bot directly, plus a prompt to ask the owner to
+  configure the username.
 - **Connected:** shows "Connected · bound `<date>`" and a Disconnect button (self-unbind needs
   no rank at all, same as the curl-based unbind above).
 - **Below the org-admin mint floor:** the page shows an honest "ask an org admin" explanation
   instead of a button wired to a guaranteed `forbidden` — see the next paragraph for why that
   floor exists and is not something this page works around.
+
+### Two bots, two purposes — configuring the decision bot username
+
+**There are two separate Telegram bots in play, and mupot only ever holds the token for one
+of them.** Confusing the two caused a real incident (mupot#1420, 2026-09-16):
+
+1. **The notification bridge bot.** mupot holds `TELEGRAM_BOT_TOKEN` (a Worker secret, `npx
+   wrangler secret put TELEGRAM_BOT_TOKEN`) for this bot and calls its Bot API directly to
+   *push* task-event notifications outward (`src/telegram-bridge/bus_notify.ts`). It is
+   send-only from mupot's side — nobody is expected to message it back, and its identity has
+   no bearing on decisions.
+2. **The decision-channel bot.** This is the bot a human actually talks TO — the Hermes
+   gateway's own bot (e.g. `@kayhermes_mubot`), running in polling mode with no webhook of its
+   own. The gateway's `telegram_control` plugin relays `/start`, `/needs`, `/answer`,
+   `/approve`, `/reject` from that chat to mupot's `POST /im/webhook`, authenticated with
+   `IM_WEBHOOK_SECRET`. **mupot never holds this bot's token** — it is a Hermes-side
+   credential, entirely outside mupot's secret store.
+
+Because mupot has no token for the decision bot, its `@username` cannot be looked up via the
+Bot API's `getMe` the way the notification bot's username could — there is no secret on mupot's
+`Env` that could ever authenticate as it. An earlier build of the My Account "Connect Telegram"
+deep link called `getMe` using `TELEGRAM_BOT_TOKEN` anyway, which silently derived and linked
+to the **notification bot's** username instead — the wrong bot, shipped to production
+(mupot#1420). The fix makes the decision bot's `@username` an explicit, non-secret, owner-typed
+setting (`org_settings.im_bot_username`) instead of ever deriving it from a token:
+
+- Set it during first-run setup, wizard step 6 ("Connect a messenger") — the field labelled
+  "Bot @username members message for decisions". Optional; setup can finish without it.
+- Set or change it any time after setup from **IM settings** (`/admin/im-settings`,
+  owner-only) — the wizard's own write endpoint (`POST /setup/im`) seals once onboarding is
+  complete, so this is the only way to configure or correct it post-go-live.
+- It is validated against Telegram's own username shape (`^[A-Za-z0-9_]{5,32}$`, an optional
+  leading `@` stripped before storage) and is **display only** — nothing in the invite mint,
+  redemption, bind, or unbind path reads it. Getting it wrong or leaving it unset never breaks
+  the actual connect flow, only the convenience deep link (My Account falls back to the plain
+  pairing-code instructions and a prompt to ask the owner to configure it).
 
 **This does not lower the mint floor.** `createProjectInvite`'s member-bind path still requires
 the ACTOR to hold org-scope admin-or-above standing regardless of who they are binding —

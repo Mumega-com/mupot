@@ -42,15 +42,17 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import {
   SETTINGS_KEYS,
   getAllSettings,
+  getSetting,
   setSetting,
   setSettings,
   isOnboardingComplete,
   getOnboardingStep,
+  isValidBotUsername,
 } from './settings'
 import { AGENT_TEMPLATES, getTemplate } from '../org/templates'
 import { createAgent } from '../org/service'
 
-type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
+export type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
 // ── model + IM choices (the non-secret config the wizard persists) ─────────────
 
@@ -89,8 +91,11 @@ function isNonEmptyString(v: unknown): v is string {
 }
 
 /** Owner gate: org role 'owner' OR a fine-grained org-scope 'owner' capability.
- *  Identity is server-derived — never read from the body or message text. */
-async function isOwner(c: Context<AppEnv>): Promise<boolean> {
+ *  Identity is server-derived — never read from the body or message text.
+ *  Exported so other owner-only settings surfaces (src/dashboard/im-settings.ts)
+ *  reuse this ONE predicate rather than retyping it — see feedback on shared
+ *  predicates drifting between copies. */
+export async function isOwner(c: Context<AppEnv>): Promise<boolean> {
   const auth = c.get('auth')
   if (!auth) return false
   if (auth.role === 'owner') return true
@@ -162,6 +167,7 @@ wizardApp.get('/', async (c) => {
           modelName: settings.get(SETTINGS_KEYS.modelName) ?? null,
           imProvider: settings.get(SETTINGS_KEYS.imProvider) ?? null,
           imChannel: settings.get(SETTINGS_KEYS.imChannel) ?? null,
+          imBotUsername: settings.get(SETTINGS_KEYS.imBotUsername) ?? null,
         }),
       ),
     )
@@ -177,6 +183,7 @@ wizardApp.get('/', async (c) => {
     modelName: settings.get(SETTINGS_KEYS.modelName) ?? '',
     imProvider: settings.get(SETTINGS_KEYS.imProvider) ?? '',
     imChannel: settings.get(SETTINGS_KEYS.imChannel) ?? '',
+    imBotUsername: settings.get(SETTINGS_KEYS.imBotUsername) ?? '',
   }
   return c.html(
     wizardShell(c.env.BRAND, 'Setup', wizardBody(c.env.BRAND, auth, step, prefill)),
@@ -255,9 +262,17 @@ wizardApp.post('/model', requireOwner, blockIfComplete, async (c) => {
 
 // POST /setup/im — step 6. Persist the IM provider + chosen channel. NEVER stores
 // the bot token — the owner is told to set it as a secret.
+//
+// bot_username: the DECISION-CHANNEL bot's @username (display only — see
+// SETTINGS_KEYS.imBotUsername's docstring and the src/types.ts TELEGRAM_BOT_TOKEN
+// incident note for why this can never be derived from a secret mupot holds and
+// must instead be a plain owner-typed setting). Optional; validated when present,
+// never required — an owner without the gateway bot handy yet can finish setup
+// and fill this in later via GET/POST /admin/im-settings.
 interface ImBody {
   provider?: unknown
   channel?: unknown
+  bot_username?: unknown
 }
 wizardApp.post('/im', requireOwner, blockIfComplete, async (c) => {
   let body: ImBody
@@ -280,15 +295,48 @@ wizardApp.post('/im', requireOwner, blockIfComplete, async (c) => {
     channel = body.channel.trim()
   }
 
-  await setSettings(c.env, {
+  // bot_username: optional, and — unlike provider/channel — a key OMITTED
+  // from the body means "leave whatever is already saved alone", never
+  // "clear it". The wizard's own client script re-POSTs provider+channel
+  // (without bot_username) when the owner clicks Continue without re-
+  // submitting the form (see wizardScript's im-next handler below); treating
+  // absent-means-blank would silently wipe a value the owner already saved.
+  // An explicit `null` or `""` DOES clear it — that is a deliberate blank,
+  // not an omission. Present-but-invalid is always a hard 400, never
+  // silently dropped.
+  const settingsToWrite: Record<string, string> = {
     [SETTINGS_KEYS.imProvider]: provider,
     [SETTINGS_KEYS.imChannel]: channel,
-  })
+  }
+  let botUsername: string | null = null
+  if (body.bot_username !== undefined) {
+    if (body.bot_username === null) {
+      botUsername = ''
+    } else if (typeof body.bot_username !== 'string') {
+      return c.json({ error: 'invalid_bot_username' }, 400)
+    } else {
+      const trimmed = body.bot_username.trim().replace(/^@/, '')
+      if (trimmed.length > 0 && !isValidBotUsername(trimmed)) {
+        return c.json({ error: 'invalid_bot_username' }, 400)
+      }
+      botUsername = trimmed
+    }
+    settingsToWrite[SETTINGS_KEYS.imBotUsername] = botUsername
+  }
+
+  await setSettings(c.env, settingsToWrite)
+
+  // Echo the ACTUAL current value, not merely what this request happened to
+  // send — when bot_username was omitted (see comment above) it was left
+  // untouched, so the honest response reflects whatever is really persisted,
+  // never a fabricated null for a value that's still saved.
+  const currentBotUsername = body.bot_username !== undefined ? botUsername : await getSetting(c.env, SETTINGS_KEYS.imBotUsername)
 
   return c.json({
     ok: true,
     provider,
     channel: channel || null,
+    bot_username: currentBotUsername || null,
     needs_secret: provider === 'telegram',
     secret_hint: provider === 'telegram' ? 'wrangler secret put TELEGRAM_BOT_TOKEN' : null,
   })
@@ -614,6 +662,7 @@ interface DoneSummary {
   modelName: string | null
   imProvider: string | null
   imChannel: string | null
+  imBotUsername: string | null
 }
 
 function doneSummaryBody(s: DoneSummary) {
@@ -633,6 +682,11 @@ function doneSummaryBody(s: DoneSummary) {
             ? html`${s.imProvider}${s.imChannel ? html` · channel <code>${s.imChannel}</code>` : html``}`
             : html`<span class="empty">not connected</span>`
         }</dd>
+        <dt>Decision bot</dt><dd>${
+          s.imBotUsername
+            ? html`@${s.imBotUsername}`
+            : html`<span class="empty">not set</span>`
+        }</dd>
       </dl>
     </div>
     <div class="card">
@@ -641,6 +695,7 @@ function doneSummaryBody(s: DoneSummary) {
         <span class="pill">Org chart · departments &amp; squads → <a href="/admin/divisions">Divisions</a></span>
         <span class="pill">Team &amp; capabilities → <a href="/admin/members">Members</a></span>
         <span class="pill">Agents &amp; wake → <a href="/">Overview</a></span>
+        <span class="pill">Decision bot username → <a href="/admin/im-settings">IM settings</a></span>
       </div>
       <p class="hint" style="margin-top:14px">Model and IM credentials are secrets — rotate them with
         <code>wrangler secret put …</code>, never through a form.</p>
@@ -654,6 +709,7 @@ interface Prefill {
   modelName: string
   imProvider: string
   imChannel: string
+  imBotUsername: string
 }
 
 function stepper(current: number) {
@@ -904,6 +960,13 @@ function stepImPanel(p: Prefill) {
             secret (never paste it here):<br />
             <code>wrangler secret put TELEGRAM_BOT_TOKEN</code>
           </div>
+          <label class="fld">Bot @username members message for decisions (the gateway bot, e.g. kayhermes_mubot)
+            <input name="bot_username" placeholder="kayhermes_mubot" value="${p.imBotUsername}" />
+          </label>
+          <p class="hint">This is the bot a human actually talks to for <code>/needs</code> and
+            <code>/approve</code> — usually a different bot than the one above, which only sends
+            notifications. Display only; it grants no authority. You can set or change this later from
+            <a href="/admin/im-settings">IM settings</a>.</p>
           <div class="actions">
             <button type="submit" class="btn secondary">Save channel</button>
             <span class="status-line" data-status></span>
@@ -1210,7 +1273,7 @@ function wizardScript(startStep: number) {
             var st = statusOf(imForm);
             var fd = new FormData(imForm);
             var provider = String(fd.get('provider') || 'none');
-            var payload = { provider: provider };
+            var payload = { provider: provider, bot_username: String(fd.get('bot_username') || '').trim() };
             if (provider === 'telegram') payload.channel = String(fd.get('channel') || '').trim();
             setStatus(st, 'Saving…');
             try {

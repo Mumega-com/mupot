@@ -25,9 +25,34 @@ export const SETTINGS_KEYS = {
   modelName: 'model_name',
   imChannel: 'im_channel',
   imProvider: 'im_provider',
+  // Display-only: the @username of the DECISION-CHANNEL bot (the gateway's
+  // bot a human talks to for /needs, /approve, /reject — see
+  // docs/operations/telegram-project-onboarding.md). mupot never holds that
+  // bot's token (it isn't mupot's bot — see src/telegram-bridge/bus_notify.ts
+  // and TELEGRAM_BOT_TOKEN's own comment in src/types.ts for the notification-
+  // only bot this pot DOES hold a token for), so this cannot be derived via
+  // getMe the way the notification bot's username could — it must be
+  // configured. Carries NO authority: nothing in the bind/redeem/authz path
+  // reads it. See src/dashboard/wizard.ts (setup step 6) and
+  // src/dashboard/im-settings.ts (post-setup edit) for the only writers, and
+  // src/dashboard/account.ts's Connect Telegram deep link for the only reader.
+  imBotUsername: 'im_bot_username',
 } as const
 
 export type SettingsKey = (typeof SETTINGS_KEYS)[keyof typeof SETTINGS_KEYS]
+
+// Telegram bot usernames are 5-32 chars of letters/digits/underscore (Telegram
+// also requires they end in "bot", but that constraint buys nothing here — this
+// is a shape check on an owner-supplied display string, not an authorization
+// rule). ONE definition, imported by every writer of im_bot_username (the
+// wizard's /setup/im step and the post-setup /admin/im-settings page) so the
+// accepted shape can never drift between the two forms.
+export const IM_BOT_USERNAME_RE = /^[A-Za-z0-9_]{5,32}$/
+
+/** True iff `v` is a syntactically valid Telegram bot @username (no leading @). */
+export function isValidBotUsername(v: unknown): v is string {
+  return typeof v === 'string' && IM_BOT_USERNAME_RE.test(v)
+}
 
 // ── reads ──────────────────────────────────────────────────────────────────────
 
