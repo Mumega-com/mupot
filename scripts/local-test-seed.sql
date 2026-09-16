@@ -2,9 +2,18 @@
 --   npm run migrate:local:test
 --   npm run seed:local:test
 
+-- im_bot_username: the DECISION-CHANNEL bot's @username (mupot#1420 incident
+-- fix). Display only, no authority — see SETTINGS_KEYS.imBotUsername's
+-- docstring (src/dashboard/settings.ts) and the src/types.ts TELEGRAM_BOT_TOKEN
+-- comment. Seeded here so the local browser smoke's Connect Telegram workflow
+-- exercises the REAL "Open in Telegram" deep-link branch, not only the no-bot-
+-- configured fallback — TELEGRAM_BOT_TOKEN stays unset in wrangler-local-test.toml
+-- (no real bot, no live network call in CI) and must never be the source of
+-- this value; im_bot_username is independent of it by design.
 INSERT INTO org_settings (key, value, updated_at) VALUES
   ('onboarding_complete', 'true', datetime('now')),
-  ('billing_state', '{"tier":"pro","event_id":"local-seed","effective_at":"2026-07-07T00:00:00.000Z"}', datetime('now'))
+  ('billing_state', '{"tier":"pro","event_id":"local-seed","effective_at":"2026-07-07T00:00:00.000Z"}', datetime('now')),
+  ('im_bot_username', 'kayhermes_mubot', datetime('now'))
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;
 
 INSERT INTO users (id, email, role, created_at)

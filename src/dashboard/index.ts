@@ -263,6 +263,7 @@ import '../departments/modules/web-ops' // side-effect: register WebOpsModule (A
 import { makeMissionControlApp } from './mission-control-routes'
 import { makeElevationApp } from './elevation'
 import { makeAccountApp } from './account'
+import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject } from '../projects/deploy'
@@ -1415,6 +1416,14 @@ dashboardApp.route('/', makeElevationApp(shell))
 // /api/members/members/:id/telegram routes — see src/dashboard/account.ts's
 // module header for the full authorization argument.
 dashboardApp.route('/', makeAccountApp(shell))
+
+// Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
+// post-setup edit surface for org_settings.im_bot_username (mupot#1420
+// incident fix). The wizard's own /setup/im write seals once onboarding is
+// complete (blockIfComplete); this is the "later" surface an owner uses to
+// set or change the decision bot's @username after go-live — see
+// src/dashboard/im-settings.ts's module header.
+dashboardApp.route('/', makeImSettingsApp(shell))
 
 // Mount Kanban Sub-app
 dashboardApp.route('/', kanbanApp)
