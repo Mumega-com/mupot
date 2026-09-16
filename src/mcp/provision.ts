@@ -26,7 +26,7 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -1893,6 +1893,40 @@ const toolUpdateAgent: ToolSpec = {
     }
     if (!Object.keys(patch).length) {
       return fail(400, 'invalid_args', 'at least one field to update is required')
+    }
+
+    // mupot#1425 adversarial gate P0-1 (kasra-review + Athena, 2026-09-16):
+    // owner_member_id is a CREDENTIAL-CONFERRING field — it decides whose
+    // member identity an agent's harness may carry into a task_verdict
+    // (src/im/origin-verdict.ts). Setting it to member M is granting THIS
+    // agent M's future standing, the exact shape POST /members/:id/tokens
+    // already fences with org-admin PLUS a target-rank ceiling ("Minting a
+    // token FOR a member yields a credential that authenticates AS that
+    // member... vertical privilege escalation", src/members/index.ts). Before
+    // this fix, the ADMIN lane above only proved squad-admin on the AGENT's
+    // squad — a squad admin with zero org standing could point an agent at
+    // the org OWNER (proved by kasra-review's K1/K1b probe: that agent's
+    // Telegram DM then resolves, via memberForChat, to the owner's full
+    // grant set for the entire IM surface). Not checked on the self lane
+    // at all — self-writing owner_member_id is refused by SELF_FORBIDDEN_
+    // FIELDS above, before `patch` is even built, so `isSelf` is always
+    // false here.
+    //
+    // exceedsTargetRankCeiling (src/auth/capability.ts) is the SAME
+    // predicate #1411's member-bind-invite path uses for the identical
+    // class of credential mint: the actor's ORG-SCOPE-LOCAL rank must be >=
+    // the target's GLOBAL rank across every scope + the role-plane bridge;
+    // self-exempt only when the actor IS the target. Reused verbatim, not
+    // re-derived — see that function's own docstring for why the two sides
+    // are deliberately asymmetric (actor scope-local, target global).
+    //
+    // Clearing (owner_member_id: null) is NOT ceiling-checked: it revokes an
+    // agent's ability to carry someone's identity, it confers nothing to
+    // anyone, so it carries none of the escalation risk minting does.
+    if (typeof patch.owner_member_id === 'string' && patch.owner_member_id.length > 0) {
+      if (await exceedsTargetRankCeiling(env, auth, patch.owner_member_id)) {
+        return fail(403, 'target_rank_exceeds_ceiling', { owner_member_id: patch.owner_member_id })
+      }
     }
 
     // Audit actor: a self-correction is attributed to the agent itself (0086's

@@ -39,15 +39,18 @@ ALTER TABLE task_verdicts ADD COLUMN decided_via TEXT
   CHECK (decided_via IS NULL OR decided_via = 'agent_attested_origin');
 ALTER TABLE task_verdicts ADD COLUMN origin_agent_id TEXT REFERENCES agents(id);
 
--- Per-(agent, chat) rate limit (src/im/origin-verdict.ts,
--- recentAppliedOriginExists): at most one APPLIED harness-attested verdict
--- per (origin_agent_id, chat) per 30s, checked by joining to members.
--- telegram_chat_id via decided_by — reuses task_verdicts as its own receipt
--- ledger rather than a new table. Partial index: only rows this query ever
--- reads carry a non-NULL origin_agent_id.
-CREATE INDEX IF NOT EXISTS idx_task_verdicts_origin_agent_decided_at
-  ON task_verdicts(origin_agent_id, decided_at)
-  WHERE origin_agent_id IS NOT NULL;
+-- Per-MEMBER rate limit (src/im/origin-verdict.ts, recentAppliedOriginExists):
+-- at most one APPLIED harness-attested verdict per resolved member per 30s.
+-- mupot#1425 P2-5 (kasra-review): an earlier version of this index/query
+-- keyed on origin_agent_id — one member owning several agents could apply
+-- many verdicts within one window by rotating agents. Keyed on decided_by
+-- (the resolved MEMBER) instead, which is the identity actually being
+-- rate-limited. Reuses task_verdicts as its own receipt ledger, no new
+-- table. Partial index: only rows this query ever reads carry
+-- decided_via = 'agent_attested_origin'.
+CREATE INDEX IF NOT EXISTS idx_task_verdicts_origin_member_decided_at
+  ON task_verdicts(decided_by, decided_at)
+  WHERE decided_via = 'agent_attested_origin';
 
 -- Append-only receipt for a first-bind-by-origin event: an owned agent's
 -- harness relayed a human_origin for a member who had no telegram_chat_id yet,
@@ -85,9 +88,16 @@ BEGIN
 END;
 
 -- Replay protection for the harness-attested-origin verdict path reuses
--- `telegram_webhook_receipts` (0152) as-is via reserveTelegramUpdate /
--- completeTelegramUpdate (src/im/telegram-receipts.ts) — no new table. Its
--- `update_id` column is unconstrained TEXT (no format CHECK), so a synthetic
--- key of the shape `origin:telegram:<chat_id>:<message_id>` fits the existing
--- PRIMARY KEY (tenant, update_id) fence without a schema change. See
--- src/im/origin-verdict.ts.
+-- `telegram_webhook_receipts` (0152) as-is — no new table. Its `update_id`
+-- column is unconstrained TEXT (no format CHECK), so a synthetic key of the
+-- shape `origin:telegram:<chat_id>:<message_id>` fits the existing PRIMARY
+-- KEY (tenant, update_id) fence without a schema change. mupot#1425 P0-2/
+-- P1-4 fix round (kasra-review + Athena): the reservation INSERT and the
+-- first-bind UPDATE (+ its audit INSERT) now run in ONE D1 batch
+-- (src/im/origin-verdict.ts's commitOriginDecision), reached only AFTER a
+-- read-only dry run has already proven the verdict authorized — not via the
+-- shared reserveTelegramUpdate/completeTelegramUpdate helpers' own
+-- check-then-write shape, which cannot express "gate statement 2 on
+-- statement 1 having landed" within one atomic batch. completeTelegramUpdate
+-- is still used to mark the reservation 'completed' once the outcome (bind
+-- landed, or a post-reservation race) is known.

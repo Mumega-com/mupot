@@ -351,7 +351,7 @@ What **must change**, not merely adapt:
   own honest answer to "can I prove this wasn't relayed by someone else," which may be
   weaker than Telegram's and must be documented as such, not silently assumed equivalent.
 
-## Harness-attested origin (mupot#1424)
+## Harness-attested origin (mupot#1424/#1425)
 
 Added 2026-09-16 for `task_verdict`'s `human_origin` field
 (`src/im/origin-verdict.ts`, `src/mcp/index.ts`). A second SHAPE of decision channel,
@@ -360,64 +360,101 @@ they talk to their OWN agent (KayHermes) in natural language, and that agent's o
 mupot calls carry a stamped origin. This section states the trust model plainly rather
 than let it be inferred from the code.
 
+**Revision 2026-09-16 (fix round, kasra-review adversarial BLOCK + Athena):** the
+FIRST version of this feature shipped a defect CLASS — side effects (the Telegram
+identity bind, the replay reservation) ran BEFORE the authorization they were supposed
+to depend on, and `agents.owner_member_id` had no target-rank ceiling on who could set
+it. Three PROVEN P0 exploits (a squad admin binding an agent to the org owner; a
+binding minted on a call that was then refused 403; the self-verdict gate converted
+away with its stated substitute empty in prod) are all closed below, by RE-ORDERING —
+every read-only conjunct now runs, and the actual `evaluateVerdictGates` predicate is
+dry-run against the candidate member's REAL fresh capabilities, before this module
+writes anything at all. This revision replaces the FIRST version's blast-radius
+sentence, which overclaimed the resulting guarantee; do not restore the old wording.
+
 **The trust statement, stated once and not softened:** the HARNESS is the attestation
 boundary. mupot trusts a `human_origin` stamp only because (a) the calling agent's seat
 is owned by the resolved member (`agents.owner_member_id`, migration 0155 — a column
 distinct from both the free-text `agents.owner` label and `agent_keys`' own
-`memberOwnsAssigneeAgent` conflict-of-interest fact; the three are never conflated), (b)
-that member is bound to the exact chat the origin claims, and (c) the message is FRESH
-and UNREPLAYED. mupot cannot itself tell a harness-stamped `human_origin` apart from one
-a MODEL typed into its own tool call — the server never sees the raw Telegram update,
-only the stamp the harness (or, adversarially, the agent loop itself) chose to attach.
-A plugin-side gate (the actual Hermes-side code that is supposed to stamp only real
-Telegram messages) can silently no-op — an older Hermes build, or `native_gateway` off —
-and mupot must not be the second layer that only works when the first one does. So every
-defense that IS server-checkable is enforced here, not merely assumed of the harness:
+`memberOwnsAssigneeAgent` conflict-of-interest fact; the three are never conflated),
+**and setting that column is itself gated by an org-scope-local target-rank ceiling on
+the ACTOR** (`exceedsTargetRankCeiling`, src/auth/capability.ts, the identical predicate
+#1411's member-bind-invite path uses for the same class of credential mint — see
+`update_agent`'s ceiling check in src/mcp/provision.ts): only an actor whose org-scope
+standing is at or above the TARGET member's global rank may point an agent at them, or
+the actor targeting their own member id (self-exempt); (b) that member is bound to the
+exact chat the origin claims, or first-binds it, but ONLY after the verdict is proven
+authorized (see the ordering below); and (c) the message is FRESH and UNREPLAYED. mupot
+cannot itself tell a harness-stamped `human_origin` apart from one a MODEL typed into
+its own tool call — the server never sees the raw Telegram update, only the stamp the
+harness (or, adversarially, the agent loop itself) chose to attach. A plugin-side gate
+(the actual Hermes-side code that is supposed to stamp only real Telegram messages) can
+silently no-op — an older Hermes build, or `native_gateway` off — and mupot must not be
+the second layer that only works when the first one does. So every defense that IS
+server-checkable is enforced here, not merely assumed of the harness, and — the
+load-bearing fix — enforced in an order where authorization gates every write:
 
-- **Ownership** (`agents.owner_member_id`) — re-read fresh every call, admin-settable
-  only, never self-settable (an agent-bound caller may not set its own
-  `owner_member_id` via `update_agent` — that would be a self-grant of exactly the
-  authority this section describes).
-- **Binding match** — the origin's `chat_id` must equal the owning member's
-  `telegram_chat_id`, or (first-bind-by-origin, no invite, no button — Hadi's direct
-  instruction, 2026-09-16) the member has none yet and this exact agent's ownership is
-  the authority to mint one, atomically, before resolving the verdict.
-- **Freshness** — `message_at` is REQUIRED and must fall within 10 minutes in the past
-  or 60 seconds in the future of the server clock (`origin_stale` otherwise). This is
-  the defense against a stale stamp reused out of context: the replay reservation below
-  only catches the EXACT SAME message reused for the EXACT SAME (task, verdict) — it
-  cannot catch a model retaining an old `(chat_id, message_id, message_at)` triple from
-  earlier in its own context and attaching it to a brand-new decision on a brand-new
-  task, since a different task_id/verdict produces a different replay digest entirely.
-  Freshness closes that gap independently of replay.
-- **Replay** — one decision per origin message, keyed on `(tenant, 'origin:telegram:' +
-  chat_id + ':' + message_id)`, reusing `telegram_webhook_receipts` (0152) verbatim via
-  `reserveTelegramUpdate`/`completeTelegramUpdate` — no forked reservation mechanism.
-  Checked, and the reservation taken, BEFORE the first-bind step too: a leaked or stale
-  stamp cannot mint a NEW binding any more than it can mint a verdict. A second call
-  naming the same origin — exact match or conflicting digest — is refused with a hard
-  409 `origin_replayed`; unlike the real Telegram webhook, this path never returns a
-  cached prior response, because two `task_verdict` calls naming the same origin is
-  always a bug or an attack, never a legitimate transport-level retry.
-- **Rate limit** — at most one APPLIED harness-attested verdict per `(origin_agent_id,
-  chat)` per 30 seconds (`origin_rate_limited` otherwise), checked against
-  `task_verdicts` itself (no separate ledger — every applied row already carries
-  `origin_agent_id`, and `decided_by` joins to the member's `telegram_chat_id`). This
-  bounds a BURST of distinct, individually fresh, individually unreplayed messages,
-  which the per-message replay check alone cannot bound.
-- **Conflict of interest** — `memberOwnsAssigneeAgent` (`agent_keys`), UNCHANGED and
-  reused as-is, not re-derived: the resolved member may not decide a task assigned to an
-  agent THEY own by that (separate) relation. This is deliberately independent of the
-  `owner_member_id` ownership check above — a member can own the CALLING agent's harness
-  without owning the TASK'S ASSIGNEE agent, and vice versa.
+1. **Ownership + ceiling** (`agents.owner_member_id`) — re-read fresh every call,
+   settable only by an actor who does not outrank-check-fail against the target
+   (above), never self-settable by the agent itself (an agent-bound caller may not set
+   its own `owner_member_id` via `update_agent` — that would be a self-grant of exactly
+   the authority this section describes).
+2. **Chat fence** (read-only) — the origin's `chat_id` must equal the owning member's
+   `telegram_chat_id`, or the member has none yet (a first-bind CANDIDATE — nothing is
+   written for this yet).
+3. **Conflict of interest** — the calling agent may not itself be the task's assignee
+   (it would be approving its own work using a stamp it wrote itself), and the resolved
+   member may not be the OWNER of the assignee agent (`agents.owner_member_id` again,
+   the load-bearing check now that `agent_keys` is empty in prod for the pilot agent).
+   `agent_keys`' `memberOwnsAssigneeAgent` is kept as an additional, non-load-bearing
+   check for the day it is populated.
+4. **Rate limit** — at most one APPLIED harness-attested verdict per resolved MEMBER
+   per 30 seconds (`origin_rate_limited` otherwise), checked against `task_verdicts`
+   itself (`decided_by` + `decided_via`, no separate ledger). Keyed on the member, not
+   the calling agent — a member who owns several agents cannot bypass this by rotating
+   which agent relays the message.
+5. **Squad membership + the REAL gate predicate** — `canOnSquad` and then
+   `evaluateVerdictGates`, the SAME function every other verdict surface (HTTP, MCP,
+   IM) calls, dry-run against the candidate member's fresh, freshly-resolved
+   capabilities. This is the actual authorization every write below is gated behind.
+6. **Freshness** — `message_at` is REQUIRED and must fall within 10 minutes in the past
+   or 60 seconds in the future of the server clock (`origin_stale` otherwise), checked
+   during parsing, before any of the above. This is a short shelf life for a captured
+   `(chat_id, message_id, message_at)` triple, not proof the harness told the truth
+   about when the human spoke — `message_at` is caller-supplied, so an injected model
+   can stamp a fresh timestamp as easily as a real harness can. What freshness actually
+   buys: a stamp scraped from old context cannot be replayed indefinitely.
+7. **ONLY IF everything above says "authorized"** does this module write anything, and
+   the two writes (the replay reservation, and the first-bind UPDATE + its audit
+   INSERT, when needed) land in ONE D1 batch (`commitOriginDecision`): the bind and its
+   receipt are gated, in SQL, on the reservation's own unique per-call stamp having
+   actually landed in the same batch, and a UNIQUE-constraint conflict (another member
+   already holds this chat) aborts the WHOLE batch — the reservation is never left
+   committed either. **A failure reserves nothing.** Replay itself: one decision per
+   origin message, keyed on `(tenant, 'origin:telegram:' + chat_id + ':' + message_id)`
+   — reuses `telegram_webhook_receipts` (0152) verbatim, no forked table. ANY
+   pre-existing row at that key — exact digest match or not — refuses the whole call
+   with a hard 409 `origin_replayed`; this path never returns a cached prior response
+   the way the live Telegram webhook's own reservation helper does, because two
+   `task_verdict` calls naming the same origin is always a bug or an attack, never a
+   legitimate transport-level retry. `writeVerdict` itself stays a separate call in the
+   caller (`src/mcp/index.ts`), evaluated a second time against the SAME resolved
+   member's auth immediately afterward — a deliberate, documented, same-request-only
+   double-check, not a second independent authorization path.
 
-**The resulting blast radius, stated plainly:** a compromised harness can forge AT MOST
-one verdict per fresh, unreplayed message from its owner's own chat — the same blast
-radius as the owner's own Telegram client sending that one message. It can never
-impersonate a DIFFERENT member (ownership is admin-set, not attacker-set), never replay
-one message twice, never reach back into stale context to mint a decision from an old
-message (freshness), and never burst more than one applied decision per chat per 30s
-window (rate limit) even with distinct real messages.
+**The resulting blast radius, stated precisely, replacing the overclaim in the first
+version of this section:** a caller holding an agent-bound seat can cast, per fresh and
+unreplayed origin message from a chat the resolved member is bound to (or eligible to
+first-bind), exactly the verdicts that member's OWN real, freshly-resolved capabilities
+would allow through `evaluateVerdictGates` — no more, no wider. It can never impersonate
+a member the ceiling above would have refused to point that agent at. It can never mint
+a binding, or reserve a replay slot, for a decision that was not first proven
+authorized. And it can never apply more than one such decision per member per 30-second
+window, regardless of how many agents that member owns. Do not describe this as "per
+message" without also naming the ceiling and the authorize-before-write ordering above
+— "per message" alone was the exact overclaim the first version made, and every P0 the
+adversarial gate proved was a violation of a clause in that overclaim, not of some
+other, unstated property.
 
 **Two hard failures, no fallback.** Every conjunct above failing falls back to the
 calling agent's own authority — exactly as if `human_origin` had been omitted, "no
@@ -428,9 +465,15 @@ have stamped anything), and a replayed origin message (409 `origin_replayed`).
 
 Evidence: `tests/task-verdict-human-origin.test.ts` (every conjunct above, flipped one
 at a time, real D1 via `applyAllMigrations`, invoked through `invokeTool` — the same
-seam MCP and `/actions/task_verdict` both dispatch through) and
+seam MCP and `/actions/task_verdict` both dispatch through — including the P0-2 proof
+that an unauthorized owner never gets bound, the P1-4 proof that an unowned agent
+cannot burn a replay slot for a later authorized one, the P0-3 proof that a
+self-assigned task refuses 409 `self_verdict` with and without an origin, the P2-5
+proof that the rate limit is per-member not per-agent, and the P2-7 proof that the
+task-detail timeline surfaces `decided_via`/the origin agent) and
 `tests/agent-owner-member.test.ts` (`owner_member_id` admin-only, self-lane-forbidden,
-partition-invariant).
+partition-invariant, and the P0-1 target-rank-ceiling proof: squad-admin-with-no-org-
+standing refused, org-owner allowed, self-target exempt).
 
 ## Evidence discipline
 

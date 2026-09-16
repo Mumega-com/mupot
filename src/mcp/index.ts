@@ -1912,21 +1912,36 @@ const toolTaskVerdict: ToolSpec = {
     if (!taskRes.ok) return taskRes
     const task = taskRes.task
 
-    // ── mupot#1424: harness-attested human origin ─────────────────────────
-    // See src/im/origin-verdict.ts for the full trust model and every
-    // conjunct. Two HARD failures refuse the whole call (never a silent
-    // fallback): a non-agent-bound caller supplying human_origin at all
-    // (nonsensical — there is no harness in that seat to have stamped
-    // anything), and a replayed origin message. Every OTHER failure mode
-    // falls back to the calling agent's own authority, exactly as if
-    // human_origin had been omitted — "no origin, or origin that does not
-    // resolve, runs under the agent seat only" (Hadi, 2026-09-16).
+    // mupot#1425 P0-2 fix (kasra-review + Athena): task-state checks moved
+    // BEFORE origin resolution — a task with no gate or not in review can
+    // never be decided regardless of auth, so resolveHarnessAttestedOrigin
+    // must never even be reached (let alone mint a reservation or a
+    // Telegram bind) for one. These two checks read only `task` fields, not
+    // `auth`, so moving them earlier changes nothing about what they gate.
+    if (!task.gate_owner) return fail(409, 'no_gate')
+    if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
+
+    // ── mupot#1424/#1425: harness-attested human origin ────────────────────
+    // See src/im/origin-verdict.ts for the full trust model, the fix-round
+    // history, and every conjunct. Two HARD failures refuse the whole call
+    // (never a silent fallback): a non-agent-bound caller supplying
+    // human_origin at all (nonsensical — there is no harness in that seat to
+    // have stamped anything), and a replayed origin message. Every OTHER
+    // failure mode falls back to the calling agent's own authority, exactly
+    // as if human_origin had been omitted — "no origin, or origin that does
+    // not resolve, runs under the agent seat only" (Hadi, 2026-09-16).
+    // resolveHarnessAttestedOrigin itself does not write ANYTHING (bind,
+    // reservation) until it has independently proven, via a read-only dry
+    // run of the SAME evaluateVerdictGates predicate below, that this exact
+    // task+verdict would be authorized for the resolved member.
     let originOutcome: HumanOriginResolution | null = null
     if (args.human_origin !== undefined) {
       if (!auth.boundAgentId) {
         return fail(400, 'human_origin_not_applicable')
       }
       originOutcome = await resolveHarnessAttestedOrigin(env, auth.boundAgentId, args.human_origin, task.id, verdict, {
+        squad_id: task.squad_id,
+        gate_owner: task.gate_owner,
         assignee_agent_id: task.assignee_agent_id,
       })
       if (originOutcome.replayed) {
@@ -1942,8 +1957,6 @@ const toolTaskVerdict: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
-    if (!task.gate_owner) return fail(409, 'no_gate')
-    if (task.status !== 'review') return fail(409, 'not_in_review', { status: task.status })
 
     // RBAC: gate ownership, the gate:loops surface cap, and self-verdict — the
     // ONE shared predicate (mupot#1080/#1081, src/tasks/index.ts) also used by

@@ -156,6 +156,80 @@ describe('update_agent — owner_member_id (mupot#1424, migration 0155)', () => 
     expect(row?.model).toBe('gpt-5.6-terra')
   })
 
+  // ── mupot#1425 P0-1 fix (kasra-review BLOCK + Athena, 2026-09-16):
+  // owner_member_id is a credential-conferring field with NO target-rank
+  // ceiling before this fix — a squad admin with zero org standing could
+  // point an agent at the org OWNER (kasra-review's proven K1/K1b chain: that
+  // agent's Telegram DM then resolves, via memberForChat, to the owner's
+  // full grant set for the entire IM surface). exceedsTargetRankCeiling
+  // (src/auth/capability.ts), reused verbatim from #1411's member-bind-
+  // invite path, closes it. ─────────────────────────────────────────────
+  describe('mupot#1425 P0-1 — target-rank ceiling on owner_member_id', () => {
+    it('a squad admin with NO org standing pointing an agent at the ORG OWNER: 403 target_rank_exceeds_ceiling, no write (Athena\'s proof-of-exploit)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-owner', 'owner@test.com', 'Owner', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-owner', 'member-org-owner', 'org', NULL, 'owner');
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-squad-admin', 'sqadmin@test.com', 'SqAdmin', 'active', '${TENANT}');
+      `)
+      const squadAdminGrant: CapabilityGrant[] = [
+        { member_id: 'member-squad-admin', scope_type: 'squad', scope_id: squadId, capability: 'admin' },
+      ]
+      const result = await invoke(
+        auth({ memberId: 'member-squad-admin', capabilities: squadAdminGrant }),
+        { agent: agentId, owner_member_id: 'member-org-owner' },
+      )
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.status).toBe(403)
+      expect(result.error).toBe('target_rank_exceeds_ceiling')
+      expect(result.detail).toEqual({ owner_member_id: 'member-org-owner' })
+
+      // The full chain proves nothing else landed either: owner_member_id
+      // stays NULL, so a subsequent task_verdict human_origin call from this
+      // agent still falls back to agent_not_owned — no verdict, no binding.
+      // (Full chain covered end to end in
+      // tests/task-verdict-human-origin.test.ts's own ceiling-interaction
+      // test; this file proves the write itself is refused.)
+      const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string | null }>()
+      expect(row?.owner_member_id).toBeNull()
+    })
+
+    it('the ORG OWNER pointing the same agent at the same target: ok (actor org-scope rank 5 >= target global rank 5)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-org-owner-2', 'owner2@test.com', 'Owner2', 'active', '${TENANT}');
+        INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-owner-2', 'member-org-owner-2', 'org', NULL, 'owner');
+      `)
+      const orgOwnerGrant: CapabilityGrant[] = [
+        { member_id: 'member-org-owner-caller', scope_type: 'org', scope_id: null, capability: 'owner' },
+      ]
+      const result = await invoke(
+        auth({ memberId: 'member-org-owner-caller', capabilities: orgOwnerGrant }),
+        { agent: agentId, owner_member_id: 'member-org-owner-2' },
+      )
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string }>()
+      expect(row?.owner_member_id).toBe('member-org-owner-2')
+    })
+
+    it('a squad admin pointing an agent at THEMSELVES: ok — self-exempt regardless of rank', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-squad-admin-2', 'sqadmin2@test.com', 'SqAdmin2', 'active', '${TENANT}');
+      `)
+      const squadAdminGrant: CapabilityGrant[] = [
+        { member_id: 'member-squad-admin-2', scope_type: 'squad', scope_id: squadId, capability: 'admin' },
+      ]
+      const result = await invoke(
+        auth({ memberId: 'member-squad-admin-2', capabilities: squadAdminGrant }),
+        { agent: agentId, owner_member_id: 'member-squad-admin-2' },
+      )
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?').bind(agentId).first<{ owner_member_id: string }>()
+      expect(row?.owner_member_id).toBe('member-squad-admin-2')
+    })
+  })
+
   it('partition invariant still holds with owner_member_id added', () => {
     const selfPatchable = new Set<string>(SELF_PATCHABLE_FIELDS)
     const selfForbidden = new Set<string>(SELF_FORBIDDEN_FIELDS)
