@@ -2060,6 +2060,11 @@ const toolUpdateAgent: ToolSpec = {
 // update (grant_agent_capability already upserts capability on a squad).
 // capability is required every call; a no-op success would swallow that
 // required argument and look like a grant change that never happened.
+//
+// 6th hard block: 409 fleet_dispatch_active when the agent still has an
+// in-air flight (preflight/running/waiting/sleeping) or an in-flight
+// dispatched task (status=in_progress, or an unconsumed task_dispatch_
+// receipt). Athena: a move is reversible; a broken production flight is not.
 const toolMoveAgentSquad: ToolSpec = {
   name: 'move_agent_squad',
   scope: "agent's current squad AND destination squad (admin on both, or org admin)",
@@ -2137,6 +2142,38 @@ const toolMoveAgentSquad: ToolSpec = {
     const binding = await resolveAgentMemberBinding(env, agent.id)
     if (binding.kind === 'unminted') {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before moving the agent')
+    }
+
+    // 6th hard block (Athena GO-WITH-CHANGES on PR #1432): refuse when the
+    // target still has an in-air flight or an in-flight dispatched task.
+    // Severing old-squad capability rows mid-flight can break a live
+    // dispatch/receipt path; a move is reversible, a broken production
+    // flight is not. Cheap existence queries — no write yet.
+    const [liveFlight, liveTask, liveDispatch] = await Promise.all([
+      env.DB.prepare(
+        `SELECT id, status FROM flights
+          WHERE tenant = ?1 AND agent = ?2
+            AND status IN ('preflight', 'running', 'waiting', 'sleeping')
+          LIMIT 1`,
+      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; status: string }>(),
+      env.DB.prepare(
+        `SELECT id FROM tasks
+          WHERE assignee_agent_id = ?1 AND status = 'in_progress'
+          LIMIT 1`,
+      ).bind(agent.id).first<{ id: string }>(),
+      env.DB.prepare(
+        `SELECT id, task_id FROM task_dispatch_receipts
+          WHERE tenant = ?1 AND agent_id = ?2 AND consumed_at IS NULL
+          LIMIT 1`,
+      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; task_id: string }>(),
+    ])
+    if (liveFlight || liveTask || liveDispatch) {
+      return fail(409, 'fleet_dispatch_active', {
+        flight_id: liveFlight?.id ?? null,
+        flight_status: liveFlight?.status ?? null,
+        task_id: liveTask?.id ?? liveDispatch?.task_id ?? null,
+        dispatch_receipt_id: liveDispatch?.id ?? null,
+      })
     }
 
     const actor: AuditActor = { id: auth.memberId as string, type: 'user' }
