@@ -2053,13 +2053,16 @@ const toolUpdateAgent: ToolSpec = {
 // who outranks you". The welded member is the agent's own identity, typically
 // squad-scoped 'member'; applying it here would refuse every squad-admin
 // move (actor org-rank 0 < target squad-rank 2) and collapse the dual-squad
-// admin bar into "org admin only". Design note for the gate, not a guess
-// that the ceiling should be wider.
+// admin bar into "org admin only". Athena ACCEPTED this skip (2026-09-18).
 //
 // same_squad → 400, not a silent no-op. This tool is a MOVE, not a grant
 // update (grant_agent_capability already upserts capability on a squad).
 // capability is required every call; a no-op success would swallow that
 // required argument and look like a grant change that never happened.
+//
+// 6th hard block (Athena REQUIRED): 409 fleet_dispatch_active when the
+// agent still has an in-air flight or an in-flight dispatched task.
+// Activity-based, not a FLEET_OPS_AGENT / FLEET_CONSUMER_AGENT allowlist.
 const toolMoveAgentSquad: ToolSpec = {
   name: 'move_agent_squad',
   scope: "agent's current squad AND destination squad (admin on both, or org admin)",
@@ -2158,6 +2161,39 @@ const toolMoveAgentSquad: ToolSpec = {
     ).bind(binding.memberId).first<{ tenant: string }>()
     if (!weldedMember || weldedMember.tenant !== env.TENANT_SLUG) {
       return fail(403, 'forbidden', { reason: 'tenant_scope' })
+    }
+
+    // 6th hard block (Athena REQUIRED): refuse when the target still has an
+    // in-air flight or an in-flight dispatched task. Activity-based, not an
+    // identity allowlist (FLEET_OPS_AGENT / FLEET_CONSUMER_AGENT is the
+    // deactivate_agent pattern; the required check here is live work).
+    // Severing old-squad grants mid-flight can break a live dispatch/receipt
+    // path; a move is reversible, a broken production flight is not.
+    const [liveFlight, liveTask, liveDispatch] = await Promise.all([
+      env.DB.prepare(
+        `SELECT id, status FROM flights
+          WHERE tenant = ?1 AND agent = ?2
+            AND status IN ('preflight', 'running', 'waiting', 'sleeping')
+          LIMIT 1`,
+      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; status: string }>(),
+      env.DB.prepare(
+        `SELECT id FROM tasks
+          WHERE assignee_agent_id = ?1 AND status = 'in_progress'
+          LIMIT 1`,
+      ).bind(agent.id).first<{ id: string }>(),
+      env.DB.prepare(
+        `SELECT id, task_id FROM task_dispatch_receipts
+          WHERE tenant = ?1 AND agent_id = ?2 AND consumed_at IS NULL
+          LIMIT 1`,
+      ).bind(env.TENANT_SLUG, agent.id).first<{ id: string; task_id: string }>(),
+    ])
+    if (liveFlight || liveTask || liveDispatch) {
+      return fail(409, 'fleet_dispatch_active', {
+        flight_id: liveFlight?.id ?? null,
+        flight_status: liveFlight?.status ?? null,
+        task_id: liveTask?.id ?? liveDispatch?.task_id ?? null,
+        dispatch_receipt_id: liveDispatch?.id ?? null,
+      })
     }
 
     // GATE-OWNER DODGE (Athena HARD-BLOCK 4): at minimum refuse when the

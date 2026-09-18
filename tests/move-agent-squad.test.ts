@@ -557,4 +557,135 @@ describe('move_agent_squad', () => {
     expect(await auditRows()).toHaveLength(0)
     expect(events).toHaveLength(0)
   })
+
+  it('Athena 6th hard block: running flight on the target agent is 409 fleet_dispatch_active', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, trigger_source)
+        VALUES ('flight-live', '${TENANT}', '${agentId}', 'in the air', 'running', 'manual');
+    `)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('fleet_dispatch_active')
+    expect(result.detail).toEqual(expect.objectContaining({
+      flight_id: 'flight-live',
+      flight_status: 'running',
+    }))
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+    expect(events).toHaveLength(0)
+  })
+
+  it('Athena 6th hard block: in-progress assigned task is 409 fleet_dispatch_active', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id)
+        VALUES (
+          'task-inflight',
+          '${FROM_SQUAD}',
+          'Live dispatch',
+          '',
+          'receipt lands',
+          'in_progress',
+          '${agentId}'
+        );
+    `)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('fleet_dispatch_active')
+    expect(result.detail).toEqual(expect.objectContaining({ task_id: 'task-inflight' }))
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+  })
+
+  it('Athena 6th hard block: unconsumed task_dispatch_receipt is 409 fleet_dispatch_active', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id)
+        VALUES (
+          'task-dispatched',
+          '${FROM_SQUAD}',
+          'Dispatched',
+          '',
+          'receipt lands',
+          'open',
+          '${agentId}'
+        );
+      INSERT INTO task_dispatch_receipts
+        (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at)
+        VALUES (
+          'dispatch-open',
+          '${TENANT}',
+          'task-dispatched',
+          '${FROM_SQUAD}',
+          '${agentId}',
+          'member',
+          '${OPERATOR}',
+          '2026-09-18T00:00:00.000Z'
+        );
+    `)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('fleet_dispatch_active')
+    expect(result.detail).toEqual(expect.objectContaining({
+      task_id: 'task-dispatched',
+      dispatch_receipt_id: 'dispatch-open',
+    }))
+    expect(await agentRow(agentId)).toEqual(before)
+  })
+
+  it('Athena 6th hard block: landed flight and consumed dispatch do not block the move', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, trigger_source)
+        VALUES ('flight-done', '${TENANT}', '${agentId}', 'already landed', 'landed', 'manual');
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id)
+        VALUES (
+          'task-done',
+          '${FROM_SQUAD}',
+          'Done',
+          '',
+          'done',
+          'done',
+          '${agentId}'
+        );
+      INSERT INTO task_dispatch_receipts
+        (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at)
+        VALUES (
+          'dispatch-done',
+          '${TENANT}',
+          'task-done',
+          '${FROM_SQUAD}',
+          '${agentId}',
+          'member',
+          '${OPERATOR}',
+          '2026-09-18T00:00:00.000Z',
+          '2026-09-18T00:01:00.000Z'
+        );
+    `)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(true)
+    expect((await agentRow(agentId))?.squad_id).toBe(TO_SQUAD)
+  })
 })
