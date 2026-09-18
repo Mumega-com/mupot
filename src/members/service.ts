@@ -14,6 +14,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, MemberToken, ConnectionChannel, Capability, CapabilityGrant } from '../types'
 import { assertBatchWritten, assertWritten, rowsWritten } from '../lib/receipt'
+import { CAPABILITY_LIVE_PREDICATE, nowCapabilitySql } from '../auth/capability'
 import {
   calculateExpiryTimestamp,
   DEFAULT_TOKEN_EXPIRY_DAYS,
@@ -399,9 +400,10 @@ export async function prepareAgentBoundTokenMintForBinding(
         WHERE member_id = ?
           AND scope_type = 'squad'
           AND scope_id = ?
+          AND ${CAPABILITY_LIVE_PREDICATE('', '?')}
         LIMIT 1`,
     )
-      .bind(memberId, agent.squad_id)
+      .bind(memberId, agent.squad_id, nowCapabilitySql())
       .first<{ capability: string }>()
     if (!committed) {
       throw new Error(

@@ -1,4 +1,5 @@
 import type { AuthContext, Env } from '../types'
+import { CAPABILITY_LIVE_PREDICATE } from '../auth/capability'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
@@ -493,6 +494,7 @@ export async function registerPendingRuntimeSeat(
              EXISTS (
                SELECT 1 FROM capabilities capability
                 WHERE capability.member_id = member.id
+                  AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                   AND (
                     capability.scope_type = 'org'
                     OR (capability.scope_type = 'department'
@@ -816,6 +818,7 @@ export async function acquireRuntimeSeatLease(
          OR EXISTS (
            SELECT 1 FROM capabilities capability
             WHERE capability.member_id = member.id
+              AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
               AND (
                 capability.scope_type = 'org'
                 OR (capability.scope_type = 'department'
@@ -959,6 +962,7 @@ export async function renewRuntimeSeatLease(
               OR EXISTS (
                 SELECT 1 FROM capabilities capability
                  WHERE capability.member_id = member.id
+                   AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                    AND (
                      capability.scope_type = 'org'
                      OR (capability.scope_type = 'department'
@@ -1058,6 +1062,7 @@ export async function releaseRuntimeSeatLease(
                 OR EXISTS (
                   SELECT 1 FROM capabilities capability
                    WHERE capability.member_id = member.id
+                     AND ${CAPABILITY_LIVE_PREDICATE('capability', "datetime('now')")}
                      AND (
                        capability.scope_type = 'org'
                        OR (capability.scope_type = 'department'
