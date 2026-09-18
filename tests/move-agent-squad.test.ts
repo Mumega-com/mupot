@@ -63,7 +63,7 @@ interface MoveResult {
   grant?: { capability: string; scope_id: string }
   grant_impact?: {
     no_longer_applies: Array<{
-      kind: 'membership' | 'capability'
+      kind: 'membership' | 'capability' | 'gate_grant'
       squad_id: string
       capability: string
     }>
@@ -734,5 +734,111 @@ describe('move_agent_squad', () => {
     expect(result.error).toBe('protected_agent')
     expect(result.detail).toEqual({ reason: 'fleet_ops_agent', agent: 'moved-agent' })
     expect((await agentRow(agentId))?.squad_id).toBe(FROM_SQUAD)
+  })
+
+  it('Athena hard-block 4 clause 2: severed gate:<cap> vs any non-done old-squad task is 409 gate_standings_change', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES (
+          'gg-architecture',
+          'gate:architecture',
+          'agent',
+          '${agentId}',
+          '${OPERATOR}',
+          '2026-09-18T00:00:00.000Z'
+        );
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner)
+        VALUES (
+          'task-other-review',
+          '${FROM_SQUAD}',
+          'Someone else is gating',
+          '',
+          'verdict lands',
+          'review',
+          NULL,
+          'gate:architecture'
+        );
+    `)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('gate_standings_change')
+    expect(result.detail).toEqual(expect.objectContaining({
+      task_ids: ['task-other-review'],
+      gate_owners: ['gate:architecture'],
+    }))
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+    expect(events).toHaveLength(0)
+  })
+
+  it('Athena hard-block 4 clause 2: done old-squad tasks with the same gate_owner do not block', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES (
+          'gg-architecture',
+          'gate:architecture',
+          'agent',
+          '${agentId}',
+          '${OPERATOR}',
+          '2026-09-18T00:00:00.000Z'
+        );
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner)
+        VALUES (
+          'task-done-gate',
+          '${FROM_SQUAD}',
+          'Already closed',
+          '',
+          'done',
+          'done',
+          NULL,
+          'gate:architecture'
+        );
+    `)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(true)
+    expect((await agentRow(agentId))?.squad_id).toBe(TO_SQUAD)
+  })
+
+  it('Athena hard-block 4 clause 2: a matching open task on a different squad does not block', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES (
+          'gg-architecture',
+          'gate:architecture',
+          'agent',
+          '${agentId}',
+          '${OPERATOR}',
+          '2026-09-18T00:00:00.000Z'
+        );
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner)
+        VALUES (
+          'task-other-squad',
+          '${OTHER_SQUAD}',
+          'Different board',
+          '',
+          'verdict lands',
+          'review',
+          NULL,
+          'gate:architecture'
+        );
+    `)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(true)
+    expect((await agentRow(agentId))?.squad_id).toBe(TO_SQUAD)
   })
 })

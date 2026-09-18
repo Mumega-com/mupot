@@ -1239,7 +1239,7 @@ export type MoveAgentSquadError =
 
 export interface MoveGrantImpact {
   no_longer_applies: Array<{
-    kind: 'membership' | 'capability'
+    kind: 'membership' | 'capability' | 'gate_grant'
     squad_id: string
     capability: string
   }>
@@ -1265,6 +1265,48 @@ export type MoveAgentSquadResult =
     }
   | { ok: false; error: MoveAgentSquadError }
 
+// Capability rows the move severs from the old home (memberships + squad-scoped
+// capabilities + the agent's/member's gate_grants). gate_grants are not
+// squad-scoped — they become inert on the old board once home standing is
+// gone — and they are the only place `gate:<cap>` strings can live
+// (`capabilities.capability` CHECKs observer/member/lead/admin/owner).
+export async function listMoveGrantImpact(
+  env: Env,
+  input: { agentId: string; memberId: string; fromSquadId: string },
+): Promise<MoveGrantImpact['no_longer_applies']> {
+  const [priorMemberships, priorCapabilities, priorGateGrants] = await Promise.all([
+    env.DB.prepare(
+      `SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?`,
+    ).bind(input.agentId, input.fromSquadId).all<{ capability: string }>(),
+    env.DB.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).bind(input.memberId, input.fromSquadId).all<{ capability: string }>(),
+    env.DB.prepare(
+      `SELECT capability FROM gate_grants
+        WHERE (principal_type = 'agent' AND principal_id = ?)
+           OR (principal_type = 'member' AND principal_id = ?)`,
+    ).bind(input.agentId, input.memberId).all<{ capability: string }>(),
+  ])
+  return [
+    ...(priorMemberships.results ?? []).map((row) => ({
+      kind: 'membership' as const,
+      squad_id: input.fromSquadId,
+      capability: row.capability,
+    })),
+    ...(priorCapabilities.results ?? []).map((row) => ({
+      kind: 'capability' as const,
+      squad_id: input.fromSquadId,
+      capability: row.capability,
+    })),
+    ...(priorGateGrants.results ?? []).map((row) => ({
+      kind: 'gate_grant' as const,
+      squad_id: input.fromSquadId,
+      capability: row.capability,
+    })),
+  ]
+}
+
 export async function moveAgentSquad(
   env: Env,
   input: {
@@ -1281,27 +1323,11 @@ export async function moveAgentSquad(
     return { ok: false, error: 'same_squad' }
   }
 
-  const [priorMemberships, priorCapabilities] = await Promise.all([
-    env.DB.prepare(
-      `SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?`,
-    ).bind(input.agentId, input.fromSquadId).all<{ capability: string }>(),
-    env.DB.prepare(
-      `SELECT capability FROM capabilities
-        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
-    ).bind(input.memberId, input.fromSquadId).all<{ capability: string }>(),
-  ])
-  const noLongerApplies: MoveGrantImpact['no_longer_applies'] = [
-    ...(priorMemberships.results ?? []).map((row) => ({
-      kind: 'membership' as const,
-      squad_id: input.fromSquadId,
-      capability: row.capability,
-    })),
-    ...(priorCapabilities.results ?? []).map((row) => ({
-      kind: 'capability' as const,
-      squad_id: input.fromSquadId,
-      capability: row.capability,
-    })),
-  ]
+  const noLongerApplies = await listMoveGrantImpact(env, {
+    agentId: input.agentId,
+    memberId: input.memberId,
+    fromSquadId: input.fromSquadId,
+  })
 
   const prepared = await prepareAgentSquadAccess(env, {
     agentId: input.agentId,

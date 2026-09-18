@@ -38,6 +38,7 @@ import {
   updateAgentProfile,
   updateUnitConfig,
   moveAgentSquad,
+  listMoveGrantImpact,
 } from '../org/service'
 import type { AgentProfilePatch, AuditActor, UnitConfigPatch } from '../org/service'
 import {
@@ -2083,6 +2084,9 @@ const toolUpdateAgent: ToolSpec = {
 //   (1) 409 fleet_dispatch_active — in-air flight or in-flight dispatched task
 //   (2) 409 protected_agent — FLEET_CONSUMER_AGENT / FLEET_OPS_AGENT identity
 //       allowlist via fleetProtectedAgent (same check as deactivate_agent).
+//
+// HARD-BLOCK 4 clause 2: 409 gate_standings_change when a severed gate:<cap>
+// string still names any non-done task on the old squad (any assignee).
 const toolMoveAgentSquad: ToolSpec = {
   name: 'move_agent_squad',
   scope: "agent's current squad AND destination squad (admin on both, or org admin)",
@@ -2220,9 +2224,45 @@ const toolMoveAgentSquad: ToolSpec = {
       })
     }
 
-    // GATE-OWNER DODGE (Athena HARD-BLOCK 4): at minimum refuse when the
-    // agent holds a status=review task that names a gate_owner (self-gating
-    // review work). In-flight tasks/flights are not reassigned by the move.
+    // HARD-BLOCK 4 clause 2 (Athena): severed gate:<cap> strings vs any
+    // non-done task on the OLD squad. Not narrowed to the mover's own
+    // tasks — severing a gate's standing mid-review is a board-consistency
+    // hazard regardless of assignee. capabilities cannot store gate:*
+    // (CHECK); those strings come from gate_grants in grant_impact.
+    const severed = await listMoveGrantImpact(env, {
+      agentId: agent.id,
+      memberId: binding.memberId,
+      fromSquadId: agent.squad_id,
+    })
+    const severedGates = [...new Set(
+      severed
+        .map((row) => row.capability)
+        .filter((cap) => cap.startsWith('gate:')),
+    )]
+    if (severedGates.length > 0) {
+      const placeholders = severedGates.map((_, i) => `?${i + 2}`).join(', ')
+      const openGates = await env.DB.prepare(
+        `SELECT id, gate_owner, assignee_agent_id FROM tasks
+          WHERE squad_id = ?1
+            AND status != 'done'
+            AND gate_owner IN (${placeholders})`,
+      ).bind(agent.squad_id, ...severedGates).all<{
+        id: string
+        gate_owner: string
+        assignee_agent_id: string | null
+      }>()
+      const matches = openGates.results ?? []
+      if (matches.length > 0) {
+        return fail(409, 'gate_standings_change', {
+          task_ids: matches.map((row) => row.id),
+          gate_owners: [...new Set(matches.map((row) => row.gate_owner))],
+        })
+      }
+    }
+
+    // GATE-OWNER DODGE (Athena HARD-BLOCK 4 clause 1): at minimum refuse when
+    // the agent holds a status=review task that names a gate_owner
+    // (self-gating review work). In-flight tasks/flights are not reassigned.
     const selfGate = await env.DB.prepare(
       `SELECT id, gate_owner FROM tasks
         WHERE assignee_agent_id = ?1
