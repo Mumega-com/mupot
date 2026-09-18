@@ -2083,6 +2083,13 @@ const toolMoveAgentSquad: ToolSpec = {
   async run(auth, env, args) {
     if (auth.boundAgentId) return fail(403, 'operator_principal_required')
 
+    // TENANT WALL (Athena HARD-BLOCK 2): this Worker's D1 is the pot. Squads
+    // have no tenant column. Revalidate the CALLER against env.TENANT_SLUG —
+    // never a caller-asserted tenant — and later the welded member row.
+    if (auth.tenant !== env.TENANT_SLUG) {
+      return fail(403, 'forbidden', { reason: 'tenant_scope' })
+    }
+
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const toSquadRef = str(args.to_squad)
@@ -2101,7 +2108,14 @@ const toolMoveAgentSquad: ToolSpec = {
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const toSquad = squadResult.value
 
-    if (agent.squad_id === toSquad.id) {
+    // Re-read the destination from the pot row (not the request) so a
+    // stale/forged id cannot skip the same-tenant existence proof.
+    const destRow = await env.DB.prepare(
+      'SELECT id, department_id FROM squads WHERE id = ?1 LIMIT 1',
+    ).bind(toSquad.id).first<{ id: string; department_id: string }>()
+    if (!destRow) return fail(404, 'squad_not_found', { squad: toSquadRef })
+
+    if (agent.squad_id === destRow.id) {
       return fail(400, 'same_squad', {
         agent: agent.id,
         squad: toSquad.id,
@@ -2120,7 +2134,7 @@ const toolMoveAgentSquad: ToolSpec = {
     // Ordered BEFORE the admin-on-to gate so a lead-on-to requesting admin
     // is a distinct 403 (cannot_grant_above_own_rank) from a lead-on-to
     // requesting member (forbidden / side:to). See the block comment above.
-    const actorDestinationRank = await actorRankOnScopeFor(env, auth, 'squad', toSquad.id)
+    const actorDestinationRank = await actorRankOnScopeFor(env, auth, 'squad', destRow.id)
     if (capabilityRank(capability) > actorDestinationRank) {
       return fail(403, 'cannot_grant_above_own_rank', {
         capability,
@@ -2130,7 +2144,7 @@ const toolMoveAgentSquad: ToolSpec = {
     }
 
     // Plant: admin on to_squad. One-sided admin on the old home is not enough.
-    if (!(await memberCanOnSquadAuth(env, auth, toSquad.id, 'admin'))) {
+    if (!(await memberCanOnSquadAuth(env, auth, destRow.id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'to' })
     }
 
@@ -2139,11 +2153,36 @@ const toolMoveAgentSquad: ToolSpec = {
       return fail(409, 'agent_identity_unminted', 'call mint_agent_token before moving the agent')
     }
 
+    const weldedMember = await env.DB.prepare(
+      'SELECT tenant FROM members WHERE id = ?1 LIMIT 1',
+    ).bind(binding.memberId).first<{ tenant: string }>()
+    if (!weldedMember || weldedMember.tenant !== env.TENANT_SLUG) {
+      return fail(403, 'forbidden', { reason: 'tenant_scope' })
+    }
+
+    // GATE-OWNER DODGE (Athena HARD-BLOCK 4): at minimum refuse when the
+    // agent holds a status=review task that names a gate_owner (self-gating
+    // review work). In-flight tasks/flights are not reassigned by the move.
+    const selfGate = await env.DB.prepare(
+      `SELECT id, gate_owner FROM tasks
+        WHERE assignee_agent_id = ?1
+          AND status = 'review'
+          AND gate_owner IS NOT NULL
+          AND trim(gate_owner) != ''
+        LIMIT 1`,
+    ).bind(agent.id).first<{ id: string; gate_owner: string }>()
+    if (selfGate) {
+      return fail(409, 'gate_owner_dodge', {
+        task_id: selfGate.id,
+        gate_owner: selfGate.gate_owner,
+      })
+    }
+
     const actor: AuditActor = { id: auth.memberId as string, type: 'user' }
     const result = await moveAgentSquad(env, {
       agentId: agent.id,
       fromSquadId: agent.squad_id,
-      toSquadId: toSquad.id,
+      toSquadId: destRow.id,
       memberId: binding.memberId,
       capability,
       actor,
@@ -2161,24 +2200,25 @@ const toolMoveAgentSquad: ToolSpec = {
 
     await emitProvisioned(env, auth.memberId as string, 'agent_moved', agent.id, {
       agent_id: agent.id,
-      squad_id: toSquad.id,
+      squad_id: destRow.id,
       member_id: binding.memberId,
       capability,
       reason,
       changed: {
-        squad_id: { from: agent.squad_id, to: toSquad.id },
+        squad_id: { from: agent.squad_id, to: destRow.id },
       },
     })
 
     return done({
-      agent: { id: agent.id, squad_id: toSquad.id },
+      agent: { id: agent.id, squad_id: destRow.id },
       from_squad: { id: agent.squad_id },
-      to_squad: { id: toSquad.id },
+      to_squad: { id: destRow.id },
       member_id: binding.memberId,
       capability,
       grant: result.grant,
       membership: result.membership,
       audit_id: result.auditId,
+      grant_impact: result.grantImpact,
     })
   },
 }

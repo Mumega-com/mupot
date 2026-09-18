@@ -1222,6 +1222,12 @@ export async function updateAgentProfile(
 // (prepareAgentSquadAccess). We do not call setAgentSquadAccess as a second
 // transaction after the home-row UPDATE: a grant failure there would leave the
 // agent already moved and severed. Same statements, one batch.
+//
+// Athena HARD-BLOCK 3 asked source-squad grants to stay dangling. The original
+// Kasra/Hadi BUILD said to clear them. We keep the DELETE (access visibly
+// shrinks) and return grant_impact.no_longer_applies so the shrink is listed.
+// Gate may invert the DELETE; the impact list stays either way.
+// In-flight tasks/flights are not reassigned by this write.
 
 export type MoveAgentSquadError =
   | 'not_found'
@@ -1230,6 +1236,21 @@ export type MoveAgentSquadError =
   | 'agent_identity_conflict'
   | 'squad_not_found'
   | 'receipt_failed'
+
+export interface MoveGrantImpact {
+  no_longer_applies: Array<{
+    kind: 'membership' | 'capability'
+    squad_id: string
+    capability: string
+  }>
+  destination_grant: {
+    squad_id: string
+    capability: AgentAccessCapability
+    opt_in: 'capability'
+  }
+  tasks_reassigned: false
+  flights_reassigned: false
+}
 
 export type MoveAgentSquadResult =
   | {
@@ -1240,6 +1261,7 @@ export type MoveAgentSquadResult =
       capability: AgentAccessCapability
       membership: Membership
       grant: CapabilityGrant
+      grantImpact: MoveGrantImpact
     }
   | { ok: false; error: MoveAgentSquadError }
 
@@ -1258,6 +1280,28 @@ export async function moveAgentSquad(
   if (input.fromSquadId === input.toSquadId) {
     return { ok: false, error: 'same_squad' }
   }
+
+  const [priorMemberships, priorCapabilities] = await Promise.all([
+    env.DB.prepare(
+      `SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ?`,
+    ).bind(input.agentId, input.fromSquadId).all<{ capability: string }>(),
+    env.DB.prepare(
+      `SELECT capability FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).bind(input.memberId, input.fromSquadId).all<{ capability: string }>(),
+  ])
+  const noLongerApplies: MoveGrantImpact['no_longer_applies'] = [
+    ...(priorMemberships.results ?? []).map((row) => ({
+      kind: 'membership' as const,
+      squad_id: input.fromSquadId,
+      capability: row.capability,
+    })),
+    ...(priorCapabilities.results ?? []).map((row) => ({
+      kind: 'capability' as const,
+      squad_id: input.fromSquadId,
+      capability: row.capability,
+    })),
+  ]
 
   const prepared = await prepareAgentSquadAccess(env, {
     agentId: input.agentId,
@@ -1362,6 +1406,16 @@ export async function moveAgentSquad(
     capability: input.capability,
     membership,
     grant,
+    grantImpact: {
+      no_longer_applies: noLongerApplies,
+      destination_grant: {
+        squad_id: input.toSquadId,
+        capability: input.capability,
+        opt_in: 'capability',
+      },
+      tasks_reassigned: false,
+      flights_reassigned: false,
+    },
   }
 }
 

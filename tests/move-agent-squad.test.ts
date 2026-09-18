@@ -61,6 +61,16 @@ interface MoveResult {
   capability?: string
   audit_id?: string
   grant?: { capability: string; scope_id: string }
+  grant_impact?: {
+    no_longer_applies: Array<{
+      kind: 'membership' | 'capability'
+      squad_id: string
+      capability: string
+    }>
+    destination_grant: { squad_id: string; capability: string; opt_in: string }
+    tasks_reassigned: boolean
+    flights_reassigned: boolean
+  }
 }
 
 describe('move_agent_squad', () => {
@@ -456,5 +466,95 @@ describe('move_agent_squad', () => {
     expect(result.status).toBe(403)
     expect(result.error).toBe('forbidden')
     expect(result.detail).toEqual({ need: 'admin' })
+  })
+
+  it('Athena HARD-BLOCK 2: tenant wall — token tenant must match this pot, not the request', async () => {
+    const before = await agentRow(agentId)
+    const result = await invoke(
+      { ...auth({ capabilities: bothAdmin }), tenant: 'other-pot' },
+      { agent: agentId, to_squad: TO_SQUAD, capability: 'member' },
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(403)
+    expect(result.error).toBe('forbidden')
+    expect(result.detail).toEqual({ reason: 'tenant_scope' })
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+  })
+
+  it('Athena HARD-BLOCK 3: response lists grant_impact; dest grant is the capability opt-in; tasks/flights are not reassigned', async () => {
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'observer',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const impact = (result.result as MoveResult).grant_impact
+    expect(impact).toBeDefined()
+    expect(impact?.no_longer_applies).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'capability', squad_id: FROM_SQUAD, capability: 'member' }),
+      ]),
+    )
+    expect(impact?.destination_grant).toEqual({
+      squad_id: TO_SQUAD,
+      capability: 'observer',
+      opt_in: 'capability',
+    })
+    expect(impact?.tasks_reassigned).toBe(false)
+    expect(impact?.flights_reassigned).toBe(false)
+    // dest grant is exactly the opt-in, not a carryover of old home 'member'
+    expect(await accessOn(TO_SQUAD)).toEqual({ membership: 'observer', capability: 'observer' })
+  })
+
+  it('Athena HARD-BLOCK 3 bonus: a revoked dest-squad grant is not resurrected — dest is only the explicit capability', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-dest-revoked', '${AGENT_MEMBER}', 'squad', '${TO_SQUAD}', 'admin');
+    `)
+    harness.sqlite.exec(`DELETE FROM capabilities WHERE id = 'cap-dest-revoked'`)
+
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'observer',
+    })
+    expect(result.ok).toBe(true)
+    expect(await accessOn(TO_SQUAD)).toEqual({ membership: 'observer', capability: 'observer' })
+  })
+
+  it('Athena HARD-BLOCK 4: refuse move when the agent has a status=review task gating itself', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner)
+        VALUES (
+          'task-self-gate',
+          '${FROM_SQUAD}',
+          'Needs verdict',
+          '',
+          'verdict lands',
+          'review',
+          '${agentId}',
+          'gate:agent-self-completion'
+        );
+    `)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('gate_owner_dodge')
+    expect(result.detail).toEqual(expect.objectContaining({
+      task_id: 'task-self-gate',
+      gate_owner: 'gate:agent-self-completion',
+    }))
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+    expect(events).toHaveLength(0)
   })
 })
