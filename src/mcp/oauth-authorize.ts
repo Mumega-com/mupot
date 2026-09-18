@@ -262,6 +262,12 @@ export interface ConsentableAgent {
   name: string
   squad_id: string
   squad_name: string
+  // mumega-com#1218 follow-up: the picker groups department -> squad -> agent.
+  // squads.department_id is NOT NULL with an FK (migrations/0001_init.sql), so this
+  // join is total — an agent can never be orphaned out of a department, and the
+  // renderer needs no "uncategorised" bucket.
+  department_id: string
+  department_name: string
   autonomy: string
   budget_cap_cents: number | null
   budget_window: string
@@ -269,6 +275,8 @@ export interface ConsentableAgent {
 }
 
 interface ConsentAgentRow {
+  department_id: string
+  department_name: string
   id: string
   slug: string
   name: string
@@ -477,13 +485,15 @@ export async function listConsentableAgents(
   const humanGrants = await resolveCapabilities(env, memberId)
   const rows = await env.DB.prepare(
     `SELECT a.id AS id, a.slug AS slug, a.name AS name, a.squad_id AS squad_id,
-            sq.name AS squad_name, a.autonomy AS autonomy,
+            sq.name AS squad_name, sq.department_id AS department_id,
+            d.name AS department_name, a.autonomy AS autonomy,
             a.budget_cap_cents AS budget_cap_cents, a.budget_window AS budget_window
        FROM agents a
        JOIN squads sq ON sq.id = a.squad_id
+       JOIN departments d ON d.id = sq.department_id
        JOIN agent_member_bindings b ON b.tenant = ?1 AND b.agent_id = a.id
       WHERE a.status = 'active'
-      ORDER BY sq.name ASC, a.name ASC`,
+      ORDER BY d.name ASC, sq.name ASC, a.name ASC`,
   ).bind(env.TENANT_SLUG).all<ConsentAgentRow>()
 
   const out: ConsentableAgent[] = []
