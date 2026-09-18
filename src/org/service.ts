@@ -1276,7 +1276,7 @@ export async function moveAgentSquad(
     // removeAgentSquadAccess's home-row guard). Map it closed rather than
     // widening this result type for a path that cannot happen here.
     if (prepared.error === 'home_squad_immutable') return { ok: false, error: 'receipt_failed' }
-    return prepared
+    return { ok: false, error: prepared.error }
   }
 
   const auditId = crypto.randomUUID()
