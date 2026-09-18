@@ -8,9 +8,11 @@
 // can shape its own response (JSON error vs re-rendered form).
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind } from '../types'
+import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind, CapabilityGrant, Membership } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
+import { assertWritten } from '../lib/receipt'
+import { prepareAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 // Reused, not duplicated (mupot#1288, Kasra's gate) — src/fleet/boot-self-report.ts's
 // bearer-authenticated boot self-report already validates a claimed model against
 // this exact shape; update_agent's model/model_fallback fields must accept exactly
@@ -1203,6 +1205,164 @@ export async function updateAgentProfile(
   const profile = await getAgentProfile(env, agentId)
   if (!profile) return { ok: false, error: 'not_found' }
   return { ok: true, value: profile, auditId }
+}
+
+// ── moveAgentSquad ────────────────────────────────────────────────────────────
+// The re-provision path update_agent refused to grow: agents.squad_id is one FK,
+// so changing home is a capability-scope change, not a profile edit. This write
+// is the whole move in ONE D1 batch — old-squad severance, home-row update,
+// destination grant, and agent_audit — so a caller never observes a moved agent
+// with dangling dual-squad grants or a grantless new home.
+//
+// owner_member_id is deliberately absent from the UPDATE. That column is the
+// human-attestation binding (0155 / PR #1425); a squad move must not rewrite
+// whose member identity the agent's harness may carry.
+//
+// The destination grant is the same writer setAgentSquadAccess uses
+// (prepareAgentSquadAccess). We do not call setAgentSquadAccess as a second
+// transaction after the home-row UPDATE: a grant failure there would leave the
+// agent already moved and severed. Same statements, one batch.
+
+export type MoveAgentSquadError =
+  | 'not_found'
+  | 'same_squad'
+  | 'agent_identity_unminted'
+  | 'agent_identity_conflict'
+  | 'squad_not_found'
+  | 'receipt_failed'
+
+export type MoveAgentSquadResult =
+  | {
+      ok: true
+      auditId: string
+      fromSquadId: string
+      toSquadId: string
+      capability: AgentAccessCapability
+      membership: Membership
+      grant: CapabilityGrant
+    }
+  | { ok: false; error: MoveAgentSquadError }
+
+export async function moveAgentSquad(
+  env: Env,
+  input: {
+    agentId: string
+    fromSquadId: string
+    toSquadId: string
+    memberId: string
+    capability: AgentAccessCapability
+    actor: AuditActor
+    reason?: string
+  },
+): Promise<MoveAgentSquadResult> {
+  if (input.fromSquadId === input.toSquadId) {
+    return { ok: false, error: 'same_squad' }
+  }
+
+  const prepared = await prepareAgentSquadAccess(env, {
+    agentId: input.agentId,
+    memberId: input.memberId,
+    squadId: input.toSquadId,
+    capability: input.capability,
+  }, {
+    agentId: input.agentId,
+    memberId: input.memberId,
+    homeSquadId: input.fromSquadId,
+    disposition: 'existing',
+  })
+  if (!prepared.ok) {
+    if (prepared.error === 'agent_not_found') return { ok: false, error: 'not_found' }
+    // prepareAgentSquadAccess never returns home_squad_immutable (that is
+    // removeAgentSquadAccess's home-row guard). Map it closed rather than
+    // widening this result type for a path that cannot happen here.
+    if (prepared.error === 'home_squad_immutable') return { ok: false, error: 'receipt_failed' }
+    return prepared
+  }
+
+  const auditId = crypto.randomUUID()
+  // Structured object, not update_agent's field-name array: a move is not a
+  // profile-field patch. agent_audit has no dedicated columns for old/new
+  // squad, granted capability, or reason — those facts live here. Timestamp
+  // is created_at; actor is actor_id / actor_type. before_state / after_state
+  // stay the AGENT_SNAPSHOT_JSON convention so owner_member_id is in both
+  // images and a reader can prove the move left it untouched.
+  const fieldsChanged = JSON.stringify({
+    squad_id: { from: input.fromSquadId, to: input.toSquadId },
+    capability: input.capability,
+    reason: input.reason ?? null,
+  })
+
+  const writes = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO agent_audit
+         (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
+       SELECT ?, id, ?, ?, 'move_agent_squad', ?, ${AGENT_SNAPSHOT_JSON}, ''
+         FROM agents WHERE id = ? AND squad_id = ?`,
+    ).bind(
+      auditId,
+      input.actor.id,
+      input.actor.type,
+      fieldsChanged,
+      input.agentId,
+      input.fromSquadId,
+    ),
+    // ONLY squad_id. owner_member_id (and every other column) stay put.
+    env.DB.prepare(
+      `UPDATE agents SET squad_id = ? WHERE id = ? AND squad_id = ?`,
+    ).bind(input.toSquadId, input.agentId, input.fromSquadId),
+    env.DB.prepare(
+      `DELETE FROM memberships WHERE agent_id = ? AND squad_id = ?`,
+    ).bind(input.agentId, input.fromSquadId),
+    env.DB.prepare(
+      `DELETE FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).bind(input.memberId, input.fromSquadId),
+    ...prepared.value.statements,
+    env.DB.prepare(
+      `UPDATE agent_audit
+          SET after_state = (SELECT ${AGENT_SNAPSHOT_JSON} FROM agents WHERE id = ?)
+        WHERE id = ?`,
+    ).bind(input.agentId, auditId),
+  ])
+
+  try {
+    assertWritten(writes[0]!, 'move_agent_squad.audit_insert')
+    assertWritten(writes[1]!, 'move_agent_squad.squad_id')
+    assertWritten(writes[writes.length - 1]!, 'move_agent_squad.audit_after')
+    // Destination grant statements are the two prepareAgentSquadAccess writes
+    // immediately before the after_state backfill — same receipt bar
+    // setAgentSquadAccess uses.
+    assertWritten(writes[writes.length - 3]!, 'move_agent_squad.membership')
+    assertWritten(writes[writes.length - 2]!, 'move_agent_squad.capability')
+  } catch {
+    return { ok: false, error: 'receipt_failed' }
+  }
+
+  const [membership, grant] = await Promise.all([
+    env.DB.prepare(
+      `SELECT id, agent_id, squad_id, capability
+         FROM memberships WHERE agent_id = ? AND squad_id = ? LIMIT 1`,
+    ).bind(input.agentId, input.toSquadId).first<Membership>(),
+    env.DB.prepare(
+      `SELECT member_id, scope_type, scope_id, capability
+         FROM capabilities
+        WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?
+        LIMIT 1`,
+    ).bind(input.memberId, input.toSquadId).first<CapabilityGrant>(),
+  ])
+  if (!membership || !grant || grant.capability !== input.capability) {
+    return { ok: false, error: 'receipt_failed' }
+  }
+
+  return {
+    ok: true,
+    auditId,
+    fromSquadId: input.fromSquadId,
+    toSquadId: input.toSquadId,
+    capability: input.capability,
+    membership,
+    grant,
+  }
 }
 
 export type DeleteAgentResult = { ok: true } | { ok: false; error: 'not_found' }

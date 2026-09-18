@@ -24,6 +24,8 @@
 //                        credential_claim (mupot#987 — never a raw field in the result;
 //                        redeem via reveal_credential_claim)
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
+//   move_agent_squad   — admin on CURRENT squad AND dest squad (no self-lane) → home-row
+//                        move + old-squad grant severance + dest grant + agent_audit
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
@@ -35,6 +37,7 @@ import {
   getAgentProfile,
   updateAgentProfile,
   updateUnitConfig,
+  moveAgentSquad,
 } from '../org/service'
 import type { AgentProfilePatch, AuditActor, UnitConfigPatch } from '../org/service'
 import {
@@ -65,7 +68,7 @@ import {
   type CredentialClaimHandle,
 } from '../auth/credential-claim'
 import { revokeMemberToken } from '../members/service'
-import { setAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
+import { setAgentSquadAccess, isAgentAccessCapability, type AgentAccessCapability } from '../members/agent-access'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import {
   GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
@@ -145,6 +148,7 @@ async function emitProvisioned(
     | 'capability'
     | 'agent_deactivated'
     | 'agent_updated'
+    | 'agent_moved'
     | 'squad_updated'
     | 'membership'
     | 'membership_removed'
@@ -1634,7 +1638,7 @@ async function readAuditDiff(
 // alone, so correcting a model cannot blank a purpose. `status` is NOT settable
 // here (deactivate_agent owns retirement, with its token/presence/key teardown)
 // and neither is squad_id (moving squads changes capability scope — that is a
-// re-provision, not an edit).
+// re-provision, not an edit; the re-provision path is move_agent_squad).
 //
 // SELF LANE (mupot#1288). Athena ruled (2026-08) that a self-row registry write
 // is inside an agent's own authority — the profile row is what every router,
@@ -2004,6 +2008,178 @@ const toolUpdateAgent: ToolSpec = {
     })
 
     return done({ agent: result.value, changed, audit_id: result.auditId })
+  },
+}
+
+// ── move_agent_squad ──────────────────────────────────────────────────────────
+// The re-provision path update_agent's comment promised and never built.
+// agents.squad_id is one FK — an agent belongs to exactly one squad — and
+// update_agent refuses to patch it (SELF / ADMIN lists, the block comment
+// above). Operators were recreating agent+squad rows instead, which is the
+// squad-sprawl tracked in mupot#1430.
+//
+// min: 'admin'. No self-lane. A caller moving even its own agent row is still
+// an admin action — this is a capability-scope change, not a profile hygiene
+// write. We do NOT lower min to 'authenticated' the way update_agent did for
+// its self lane.
+//
+// operator_principal_required is the FIRST statement, matching every other
+// provision write that mutates an existing peer's identity/credential plane
+// (see tests/provision-tools.test.ts's exhaustive sweep). That is not a
+// deviation from min:'admin': the floor still requires admin on SOME scope
+// before run() is entered; the guard additionally refuses a bound-agent
+// caller who happens to hold admin (reachable since 0087 dropped the home
+// ceiling). A bound agent must not yank itself — or a peer — into another
+// squad.
+//
+// Dual-squad admin: the caller must hold admin on the agent's CURRENT squad
+// AND admin on to_squad (org admin satisfies both via canOnSquadAuth /
+// hasCapability inheritance). One-sided admin cannot yank an agent out of a
+// squad it has no standing on, or plant one into a squad it does not run.
+//
+// capability is required every call — no silent carryover from the old squad.
+// The grant-height ceiling is actorRankOnScopeFor(env, auth, 'squad', to) +
+// capabilityRank, the same predicate POST /members/:id/capabilities uses
+// (src/members/index.ts). We reuse those functions; we do not reinvent a
+// ladder. Checked BEFORE the admin-on-destination gate so it is a live
+// check: a lead on to_squad requesting 'admin' is 403 cannot_grant_above_
+// own_rank, not swallowed by the subsequent admin-on-to refusal. A lead
+// requesting 'member' (within their rank) still dies on admin-on-to —
+// planting an agent is an admin act even when the grant is in-rank.
+//
+// exceedsTargetRankCeiling is deliberately NOT applied to the agent's welded
+// member. That function compares a TARGET MEMBER's global standing against
+// the actor's org-scope rank — the rule for "do not mint/suspend a principal
+// who outranks you". The welded member is the agent's own identity, typically
+// squad-scoped 'member'; applying it here would refuse every squad-admin
+// move (actor org-rank 0 < target squad-rank 2) and collapse the dual-squad
+// admin bar into "org admin only". Design note for the gate, not a guess
+// that the ceiling should be wider.
+//
+// same_squad → 400, not a silent no-op. This tool is a MOVE, not a grant
+// update (grant_agent_capability already upserts capability on a squad).
+// capability is required every call; a no-op success would swallow that
+// required argument and look like a grant change that never happened.
+const toolMoveAgentSquad: ToolSpec = {
+  name: 'move_agent_squad',
+  scope: "agent's current squad AND destination squad (admin on both, or org admin)",
+  min: 'admin',
+  args:
+    '{ agent: string (id|slug), to_squad: string (id|slug), capability: "observer"|"member"|"lead"|"admin", reason?: string }' +
+    ' -- admin on the agent\'s CURRENT squad AND admin on to_squad (org admin satisfies both).' +
+    ' capability is required every call (no carryover from the old squad) and cannot exceed' +
+    ' the caller\'s rank on to_squad. owner_member_id is never touched.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      agent: STRING_SCHEMA,
+      to_squad: STRING_SCHEMA,
+      capability: { type: 'string', enum: ['observer', 'member', 'lead', 'admin'] },
+      reason: STRING_SCHEMA,
+    },
+    required: ['agent', 'to_squad', 'capability'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+
+    const agentRef = str(args.agent)
+    if (!agentRef) return fail(400, 'invalid_args', 'agent required')
+    const toSquadRef = str(args.to_squad)
+    if (!toSquadRef) return fail(400, 'invalid_args', 'to_squad required')
+    if (!isAgentAccessCapability(args.capability)) {
+      return fail(400, 'invalid_capability', 'capability must be observer, member, lead, or admin')
+    }
+    const capability = args.capability
+    const reason = str(args.reason) ?? undefined
+
+    const agentResult = await resolveAgentRef(env, agentRef)
+    if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
+    const agent = agentResult.value
+
+    const squadResult = await resolveSquadRef(env, toSquadRef)
+    if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+    const toSquad = squadResult.value
+
+    if (agent.squad_id === toSquad.id) {
+      return fail(400, 'same_squad', {
+        agent: agent.id,
+        squad: toSquad.id,
+      })
+    }
+
+    // Yank: admin on the agent's CURRENT home. memberCanOnSquadAuth sees both
+    // planes (legacy role + grants); org admin inherits down. No separate
+    // hasWorkspaceAdmin disjunct — same R3 reasoning as update_agent.
+    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'from' })
+    }
+
+    // Grant-height on the DESTINATION, reused from /members/:id/capabilities.
+    // actorRankOnScopeFor is the non-HTTP form of actorMaxRankOnScope.
+    // Ordered BEFORE the admin-on-to gate so a lead-on-to requesting admin
+    // is a distinct 403 (cannot_grant_above_own_rank) from a lead-on-to
+    // requesting member (forbidden / side:to). See the block comment above.
+    const actorDestinationRank = await actorRankOnScopeFor(env, auth, 'squad', toSquad.id)
+    if (capabilityRank(capability) > actorDestinationRank) {
+      return fail(403, 'cannot_grant_above_own_rank', {
+        capability,
+        scope: 'squad',
+        side: 'to',
+      })
+    }
+
+    // Plant: admin on to_squad. One-sided admin on the old home is not enough.
+    if (!(await memberCanOnSquadAuth(env, auth, toSquad.id, 'admin'))) {
+      return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'to' })
+    }
+
+    const binding = await resolveAgentMemberBinding(env, agent.id)
+    if (binding.kind === 'unminted') {
+      return fail(409, 'agent_identity_unminted', 'call mint_agent_token before moving the agent')
+    }
+
+    const actor: AuditActor = { id: auth.memberId as string, type: 'user' }
+    const result = await moveAgentSquad(env, {
+      agentId: agent.id,
+      fromSquadId: agent.squad_id,
+      toSquadId: toSquad.id,
+      memberId: binding.memberId,
+      capability,
+      actor,
+      reason,
+    })
+    if (!result.ok) {
+      if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
+      if (result.error === 'squad_not_found') return fail(404, 'squad_not_found', { squad: toSquadRef })
+      if (result.error === 'same_squad') {
+        return fail(400, 'same_squad', { agent: agent.id, squad: toSquad.id })
+      }
+      if (result.error === 'receipt_failed') return fail(500, result.error)
+      return fail(409, result.error)
+    }
+
+    await emitProvisioned(env, auth.memberId as string, 'agent_moved', agent.id, {
+      agent_id: agent.id,
+      squad_id: toSquad.id,
+      member_id: binding.memberId,
+      capability,
+      reason,
+      changed: {
+        squad_id: { from: agent.squad_id, to: toSquad.id },
+      },
+    })
+
+    return done({
+      agent: { id: agent.id, squad_id: toSquad.id },
+      from_squad: { id: agent.squad_id },
+      to_squad: { id: toSquad.id },
+      member_id: binding.memberId,
+      capability,
+      grant: result.grant,
+      membership: result.membership,
+      audit_id: result.auditId,
+    })
   },
 }
 
@@ -2444,5 +2620,6 @@ export const PROVISION_TOOLS: ToolSpec[] = [
   toolRegisterAgentKey,
   toolDeactivateAgent,
   toolUpdateAgent,
+  toolMoveAgentSquad,
   toolUpdateSquad,
 ]

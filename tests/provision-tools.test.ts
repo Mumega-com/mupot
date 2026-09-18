@@ -278,6 +278,7 @@ describe('provision tools — advertised', () => {
     expect(names).toContain('verify_agent_connection')
     expect(names).toContain('register_agent_key')
     expect(names).toContain('grant_agent_capability')
+    expect(names).toContain('move_agent_squad')
     expect(names).toContain('squad_member_add')
     expect(names).toContain('squad_member_remove')
     expect(names).toContain('squad_member_list')
