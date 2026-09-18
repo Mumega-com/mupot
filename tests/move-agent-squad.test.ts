@@ -688,4 +688,51 @@ describe('move_agent_squad', () => {
     expect(result.ok).toBe(true)
     expect((await agentRow(agentId))?.squad_id).toBe(TO_SQUAD)
   })
+
+  it('Athena Q2 layer 2: FLEET_CONSUMER_AGENT by slug is 409 protected_agent (deactivate_agent check)', async () => {
+    env.FLEET_CONSUMER_AGENT = 'moved-agent'
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('protected_agent')
+    expect(result.detail).toEqual({ reason: 'fleet_consumer_agent', agent: 'moved-agent' })
+    expect(await agentRow(agentId)).toEqual(before)
+    expect(await auditRows()).toHaveLength(0)
+  })
+
+  it('Athena Q2 layer 2: FLEET_CONSUMER_AGENT by id is 409 protected_agent', async () => {
+    env.FLEET_CONSUMER_AGENT = agentId
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('protected_agent')
+    expect(result.detail).toEqual({ reason: 'fleet_consumer_agent', agent: 'moved-agent' })
+    expect((await agentRow(agentId))?.squad_id).toBe(FROM_SQUAD)
+  })
+
+  it('Athena Q2 layer 2: FLEET_OPS_AGENT is 409 protected_agent', async () => {
+    env.FLEET_OPS_AGENT = 'moved-agent'
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('protected_agent')
+    expect(result.detail).toEqual({ reason: 'fleet_ops_agent', agent: 'moved-agent' })
+    expect((await agentRow(agentId))?.squad_id).toBe(FROM_SQUAD)
+  })
 })

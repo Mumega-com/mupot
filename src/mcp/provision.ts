@@ -271,6 +271,25 @@ async function discardReplacementHandoff(
 
 // Map a failed resolve to the right MCP error: ambiguous slug → 409 (caller must
 // disambiguate with the id), absent → 404 not_found.
+// Single source of truth for the fleet-identity allowlist (Athena Q2 layer 2).
+// deactivate_agent and move_agent_squad both refuse a match against
+// env.FLEET_CONSUMER_AGENT / env.FLEET_OPS_AGENT on id OR slug — fleet's
+// identifier space is the slug (see the id↔slug bridge in src/fleet/registry.ts).
+function fleetProtectedAgent(
+  env: Env,
+  agent: { id: string; slug: string },
+): { reason: 'fleet_consumer_agent' | 'fleet_ops_agent'; agent: string } | null {
+  const consumerAgent = env.FLEET_CONSUMER_AGENT?.trim()
+  if (consumerAgent && (consumerAgent === agent.id || consumerAgent === agent.slug)) {
+    return { reason: 'fleet_consumer_agent', agent: agent.slug }
+  }
+  const opsAgent = env.FLEET_OPS_AGENT?.trim()
+  if (opsAgent && (opsAgent === agent.id || opsAgent === agent.slug)) {
+    return { reason: 'fleet_ops_agent', agent: agent.slug }
+  }
+  return null
+}
+
 function resolveFail(reason: 'not_found' | 'ambiguous', notFoundCode: string) {
   if (reason === 'ambiguous') {
     return fail(409, 'ambiguous_slug', 'slug matches multiple rows — use the id instead')
@@ -2060,9 +2079,10 @@ const toolUpdateAgent: ToolSpec = {
 // capability is required every call; a no-op success would swallow that
 // required argument and look like a grant change that never happened.
 //
-// 6th hard block (Athena REQUIRED): 409 fleet_dispatch_active when the
-// agent still has an in-air flight or an in-flight dispatched task.
-// Activity-based, not a FLEET_OPS_AGENT / FLEET_CONSUMER_AGENT allowlist.
+// 6th hard block (Athena REQUIRED, BOTH layers):
+//   (1) 409 fleet_dispatch_active — in-air flight or in-flight dispatched task
+//   (2) 409 protected_agent — FLEET_CONSUMER_AGENT / FLEET_OPS_AGENT identity
+//       allowlist via fleetProtectedAgent (same check as deactivate_agent).
 const toolMoveAgentSquad: ToolSpec = {
   name: 'move_agent_squad',
   scope: "agent's current squad AND destination squad (admin on both, or org admin)",
@@ -2163,12 +2183,16 @@ const toolMoveAgentSquad: ToolSpec = {
       return fail(403, 'forbidden', { reason: 'tenant_scope' })
     }
 
-    // 6th hard block (Athena REQUIRED): refuse when the target still has an
-    // in-air flight or an in-flight dispatched task. Activity-based, not an
-    // identity allowlist (FLEET_OPS_AGENT / FLEET_CONSUMER_AGENT is the
-    // deactivate_agent pattern; the required check here is live work).
-    // Severing old-squad grants mid-flight can break a live dispatch/receipt
-    // path; a move is reversible, a broken production flight is not.
+    // 6th hard block layer 2 (Athena REQUIRED): identity allowlist — same
+    // check deactivate_agent uses (fleetProtectedAgent). Distinct 409
+    // protected_agent so the identity refusal is not collapsed into the
+    // activity code.
+    const protectedFleet = fleetProtectedAgent(env, agent)
+    if (protectedFleet) return fail(409, 'protected_agent', protectedFleet)
+
+    // 6th hard block layer 1 (Athena REQUIRED): refuse when the target still
+    // has an in-air flight or an in-flight dispatched task. Severing old-squad
+    // grants mid-flight can break a live dispatch/receipt path.
     const [liveFlight, liveTask, liveDispatch] = await Promise.all([
       env.DB.prepare(
         `SELECT id, status FROM flights
@@ -2410,17 +2434,10 @@ const toolDeactivateAgent: ToolSpec = {
 
     // HARD GUARD: the pot's own fleet-control identities are load-bearing —
     // deactivating the consumer daemon or the ops agent breaks fleet control
-    // for every other agent on the pot. Fleet's identifier space is the SLUG,
-    // not the uuid (see the id↔slug bridge note in src/fleet/registry.ts), so
-    // match the env-configured identity against both.
-    const consumerAgent = env.FLEET_CONSUMER_AGENT?.trim()
-    if (consumerAgent && (consumerAgent === agent.id || consumerAgent === agent.slug)) {
-      return fail(409, 'protected_agent', { reason: 'fleet_consumer_agent', agent: agent.slug })
-    }
-    const opsAgent = env.FLEET_OPS_AGENT?.trim()
-    if (opsAgent && (opsAgent === agent.id || opsAgent === agent.slug)) {
-      return fail(409, 'protected_agent', { reason: 'fleet_ops_agent', agent: agent.slug })
-    }
+    // for every other agent on the pot. Shared with move_agent_squad via
+    // fleetProtectedAgent (id OR slug).
+    const protectedFleet = fleetProtectedAgent(env, agent)
+    if (protectedFleet) return fail(409, 'protected_agent', protectedFleet)
 
     // HARD GUARD: an agent-bound token cannot deactivate the very agent it is
     // bound to — the caller would be cutting off its own credential mid-call.
