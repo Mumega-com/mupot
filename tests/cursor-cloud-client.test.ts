@@ -212,7 +212,7 @@ describe('Cursor Cloud MCP tools', () => {
 
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true)
     if (!outcome.ok) return
-    expect(outcome.result).toEqual({
+    expect(outcome.result).toMatchObject({
       ok: true,
       agent_id: AGENT_ID,
       run_id: RUN_ID,

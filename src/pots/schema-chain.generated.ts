@@ -2881,9 +2881,25 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "telegram_origin_bind_receipts_no_delete" },
     ],
   },
+  {
+    file: "0156_harness_reservations.sql",
+    sha256: "20a9ab9b07b7e45b9bf237da9e9d599f058734a4664b39945dbc8bb5a56ad72b",
+    statements: [
+      "-- 0156_harness_reservations.sql — Harness Adapter SPI & pre-dispatch reservations.\n--\n-- mupot#1428 / Flight f0150aed-caee-4411-9690-1d03d7d9ea43\n--\n-- Why this table exists:\n-- Vendor agent dispatches (e.g. Cursor Cloud, Grok CLI, Hermes, Codex) must be\n-- reserved authoritatively in Mupot BEFORE contacting vendor cloud APIs.\n-- Calling vendor cloud APIs before creating Mupot Task & Flight records caused\n-- 30-second MCP client timeouts and left untracked orphan runs on vendor infrastructure.\n--\n-- With this table:\n-- 1. Mupot creates Task + Flight + harness_reservations (state='reserved') < 200ms.\n-- 2. MCP returns { accepted: true, state: 'reserved', reservation_id, task_id, flight_id }.\n-- 3. The vendor execution attaches asynchronously via ToolCtx.waitUntil or background reconcile.\n-- 4. Idempotency is enforced per (tenant, adapter, idempotency_key).\n\nCREATE TABLE IF NOT EXISTS harness_reservations (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  adapter TEXT NOT NULL CHECK (adapter IN (\n    'cursor-cloud','grok-cli','hermes','codex-cli','claude-code','antigravity-cli'\n  )),\n  idempotency_key TEXT NOT NULL CHECK (\n    length(trim(idempotency_key)) BETWEEN 1 AND 128\n    AND idempotency_key NOT GLOB '*[^A-Za-z0-9_.:-]*'\n  ),\n  request_digest TEXT NOT NULL CHECK (\n    length(request_digest) = 64\n    AND request_digest = lower(request_digest)\n    AND request_digest NOT GLOB '*[^0-9a-f]*'\n  ),\n  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,\n  flight_id TEXT NOT NULL REFERENCES flights(id) ON DELETE RESTRICT,\n  agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  squad_id TEXT NOT NULL,\n  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('member','agent')),\n  actor_id TEXT NOT NULL,\n  state TEXT NOT NULL CHECK (state IN (\n    'reserved','attaching','attached','failed','reconciled'\n  )),\n  vendor_agent_id TEXT,\n  vendor_run_id TEXT,\n  vendor_url TEXT,\n  last_vendor_status TEXT,\n  attach_lease_until TEXT,\n  last_error TEXT CHECK (last_error IS NULL OR length(last_error) BETWEEN 1 AND 2000),\n  reserved_at TEXT NOT NULL,\n  attached_at TEXT,\n  reconciled_at TEXT,\n  updated_at TEXT NOT NULL,\n  UNIQUE (tenant, adapter, idempotency_key)\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_reservations_reconcile\n  ON harness_reservations (tenant, state, updated_at);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_reservations_task\n  ON harness_reservations (tenant, task_id);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_reservations_vendor\n  ON harness_reservations (tenant, adapter, vendor_run_id);",
+    ],
+    objects: [
+      { type: "table", name: "harness_reservations" },
+      { type: "index", name: "idx_harness_reservations_reconcile" },
+      { type: "index", name: "idx_harness_reservations_task" },
+      { type: "index", name: "idx_harness_reservations_vendor" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "9a136d395fd534293308bfcd42a121b5607916459d74da144e5447662d1fbcd4"
+export const SCHEMA_CHAIN_DIGEST: string = "7ddacad21293481fa2dc54433a8df8a194763b5aa5c68ec6627377055ba2d915"
