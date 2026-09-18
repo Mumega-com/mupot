@@ -1,7 +1,10 @@
 # Identity & Access Redesign
 
 **Status:** Design. Fresh-eyes audit + target model, 2026-07-20 (Hadi direction).
-Feeds the roadmap: **v0.26 Identity & Scoped Access**. Companion to
+Feeds the roadmap under **Identity & Unified Access** — DEFERRED, UNSCHEDULED
+(requires a new post-v0.30 version assignment; see ROADMAP.md. Originally
+planned as "v0.26 Identity & Scoped Access" — that number was renumbered away
+2026-08-08 and never reassigned; do not cite it as a target version). Companion to
 [console-navigation-consolidation.md](console-navigation-consolidation.md) (the
 access surfaces are five of the menus that must converge) and
 [sovereign-core-operated-presence.md](sovereign-core-operated-presence.md) (guest
@@ -68,7 +71,8 @@ single "principal" concept.
 ## Target model
 
 Three moves. They converge — each unlocks the next, and together they also deliver
-the guest-presence check-in/out and the v0.26 governed-tool grant/binding.
+the guest-presence check-in/out and the Governed Tools grant/binding (also
+deferred/unscheduled, see ROADMAP.md).
 
 ### 1. One principal, honestly typed
 
@@ -121,8 +125,8 @@ CREATE TABLE token_grants (
   check-in/out needs. Same table, same mechanism.
 - Adds an optional **`resource`** filter (a project id, a tool-class like
   `cro:*`, an action-class like `read`/`draft`/`write`/`publish`) — this is the
-  fine-grain Hadi asked for, and it is the same shape as the v0.26 governed-tool
-  action classes, so the two land as one system.
+  fine-grain Hadi asked for, and it is the same shape as the (deferred,
+  unscheduled) Governed Tools action classes, so the two land as one system.
 
 ### 3. One "Create access key" flow that bundles the address
 
@@ -166,14 +170,15 @@ guarantees the key always ships with its address and a working config.
 4. `mint`/`create_key` always returns the MCP endpoint and a paste-ready config.
 5. One principal table is the source of truth for authN; People and Agents are
    `kind`-filtered views, never separate identity systems.
-6. No model-selected principal, scope, or credential (matches the v0.26 rule).
+6. No model-selected principal, scope, or credential (matches the Governed
+   Tools rule).
 
 ## Why this is one job, not four
 
 The same `token_grants` + `expires_at` mechanism delivers:
 - **Fine-grained API keys** (the operator complaint),
 - **Guest presence / check-in-out** (scoped + TTL credential — see operated-presence doc),
-- **v0.26 governed-tool grant/binding** (action-class scoping on the token),
+- **Governed Tools grant/binding** (action-class scoping on the token; deferred/unscheduled),
 - and it **retires the split-token RBAC edge** that held a flight during this session.
 
 Fixing identity once clears all of them.
