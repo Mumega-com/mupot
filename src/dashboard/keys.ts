@@ -143,9 +143,11 @@ export type MintResult =
  *     Grant the member the capability separately first, then mint an attesting key.
  *  5. Mint a member_token (channel='workspace') via the shared service. The token
  *     carries the member's OWN authority (resolved from `capabilities` at auth time);
- *     the preset is an audit label, not an enforced scope-down (per-key scope-down
- *     ships in v0.26 token_grants). Revoking the token removes exactly the token —
- *     it leaves no residual standing power, because mint wrote none.
+ *     the preset is an audit label, not an enforced scope-down. Per-key scope-down
+ *     (token_grants) is DEFERRED, UNSCHEDULED — see ROADMAP.md's "Identity & Unified
+ *     Access" (requires a new post-v0.30 version assignment; do not cite a version
+ *     number here again until one is actually assigned). Revoking the token removes
+ *     exactly the token — it leaves no residual standing power, because mint wrote none.
  *  6. Return raw once; never persisted.
  */
 export async function mintScopedKey(env: Env, params: MintParams): Promise<MintResult> {
@@ -208,8 +210,9 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
   //    the member ALREADY holds >= the preset capability on the resolved scope; if not,
   //    it refuses (never elevate). Grant the member the capability out-of-band first.
   //    Per-key scope-DOWN (an observer key for an admin member) requires token-scoped
-  //    grants and lands in v0.26 (token_grants); until then the token honestly carries
-  //    the member's own authority and the preset is an audit label only.
+  //    grants (token_grants) — DEFERRED, UNSCHEDULED (see ROADMAP.md's "Identity &
+  //    Unified Access", post-v0.30, no version assigned); until then the token
+  //    honestly carries the member's own authority and the preset is an audit label only.
   const scopeDeptId =
     preset.scopeType === 'squad' && resolvedScopeId
       ? (
@@ -500,14 +503,15 @@ export function keysMintedBody(
 ) {
   // Honest disclosure: the token carries the member's OWN authority (resolved from
   // `capabilities` at auth). The preset is an audit label, not an enforced scope-down —
-  // per-key scope-down ships in v0.26 (token_grants). Never let the preset label read as
-  // a capability boundary it does not yet enforce.
+  // per-key scope-down (token_grants) is DEFERRED, UNSCHEDULED (ROADMAP.md, post-v0.30,
+  // no version assigned). Never let the preset label read as a capability boundary it
+  // does not yet enforce, and never re-promise a version number here until one is real.
   const scopeNotice = `<div class="warn-box" style="margin-bottom:14px;border-color:var(--warn)">
     <strong>Scope not yet enforced per-key.</strong>
     This token carries <strong>${esc(memberName)}</strong>'s own capabilities. The preset
-    names the intended scope for the audit trail; per-key scope-down is enforced starting
-    v0.26. Do not treat the preset label as a capability boundary. Revoking this token
-    removes exactly this token — it leaves no standing grant behind.
+    names the intended scope for the audit trail; per-key scope-down is not yet built and
+    has no scheduled version. Do not treat the preset label as a capability boundary.
+    Revoking this token removes exactly this token — it leaves no standing grant behind.
   </div>`
   return html`
 <div class="crumbs"><a href="/">Overview</a> › <a href="/admin/keys">Scoped API Keys</a> › Key provisioned</div>
