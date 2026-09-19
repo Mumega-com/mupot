@@ -146,6 +146,7 @@ import {
 } from '../fleet/registry'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
+import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
@@ -5380,6 +5381,7 @@ export const TOOLS: ToolSpec[] = [
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,

@@ -26,6 +26,10 @@
 //   register_agent_key — admin on the agent's squad → public-only signed-runtime identity
 //   move_agent_squad   — admin on CURRENT squad AND dest squad (no self-lane) → home-row
 //                        move + old-squad grant severance + dest grant + agent_audit
+//   agent_lifecycle    — PILOT composite router over move/grant/deactivate/mint.
+//                        Explicit action delegates to those run()s; intent goes
+//                        through Jev with a decline-on-low-confidence gate. Adds
+//                        no authorization of its own.
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
@@ -590,7 +594,7 @@ const toolGetAgentProfile: ToolSpec = {
 // the raw token itself never appears in this tool's result; redeem the claim via
 // reveal_credential_claim). Default grant is 'member'; callers may lower to
 // 'observer' but never above member.
-const toolMintAgentToken: ToolSpec = {
+export const toolMintAgentToken: ToolSpec = {
   name: 'mint_agent_token',
   scope: "agent's squad",
   min: 'admin',
@@ -1345,7 +1349,7 @@ const toolProvisionAgentConnection: ToolSpec = {
 // ── grant_agent_capability ───────────────────────────────────────────────────
 // Grants the one active member identity welded to an existing agent a capability
 // on another squad. It never mints or returns a credential.
-const toolGrantAgentCapability: ToolSpec = {
+export const toolGrantAgentCapability: ToolSpec = {
   name: 'grant_agent_capability',
   scope: 'target squad',
   min: 'admin',
@@ -2087,7 +2091,7 @@ const toolUpdateAgent: ToolSpec = {
 //
 // HARD-BLOCK 4 clause 2: 409 gate_standings_change when a severed gate:<cap>
 // string still names any non-done task on the old squad (any assignee).
-const toolMoveAgentSquad: ToolSpec = {
+export const toolMoveAgentSquad: ToolSpec = {
   name: 'move_agent_squad',
   scope: "agent's current squad AND destination squad (admin on both, or org admin)",
   min: 'admin',
@@ -2445,7 +2449,7 @@ const toolUpdateSquad: ToolSpec = {
 // presence row(s) (drops off the fleet/radar roster), and removes its
 // signed-runtime public key(s) (agent_keys — a future signed-attach fails
 // closed with no key to verify against).
-const toolDeactivateAgent: ToolSpec = {
+export const toolDeactivateAgent: ToolSpec = {
   name: 'deactivate_agent',
   scope: "agent's squad",
   min: 'admin',
