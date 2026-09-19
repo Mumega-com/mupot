@@ -76,6 +76,23 @@ function memberAuth(): AuthContext {
   } as AuthContext
 }
 
+// Admin on the DESTINATION only. That clears invokeTool's scope-agnostic
+// min:'admin' floor (admin on ANY scope) and still fails move_agent_squad's
+// from-squad admin check — so the composite's refusal is the delegate's, not
+// the floor's, and both calls go through the production seam.
+function destOnlyAdminAuth(): AuthContext {
+  return {
+    userId: MEMBER_ONLY,
+    memberId: MEMBER_ONLY,
+    email: 'member@example.test',
+    role: 'member',
+    tenant: TENANT,
+    channel: 'workspace',
+    boundAgentId: null,
+    capabilities: [grant(MEMBER_ONLY, 'squad', DEST_SQUAD, 'admin')],
+  } as AuthContext
+}
+
 function memoryKv(): Env['SESSIONS'] {
   const store = new Map<string, string>()
   return {
@@ -291,15 +308,26 @@ describe('agent_lifecycle', () => {
   })
 
   it('surfaces the underlying tool\'s authz refusal unchanged (delegation, not a new gate)', async () => {
-    const args = { agent: AGENT_ID, to_squad: DEST_SQUAD, capability: 'member' as const }
-    const direct = await toolMoveAgentSquad.run(memberAuth(), env, args, ctx)
-    const via = await runAgentLifecycle(memberAuth(), env, {
+    const caller = destOnlyAdminAuth()
+    const direct = await invokeTool(caller, env, 'move_agent_squad', {
+      agent: AGENT_ID,
+      to_squad: DEST_SQUAD,
+      capability: 'member',
+    }, ORIGIN)
+    const via = await invokeTool(caller, env, 'agent_lifecycle', {
       agent: AGENT_ID,
       action: 'move_squad',
       params: { to_squad: DEST_SQUAD, capability: 'member' },
-    }, ctx)
+    }, ORIGIN)
     expect(direct.ok).toBe(false)
-    expect(via).toEqual(direct)
+    expect(via.ok).toBe(false)
+    if (direct.ok || via.ok) return
+    // invokeTool stamps `tool`; the refusal body must be the delegate's.
+    expect(direct.error).toBe('forbidden')
+    expect(direct.detail).toEqual({ need: 'admin', scope: 'squad', side: 'from' })
+    expect(via.status).toBe(direct.status)
+    expect(via.error).toBe(direct.error)
+    expect(via.detail).toEqual(direct.detail)
   })
 
   it('invokeTool floor still refuses a caller who holds no admin anywhere', async () => {
