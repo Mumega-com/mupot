@@ -1136,7 +1136,9 @@ const toolTaskUpdate: ToolSpec = {
   name: 'task_update',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, assignee_member_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string, reversal_reason?: string }',
+  args: '{ task_id: string, project_id?: string|null, title?: string, body?: string, note?: string, reason?: string, done_when?: string, status?: "open"|"in_progress"|"blocked"|"done"|"review", priority?: "P0"|"P1"|"P2"|"P3"|null, parent_task_id?: string|null, assignee_agent_id?: string|null, assignee_member_id?: string|null, gate_owner?: string|null, gate_owner_reason?: string, reversal_reason?: string, verdict_reversal_reason?: string }' +
+    ' -- note/reason are appended to the task body as extra content, not stored separately.' +
+    ' verdict_reversal_reason (falls back to reason) is the required context when this call reverses an existing task_verdict.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1144,10 +1146,10 @@ const toolTaskUpdate: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       body: STRING_SCHEMA,
-      note: STRING_SCHEMA,
-      reason: STRING_SCHEMA,
+      note: { ...STRING_SCHEMA, description: 'Appended to the task body as extra content alongside `reason`, not stored as a separate field.' },
+      reason: { ...STRING_SCHEMA, description: 'Appended to the task body as extra content alongside `note`, not stored as a separate field.' },
       reversal_reason: STRING_SCHEMA,
-      verdict_reversal_reason: STRING_SCHEMA,
+      verdict_reversal_reason: { ...STRING_SCHEMA, description: 'Required context when this call reverses an existing task_verdict; falls back to `reason` if omitted.' },
       done_when: STRING_SCHEMA,
       status: STRING_SCHEMA,
       priority: { type: ['string', 'null'], description: 'Rank, or null to return the task to UNTRIAGED.' },
@@ -2084,13 +2086,16 @@ const toolTaskVerdictReverse: ToolSpec = {
   name: 'task_verdict_reverse',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string, reason: string, gate_owner?: string|null, gate_owner_reason?: string }',
+  args: '{ task_id: string, reason?: string, reversal_reason?: string, gate_owner?: string|null, gate_owner_reason?: string }' +
+    ' -- reason/reversal_reason are each optional in the schema (JSON Schema cannot express' +
+    ' "at least one of"), but run() 400s as verdict_reversal_reason_required unless at least' +
+    ' one is a non-empty string. reversal_reason takes precedence when both are given.',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       reason: STRING_SCHEMA,
-      reversal_reason: STRING_SCHEMA,
+      reversal_reason: { ...STRING_SCHEMA, description: 'Takes precedence over `reason` when both are given.' },
       gate_owner: STRING_SCHEMA,
       gate_owner_reason: STRING_SCHEMA,
     },
