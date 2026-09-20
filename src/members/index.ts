@@ -175,29 +175,43 @@ interface AcceptInviteBody {
   telegram_chat_id?: unknown
 }
 
-membersApp.post('/invites/:id/accept', async (c) => {
-  const inviteId = c.req.param('id')
+// ── shared accept logic (mupot#1436 A1) ────────────────────────────────────
+//
+// Extracted out of the POST /invites/:id/accept handler below so the public
+// web invite-landing page (GET/POST /invite/:id, src/dashboard/invite.ts) can
+// redeem a legacy invite through the EXACT SAME write path — no second copy
+// of the claim/mint/rollback SQL. Only the display name is caller-supplied;
+// the email always comes from the invite row (server-trusted).
 
-  let body: AcceptInviteBody
-  try {
-    body = (await c.req.json()) as AcceptInviteBody
-  } catch {
-    return c.json({ error: 'invalid_json' }, 400)
-  }
+export interface AcceptInviteSuccess {
+  member_id: string
+  email: string
+  capability: { scope_type: CapabilityScopeType; scope_id: string | null; capability: Capability }
+  token: { id: string; label: 'workspace'; channel: ConnectionChannel; raw: string }
+}
 
-  if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
+export type AcceptInviteError =
+  | 'invite_not_found'
+  | 'project_invite_requires_telegram'
+  | 'invite_already_accepted'
+  | 'member_already_exists'
 
-  // Telegram identity is accepted only from the authenticated webhook envelope.
-  // The public/browser redemption body is never an identity authority, even when
-  // it carries a syntactically valid numeric chat id.
-  if (Object.prototype.hasOwnProperty.call(body, 'telegram_chat_id')) {
-    return c.json({ error: 'telegram_identity_requires_authenticated_webhook' }, 400)
-  }
+export type AcceptInviteResult =
+  | { ok: true; value: AcceptInviteSuccess }
+  | { ok: false; error: AcceptInviteError }
 
-  if (!isNonEmptyString(body.display_name)) return c.json({ error: 'invalid_display_name' }, 400)
-  const displayName = body.display_name.trim()
-
-  const invite = await c.env.DB.prepare(
+/**
+ * Redeem a legacy (non-Telegram/non-project) invite: mint the member,
+ * capability grant and workspace token atomically. A Telegram/project invite
+ * (pairing_hash set) is refused here — those redeem only through the
+ * authenticated Hermes webhook (redeemTelegramProjectInvite, project-invites.ts).
+ */
+export async function acceptInvite(
+  env: Env,
+  inviteId: string,
+  displayName: string,
+): Promise<AcceptInviteResult> {
+  const invite = await env.DB.prepare(
     `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
             pairing_expires_at, capability, invited_by, accepted_at, created_at
        FROM invites WHERE id = ? LIMIT 1`,
@@ -205,19 +219,19 @@ membersApp.post('/invites/:id/accept', async (c) => {
     .bind(inviteId)
     .first<InviteRow>()
 
-  if (!invite) return c.json({ error: 'invite_not_found' }, 404)
+  if (!invite) return { ok: false, error: 'invite_not_found' }
   if (
     invite.project_id !== null
     || invite.squad_id !== null
     || invite.pairing_hash !== null
     || invite.pairing_expires_at !== null
   ) {
-    return c.json({ error: 'project_invite_requires_telegram' }, 409)
+    return { ok: false, error: 'project_invite_requires_telegram' }
   }
-  if (invite.accepted_at) return c.json({ error: 'invite_already_accepted' }, 409)
+  if (invite.accepted_at) return { ok: false, error: 'invite_already_accepted' }
 
-  // Mint the member. The email comes from the INVITE (server-trusted), never the
-  // request body — the body only supplies the display name / IM handle.
+  // Mint the member. The email comes from the INVITE (server-trusted), never a
+  // caller-supplied value — callers only ever supply the display name.
   const member: Member = {
     id: crypto.randomUUID(),
     email: invite.email,
@@ -242,7 +256,7 @@ membersApp.post('/invites/:id/accept', async (c) => {
   // Atomic redemption: flip accepted_at ONLY if still unaccepted (single-use),
   // then create member + capability + token in the same batch. If the conditional
   // UPDATE changed zero rows, a concurrent accept won the race → 409.
-  const claim = await c.env.DB.prepare(
+  const claim = await env.DB.prepare(
     'UPDATE invites SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL',
   )
     .bind(acceptedAt, inviteId)
@@ -250,12 +264,12 @@ membersApp.post('/invites/:id/accept', async (c) => {
 
   // D1 exposes the affected-row count under meta.changes.
   if (!claim.meta || claim.meta.changes === 0) {
-    return c.json({ error: 'invite_already_accepted' }, 409)
+    return { ok: false, error: 'invite_already_accepted' }
   }
 
   try {
-    const acceptWrites = await c.env.DB.batch([
-      c.env.DB.prepare(
+    const acceptWrites = await env.DB.batch([
+      env.DB.prepare(
         'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ).bind(
         member.id,
@@ -264,14 +278,14 @@ membersApp.post('/invites/:id/accept', async (c) => {
         member.telegram_chat_id,
         member.status,
         member.created_at,
-        c.env.TENANT_SLUG,
+        env.TENANT_SLUG,
       ),
-      c.env.DB.prepare(
+      env.DB.prepare(
         'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
       ).bind(grantId, member.id, scopeType, scopeId, invite.capability),
-      c.env.DB.prepare(
+      env.DB.prepare(
         'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
-      ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', c.env.TENANT_SLUG),
+      ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
     ])
     // Receipt (#186): all three mint rows must land before we return `raw`. A
     // 0-row INSERT does not throw on its own; a partial mint would hand out a
@@ -281,18 +295,21 @@ membersApp.post('/invites/:id/accept', async (c) => {
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
     // on members.email UNIQUE). The conditional claim above already serialized us.
-    await c.env.DB.prepare('UPDATE invites SET accepted_at = NULL WHERE id = ?')
+    await env.DB.prepare('UPDATE invites SET accepted_at = NULL WHERE id = ?')
       .bind(inviteId)
       .run()
-    if (isUniqueViolation(err)) return c.json({ error: 'member_already_exists' }, 409)
+    if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
     throw err
   }
 
-  // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
-  protectRawTokenResponse(c)
-  return c.json(
-    {
+  return {
+    ok: true,
+    value: {
       member_id: member.id,
+      // invite.email (InviteRow) is non-null (invites.email NOT NULL); member.email
+      // is typed string | null on the shared Member shape (IM-only members carry
+      // none), so read it from the invite, not the just-built member row.
+      email: invite.email,
       capability: { scope_type: scopeType, scope_id: scopeId, capability: invite.capability },
       token: {
         id: tokenId,
@@ -300,6 +317,48 @@ membersApp.post('/invites/:id/accept', async (c) => {
         channel: 'workspace' as ConnectionChannel,
         raw: rawToken,
       },
+    },
+  }
+}
+
+function acceptInviteErrorStatus(error: AcceptInviteError): 404 | 409 {
+  return error === 'invite_not_found' ? 404 : 409
+}
+
+membersApp.post('/invites/:id/accept', async (c) => {
+  const inviteId = c.req.param('id')
+
+  let body: AcceptInviteBody
+  try {
+    body = (await c.req.json()) as AcceptInviteBody
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  if (!body || typeof body !== 'object') return c.json({ error: 'invalid_json' }, 400)
+
+  // Telegram identity is accepted only from the authenticated webhook envelope.
+  // The public/browser redemption body is never an identity authority, even when
+  // it carries a syntactically valid numeric chat id.
+  if (Object.prototype.hasOwnProperty.call(body, 'telegram_chat_id')) {
+    return c.json({ error: 'telegram_identity_requires_authenticated_webhook' }, 400)
+  }
+
+  if (!isNonEmptyString(body.display_name)) return c.json({ error: 'invalid_display_name' }, 400)
+  const displayName = body.display_name.trim()
+
+  const result = await acceptInvite(c.env, inviteId, displayName)
+  if (!result.ok) {
+    return c.json({ error: result.error }, acceptInviteErrorStatus(result.error))
+  }
+
+  // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
+  protectRawTokenResponse(c)
+  return c.json(
+    {
+      member_id: result.value.member_id,
+      capability: result.value.capability,
+      token: result.value.token,
     },
     201,
   )

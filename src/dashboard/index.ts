@@ -401,7 +401,7 @@ dashboardApp.use('*', async (c, next) => {
     c.req.query('format') === 'json' ||
     (accept.includes('application/json') && !accept.includes('text/html'))
   if (wantsJson) return c.json({ error: 'forbidden', need: 'capability' }, 403)
-  return c.html(shell(c.env, 'No access', noDashboardAccessBody()), 403)
+  return c.html(shell(c.env, 'No access', noDashboardAccessBody(auth)), 403)
 })
 
 // Addon discoverability is part of the server-rendered shell, not a client-side
@@ -4597,9 +4597,16 @@ export function orgAdminForbiddenJson(action: string, auth: AuthContext | null |
 // FLIGHT-001 F2 — the capability-floor deny page. Deliberately does NOT link
 // back to "/" — a zero-capability member would just bounce off the same gate.
 // Points to logout instead so the visitor can sign in with the right account.
-function noDashboardAccessBody() {
-  return html`<h1>No access</h1><p class="empty">Your account is signed in, but it doesn't hold any
-    capability grant on this workspace yet. Ask an admin to add you to a squad.</p>
+//
+// mupot#1436 A4: names the signed-in identity and points at the real remedy
+// (an admin-issued invite link — mupot#1436 A1/A5) rather than the generic
+// "ask an admin to add you to a squad", which named no concrete next step.
+// No "request access" button here yet — that needs a needs_you write path
+// this task does not build (filed as a follow-up).
+function noDashboardAccessBody(auth: AuthContext) {
+  const who = auth.email ?? auth.userId
+  return html`<h1>No access</h1><p class="empty">Signed in as <strong>${who}</strong>. No access in
+    this org yet. Ask an admin for an invite link.</p>
     <p><a href="/auth/logout">← Sign out</a></p>`
 }
 
@@ -6305,6 +6312,11 @@ function membersAdminBody(
         <button type="submit" class="btn">Send invite</button>
       </form>
       <div id="invite-status" class="status-line"></div>
+      <div id="invite-link-wrap" style="margin-top:8px" hidden>
+        <label for="invite-link" style="font-size:13px;color:var(--muted)">Invite link — share this with the person</label>
+        <input id="invite-link" type="text" readonly onclick="this.select()"
+          style="width:100%;margin-top:4px;font-family:monospace;font-size:13px" />
+      </div>
     </div>
 
     <h2>Directory</h2>
@@ -6549,6 +6561,8 @@ function membersAdminScript(scopeOptions: string) {
         // ── invite ──
         var inviteForm = document.getElementById('invite-form');
         var inviteStatus = document.getElementById('invite-status');
+        var inviteLinkWrap = document.getElementById('invite-link-wrap');
+        var inviteLinkInput = document.getElementById('invite-link');
         if (inviteForm) {
           inviteForm.addEventListener('submit', async function (e) {
             e.preventDefault();
@@ -6560,13 +6574,18 @@ function membersAdminScript(scopeOptions: string) {
             var dep = String(fd.get('department_id') || '');
             if (dep) payload.department_id = dep;
             inviteStatus.textContent = 'Creating invite…';
+            if (inviteLinkWrap) inviteLinkWrap.setAttribute('hidden', '');
             try {
               var res = await postJSON(API + '/invites', 'POST', payload);
               var data = await res.json().catch(function () { return {}; });
               if (res.ok) {
+                var inviteId = data.invite && data.invite.id;
                 inviteStatus.textContent =
-                  'Invite created. Redemption id: ' + (data.invite && data.invite.id) +
-                  ' — share the accept link; first connect mints the member + token (shown once).';
+                  'Invite created. Share the link below — first accept mints the member + token.';
+                if (inviteId && inviteLinkWrap && inviteLinkInput) {
+                  inviteLinkInput.value = location.origin + '/invite/' + encodeURIComponent(inviteId);
+                  inviteLinkWrap.removeAttribute('hidden');
+                }
                 inviteForm.reset();
               } else if (res.status === 403) {
                 inviteStatus.textContent = 'Forbidden — you need admin on this scope to invite.';
