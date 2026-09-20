@@ -25,7 +25,7 @@ import { csrf } from 'hono/csrf'
 import { html, raw as honoRaw } from 'hono/html'
 import { setCookie } from 'hono/cookie'
 import type { Env, Capability } from '../types'
-import { acceptInvite } from '../members'
+import { acceptInvite, protectRawTokenResponse } from '../members'
 
 type AppEnv = { Bindings: Env }
 
@@ -63,11 +63,15 @@ interface InviteLandingRow {
 }
 
 /**
- * Best-effort human label for the inviter. Tries the members table first
- * (network members carry a display_name), falls back to the legacy web
- * users table (email only — no display_name column), and finally to a
- * generic label rather than leaking "member_not_found"-shaped detail to an
- * unauthenticated visitor.
+ * Best-effort human label for the inviter, for an UNAUTHENTICATED public
+ * page. Tries the members table (network members carry a display_name),
+ * otherwise falls back to a generic label.
+ *
+ * mupot#1436 round 2 P1-B: this used to also fall back to `users.email` —
+ * an inviter's email, PII, rendered to any anonymous visitor holding the
+ * invite link. Dropped entirely; there is no email rung. A missing
+ * display_name (e.g. the legacy web `users` table has none) always renders
+ * as "an admin", never the inviter's address.
  */
 async function resolveInviterName(env: Env, invitedBy: string | null): Promise<string> {
   if (!invitedBy) return 'an admin'
@@ -75,10 +79,6 @@ async function resolveInviterName(env: Env, invitedBy: string | null): Promise<s
     .bind(invitedBy)
     .first<{ display_name: string | null }>()
   if (member?.display_name) return member.display_name
-  const user = await env.DB.prepare('SELECT email FROM users WHERE id = ?1 LIMIT 1')
-    .bind(invitedBy)
-    .first<{ email: string | null }>()
-  if (user?.email) return user.email
   return 'an admin'
 }
 
@@ -242,6 +242,11 @@ export const inviteApp = new Hono<AppEnv>()
 inviteApp.use('*', csrf())
 
 inviteApp.get('/:id', async (c) => {
+  // WARN-A: same no-store/no-referrer floor as the JSON token-mint routes
+  // (src/members/index.ts) — set once, before any branch, so it lands on
+  // every response this handler can return (Hono's c.header() carries
+  // through into c.html() regardless of which branch/status runs).
+  protectRawTokenResponse(c)
   const inviteId = c.req.param('id')
   const view = await loadInviteLanding(c.env, inviteId)
   if (view.kind === 'not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
@@ -255,6 +260,9 @@ interface AcceptInviteForm {
 }
 
 inviteApp.post('/:id', async (c) => {
+  // WARN-A: see the GET handler above — same headers, every response this
+  // handler can return (error pages AND the success redirect).
+  protectRawTokenResponse(c)
   const inviteId = c.req.param('id')
 
   // Re-check state before minting: a stale form re-submitted after the invite
@@ -273,12 +281,22 @@ inviteApp.post('/:id', async (c) => {
     return c.html(invitePageBody(c.env.BRAND, view.ctx, 'Enter your name to continue.'), 400)
   }
 
-  const result = await acceptInvite(c.env, inviteId, displayName)
+  // WARN-C: mintToken:false — this page authenticates the human by sending
+  // them to log in (OAuth/session), never by handing back a bearer, so it
+  // must not mint (or persist, in member_tokens) a workspace token just to
+  // discard it. `result.value.token` is `null` on this path; see acceptInvite.
+  const result = await acceptInvite(c.env, inviteId, displayName, { mintToken: false })
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
     if (result.error === 'invite_already_accepted') return c.html(inviteAlreadyAcceptedBody(c.env.BRAND), 409)
     if (result.error === 'project_invite_requires_telegram') {
       return c.html(inviteTelegramOnlyBody(c.env.BRAND, view.ctx), 409)
+    }
+    if (result.error === 'invalid_display_name') {
+      return c.html(
+        invitePageBody(c.env.BRAND, view.ctx, 'Enter a name up to 120 characters long.'),
+        400,
+      )
     }
     // member_already_exists
     return c.html(
@@ -288,21 +306,57 @@ inviteApp.post('/:id', async (c) => {
   }
 
   // mupot#1436 A2 (gated, not built here): stash a short-lived pointer to the
-  // just-minted member so a follow-on login can link the two — WITHOUT ever
-  // handing the raw workspace token to the browser. The raw token minted
-  // inside acceptInvite is intentionally DISCARDED here (never read out of
-  // `result.value.token.raw`, never logged): a web visitor authenticates by
-  // logging in (OAuth/session), not by holding a bearer token, and the token
-  // API redemption path is the one that DOES need to hand it back once. The
-  // callback itself is not touched here; until A2 wires it up, this marker
-  // simply expires unused after PENDING_INVITE_TTL_SECONDS.
+  // just-minted member so a follow-on login can link the two.
+  //
+  // mupot#1436 round 2 P1-D, contract per Athena's design ruling — the A2
+  // SECURITY CONTRACT this marker's future reader (the /auth/callback
+  // handler, NOT built here) MUST honor:
+  //
+  //   1. CALLBACK IS LINK-ONLY. On a valid marker, callback calls
+  //      linkLoginIdentity(memberIdFromInviteRow, ...) — the member id comes
+  //      from the D1 invite row (step 2), never from the marker being
+  //      trusted blind. It MUST NOT call findOrCreateHumanMember(...) or
+  //      resolveHumanMemberId(email) for this flow: those are the ordinary
+  //      no-invite login path, and running them here would let the callback
+  //      silently create or attach to a DIFFERENT member than the one this
+  //      invite minted.
+  //   2. D1 IS THE AUTHORITY, KV IS ONLY A POINTER. The callback re-reads
+  //      the invite row by marker.invite_id and requires BOTH: accepted_at
+  //      IS NOT NULL (this exact accept happened), AND the IdP-verified
+  //      email from the OAuth response equals invite.email, compared
+  //      case-normalized (lower-cased, matching idx_members_email_lower's
+  //      own normalization). The KV blob (invite_id/member_id/issued_at) is
+  //      never itself sufficient to link — it is a lookup key, not a claim.
+  //   3. KV IS SINGLE-USE VIA ATOMIC DELETE ON FIRST READ. The callback
+  //      must delete the KV key in the same step it reads it (get-then-
+  //      delete, no window where a replayed callback can read it twice).
+  //      TTL at write time is 600–900s — long enough for a real OAuth
+  //      round-trip, short enough that an abandoned marker is not a
+  //      standing liability.
+  //   4. THE MARKER MUST BE BOUND TO THE OAUTH STATE the callback already
+  //      validates for CSRF (auth/index.ts's existing state check) — one
+  //      state value links AT MOST ONE invite. A foreign or replayed state
+  //      arriving with a stale/foreign marker cookie links NOTHING; the
+  //      binding must be checked before step 1 runs, not after.
+  //   5. THE REFUSAL PAGE NAMES ORG/SQUAD ONLY, NEVER AN EMAIL — if the
+  //      email-equality check in (2) fails, or the state binding in (4)
+  //      fails, the human-facing failure copy may say which org/squad the
+  //      invite was for, but must never echo invite.email or the IdP email
+  //      back into the page (same PII discipline as P1-B on this page).
+  //
+  // Until A2 lands, no code path reads this marker — it simply expires
+  // unused after PENDING_INVITE_TTL_SECONDS. This page's own behaviour
+  // (mint member + capability, then send the human to log in) is correct
+  // and complete on its own without A2. The KV payload below deliberately
+  // carries NO email (data minimization — D1's invite row is the source of
+  // truth per (2), so the KV blob never needs to duplicate it).
   const pendingId = randomHex(24)
   await c.env.SESSIONS.put(
     `${PENDING_INVITE_KV_PREFIX}${pendingId}`,
     JSON.stringify({
       invite_id: inviteId,
       member_id: result.value.member_id,
-      email: result.value.email,
+      issued_at: new Date().toISOString(),
     }),
     { expirationTtl: PENDING_INVITE_TTL_SECONDS },
   )

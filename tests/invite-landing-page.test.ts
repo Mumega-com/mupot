@@ -11,6 +11,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { assertNoRawToken } from './helpers/assert-no-raw-token'
 import {
   inviteApp,
   PENDING_INVITE_COOKIE,
@@ -32,6 +33,15 @@ function makeHarness(): SqliteD1Harness {
       VALUES ('inv-legacy', 'newcomer@example.com', 'dept-a', 'member', 'member-admin');
     INSERT INTO invites (id, email, capability, invited_by, accepted_at)
       VALUES ('inv-used', 'used@example.com', 'member', 'member-admin', datetime('now'));
+  `)
+  // P1-B fixture: an inviter that has NO row in `members` (so the
+  // display_name lookup misses) but DOES have an email in the legacy web
+  // `users` table — the exact shape resolveInviterName's dropped fallback
+  // used to leak.
+  harness.sqlite.exec(`
+    INSERT INTO users (id, email, role) VALUES ('user-legacy-inviter', 'inviter@example.com', 'admin');
+    INSERT INTO invites (id, email, capability, invited_by)
+      VALUES ('inv-user-inviter', 'pii-check@example.com', 'member', 'user-legacy-inviter');
   `)
   // A Telegram/project invite — must go through the trigger's atomic column
   // group (0152), so insert every one of project_id/squad_id/pairing_hash/
@@ -141,6 +151,35 @@ describe('GET /invite/:id', () => {
     expect(body).toContain('name="display_name"')
     expect(body).toContain(`action="/invite/inv-legacy"`)
   })
+
+  // mupot#1436 round 2 P1-B: resolveInviterName used to fall back to
+  // `users.email` when the inviter had no members.display_name — leaking an
+  // admin's email address to any anonymous visitor holding the invite link.
+  it('never leaks the inviter email when they have no display_name (PII fix)', async () => {
+    harness = makeHarness()
+    const { env } = envFor(harness)
+    const res = await inviteApp.fetch(get('/inv-user-inviter'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('an admin')
+    expect(body).not.toContain('inviter@example.com')
+    // Whole rendered <body> (excluding the <head>'s inline CSS, which
+    // legitimately contains `@media` at-rules and would otherwise false-fail
+    // this check) must carry no '@' at all — the one PII shape that matters.
+    const rendered = body.slice(body.indexOf('<body>'))
+    expect(rendered).not.toContain('@')
+  })
+
+  // mupot#1436 round 2 WARN-A: the same no-store/no-referrer floor the JSON
+  // token-mint routes carry (src/members/index.ts protectRawTokenResponse),
+  // reused here — this page is the same sensitive-redemption threat model.
+  it('sets Cache-Control: no-store and Referrer-Policy: no-referrer', async () => {
+    harness = makeHarness()
+    const { env } = envFor(harness)
+    const res = await inviteApp.fetch(get('/inv-legacy'), env)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer')
+  })
 })
 
 describe('POST /invite/:id', () => {
@@ -193,7 +232,31 @@ describe('POST /invite/:id', () => {
     expect(memberCount(harness)).toBe(before)
   })
 
-  it('on success: mints member+capability+token, sets pending-invite KV+cookie, redirects to /auth/login, never leaks the raw token', async () => {
+  // mupot#1436 round 2 WARN-B: the 120-char cap is enforced SERVER-SIDE inside
+  // acceptInvite (see tests/accept-invite-direct.test.ts for the function-level
+  // proof both callers share it) — this exercises it through the actual HTTP
+  // form path so a bypassed/absent client-side maxlength doesn't get through.
+  it('rejects a display name over 120 characters', async () => {
+    harness = makeHarness()
+    const { env } = envFor(harness)
+    const before = memberCount(harness)
+    const res = await inviteApp.fetch(postForm('/inv-legacy', { display_name: 'x'.repeat(200_000) }), env)
+    expect(res.status).toBe(400)
+    expect(await res.text()).toMatch(/120 characters/i)
+    expect(memberCount(harness)).toBe(before)
+  })
+
+  // mupot#1436 round 2 WARN-A (POST leg — see the GET test above for the same
+  // headers on that method).
+  it('sets Cache-Control: no-store and Referrer-Policy: no-referrer', async () => {
+    harness = makeHarness()
+    const { env } = envFor(harness)
+    const res = await inviteApp.fetch(postForm('/inv-legacy', { display_name: '   ' }), env)
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer')
+  })
+
+  it('on success: mints member+capability (NOT a token), sets pending-invite KV+cookie, redirects to /auth/login, never leaks a raw token', async () => {
     harness = makeHarness()
     const { env, kv } = envFor(harness)
     const before = memberCount(harness)
@@ -203,11 +266,12 @@ describe('POST /invite/:id', () => {
     // Redirect, not a token-bearing JSON body.
     expect(res.status).toBe(302)
     expect(res.headers.get('location')).toBe('/auth/login')
-    const bodyText = await res.text()
-    expect(bodyText).not.toMatch(/mupot_[0-9a-f]{64}/)
+    // P1-C: the real check — every header, the status text, the body (0
+    // occurrences allowed here), and every KV value this request wrote.
+    await assertNoRawToken(res, kv.store)
 
-    // The member + capability + workspace token landed via the SAME write path
-    // as the JSON API (acceptInvite).
+    // The member + capability landed via the SAME write path as the JSON API
+    // (acceptInvite) — but WARN-C: no workspace token, this page never mints one.
     expect(memberCount(harness)).toBe(before + 1)
     const member = harness.sqlite
       .prepare(`SELECT id, email, display_name FROM members WHERE email = ?`)
@@ -220,30 +284,49 @@ describe('POST /invite/:id', () => {
       .get(member!.id) as { capability: string; scope_type: string; scope_id: string } | undefined
     expect(cap).toEqual({ capability: 'member', scope_type: 'department', scope_id: 'dept-a' })
 
-    const tokenRow = harness.sqlite
-      .prepare(`SELECT id FROM member_tokens WHERE member_id = ?`)
-      .get(member!.id)
-    expect(tokenRow).toBeDefined()
+    // WARN-C: the HTML accept path must write ZERO member_tokens rows — the
+    // pre-fix behaviour minted (and immediately discarded) one per accept.
+    const tokenCount = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?`)
+      .get(member!.id) as { n: number }
+    expect(tokenCount.n).toBe(0)
 
     const invite = harness.sqlite
       .prepare(`SELECT accepted_at FROM invites WHERE id = 'inv-legacy'`)
       .get() as { accepted_at: string | null }
     expect(invite.accepted_at).not.toBeNull()
 
-    // Cookie: HttpOnly + Secure + the pending marker.
+    // Cookie: HttpOnly + Secure + SameSite=Lax + Path=/ + the pinned 600s TTL
+    // (P1-D — both mutated independently: SameSite→None and TTL→2592000 must
+    // each fail this block).
     const setCookie = res.headers.get('set-cookie') ?? ''
     expect(setCookie).toContain(`${PENDING_INVITE_COOKIE}=`)
     expect(setCookie.toLowerCase()).toContain('httponly')
     expect(setCookie.toLowerCase()).toContain('secure')
+    expect(setCookie.toLowerCase()).toContain('samesite=lax')
+    expect(setCookie.toLowerCase()).toContain('path=/')
+    expect(setCookie.toLowerCase()).toContain('max-age=600')
     const cookieMatch = setCookie.match(new RegExp(`${PENDING_INVITE_COOKIE}=([^;]+)`))
     expect(cookieMatch).not.toBeNull()
     const pendingId = cookieMatch![1]
 
-    // KV: the SAME id, carrying invite/member/email — never the raw token.
+    // KV: the SAME id, carrying invite_id/member_id/issued_at ONLY (no
+    // email, no raw token) — written with the same pinned 600s TTL.
+    expect(kv.ttls.get(`${PENDING_INVITE_KV_PREFIX}${pendingId}`)).toBe(600)
     const kvValue = kv.store.get(`${PENDING_INVITE_KV_PREFIX}${pendingId}`)
     expect(kvValue).toBeDefined()
-    const parsed = JSON.parse(kvValue!) as { invite_id: string; member_id: string; email: string }
-    expect(parsed).toEqual({ invite_id: 'inv-legacy', member_id: member!.id, email: 'newcomer@example.com' })
+    // Athena's design ruling (round 2, same fix pass): the KV payload carries
+    // ONLY {invite_id, member_id, issued_at} — no email. D1's invite row is
+    // the authority for the email-equality check a future A2 callback must
+    // run (see the contract comment at the write site); the KV blob must
+    // never duplicate PII it doesn't need.
+    const parsed = JSON.parse(kvValue!) as { invite_id: string; member_id: string; issued_at: string }
+    expect(Object.keys(parsed).sort()).toEqual(['invite_id', 'issued_at', 'member_id'])
+    expect(parsed.invite_id).toBe('inv-legacy')
+    expect(parsed.member_id).toBe(member!.id)
+    expect(new Date(parsed.issued_at).toString()).not.toBe('Invalid Date')
+    expect(kvValue).not.toContain('email')
+    expect(kvValue).not.toContain('newcomer@example.com')
     expect(kvValue).not.toMatch(/"raw"/)
   })
 })

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { membersApp } from '../src/members'
 import { dashboardApp } from '../src/dashboard'
+import { assertNoRawToken } from './helpers/assert-no-raw-token'
 import type { Env } from '../src/types'
 
 function makeEnv(options: {
@@ -121,6 +122,10 @@ describe('member token responses', () => {
 
     expect(res.status).toBe(201)
     expectSensitiveTokenHeaders(res)
+    // mupot#1436 round 2 P1-C: this is the JSON path, which DOES hand the raw
+    // token back on purpose — assert it appears in the body EXACTLY ONCE and
+    // nowhere else (no header leak, e.g. a stray debug `X-Mupot-Token`).
+    await assertNoRawToken(res, undefined, { allowedInBody: 1 })
     expect(((await res.json()) as { token: { raw: string } }).token.raw).toMatch(/^mupot_/)
   })
 

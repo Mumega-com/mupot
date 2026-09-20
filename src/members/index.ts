@@ -118,7 +118,14 @@ function isUniqueViolation(err: unknown): boolean {
 // A raw bearer is returned exactly once on the two mint paths below. Keep that
 // response out of browser/edge caches and prevent a subsequent navigation from
 // forwarding its URL as a Referer.
-function protectRawTokenResponse(c: Context): void {
+//
+// Exported (mupot#1436 round 2, WARN-A) so the public web invite-landing page
+// (src/dashboard/invite.ts) can apply the SAME headers to every /invite/:id
+// response instead of growing its own copy — that page never returns a raw
+// token in the body, but it is the same sensitive-redemption threat model
+// (an unauthenticated, unguessable-id-gated mint) and belongs behind the same
+// no-store/no-referrer floor.
+export function protectRawTokenResponse(c: Context): void {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
 }
@@ -187,7 +194,11 @@ export interface AcceptInviteSuccess {
   member_id: string
   email: string
   capability: { scope_type: CapabilityScopeType; scope_id: string | null; capability: Capability }
-  token: { id: string; label: 'workspace'; channel: ConnectionChannel; raw: string }
+  // null when the caller opted out of minting (mupot#1436 round 2 WARN-C —
+  // the web invite-landing page authenticates by sending the human to log
+  // in, never by handing back a bearer, so it has no use for a token and
+  // must not mint/persist one just to discard it).
+  token: { id: string; label: 'workspace'; channel: ConnectionChannel; raw: string } | null
 }
 
 export type AcceptInviteError =
@@ -195,6 +206,10 @@ export type AcceptInviteError =
   | 'project_invite_requires_telegram'
   | 'invite_already_accepted'
   | 'member_already_exists'
+  // mupot#1436 round 2 WARN-B: server-side cap, enforced HERE so every caller
+  // (JSON API, web invite-landing form) inherits the same limit rather than
+  // each re-implementing (and potentially forgetting) its own.
+  | 'invalid_display_name'
 
 export type AcceptInviteResult =
   | { ok: true; value: AcceptInviteSuccess }
@@ -210,7 +225,12 @@ export async function acceptInvite(
   env: Env,
   inviteId: string,
   displayName: string,
+  // mupot#1436 round 2 WARN-C. Defaults to true so the existing JSON API
+  // caller is unchanged; the web invite-landing page passes false.
+  options?: { mintToken?: boolean },
 ): Promise<AcceptInviteResult> {
+  const mintToken = options?.mintToken ?? true
+
   const invite = await env.DB.prepare(
     `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
             pairing_expires_at, capability, invited_by, accepted_at, created_at
@@ -230,12 +250,20 @@ export async function acceptInvite(
   }
   if (invite.accepted_at) return { ok: false, error: 'invite_already_accepted' }
 
+  // WARN-B: cap + validate BEFORE any mutation — a name that fails this check
+  // must not flip accepted_at or spend the invite. 120 matches the web form's
+  // (advisory, client-side-only) maxlength; this is the enforcement.
+  const trimmedDisplayName = displayName.trim()
+  if (!trimmedDisplayName || trimmedDisplayName.length > 120) {
+    return { ok: false, error: 'invalid_display_name' }
+  }
+
   // Mint the member. The email comes from the INVITE (server-trusted), never a
   // caller-supplied value — callers only ever supply the display name.
   const member: Member = {
     id: crypto.randomUUID(),
     email: invite.email,
-    display_name: displayName,
+    display_name: trimmedDisplayName,
     telegram_chat_id: null,
     status: 'active',
     created_at: new Date().toISOString(),
@@ -246,10 +274,11 @@ export async function acceptInvite(
   const scopeType: CapabilityScopeType = invite.department_id ? 'department' : 'org'
   const scopeId: string | null = invite.department_id
 
-  // Mint the workspace token now so we can hand it back exactly once.
-  const rawToken = mintRawToken()
-  const tokenHash = await sha256Hex(rawToken)
-  const tokenId = crypto.randomUUID()
+  // Mint the workspace token now (unless the caller opted out, WARN-C) so we
+  // can hand it back exactly once.
+  const rawToken = mintToken ? mintRawToken() : null
+  const tokenHash = rawToken !== null ? await sha256Hex(rawToken) : null
+  const tokenId = mintToken ? crypto.randomUUID() : null
   const grantId = crypto.randomUUID()
   const acceptedAt = new Date().toISOString()
 
@@ -268,7 +297,7 @@ export async function acceptInvite(
   }
 
   try {
-    const acceptWrites = await env.DB.batch([
+    const writes = [
       env.DB.prepare(
         'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ).bind(
@@ -283,14 +312,24 @@ export async function acceptInvite(
       env.DB.prepare(
         'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
       ).bind(grantId, member.id, scopeType, scopeId, invite.capability),
-      env.DB.prepare(
-        'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
-      ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
-    ])
-    // Receipt (#186): all three mint rows must land before we return `raw`. A
-    // 0-row INSERT does not throw on its own; a partial mint would hand out a
-    // show-once token bound to a broken identity. Failure → the catch rolls the
-    // invite back so the person can retry.
+    ]
+    // WARN-C: only append (and only ever write) the token row when the caller
+    // asked to mint one — the array's length IS the write count assertBatchWritten
+    // below checks, so an HTML-path accept genuinely never inserts into
+    // member_tokens, not merely "never returns" its row.
+    if (mintToken && tokenId !== null && tokenHash !== null) {
+      writes.push(
+        env.DB.prepare(
+          'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
+        ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
+      )
+    }
+    const acceptWrites = await env.DB.batch(writes)
+    // Receipt (#186): every mint row (member + capability, plus the token row
+    // when minted) must land before we return `raw`. A 0-row INSERT does not
+    // throw on its own; a partial mint would hand out a show-once token bound
+    // to a broken identity. Failure → the catch rolls the invite back so the
+    // person can retry.
     assertBatchWritten(acceptWrites, 'invite_accept_mint', 1)
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
@@ -311,18 +350,23 @@ export async function acceptInvite(
       // none), so read it from the invite, not the just-built member row.
       email: invite.email,
       capability: { scope_type: scopeType, scope_id: scopeId, capability: invite.capability },
-      token: {
-        id: tokenId,
-        label: 'workspace',
-        channel: 'workspace' as ConnectionChannel,
-        raw: rawToken,
-      },
+      token:
+        mintToken && tokenId !== null && rawToken !== null
+          ? {
+              id: tokenId,
+              label: 'workspace',
+              channel: 'workspace' as ConnectionChannel,
+              raw: rawToken,
+            }
+          : null,
     },
   }
 }
 
-function acceptInviteErrorStatus(error: AcceptInviteError): 404 | 409 {
-  return error === 'invite_not_found' ? 404 : 409
+function acceptInviteErrorStatus(error: AcceptInviteError): 400 | 404 | 409 {
+  if (error === 'invite_not_found') return 404
+  if (error === 'invalid_display_name') return 400
+  return 409
 }
 
 membersApp.post('/invites/:id/accept', async (c) => {
