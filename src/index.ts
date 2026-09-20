@@ -33,6 +33,7 @@ import { membersApp } from './members'
 import { mcpActionsApp, mcpApp } from './mcp'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
+import { inviteApp } from './dashboard/invite'
 import { channelsApp, reconcileMembership } from './channels'
 import { channelsAdminApp } from './channels/admin'
 import { ghlInboundApp } from './integrations/ghl-routes'
@@ -230,6 +231,13 @@ app.route('/device', deviceApp)
 // Project sub-worker preview (`/preview/:project_id/*`) must precede the
 // dashboard '/' catch-all so the iframe is not redirected through login HTML.
 app.route('/', platformApp)
+
+// Public web invite-landing page (mupot#1436 A1): unauthenticated by design
+// (the invite id is the redemption secret, same as
+// POST /api/members/invites/:id/accept). Its own tiny Hono app so it never
+// passes through dashboardApp's requireAuth / capability-floor middleware —
+// mounted before the dashboard '/' catch-all like every other public prefix.
+app.route('/invite', inviteApp)
 
 app.route(ROUTES.dashboard, dashboardApp)
 

@@ -19,6 +19,7 @@ import { resellerApp } from '../src/reseller/routes'
 import { ssoApp } from '../src/auth/sso-routes'
 import { busApp } from '../src/bus/index'
 import { studioApp } from '../src/dashboard/studio'
+import { inviteApp } from '../src/dashboard/invite'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -43,6 +44,12 @@ const CASES: Case[] = [
   { name: 'bus: emit', app: busApp, path: '/emit', body: { type: 'x' } },
   { name: 'studio: chat', app: studioApp, path: '/chat', body: { message: 'hi' } },
   { name: 'studio: dispatch', app: studioApp, path: '/dispatch', body: {} },
+  // mupot#1436 round 2 P1-D(3): inviteApp is unauthenticated (no session
+  // cookie at all — the invite id is its own redemption secret), so it isn't
+  // "cookie-authenticated" in the sense the rest of this ratchet targets, but
+  // it IS a browser-form mutation target guarded by its own csrf() the same
+  // way the rest of these are — belongs in the same regression net.
+  { name: 'invite: web accept', app: inviteApp, path: '/does-not-exist', body: { display_name: 'Eve' } },
 ]
 
 describe('CSRF on cookie-authenticated top-level mounts', () => {
