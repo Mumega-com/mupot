@@ -281,6 +281,11 @@ export interface Env {
   STRIPE_SECRET_KEY?: string
   STRIPE_WEBHOOK_SECRET?: string
   SUPABASE_WEBHOOK_SECRET?: string
+  // TypeSafe Jev (System One) — used only by the agent_lifecycle intent path.
+  // Absent ⇒ that path returns classifier_unavailable (no guess, no execute).
+  // Explicit `action` never reads this. Secret via `wrangler secret put` if
+  // a deployment wants the free-text path; this pilot does not deploy it.
+  TYPESAFE_API_KEY?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
