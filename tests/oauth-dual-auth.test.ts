@@ -493,7 +493,10 @@ describe('C6 legacyRoleSatisfies escape unreachable for OAuth principals', () =>
     // hasCapability with empty grants returns false for any check.
     expect(hasCapability([], 'org', null, 'admin')).toBe(false)
     expect(hasCapability([], 'org', null, 'member')).toBe(false)
-    expect(hasCapability([], 'squad', 'any-squad', 'member')).toBe(false)
+    // G-FP1b point 1: hasCapability's 'squad' overload requires a real
+    // SquadScope — an empty grants array returns false regardless of shape,
+    // but a real scope object is used here rather than a bare id.
+    expect(hasCapability([], 'squad', { id: 'any-squad', department_id: '', kind: 'work' }, 'member')).toBe(false)
   })
 })
 

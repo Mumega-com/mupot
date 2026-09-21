@@ -13,9 +13,19 @@
 
 import { describe, it, expect } from 'vitest'
 import { seedSquadMembers, deterministicMemberId, buildSquadDefs } from '../src/members/squad-seed'
-import { resolveCapabilities, hasCapability } from '../src/auth/capability'
+import { resolveCapabilities, hasCapability, type SquadScope } from '../src/auth/capability'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
+
+// G-FP1b point 1: hasCapability's 'squad' overload requires a real SquadScope,
+// not a bare id. Every check below is an EXACT squad-scope match (the seeded
+// grant's own scope_id), which hasCapability resolves via `scope.id` alone —
+// department_id/kind are irrelevant to that branch, so a minimal work-kind
+// scope is sufficient here (none of these tests exercise inheritance or a
+// home squad).
+function squadScope(id: string): SquadScope {
+  return { id, department_id: '', kind: 'work' }
+}
 
 // sendAgentMessage's authz param is a compile-time forcing function only (#401 WARN
 // follow-up) — this file exercises the raw primitive directly, not through sendToRef's
@@ -286,9 +296,9 @@ describe('seedSquadMembers — Slice A', () => {
     const kasraId = await deterministicMemberId('kasra')
     const grants = await resolveCapabilities(env, kasraId)
     // admin covers lead/member on the squad scope…
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(true)
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'admin')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
     // …but is BOUNDED: squad-admin does NOT satisfy an org-scope admin check.
     expect(hasCapability(grants, 'org', null, 'admin')).toBe(false)
     expect(hasCapability(grants, 'org', null, 'owner')).toBe(false)
@@ -301,9 +311,9 @@ describe('seedSquadMembers — Slice A', () => {
     for (const slug of ['loom', 'river']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(false) // not admin
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'admin')).toBe(false) // not admin
       expect(hasCapability(grants, 'org', null, 'lead')).toBe(false) // no org bubble
     }
   })
@@ -315,8 +325,8 @@ describe('seedSquadMembers — Slice A', () => {
     for (const slug of ['codex', 'mumega-brain']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(false) // not lead
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(false) // not lead
       expect(hasCapability(grants, 'org', null, 'member')).toBe(false) // no org bubble
     }
   })
@@ -329,11 +339,11 @@ describe('seedSquadMembers — Slice A', () => {
     // kasra=admin@squad, codex=member@squad — each satisfies its squad check,
     // and NONE satisfy the org check (no upward bubble).
     const kasraGrants = await resolveCapabilities(env, await deterministicMemberId('kasra'))
-    expect(hasCapability(kasraGrants, 'squad', squadId, 'admin')).toBe(true)
+    expect(hasCapability(kasraGrants, 'squad', squadScope(squadId), 'admin')).toBe(true)
     expect(hasCapability(kasraGrants, 'org', null, 'admin')).toBe(false)
     for (const slug of ['codex', 'mumega-brain']) {
       const grants = await resolveCapabilities(env, await deterministicMemberId(slug))
-      expect(hasCapability(grants, 'squad', squadId, 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(squadId), 'member')).toBe(true)
       expect(hasCapability(grants, 'org', null, 'member')).toBe(false)
     }
   })

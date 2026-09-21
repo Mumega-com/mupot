@@ -259,7 +259,18 @@ function makeMintEnv(opts: MintEnvOptions = {}): { env: Env; calls: CallRecord[]
               return opts.member ?? null // member-belongs-to-pot check
             }
             if (sql.includes('FROM squads') && sql.includes('department_id')) {
-              return opts.squadDepartmentId ?? null // scopeDeptId inheritance lookup
+              // loadSquadScope (src/auth/capability.ts) — `hasCapabilityOnDynamicScope`'s
+              // squad-scope load. Full SquadScope shape now (id + department_id + kind),
+              // not just the bare department_id the old, separate inheritance-only query
+              // returned — synthesized from squadDepartmentId's department_id plus the
+              // bound scope id, defaulting kind to 'work' (no test here exercises a home
+              // scope through mintScopedKey).
+              if (!opts.squadDepartmentId) return null
+              return {
+                id: call.binds[0],
+                department_id: opts.squadDepartmentId.department_id ?? null,
+                kind: opts.squadDepartmentId.kind ?? 'work',
+              }
             }
             if (sql.includes('FROM squads')) {
               return opts.squad ?? null // squad-exists check

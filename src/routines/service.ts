@@ -297,6 +297,23 @@ async function principalCanMutateRoutinePolicy(
   squadId: string,
 ): Promise<boolean> {
   if (principal.tenant !== env.TENANT_SLUG) return false
+  // G-FP1b point 2/3: workspace_admin's bypass is gated by kind alone — a
+  // SEPARATE, cheap lookup on `squads` directly, deliberately NOT joined to
+  // project_squad_access. The original code checked `workspace_admin` before
+  // any DB read at all, so a workspace_admin bypassed even when no
+  // project_squad_access edge existed yet, and the caller (createRoutine/
+  // updateRoutine) went on to its OWN validateOwnership check for the more
+  // specific `responsible_squad_forbidden` diagnosis. Joining the two checks
+  // into one query (an earlier version of this fix) silently changed that: a
+  // workspace_admin with no edge now got the generic 'forbidden' from THIS
+  // function instead of ever reaching validateOwnership — a real behavior
+  // regression caught by tests/routines-service.test.ts, not just a wrong
+  // error code.
+  const squadKind = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(squadId)
+    .first<{ kind: OrgKind }>()
+  if (principal.workspace_admin && squadKind?.kind !== 'home') return true
+
   const squad = await env.DB.prepare(
     `SELECT s.department_id, s.kind
        FROM squads s
@@ -304,8 +321,6 @@ async function principalCanMutateRoutinePolicy(
       WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
   ).bind(squadId, projectId).first<{ department_id: string; kind: OrgKind }>()
   if (!squad) return false
-  // G-FP1b point 2/3: workspace_admin gated by kind, resolved AFTER we know it.
-  if (principal.workspace_admin && squad.kind !== 'home') return true
   const scope: SquadScope = { id: squadId, department_id: squad.department_id, kind: squad.kind }
   return (
     hasCapability(principal.grants, 'squad', scope, 'admin') ||

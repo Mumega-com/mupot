@@ -1,0 +1,5 @@
+{
+  "_why": "Files where a squad-scope capability check (hasCapability/canOnSquad/canOnSquadAuth/memberCanOnSquad/memberCanOnSquadAuth/actorRankOnScopeFor) is called with the typechecker suppressed (@ts-ignore/@ts-expect-error) or an `as any`/`as SquadScope` cast, forcing a bare id past the SquadScope requirement (mupot#1452 round 2 defect class). RATCHET: this list may only shrink. scripts/check-bare-squad-id-authz.mjs fails on any file not listed, and ALSO fails if a listed file no longer violates (a fixed file must leave the list, or the ratchet becomes an exemption).",
+  "_measured": "2026-09-21, against main 2c432623, FP-01 Slice 1 v2 (G-FP1b)",
+  "files": []
+}

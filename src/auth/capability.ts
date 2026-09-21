@@ -268,8 +268,13 @@ export async function hasCapabilityOnDynamicScope(
     return hasCapability(grants, 'department', scopeId, min)
   }
   if (!scopeId) return false
-  const scope = await loadSquadScope(env, scopeId)
-  if (!scope) return false
+  // resolveSquadScopeArg (not loadSquadScope directly): a scope_id with no
+  // backing `squads` row must still resolve for an EXACT squad-scope grant
+  // match (capabilities.scope_id carries no FK — see resolveSquadScopeArg's
+  // own doc comment). loadSquadScope alone would return null here and this
+  // function would answer false even when an exact grant on that literal
+  // scope_id exists.
+  const scope = await resolveSquadScopeArg(env, scopeId)
   return hasCapability(grants, 'squad', scope, min)
 }
 
@@ -313,9 +318,25 @@ export type CapabilityScope = (c: Context) => { type: CapabilityScopeType; id: s
 // is the one loader boundary where a bare squad id is legitimately allowed
 // IN — it is resolved to a real SquadScope before a single capability check
 // ever runs, and `hasCapability` itself never sees the bare id.
-async function resolveSquadScopeArg(env: Env, squadIdOrScope: string | SquadScope): Promise<SquadScope | null> {
+async function resolveSquadScopeArg(env: Env, squadIdOrScope: string | SquadScope): Promise<SquadScope> {
   if (typeof squadIdOrScope !== 'string') return squadIdOrScope
-  return loadSquadScope(env, squadIdOrScope)
+  const loaded = await loadSquadScope(env, squadIdOrScope)
+  if (loaded) return loaded
+  // No backing `squads` row (capabilities.scope_id carries no FK — see
+  // migrations/0002_members.sql and
+  // tests/agent-bound-oauth-consent.test.ts's "no FK, nothing stops a stray
+  // value" coverage). This is intentional, tested product behaviour: an
+  // EXACT squad-scope grant on a scope_id with no backing row must still
+  // resolve — the pre-G-FP1b implementation allowed exactly this (a
+  // nonexistent squad's resolveSquadDepartment returned null, so only
+  // hasCapability's exact-match and org-wide branches could ever fire; department
+  // inheritance was already structurally impossible). `department_id: ''`
+  // can never collide with a real department id (always a UUID), so this
+  // synthetic scope still blocks department-scope inheritance exactly as
+  // the old null-deptId did — it only ever satisfies an EXACT match on
+  // `squadIdOrScope` itself. `kind: 'work'` is moot here: the exact-match
+  // branch never consults it.
+  return { id: squadIdOrScope, department_id: '', kind: 'work' }
 }
 
 /**
@@ -338,7 +359,6 @@ export async function canOnSquad(
   min: Capability,
 ): Promise<boolean> {
   const scope = await resolveSquadScopeArg(env, squadIdOrScope)
-  if (!scope) return false
   return hasCapability(grants, 'squad', scope, min)
 }
 
@@ -383,7 +403,6 @@ export async function canOnSquadAuth(
   min: Capability,
 ): Promise<boolean> {
   const scope = await resolveSquadScopeArg(env, squadIdOrScope)
-  if (!scope) return false
   // The legacy ROLE plane, asked at the caller's OWN `min` — not at isOrgAdmin's
   // fixed admin-rank question. isOrgAdmin answers "is this an org admin?"; that is
   // the right question for the two call sites here (both pass 'admin'), but it
@@ -545,10 +564,12 @@ export async function actorRankOnScopeFor(
   // ORG-scope-shaped fact, and must be gated by planeCoversScope on a squad
   // scope — a legacy owner/admin's rank on a home squad is 0 from this
   // floor, same as it is via hasCapability's own org/role-plane exclusion.
+  // resolveSquadScopeArg (not loadSquadScope directly): a scope_id with no
+  // backing `squads` row must still resolve for an EXACT squad-scope grant
+  // match — see resolveSquadScopeArg's own doc comment.
   let squadScope: SquadScope | null = null
   if (scopeType === 'squad' && scopeId) {
-    squadScope = await loadSquadScope(env, scopeId)
-    if (!squadScope) return 0
+    squadScope = await resolveSquadScopeArg(env, scopeId)
   }
   const roleCovers = squadScope ? planeCoversScope('role', squadScope) : true
   let max = roleCovers ? (auth.role === 'owner' ? RANK.owner : auth.role === 'admin' ? RANK.admin : 0) : 0

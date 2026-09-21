@@ -28,7 +28,7 @@ const ADMIN_MEMBER_ID = 'member-admin'
 
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
-    CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL);
+    CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'work');
     CREATE TABLE capabilities (
       id TEXT PRIMARY KEY, member_id TEXT NOT NULL, scope_type TEXT NOT NULL,
       scope_id TEXT, capability TEXT NOT NULL
