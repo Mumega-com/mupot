@@ -12,7 +12,7 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../types'
 import { requireAuth } from '../auth'
-import { isOrgAdmin } from '../auth/capability'
+import { isOrgAdmin, canOnSquadAuth } from '../auth/capability'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 
@@ -84,10 +84,12 @@ export async function loadKanbanData(
       return { mode: 'project', project: null, lanes: [] }
     }
 
-    // Load tasks for project, strictly filtered to accessible squads
+    // Load tasks for project, strictly filtered to accessible squads. A home
+    // squad (mupot#1452 P0-1: a member's private room) is excluded from this
+    // rollup unconditionally — even for an org admin/isAllAccessible caller.
     const squadFilter = isAllAccessible
-      ? ''
-      : ' AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))'
+      ? " AND s.kind != 'home'"
+      : " AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)) AND s.kind != 'home'"
     
     const taskRows = await env.DB.prepare(`
       SELECT 
@@ -146,11 +148,12 @@ export async function loadKanbanData(
     }
   }
 
-  // 3. Matrix View (?view=matrix) — Multi-Squad Org Grid
+  // 3. Matrix View (?view=matrix) — Multi-Squad Org Grid. Home squads (mupot#1452
+  // P0-1) are excluded from this org-wide rollup unconditionally.
   if (params.view === 'matrix') {
     const squadFilter = isAllAccessible
-      ? ''
-      : ' WHERE t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+      ? " WHERE s.kind != 'home'"
+      : " WHERE t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1)) AND s.kind != 'home'"
 
     const taskRows = await env.DB.prepare(`
       SELECT 
@@ -214,8 +217,16 @@ export async function loadKanbanData(
   if (params.squadIdOrSlug) {
     targetSquad = await env.DB.prepare('SELECT * FROM squads WHERE id = ?1 OR slug = ?1').bind(params.squadIdOrSlug).first<Squad>()
     if (targetSquad) {
-      // Enforce Squad-scope authorization
-      if (!isAllAccessible && (!accessibleSquadIds || !accessibleSquadIds.includes(targetSquad.id))) {
+      // Enforce Squad-scope authorization. mupot#1452 P0-1: a kind='home' squad
+      // (a member's private room) is NEVER covered by isAllAccessible (org-admin
+      // or org-wide grant) — accessibleSquadIds is `null` for that caller
+      // precisely because resolveAccessibleSquadIds short-circuits before
+      // resolving a per-squad list, so a home squad needs its OWN exact check
+      // here rather than trusting the org-wide bypass.
+      const allowed = targetSquad.kind === 'home'
+        ? await canOnSquadAuth(env, auth, targetSquad.id, 'observer')
+        : isAllAccessible || (!!accessibleSquadIds && accessibleSquadIds.includes(targetSquad.id))
+      if (!allowed) {
         return { mode: 'squad', squad: null, lanes: [] }
       }
       targetSquadId = targetSquad.id
@@ -224,8 +235,10 @@ export async function loadKanbanData(
     targetSquadId = accessibleSquadIds[0]
     targetSquad = await env.DB.prepare('SELECT * FROM squads WHERE id = ?1').bind(targetSquadId).first<Squad>()
   } else if (isAllAccessible) {
-    // Only org admins may default to the first squad in DB
-    targetSquad = await env.DB.prepare('SELECT * FROM squads ORDER BY created_at ASC LIMIT 1').first<Squad>()
+    // Only org admins may default to the first squad in DB — home squads
+    // (mupot#1452 P0-1) are excluded so an org admin never lands on a
+    // member's private room by mere alphabetical/creation-order default.
+    targetSquad = await env.DB.prepare("SELECT * FROM squads WHERE kind != 'home' ORDER BY created_at ASC LIMIT 1").first<Squad>()
     if (targetSquad) targetSquadId = targetSquad.id
   }
 

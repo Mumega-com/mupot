@@ -198,3 +198,63 @@ describe('BLOCK-1: input.kind is inert on the real schema — only opts.kind is 
     harness.close()
   })
 })
+
+// mupot#1452 P1-7: src/departments/registry.ts's addon-activation entitlement
+// gate had its OWN, unfiltered `SELECT COUNT(*) FROM squads` — unlike its three
+// siblings above (org/service.ts's department/squad/agent create gates), it
+// counted every squad regardless of kind, so existing HOME squads (a member's
+// private room) inflated the count against an addon activation's maxSquads
+// ceiling. Real migration chain + a REAL registered module (FixtureModule,
+// 1 default squad) — not the hand-rolled SQL-pattern-matching mock the other
+// activate() suites use, which does not model `kind` on a squad row at all and
+// so cannot see this defect.
+describe('mupot#1452 P1-7: departments/registry.ts activation gate counts only kind=\'work\' squads', () => {
+  it('existing HOME squads do not count against an addon activation\'s maxSquads ceiling (free tier, maxSquads=1)', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const env = envFor(harness)
+    const { register, activate } = await import('../src/departments/registry')
+    const { FixtureModule } = await import('../src/departments/modules/fixture')
+    register(FixtureModule)
+
+    // Three home squads pre-exist (e.g. three members' private rooms) — none
+    // of them may count toward the free tier's maxSquads=1 ceiling that
+    // FixtureModule's single default squad must fit under.
+    const homeDept = await createDepartment(env, { slug: 'dept-homes', name: 'Homes' }, { kind: 'home' })
+    if (!homeDept.ok) throw new Error('setup failed')
+    for (let i = 0; i < 3; i += 1) {
+      const home = await createSquad(env, homeDept.value.id, { slug: `home-${i}`, name: `Home ${i}` }, { kind: 'home' })
+      expect(home.ok).toBe(true)
+    }
+
+    const result = await activate(harness.db, 'fixture')
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(`activation unexpectedly failed: ${JSON.stringify(result)}`)
+    expect(result.seeded).toBe(true)
+
+    harness.close()
+  })
+
+  it('MUTATION-GUARD-SENSITIVE COUNTERPART: existing WORK squads DO count and can block activation (proves the query is not simply unconditional-pass)', async () => {
+    const harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const env = envFor(harness)
+    const { register, activate } = await import('../src/departments/registry')
+    const { FixtureModule } = await import('../src/departments/modules/fixture')
+    register(FixtureModule)
+
+    // One work squad already consumes the free tier's maxSquads=1 ceiling —
+    // FixtureModule's one default squad must now be refused.
+    const workDept = await createDepartment(env, { slug: 'dept-work', name: 'Work' })
+    if (!workDept.ok) throw new Error('setup failed')
+    const existing = await createSquad(env, workDept.value.id, { slug: 'existing-work', name: 'Existing' })
+    expect(existing.ok).toBe(true)
+
+    const result = await activate(harness.db, 'fixture')
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('activation should have been refused')
+    expect(result.reason).toBe('squad_limit_reached')
+
+    harness.close()
+  })
+})

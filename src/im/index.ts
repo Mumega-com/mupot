@@ -29,7 +29,6 @@ import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import type {
   Env,
   Member,
-  Capability,
   CapabilityGrant,
   BusEvent,
   Agent,
@@ -37,7 +36,7 @@ import type {
   Task,
   AuthContext,
 } from '../types'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, canOnSquad as canOnSquadCore } from '../auth/capability'
 import { createBus } from '../bus'
 import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError } from '../tasks/service'
 import { evaluateVerdictGates } from '../tasks/index'
@@ -104,33 +103,13 @@ export async function memberForChat(env: Env, chatId: string): Promise<Member | 
   return row
 }
 
-// ── scope helpers (frozen 4-arg hasCapability + explicit inheritance) ─────────
-// The frozen API is hasCapability(grants, scopeType, scopeId, min). Per the
-// contract: an 'org' grant applies to ALL scopes (handled inside hasCapability);
-// a 'department' grant applies to that department AND its squads; a 'squad' grant
-// applies to that squad. To gate a SQUAD action we therefore check the squad
-// grant AND the squad's department grant explicitly — fail-closed if the squad's
-// department can't be resolved (unknown squad → no inheritance, no access).
-async function squadDepartmentId(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
-
-async function canOnSquad(
-  env: Env,
-  grants: CapabilityGrant[],
-  squadId: string,
-  min: Capability,
-): Promise<boolean> {
-  // squad-level grant (also covers an org grant, per hasCapability's contract)
-  if (hasCapability(grants, 'squad', squadId, min)) return true
-  // inherited department-level grant
-  const deptId = await squadDepartmentId(env, squadId)
-  if (deptId && hasCapability(grants, 'department', deptId, min)) return true
-  return false
-}
+// ── scope helper ────────────────────────────────────────────────────────────
+// Delegates to the canonical src/auth/capability.ts#canOnSquad — single
+// implementation, so the kind='home' exclusion (mupot#1452 P0-1: org and
+// department grants never cover a member's private home squad) lives in ONE
+// place rather than being re-derived here via a hand-rolled squad+department
+// hasCapability pair that would need the same fix applied a second time.
+const canOnSquad = canOnSquadCore
 
 // ── lookups: a human types a NAME/slug, not a uuid ────────────────────────────
 // We resolve a free-text reference to exactly one squad/agent in THIS pot. We

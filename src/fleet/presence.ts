@@ -293,9 +293,18 @@ export async function touchPresence(
   }
 }
 
+// mupot#1452 P0-1 / Athena's ruling: a home squad (a member's private room)
+// stays out of every work-tree rollup, presence included — and this exclusion
+// is UNCONDITIONAL, applied before the `squadIds` scoping below, so it also
+// covers the `null` ("unrestricted", org-scope grant / legacy owner/admin)
+// case that would otherwise show every home agent's check-in to any org admin.
 const PRESENCE_SELECT = `SELECT member_id, display_name, source, label, agent_id, last_seen_at, first_seen_at,
        harness, machine, model, provider, effort, flight_id
-       FROM presence WHERE tenant = ?1`
+       FROM presence
+      WHERE tenant = ?1
+        AND (agent_id IS NULL OR agent_id NOT IN (
+          SELECT a.id FROM agents a JOIN squads s ON s.id = a.squad_id WHERE s.kind = 'home'
+        ))`
 
 /**
  * listPresence — the pot's flock/check-in roster.

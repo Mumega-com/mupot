@@ -34,7 +34,7 @@ describe('resolveReadableSquadIds', () => {
   it('collects complete naturally deduplicated scope through bounded keyset pages', async () => {
     harness = createSqliteD1()
     harness.sqlite.exec(`
-      CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL);
+      CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'work');
       WITH RECURSIVE seq(n) AS (
         VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 1200
       )
@@ -57,7 +57,7 @@ describe('resolveReadableSquadIds', () => {
 
   it('terminates after one empty bounded page', async () => {
     harness = createSqliteD1()
-    harness.sqlite.exec('CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL)')
+    harness.sqlite.exec("CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'work')")
     const calls: QueryCall[] = []
     const env = { DB: probedDb(harness.db, calls) } as Env
 

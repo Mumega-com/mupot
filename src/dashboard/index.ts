@@ -54,6 +54,8 @@ import {
   hasSurfaceCap,
   isOrgAdmin,
   holdsCapabilityFloor,
+  canOnSquadAuth,
+  canOnSquad as canOnSquadCore,
 } from '../auth/capability'
 // Legible refusals (#530 follow-on): a 403 that names the signed-in principal and
 // their actual standing, not just the requirement they failed. See src/auth/refusal.ts.
@@ -1677,7 +1679,17 @@ dashboardApp.get('/squads/:id', async (c) => {
     return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
   }
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
+  // mupot#1452 P0-1: a kind='home' squad is NEVER covered by org-scope read
+  // (legacy role or grant) — only an exact squad-scope grant qualifies, so the
+  // isOrgAdmin bypass below must not reach it. canOnSquadRead already excludes
+  // org/department grants for a home squad; the outer isOrgAdmin shortcut is
+  // the piece that used to skip calling it at all for an org admin/owner.
+  if (squad.kind === 'home') {
+    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+    if (!(await canOnSquadRead(c.env, grants, squadId))) {
+      return c.html(shell(c.env, 'Squad', errorBody('You do not have access to this squad.')), 403)
+    }
+  } else if (!isOrgAdmin(auth)) {
     const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
     const orgRead = hasCapability(grants, 'org', null, 'observer')
     const squadRead = orgRead || (await canOnSquadRead(c.env, grants, squadId))
@@ -1739,7 +1751,16 @@ dashboardApp.get('/agents/:id', async (c) => {
     return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
   }
   const auth = c.get('auth')
-  if (!isOrgAdmin(auth)) {
+  const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
+  // mupot#1452 P0-1: an agent living on a kind='home' squad is NEVER covered by
+  // org-scope read (legacy role or grant) — see the identical gate on
+  // GET /squads/:id above for the full rationale.
+  if (squad?.kind === 'home') {
+    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+    if (!(await canOnSquadRead(c.env, grants, agent.squad_id))) {
+      return c.html(shell(c.env, 'Agent', errorBody('You do not have access to this agent.')), 403)
+    }
+  } else if (!isOrgAdmin(auth)) {
     const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
     const orgRead = hasCapability(grants, 'org', null, 'observer')
     const squadRead = orgRead || (await canOnSquadRead(c.env, grants, agent.squad_id))
@@ -1747,7 +1768,6 @@ dashboardApp.get('/agents/:id', async (c) => {
       return c.html(shell(c.env, 'Agent', errorBody('You do not have access to this agent.')), 403)
     }
   }
-  const squad = await getById<Squad>(c.env, 'squads', agent.squad_id)
   // Mirror the wake API's real gate (lead+ on the agent's squad) so squad leads
   // see a working button — the API re-checks server-side either way.
   const canWake = await canOnSquad(c.env, auth, agent.squad_id)
@@ -2832,17 +2852,14 @@ dashboardApp.post('/squads/:id/agents/join', async (c) => {
   if (!squad) return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
   // Join writes a membership — requires admin on the TARGET squad (same gate as
   // POST /agents/:id/memberships in src/org/index.ts; dept grants inherit).
-  if (isOrgAdmin(auth)) {
-    // org-admin ok
-  } else {
-    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
-    const deptId = await squadDepartment(c.env, squadId)
-    if (!hasCapability(grants, 'squad', squadId, 'admin', deptId)) {
-      return c.html(
-        shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent requires admin on this squad.')),
-        403,
-      )
-    }
+  // canOnSquadAuth (mupot#1452 P0-1): a kind='home' squad excludes the org-admin
+  // shortcut this route used to take unconditionally — an org admin with no
+  // exact admin grant on a member's private home is refused like anyone else.
+  if (!(await canOnSquadAuth(c.env, auth, squadId, 'admin'))) {
+    return c.html(
+      shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent requires admin on this squad.')),
+      403,
+    )
   }
 
   const form = await c.req.parseBody()
@@ -2963,14 +2980,6 @@ function hasOrgOwnerCapability(auth: AuthContext): boolean {
 // agents (with department→squad inheritance). isOrgAdmin() doubles as the legacy
 // owner/admin escape, identical to requireCapability's.
 
-/** Resolve a squad's department for department→squad capability inheritance. */
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
-
 /** org-scope capability gate (e.g. minting a token / creating a department → admin). */
 async function canOnOrg(env: Env, auth: AuthContext, min: 'admin' | 'owner'): Promise<boolean> {
   if (isOrgAdmin(auth)) return true
@@ -2991,13 +3000,12 @@ async function canOnDepartment(
   return hasCapability(grants, 'department', departmentId, 'admin')
 }
 
-/** squad-scope gate (creating an agent → lead on THAT squad, dept grants inherit). */
+/** squad-scope gate (creating an agent → lead on THAT squad, dept grants inherit).
+ *  Delegates to the canonical src/auth/capability.ts#canOnSquadAuth (mupot#1452
+ *  P0-1: excludes the org-admin / department shortcuts for a kind='home' squad,
+ *  where only an exact squad-scope grant qualifies). */
 async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
-  if (!auth.memberId) return false
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, 'lead', deptId)
+  return canOnSquadAuth(env, auth, squadId, 'lead')
 }
 
 /**
@@ -3007,10 +3015,11 @@ async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise
  * its board, matching the read floor everywhere else in this file (agent
  * roster, projects). Takes already-resolved `grants` (caller already resolved
  * them for the org-read check this is OR'd with) rather than re-querying.
+ * Delegates to the canonical canOnSquad (grants-only variant) for the same
+ * kind='home' exclusion reason as canOnSquad above.
  */
 async function canOnSquadRead(env: Env, grants: CapabilityGrant[], squadId: string): Promise<boolean> {
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, 'observer', deptId)
+  return canOnSquadCore(env, grants, squadId, 'observer')
 }
 
 async function loadMembers(env: Env): Promise<Member[]> {

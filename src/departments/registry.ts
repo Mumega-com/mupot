@@ -409,8 +409,14 @@ export function createDepartmentRegistry(): DepartmentRegistry {
         }
       }
       if (!existingSeedReceipt && module.defaultSquads.length > 0) {
+        // mupot#1452 P1-7: count only kind='work' squads against the plan
+        // ceiling, like its three siblings in src/org/service.ts (departments,
+        // squads, agents) — a member's private kind='home' squad is
+        // structurally exempt from every plan counter (mupot#925 P0-N1), so
+        // counting it here would make an addon activation fail closed for a
+        // reason that has nothing to do with the addon's own squads.
         const squadCount =
-          (await db.prepare('SELECT COUNT(*) AS n FROM squads').bind().first<{ n: number }>())?.n ?? 0
+          (await db.prepare("SELECT COUNT(*) AS n FROM squads WHERE kind = 'work'").bind().first<{ n: number }>())?.n ?? 0
         const tier = await resolveTierFromDb(db)
         if (!withinLimit(tier, 'maxSquads', squadCount + module.defaultSquads.length)) {
           return {
