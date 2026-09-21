@@ -1,4 +1,4 @@
-import { canOnSquad, hasCapability, resolveCapabilities, type SquadScope } from './capability'
+import { brandSquadScope, canOnSquad, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import { resolveAgentMemberBinding } from '../members/service'
 import type { AuthContext, Env, OrgKind } from '../types'
 
@@ -98,7 +98,7 @@ async function findAgentAuthorizedForLead(
   ).bind(agentId, auth.memberId).first<AuthorizedAgentRow>()
   if (!agent) return null
 
-  const agentScope: SquadScope = { id: agent.squad_id, department_id: agent.department_id, kind: agent.kind }
+  const agentScope = brandSquadScope({ id: agent.squad_id, department_id: agent.department_id, kind: agent.kind })
   if (
     auth.capabilities !== undefined
     && !hasCapability(auth.capabilities, 'squad', agentScope, 'lead')
@@ -115,7 +115,37 @@ async function authorizeRouterScope(
 ): Promise<ExecutionScopeDecision> {
   const required = request.action === 'router:read' ? 'observer' : 'lead'
   const actorMemberId = auth.memberId
-  if (!actorMemberId || !(await principalCanOnSquad(env, auth, request.squadId, required))) {
+  if (!actorMemberId) return forbidden()
+
+  // Athena's reconciliation on fail-closed vs planeCoversScope (adversarial
+  // round on G-FP1b): "authz on an unknown squad row fails closed (no
+  // authority), but a caller that legitimately references a deleted squad
+  // gets a 404-class result, not a 403, where existing tests expect that —
+  // that is a loader/route concern, not a predicate one." principalCanOnSquad
+  // now correctly fails closed for EVERY caller (org-admin included) on a
+  // squad row that doesn't exist, which would otherwise collapse an org
+  // admin's "missing squad" into the SAME 403 an ordinary caller's
+  // "unauthorized OR missing" gets — losing the 404 existing tests expect.
+  // Special-case only the org-admin plane here, ahead of the fail-closed
+  // predicate: an org admin's authority does not depend on resolving a
+  // SquadScope for a nonexistent row, so its existence is checked directly.
+  // A non-admin caller is UNAFFECTED — principalCanOnSquad below still fails
+  // closed identically for "unauthorized" and "missing" (the anti-
+  // enumeration property below this function).
+  if (await principalIsOrgAdmin(env, auth)) {
+    const squad = await loadSquadScope(env, request.squadId)
+    if (!squad) return notFound()
+    if (!planeCoversScope('org', squad)) return forbidden()
+    return {
+      ok: true,
+      tenant: env.TENANT_SLUG,
+      squadId: squad.id,
+      agentId: null,
+      source: 'principal',
+    }
+  }
+
+  if (!(await principalCanOnSquad(env, auth, request.squadId, required))) {
     return forbidden()
   }
 
@@ -161,6 +191,12 @@ async function authorizeMeterScope(
       .bind(request.agentId)
       .first<{ id: string; squad_id: string }>()
     if (!agent) return notFound()
+    // Adversarial round 1 (Athena, P2): this used to bypass unconditionally
+    // — an org admin could read execution-meter data for an agent living in
+    // another member's home squad. Fail closed on an unknown squad row too
+    // (never treat a missing row as a work squad).
+    const scope = await loadSquadScope(env, agent.squad_id)
+    if (!scope || !planeCoversScope('org', scope)) return forbidden()
     return {
       ok: true,
       tenant: env.TENANT_SLUG,

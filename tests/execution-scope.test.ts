@@ -131,6 +131,26 @@ describe('authorizeExecutionScope', () => {
     })).resolves.toEqual({ ok: false, status: 404, error: 'not_found' })
   })
 
+  // Athena's fail-closed/404-vs-403 reconciliation (adversarial round on
+  // G-FP1b): the org-admin fast path added to authorizeRouterScope to
+  // restore the 404-on-missing-squad property above must NOT become a new
+  // route ahead of the home-squad scope check — an org admin naming a REAL
+  // home squad must still be refused (403), never treated as "not found"
+  // (which would itself leak "this squad id exists" for a home squad) and
+  // never admitted.
+  it('refuses (403, not 404 or ok) when an org admin names a REAL home-kind squad for router access', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind)
+      VALUES ('squad-home-router', '${DEPARTMENT}', 'home-router', 'Home', 'home');
+    `)
+    await expect(authorizeExecutionScope(env, auth('org-admin'), {
+      action: 'router:read', squadId: 'squad-home-router',
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+    await expect(authorizeExecutionScope(env, auth('org-admin'), {
+      action: 'router:mutate', squadId: 'squad-home-router',
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
   it('denies a directory session with an empty ambient ceiling despite a durable squad lead grant', async () => {
     const clamped = auth('lead-a', { channel: 'directory', capabilities: [] })
 
@@ -261,5 +281,68 @@ describe('authorizeExecutionScope', () => {
     await expect(authorizeExecutionScope(env, auth('member-a', { boundAgentId: AGENT_A }), {
       action: 'meter:read', agentId: AGENT_A,
     })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+})
+
+// Adversarial round 1 P1 (Athena): "two mutation survivors" in this file —
+// findAgentAuthorizedForLead's raw-SQL EXISTS clause (src/auth/execution-
+// scope.ts:79-96) replicates hasCapability's org/department inheritance rule
+// inline rather than going through planeCoversScope, so it needed the same
+// kind='home' exclusion hand-added to both disjuncts (s.kind != 'home'). A
+// home squad is the ONE case that distinguishes "exclusion present" from
+// "exclusion silently deleted" — every existing test above uses only work
+// squads, so none of them would notice either leg going missing.
+describe('authorizeExecutionScope — home squad exclusion (G-FP1b point 2)', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+  const HOME_SQUAD = 'squad-home-agent'
+  const HOME_AGENT = 'agent-home'
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seed(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind)
+      VALUES ('${HOME_SQUAD}', '${DEPARTMENT}', 'home-agent', 'Home', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+      VALUES ('${HOME_AGENT}', '${HOME_SQUAD}', 'home-agent', 'Home Agent', 'active');
+      INSERT INTO members (id, display_name, status, tenant) VALUES
+        ('org-lead', 'Org Lead', 'active', '${TENANT}'),
+        ('dept-lead', 'Dept Lead', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('org-lead-org', 'org-lead', 'org', NULL, 'lead'),
+        ('dept-lead-dept', 'dept-lead', 'department', '${DEPARTMENT}', 'lead');
+    `)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as Env
+  })
+
+  afterEach(() => harness.close())
+
+  it('org-admin bypass (principalIsOrgAdmin path): refused for an agent living in a home squad', async () => {
+    await expect(authorizeExecutionScope(env, auth('org-admin'), {
+      action: 'meter:read', agentId: HOME_AGENT,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('findAgentAuthorizedForLead ORG leg: an org-scope LEAD durable grant does not reach an agent in a home squad', async () => {
+    await expect(authorizeExecutionScope(env, auth('org-lead', { capabilities: undefined }), {
+      action: 'meter:read', agentId: HOME_AGENT,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('findAgentAuthorizedForLead DEPARTMENT leg: a department-scope LEAD durable grant on the home\'s OWN department does not reach the home agent', async () => {
+    await expect(authorizeExecutionScope(env, auth('dept-lead', { capabilities: undefined }), {
+      action: 'meter:read', agentId: HOME_AGENT,
+    })).resolves.toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+
+  it('sanity: the SAME org/department durable grants DO reach an agent on a real work squad in that department', async () => {
+    await expect(authorizeExecutionScope(env, auth('org-lead', { capabilities: undefined }), {
+      action: 'meter:read', agentId: AGENT_A,
+    })).resolves.toEqual({ ok: true, tenant: TENANT, squadId: SQUAD_A, agentId: AGENT_A, source: 'principal' })
+    await expect(authorizeExecutionScope(env, auth('dept-lead', { capabilities: undefined }), {
+      action: 'meter:read', agentId: AGENT_A,
+    })).resolves.toEqual({ ok: true, tenant: TENANT, squadId: SQUAD_A, agentId: AGENT_A, source: 'principal' })
   })
 })
