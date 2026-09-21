@@ -1592,11 +1592,19 @@ describe('Telegram project invitation service', () => {
     const joined = harness.sqlite.prepare(`
       SELECT id FROM members WHERE telegram_chat_id = '9002001' AND tenant = ?
     `).get(TENANT) as { id: string }
-    expect(harness.sqlite.prepare(`
-      SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = ?
-    `).all(joined.id)).toEqual([{
-      scope_type: 'squad', scope_id: 'squad-participants', capability: 'member',
-    }])
+    // FP-01 Slice 2 v2 (successor to PR #1488, plugin v2 contract §2f(a)
+    // point 3): the SAME /start reply is this member's first message, so
+    // memberIntakeEnvelope ALSO provisions a home squad + 'admin' capability
+    // there right away — a second row alongside the squad-participants
+    // 'member' grant from the invite redemption itself.
+    {
+      const grants = harness.sqlite.prepare(`
+        SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = ? ORDER BY capability
+      `).all(joined.id) as { scope_type: string; scope_id: string; capability: string }[]
+      expect(grants).toHaveLength(2)
+      expect(grants).toContainEqual({ scope_type: 'squad', scope_id: 'squad-participants', capability: 'member' })
+      expect(grants.find(g => g.scope_id !== 'squad-participants')).toMatchObject({ scope_type: 'squad', capability: 'admin' })
+    }
     harness.sqlite.prepare(`
       INSERT INTO gate_grants (
         id, capability, principal_type, principal_id, granted_by, created_at

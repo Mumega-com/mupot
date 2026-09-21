@@ -355,6 +355,15 @@ describe('Routine proposal submission and governed actions', () => {
 
   it('routes propose mode through the existing Task review gate', async () => {
     fixture = await makeReadyRoutineFixture('propose')
+    // FP-01 Slice 2 v2 (successor to PR #1488, P1-6): notifyHumanWait now
+    // addresses the RESOLVED gate:routines holder, never run.assigned_agent_id
+    // (the submitting agent, agent-1) — a gate_grants row is required for a
+    // 'delivered' outcome. agent-2 (already present in this fixture, squad-1
+    // member) is the live holder here.
+    fixture.harness.sqlite.exec(`
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('gate-routines-agent2', 'gate:routines', 'agent', 'agent-2', 'test', datetime('now'));
+    `)
     let insertAttempts = 0
     const notifyingEnv = observeHumanWaitMessage(fixture.env, () => {
       insertAttempts += 1
@@ -381,7 +390,7 @@ describe('Routine proposal submission and governed actions', () => {
     })
     const message = row(fixture, "SELECT to_agent, from_agent, from_member, kind, request_id, project_id, body FROM agent_messages")
     expect(message).toMatchObject({
-      to_agent: 'agent-1', from_agent: 'mupot-routines', from_member: 'system:routines',
+      to_agent: 'agent-2', from_agent: 'mupot-routines', from_member: 'system:routines',
       kind: 'ack', request_id: 'routine-human:run-1:task-1', project_id: 'project-1',
     })
     expect(JSON.parse(String(message?.body))).toEqual({
@@ -394,7 +403,7 @@ describe('Routine proposal submission and governed actions', () => {
       decision: { type: 'review', task_id: 'control-task' },
     })
     const lease = await leaseAgentInbox(fixture.env, {
-      agent: 'agent-1', limit: 1, leaseSeconds: 60,
+      agent: 'agent-2', limit: 1, leaseSeconds: 60,
     })
     expect(lease).toMatchObject({
       ok: true,

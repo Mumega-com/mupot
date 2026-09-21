@@ -1256,6 +1256,12 @@ export interface WriteVerdictInput {
   // both columns stay NULL, unchanged from before this fields existed.
   decidedVia?: 'agent_attested_origin'
   originAgentId?: string | null
+  // proposalId (0159_task_verdict_proposal_binding.sql, FP-01 Slice 2 v2,
+  // successor to PR #1488's P0-2): the routine_run_actions.id this verdict
+  // decides. Callers should not compute this themselves — resolve it via
+  // resolveVerdictProposalId and pass the result straight through; writeVerdict
+  // does this automatically for its own callers when omitted (see below).
+  proposalId?: string | null
 }
 
 export class VerdictRaceError extends Error {
@@ -1263,6 +1269,78 @@ export class VerdictRaceError extends Error {
     super(`verdict_race: task ${taskId} is no longer in review (concurrent verdict won)`)
     this.name = 'VerdictRaceError'
   }
+}
+
+// resolveVerdictProposalId — FP-01 Slice 2 v2 (successor to PR #1488, P0-2).
+// Binds a verdict to the SPECIFIC routine proposal it decides, closing the
+// "latest verdict on the control task" replay class (ADVERSARIAL PATTERN
+// LIBRARY, kasra-review 2026-09-21, PR #1488, finding 2). This is a raw
+// table read on routine_run_actions, NOT a call into src/routines/actions.ts
+// — that module already imports from this file (`tasks/service`), so an
+// import the other direction would be a cycle. There can be at most ONE
+// routine_run_actions row waiting on a given control task at a time (by
+// construction: reserveAction refuses a second proposal while an earlier
+// one is still 'pending'/'waiting' on the same run), so this is a lookup,
+// not a heuristic — the row IS the proposal this human-review gate exists
+// for, or there is none (an ordinary, non-routine task review) and the
+// verdict's proposal_id stays NULL, unchanged from every verdict cast
+// before this feature existed.
+// markVerdictReversed — FP-01 Slice 2 v2 (successor to PR #1488, Athena's
+// design ruling on the successor brief): task_verdict_reverse previously
+// wrote NO new task_verdicts row at all (only the verdict_reversals audit
+// receipt + the task's own status flip back to 'review') — the ORIGINAL
+// verdict row stayed the "latest verdict" forever, so a proposal-bound
+// reader had no way to know it had been undone. Called from BOTH reversal
+// write surfaces (the HTTP PATCH twin and the MCP task_update tool — the
+// same two call sites that already write the verdict_reversals receipt) at
+// the exact moment a reversal is confirmed, so the two facts (the audit
+// receipt existing, and the verdict itself being marked reversed) can never
+// drift apart. Targets the SAME row `ORDER BY decided_at DESC, id DESC LIMIT 1`
+// resolves for approvedGate/latestTaskVerdict-style reads — the one this
+// reversal is actually undoing — and is a no-op (0 rows) if that row is
+// already reversed, making the call idempotent under retry.
+export async function markVerdictReversed(env: Env, taskId: string, reversedAt: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE task_verdicts SET reversed_at = ?
+      WHERE id = (
+        SELECT id FROM task_verdicts WHERE task_id = ? AND reversed_at IS NULL
+         ORDER BY decided_at DESC, id DESC LIMIT 1
+      )`,
+  ).bind(reversedAt, taskId).run()
+}
+
+// verdictIsHuman — FP-01 Slice 2 v2 (successor to PR #1488, P0-3): the ONE
+// shared predicate for "was this verdict actually cast by a human", used
+// wherever a downstream effect (a project_access grant) claims human
+// authorization as its justification. A verdict is human when EITHER it
+// carries the harness-attested human_origin stamp (decided_via =
+// 'agent_attested_origin', mupot#1424/#1425 — decided_by is always a
+// member id in that case, resolved server-side from the origin, never
+// caller-supplied) OR decided_by itself resolves to a live row in the
+// members table — i.e. the calling principal that cast this verdict was a
+// member (verdictPrincipal's `type: 'member'` branch, src/tasks/index.ts),
+// not an agent exercising its own gate:routines capability. Deliberately a
+// DB lookup rather than a stored discriminator column: members and agents
+// occupy disjoint UUID spaces, so "does decided_by name a member" is exactly
+// "was the decider a member" with no separate column that could drift from
+// the row it describes.
+export async function verdictIsHuman(
+  env: Env,
+  verdict: Pick<TaskVerdict, 'decided_by' | 'decided_via'>,
+): Promise<boolean> {
+  if (verdict.decided_via === 'agent_attested_origin') return true
+  const member = await env.DB.prepare('SELECT 1 FROM members WHERE id = ? LIMIT 1').bind(verdict.decided_by).first()
+  return member !== null
+}
+
+export async function resolveVerdictProposalId(env: Env, task: Task): Promise<string | null> {
+  if (task.gate_owner !== 'gate:routines') return null
+  const row = await env.DB.prepare(
+    `SELECT id FROM routine_run_actions
+      WHERE source_type = 'task' AND source_id = ? AND status = 'waiting' AND gate_status = 'pending'
+      ORDER BY updated_at DESC, id DESC LIMIT 1`,
+  ).bind(task.id).first<{ id: string }>()
+  return row?.id ?? null
 }
 
 // mupot#1425 round-2 adversarial gate (kasra-review P0-B): the project-evidence
@@ -1344,6 +1422,8 @@ export function buildVerdictStatements(
     decided_at: now,
     decided_via: input.decidedVia ?? null,
     origin_agent_id: input.originAgentId ?? null,
+    proposal_id: input.proposalId ?? null,
+    reversed_at: null,
   }
 
   const guardSql = extraGuard ? ` AND ${extraGuard.sql}` : ''
@@ -1354,8 +1434,8 @@ export function buildVerdictStatements(
       `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ?)`,
     ).bind(
       verdictRow.id,
@@ -1366,6 +1446,7 @@ export function buildVerdictStatements(
       verdictRow.decided_at,
       verdictRow.decided_via,
       verdictRow.origin_agent_id,
+      verdictRow.proposal_id,
       input.task.id,
       newStatus,
       now,
@@ -1410,7 +1491,24 @@ export async function writeVerdict(
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
   await assertVerdictWritable(env, input.task)
 
-  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, input)
+  // proposalId auto-resolution (FP-01 Slice 2 v2): every ordinary caller of
+  // writeVerdict (HTTP twin, MCP task_verdict's fallback path, IM /approve)
+  // gets the binding for free without needing to know routines exist. Only
+  // origin-verdict.ts's commitOriginDecision bypasses writeVerdict (it builds
+  // its OWN D1 batch via buildVerdictStatements directly) and resolves this
+  // itself, the same way, immediately before building its statements — see
+  // that file. Read-then-write has a narrow window (the resolved action
+  // could in principle stop being the active one between this read and the
+  // batch below landing), acceptable here because it only ever WIDENS to
+  // "no binding" in that window, never fabricates one, and Athena's
+  // decided_at > proposal.created_at conjunct at the read site
+  // (src/routines/actions.ts) is the actual authorization gate — this value
+  // is consumed for that comparison, not trusted as authorization itself.
+  const resolvedInput: WriteVerdictInput = input.proposalId !== undefined
+    ? input
+    : { ...input, proposalId: await resolveVerdictProposalId(env, input.task) }
+
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, resolvedInput)
   const results = await env.DB.batch(statements)
 
   if (!results[0]?.meta?.changes) {

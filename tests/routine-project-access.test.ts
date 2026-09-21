@@ -182,6 +182,12 @@ describe('project_access routine proposal (FP-01 Slice 2, mupot#1443)', () => {
     await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal))
       .resolves.toMatchObject({ ok: true, status: 'waiting', reason: 'review' })
 
+    // P0-3 (FP-01 Slice 2 v2): the grant executor now requires the deciding
+    // principal to actually resolve to a human (verdictIsHuman) — ownerAuth's
+    // 'owner-1' must be a REAL, active members row for that check to pass,
+    // not merely an AuthContext.role='owner' bypass value.
+    await seedMember(fixture, 'owner-1')
+
     // The REAL task_verdict MCP tool — not a raw task_verdicts INSERT.
     const verdictOutcome = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
       task_id: 'control-task', verdict: 'approved', note: 'approved for Shadi',
@@ -245,6 +251,7 @@ describe('project_access routine proposal (FP-01 Slice 2, mupot#1443)', () => {
     const home = await createHomeForMember(fixture.env, 'member-shadi')
     if (!home.ok) throw new Error('home not created')
     expect(home.squad.id).not.toBe('squad-1')
+    await seedMember(fixture, 'owner-1') // P0-3: a real human decider
 
     const proposal = fixture.proposal({
       key: 'grant-1', kind: 'project_access',
@@ -265,6 +272,7 @@ describe('project_access routine proposal (FP-01 Slice 2, mupot#1443)', () => {
   it('fails closed when the member has no home yet (createHomeForMember never ran)', async () => {
     fixture = await makeReadyRoutineFixture('propose')
     await seedMember(fixture, 'member-no-home')
+    await seedMember(fixture, 'owner-1') // P0-3: a real human decider
 
     const proposal = fixture.proposal({
       key: 'grant-1', kind: 'project_access',

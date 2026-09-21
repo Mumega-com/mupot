@@ -53,12 +53,19 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
     })
   })
 
-  it("'pending' for a bound member with no home yet", async () => {
+  it("'pending' for a bound member with no home yet — memberIntakeEnvelope now self-heals it (FP-01 Slice 2 v2, plugin v2 contract §2f(a) point 3)", async () => {
     fixture = await makeReadyRoutineFixture('propose')
     const member = await seedMember(fixture, 'member-shadi')
-    await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toEqual({
-      bound: true, member_id: 'member-shadi', home_squad_id: null, intake_state: 'pending',
-    })
+    const result = await memberIntakeEnvelope(fixture.env, member)
+    // home_squad_id is no longer null here: this IS the member's first
+    // contact, so memberIntakeEnvelope provisions their home right away
+    // (createHomeForMember, under their own standing) rather than reporting
+    // an absent home a caller would have to separately provision.
+    expect(result.home_squad_id).toEqual(expect.any(String))
+    expect(result).toMatchObject({ bound: true, member_id: 'member-shadi', intake_state: 'pending' })
+    // Idempotent: a second call finds the SAME home, never a second one.
+    const second = await memberIntakeEnvelope(fixture.env, member)
+    expect(second.home_squad_id).toBe(result.home_squad_id)
   })
 
   it("'pending' for a bound member WITH a home but no project_access proposal yet", async () => {
@@ -130,6 +137,7 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
         input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'onboarding' },
       })
       await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+      await seedMember(fixture, 'owner-1') // P0-3 (FP-01 Slice 2 v2): a real human decider
       await invokeTool(ownerAuth(), fixture.env, 'task_verdict', { task_id: 'control-task', verdict: 'approved' })
       const finished = await submitRoutineProposal(fixture.env, fixture.principal, proposal)
       expect(finished).toMatchObject({ ok: true, status: 'succeeded' })

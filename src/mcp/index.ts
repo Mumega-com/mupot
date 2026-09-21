@@ -88,6 +88,7 @@ import {
   writeVerdict,
   VerdictRaceError,
   TaskEvidenceFenceError,
+  markVerdictReversed,
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
@@ -1648,6 +1649,7 @@ const toolTaskUpdate: ToolSpec = {
     // An org owner/admin may reverse an approved/rejected verdict back to review,
     // but may never do so invisibly. The receipt is written to an append-only table.
     if (reversesVerdict) {
+      const reversedAt = new Date().toISOString()
       await env.DB.prepare(
         `INSERT INTO verdict_reversals
            (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
@@ -1665,6 +1667,10 @@ const toolTaskUpdate: ToolSpec = {
           auth.memberId as string,
         )
         .run()
+      // FP-01 Slice 2 v2: mark the ORIGINAL verdict row reversed so a
+      // proposal-bound reader (executeRoutineAction's grant check) stops
+      // treating it as the still-live 'latest approved' decision.
+      await markVerdictReversed(env, next.id, reversedAt)
     }
 
     return done({ task: next, ...(gateWake ? { gate_wake: gateWake } : {}) })

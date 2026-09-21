@@ -485,6 +485,24 @@ const toolProjectSquadList: ToolSpec = {
   },
 }
 
+// KNOWN GAP, NOT FIXED HERE (FP-01 Slice 2 v2, Athena's design ruling on the
+// successor to PR #1488, P2-9 — Athena is filing the tracking issue, not
+// this PR): an org admin calling this tool directly against a member's HOME
+// squad writes a project_squad_access row with ZERO proposal, ZERO verdict,
+// and ZERO project_access_grant_receipts row — project_access_grant_receipts
+// is therefore NOT a complete record of every home->project grant, only of
+// the ones that went through the routine-proposal chain
+// (src/routines/actions.ts's project_access kind ->
+// src/projects/service.ts's executeProjectAccessGrant). This bypass is
+// INHERITED from #1472's own ruling that project_squad_access is
+// deliberately unguarded for a home-squad target — not introduced by this
+// PR — but it means the chain's "member builds, human gates, exactly one
+// privileged writer" invariant does not hold against THIS tool. Per
+// Athena's ruling: a direct org-admin write onto a home is FORBIDDEN by
+// policy going forward — elevation with a receipt is the only sanctioned
+// path — even though the code does not yet enforce that. Do not widen this
+// tool's own gate as a side effect of an unrelated change; the fix belongs
+// to whatever closes the tracked issue.
 const toolProjectSquadSet: ToolSpec = {
   name: 'project_squad_set',
   scope: 'workspace project squad-access edge',

@@ -2,6 +2,8 @@ import { listNeedsYou } from '../attention/service'
 import { priceUsage } from '../economy/prices'
 import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
 import { principalCanReadProject, routinePrincipal } from '../routines/access'
+import { callerHoldsGateCapability } from '../tasks/index'
+import { hasCapability } from '../auth/capability'
 import { publicRoutineRun } from '../routines/public'
 import {
   archiveRoutine,
@@ -555,8 +557,67 @@ const needsYouList: ToolSpec = {
   },
 }
 
+// project_access_reintake_authorize — FP-01 Slice 2 v2 (successor to PR
+// #1488, adversarial P2-8 + Athena's design ruling: "Re-intake = a
+// receipted 're-intake authorized' action, human-word-gated (org admin or
+// gate owner), receipt row in the same append-only table with reason +
+// who; derivation = (proposal OR receipt) AND NOT
+// re-intake-authorized-after-it."). Closes the one-way-door bug: once a
+// member ever received a project_access grant receipt, PR #1488 had no
+// supported path back to intake_state='pending' (the ledger is
+// DELETE-blocked by 0157's append-only trigger). This tool writes a NEW
+// row of a DIFFERENT kind ('reintake_authorized', migrations/0160) — it
+// never deletes or mutates anything — that memberIntakeEnvelope's
+// derivation (src/im/index.ts) reads to decide whether a later contact
+// should be treated as a fresh intake.
+//
+// AUTHORITY: org admin (the legacyOwnerAdmin escape callerHoldsGateCapability
+// already grants) OR the live holder of gate:routines (the SAME gate the
+// project_access proposal chain itself gates on) — "human word", never an
+// agent-bound caller (refused unconditionally below, before any capability
+// check, mirroring squad_member_add's own belt-and-suspenders pattern).
+const projectAccessReintakeAuthorize: ToolSpec = {
+  name: 'project_access_reintake_authorize',
+  scope: 'target member re-intake authorization',
+  min: 'member',
+  args: '{ member_id: string, reason: string }' +
+    ' -- org admin or gate:routines holder only; member principal only (never agent-bound).' +
+    ' Writes an append-only project_access_grant_receipts row of kind=\'reintake_authorized\'' +
+    ' that memberIntakeEnvelope reads to allow a fresh intake after this timestamp.',
+  inputSchema: {
+    type: 'object',
+    properties: { member_id: id(), reason: string(2000) },
+    required: ['member_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (auth.boundAgentId) return fail(403, 'forbidden', { need: 'member_principal' })
+    if (!validId(args.member_id)) return fail(400, 'invalid_member_id')
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+    if (!reason) return fail(400, 'reason_required')
+    const authorized = await callerHoldsGateCapability(env, auth, '', 'gate:routines')
+    if (!authorized) return fail(403, 'forbidden', { need: 'admin_or_gate:routines' })
+    const member = await env.DB.prepare(
+      `SELECT id FROM members WHERE id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL) LIMIT 1`,
+    ).bind(args.member_id, env.TENANT_SLUG).first()
+    if (!member) return fail(404, 'member_not_found')
+    const isOrgAdmin = auth.capabilities === undefined
+      ? auth.role === 'owner' || auth.role === 'admin'
+      : hasCapability(auth.capabilities, 'org', null, 'admin')
+    const decidedVia = isOrgAdmin ? 'org_admin' : 'gate:routines'
+    const receiptId = crypto.randomUUID()
+    const now = new Date().toISOString()
+    await env.DB.prepare(
+      `INSERT INTO project_access_grant_receipts (id, tenant, kind, member_id, decided_by, decided_via, reason, created_at)
+       VALUES (?, ?, 'reintake_authorized', ?, ?, ?, ?, ?)`,
+    ).bind(receiptId, env.TENANT_SLUG, args.member_id, auth.memberId ?? auth.userId, decidedVia, reason, now).run()
+    return done({ id: receiptId, member_id: args.member_id, reason, created_at: now })
+  },
+}
+
 export const ROUTINE_TOOLS: ToolSpec[] = [
   routineList, routineGet, routineCreate, routineUpdate,
   lifecycle('routine_enable', enableRoutine), lifecycle('routine_pause', pauseRoutine), lifecycle('routine_archive', archiveRoutine),
   routineRunNow, routineRunList, routineRunGet, routineRunAnswer, routineRunCancel, routineProposalSubmit, reportRunUsage, needsYouList,
+  projectAccessReintakeAuthorize,
 ]

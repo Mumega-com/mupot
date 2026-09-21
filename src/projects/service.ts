@@ -1,8 +1,9 @@
-import type { D1Result } from '@cloudflare/workers-types'
+import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 import { projectSelectSql } from './columns'
 import { isSafeHttpsUrl, isValidWorkerName, slugFromProjectName } from './urls'
+import { assertWritten } from '../lib/receipt'
 
 const PROJECT_STATUSES: readonly ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
 const PROJECT_ACCESS_LEVELS: readonly ProjectAccessLevel[] = ['read', 'write', 'admin']
@@ -83,6 +84,19 @@ function isProjectStatus(value: unknown): value is ProjectStatus {
 
 function isProjectAccessLevel(value: unknown): value is ProjectAccessLevel {
   return typeof value === 'string' && (PROJECT_ACCESS_LEVELS as readonly string[]).includes(value)
+}
+
+// projectAccessLevelRank — the ONE ordering table for ProjectAccessLevel
+// (FP-01 Slice 2 v2, successor to PR #1488's adversarial finding 10: a
+// fourth 3-level PROJECT_ACCESS_RANK map had been hand-rolled in
+// src/routines/actions.ts, alongside four pre-existing binary write|admin
+// checks — src/projects/access.ts, src/projects/start-gate.ts,
+// src/addons/project-link/service.ts, src/attention/service.ts — none of
+// which share an ordering with each other or with this one). PROJECT_ACCESS_LEVELS'
+// own declared order (read, write, admin) IS the rank — this just exposes
+// it as a comparable number so a caller never re-derives its own copy.
+export function projectAccessLevelRank(level: ProjectAccessLevel): number {
+  return PROJECT_ACCESS_LEVELS.indexOf(level)
 }
 
 export function isValidProjectTargetDate(value: unknown): value is string {
@@ -481,6 +495,36 @@ export async function listProjectSquads(env: Env, projectId: string): Promise<Pr
   return result.results ?? []
 }
 
+// projectSquadAccessStatements — FP-01 Slice 2 v2 (successor to PR #1488,
+// P1-5): extracted from upsertProjectSquadAccess's own body, unchanged in
+// behavior, so executeProjectAccessGrant below can append its OWN receipt
+// INSERT to the SAME statement list and run everything as ONE batch —
+// previously the grant (via upsertProjectSquadAccess, its own separate
+// batch) and the project_access_grant_receipts INSERT were two independent
+// D1 calls; a failure of the second left a live, unreceipted grant (see
+// ADVERSARIAL PATTERN LIBRARY finding 5, kasra-review 2026-09-21, PR #1488).
+// Pure/sync (no `env.DB.batch()` call inside), mirroring the
+// buildVerdictStatements pattern (src/tasks/service.ts) for the same reason:
+// a caller building a larger batch needs the STATEMENTS, not an executed
+// result.
+function projectSquadAccessStatements(
+  env: Env,
+  projectId: string,
+  squadId: string,
+  accessLevel: ProjectAccessLevel,
+  grantedAt: string,
+): D1PreparedStatement[] {
+  const upsertStmt = env.DB.prepare(
+    `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = excluded.access_level`,
+  ).bind(projectId, squadId, accessLevel, grantedAt)
+  const needsInvalidate = accessLevel !== 'write' && accessLevel !== 'admin'
+  return needsInvalidate
+    ? [upsertStmt, invalidateSquadScopedProviderBindingsStatement(env, projectId, squadId)]
+    : [upsertStmt]
+}
+
 export async function upsertProjectSquadAccess(
   env: Env,
   projectId: string,
@@ -505,16 +549,9 @@ export async function upsertProjectSquadAccess(
   // exactly this "two writes, one unit" shape — e.g. flight/service.ts,
   // auth/index.ts) — there is no instant where the access change is
   // committed but the invalidation is not, or vice versa.
-  const upsertStmt = env.DB.prepare(
-    `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = excluded.access_level`,
-  ).bind(projectId, squadId, accessLevel, grantedAt)
-  const needsInvalidate = accessLevel !== 'write' && accessLevel !== 'admin'
+  const statements = projectSquadAccessStatements(env, projectId, squadId, accessLevel, grantedAt)
   try {
-    const results = needsInvalidate
-      ? await env.DB.batch([upsertStmt, invalidateSquadScopedProviderBindingsStatement(env, projectId, squadId)])
-      : [await upsertStmt.run()]
+    const results = statements.length > 1 ? await env.DB.batch(statements) : [await statements[0].run()]
     if (!wrote(results[0])) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     const mapped = triggerMutationError(error)
@@ -573,6 +610,18 @@ export type ProjectAccessGrantError = ProjectMutationError | 'verdict_mismatch'
 // migrations/0157): a retried execution (executeRoutineAction can be replayed —
 // see src/routines/actions.ts) re-runs the upsert (itself idempotent) and finds
 // the EXISTING receipt row rather than writing a second one or erroring.
+//
+// ATOMIC grant + receipt (FP-01 Slice 2 v2, successor to PR #1488, P1-5): the
+// grant (project_squad_access) and its append-only receipt now land in ONE
+// `env.DB.batch()` — built from projectSquadAccessStatements' SAME statements
+// upsertProjectSquadAccess uses, plus this function's own receipt INSERT
+// appended to the list, never as two independent D1 calls. Closes the
+// adversarial gate's PROVEN failure mode: forcing only the receipt INSERT to
+// fail used to leave project_squad_access committed with ZERO
+// project_access_grant_receipts rows — "the standing privilege is live and
+// unreceipted," the exact outcome 0157's own header says the table exists to
+// prevent. `assertWritten` on each required statement turns a silent 0-row
+// write into a loud throw rather than a phantom success.
 export async function executeProjectAccessGrant(
   env: Env,
   input: {
@@ -602,25 +651,54 @@ export async function executeProjectAccessGrant(
   }
   if (!isProjectAccessLevel(input.accessLevel)) return { ok: false, error: 'invalid_access_level' }
 
-  const upserted = await upsertProjectSquadAccess(env, input.projectId, input.squadId, input.accessLevel)
-  if (!upserted.ok) return upserted
+  // Same pre-checks upsertProjectSquadAccess itself performs — duplicated
+  // (not delegated) because this function now builds its OWN batch rather
+  // than calling upsertProjectSquadAccess end-to-end, so it must reproduce
+  // its validation ahead of that batch.
+  const project = await getProject(env, input.projectId)
+  if (!project) return { ok: false, error: 'project_not_found' }
+  if (project.status === 'archived') return { ok: false, error: 'archived_project' }
+  if ((await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(input.squadId).first()) === null) {
+    return { ok: false, error: 'squad_not_found' }
+  }
 
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
+  const grantStatements = projectSquadAccessStatements(env, input.projectId, input.squadId, input.accessLevel, now)
+  const receiptStmt = env.DB.prepare(
+    `INSERT INTO project_access_grant_receipts (
+      id, tenant, project_id, squad_id, member_id, access_level,
+      proposal_id, verdict_id, decided_by, decided_via, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    id, env.TENANT_SLUG, input.projectId, input.squadId, input.memberId, input.accessLevel,
+    input.proposalId, input.verdictId, input.decidedBy, input.decidedVia, now,
+  )
   try {
-    await env.DB.prepare(
-      `INSERT INTO project_access_grant_receipts (
-        id, tenant, project_id, squad_id, member_id, access_level,
-        proposal_id, verdict_id, decided_by, decided_via, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(
-      id, env.TENANT_SLUG, input.projectId, input.squadId, input.memberId, input.accessLevel,
-      input.proposalId, input.verdictId, input.decidedBy, input.decidedVia, now,
-    ).run()
-  } catch {
-    // Race: a concurrent execution of the SAME proposal already inserted the
-    // receipt between our SELECT above and this INSERT — UNIQUE(proposal_id)
-    // refuses the second row. Adopt the one that won, rather than error.
+    const results = await env.DB.batch([...grantStatements, receiptStmt])
+    // grantStatements[0] (the upsert) and the LAST result (the receipt
+    // INSERT) must each write exactly 1 row; a middle invalidate statement
+    // (present only when accessLevel is 'read') is best-effort and may
+    // legitimately write 0 (upsertProjectSquadAccess never checks it
+    // either) — asserted individually rather than via assertBatchWritten,
+    // which would wrongly demand >=1 from that optional statement too.
+    assertWritten(results[0], 'execute_project_access_grant.upsert', 1)
+    assertWritten(results[results.length - 1], 'execute_project_access_grant.receipt', 1)
+  } catch (error) {
+    const mapped = triggerMutationError(error)
+    if (mapped) return { ok: false, error: mapped }
+    if (isForeignKeyViolation(error)) {
+      if (!await getProject(env, input.projectId)) return { ok: false, error: 'project_not_found' }
+      if ((await env.DB.prepare('SELECT 1 FROM squads WHERE id = ?').bind(input.squadId).first()) === null) {
+        return { ok: false, error: 'squad_not_found' }
+      }
+      return { ok: false, error: 'project_not_found' }
+    }
+    // UNIQUE(proposal_id) refusal: a concurrent execution of the SAME
+    // proposal already inserted the receipt (and its grant) between our
+    // SELECT above and this batch committing. Adopt the winner rather than
+    // error — same "classify, don't compensate a real winner" doctrine used
+    // throughout this codebase (e.g. org/service.ts's createHomeForMember).
     const raced = await env.DB.prepare(
       `SELECT id, project_id, squad_id, member_id, access_level, proposal_id, verdict_id, decided_by, decided_via, created_at
          FROM project_access_grant_receipts WHERE proposal_id = ?`,

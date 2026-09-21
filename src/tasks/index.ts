@@ -25,7 +25,7 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, markVerdictReversed } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -1183,6 +1183,7 @@ tasksApp.patch('/:id', async (c) => {
     if (reversesVerdict) {
       const actorId = auth.memberId || auth.boundAgentId || 'unknown'
       const actorType = auth.boundAgentId ? 'agent' : 'member'
+      const reversedAt = new Date().toISOString()
       await c.env.DB.prepare(
         `INSERT INTO verdict_reversals
            (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
@@ -1201,6 +1202,10 @@ tasksApp.patch('/:id', async (c) => {
           actorType,
         )
         .run()
+      // FP-01 Slice 2 v2: mark the ORIGINAL verdict row reversed so a
+      // proposal-bound reader (executeRoutineAction's grant check) stops
+      // treating it as the still-live 'latest approved' decision.
+      await markVerdictReversed(c.env, next.id, reversedAt)
     }
   }
 

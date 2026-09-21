@@ -56,7 +56,7 @@ import { routeAgentWake } from '../agents/wake-routing'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { redeemTelegramProjectInvite } from '../members/project-invites'
 import { listNeedsYou } from '../attention/service'
-import { answerRoutineRun, getRoutinePendingQuestion } from '../routines/actions'
+import { answerRoutineRun, getRoutinePendingQuestion, getRoutineProjectAccessRequest } from '../routines/actions'
 import { routinePrincipal } from '../routines/access'
 import { projectReadAccessFromGrants, projectVisibilityClause } from '../projects/access'
 import { completeTelegramUpdate, reserveTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
@@ -153,10 +153,29 @@ async function resolveAgent(env: Env, ref: string): Promise<Agent | 'ambiguous' 
 
 // The member's default squad: the single squad they hold a squad-scoped grant on.
 // Used so "task: …" with no @squad still works for someone bound to one squad.
-async function soleSquadGrant(grants: CapabilityGrant[]): Promise<string | null> {
-  const squadGrants = grants.filter((g) => g.scope_type === 'squad' && g.scope_id)
-  const ids = new Set(squadGrants.map((g) => g.scope_id as string))
-  return ids.size === 1 ? [...ids][0] : null
+// FP-01 Slice 2 v2 (successor to PR #1488, plugin v2 contract §2f(a) point 3
+// collateral fix): every bound member now gets a home squad on first
+// contact (memberIntakeEnvelope), which ALSO grants them an 'admin'
+// capability there — meaning EVERY such member has at least two squad-scope
+// grants going forward, permanently breaking "task: <title>" (no @ref)'s
+// old "there is exactly one, use it" shorthand for anyone who previously
+// had exactly one real working-squad grant. A home squad is a private
+// personal space, never a team the member does `task:` shorthand work for
+// (the same "home is special" treatment G-FP1b already applies to workspace-
+// admin standing) — excluded from the ambiguity count here for that reason,
+// not merely to route around the collision.
+async function soleSquadGrant(env: Env, grants: CapabilityGrant[]): Promise<string | null> {
+  const squadIds = [...new Set(
+    grants.filter((g) => g.scope_type === 'squad' && g.scope_id).map((g) => g.scope_id as string),
+  )]
+  if (squadIds.length === 0) return null
+  if (squadIds.length === 1) return squadIds[0]
+  const placeholders = squadIds.map((_, index) => `?${index + 1}`).join(', ')
+  const rows = await env.DB.prepare(
+    `SELECT id FROM squads WHERE id IN (${placeholders}) AND kind != 'home'`,
+  ).bind(...squadIds).all<{ id: string }>()
+  const nonHomeIds = rows.results ?? []
+  return nonHomeIds.length === 1 ? nonHomeIds[0].id : null
 }
 
 // ── intent parsing (text → intent; identity is NEVER here) ────────────────────
@@ -401,6 +420,20 @@ async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], p
     if (item.allowed_actions.includes('answer')) {
       const question = await getRoutinePendingQuestion(env, principal, item.source_id)
       if (question) questionText = `\n${question.question}${question.choices.length ? ` Choices: ${question.choices.join(' | ')}` : ''}`
+    }
+    // FP-01 Slice 2 v2 (successor to PR #1488, P1-6): a project_access
+    // proposal must show member/project/access_level/reason BEFORE /approve
+    // is possible — "the human approved it" is not defensible when the
+    // channel never showed them what "it" is. Checked for every 'approve'-
+    // eligible item (cheap: a single-row lookup keyed on the task id that
+    // is a no-op unless a project_access proposal is actually waiting on
+    // it), not just 'answer' items.
+    if (item.allowed_actions.includes('approve')) {
+      const request = await getRoutineProjectAccessRequest(env, principal, item.source_id)
+      if (request) {
+        questionText += `\nGrant ${request.access_level} on ${request.project_name} to `
+          + `${request.member_name ?? request.member_id} (${request.member_id}). Reason: ${request.reason}`
+      }
     }
     let line = `${item.project_name}: ${item.title} (${item.source_id})${questionText}\n${actions.join(' · ')}`
     if (line.length > 3900) {
@@ -777,7 +810,7 @@ async function taskReply(
     if (!r) return `No squad named "${squadRef}" here.`
     squad = r
   } else {
-    const soleId = await soleSquadGrant(grants)
+    const soleId = await soleSquadGrant(env, grants)
     if (!soleId) {
       return 'Which squad? You belong to more than one — say "task: <title> @squad".'
     }
@@ -881,29 +914,47 @@ export async function resolveMemberProjects(
   return rows.results ?? []
 }
 
-// POST /resolve-project — plugin contract (mupot-plugin PR #17 addendum):
-// { chat_id, query, limit? } -> { bound, member_id, projects }. Same
-// shared-secret auth as /webhook; NOT a Telegram update (no update_id/
-// reservation needed — a pure read has no effect to make idempotent), so it
-// takes chat_id directly rather than a full Telegram envelope. Mubot's
-// floor: this route carries no MCP-tool capability floor at all — the
-// shared webhook secret is the only gate, same as /webhook itself, so any
-// caller holding that secret (Mubot's relay) can call it; the RESULT is
-// still bounded by the bound member's own readable projects, never Mubot's.
+// POST /resolve-project — plugin contract (mupot-plugin PR #19 v2 addendum,
+// FP-01 Slice 2 v2, Athena's design ruling: "resolve-project fence = ENVELOPE
+// IDENTITY, not a token"). Body shape is now the SAME Telegram envelope
+// /webhook verifies — { update_id, message: { from: { id }, chat: { id,
+// type: 'private' }, text }, query } — plus `query`/`limit`, over the SAME
+// shared-secret header. This closes the adversarial P1 finding on the prior
+// `{ chat_id, query }` shape (kasra-review 2026-09-21, PR #1488): a bare
+// `chat_id` body field was never a fence — any secret holder could pick
+// ANY member's identity by varying it, unlike /webhook where the identity
+// comes from a signed Telegram envelope that ALSO enforces private_chat and
+// from.id === chat.id. Deriving chatId/userId from `message.from.id` /
+// `message.chat.id` here (identical fields, identical checks) restores that
+// parity — a `member_id` or bare `chat_id` at the body's top level is never
+// read at all, so it cannot select a different member's identity no matter
+// what value is supplied. NOT a reservation-guarded update (no update_id
+// idempotency needed — a pure read has no effect to make idempotent); the
+// envelope's update_id/text fields are accepted for shape parity with
+// /webhook and are otherwise unused here.
 imApp.post('/resolve-project', async (c) => {
   if (!c.env.IM_WEBHOOK_SECRET) return c.json({ error: 'webhook_not_configured' }, 503)
   const providedSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token')
   if (!providedSecret || !timingSafeEqual(providedSecret, c.env.IM_WEBHOOK_SECRET)) {
     return c.json({ error: 'unauthorized' }, 401)
   }
-  let body: { chat_id?: unknown; query?: unknown; limit?: unknown }
+  let body: TelegramUpdate & { query?: unknown; limit?: unknown }
   try {
     body = await c.req.json()
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
-  const chatId = telegramId(body.chat_id)
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'invalid_update' }, 400)
+  const chatId = telegramId(body.message?.chat?.id)
   if (!chatId) return c.json({ error: 'no_chat_id' }, 400)
+  const userId = telegramId(body.message?.from?.id)
+  if (!userId) return c.json({ error: 'no_user_id' }, 400)
+  // Identity fence — the SAME two conjuncts /webhook enforces (private_chat
+  // + userId === chatId). A `chat_id`/`member_id` anywhere else in the body
+  // is never consulted, so it can never stand in for these.
+  if (body.message?.chat?.type !== 'private' || userId !== chatId) {
+    return c.json({ error: 'private_chat_required' }, 400)
+  }
   const query = typeof body.query === 'string' ? body.query : ''
   if (!query.trim()) return c.json({ error: 'invalid_query' }, 400)
   const limit = typeof body.limit === 'number' && Number.isFinite(body.limit) ? body.limit : RESOLVE_PROJECT_MAX_CANDIDATES
@@ -1023,23 +1074,71 @@ export async function memberIntakeEnvelope(
   member: Member | null,
 ): Promise<{ bound: boolean; member_id: string | null; home_squad_id: string | null; intake_state: IntakeState }> {
   if (!member) return { bound: false, member_id: null, home_squad_id: null, intake_state: 'none' }
-  const { getMemberHomeSquad } = await import('../org/service')
+  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
   const home = await getMemberHomeSquad(env, member.id)
-  const proposed = await env.DB.prepare(
-    `SELECT 1 WHERE EXISTS (
-        SELECT 1 FROM routine_run_actions
-         WHERE tenant = ?1 AND kind = 'project_access'
-           AND json_extract(input_json, '$.member_id') = ?2
-      ) OR EXISTS (
-        SELECT 1 FROM project_access_grant_receipts
-         WHERE tenant = ?1 AND member_id = ?2
-      )`,
-  ).bind(env.TENANT_SLUG, member.id).first()
+  // HOME CREATION ON FIRST CONTACT (mupot-plugin PR #19 v2 contract, §2f(a)
+  // point 3): a bound member with no home yet gets one provisioned right
+  // here, under THEIR OWN standing — the envelope that produced `member`
+  // (memberForChat, chat_id -> member) already proves this call is on this
+  // exact member's behalf, so calling createHomeForMember(member.id) is
+  // member-self provisioning, never Mubot or an agent acting for them.
+  // createHomeForMember is idempotent (adopts an existing home+capability
+  // row rather than duplicating one), so this is safe to call on every
+  // message from a homeless bound member, not just a literal /start — the
+  // first one to land wins, every later one is a no-op read-through.
+  let homeId = home?.id ?? null
+  if (!homeId) {
+    const created = await createHomeForMember(env, member.id)
+    if (created.ok) homeId = created.squad.id
+    // AUDITED (Athena's design ruling): every provisioning attempt from
+    // this call site — success (created/existing) or failure — writes an
+    // append-only receipt (migrations/0161, member_home_provisioning_receipts;
+    // see that migration's header for why NO existing ledger fit). Best-
+    // effort: a receipt-write failure must never turn an otherwise-
+    // successful home creation into a user-visible error, so this never
+    // throws into the caller.
+    try {
+      await env.DB.prepare(
+        `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+         VALUES (?, ?, ?, ?, 'telegram', ?)`,
+      ).bind(
+        crypto.randomUUID(), env.TENANT_SLUG, member.id,
+        created.ok ? created.squad.id : null,
+        created.ok ? created.disposition : 'failed',
+      ).run()
+    } catch { /* best-effort audit write; never blocks the reply */ }
+  }
+  // FP-01 Slice 2 v2 (successor to PR #1488, P2-8 + Athena's design ruling):
+  // 'complete' still means "a proposal OR a 'grant' receipt exists" — but
+  // now ALSO "AND no 're-intake authorized' row (migrations/0160,
+  // project_access_reintake_authorize MCP tool) postdates the LATER of
+  // those two." Compared via julianday(), not raw string comparison —
+  // routine_run_actions.created_at is `datetime('now')` ('YYYY-MM-DD
+  // HH:MM:SS') while project_access_grant_receipts.created_at is
+  // `strftime('%Y-%m-%dT%H:%M:%fZ','now')`-shaped; the two formats do NOT
+  // compare correctly as plain strings (the space/'T' separator alone would
+  // make every routine_run_actions timestamp sort before every
+  // project_access_grant_receipts one, regardless of actual time order) —
+  // julianday() parses both correctly.
+  const completion = await env.DB.prepare(
+    `SELECT
+        (SELECT MAX(julianday(created_at)) FROM routine_run_actions
+          WHERE tenant = ?1 AND kind = 'project_access'
+            AND json_extract(input_json, '$.member_id') = ?2) AS proposal_jd,
+        (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
+          WHERE tenant = ?1 AND member_id = ?2 AND kind = 'grant') AS grant_jd,
+        (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
+          WHERE tenant = ?1 AND member_id = ?2 AND kind = 'reintake_authorized') AS reintake_jd`,
+  ).bind(env.TENANT_SLUG, member.id).first<{ proposal_jd: number | null; grant_jd: number | null; reintake_jd: number | null }>()
+  const completionJd = Math.max(completion?.proposal_jd ?? -Infinity, completion?.grant_jd ?? -Infinity)
+  const hasCompletion = Number.isFinite(completionJd)
+  const reintakeAfter = completion?.reintake_jd != null && completion.reintake_jd > completionJd
+  const complete = hasCompletion && !reintakeAfter
   return {
     bound: true,
     member_id: member.id,
-    home_squad_id: home?.id ?? null,
-    intake_state: proposed ? 'complete' : 'pending',
+    home_squad_id: homeId,
+    intake_state: complete ? 'complete' : 'pending',
   }
 }
 
