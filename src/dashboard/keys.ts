@@ -46,6 +46,7 @@ import {
   resolveCapabilities,
   hasCapability,
   targetMaxRankAcrossScopes,
+  exceedsTargetRankCeilingGivenRanks,
 } from '../auth/capability'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
@@ -134,6 +135,15 @@ export interface MintParams {
    * legacy web-login) — the route handler is responsible for resolving it.
    */
   minterRank: number
+  /**
+   * The minter's OWN member id, if they have one (mupot#1454 round 2, F2).
+   * Used ONLY for the target-rank ceiling's self-exemption via
+   * `exceedsTargetRankCeilingGivenRanks` — a principal can never outrank
+   * themselves. Optional: omitting it (or passing null) never allows an
+   * unsafe mint, it can only deny a legitimate self-mint, so this is
+   * backward-compatible with every existing caller.
+   */
+  minterMemberId?: string | null
 }
 
 export type MintResult =
@@ -166,7 +176,7 @@ export type MintResult =
  *  6. Return raw once; never persisted.
  */
 export async function mintScopedKey(env: Env, params: MintParams): Promise<MintResult> {
-  const { memberId, presetId, scopeId, minterRank } = params
+  const { memberId, presetId, scopeId, minterRank, minterMemberId = null } = params
 
   // 1. Validate preset.
   const preset = findPreset(presetId)
@@ -198,10 +208,15 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
   //     the target's OWN capabilities at auth time (step 4/S1), so a target
   //     whose real standing on ANY scope — or the legacy role plane —
   //     outranks the minter must be refused, independent of which (lower)
-  //     preset was picked. Uses the shared non-HTTP primitive so this can
-  //     never drift from the HTTP sibling's predicate.
+  //     preset was picked. mupot#1454 round 2 (F2/P2): this used to hand-roll
+  //     `targetRank > minterRank` directly, WITHOUT the self-exemption
+  //     `exceedsTargetRankCeiling` carries — an org admin minting for
+  //     THEMSELVES could be refused if their global rank (via an unrelated
+  //     grant) exceeded their org-scope-local minterRank. Now calls the
+  //     shared pure predicate (`exceedsTargetRankCeilingGivenRanks`) so this
+  //     can never drift from the HTTP sibling's rule again.
   const targetRank = await targetMaxRankAcrossScopes(env, memberId)
-  if (targetRank > minterRank) {
+  if (exceedsTargetRankCeilingGivenRanks(minterMemberId, minterRank, memberId, targetRank)) {
     return { ok: false, error: 'target_rank_ceiling' }
   }
 

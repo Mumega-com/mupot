@@ -73,10 +73,29 @@ export function isDomainAllowed(email: string, config: SsoConfig): boolean {
 
 /**
  * Retrieves the current SSO configuration from org_settings.
+ *
+ * mupot#1454 round 2 (F3): getJSON hands back whatever JSON was stored,
+ * unknown keys and all — a config written before POST /config's `.strict()`
+ * schema existed (this fix) could carry a legacy/junk key. Before this fix,
+ * GET /config would echo that key straight back, and an honest GET -> edit ->
+ * POST round trip (the admin never touched the junk field) would then fail
+ * `.strict()` on a key the admin didn't even know was there. Whitelisted to
+ * exactly the known SsoConfig shape here — this does NOT validate individual
+ * field VALUES (e.g. an out-of-allowlist `default_role` from before this fix
+ * passes through unchanged; that is autoEnrollSsoMember's job, at enroll
+ * time, so the two responsibilities stay separate), only drops keys this
+ * config does not declare.
  */
 export async function getSsoConfig(env: Env): Promise<SsoConfig> {
-  const config = await getJSON<SsoConfig>(env, 'sso_config')
-  return config ? { ...DEFAULT_SSO_CONFIG, ...config } : DEFAULT_SSO_CONFIG
+  const stored = await getJSON<Partial<SsoConfig>>(env, 'sso_config')
+  const merged: SsoConfig = stored ? { ...DEFAULT_SSO_CONFIG, ...stored } : DEFAULT_SSO_CONFIG
+  return {
+    enabled: merged.enabled,
+    allowed_domains: merged.allowed_domains,
+    default_role: merged.default_role,
+    enforce_sso: merged.enforce_sso,
+    idp_provider: merged.idp_provider,
+  }
 }
 
 /**

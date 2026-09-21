@@ -169,4 +169,45 @@ describe('SSO default_role allowlist (mupot#1454)', () => {
     expect(published.type).toBe('member.auto_enrolled')
     expect(published.payload.role).toBe('member') // the emitted event, not the stored 'owner'
   })
+
+  // ── (c) mupot#1454 round 2, F3: GET must not echo unknown keys back ───────
+  //
+  // POST /config's new `.strict()` schema (F1/F2 above) means a config
+  // written before this fix — or carrying any legacy/junk key — would fail
+  // an otherwise-honest GET -> edit -> POST round trip on a field the admin
+  // never touched. getSsoConfig now whitelists the known SsoConfig shape on
+  // read, so GET always returns a clean, strict-schema-compatible object.
+  it('a stored config with an extra/unknown key is stripped by GET, and POSTing the returned body succeeds', async () => {
+    await harness.db.prepare(
+      `INSERT INTO org_settings (key, value, updated_at) VALUES ('sso_config', ?1, datetime('now'))`,
+    ).bind(JSON.stringify({
+      enabled: true,
+      allowed_domains: ['sso-role-tenant.test'],
+      default_role: 'member',
+      enforce_sso: false,
+      idp_provider: 'google',
+      legacy_junk_field: 'some pre-fix value nobody reads anymore',
+    })).run()
+
+    const getRes = await ssoApp.request('/config', { headers: { cookie } }, env)
+    expect(getRes.status).toBe(200)
+    const getBody = await getRes.json<{ ok: boolean; config: Record<string, unknown> }>()
+    expect(getBody.ok).toBe(true)
+    expect(getBody.config).not.toHaveProperty('legacy_junk_field')
+    expect(getBody.config).toEqual({
+      enabled: true,
+      allowed_domains: ['sso-role-tenant.test'],
+      default_role: 'member',
+      enforce_sso: false,
+      idp_provider: 'google',
+    })
+
+    // The honest round trip: POST exactly what GET returned. Must succeed —
+    // the admin never touched (and never even saw) the junk field.
+    const postRes = await ssoApp.request('/config', jsonReq(getBody.config, cookie), env)
+    expect(postRes.status).toBe(200)
+    const postBody = await postRes.json<{ ok: boolean; config: Record<string, unknown> }>()
+    expect(postBody.ok).toBe(true)
+    expect(postBody.config).not.toHaveProperty('legacy_junk_field')
+  })
 })

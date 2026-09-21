@@ -537,17 +537,45 @@ export async function targetMaxRankAcrossScopes(env: Env, targetMemberId: string
  * null)` flips the A1 probe to 403 (org-scope-local rank 4 < owner's global
  * rank 5); `actorMaxRankAcrossScopes` is deleted — nothing else called it.
  */
+/**
+ * The pure predicate at the heart of `exceedsTargetRankCeiling` — no DB
+ * access, just the comparison + self-exemption. Split out (mupot#1454
+ * round 2, F2/P2) because a non-HTTP service function that receives a
+ * caller-resolved actor rank (rather than a full AuthContext) needs this
+ * EXACT rule, self-exemption included, without paying for — or
+ * reimplementing — the DB round trip `exceedsTargetRankCeiling` uses to
+ * derive that rank from an AuthContext.
+ *
+ * mupot#1453 (`mintScopedKey`, src/dashboard/keys.ts) hand-rolled
+ * `targetRank > minterRank` here WITHOUT the self-exemption below, and
+ * drifted from this predicate the moment it was written: an org admin whose
+ * GLOBAL rank exceeds their org-scope-local rank (e.g. they also hold
+ * 'owner' on one unrelated squad) minting a key for THEMSELVES — even at
+ * the lowest preset — was refused, because the comparison saw their own
+ * global rank as "outranking" their org-scope-local minterRank. Never
+ * reimplement this comparison inline again; call this function (or, when a
+ * full AuthContext is already in hand, `exceedsTargetRankCeiling` below).
+ */
+export function exceedsTargetRankCeilingGivenRanks(
+  actorMemberId: string | null,
+  actorRank: number,
+  targetMemberId: string,
+  targetRank: number,
+): boolean {
+  if (actorMemberId && actorMemberId === targetMemberId) return false
+  return targetRank > actorRank
+}
+
 export async function exceedsTargetRankCeiling(
   env: Env,
   auth: AuthContext,
   targetMemberId: string,
 ): Promise<boolean> {
-  if (auth.memberId && auth.memberId === targetMemberId) return false
   const [targetRank, actorRank] = await Promise.all([
     targetMaxRankAcrossScopes(env, targetMemberId),
     actorRankOnScopeFor(env, auth, 'org', null),
   ])
-  return targetRank > actorRank
+  return exceedsTargetRankCeilingGivenRanks(auth.memberId ?? null, actorRank, targetMemberId, targetRank)
 }
 
 // ── surface-capability gate (#106) ────────────────────────────────────────────

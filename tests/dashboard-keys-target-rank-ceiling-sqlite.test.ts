@@ -170,4 +170,69 @@ describe('mintScopedKey — target-rank ceiling (mupot#1453), real SQLite D1', (
       harness.close()
     }
   })
+
+  // mupot#1454 round 2, F2/P2: the original mintScopedKey fix hand-rolled
+  // `targetRank > minterRank` WITHOUT the self-exemption
+  // `exceedsTargetRankCeilingGivenRanks` carries, so it drifted the moment it
+  // was written — an org admin whose GLOBAL rank (via an unrelated grant)
+  // exceeds their org-scope-local minterRank was refused when minting a key
+  // for THEMSELVES, even at the lowest preset.
+  it('admin mints for THEMSELVES — allowed even when their global rank (via an unrelated squad grant) exceeds minterRank', async () => {
+    const harness = createSqliteD1()
+    try {
+      applyAllMigrations(harness.sqlite)
+      const env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      addMember(harness.sqlite, 'self-minter')
+      addSquad(harness.sqlite, 'squad-self', 'dept-self')
+      // Org-scope observer grant — satisfies the 'brain' preset's own S1
+      // attest check (member must already hold >= the preset's capability).
+      grantCapability(harness.sqlite, 'self-minter', 'org', null, 'observer')
+      // Unrelated squad-scope OWNER grant (global rank 5) — outranks the
+      // org-scope-local minterRank (4, org:admin) this minter authenticates
+      // the mint request at. Squad grants never bubble UP to org, so this
+      // does not affect the attest check above.
+      grantCapability(harness.sqlite, 'self-minter', 'squad', 'squad-self', 'owner')
+
+      const result = await mintScopedKey(env, {
+        memberId: 'self-minter',
+        presetId: 'brain', // role=observer, rank 1, org scope — no scope_id needed
+        scopeId: null,
+        minterRank: 4, // admin, org-scope-local
+        minterMemberId: 'self-minter', // minting for themselves
+      })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) throw new Error(`expected success, got ${result.error}`)
+      expect(tokenCount(harness.sqlite, 'self-minter')).toBe(1)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('the SAME target-outranks scenario is still refused when minting for a DIFFERENT member (self-exemption does not leak)', async () => {
+    const harness = createSqliteD1()
+    try {
+      applyAllMigrations(harness.sqlite)
+      const env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+
+      addMember(harness.sqlite, 'actor')
+      addMember(harness.sqlite, 'other-owner')
+      grantCapability(harness.sqlite, 'other-owner', 'org', null, 'owner')
+
+      const result = await mintScopedKey(env, {
+        memberId: 'other-owner',
+        presetId: 'observer',
+        scopeId: null,
+        minterRank: 4,
+        minterMemberId: 'actor', // NOT the target
+      })
+
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected refusal')
+      expect(result.error).toBe('target_rank_ceiling')
+    } finally {
+      harness.close()
+    }
+  })
 })
