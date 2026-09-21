@@ -117,20 +117,19 @@ BEGIN
   );
   -- INSERT-time bind invites still require the full project field set.
   -- Accept-time stamp (A2): member_id may land on a legacy or plain-squad
-  -- row whose pairing columns stay NULL.
+  -- row whose pairing columns stay NULL. Stamping member_id while any
+  -- pairing column is set is refused even on an otherwise-legal Telegram
+  -- row (P1-B) — bind invites write member_id on INSERT, not UPDATE.
   SELECT RAISE(ABORT, 'project invite member bind requires the full project field set')
   WHERE NEW.member_id IS NOT NULL
-    AND NEW.pairing_hash IS NOT NULL
-    AND NOT (
-      NEW.project_id IS NOT NULL
-      AND NEW.squad_id IS NOT NULL
-      AND NEW.pairing_hash IS NOT NULL
-      AND NEW.pairing_expires_at IS NOT NULL
-      AND length(trim(NEW.project_id)) > 0
-      AND length(trim(NEW.squad_id)) > 0
-      AND length(trim(NEW.pairing_hash)) > 0
-      AND length(trim(NEW.pairing_expires_at)) > 0
-    );
+    AND (NEW.pairing_hash IS NOT NULL OR NEW.pairing_expires_at IS NOT NULL)
+    AND (OLD.member_id IS NULL OR OLD.member_id <> NEW.member_id);
+  -- member_id is write-once. Rollback may NULL it; a different member
+  -- must not overwrite a stamp that already landed.
+  SELECT RAISE(ABORT, 'invite member_id is write-once')
+  WHERE OLD.member_id IS NOT NULL
+    AND NEW.member_id IS NOT NULL
+    AND OLD.member_id <> NEW.member_id;
   SELECT RAISE(ABORT, 'project invite member bind requires a non-blank member_id')
   WHERE NEW.member_id IS NOT NULL AND length(trim(NEW.member_id)) = 0;
   SELECT RAISE(ABORT, 'project invite pairing hash must be 64 hex characters')

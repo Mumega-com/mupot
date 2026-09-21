@@ -282,10 +282,10 @@ inviteApp.post('/:id', async (c) => {
     return c.html(invitePageBody(c.env.BRAND, view.ctx, 'Enter your name to continue.'), 400)
   }
 
-  // WARN-C: mintToken:false — this page authenticates the human by sending
-  // them to log in (OAuth/session), never by handing back a bearer, so it
-  // must not mint (or persist, in member_tokens) a workspace token just to
-  // discard it. `result.value.token` is `null` on this path; see acceptInvite.
+  // LOAD-BEARING: the public JSON accept mints a token but writes no KV
+  // marker; the web path writes the marker but mints no token; flipping
+  // this to true lets a JSON-accepted invite be linked to a victim's
+  // Google identity (adversarial gate #1458).
   const result = await acceptInvite(c.env, inviteId, displayName, { mintToken: false })
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)

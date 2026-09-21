@@ -37,7 +37,6 @@ export type InviteLinkDecision =
         | 'missing_marker'
         | 'd1_mismatch'
         | 'email_mismatch'
-        | 'identity_conflict'
       orgName: string
       squadName: string | null
     }

@@ -26,6 +26,7 @@ import {
   consumePendingInviteMarker,
   decidePendingInviteLink,
   inviteLoginMismatchBody,
+  parsePendingInviteIdFromState,
   pendingInviteEmailsMatch,
 } from '../src/auth/pending-invite-link'
 import { acceptInvite } from '../src/members'
@@ -195,6 +196,37 @@ describe('decidePendingInviteLink — unit gates (mutation-proved)', () => {
     expect(kv.store.size).toBe(0)
   })
 
+  it('P1-A: member_id stamp with null accepted_at is d1_mismatch (rollback residue)', async () => {
+    harness = makeHarness()
+    const kv = memoryKv()
+    const env = envFor(harness, kv)
+    harness.sqlite.exec(`
+      UPDATE invites SET member_id = 'member-admin', accepted_at = NULL
+       WHERE id = 'inv-legacy'
+    `)
+    kv.store.set(
+      `${PENDING_INVITE_KV_PREFIX}pending-rollback-residue`,
+      JSON.stringify({
+        invite_id: 'inv-legacy',
+        member_id: 'member-admin',
+        issued_at: new Date().toISOString(),
+      }),
+    )
+    const decision = await decidePendingInviteLink({
+      env,
+      statePendingId: 'pending-rollback-residue',
+      cookiePendingId: 'pending-rollback-residue',
+      idpEmail: 'newcomer@example.com',
+      orgName: BRAND,
+    })
+    expect(decision).toEqual({
+      action: 'refuse',
+      reason: 'd1_mismatch',
+      orgName: BRAND,
+      squadName: null,
+    })
+  })
+
   it('refuses when D1 invite is not accepted or has no member stamp', async () => {
     harness = makeHarness()
     const kv = memoryKv()
@@ -257,6 +289,16 @@ describe('decidePendingInviteLink — unit gates (mutation-proved)', () => {
       orgName: BRAND,
       squadName: null,
     })
+  })
+
+  it('WARN-E: parsePendingInviteIdFromState excludes reauth and the literal 1 bind', () => {
+    expect(parsePendingInviteIdFromState('1')).toBeNull()
+    expect(parsePendingInviteIdFromState(JSON.stringify({ reauth: true }))).toBeNull()
+    expect(
+      parsePendingInviteIdFromState(JSON.stringify({ reauth: true, pending_invite: 'inv-x' })),
+    ).toBeNull()
+    expect(parsePendingInviteIdFromState(JSON.stringify({ pending_invite: 'inv-x' }))).toBe('inv-x')
+    expect(parsePendingInviteIdFromState('not-json')).toBeNull()
   })
 
   it('refuse HTML names org/squad only — no email echo', () => {
@@ -337,6 +379,22 @@ describe('GET /auth/callback — pending-invite link (A2)', () => {
       .get() as { accepted_at: string; member_id: string }
     expect(after.accepted_at).toBe(invite.accepted_at)
     expect(after.member_id).toBe(invite.member_id)
+  })
+
+  it('WARN-F: refuse clears the pending-invite cookie', async () => {
+    harness = makeHarness()
+    const kv = memoryKv()
+    const env = envFor(harness, kv)
+
+    const accept = await inviteApp.fetch(postForm('/inv-legacy', { display_name: 'Newcomer Nancy' }), env)
+    const pendingId = pendingIdFromAccept(accept)
+    stubGoogle('other@example.com', 'google-sub-other')
+    const state = await startLogin(env, pendingId)
+    const res = await authApp.fetch(callbackReq(state, pendingId), env)
+    expect(res.status).toBe(403)
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    expect(setCookie).toContain(`${PENDING_INVITE_COOKIE}=`)
+    expect(setCookie).toMatch(/Max-Age=0|max-age=0|Expires=/i)
   })
 
   it('replayed state links nothing (state already consumed)', async () => {
