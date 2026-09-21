@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth, loadSquadScope, type SquadScope } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates } from '../tasks/index'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -478,7 +478,7 @@ async function authenticateMemberInner(c: {
 export async function memberCanOnSquad(
   env: Env,
   grants: CapabilityGrant[],
-  squadIdOrScope: string | SquadScope,
+  squadIdOrScope: string | SquadScopeLike,
   min: Capability,
 ): Promise<boolean> {
   return canOnSquad(env, grants, squadIdOrScope, min)
@@ -491,7 +491,7 @@ export async function memberCanOnSquad(
 export async function memberCanOnSquadAuth(
   env: Env,
   auth: AuthContext,
-  squadIdOrScope: string | SquadScope,
+  squadIdOrScope: string | SquadScopeLike,
   min: Capability,
 ): Promise<boolean> {
   return canOnSquadAuth(env, auth, squadIdOrScope, min)
@@ -2491,7 +2491,7 @@ function memberCanAccessFlight(
     // fall through to the real per-squad check there, same as everywhere
     // else in this file.
     const bypassAppliesHere = workspaceAdmin && squad.kind !== 'home'
-    if (!bypassAppliesHere && !hasCapability(grants, 'squad', squad, minimum)) return false
+    if (!bypassAppliesHere && !hasCapability(grants, 'squad', brandSquadScope(squad), minimum)) return false
   }
   return true
 }
@@ -2580,7 +2580,7 @@ const toolFlightDispatch: ToolSpec = {
       // G-FP1b point 3/F: same bypass gate as above — referencedSquad is a
       // full Squad row (kind included) from loadFlightSquads.
       const bypassAppliesHere = workspaceAdmin && referencedSquad.kind !== 'home'
-      if (!bypassAppliesHere && !hasCapability(grants, 'squad', referencedSquad, requiredCapability)) {
+      if (!bypassAppliesHere && !hasCapability(grants, 'squad', brandSquadScope(referencedSquad), requiredCapability)) {
         return fail(
           403,
           (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',

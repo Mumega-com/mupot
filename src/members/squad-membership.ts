@@ -1,4 +1,4 @@
-import { canOnSquad, hasCapability, type SquadScope } from '../auth/capability'
+import { brandSquadScope, canOnSquad, hasCapability } from '../auth/capability'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
   commitAgentSquadAccess,
@@ -67,7 +67,7 @@ export async function authorizeSquadMembershipWrite(input: {
     return { ok: false, error: 'self_grant' }
   }
   const grants: CapabilityGrant[] = input.auth.capabilities ?? []
-  const scope: SquadScope = input.squad
+  const scope = brandSquadScope(input.squad)
   const mayMutate = await canOnSquad(input.env, grants, scope, 'lead')
   if (!mayMutate) {
     return { ok: false, error: 'forbidden' }

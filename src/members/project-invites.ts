@@ -1,6 +1,7 @@
 import type { AuthContext, Capability, CapabilityGrant, Env, OrgKind } from '../types'
 import {
   actorRankOnScopeFor,
+  brandSquadScope,
   capabilityRank,
   exceedsTargetRankCeiling,
   hasCapability,
@@ -10,7 +11,6 @@ import {
   resolveCapabilities,
   targetLegacyRoleRank,
   targetMaxRankAcrossScopes,
-  type SquadScope,
 } from '../auth/capability'
 import { sha256Hex } from './service'
 import { claimTimestamp } from '../lib/claim-timestamp'
@@ -235,7 +235,13 @@ async function actorRankOnSquad(
     // no floor here for any role, resolved or not.
     return 0
   }
-  const scope: SquadScope = { id: squadId, department_id: departmentId, kind: await squadKindOf(env, squadId) }
+  // Adversarial round 1 (Athena, §2e-9): a missing/unknown squad row is
+  // NEVER treated as a work squad — fail closed (rank 0) rather than
+  // defaulting kind to 'work', which would let inheritance reach a squad we
+  // cannot actually classify (e.g. a home whose row was deleted).
+  const kind = await squadKindOf(env, squadId)
+  if (kind === null) return 0
+  const scope = brandSquadScope({ id: squadId, department_id: departmentId, kind })
   const grants: CapabilityGrant[] = auth.capabilities ?? await resolveCapabilities(env, auth.memberId)
   for (const capability of CAPABILITIES) {
     if (hasCapability(grants, 'squad', scope, capability)) {
@@ -259,9 +265,9 @@ async function actorRankOnSquad(
 /** Small helper: a squad's kind alone, for callers that already resolved its
  *  department_id via a different query and don't need a second full
  *  SquadScope load. */
-async function squadKindOf(env: Env, squadId: string): Promise<OrgKind> {
+async function squadKindOf(env: Env, squadId: string): Promise<OrgKind | null> {
   const row = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1 LIMIT 1').bind(squadId).first<{ kind: OrgKind }>()
-  return row?.kind ?? 'work'
+  return row?.kind ?? null
 }
 
 /**

@@ -1,5 +1,5 @@
 import type { AuthContext, Env, OrgKind } from '../types'
-import { hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities, type SquadScope } from '../auth/capability'
+import { brandSquadScope, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { MemberTokenFingerprintEnv } from '../members/service'
@@ -389,7 +389,7 @@ async function requirePendingSeatRegistrationAuthority(
     nowSqlUtc(),
   ).first<{ token_hash: string; squad_id: string; department_id: string; kind: OrgKind }>()
   if (!row) throw new RuntimeSeatError('workspace_token_required')
-  const rowScope: SquadScope = { id: row.squad_id, department_id: row.department_id, kind: row.kind }
+  const rowScope = brandSquadScope({ id: row.squad_id, department_id: row.department_id, kind: row.kind })
 
   const effectiveGrants = auth.capabilities ?? (await resolveCapabilities(env, memberId))
   if (!hasCapability(effectiveGrants, 'squad', rowScope, 'member')) {

@@ -1633,16 +1633,22 @@ describe('G. consent screen escaping — slug, squad name, budget window (not ju
     // raw id — so a hostile scope_id still reaches the markup and still has to be
     // escaped there. The rendering changed; this hazard did not.
     //
-    // The P0-1 clamp drops any grant on a scope the human holds nothing on — a
-    // first version of this test gave agent-a's dedicated member a grant on a
-    // nonsense scope_id and nothing else, which the clamp silently dropped before
-    // the render ever saw it (100% green even with .map(escapeHtml)
-    // deleted — the exact "different mechanism, same visible result" trap noted
-    // elsewhere in this suite). Fixed by ALSO granting the human an exact-match
-    // capability on that same literal scope_id string, so the clamp lets the
-    // grant through and the escaping is the thing actually under test.
+    // Adversarial round 1 on G-FP1b (Athena, 2026-09-21): a capabilities row whose
+    // scope_id has NO backing squads row now resolves to ZERO authority via ANY
+    // plane — fail closed on a missing/unknown squad row, full stop (closing the
+    // fail-open hole a first cut of the SquadScope refactor introduced: a
+    // fabricated `kind: 'work'` fallback for a dead scope_id would have let an
+    // org grant "regain" a squad whose row had been deleted). So a grant on a
+    // scope_id with no real squad row behind it can no longer survive the P0-1
+    // clamp at all — this test's ORIGINAL premise (a hostile scope_id with no
+    // backing row still reaching the render) is exactly the shape that fail-closed
+    // rule now forbids. A REAL squad row, whose id IS the hostile string, is the
+    // still-current way `capabilities.scope_id` having no FK actually matters:
+    // nothing stops a squad's OWN id from ever being a hostile string, and the
+    // render must still escape it.
     const hostileScopeId = '"><script>alert(6)</script>'
     harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('${hostileScopeId}', 'dept-eng', 'hostile-squad', 'Hostile Squad');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-a-hostile-scope', '${MEMBER_AGENT_A}', 'squad', '${hostileScopeId}', 'member');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)

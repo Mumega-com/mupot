@@ -72,6 +72,40 @@ const GATE_CALL_RE = new RegExp(`(?:^|[^A-Za-z0-9_.])(?:${GATE_FUNCTIONS.join('|
 const TS_SUPPRESSION_RE = /@ts-ignore|@ts-expect-error/
 const UNSAFE_CAST_RE = /\bas\s+any\b|\bas\s+SquadScope\b|\bas\s+unknown\s+as\s+SquadScope\b/
 
+// Adversarial round 1 on G-FP1b (P1, Athena): a 1-of-9-escapes ratchet is not a belt.
+// The 9 escapes named, and how each is now caught:
+//   1. same-line `as any` / `as SquadScope`                -> UNSAFE_CAST_RE, same line
+//   2. same-line `@ts-ignore`/`@ts-expect-error`            -> TS_SUPPRESSION_RE, same line
+//   3. suppression comment ONE line above                  -> TS_SUPPRESSION_RE, SUPPRESSION_LOOKBACK
+//   4. suppression comment TWO lines above                 -> TS_SUPPRESSION_RE, SUPPRESSION_LOOKBACK
+//   5. multi-line cast (the `as any` on a continuation line
+//      of a call that wraps across lines)                  -> UNSAFE_CAST_RE, CAST_LOOKBACK
+//   6. a HOISTED cast (`const x = squadId as any` a few
+//      lines above, then `hasCapability(..., x, ...)`)      -> UNSAFE_CAST_RE, CAST_LOOKBACK
+//   7. a fabricated `{id, department_id, kind: 'work'}`
+//      literal typed directly as SquadScope                -> the BRAND makes this a compile
+//      error on its own (SquadScope is unconstructable outside brandSquadScope); this ratchet
+//      additionally flags an unbranded object literal sitting on a gate-call line as
+//      defense-in-depth (LITERAL_SCOPE_RE)
+//   8. kind lifted straight off a request body               -> same brand protection, plus
+//      REQUEST_BODY_KIND_RE flags `<something>.kind` piped into brandSquadScope on a line
+//      where the object being read from looks like a parsed body (`body`/`args`/`input`/`req`)
+//   9. a reintroduced optional `squadKind?` parameter        -> SQUAD_KIND_OPTIONAL_RE, scanned
+//      over the WHOLE file, not just near a gate call — this is banned outright, anywhere
+//  10. a bare id smuggled through hasCapabilityOnDynamicScope
+//      by hardcoding scopeType to the literal 'squad'        -> DYNAMIC_SCOPE_LITERAL_SQUAD_RE
+//
+// LOOKBACK windows are wider for a cast (which can legitimately sit a few lines above a call
+// that spans multiple arguments) than for a suppression comment (which conventionally sits
+// immediately above, but round 1 wants two lines honored too).
+const SUPPRESSION_LOOKBACK = 2
+const CAST_LOOKBACK = 5
+
+const LITERAL_SCOPE_RE = /\{\s*id\s*:.*department_id\s*:.*kind\s*:/
+const REQUEST_BODY_KIND_RE = /\b(?:body|args|input|req|request)\.[A-Za-z0-9_.]*kind\b/
+const SQUAD_KIND_OPTIONAL_RE = /\bsquadKind\s*\?\s*:/
+const DYNAMIC_SCOPE_LITERAL_SQUAD_RE = /hasCapabilityOnDynamicScope\s*\([^)]*'squad'/
+
 const EXEMPT_RE = /bare-squad-id-exempt:\s*(.+?)\s*$/
 
 function baselineSizeOnTarget() {
@@ -117,29 +151,102 @@ function walk(dir) {
   return out
 }
 
+/** Join lines [i - back, i] into one string for a multi-line regex test, and return
+ *  the matching line's own text (for the exemption-comment lookup) alongside it. */
+function windowAbove(lines, i, back) {
+  const start = Math.max(0, i - back)
+  return lines.slice(start, i)
+}
+
+function findExemptIn(candidateLines) {
+  for (const l of candidateLines) {
+    const m = l.match(EXEMPT_RE)
+    if (m) return m[1]
+  }
+  return null
+}
+
 /**
- * Scan one file's source for a gate-function call whose line (or the line directly above)
- * suppresses the typechecker or casts into SquadScope. Pure — no I/O — so tests can drive it
- * with synthetic source. Returns { violations: [{ line, snippet }], exemptions: [{ line, reason }] }.
+ * Scan one file's source for a gate-function call whose line (or a nearby line) suppresses
+ * the typechecker, casts into SquadScope, or otherwise smuggles a bare id/fabricated scope
+ * past the SquadScope requirement — plus two checks that are NOT gate-call-anchored at all
+ * (a reintroduced `squadKind?` parameter, banned anywhere in the file; a fabricated scope
+ * literal or request-body-derived kind sitting on the gate-call line itself). Pure — no I/O —
+ * so tests can drive it with synthetic source. Returns
+ * { violations: [{ line, snippet }], exemptions: [{ line, reason }] }.
  */
 export function scanSource(source) {
   const lines = source.split('\n')
   const violations = []
   const exemptions = []
+  const flaggedLines = new Set()
+
+  function flag(i, reasonLines) {
+    if (flaggedLines.has(i)) return
+    const exempt = findExemptIn(reasonLines)
+    if (exempt) {
+      exemptions.push({ line: i + 1, reason: exempt })
+    } else {
+      violations.push({ line: i + 1, snippet: lines[i].trim() })
+    }
+    flaggedLines.add(i)
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
-    if (!GATE_CALL_RE.test(line)) continue
-    const above = i > 0 ? lines[i - 1] : ''
-    const suppressed = TS_SUPPRESSION_RE.test(line) || TS_SUPPRESSION_RE.test(above) || UNSAFE_CAST_RE.test(line)
-    if (!suppressed) continue
 
-    const exemptMatch = line.match(EXEMPT_RE) || above.match(EXEMPT_RE)
-    if (exemptMatch) {
-      exemptions.push({ line: i + 1, reason: exemptMatch[1] })
-    } else {
-      violations.push({ line: i + 1, snippet: line.trim() })
+    // Escape 9: a reintroduced optional `squadKind?` parameter — banned
+    // anywhere in the file, not only near a gate call (mupot#1452 round 2's
+    // exact defect shape).
+    if (SQUAD_KIND_OPTIONAL_RE.test(line)) {
+      flag(i, [line])
+      continue
     }
+
+    // Escape 10 is anchored on hasCapabilityOnDynamicScope, which is
+    // deliberately NOT in GATE_FUNCTIONS (it is the sanctioned escape hatch
+    // for hasCapability's own overloads) — checked independently of the
+    // GATE_CALL_RE filter below.
+    if (DYNAMIC_SCOPE_LITERAL_SQUAD_RE.test(line)) {
+      flag(i, [line])
+      continue
+    }
+
+    if (!GATE_CALL_RE.test(line)) continue
+
+    // Escapes 3/4: a suppression comment up to SUPPRESSION_LOOKBACK lines above.
+    const suppressionWindow = windowAbove(lines, i, SUPPRESSION_LOOKBACK)
+    const suppressionLine = suppressionWindow.find((l) => TS_SUPPRESSION_RE.test(l))
+
+    // Escapes 1/5/6: an unsafe cast on the call line itself, or up to
+    // CAST_LOOKBACK lines above (a multi-line call, or a hoisted
+    // `const x = squadId as any` a few lines before its use).
+    const castWindow = windowAbove(lines, i, CAST_LOOKBACK)
+    const castLine = UNSAFE_CAST_RE.test(line) ? line : castWindow.find((l) => UNSAFE_CAST_RE.test(l))
+
+    // Escape 2 (same-line suppression) is covered by suppressionLine === line
+    // when SUPPRESSION_LOOKBACK's window includes the call line itself — it
+    // does not (windowAbove excludes index i), so check the call line directly too.
+    const sameLineSuppressed = TS_SUPPRESSION_RE.test(line)
+
+    // Escape 10: hasCapabilityOnDynamicScope hardcoded to scopeType 'squad' —
+    // the dynamic dispatcher exists ONLY for a genuinely runtime-determined
+    // scope type; a literal 'squad' argument means the caller already knows
+    // the scope statically and should be forced through hasCapability's
+    // overloads instead.
+    const dynamicScopeEscape = DYNAMIC_SCOPE_LITERAL_SQUAD_RE.test(line)
+
+    // Escapes 7/8: a fabricated inline scope literal, or a request-body-shaped
+    // `.kind` read, sitting on the gate-call line itself. (The branded
+    // SquadScope type already makes a bare literal a TYPE ERROR on its own —
+    // this is defense-in-depth for the case where brandSquadScope itself is
+    // fed body-shaped fields.)
+    const fabricatedLiteral = LITERAL_SCOPE_RE.test(line) && REQUEST_BODY_KIND_RE.test(line)
+
+    if (!sameLineSuppressed && !suppressionLine && !castLine && !dynamicScopeEscape && !fabricatedLiteral) continue
+
+    const reasonLines = [line, ...suppressionWindow, ...castWindow]
+    flag(i, reasonLines)
   }
 
   return { violations, exemptions }

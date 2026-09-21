@@ -25,7 +25,7 @@
 // holds gate:loops but not outreach:send-gated (surface cap) — see
 // tests/tasks-verdict-gates.test.ts and tests/dashboard-approvals-can-verdict.test.ts.
 
-import type { Env, Task, AuthContext } from '../types'
+import type { Env, Task, AuthContext, OrgKind } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache } from '../tasks/index'
 import { resolveGatePrincipal } from '../gates/principal'
@@ -175,7 +175,7 @@ const PUBLISHABLE_SELECT = `
 // are scoped to this one function call, discarded after, never shared across
 // requests or callers).
 async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[]): Promise<ApprovalItem[]> {
-  const deptCache = new Map<string, Promise<string | null>>()
+  const deptCache = new Map<string, Promise<{ department_id: string; kind: OrgKind } | null>>()
   const gateCache = createVerdictGateCache()
   return Promise.all(
     rows.map(async (row) => {

@@ -18,7 +18,7 @@
 import type { Env, CapabilityGrant, MessageCreatedPayload } from '../types'
 import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
-import { canOnSquad } from '../auth/capability'
+import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
@@ -2194,9 +2194,22 @@ async function visibleNamedAgents(
   memberId: string,
 ): Promise<Array<SendAgentRow & { guestFence?: GuestVisibilityFence }>> {
   const named = await agentsNamed(env, name)
-  if (authz.isAdmin) return named
   const visible: Array<SendAgentRow & { guestFence?: GuestVisibilityFence }> = []
   for (const candidate of named) {
+    // Adversarial round 1 (Athena, P2): `authz.isAdmin` used to bypass this
+    // whole function unconditionally, returning EVERY name match including
+    // an agent living in another member's home squad — "send-into-home" by
+    // resolving a name, not an id. The admin bypass now applies ONLY to a
+    // candidate whose squad is NOT a home; a home-squad candidate still goes
+    // through the ordinary visibility check, which an org-wide admin cannot
+    // satisfy (G-FP1b point 2/3) unless they hold the home's own exact grant.
+    if (authz.isAdmin) {
+      const scope = await loadSquadScope(env, candidate.squad_id)
+      if (scope && planeCoversScope('org', scope)) {
+        visible.push(candidate)
+        continue
+      }
+    }
     const visibility = await recipientVisibilityOnSenderSquads(env, memberId, authz.grants, candidate)
     if (visibility.visible) visible.push({ ...candidate, guestFence: visibility.guestFence })
   }
@@ -2413,7 +2426,19 @@ async function resolveVisibleSendTargetOnce(
 > {
   if (authz.isAdmin) {
     const resolved = await resolveAgentRef(env, toRef)
-    if (resolved.ok) return { ok: true, value: resolved.value }
+    if (resolved.ok) {
+      // Adversarial round 1 (Athena, P2): send-into-home by ID — the admin
+      // resolve path used to skip visibility entirely for an exact id/slug
+      // match. A home-squad target still needs the ordinary visibility
+      // check; an org-wide admin cannot satisfy it (G-FP1b point 2/3)
+      // unless they hold the home's own exact grant.
+      const scope = await loadSquadScope(env, resolved.value.squad_id)
+      if (scope && !planeCoversScope('org', scope)) {
+        const visibility = await recipientVisibilityOnSenderSquads(env, memberId ?? '', authz.grants, resolved.value)
+        if (!visibility.visible) return { ok: false, reason: 'send_target_not_visible' }
+      }
+      return { ok: true, value: resolved.value }
+    }
     const named = await agentsNamed(env, toRef)
     if (named.length === 1) return { ok: true, value: named[0] }
     return { ok: false, reason: named.length > 1 ? 'recipient_ambiguous' : 'recipient_not_found' }
@@ -2480,6 +2505,13 @@ export async function sendToRef(
       // expected to disambiguate by id; there is no visibility gate to protect here).
       const r = await resolveAgentRef(env, toRef)
       if (r.ok) {
+        // Adversarial round 1 (Athena, P2): send-into-home by ID — same fix
+        // as resolveVisibleSendTargetOnce's admin branch above.
+        const scope = await loadSquadScope(env, r.value.squad_id)
+        if (scope && !planeCoversScope('org', scope)) {
+          const visibility = await recipientVisibilityOnSenderSquads(env, input.fromMember, authz.grants, r.value)
+          if (!visibility.visible) return { ok: false, reason: 'send_target_not_visible' }
+        }
         return { ok: true, resolved: r, squadViaProjectOnly: false }
       }
       if (r.reason === 'ambiguous') {

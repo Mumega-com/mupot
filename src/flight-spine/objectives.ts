@@ -1,5 +1,5 @@
 import type { AuthContext, Capability, Env, OrgKind } from '../types'
-import { hasCapability, planeCoversScope, resolveCapabilities } from '../auth/capability'
+import { brandSquadScope, hasCapability, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { isEnforceableCap } from '../agents/meter'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
@@ -230,18 +230,19 @@ export async function requireFlightSpineSquadAuthority(
     SELECT id, department_id, budget_cap_cents, kind FROM squads WHERE id = ?1
   `).bind(squadId).first<SquadAuthorityRow>()
   if (!squad) throw new ObjectiveError('objective_forbidden')
+  const squadScope = brandSquadScope(squad)
 
   // G-FP1b point 2/3: the legacy-role plane never covers a home squad —
   // otherwise an org owner/admin with zero grant rows could act on ANY
   // member's home flight-spine objective.
   const legacyAdmin = auth.capabilities === undefined
     && (auth.role === 'owner' || auth.role === 'admin')
-    && planeCoversScope('role', squad)
+    && planeCoversScope('role', squadScope)
   // A defined capability view is the auth layer's effective ambient authority.
   // In particular, [] is the directory ceiling and a narrowed array can be a
   // consent clamp; rereading wider DB grants here would undo both controls.
   const grants = auth.capabilities ?? (await resolveCapabilities(env, principal.authorityMemberId))
-  if (!legacyAdmin && !hasCapability(grants, 'squad', squad, minimum)) {
+  if (!legacyAdmin && !hasCapability(grants, 'squad', squadScope, minimum)) {
     throw new ObjectiveError(minimum === 'lead'
       ? 'objective_budget_forbidden'
       : 'objective_forbidden')
@@ -256,7 +257,7 @@ export async function requireFlightSpineSquadAuthority(
       scope_type: 'squad',
       scope_id: squad.id,
       capability: membership.capability,
-    }], 'squad', squad, minimum)) {
+    }], 'squad', squadScope, minimum)) {
       throw new ObjectiveError(minimum === 'lead'
         ? 'objective_budget_forbidden'
         : 'objective_forbidden')

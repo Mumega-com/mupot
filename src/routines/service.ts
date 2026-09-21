@@ -17,7 +17,7 @@ import {
   principalCanRunForSquad,
   type RoutinePrincipal,
 } from './access'
-import { hasCapability, type SquadScope } from '../auth/capability'
+import { brandSquadScope, hasCapability } from '../auth/capability'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -312,7 +312,12 @@ async function principalCanMutateRoutinePolicy(
   const squadKind = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1 LIMIT 1')
     .bind(squadId)
     .first<{ kind: OrgKind }>()
-  if (principal.workspace_admin && squadKind?.kind !== 'home') return true
+  // Adversarial round 1 (Athena, §2e-9): fail CLOSED on a missing/unknown
+  // squad row — `squadKind?.kind !== 'home'` was true (bypass applied) both
+  // for a real work squad AND for a squad that does not exist at all
+  // (`undefined !== 'home'`). A missing row must never be treated as a
+  // bypassable work squad.
+  if (principal.workspace_admin && squadKind !== null && squadKind.kind !== 'home') return true
 
   const squad = await env.DB.prepare(
     `SELECT s.department_id, s.kind
@@ -321,7 +326,7 @@ async function principalCanMutateRoutinePolicy(
       WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
   ).bind(squadId, projectId).first<{ department_id: string; kind: OrgKind }>()
   if (!squad) return false
-  const scope: SquadScope = { id: squadId, department_id: squad.department_id, kind: squad.kind }
+  const scope = brandSquadScope({ id: squadId, department_id: squad.department_id, kind: squad.kind })
   return (
     hasCapability(principal.grants, 'squad', scope, 'admin') ||
     hasCapability(principal.grants, 'department', squad.department_id, 'admin')

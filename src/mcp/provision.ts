@@ -32,7 +32,7 @@
 //                        no authorization of its own.
 
 import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
-import { capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
+import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
 import {
   createDepartment,
   createSquad,
@@ -315,7 +315,7 @@ export function callerCanGrantAgentCapability(
   squad: Pick<Squad, 'id' | 'department_id' | 'kind'>,
   capability: Capability,
 ): boolean {
-  return hasCapability(grants, 'squad', squad, capability)
+  return hasCapability(grants, 'squad', brandSquadScope(squad), capability)
 }
 
 // ── create_department ───────────────────────────────────────────────────────────

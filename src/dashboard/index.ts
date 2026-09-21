@@ -3106,9 +3106,14 @@ async function loadDepartments(env: Env): Promise<Department[]> {
   return rows.results ?? []
 }
 
+// G-FP1b point 2/3: this is the generic "list every squad for a picker/org-tree/
+// kanban-sidebar display" helper — no caller of it should see a member's home
+// squad by default. Excluded directly here rather than per-caller: a home
+// squad's own legitimate viewers reach it through an explicit-grant-checked
+// path (canOnSquad/canOnSquadAuth), never through this org-wide listing.
 async function loadSquads(env: Env): Promise<Squad[]> {
   const rows = await env.DB.prepare(
-    'SELECT id, department_id, slug, name, charter, created_at FROM squads ORDER BY created_at ASC, name ASC',
+    `SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE kind != 'home' ORDER BY created_at ASC, name ASC`,
   ).all<Squad>()
   return rows.results ?? []
 }

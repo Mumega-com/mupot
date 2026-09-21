@@ -1,5 +1,5 @@
 import type { Env, OrgKind } from '../types'
-import { hasCapability, planeCoversScope, type SquadScope } from '../auth/capability'
+import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
 import type { RoutinePrincipal } from '../routines/access'
@@ -118,7 +118,7 @@ function urgency(rank: number): NeedsYouItem['urgency'] {
 
 function principalCanActOnSquad(row: SourceRow, principal: RoutinePrincipal): boolean {
   if (row.squad_id === null || row.squad_department_id === null || row.squad_kind === null) return false
-  const scope: SquadScope = { id: row.squad_id, department_id: row.squad_department_id, kind: row.squad_kind }
+  const scope = brandSquadScope({ id: row.squad_id, department_id: row.squad_department_id, kind: row.squad_kind })
   // G-FP1b point 2/3: legacy_owner_admin never covers a home squad — a needs-
   // you row about another member's home task/routine must not surface to an
   // unrelated owner/admin login with zero grant rows there.
@@ -127,7 +127,21 @@ function principalCanActOnSquad(row: SourceRow, principal: RoutinePrincipal): bo
 }
 
 function principalCanAnswerRoutine(row: SourceRow, principal: RoutinePrincipal): boolean {
-  if (principal.workspace_admin) return true
+  // Adversarial round 1 (Athena, P2): `workspace_admin` used to bypass
+  // UNCONDITIONALLY, ahead of any home-squad exclusion — an org-wide admin
+  // could answer a routine question about another member's home regardless
+  // of project access level. The bypass must be scope-aware the same way
+  // every other admin bypass in this file already is: never reach a home
+  // squad via the legacy-role plane or an org-scope grant, exact-match
+  // grants excepted (a home's own owner is unaffected either way, since
+  // they separately pass the plain squad-access check below).
+  if (principal.workspace_admin) {
+    if (row.squad_id === null || row.squad_department_id === null || row.squad_kind === null) return false
+    const scope = brandSquadScope({ id: row.squad_id, department_id: row.squad_department_id, kind: row.squad_kind })
+    const legacyPlaneCovers = principal.legacy_owner_admin === true && planeCoversScope('role', scope)
+    const orgGrantCovers = hasCapability(principal.grants, 'org', null, 'member') && planeCoversScope('org', scope)
+    if (legacyPlaneCovers || orgGrantCovers) return true
+  }
   return (row.project_access_level === 'write' || row.project_access_level === 'admin')
     && principalCanActOnSquad(row, principal)
 }

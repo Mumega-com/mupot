@@ -54,6 +54,12 @@ function makeEnv(task: Task) {
             return {
               async first<T>() {
                 if (sql.includes('FROM tasks')) return task as T
+                // G-FP1b point 2/3: canActOnSquad now resolves the squad's
+                // kind (in addition to its pre-existing department_id lookup)
+                // before honouring the legacy-owner bypass, so it can refuse
+                // that bypass on a home squad. Every task in this fixture
+                // lives on an ordinary work squad.
+                if (sql.includes('FROM squads')) return { department_id: 'dept-1', kind: 'work' } as T
                 return null as T
               },
               async run() {

@@ -8,7 +8,7 @@
 
 import { Hono, type MiddlewareHandler } from 'hono'
 import { z } from 'zod'
-import type { Env, AuthContext, Capability, ChannelBinding } from '../types'
+import type { Env, AuthContext, Capability, ChannelBinding, OrgKind } from '../types'
 import { requireAuth } from '../auth'
 import { csrf } from 'hono/csrf'
 import { requireOrgCapability, actorMaxRankOnScope } from '../auth/capability'
@@ -72,10 +72,15 @@ channelsAdminApp.post('/bindings', requireOrgCapability('admin'), async (c) => {
     return c.json({ error: 'max_capability too high (member|lead only)' }, 400)
   }
   // squad must exist in this tenant's DB
-  const squad = await c.env.DB.prepare('SELECT id FROM squads WHERE id = ?1')
+  const squad = await c.env.DB.prepare('SELECT id, kind FROM squads WHERE id = ?1')
     .bind(body.squad_id.trim())
-    .first<{ id: string }>()
+    .first<{ id: string; kind: OrgKind }>()
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+  // G-FP1b point 4/P0-2: a channel binding is what makes ensureSquadGrant
+  // (src/channels/sync.ts) mint channel_capability_grants rows for every
+  // channel member — a SECOND standing-grant table besides `capabilities`.
+  // No standing grant path into a home squad may exist through it either.
+  if (squad.kind === 'home') return c.json({ error: 'home_scope_not_grantable' }, 403)
 
   const id = crypto.randomUUID()
   try {

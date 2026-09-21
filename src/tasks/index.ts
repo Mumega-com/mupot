@@ -23,8 +23,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
-import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope } from '../auth/capability'
-import { resolveAllSquadIds } from '../projects/readable-squads'
+import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
@@ -95,12 +94,14 @@ function legacyOwnerAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
 
-// Resolve a squad's department for department→squad capability inheritance.
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
+// Resolve a squad's department (for department→squad capability inheritance)
+// AND its kind (for the home exclusion, G-FP1b point 2/3) in ONE query — see
+// canActOnSquad's cache comment below for why this must not be two queries.
+async function squadScopeFacts(env: Env, squadId: string): Promise<{ department_id: string; kind: OrgKind } | null> {
+  const r = await env.DB.prepare('SELECT department_id, kind FROM squads WHERE id = ?1')
     .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
+    .first<{ department_id: string; kind: OrgKind }>()
+  return r ?? null
 }
 
 // member+ gate on a specific squad. Returns true when the caller may create/mutate
@@ -120,19 +121,28 @@ async function squadDepartment(env: Env, squadId: string): Promise<string | null
 // through tasksApp.fetch in a test harness; testing the primitive itself keeps
 // the #406 admin-floor coverage real rather than skipped.
 // mupot#1319 gate BLOCK-1: `deptCache` is an OPTIONAL, caller-supplied memo
-// for squadDepartment's `SELECT department_id FROM squads` — squad_id ->
-// department_id never changes within one request, but decorateApprovals
-// (src/dashboard/approvals.ts) calls this once per queue row, and a gate
-// queue is typically a handful of squads holding many rows each, so an
-// unmemoized lookup re-queries the SAME squad N times. Omitted (undefined)
-// by every other existing call site, so behavior and cost there is
-// unchanged — caching only activates when a caller opts in.
+// for squadScopeFacts's `SELECT department_id, kind FROM squads` — squad_id
+// -> {department_id, kind} never changes within one request, but
+// decorateApprovals (src/dashboard/approvals.ts) calls this once per queue
+// row, and a gate queue is typically a handful of squads holding many rows
+// each, so an unmemoized lookup re-queries the SAME squad N times. Omitted
+// (undefined) by every other existing call site, so behavior and cost there
+// is unchanged — caching only activates when a caller opts in.
+//
+// G-FP1b point 2/3: this used to be TWO queries — squadDepartment (cached)
+// plus a separate, UNCACHED squadKindOnly added for the home exclusion. That
+// doubled decorateApprovals' D1 statement count and defeated the O(1)-growth
+// guarantee tests/dashboard-approvals-query-cost.test.ts exists to enforce
+// (kind was re-queried fresh for every row, even when department_id was
+// already served from cache). Folded into the ONE cached query/promise
+// instead — same shape as the original fix's own reasoning, just widened to
+// carry kind alongside department_id.
 export async function canActOnSquad(
   env: Env,
   auth: AuthContext,
   squadId: string,
   min: Capability = 'member',
-  deptCache?: Map<string, Promise<string | null>>,
+  deptCache?: Map<string, Promise<{ department_id: string; kind: OrgKind } | null>>,
 ): Promise<boolean> {
   // The cache stores the PROMISE, not the resolved value. decorateApprovals
   // (src/dashboard/approvals.ts) drives every row through Promise.all
@@ -146,18 +156,17 @@ export async function canActOnSquad(
   // the map slot before its own `await`, so every concurrent sibling for
   // that squadId finds the in-flight promise already there and awaits the
   // SAME one — one real query serves the whole concurrent batch.
-  let deptPromise: Promise<string | null>
+  let factsPromise: Promise<{ department_id: string; kind: OrgKind } | null>
   const cached = deptCache?.get(squadId)
   if (cached) {
-    deptPromise = cached
+    factsPromise = cached
   } else {
-    deptPromise = squadDepartment(env, squadId)
-    if (deptCache) deptCache.set(squadId, deptPromise)
+    factsPromise = squadScopeFacts(env, squadId)
+    if (deptCache) deptCache.set(squadId, factsPromise)
   }
-  const deptId = await deptPromise
-  const kind = await squadKindOnly(env, squadId)
-  if (kind === null) return false
-  const scope = { id: squadId, department_id: deptId ?? '', kind }
+  const facts = await factsPromise
+  if (facts === null) return false
+  const scope = brandSquadScope({ id: squadId, department_id: facts.department_id, kind: facts.kind })
   // G-FP1b point 2/3: legacyOwnerAdmin never bypasses a home squad.
   if (legacyOwnerAdmin(auth) && planeCoversScope('role', scope)) return true
   if (!auth.memberId) return false
@@ -165,25 +174,22 @@ export async function canActOnSquad(
   return hasCapability(grants, 'squad', scope, min)
 }
 
-/** A squad's kind alone — cheap, uncached (deptCache above already memoizes
- *  the department_id half of the same row for the hot decorateApprovals
- *  path; kind is only needed for the home exclusion, not worth a second
- *  shared cache map for this PR). */
-async function squadKindOnly(env: Env, squadId: string): Promise<OrgKind | null> {
-  const r = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1').bind(squadId).first<{ kind: OrgKind }>()
-  return r?.kind ?? null
-}
-
+// `null` = unrestricted (legacy owner/admin, or an org-scope grant holder) —
+// the caller adds NO `squad_id IN (...)` clause at all, same zero-extra-query
+// cost as before G-FP1b. That is exactly why this alone is NOT enough to
+// exclude home squads: a materialized "every non-home squad id" list would
+// change this from "no filter" to "an enumerated filter" for the common
+// admin case, which is both a real cost regression AND breaks the "an
+// unrestricted read costs the same query shape as always" property
+// tests/tasks-list-rbac.test.ts asserts directly. Home exclusion for the
+// `null` case is instead pushed into the CALLER's SQL as a `NOT EXISTS`
+// clause (see the `readable === null` branch in the GET / handler below) —
+// this function's contract is otherwise UNCHANGED from before this PR.
 async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
-  // G-FP1b point 2/3: `null` used to mean "see literally every squad" for a
-  // legacy owner/admin or an org-scope grant holder — leaking every
-  // member's home into task_list/task_board. Both branches now return the
-  // explicit list of every NON-home squad instead (resolveAllSquadIds is
-  // shared with src/projects/readable-squads.ts's identical fix).
-  if (legacyOwnerAdmin(auth)) return resolveAllSquadIds(env, { excludeHome: true })
+  if (legacyOwnerAdmin(auth)) return null
   if (!auth.memberId) return []
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, 'member')) return resolveAllSquadIds(env, { excludeHome: true })
+  if (hasCapability(grants, 'org', null, 'member')) return null
 
   const squadIds = new Set<string>()
   const deptIds = new Set<string>()
@@ -338,6 +344,15 @@ tasksApp.get('/', async (c) => {
         )`)
         binds.push(JSON.stringify(readable))
       }
+    } else {
+      // G-FP1b point 2/3: `readable === null` means "unrestricted" (legacy
+      // owner/admin, or an org-scope grant holder) — no `squad_id IN (...)`
+      // enumeration, by design (see readableSquadIds's doc comment). That
+      // must not include a member's home squad, so the exclusion is pushed
+      // into the query itself instead of into a materialized id list.
+      clauses.push(`NOT EXISTS (
+        SELECT 1 FROM squads s WHERE s.id = tasks.squad_id AND s.kind = 'home'
+      )`)
     }
   }
   if (projectId !== undefined) {

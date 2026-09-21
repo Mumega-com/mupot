@@ -1,7 +1,7 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
-import { hasCapability } from '../auth/capability'
+import { brandSquadScope, hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
 import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
@@ -300,7 +300,7 @@ async function selectAgent(
   // so a per-candidate SquadScope is built from the row already in hand.
   const eligible = candidates.filter(candidate => {
     if (assignedAgentId !== null && candidate.id !== assignedAgentId) return false
-    const scope = { id: policy.responsible_squad_id, department_id: candidate.department_id, kind: candidate.kind }
+    const scope = brandSquadScope({ id: policy.responsible_squad_id, department_id: candidate.department_id, kind: candidate.kind })
     return hasCapability(grants.get(candidate.member_id) ?? [], 'squad', scope, 'member')
   }).sort((left, right) => {
     const preferred = policy.preferred_agent_id

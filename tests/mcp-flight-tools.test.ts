@@ -1196,6 +1196,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         CREATE TABLE squads (
           id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
           charter TEXT, budget_cap_cents INTEGER, budget_window TEXT NOT NULL DEFAULT 'day',
+          kind TEXT NOT NULL DEFAULT 'work',
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE agents (

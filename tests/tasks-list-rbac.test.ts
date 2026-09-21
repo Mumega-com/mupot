@@ -76,7 +76,13 @@ function makeEnv(role: 'owner' | 'admin' | 'member') {
                     rows = rows.filter((task) => task.squad_id === squadId)
                   }
                   if (sql.includes('squad_id IN')) {
-                    const squadIds = args as string[]
+                    // Production binds ONE json_each(?) param — a JSON-encoded
+                    // array — not one bound value per squad id (see
+                    // src/tasks/index.ts's readableSquadIds clause). Parse it
+                    // the same way, rather than treating `args` itself as the
+                    // squad-id list.
+                    const [readableJson] = args as [string]
+                    const squadIds = JSON.parse(readableJson) as string[]
                     rows = rows.filter((task) => squadIds.includes(task.squad_id))
                   }
                   // #22 v1 ATC ranking (P1 fix, 2026-07-16): GET / now issues
@@ -96,6 +102,15 @@ function makeEnv(role: 'owner' | 'admin' | 'member') {
                     rows = rows.filter((task) => !actionable.has(task.status))
                   }
                   return { results: rows } as { results: T[] }
+                }
+                // G-FP1b point 2/3: readableSquadIds now materializes the
+                // explicit list of every non-home squad for a legacy owner
+                // (resolveAllSquadIds's paginated `FROM squads` query),
+                // rather than returning `null` (unrestricted, zero DB cost)
+                // as before — this mock's squad set is exactly the two work
+                // squads the fixture tasks live on, one page.
+                if (sql.includes('FROM squads')) {
+                  return { results: [{ id: 'sq-growth' }, { id: 'sq-ops' }] } as { results: T[] }
                 }
                 return { results: [] } as { results: T[] }
               },

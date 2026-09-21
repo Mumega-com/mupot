@@ -120,6 +120,72 @@ const canOnSquad = sharedCanOnSquad // @ts-ignore unrelated note on this exact l
   assert.equal(violations.length, 0)
 })
 
+test('a suppression comment TWO lines above a gated call is flagged (adversarial round 1 escape #4)', () => {
+  const src = `
+export function check(grants, squadId) {
+  // @ts-expect-error two lines up
+  const x = 1
+  return hasCapability(grants, 'squad', squadId, 'member')
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 1)
+})
+
+test('a multi-line cast a few lines above the call is flagged (adversarial round 1 escape #5/#6, hoisted cast)', () => {
+  const src = `
+export async function check(env, grants, squadId) {
+  const hoisted = squadId as any
+  const unrelated1 = 1
+  const unrelated2 = 2
+  return canOnSquad(env, grants, hoisted, 'admin')
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 1)
+})
+
+test('a reintroduced optional squadKind? parameter is flagged ANYWHERE in the file (adversarial round 1 escape #9)', () => {
+  const src = `
+export function hasCapability(grants, scopeType, scopeId, min, squadKind?: OrgKind) {
+  return true
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 1)
+  assert.match(violations[0].snippet, /squadKind/)
+})
+
+test("hasCapabilityOnDynamicScope hardcoded to scopeType 'squad' is flagged (adversarial round 1 escape #10)", () => {
+  const src = `
+export async function check(env, grants, squadId) {
+  return hasCapabilityOnDynamicScope(env, grants, 'squad', squadId, 'member')
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 1)
+})
+
+test('hasCapabilityOnDynamicScope with a genuinely dynamic scopeType variable is NOT flagged', () => {
+  const src = `
+export async function check(env, grants, scopeType, scopeId) {
+  return hasCapabilityOnDynamicScope(env, grants, scopeType, scopeId, 'member')
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 0)
+})
+
+test('a fabricated inline scope literal built from a request body is flagged (adversarial round 1 escapes #7/#8)', () => {
+  const src = `
+export function check(grants, body) {
+  return hasCapability(grants, 'squad', { id: body.squad_id, department_id: body.dept_id, kind: body.kind }, 'member')
+}
+`
+  const { violations } = scanSource(src)
+  assert.equal(violations.length, 1)
+})
+
 test('a suppression comment near, but not on/above, a gated call line does not flag it', () => {
   const src = `
 export function unrelated() {

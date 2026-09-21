@@ -94,25 +94,30 @@ export async function resolveGrantedSquadIds(
 // resolveCapabilities / org-grant-shortcut sequence a third and fourth time —
 // see [[feedback_two_tools_two_copies_of_one_predicate]] on why N copies of
 // one security predicate silently drift apart.
+// `null` (unrestricted) is UNCHANGED by G-FP1b — still zero extra D1 cost,
+// exactly as before this PR (an earlier cut of this fix materialized every
+// non-home squad id instead, which (a) turned a free check into a real query
+// on every dashboard/task/agent read for the common org-admin case, and (b)
+// broke several tests' explicit "an unrestricted caller issues the SAME
+// query shape as always, no extra filter" assertions — see
+// tests/dashboard-agents-admin.test.ts's own doc comment on exactly this
+// property). Home exclusion for the unrestricted case is instead the
+// CONSUMER's job: every one of this function's callers that reads squad-
+// scoped rows already joins `squads` (or filters against a real squad list)
+// and must add `kind != 'home'` there, the same way
+// src/dashboard/agents-admin.ts's loadAllAgents and
+// src/tasks/index.ts's GET / handler do. See the PR body's per-consumer
+// table for which of the eight callers carry that exclusion and how it was
+// verified.
 export async function resolveAccessibleSquadIds(
   env: Env,
   auth: AuthContext,
   minimum: Capability = 'observer',
 ): Promise<string[] | null> {
-  // G-FP1b point 2/3: `null` used to mean "org admin, see literally every
-  // squad" — which leaked every member's home into every dashboard surface
-  // built on this function (kanban, fleet, brain, agents-admin, mission
-  // control, mcp/runners). `null` no longer means that: an org-admin/owner
-  // now gets the explicit list of every NON-home squad, same as an org-scope
-  // GRANT holder does below. KNOWN FOLLOW-UP (see PR body): at least one
-  // consumer (src/dashboard/kanban-routes.ts's `loadKanbanData`) ALSO calls
-  // `isOrgAdmin(auth)` directly as its own independent "show everything"
-  // shortcut, bypassing whatever this function returns — every consumer of
-  // this function needs the same audit, not just this shared predicate.
-  if (isOrgAdmin(auth)) return resolveAllSquadIds(env, { excludeHome: true })
+  if (isOrgAdmin(auth)) return null
   if (!auth.memberId) return []
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env, { excludeHome: true })
+  if (hasCapability(grants, 'org', null, minimum)) return null
   return resolveGrantedSquadIds(env, grants, minimum)
 }
 

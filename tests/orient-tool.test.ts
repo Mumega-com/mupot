@@ -59,9 +59,14 @@ function makeEnv(opts: Opts = {}): Env {
             return { id: AGENT.id, squad_id: AGENT.squad_id } // ref lookup
           }
           // buildOrient squad row (has charter/okr) vs resolveSquadDepartment (department_id only)
+          // vs loadSquadScope (src/auth/capability.ts — id/department_id/kind, no test here
+          // exercises a home squad).
           if (sql.includes('FROM squads')) {
             if (sql.includes('charter')) {
               return { id: 'squad-1', name: 'Growth', charter: 'Win customers', okr: 'Pipeline', department_id: 'dept-1' }
+            }
+            if (sql.includes('kind')) {
+              return { id: 'squad-1', department_id: 'dept-1', kind: 'work' }
             }
             return { department_id: 'dept-1' }
           }

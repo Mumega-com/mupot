@@ -155,6 +155,19 @@ export async function createElevationRequest(
   if (!['org', 'department', 'squad'].includes(input.scopeType)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid scope_type' }
   }
+  // Adversarial round 1 on G-FP1b (P0-1, Athena): action:home_access must
+  // name ONE exact home squad — an org- or department-scoped request for it
+  // would (per hasElevatedAction's own "an org grant covers every scope"
+  // matcher rule) approve access to EVERY home, including ones created
+  // later, the moment any ordinary org admin approves it. Refused at REQUEST
+  // time so this can never even reach an approver.
+  if (uniqueActions.includes('action:home_access') && input.scopeType !== 'squad') {
+    return {
+      ok: false,
+      reason: 'invalid_elevation_request',
+      detail: 'action:home_access must name an exact squad scope, never org or department',
+    }
+  }
   if (!isValidElevationDuration(input.durationMinutes)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid duration_minutes' }
   }
@@ -814,10 +827,24 @@ export async function hasElevatedAction(
   }
 
   const normalizedScopeId = scopeId ?? ''
+  // Adversarial round 1 on G-FP1b (P0-1, Athena): the matcher's org/department
+  // limbs are inheritance, exactly like hasCapability's — so they must be
+  // gated by planeCoversScope the same way. Without this, an org-scope
+  // elevation grant for ANY action would satisfy a check against a home
+  // squad (the request-time refusal above stops action:home_access
+  // specifically from ever being REQUESTED at org/department scope, but a
+  // grant already on disk, or a future action with the same shape, must not
+  // rely on that alone — defence in depth, dynamic import to avoid the
+  // capability.ts <-> elevation.ts module cycle).
+  const { loadSquadScope: loadSquadScopeForMatch, planeCoversScope: planeCoversScopeForMatch } = await import('./capability')
+  const targetSquadScope = scopeType === 'squad' && scopeId ? await loadSquadScopeForMatch(env, scopeId) : null
+  const inheritancePlaneCovers = (plane: 'org' | 'department'): boolean =>
+    targetSquadScope ? planeCoversScopeForMatch(plane, targetSquadScope) : true
+
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
   const match = grants.find((g) => {
     if (g.action !== action) return false
-    if (g.scope_type === 'org') return true
+    if (g.scope_type === 'org') return inheritancePlaneCovers('org')
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
     if (
       scopeType === 'squad' &&
@@ -825,7 +852,7 @@ export async function hasElevatedAction(
       opts.squadDepartmentId &&
       g.scope_id === opts.squadDepartmentId
     ) {
-      return true
+      return inheritancePlaneCovers('department')
     }
     return false
   })

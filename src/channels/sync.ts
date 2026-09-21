@@ -18,7 +18,7 @@
 //   - We ONLY manage rows in channel_capability_grants. Manual grants in
 //     capabilities are never mutated by sync; resolveCapabilities unions both.
 
-import type { Env, Capability, ChannelBinding } from '../types'
+import type { Env, Capability, ChannelBinding, OrgKind } from '../types'
 import { capabilityRank } from '../auth/capability'
 import { getAdapter } from './registry'
 import { redactSecretPatterns } from '../lib/redact'
@@ -113,6 +113,14 @@ async function ensureSquadGrant(
   squadId: string,
   targetRank: number,
 ): Promise<void> {
+  // G-FP1b point 4/P0-2: belt-and-braces — channels/admin.ts's POST /bindings
+  // already refuses to bind a home squad, but this is the ONE function that
+  // actually writes channel_capability_grants (a SECOND standing-grant table
+  // besides `capabilities`), so it must refuse on its own too: a binding
+  // created before this fix, or any future caller of this function, must
+  // never mint a channel-derived grant on a home squad.
+  const squadKind = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1').bind(squadId).first<{ kind: OrgKind }>()
+  if (squadKind?.kind === 'home') return
   const existing = await env.DB.prepare(
     `SELECT capability FROM channel_capability_grants
       WHERE binding_id = ?1 AND member_id = ?2 AND squad_id = ?3

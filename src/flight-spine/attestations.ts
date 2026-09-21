@@ -1,5 +1,5 @@
 import type { AuthContext, OrgKind } from '../types'
-import { hasCapability, resolveCapabilities, type SquadScope } from '../auth/capability'
+import { brandSquadScope, hasCapability, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import {
   deriveSafeMemberTokenFingerprint,
@@ -143,7 +143,7 @@ async function readLiveTokenBinding(
   // present, an empty/observer view must stay denied even if D1 still contains a
   // stronger grant. A second live read is the revocation check and never widens
   // that ceiling.
-  const rowScope: SquadScope = { id: row.squad_id, department_id: row.department_id, kind: row.kind }
+  const rowScope = brandSquadScope({ id: row.squad_id, department_id: row.department_id, kind: row.kind })
   const effectiveGrants = auth.capabilities
     ?? (await resolveCapabilities(env, identity.memberId))
   if (!hasCapability(effectiveGrants, 'squad', rowScope, 'member')) {

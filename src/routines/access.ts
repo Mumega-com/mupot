@@ -1,4 +1,4 @@
-import { hasCapability, type SquadScope } from '../auth/capability'
+import { brandSquadScope, hasCapability } from '../auth/capability'
 import type { AuthContext, CapabilityGrant, Env, OrgKind } from '../types'
 import {
   projectReadAccessFromGrants,
@@ -65,6 +65,6 @@ export async function principalCanRunForSquad(
   // G-FP1b point 2/3: workspace_admin must not reach a home squad — checked
   // AFTER resolving the squad's kind, not before.
   if (principal.workspace_admin && squad.kind !== 'home') return true
-  const scope: SquadScope = { id: squadId, department_id: squad.department_id, kind: squad.kind }
+  const scope = brandSquadScope({ id: squadId, department_id: squad.department_id, kind: squad.kind })
   return hasCapability(principal.grants, 'squad', scope, 'member')
 }
