@@ -139,6 +139,20 @@ function makeDb(
       const dept = (opts.squadDepartments ?? {})[squadId]
       return dept === undefined ? null : { department_id: dept }
     }
+    // loadSquadScope (src/auth/capability.ts) — canOnSquad's squad-scope
+    // load, used by recipientVisibilityOnSenderSquads. Every squad this test
+    // file references is treated as EXISTING (kind='work') even when
+    // `opts.squadDepartments` never set an entry for it — that map is only
+    // meaningful for the SEPARATE department-inheritance query above; a
+    // squad's own EXISTENCE (needed for the exact-match branch every squad-
+    // scope check now requires) is not the same fact as "does it have a
+    // configured department for inheritance testing". Falls back to an
+    // empty-string department id, which can never collide with a real one.
+    if (sql.includes('SELECT id, department_id, kind FROM squads WHERE id = ?1')) {
+      const [squadId] = b as [string]
+      const dept = (opts.squadDepartments ?? {})[squadId]
+      return { id: squadId, department_id: dept ?? '', kind: 'work' }
+    }
     throw new Error('unhandled first sql: ' + sql)
   }
 
