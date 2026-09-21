@@ -1,10 +1,13 @@
-import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
+import type { AuthContext, Capability, CapabilityGrant, Env, OrgKind } from '../types'
 import {
   actorRankOnScopeFor,
+  brandSquadScope,
   capabilityRank,
   exceedsTargetRankCeiling,
   hasCapability,
   legacyRoleRank,
+  loadSquadScope,
+  planeCoversScope,
   resolveCapabilities,
   targetLegacyRoleRank,
   targetMaxRankAcrossScopes,
@@ -100,6 +103,7 @@ export type CreateProjectInviteError =
   | 'archived_project'
   | 'project_not_active'
   | 'project_squad_not_linked'
+  | 'home_scope_not_invitable'
   | 'member_not_found'
   | 'member_not_active'
   | 'member_missing_email'
@@ -153,6 +157,7 @@ interface ProjectRow {
 interface ProjectSquadRow {
   squad_id: string
   department_id: string
+  kind: OrgKind
 }
 
 interface RedeemableInviteRow {
@@ -230,9 +235,16 @@ async function actorRankOnSquad(
     // no floor here for any role, resolved or not.
     return 0
   }
+  // Adversarial round 1 (Athena, §2e-9): a missing/unknown squad row is
+  // NEVER treated as a work squad — fail closed (rank 0) rather than
+  // defaulting kind to 'work', which would let inheritance reach a squad we
+  // cannot actually classify (e.g. a home whose row was deleted).
+  const kind = await squadKindOf(env, squadId)
+  if (kind === null) return 0
+  const scope = brandSquadScope({ id: squadId, department_id: departmentId, kind })
   const grants: CapabilityGrant[] = auth.capabilities ?? await resolveCapabilities(env, auth.memberId)
   for (const capability of CAPABILITIES) {
-    if (hasCapability(grants, 'squad', squadId, capability, departmentId)) {
+    if (hasCapability(grants, 'squad', scope, capability)) {
       return capabilityRank(capability)
     }
   }
@@ -240,7 +252,22 @@ async function actorRankOnSquad(
   // when capabilities were never resolved for this principal at all — never
   // when they were resolved (even to an empty array), which is itself the
   // real "no standing here" answer and must not be overridden upward.
-  return auth.capabilities === undefined ? legacyRoleRank(auth.role) : 0
+  //
+  // G-FP1b point 2: that coarse-role floor must ALSO never cover a home
+  // squad — otherwise a legacy owner/admin with unresolved capabilities gets
+  // rank 5/4 on ANY member's home the moment the exact-grant loop above
+  // finds nothing, which is precisely the master-key shape this predicate
+  // exists to close.
+  if (auth.capabilities !== undefined) return 0
+  return planeCoversScope('role', scope) ? legacyRoleRank(auth.role) : 0
+}
+
+/** Small helper: a squad's kind alone, for callers that already resolved its
+ *  department_id via a different query and don't need a second full
+ *  SquadScope load. */
+async function squadKindOf(env: Env, squadId: string): Promise<OrgKind | null> {
+  const row = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1 LIMIT 1').bind(squadId).first<{ kind: OrgKind }>()
+  return row?.kind ?? null
 }
 
 /**
@@ -298,11 +325,10 @@ async function currentMemberOrgRank(env: Env, memberId: string): Promise<number>
  */
 async function currentMemberSquadRank(env: Env, memberId: string, squadId: string): Promise<number> {
   const grants = await resolveCapabilities(env, memberId)
-  const squad = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1 LIMIT 1')
-    .bind(squadId)
-    .first<{ department_id: string | null }>()
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return 0
   for (const capability of CAPABILITIES) {
-    if (hasCapability(grants, 'squad', squadId, capability, squad?.department_id ?? undefined)) {
+    if (hasCapability(grants, 'squad', scope, capability)) {
       return capabilityRank(capability)
     }
   }
@@ -529,13 +555,23 @@ export async function createProjectInvite(
   if (project.status !== 'active') return { ok: false, error: 'project_not_active' }
 
   const edge = await env.DB.prepare(
-    `SELECT access.squad_id, squad.department_id
+    `SELECT access.squad_id, squad.department_id, squad.kind
        FROM project_squad_access access
        JOIN squads squad ON squad.id = access.squad_id
       WHERE access.project_id = ?1 AND access.squad_id = ?2
       LIMIT 1`,
   ).bind(projectId, squadId).first<ProjectSquadRow>()
   if (!edge) return { ok: false, error: 'project_squad_not_linked' }
+  // G-FP1b point 4: a project↔squad edge legitimately exists for a home
+  // squad (that is how Slice 2's grant lands — project_squad_set on the
+  // home squad, deliberately untouched by this PR). But an INVITE minted
+  // against that edge is a DIFFERENT thing: it lets an ARBITRARY invitee
+  // redeem a standing capabilities row on the squad itself (see the
+  // 'squad' scope_type INSERT at redemption, below) — i.e. it grants entry
+  // INTO the squad, not merely project access FOR it. For a home squad that
+  // is exactly the standing-grant-into-home path point 4 forbids, so the
+  // invite is refused here regardless of the caller's own rank.
+  if (edge.kind === 'home') return { ok: false, error: 'home_scope_not_invitable' }
 
   // mupot#1411 P0-1 (kasra-review, 2026-09-15): a member-bind invite mints a
   // Telegram credential that authenticates AS the target member — exactly the

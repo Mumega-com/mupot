@@ -375,19 +375,35 @@ export async function loadFleetRadar(
       env.DB.prepare(
         'SELECT id, squad_id, slug, name, role, model, status, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window, created_at FROM agents ORDER BY created_at ASC, name ASC',
       ).all<Agent>(),
-      env.DB.prepare('SELECT id, department_id, slug, name FROM squads ORDER BY created_at ASC, name ASC').all<
-        Pick<Squad, 'id' | 'department_id' | 'name'>
+      // `kind` is selected (though not part of this function's own Squad shape)
+      // SOLELY to build the home-squad exclusion set below — a raw, ungated
+      // `agents`/`squads` SELECT like this one is exactly the shape the
+      // resolveAccessibleSquadIds consumer audit (adversarial round on
+      // G-FP1b) found leaking a member's home squad onto the shared /radar
+      // dashboard for an org-admin/unrestricted (`squadIds: null`) viewer.
+      env.DB.prepare('SELECT id, department_id, slug, name, kind FROM squads ORDER BY created_at ASC, name ASC').all<
+        Pick<Squad, 'id' | 'department_id' | 'name'> & { kind: string }
       >(),
       loadAgentStats(env),
       loadAgentRuntimeStates(env, nowMs),
       listFleetAgentRuntimeView(env, nowMs, squadIds),
-      listPresence(env, nowMs, squadIds),
+      listPresence(env, nowMs, squadIds, true),
       loadRecentTasks(env),
       listFlights(env, 500),
     ])
 
-  const agents = (agentRows.results ?? []).filter((a) => !accessibleSet || accessibleSet.has(a.squad_id))
-  const squads = (squadRows.results ?? []).filter((s) => !accessibleSet || accessibleSet.has(s.id))
+  // Unconditional — never gated behind `isFiltered`/`accessibleSet`, the same
+  // way every other resolveAccessibleSquadIds consumer's home exclusion is:
+  // a home squad is excluded even for an unrestricted (org-admin) caller.
+  const homeSquadIds = new Set(
+    (squadRows.results ?? []).filter((s) => s.kind === 'home').map((s) => s.id),
+  )
+  const agents = (agentRows.results ?? []).filter(
+    (a) => (!accessibleSet || accessibleSet.has(a.squad_id)) && !homeSquadIds.has(a.squad_id),
+  )
+  const squads = (squadRows.results ?? []).filter(
+    (s) => (!accessibleSet || accessibleSet.has(s.id)) && !homeSquadIds.has(s.id),
+  )
 
   const agentSquadMap = new Map<string, string>()
   for (const a of agentRows.results ?? []) {
@@ -396,10 +412,13 @@ export async function loadFleetRadar(
   }
 
   const scopedFlights = (flights ?? []).filter((f) => {
-    if (!accessibleSet) return true
     const sIds = flightSquadIds(f) ?? (
       agentSquadMap.has(f.agent) ? [agentSquadMap.get(f.agent)!] : []
     )
+    // Home exclusion is unconditional (see agents/squads above); the
+    // accessibleSet membership check remains conditional on isFiltered.
+    if (sIds.some((id) => homeSquadIds.has(id))) return false
+    if (!accessibleSet) return true
     return sIds.some((id) => accessibleSet.has(id))
   })
 

@@ -215,6 +215,31 @@ jobs:
       - name: Guard — MCP tool tests must enter through invokeTool
         run: node scripts/check-mcp-tool-seam.mjs
 
+  bare-squad-id-authz:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — same reason as mcp-tool-seam above: the ratchet
+      # compares the baseline against the merge target, and a shallow clone cannot read it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Ratchet (FP-01 Slice 1 v2, G-FP1b point 1; mupot#1452 round 2 defect class): a
+      # squad-scope capability check (hasCapability/canOnSquad/canOnSquadAuth/
+      # memberCanOnSquad/memberCanOnSquadAuth/actorRankOnScopeFor) must never be forced to
+      # accept a bare id in place of a real SquadScope by suppressing the typechecker
+      # (@ts-ignore/@ts-expect-error) or an `as any`/`as SquadScope` cast — the typechecker
+      # itself is the primary enforcement (src/auth/capability.ts's overloads); this is the
+      # second belt. The baseline may shrink, never grow.
+      # Self-tests FIRST — same discipline as the other ratchets: a gate with no tests of
+      # its own is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/check-bare-squad-id-authz.test.mjs
+      - name: Guard — squad-scope capability checks must not force a bare id past SquadScope
+        run: node scripts/check-bare-squad-id-authz.mjs
+
   schema-chain-fresh:
     runs-on: ubuntu-latest
     steps:

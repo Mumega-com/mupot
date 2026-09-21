@@ -35,6 +35,7 @@ import type {
   Capability,
   CapabilityScopeType,
   ConnectionChannel,
+  OrgKind,
 } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
@@ -580,6 +581,7 @@ function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 
     || error === 'forbidden'
     || error === 'cannot_grant_above_own_rank'
     || error === 'member_not_active'
+    || error === 'home_scope_not_invitable'
   ) return 403
   if (error === 'pairing_code_collision') return 409
   return 400
@@ -1061,11 +1063,20 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
     // Verify the referenced scope exists in this pot.
     const table = scopeType === 'department' ? 'departments' : 'squads'
     const exists = await c.env.DB.prepare(
-      `SELECT id FROM ${table} WHERE id = ? LIMIT 1`,
+      `SELECT id, kind FROM ${table} WHERE id = ? LIMIT 1`,
     )
       .bind(scopeId)
-      .first<{ id: string }>()
+      .first<{ id: string; kind: OrgKind }>()
     if (!exists) return c.json({ error: `${scopeType}_not_found` }, 404)
+    // G-FP1b point 4: NO standing grant path into a kind='home' squad OR
+    // department except createHomeForMember (the only writer of a home
+    // capability row). This is the general grant/revoke API — refuse a home
+    // target outright, for BOTH actions, regardless of the caller's own
+    // rank. A home department can exist too (resolveHomeDepartmentId in
+    // org/service.ts creates one), so the same refusal covers it.
+    if (exists.kind === 'home') {
+      return c.json({ error: 'home_scope_not_grantable' }, 403)
+    }
   }
 
   const ceiling = await targetRankCeiling(c, memberId)

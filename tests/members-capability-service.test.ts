@@ -131,6 +131,12 @@ function makeGrantRouteEnv(
           }
           // mupot#1411 P0-A round 4: same role-plane bridge as above.
           if (sql.includes('FROM members') && sql.includes('lower(email)')) return { email: null } as T
+          // G-FP1b point 2: targetMaxRankAcrossScopes now excludes a home-squad
+          // grant from a target's global rank ceiling — loadSquadScope
+          // (src/auth/capability.ts) is called per squad-scope grant to check.
+          // No test here exercises a home scope — every squad it resolves is
+          // kind='work'.
+          if (sql.includes('FROM squads')) return { id: 'squad-elsewhere', department_id: null, kind: 'work' } as T
           throw new Error(`unexpected first query: ${sql}`)
         },
         async all<T>() {

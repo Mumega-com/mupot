@@ -26,14 +26,13 @@
 import { Hono } from 'hono'
 import type {
   Env,
-  Capability,
   CapabilityGrant,
   BusEvent,
   Agent,
   Squad,
   ChannelBinding,
 } from '../types'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, canOnSquad as sharedCanOnSquad } from '../auth/capability'
 import { createBus } from '../bus'
 import { sha256Hex } from '../lib/canonical-json'
 import { getAdapter } from './registry'
@@ -108,28 +107,11 @@ async function memberForIdentity(
 // Re-enable Google email auto-bind ONLY behind a verified Google-signed JWT
 // (audience = the app's project) so the email is cryptographically authenticated.
 
-// ── scope helpers (frozen hasCapability + explicit department inheritance) ─────
-// Mirrors src/im: a SQUAD action is allowed by a squad grant, an inherited
-// department grant, or an org grant. Fail-closed when the squad's department is
-// unresolvable (unknown squad → no inheritance, no access).
-async function squadDepartmentId(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
-
-async function canOnSquad(
-  env: Env,
-  grants: CapabilityGrant[],
-  squadId: string,
-  min: Capability,
-): Promise<boolean> {
-  if (hasCapability(grants, 'squad', squadId, min)) return true
-  const deptId = await squadDepartmentId(env, squadId)
-  if (deptId && hasCapability(grants, 'department', deptId, min)) return true
-  return false
-}
+// ── scope helper ────────────────────────────────────────────────────────────
+// G-FP1b point 1: delegates to the ONE canOnSquad in src/auth/capability.ts
+// (same reasoning as src/im/index.ts's identical fix) rather than a
+// hand-rolled bare-id + separately-resolved-deptId reimplementation.
+const canOnSquad = sharedCanOnSquad
 
 // ── lookups (a human types a name/slug, not a uuid) ───────────────────────────
 async function resolveAgent(env: Env, ref: string): Promise<Agent | 'ambiguous' | null> {

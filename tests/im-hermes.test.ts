@@ -100,6 +100,12 @@ function makeEnv(opts: {
             async first<T>() {
               if (sql.includes('FROM members') && sql.includes('telegram_chat_id')) return member as T
               if (sql.includes('SELECT department_id FROM squads')) return { department_id: squad.department_id } as T
+              // loadSquadScope (src/auth/capability.ts) — canOnSquad's squad-scope
+              // load, used by verdictReply/quick-add's permission checks. No test
+              // here exercises a home squad — every squad resolves as kind='work'.
+              if (sql.includes('SELECT id, department_id, kind FROM squads WHERE id = ?1')) {
+                return { id: squad.id, department_id: squad.department_id, kind: 'work' } as T
+              }
               if (sql.includes('FROM tasks') && sql.includes('WHERE id = ?1')) {
                 const [id] = args as [string]
                 return (tasks.find((task) => task.id === id) as T) ?? null as T | null

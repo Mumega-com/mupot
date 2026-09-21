@@ -21,9 +21,167 @@
 // only itself. Grants never bubble UP (a squad/department grant is not an org grant).
 
 import type { Context, MiddlewareHandler } from 'hono'
-import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
+import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, OrgKind } from '../types'
 import { hasActiveGateGrant } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
+
+// ── squad scope (mupot#1452 round 2 successor, G-FP1b point 1) ────────────────
+//
+// mupot#1452 round 2 tried to exclude `kind='home'` squads from inherited
+// authority by adding an OPTIONAL "squadKind" (typed `OrgKind`, question-mark
+// modifier) parameter to
+// hasCapability/canOnSquad/canOnSquadAuth. An optional parameter on an authz
+// predicate is the opposite of a chokepoint: every one of the ~25 existing
+// call sites that did not know about the new parameter silently kept the OLD
+// (kind-blind) behaviour, and the round-2 adversarial pass demonstrated the
+// exact bypass on org-scope grants, elevation, invites, flight-spine, and
+// projects/access. See MEMORY
+// feedback_optional_parameter_on_authz_predicate_is_not_a_chokepoint.md.
+//
+// The fix is structural, not another parameter: a squad-scope capability
+// check REQUIRES a `SquadScope` — id + department_id + kind, loaded fresh
+// from D1 by the ONE function below — never a bare `string` id. hasCapability
+// is overloaded so that `hasCapability(grants, 'squad', someSquadId, min)`
+// with `someSquadId: string` FAILS TO TYPECHECK; only a real `SquadScope`
+// (from `loadSquadScope`, or a full `Squad`/`HomeSquadRow`-shaped object that
+// structurally satisfies it) is accepted. scripts/check-bare-squad-id-authz.mjs
+// is the CI-side belt (catches a `// @ts-expect-error`/`as any` escape around
+// this at the text level); the typechecker is the braces.
+// Adversarial round 1 on G-FP1b (P1, Athena): a 1-of-9-escapes ratchet plus a
+// plain structural type let a caller fabricate a SquadScope out of thin air
+// (a hoisted `as SquadScope`, a hand-built `{id, department_id, kind: 'work'}`
+// literal, kind lifted straight off a request body) and every one of those
+// would typecheck cleanly against a bare `{id, department_id, kind}`
+// interface. `SQUAD_SCOPE_BRAND` is a module-private symbol never exported —
+// only `brandSquadScope` (below) can attach it, so a caller anywhere else in
+// the tree that writes out the three visible fields by hand gets a TYPE
+// ERROR (missing the brand), not a silently-accepted scope. Every
+// construction site in this codebase goes through `brandSquadScope` with
+// fields that just came out of a real `squads` row (loadSquadScope, or a
+// query result already shaped like one) — never from a request body, an
+// elevation grant, or a hand-typed literal.
+declare const SQUAD_SCOPE_BRAND: unique symbol
+
+export interface SquadScope {
+  readonly [SQUAD_SCOPE_BRAND]: true
+  id: string
+  department_id: string
+  kind: OrgKind
+}
+
+/**
+ * brandSquadScope — the ONLY sanctioned way to construct a `SquadScope` from
+ * raw fields. Callers must be able to point at the real `squads` row the
+ * fields came from (a `loadSquadScope`/`resolveSquadRef`/`getSquad`-style
+ * query result, or a full `Squad` row) — never a value assembled from a
+ * request body, an elevation grant's own scope_id/kind pair, or a literal
+ * typed in by hand for convenience. This is a thin, deliberately unchecked
+ * cast at the one seam that must exist for the type to be constructible at
+ * all; it carries no runtime validation because its whole job is to be the
+ * single grep-able chokepoint a reviewer (or a future ratchet) can point at,
+ * not to re-verify what its caller already fetched from D1.
+ */
+export function brandSquadScope(fields: { id: string; department_id: string; kind: OrgKind }): SquadScope {
+  // The ONE sanctioned unchecked cast in this codebase for this type — see
+  // the doc comment above for why this exists and what may call it.
+  return fields as unknown as SquadScope
+}
+
+/**
+ * loadSquadScope — the ONE loader for a squad's authz-relevant shape. Every
+ * squad-scope capability check must go through this (or already hold a
+ * structurally-compatible object, e.g. a full `Squad` row) rather than
+ * resolving `department_id`/`kind` piecemeal — that piecemeal pattern is
+ * exactly what let round 2's `kind` exclusion miss ~25 call sites that
+ * resolved department_id alone and never looked at kind at all.
+ */
+export async function loadSquadScope(env: Env, squadId: string): Promise<SquadScope | null> {
+  const row = await env.DB.prepare('SELECT id, department_id, kind FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ id: string; department_id: string; kind: OrgKind }>()
+  return row ? brandSquadScope(row) : null
+}
+
+/**
+ * planeCoversScope — G-FP1b point 2. A `kind='home'` squad (a member's own
+ * private room, written ONLY by `createHomeForMember`) is capability-dead to
+ * every INHERITED authority plane: an org-scope grant, a department-scope
+ * grant, and the legacy `auth.role` owner/admin plane all answer false here
+ * for a home scope. The ONLY plane that ever covers a home squad is an EXACT
+ * squad-scope grant on that exact squad (the direct admin row
+ * `createHomeForMember` writes) — that check does not call this helper at
+ * all, by design, because it is not inheritance.
+ *
+ * This is intentionally the SAME answer for every plane today (org,
+ * department, role) — kept as three named call sites rather than one
+ * `if (scope.kind === 'home') return false` inlined three times, so (a) a
+ * future plane-specific carve-out has one place to add a branch, and (b) a
+ * reviewer/grep can see every plane this file believes can reach a squad and
+ * confirm none of them was missed — the exact class of miss round 2 had.
+ *
+ * TABLE INVENTORY (adversarial round 1, Athena — every table that can yield
+ * squad-scope authority, and what gates its WRITER against a home target;
+ * the next grant table should be added here and gated the same way):
+ *
+ *   capabilities              — the primary grant table. WRITERS: src/members/index.ts's
+ *                                POST /members/:id/capabilities (home_scope_not_grantable),
+ *                                src/mcp/provision.ts's grant_agent_capability
+ *                                (home_scope_not_grantable, checked before elevation),
+ *                                src/members/squad-membership.ts's addSquadMember/
+ *                                removeSquadMember (home_squad_immutable),
+ *                                src/members/project-invites.ts's createProjectInvite
+ *                                (home_scope_not_invitable), src/onboarding/doors.ts's
+ *                                selfGrant (home_scope_not_grantable). The ONLY writer that
+ *                                MAY target a home is org/service.ts's createHomeForMember
+ *                                (the member's own exact-match admin row).
+ *   channel_capability_grants — a SECOND capabilities-shaped table, unioned into
+ *                                resolveCapabilities below as scope_type='squad' exact rows.
+ *                                WRITERS: src/channels/admin.ts's POST /bindings
+ *                                (home_scope_not_grantable at bind time) and
+ *                                src/channels/sync.ts's ensureSquadGrant (belt-and-braces
+ *                                refusal, since a binding could predate the fix). READER
+ *                                BELT: resolveCapabilities' UNION branch for this table
+ *                                JOINs squads.kind and drops any row where kind='home' at
+ *                                resolution time, so an already-poisoned row can never
+ *                                resolve as live authority even before a cleanup runs
+ *                                (scripts/cleanup-home-channel-grants.mjs is the idempotent
+ *                                data-hygiene follow-up for existing rows).
+ *   elevation_grants           — time-boxed, NEVER standing. src/auth/elevation.ts's
+ *                                createElevationRequest refuses to even REQUEST
+ *                                action:home_access at org/department scope, and
+ *                                hasElevatedAction's matcher gates its own org/department
+ *                                inheritance limbs through this exact function. The
+ *                                approver-authority re-check (also in hasElevatedAction)
+ *                                means only a home's exact-grant holder can durably remain
+ *                                the approver — see tests/home-access-elevation.test.ts.
+ *   memberships                — agent↔squad RBAC edge (mirrors `capabilities` for AGENTS
+ *                                rather than members). Same writers as `capabilities` above
+ *                                (addSquadMember/removeSquadMember write both in one
+ *                                transaction), so the same home_squad_immutable refusal
+ *                                covers it — there is no separate memberships writer.
+ *   gate_grants                — NOT squad-scoped. A gate_grants row names a free-text
+ *                                'gate:*' surface capability tied to a principal
+ *                                (migrations/0008_gate_grants.sql) — it has no scope_id/
+ *                                squad concept at all, so it cannot confer authority on a
+ *                                home squad by construction. No guard needed.
+ *   project_squad_access       — DELIBERATELY UNGUARDED, on purpose. This is a squad's own
+ *                                OUTBOUND grant of access TO a project (project_squad_set/
+ *                                project_squad_remove, src/mcp/projects.ts) — the opposite
+ *                                direction from "who has capability ON the squad". FP-01
+ *                                Slice 2's own design uses this to give a member's home
+ *                                write access to a project; blocking it would break the
+ *                                feature this flight exists to build. It never grants
+ *                                anyone entry INTO the squad itself.
+ */
+export type CapabilityPlane = 'org' | 'department' | 'role'
+
+export function planeCoversScope(plane: CapabilityPlane, scope: SquadScope): boolean {
+  if (scope.kind === 'home') return false
+  // Reference the parameter so a future per-plane carve-out is a small diff,
+  // not a signature change — every current plane answers identically.
+  void plane
+  return true
+}
 
 // ── ladder ────────────────────────────────────────────────────────────────────
 
@@ -100,9 +258,19 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
        FROM capabilities
       WHERE member_id = ?1
      UNION ALL
-     SELECT member_id, 'squad' AS scope_type, squad_id AS scope_id, capability
-       FROM channel_capability_grants
-      WHERE member_id = ?1`,
+     -- G-FP1b point 4/P0-2 (Athena's resolver-side belt): channel_capability_grants
+     -- is written ONLY by ensureSquadGrant (src/channels/sync.ts), which now
+     -- refuses a home-squad target — but this JOIN+filter also protects
+     -- against an already-poisoned row from before that fix (or any future
+     -- writer that forgets the check): a channel-derived grant on a squad
+     -- that is (or has since become) kind='home' never resolves as a live
+     -- grant, full stop. The capabilities table's OWN squad-scope rows are
+     -- NOT filtered this way — a home's exact-match admin grant
+     -- (createHomeForMember's own write) must still resolve.
+     SELECT ccg.member_id, 'squad' AS scope_type, ccg.squad_id AS scope_id, ccg.capability
+       FROM channel_capability_grants ccg
+       JOIN squads s ON s.id = ccg.squad_id
+      WHERE ccg.member_id = ?1 AND s.kind != 'home'`,
   )
     .bind(memberId)
     .all<CapabilityGrant>()
@@ -114,47 +282,97 @@ export async function resolveCapabilities(env: Env, memberId: string): Promise<C
 /**
  * hasCapability — pure ladder + scope-inheritance check. No DB access.
  *
- * @param grants            the member's grant rows (from resolveCapabilities)
- * @param scopeType         the scope the route targets ('org' | 'department' | 'squad')
- * @param scopeId           the id of that scope (null for org)
- * @param min               the minimum capability required
- * @param squadDepartmentId OPTIONAL — when checking a 'squad' scope, the squad's
- *                          department_id, so a department grant can inherit down.
- *                          Omit it and the check is the safe subset (org + exact
- *                          scope), never over-granting.
+ * OVERLOADED (G-FP1b point 1): a 'squad' scope check REQUIRES a `SquadScope`
+ * object (id + department_id + kind), never a bare string id — passing a
+ * plain squad-id string where the compiler expects a SquadScope is a
+ * TYPE ERROR, not a runtime under-check. Load one with `loadSquadScope`, or
+ * pass a full `Squad`/`HomeSquadRow` row (either structurally satisfies it).
  *
- * An 'org' grant covers ALL scopes. A 'department' grant covers its own squads
- * (only when squadDepartmentId names that department). A 'squad' grant covers
- * only itself. Grants never bubble UP.
+ * An 'org' grant covers ALL scopes EXCEPT a home squad (see
+ * `planeCoversScope`). A 'department' grant covers its own squads the same
+ * way. A 'squad' grant covers only itself — including a home squad, since
+ * that is an EXACT match, not inheritance. Grants never bubble UP.
  */
+export function hasCapability(grants: CapabilityGrant[], scopeType: 'org', scopeId: null, min: Capability): boolean
 export function hasCapability(
+  grants: CapabilityGrant[],
+  scopeType: 'department',
+  scopeId: string,
+  min: Capability,
+): boolean
+export function hasCapability(
+  grants: CapabilityGrant[],
+  scopeType: 'squad',
+  scope: SquadScope,
+  min: Capability,
+): boolean
+export function hasCapability(
+  grants: CapabilityGrant[],
+  scopeType: CapabilityScopeType,
+  scopeIdOrScope: string | null | SquadScope,
+  min: Capability,
+): boolean {
+  if (scopeType === 'squad') {
+    const scope = scopeIdOrScope as SquadScope
+    for (const g of grants) {
+      // Exact squad-scope grant always covers itself — this is what makes a
+      // home squad's own direct admin row (createHomeForMember) work; it is
+      // NOT inheritance, so planeCoversScope does not gate it.
+      if (g.scope_type === 'squad' && g.scope_id === scope.id && meets(g.capability, min)) return true
+      // Org-wide grant — gated by planeCoversScope (never covers a home squad).
+      if (g.scope_type === 'org' && meets(g.capability, min) && planeCoversScope('org', scope)) return true
+      // Department → squad inheritance — same gate.
+      if (
+        g.scope_type === 'department' &&
+        g.scope_id === scope.department_id &&
+        meets(g.capability, min) &&
+        planeCoversScope('department', scope)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  // org / department: no `kind` concept reachable through THIS scope type —
+  // kind='home' is a property of squads, not of the department/org row being
+  // checked here, so no planeCoversScope gate applies on this branch.
+  for (const g of grants) {
+    if (g.scope_type === 'org' && meets(g.capability, min)) return true
+    if (g.scope_type === scopeType && g.scope_id === scopeIdOrScope && meets(g.capability, min)) return true
+  }
+  return false
+}
+
+/**
+ * hasCapabilityOnDynamicScope — for the small set of callers that do not know
+ * `scopeType` until runtime (elevation decisions, OAuth grant-height
+ * derivation, Discord role sync, readable-squads enumeration). Loads a
+ * SquadScope from D1 itself when the scope turns out to be a squad — never
+ * accepts a caller-supplied department id standing in for it. This is the
+ * dynamic-dispatch escape hatch for the handful of genuinely scope-agnostic
+ * callers; every caller that DOES know its scopeType statically must call
+ * `hasCapability` directly so the compiler enforces the SquadScope
+ * requirement on it.
+ */
+export async function hasCapabilityOnDynamicScope(
+  env: Env,
   grants: CapabilityGrant[],
   scopeType: CapabilityScopeType,
   scopeId: string | null,
   min: Capability,
-  squadDepartmentId?: string | null,
-): boolean {
-  for (const g of grants) {
-    // An org-wide grant covers every scope.
-    if (g.scope_type === 'org' && meets(g.capability, min)) return true
-
-    // Exact-scope match (same type + same id).
-    if (g.scope_type === scopeType && g.scope_id === scopeId && meets(g.capability, min)) {
-      return true
-    }
-
-    // Department → squad inheritance: a grant on the squad's department covers it.
-    if (
-      scopeType === 'squad' &&
-      g.scope_type === 'department' &&
-      squadDepartmentId != null &&
-      g.scope_id === squadDepartmentId &&
-      meets(g.capability, min)
-    ) {
-      return true
-    }
+): Promise<boolean> {
+  if (scopeType === 'org') return hasCapability(grants, 'org', null, min)
+  if (scopeType === 'department') {
+    if (!scopeId) return false
+    return hasCapability(grants, 'department', scopeId, min)
   }
-  return false
+  if (!scopeId) return false
+  // Fail closed on a missing/unknown squad row — see resolveSquadScopeArg's
+  // doc comment (Athena, adversarial round 1 on G-FP1b).
+  const scope = await resolveSquadScopeArg(env, scopeId)
+  if (!scope) return false
+  return hasCapability(grants, 'squad', scope, min)
 }
 
 // ── capability floor (deny-by-default chokepoint, #183 AAGATE) ──────────────────
@@ -189,13 +407,44 @@ export function holdsCapabilityFloor(auth: AuthContext, min: Capability): boolea
 /** A route declares the scope it targets as a function of the request context. */
 export type CapabilityScope = (c: Context) => { type: CapabilityScopeType; id: string | null }
 
-// ── D1: resolve a squad's department for inheritance ───────────────────────────
+// ── D1: resolve a squad's scope for inheritance (see loadSquadScope, above) ────
+//
+// A caller who ALREADY holds a full squad row (id + department_id + kind —
+// e.g. a `Squad` or `HomeSquadRow`) may pass it directly; `canOnSquad`/
+// `canOnSquadAuth` only hit D1 themselves when given a bare id string. This
+// is the one loader boundary where a bare squad id is legitimately allowed
+// IN — it is resolved to a real SquadScope before a single capability check
+// ever runs, and `hasCapability` itself never sees the bare id.
+// Adversarial round 1 on G-FP1b (Athena, 2026-09-21): an EARLIER version of
+// this function fabricated a synthetic `{id, department_id: '', kind: 'work'}`
+// scope when the `squads` row was missing, reasoning that
+// capabilities.scope_id carries no FK so an exact grant on a dead/garbage
+// scope_id should still resolve. That is a FAIL-OPEN hole: deleting a home
+// squad's row (or a capability row simply outliving its squad) would let an
+// ORG-WIDE grant "regain" the scope, because nothing on the fabricated scope
+// records that it used to be — or might be — a home. Athena's ruling:
+// "a missing/unknown squad row is NEVER a work squad for authz — fail closed
+// everywhere." This function now returns `null` on a missing row, full stop
+// — NO authority resolves for it via ANY plane, including an exact-id match.
+// Distinguishing "squad genuinely doesn't exist" (a 404-class outcome) from
+// "squad exists but you lack rank" (403) is a LOADER/ROUTE concern for a
+// caller that needs it, never something this predicate should paper over by
+// inventing a scope.
+// The convenience input shape `canOnSquad`/`canOnSquadAuth` accept alongside
+// a bare id: an already-loaded `SquadScope`, OR a plain object shaped like
+// one (a full `Squad` row, a `HomeSquadRow`, etc.) that the CALLER already
+// obtained from a real `squads`/`agents` query — never from a request body
+// or a hand-typed literal. This is deliberately auto-branded below rather
+// than requiring every such call site to say `brandSquadScope(squad)`
+// explicitly: unlike the ~7 sites that build a scope from SEPARATELY
+// resolved fields (which DO have to call brandSquadScope, since a bare
+// object literal no longer typechecks as SquadScope), a caller that already
+// holds a full row from a real table is not fabricating anything.
+export type SquadScopeLike = SquadScope | { id: string; department_id: string; kind: OrgKind }
 
-async function resolveSquadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
+async function resolveSquadScopeArg(env: Env, squadIdOrScope: string | SquadScopeLike): Promise<SquadScope | null> {
+  if (typeof squadIdOrScope === 'string') return loadSquadScope(env, squadIdOrScope)
+  return brandSquadScope(squadIdOrScope)
 }
 
 /**
@@ -206,15 +455,20 @@ async function resolveSquadDepartment(env: Env, squadId: string): Promise<string
  * call-path, src/agents/messages.ts) can reuse the SAME check without importing mcp/index.ts,
  * which would create a circular import (mcp/index.ts already imports agents/messages.ts).
  * mcp/index.ts's `memberCanOnSquad` delegates to this so there is exactly one implementation.
+ *
+ * Accepts either a bare squad id (loaded fresh here) or an already-loaded
+ * `SquadScope`/`Squad` — never a caller-supplied department id standing in
+ * for it (that was the round-2 defect class).
  */
 export async function canOnSquad(
   env: Env,
   grants: CapabilityGrant[],
-  squadId: string,
+  squadIdOrScope: string | SquadScopeLike,
   min: Capability,
 ): Promise<boolean> {
-  const deptId = await resolveSquadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, min, deptId)
+  const scope = await resolveSquadScopeArg(env, squadIdOrScope)
+  if (!scope) return false
+  return hasCapability(grants, 'squad', scope, min)
 }
 
 /**
@@ -254,19 +508,46 @@ export async function canOnSquad(
 export async function canOnSquadAuth(
   env: Env,
   auth: AuthContext | null | undefined,
-  squadId: string,
+  squadIdOrScope: string | SquadScopeLike,
   min: Capability,
 ): Promise<boolean> {
+  const scope = await resolveSquadScopeArg(env, squadIdOrScope)
+  if (!scope) return false
   // The legacy ROLE plane, asked at the caller's OWN `min` — not at isOrgAdmin's
   // fixed admin-rank question. isOrgAdmin answers "is this an org admin?"; that is
   // the right question for the two call sites here (both pass 'admin'), but it
   // ignores `min`, so a future caller asking for 'owner' would have been satisfied
   // by a rank-4 admin. A rank ceiling has to guard the TARGET, not just the grant.
-  if (auth && legacyRoleSatisfies(auth.role, min)) return true
+  //
+  // G-FP1b point 2: this used to be an UNCONDITIONAL role-plane bypass — exactly
+  // the master-key shape mupot#1452 round 1 found on the org-grant plane, just on
+  // the OTHER authority plane this function exists to see. Gated by
+  // planeCoversScope so a legacy owner/admin gets ZERO standing on a home squad
+  // from this branch; only an exact squad-scope grant (below, via canOnSquad) or
+  // an elevation grant (further below) reaches a home.
+  if (auth && legacyRoleSatisfies(auth.role, min) && planeCoversScope('role', scope)) return true
   // The modern ORG-GRANT plane needs no separate limb: hasCapability's org branch
-  // already matches an org-scope grant at `min` for a squad question, so canOnSquad
-  // covers it — at the caller's min, with department inheritance intact.
-  return canOnSquad(env, auth?.capabilities ?? [], squadId, min)
+  // already matches an org-scope grant at `min` for a squad question (gated by
+  // planeCoversScope internally), so canOnSquad covers it — at the caller's min,
+  // with department inheritance intact, and zero standing on a home squad from
+  // this plane either.
+  if (await canOnSquad(env, auth?.capabilities ?? [], scope, min)) return true
+  // Elevation-to-home (G-FP1b point 4): a home squad grants no standing access
+  // from org/department/role planes by design (planeCoversScope above). The
+  // ONLY additional door is a time-boxed, human-approved elevation grant naming
+  // this exact squad. Bound-agent sessions only — see the PR body / this file's
+  // header memory for why a pure web-session (dashboard) operator cannot use
+  // this path without a schema change to migrations/0148 (agent_session_id is
+  // NOT NULL there), which is out of scope for this PR.
+  //
+  // Dynamic import to avoid a module cycle: src/auth/elevation.ts already
+  // imports `hasCapability`/`resolveCapabilities` from this file statically.
+  if (scope.kind === 'home' && auth?.boundAgentId) {
+    const { hasElevatedAction } = await import('./elevation')
+    const result = await hasElevatedAction(env, auth, 'action:home_access', 'squad', scope.id)
+    if (result.granted) return true
+  }
+  return false
 }
 
 // ── middleware ──────────────────────────────────────────────────────────────────
@@ -324,12 +605,7 @@ export function requireCapability(scope: CapabilityScope, min: Capability): Midd
 
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
 
-    let squadDepartmentId: string | null = null
-    if (target.type === 'squad' && target.id !== null) {
-      squadDepartmentId = await resolveSquadDepartment(c.env, target.id)
-    }
-
-    if (hasCapability(grants, target.type, target.id, min, squadDepartmentId)) {
+    if (await hasCapabilityOnDynamicScope(c.env, grants, target.type, target.id, min)) {
       await next()
       return
     }
@@ -394,14 +670,31 @@ export async function actorRankOnScopeFor(
   scopeType: CapabilityScopeType,
   scopeId: string | null,
 ): Promise<number> {
-  let max = auth.role === 'owner' ? RANK.owner : auth.role === 'admin' ? RANK.admin : 0
-  if (auth.memberId) {
+  // G-FP1b point 2: the coarse legacy-role floor (owner=5/admin=4) is an
+  // ORG-scope-shaped fact, and must be gated by planeCoversScope on a squad
+  // scope — a legacy owner/admin's rank on a home squad is 0 from this
+  // floor, same as it is via hasCapability's own org/role-plane exclusion.
+  // Adversarial round 1 (Athena): a missing/unknown squad row must fail
+  // CLOSED for every plane, including this legacy-role floor — squadScope
+  // being null because scopeType isn't 'squad' (role floor unaffected, as
+  // always) and squadScope being null because the ROW IS MISSING (role
+  // floor must NOT apply) are different cases and must not be conflated.
+  let squadScope: SquadScope | null = null
+  let unknownSquadRow = false
+  if (scopeType === 'squad' && scopeId) {
+    squadScope = await resolveSquadScopeArg(env, scopeId)
+    if (!squadScope) unknownSquadRow = true
+  }
+  const roleCovers = unknownSquadRow ? false : squadScope ? planeCoversScope('role', squadScope) : true
+  let max = roleCovers ? (auth.role === 'owner' ? RANK.owner : auth.role === 'admin' ? RANK.admin : 0) : 0
+  if (auth.memberId && !unknownSquadRow) {
     const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-    const squadDept =
-      scopeType === 'squad' && scopeId ? await resolveSquadDepartment(env, scopeId) : null
     // highest capability that resolves true on this scope = the actor's ceiling
     for (const cap of ['owner', 'admin', 'lead', 'member', 'observer'] as Capability[]) {
-      if (hasCapability(grants, scopeType, scopeId, cap, squadDept ?? undefined)) {
+      const resolves = squadScope
+        ? hasCapability(grants, 'squad', squadScope, cap)
+        : await hasCapabilityOnDynamicScope(env, grants, scopeType, scopeId, cap)
+      if (resolves) {
         max = Math.max(max, RANK[cap])
         break
       }
@@ -495,6 +788,19 @@ export async function targetMaxRankAcrossScopes(env: Env, targetMemberId: string
   const grants = await resolveCapabilities(env, targetMemberId)
   let max = 0
   for (const grant of grants) {
+    // G-FP1b point 2 (Athena's intent, documented rather than assumed): "a
+    // home row is capability-dead OUTSIDE the home" cuts both ways — it does
+    // not inherit access IN from org/department/role, and it must not
+    // inflate the member's GLOBAL rank used to protect them from actions on
+    // every OTHER scope (this ceiling). A member whose only standing is
+    // admin on their own private home is not thereby immune to suspension,
+    // token-mint-for, or a capability-grant action targeting them elsewhere
+    // — so a home-squad grant is excluded from this max, and only a WORK
+    // squad's grant counts.
+    if (grant.scope_type === 'squad' && grant.scope_id) {
+      const scope = await loadSquadScope(env, grant.scope_id)
+      if (scope?.kind === 'home') continue
+    }
     max = Math.max(max, RANK[grant.capability])
   }
   max = Math.max(max, await targetLegacyRoleRank(env, targetMemberId))

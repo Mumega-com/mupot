@@ -142,7 +142,7 @@ export interface BrainView {
 }
 
 export interface BrainViewDeps {
-  listLoopsFn?: (env: Env, opts?: { squadIds?: string[] | null }) => Promise<LoopManifest[]>
+  listLoopsFn?: (env: Env, opts?: { squadIds?: string[] | null; excludeHome?: boolean }) => Promise<LoopManifest[]>
   listDecisionsFn?: (env: Env, loopId: string, opts?: { limit?: number }) => Promise<LoopDecisionRow[]>
   loadPhysicsFn?: (env: Env) => Promise<PhysicsSnapshot | null>
   loadDirectiveFn?: (env: Env) => Promise<HumanDirective | null>
@@ -186,7 +186,7 @@ export async function loadBrainView(env: Env, auth: AuthContext, deps: BrainView
   const [physics, directive, loops] = await Promise.all([
     physicsFn(env).catch(() => null),
     directiveFn(env).catch(() => null),
-    listFn(env, { squadIds }),
+    listFn(env, { squadIds, excludeHome: true }),
   ])
 
   const loopRows: BrainLoopRow[] = loops.map((l) => ({

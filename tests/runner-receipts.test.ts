@@ -240,6 +240,49 @@ describe('Flight-004 Tentacles: Runner Receipts', () => {
     // Squad A caller requesting foreign squad-b explicitly -> 403
     const listResForeign = await mcpApp.fetch(mcpRequest('runner_list', { squad_id: 'squad-b' }, authSquadA), env)
     expect(listResForeign.status).toBe(403)
+
+    // resolveAccessibleSquadIds consumer audit (adversarial round on
+    // G-FP1b): an org-admin's UNRESTRICTED runner_list (squad_ids: null)
+    // must still exclude a runner receipt recorded against a home squad —
+    // seed one directly (bypassing runner_record's own guard, which is
+    // tested separately below) to prove listRunners' own SQL excludes it
+    // even if a row somehow predates that guard.
+    await harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-home-c', 'dept-home-c', 'Home Dept C');
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES
+        ('squad-home-c', 'dept-home-c', 'home-c', 'Home C', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('agent-home-c', 'squad-home-c', 'agent-home-c', 'Agent Home C', 'operator', 'test', 'active');
+      INSERT INTO runner_receipts (
+        id, tenant, seat_agent_id, squad_id, name, task, status,
+        started_at, ended_at, evidence_summary, verdict_line, log_url, created_at, updated_at
+      ) VALUES (
+        'run-home-c-secret', 'mumega', 'agent-home-c', 'squad-home-c', 'home-secret-task', 'do something private',
+        'landed', ${Date.now()}, ${Date.now()}, NULL, NULL, NULL, datetime('now'), datetime('now')
+      );
+    `)
+
+    const listResOrg = await mcpApp.fetch(mcpRequest('runner_list', {}, authOrg), env)
+    expect(listResOrg.status).toBe(200)
+    const listBodyOrg = (await listResOrg.json()) as { ok: boolean; result: { runners: Array<{ id: string }> } }
+    expect(listBodyOrg.result.runners.map((r) => r.id)).toContain('run-secret-rotate')
+    expect(listBodyOrg.result.runners.map((r) => r.id)).toContain('run-gate-b')
+    expect(listBodyOrg.result.runners.map((r) => r.id)).not.toContain('run-home-c-secret')
+
+    // Write-side: an org-admin (unbound caller) must be refused when trying
+    // to RECORD a runner receipt as the home-squad agent's seat — the same
+    // "org-scope never reaches into home" rule enforced everywhere else.
+    const recHomeRes = await mcpApp.fetch(
+      mcpRequest(
+        'runner_record',
+        { seat_agent_id: 'agent-home-c', name: 'sneak-in', task: 'act as the home agent', status: 'running' },
+        authOrg,
+      ),
+      env,
+    )
+    expect(recHomeRes.status).toBe(403)
+    const recHomeBody = (await recHomeRes.json()) as { ok: boolean; error: string }
+    expect(recHomeBody.error).toBe('home_scope_not_grantable')
   })
 
   it('validation and constraint fail-closed tests', async () => {

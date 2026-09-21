@@ -166,6 +166,19 @@ export async function selfGrant(env: Env, input: SelfGrantInput): Promise<DoorRe
   if ((CAPABILITY_RANK[input.capability] ?? 99) > (CAPABILITY_RANK[door.max_capability] ?? 0)) {
     return { ok: false, error: 'above_door_ceiling', detail: `max: ${door.max_capability}` }
   }
+  // G-FP1b point 4: no standing grant path into a kind='home' squad or
+  // department except createHomeForMember. A door is org-boundary
+  // self-service consent — it must never be how a member (or anyone else)
+  // self-selects into another member's home.
+  if (input.scopeType === 'squad' || input.scopeType === 'department') {
+    const table = input.scopeType === 'squad' ? 'squads' : 'departments'
+    const target = await env.DB.prepare(`SELECT kind FROM ${table} WHERE id = ?1 LIMIT 1`)
+      .bind(input.scopeId)
+      .first<{ kind: string }>()
+    if (target?.kind === 'home') {
+      return { ok: false, error: 'home_scope_not_grantable' }
+    }
+  }
 
   // Read the prior grant BEFORE writing. This is the only moment it is knowable.
   const prior = await env.DB.prepare(

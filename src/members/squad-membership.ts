@@ -1,4 +1,4 @@
-import { canOnSquad, hasCapability } from '../auth/capability'
+import { brandSquadScope, canOnSquad, hasCapability } from '../auth/capability'
 import type { AuthContext, Capability, CapabilityGrant, Env, Squad } from '../types'
 import {
   commitAgentSquadAccess,
@@ -31,7 +31,7 @@ export type SquadMembershipMutationError =
   | 'agent_identity_conflict'
   | 'home_squad_immutable'
 
-export type SquadMembershipTarget = Pick<Squad, 'id' | 'department_id'>
+export type SquadMembershipTarget = Pick<Squad, 'id' | 'department_id' | 'kind'>
 
 export interface SquadMembershipListRow {
   agent_id: string
@@ -67,7 +67,8 @@ export async function authorizeSquadMembershipWrite(input: {
     return { ok: false, error: 'self_grant' }
   }
   const grants: CapabilityGrant[] = input.auth.capabilities ?? []
-  const mayMutate = await canOnSquad(input.env, grants, input.squad.id, 'lead')
+  const scope = brandSquadScope(input.squad)
+  const mayMutate = await canOnSquad(input.env, grants, scope, 'lead')
   if (!mayMutate) {
     return { ok: false, error: 'forbidden' }
   }
@@ -81,26 +82,14 @@ export async function authorizeSquadMembershipWrite(input: {
     .first<{ capability: string }>()
   const targetCurrentRank = (targetMembership?.capability ?? null) as Capability | null
   if (targetCurrentRank !== null) {
-    const canAffectTarget = hasCapability(
-      grants,
-      'squad',
-      input.squad.id,
-      targetCurrentRank,
-      input.squad.department_id,
-    )
+    const canAffectTarget = hasCapability(grants, 'squad', scope, targetCurrentRank)
     if (!canAffectTarget) {
       return { ok: false, error: 'cannot_affect_higher_rank' }
     }
   }
   // ── Requested-rank ceiling: the caller must be able to confer the requested rank.
   if (input.requestedCapability !== null) {
-    const canGrant = hasCapability(
-      grants,
-      'squad',
-      input.squad.id,
-      input.requestedCapability,
-      input.squad.department_id,
-    )
+    const canGrant = hasCapability(grants, 'squad', scope, input.requestedCapability)
     if (!canGrant) {
       return { ok: false, error: 'cannot_grant_above_own_rank' }
     }
@@ -151,6 +140,10 @@ export async function addSquadMember(input: {
   | { ok: true; receiptId: string; result: 'created' | 'updated' | 'unchanged'; memberId: string }
   | { ok: false; error: SquadMembershipMutationError }
 > {
+  // G-FP1b point 4: no standing grant path into a kind='home' squad except
+  // createHomeForMember. Refused BEFORE the rank-ceiling checks below —
+  // absolute, not "unless you outrank the target".
+  if (input.squad.kind === 'home') return { ok: false, error: 'home_squad_immutable' }
   const authorized = await authorizeSquadMembershipWrite({
     env: input.env,
     auth: input.auth,
@@ -226,6 +219,10 @@ export async function removeSquadMember(input: {
   | { ok: true; receiptId: string; result: 'removed' | 'unchanged' }
   | { ok: false; error: SquadMembershipMutationError }
 > {
+  // G-FP1b point 4: same absolute refusal as addSquadMember — the ONLY
+  // writer of a home capability row is createHomeForMember, on either side
+  // of the verb.
+  if (input.squad.kind === 'home') return { ok: false, error: 'home_squad_immutable' }
   const authorized = await authorizeSquadMembershipWrite({
     env: input.env,
     auth: input.auth,

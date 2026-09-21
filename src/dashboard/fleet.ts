@@ -195,7 +195,16 @@ export async function loadFleet(env: Env, nowMs: number, auth: AuthContext): Pro
   const statement = env.DB.prepare(
     `SELECT member_id, display_name, source, label, agent_id, last_seen_at,
             harness, machine, model, provider, effort, flight_id
-       FROM presence WHERE tenant = ?1${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`,
+       FROM presence
+      WHERE tenant = ?1
+        -- G-FP1b point 2/3: applied UNCONDITIONALLY (not only when scopeClause
+        -- is present) — an unrestricted (org-admin) read must not surface a
+        -- home-squad agent's presence row (harness/machine/model/flight_id are
+        -- real work metadata, not just "seen recently").
+        AND (agent_id IS NULL OR agent_id NOT IN (
+          SELECT a.id FROM agents a JOIN squads s ON s.id = a.squad_id WHERE s.kind = 'home'
+        ))${scopeClause}
+      ORDER BY last_seen_at DESC LIMIT 200`,
   )
   const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
   const res = await bound.all<{

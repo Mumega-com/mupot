@@ -13,9 +13,19 @@
 
 import { describe, it, expect } from 'vitest'
 import { seedSquadMembers, deterministicMemberId, buildSquadDefs } from '../src/members/squad-seed'
-import { resolveCapabilities, hasCapability } from '../src/auth/capability'
+import { resolveCapabilities, hasCapability, type SquadScope } from '../src/auth/capability'
 import { sendAgentMessage, readAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
+
+// G-FP1b point 1: hasCapability's 'squad' overload requires a real SquadScope,
+// not a bare id. Every check below is an EXACT squad-scope match (the seeded
+// grant's own scope_id), which hasCapability resolves via `scope.id` alone —
+// department_id/kind are irrelevant to that branch, so a minimal work-kind
+// scope is sufficient here (none of these tests exercise inheritance or a
+// home squad).
+function squadScope(id: string): SquadScope {
+  return { id, department_id: '', kind: 'work' }
+}
 
 // sendAgentMessage's authz param is a compile-time forcing function only (#401 WARN
 // follow-up) — this file exercises the raw primitive directly, not through sendToRef's
@@ -64,7 +74,7 @@ interface AgentMsgRow {
  *  - SELECT from capabilities (for resolveCapabilities)
  *  - INSERT INTO / UPDATE / SELECT agent_messages (for round-trip test)
  */
-function makeDb() {
+function makeDb(squadKinds: Map<string, string> = new Map()) {
   const members: MemberRow[] = []
   const capabilities: CapabilityRow[] = []
   const messages: AgentMsgRow[] = []
@@ -171,6 +181,15 @@ function makeDb() {
           const m = members.find((x) => x.email === email)
           if (!m) return null
           return { id: m.id } as unknown as T
+        }
+
+        // Round-2 (Athena §2e-9): seedSquadMembers' home-squad guard —
+        // SELECT kind FROM squads WHERE id = ?1. Every squad id this file
+        // uses resolves as 'work' unless the test explicitly registered it
+        // as 'home' via the squadKinds map passed into makeDb().
+        if (/SELECT kind FROM squads WHERE id = \?1/i.test(s)) {
+          const [squadId] = binds as [string]
+          return { kind: squadKinds.get(squadId) ?? 'work' } as unknown as T
         }
 
         throw new Error(`squad-seed makeDb: unhandled first sql:\n${s}`)
@@ -286,9 +305,9 @@ describe('seedSquadMembers — Slice A', () => {
     const kasraId = await deterministicMemberId('kasra')
     const grants = await resolveCapabilities(env, kasraId)
     // admin covers lead/member on the squad scope…
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(true)
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'admin')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(true)
+    expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
     // …but is BOUNDED: squad-admin does NOT satisfy an org-scope admin check.
     expect(hasCapability(grants, 'org', null, 'admin')).toBe(false)
     expect(hasCapability(grants, 'org', null, 'owner')).toBe(false)
@@ -301,9 +320,9 @@ describe('seedSquadMembers — Slice A', () => {
     for (const slug of ['loom', 'river']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'admin')).toBe(false) // not admin
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'admin')).toBe(false) // not admin
       expect(hasCapability(grants, 'org', null, 'lead')).toBe(false) // no org bubble
     }
   })
@@ -315,8 +334,8 @@ describe('seedSquadMembers — Slice A', () => {
     for (const slug of ['codex', 'mumega-brain']) {
       const id = await deterministicMemberId(slug)
       const grants = await resolveCapabilities(env, id)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
-      expect(hasCapability(grants, 'squad', SQUAD_ID, 'lead')).toBe(false) // not lead
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(SQUAD_ID), 'lead')).toBe(false) // not lead
       expect(hasCapability(grants, 'org', null, 'member')).toBe(false) // no org bubble
     }
   })
@@ -329,11 +348,11 @@ describe('seedSquadMembers — Slice A', () => {
     // kasra=admin@squad, codex=member@squad — each satisfies its squad check,
     // and NONE satisfy the org check (no upward bubble).
     const kasraGrants = await resolveCapabilities(env, await deterministicMemberId('kasra'))
-    expect(hasCapability(kasraGrants, 'squad', squadId, 'admin')).toBe(true)
+    expect(hasCapability(kasraGrants, 'squad', squadScope(squadId), 'admin')).toBe(true)
     expect(hasCapability(kasraGrants, 'org', null, 'admin')).toBe(false)
     for (const slug of ['codex', 'mumega-brain']) {
       const grants = await resolveCapabilities(env, await deterministicMemberId(slug))
-      expect(hasCapability(grants, 'squad', squadId, 'member')).toBe(true)
+      expect(hasCapability(grants, 'squad', squadScope(squadId), 'member')).toBe(true)
       expect(hasCapability(grants, 'org', null, 'member')).toBe(false)
     }
   })
@@ -405,6 +424,25 @@ describe('seedSquadMembers — Slice A', () => {
     if (result.ok) return
     expect(result.reason).toBe('squad_required')
     // Nothing written.
+    expect(db._members.length).toBe(0)
+    expect(db._capabilities.length).toBe(0)
+  })
+
+  // Athena's §2e-9 sharpening (Round 2 on #1472): squad-seed.ts is dev/
+  // fixture-only today (its only callers are scripts/seed-squad.ts, a
+  // documentation/dry-run reference never invoked automatically, and this
+  // test file — see the guard's own doc comment in src/members/squad-seed.ts)
+  // but it writes squad-scope `capabilities` rows the same way every other
+  // writer in this PR does, so it gets the same table-exhaustive refusal:
+  // never grant squad-scope capability into a home squad, reachable or not.
+  it('refuses a home-kind squad: home_scope_not_grantable, zero rows written', async () => {
+    const homeSquadId = 'sq-home-0001-0001-0001-000000000001'
+    const db = makeDb(new Map([[homeSquadId, 'home']]))
+    const env = makeEnv(db)
+    const result = await seedSquadMembers(env, homeSquadId)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('home_scope_not_grantable')
     expect(db._members.length).toBe(0)
     expect(db._capabilities.length).toBe(0)
   })

@@ -25,6 +25,7 @@ import type {
   Agent,
   Membership,
   Capability,
+  OrgKind,
 } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
@@ -34,7 +35,7 @@ import { csrf } from 'hono/csrf'
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
-import { resolveCapabilities, hasCapability, isOrgAdmin } from '../auth/capability'
+import { resolveCapabilities, hasCapability, isOrgAdmin, loadSquadScope, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
@@ -52,11 +53,11 @@ import {
 // org role satisfies any scoped check. Mirrors requireCapability's legacy escape.
 
 // Resolve a squad's department for department→squad capability inheritance.
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
+async function departmentKind(env: Env, departmentId: string): Promise<OrgKind | null> {
+  const r = await env.DB.prepare('SELECT kind FROM departments WHERE id = ?1')
+    .bind(departmentId)
+    .first<{ kind: OrgKind }>()
+  return r?.kind ?? null
 }
 
 // Capability gate on a department scope (e.g. creating a squad → admin on the dept).
@@ -66,7 +67,10 @@ async function canOnDepartment(
   departmentId: string,
   min: Capability,
 ): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
+  // G-FP1b point 2/3: isOrgAdmin never bypasses a home department
+  // (resolveHomeDepartmentId in org/service.ts can make one kind='home').
+  const kind = await departmentKind(env, departmentId)
+  if (isOrgAdmin(auth) && kind !== 'home') return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   return hasCapability(grants, 'department', departmentId, min)
@@ -80,11 +84,13 @@ async function canOnSquad(
   squadId: string,
   min: Capability,
 ): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return false
+  // G-FP1b point 2/3: isOrgAdmin never bypasses a home squad.
+  if (isOrgAdmin(auth) && planeCoversScope('org', scope)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, min, deptId)
+  return hasCapability(grants, 'squad', scope, min)
 }
 
 // Hard tenant guard. The DB is per-tenant, but a stolen/misrouted token must not
@@ -129,8 +135,14 @@ orgApp.use('*', async (c, next) => {
 // ── departments ──────────────────────────────────────────────────────────────
 
 orgApp.get('/departments', async (c) => {
+  // G-FP1b point 2/3/P2 (Athena adversarial round 1): this route has NO
+  // capability gate beyond tenant scope — any authenticated principal with
+  // zero grants could see every department, including a member's own home
+  // department (resolveHomeDepartmentId can mint kind='home' departments,
+  // not only squads). Excluded here the same way home squads are excluded
+  // from org-wide listings elsewhere.
   const rows = await c.env.DB.prepare(
-    'SELECT id, slug, name, created_at FROM departments ORDER BY created_at ASC, slug ASC',
+    `SELECT id, slug, name, created_at FROM departments WHERE kind != 'home' ORDER BY created_at ASC, slug ASC`,
   ).all<Department>()
   return c.json({ departments: rows.results ?? [] })
 })
@@ -309,7 +321,7 @@ orgApp.post('/agents/:id/memberships', async (c) => {
   if (!isOrgAdmin(auth)) {
     if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
-    if (!hasCapability(grants, 'squad', squad.id, capability, squad.department_id)) {
+    if (!hasCapability(grants, 'squad', brandSquadScope(squad), capability)) {
       return c.json({ error: 'cannot_grant_above_own_rank' }, 403)
     }
   }
@@ -353,12 +365,19 @@ interface DepartmentNode extends Department {
 }
 
 orgApp.get('/tree', async (c) => {
+  // G-FP1b point 2/3/P2 (Athena adversarial round 1): same gap as
+  // GET /departments — no capability gate beyond tenant scope, so this
+  // route excludes every home department AND squad directly (agents/
+  // memberships transitively disappear with their squad, since they are
+  // filtered by squad_id membership in the assembly below, not by their own
+  // query).
+  //
   // Pull every table once, then assemble in-memory. The pot is small (one org),
   // so four scans beat N+1 round-trips.
   const [depts, squads, agents, memberships] = await Promise.all([
-    c.env.DB.prepare('SELECT id, slug, name, created_at FROM departments').all<Department>(),
+    c.env.DB.prepare(`SELECT id, slug, name, created_at FROM departments WHERE kind != 'home'`).all<Department>(),
     c.env.DB.prepare(
-      'SELECT id, department_id, slug, name, charter, created_at FROM squads',
+      `SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE kind != 'home'`,
     ).all<Squad>(),
     c.env.DB.prepare(
       'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents',

@@ -13,7 +13,7 @@ import { createBus } from '../bus'
 // Fine-grained RBAC. /wake targets the agent's SQUAD scope (lead+). The squad id
 // is only known after the agent row loads, so we check inline rather than as
 // route middleware (the scope is data-derived, not static).
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, loadSquadScope, planeCoversScope } from '../auth/capability'
 
 // A pure web-login owner/admin (no fine-grained capabilities) is not locked out of
 // org administration: owner/admin org role satisfies any squad-scope lead+ check.
@@ -23,13 +23,6 @@ function legacyOwnerAdmin(auth: AuthContext): boolean {
   return auth.role === 'owner' || auth.role === 'admin'
 }
 
-// Resolve a squad's department for department→squad capability inheritance.
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
 
 export const agentsApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -79,11 +72,16 @@ agentsApp.post('/:agentId/wake', async (c) => {
   // RBAC: waking an agent requires lead+ on that agent's squad (it spends model +
   // bus quota and emits org-mutating actions). A pure web-login owner/admin is
   // allowed via the legacy-role escape; member principals must hold a grant.
-  if (!legacyOwnerAdmin(auth)) {
+  //
+  // G-FP1b point 2/3: the legacy-role escape must not reach a home squad — an
+  // agent living in a member's home (e.g. their bootstrapSelf agent) must not
+  // be wakeable by an unrelated owner/admin login with zero grant rows there.
+  const wakeScope = await loadSquadScope(c.env, agent.squad_id)
+  if (!wakeScope) return c.json({ error: 'agent_not_found' }, 404)
+  if (!(legacyOwnerAdmin(auth) && planeCoversScope('role', wakeScope))) {
     if (!auth.memberId) return c.json({ error: 'forbidden', need: 'lead' }, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
-    const deptId = await squadDepartment(c.env, agent.squad_id)
-    if (!hasCapability(grants, 'squad', agent.squad_id, 'lead', deptId)) {
+    if (!hasCapability(grants, 'squad', wakeScope, 'lead')) {
       return c.json({ error: 'forbidden', need: 'lead' }, 403)
     }
   }

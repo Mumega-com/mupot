@@ -1,5 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
-import type { Env, Project } from '../types'
+import type { Env, OrgKind, Project } from '../types'
 import { projectVisibilityClause } from '../projects/access'
 import { nextRoutineOccurrence, routineOccurrenceKey, validateRoutineSchedule } from './schedule'
 import type {
@@ -17,7 +17,7 @@ import {
   principalCanRunForSquad,
   type RoutinePrincipal,
 } from './access'
-import { hasCapability } from '../auth/capability'
+import { brandSquadScope, hasCapability } from '../auth/capability'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -296,17 +296,39 @@ async function principalCanMutateRoutinePolicy(
   projectId: string,
   squadId: string,
 ): Promise<boolean> {
-  if (principal.workspace_admin) return true
   if (principal.tenant !== env.TENANT_SLUG) return false
+  // G-FP1b point 2/3: workspace_admin's bypass is gated by kind alone — a
+  // SEPARATE, cheap lookup on `squads` directly, deliberately NOT joined to
+  // project_squad_access. The original code checked `workspace_admin` before
+  // any DB read at all, so a workspace_admin bypassed even when no
+  // project_squad_access edge existed yet, and the caller (createRoutine/
+  // updateRoutine) went on to its OWN validateOwnership check for the more
+  // specific `responsible_squad_forbidden` diagnosis. Joining the two checks
+  // into one query (an earlier version of this fix) silently changed that: a
+  // workspace_admin with no edge now got the generic 'forbidden' from THIS
+  // function instead of ever reaching validateOwnership — a real behavior
+  // regression caught by tests/routines-service.test.ts, not just a wrong
+  // error code.
+  const squadKind = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(squadId)
+    .first<{ kind: OrgKind }>()
+  // Adversarial round 1 (Athena, §2e-9): fail CLOSED on a missing/unknown
+  // squad row — `squadKind?.kind !== 'home'` was true (bypass applied) both
+  // for a real work squad AND for a squad that does not exist at all
+  // (`undefined !== 'home'`). A missing row must never be treated as a
+  // bypassable work squad.
+  if (principal.workspace_admin && squadKind !== null && squadKind.kind !== 'home') return true
+
   const squad = await env.DB.prepare(
-    `SELECT s.department_id
+    `SELECT s.department_id, s.kind
        FROM squads s
        JOIN project_squad_access psa ON psa.squad_id = s.id
       WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
-  ).bind(squadId, projectId).first<{ department_id: string }>()
+  ).bind(squadId, projectId).first<{ department_id: string; kind: OrgKind }>()
   if (!squad) return false
+  const scope = brandSquadScope({ id: squadId, department_id: squad.department_id, kind: squad.kind })
   return (
-    hasCapability(principal.grants, 'squad', squadId, 'admin', squad.department_id) ||
+    hasCapability(principal.grants, 'squad', scope, 'admin') ||
     hasCapability(principal.grants, 'department', squad.department_id, 'admin')
   )
 }

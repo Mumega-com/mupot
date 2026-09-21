@@ -73,6 +73,12 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
             if (sql.includes('SELECT department_id FROM squads')) {
               return args[0] === AGENT.squad_id ? { department_id: 'dept-1' } : null
             }
+            // loadSquadScope (src/auth/capability.ts) — canOnSquad's squad-scope
+            // load. No test here exercises a home squad — every squad resolves
+            // as kind='work'.
+            if (sql.includes('SELECT id, department_id, kind FROM squads WHERE id = ?1')) {
+              return args[0] === AGENT.squad_id ? { id: AGENT.squad_id, department_id: 'dept-1', kind: 'work' } : null
+            }
             if (sql.includes('FROM agents') && sql.includes('WHERE id')) {
               return agentExists && args[0] === AGENT.id ? agentRow : null
             }

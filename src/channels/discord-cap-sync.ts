@@ -35,7 +35,7 @@
 // sync can resolve names to the IDs the Discord API requires.
 
 import type { Env, Capability, CapabilityGrant, CapabilityScopeType } from '../types'
-import { resolveCapabilities, hasCapability } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasCapabilityOnDynamicScope } from '../auth/capability'
 import { addMemberRole, removeMemberRole, discordGet, getDiscordAdminToken } from './adapters/discord'
 
 // ── §2A capability → Discord role name map ────────────────────────────────────
@@ -193,7 +193,7 @@ export async function checkInboundDiscordCap(
 
   // 3. Capability — real RBAC, loaded from D1, never from the Discord role.
   const grants = await resolveCapabilities(env, identity.memberId)
-  if (!hasCapability(grants, scopeType, scopeId, minCapability)) {
+  if (!(await hasCapabilityOnDynamicScope(env, grants, scopeType, scopeId, minCapability))) {
     return { ok: false, reason: 'insufficient' }
   }
 

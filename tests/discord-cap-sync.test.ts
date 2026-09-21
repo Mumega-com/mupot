@@ -90,6 +90,15 @@ function makeDb(opts: {
           return { external_user_id: identity.external_user_id, status: member.status } as unknown as T
         }
 
+        // loadSquadScope (src/auth/capability.ts) — hasCapabilityOnDynamicScope's
+        // squad-scope load, used whenever checkInboundDiscordCap's scopeType is
+        // 'squad'. No home-squad case is exercised through this mock — every
+        // squad it resolves is kind='work'.
+        if (/FROM squads WHERE id = \?1/.test(s)) {
+          const [squadId] = binds as [string]
+          return { id: squadId, department_id: null, kind: 'work' } as unknown as T
+        }
+
         throw new Error(`discord-cap-sync makeDb: unhandled first sql:\n${s}`)
       },
       async all<T>(): Promise<{ results: T[] }> {
@@ -229,8 +238,14 @@ describe('§4(b) — no scope escalation: squad grant cannot satisfy org-scope c
     const { resolveCapabilities, hasCapability } = await import('../src/auth/capability')
     const grants = await resolveCapabilities(env, ALICE_MEMBER_ID)
 
-    // Squad-scope check passes.
-    expect(hasCapability(grants, 'squad', SQUAD_ID, 'member')).toBe(true)
+    // Squad-scope check passes. G-FP1b point 1: hasCapability's 'squad' overload
+    // requires a real SquadScope, not a bare id — load one the same way
+    // production code does.
+    const { loadSquadScope } = await import('../src/auth/capability')
+    const squadScope = await loadSquadScope(env, SQUAD_ID)
+    expect(squadScope).not.toBeNull()
+    if (!squadScope) throw new Error('setup failed')
+    expect(hasCapability(grants, 'squad', squadScope, 'member')).toBe(true)
 
     // Org-scope check FAILS — grants do NOT bubble up.
     expect(hasCapability(grants, 'org', null, 'member')).toBe(false)

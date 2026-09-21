@@ -1,7 +1,7 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
-import { hasCapability } from '../auth/capability'
+import { brandSquadScope, hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
 import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
@@ -9,7 +9,7 @@ import { getFleetAgentRuntimeStates } from '../fleet/registry'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
 import { createTask, TaskCreateFenceError } from '../tasks/service'
-import type { CapabilityGrant, Env, Project, Task } from '../types'
+import type { CapabilityGrant, Env, OrgKind, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
@@ -70,6 +70,7 @@ export interface CandidateRow {
   id: string
   slug: string
   department_id: string
+  kind: OrgKind
   member_id: string
 }
 
@@ -230,7 +231,7 @@ export async function loadCandidates(
   limit: number = CANDIDATE_LIMIT,
 ): Promise<CandidateRow[]> {
   const result = await env.DB.prepare(
-    `SELECT a.id, a.slug, s.department_id, b.member_id
+    `SELECT a.id, a.slug, s.department_id, s.kind, b.member_id
        FROM agents a
        JOIN squads s ON s.id = ?1
        JOIN agent_member_bindings b
@@ -294,15 +295,13 @@ async function selectAgent(
   const candidates = await loadCandidates(env, policy.responsible_squad_id)
   const memberIds = candidates.map(candidate => candidate.member_id)
   const grants = await loadCandidateGrants(env, [...new Set(memberIds)])
+  // No extra D1 round trip for the squad's kind — every candidate row already
+  // carries the SAME squad's department_id/kind (loadCandidates' own JOIN),
+  // so a per-candidate SquadScope is built from the row already in hand.
   const eligible = candidates.filter(candidate => {
     if (assignedAgentId !== null && candidate.id !== assignedAgentId) return false
-    return hasCapability(
-      grants.get(candidate.member_id) ?? [],
-      'squad',
-      policy.responsible_squad_id,
-      'member',
-      candidate.department_id,
-    )
+    const scope = brandSquadScope({ id: policy.responsible_squad_id, department_id: candidate.department_id, kind: candidate.kind })
+    return hasCapability(grants.get(candidate.member_id) ?? [], 'squad', scope, 'member')
   }).sort((left, right) => {
     const preferred = policy.preferred_agent_id
     if (left.id === preferred && right.id !== preferred) return -1

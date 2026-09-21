@@ -12,7 +12,6 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../types'
 import { requireAuth } from '../auth'
-import { isOrgAdmin } from '../auth/capability'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 
@@ -62,7 +61,13 @@ export async function loadKanbanData(
   params: { squadIdOrSlug?: string; projectIdOrSlug?: string; view?: string },
 ): Promise<KanbanBoardData> {
   const accessibleSquadIds = await resolveAccessibleSquadIds(env, auth)
-  const isAllAccessible = isOrgAdmin(auth) || accessibleSquadIds === null
+  // G-FP1b point 2/3: this used to OR in `isOrgAdmin(auth)` directly, an
+  // independent "show everything" shortcut that bypassed whatever
+  // resolveAccessibleSquadIds returned — including the home-squad exclusion
+  // that function now applies. resolveAccessibleSquadIds never returns
+  // `null` any more (an org admin now gets the explicit list of every
+  // NON-home squad instead), so this is just that one predicate now.
+  const isAllAccessible = accessibleSquadIds === null
 
   // Fail-closed for grant-less members
   if (!isAllAccessible && accessibleSquadIds && accessibleSquadIds.length === 0) {
@@ -99,7 +104,7 @@ export async function loadKanbanData(
       FROM tasks t
       JOIN squads s ON t.squad_id = s.id
       LEFT JOIN agents a ON t.assignee_agent_id = a.id
-      WHERE t.project_id = ?1${squadFilter}
+      WHERE t.project_id = ?1 AND s.kind != 'home'${squadFilter}
       ORDER BY s.name ASC, ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
     `).bind(
       project.id,
@@ -150,10 +155,10 @@ export async function loadKanbanData(
   if (params.view === 'matrix') {
     const squadFilter = isAllAccessible
       ? ''
-      : ' WHERE t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
+      : ' AND t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))'
 
     const taskRows = await env.DB.prepare(`
-      SELECT 
+      SELECT
         t.id, t.squad_id, t.project_id, t.priority, t.parent_task_id,
         t.title, t.body, t.status, t.assignee_agent_id, t.github_issue_url,
         t.result, t.completed_at, t.gate_owner, t.done_when, t.created_at, t.updated_at,
@@ -164,7 +169,7 @@ export async function loadKanbanData(
       JOIN squads s ON t.squad_id = s.id
       LEFT JOIN projects p ON t.project_id = p.id
       LEFT JOIN agents a ON t.assignee_agent_id = a.id
-      ${squadFilter}
+      WHERE s.kind != 'home'${squadFilter}
       ORDER BY s.name ASC, ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
     `).bind(
       ...(isAllAccessible ? [] : [JSON.stringify(accessibleSquadIds ?? [])]),
@@ -214,8 +219,15 @@ export async function loadKanbanData(
   if (params.squadIdOrSlug) {
     targetSquad = await env.DB.prepare('SELECT * FROM squads WHERE id = ?1 OR slug = ?1').bind(params.squadIdOrSlug).first<Squad>()
     if (targetSquad) {
-      // Enforce Squad-scope authorization
-      if (!isAllAccessible && (!accessibleSquadIds || !accessibleSquadIds.includes(targetSquad.id))) {
+      // Enforce Squad-scope authorization. G-FP1b point 2/3: `isAllAccessible`
+      // (an org-admin/org-grant caller) must NOT bypass this for an explicit
+      // home-squad request — `isAllAccessible` only ever means "unrestricted
+      // over WORK squads" now (see resolveAccessibleSquadIds's doc comment);
+      // a home target still needs its own exact grant, checked the same way
+      // an explicit squad_id ask is checked everywhere else in this codebase.
+      const targetIsHome = targetSquad.kind === 'home'
+      const allAccessibleAppliesHere = isAllAccessible && !targetIsHome
+      if (!allAccessibleAppliesHere && (!accessibleSquadIds || !accessibleSquadIds.includes(targetSquad.id))) {
         return { mode: 'squad', squad: null, lanes: [] }
       }
       targetSquadId = targetSquad.id
@@ -224,8 +236,9 @@ export async function loadKanbanData(
     targetSquadId = accessibleSquadIds[0]
     targetSquad = await env.DB.prepare('SELECT * FROM squads WHERE id = ?1').bind(targetSquadId).first<Squad>()
   } else if (isAllAccessible) {
-    // Only org admins may default to the first squad in DB
-    targetSquad = await env.DB.prepare('SELECT * FROM squads ORDER BY created_at ASC LIMIT 1').first<Squad>()
+    // Only org admins may default to the first squad in DB — never default
+    // into a member's home squad by omission.
+    targetSquad = await env.DB.prepare(`SELECT * FROM squads WHERE kind != 'home' ORDER BY created_at ASC LIMIT 1`).first<Squad>()
     if (targetSquad) targetSquadId = targetSquad.id
   }
 

@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapability, resolveCapabilities } from './capability'
+import { hasCapabilityOnDynamicScope, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -154,6 +154,19 @@ export async function createElevationRequest(
   }
   if (!['org', 'department', 'squad'].includes(input.scopeType)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid scope_type' }
+  }
+  // Adversarial round 1 on G-FP1b (P0-1, Athena): action:home_access must
+  // name ONE exact home squad — an org- or department-scoped request for it
+  // would (per hasElevatedAction's own "an org grant covers every scope"
+  // matcher rule) approve access to EVERY home, including ones created
+  // later, the moment any ordinary org admin approves it. Refused at REQUEST
+  // time so this can never even reach an approver.
+  if (uniqueActions.includes('action:home_access') && input.scopeType !== 'squad') {
+    return {
+      ok: false,
+      reason: 'invalid_elevation_request',
+      detail: 'action:home_access must name an exact squad scope, never org or department',
+    }
   }
   if (!isValidElevationDuration(input.durationMinutes)) {
     return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid duration_minutes' }
@@ -359,6 +372,36 @@ export async function resolveScopeDepartmentId(
   return row?.department_id ?? null
 }
 
+/** decidedByOrgAdminCoversScope — G-FP1b point 2 (Athena, pre-merge completion
+ *  delta on #1472): `decidedByIsOrgAdmin === true` is a deliberate exception
+ *  in decideElevationRequest's authority check — it lets an org admin decide
+ *  a home-scoped `action:home_access` REQUEST, the sanctioned "human decides,
+ *  time-boxed, receipted" door (see the comment above decidedByHasAuthority).
+ *  But that exception must NOT become the same org-admin-reaches-into-home
+ *  hole this whole PR closes everywhere else: an org admin holding NOTHING
+ *  on a member's home squad must not be able to approve OR deny a request
+ *  scoped to it. Gated the same way every other org-plane bypass in this
+ *  codebase is — planeCoversScope('org', scope), never conditional, never
+ *  bypassed for org/department-scoped requests (planeCoversScope only has an
+ *  opinion about a SQUAD scope, so those pass through unaffected — action:
+ *  home_access itself can only ever be requested at squad scope, per the
+ *  request-time refusal above, but this authority check runs for every
+ *  elevation action/scope shape, not only home_access). An unknown/missing
+ *  squad row fails closed (no authority), matching this codebase's other
+ *  loaders. */
+async function decidedByOrgAdminCoversScope(
+  env: Env,
+  decidedByIsOrgAdmin: boolean | undefined,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<boolean> {
+  if (decidedByIsOrgAdmin !== true) return false
+  if (scopeType !== 'squad' || !scopeId) return true
+  const scope = await loadSquadScope(env, scopeId)
+  if (!scope) return false
+  return planeCoversScope('org', scope)
+}
+
 /**
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
@@ -415,20 +458,28 @@ export async function decideElevationRequest(
   // Authority is evaluated against the REQUEST's own scope. Approve may narrow
   // the action set, never the scope (enforced below), so the request's scope is
   // the scope of both decisions.
-  const requestScopeDepartmentId = await resolveScopeDepartmentId(
-    env,
-    request.requested_scope_type as CapabilityScopeType,
-    request.requested_scope_id,
-  )
+  // hasCapabilityOnDynamicScope (not hasCapability directly): the request's
+  // scope_type is not known statically here, and — per G-FP1b — a squad-scope
+  // check must load a real SquadScope (kind included) rather than a bare id +
+  // a separately-resolved department id, so an approver's org/department/role
+  // authority correctly answers false for a home squad. Deliberate exception:
+  // `decidedByIsOrgAdmin === true` still authorizes approving a home-scoped
+  // REQUEST — that is the intended "human decides, time-boxed, receipted"
+  // door (G-FP1b point 4), not a standing bypass of the home's own reads.
   const decidedByHasAuthority =
-    input.decidedByIsOrgAdmin === true ||
-    hasCapability(
+    (await decidedByOrgAdminCoversScope(
+      env,
+      input.decidedByIsOrgAdmin,
+      request.requested_scope_type as CapabilityScopeType,
+      request.requested_scope_id || null,
+    )) ||
+    (await hasCapabilityOnDynamicScope(
+      env,
       input.decidedByCapabilities,
       request.requested_scope_type as CapabilityScopeType,
       request.requested_scope_id || null,
       'admin',
-      requestScopeDepartmentId,
-    )
+    ))
   if (!decidedByHasAuthority) {
     return {
       ok: false,
@@ -487,10 +538,9 @@ export async function decideElevationRequest(
   // above, so this re-check is over the same scope the hoisted gate cleared. It
   // stays as defence in depth and must honour the SAME two planes, or an owner
   // clears the first gate and is refused by the second.
-  const squadDepartmentId = await resolveScopeDepartmentId(env, scopeType, scopeId)
   if (
-    input.decidedByIsOrgAdmin !== true &&
-    !hasCapability(input.decidedByCapabilities, scopeType, scopeId || null, 'admin', squadDepartmentId)
+    !(await decidedByOrgAdminCoversScope(env, input.decidedByIsOrgAdmin, scopeType, scopeId || null)) &&
+    !(await hasCapabilityOnDynamicScope(env, input.decidedByCapabilities, scopeType, scopeId || null, 'admin'))
   ) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
@@ -812,10 +862,24 @@ export async function hasElevatedAction(
   }
 
   const normalizedScopeId = scopeId ?? ''
+  // Adversarial round 1 on G-FP1b (P0-1, Athena): the matcher's org/department
+  // limbs are inheritance, exactly like hasCapability's — so they must be
+  // gated by planeCoversScope the same way. Without this, an org-scope
+  // elevation grant for ANY action would satisfy a check against a home
+  // squad (the request-time refusal above stops action:home_access
+  // specifically from ever being REQUESTED at org/department scope, but a
+  // grant already on disk, or a future action with the same shape, must not
+  // rely on that alone — defence in depth, dynamic import to avoid the
+  // capability.ts <-> elevation.ts module cycle).
+  const { loadSquadScope: loadSquadScopeForMatch, planeCoversScope: planeCoversScopeForMatch } = await import('./capability')
+  const targetSquadScope = scopeType === 'squad' && scopeId ? await loadSquadScopeForMatch(env, scopeId) : null
+  const inheritancePlaneCovers = (plane: 'org' | 'department'): boolean =>
+    targetSquadScope ? planeCoversScopeForMatch(plane, targetSquadScope) : true
+
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
   const match = grants.find((g) => {
     if (g.action !== action) return false
-    if (g.scope_type === 'org') return true
+    if (g.scope_type === 'org') return inheritancePlaneCovers('org')
     if (g.scope_type === scopeType && g.scope_id === normalizedScopeId) return true
     if (
       scopeType === 'squad' &&
@@ -823,18 +887,21 @@ export async function hasElevatedAction(
       opts.squadDepartmentId &&
       g.scope_id === opts.squadDepartmentId
     ) {
-      return true
+      return inheritancePlaneCovers('department')
     }
     return false
   })
   if (!match) return { granted: false, reason: 'no_matching_grant' }
 
   // Re-derive the APPROVER's authority live — never trust that they still
-  // hold what they granted just because the grant row exists.
+  // hold what they granted just because the grant row exists. For a
+  // 'action:home_access' grant on a home squad, this means ONLY the home's
+  // OWNER (the sole holder of an exact squad-scope grant there — org/
+  // department/role planes are capability-dead on a home, G-FP1b point 2)
+  // can durably remain the approver: an org admin's authority re-check fails
+  // closed with `approver_authority_lost` here, by design.
   const approverCapabilities = await resolveCapabilities(env, match.approved_by_member_id)
-  const approverDeptId =
-    match.scope_type === 'squad' ? await resolveScopeDepartmentId(env, match.scope_type, match.scope_id) : null
-  if (!hasCapability(approverCapabilities, match.scope_type, match.scope_id || null, 'admin', approverDeptId)) {
+  if (!(await hasCapabilityOnDynamicScope(env, approverCapabilities, match.scope_type, match.scope_id || null, 'admin'))) {
     return { granted: false, reason: 'approver_authority_lost' }
   }
 

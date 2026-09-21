@@ -32,6 +32,9 @@ interface SyncState {
   identities: { platform: string; external_user_id: string; member_id: string }[]
   channelGrants: ChannelGrant[]
   manualGrants: ManualGrant[]
+  // squad_id → kind, defaulted to 'work' when a binding's squad_id has no entry
+  // (every pre-existing test in this file targets squad-1 with no home semantics).
+  squadKinds?: Record<string, string>
 }
 
 function makeStatement(state: SyncState, sql: string, args: unknown[]) {
@@ -51,6 +54,15 @@ function makeStatement(state: SyncState, sql: string, args: unknown[]) {
           (g) => g.binding_id === bindingId && g.member_id === memberId && g.squad_id === squadId,
         )
         return (row ? { capability: row.capability } : null) as T | null
+      }
+
+      // ensureSquadGrant's belt-and-braces home-kind check (P0-2 fix, G-FP1b
+      // point 4): SELECT kind FROM squads WHERE id = ?1. Defaults to 'work'
+      // so every pre-existing test in this file is unaffected.
+      if (sql.includes('SELECT kind FROM squads WHERE id')) {
+        const [squadId] = args
+        const kind = state.squadKinds?.[String(squadId)] ?? 'work'
+        return { kind } as T
       }
 
       return null
@@ -179,5 +191,29 @@ describe('reconcileMembership', () => {
     expect(state.manualGrants).toHaveLength(1)
     expect(state.channelGrants.map((g) => g.binding_id)).toEqual(['bind-b'])
     expect(state.channelGrants[0].capability).toBe('member')
+  })
+
+  // Athena's §2e-8 table-exhaustive requirement (Round 2 on #1472): one
+  // mutation-proven test PER writer table. `channel_capability_grants` is
+  // written ONLY by ensureSquadGrant (src/channels/sync.ts) — a channel
+  // member present in a bound channel must NEVER receive a standing grant
+  // when the bound squad is kind='home', even though every other condition
+  // (member present, no existing grant) is identical to the happy-path test
+  // above.
+  it('never writes a channel_capability_grants row for a home-kind squad, even with a present, ungranted member', async () => {
+    const { reconcileMembership } = await import('../src/channels/sync')
+    membersByChannel = { 'chan-home': ['external-1'] }
+    const state: SyncState = {
+      bindings: [{ ...binding('bind-home', 'chan-home'), squad_id: 'squad-home-1' }],
+      identities: [{ platform: 'test', external_user_id: 'external-1', member_id: 'member-1' }],
+      manualGrants: [],
+      channelGrants: [],
+      squadKinds: { 'squad-home-1': 'home' },
+    }
+
+    const report = await reconcileMembership(makeEnv(state))
+
+    expect(report).toEqual({ bindings: 1, reconciled: 1, failed: 0 })
+    expect(state.channelGrants).toHaveLength(0)
   })
 })

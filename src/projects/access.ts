@@ -1,4 +1,4 @@
-import { hasCapability } from '../auth/capability'
+import { capabilityRank, hasCapability } from '../auth/capability'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
 
 export interface ProjectReadAccess {
@@ -21,7 +21,14 @@ export function projectReadAccessFromGrants(
   const squadIds = new Set<string>()
   const departmentIds = new Set<string>()
   for (const grant of grants) {
-    if (!hasCapability([grant], grant.scope_type, grant.scope_id, 'observer')) continue
+    // Self-referential check (is THIS grant, on ITS OWN declared scope, at
+    // least observer) — never scope inheritance, so this is exactly
+    // `capabilityRank(grant.capability) >= capabilityRank('observer')` and
+    // needs no SquadScope/kind lookup (this function is deliberately
+    // pure/sync — no `env` to load one with). A member's own home-squad
+    // grant is legitimately theirs to see here; no home exclusion applies
+    // to a caller reading their OWN scopes.
+    if (capabilityRank(grant.capability) < capabilityRank('observer')) continue
     if (grant.scope_type === 'squad' && grant.scope_id) squadIds.add(grant.scope_id)
     if (grant.scope_type === 'department' && grant.scope_id) departmentIds.add(grant.scope_id)
   }

@@ -141,10 +141,19 @@ export async function getLoop(env: Env, id: string): Promise<LoopManifest | null
  * "in scope" when its OWN squad_id is one of the caller's squads, or (for an
  * agent-owned loop, where squad_id is null by the schema's "exactly one of
  * squad_id/agent_id" invariant — see manifest.ts) the owning agent's squad is.
+ *
+ * `excludeHome` (adversarial round on G-FP1b, resolveAccessibleSquadIds
+ * consumer audit): dashboard/brain.ts is a VIEW over a member's own
+ * accessible squads — an org-admin/legacy-owner viewer gets `squadIds: null`
+ * (unrestricted) from resolveAccessibleSquadIds, which without this flag
+ * would surface every other member's home-squad loops on a shared dashboard.
+ * The engine driver loop, the admin-gated loop API, and mcp/loops.ts must
+ * keep ticking/managing a home-squad agent's OWN loop — none of them pass
+ * this flag, so they are unaffected.
  */
 export async function listLoops(
   env: Env,
-  opts: { status?: LoopStatus; squadIds?: string[] | null } = {},
+  opts: { status?: LoopStatus; squadIds?: string[] | null; excludeHome?: boolean } = {},
 ): Promise<LoopManifest[]> {
   // Plain `?` placeholders throughout (matches this file's existing style) —
   // the bind array is built in the SAME order the clauses below append `?`,
@@ -162,12 +171,20 @@ export async function listLoops(
         ))
       )`
   }
+  const homeClause = opts.excludeHome
+    ? `
+      AND NOT EXISTS (
+        SELECT 1 FROM squads hs
+         WHERE hs.kind = 'home'
+           AND (hs.id = loops.squad_id OR hs.id IN (SELECT a.squad_id FROM agents a WHERE a.id = loops.agent_id))
+      )`
+    : ''
   const statement = env.DB.prepare(
     opts.status
       ? `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
-           FROM loops WHERE tenant = ? AND status = ?${scopeClause} ORDER BY created_at DESC`
+           FROM loops WHERE tenant = ? AND status = ?${scopeClause}${homeClause} ORDER BY created_at DESC`
       : `SELECT id, tenant, squad_id, agent_id, status, spec, dry_rounds, created_at, updated_at
-           FROM loops WHERE tenant = ?${scopeClause} ORDER BY created_at DESC`,
+           FROM loops WHERE tenant = ?${scopeClause}${homeClause} ORDER BY created_at DESC`,
   )
   const bind: unknown[] = [env.TENANT_SLUG]
   if (opts.status) bind.push(opts.status)

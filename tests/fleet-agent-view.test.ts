@@ -87,7 +87,11 @@ function makeDb(opts: MockDbOpts = {}) {
       })
     }
     // listFleetAgents (kept for compat)
-    if (sql.includes('FROM fleet_agents WHERE tenant')) {
+    // G-FP1b point 2/3's home-squad exclusion (src/fleet/registry.ts) inserted
+    // a multi-line comment + NOT EXISTS clause between `FROM fleet_agents` and
+    // `WHERE tenant`, breaking the old single-string match — loosened to two
+    // independent substring checks (no other `all()` branch queries this table).
+    if (sql.includes('FROM fleet_agents') && sql.includes('WHERE tenant')) {
       const [tenant] = b as [string]
       return [...fleet.values()].filter((r) => r.tenant === tenant).sort((x, y) => x.agent_id < y.agent_id ? -1 : 1)
     }

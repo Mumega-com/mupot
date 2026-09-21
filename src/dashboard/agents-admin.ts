@@ -132,7 +132,16 @@ export async function loadAllAgents(env: Env, auth: AuthContext): Promise<AgentA
      JOIN squads s ON s.id = a.squad_id
      LEFT JOIN departments d ON d.id = s.department_id
      LEFT JOIN tasks t ON t.assignee_agent_id = a.id
-     WHERE 1=1${scopeClause}
+     -- G-FP1b point 2/3: resolveAccessibleSquadIds returns null (no extra
+     -- query) for an unrestricted caller, same as before this PR — so the
+     -- home exclusion is pushed into this query directly rather than
+     -- materializing every non-home squad id (that would cost a second D1
+     -- round trip on every load AND break the "unrestricted = no scope
+     -- clause" assumption several tests here assert). Applied unconditionally
+     -- (not only in the null branch): a scoped caller's own grants can never
+     -- legitimately include a home squad anyway (see resolveGrantedSquadIds),
+     -- so this is a no-op there and a real exclusion in the null branch.
+     WHERE s.kind != 'home'${scopeClause}
      GROUP BY a.id, a.slug, a.name, a.role, a.model, a.status, a.created_at,
               a.squad_id, s.name, d.name,
               a.okr, a.kpi_target, a.kpi_progress, a.effort, a.autonomy,
@@ -166,6 +175,7 @@ export async function loadSquadOptions(env: Env): Promise<SquadOption[]> {
     `SELECT s.id AS id, s.name AS name, d.name AS dept_name
        FROM squads s
        LEFT JOIN departments d ON d.id = s.department_id
+      WHERE s.kind != 'home'
       ORDER BY d.name ASC, s.name ASC`,
   ).all<SquadOption>()
   return rows.results ?? []

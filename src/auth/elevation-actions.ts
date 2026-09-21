@@ -146,6 +146,24 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Dispatching enqueues work; it does not itself grant standing authority beyond the dispatch record.',
   },
+  // FP-01 Slice 1 v2 (G-FP1b point 4): the ONE additional door into a
+  // kind='home' squad besides createHomeForMember's own write — a time-
+  // boxed, human-approved, exact-squad-scoped read for a BOUND-AGENT session
+  // (never a standing grant). Consumed by src/auth/capability.ts's
+  // canOnSquadAuth. A pure web-session (dashboard) operator cannot use this
+  // action today — hasElevatedAction refuses any non-agent session with
+  // `not_agent_session` before this registry is ever consulted, and
+  // migrations/0148_elevation_ledger.sql's elevation_requests.agent_session_id
+  // is NOT NULL, so a human-operator variant needs a schema decision out of
+  // scope for this PR (see the PR body's "not done" list).
+  'action:home_access': {
+    key: 'action:home_access',
+    enforced: true,
+    label: 'Access a member\'s home',
+    description: 'Time-boxed read on ONE named home squad (never a standing grant).',
+    effect: 'reversible',
+    effectNote: 'Read-only and scoped to a single squad; the access itself leaves no lasting effect once the grant expires.',
+  },
 })
 
 export type ElevationActionKey = keyof typeof ELEVATION_ACTIONS

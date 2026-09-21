@@ -660,7 +660,18 @@ export async function listFleetAgentRuntimeView(
   }
   const statement = env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host
-       FROM fleet_agents WHERE tenant = ?1${scopeClause} ORDER BY agent_id ASC`,
+       FROM fleet_agents
+      WHERE tenant = ?1
+        -- G-FP1b point 2/3: applied UNCONDITIONALLY — an unrestricted
+        -- (org-admin) read must not surface a fleet-registered agent whose
+        -- ONLY squad membership is someone's home (fleet_agents.squads is a
+        -- denormalized JSON array of squad SLUGS, so this checks slugs
+        -- against the current home-squad slug set rather than joining ids).
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(fleet_agents.squads) je
+           WHERE je.value IN (SELECT slug FROM squads WHERE kind = 'home')
+        )${scopeClause}
+      ORDER BY agent_id ASC`,
   )
   const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)
   const rows = await bound.all<Record<string, unknown>>()

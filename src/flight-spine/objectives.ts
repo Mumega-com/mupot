@@ -1,5 +1,5 @@
-import type { AuthContext, Capability, Env } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import type { AuthContext, Capability, Env, OrgKind } from '../types'
+import { brandSquadScope, hasCapability, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { isEnforceableCap } from '../agents/meter'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import {
@@ -87,6 +87,7 @@ interface SquadAuthorityRow {
   id: string
   department_id: string
   budget_cap_cents: number | null
+  kind: OrgKind
 }
 
 export interface FlightSpinePrincipal {
@@ -226,23 +227,22 @@ export async function requireFlightSpineSquadAuthority(
   minimum: Capability,
 ): Promise<SquadAuthorityRow> {
   const squad = await env.DB.prepare(`
-    SELECT id, department_id, budget_cap_cents FROM squads WHERE id = ?1
+    SELECT id, department_id, budget_cap_cents, kind FROM squads WHERE id = ?1
   `).bind(squadId).first<SquadAuthorityRow>()
   if (!squad) throw new ObjectiveError('objective_forbidden')
+  const squadScope = brandSquadScope(squad)
 
+  // G-FP1b point 2/3: the legacy-role plane never covers a home squad —
+  // otherwise an org owner/admin with zero grant rows could act on ANY
+  // member's home flight-spine objective.
   const legacyAdmin = auth.capabilities === undefined
     && (auth.role === 'owner' || auth.role === 'admin')
+    && planeCoversScope('role', squadScope)
   // A defined capability view is the auth layer's effective ambient authority.
   // In particular, [] is the directory ceiling and a narrowed array can be a
   // consent clamp; rereading wider DB grants here would undo both controls.
   const grants = auth.capabilities ?? (await resolveCapabilities(env, principal.authorityMemberId))
-  if (!legacyAdmin && !hasCapability(
-    grants,
-    'squad',
-    squad.id,
-    minimum,
-    squad.department_id,
-  )) {
+  if (!legacyAdmin && !hasCapability(grants, 'squad', squadScope, minimum)) {
     throw new ObjectiveError(minimum === 'lead'
       ? 'objective_budget_forbidden'
       : 'objective_forbidden')
@@ -257,7 +257,7 @@ export async function requireFlightSpineSquadAuthority(
       scope_type: 'squad',
       scope_id: squad.id,
       capability: membership.capability,
-    }], 'squad', squad.id, minimum)) {
+    }], 'squad', squadScope, minimum)) {
       throw new ObjectiveError(minimum === 'lead'
         ? 'objective_budget_forbidden'
         : 'objective_forbidden')

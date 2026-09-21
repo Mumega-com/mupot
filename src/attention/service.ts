@@ -1,5 +1,5 @@
-import type { Env } from '../types'
-import { hasCapability } from '../auth/capability'
+import type { Env, OrgKind } from '../types'
+import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
 import type { RoutinePrincipal } from '../routines/access'
@@ -75,6 +75,7 @@ interface SourceRow {
   deadline_at: string | null
   squad_id: string | null
   squad_department_id: string | null
+  squad_kind: OrgKind | null
   project_access_level: 'read' | 'write' | 'admin' | null
   assignee_agent_id: string | null
   gate_owner: string | null
@@ -116,18 +117,31 @@ function urgency(rank: number): NeedsYouItem['urgency'] {
 }
 
 function principalCanActOnSquad(row: SourceRow, principal: RoutinePrincipal): boolean {
-  return principal.legacy_owner_admin === true
-    || (row.squad_id !== null && hasCapability(
-      principal.grants,
-      'squad',
-      row.squad_id,
-      'member',
-      row.squad_department_id,
-    ))
+  if (row.squad_id === null || row.squad_department_id === null || row.squad_kind === null) return false
+  const scope = brandSquadScope({ id: row.squad_id, department_id: row.squad_department_id, kind: row.squad_kind })
+  // G-FP1b point 2/3: legacy_owner_admin never covers a home squad — a needs-
+  // you row about another member's home task/routine must not surface to an
+  // unrelated owner/admin login with zero grant rows there.
+  return (principal.legacy_owner_admin === true && planeCoversScope('role', scope))
+    || hasCapability(principal.grants, 'squad', scope, 'member')
 }
 
 function principalCanAnswerRoutine(row: SourceRow, principal: RoutinePrincipal): boolean {
-  if (principal.workspace_admin) return true
+  // Adversarial round 1 (Athena, P2): `workspace_admin` used to bypass
+  // UNCONDITIONALLY, ahead of any home-squad exclusion — an org-wide admin
+  // could answer a routine question about another member's home regardless
+  // of project access level. The bypass must be scope-aware the same way
+  // every other admin bypass in this file already is: never reach a home
+  // squad via the legacy-role plane or an org-scope grant, exact-match
+  // grants excepted (a home's own owner is unaffected either way, since
+  // they separately pass the plain squad-access check below).
+  if (principal.workspace_admin) {
+    if (row.squad_id === null || row.squad_department_id === null || row.squad_kind === null) return false
+    const scope = brandSquadScope({ id: row.squad_id, department_id: row.squad_department_id, kind: row.squad_kind })
+    const legacyPlaneCovers = principal.legacy_owner_admin === true && planeCoversScope('role', scope)
+    const orgGrantCovers = hasCapability(principal.grants, 'org', null, 'member') && planeCoversScope('org', scope)
+    if (legacyPlaneCovers || orgGrantCovers) return true
+  }
   return (row.project_access_level === 'write' || row.project_access_level === 'admin')
     && principalCanActOnSquad(row, principal)
 }
@@ -264,7 +278,7 @@ async function sourceRows(
       'Approval required by ' || t.gate_owner AS reason,
       0 AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
+      t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
       t.assignee_agent_id, t.gate_owner,
       CASE WHEN EXISTS (
         SELECT 1 FROM gate_grants g
@@ -304,7 +318,7 @@ async function sourceRows(
       CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END AS urgency_rank,
       r.responsible_squad_id AS responsible, r.created_by AS requested_by,
       rr.created_at, rr.scheduled_for AS deadline_at,
-      r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id,
+      r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind,
       psa.access_level AS project_access_level,
       NULL AS assignee_agent_id, NULL AS gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(rr.scheduled_for, '${DEADLINE_SENTINEL}') AS sort_deadline,
@@ -328,7 +342,7 @@ async function sourceRows(
       'Blocked work requires ' || t.gate_owner AS reason,
       2 AS urgency_rank, t.gate_owner AS responsible, NULL AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
+      t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
       NULL AS assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
@@ -345,7 +359,7 @@ async function sourceRows(
       'Approved output awaits publication' AS reason,
       3 AS urgency_rank, 'workspace_admin' AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
-      t.squad_id, s.department_id AS squad_department_id, NULL AS project_access_level,
+      t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
       t.assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp

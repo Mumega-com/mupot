@@ -18,7 +18,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
-import { hasCapability, isOrgAdmin, resolveCapabilities } from './capability'
+import { hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   linkLoginIdentity,
   listLoginIdentities,
@@ -921,23 +921,28 @@ authApp.get('/identities', requireAuthMw(), async (c) => {
 // who characteristically holds zero capability rows. Before this, that made
 // the pending-elevation list return 200 with an empty array for the owner: not
 // a visible refusal, just a permanent, silent "nothing pending".
-function scopeAuthorityOk(
+// G-FP1b point 2: isOrgAdmin's bypass must not reach a home squad — an org
+// owner/admin with zero grant rows must not be able to decide (or even see)
+// an elevation request scoped to another member's home. Made ASYNC (env
+// added) so this can resolve the scope's `kind` itself via
+// hasCapabilityOnDynamicScope, rather than trusting a caller-supplied
+// department id that carries no kind information (the round-2 defect class).
+async function scopeAuthorityOk(
+  env: Env,
   auth: AuthContext | null | undefined,
   capabilities: CapabilityGrant[] | undefined,
   scopeType: CapabilityScopeType,
   scopeId: string,
-  squadDepartmentId: string | null,
-): boolean {
+): Promise<boolean> {
+  const scopeIdOrNull = scopeId || null
+  if (scopeType === 'squad' && scopeIdOrNull) {
+    const scope = await loadSquadScope(env, scopeIdOrNull)
+    if (!scope) return false
+    if (isOrgAdmin(auth) && planeCoversScope('org', scope)) return true
+    return hasCapability(capabilities ?? [], 'squad', scope, 'admin')
+  }
   if (isOrgAdmin(auth)) return true
-  return hasCapability(capabilities ?? [], scopeType, scopeId || null, 'admin', squadDepartmentId)
-}
-
-async function resolveSquadDepartmentId(env: Env, scopeType: string, scopeId: string): Promise<string | null> {
-  if (scopeType !== 'squad' || !scopeId) return null
-  const row = await env.DB.prepare(`SELECT department_id FROM squads WHERE id = ?1 LIMIT 1`)
-    .bind(scopeId)
-    .first<{ department_id: string }>()
-  return row?.department_id ?? null
+  return hasCapabilityOnDynamicScope(env, capabilities ?? [], scopeType, scopeIdOrNull, 'admin')
 }
 
 // GET /auth/elevation/requests → pending elevation requests the CALLER has
@@ -951,8 +956,7 @@ authApp.get('/elevation/requests', requireAuthMw(), async (c) => {
   const all = await listPendingElevationRequests(c.env, c.env.TENANT_SLUG)
   const visible: Array<Record<string, unknown>> = []
   for (const r of all) {
-    const deptId = await resolveSquadDepartmentId(c.env, r.requested_scope_type, r.requested_scope_id)
-    if (!scopeAuthorityOk(auth, capabilities, r.requested_scope_type as CapabilityScopeType, r.requested_scope_id, deptId)) continue
+    if (!(await scopeAuthorityOk(c.env, auth, capabilities, r.requested_scope_type as CapabilityScopeType, r.requested_scope_id))) continue
     visible.push({
       id: r.id,
       agent_session_id: r.agent_session_id,
@@ -1070,8 +1074,7 @@ authApp.get('/elevation/active', requireAuthMw(), async (c) => {
   const all = await listActiveElevationGrants(c.env, c.env.TENANT_SLUG)
   const visible: Array<Record<string, unknown>> = []
   for (const g of all) {
-    const deptId = await resolveSquadDepartmentId(c.env, g.scope_type, g.scope_id)
-    if (!scopeAuthorityOk(auth, capabilities, g.scope_type, g.scope_id, deptId)) continue
+    if (!(await scopeAuthorityOk(c.env, auth, capabilities, g.scope_type, g.scope_id))) continue
     visible.push({
       id: g.id,
       agent_session_id: g.agent_session_id,
@@ -1098,8 +1101,7 @@ authApp.post('/elevation/:id/revoke', requireAuthMw(), async (c) => {
   const grant = await loadElevationGrantById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
   if (!grant) return c.json({ error: 'not_found' }, 404)
   const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
-  const deptId = await resolveSquadDepartmentId(c.env, grant.scope_type, grant.scope_id)
-  if (!scopeAuthorityOk(auth, capabilities, grant.scope_type, grant.scope_id, deptId)) {
+  if (!(await scopeAuthorityOk(c.env, auth, capabilities, grant.scope_type, grant.scope_id))) {
     return c.json({ error: 'forbidden', need: 'admin', scope: { type: grant.scope_type, id: grant.scope_id } }, 403)
   }
   const { revoked } = await revokeElevationGrant(c.env, c.env.TENANT_SLUG, grant.id, 'human_revoke')
@@ -1116,8 +1118,7 @@ authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
   const grant = await loadElevationGrantById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
   if (!grant) return c.json({ error: 'not_found' }, 404)
   const capabilities = auth.capabilities ?? (await resolveCapabilities(c.env, auth.webSessionMemberId))
-  const deptId = await resolveSquadDepartmentId(c.env, grant.scope_type, grant.scope_id)
-  if (!scopeAuthorityOk(auth, capabilities, grant.scope_type, grant.scope_id, deptId)) {
+  if (!(await scopeAuthorityOk(c.env, auth, capabilities, grant.scope_type, grant.scope_id))) {
     return c.json({ error: 'forbidden', need: 'admin', scope: { type: grant.scope_type, id: grant.scope_id } }, 403)
   }
   const usage = await listElevationUsage(c.env, c.env.TENANT_SLUG, grant.id)

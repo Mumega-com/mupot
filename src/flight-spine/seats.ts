@@ -1,5 +1,5 @@
-import type { AuthContext, Env } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import type { AuthContext, Env, OrgKind } from '../types'
+import { brandSquadScope, hasCapability, loadSquadScope, planeCoversScope, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { MemberTokenFingerprintEnv } from '../members/service'
@@ -344,7 +344,7 @@ async function requirePendingSeatRegistrationAuthority(
   }
 
   const row = await env.DB.prepare(`
-    SELECT token.token_hash, agent.squad_id, squad.department_id
+    SELECT token.token_hash, agent.squad_id, squad.department_id, squad.kind
       FROM token_binding_attestations attestation
       JOIN member_tokens token
         ON token.id = attestation.token_id
@@ -387,27 +387,16 @@ async function requirePendingSeatRegistrationAuthority(
     agentId,
     attestation.credentialFingerprint,
     nowSqlUtc(),
-  ).first<{ token_hash: string; squad_id: string; department_id: string }>()
+  ).first<{ token_hash: string; squad_id: string; department_id: string; kind: OrgKind }>()
   if (!row) throw new RuntimeSeatError('workspace_token_required')
+  const rowScope = brandSquadScope({ id: row.squad_id, department_id: row.department_id, kind: row.kind })
 
   const effectiveGrants = auth.capabilities ?? (await resolveCapabilities(env, memberId))
-  if (!hasCapability(
-    effectiveGrants,
-    'squad',
-    row.squad_id,
-    'member',
-    row.department_id,
-  )) {
+  if (!hasCapability(effectiveGrants, 'squad', rowScope, 'member')) {
     throw new RuntimeSeatError('workspace_token_required')
   }
   const liveGrants = await resolveCapabilities(env, memberId)
-  if (!hasCapability(
-    liveGrants,
-    'squad',
-    row.squad_id,
-    'member',
-    row.department_id,
-  )) {
+  if (!hasCapability(liveGrants, 'squad', rowScope, 'member')) {
     throw new RuntimeSeatError('workspace_token_required')
   }
   return {
@@ -680,26 +669,18 @@ async function requireLeaseAuthority(
   ) {
     throw new RuntimeSeatError('lease_forbidden')
   }
+  const squadScope = await loadSquadScope(env, squadId)
+  if (!squadScope) throw new RuntimeSeatError('lease_forbidden')
+  // G-FP1b point 2/3: the legacy-role plane never covers a home squad.
   const legacyAdmin = auth.capabilities === undefined
     && (auth.role === 'owner' || auth.role === 'admin')
+    && planeCoversScope('role', squadScope)
   const effectiveGrants = auth.capabilities ?? (await resolveCapabilities(env, actor.memberId))
-  if (!legacyAdmin && !hasCapability(
-    effectiveGrants,
-    'squad',
-    squadId,
-    'member',
-    departmentId,
-  )) {
+  if (!legacyAdmin && !hasCapability(effectiveGrants, 'squad', squadScope, 'member')) {
     throw new RuntimeSeatError('lease_forbidden')
   }
   const liveGrants = await resolveCapabilities(env, actor.memberId)
-  if (!legacyAdmin && !hasCapability(
-    liveGrants,
-    'squad',
-    squadId,
-    'member',
-    departmentId,
-  )) {
+  if (!legacyAdmin && !hasCapability(liveGrants, 'squad', squadScope, 'member')) {
     throw new RuntimeSeatError('lease_forbidden')
   }
   return { actor, squadId, departmentId, legacyAdmin }

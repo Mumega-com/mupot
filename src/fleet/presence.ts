@@ -316,8 +316,21 @@ const PRESENCE_SELECT = `SELECT member_id, display_name, source, label, agent_id
  *      department) that resolves into one of the caller's squads — i.e. a
  *      squadmate's presence is visible, a stranger's is not.
  * Filtered at the QUERY (WHERE), never post-fetch in JS.
+ *
+ * `excludeHome` (resolveAccessibleSquadIds consumer audit, G-FP1b): the two
+ * dashboard viewers of this list (radar.ts, mission-control-routes.ts) pass
+ * `true` so a home-squad agent's check-in, or a home squad member's own
+ * presence, never surfaces on a SHARED dashboard for an org-admin/
+ * unrestricted (`squadIds: null`) viewer. Every other pre-existing caller
+ * (registry/presence-routes.ts, mcp/presence.ts, concierge/service.ts) omits
+ * it and is unaffected.
  */
-export async function listPresence(env: Env, nowMs: number, squadIds?: string[] | null): Promise<PresenceView[]> {
+export async function listPresence(
+  env: Env,
+  nowMs: number,
+  squadIds?: string[] | null,
+  excludeHome = false,
+): Promise<PresenceView[]> {
   let scopeClause = ''
   let idsJson: string | null = null
   if (squadIds !== undefined && squadIds !== null) {
@@ -337,7 +350,20 @@ export async function listPresence(env: Env, nowMs: number, squadIds?: string[] 
         )
       )`
   }
-  const statement = env.DB.prepare(`${PRESENCE_SELECT}${scopeClause} ORDER BY last_seen_at DESC LIMIT 200`)
+  const homeClause = excludeHome
+    ? `
+      AND NOT (
+        (agent_id IS NOT NULL AND agent_id IN (
+          SELECT a.id FROM agents a JOIN squads s ON s.id = a.squad_id WHERE s.kind = 'home'
+        ))
+        OR member_id IN (
+          SELECT member_id FROM capabilities c
+          JOIN squads s ON s.id = c.scope_id
+          WHERE c.scope_type = 'squad' AND s.kind = 'home'
+        )
+      )`
+    : ''
+  const statement = env.DB.prepare(`${PRESENCE_SELECT}${scopeClause}${homeClause} ORDER BY last_seen_at DESC LIMIT 200`)
   const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
   const res = await bound.all<PresenceRow>()
   const rows = (res.results ?? []).map((r) => {
