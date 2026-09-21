@@ -190,14 +190,20 @@ describe('Telegram project onboarding schema', () => {
       )
     `).run(VALID_PAIRING_HASH)).not.toThrow()
 
-    // An UPDATE that attaches member_id to a row missing project fields is
-    // refused too (the UPDATE trigger lists member_id in its OF clause).
+    // mupot#1436 A2/0156: an UPDATE that stamps member_id onto a legacy
+    // (pairing-null) row is the accept-time authority write. INSERT of a
+    // member_id without the full project field set stays refused above —
+    // that is still a bind-invite mint, not an accept stamp.
     harness.sqlite.exec(`
       INSERT INTO invites (id, email) VALUES ('member-bind-update-target', 'member-bind-update-target@example.com')
     `)
     expect(() => harness.sqlite.exec(`
       UPDATE invites SET member_id = 'member-bind-schema' WHERE id = 'member-bind-update-target'
-    `)).toThrow(/project invite member bind requires the full project field set/)
+    `)).not.toThrow()
+    const stamped = harness.sqlite
+      .prepare(`SELECT member_id FROM invites WHERE id = 'member-bind-update-target'`)
+      .get() as { member_id: string }
+    expect(stamped.member_id).toBe('member-bind-schema')
   })
 
   // P3 (kasra-review, 2026-09-15): member_id is a bare TEXT column with no

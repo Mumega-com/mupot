@@ -216,10 +216,14 @@ export type AcceptInviteResult =
   | { ok: false; error: AcceptInviteError }
 
 /**
- * Redeem a legacy (non-Telegram/non-project) invite: mint the member,
- * capability grant and workspace token atomically. A Telegram/project invite
- * (pairing_hash set) is refused here — those redeem only through the
+ * Redeem a web invite: mint the member, capability grant and (optionally)
+ * workspace token atomically. A Telegram/project invite (pairing_hash or
+ * pairing_expires_at set) is refused here — those redeem only through the
  * authenticated Hermes webhook (redeemTelegramProjectInvite, project-invites.ts).
+ * A3: a plain squad invite (squad_id set, pairing columns NULL) grants the
+ * human-plane squad capability through this same writer — not a hand-rolled
+ * memberships insert. #1161 setSquadMembership is the agent-plane writer and
+ * cannot bind a freshly minted human (no agent_id).
  */
 export async function acceptInvite(
   env: Env,
@@ -240,11 +244,13 @@ export async function acceptInvite(
     .first<InviteRow>()
 
   if (!invite) return { ok: false, error: 'invite_not_found' }
+  // A3-1: pairing_hash or pairing_expires_at is the Telegram door. A3-2:
+  // project_id without a web project-bind path stays 409 (filed separately).
+  // squad_id alone is a web accept after 0156.
   if (
-    invite.project_id !== null
-    || invite.squad_id !== null
-    || invite.pairing_hash !== null
+    invite.pairing_hash !== null
     || invite.pairing_expires_at !== null
+    || invite.project_id !== null
   ) {
     return { ok: false, error: 'project_invite_requires_telegram' }
   }
@@ -269,10 +275,15 @@ export async function acceptInvite(
     created_at: new Date().toISOString(),
   }
 
-  // The scope the invite's capability is granted on: org-wide when no department,
-  // otherwise that department.
-  const scopeType: CapabilityScopeType = invite.department_id ? 'department' : 'org'
-  const scopeId: string | null = invite.department_id
+  // A3-2: squad-first. The grant is the same capabilities INSERT this
+  // function already owns for org/department — not a memberships-table
+  // write (that table is the #1161 agent plane).
+  const scopeType: CapabilityScopeType = invite.squad_id
+    ? 'squad'
+    : invite.department_id
+      ? 'department'
+      : 'org'
+  const scopeId: string | null = invite.squad_id ?? invite.department_id
 
   // Mint the workspace token now (unless the caller opted out, WARN-C) so we
   // can hand it back exactly once.
@@ -324,6 +335,15 @@ export async function acceptInvite(
         ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
       )
     }
+    // A2: D1 is the callback's authority for which member this accept minted.
+    // 0156 allows this stamp on a legacy/plain-squad row; the KV marker's
+    // member_id is only a pointer and must not be trusted blind.
+    writes.push(
+      env.DB.prepare('UPDATE invites SET member_id = ? WHERE id = ? AND accepted_at IS NOT NULL').bind(
+        member.id,
+        inviteId,
+      ),
+    )
     const acceptWrites = await env.DB.batch(writes)
     // Receipt (#186): every mint row (member + capability, plus the token row
     // when minted) must land before we return `raw`. A 0-row INSERT does not

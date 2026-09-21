@@ -51,6 +51,13 @@ import {
   revokeElevationGrant,
 } from './elevation'
 import { ELEVATION_ACTIONS } from './elevation-actions'
+import {
+  PENDING_INVITE_COOKIE,
+  decidePendingInviteLink,
+  inviteLoginMismatchBody,
+  linkAcceptedInviteIdentity,
+  parsePendingInviteIdFromState,
+} from './pending-invite-link'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -472,8 +479,15 @@ authApp.get('/login', async (c) => {
   }
 
   // CSRF state — random, single-use, stored server-side (KV) with short TTL.
+  // A2: if the invite-landing page planted mupot_pending_invite, bind that
+  // pointer into THIS state. Callback links at most one invite per state;
+  // a foreign/replayed state with a leftover cookie links nothing.
   const state = randomId(24)
-  await env.SESSIONS.put(stateKey(state), '1', { expirationTtl: STATE_TTL_SECONDS })
+  const pendingInviteId = getCookie(c, PENDING_INVITE_COOKIE)
+  const statePayload = pendingInviteId
+    ? JSON.stringify({ pending_invite: pendingInviteId })
+    : '1'
+  await env.SESSIONS.put(stateKey(state), statePayload, { expirationTtl: STATE_TTL_SECONDS })
 
   const params = new URLSearchParams({
     client_id: env.OAUTH_CLIENT_ID,
@@ -616,6 +630,51 @@ authApp.get('/callback', async (c) => {
 
   const derivedId = await deriveUserId('google', info.sub)
   const email = info.email ?? null
+
+  // mupot#1436 A2 — LINK-ONLY. When login bound a pending-invite pointer
+  // into this state, callback re-verifies D1 (accepted_at + email match)
+  // and calls linkLoginIdentity for THAT member. It never falls through
+  // to resolveHumanMemberId / findOrCreateHumanMember on this path.
+  const inviteDecision = await decidePendingInviteLink({
+    env,
+    statePendingId: parsePendingInviteIdFromState(seen),
+    cookiePendingId: getCookie(c, PENDING_INVITE_COOKIE),
+    idpEmail: email,
+    orgName: env.BRAND || env.TENANT_SLUG,
+  })
+  if (inviteDecision.action === 'refuse') {
+    deleteCookie(c, PENDING_INVITE_COOKIE, { path: '/' })
+    c.header('Cache-Control', 'no-store')
+    c.header('Referrer-Policy', 'no-referrer')
+    return c.html(
+      inviteLoginMismatchBody(env.BRAND || env.TENANT_SLUG, {
+        orgName: inviteDecision.orgName,
+        squadName: inviteDecision.squadName,
+      }),
+      403,
+    )
+  }
+  if (inviteDecision.action === 'link' && email) {
+    const linked = await linkAcceptedInviteIdentity(env, {
+      tenant: env.TENANT_SLUG,
+      provider: 'google',
+      providerSubject: info.sub,
+      verifiedEmail: email,
+      memberId: inviteDecision.memberId,
+    })
+    deleteCookie(c, PENDING_INVITE_COOKIE, { path: '/' })
+    if (!linked.ok) {
+      c.header('Cache-Control', 'no-store')
+      c.header('Referrer-Policy', 'no-referrer')
+      return c.html(
+        inviteLoginMismatchBody(env.BRAND || env.TENANT_SLUG, {
+          orgName: env.BRAND || env.TENANT_SLUG,
+          squadName: null,
+        }),
+        403,
+      )
+    }
+  }
 
   // Dedup on verified email (#262): a prior mumega SSO handoff may have already
   // created this user — reuse that row so one human = one mupot user. `userId` is
