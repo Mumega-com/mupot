@@ -134,10 +134,14 @@ function makeDb(
       const [tenant, agentId] = b as [string, string]
       return keys[`${tenant}:${agentId}`] ?? null
     }
-    if (sql.includes('SELECT department_id FROM squads WHERE id = ?1')) {
+    if (sql.includes('FROM squads WHERE id = ?1')) {
+      // mupot#1452 P0-1: src/auth/capability.ts#resolveSquadContext now also
+      // selects `kind` (a home squad excludes org/department grants) — none of
+      // these tests exercise a home squad, so 'work' (unchanged behavior) is
+      // the correct default for every squad here.
       const [squadId] = b as [string]
       const dept = squadDepartments[squadId]
-      return dept === undefined ? null : { department_id: dept }
+      return dept === undefined ? null : { department_id: dept, kind: 'work' }
     }
     throw new Error('unhandled first: ' + sql)
   }

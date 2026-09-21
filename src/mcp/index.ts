@@ -2479,7 +2479,11 @@ function memberCanAccessFlight(
   for (const squadId of meta.squad_ids) {
     const squad = squadCache.get(squadId)
     if (!squad) return false
-    if (!workspaceAdmin && !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
+    // mupot#1452 P0-1: workspaceAdmin (an org-scope grant or legacy role) never
+    // bypasses a kind='home' squad — only an exact squad-scope grant does, so
+    // for a home squad this falls through to hasCapability's real (kind-aware)
+    // check instead of short-circuiting true.
+    if ((!workspaceAdmin || squad.kind === 'home') && !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id, squad.kind)) return false
   }
   return true
 }
@@ -2549,7 +2553,11 @@ const toolFlightDispatch: ToolSpec = {
     const executorAgent = isDelegated ? await loadAgent(env, executorAgentId) : boundAgent
     if (!executorAgent) return fail(404, 'executor_agent_not_found')
     if (executorAgent.status !== 'active') return fail(409, 'executor_agent_inactive')
-    if (isDelegated && !workspaceAdmin && !(await memberCanOnSquad(env, grants, executorAgent.squad_id, 'lead'))) {
+    // canOnSquadAuth (mupot#1452 P0-1): sees both the org-grant and legacy-role
+    // planes the manual `workspaceAdmin` shortcut this used to be built from
+    // did too, but — unlike that shortcut — excludes BOTH of them for a
+    // kind='home' squad, where only an exact squad-scope grant qualifies.
+    if (isDelegated && !(await canOnSquadAuth(env, auth, executorAgent.squad_id, 'lead'))) {
       return fail(403, 'flight_delegation_forbidden', { need: 'lead', scope: 'squad', squad_id: executorAgent.squad_id })
     }
 
@@ -2560,7 +2568,11 @@ const toolFlightDispatch: ToolSpec = {
     if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
     for (const referencedSquad of referencedSquads) {
-      if (!workspaceAdmin && !hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
+      // mupot#1452 P0-1: same home-squad exclusion as memberCanAccessFlight above.
+      if (
+        (!workspaceAdmin || referencedSquad.kind === 'home') &&
+        !hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id, referencedSquad.kind)
+      ) {
         return fail(
           403,
           (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',
@@ -2984,9 +2996,10 @@ const toolFlightList: ToolSpec = {
     if (!squadId) return fail(400, 'invalid_args')
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(403, 'forbidden')
-    const grants = auth.capabilities ?? []
-    const workspaceAdmin = hasWorkspaceAdmin(auth)
-    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
+    // canOnSquadAuth (mupot#1452 P0-1): sees both the org-grant and legacy-role
+    // planes a manual hasWorkspaceAdmin bypass would, but excludes BOTH for a
+    // kind='home' squad — only an exact squad-scope grant qualifies there.
+    if (!(await canOnSquadAuth(env, auth, squad.id, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     }
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
@@ -3271,11 +3284,12 @@ const toolWakeAgent: ToolSpec = {
     if (!agentRes.ok) return agentRes
     const agent = agentRes.agent
 
-    const grants = auth.capabilities ?? []
     // Workspace admin bypass matches agentsApp: an org owner/admin can wake any
-    // agent in the pot without hand-granting lead on every squad first.
-    const workspaceAdmin = hasWorkspaceAdmin(auth)
-    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
+    // agent in the pot without hand-granting lead on every squad first — EXCEPT
+    // a kind='home' squad (mupot#1452 P0-1), which canOnSquadAuth excludes from
+    // both the org-grant and legacy-role planes, so only an exact squad-scope
+    // grant can wake an agent living on someone's private home.
+    if (!(await canOnSquadAuth(env, auth, agent.squad_id, 'lead'))) {
       return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
     }
 

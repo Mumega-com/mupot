@@ -39,7 +39,7 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
     CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
     CREATE TABLE squads (
       id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL,
-      name TEXT NOT NULL, charter TEXT
+      name TEXT NOT NULL, charter TEXT, kind TEXT NOT NULL DEFAULT 'work'
     );
     CREATE TABLE agents (
       id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,

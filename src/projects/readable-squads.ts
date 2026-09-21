@@ -22,6 +22,7 @@ export async function resolveReadableSquadIds(
       `SELECT id FROM squads
         WHERE (id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
            OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+          AND kind != 'home'
           AND id > ?3
         ORDER BY id
         LIMIT ?4`,
@@ -94,6 +95,10 @@ export async function resolveAccessibleSquadIds(
   return resolveGrantedSquadIds(env, grants, minimum)
 }
 
+// mupot#1452 P0-1 / Athena's ruling: home squads (kind='home', a member's
+// private room) never appear in a work-tree rollup, regardless of who is
+// asking — org-admin included. Excluded in SQL so no caller of
+// resolveAllSquadIds needs its own kind filter.
 export async function resolveAllSquadIds(env: Env): Promise<string[]> {
   const resolved: string[] = []
   let lastId = ''
@@ -101,7 +106,8 @@ export async function resolveAllSquadIds(env: Env): Promise<string[]> {
   while (true) {
     const result = await env.DB.prepare(
       `SELECT id FROM squads
-        WHERE id > ?1
+        WHERE kind != 'home'
+          AND id > ?1
         ORDER BY id
         LIMIT ?2`,
     ).bind(lastId, READABLE_SQUAD_PAGE_SIZE).all<{ id: string }>()

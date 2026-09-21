@@ -34,7 +34,7 @@ import { csrf } from 'hono/csrf'
 // is org admin; creating a squad in a department is admin+ on THAT department;
 // creating an agent / attaching a membership in a squad is lead+ on THAT squad.
 // The scope is data-derived (URL param), so we check inline with the pure API.
-import { resolveCapabilities, hasCapability, isOrgAdmin } from '../auth/capability'
+import { resolveCapabilities, hasCapability, isOrgAdmin, canOnSquadAuth } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
@@ -51,14 +51,6 @@ import {
 // fine-grained capabilities) keeps full admin reach over the org chart — owner/admin
 // org role satisfies any scoped check. Mirrors requireCapability's legacy escape.
 
-// Resolve a squad's department for department→squad capability inheritance.
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
-}
-
 // Capability gate on a department scope (e.g. creating a squad → admin on the dept).
 async function canOnDepartment(
   env: Env,
@@ -73,19 +65,11 @@ async function canOnDepartment(
 }
 
 // Capability gate on a squad scope (e.g. creating an agent / membership → lead on
-// the squad), with department→squad inheritance resolved from D1.
-async function canOnSquad(
-  env: Env,
-  auth: AuthContext,
-  squadId: string,
-  min: Capability,
-): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
-  if (!auth.memberId) return false
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, min, deptId)
-}
+// the squad). Delegates to the canonical src/auth/capability.ts#canOnSquadAuth —
+// which sees BOTH the legacy owner/admin role and grant planes AND (mupot#1452
+// P0-1) excludes both of them for a kind='home' squad, so an org admin with no
+// exact grant on a member's private home is refused exactly like anyone else.
+const canOnSquad = canOnSquadAuth
 
 // Hard tenant guard. The DB is per-tenant, but a stolen/misrouted token must not
 // be able to touch a pot it was not minted for. Returns true when in-scope.
