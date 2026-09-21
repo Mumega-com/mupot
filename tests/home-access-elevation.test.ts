@@ -26,7 +26,7 @@ import { createHomeForMember } from '../src/org/service'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { createElevationRequest, decideElevationRequest } from '../src/auth/elevation'
+import { createElevationRequest, decideElevationRequest, type DecideElevationResult } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
 
 const TENANT = 'tenant-home-elevation'
@@ -168,6 +168,41 @@ async function decideAsApprover(
   )
 }
 
+/** Mirrors decideAsApprover, but authenticates the decider via the legacy
+ *  `decidedByIsOrgAdmin` boolean plane — the bootstrap-owner shape
+ *  (`decidedByCapabilities: []`, zero capability rows) — instead of a real
+ *  capability grant, to exercise decideElevationRequest's own org-admin
+ *  disjunct directly (pre-merge completion delta, Athena: this disjunct
+ *  must be gated by planeCoversScope('org', scope) for a squad scope, the
+ *  same as every other org-plane bypass in this codebase). */
+async function decideAsOrgAdminFlag(
+  requestId: string,
+  decision: 'approve' | 'deny',
+  nowMs: number,
+): Promise<DecideElevationResult> {
+  const approverSession = await createWebSession(
+    env,
+    `raw-org-admin-flag-${nowMs}`,
+    { tenant: TENANT, memberId: ORG_ADMIN_MEMBER_ID, loginIdentityId: ORG_ADMIN_IDENTITY_ID },
+    nowMs,
+  )
+  return decideElevationRequest(
+    env,
+    {
+      tenant: TENANT,
+      requestId,
+      decision,
+      selectedActions: decision === 'approve' ? ['action:home_access'] : undefined,
+      decidedByMemberId: ORG_ADMIN_MEMBER_ID,
+      decidedByIsOrgAdmin: true,
+      decidedByCapabilities: [],
+      decidedByWebSessionHash: approverSession.id_hash,
+      recentReauthOk: true,
+    },
+    nowMs,
+  )
+}
+
 beforeEach(async () => {
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
@@ -211,6 +246,64 @@ describe('elevation-to-home (G-FP1b point 4, bound-agent sessions)', () => {
 
     // No grant exists — mubot still has no access.
     expect(await canOnSquadAuth(env, mubotAuth(), homeSquadId, 'observer')).toBe(false)
+  })
+
+  // Pre-merge completion delta (Athena): the test above exercises an org-scope
+  // CAPABILITY GRANT decider (decidedByCapabilities: [{scope_type:'org',...}]),
+  // which was already refused by hasCapabilityOnDynamicScope's own home
+  // exclusion. These two tests exercise the OTHER authority plane —
+  // `decidedByIsOrgAdmin: true` (the legacy-role/bootstrap-owner shape, zero
+  // capability rows) — which decideElevationRequest treats as a deliberate
+  // exception for approving/denying action:home_access, and which must be
+  // gated by planeCoversScope('org', scope) the same way, or an org admin
+  // with NOTHING on a member's home could still decide a request scoped to it.
+  it('an org-admin via the decidedByIsOrgAdmin FLAG (zero capability rows) cannot APPROVE action:home_access for someone else\'s home', async () => {
+    const t0 = Date.parse('2026-09-21T12:00:00.000Z')
+    const sessionId = await checkIn()
+    const req = await requestHomeAccess(sessionId, 60, t0)
+    if (!req.ok) throw new Error('setup failed')
+
+    const decision = await decideAsOrgAdminFlag(req.requestId, 'approve', t0)
+    expect(decision.ok).toBe(false)
+    if (decision.ok) return
+    expect(decision.reason).toBe('forbidden')
+
+    // Nothing changed: request still pending, no decider recorded, no grant.
+    const row = await env.DB.prepare(
+      `SELECT status, decided_by_member_id FROM elevation_requests WHERE id = ?1`,
+    )
+      .bind(req.requestId)
+      .first<{ status: string; decided_by_member_id: string | null }>()
+    expect(row?.status).toBe('pending')
+    expect(row?.decided_by_member_id).toBeNull()
+    const grantCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM elevation_grants WHERE elevation_request_id = ?1`,
+    )
+      .bind(req.requestId)
+      .first<{ n: number }>()
+    expect(grantCount?.n ?? 0).toBe(0)
+    expect(await canOnSquadAuth(env, mubotAuth(), homeSquadId, 'observer')).toBe(false)
+  })
+
+  it('an org-admin via the decidedByIsOrgAdmin FLAG (zero capability rows) cannot DENY action:home_access for someone else\'s home', async () => {
+    const t0 = Date.parse('2026-09-21T12:00:00.000Z')
+    const sessionId = await checkIn()
+    const req = await requestHomeAccess(sessionId, 60, t0)
+    if (!req.ok) throw new Error('setup failed')
+
+    const decision = await decideAsOrgAdminFlag(req.requestId, 'deny', t0)
+    expect(decision.ok).toBe(false)
+    if (decision.ok) return
+    expect(decision.reason).toBe('forbidden')
+
+    // Nothing changed: request still pending (NOT denied), no decider recorded.
+    const row = await env.DB.prepare(
+      `SELECT status, decided_by_member_id FROM elevation_requests WHERE id = ?1`,
+    )
+      .bind(req.requestId)
+      .first<{ status: string; decided_by_member_id: string | null }>()
+    expect(row?.status).toBe('pending')
+    expect(row?.decided_by_member_id).toBeNull()
   })
 
   it('org:admin refused -> home owner approves -> allowed -> expiry -> refused again', async () => {

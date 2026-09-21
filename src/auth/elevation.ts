@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, resolveCapabilities } from './capability'
+import { hasCapabilityOnDynamicScope, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -372,6 +372,36 @@ export async function resolveScopeDepartmentId(
   return row?.department_id ?? null
 }
 
+/** decidedByOrgAdminCoversScope — G-FP1b point 2 (Athena, pre-merge completion
+ *  delta on #1472): `decidedByIsOrgAdmin === true` is a deliberate exception
+ *  in decideElevationRequest's authority check — it lets an org admin decide
+ *  a home-scoped `action:home_access` REQUEST, the sanctioned "human decides,
+ *  time-boxed, receipted" door (see the comment above decidedByHasAuthority).
+ *  But that exception must NOT become the same org-admin-reaches-into-home
+ *  hole this whole PR closes everywhere else: an org admin holding NOTHING
+ *  on a member's home squad must not be able to approve OR deny a request
+ *  scoped to it. Gated the same way every other org-plane bypass in this
+ *  codebase is — planeCoversScope('org', scope), never conditional, never
+ *  bypassed for org/department-scoped requests (planeCoversScope only has an
+ *  opinion about a SQUAD scope, so those pass through unaffected — action:
+ *  home_access itself can only ever be requested at squad scope, per the
+ *  request-time refusal above, but this authority check runs for every
+ *  elevation action/scope shape, not only home_access). An unknown/missing
+ *  squad row fails closed (no authority), matching this codebase's other
+ *  loaders. */
+async function decidedByOrgAdminCoversScope(
+  env: Env,
+  decidedByIsOrgAdmin: boolean | undefined,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<boolean> {
+  if (decidedByIsOrgAdmin !== true) return false
+  if (scopeType !== 'squad' || !scopeId) return true
+  const scope = await loadSquadScope(env, scopeId)
+  if (!scope) return false
+  return planeCoversScope('org', scope)
+}
+
 /**
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
@@ -437,7 +467,12 @@ export async function decideElevationRequest(
   // REQUEST — that is the intended "human decides, time-boxed, receipted"
   // door (G-FP1b point 4), not a standing bypass of the home's own reads.
   const decidedByHasAuthority =
-    input.decidedByIsOrgAdmin === true ||
+    (await decidedByOrgAdminCoversScope(
+      env,
+      input.decidedByIsOrgAdmin,
+      request.requested_scope_type as CapabilityScopeType,
+      request.requested_scope_id || null,
+    )) ||
     (await hasCapabilityOnDynamicScope(
       env,
       input.decidedByCapabilities,
@@ -504,7 +539,7 @@ export async function decideElevationRequest(
   // stays as defence in depth and must honour the SAME two planes, or an owner
   // clears the first gate and is refused by the second.
   if (
-    input.decidedByIsOrgAdmin !== true &&
+    !(await decidedByOrgAdminCoversScope(env, input.decidedByIsOrgAdmin, scopeType, scopeId || null)) &&
     !(await hasCapabilityOnDynamicScope(env, input.decidedByCapabilities, scopeType, scopeId || null, 'admin'))
   ) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
