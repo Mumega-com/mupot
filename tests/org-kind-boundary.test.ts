@@ -126,11 +126,26 @@ describe('BLOCK-1: POST /departments, POST /departments/:id/squads, POST /squads
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ?').get('s1')).toEqual({ n: 2 })
   })
 
-  it('the planted-row-would-be-invisible aggravation: even if the gate WERE skipped, GET /departments never selects kind — pinned so a future column addition does not quietly reopen the visibility gap', async () => {
-    harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('d-home', 'home-ish', 'Home-ish', 'home')`)
+  // G-FP1b point 2/3 (adversarial round 1, P2) landed a STRONGER guarantee
+  // than this test originally pinned: GET /departments now excludes a
+  // kind='home' row from the result set entirely (src/org/index.ts adds
+  // `WHERE kind != 'home'`), rather than merely hiding the `kind` column on
+  // an otherwise-still-visible row. This test is rewritten to pin BOTH
+  // properties without weakening either: (1) a home department is fully
+  // ABSENT from the list (the stronger property that superseded the
+  // original "invisible column" framing), and (2) `kind` is never selected
+  // for the departments that DO appear — pinned so a future column addition
+  // does not quietly reopen the leak this test was originally written
+  // against.
+  it('GET /departments excludes a home-kind row entirely, and never selects `kind` for the work-kind rows that remain', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name, kind) VALUES ('d-home', 'home-ish', 'Home-ish', 'home');
+      INSERT INTO departments (id, slug, name, kind) VALUES ('d-work', 'work-dept', 'Work Dept', 'work');
+    `)
     const res = await orgApp.fetch(new Request('https://pot.example/departments'), env)
     expect(res.status).toBe(200)
     const body = await res.json() as { departments: Record<string, unknown>[] }
+    expect(body.departments.map((d) => d.id)).toEqual(['d-work'])
     expect(body.departments[0]).not.toHaveProperty('kind')
   })
 })

@@ -34,6 +34,15 @@ const migrations = [
   '../migrations/0053_marketing_monitor_runs.sql',
   '../migrations/0054_marketing_recommendations.sql',
   '../migrations/0055_projects.sql',
+  // 0093 adds squads.kind (work/home). G-FP1b's resolveCapabilities
+  // (src/auth/capability.ts) now unconditionally JOINs squads.kind in its
+  // channel_capability_grants UNION branch — omitting 0093 here does not
+  // skip a feature, it makes THAT query reference a column this fixture
+  // never created, so `resolveOrgAdmin`'s bearer path throws (caught by
+  // addons/routes.ts's try/catch and surfaced as a bare 401) on every
+  // request that reaches capability resolution. Same curated-migration-
+  // list drift class as the 0099 note below.
+  '../migrations/0093_org_kind_home_exemption.sql',
   '../migrations/0094_flight_dispatched_by.sql',
   // 0099 adds member_tokens.expires_at/last_used_at, which the bearer lookup now
   // references. Omitting it here does not skip a feature — it makes the auth query
