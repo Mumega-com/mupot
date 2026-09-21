@@ -58,6 +58,7 @@ import { redeemTelegramProjectInvite } from '../members/project-invites'
 import { listNeedsYou } from '../attention/service'
 import { answerRoutineRun, getRoutinePendingQuestion } from '../routines/actions'
 import { routinePrincipal } from '../routines/access'
+import { projectReadAccessFromGrants, projectVisibilityClause } from '../projects/access'
 import { completeTelegramUpdate, reserveTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
 
 type AppEnv = { Bindings: Env }
@@ -813,6 +814,106 @@ async function taskReply(
 export const imApp = new Hono<AppEnv>()
 
 imApp.get('/health', (c) => c.json({ ok: true, component: 'im', tenant: c.env.TENANT_SLUG }))
+
+export interface ResolvedProjectCandidate {
+  id: string
+  slug: string
+  name: string
+}
+
+const RESOLVE_PROJECT_MAX_CANDIDATES = 5
+
+// resolveMemberProjects — mupot-plugin PR #17 contract addendum (FP-01 Slice
+// 2, mupot#1443): the plugin needs to turn a member's OWN free-text project
+// reference ("Psychonom") into a real project id, WITHOUT Mubot resolving
+// over its own whole project_list (Mubot's own standing may see projects
+// this member cannot, or vice versa — the member's OWN readable set is the
+// only correct answer here).
+//
+// Deliberately NOT an MCP tool: an MCP tool's caller is the AGENT (Mubot),
+// and there is no existing, safe way for an MCP arg to assert "resolve
+// using THIS OTHER member's standing" without inventing a fresh act-as-
+// member primitive (a real capability-modeling question this flight has no
+// mandate to open). The one place a member's identity is ALREADY
+// authenticated server-side without trusting caller-supplied text is the
+// chat_id -> member mapping this file already enforces for everything else
+// (file header: "Identity is ALWAYS derived server-side... We NEVER read an
+// identity out of message TEXT"). So this is exposed on the SAME
+// shared-secret-authenticated IM surface, keyed on chat_id, never on a
+// caller-supplied member_id — Mubot cannot use it to probe an arbitrary
+// member's readable projects, only the one bound to the chat that called it.
+//
+// NO-ORACLE: a query that matches a REAL but unreadable project returns the
+// exact same shape as a query matching nothing — the visibility clause is
+// baked into the SQL itself, so there is no separate "exists but hidden"
+// branch to leak through.
+export async function resolveMemberProjects(
+  env: Env,
+  memberId: string,
+  query: string,
+  limit = RESOLVE_PROJECT_MAX_CANDIDATES,
+): Promise<ResolvedProjectCandidate[]> {
+  const needle = query.trim()
+  if (!needle) return []
+  const boundedLimit = Math.min(RESOLVE_PROJECT_MAX_CANDIDATES, Math.max(1, Math.floor(limit)))
+
+  const grants = await resolveCapabilities(env, memberId)
+  const access = projectReadAccessFromGrants(
+    { userId: memberId, email: null, role: 'member', tenant: env.TENANT_SLUG, memberId, capabilities: grants },
+    grants,
+  )
+  const visibility = projectVisibilityClause(access)
+  const like = `%${needle.replace(/[%_]/g, char => `\\${char}`)}%`
+  // Bare `?` throughout, matching projectVisibilityClause's own convention —
+  // mixing bare `?` with explicit `?1`/`?2` numbering in one statement lets
+  // SQLite's auto-numbering collide with an explicit number used later in
+  // the same text (measured: LIMIT's explicit ?3 collided with the first
+  // bare `?` from visibility.sql, binding a JSON array string where an
+  // integer was expected). Bind order matches left-to-right text order.
+  const rows = await env.DB.prepare(
+    `SELECT p.id, p.slug, p.name
+       FROM projects p
+      WHERE (p.slug = ? OR p.slug LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\')
+        AND ${visibility.sql}
+      ORDER BY (p.slug = ?) DESC, p.name ASC
+      LIMIT ?`,
+  ).bind(needle, like, like, ...visibility.binds, needle, boundedLimit).all<ResolvedProjectCandidate>()
+  return rows.results ?? []
+}
+
+// POST /resolve-project — plugin contract (mupot-plugin PR #17 addendum):
+// { chat_id, query, limit? } -> { bound, member_id, projects }. Same
+// shared-secret auth as /webhook; NOT a Telegram update (no update_id/
+// reservation needed — a pure read has no effect to make idempotent), so it
+// takes chat_id directly rather than a full Telegram envelope. Mubot's
+// floor: this route carries no MCP-tool capability floor at all — the
+// shared webhook secret is the only gate, same as /webhook itself, so any
+// caller holding that secret (Mubot's relay) can call it; the RESULT is
+// still bounded by the bound member's own readable projects, never Mubot's.
+imApp.post('/resolve-project', async (c) => {
+  if (!c.env.IM_WEBHOOK_SECRET) return c.json({ error: 'webhook_not_configured' }, 503)
+  const providedSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token')
+  if (!providedSecret || !timingSafeEqual(providedSecret, c.env.IM_WEBHOOK_SECRET)) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+  let body: { chat_id?: unknown; query?: unknown; limit?: unknown }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  const chatId = telegramId(body.chat_id)
+  if (!chatId) return c.json({ error: 'no_chat_id' }, 400)
+  const query = typeof body.query === 'string' ? body.query : ''
+  if (!query.trim()) return c.json({ error: 'invalid_query' }, 400)
+  const limit = typeof body.limit === 'number' && Number.isFinite(body.limit) ? body.limit : RESOLVE_PROJECT_MAX_CANDIDATES
+
+  const member = await memberForChat(c.env, chatId)
+  if (!member) return c.json({ bound: false, member_id: null, projects: [] })
+
+  const projects = await resolveMemberProjects(c.env, member.id, query, limit)
+  return c.json({ bound: true, member_id: member.id, projects })
+})
 
 // Display names and usernames never identify a human or contribute authority.
 interface TelegramUpdate {
