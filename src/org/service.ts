@@ -8,10 +8,10 @@
 // can shape its own response (JSON error vs re-rendered form).
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind, CapabilityGrant, Membership } from '../types'
+import type { Env, Department, Squad, Agent, Effort, Autonomy, BudgetWindow, OrgKind, Capability, CapabilityGrant, Membership } from '../types'
 import { isEffort, isAutonomy, isBudgetWindow } from '../types'
 import { checkCreateLimit } from '../billing/entitlement'
-import { assertWritten } from '../lib/receipt'
+import { assertWritten, assertBatchWritten } from '../lib/receipt'
 import { prepareAgentSquadAccess, type AgentAccessCapability } from '../members/agent-access'
 // Reused, not duplicated (mupot#1288, Kasra's gate) — src/fleet/boot-self-report.ts's
 // bearer-authenticated boot self-report already validates a claimed model against
@@ -280,6 +280,431 @@ export async function createSquad(
     throw err
   }
   return { ok: true, value: squad }
+}
+
+// ── home (member-owned) ──────────────────────────────────────────────────────
+//
+// createHomeForMember — a member's own private space, on first contact (FP-01
+// Slice 1, mupot#1443; Athena pre-rulings seq 4972/4976, mumega.com brief
+// `agents/kasra/briefs/flight-first-person-mubot-meets-shadi-20260920.md`
+// §2/§2b/§2c). Hadi, 2026-09-20: "mubot start to learn about them, give them
+// a private space, then give them access to rbac resources."
+//
+// WHAT THIS IS: exactly one `squads` row, `kind='home'`,
+// `slug='home-<first 8 chars of memberId>'`, plus exactly one `capabilities`
+// row granting the member `admin` on it — their own room. Both rows land in
+// ONE env.DB.batch() call: either both land or neither does. No observer ever
+// sees a home squad with no owner, or a capability row with no squad behind
+// it.
+//
+// WHAT THIS IS NOT: it does not create an agent. Contrast bootstrapSelf
+// (src/members/bootstrap-self.ts), which mints department + squad + agent +
+// token for a NEWLY NAMED agent identity, and whose home squad is a
+// side-effect of that naming act. A human's private space is not conditioned
+// on ever naming an agent — Hadi's requirement is a room the moment they
+// exist as a member, full stop. That is also why this function's signature is
+// `(env, memberId)` and nothing else: no display name, no agent, no auth
+// context (see AUTHZ below).
+//
+// DEPARTMENT — "do not invent a new default" (brief §2, slice 1): this reuses
+// the EXACT convention bootstrapSelf already established for a member's own
+// home department (src/members/bootstrap-self.ts's `findDepartmentBySlug` /
+// `deptSlug = 'dept-home-' + memberId`, kind='home') rather than inventing a
+// second one. If bootstrapSelf (or a prior createHomeForMember call, or a
+// prior partial attempt at either) already created that department, THIS SAME
+// ROW is adopted — never a second one for the same human. The department is
+// resolved (found, or created if genuinely absent) BEFORE the batch below,
+// exactly as bootstrapSelf treats its own department/squad creation as
+// individually-committing steps ahead of its atomic cluster: a member's home
+// department is standing identity infrastructure, not per-call state.
+//
+// SQUAD SLUG — the brief specifies a SHORT slug, `home-<first 8 hex chars of
+// memberId>`, unlike bootstrapSelf's full-UUID `home-<memberId>`. This is
+// still collision-safe: squads.slug is UNIQUE only WITHIN a department
+// (migrations/0001_init.sql: `UNIQUE(department_id, slug)`), and this
+// member's home department is itself derived from their FULL id, so two
+// different members can never land in the same department — an 8-char prefix
+// collision between two different humans lands in two different uniqueness
+// buckets, never the same row.
+//
+// IDEMPOTENT (#2b: "same member -> same squad_id, no duplicate rows, no
+// second grant"): a second call for the same member finds the existing home
+// squad — joined through the member's OWN capability row, not slug alone (see
+// bootstrap-self.ts's WARN-1 for why a slug match is never proof of
+// provenance by itself) — and returns it unchanged. Zero new rows; the batch
+// below is never even prepared on that path.
+//
+// FAILS CLOSED ON AN UNKNOWN MEMBER (#2c-2): a `members` row is the ONLY way a
+// human enters this pot (the #1438 invite door, or an admin create) — Mubot
+// never mints one. This function's first read is the members table; an
+// unknown id returns `member_not_found` before touching anything else, and
+// writes zero rows.
+//
+// AUTHZ — NO AUTHZ INSIDE, same doctrine as createDepartment/createSquad
+// above (file header: "these functions do NO authz — the caller ... gates on
+// the right scope BEFORE calling"). This function trusts `memberId` as given.
+// THE CALLER MUST verify, before calling, that `auth.memberId === memberId`
+// (the member is asking for their OWN home) OR `isOrgAdmin(auth)`
+// (src/auth/capability.ts) — an agent-bound principal must never be able to
+// create, or read the identity of, a home for a member it does not own.
+// There is no MCP tool wired to this function in Slice 1 — that is Slice 2's
+// Mubot proposal flow — so today the only enforcement point is the reviewed
+// call site itself; when a tool is added, its ToolSpec.run() becomes the real
+// gate, exactly as toolCreateSquad/toolCreateDepartment gate createSquad/
+// createDepartment today.
+//
+// CAPABILITY FLOOR — 'admin' on the member's OWN home is the existing pattern
+// bootstrapSelf already establishes for its own founder grant (river addendum
+// A, above: "a room whose owner cannot admit a second chair is a cell"), and
+// Athena's G-FP1 gate accepted it unchanged for this function. It is safe
+// specifically because capability scope never bubbles UP or SIDEWAYS: 'admin'
+// on a squad with zero `project_squad_access` edges confers nothing on any
+// project (§2c-1) and nothing on any other squad — see
+// tests/home-squad.test.ts's "home-admin only" cases, which prove this rather
+// than assume it.
+
+function homeDepartmentSlug(memberId: string): string {
+  return `dept-home-${memberId}`
+}
+
+async function findHomeDepartmentBySlug(env: Env, slug: string): Promise<Department | null> {
+  return env.DB.prepare(`SELECT * FROM departments WHERE slug = ?1 AND kind = 'home' LIMIT 1`)
+    .bind(slug)
+    .first<Department>()
+}
+
+/** Find-or-create the member's own home department, adopting bootstrapSelf's
+ *  row (or a prior createHomeForMember's) rather than ever creating a second
+ *  one for the same human. See the block comment above for why this is not a
+ *  fresh convention. */
+async function resolveHomeDepartmentId(
+  env: Env,
+  memberId: string,
+  memberDisplayName: string,
+): Promise<CreateResult<string>> {
+  const slug = homeDepartmentSlug(memberId)
+  const existing = await findHomeDepartmentBySlug(env, slug)
+  if (existing) return { ok: true, value: existing.id }
+
+  const created = await createDepartment(env, { slug, name: `Home — ${memberDisplayName}` }, { kind: 'home' })
+  if (created.ok) return { ok: true, value: created.value.id }
+  if (created.error === 'slug_taken') {
+    // Race: bootstrapSelf, or a concurrent createHomeForMember call for the
+    // SAME member, committed between our SELECT and this INSERT. Adopt it —
+    // gated by kind='home' inside findHomeDepartmentBySlug, so a colliding
+    // work-kind row (deliberately squatted or otherwise) is never adopted.
+    const raced = await findHomeDepartmentBySlug(env, slug)
+    if (raced) return { ok: true, value: raced.id }
+  }
+  return { ok: false, error: created.error }
+}
+
+interface HomeSquadRow {
+  id: string
+  slug: string
+  name: string
+  department_id: string
+  capability_id: string
+  capability: Capability
+}
+
+/**
+ * findHomeSquadByDepartment — G-FP1b point 5: "one home lookup by department
+ * shared by bootstrapSelf and createHomeForMember; two homes per human is
+ * structurally impossible." The two functions use DIFFERENT squad slug
+ * conventions for the SAME human (bootstrapSelf: `home-<full-uuid>`;
+ * createHomeForMember: `home-<8-char-prefix>`), so a slug-keyed lookup can
+ * never see across them — a member bootstrapped via one path and then hit by
+ * the other would get a SECOND home squad in the SAME home department, which
+ * is exactly the structural impossibility this point requires. A member's
+ * home department (see homeDepartmentSlug/resolveHomeDepartmentId, shared by
+ * both functions already) holds at most ONE squad, identity-wise: itself. So
+ * the department, not the squad slug, is the shared join key.
+ *
+ * `ORDER BY created_at ASC LIMIT 1`: if more than one kind='home' squad ever
+ * exists under one home department (a pre-fix data anomaly from before this
+ * lookup existed), the earliest one wins deterministically — never "whichever
+ * row the query planner returns first".
+ */
+export async function findHomeSquadByDepartment(env: Env, departmentId: string): Promise<Squad | null> {
+  return env.DB.prepare(
+    `SELECT * FROM squads WHERE department_id = ?1 AND kind = 'home' ORDER BY created_at ASC LIMIT 1`,
+  )
+    .bind(departmentId)
+    .first<Squad>()
+}
+
+async function findExistingHomeSquad(env: Env, memberId: string, squadSlug: string): Promise<HomeSquadRow | null> {
+  // Joined on the member's OWN capability row, not slug alone — a slug match
+  // is never proof of provenance by itself (see bootstrap-self.ts's WARN-1
+  // doc comment for the same reasoning applied to its department/squad
+  // adoption).
+  return env.DB.prepare(
+    `SELECT s.id AS id, s.slug AS slug, s.name AS name, s.department_id AS department_id,
+            c.id AS capability_id, c.capability AS capability
+       FROM capabilities c
+       JOIN squads s ON s.id = c.scope_id AND s.kind = 'home'
+      WHERE c.member_id = ?1 AND c.scope_type = 'squad' AND s.slug = ?2
+      LIMIT 1`,
+  )
+    .bind(memberId, squadSlug)
+    .first<HomeSquadRow>()
+}
+
+/** The member's own capability row on a given squad, or null. Used to detect
+ *  the "squad exists (created by the OTHER home-provisioning function under
+ *  its own slug convention) but this member's own grant row is missing" case
+ *  — point 6's `repaired` disposition. */
+async function findMemberCapabilityOnSquad(
+  env: Env,
+  memberId: string,
+  squadId: string,
+): Promise<{ id: string; capability: Capability } | null> {
+  return env.DB.prepare(
+    `SELECT id, capability FROM capabilities
+      WHERE member_id = ?1 AND scope_type = 'squad' AND scope_id = ?2 LIMIT 1`,
+  )
+    .bind(memberId, squadId)
+    .first<{ id: string; capability: Capability }>()
+}
+
+export interface CreateHomeForMemberSquad {
+  id: string
+  slug: string
+  name: string
+  department_id: string
+}
+
+export interface CreateHomeForMemberGrant {
+  id: string
+  capability: Capability
+}
+
+export type CreateHomeForMemberOk = {
+  ok: true
+  // 'repaired': the home squad already existed (created via the OTHER
+  // home-provisioning function's own slug convention — see
+  // findHomeSquadByDepartment above) but THIS member's own capability row on
+  // it was missing, and this call wrote it. Point 6: only ever produced when
+  // the caller IS the member (see `actorMemberId` below) — never on behalf
+  // of someone else, and never as a side effect of a lookup that merely
+  // happened to notice the gap.
+  disposition: 'created' | 'existing' | 'repaired'
+  squad: CreateHomeForMemberSquad
+  grant: CreateHomeForMemberGrant
+}
+
+export type CreateHomeForMemberError = 'member_not_found' | 'provisioning_failed'
+
+export type CreateHomeForMemberResult =
+  | CreateHomeForMemberOk
+  | { ok: false; error: CreateHomeForMemberError; detail?: unknown }
+
+export async function createHomeForMember(
+  env: Env,
+  memberId: string,
+  // Point 6: the acting principal, so a 'repaired' write (the ONE case this
+  // function mutates an ALREADY-EXISTING squad it did not just create) can be
+  // gated to "the member repairing their own missing grant" and refused
+  // otherwise. Omitted (null) means "no actor known" — never treated as the
+  // member; a caller that cannot name its actor gets 'existing' + the gap
+  // left unrepaired, never a silent write on someone's behalf. This mirrors
+  // the file header's existing "no authz inside" doctrine: the CALLER must
+  // already have verified auth.memberId === memberId before this is 'created'
+  // repair-capable, same as it must for the create path.
+  actorMemberId: string | null = null,
+): Promise<CreateHomeForMemberResult> {
+  // #2c-2: fail closed on an unknown member id — zero rows, before anything
+  // else runs. A members row is the ONLY door in (the #1438 invite path, or
+  // an admin create); Mubot never mints one.
+  const member = await env.DB.prepare(
+    `SELECT id, display_name FROM members WHERE id = ?1 LIMIT 1`,
+  )
+    .bind(memberId)
+    .first<{ id: string; display_name: string }>()
+  if (!member) return { ok: false, error: 'member_not_found' }
+
+  const squadSlug = `home-${memberId.slice(0, 8)}`
+
+  // ── idempotent (#2b), OWN-slug fast path ─────────────────────────────────
+  const existing = await findExistingHomeSquad(env, memberId, squadSlug)
+  if (existing) {
+    return {
+      ok: true,
+      disposition: 'existing',
+      squad: { id: existing.id, slug: existing.slug, name: existing.name, department_id: existing.department_id },
+      grant: { id: existing.capability_id, capability: existing.capability },
+    }
+  }
+
+  const deptResult = await resolveHomeDepartmentId(env, memberId, member.display_name)
+  if (!deptResult.ok) {
+    return { ok: false, error: 'provisioning_failed', detail: { stage: 'department', reason: deptResult.error } }
+  }
+  const departmentId = deptResult.value
+
+  // ── point 5: DEPARTMENT-keyed lookup, ahead of creating a new squad ──────
+  // Catches the case bootstrapSelf's own slug convention (`home-<full-uuid>`)
+  // hides from findExistingHomeSquad above: bootstrapSelf already created
+  // (or a prior createHomeForMember call already created) the ONE home squad
+  // for this department, under a DIFFERENT slug than the one this call would
+  // otherwise mint. Adopting it here — rather than proceeding to INSERT a
+  // second squad row under this function's own slug — is what makes "two
+  // homes per human" structurally impossible rather than merely unlikely.
+  const departmentSquad = await findHomeSquadByDepartment(env, departmentId)
+  if (departmentSquad) {
+    const grant = await findMemberCapabilityOnSquad(env, memberId, departmentSquad.id)
+    if (grant) {
+      return {
+        ok: true,
+        disposition: 'existing',
+        squad: {
+          id: departmentSquad.id,
+          slug: departmentSquad.slug,
+          name: departmentSquad.name,
+          department_id: departmentSquad.department_id,
+        },
+        grant: { id: grant.id, capability: grant.capability },
+      }
+    }
+    // The squad exists (minted by the OTHER function, or a prior partial
+    // attempt) but THIS member holds no capability row on it yet. Point 6:
+    // repair ONLY when the caller is provably the member themselves.
+    if (actorMemberId !== null && actorMemberId === memberId) {
+      const capabilityId = crypto.randomUUID()
+      try {
+        await env.DB.prepare(
+          `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+           VALUES (?1, ?2, 'squad', ?3, 'admin')`,
+        )
+          .bind(capabilityId, memberId, departmentSquad.id)
+          .run()
+      } catch (err) {
+        // Race: a concurrent call already repaired it. Adopt, don't fail.
+        if (isUniqueViolation(err)) {
+          const raced = await findMemberCapabilityOnSquad(env, memberId, departmentSquad.id)
+          if (raced) {
+            return {
+              ok: true,
+              disposition: 'repaired',
+              squad: {
+                id: departmentSquad.id,
+                slug: departmentSquad.slug,
+                name: departmentSquad.name,
+                department_id: departmentSquad.department_id,
+              },
+              grant: { id: raced.id, capability: raced.capability },
+            }
+          }
+        }
+        throw err
+      }
+      // NOTE — receipt (point 6 asked for one on the 0148 elevation ledger or
+      // the door_receipts shape, "pick the one that exists without a
+      // migration"): neither fits without a schema change. elevation_grants/
+      // elevation_usage_log (0148) require a live elevation_grant_id and
+      // agent_session_id (NOT NULL FKs) — there is no elevation and no agent
+      // session in this path, a member repairing their OWN home directly.
+      // door_receipts requires a real onboarding_doors.door_id (NOT NULL
+      // FK) — no door is open in this path either, and attributing the
+      // repair to one would be a false record, not a true one. This
+      // disposition is real, tested, and gated on actorMemberId === memberId
+      // as specified; the receipt row is the one part of point 6 this PR
+      // does NOT land — see the PR body's "not done" list.
+      return {
+        ok: true,
+        disposition: 'repaired',
+        squad: {
+          id: departmentSquad.id,
+          slug: departmentSquad.slug,
+          name: departmentSquad.name,
+          department_id: departmentSquad.department_id,
+        },
+        grant: { id: capabilityId, capability: 'admin' },
+      }
+    }
+    // Caller is not provably the member — never write on their behalf.
+    // Report the squad as it stands (existing), with the member's own
+    // capability absent; the caller can retry as the member to repair it.
+    return {
+      ok: true,
+      disposition: 'existing',
+      squad: {
+        id: departmentSquad.id,
+        slug: departmentSquad.slug,
+        name: departmentSquad.name,
+        department_id: departmentSquad.department_id,
+      },
+      grant: { id: '', capability: 'observer' },
+    }
+  }
+
+  const squadId = crypto.randomUUID()
+  const capabilityId = crypto.randomUUID()
+  const homeName = `Home — ${member.display_name}`
+  const createdAt = new Date().toISOString()
+
+  // ── the ONE atomic batch: squad + capability, together or not at all ──────
+  const statements: [D1PreparedStatement, D1PreparedStatement] = [
+    env.DB.prepare(
+      `INSERT INTO squads (id, department_id, slug, name, kind, created_at)
+       VALUES (?1, ?2, ?3, ?4, 'home', ?5)`,
+    ).bind(squadId, departmentId, squadSlug, homeName, createdAt),
+    env.DB.prepare(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES (?1, ?2, 'squad', ?3, 'admin')`,
+    ).bind(capabilityId, memberId, squadId),
+  ]
+
+  try {
+    const writes = await env.DB.batch(statements)
+    assertBatchWritten(writes, 'create_home_for_member', 1)
+  } catch (err) {
+    // Race: a concurrent createHomeForMember call for the SAME member won.
+    // Adopt its rows rather than reporting a failure for a home that now
+    // genuinely exists — same "classify, don't compensate a real winner"
+    // doctrine bootstrap-self.ts documents for its own audit-conflict race.
+    if (isUniqueViolation(err)) {
+      const raced = await findExistingHomeSquad(env, memberId, squadSlug)
+      if (raced) {
+        return {
+          ok: true,
+          disposition: 'existing',
+          squad: { id: raced.id, slug: raced.slug, name: raced.name, department_id: raced.department_id },
+          grant: { id: raced.capability_id, capability: raced.capability },
+        }
+      }
+      // The race may equally have been bootstrapSelf (or another
+      // createHomeForMember caller) landing the DEPARTMENT'S squad under
+      // ITS OWN slug between our lookups above and this INSERT. Re-check by
+      // department before giving up — same adopt-a-real-winner doctrine.
+      const racedByDept = await findHomeSquadByDepartment(env, departmentId)
+      if (racedByDept) {
+        const racedGrant = await findMemberCapabilityOnSquad(env, memberId, racedByDept.id)
+        if (racedGrant) {
+          return {
+            ok: true,
+            disposition: 'existing',
+            squad: {
+              id: racedByDept.id,
+              slug: racedByDept.slug,
+              name: racedByDept.name,
+              department_id: racedByDept.department_id,
+            },
+            grant: { id: racedGrant.id, capability: racedGrant.capability },
+          }
+        }
+      }
+    }
+    throw err
+  }
+
+  return {
+    ok: true,
+    disposition: 'created',
+    squad: { id: squadId, slug: squadSlug, name: homeName, department_id: departmentId },
+    grant: { id: capabilityId, capability: 'admin' },
+  }
 }
 
 // ── agents ───────────────────────────────────────────────────────────────────

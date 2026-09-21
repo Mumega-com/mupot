@@ -1,4 +1,4 @@
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { hasCapability, loadSquadScope, resolveCapabilities } from '../auth/capability'
 import { resolveActiveAgentMember } from '../members/service'
 import type { Agent, Env } from '../types'
 
@@ -33,15 +33,11 @@ export async function resolveTaskAssignee(
     return { value: null, error: 'assignee_not_in_squad' }
   }
 
-  const squad = await env.DB.prepare(
-    'SELECT department_id FROM squads WHERE id = ?1 LIMIT 1',
-  )
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  if (!squad) return { value: null, error: 'assignee_not_in_squad' }
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return { value: null, error: 'assignee_not_in_squad' }
 
   const grants = await resolveCapabilities(env, memberId)
-  return hasCapability(grants, 'squad', squadId, 'member', squad.department_id)
+  return hasCapability(grants, 'squad', scope, 'member')
     ? { value: agent.id }
     : { value: null, error: 'assignee_not_in_squad' }
 }
@@ -92,15 +88,11 @@ export async function resolveTaskAssigneeMember(
   if (!member) return { value: null, error: 'invalid_assignee' }
   if (member.status !== 'active') return { value: null, error: 'assignee_not_in_squad' }
 
-  const squad = await env.DB.prepare(
-    'SELECT department_id FROM squads WHERE id = ?1 LIMIT 1',
-  )
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  if (!squad) return { value: null, error: 'assignee_not_in_squad' }
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return { value: null, error: 'assignee_not_in_squad' }
 
   const grants = await resolveCapabilities(env, member.id)
-  return hasCapability(grants, 'squad', squadId, 'member', squad.department_id)
+  return hasCapability(grants, 'squad', scope, 'member')
     ? { value: member.id }
     : { value: null, error: 'assignee_not_in_squad' }
 }

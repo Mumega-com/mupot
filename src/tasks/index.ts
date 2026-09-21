@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
-import type { Env, AuthContext, Task, Squad, Capability } from '../types'
+import type { Env, AuthContext, Task, Squad, Capability, OrgKind } from '../types'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 
 // requireAuth is owned by the auth component; it sets c.get('auth').
@@ -23,7 +23,8 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
-import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope } from '../auth/capability'
+import { resolveAllSquadIds } from '../projects/readable-squads'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES } from './service'
 import type { TaskStatus } from './service'
@@ -133,9 +134,6 @@ export async function canActOnSquad(
   min: Capability = 'member',
   deptCache?: Map<string, Promise<string | null>>,
 ): Promise<boolean> {
-  if (legacyOwnerAdmin(auth)) return true
-  if (!auth.memberId) return false
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   // The cache stores the PROMISE, not the resolved value. decorateApprovals
   // (src/dashboard/approvals.ts) drives every row through Promise.all
   // CONCURRENTLY, so all rows for the same squad reach this line in the same
@@ -157,33 +155,63 @@ export async function canActOnSquad(
     if (deptCache) deptCache.set(squadId, deptPromise)
   }
   const deptId = await deptPromise
-  return hasCapability(grants, 'squad', squadId, min, deptId)
+  const kind = await squadKindOnly(env, squadId)
+  if (kind === null) return false
+  const scope = { id: squadId, department_id: deptId ?? '', kind }
+  // G-FP1b point 2/3: legacyOwnerAdmin never bypasses a home squad.
+  if (legacyOwnerAdmin(auth) && planeCoversScope('role', scope)) return true
+  if (!auth.memberId) return false
+  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
+  return hasCapability(grants, 'squad', scope, min)
+}
+
+/** A squad's kind alone — cheap, uncached (deptCache above already memoizes
+ *  the department_id half of the same row for the hot decorateApprovals
+ *  path; kind is only needed for the home exclusion, not worth a second
+ *  shared cache map for this PR). */
+async function squadKindOnly(env: Env, squadId: string): Promise<OrgKind | null> {
+  const r = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1').bind(squadId).first<{ kind: OrgKind }>()
+  return r?.kind ?? null
 }
 
 async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
-  if (legacyOwnerAdmin(auth)) return null
+  // G-FP1b point 2/3: `null` used to mean "see literally every squad" for a
+  // legacy owner/admin or an org-scope grant holder — leaking every
+  // member's home into task_list/task_board. Both branches now return the
+  // explicit list of every NON-home squad instead (resolveAllSquadIds is
+  // shared with src/projects/readable-squads.ts's identical fix).
+  if (legacyOwnerAdmin(auth)) return resolveAllSquadIds(env, { excludeHome: true })
   if (!auth.memberId) return []
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, 'member')) return null
+  if (hasCapability(grants, 'org', null, 'member')) return resolveAllSquadIds(env, { excludeHome: true })
 
   const squadIds = new Set<string>()
   const deptIds = new Set<string>()
   for (const grant of grants) {
-    if (grant.scope_type === 'squad' && grant.scope_id && hasCapability([grant], 'squad', grant.scope_id, 'member')) {
+    // Self-referential check (this grant, on its OWN scope) — exact-scope
+    // squad grants always cover their own squad regardless of kind, and a
+    // department-scope grant never legitimately names a home department
+    // after this PR's C-surface refusals, so no SquadScope/kind lookup is
+    // needed here either.
+    if (grant.scope_type === 'squad' && grant.scope_id && capabilityRank(grant.capability) >= capabilityRank('member')) {
       squadIds.add(grant.scope_id)
     }
-    if (grant.scope_type === 'department' && grant.scope_id && hasCapability([grant], 'department', grant.scope_id, 'member')) {
+    if (grant.scope_type === 'department' && grant.scope_id && capabilityRank(grant.capability) >= capabilityRank('member')) {
       deptIds.add(grant.scope_id)
     }
   }
 
   if (deptIds.size > 0) {
+    // Defense in depth: a department-scope grant should never legitimately
+    // name a home department after this PR's writer refusals, but the
+    // exclusion costs nothing to assert here directly too.
     const rows = await env.DB.prepare(
       `SELECT id
          FROM squads
         WHERE department_id IN (
           SELECT CAST(value AS TEXT) FROM json_each(?)
-        )`,
+        )
+        AND kind != 'home'`,
     )
       .bind(JSON.stringify([...deptIds]))
       .all<{ id: string }>()

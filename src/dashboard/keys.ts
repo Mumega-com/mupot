@@ -44,7 +44,7 @@ import type { RolePreset } from '../auth/role-presets'
 import {
   capabilityRank,
   resolveCapabilities,
-  hasCapability,
+  hasCapabilityOnDynamicScope,
   targetMaxRankAcrossScopes,
   exceedsTargetRankCeilingGivenRanks,
 } from '../auth/capability'
@@ -255,22 +255,8 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
   //    grants (token_grants) — DEFERRED, UNSCHEDULED (see ROADMAP.md's "Identity &
   //    Unified Access", post-v0.30, no version assigned); until then the token
   //    honestly carries the member's own authority and the preset is an audit label only.
-  const scopeDeptId =
-    preset.scopeType === 'squad' && resolvedScopeId
-      ? (
-          await env.DB.prepare(`SELECT department_id FROM squads WHERE id = ?1 LIMIT 1`)
-            .bind(resolvedScopeId)
-            .first<{ department_id: string | null }>()
-        )?.department_id ?? null
-      : null
   const grants = await resolveCapabilities(env, memberId)
-  const alreadyHolds = hasCapability(
-    grants,
-    preset.scopeType,
-    resolvedScopeId,
-    preset.role,
-    scopeDeptId,
-  )
+  const alreadyHolds = await hasCapabilityOnDynamicScope(env, grants, preset.scopeType, resolvedScopeId, preset.role)
   if (!alreadyHolds) {
     return { ok: false, error: 'member_lacks_capability' }
   }

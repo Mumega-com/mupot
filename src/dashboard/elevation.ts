@@ -78,12 +78,11 @@ import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import { hasCapabilityOnDynamicScope, resolveCapabilities } from '../auth/capability'
 import {
   listPendingElevationRequests,
   loadElevationRequestById,
   listActiveElevationGrants,
-  resolveScopeDepartmentId,
   type ElevationRequestRecord,
   type ElevationGrantRecord,
 } from '../auth/elevation'
@@ -171,8 +170,7 @@ async function operatorIsAdminOnScope(
   scopeType: CapabilityScopeType,
   scopeId: string,
 ): Promise<boolean> {
-  const deptId = await resolveScopeDepartmentId(env, scopeType, scopeId)
-  return hasCapability(capabilities, scopeType, scopeId || null, 'admin', deptId)
+  return hasCapabilityOnDynamicScope(env, capabilities, scopeType, scopeId || null, 'admin')
 }
 
 function notBridgedBody(): Html {

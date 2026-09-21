@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapability, resolveCapabilities } from './capability'
+import { hasCapabilityOnDynamicScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -415,20 +415,23 @@ export async function decideElevationRequest(
   // Authority is evaluated against the REQUEST's own scope. Approve may narrow
   // the action set, never the scope (enforced below), so the request's scope is
   // the scope of both decisions.
-  const requestScopeDepartmentId = await resolveScopeDepartmentId(
-    env,
-    request.requested_scope_type as CapabilityScopeType,
-    request.requested_scope_id,
-  )
+  // hasCapabilityOnDynamicScope (not hasCapability directly): the request's
+  // scope_type is not known statically here, and — per G-FP1b — a squad-scope
+  // check must load a real SquadScope (kind included) rather than a bare id +
+  // a separately-resolved department id, so an approver's org/department/role
+  // authority correctly answers false for a home squad. Deliberate exception:
+  // `decidedByIsOrgAdmin === true` still authorizes approving a home-scoped
+  // REQUEST — that is the intended "human decides, time-boxed, receipted"
+  // door (G-FP1b point 4), not a standing bypass of the home's own reads.
   const decidedByHasAuthority =
     input.decidedByIsOrgAdmin === true ||
-    hasCapability(
+    (await hasCapabilityOnDynamicScope(
+      env,
       input.decidedByCapabilities,
       request.requested_scope_type as CapabilityScopeType,
       request.requested_scope_id || null,
       'admin',
-      requestScopeDepartmentId,
-    )
+    ))
   if (!decidedByHasAuthority) {
     return {
       ok: false,
@@ -487,10 +490,9 @@ export async function decideElevationRequest(
   // above, so this re-check is over the same scope the hoisted gate cleared. It
   // stays as defence in depth and must honour the SAME two planes, or an owner
   // clears the first gate and is refused by the second.
-  const squadDepartmentId = await resolveScopeDepartmentId(env, scopeType, scopeId)
   if (
     input.decidedByIsOrgAdmin !== true &&
-    !hasCapability(input.decidedByCapabilities, scopeType, scopeId || null, 'admin', squadDepartmentId)
+    !(await hasCapabilityOnDynamicScope(env, input.decidedByCapabilities, scopeType, scopeId || null, 'admin'))
   ) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
@@ -830,11 +832,14 @@ export async function hasElevatedAction(
   if (!match) return { granted: false, reason: 'no_matching_grant' }
 
   // Re-derive the APPROVER's authority live — never trust that they still
-  // hold what they granted just because the grant row exists.
+  // hold what they granted just because the grant row exists. For a
+  // 'action:home_access' grant on a home squad, this means ONLY the home's
+  // OWNER (the sole holder of an exact squad-scope grant there — org/
+  // department/role planes are capability-dead on a home, G-FP1b point 2)
+  // can durably remain the approver: an org admin's authority re-check fails
+  // closed with `approver_authority_lost` here, by design.
   const approverCapabilities = await resolveCapabilities(env, match.approved_by_member_id)
-  const approverDeptId =
-    match.scope_type === 'squad' ? await resolveScopeDepartmentId(env, match.scope_type, match.scope_id) : null
-  if (!hasCapability(approverCapabilities, match.scope_type, match.scope_id || null, 'admin', approverDeptId)) {
+  if (!(await hasCapabilityOnDynamicScope(env, approverCapabilities, match.scope_type, match.scope_id || null, 'admin'))) {
     return { granted: false, reason: 'approver_authority_lost' }
   }
 

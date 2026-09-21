@@ -24,7 +24,7 @@
 // /oauth/consent branch for the full design).
 
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
-import { resolveCapabilities, canOnSquad, hasCapability, capabilityRank } from '../auth/capability'
+import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
 import {
   carriesOrgAdmin,
@@ -292,16 +292,13 @@ async function humanMaxRankOnScope(
   scopeType: CapabilityScopeType,
   scopeId: string | null,
 ): Promise<number> {
-  if (scopeType === 'squad' && scopeId) {
-    // canOnSquad resolves department inheritance from D1; walk the ladder top-down
-    // and stop at the first rank the human actually clears.
-    for (const cap of RANK_ORDER) {
-      if (await canOnSquad(env, humanGrants, scopeId, cap)) return capabilityRank(cap)
-    }
-    return 0
-  }
+  // hasCapabilityOnDynamicScope (not a hand-branched squad/else split): the
+  // prior version's `if (scopeType === 'squad' && scopeId)` fell through to
+  // the org/department-only branch for `scopeType === 'squad'` with a falsy
+  // scopeId — walk the ladder top-down and stop at the first rank the human
+  // actually clears, same as canOnSquad resolving department inheritance.
   for (const cap of RANK_ORDER) {
-    if (hasCapability(humanGrants, scopeType, scopeId, cap)) return capabilityRank(cap)
+    if (await hasCapabilityOnDynamicScope(env, humanGrants, scopeType, scopeId, cap)) return capabilityRank(cap)
   }
   return 0
 }
@@ -491,7 +488,13 @@ export async function listConsentableAgents(
     // An org-wide admin/owner covers every scope by definition — the same rule
     // canOnSquad already applies to an org-scope GRANT. This adds only the legacy
     // role plane, so it can never admit a principal that isOrgAdmin would refuse.
-    if (!orgWideAdmin && !(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
+    //
+    // G-FP1b point 3/F: EXCEPT a kind='home' squad — org-wide standing must not
+    // list another member's home agent in this consent picker. Fall through to
+    // the real per-squad check, which an org grant alone never satisfies there.
+    const rowSquadScope = await loadSquadScope(env, row.squad_id)
+    const orgWideAdminAppliesHere = orgWideAdmin && rowSquadScope?.kind !== 'home'
+    if (!orgWideAdminAppliesHere && !(await canOnSquad(env, humanGrants, row.squad_id, 'admin'))) continue
     // The preview shows the TRUE clamped result (P0-1) — `memberId` here IS the
     // viewing/consenting human, so this is honest about exactly what the session
     // would carry, never the agent's raw (possibly higher) grant.

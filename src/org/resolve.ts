@@ -10,7 +10,7 @@
 // read-side orient gates). So: resolve by id first; on a slug, COUNT matches and REFUSE
 // an ambiguous one. The caller must use the id (or a unique slug). Fail-closed.
 
-import type { Env } from '../types'
+import type { Env, OrgKind } from '../types'
 
 export type ResolveResult<T> = { ok: true; value: T } | { ok: false; reason: 'not_found' | 'ambiguous' }
 
@@ -46,11 +46,15 @@ export function resolveDepartmentRef(env: Env, ref: string): Promise<ResolveResu
   return resolveByIdThenSlug(env, 'id', 'departments', ref)
 }
 
+// `kind` is included (not just id/department_id) so the resolved row is
+// directly a `SquadScope` (src/auth/capability.ts) — every caller that feeds
+// it straight into hasCapability/canOnSquad for a 'squad' scope gets the
+// kind='home' isolation for free, without a second D1 round trip.
 export function resolveSquadRef(
   env: Env,
   ref: string,
-): Promise<ResolveResult<{ id: string; department_id: string }>> {
-  return resolveByIdThenSlug(env, 'id, department_id', 'squads', ref)
+): Promise<ResolveResult<{ id: string; department_id: string; kind: OrgKind }>> {
+  return resolveByIdThenSlug(env, 'id, department_id, kind', 'squads', ref)
 }
 
 /**

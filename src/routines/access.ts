@@ -1,5 +1,5 @@
-import { hasCapability } from '../auth/capability'
-import type { AuthContext, CapabilityGrant, Env } from '../types'
+import { hasCapability, type SquadScope } from '../auth/capability'
+import type { AuthContext, CapabilityGrant, Env, OrgKind } from '../types'
 import {
   projectReadAccessFromGrants,
   projectVisibilityClause,
@@ -55,18 +55,16 @@ export async function principalCanRunForSquad(
   squadId: string,
 ): Promise<boolean> {
   if (principal.tenant !== env.TENANT_SLUG) return false
-  if (principal.workspace_admin) return true
   const squad = await env.DB.prepare(
-    `SELECT s.department_id
+    `SELECT s.department_id, s.kind
        FROM squads s
        JOIN project_squad_access psa ON psa.squad_id = s.id
       WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
-  ).bind(squadId, projectId).first<{ department_id: string }>()
-  return squad !== null && hasCapability(
-    principal.grants,
-    'squad',
-    squadId,
-    'member',
-    squad.department_id,
-  )
+  ).bind(squadId, projectId).first<{ department_id: string; kind: OrgKind }>()
+  if (squad === null) return false
+  // G-FP1b point 2/3: workspace_admin must not reach a home squad — checked
+  // AFTER resolving the squad's kind, not before.
+  if (principal.workspace_admin && squad.kind !== 'home') return true
+  const scope: SquadScope = { id: squadId, department_id: squad.department_id, kind: squad.kind }
+  return hasCapability(principal.grants, 'squad', scope, 'member')
 }

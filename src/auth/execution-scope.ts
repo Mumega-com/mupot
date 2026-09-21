@@ -1,6 +1,6 @@
-import { canOnSquad, hasCapability, resolveCapabilities } from './capability'
+import { canOnSquad, hasCapability, resolveCapabilities, type SquadScope } from './capability'
 import { resolveAgentMemberBinding } from '../members/service'
-import type { AuthContext, Env } from '../types'
+import type { AuthContext, Env, OrgKind } from '../types'
 
 export type ExecutionScopeRequest =
   | { action: 'router:read'; squadId: string }
@@ -50,6 +50,7 @@ interface AuthorizedAgentRow {
   id: string
   squad_id: string
   department_id: string
+  kind: OrgKind
 }
 
 /**
@@ -75,7 +76,7 @@ async function findAgentAuthorizedForLead(
          FROM channel_capability_grants
         WHERE member_id = ?2
      )
-     SELECT a.id, a.squad_id, s.department_id
+     SELECT a.id, a.squad_id, s.department_id, s.kind
        FROM agents a
        JOIN squads s ON s.id = a.squad_id
       WHERE a.id = ?1
@@ -84,18 +85,23 @@ async function findAgentAuthorizedForLead(
             FROM durable_grants g
            WHERE g.capability IN ('lead', 'admin', 'owner')
              AND (
-               g.scope_type = 'org'
-               OR (g.scope_type = 'squad' AND g.scope_id = a.squad_id)
-               OR (g.scope_type = 'department' AND g.scope_id = s.department_id)
+               (g.scope_type = 'squad' AND g.scope_id = a.squad_id)
+               -- G-FP1b point 2: org/department inheritance never covers a
+               -- home squad — this raw-SQL EXISTS was replicating
+               -- hasCapability's inheritance rule without going through
+               -- planeCoversScope, so it needed the SAME exclusion inline.
+               OR (g.scope_type = 'org' AND s.kind != 'home')
+               OR (g.scope_type = 'department' AND g.scope_id = s.department_id AND s.kind != 'home')
              )
         )
       LIMIT 1`,
   ).bind(agentId, auth.memberId).first<AuthorizedAgentRow>()
   if (!agent) return null
 
+  const agentScope: SquadScope = { id: agent.squad_id, department_id: agent.department_id, kind: agent.kind }
   if (
     auth.capabilities !== undefined
-    && !hasCapability(auth.capabilities, 'squad', agent.squad_id, 'lead', agent.department_id)
+    && !hasCapability(auth.capabilities, 'squad', agentScope, 'lead')
   ) {
     return null
   }

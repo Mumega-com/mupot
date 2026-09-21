@@ -1,7 +1,7 @@
 import type { D1Result } from '@cloudflare/workers-types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
-import { hasCapability } from '../auth/capability'
+import { hasCapability, loadSquadScope } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
 import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
@@ -294,15 +294,11 @@ async function selectAgent(
   const candidates = await loadCandidates(env, policy.responsible_squad_id)
   const memberIds = candidates.map(candidate => candidate.member_id)
   const grants = await loadCandidateGrants(env, [...new Set(memberIds)])
+  const responsibleSquadScope = await loadSquadScope(env, policy.responsible_squad_id)
   const eligible = candidates.filter(candidate => {
     if (assignedAgentId !== null && candidate.id !== assignedAgentId) return false
-    return hasCapability(
-      grants.get(candidate.member_id) ?? [],
-      'squad',
-      policy.responsible_squad_id,
-      'member',
-      candidate.department_id,
-    )
+    if (!responsibleSquadScope) return false
+    return hasCapability(grants.get(candidate.member_id) ?? [], 'squad', responsibleSquadScope, 'member')
   }).sort((left, right) => {
     const preferred = policy.preferred_agent_id
     if (left.id === preferred && right.id !== preferred) return -1

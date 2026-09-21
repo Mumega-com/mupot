@@ -218,7 +218,7 @@
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, Agent, AuthContext, Department, Squad, Capability } from '../types'
-import { createDepartment, createSquad, prepareAgentCreate, isValidSlug } from '../org/service'
+import { createDepartment, createSquad, findHomeSquadByDepartment, prepareAgentCreate, isValidSlug } from '../org/service'
 import { prepareAgentBoundTokenMint, resolveActiveAgentMember, type AgentForMint } from './service'
 import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
 
@@ -546,6 +546,7 @@ async function findSquadBySlug(env: Env, departmentId: string, slug: string): Pr
 export interface BootstrapSelfDeps {
   createDepartment: typeof createDepartment
   createSquad: typeof createSquad
+  findHomeSquadByDepartment: typeof findHomeSquadByDepartment
   prepareAgentCreate: typeof prepareAgentCreate
   prepareAgentBoundTokenMint: typeof prepareAgentBoundTokenMint
   checkRateLimit: typeof checkBootstrapSelfRateLimit
@@ -556,6 +557,7 @@ export function defaultBootstrapSelfDeps(): BootstrapSelfDeps {
   return {
     createDepartment,
     createSquad,
+    findHomeSquadByDepartment,
     prepareAgentCreate,
     prepareAgentBoundTokenMint,
     checkRateLimit: checkBootstrapSelfRateLimit,
@@ -650,25 +652,41 @@ export async function bootstrapSelf(
 
   let squad: Squad
   let squadCreatedHere = false
-  const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName }, { kind: 'home' })
-  if (squadResult.ok) {
-    squad = squadResult.value
-    squadCreatedHere = true
-  } else if (squadResult.error === 'slug_taken') {
-    // P0-N2 — adopt-existing, same kind='home' gate as the department above
-    // (WARN-1): a squad slug match under this department is only adoptable
-    // when it is ALSO kind='home' — a work-kind squad squatting on this slug
-    // is never adopted, treated as not-found below instead.
-    const existing = await findSquadBySlug(env, departmentId, squadSlug)
-    if (!existing) {
-      await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
-      return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: 'slug_taken_but_not_found' } }
-    }
-    squad = existing
+
+  // G-FP1b point 5 ("one home lookup by department shared by bootstrapSelf
+  // and createHomeForMember; two homes per human is structurally
+  // impossible"): checked by DEPARTMENT, ahead of the slug-based check
+  // below, because createHomeForMember mints its home squad under a
+  // DIFFERENT slug convention (`home-<8-char-prefix>` vs this function's own
+  // `home-<full-uuid>`) — a slug-only check here would never see it, and
+  // `deps.createSquad` below would then happily mint a SECOND home squad in
+  // the SAME home department. See org/service.ts's findHomeSquadByDepartment
+  // doc comment for the full reasoning; this is the other half of the same
+  // shared lookup.
+  const byDepartment = await deps.findHomeSquadByDepartment(env, departmentId)
+  if (byDepartment) {
+    squad = byDepartment
   } else {
-    if (isEntitlementLimitReason(squadResult.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
-    await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
-    return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: squadResult.error } }
+    const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName }, { kind: 'home' })
+    if (squadResult.ok) {
+      squad = squadResult.value
+      squadCreatedHere = true
+    } else if (squadResult.error === 'slug_taken') {
+      // P0-N2 — adopt-existing, same kind='home' gate as the department above
+      // (WARN-1): a squad slug match under this department is only adoptable
+      // when it is ALSO kind='home' — a work-kind squad squatting on this slug
+      // is never adopted, treated as not-found below instead.
+      const existing = await findSquadBySlug(env, departmentId, squadSlug)
+      if (!existing) {
+        await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
+        return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: 'slug_taken_but_not_found' } }
+      }
+      squad = existing
+    } else {
+      if (isEntitlementLimitReason(squadResult.error)) await refundBootstrapSelfRateLimit(env, consentingMemberId)
+      await compensateCreatedRows(env, null, departmentCreatedHere ? departmentId : null)
+      return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: squadResult.error } }
+    }
   }
 
   // ── agent + member + weld + capability + token + audit: ONE atomic batch ───

@@ -1,5 +1,5 @@
-import type { AuthContext } from '../types'
-import { hasCapability, resolveCapabilities } from '../auth/capability'
+import type { AuthContext, OrgKind } from '../types'
+import { hasCapability, resolveCapabilities, type SquadScope } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import {
   deriveSafeMemberTokenFingerprint,
@@ -41,6 +41,7 @@ interface LiveTokenBindingRow {
   expires_at: string | null
   squad_id: string
   department_id: string
+  kind: OrgKind
 }
 
 interface TokenBindingAttestationRow {
@@ -102,7 +103,7 @@ async function readLiveTokenBinding(
   const row = await env.DB.prepare(`
     SELECT token.id AS token_id, token.member_id, token.agent_id,
            token.token_hash, token.expires_at, agent.squad_id,
-           squad.department_id
+           squad.department_id, squad.kind
       FROM member_tokens token
       JOIN members member
         ON member.id = token.member_id
@@ -142,25 +143,14 @@ async function readLiveTokenBinding(
   // present, an empty/observer view must stay denied even if D1 still contains a
   // stronger grant. A second live read is the revocation check and never widens
   // that ceiling.
+  const rowScope: SquadScope = { id: row.squad_id, department_id: row.department_id, kind: row.kind }
   const effectiveGrants = auth.capabilities
     ?? (await resolveCapabilities(env, identity.memberId))
-  if (!hasCapability(
-    effectiveGrants,
-    'squad',
-    row.squad_id,
-    'member',
-    row.department_id,
-  )) {
+  if (!hasCapability(effectiveGrants, 'squad', rowScope, 'member')) {
     throw new AttestationError('workspace_token_required')
   }
   const liveGrants = await resolveCapabilities(env, identity.memberId)
-  if (!hasCapability(
-    liveGrants,
-    'squad',
-    row.squad_id,
-    'member',
-    row.department_id,
-  )) {
+  if (!hasCapability(liveGrants, 'squad', rowScope, 'member')) {
     throw new AttestationError('workspace_token_required')
   }
   return row

@@ -1,5 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
-import type { Env, Project } from '../types'
+import type { Env, OrgKind, Project } from '../types'
 import { projectVisibilityClause } from '../projects/access'
 import { nextRoutineOccurrence, routineOccurrenceKey, validateRoutineSchedule } from './schedule'
 import type {
@@ -17,7 +17,7 @@ import {
   principalCanRunForSquad,
   type RoutinePrincipal,
 } from './access'
-import { hasCapability } from '../auth/capability'
+import { hasCapability, type SquadScope } from '../auth/capability'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -296,17 +296,19 @@ async function principalCanMutateRoutinePolicy(
   projectId: string,
   squadId: string,
 ): Promise<boolean> {
-  if (principal.workspace_admin) return true
   if (principal.tenant !== env.TENANT_SLUG) return false
   const squad = await env.DB.prepare(
-    `SELECT s.department_id
+    `SELECT s.department_id, s.kind
        FROM squads s
        JOIN project_squad_access psa ON psa.squad_id = s.id
       WHERE s.id = ? AND psa.project_id = ? AND psa.access_level IN ('write','admin')`,
-  ).bind(squadId, projectId).first<{ department_id: string }>()
+  ).bind(squadId, projectId).first<{ department_id: string; kind: OrgKind }>()
   if (!squad) return false
+  // G-FP1b point 2/3: workspace_admin gated by kind, resolved AFTER we know it.
+  if (principal.workspace_admin && squad.kind !== 'home') return true
+  const scope: SquadScope = { id: squadId, department_id: squad.department_id, kind: squad.kind }
   return (
-    hasCapability(principal.grants, 'squad', squadId, 'admin', squad.department_id) ||
+    hasCapability(principal.grants, 'squad', scope, 'admin') ||
     hasCapability(principal.grants, 'department', squad.department_id, 'admin')
   )
 }

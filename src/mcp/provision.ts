@@ -312,10 +312,10 @@ function createErrorToFail(error: string) {
 /** Check whether the caller's effective target-squad grant covers a requested capability. */
 export function callerCanGrantAgentCapability(
   grants: CapabilityGrant[],
-  squad: Pick<Squad, 'id' | 'department_id'>,
+  squad: Pick<Squad, 'id' | 'department_id' | 'kind'>,
   capability: Capability,
 ): boolean {
-  return hasCapability(grants, 'squad', squad.id, capability, squad.department_id)
+  return hasCapability(grants, 'squad', squad, capability)
 }
 
 // ── create_department ───────────────────────────────────────────────────────────
@@ -1392,9 +1392,15 @@ export const toolGrantAgentCapability: ToolSpec = {
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const squad = squadResult.value
 
+    // G-FP1b point 4: no standing grant path into a kind='home' squad except
+    // createHomeForMember. Refused absolutely — even elevation does not open
+    // this door, since a home's ONLY writer is the member's own
+    // self-provisioning call.
+    if (squad.kind === 'home') return fail(403, 'home_scope_not_grantable')
+
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+    if (!(await memberCanOnSquad(env, grants, squad, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {

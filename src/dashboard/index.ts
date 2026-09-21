@@ -41,6 +41,7 @@ import type {
   Capability,
   CapabilityScopeType,
   ConnectionChannel,
+  OrgKind,
 } from '../types'
 
 import { requireAuth } from '../auth'
@@ -55,6 +56,8 @@ import {
   isOrgAdmin,
   holdsCapabilityFloor,
   exceedsTargetRankCeiling,
+  loadSquadScope,
+  planeCoversScope,
 } from '../auth/capability'
 // Legible refusals (#530 follow-on): a 403 that names the signed-in principal and
 // their actual standing, not just the requirement they failed. See src/auth/refusal.ts.
@@ -1437,7 +1440,11 @@ dashboardApp.get('/dashboard/kanban', async (c) => {
   const view = c.req.query('view')
 
   const accessibleSquadIds = await resolveAccessibleSquadIds(c.env, auth)
-  const isAllAccessible = isOrgAdmin(auth) || accessibleSquadIds === null
+  // G-FP1b point 2/3: same fix as src/dashboard/kanban-routes.ts — drop the
+  // redundant `isOrgAdmin(auth)` shortcut, which bypassed
+  // resolveAccessibleSquadIds's home-squad exclusion and would otherwise
+  // list every member's home squad in this picker for any org admin.
+  const isAllAccessible = accessibleSquadIds === null
 
   const [data, allSquads, allProjects] = await Promise.all([
     loadKanbanData(c.env, auth, { squadIdOrSlug: squad, projectIdOrSlug: project, view }),
@@ -2865,16 +2872,19 @@ dashboardApp.post('/squads/:id/agents/join', async (c) => {
   if (!squad) return c.html(shell(c.env, 'Squad', errorBody('Squad not found.')), 404)
   // Join writes a membership — requires admin on the TARGET squad (same gate as
   // POST /agents/:id/memberships in src/org/index.ts; dept grants inherit).
-  if (isOrgAdmin(auth)) {
-    // org-admin ok
-  } else {
-    const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
-    const deptId = await squadDepartment(c.env, squadId)
-    if (!hasCapability(grants, 'squad', squadId, 'admin', deptId)) {
-      return c.html(
-        shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent requires admin on this squad.')),
-        403,
-      )
+  // G-FP1b point 2/3: isOrgAdmin never bypasses a home squad — resolve scope
+  // first, same as canOnSquad above.
+  {
+    const joinScope = await loadSquadScope(c.env, squadId)
+    const orgAdminAppliesHere = isOrgAdmin(auth) && joinScope !== null && planeCoversScope('org', joinScope)
+    if (!orgAdminAppliesHere) {
+      const grants = auth.memberId ? auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId)) : []
+      if (!joinScope || !hasCapability(grants, 'squad', joinScope, 'admin')) {
+        return c.html(
+          shell(c.env, `Squad · ${squad.name}`, errorBody('Joining an existing agent requires admin on this squad.')),
+          403,
+        )
+      }
     }
   }
 
@@ -2996,12 +3006,15 @@ function hasOrgOwnerCapability(auth: AuthContext): boolean {
 // agents (with department→squad inheritance). isOrgAdmin() doubles as the legacy
 // owner/admin escape, identical to requireCapability's.
 
-/** Resolve a squad's department for department→squad capability inheritance. */
-async function squadDepartment(env: Env, squadId: string): Promise<string | null> {
-  const r = await env.DB.prepare('SELECT department_id FROM squads WHERE id = ?1')
-    .bind(squadId)
-    .first<{ department_id: string }>()
-  return r?.department_id ?? null
+/** A department's kind — resolveHomeDepartmentId (src/org/service.ts) can
+ *  make a department kind='home' too, not only squads; consulted below so
+ *  isOrgAdmin never bypasses a home department the same way G-FP1b closes
+ *  the squad case. */
+async function departmentKind(env: Env, departmentId: string): Promise<OrgKind | null> {
+  const r = await env.DB.prepare('SELECT kind FROM departments WHERE id = ?1')
+    .bind(departmentId)
+    .first<{ kind: OrgKind }>()
+  return r?.kind ?? null
 }
 
 /** org-scope capability gate (e.g. minting a token / creating a department → admin). */
@@ -3018,7 +3031,10 @@ async function canOnDepartment(
   auth: AuthContext,
   departmentId: string,
 ): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
+  // G-FP1b point 2/3 (extended to departments, see departmentKind above):
+  // isOrgAdmin never bypasses a home department.
+  const kind = await departmentKind(env, departmentId)
+  if (isOrgAdmin(auth) && kind !== 'home') return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
   return hasCapability(grants, 'department', departmentId, 'admin')
@@ -3026,11 +3042,13 @@ async function canOnDepartment(
 
 /** squad-scope gate (creating an agent → lead on THAT squad, dept grants inherit). */
 async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
-  if (isOrgAdmin(auth)) return true
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return false
+  // G-FP1b point 2/3: isOrgAdmin never bypasses a home squad.
+  if (isOrgAdmin(auth) && planeCoversScope('org', scope)) return true
   if (!auth.memberId) return false
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, 'lead', deptId)
+  return hasCapability(grants, 'squad', scope, 'lead')
 }
 
 /**
@@ -3042,8 +3060,9 @@ async function canOnSquad(env: Env, auth: AuthContext, squadId: string): Promise
  * them for the org-read check this is OR'd with) rather than re-querying.
  */
 async function canOnSquadRead(env: Env, grants: CapabilityGrant[], squadId: string): Promise<boolean> {
-  const deptId = await squadDepartment(env, squadId)
-  return hasCapability(grants, 'squad', squadId, 'observer', deptId)
+  const scope = await loadSquadScope(env, squadId)
+  if (!scope) return false
+  return hasCapability(grants, 'squad', scope, 'observer')
 }
 
 async function loadMembers(env: Env): Promise<Member[]> {

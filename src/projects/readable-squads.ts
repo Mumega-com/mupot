@@ -1,5 +1,5 @@
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
-import { hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
+import { capabilityRank, hasCapability, isOrgAdmin, resolveCapabilities } from '../auth/capability'
 
 const READABLE_SQUAD_PAGE_SIZE = 500
 
@@ -54,12 +54,24 @@ export async function resolveGrantedSquadIds(
   grants: CapabilityGrant[],
   minimum: Capability,
 ): Promise<string[]> {
-  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env)
+  // G-FP1b point 2/3: an org-scope grant resolves to EVERY squad EXCEPT a
+  // home squad (resolveAllSquadIds would otherwise leak every member's home
+  // into any org-grant holder's "which squads can I see" answer — the exact
+  // shape of the acceptance tests for squad_recall/squad_member_list/
+  // task_list/task_board/kanban). An EXACT squad-scope grant naming a home
+  // (below, in the per-grant loop) still resolves it — that is the home's
+  // owner, not an inherited plane.
+  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env, { excludeHome: true })
 
   const squadIds: string[] = []
   const departmentIds: string[] = []
   for (const grant of grants) {
-    if (!grant.scope_id || !hasCapability([grant], grant.scope_type, grant.scope_id, minimum)) continue
+    if (!grant.scope_id) continue
+    // Self-referential check (this grant, on its OWN declared scope) — no
+    // inheritance involved, so this is exactly a rank comparison and needs
+    // no SquadScope/kind lookup (an exact squad-scope grant always covers
+    // its own squad regardless of kind, per hasCapability's contract).
+    if (capabilityRank(grant.capability) < capabilityRank(minimum)) continue
     if (grant.scope_type === 'squad') squadIds.push(grant.scope_id)
     if (grant.scope_type === 'department') departmentIds.push(grant.scope_id)
   }
@@ -87,21 +99,32 @@ export async function resolveAccessibleSquadIds(
   auth: AuthContext,
   minimum: Capability = 'observer',
 ): Promise<string[] | null> {
-  if (isOrgAdmin(auth)) return null
+  // G-FP1b point 2/3: `null` used to mean "org admin, see literally every
+  // squad" — which leaked every member's home into every dashboard surface
+  // built on this function (kanban, fleet, brain, agents-admin, mission
+  // control, mcp/runners). `null` no longer means that: an org-admin/owner
+  // now gets the explicit list of every NON-home squad, same as an org-scope
+  // GRANT holder does below. KNOWN FOLLOW-UP (see PR body): at least one
+  // consumer (src/dashboard/kanban-routes.ts's `loadKanbanData`) ALSO calls
+  // `isOrgAdmin(auth)` directly as its own independent "show everything"
+  // shortcut, bypassing whatever this function returns — every consumer of
+  // this function needs the same audit, not just this shared predicate.
+  if (isOrgAdmin(auth)) return resolveAllSquadIds(env, { excludeHome: true })
   if (!auth.memberId) return []
   const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, minimum)) return null
+  if (hasCapability(grants, 'org', null, minimum)) return resolveAllSquadIds(env, { excludeHome: true })
   return resolveGrantedSquadIds(env, grants, minimum)
 }
 
-export async function resolveAllSquadIds(env: Env): Promise<string[]> {
+export async function resolveAllSquadIds(env: Env, opts: { excludeHome?: boolean } = {}): Promise<string[]> {
   const resolved: string[] = []
   let lastId = ''
+  const kindClause = opts.excludeHome ? `AND kind != 'home'` : ''
 
   while (true) {
     const result = await env.DB.prepare(
       `SELECT id FROM squads
-        WHERE id > ?1
+        WHERE id > ?1 ${kindClause}
         ORDER BY id
         LIMIT ?2`,
     ).bind(lastId, READABLE_SQUAD_PAGE_SIZE).all<{ id: string }>()

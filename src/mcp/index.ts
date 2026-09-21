@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth, loadSquadScope, type SquadScope } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates } from '../tasks/index'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -478,10 +478,10 @@ async function authenticateMemberInner(c: {
 export async function memberCanOnSquad(
   env: Env,
   grants: CapabilityGrant[],
-  squadId: string,
+  squadIdOrScope: string | SquadScope,
   min: Capability,
 ): Promise<boolean> {
-  return canOnSquad(env, grants, squadId, min)
+  return canOnSquad(env, grants, squadIdOrScope, min)
 }
 
 /** The same check, seeing BOTH authority planes — see canOnSquadAuth's header.
@@ -491,10 +491,10 @@ export async function memberCanOnSquad(
 export async function memberCanOnSquadAuth(
   env: Env,
   auth: AuthContext,
-  squadId: string,
+  squadIdOrScope: string | SquadScope,
   min: Capability,
 ): Promise<boolean> {
-  return canOnSquadAuth(env, auth, squadId, min)
+  return canOnSquadAuth(env, auth, squadIdOrScope, min)
 }
 
 // ── d1 helpers (read-only lookups; allow-listed table names) ──────────────────
@@ -773,8 +773,16 @@ async function resolveScopedSquad(
   if (!squadRes.ok) return squadRes
   const squad = squadRes.squad
 
+  // G-FP1b point 3/F: `workspaceAdminBypass` (org admin) must NOT reach a
+  // kind='home' squad — that is exactly the org-grant-plane master key
+  // round 1 found, just reachable through resolveTaskSquad/resolveScopedSquad
+  // instead of hasCapability directly. An org admin's bypass is honoured
+  // ONLY on a work squad; on a home squad this falls through to the same
+  // memberCanOnSquad check every non-admin caller goes through — which
+  // (via planeCoversScope) an org grant alone can never satisfy on a home.
   const grants = auth.capabilities ?? []
-  if (!workspaceAdminBypass && !(await memberCanOnSquad(env, grants, squad.id, min))) {
+  const bypassAppliesHere = workspaceAdminBypass && squad.kind !== 'home'
+  if (!bypassAppliesHere && !(await memberCanOnSquad(env, grants, squad, min))) {
     return failOnly(403, 'forbidden', { need: min, scope: 'squad' })
   }
   return { ok: true, squad }
@@ -2479,7 +2487,11 @@ function memberCanAccessFlight(
   for (const squadId of meta.squad_ids) {
     const squad = squadCache.get(squadId)
     if (!squad) return false
-    if (!workspaceAdmin && !hasCapability(grants, 'squad', squad.id, minimum, squad.department_id)) return false
+    // G-FP1b point 3/F: the org-admin bypass must not reach a home squad —
+    // fall through to the real per-squad check there, same as everywhere
+    // else in this file.
+    const bypassAppliesHere = workspaceAdmin && squad.kind !== 'home'
+    if (!bypassAppliesHere && !hasCapability(grants, 'squad', squad, minimum)) return false
   }
   return true
 }
@@ -2549,8 +2561,13 @@ const toolFlightDispatch: ToolSpec = {
     const executorAgent = isDelegated ? await loadAgent(env, executorAgentId) : boundAgent
     if (!executorAgent) return fail(404, 'executor_agent_not_found')
     if (executorAgent.status !== 'active') return fail(409, 'executor_agent_inactive')
-    if (isDelegated && !workspaceAdmin && !(await memberCanOnSquad(env, grants, executorAgent.squad_id, 'lead'))) {
-      return fail(403, 'flight_delegation_forbidden', { need: 'lead', scope: 'squad', squad_id: executorAgent.squad_id })
+    if (isDelegated) {
+      // G-FP1b point 3/F: the org-admin bypass must not reach a home squad.
+      const executorSquadScope = await loadSquadScope(env, executorAgent.squad_id)
+      const bypassAppliesHere = workspaceAdmin && executorSquadScope?.kind !== 'home'
+      if (!bypassAppliesHere && !(await memberCanOnSquad(env, grants, executorAgent.squad_id, 'lead'))) {
+        return fail(403, 'flight_delegation_forbidden', { need: 'lead', scope: 'squad', squad_id: executorAgent.squad_id })
+      }
     }
 
     const meta = parseFlightMetaV1(parseJsonArg(args.meta_json))
@@ -2560,7 +2577,10 @@ const toolFlightDispatch: ToolSpec = {
     if (referencedSquads.length !== meta.squad_ids.length) return fail(403, 'forbidden')
     const requiredCapability: Capability = (requestedBudget as number) > 0 ? 'lead' : 'member'
     for (const referencedSquad of referencedSquads) {
-      if (!workspaceAdmin && !hasCapability(grants, 'squad', referencedSquad.id, requiredCapability, referencedSquad.department_id)) {
+      // G-FP1b point 3/F: same bypass gate as above — referencedSquad is a
+      // full Squad row (kind included) from loadFlightSquads.
+      const bypassAppliesHere = workspaceAdmin && referencedSquad.kind !== 'home'
+      if (!bypassAppliesHere && !hasCapability(grants, 'squad', referencedSquad, requiredCapability)) {
         return fail(
           403,
           (requestedBudget as number) > 0 ? 'flight_budget_forbidden' : 'forbidden',
@@ -2986,7 +3006,9 @@ const toolFlightList: ToolSpec = {
     if (!squad) return fail(403, 'forbidden')
     const grants = auth.capabilities ?? []
     const workspaceAdmin = hasWorkspaceAdmin(auth)
-    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, squad.id, 'observer'))) {
+    // G-FP1b point 3/F: bypass gated off a home squad.
+    const bypassAppliesHere = workspaceAdmin && squad.kind !== 'home'
+    if (!bypassAppliesHere && !(await memberCanOnSquad(env, grants, squad, 'observer'))) {
       return fail(403, 'forbidden', { need: 'observer', scope: 'squad' })
     }
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
@@ -3273,9 +3295,14 @@ const toolWakeAgent: ToolSpec = {
 
     const grants = auth.capabilities ?? []
     // Workspace admin bypass matches agentsApp: an org owner/admin can wake any
-    // agent in the pot without hand-granting lead on every squad first.
+    // agent in the pot without hand-granting lead on every squad first — EXCEPT
+    // an agent living in someone's home squad (G-FP1b point 3/F): waking
+    // another member's home agent must fall through to the same
+    // memberCanOnSquad check everyone else goes through.
     const workspaceAdmin = hasWorkspaceAdmin(auth)
-    if (!workspaceAdmin && !(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
+    const agentSquadScope = await loadSquadScope(env, agent.squad_id)
+    const bypassAppliesHere = workspaceAdmin && agentSquadScope?.kind !== 'home'
+    if (!bypassAppliesHere && !(await memberCanOnSquad(env, grants, agent.squad_id, 'lead'))) {
       return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
     }
 

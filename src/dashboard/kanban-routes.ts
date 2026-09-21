@@ -12,7 +12,6 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../types'
 import { requireAuth } from '../auth'
-import { isOrgAdmin } from '../auth/capability'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
 
@@ -62,7 +61,13 @@ export async function loadKanbanData(
   params: { squadIdOrSlug?: string; projectIdOrSlug?: string; view?: string },
 ): Promise<KanbanBoardData> {
   const accessibleSquadIds = await resolveAccessibleSquadIds(env, auth)
-  const isAllAccessible = isOrgAdmin(auth) || accessibleSquadIds === null
+  // G-FP1b point 2/3: this used to OR in `isOrgAdmin(auth)` directly, an
+  // independent "show everything" shortcut that bypassed whatever
+  // resolveAccessibleSquadIds returned — including the home-squad exclusion
+  // that function now applies. resolveAccessibleSquadIds never returns
+  // `null` any more (an org admin now gets the explicit list of every
+  // NON-home squad instead), so this is just that one predicate now.
+  const isAllAccessible = accessibleSquadIds === null
 
   // Fail-closed for grant-less members
   if (!isAllAccessible && accessibleSquadIds && accessibleSquadIds.length === 0) {
