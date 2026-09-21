@@ -45,8 +45,11 @@ export async function findOrCreateHumanMember(
     const { grantSignupDefault } = await import('../onboarding/doors')
     await grantSignupDefault(env, memberId)
   } catch (err) {
+    // CodeQL js/clear-text-logging: never log a field sourced from `env` here —
+    // some callers (e.g. the OAuth callback path) pass an Env carrying secrets,
+    // and the scanner taints the whole object once that happens anywhere in the
+    // codebase. memberId alone is unique and sufficient to find this row.
     console.error('oauth: signup default grant failed (non-fatal, member still created)', {
-      tenant: env.TENANT_SLUG,
       member_id: memberId,
       error: err instanceof Error ? err.message : String(err),
     })
