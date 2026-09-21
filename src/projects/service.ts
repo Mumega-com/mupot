@@ -622,6 +622,20 @@ export type ProjectAccessGrantError = ProjectMutationError | 'verdict_mismatch'
 // unreceipted," the exact outcome 0157's own header says the table exists to
 // prevent. `assertWritten` on each required statement turns a silent 0-row
 // write into a loud throw rather than a phantom success.
+//
+// KNOWN GAP, NOT FIXED HERE (P2-5, kasra-review adversarial round 2 on PR
+// #1490 — Kasra-core's call): there is no RECEIPTED path to REVOKE a grant
+// this function made. Once a member's home squad holds access_level on a
+// project, the only way to remove it is project_squad_set (an org-admin
+// tool, itself the P2-9 bypass documented at its own definition,
+// src/mcp/projects.ts) or a raw project_squad_access UPSERT that overwrites
+// the level in place — neither writes anything to
+// project_access_grant_receipts, so a revoked or downgraded grant leaves NO
+// audit trail distinguishable from "never granted differently." A
+// project_access_revoke tool (mirroring this function's own atomic
+// grant+receipt shape, with a `kind='revoke'` receipt row) is the natural
+// fix but is real, net-new scope beyond this round's remit — filed, not
+// built here.
 export async function executeProjectAccessGrant(
   env: Env,
   input: {

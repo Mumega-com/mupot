@@ -211,9 +211,9 @@ describe('FP-01 Slice 2 v2 — project_access chain (successor to PR #1488)', ()
     })
   })
 
-  // ── P0-3: the verdict must be cast by a HUMAN ──────────────────────────────
-  describe('P0-3: verdictIsHuman — an agent exercising its own gate:routines capability never authorizes a grant', () => {
-    it('a SIBLING AGENT (agent-2, gate:routines, no human_origin) approves -> no grant lands', async () => {
+  // ── P0-3 / P2-4: the verdict must be cast by a HUMAN ───────────────────────
+  describe('P0-3/P2-4: verdictIsHuman — an agent exercising its own gate:routines capability never authorizes a grant', () => {
+    it('P2-4 (round 2): a SIBLING AGENT (agent-2, gate:routines, no human_origin) is refused AT THE VERDICT WRITE — the task stays \'review\', still on /needs', async () => {
       fixture = await makeReadyRoutineFixture('propose')
       await seedMember(fixture, 'member-shadi')
       const home = await createHomeForMember(fixture.env, 'member-shadi')
@@ -227,31 +227,48 @@ describe('FP-01 Slice 2 v2 — project_access chain (successor to PR #1488)', ()
       await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal))
         .resolves.toMatchObject({ ok: true, status: 'waiting', reason: 'review' })
 
+      // P2-4: refused at the WRITE — the task never leaves 'review' for a
+      // non-human decider on a project_access-gating task at all.
       const verdictOutcome = await invokeTool(agent2Auth(), fixture.env, 'task_verdict', {
         task_id: 'control-task', verdict: 'approved', note: 'approved by a peer agent',
       })
-      expect(verdictOutcome.ok).toBe(true)
+      expect(verdictOutcome.ok).toBe(false)
+      expect(verdictOutcome.error).toBe('non_human_verdict_refused')
 
-      const verdictRow = row(fixture, "SELECT decided_by, decided_via FROM task_verdicts WHERE task_id = 'control-task'")
-      expect(verdictRow).toEqual({ decided_by: 'agent-2', decided_via: null })
-
-      const replayed = await submitRoutineProposal(fixture.env, fixture.principal, proposal)
-      expect(replayed).not.toMatchObject({ status: 'succeeded' })
+      // NOTHING was written: no verdict row at all, task still 'review' —
+      // an agent holding gate:routines cannot even consume the gate once,
+      // let alone repeatedly (the starvation shape P2-4 closes: consuming
+      // the gate into 'approved' with no grant ever able to land would have
+      // dropped the item off /needs permanently).
+      expect(row(fixture, "SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'control-task'")).toEqual({ n: 0 })
+      expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'review' })
       zeroGrantsAndReceipts(fixture)
     })
 
-    it('the SAME approved-by-agent verdict, replayed via executeRoutineAction directly, refuses with a receipt-less failure', async () => {
+    it('P0-3 DIRECT-STATE (defense-in-depth): a non-human verdict that somehow landed anyway (bypassing the write-time gate) still never authorizes a grant', async () => {
+      // Proves resolveProposalVerdict's own verdictIsHuman check (inside
+      // executeRoutineAction's project_access branch) is independently
+      // load-bearing — not merely redundant with P2-4's write-time gate —
+      // by seeding the exact row shape that gate exists to prevent
+      // directly, rather than routing through a write surface that (by
+      // design, after P2-4) would now refuse to produce it.
       fixture = await makeReadyRoutineFixture('propose')
       await seedMember(fixture, 'member-shadi')
       const home = await createHomeForMember(fixture.env, 'member-shadi')
       if (!home.ok) throw new Error('home not created')
-      fixture.harness.sqlite.exec(`
-        INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
-        VALUES ('agent2-gate-routines', 'gate:routines', 'agent', 'agent-2', 'test', datetime('now'));
-      `)
+
       const proposal = fixture.proposal(grantProposal())
       await submitRoutineProposal(fixture.env, fixture.principal, proposal)
-      await invokeTool(agent2Auth(), fixture.env, 'task_verdict', { task_id: 'control-task', verdict: 'approved' })
+      const actionRow = row(fixture, "SELECT id, created_at FROM routine_run_actions WHERE action_key = 'grant-1'") as
+        { id: string; created_at: string } | undefined
+      expect(actionRow?.id).toBeTruthy()
+
+      fixture.harness.sqlite.exec(`
+        UPDATE routine_run_actions SET gate_status = 'approved', status = 'pending' WHERE id = '${actionRow?.id}';
+        INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, proposal_id)
+        VALUES ('verdict-agent-decided', 'control-task', 'approved', 'peer agent', 'agent-2',
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL, '${actionRow?.id}');
+      `)
 
       const finished = await executeRoutineAction(fixture.env, 'run-1', 'grant-1')
       expect(finished).not.toMatchObject({ status: 'succeeded' })
@@ -392,6 +409,136 @@ describe('FP-01 Slice 2 v2 — project_access chain (successor to PR #1488)', ()
       // untouched) was NOT what got consulted.
       await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal))
         .resolves.toEqual({ ok: false, error: 'access_ceiling_exceeded' })
+    })
+  })
+
+  // ── P2-1: named mutation survivors (round 2, kasra-review adversarial gate) ─
+  describe('P2-1: mutation survivors M4 and M8', () => {
+    it('M4: a REJECTED verdict never grants — status stays rejected, zero grants, zero receipts', async () => {
+      fixture = await makeReadyRoutineFixture('propose')
+      await seedMember(fixture, 'member-shadi')
+      await seedMember(fixture, 'owner-1')
+      const home = await createHomeForMember(fixture.env, 'member-shadi')
+      if (!home.ok) throw new Error('home not created')
+
+      const proposal = fixture.proposal(grantProposal())
+      await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+      const rejection = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+        task_id: 'control-task', verdict: 'rejected', note: 'not this time',
+      })
+      expect(rejection.ok).toBe(true)
+
+      expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'rejected' })
+      const finished = await executeRoutineAction(fixture.env, 'run-1', 'grant-1')
+      expect(finished).not.toMatchObject({ status: 'succeeded' })
+      zeroGrantsAndReceipts(fixture)
+    })
+
+    it(
+      'M8: TWO waiting project_access actions on the SAME control task, a verdict bound to the OTHER proposal -> ' +
+      'this proposal gets NO grant (proves the `proposal_id = ?` conjunct is load-bearing, not merely "a verdict on this task")',
+      async () => {
+        fixture = await makeReadyRoutineFixture('propose')
+        await seedMember(fixture, 'member-shadi')
+        await seedMember(fixture, 'member-other')
+        const home = await createHomeForMember(fixture.env, 'member-shadi')
+        if (!home.ok) throw new Error('home not created')
+        const homeOther = await createHomeForMember(fixture.env, 'member-other')
+        if (!homeOther.ok) throw new Error('home not created')
+
+        // Action A: the REAL proposal, reserved through the normal flow —
+        // this is action.id we will (correctly) refuse to grant.
+        const proposalA = fixture.proposal(grantProposal({ member_id: 'member-shadi', reason: 'A' }))
+        await submitRoutineProposal(fixture.env, fixture.principal, proposalA)
+        const actionA = row(fixture, "SELECT id, created_at FROM routine_run_actions WHERE action_key = 'grant-1'") as
+          { id: string; created_at: string }
+
+        // Action B: a SECOND project_access action on the SAME control task —
+        // not reachable via the public API (reserveAction refuses a second
+        // live proposal per run), inserted directly to construct the exact
+        // multi-action shape the `proposal_id = ?` conjunct must distinguish.
+        const actionBId = 'action-b-id'
+        fixture.harness.sqlite.exec(`
+          INSERT INTO routine_run_actions (
+            id, tenant, project_id, run_id, action_key, kind, input_json,
+            validation_status, gate_status, status, source_type, source_id, created_at, updated_at
+          ) VALUES (
+            '${actionBId}', 'tenant-a', 'project-1', 'run-1', 'grant-B', 'project_access',
+            '${JSON.stringify({ member_id: 'member-other', project_id: 'project-1', access_level: 'write', reason: 'B' }).replaceAll("'", "''")}',
+            'accepted', 'pending', 'waiting', 'task', 'control-task', datetime('now'), datetime('now')
+          );
+        `)
+
+        // The verdict is bound to action B (proposal_id = actionBId) — a
+        // real human, freshly decided, genuinely approved.
+        await seedMember(fixture, 'owner-1')
+        fixture.harness.sqlite.exec(`
+          INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, proposal_id)
+          VALUES ('verdict-for-b', 'control-task', 'approved', 'approved B', 'owner-1',
+                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), '${actionBId}');
+        `)
+        // Also flip A's own gate_status to 'approved' the way the generic
+        // approvedGate flip would (task-level latest verdict is 'approved') —
+        // simulating the REAL state executeRoutineAction would reach for A.
+        fixture.harness.sqlite.exec(`
+          UPDATE routine_run_actions SET gate_status = 'approved', status = 'pending' WHERE id = '${actionA.id}'
+        `)
+
+        // Executing A must NOT grant — the verdict names B, not A.
+        const finishedA = await executeRoutineAction(fixture.env, 'run-1', 'grant-1')
+        expect(finishedA).not.toMatchObject({ status: 'succeeded' })
+        expect(row(fixture, `SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = '${home.squad.id}'`)).toEqual({ n: 0 })
+        expect(row(fixture, 'SELECT COUNT(*) AS n FROM project_access_grant_receipts')).toEqual({ n: 0 })
+      },
+    )
+  })
+
+  // ── P2-3: verdictIsHuman must check the decider's CURRENT liveness ────────
+  describe('P2-3: a decider suspended between verdict and replay no longer authorizes a grant', () => {
+    it('owner-1 casts a real approval, is then SUSPENDED, and the replay refuses (no grant)', async () => {
+      fixture = await makeReadyRoutineFixture('propose')
+      await seedMember(fixture, 'member-shadi')
+      await seedMember(fixture, 'owner-1')
+      const home = await createHomeForMember(fixture.env, 'member-shadi')
+      if (!home.ok) throw new Error('home not created')
+
+      const proposal = fixture.proposal(grantProposal())
+      await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+      const approved = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+        task_id: 'control-task', verdict: 'approved', note: 'approved for Shadi',
+      })
+      expect(approved.ok).toBe(true)
+
+      // The decider is suspended AFTER casting the verdict, BEFORE the
+      // routine ever replays — their standing to have decided anything is
+      // gone the instant they're suspended, exactly like the target
+      // member's own eligibility is re-checked at execute time.
+      fixture.harness.sqlite.exec("UPDATE members SET status = 'suspended' WHERE id = 'owner-1'")
+
+      const finished = await executeRoutineAction(fixture.env, 'run-1', 'grant-1')
+      expect(finished).not.toMatchObject({ status: 'succeeded' })
+      zeroGrantsAndReceipts(fixture)
+    })
+
+    it('a decider from a DIFFERENT tenant no longer authorizes a grant either', async () => {
+      fixture = await makeReadyRoutineFixture('propose')
+      await seedMember(fixture, 'member-shadi')
+      await seedMember(fixture, 'owner-1')
+      const home = await createHomeForMember(fixture.env, 'member-shadi')
+      if (!home.ok) throw new Error('home not created')
+
+      const proposal = fixture.proposal(grantProposal())
+      await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+      const approved = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+        task_id: 'control-task', verdict: 'approved',
+      })
+      expect(approved.ok).toBe(true)
+
+      fixture.harness.sqlite.exec("UPDATE members SET tenant = 'another-tenant' WHERE id = 'owner-1'")
+
+      const finished = await executeRoutineAction(fixture.env, 'run-1', 'grant-1')
+      expect(finished).not.toMatchObject({ status: 'succeeded' })
+      zeroGrantsAndReceipts(fixture)
     })
   })
 })

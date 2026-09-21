@@ -53,19 +53,21 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
     })
   })
 
-  it("'pending' for a bound member with no home yet — memberIntakeEnvelope now self-heals it (FP-01 Slice 2 v2, plugin v2 contract §2f(a) point 3)", async () => {
+  it("'pending' for a bound member with no home yet — memberIntakeEnvelope is READ-ONLY (FP-01 Slice 2 v2 round 2, P1-a) and never provisions one itself", async () => {
     fixture = await makeReadyRoutineFixture('propose')
     const member = await seedMember(fixture, 'member-shadi')
-    const result = await memberIntakeEnvelope(fixture.env, member)
-    // home_squad_id is no longer null here: this IS the member's first
-    // contact, so memberIntakeEnvelope provisions their home right away
-    // (createHomeForMember, under their own standing) rather than reporting
-    // an absent home a caller would have to separately provision.
-    expect(result.home_squad_id).toEqual(expect.any(String))
-    expect(result).toMatchObject({ bound: true, member_id: 'member-shadi', intake_state: 'pending' })
-    // Idempotent: a second call finds the SAME home, never a second one.
-    const second = await memberIntakeEnvelope(fixture.env, member)
-    expect(second.home_squad_id).toBe(result.home_squad_id)
+    // memberIntakeEnvelope no longer self-heals a missing home — that write
+    // moved to provisionHomeOnFirstContact, called ONLY from
+    // handleImMessage's 'join' case (see tests/im-webhook-idempotency.test.ts
+    // for that path). A bare read against a member who never joined via
+    // Telegram stays home_squad_id: null, and — critically — writes nothing
+    // (no home, no capability, no receipt row).
+    await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toEqual({
+      bound: true, member_id: 'member-shadi', home_squad_id: null, intake_state: 'pending',
+    })
+    expect(fixture.harness.sqlite.prepare(
+      'SELECT COUNT(*) AS n FROM member_home_provisioning_receipts',
+    ).get()).toEqual({ n: 0 })
   })
 
   it("'pending' for a bound member WITH a home but no project_access proposal yet", async () => {
@@ -78,23 +80,71 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
     })
   })
 
-  it("'complete' once a project_access proposal naming this member exists, regardless of its own verdict", async () => {
+  it(
+    "P2-6 (FP-01 Slice 2 v2 round 2, kasra-review adversarial gate on PR #1490): " +
+    "a project_access proposal ALONE — no human verdict yet — stays 'pending', " +
+    "never 'complete'; closes the cross-member DoS where naming a VICTIM in an " +
+    "undecided proposal used to permanently lock their intake_state",
+    async () => {
+      fixture = await makeReadyRoutineFixture('propose')
+      const member = await seedMember(fixture, 'member-shadi')
+      const home = await createHomeForMember(fixture.env, 'member-shadi')
+      if (!home.ok) throw new Error('home not created')
+
+      const proposal = fixture.proposal({
+        key: 'grant-1', kind: 'project_access',
+        input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'first thing I want done' },
+      })
+      await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal))
+        .resolves.toMatchObject({ ok: true, status: 'waiting', reason: 'review' })
+
+      // The proposal exists, but NO human has decided it — must stay 'pending'.
+      await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toEqual({
+        bound: true, member_id: 'member-shadi', home_squad_id: home.squad.id, intake_state: 'pending',
+      })
+    },
+  )
+
+  it("'complete' once a HUMAN VERDICT decides the proposal (approved) — not merely on the proposal existing", async () => {
     fixture = await makeReadyRoutineFixture('propose')
     const member = await seedMember(fixture, 'member-shadi')
     const home = await createHomeForMember(fixture.env, 'member-shadi')
     if (!home.ok) throw new Error('home not created')
+    await seedMember(fixture, 'owner-1') // P0-3: a real human decider
 
     const proposal = fixture.proposal({
       key: 'grant-1', kind: 'project_access',
       input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'first thing I want done' },
     })
-    await expect(submitRoutineProposal(fixture.env, fixture.principal, proposal))
-      .resolves.toMatchObject({ ok: true, status: 'waiting', reason: 'review' })
+    await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+    const verdictOutcome = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+      task_id: 'control-task', verdict: 'approved',
+    })
+    expect(verdictOutcome.ok).toBe(true)
 
-    // 'complete' fires on the PROPOSAL existing — before any human verdict at all.
     await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toEqual({
       bound: true, member_id: 'member-shadi', home_squad_id: home.squad.id, intake_state: 'complete',
     })
+  })
+
+  it("P2-6 CLOSED: a proposal naming a VICTIM who never contacted the bot stays 'pending' for them until a human actually decides it", async () => {
+    fixture = await makeReadyRoutineFixture('propose')
+    const victim = await seedMember(fixture, 'victim-member')
+    const home = await createHomeForMember(fixture.env, 'victim-member')
+    if (!home.ok) throw new Error('home not created')
+
+    // Mubot (or any proposer) names the victim in a proposal the victim
+    // never asked for and no human has seen yet.
+    const proposal = fixture.proposal({
+      key: 'grant-1', kind: 'project_access',
+      input: { member_id: 'victim-member', project_id: 'project-1', access_level: 'write', reason: 'proposed on their behalf' },
+    })
+    await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+
+    // The victim's OWN first-person intake must still read 'pending' — the
+    // plugin's §2f gate (only offer intake while 'pending') is not
+    // permanently defeated by someone else's undecided proposal about them.
+    await expect(memberIntakeEnvelope(fixture.env, victim)).resolves.toMatchObject({ intake_state: 'pending' })
   })
 
   it(
@@ -106,6 +156,7 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
       const home = await createHomeForMember(fixture.env, 'member-shadi')
       if (!home.ok) throw new Error('home not created')
 
+      await seedMember(fixture, 'owner-1') // P2-4: a real human decider (the verdict WRITE itself now requires one)
       const proposal = fixture.proposal({
         key: 'grant-1', kind: 'project_access',
         input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'onboarding' },
@@ -160,10 +211,11 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
     },
   )
 
-  it('does not mark ANOTHER member complete from a proposal naming someone else', async () => {
+  it('does not mark ANOTHER member complete from a proposal (and its verdict) naming someone else', async () => {
     fixture = await makeReadyRoutineFixture('propose')
     const member = await seedMember(fixture, 'member-shadi')
     await seedMember(fixture, 'member-other')
+    await seedMember(fixture, 'owner-1') // P0-3/P2-4: a real human decider
     const home = await createHomeForMember(fixture.env, 'member-shadi')
     if (!home.ok) throw new Error('home not created')
     await createHomeForMember(fixture.env, 'member-other')
@@ -173,6 +225,10 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
       input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'onboarding' },
     })
     await submitRoutineProposal(fixture.env, fixture.principal, proposal)
+    const verdictOutcome = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+      task_id: 'control-task', verdict: 'approved',
+    })
+    expect(verdictOutcome.ok).toBe(true)
 
     const other = await fixture.env.DB.prepare(
       `SELECT id, email, display_name, telegram_chat_id, status, created_at FROM members WHERE id = 'member-other'`,
@@ -180,4 +236,29 @@ describe('memberIntakeEnvelope (FP-01 Slice 2, mupot-plugin PR #17)', () => {
     await expect(memberIntakeEnvelope(fixture.env, other!)).resolves.toMatchObject({ intake_state: 'pending' })
     await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toMatchObject({ intake_state: 'complete' })
   })
+
+  it(
+    'TOLERATES ITS OWN MIGRATIONS NOT HAVING RUN YET: with task_verdicts.proposal_id (0159) missing, ' +
+    'memberIntakeEnvelope degrades to \'pending\' instead of throwing — runs on EVERY /im/webhook message',
+    async () => {
+      fixture = await makeReadyRoutineFixture('propose')
+      const member = await seedMember(fixture, 'member-shadi')
+      const home = await createHomeForMember(fixture.env, 'member-shadi')
+      if (!home.ok) throw new Error('home not created')
+
+      // Simulate "0159 has not been applied yet" against the REAL,
+      // otherwise fully-migrated schema (applyAllMigrations already ran
+      // inside makeReadyRoutineFixture) — drop just the one new column the
+      // completion query's JOIN depends on.
+      fixture.harness.sqlite.exec(`
+        DROP INDEX IF EXISTS idx_task_verdicts_proposal;
+        DROP TRIGGER IF EXISTS task_verdicts_no_update;
+        ALTER TABLE task_verdicts DROP COLUMN proposal_id;
+      `)
+
+      await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toEqual({
+        bound: true, member_id: 'member-shadi', home_squad_id: home.squad.id, intake_state: 'pending',
+      })
+    },
+  )
 })

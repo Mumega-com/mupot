@@ -1701,7 +1701,7 @@ export async function executeRoutineAction(
       if (!verdict || verdict.verdict !== 'approved') {
         return classifyActionFailure(env, run, policy, action, 'verdict_not_found')
       }
-      if (!(await verdictIsHuman(env, verdict))) {
+      if (!(await verdictIsHuman(env, verdict, run.tenant))) {
         return classifyActionFailure(env, run, policy, action, 'rejected_non_human_verdict')
       }
       const homeSquad = await getMemberHomeSquad(env, typedAction.input.member_id)

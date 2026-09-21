@@ -38,7 +38,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability, canOnSquad as sharedCanOnSquad } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, NonHumanVerdictRefusedError } from '../tasks/service'
 import { evaluateVerdictGates } from '../tasks/index'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
@@ -343,6 +343,17 @@ export async function handleImMessage(
     // is a weak enumeration oracle over a secret pairing code. The distinguishing detail
     // (`result.error`) stays in this function's return value / caller-side receipts and
     // observability — never in the text that reaches the requester.
+    // HOME CREATION ON FIRST CONTACT (mupot-plugin PR #19 v2 contract,
+    // §2f(a) point 3; scoped down in FP-01 Slice 2 v2 round 2, P1-a): a
+    // successful invite redemption is the ONE unambiguous first-contact
+    // event this webhook can observe — provisioning happens HERE, exactly
+    // once per redemption, never on any later or unrelated message (see
+    // memberIntakeEnvelope's own doc comment for why it moved out of the
+    // per-message read path). Members bound through a different channel
+    // (e.g. the /account web Connect Telegram flow) are not provisioned by
+    // this call site — a known, narrower scope than "any first message",
+    // tracked as a follow-up rather than solved here.
+    if (result.ok) await provisionHomeOnFirstContact(env, result.value.member_id)
     return result.ok ? joinedReply(result.value.project_id) : 'Could not join. Ask an admin for a new invitation.'
   }
 
@@ -389,6 +400,31 @@ export async function handleImMessage(
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
   }
+}
+
+// provisionHomeOnFirstContact — FP-01 Slice 2 v2 round 2 (P1-a): the ONE
+// write path for a bound member's home-squad provisioning over IM. Called
+// EXACTLY once, from handleImMessage's 'join' case, right after a Telegram
+// project-invite redemption succeeds — never from the per-message
+// read-only envelope (memberIntakeEnvelope). Idempotent: an existing home
+// is a pure read, no write attempted, no receipt written. On an actual
+// provisioning attempt, a receipt (migrations/0161,
+// member_home_provisioning_receipts) is written ONLY on success
+// (created/existing) — a FAILED attempt writes nothing, so a transient
+// failure can never accumulate unbounded rows in an append-only table; the
+// next successful join (if the member ever retries) is what gets audited.
+async function provisionHomeOnFirstContact(env: Env, memberId: string): Promise<void> {
+  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
+  const home = await getMemberHomeSquad(env, memberId)
+  if (home) return // idempotent: already has one — no write, no receipt.
+  const created = await createHomeForMember(env, memberId)
+  if (!created.ok) return // failed provisioning — no receipt row.
+  try {
+    await env.DB.prepare(
+      `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+       VALUES (?, ?, ?, ?, 'telegram', ?)`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, created.disposition).run()
+  } catch { /* best-effort audit write; never blocks the join reply */ }
 }
 
 function joinedReply(projectId: string): string {
@@ -705,6 +741,9 @@ async function verdictReply(
     if (err instanceof TaskEvidenceFenceError) {
       return `"${task.title}"'s squad no longer has write access to its project — the verdict was not recorded.`
     }
+    if (err instanceof NonHumanVerdictRefusedError) {
+      return `"${task.title}" gates a member's project access request and needs your decision — the verdict was not recorded.`
+    }
     throw err
   }
 
@@ -949,6 +988,18 @@ imApp.post('/resolve-project', async (c) => {
   if (!chatId) return c.json({ error: 'no_chat_id' }, 400)
   const userId = telegramId(body.message?.from?.id)
   if (!userId) return c.json({ error: 'no_user_id' }, 400)
+  // P1-b (FP-01 Slice 2 v2 round 2): update_id is REQUIRED and RESERVED —
+  // the SAME reserveTelegramUpdate/completeTelegramUpdate helper /webhook
+  // itself uses (src/im/telegram-receipts.ts), not a hand-rolled copy. Prior
+  // to this fix, this route had no update_id requirement and no
+  // telegram_webhook_receipts row at all — replayable without limit, and an
+  // oracle over telegram-id -> member -> readable-project-set for anyone
+  // holding the shared secret. Reserving turns a replay of the identical
+  // (update_id, identity, query) into the STORED prior response rather than
+  // a second execution, exactly like every other webhook call this file
+  // makes idempotent.
+  const updateId = telegramId(body.update_id, true)
+  if (!updateId) return c.json({ error: 'no_update_id' }, 400)
   // Identity fence — the SAME two conjuncts /webhook enforces (private_chat
   // + userId === chatId). A `chat_id`/`member_id` anywhere else in the body
   // is never consulted, so it can never stand in for these.
@@ -959,11 +1010,38 @@ imApp.post('/resolve-project', async (c) => {
   if (!query.trim()) return c.json({ error: 'invalid_query' }, 400)
   const limit = typeof body.limit === 'number' && Number.isFinite(body.limit) ? body.limit : RESOLVE_PROJECT_MAX_CANDIDATES
 
-  const member = await memberForChat(c.env, chatId)
-  if (!member) return c.json({ bound: false, member_id: null, projects: [] })
+  // Namespaced update_id ('resolve-project:<id>') — telegram_webhook_receipts
+  // has ONE UNIQUE(tenant, update_id) keyspace shared with /webhook. The
+  // plugin may legitimately reuse the SAME Telegram update_id for both a
+  // /webhook call and a /resolve-project call over the SAME inbound update
+  // (one message, two purposes) — without a route-scoped prefix those two
+  // calls would collide on this route's very first request.
+  const scopedUpdateId = `resolve-project:${updateId}`
+  let digest: string
+  try {
+    digest = await canonicalJsonDigest({ update_id: updateId, telegram_user_id: userId, chat_id: chatId, query, limit })
+  } catch {
+    return c.json({ error: 'invalid_update' }, 400)
+  }
+  const identity: TelegramUpdateIdentity = { update_id: scopedUpdateId, telegram_user_id: userId, request_digest: digest }
+  const reservation = await reserveTelegramUpdate(c.env, identity)
+  if (!reservation.ok) return c.json({ error: reservation.error }, 409)
+  if (reservation.duplicate) {
+    try {
+      return c.json(JSON.parse(reservation.response_text))
+    } catch {
+      return c.json({ error: 'update_in_progress' }, 409)
+    }
+  }
 
-  const projects = await resolveMemberProjects(c.env, member.id, query, limit)
-  return c.json({ bound: true, member_id: member.id, projects })
+  const member = await memberForChat(c.env, chatId)
+  const response = member
+    ? { bound: true as const, member_id: member.id, projects: await resolveMemberProjects(c.env, member.id, query, limit) }
+    : { bound: false as const, member_id: null, projects: [] }
+
+  const stored = await completeTelegramUpdate(c.env, identity, JSON.stringify(response))
+  if (stored === null) return c.json({ error: 'update_in_progress' }, 409)
+  return c.json(JSON.parse(stored))
 })
 
 // Display names and usernames never identify a human or contribute authority.
@@ -1074,65 +1152,78 @@ export async function memberIntakeEnvelope(
   member: Member | null,
 ): Promise<{ bound: boolean; member_id: string | null; home_squad_id: string | null; intake_state: IntakeState }> {
   if (!member) return { bound: false, member_id: null, home_squad_id: null, intake_state: 'none' }
-  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
+  // READ-ONLY, genuinely (FP-01 Slice 2 v2 round 2, P1-a): this function is
+  // called at the END of EVERY /im/webhook request — including a bare
+  // status probe with no actionable intent at all — purely to compute the
+  // response envelope. It must never itself provision a home; that is
+  // provisionHomeOnFirstContact's job, called ONLY from handleImMessage's
+  // 'join' case (the one unambiguous first-contact event), never here. A
+  // prior version of this function called createHomeForMember whenever a
+  // bound member had no home, on EVERY message — under IM_WEBHOOK_SECRET
+  // alone (no rate limit, no idempotency beyond createHomeForMember's own),
+  // any secret holder replaying probes against a homeless member minted
+  // repeated 'failed'-disposition rows into the append-only
+  // member_home_provisioning_receipts table with no way to ever clean them
+  // up. Fixed by moving provisioning entirely out of this read path.
+  const { getMemberHomeSquad } = await import('../org/service')
   const home = await getMemberHomeSquad(env, member.id)
-  // HOME CREATION ON FIRST CONTACT (mupot-plugin PR #19 v2 contract, §2f(a)
-  // point 3): a bound member with no home yet gets one provisioned right
-  // here, under THEIR OWN standing — the envelope that produced `member`
-  // (memberForChat, chat_id -> member) already proves this call is on this
-  // exact member's behalf, so calling createHomeForMember(member.id) is
-  // member-self provisioning, never Mubot or an agent acting for them.
-  // createHomeForMember is idempotent (adopts an existing home+capability
-  // row rather than duplicating one), so this is safe to call on every
-  // message from a homeless bound member, not just a literal /start — the
-  // first one to land wins, every later one is a no-op read-through.
-  let homeId = home?.id ?? null
-  if (!homeId) {
-    const created = await createHomeForMember(env, member.id)
-    if (created.ok) homeId = created.squad.id
-    // AUDITED (Athena's design ruling): every provisioning attempt from
-    // this call site — success (created/existing) or failure — writes an
-    // append-only receipt (migrations/0161, member_home_provisioning_receipts;
-    // see that migration's header for why NO existing ledger fit). Best-
-    // effort: a receipt-write failure must never turn an otherwise-
-    // successful home creation into a user-visible error, so this never
-    // throws into the caller.
-    try {
-      await env.DB.prepare(
-        `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
-         VALUES (?, ?, ?, ?, 'telegram', ?)`,
-      ).bind(
-        crypto.randomUUID(), env.TENANT_SLUG, member.id,
-        created.ok ? created.squad.id : null,
-        created.ok ? created.disposition : 'failed',
-      ).run()
-    } catch { /* best-effort audit write; never blocks the reply */ }
-  }
-  // FP-01 Slice 2 v2 (successor to PR #1488, P2-8 + Athena's design ruling):
-  // 'complete' still means "a proposal OR a 'grant' receipt exists" — but
-  // now ALSO "AND no 're-intake authorized' row (migrations/0160,
-  // project_access_reintake_authorize MCP tool) postdates the LATER of
-  // those two." Compared via julianday(), not raw string comparison —
-  // routine_run_actions.created_at is `datetime('now')` ('YYYY-MM-DD
-  // HH:MM:SS') while project_access_grant_receipts.created_at is
-  // `strftime('%Y-%m-%dT%H:%M:%fZ','now')`-shaped; the two formats do NOT
+  const homeId = home?.id ?? null
+  // FP-01 Slice 2 v2 round 2 (P2-6, kasra-review adversarial gate on PR
+  // #1490): the PRIOR derivation flipped 'complete' the moment a
+  // project_access proposal merely EXISTED naming this member — BEFORE any
+  // human ever verdicted it. That is a cross-member DoS: ANY proposer
+  // (Mubot) can permanently lock a VICTIM's intake_state to 'complete' by
+  // naming them in a proposal they never asked for and no human has
+  // decided — the plugin only offers first-person intake while
+  // intake_state==='pending' (§2f), so this silently and permanently kills
+  // it for someone who never spoke to the bot.
+  //
+  // FIX: 'complete' now requires a DECIDED outcome — a task_verdicts row
+  // BOUND (via proposal_id, 0159) to a project_access proposal naming this
+  // member, OR a grant receipt. A REJECTED verdict still counts (Athena's
+  // "denied stays complete" ruling, PR #1488's own round-2 condition) —
+  // it IS a decision, just not a grant; only the UNDECIDED-proposal case is
+  // now excluded. Bound via proposal_id specifically (not "any verdict on
+  // the control task") so a stale/unrelated verdict elsewhere on the same
+  // control task can't manufacture a false 'complete' either.
+  //
+  // Compared via julianday(), not raw string comparison — routine_run_actions
+  // (and by extension a joined task_verdicts.decided_at) and
+  // project_access_grant_receipts.created_at are shaped differently
+  // ('YYYY-MM-DD HH:MM:SS' via `datetime('now')` vs 'YYYY-MM-DDTHH:MM:SS.SSSZ'
+  // via `strftime('%Y-%m-%dT%H:%M:%fZ','now')`) — the two formats do NOT
   // compare correctly as plain strings (the space/'T' separator alone would
-  // make every routine_run_actions timestamp sort before every
-  // project_access_grant_receipts one, regardless of actual time order) —
+  // make every datetime('now')-shaped timestamp sort before every
+  // strftime(...'%fZ'...)-shaped one, regardless of actual time order) —
   // julianday() parses both correctly.
-  const completion = await env.DB.prepare(
-    `SELECT
-        (SELECT MAX(julianday(created_at)) FROM routine_run_actions
-          WHERE tenant = ?1 AND kind = 'project_access'
-            AND json_extract(input_json, '$.member_id') = ?2) AS proposal_jd,
-        (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
-          WHERE tenant = ?1 AND member_id = ?2 AND kind = 'grant') AS grant_jd,
-        (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
-          WHERE tenant = ?1 AND member_id = ?2 AND kind = 'reintake_authorized') AS reintake_jd`,
-  ).bind(env.TENANT_SLUG, member.id).first<{ proposal_jd: number | null; grant_jd: number | null; reintake_jd: number | null }>()
-  const completionJd = Math.max(completion?.proposal_jd ?? -Infinity, completion?.grant_jd ?? -Infinity)
+  // TOLERATES ITS OWN MIGRATIONS NOT HAVING RUN YET (code and migrations
+  // here deploy as separate manual steps): this query references
+  // task_verdicts.proposal_id (0159) and
+  // project_access_grant_receipts.kind (0160) — both new. This function
+  // runs on EVERY /im/webhook message, so a deploy of this code ahead of
+  // either migration must degrade safely, never 500 the whole webhook.
+  // 'pending' is the conservative default (the same value a genuinely
+  // undecided member reads) — never fabricates 'complete'.
+  let completionJd = -Infinity
+  let reintakeJd: number | null = null
+  try {
+    const completion = await env.DB.prepare(
+      `SELECT
+          (SELECT MAX(julianday(tv.decided_at))
+             FROM routine_run_actions rra
+             JOIN task_verdicts tv ON tv.proposal_id = rra.id
+            WHERE rra.tenant = ?1 AND rra.kind = 'project_access'
+              AND json_extract(rra.input_json, '$.member_id') = ?2) AS decision_jd,
+          (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
+            WHERE tenant = ?1 AND member_id = ?2 AND kind = 'grant') AS grant_jd,
+          (SELECT MAX(julianday(created_at)) FROM project_access_grant_receipts
+            WHERE tenant = ?1 AND member_id = ?2 AND kind = 'reintake_authorized') AS reintake_jd`,
+    ).bind(env.TENANT_SLUG, member.id).first<{ decision_jd: number | null; grant_jd: number | null; reintake_jd: number | null }>()
+    completionJd = Math.max(completion?.decision_jd ?? -Infinity, completion?.grant_jd ?? -Infinity)
+    reintakeJd = completion?.reintake_jd ?? null
+  } catch { /* 0159/0160 not yet applied — degrade to the conservative 'pending' default below */ }
   const hasCompletion = Number.isFinite(completionJd)
-  const reintakeAfter = completion?.reintake_jd != null && completion.reintake_jd > completionJd
+  const reintakeAfter = reintakeJd != null && reintakeJd > completionJd
   const complete = hasCompletion && !reintakeAfter
   return {
     bound: true,

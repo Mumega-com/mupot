@@ -55,9 +55,18 @@ describe('POST /im/resolve-project', () => {
 
   // envelope() mirrors /webhook's own TelegramUpdate shape — the plugin v2
   // contract (mupot-plugin PR #19) sends this SAME shape to /resolve-project.
+  // update_id auto-increments per call (P1-b, FP-01 Slice 2 v2 round 2):
+  // update_id is now RESERVED (telegram_webhook_receipts, namespaced
+  // 'resolve-project:<id>') exactly like /webhook's own update_id — reusing
+  // a fixed literal across every call in a multi-call test would make every
+  // call AFTER the first a replay of the FIRST, silently returning its
+  // cached response instead of exercising a fresh request. Tests that need
+  // a SPECIFIC repeated update_id (the replay tests themselves) pass one
+  // explicitly via `overrides`.
+  let nextUpdateId = 1
   function envelope(userId: number, chatId: number, query: string, overrides: Record<string, unknown> = {}) {
     return {
-      update_id: 1,
+      update_id: nextUpdateId++,
       message: { from: { id: userId }, chat: { id: chatId, type: 'private' }, text: '' },
       query,
       ...overrides,
@@ -151,5 +160,64 @@ describe('POST /im/resolve-project', () => {
     // must refuse, never silently pick either id as "the" identity.
     const res = await post(envelope(123, 999, 'Psychonom'))
     expect(res.status).toBe(400)
+  })
+
+  // ── P1-b (FP-01 Slice 2 v2 round 2): update_id is REQUIRED and RESERVED ──
+  it('P1-b: missing update_id refuses with 400', async () => {
+    const body = envelope(123, 123, 'Psychonom') as Record<string, unknown>
+    delete body.update_id
+    const res = await post(body)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'no_update_id' })
+  })
+
+  it('P1-b: replaying the IDENTICAL request (same update_id, same everything) returns the SAME stored response, never a second execution', async () => {
+    const request = envelope(123, 123, 'Psychonom')
+    const first = await (await post(request)).json()
+    const second = await (await post(request)).json()
+    expect(second).toEqual(first)
+    // Exactly one reservation row for this update_id — a replay never mints a second.
+    expect(harness.sqlite.prepare(
+      "SELECT COUNT(*) AS n FROM telegram_webhook_receipts WHERE update_id = ?",
+    ).get(`resolve-project:${request.update_id}`)).toEqual({ n: 1 })
+  })
+
+  it('P1-b: reusing the SAME update_id with a DIFFERENT query is REFUSED (409 update_conflict), never silently re-processed', async () => {
+    const updateId = nextUpdateId++
+    const first = await (await post(envelope(123, 123, 'Psychonom', { update_id: updateId }))).json() as { projects: unknown[] }
+    expect(first.projects).toHaveLength(1)
+    // Same update_id, a DIFFERENT query — the digest no longer matches the
+    // reserved receipt's own digest, so reserveTelegramUpdate refuses this
+    // as 'update_conflict' rather than either replaying the first result OR
+    // actually running the second query — the exact unbounded-oracle class
+    // this fix closes: a caller cannot mint one update_id and vary the
+    // query underneath it to probe multiple things "for free".
+    const secondRes = await post(envelope(123, 123, 'zzz-nonexistent-query', { update_id: updateId }))
+    expect(secondRes.status).toBe(409)
+    expect(await secondRes.json()).toEqual({ error: 'update_conflict' })
+  })
+
+  it('P1-b: a DIFFERENT update_id for the SAME query is a genuinely fresh request, not a replay', async () => {
+    const a = await (await post(envelope(123, 123, 'Psychonom'))).json()
+    const b = await (await post(envelope(123, 123, 'Psychonom'))).json()
+    expect(a).toEqual(b) // same content, but...
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM telegram_webhook_receipts').get())
+      .toEqual({ n: 2 }) // ...two independent reservations, not one replayed.
+  })
+
+  it('P1-b: /resolve-project\'s reservation is namespaced separately from /webhook\'s own update_id space', async () => {
+    // The plugin may legitimately reuse the SAME Telegram update_id for both
+    // a /webhook call and a /resolve-project call over the same inbound
+    // update — they must not collide.
+    const shared = nextUpdateId++
+    const webhookRes = await app.fetch(new Request('https://pot.test/im/webhook', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Telegram-Bot-Api-Secret-Token': SECRET },
+      body: JSON.stringify({ update_id: shared, message: { chat: { id: 123, type: 'private' }, from: { id: 123 }, text: '/help' } }),
+    }), env)
+    expect(webhookRes.status).toBe(200)
+    const resolveRes = await post(envelope(123, 123, 'Psychonom', { update_id: shared }))
+    expect(resolveRes.status).toBe(200)
+    const body = await resolveRes.json() as { projects: unknown[] }
+    expect(body.projects).toHaveLength(1)
   })
 })

@@ -52,6 +52,16 @@ function orgAdminAuth(): AuthContext {
   }
 }
 
+// A real, active member with squad-1 member+ — task_verdict's base guard
+// (memberCanOnSquad) needs a real grant, and P0-3/P2-4 (successor round 2)
+// require decided_by to resolve to a real, active members row.
+function ownerAuth(): AuthContext {
+  return {
+    userId: 'owner-1', email: 'owner@example.com', role: 'owner', tenant: 'tenant-a', memberId: 'owner-1',
+    capabilities: [{ member_id: 'owner-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }],
+  }
+}
+
 describe('FP-01 Slice 2 v2 — P1-6 (IM /needs shows the decision) and P2-8 (re-intake)', () => {
   let fixture: ReadyRoutineFixture | undefined
   afterEach(() => {
@@ -96,10 +106,16 @@ describe('FP-01 Slice 2 v2 — P1-6 (IM /needs shows the decision) and P2-8 (re-
     const home = await createHomeForMember(fixture.env, 'member-shadi')
     if (!home.ok) throw new Error('home not created')
 
+    await seedMember(fixture, 'owner-1') // P0-3/P2-4: a real human decider
     const proposal = fixture.proposal(grantProposal())
     await submitRoutineProposal(fixture.env, fixture.principal, proposal)
 
-    // 'complete' once the proposal exists (regardless of its verdict).
+    // P2-6 (round 2): 'complete' now requires an actual human VERDICT, not
+    // merely the proposal existing.
+    const verdictOutcome = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+      task_id: 'control-task', verdict: 'approved',
+    })
+    expect(verdictOutcome.ok).toBe(true)
     await expect(memberIntakeEnvelope(fixture.env, member)).resolves.toMatchObject({ intake_state: 'complete' })
 
     // A NON-admin, NON-gate-holder member is refused.

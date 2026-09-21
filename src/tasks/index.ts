@@ -25,7 +25,7 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, markVerdictReversed } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -827,12 +827,15 @@ tasksApp.patch('/:id', async (c) => {
   if (body.status !== undefined) {
     // PATCH may only set patchable statuses; approved|rejected require the verdict endpoint.
     if (!isPatchableStatus(body.status)) return c.json({ error: 'invalid_status' }, 400)
-    
-    const isVerdictReversal =
-      (existing.status === 'approved' || existing.status === 'rejected') &&
-      body.status === 'review'
 
-    if (isVerdictReversal) {
+    // FP-01 Slice 2 v2 round 2 (Athena's binding ruling): 'retry_completion'
+    // is the SAME reversal request as 'fresh', just observed after a prior
+    // attempt already closed the gate (reversed_at set) — a plain
+    // approved/rejected->review check alone cannot see that, and would
+    // otherwise refuse the retry as an ordinary review->review transition.
+    const reversalKind = await detectVerdictReversalRequest(c.env, existing, body.status)
+
+    if (reversalKind !== 'none') {
       // VERDICT REVERSAL PATH (P0 fix, mupot#1181)
       reversalReason =
         typeof body.reversal_reason === 'string'
@@ -1155,8 +1158,22 @@ tasksApp.patch('/:id', async (c) => {
 
   stampTaskUpdate(next, existing.status, new Date().toISOString())
 
+  const auth = c.get('auth')
   try {
-    await persistTaskUpdate(c.env, existing, next)
+    if (reversesVerdict) {
+      // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
+      // FIRST — see reverseTaskVerdict's own doc comment (src/tasks/service.ts).
+      const actorId = auth.memberId || auth.boundAgentId || 'unknown'
+      const actorType = auth.boundAgentId ? 'agent' : 'member'
+      const outcome = await reverseTaskVerdict(c.env, {
+        existing, next, tenant: c.env.TENANT_SLUG, reason: reversalReason, actorId, actorType,
+      })
+      if (!outcome.ok) return c.json({ error: outcome.error }, 409)
+      next.status = outcome.task.status
+      next.updated_at = outcome.task.updated_at
+    } else {
+      await persistTaskUpdate(c.env, existing, next)
+    }
   } catch (error) {
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
@@ -1171,43 +1188,12 @@ tasksApp.patch('/:id', async (c) => {
     statusChanged: existing.status !== next.status,
   })
 
-  {
-    const auth = c.get('auth')
-    await emitTaskEvent(
-      c.env,
-      'task.updated',
-      next,
-      auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
-    )
-
-    if (reversesVerdict) {
-      const actorId = auth.memberId || auth.boundAgentId || 'unknown'
-      const actorType = auth.boundAgentId ? 'agent' : 'member'
-      const reversedAt = new Date().toISOString()
-      await c.env.DB.prepare(
-        `INSERT INTO verdict_reversals
-           (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
-            actor_id, actor_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7, ?8, ?9)`,
-      )
-        .bind(
-          crypto.randomUUID(),
-          c.env.TENANT_SLUG,
-          next.id,
-          next.squad_id,
-          existing.status,
-          existing.status,
-          reversalReason,
-          actorId,
-          actorType,
-        )
-        .run()
-      // FP-01 Slice 2 v2: mark the ORIGINAL verdict row reversed so a
-      // proposal-bound reader (executeRoutineAction's grant check) stops
-      // treating it as the still-live 'latest approved' decision.
-      await markVerdictReversed(c.env, next.id, reversedAt)
-    }
-  }
+  await emitTaskEvent(
+    c.env,
+    'task.updated',
+    next,
+    auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
+  )
 
   return c.json({ task: next })
 })
@@ -1656,6 +1642,13 @@ tasksApp.post('/:id/verdict', async (c) => {
       // #399: the task's owning squad no longer holds write/admin on its project —
       // fence the verdict rather than let it land in the project's evidence feed.
       return c.json({ error: 'project_access_forbidden', need: 'project_write' }, 403)
+    }
+    if (err instanceof NonHumanVerdictRefusedError) {
+      // P2-4: refused at the write — the task stays 'review', still on /needs.
+      return c.json({
+        error: 'non_human_verdict_refused',
+        detail: 'this task gates a project_access proposal and requires a human decider',
+      }, 409)
     }
     throw err // propagate unexpected errors (5xx)
   }

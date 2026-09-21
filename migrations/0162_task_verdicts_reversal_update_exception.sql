@@ -23,10 +23,20 @@
 --
 -- Replace the trigger with one that admits TWO allow-shapes:
 --   1. The 0069 historical one-time backfill (`OLD.project_id IS NULL`,
---      NEW.project_id changing) — kept verbatim; it is inert on any row
---      that already has a non-NULL project_id (i.e. every row created after
---      0069 ran), so keeping it costs nothing and preserves 0069's own
---      documented intent for anyone re-reading its history.
+--      NEW.project_id changing) — inert on any row that already has a
+--      non-NULL project_id (i.e. every row created after 0069 ran, which
+--      is every row in any system that has already applied 0069 — meaning
+--      every production row today, since 0069 is far below this build's
+--      migration head). NOT kept byte-for-byte verbatim from 0069, though:
+--      kasra-review adversarial round 2 (PR #1490, P2-7) found that 0069's
+--      original WHEN clause never pinned decided_via/origin_agent_id/
+--      proposal_id/reversed_at at all — meaning an UPDATE changing ONLY
+--      those four columns on a (today hypothetical) project_id-IS-NULL row
+--      would have slipped through shape 1 disguised as "the backfill".
+--      Pinned here for defense-in-depth even though the shape is already
+--      provably inert on every row this build's own migrations can ever
+--      produce (0159/0160 always populate a real project_id at INSERT
+--      time) — see tests/task-verdict-reversal.test.ts's dedicated proof.
 --   2. The reversal exception: `OLD.reversed_at IS NULL AND NEW.reversed_at
 --      IS NOT NULL`, with EVERY OTHER COLUMN — including the columns 0155
 --      added (decided_via, origin_agent_id) and 0159 added (proposal_id) —
@@ -40,8 +50,8 @@ DROP TRIGGER IF EXISTS task_verdicts_no_update;
 CREATE TRIGGER task_verdicts_no_update
 BEFORE UPDATE ON task_verdicts
 WHEN NOT (
-  -- Shape 1: 0069's historical one-time project_id backfill (inert on
-  -- every row created after that migration ran; kept verbatim).
+  -- Shape 1: 0069's historical one-time project_id backfill — now ALSO
+  -- pinning decided_via/origin_agent_id/proposal_id/reversed_at (P2-7).
   (
     OLD.project_id IS NULL
     AND NEW.project_id IS (SELECT project_id FROM tasks WHERE id = OLD.task_id)
@@ -51,6 +61,10 @@ WHEN NOT (
     AND NEW.note IS OLD.note
     AND NEW.decided_by IS OLD.decided_by
     AND NEW.decided_at IS OLD.decided_at
+    AND NEW.decided_via IS OLD.decided_via
+    AND NEW.origin_agent_id IS OLD.origin_agent_id
+    AND NEW.proposal_id IS OLD.proposal_id
+    AND NEW.reversed_at IS OLD.reversed_at
   )
   OR
   -- Shape 2: markVerdictReversed's ONE-TIME reversed_at stamp.

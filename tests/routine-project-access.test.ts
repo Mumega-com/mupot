@@ -138,6 +138,7 @@ describe('project_access routine proposal (FP-01 Slice 2, mupot#1443)', () => {
   it('rejection path: no grant lands, and the record says rejected', async () => {
     fixture = await makeReadyRoutineFixture('propose')
     await seedMember(fixture, 'member-shadi')
+    await seedMember(fixture, 'owner-1') // P2-4: the verdict WRITE itself now requires a real human decider
     const home = await createHomeForMember(fixture.env, 'member-shadi')
     if (!home.ok) throw new Error('home not created')
 
