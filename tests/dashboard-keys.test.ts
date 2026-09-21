@@ -190,12 +190,14 @@ describe('loadKeysView', () => {
 
 // ── 3. mintScopedKey ──────────────────────────────────────────────────────────
 //
-// DB call order (per mintScopedKey):
-//   1. .first() — member exists check
-//   2. .first() — squad/dept exists check (only for squad/department scope)
-//   3. .first() — existing capability read (rank-max upsert gate)
-//   4. .run()   — INSERT OR REPLACE capabilities (skipped if existing rank >=)
-//   5. .run()   — INSERT member_tokens
+// DB call order (per mintScopedKey), current shape:
+//   1. .first() — member-belongs-to-pot check
+//   2. .all()   — resolveCapabilities, for the target-rank ceiling (mupot#1453)
+//   3. .first() — targetLegacyRoleRank's members.email bridge (same ceiling)
+//   4. .first() — squad/dept exists check (only for squad/department scope)
+//   5. .first() — squad's department_id (inheritance check, squad scope only)
+//   6. .all()   — resolveCapabilities again, for the S1 attest/"already holds" check
+//   7. .run()   — INSERT member_tokens
 //
 // minterRank values used in tests:
 //   owner=5, admin=4, lead=3, member=2, observer=1
@@ -203,13 +205,84 @@ describe('loadKeysView', () => {
 //   owner minting admin(admin,4):      minterRank=5, presetRank=4 → 4<5 → OK
 //   admin minting admin(admin,4):      minterRank=4, presetRank=4 → 4>=4 → rank_ceiling
 //   admin minting observer(observer,1):minterRank=4, presetRank=1 → 1<4 → OK
+//
+// The mock below dispatches by SQL content, not by call ordinal — mupot#1453
+// added two new DB round trips (the target-rank ceiling) between the member
+// check and the scope-validation checks, so an ordinal-indexed mock would
+// silently feed every later call the wrong fixture. Keyed dispatch makes the
+// mock immune to future reordering of the same kind.
+
+interface MintEnvOptions {
+  member?: Record<string, unknown> | null
+  squad?: Record<string, unknown> | null
+  department?: Record<string, unknown> | null
+  squadDepartmentId?: Record<string, unknown> | null
+  /** resolveCapabilities' result for the target member — reused for BOTH the
+   *  target-rank ceiling (mupot#1453) and the S1 attest check, since both
+   *  call sites resolve capabilities for the SAME target memberId. */
+  grants?: Record<string, unknown>[]
+  /** targetLegacyRoleRank's members.email bridge lookup. Default (undefined)
+   *  = no matching row = legacy-role rank 0 (the common, safe case). */
+  memberEmail?: Record<string, unknown> | null
+  /** targetLegacyRoleRank's users.role lookup (only reached when memberEmail
+   *  resolves to a non-null email). */
+  userRole?: Record<string, unknown> | null
+  runChanges?: number
+}
+
+function makeMintEnv(opts: MintEnvOptions = {}): { env: Env; calls: CallRecord[] } {
+  const calls: CallRecord[] = []
+  const env = {
+    TENANT_SLUG: 'test-tenant',
+    DB: {
+      prepare(sql: string) {
+        const call: CallRecord = { sql, binds: [] }
+        calls.push(call)
+        const stmt = {
+          bind(...args: unknown[]) { call.binds = args; return stmt },
+          async all() {
+            // The only .all() query mintScopedKey's call graph issues is
+            // resolveCapabilities (capabilities UNION ALL
+            // channel_capability_grants) — always for the SAME target
+            // memberId, whether it's serving the ceiling check or the S1
+            // attest check.
+            return { results: opts.grants ?? [] }
+          },
+          async first() {
+            if (sql.includes('FROM members') && sql.includes('lower(email)')) {
+              return opts.memberEmail ?? null // targetLegacyRoleRank: members bridge
+            }
+            if (sql.includes('FROM users')) {
+              return opts.userRole ?? null // targetLegacyRoleRank: users.role
+            }
+            if (sql.includes('FROM members')) {
+              return opts.member ?? null // member-belongs-to-pot check
+            }
+            if (sql.includes('FROM squads') && sql.includes('department_id')) {
+              return opts.squadDepartmentId ?? null // scopeDeptId inheritance lookup
+            }
+            if (sql.includes('FROM squads')) {
+              return opts.squad ?? null // squad-exists check
+            }
+            if (sql.includes('FROM departments')) {
+              return opts.department ?? null // department-exists check
+            }
+            return null
+          },
+          async run() {
+            return { meta: { changes: opts.runChanges ?? 1 } }
+          },
+        }
+        return stmt
+      },
+    },
+  } as unknown as Env
+  return { env, calls }
+}
 
 describe('mintScopedKey', () => {
   // ATTEST, never GRANT (S1): mint verifies the member already holds >= the preset
-  // capability and writes NOTHING to the principal. Call order for a squad preset:
-  //   member-exists (.first) → squad-exists (.first) → department_id lookup (.first)
-  //   → resolveCapabilities (.all) → mintMemberToken INSERT (.run).
-  // The mock indexes every result array by prepare-call ordinal.
+  // capability and writes NOTHING to the principal.
   const noStandingGrant = (calls: { sql: string }[]) => {
     expect(calls.some((c) => c.sql.includes('INTO capabilities'))).toBe(false)
     expect(calls.some((c) => c.sql.includes('INTO gate_grants'))).toBe(false)
@@ -217,15 +290,11 @@ describe('mintScopedKey', () => {
 
   // Happy path: sales-rep (squad scope), member already holds member@s1.
   it('returns ok:true + raw token for a valid sales-rep mint (member already holds the cap)', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [
-        { id: 'm1' },              // member exists
-        { id: 's1' },              // squad exists
-        { department_id: null },   // squad's department (for inheritance check)
-      ],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -244,9 +313,11 @@ describe('mintScopedKey', () => {
 
   // Refuses when the member lacks the preset capability — never elevates.
   it('returns member_lacks_capability when the member does not already hold the cap', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], []], // resolveCapabilities → no grants
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [], // resolveCapabilities → no grants
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -263,13 +334,10 @@ describe('mintScopedKey', () => {
   })
 
   // Happy path: admin preset (org scope), member already holds admin@org.
-  // Org call order: member-exists (.first) → resolveCapabilities (.all) → token (.run).
   it('mints org-scope admin preset when member holds admin@org (scope_id null)', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm2' }],
-      queryBatches: [[], [
-        { member_id: 'm2', scope_type: 'org', scope_id: null, capability: 'admin' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm2' },
+      grants: [{ member_id: 'm2', scope_type: 'org', scope_id: null, capability: 'admin' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm2',
@@ -283,11 +351,11 @@ describe('mintScopedKey', () => {
 
   // Happy path: observer preset (squad scope), member already holds observer@s2.
   it('mints observer preset when member holds observer@s2', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm3' }, { id: 's2' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm3', scope_type: 'squad', scope_id: 's2', capability: 'observer' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm3' },
+      squad: { id: 's2' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm3', scope_type: 'squad', scope_id: 's2', capability: 'observer' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm3',
@@ -301,7 +369,7 @@ describe('mintScopedKey', () => {
 
   // Guard: unknown preset (no DB calls, no minterRank needed)
   it('returns ok:false + unknown_preset for an unrecognised preset id', async () => {
-    const { env } = makeEnv()
+    const { env } = makeMintEnv()
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'hacker', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -310,9 +378,7 @@ describe('mintScopedKey', () => {
 
   // Guard: inactive / missing member
   it('returns ok:false + member_not_found when member row is null', async () => {
-    const { env } = makeEnv({
-      firstResults: [null], // member not found
-    })
+    const { env } = makeMintEnv({ member: null })
     const result = await mintScopedKey(env, { memberId: 'ghost', presetId: 'admin', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -321,9 +387,7 @@ describe('mintScopedKey', () => {
 
   // Guard: squad preset requires scope_id
   it('returns scope_id_required_for_squad_preset when scope_id is null for squad preset', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }],
-    })
+    const { env } = makeMintEnv({ member: { id: 'm1' } })
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: null, minterRank: 4 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -332,12 +396,7 @@ describe('mintScopedKey', () => {
 
   // Guard: tenant-scope — squad_id must exist in this pot's DB
   it('returns ok:false + squad_not_found when squad does not exist in this pot', async () => {
-    const { env } = makeEnv({
-      firstResults: [
-        { id: 'm1' },  // member found
-        null,          // squad NOT found — tenant-scope guard
-      ],
-    })
+    const { env } = makeMintEnv({ member: { id: 'm1' }, squad: null })
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'foreign-squad-uuid', minterRank: 4 })
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('expected failure')
@@ -346,11 +405,11 @@ describe('mintScopedKey', () => {
 
   // Show-once discipline: raw is on the result, not stored separately
   it('show-once: raw token is returned on result and is a mupot_ prefixed string', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' }],
     })
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 's1', minterRank: 4 })
     expect(result.ok).toBe(true)
@@ -362,11 +421,11 @@ describe('mintScopedKey', () => {
   // A member holding MORE than the preset (lead >= observer) still mints — and still
   // writes no standing grant (the token carries the member's own authority).
   it('mints (no principal write) when the member holds a HIGHER capability than the preset', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'lead' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'lead' }],
     })
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'observer', scopeId: 's1', minterRank: 4 })
     expect(result.ok).toBe(true)
@@ -378,11 +437,11 @@ describe('mintScopedKey', () => {
 
   // Token label encodes the preset id for the audit trail
   it('token label encodes preset id and scope_id for audit trail', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 'squad-abc' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 'squad-abc', capability: 'member' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 'squad-abc' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 'squad-abc', capability: 'member' }],
     })
     const result = await mintScopedKey(env, { memberId: 'm1', presetId: 'sales-rep', scopeId: 'squad-abc', minterRank: 4 })
     expect(result.ok).toBe(true)
@@ -393,11 +452,9 @@ describe('mintScopedKey', () => {
 
   // Org preset: label has no scope segment (null scope)
   it('label for org preset has no scope_id segment', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm2' }],
-      queryBatches: [[], [
-        { member_id: 'm2', scope_type: 'org', scope_id: null, capability: 'admin' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm2' },
+      grants: [{ member_id: 'm2', scope_type: 'org', scope_id: null, capability: 'admin' }],
     })
     const result = await mintScopedKey(env, { memberId: 'm2', presetId: 'admin', scopeId: null, minterRank: 5 })
     expect(result.ok).toBe(true)
@@ -405,12 +462,12 @@ describe('mintScopedKey', () => {
     expect(result.label).toBe('[preset:admin]')
   })
 
-  // ── NEW: rank-ceiling tests (the BLOCK fix) ──────────────────────────────────
+  // ── preset rank-ceiling tests (mupot#1330/#1337-era: preset must be < minterRank) ──
 
   // (1) admin minting admin preset → 403 (rank_ceiling: 4 >= 4)
   it('rank_ceiling: admin (rank 4) cannot mint admin preset (rank 4)', async () => {
-    const { env } = makeEnv()
-    // rank_ceiling fires before any DB access — no firstResults needed
+    const { env } = makeMintEnv()
+    // rank_ceiling fires before any DB access — no fixtures needed
     const result = await mintScopedKey(env, {
       memberId: 'm-admin',
       presetId: 'admin',
@@ -424,11 +481,9 @@ describe('mintScopedKey', () => {
 
   // (2) owner minting admin preset → OK (rank 4 < 5), member holds admin@org
   it('rank_ceiling: owner (rank 5) CAN mint admin preset (rank 4)', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }],
-      queryBatches: [[], [
-        { member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'admin' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      grants: [{ member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'admin' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -441,11 +496,11 @@ describe('mintScopedKey', () => {
 
   // (3) admin minting sales-rep (member, rank 2) → OK; admin minting observer (rank 1) → OK
   it('rank_ceiling: admin (rank 4) can mint sales-rep (member, rank 2)', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'member' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -457,11 +512,11 @@ describe('mintScopedKey', () => {
   })
 
   it('rank_ceiling: admin (rank 4) can mint observer preset (rank 1)', async () => {
-    const { env } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'observer' },
-      ]],
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'observer' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -475,11 +530,11 @@ describe('mintScopedKey', () => {
   // (4) attest-not-grant: preset needs MORE than the member holds → refuse, never upgrade.
   //     (Old behavior: mint silently upgraded observer→member. New: refuse.)
   it('attest: sales-rep (member) refused when member holds only observer@s1 — never upgrades', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'observer' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'observer' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -497,11 +552,11 @@ describe('mintScopedKey', () => {
 
   // (5) member holds MORE than the preset (lead >= observer) → mint OK, no principal write.
   it('attest: observer preset mints when member holds lead@s1, writing no standing grant', async () => {
-    const { env, calls } = makeEnv({
-      firstResults: [{ id: 'm1' }, { id: 's1' }, { department_id: null }],
-      queryBatches: [[], [], [], [
-        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'lead' },
-      ]],
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [{ member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'lead' }],
     })
     const result = await mintScopedKey(env, {
       memberId: 'm1',
@@ -513,6 +568,70 @@ describe('mintScopedKey', () => {
     if (!result.ok) throw new Error('expected ok')
     expect(calls.some((c) => c.sql.includes('INTO capabilities'))).toBe(false)
     expect(calls.some((c) => c.sql.includes('INTO gate_grants'))).toBe(false)
+  })
+
+  // ── mupot#1453: TARGET-rank ceiling (the member's REAL standing, not the preset) ──
+
+  it('target_rank_ceiling: admin (rank 4) refused minting for a member who globally holds owner (rank 5), even at a low preset', async () => {
+    const { env, calls } = makeMintEnv({
+      member: { id: 'm1' },
+      // The target's real standing is org→owner (rank 5) — on a DIFFERENT
+      // scope than the one being minted for. resolveCapabilities is global,
+      // so this must be caught even though the preset itself is 'observer'.
+      grants: [{ member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'observer',
+      scopeId: null,
+      minterRank: 4, // admin
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected failure')
+    expect(result.error).toBe('target_rank_ceiling')
+    // Refused before any scope validation or mint — no token minted.
+    expect(calls.some((c) => c.sql.includes('INTO member_tokens'))).toBe(false)
+    noStandingGrant(calls)
+  })
+
+  it('target_rank_ceiling: admin (rank 4) refused minting for a member whose ONLY standing is the legacy role plane (owner, rank 5)', async () => {
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      grants: [], // zero capability rows — bootstrap-owner shape
+      memberEmail: { email: 'owner@x.test' },
+      userRole: { role: 'owner' },
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'observer',
+      scopeId: null,
+      minterRank: 4,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected failure')
+    expect(result.error).toBe('target_rank_ceiling')
+  })
+
+  it('target_rank_ceiling: equal rank (target == minter) is NOT refused by this ceiling (strict >)', async () => {
+    // Target's global rank (admin, 4) equals the minter's rank (4) exactly.
+    // exceedsTargetRankCeiling's HTTP sibling uses a strict `>` — this must
+    // match, or an admin could never mint even a low preset for a peer admin.
+    const { env } = makeMintEnv({
+      member: { id: 'm1' },
+      squad: { id: 's1' },
+      squadDepartmentId: { department_id: null },
+      grants: [
+        { member_id: 'm1', scope_type: 'org', scope_id: null, capability: 'admin' },
+        { member_id: 'm1', scope_type: 'squad', scope_id: 's1', capability: 'admin' },
+      ],
+    })
+    const result = await mintScopedKey(env, {
+      memberId: 'm1',
+      presetId: 'sales-rep', // rank 2, < minterRank 4 — preset ceiling passes
+      scopeId: 's1',
+      minterRank: 4,
+    })
+    expect(result.ok).toBe(true)
   })
 })
 

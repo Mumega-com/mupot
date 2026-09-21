@@ -1899,6 +1899,8 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
     const view = await loadKeysView(c.env)
     const msg = result.error === 'rank_ceiling'
       ? 'You cannot mint a key at or above your own capability rank. An admin cannot mint another admin; only an owner can.'
+      : result.error === 'target_rank_ceiling'
+      ? 'This member already outranks you (on some scope, or the legacy role plane). You cannot mint a key for a member who outranks you.'
       : result.error === 'member_not_found'
       ? 'Member not found or inactive.'
       : result.error === 'squad_not_found'
@@ -1913,7 +1915,11 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       ? 'This member does not hold the capability this preset attests. Minting a key never elevates a member — grant the capability to the member first, then mint an attesting key.'
       : `Mint failed: ${result.error}`
     const statusCode =
-      result.error === 'rank_ceiling' || result.error === 'member_lacks_capability' ? 403 : 400
+      result.error === 'rank_ceiling' ||
+      result.error === 'target_rank_ceiling' ||
+      result.error === 'member_lacks_capability'
+        ? 403
+        : 400
     return c.html(
       shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
       statusCode,

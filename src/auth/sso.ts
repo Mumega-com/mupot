@@ -5,10 +5,27 @@ import { getJSON, setJSON } from '../dashboard/settings'
 import { createBus } from '../bus'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
 
+// mupot#1454: the ONLY roles a self-service SSO auto-enrollment may hand a
+// brand-new member. Deliberately excludes 'admin' (and every capability above
+// it) — auto-enrollment mints a capability row for an identity nobody has
+// vetted yet (the P0 header above documents these routes were unauthenticated
+// from #1231 to 2026-09-02), so the safe ceiling here is "never auto-grant
+// org authority", not a rank comparison against some other principal (there
+// is no pre-existing target to compare against — the member doesn't exist
+// yet). Single source of truth for both the config-write validator
+// (sso-routes.ts) and the enroll-time re-validation below, so the two can
+// never drift apart.
+export const SSO_ALLOWED_DEFAULT_ROLES = ['observer', 'member'] as const
+export type SsoDefaultRole = (typeof SSO_ALLOWED_DEFAULT_ROLES)[number]
+
+export function isAllowedSsoDefaultRole(value: unknown): value is SsoDefaultRole {
+  return (SSO_ALLOWED_DEFAULT_ROLES as readonly unknown[]).includes(value)
+}
+
 export interface SsoConfig {
   enabled: boolean
   allowed_domains: string[]
-  default_role: 'member' | 'admin'
+  default_role: SsoDefaultRole
   enforce_sso: boolean
   idp_provider: 'google' | 'saml' | 'generic'
 }
@@ -32,7 +49,10 @@ export interface AutoEnrollResult {
   ok: boolean
   memberId?: string
   email: string
-  role: 'member' | 'admin'
+  // 'admin' is only ever reported for an EXISTING member (their real,
+  // already-held capability — see the existing-member branch below); a NEW
+  // member's role is always the (validated) SsoDefaultRole from config.
+  role: 'member' | 'admin' | SsoDefaultRole
   isNew: boolean
   error?: string
 }
@@ -144,7 +164,23 @@ export async function autoEnrollSsoMember(
 
   // Provision new member
   const memberId = crypto.randomUUID()
-  const role = config.default_role || 'member'
+  // mupot#1454: config.default_role is whatever JSON `getJSON` handed back from
+  // org_settings — a runtime value, NOT guaranteed to satisfy the (now
+  // narrowed) compile-time SsoDefaultRole type. A config written before this
+  // fix (or edited directly in D1) can still carry 'admin' or anything else.
+  // Never trust the stored value to already be safe — re-check it against the
+  // exact same allowlist the config-write route now enforces, and clamp to
+  // the non-elevating default ('member') on any miss instead of minting the
+  // stored value's capability. Audited, no PII/secrets: tenant + the rejected
+  // value only.
+  const storedDefaultRole = config.default_role
+  const roleIsAllowed = isAllowedSsoDefaultRole(storedDefaultRole)
+  if (!roleIsAllowed) {
+    console.error(
+      `sso.autoEnrollSsoMember: stored default_role ${JSON.stringify(storedDefaultRole)} for tenant ${env.TENANT_SLUG} is not in the allowlist; clamped to 'member'`,
+    )
+  }
+  const role: SsoDefaultRole = roleIsAllowed ? storedDefaultRole : 'member'
   const nowIso = new Date().toISOString()
 
   await env.DB.batch([
