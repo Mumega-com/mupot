@@ -136,7 +136,7 @@ export interface SeedResult {
 
 export interface SeedFailure {
   ok: false
-  reason: 'db_error' | 'squad_required'
+  reason: 'db_error' | 'squad_required' | 'home_scope_not_grantable'
   detail: string
 }
 
@@ -179,6 +179,28 @@ export async function seedSquadMembers(
       detail: 'seedSquadMembers requires a squadId — no org-scope fallback for squad agents',
     }
   }
+
+  // Athena's §2e-9 sharpening (Round 2 on #1472): this module is currently
+  // dev/fixture-only — its ONLY callers are scripts/seed-squad.ts (a
+  // documentation/dry-run reference, explicitly "NOT deploy this as a
+  // Worker", never invoked automatically) and this file's own test. No
+  // route, MCP tool, or startup path calls it. That makes it unreachable
+  // against a live home squad today — but the belt-and-braces rule applied
+  // everywhere else in this PR (every writer of squad-scope capability
+  // refuses a home target, not just the ones currently reachable) applies
+  // here too, so a future caller that wires this seed into a real endpoint
+  // inherits the refusal for free rather than reintroducing the hole.
+  const squadRow = await env.DB.prepare('SELECT kind FROM squads WHERE id = ?1')
+    .bind(squadId)
+    .first<{ kind: string }>()
+  if (squadRow?.kind === 'home') {
+    return {
+      ok: false,
+      reason: 'home_scope_not_grantable',
+      detail: `squad ${squadId} is a home squad — seedSquadMembers never grants squad-scope capability into a home`,
+    }
+  }
+
   const defs = buildSquadDefs(squadId)
   const now = new Date().toISOString()
   const results: SeedResult['seeded'] = []

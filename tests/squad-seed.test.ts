@@ -74,7 +74,7 @@ interface AgentMsgRow {
  *  - SELECT from capabilities (for resolveCapabilities)
  *  - INSERT INTO / UPDATE / SELECT agent_messages (for round-trip test)
  */
-function makeDb() {
+function makeDb(squadKinds: Map<string, string> = new Map()) {
   const members: MemberRow[] = []
   const capabilities: CapabilityRow[] = []
   const messages: AgentMsgRow[] = []
@@ -181,6 +181,15 @@ function makeDb() {
           const m = members.find((x) => x.email === email)
           if (!m) return null
           return { id: m.id } as unknown as T
+        }
+
+        // Round-2 (Athena §2e-9): seedSquadMembers' home-squad guard —
+        // SELECT kind FROM squads WHERE id = ?1. Every squad id this file
+        // uses resolves as 'work' unless the test explicitly registered it
+        // as 'home' via the squadKinds map passed into makeDb().
+        if (/SELECT kind FROM squads WHERE id = \?1/i.test(s)) {
+          const [squadId] = binds as [string]
+          return { kind: squadKinds.get(squadId) ?? 'work' } as unknown as T
         }
 
         throw new Error(`squad-seed makeDb: unhandled first sql:\n${s}`)
@@ -415,6 +424,25 @@ describe('seedSquadMembers — Slice A', () => {
     if (result.ok) return
     expect(result.reason).toBe('squad_required')
     // Nothing written.
+    expect(db._members.length).toBe(0)
+    expect(db._capabilities.length).toBe(0)
+  })
+
+  // Athena's §2e-9 sharpening (Round 2 on #1472): squad-seed.ts is dev/
+  // fixture-only today (its only callers are scripts/seed-squad.ts, a
+  // documentation/dry-run reference never invoked automatically, and this
+  // test file — see the guard's own doc comment in src/members/squad-seed.ts)
+  // but it writes squad-scope `capabilities` rows the same way every other
+  // writer in this PR does, so it gets the same table-exhaustive refusal:
+  // never grant squad-scope capability into a home squad, reachable or not.
+  it('refuses a home-kind squad: home_scope_not_grantable, zero rows written', async () => {
+    const homeSquadId = 'sq-home-0001-0001-0001-000000000001'
+    const db = makeDb(new Map([[homeSquadId, 'home']]))
+    const env = makeEnv(db)
+    const result = await seedSquadMembers(env, homeSquadId)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.reason).toBe('home_scope_not_grantable')
     expect(db._members.length).toBe(0)
     expect(db._capabilities.length).toBe(0)
   })

@@ -482,14 +482,13 @@ export interface CreateHomeForMemberGrant {
 
 export type CreateHomeForMemberOk = {
   ok: true
-  // 'repaired': the home squad already existed (created via the OTHER
-  // home-provisioning function's own slug convention — see
-  // findHomeSquadByDepartment above) but THIS member's own capability row on
-  // it was missing, and this call wrote it. Point 6: only ever produced when
-  // the caller IS the member (see `actorMemberId` below) — never on behalf
-  // of someone else, and never as a side effect of a lookup that merely
-  // happened to notice the gap.
-  disposition: 'created' | 'existing' | 'repaired'
+  // Point 6 (Athena's round-2 ruling): 'repaired' was REMOVED. It would have
+  // written a capability row for an already-existing squad with no
+  // receipted ledger to record it on (see the doc comment inside the
+  // function, at the department-lookup branch, for the three ledgers
+  // checked and rejected) — rather than ship that write with no receipt,
+  // the repair path is closed. This disposition is now exactly two values.
+  disposition: 'created' | 'existing'
   squad: CreateHomeForMemberSquad
   grant: CreateHomeForMemberGrant
 }
@@ -503,40 +502,36 @@ export type CreateHomeForMemberResult =
 export async function createHomeForMember(
   env: Env,
   memberId: string,
-  // Point 6: the acting principal, so a 'repaired' write (the ONE case this
-  // function mutates an ALREADY-EXISTING squad it did not just create) can be
-  // gated to "the member repairing their own missing grant" and refused
-  // otherwise. Omitted (null) means "no actor known" — never treated as the
-  // member; a caller that cannot name its actor gets 'existing' + the gap
-  // left unrepaired, never a silent write on someone's behalf. This mirrors
-  // the file header's existing "no authz inside" doctrine: the CALLER must
-  // already have verified auth.memberId === memberId before this is 'created'
-  // repair-capable, same as it must for the create path.
-  actorMemberId: string | null = null,
 ): Promise<CreateHomeForMemberResult> {
-  // #2c-2: fail closed on an unknown member id — zero rows, before anything
-  // else runs. A members row is the ONLY door in (the #1438 invite path, or
-  // an admin create); Mubot never mints one.
+  // #2c-2 / mupot#1452 P1-1 (restored — adversarial round 1 on #1472 flagged
+  // this gate as LOST in the v2 port): fail closed on an unknown, foreign-
+  // tenant, or non-active member id — zero rows, before anything else runs.
+  // A members row is the ONLY door in (the #1438 invite path, or an admin
+  // create); Mubot never mints one. `tenant IS NULL` covers pre-tenant-
+  // column rows the same way this file's other member reads do — never
+  // widened to admit a DIFFERENT tenant's member.
   const member = await env.DB.prepare(
-    `SELECT id, display_name FROM members WHERE id = ?1 LIMIT 1`,
+    `SELECT id, display_name FROM members WHERE id = ?1 AND status = 'active' AND (tenant = ?2 OR tenant IS NULL) LIMIT 1`,
   )
-    .bind(memberId)
+    .bind(memberId, env.TENANT_SLUG)
     .first<{ id: string; display_name: string }>()
   if (!member) return { ok: false, error: 'member_not_found' }
 
   const squadSlug = `home-${memberId.slice(0, 8)}`
 
-  // ── idempotent (#2b), OWN-slug fast path ─────────────────────────────────
-  const existing = await findExistingHomeSquad(env, memberId, squadSlug)
-  if (existing) {
-    return {
-      ok: true,
-      disposition: 'existing',
-      squad: { id: existing.id, slug: existing.slug, name: existing.name, department_id: existing.department_id },
-      grant: { id: existing.capability_id, capability: existing.capability },
-    }
-  }
-
+  // Adversarial round 1 on G-FP1b (P2, Athena): this function used to check
+  // the SLUG-keyed findExistingHomeSquad BEFORE resolving the member's own
+  // department — even though that check is itself member-guarded
+  // (member_id in its WHERE clause), leading with a lookup keyed on an
+  // 8-CHAR PREFIX invited exactly the class of confusion (two member ids
+  // sharing a prefix; different callers reasoning about "which check ran
+  // first") that a full, unambiguous key should never have to share space
+  // with. The DEPARTMENT lookup below is keyed on the member's FULL id
+  // (dept-home-<full-memberId>, never truncated) and is now the ONLY path —
+  // slug is used nowhere in this function's OWN lookup logic any more
+  // (findExistingHomeSquad now exists solely as this function's own
+  // unique-constraint race-recovery helper, further down, which is
+  // additionally member-guarded there too).
   const deptResult = await resolveHomeDepartmentId(env, memberId, member.display_name)
   if (!deptResult.ok) {
     return { ok: false, error: 'provisioning_failed', detail: { stage: 'department', reason: deptResult.error } }
@@ -567,65 +562,21 @@ export async function createHomeForMember(
         grant: { id: grant.id, capability: grant.capability },
       }
     }
-    // The squad exists (minted by the OTHER function, or a prior partial
-    // attempt) but THIS member holds no capability row on it yet. Point 6:
-    // repair ONLY when the caller is provably the member themselves.
-    if (actorMemberId !== null && actorMemberId === memberId) {
-      const capabilityId = crypto.randomUUID()
-      try {
-        await env.DB.prepare(
-          `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-           VALUES (?1, ?2, 'squad', ?3, 'admin')`,
-        )
-          .bind(capabilityId, memberId, departmentSquad.id)
-          .run()
-      } catch (err) {
-        // Race: a concurrent call already repaired it. Adopt, don't fail.
-        if (isUniqueViolation(err)) {
-          const raced = await findMemberCapabilityOnSquad(env, memberId, departmentSquad.id)
-          if (raced) {
-            return {
-              ok: true,
-              disposition: 'repaired',
-              squad: {
-                id: departmentSquad.id,
-                slug: departmentSquad.slug,
-                name: departmentSquad.name,
-                department_id: departmentSquad.department_id,
-              },
-              grant: { id: raced.id, capability: raced.capability },
-            }
-          }
-        }
-        throw err
-      }
-      // NOTE — receipt (point 6 asked for one on the 0148 elevation ledger or
-      // the door_receipts shape, "pick the one that exists without a
-      // migration"): neither fits without a schema change. elevation_grants/
-      // elevation_usage_log (0148) require a live elevation_grant_id and
-      // agent_session_id (NOT NULL FKs) — there is no elevation and no agent
-      // session in this path, a member repairing their OWN home directly.
-      // door_receipts requires a real onboarding_doors.door_id (NOT NULL
-      // FK) — no door is open in this path either, and attributing the
-      // repair to one would be a false record, not a true one. This
-      // disposition is real, tested, and gated on actorMemberId === memberId
-      // as specified; the receipt row is the one part of point 6 this PR
-      // does NOT land — see the PR body's "not done" list.
-      return {
-        ok: true,
-        disposition: 'repaired',
-        squad: {
-          id: departmentSquad.id,
-          slug: departmentSquad.slug,
-          name: departmentSquad.name,
-          department_id: departmentSquad.department_id,
-        },
-        grant: { id: capabilityId, capability: 'admin' },
-      }
-    }
-    // Caller is not provably the member — never write on their behalf.
-    // Report the squad as it stands (existing), with the member's own
-    // capability absent; the caller can retry as the member to repair it.
+    // Athena's round-2 ruling on point 6 (2026-09-21): the 'repaired'
+    // disposition asked for a receipt on an existing ledger; NONE of the
+    // three checked (0148 elevation_grants/elevation_usage_log — NOT NULL
+    // elevation_grant_id/agent_session_id; door_receipts — NOT NULL
+    // onboarding_doors.door_id; membership_receipts — NOT NULL
+    // target_agent_id) fit a member-only, agent-less, door-less,
+    // session-less event without a schema change. Rather than ship a write
+    // path with no receipt ("both-pending"), the repair path is CLOSED: this
+    // function NEVER writes a capability row for an already-existing squad,
+    // regardless of who is calling. The squad exists (minted by the OTHER
+    // home-provisioning function, or a prior partial attempt) but this
+    // member holds no capability row on it — reported as 'existing' with no
+    // grant, always. Re-repair, if ever needed, happens only through the
+    // CREATE path's own idempotent adoption once a real receipted mechanism
+    // exists for it — not silently here.
     return {
       ok: true,
       disposition: 'existing',

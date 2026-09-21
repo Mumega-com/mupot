@@ -116,6 +116,57 @@ describe('createHomeForMember (D1, real migration chain)', () => {
     expect(after).toEqual(before)
   })
 
+  // ── (c2) tenant/status gate — restored (adversarial round 1 on #1472, P1:
+  // "tenant/status gate LOST in the port"). The v2 port's member lookup was a
+  // bare `SELECT id, display_name FROM members WHERE id=?1`, which would have
+  // provisioned a home squad for a SUSPENDED member, or for a member row
+  // belonging to a DIFFERENT tenant sharing this D1 instance. Both must fail
+  // closed exactly like an unknown id — zero rows written.
+  it('(c2) a suspended member fails closed: member_not_found, zero rows written', async () => {
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES (?1, ?2, NULL, ?3, 'suspended', datetime('now'))`,
+    )
+      .bind('member-suspended', TENANT, 'Suspended Member')
+      .run()
+
+    const before = { squads: await countRows('squads'), caps: await countRows('capabilities'), depts: await countRows('departments') }
+    const result = await createHomeForMember(env, 'member-suspended')
+    expect(result).toEqual({ ok: false, error: 'member_not_found' })
+
+    const after = { squads: await countRows('squads'), caps: await countRows('capabilities'), depts: await countRows('departments') }
+    expect(after).toEqual(before)
+  })
+
+  it('(c3) a member row belonging to a DIFFERENT tenant fails closed: member_not_found, zero rows written', async () => {
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES (?1, ?2, NULL, ?3, 'active', datetime('now'))`,
+    )
+      .bind('member-foreign-tenant', 'a-different-tenant', 'Foreign Tenant Member')
+      .run()
+
+    const before = { squads: await countRows('squads'), caps: await countRows('capabilities'), depts: await countRows('departments') }
+    const result = await createHomeForMember(env, 'member-foreign-tenant')
+    expect(result).toEqual({ ok: false, error: 'member_not_found' })
+
+    const after = { squads: await countRows('squads'), caps: await countRows('capabilities'), depts: await countRows('departments') }
+    expect(after).toEqual(before)
+  })
+
+  it('(c4) a member row with NULL tenant (pre-tenant-column row) is still admitted — not the same gate as a foreign tenant', async () => {
+    await env.DB.prepare(
+      `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+       VALUES (?1, NULL, NULL, ?2, 'active', datetime('now'))`,
+    )
+      .bind('member-null-tenant', 'Null Tenant Member')
+      .run()
+
+    const result = await createHomeForMember(env, 'member-null-tenant')
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.disposition).toBe('created')
+  })
+
   it('reuses the SAME home department bootstrapSelf would derive (dept-home-<memberId>), never inventing a second one', async () => {
     await seedMember('member-shadi', 'Shadi')
     // Simulate a prior bootstrapSelf run that already created the member's home
