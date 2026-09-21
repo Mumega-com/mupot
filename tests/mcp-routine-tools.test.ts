@@ -244,7 +244,7 @@ describe('routine MCP tools', () => {
     if (!schema) throw new Error('proposal schema missing')
     const action = schema.properties?.action
     expect(action).toMatchObject({ type: 'object', additionalProperties: false })
-    expect(action?.oneOf).toHaveLength(5)
+    expect(action?.oneOf).toHaveLength(6)
     const base = {
       version: 'routine.proposal/v1', run_id: 'run-1', project_id: 'project-1',
       situation_digest: 'a'.repeat(64), summary: 'A bounded proposal.',
@@ -256,6 +256,23 @@ describe('routine MCP tools', () => {
     expect(matchesSchema(schema, { ...base, action: { key: 'fraction', kind: 'dispatch_flight', input: { goal: 'Flight', task_ids: ['task-1'], artifact_refs: [], budget_micro_usd: 1.5 } } })).toBe(false)
     expect(matchesSchema(schema, { ...base, action: { key: 'extra', kind: 'no_action', input: { reason: 'No action.', actor_id: 'forged' } } })).toBe(false)
     expect(matchesSchema(schema, { ...base, action: { key: 'bad-time', kind: 'no_action', input: { reason: 'No action.', next_check_at: 'tomorrow' } } })).toBe(false)
+    // project_access (FP-01 Slice 2, mupot#1443) — schema/parser equivalence
+    // for the new kind, same discipline as every kind above it.
+    expect(matchesSchema(schema, {
+      ...base,
+      action: {
+        key: 'grant-1', kind: 'project_access',
+        input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'onboarding' },
+      },
+    })).toBe(true)
+    expect(matchesSchema(schema, {
+      ...base,
+      action: { key: 'grant-bad-level', kind: 'project_access', input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'owner', reason: 'onboarding' } },
+    })).toBe(false)
+    expect(matchesSchema(schema, {
+      ...base,
+      action: { key: 'grant-extra', kind: 'project_access', input: { member_id: 'member-shadi', project_id: 'project-1', access_level: 'write', reason: 'onboarding', squad_id: 'forged' } },
+    })).toBe(false)
   })
 
   it('uses the shared services for every routine command and returns safe REST-shaped records', async () => {

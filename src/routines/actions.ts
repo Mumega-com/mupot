@@ -18,6 +18,8 @@ import {
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
 import { projectVisibilityClause } from '../projects/access'
+import { executeProjectAccessGrant } from '../projects/service'
+import { getMemberHomeSquad } from '../org/service'
 import { principalCanReadProject, principalCanRunForSquad, type RoutinePrincipal } from './access'
 import {
   parseRoutineProposal,
@@ -41,6 +43,7 @@ type ProposalError =
   | 'stale_situation' | 'invalid_policy' | 'project_not_active' | 'assignee_ineligible'
   | 'reference_out_of_scope' | 'budget_exceeded' | 'action_key_conflict'
   | 'proposal_already_submitted' | 'receipt_failed'
+  | 'member_not_eligible' | 'access_ceiling_exceeded'
 
 type ActionError =
   | 'run_not_found' | 'action_not_found' | 'approval_required' | 'action_waiting'
@@ -598,6 +601,45 @@ async function validateActionScope(
       if (!await referenceReadable(env, run, policy, reference)) return 'reference_out_of_scope'
     }
   }
+  if (action.kind === 'project_access') {
+    return validateProjectAccessScope(env, run, policy, action)
+  }
+  return null
+}
+
+// project_access validation (FP-01 Slice 2, mupot#1443, brief §2 Task A).
+// Three conjuncts, all re-derived from the DATABASE at validate time — never
+// trusted from the proposal payload:
+//   1. member exists, is 'active', and is this tenant's own (or legacy
+//      tenant-less) row — the SAME predicate createHomeForMember uses
+//      (src/org/service.ts) so the two functions can never disagree about
+//      who is a real, live member.
+//   2. the proposal names THIS run's own project — a routine is scoped to
+//      one project (run.project_id); it may never propose access to a
+//      DIFFERENT project it was never dispatched against.
+//   3. access_level does not exceed the PROPOSING squad's OWN rank on the
+//      project (project_squad_access.access_level for policy.responsible_squad_id) —
+//      a squad can never propose handing out more than it itself holds.
+const PROJECT_ACCESS_RANK: Readonly<Record<'read' | 'write' | 'admin', number>> = { read: 1, write: 2, admin: 3 }
+
+async function validateProjectAccessScope(
+  env: Env,
+  run: RunContext,
+  policy: RoutinePolicySnapshot,
+  action: Extract<RoutineProposalAction, { kind: 'project_access' }>,
+): Promise<ProposalError | null> {
+  if (action.input.project_id !== run.project_id) return 'reference_out_of_scope'
+  const member = await env.DB.prepare(
+    `SELECT id FROM members WHERE id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL) LIMIT 1`,
+  ).bind(action.input.member_id, run.tenant).first()
+  if (!member) return 'member_not_eligible'
+  const squadAccess = await env.DB.prepare(
+    `SELECT access_level FROM project_squad_access WHERE project_id = ? AND squad_id = ?`,
+  ).bind(run.project_id, policy.responsible_squad_id).first<{ access_level: 'read' | 'write' | 'admin' }>()
+  if (!squadAccess) return 'reference_out_of_scope'
+  if (PROJECT_ACCESS_RANK[action.input.access_level] > PROJECT_ACCESS_RANK[squadAccess.access_level]) {
+    return 'access_ceiling_exceeded'
+  }
   return null
 }
 
@@ -857,6 +899,23 @@ async function approvedGate(env: Env, action: ActionRow): Promise<'approved' | '
     `SELECT verdict FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
   ).bind(action.source_id).first<{ verdict: 'approved' | 'rejected' }>()
   return verdict?.verdict ?? null
+}
+
+// latestTaskVerdict — FP-01 Slice 2 (mupot#1443): unlike approvedGate above
+// (which only reads WHILE gate_status is still 'pending', i.e. before this
+// module flips it to 'approved'), executeRoutineAction's project_access
+// branch runs AFTER that flip and needs the verdict's own id/decider to
+// stamp the grant receipt (proposal_id -> verdict_id -> grant receipt id).
+// Deliberately unconditional on gate_status so it can be called at that
+// later point.
+async function latestTaskVerdict(
+  env: Env,
+  taskId: string,
+): Promise<{ id: string; verdict: 'approved' | 'rejected'; decided_by: string; decided_via: string | null } | null> {
+  return env.DB.prepare(
+    `SELECT id, verdict, decided_by, decided_via FROM task_verdicts
+      WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
+  ).bind(taskId).first()
 }
 
 async function replayWaitingAction(
@@ -1518,6 +1577,43 @@ export async function executeRoutineAction(
       }
     } else if (typedAction.kind === 'ask_human') {
       return { ok: false, error: 'action_waiting' }
+    } else if (typedAction.kind === 'project_access') {
+      // Reached only after the gate-approved branch above (action.gate_status
+      // was 'pending', is now 'approved') — approvedGate already proved a
+      // task_verdicts row exists for run.task_id. Re-read it here (not
+      // reused from above — see latestTaskVerdict's doc comment) purely to
+      // get the verdict's OWN id/decider for the receipt; this is not a
+      // second authorization check.
+      const verdict = run.task_id ? await latestTaskVerdict(env, run.task_id) : null
+      if (!verdict || verdict.verdict !== 'approved') {
+        return classifyActionFailure(env, run, policy, action, 'verdict_not_found')
+      }
+      const homeSquad = await getMemberHomeSquad(env, typedAction.input.member_id)
+      if (!homeSquad) {
+        return classifyActionFailure(env, run, policy, action, 'member_home_not_found')
+      }
+      const grant = await executeProjectAccessGrant(env, {
+        projectId: typedAction.input.project_id,
+        squadId: homeSquad.id,
+        memberId: typedAction.input.member_id,
+        accessLevel: typedAction.input.access_level,
+        proposalId: action.id,
+        verdictId: verdict.id,
+        decidedBy: verdict.decided_by,
+        decidedVia: verdict.decided_via,
+      })
+      if (!grant.ok) {
+        return classifyActionFailure(env, run, policy, action, grant.error)
+      }
+      result = {
+        project_id: typedAction.input.project_id,
+        member_id: typedAction.input.member_id,
+        squad_id: homeSquad.id,
+        access_level: typedAction.input.access_level,
+        proposal_id: action.id,
+        verdict_id: verdict.id,
+        grant_receipt_id: grant.value.id,
+      }
     } else {
       result = { no_action: true, reason: typedAction.input.reason }
     }

@@ -14,12 +14,25 @@ export interface RoutineProposalReference {
   id: string
 }
 
+// project_access (FP-01 Slice 2, mupot#1443, brief §2/§2f): a proposal that a
+// MEMBER (never a project) be granted `access_level` on `project_id`. The
+// ONLY grant this action kind may ever produce lands on the PROPOSING
+// member's own HOME squad (src/org/service.ts's getMemberHomeSquad) —
+// never an arbitrary squad_id, so the payload deliberately carries
+// member_id, not squad_id. Execution (src/routines/actions.ts's
+// executeRoutineAction) never runs before a human verdict on the routine's
+// control task (routes through waitForHuman('review') like every other
+// kind under execution_mode='propose'), and writes a
+// project_access_grant_receipts row referencing that verdict's id —
+// proposal_id -> verdict_id -> grant receipt id, in that order, never
+// collapsed.
 export type RoutineProposalAction =
   | { key: string; kind: 'create_task'; input: { title: string; description: string; assignee_agent_id?: string } }
   | { key: string; kind: 'dispatch_flight'; input: { goal: string; task_ids: string[]; artifact_refs: string[]; budget_micro_usd: number } }
   | { key: string; kind: 'request_review'; input: { source_type: 'task' | 'flight' | 'artifact'; source_id: string; summary: string } }
   | { key: string; kind: 'ask_human'; input: { question: string; choices?: string[]; references: RoutineProposalReference[] } }
   | { key: string; kind: 'no_action'; input: { reason: string; next_check_at?: string } }
+  | { key: string; kind: 'project_access'; input: { member_id: string; project_id: string; access_level: 'read' | 'write' | 'admin'; reason: string } }
 
 export interface RoutineProposal {
   version: typeof ROUTINE_PROPOSAL_VERSION
@@ -35,11 +48,12 @@ export type ProposalParseResult =
   | { ok: false; error: 'invalid_envelope' | 'unknown_key' | 'invalid_action' | 'unsupported_action' | 'invalid_action_input' }
 
 const ACTION_KINDS = new Set<RoutineActionKind>([
-  'create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action',
+  'create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action', 'project_access',
 ])
 const ACTION_KEY = /^[A-Za-z0-9_.:-]{1,200}$/
 const DIGEST = /^[a-f0-9]{64}$/
 const SOURCE_TYPES = new Set(['task', 'flight', 'artifact'])
+const PROJECT_ACCESS_LEVELS = new Set(['read', 'write', 'admin'])
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -169,6 +183,27 @@ function parseAction(action: Record<string, unknown>): ProposalParseResult | Rou
         question: input.question,
         ...(input.choices === undefined ? {} : { choices: [...input.choices] }),
         references,
+      },
+    }
+  }
+
+  if (action.kind === 'project_access') {
+    if (!exactKeys(input, ['member_id', 'project_id', 'access_level', 'reason'])) return { ok: false, error: 'unknown_key' }
+    if (
+      !boundedRef(input.member_id)
+      || !boundedRef(input.project_id)
+      || typeof input.access_level !== 'string' || !PROJECT_ACCESS_LEVELS.has(input.access_level)
+      || !bounded(input.reason, 1, 2000)
+    ) {
+      return { ok: false, error: 'invalid_action_input' }
+    }
+    return {
+      key: action.key, kind: action.kind,
+      input: {
+        member_id: input.member_id,
+        project_id: input.project_id,
+        access_level: input.access_level as 'read' | 'write' | 'admin',
+        reason: input.reason,
       },
     }
   }

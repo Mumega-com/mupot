@@ -535,6 +535,109 @@ export async function upsertProjectSquadAccess(
   return { ok: true, value: access ?? { project_id: projectId, squad_id: squadId, access_level: accessLevel, granted_at: grantedAt } }
 }
 
+export interface ProjectAccessGrantReceipt {
+  id: string
+  project_id: string
+  squad_id: string
+  member_id: string
+  access_level: ProjectAccessLevel
+  proposal_id: string
+  verdict_id: string
+  decided_by: string
+  decided_via: string | null
+  created_at: string
+}
+
+export type ProjectAccessGrantError = ProjectMutationError | 'verdict_mismatch'
+
+// executeProjectAccessGrant — FP-01 Slice 2 (mupot#1443, brief §2 Task A): the
+// ONE place a `project_access` routine proposal's human verdict turns into a
+// standing grant. Called EXCLUSIVELY from src/routines/actions.ts's
+// executeRoutineAction, itself only reachable after approvedGate() has
+// confirmed a task_verdicts row exists for the control task — this function
+// never gates on that itself (same "caller gates before calling" doctrine as
+// createHomeForMember/createSquad in src/org/service.ts), it only WRITES.
+//
+// This is the narrow, server-internal exception the brief asked for: it
+// calls upsertProjectSquadAccess directly (the same function project_squad_set
+// calls), never the MCP tool's requireWorkspaceAdmin gate — project_squad_access
+// is DELIBERATELY UNGUARDED for a home-squad target (src/auth/capability.ts's
+// planeCoversScope table inventory says so explicitly: "FP-01 Slice 2's own
+// design uses this to give a member's home write access to a project;
+// blocking it would break the feature this flight exists to build"). No
+// change to project_squad_set's own authz — this function is a second,
+// narrower caller of the same underlying writer, reachable only through the
+// routine-proposal verdict path, never exposed as its own MCP tool.
+//
+// IDEMPOTENT on proposalId (UNIQUE(proposal_id) on project_access_grant_receipts,
+// migrations/0157): a retried execution (executeRoutineAction can be replayed —
+// see src/routines/actions.ts) re-runs the upsert (itself idempotent) and finds
+// the EXISTING receipt row rather than writing a second one or erroring.
+export async function executeProjectAccessGrant(
+  env: Env,
+  input: {
+    projectId: string
+    squadId: string
+    memberId: string
+    accessLevel: unknown
+    proposalId: string
+    verdictId: string
+    decidedBy: string
+    decidedVia: string | null
+  },
+): Promise<ProjectMutationResult<ProjectAccessGrantReceipt> | { ok: false; error: ProjectAccessGrantError }> {
+  const existingReceipt = await env.DB.prepare(
+    `SELECT id, project_id, squad_id, member_id, access_level, proposal_id, verdict_id, decided_by, decided_via, created_at
+       FROM project_access_grant_receipts WHERE proposal_id = ?`,
+  ).bind(input.proposalId).first<ProjectAccessGrantReceipt>()
+  if (existingReceipt) {
+    // A proposal id is immutable once decided — a replay with a DIFFERENT
+    // verdict id would mean two verdicts claim to authorize the same
+    // proposal, which the caller (executeRoutineAction) must never allow to
+    // reach here twice with different verdicts. Checked anyway: silent
+    // divergence between the receipt and a later mismatched replay is worse
+    // than a loud refusal.
+    if (existingReceipt.verdict_id !== input.verdictId) return { ok: false, error: 'verdict_mismatch' }
+    return { ok: true, value: existingReceipt }
+  }
+  if (!isProjectAccessLevel(input.accessLevel)) return { ok: false, error: 'invalid_access_level' }
+
+  const upserted = await upsertProjectSquadAccess(env, input.projectId, input.squadId, input.accessLevel)
+  if (!upserted.ok) return upserted
+
+  const id = crypto.randomUUID()
+  const now = new Date().toISOString()
+  try {
+    await env.DB.prepare(
+      `INSERT INTO project_access_grant_receipts (
+        id, tenant, project_id, squad_id, member_id, access_level,
+        proposal_id, verdict_id, decided_by, decided_via, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      id, env.TENANT_SLUG, input.projectId, input.squadId, input.memberId, input.accessLevel,
+      input.proposalId, input.verdictId, input.decidedBy, input.decidedVia, now,
+    ).run()
+  } catch {
+    // Race: a concurrent execution of the SAME proposal already inserted the
+    // receipt between our SELECT above and this INSERT — UNIQUE(proposal_id)
+    // refuses the second row. Adopt the one that won, rather than error.
+    const raced = await env.DB.prepare(
+      `SELECT id, project_id, squad_id, member_id, access_level, proposal_id, verdict_id, decided_by, decided_via, created_at
+         FROM project_access_grant_receipts WHERE proposal_id = ?`,
+    ).bind(input.proposalId).first<ProjectAccessGrantReceipt>()
+    if (raced) return { ok: true, value: raced }
+    return { ok: false, error: 'receipt_failed' }
+  }
+  return {
+    ok: true,
+    value: {
+      id, project_id: input.projectId, squad_id: input.squadId, member_id: input.memberId,
+      access_level: input.accessLevel, proposal_id: input.proposalId, verdict_id: input.verdictId,
+      decided_by: input.decidedBy, decided_via: input.decidedVia, created_at: now,
+    },
+  }
+}
+
 export async function removeProjectSquadAccess(
   env: Env,
   projectId: string,

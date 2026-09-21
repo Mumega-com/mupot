@@ -264,6 +264,33 @@ describe('authenticated Telegram receipts and human controls', () => {
     expect(receipt()).toEqual(stored)
   })
 
+  // mupot-plugin PR #17 contract (FP-01 Slice 2, mupot#1443): the webhook
+  // JSON reply carries `bound`/`member_id` as TYPED fields so the plugin's
+  // first-person skill never has to string-match `reply`'s prose to learn
+  // whether a chat is bound to a member.
+  it('reports bound:false, member_id:null for an unbound chat, and bound:true with the new member id in the SAME /start reply that redeems the invite', async () => {
+    const code = await invite()
+    const unboundResponse = await post(envelope('/help', 9))
+    expect(await unboundResponse.json()).toMatchObject({ bound: false, member_id: null })
+
+    const joinResponse = await post(envelope(`/start ${code}`))
+    const joinBody = await joinResponse.json() as { reply: string; bound: boolean; member_id: string | null }
+    expect(joinBody.bound).toBe(true)
+    expect(typeof joinBody.member_id).toBe('string')
+    const memberRow = harness.sqlite.prepare(
+      "SELECT id FROM members WHERE telegram_chat_id = '123' AND id != 'inviter-member'",
+    ).get() as { id: string }
+    expect(joinBody.member_id).toBe(memberRow.id)
+
+    // Once bound, every subsequent reply (not only /start) carries the same
+    // bound member id — a stable, typed fact the plugin can rely on.
+    const afterJoin = await (await post(envelope('/help', 11))).json() as { bound: boolean; member_id: string | null }
+    expect(afterJoin).toMatchObject({ bound: true, member_id: memberRow.id })
+
+    // Replay of the SAME /start update returns the identical stored fields.
+    expect(await (await post(envelope(`/start ${code}`))).json()).toEqual(joinBody)
+  })
+
   it('carries authenticated receipt identity into redemption and refuses another user without any writes', async () => {
     const code = await invite()
     await post(envelope(`/start ${code}`))

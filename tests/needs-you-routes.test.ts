@@ -32,7 +32,13 @@ function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): Sqli
   for (const file of readdirSync(MIGRATIONS_DIR).filter(file => file.endsWith('.sql')).sort()) {
     if (
       !includeRoutineMigrations
-      && (file.startsWith('0073_') || file.startsWith('0074_'))
+      // 0158 rebuilds routine_run_actions (FP-01 Slice 2, mupot#1443: widens
+      // its kind CHECK to admit 'project_access') and depends on 0073's table
+      // existing, so it belongs in the SAME "routine tables absent" exclusion
+      // group as 0073/0074, or this rolling-deploy simulation breaks with
+      // "no such table: routine_run_actions" instead of exercising the
+      // degrade-to-empty path this test is actually about.
+      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_'))
     ) {
       continue
     }
