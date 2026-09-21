@@ -232,6 +232,11 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
       // attested) verdict shape, unchanged from before those fields existed.
       null,
       null,
+      // proposal_id (0159, FP-01 Slice 2 v2): NULL — writeVerdict's
+      // auto-resolution (resolveVerdictProposalId) short-circuits on
+      // task.gate_owner !== 'gate:routines' WITHOUT touching the DB, and
+      // makeTask() below does not set gate_owner to 'gate:routines'.
+      null,
       // the landed-proof EXISTS params: task.id, newStatus, now
       task.id,
       'approved',

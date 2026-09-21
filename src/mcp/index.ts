@@ -88,6 +88,9 @@ import {
   writeVerdict,
   VerdictRaceError,
   TaskEvidenceFenceError,
+  NonHumanVerdictRefusedError,
+  detectVerdictReversalRequest,
+  reverseTaskVerdict,
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
@@ -1265,11 +1268,13 @@ const toolTaskUpdate: ToolSpec = {
             : undefined,
         })
       }
-      const isVerdictReversal =
-        (existing.status === 'approved' || existing.status === 'rejected') &&
-        args.status === 'review'
+      // FP-01 Slice 2 v2 round 2 (Athena's binding ruling): 'retry_completion'
+      // is the SAME reversal request as 'fresh', just observed after a prior
+      // attempt already closed the gate (reversed_at set) — see
+      // detectVerdictReversalRequest's doc comment (src/tasks/service.ts).
+      const reversalKind = await detectVerdictReversalRequest(env, existing, args.status)
 
-      if (isVerdictReversal) {
+      if (reversalKind !== 'none') {
         // VERDICT REVERSAL PATH (P0 fix, mupot#1181)
         // Org owner/admin only, mandatory reason, append-only receipt to verdict_reversals table.
         reversalReason =
@@ -1578,7 +1583,19 @@ const toolTaskUpdate: ToolSpec = {
 
     stampTaskUpdate(next, existing.status, new Date().toISOString())
     try {
-      await persistTaskUpdate(env, existing, next)
+      if (reversesVerdict) {
+        // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
+        // FIRST — see reverseTaskVerdict's own doc comment (src/tasks/service.ts).
+        const outcome = await reverseTaskVerdict(env, {
+          existing, next, tenant: env.TENANT_SLUG, reason: reversalReason,
+          actorId: auth.memberId as string, actorType: 'member',
+        })
+        if (!outcome.ok) return fail(409, outcome.error)
+        next.status = outcome.task.status
+        next.updated_at = outcome.task.updated_at
+      } else {
+        await persistTaskUpdate(env, existing, next)
+      }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
@@ -1643,29 +1660,9 @@ const toolTaskUpdate: ToolSpec = {
       next.gate_wake_notice = gateWake.notice
     }
 
-    // VERDICT REVERSAL RECEIPT.
-    //
-    // An org owner/admin may reverse an approved/rejected verdict back to review,
-    // but may never do so invisibly. The receipt is written to an append-only table.
-    if (reversesVerdict) {
-      await env.DB.prepare(
-        `INSERT INTO verdict_reversals
-           (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason,
-            actor_id, actor_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7, ?8, 'member')`,
-      )
-        .bind(
-          crypto.randomUUID(),
-          env.TENANT_SLUG,
-          next.id,
-          next.squad_id,
-          existing.status,
-          existing.status,
-          reversalReason,
-          auth.memberId as string,
-        )
-        .run()
-    }
+    // VERDICT REVERSAL: the audit receipt and the reversed_at stamp already
+    // landed atomically, in the gate-closing-first order, inside
+    // reverseTaskVerdict above — nothing left to do here.
 
     return done({ task: next, ...(gateWake ? { gate_wake: gateWake } : {}) })
   },
@@ -2083,6 +2080,13 @@ const toolTaskVerdict: ToolSpec = {
       if (err instanceof TaskEvidenceFenceError) {
         // #399: owning squad no longer holds write/admin on the task's project.
         return fail(403, 'forbidden', { need: 'project_write' })
+      }
+      if (err instanceof NonHumanVerdictRefusedError) {
+        // P2-4: the task stays 'review' — nothing was written — so it
+        // remains visible on /needs for a real human to decide.
+        return fail(409, 'non_human_verdict_refused', {
+          detail: 'this task gates a project_access proposal and requires a human decider (a member, or a harness-attested human_origin)',
+        })
       }
       throw err
     }

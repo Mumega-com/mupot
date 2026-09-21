@@ -15,9 +15,12 @@ import {
   persistTaskUpdate,
   stampTaskUpdate,
   TaskUpdateConflictError,
+  verdictIsHuman,
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
 import { projectVisibilityClause } from '../projects/access'
+import { executeProjectAccessGrant, projectAccessLevelRank } from '../projects/service'
+import { getMemberHomeSquad } from '../org/service'
 import { principalCanReadProject, principalCanRunForSquad, type RoutinePrincipal } from './access'
 import {
   parseRoutineProposal,
@@ -29,6 +32,7 @@ import {
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId } from './identity'
+import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
 const ROUTINE_GATE = 'gate:routines'
 const ROUTINE_ACTOR = 'mupot-routines'
@@ -41,6 +45,13 @@ type ProposalError =
   | 'stale_situation' | 'invalid_policy' | 'project_not_active' | 'assignee_ineligible'
   | 'reference_out_of_scope' | 'budget_exceeded' | 'action_key_conflict'
   | 'proposal_already_submitted' | 'receipt_failed'
+  | 'member_not_eligible' | 'access_ceiling_exceeded'
+  // execution_mode_forbidden_for_kind (FP-01 Slice 2 v2, P0-1): project_access
+  // may only ever be PROPOSED under policy.execution_mode='propose' — see
+  // submitRoutineProposal's typed refusal, which exists specifically so this
+  // privileged kind can never even be reserved under a policy that would
+  // otherwise let ordinary actions execute without a human in the loop.
+  | 'execution_mode_forbidden_for_kind'
 
 type ActionError =
   | 'run_not_found' | 'action_not_found' | 'approval_required' | 'action_waiting'
@@ -128,6 +139,10 @@ interface ActionRow {
   source_id: string | null
   receipt_id: string | null
   result_json: string | null
+  // created_at (FP-01 Slice 2 v2, P0-2): when THIS proposal was accepted —
+  // resolveProposalVerdict requires a bound verdict's decided_at to postdate
+  // it, closing the "approve now, propose later, replay" reservoir class.
+  created_at: string
 }
 
 function wrote(result: D1Result<unknown>): boolean {
@@ -260,7 +275,7 @@ async function loadAction(env: Env, runId: string, actionKey: string): Promise<A
   return env.DB.prepare(
     `SELECT id, tenant, project_id, run_id, action_key, kind, input_json,
             validation_status, gate_status, status, source_type, source_id,
-            receipt_id, result_json
+            receipt_id, result_json, created_at
        FROM routine_run_actions WHERE run_id = ? AND action_key = ? AND tenant = ?`,
   ).bind(runId, actionKey, env.TENANT_SLUG).first<ActionRow>()
 }
@@ -269,7 +284,7 @@ export async function loadHumanAction(env: Env, runId: string): Promise<ActionRo
   return env.DB.prepare(
     `SELECT id, tenant, project_id, run_id, action_key, kind, input_json,
             validation_status, gate_status, status, source_type, source_id,
-            receipt_id, result_json
+            receipt_id, result_json, created_at
        FROM routine_run_actions
       WHERE run_id = ? AND tenant = ? AND kind = 'ask_human'
       ORDER BY updated_at DESC, id DESC LIMIT 1`,
@@ -383,7 +398,16 @@ function humanWaitBody(
 // `notification_pending` field (so RoutineProposalResult/RoutineActionResult
 // and every MCP/route consumer of them are unchanged) and ALSO surface the
 // new `notification_reason` as a purely additive field.
-export type NotifyHumanWaitRefusalReason = 'no_recipient' | 'no_decision' | 'delivery_refused'
+// requires_human (FP-01 Slice 2 v2, successor to PR #1488, P1-6): the
+// PREVIOUS 'delivered: true' for a 'review' wait meant only that
+// run.assigned_agent_id — the agent that JUST SUBMITTED the proposal — got
+// an inbox ack that it is now waiting. No human was ever notified through
+// that send; agent inboxes are not a channel a human reads. This reason
+// names the honest outcome once notifyHumanWait resolves the REAL gate
+// owner and finds a human holds it (the expected case for gate:routines):
+// there is no agent-inbox channel to that principal at all, so the human
+// must find this item via /needs — never silently reported as delivered.
+export type NotifyHumanWaitRefusalReason = 'no_recipient' | 'no_decision' | 'delivery_refused' | 'requires_human'
 
 export type NotifyHumanWaitOutcome =
   | { delivered: true }
@@ -405,6 +429,46 @@ export async function notifyHumanWait(
           : null
       })()
   if (!decision) return { delivered: false, reason: 'no_decision' }
+
+  // FP-01 Slice 2 v2 (successor to PR #1488, P1-6): a 'review' wait means a
+  // TASK entered review under ROUTINE_GATE — the actual decision-maker is
+  // whoever holds that gate capability (resolveSoleGateOwnerAgent, the SAME
+  // resolution the MCP task_update wake path uses, src/mcp/index.ts's
+  // wakeGateOwnerOnReview), never run.assigned_agent_id (that is the agent
+  // that just SUBMITTED the proposal and is, by definition, the one now
+  // blocked waiting — sending it an inbox ack is not notifying a human).
+  // 'answer' waits are unchanged (ask_human has no gate_owner/task behind
+  // it in this run of the machinery; out of scope for this fix).
+  if (reason === 'review') {
+    const resolution = await resolveSoleGateOwnerAgent(env, ROUTINE_GATE)
+    if (resolution.status !== 'resolved') return { delivered: false, reason: 'no_recipient' }
+    if (resolution.principal.type === 'member') {
+      // The expected steady state: a human holds gate:routines. There is no
+      // agent-inbox channel to a member — the human finds this item via
+      // /needs. Reporting 'delivered' here would be a fabricated signal.
+      return { delivered: false, reason: 'requires_human' }
+    }
+    try {
+      const delivery = await sendAgentMessage(env, {
+        fromAgent: ROUTINE_ACTOR,
+        fromMember: ROUTINE_MEMBER,
+        toAgent: resolution.principal.id,
+        kind: 'ack',
+        requestId: await humanWaitRequestId(run.id, action.action_key),
+        projectId: run.project_id,
+        body: humanWaitBody(run, action, reason, decision),
+      }, {
+        system: true,
+        reason: 'human-wait target is the resolved live holder of the gate capability, not the submitting agent',
+      }, {
+        systemProjectAttribution: true,
+        requireActiveRecipientProjectAccess: true,
+      })
+      return delivery.ok ? { delivered: true } : { delivered: false, reason: 'delivery_refused' }
+    } catch {
+      return { delivered: false, reason: 'delivery_refused' }
+    }
+  }
 
   try {
     const delivery = await sendAgentMessage(env, {
@@ -597,6 +661,58 @@ async function validateActionScope(
     for (const reference of action.input.references) {
       if (!await referenceReadable(env, run, policy, reference)) return 'reference_out_of_scope'
     }
+  }
+  if (action.kind === 'project_access') {
+    return validateProjectAccessScope(env, run, action)
+  }
+  return null
+}
+
+// project_access validation (FP-01 Slice 2, mupot#1443, brief §2 Task A).
+// Three conjuncts, all re-derived from the DATABASE at validate time — never
+// trusted from the proposal payload:
+//   1. member exists, is 'active', and is this tenant's own (or legacy
+//      tenant-less) row — the SAME predicate createHomeForMember uses
+//      (src/org/service.ts) so the two functions can never disagree about
+//      who is a real, live member.
+//   2. the proposal names THIS run's own project — a routine is scoped to
+//      one project (run.project_id); it may never propose access to a
+//      DIFFERENT project it was never dispatched against.
+//   3. access_level does not exceed the PROPOSER's OWN rank on the project.
+//
+// FP-01 Slice 2 v2 (successor to PR #1488, adversarial P2-10): (a) the rank
+// comparison now uses projectAccessLevelRank (src/projects/service.ts) — the
+// existing PROJECT_ACCESS_LEVELS ordering, exposed as a shared export —
+// instead of a locally hand-rolled 3-level map (a "fifth copy" of this
+// ordering per the adversarial gate). (b) the ceiling is now the PROPOSING
+// AGENT's own structural squad (agents.squad_id for run.assigned_agent_id),
+// not policy.responsible_squad_id. Those two can differ: policy_json is
+// ROUTINE CONFIG (settable by whoever created/updated the routine), and
+// principalCanRunForSquad only requires the agent hold a member+ CAPABILITY
+// grant on responsible_squad_id — capability grants are cross-squad-
+// grantable, so an agent whose own home squad has thin project access could
+// otherwise borrow a highly-privileged responsible_squad_id's ceiling. Using
+// the agent's own agents.squad_id row pins the ceiling to something the
+// routine's config can't move.
+async function validateProjectAccessScope(
+  env: Env,
+  run: RunContext,
+  action: Extract<RoutineProposalAction, { kind: 'project_access' }>,
+): Promise<ProposalError | null> {
+  if (action.input.project_id !== run.project_id) return 'reference_out_of_scope'
+  const member = await env.DB.prepare(
+    `SELECT id FROM members WHERE id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL) LIMIT 1`,
+  ).bind(action.input.member_id, run.tenant).first()
+  if (!member) return 'member_not_eligible'
+  if (!run.assigned_agent_id) return 'reference_out_of_scope'
+  const proposerSquad = await env.DB.prepare(
+    `SELECT psa.access_level FROM agents a
+       JOIN project_squad_access psa ON psa.squad_id = a.squad_id
+      WHERE a.id = ? AND psa.project_id = ?`,
+  ).bind(run.assigned_agent_id, run.project_id).first<{ access_level: 'read' | 'write' | 'admin' }>()
+  if (!proposerSquad) return 'reference_out_of_scope'
+  if (projectAccessLevelRank(action.input.access_level) > projectAccessLevelRank(proposerSquad.access_level)) {
+    return 'access_ceiling_exceeded'
   }
   return null
 }
@@ -851,12 +967,62 @@ async function waitForHuman(
   }
 }
 
+// approvedGate flips a WAITING action's own gate_status/status generically,
+// for every routine action kind that can go through waitForHuman('review')
+// — create_task, dispatch_flight, request_review, ask_human, project_access
+// alike. It is intentionally left reading "the latest verdict on the
+// control task" (unbound to any one proposal) because that generic flip is
+// not, on its own, a privileged effect: a stale-verdict replay through THIS
+// function only ever gets an action into 'approved'/'pending' bookkeeping
+// state, never any downstream write. The privileged effect for
+// project_access — the actual project_squad_access grant — is authorized
+// separately, by resolveProposalVerdict below, which IS bound to this exact
+// proposal. See PR #1488's adversarial finding 2 (kasra-review 2026-09-21)
+// for the exploit this split closes without widening approvedGate's blast
+// radius onto the other four action kinds' existing, separately-tested
+// behavior.
 async function approvedGate(env: Env, action: ActionRow): Promise<'approved' | 'rejected' | null> {
   if (action.gate_status !== 'pending' || action.source_type !== 'task' || !action.source_id) return null
   const verdict = await env.DB.prepare(
     `SELECT verdict FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
   ).bind(action.source_id).first<{ verdict: 'approved' | 'rejected' }>()
   return verdict?.verdict ?? null
+}
+
+// resolveProposalVerdict — FP-01 Slice 2 v2 (successor to PR #1488, P0-2):
+// unlike approvedGate above, this IS the gate on the privileged effect
+// (the project_squad_access grant) and is bound to the SPECIFIC proposal
+// being executed, not merely "a verdict exists on the control task":
+//   1. proposal_id = action.id — the verdict must NAME this proposal
+//      (0159_task_verdict_proposal_binding.sql; stamped server-side at
+//      verdict-write time by resolveVerdictProposalId, never caller-
+//      supplied), closing the cross-proposal replay the adversarial gate
+//      demonstrated (approve an unrelated earlier proposal on the same
+//      long-lived control task, reopen it, submit a NEW proposal, replay).
+//   2. decided_at > action.created_at — Athena's design ruling, belt-and-
+//      suspenders alongside (1): the verdict must postdate the proposal it
+//      claims to decide.
+//   3. reversed_at IS NULL — a reversed approval (task_verdict_reverse,
+//      src/mcp/index.ts / src/tasks/index.ts) must never re-authorize a
+//      grant it no longer stands behind.
+// Returns null (never falls back to "no verdict = treat as absent-but-
+// harmless") on anything but a clean 'approved' or 'rejected' match — the
+// caller must treat null as "not yet decided for THIS proposal," exactly
+// like no verdict existing at all.
+async function resolveProposalVerdict(
+  env: Env,
+  action: ActionRow,
+): Promise<{ id: string; verdict: 'approved' | 'rejected'; decided_by: string; decided_via: 'agent_attested_origin' | null } | null> {
+  return env.DB.prepare(
+    `SELECT id, verdict, decided_by, decided_via FROM task_verdicts
+      WHERE proposal_id = ? AND decided_at > ? AND reversed_at IS NULL
+      ORDER BY decided_at DESC, id DESC LIMIT 1`,
+  ).bind(action.id, action.created_at)
+    // decided_via's DB-level CHECK constraint restricts it to NULL or
+    // 'agent_attested_origin' (migrations/0155) — the generic type param
+    // documents that constraint for callers (verdictIsHuman) rather than
+    // widening to `string | null` and forcing every caller to re-narrow.
+    .first<{ id: string; verdict: 'approved' | 'rejected'; decided_by: string; decided_via: 'agent_attested_origin' | null }>()
 }
 
 async function replayWaitingAction(
@@ -1518,6 +1684,52 @@ export async function executeRoutineAction(
       }
     } else if (typedAction.kind === 'ask_human') {
       return { ok: false, error: 'action_waiting' }
+    } else if (typedAction.kind === 'project_access') {
+      // Reached only after the gate-approved branch above generically
+      // flipped action.gate_status 'pending' -> 'approved' — that flip is
+      // NOT sufficient authorization for this privileged effect (see
+      // approvedGate's own doc comment above). resolveProposalVerdict is
+      // the REAL gate here: bound to THIS proposal (action.id), fresh
+      // (postdates action.created_at), and not reversed. P0-3: the verdict
+      // must also have been cast by a human — an agent's own gate:routines
+      // capability approving the control task is not "member builds, human
+      // gates" (see ADVERSARIAL PATTERN LIBRARY finding 3, kasra-review
+      // 2026-09-21, PR #1488). Both checks fail closed with a typed,
+      // receipt-less refusal — no project_access_grant_receipts row is ever
+      // written on either path.
+      const verdict = await resolveProposalVerdict(env, action)
+      if (!verdict || verdict.verdict !== 'approved') {
+        return classifyActionFailure(env, run, policy, action, 'verdict_not_found')
+      }
+      if (!(await verdictIsHuman(env, verdict, run.tenant))) {
+        return classifyActionFailure(env, run, policy, action, 'rejected_non_human_verdict')
+      }
+      const homeSquad = await getMemberHomeSquad(env, typedAction.input.member_id)
+      if (!homeSquad) {
+        return classifyActionFailure(env, run, policy, action, 'member_home_not_found')
+      }
+      const grant = await executeProjectAccessGrant(env, {
+        projectId: typedAction.input.project_id,
+        squadId: homeSquad.id,
+        memberId: typedAction.input.member_id,
+        accessLevel: typedAction.input.access_level,
+        proposalId: action.id,
+        verdictId: verdict.id,
+        decidedBy: verdict.decided_by,
+        decidedVia: verdict.decided_via,
+      })
+      if (!grant.ok) {
+        return classifyActionFailure(env, run, policy, action, grant.error)
+      }
+      result = {
+        project_id: typedAction.input.project_id,
+        member_id: typedAction.input.member_id,
+        squad_id: homeSquad.id,
+        access_level: typedAction.input.access_level,
+        proposal_id: action.id,
+        verdict_id: verdict.id,
+        grant_receipt_id: grant.value.id,
+      }
     } else {
       result = { no_action: true, reason: typedAction.input.reason }
     }
@@ -1541,6 +1753,61 @@ export async function getRoutinePendingQuestion(
   if (!policy || !await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) return null
   const action = await loadHumanAction(env, run.id)
   return action?.status === 'waiting' ? pendingQuestion(action) : null
+}
+
+export interface RoutineProjectAccessRequest {
+  member_id: string
+  member_name: string | null
+  project_id: string
+  project_name: string
+  access_level: 'read' | 'write' | 'admin'
+  reason: string
+}
+
+// getRoutineProjectAccessRequest — FP-01 Slice 2 v2 (successor to PR #1488,
+// P1-6): the human decision surface (IM /needs, src/im/index.ts's
+// needsReply) must show WHAT is being decided before /approve is possible.
+// Mirrors getRoutinePendingQuestion's shape/gating exactly (member-principal
+// only, principalCanReadProject-gated) but keyed on the CONTROL TASK id
+// (item.source_id for a 'task'-sourced /needs row), not a run id — a
+// project_access proposal surfaces on /needs as an ordinary gated task, so
+// the caller (needsReply) has the task id, not the run id, in hand.
+export async function getRoutineProjectAccessRequest(
+  env: Env,
+  principal: RoutinePrincipal,
+  taskId: string,
+): Promise<RoutineProjectAccessRequest | null> {
+  if (principal.actor_type !== 'member') return null
+  const runRow = await env.DB.prepare(
+    `SELECT id FROM routine_runs WHERE task_id = ? AND tenant = ? LIMIT 1`,
+  ).bind(taskId, env.TENANT_SLUG).first<{ id: string }>()
+  if (!runRow) return null
+  const run = await loadRun(env, runRow.id)
+  if (!run || !await principalCanReadProject(env, principal, run.project_id)) return null
+  const action = await env.DB.prepare(
+    `SELECT input_json FROM routine_run_actions
+      WHERE run_id = ? AND tenant = ? AND kind = 'project_access' AND status = 'waiting' AND gate_status = 'pending'
+      ORDER BY updated_at DESC, id DESC LIMIT 1`,
+  ).bind(run.id, run.tenant).first<{ input_json: string }>()
+  if (!action) return null
+  let input: { member_id: string; project_id: string; access_level: 'read' | 'write' | 'admin'; reason: string }
+  try {
+    input = JSON.parse(action.input_json)
+  } catch {
+    return null
+  }
+  const [member, project] = await Promise.all([
+    env.DB.prepare('SELECT display_name FROM members WHERE id = ?').bind(input.member_id).first<{ display_name: string }>(),
+    env.DB.prepare('SELECT name FROM projects WHERE id = ?').bind(input.project_id).first<{ name: string }>(),
+  ])
+  return {
+    member_id: input.member_id,
+    member_name: member?.display_name ?? null,
+    project_id: input.project_id,
+    project_name: project?.name ?? input.project_id,
+    access_level: input.access_level,
+    reason: input.reason,
+  }
 }
 
 export async function answerRoutineRun(
@@ -1858,6 +2125,18 @@ export async function submitRoutineProposal(
   }
   const policy = parsePolicy(run.policy_json)
   if (!policy) return { ok: false, error: 'invalid_policy' }
+  // FP-01 Slice 2 v2 (successor to PR #1488, P0-1): project_access is the
+  // one action kind whose executed effect is a standing privilege grant, so
+  // it may only ever be proposed under a policy that routes EVERY action
+  // through the human-review gate. Refusing at submit time — before
+  // reserveAction ever inserts the routine_run_actions row — means an
+  // 'execute_internal' (or any future non-'propose') policy can never even
+  // reserve one of these, closing the class the adversarial gate proved
+  // live: execute_internal + a pre-existing approved verdict on the control
+  // task landed a grant with gate_status='not_required', zero human review.
+  if (proposal.action.kind === 'project_access' && policy.execution_mode !== 'propose') {
+    return { ok: false, error: 'execution_mode_forbidden_for_kind' }
+  }
   if (!await principalCanRunForSquad(env, principal, run.project_id, policy.responsible_squad_id)) {
     return { ok: false, error: 'forbidden' }
   }
@@ -1902,7 +2181,22 @@ export async function submitRoutineProposal(
     const result = await executeRoutineAction(env, run.id, proposal.action.key)
     return result.ok ? { ...result, duplicate } : result
   }
-  if (policy.execution_mode === 'propose' || proposal.action.kind === 'request_review') {
+  // `|| proposal.action.kind === 'project_access'` is defense-in-depth, not
+  // reachable in normal operation: the typed refusal above already returns
+  // before reserveAction whenever a project_access proposal's policy is not
+  // 'propose', so by the time execution reaches this line
+  // policy.execution_mode === 'propose' is already true for this kind and
+  // the first disjunct already covers it. Kept (per Kasra-core's original
+  // brief and Athena's confirming ruling: "always human-gated regardless of
+  // execution_mode") so this line stays correct on its own even if a future
+  // change adds another path into this function that skips the submit-time
+  // refusal — see the successor PR body for why this specific line is
+  // intentionally not independently mutation-tested.
+  if (
+    policy.execution_mode === 'propose'
+    || proposal.action.kind === 'request_review'
+    || proposal.action.kind === 'project_access'
+  ) {
     const result = await waitForHuman(env, run, action, 'review')
     return result.ok ? { ...result, duplicate } : result
   }

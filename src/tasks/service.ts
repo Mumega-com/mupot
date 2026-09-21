@@ -461,6 +461,38 @@ function mapTaskProjectUpdateError(error: unknown): never {
   throw error
 }
 
+// buildTaskUpdateStatement — extracted from persistTaskUpdate's own body,
+// unchanged in behavior (FP-01 Slice 2 v2 round 2, P0), so reverseTaskVerdict
+// below can append its OWN two statements to the SAME batch as this one and
+// run everything as ONE atomic unit, mirroring the buildVerdictStatements /
+// projectSquadAccessStatements pattern already used elsewhere in this file
+// and in src/projects/service.ts for exactly this "extract the pure
+// statement, let a bigger batch include it" shape.
+function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
+  return env.DB.prepare(
+    `UPDATE tasks
+        SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+      WHERE id = ? AND updated_at = ? AND project_id IS ?`,
+  ).bind(
+    next.title,
+    next.body,
+    next.done_when,
+    next.status,
+    next.priority ?? null,
+    next.parent_task_id ?? null,
+    next.assignee_agent_id,
+    next.assignee_member_id ?? null,
+    next.github_issue_url,
+    next.gate_owner,
+    next.project_id,
+    next.completed_at,
+    next.updated_at,
+    next.id,
+    existing.updated_at,
+    existing.project_id,
+  )
+}
+
 export async function persistTaskUpdate(
   env: Env,
   existing: Task,
@@ -474,34 +506,166 @@ export async function persistTaskUpdate(
 
   let result
   try {
-    result = await env.DB.prepare(
-      `UPDATE tasks
-          SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
-        WHERE id = ? AND updated_at = ? AND project_id IS ?`,
-    )
-      .bind(
-        next.title,
-        next.body,
-        next.done_when,
-        next.status,
-        next.priority ?? null,
-        next.parent_task_id ?? null,
-        next.assignee_agent_id,
-        next.assignee_member_id ?? null,
-        next.github_issue_url,
-        next.gate_owner,
-        next.project_id,
-        next.completed_at,
-        next.updated_at,
-        next.id,
-        existing.updated_at,
-        existing.project_id,
-      )
-      .run()
+    result = await buildTaskUpdateStatement(env, existing, next).run()
   } catch (error) {
     mapTaskProjectUpdateError(error)
   }
   if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
+}
+
+// findLatestVerdict — the task-bound "latest verdict" read, shared by
+// reverseTaskVerdict and detectVerdictReversalRequest below. Deliberately
+// NOT proposal-bound (unlike resolveProposalVerdict, src/routines/actions.ts)
+// — a reversal targets the verdict actually sitting on the task right now,
+// whatever put it there.
+async function findLatestVerdict(env: Env, taskId: string): Promise<TaskVerdict | null> {
+  return env.DB.prepare(
+    `SELECT id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, reversed_at
+       FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,
+  ).bind(taskId).first<TaskVerdict>()
+}
+
+export interface VerdictReversalInput {
+  existing: Task
+  // The FULLY patched target row (title/body/gate_owner/etc. may also
+  // differ from `existing`, exactly like persistTaskUpdate's own `next`) —
+  // `next.status` must be 'review' and `next.updated_at` already stamped.
+  // Not re-applied at all in the 'retry_completion' case (see step 2 below).
+  next: Task
+  tenant: string
+  reason: string
+  actorId: string
+  actorType: 'agent' | 'member'
+}
+
+export type VerdictReversalOutcome =
+  | { ok: true; task: Task }
+  | { ok: false; error: 'no_verdict_to_reverse' }
+
+// reverseTaskVerdict — FP-01 Slice 2 v2 round 2 (P0, kasra-review adversarial
+// gate on PR #1490 + Athena's binding ordering rider): the ONE function both
+// write surfaces (the HTTP PATCH twin, src/tasks/index.ts, and the MCP
+// task_update tool, src/mcp/index.ts) call to reverse a verdict. Replaces
+// the PRIOR sequential design (persistTaskUpdate, THEN a bare
+// verdict_reversals INSERT, THEN markVerdictReversed as three independent
+// `.run()`/`.exec()` calls) — a failure of the LAST of those three left the
+// task flipped to 'review' with an audit row, but reversed_at still NULL,
+// so a routine replay could still land the grant on the "reversed" verdict,
+// AND the admin could not even retry (existing.status was already 'review',
+// so the ordinary transition matrix refuses review->review).
+//
+// ORDER IS THE FIX, PER ATHENA'S BINDING RULING: reversed_at is stamped
+// FIRST, unconditionally, before anything else is attempted — it is the
+// GATE-CLOSING write (executeRoutineAction's resolveProposalVerdict filters
+// `reversed_at IS NULL`), so once it lands, a grant can never replay off
+// this verdict again, regardless of what happens to the other two writes
+// afterward. The task status flip and the audit receipt follow, together
+// where the D1 harness makes that atomic, but their SUCCESS OR FAILURE never
+// re-opens the gate — there is no code path, in this function, that could
+// ever clear or skip the reversed_at stamp once it is set.
+//
+// TOLERATES ITS OWN MIGRATION NOT HAVING RUN YET (code and migrations here
+// deploy as separate manual steps): if 0162 has not been applied — the
+// original 0069 append-only trigger is still the only one live — the
+// reversed_at UPDATE (inside markVerdictReversed) throws BEFORE the status
+// flip or the audit insert are even attempted. Nothing partial to reconcile;
+// the caller reports a clean failure and a retry once 0162 lands succeeds
+// outright, from a clean starting state.
+//
+// IDEMPOTENT end-to-end — safe to call twice for the SAME reversal, whether
+// the first call fully succeeded, partially succeeded, or was never
+// attempted:
+//   1. markVerdictReversed's own WHERE only matches a still-unreversed
+//      verdict row — reversing an already-reversed verdict is a 0-row no-op.
+//   2. The status flip is skipped entirely once task.status is already
+//      'review' (nothing left to flip) — its own optimistic-concurrency
+//      WHERE would otherwise also just no-op on a stale `updated_at`.
+//   3. The audit receipt's `id` is DETERMINISTIC — derived from the verdict
+//      being reversed, which can only ever be reversed once (the trigger's
+//      own WHEN clause enforces NULL -> value exactly once) — so a retried
+//      INSERT of the identical row is refused by its own UNIQUE(id)
+//      constraint, caught here, and treated as "already recorded", never a
+//      second receipt or a caller-visible error.
+export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput): Promise<VerdictReversalOutcome> {
+  const { existing, next, tenant, reason, actorId, actorType } = input
+  const verdict = await findLatestVerdict(env, existing.id)
+  if (!verdict) return { ok: false, error: 'no_verdict_to_reverse' }
+  const fromStatus = existing.status
+
+  // Step 1 — CLOSE THE GATE FIRST, unconditionally, before anything else.
+  await markVerdictReversed(env, existing.id, next.updated_at)
+
+  // Step 2 — the FULL task update (status flip + whatever else this PATCH
+  // also changed) — skipped entirely when existing.status is ALREADY
+  // 'review': by construction (detectVerdictReversalRequest's own
+  // 'retry_completion' condition), that can only be true once step 2
+  // already fully landed on an earlier attempt — every field in `next` is
+  // already correctly in the row, there is nothing left to write, and
+  // re-running it would consume a fresh `next.updated_at` the caller never
+  // re-derived from a re-read (a real conflict, not a retry).
+  let landed = existing
+  if (existing.status !== 'review') {
+    if (
+      (existing.priority !== next.priority || existing.body !== next.body
+        || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id)
+      && (next.priority === 'P0' || next.priority === 'P1')
+    ) {
+      assertValidIntakeContract(next, { allowDeferredPredicate: true })
+    }
+    let result
+    try {
+      result = await buildTaskUpdateStatement(env, existing, next).run()
+    } catch (error) {
+      mapTaskProjectUpdateError(error)
+    }
+    if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
+    landed = next
+  }
+
+  // Step 3 — the audit receipt, deterministic id keyed on the verdict.
+  const receiptId = `reversal:${verdict.id}`
+  try {
+    await env.DB.prepare(
+      `INSERT INTO verdict_reversals
+         (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason, actor_id, actor_type)
+       VALUES (?, ?, ?, ?, ?, 'review', ?, ?, ?, ?)`,
+    ).bind(
+      receiptId, tenant, landed.id, landed.squad_id, fromStatus, fromStatus, reason, actorId, actorType,
+    ).run()
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error
+  }
+
+  return { ok: true, task: landed }
+}
+
+// detectVerdictReversalRequest — a PATCH/task_update asking to move
+// 'approved'/'rejected' -> 'review' is unambiguously a fresh reversal. One
+// asking 'review' -> 'review' is ORDINARILY refused by the transition
+// matrix — EXCEPT when it is a retry completing a reversal that already
+// closed the gate (reversed_at set) on an earlier, partially-failed
+// attempt: that retry must complete, never report invalid_transition
+// (Athena's binding ruling). The signal is narrow on purpose — task.status
+// already 'review' AND its latest verdict already reversed — so an
+// unrelated, ordinary review->review request (which supplies no
+// reason and is not gated on owner/admin) is never misclassified.
+export type VerdictReversalRequestKind = 'fresh' | 'retry_completion' | 'none'
+
+export async function detectVerdictReversalRequest(
+  env: Env,
+  task: Task,
+  bodyStatus: string,
+): Promise<VerdictReversalRequestKind> {
+  if (bodyStatus !== 'review') return 'none'
+  if (task.status === 'approved' || task.status === 'rejected') return 'fresh'
+  if (task.status !== 'review') return 'none'
+  const verdict = await findLatestVerdict(env, task.id)
+  if (!verdict || !verdict.reversed_at) return 'none'
+  return 'retry_completion'
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -1256,6 +1420,12 @@ export interface WriteVerdictInput {
   // both columns stay NULL, unchanged from before this fields existed.
   decidedVia?: 'agent_attested_origin'
   originAgentId?: string | null
+  // proposalId (0159_task_verdict_proposal_binding.sql, FP-01 Slice 2 v2,
+  // successor to PR #1488's P0-2): the routine_run_actions.id this verdict
+  // decides. Callers should not compute this themselves — resolve it via
+  // resolveVerdictProposalId and pass the result straight through; writeVerdict
+  // does this automatically for its own callers when omitted (see below).
+  proposalId?: string | null
 }
 
 export class VerdictRaceError extends Error {
@@ -1263,6 +1433,125 @@ export class VerdictRaceError extends Error {
     super(`verdict_race: task ${taskId} is no longer in review (concurrent verdict won)`)
     this.name = 'VerdictRaceError'
   }
+}
+
+// NonHumanVerdictRefusedError — FP-01 Slice 2 v2 round 2 (P2-4, kasra-review
+// adversarial round 2 on PR #1490): P0-3's verdictIsHuman only refused the
+// GRANT once the (non-human) verdict already existed — the task itself had
+// already been consumed into 'approved'/'rejected', dropped off /needs, and
+// a real human never saw it. A non-human agent holding gate:routines could
+// therefore permanently starve a project_access proposal: the task can never
+// re-enter review on its own, so the grant retries forever and refuses
+// forever. The verdict WRITE ITSELF must refuse for a project_access-gating
+// task when the decider is not human — the task then STAYS in 'review',
+// still visible on /needs, so a real human can still decide it.
+export class NonHumanVerdictRefusedError extends Error {
+  constructor(taskId: string) {
+    super(`non_human_verdict_refused: task ${taskId} gates a project_access proposal and requires a human decider`)
+    this.name = 'NonHumanVerdictRefusedError'
+  }
+}
+
+// controlTaskGatesProjectAccess — true when `task` is CURRENTLY the human-
+// review gate for a project_access routine proposal (the one privileged
+// action kind whose grant effect a non-human verdict must never authorize —
+// see P0-3/verdictIsHuman above). Deliberately narrower than
+// resolveVerdictProposalId (which resolves ANY waiting routine action kind)
+// — the human-required-at-write-time rule is scoped to project_access only,
+// matching the brief's own scoping of P0-3/P2-4 to that one privileged kind.
+export async function controlTaskGatesProjectAccess(env: Env, task: Task): Promise<boolean> {
+  if (task.gate_owner !== 'gate:routines') return false
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM routine_run_actions
+      WHERE source_type = 'task' AND source_id = ? AND status = 'waiting' AND gate_status = 'pending' AND kind = 'project_access'
+      LIMIT 1`,
+  ).bind(task.id).first()
+  return row !== null
+}
+
+// resolveVerdictProposalId — FP-01 Slice 2 v2 (successor to PR #1488, P0-2).
+// Binds a verdict to the SPECIFIC routine proposal it decides, closing the
+// "latest verdict on the control task" replay class (ADVERSARIAL PATTERN
+// LIBRARY, kasra-review 2026-09-21, PR #1488, finding 2). This is a raw
+// table read on routine_run_actions, NOT a call into src/routines/actions.ts
+// — that module already imports from this file (`tasks/service`), so an
+// import the other direction would be a cycle. There can be at most ONE
+// routine_run_actions row waiting on a given control task at a time (by
+// construction: reserveAction refuses a second proposal while an earlier
+// one is still 'pending'/'waiting' on the same run), so this is a lookup,
+// not a heuristic — the row IS the proposal this human-review gate exists
+// for, or there is none (an ordinary, non-routine task review) and the
+// verdict's proposal_id stays NULL, unchanged from every verdict cast
+// before this feature existed.
+// markVerdictReversed — FP-01 Slice 2 v2 (successor to PR #1488, Athena's
+// design ruling on the successor brief): task_verdict_reverse previously
+// wrote NO new task_verdicts row at all (only the verdict_reversals audit
+// receipt + the task's own status flip back to 'review') — the ORIGINAL
+// verdict row stayed the "latest verdict" forever, so a proposal-bound
+// reader had no way to know it had been undone. Called from BOTH reversal
+// write surfaces (the HTTP PATCH twin and the MCP task_update tool — the
+// same two call sites that already write the verdict_reversals receipt) at
+// the exact moment a reversal is confirmed, so the two facts (the audit
+// receipt existing, and the verdict itself being marked reversed) can never
+// drift apart. Targets the SAME row `ORDER BY decided_at DESC, id DESC LIMIT 1`
+// resolves for approvedGate/latestTaskVerdict-style reads — the one this
+// reversal is actually undoing — and is a no-op (0 rows) if that row is
+// already reversed, making the call idempotent under retry.
+export async function markVerdictReversed(env: Env, taskId: string, reversedAt: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE task_verdicts SET reversed_at = ?
+      WHERE id = (
+        SELECT id FROM task_verdicts WHERE task_id = ? AND reversed_at IS NULL
+         ORDER BY decided_at DESC, id DESC LIMIT 1
+      )`,
+  ).bind(reversedAt, taskId).run()
+}
+
+// verdictIsHuman — FP-01 Slice 2 v2 (successor to PR #1488, P0-3): the ONE
+// shared predicate for "was this verdict actually cast by a human", used
+// wherever a downstream effect (a project_access grant) claims human
+// authorization as its justification. A verdict is human when EITHER it
+// carries the harness-attested human_origin stamp (decided_via =
+// 'agent_attested_origin', mupot#1424/#1425 — decided_by is always a
+// member id in that case, resolved server-side from the origin, never
+// caller-supplied) OR decided_by itself resolves to a live row in the
+// members table — i.e. the calling principal that cast this verdict was a
+// member (verdictPrincipal's `type: 'member'` branch, src/tasks/index.ts),
+// not an agent exercising its own gate:routines capability. Deliberately a
+// DB lookup rather than a stored discriminator column: members and agents
+// occupy disjoint UUID spaces, so "does decided_by name a member" is exactly
+// "was the decider a member" with no separate column that could drift from
+// the row it describes.
+// P2-3 (kasra-review adversarial round 2 on PR #1490): the FIRST version of
+// this predicate resolved decided_by against ANY members row, active or
+// not, and against ANY tenant — inconsistent with every other member-
+// liveness check in this codebase (e.g. the target member's own eligibility
+// check, src/routines/actions.ts's validateProjectAccessScope: `status =
+// 'active' AND (tenant = ? OR tenant IS NULL)`). A decider suspended (or
+// belonging to a different tenant) AFTER casting a verdict but BEFORE the
+// routine replays must not still count as "a human decided this" — their
+// standing to decide anything is gone the moment they're suspended, exactly
+// like the target member's own eligibility is re-checked at execute time.
+export async function verdictIsHuman(
+  env: Env,
+  verdict: Pick<TaskVerdict, 'decided_by' | 'decided_via'>,
+  tenant: string,
+): Promise<boolean> {
+  if (verdict.decided_via === 'agent_attested_origin') return true
+  const member = await env.DB.prepare(
+    `SELECT 1 FROM members WHERE id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL) LIMIT 1`,
+  ).bind(verdict.decided_by, tenant).first()
+  return member !== null
+}
+
+export async function resolveVerdictProposalId(env: Env, task: Task): Promise<string | null> {
+  if (task.gate_owner !== 'gate:routines') return null
+  const row = await env.DB.prepare(
+    `SELECT id FROM routine_run_actions
+      WHERE source_type = 'task' AND source_id = ? AND status = 'waiting' AND gate_status = 'pending'
+      ORDER BY updated_at DESC, id DESC LIMIT 1`,
+  ).bind(task.id).first<{ id: string }>()
+  return row?.id ?? null
 }
 
 // mupot#1425 round-2 adversarial gate (kasra-review P0-B): the project-evidence
@@ -1344,6 +1633,8 @@ export function buildVerdictStatements(
     decided_at: now,
     decided_via: input.decidedVia ?? null,
     origin_agent_id: input.originAgentId ?? null,
+    proposal_id: input.proposalId ?? null,
+    reversed_at: null,
   }
 
   const guardSql = extraGuard ? ` AND ${extraGuard.sql}` : ''
@@ -1354,8 +1645,8 @@ export function buildVerdictStatements(
       `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
-      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
           WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ?)`,
     ).bind(
       verdictRow.id,
@@ -1366,6 +1657,7 @@ export function buildVerdictStatements(
       verdictRow.decided_at,
       verdictRow.decided_via,
       verdictRow.origin_agent_id,
+      verdictRow.proposal_id,
       input.task.id,
       newStatus,
       now,
@@ -1410,7 +1702,36 @@ export async function writeVerdict(
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
   await assertVerdictWritable(env, input.task)
 
-  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, input)
+  // P2-4 (FP-01 Slice 2 v2 round 2): refuse a non-human verdict AT THE
+  // WRITE, not only later at grant time, when this task is CURRENTLY
+  // gating a project_access proposal — see NonHumanVerdictRefusedError's
+  // doc comment. The task then stays 'review' (still on /needs) instead of
+  // being consumed into 'approved' with no grant ever able to land.
+  if (await controlTaskGatesProjectAccess(env, input.task)) {
+    const humanDecider = await verdictIsHuman(
+      env, { decided_by: input.decidedBy, decided_via: input.decidedVia ?? null }, env.TENANT_SLUG,
+    )
+    if (!humanDecider) throw new NonHumanVerdictRefusedError(input.task.id)
+  }
+
+  // proposalId auto-resolution (FP-01 Slice 2 v2): every ordinary caller of
+  // writeVerdict (HTTP twin, MCP task_verdict's fallback path, IM /approve)
+  // gets the binding for free without needing to know routines exist. Only
+  // origin-verdict.ts's commitOriginDecision bypasses writeVerdict (it builds
+  // its OWN D1 batch via buildVerdictStatements directly) and resolves this
+  // itself, the same way, immediately before building its statements — see
+  // that file. Read-then-write has a narrow window (the resolved action
+  // could in principle stop being the active one between this read and the
+  // batch below landing), acceptable here because it only ever WIDENS to
+  // "no binding" in that window, never fabricates one, and Athena's
+  // decided_at > proposal.created_at conjunct at the read site
+  // (src/routines/actions.ts) is the actual authorization gate — this value
+  // is consumed for that comparison, not trusted as authorization itself.
+  const resolvedInput: WriteVerdictInput = input.proposalId !== undefined
+    ? input
+    : { ...input, proposalId: await resolveVerdictProposalId(env, input.task) }
+
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, resolvedInput)
   const results = await env.DB.batch(statements)
 
   if (!results[0]?.meta?.changes) {

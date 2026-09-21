@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { Hono } from 'hono'
 import { imApp } from '../src/im'
+import { createHomeForMember } from '../src/org/service'
 import { createProjectInvite, redeemTelegramProjectInvite } from '../src/members/project-invites'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -38,11 +39,22 @@ describe('authenticated Telegram receipts and human controls', () => {
       body: JSON.stringify(body),
     }), env)
   }
-  function member(capability = 'member') {
+  // FP-01 Slice 2 v2 (successor to PR #1488, plugin v2 contract §2f(a)
+  // point 3): memberIntakeEnvelope now provisions a home squad for ANY
+  // bound member with none, on ANY message, not just /start — so a test
+  // member with no home would otherwise pick up a NEW home squad +
+  // capability row as an incidental side effect of whatever unrelated
+  // command it sends, breaking every businessState() before/after
+  // equality check in this file. Pre-provisioning the home HERE (via the
+  // real createHomeForMember, not a hand-rolled row) keeps each test's own
+  // subject the only thing businessState() sees change — the SAME
+  // resolution tests/routine-project-access.test.ts's fixture uses.
+  async function member(capability = 'member') {
     harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
       VALUES ('human-1', 'human@example.com', 'Human', '123', 'active', 'telegram-test')`).run()
     harness.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-human', 'human-1', 'squad', 'squad-1', ?)`).run(capability)
+    await createHomeForMember(env, 'human-1')
   }
   function receipt() {
     return harness.sqlite.prepare('SELECT * FROM telegram_webhook_receipts ORDER BY update_id').all()
@@ -108,7 +120,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('requires the actual configured Telegram secret before reserving or acting', async () => {
-    member()
+    await member()
     const before = businessState()
     expect((await post(envelope('task: do work'), 'wrong')).status).toBe(401)
     expect(receipt()).toEqual([])
@@ -120,7 +132,7 @@ describe('authenticated Telegram receipts and human controls', () => {
     { ...envelope('task: do work').message, from: { id: 456 } },
     { ...envelope('task: do work').message, chat: { id: 123 } },
   ])('refuses non-private or mismatched sender chats', async message => {
-    member()
+    await member()
     const before = businessState()
     const response = await post({ update_id: 10, message })
     expect(response.status).toBe(400)
@@ -129,7 +141,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('stores the verified user and replays the stored response with exactly one task effect', async () => {
-    member()
+    await member()
     const first = await post(envelope('task: do work'))
     const body = await first.json()
     expect(first.status).toBe(200)
@@ -143,7 +155,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('allows only one concurrent update to produce the task effect', async () => {
-    member()
+    await member()
     // Hold the external Queue acknowledgement after the real task write, so
     // the retry observes an in-flight effect independent of hash timing.
     let release!: () => void
@@ -165,7 +177,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('never resolves a member mapping from another tenant', async () => {
-    member()
+    await member()
     harness.sqlite.exec("UPDATE members SET tenant = 'another-tenant'")
     const before = businessState()
     const response = await post(envelope('task: forbidden'))
@@ -174,7 +186,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('records one authorized verdict and refuses forwarding, revocation and conflicting or terminal decisions', async () => {
-    member()
+    await member()
     harness.sqlite.exec(`
       INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
       VALUES ('task-verdict', 'squad-1', 'project-1', 'Decision', 'done', 'review', 'gate:human');
@@ -205,7 +217,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('canonicalizes identity numbers and ignores untrusted extra metadata on retry', async () => {
-    member()
+    await member()
     const first = await (await post(envelope('/status'))).json()
     const stored = receipt()
     const retry = { update_id: '10', message: { text: '/status', from: { id: '123', username: 'changed' }, chat: { type: 'private', id: '123' } }, member_id: 'forged' }
@@ -214,7 +226,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('conflicting text, principal or forwarding metadata cannot overwrite a receipt or cause effects', async () => {
-    member()
+    await member()
     await post(envelope('task: original'))
     const stored = receipt()
     const before = businessState()
@@ -229,7 +241,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it.each(['processing', 'unknown'])('does not retry effects after interrupted %s reservation', async state => {
-    member()
+    await member()
     await post(envelope('task: original'))
     harness.sqlite.prepare('UPDATE telegram_webhook_receipts SET state = ?, response_text = NULL, completed_at = NULL').run(state)
     const stored = receipt()
@@ -254,14 +266,56 @@ describe('authenticated Telegram receipts and human controls', () => {
     expect(harness.sqlite.prepare("SELECT telegram_chat_id, status FROM members WHERE id != 'inviter-member'").all()).toEqual([{ telegram_chat_id: '123', status: 'active' }])
     // mupot#1411 round 6: excludes 'inviter-member' — the invite() fixture
     // now also inserts a real capabilities row for it (see the comment
-    // above), so this asserts only the net-new JOINED member's own grant.
-    expect(harness.sqlite.prepare("SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id != 'inviter-member'").all()).toEqual([{ scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }])
+    // above), so this asserts only the net-new JOINED member's own grants.
+    //
+    // FP-01 Slice 2 v2 (successor to PR #1488, plugin v2 contract §2f(a)
+    // point 3): a SECOND row now lands in the SAME /start reply — this is
+    // the joined member's FIRST message, and memberIntakeEnvelope
+    // provisions their home squad + 'admin' capability there right away
+    // (see memberIntakeEnvelope, src/im/index.ts). The squad-1 'member'
+    // grant (from the invite redemption) is unaffected.
+    {
+      const grants = harness.sqlite.prepare(
+        "SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id != 'inviter-member' ORDER BY capability",
+      ).all() as { scope_type: string; scope_id: string; capability: string }[]
+      expect(grants).toHaveLength(2)
+      expect(grants).toContainEqual({ scope_type: 'squad', scope_id: 'squad-1', capability: 'member' })
+      const homeGrant = grants.find(g => g.scope_id !== 'squad-1')
+      expect(homeGrant).toMatchObject({ scope_type: 'squad', capability: 'admin' })
+    }
     expect(harness.sqlite.prepare('SELECT * FROM member_tokens').all()).toEqual([])
     const before = businessState()
     const stored = receipt()
     expect(await (await post(request)).json()).toEqual(body)
     expect(businessState()).toEqual(before)
     expect(receipt()).toEqual(stored)
+  })
+
+  // mupot-plugin PR #17 contract (FP-01 Slice 2, mupot#1443): the webhook
+  // JSON reply carries `bound`/`member_id` as TYPED fields so the plugin's
+  // first-person skill never has to string-match `reply`'s prose to learn
+  // whether a chat is bound to a member.
+  it('reports bound:false, member_id:null for an unbound chat, and bound:true with the new member id in the SAME /start reply that redeems the invite', async () => {
+    const code = await invite()
+    const unboundResponse = await post(envelope('/help', 9))
+    expect(await unboundResponse.json()).toMatchObject({ bound: false, member_id: null })
+
+    const joinResponse = await post(envelope(`/start ${code}`))
+    const joinBody = await joinResponse.json() as { reply: string; bound: boolean; member_id: string | null }
+    expect(joinBody.bound).toBe(true)
+    expect(typeof joinBody.member_id).toBe('string')
+    const memberRow = harness.sqlite.prepare(
+      "SELECT id FROM members WHERE telegram_chat_id = '123' AND id != 'inviter-member'",
+    ).get() as { id: string }
+    expect(joinBody.member_id).toBe(memberRow.id)
+
+    // Once bound, every subsequent reply (not only /start) carries the same
+    // bound member id — a stable, typed fact the plugin can rely on.
+    const afterJoin = await (await post(envelope('/help', 11))).json() as { bound: boolean; member_id: string | null }
+    expect(afterJoin).toMatchObject({ bound: true, member_id: memberRow.id })
+
+    // Replay of the SAME /start update returns the identical stored fields.
+    expect(await (await post(envelope(`/start ${code}`))).json()).toEqual(joinBody)
   })
 
   it('carries authenticated receipt identity into redemption and refuses another user without any writes', async () => {
@@ -290,7 +344,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('renders only accessible Needs You items and server-allowed actions as roles change', async () => {
-    member('observer')
+    await member('observer')
     harness.sqlite.exec(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
       VALUES ('task-visible', 'squad-1', 'project-1', 'Public decision', 'done', 'review', 'gate:human'),
              ('task-hidden', 'squad-2', 'project-2', 'Private secret', 'done', 'review', 'gate:human');`)
@@ -312,7 +366,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('keeps Needs You deliverable as one Telegram message and signals omitted items', async () => {
-    member('observer')
+    await member('observer')
     for (let index = 0; index < 10; index++) {
       harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
         VALUES (?, 'squad-1', 'project-1', ?, 'done', 'review', 'gate:human')`)
@@ -325,7 +379,7 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it.each(['suspended', 'revoked'])('refuses task effects for %s membership', async status => {
-    member()
+    await member()
     if (status === 'suspended') harness.sqlite.exec("UPDATE members SET status = 'suspended'")
     else harness.sqlite.exec('DELETE FROM capabilities')
     const before = businessState()

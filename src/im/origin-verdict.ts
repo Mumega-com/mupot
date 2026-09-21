@@ -119,6 +119,7 @@ import {
   assertVerdictWritable,
   buildVerdictStatements,
   emitVerdictBusEvent,
+  resolveVerdictProposalId,
   TaskEvidenceFenceError,
   VerdictRaceError,
   type TaskActor,
@@ -490,9 +491,19 @@ async function commitOriginDecision(
   const reservationLandedGuardSql =
     "EXISTS (SELECT 1 FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing')"
 
+  // proposalId (FP-01 Slice 2 v2): resolved here, not inside
+  // buildVerdictStatements (a pure/sync builder shared with writeVerdict),
+  // since this call site builds its OWN batch rather than going through
+  // writeVerdict's auto-resolution. See resolveVerdictProposalId's doc
+  // comment (src/tasks/service.ts) for why this is a safe read-then-write.
+  const proposalId = await resolveVerdictProposalId(env, task)
+
   const verdictBuild = buildVerdictStatements(
     env,
-    { task, verdict, note, decidedBy: owner.id, decidedVia: 'agent_attested_origin', originAgentId: boundAgentId },
+    {
+      task, verdict, note, decidedBy: owner.id, decidedVia: 'agent_attested_origin',
+      originAgentId: boundAgentId, proposalId,
+    },
     {
       sql: `${ownershipGuardSql} AND ${chatEligibleGuardSql} AND ${reservationLandedGuardSql}`,
       params: [

@@ -552,6 +552,16 @@ export interface TaskVerdict {
   // (which may differ from decided_by, always a member id in that case).
   decided_via: 'agent_attested_origin' | null
   origin_agent_id: string | null
+  // proposal_id / reversed_at (0159_task_verdict_proposal_binding.sql, FP-01
+  // Slice 2 v2): proposal_id names the routine_run_actions.id this verdict
+  // decided, resolved server-side at write time (never caller-supplied) —
+  // NULL for every verdict not cast against a routine's human-review gate.
+  // reversed_at is the ONE narrow exception to "append-only, no UPDATE
+  // path": task_verdict_reverse stamps it on the verdict it reverses so a
+  // proposal-bound reader (executeRoutineAction's grant check) can exclude
+  // a reversed approval instead of treating it as still 'latest approved'.
+  proposal_id: string | null
+  reversed_at: string | null
 }
 
 // ── Auth (app-layer RBAC; AuthN delegated to the perimeter/OAuth) ──

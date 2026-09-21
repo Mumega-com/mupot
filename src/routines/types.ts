@@ -7,7 +7,7 @@ export type RoutineRunStatus =
   | 'succeeded' | 'failed' | 'skipped' | 'cancelled'
 export type RoutineWaitingReason = 'agent' | 'approval' | 'answer' | 'review' | 'budget'
 export type RoutineActionKind =
-  | 'create_task' | 'dispatch_flight' | 'request_review' | 'ask_human' | 'no_action'
+  | 'create_task' | 'dispatch_flight' | 'request_review' | 'ask_human' | 'no_action' | 'project_access'
 
 export type RoutineSchedule =
   | { kind: 'manual'; timezone: string; runOnceAt?: never; cronExpression?: never }
@@ -88,3 +88,4 @@ export type RoutineAction =
   | { key: string; kind: 'request_review'; input: Record<string, unknown> }
   | { key: string; kind: 'ask_human'; input: Record<string, unknown> }
   | { key: string; kind: 'no_action'; input: Record<string, unknown> }
+  | { key: string; kind: 'project_access'; input: Record<string, unknown> }

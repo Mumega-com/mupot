@@ -130,6 +130,25 @@ function makeEnv(
                 }
                 if (sql.includes('FROM squads WHERE id = ?1')) return squads.get(args[0] as string) ?? null
                 if (sql.includes('FROM tasks WHERE id = ?1')) return tasks.get(args[0] as string) ?? null
+                // FP-01 Slice 2 v2 round 2 (P0): reverseTaskVerdict's own
+                // findLatestVerdict read — task_verdict_reverse now checks a
+                // verdict actually exists before reversing it (it never did
+                // before). Synthesize one whenever the seeded task's CURRENT
+                // status is 'approved'/'rejected' — every test in this file
+                // that exercises reversal seeds exactly that shape, matching
+                // "this task has an existing verdict to reverse".
+                if (sql.includes('FROM task_verdicts')) {
+                  const taskId = args[0] as string
+                  const target = tasks.get(taskId)
+                  if (target && (target.status === 'approved' || target.status === 'rejected')) {
+                    return {
+                      id: `verdict-${taskId}`, task_id: taskId, verdict: target.status,
+                      note: null, decided_by: 'member-1', decided_at: 'now',
+                      decided_via: null, origin_agent_id: null, proposal_id: null, reversed_at: null,
+                    }
+                  }
+                  return null
+                }
                 return null
               },
               async all() {
