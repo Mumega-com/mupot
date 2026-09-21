@@ -467,6 +467,33 @@ describe('Telegram project invitation service', () => {
     expect(result).toEqual({ ok: false, error: expectedError })
   })
 
+  // Athena's §2e-8 table-exhaustive requirement (Round 2 on #1472): the
+  // `capabilities` table has FIVE writers gated against a home target — this
+  // is the createProjectInvite one (G-FP1b point 4). A project↔squad edge
+  // CAN legitimately exist for a home squad (project_squad_set is the
+  // deliberately-untouched grant direction), but minting an INVITE against
+  // that edge would let an arbitrary invitee redeem a standing `capabilities`
+  // row on the home squad itself — refused regardless of the inviter's own
+  // rank on it.
+  it('refuses to mint a project invite whose linked squad is kind=home: home_scope_not_invitable', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind)
+      VALUES ('squad-someones-home', 'department-delivery', 'home-someone', 'Home', 'home');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level)
+      VALUES ('project-active', 'squad-someones-home', 'write');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-inviter-home-admin', 'member-inviter', 'squad', 'squad-someones-home', 'admin');
+    `)
+
+    const before = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM invites').get() as { n: number }
+
+    const result = await createInvite('home-invitee@example.test', { squad_id: 'squad-someones-home' })
+    expect(result).toEqual({ ok: false, error: 'home_scope_not_invitable' })
+
+    const after = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM invites').get() as { n: number }
+    expect(after.n).toBe(before.n)
+  })
+
   it('refuses a capability above the inviter rank on the selected squad', async () => {
     await expect(createInvite('owner@example.test', { capability: 'owner' })).resolves.toEqual({
       ok: false,

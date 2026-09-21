@@ -103,6 +103,35 @@ describe('legacy owner / org-grant plane never covers a home squad (G-FP1b point
     expect(await canOnSquad(env, orgGrants, homeSquadId, 'observer')).toBe(false)
   })
 
+  // planeCoversScope's DEPARTMENT limb (adversarial round 1 P1: "two mutation
+  // survivors" — one of them this branch, src/auth/capability.ts:329, whose
+  // ONLY call site this is). A department-scope grant on EXACTLY the home
+  // squad's own department must not inherit into the home the same way an
+  // org-scope grant must not — the home lives IN a real department (the
+  // member's own dept-home-<memberId>), so this is not a hypothetical: any
+  // admin standing at that department scope (e.g. a future feature granting
+  // department leads department-wide admin) must still be refused here.
+  it('hasCapability/canOnSquad: a DEPARTMENT-scope ADMIN grant on the home\'s OWN department does not cover the home squad', async () => {
+    const scope = await loadSquadScope(env, homeSquadId)
+    expect(scope).not.toBeNull()
+    if (!scope) return
+    const deptGrants: CapabilityGrant[] = [
+      { member_id: 'dept-admin-1', scope_type: 'department', scope_id: scope.department_id, capability: 'admin' },
+    ]
+    expect(hasCapability(deptGrants, 'squad', scope, 'observer')).toBe(false)
+    expect(await canOnSquad(env, deptGrants, homeSquadId, 'observer')).toBe(false)
+
+    // Sanity: the SAME department-scope grant DOES cover a real work squad in
+    // that same department — proves the refusal above is the home exclusion
+    // on this specific limb, not a broken department-inheritance branch.
+    const workSquad = await createSquad(env, scope.department_id, { slug: 'squad-dept-sanity', name: 'Dept Sanity' })
+    if (!workSquad.ok) throw new Error('setup failed')
+    const workScope = await loadSquadScope(env, workSquad.value.id)
+    expect(workScope).not.toBeNull()
+    if (!workScope) return
+    expect(hasCapability(deptGrants, 'squad', workScope, 'observer')).toBe(true)
+  })
+
   it('canOnSquadAuth: neither the legacy-role plane nor an org grant reaches a home squad', async () => {
     expect(await canOnSquadAuth(env, LEGACY_OWNER, homeSquadId, 'observer')).toBe(false)
     expect(await canOnSquadAuth(env, orgGrantHolder('org-admin-2'), homeSquadId, 'observer')).toBe(false)
@@ -407,11 +436,15 @@ describe('one home lookup by department — two homes per human is structurally 
     expect(found?.id).toBe(squadResult.value.id)
   })
 
-  it('"repaired" disposition: caller === member gets a missing capability row written; a non-member caller does not', async () => {
+  it('point 6 (Athena round-2 ruling): the repair path is CLOSED — a missing capability row on an already-existing squad is never written by createHomeForMember, for anyone', async () => {
     await seedMember('member-c')
     // Squad exists (as if minted by the other function) but member-c's OWN
-    // capability row is missing — the gap createHomeForMember's 'repaired'
-    // disposition exists to close.
+    // capability row is missing. No existing receipted ledger fits this
+    // event (0148 elevation_grants/elevation_usage_log, door_receipts, and
+    // membership_receipts were each checked and rejected — see the doc
+    // comment inside createHomeForMember), so rather than ship a
+    // capability-granting write with no receipt, this gap is reported as
+    // 'existing' and NEVER repaired here, regardless of who calls.
     const deptResult = await createDepartment(env, { slug: 'dept-home-member-c', name: 'Home — Member C' }, { kind: 'home' })
     if (!deptResult.ok) throw new Error('setup failed')
     const squadResult = await createSquad(
@@ -422,28 +455,20 @@ describe('one home lookup by department — two homes per human is structurally 
     )
     if (!squadResult.ok) throw new Error('setup failed')
 
-    // Point 6: a caller who is NOT the member gets 'existing', no write.
-    const asOther = await createHomeForMember(env, 'member-c', 'member-someone-else')
+    // Neither a non-member caller...
+    const asOther = await createHomeForMember(env, 'member-c')
     if (!asOther.ok) throw new Error('assertion setup failed')
     expect(asOther.disposition).toBe('existing')
-    const noGrantYet = await env.DB.prepare(
+
+    // ...nor the member themselves gets the gap written.
+    const asSelf = await createHomeForMember(env, 'member-c')
+    if (!asSelf.ok) throw new Error('assertion failed')
+    expect(asSelf.disposition).toBe('existing')
+    expect(asSelf.squad.id).toBe(squadResult.value.id)
+
+    const noGrant = await env.DB.prepare(
       `SELECT 1 FROM capabilities WHERE member_id = 'member-c' AND scope_type = 'squad' AND scope_id = ?1`,
     ).bind(squadResult.value.id).first()
-    expect(noGrantYet).toBeNull()
-
-    // The member themselves DOES get the gap repaired.
-    const asSelf = await createHomeForMember(env, 'member-c', 'member-c')
-    if (!asSelf.ok) throw new Error('assertion failed')
-    expect(asSelf.disposition).toBe('repaired')
-    expect(asSelf.squad.id).toBe(squadResult.value.id)
-    const grantNow = await env.DB.prepare(
-      `SELECT capability FROM capabilities WHERE member_id = 'member-c' AND scope_type = 'squad' AND scope_id = ?1`,
-    ).bind(squadResult.value.id).first<{ capability: string }>()
-    expect(grantNow?.capability).toBe('admin')
-
-    // Idempotent from here on — a THIRD call (as self) is now 'existing'.
-    const asSelfAgain = await createHomeForMember(env, 'member-c', 'member-c')
-    if (!asSelfAgain.ok) throw new Error('assertion failed')
-    expect(asSelfAgain.disposition).toBe('existing')
+    expect(noGrant).toBeNull()
   })
 })
