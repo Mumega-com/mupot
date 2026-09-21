@@ -992,16 +992,32 @@ interface StoredTelegramReplyValue {
 //   'pending' — bound, but the project_access proposal chain (FP-01 Slice 2
 //               Task A) has not yet been submitted for this member.
 //   'complete'— a project_access routine proposal naming this member EXISTS
-//               (routine_run_actions.kind='project_access', regardless of
-//               its own approved/rejected/waiting outcome — "complete" names
-//               the INTAKE conversation having produced a proposal, not the
-//               grant's own verdict, which is a separate, later fact the
-//               grant chain itself already tracks via task_verdicts/
-//               project_access_grant_receipts).
-// NO MIGRATION: this reuses routine_run_actions.input_json (already storing
-// member_id on a project_access action's own input, migrations/0073+0158) —
-// deliberately not a new members column/engram marker, since one already
-// existed that needed no schema change at all.
+//               (routine_run_actions.kind='project_access') OR its
+//               append-only project_access_grant_receipts row exists —
+//               regardless of the proposal's own approved/rejected/waiting
+//               outcome. "complete" names the INTAKE conversation having
+//               produced a proposal, not the grant's own verdict, which is a
+//               separate, later fact the grant chain itself already tracks
+//               via task_verdicts.
+//
+// ATHENA ROUND-2 CONDITION 1: the receipt-row OR is not redundant. A
+// routine_run_actions row is ordinary application data (no ON DELETE
+// RESTRICT protects it from a rollback, an operator DELETE, or a future
+// cleanup job) — the append-only project_access_grant_receipts row
+// (migrations/0157) is the durable side of the pair. Checking BOTH means a
+// deleted/rolled-back proposal row still reads 'complete' as long as its
+// receipt survives. And a REJECTED verdict must NEVER flip a member back to
+// 'pending': the routine_run_actions row (existence, not status) already
+// covers this — a rejected proposal still exists, still counts as
+// 'complete'. RE-INTAKE REQUIRES HUMAN WORD: nothing in this file ever
+// deletes a project_access proposal or its receipt to "retry" intake; that
+// would need an explicit human decision (a new proposal, or an operator
+// action) — this derivation only ever reads, it never manufactures a path
+// back to 'pending' on its own.
+//
+// NO MIGRATION for the routine_run_actions leg: reuses input_json (already
+// storing member_id on a project_access action's own input, migrations/
+// 0073+0158). The receipt leg reuses the table Task A already added.
 export async function memberIntakeEnvelope(
   env: Env,
   member: Member | null,
@@ -1010,10 +1026,14 @@ export async function memberIntakeEnvelope(
   const { getMemberHomeSquad } = await import('../org/service')
   const home = await getMemberHomeSquad(env, member.id)
   const proposed = await env.DB.prepare(
-    `SELECT 1 FROM routine_run_actions
-      WHERE tenant = ?1 AND kind = 'project_access'
-        AND json_extract(input_json, '$.member_id') = ?2
-      LIMIT 1`,
+    `SELECT 1 WHERE EXISTS (
+        SELECT 1 FROM routine_run_actions
+         WHERE tenant = ?1 AND kind = 'project_access'
+           AND json_extract(input_json, '$.member_id') = ?2
+      ) OR EXISTS (
+        SELECT 1 FROM project_access_grant_receipts
+         WHERE tenant = ?1 AND member_id = ?2
+      )`,
   ).bind(env.TENANT_SLUG, member.id).first()
   return {
     bound: true,
