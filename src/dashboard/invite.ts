@@ -13,12 +13,10 @@
 // the JSON API calls (src/members/index.ts) — one write path, not a second
 // copy of the claim/mint/rollback SQL.
 //
-// mupot#1436 A2 (gated by Athena, NOT built here): after a successful accept
-// this page sets a short-lived "pending invite" marker (KV + HttpOnly cookie)
-// but does NOT touch /auth/callback to consume it. Until A2 lands, the marker
-// simply expires unused after 10 minutes — this page's own behaviour (mint
-// member + capability + token, then send the human to log in) is correct and
-// complete on its own; A2 only wires the LOGIN side to notice the marker.
+// mupot#1436 A2 (src/auth/pending-invite-link.ts + /auth/login + /auth/callback):
+// after a successful accept this page sets a short-lived "pending invite"
+// marker (KV + HttpOnly cookie). Login binds that pointer into OAuth state;
+// callback is link-only against the D1 invite row.
 
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -26,12 +24,15 @@ import { html, raw as honoRaw } from 'hono/html'
 import { setCookie } from 'hono/cookie'
 import type { Env, Capability } from '../types'
 import { acceptInvite, protectRawTokenResponse } from '../members'
+import {
+  PENDING_INVITE_COOKIE,
+  PENDING_INVITE_KV_PREFIX,
+  PENDING_INVITE_TTL_SECONDS,
+} from '../auth/pending-invite-link'
 
 type AppEnv = { Bindings: Env }
 
-export const PENDING_INVITE_COOKIE = 'mupot_pending_invite'
-export const PENDING_INVITE_KV_PREFIX = 'pending_invite_link:'
-export const PENDING_INVITE_TTL_SECONDS = 600
+export { PENDING_INVITE_COOKIE, PENDING_INVITE_KV_PREFIX, PENDING_INVITE_TTL_SECONDS }
 
 // ── view model ───────────────────────────────────────────────────────────────
 
@@ -57,6 +58,7 @@ interface InviteLandingRow {
   project_id: string | null
   squad_id: string | null
   pairing_hash: string | null
+  pairing_expires_at: string | null
   capability: Capability
   invited_by: string | null
   accepted_at: string | null
@@ -84,8 +86,8 @@ async function resolveInviterName(env: Env, invitedBy: string | null): Promise<s
 
 export async function loadInviteLanding(env: Env, inviteId: string): Promise<InviteLandingView> {
   const invite = await env.DB.prepare(
-    `SELECT id, department_id, project_id, squad_id, pairing_hash, capability,
-            invited_by, accepted_at
+    `SELECT id, department_id, project_id, squad_id, pairing_hash, pairing_expires_at,
+            capability, invited_by, accepted_at
        FROM invites WHERE id = ?1 LIMIT 1`,
   )
     .bind(inviteId)
@@ -123,11 +125,10 @@ export async function loadInviteLanding(env: Env, inviteId: string): Promise<Inv
     inviterName,
   }
 
-  // 0152's trigger keeps project_id/squad_id/pairing_hash jointly null or all
-  // set, so pairing_hash alone is the reliable "this is a Telegram/project
-  // invite" signal — it is redeemed ONLY through the authenticated Hermes
-  // webhook (redeemTelegramProjectInvite, ../members/project-invites.ts).
-  return invite.pairing_hash !== null
+  // A3: pairing_hash OR pairing_expires_at is the Telegram door (unchanged
+  // 409). A plain squad invite (squad_id set, pairing columns NULL) is a
+  // web accept — 0156 legalized that shape.
+  return invite.pairing_hash !== null || invite.pairing_expires_at !== null
     ? { kind: 'telegram_only', ctx }
     : { kind: 'ready', ctx }
 }
@@ -281,10 +282,10 @@ inviteApp.post('/:id', async (c) => {
     return c.html(invitePageBody(c.env.BRAND, view.ctx, 'Enter your name to continue.'), 400)
   }
 
-  // WARN-C: mintToken:false — this page authenticates the human by sending
-  // them to log in (OAuth/session), never by handing back a bearer, so it
-  // must not mint (or persist, in member_tokens) a workspace token just to
-  // discard it. `result.value.token` is `null` on this path; see acceptInvite.
+  // LOAD-BEARING: the public JSON accept mints a token but writes no KV
+  // marker; the web path writes the marker but mints no token; flipping
+  // this to true lets a JSON-accepted invite be linked to a victim's
+  // Google identity (adversarial gate #1458).
   const result = await acceptInvite(c.env, inviteId, displayName, { mintToken: false })
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
@@ -344,12 +345,9 @@ inviteApp.post('/:id', async (c) => {
   //      invite was for, but must never echo invite.email or the IdP email
   //      back into the page (same PII discipline as P1-B on this page).
   //
-  // Until A2 lands, no code path reads this marker — it simply expires
-  // unused after PENDING_INVITE_TTL_SECONDS. This page's own behaviour
-  // (mint member + capability, then send the human to log in) is correct
-  // and complete on its own without A2. The KV payload below deliberately
-  // carries NO email (data minimization — D1's invite row is the source of
-  // truth per (2), so the KV blob never needs to duplicate it).
+  // A2's reader is src/auth/pending-invite-link.ts (via /auth/login +
+  // /auth/callback). The KV payload deliberately carries NO email (data
+  // minimization — D1's invite row is the source of truth per (2)).
   const pendingId = randomHex(24)
   await c.env.SESSIONS.put(
     `${PENDING_INVITE_KV_PREFIX}${pendingId}`,

@@ -68,7 +68,7 @@ import {
 // The validated invite payload, stashed by the parse middleware so the scope
 // extractor (which runs inside requireCapability) can read the target department.
 interface ParsedInvite {
-  kind: 'legacy' | 'project'
+  kind: 'legacy' | 'project' | 'squad'
   email: string
   /** Bind path only — an existing member to attach a Telegram identity to. */
   member_id: string | null
@@ -217,11 +217,29 @@ export type AcceptInviteResult =
   | { ok: false; error: AcceptInviteError }
 
 /**
- * Redeem a legacy (non-Telegram/non-project) invite: mint the member,
- * capability grant and workspace token atomically. A Telegram/project invite
- * (pairing_hash set) is refused here — those redeem only through the
+ * Redeem a web invite: mint the member, capability grant and (optionally)
+ * workspace token atomically. A Telegram/project invite (pairing_hash or
+ * pairing_expires_at set) is refused here — those redeem only through the
  * authenticated Hermes webhook (redeemTelegramProjectInvite, project-invites.ts).
+ * A3: a plain squad invite (squad_id set, pairing columns NULL) grants the
+ * human-plane squad capability through this same writer — not a hand-rolled
+ * memberships insert. #1161 setSquadMembership is the agent-plane writer and
+ * cannot bind a freshly minted human (no agent_id).
  */
+/** Telegram/project door. Any one conjunct is enough — legal D1 rows cannot
+ *  isolate them, so callers and WARN-D tests go through this helper. */
+export function isTelegramDoorInvite(invite: {
+  pairing_hash: string | null
+  pairing_expires_at: string | null
+  project_id: string | null
+}): boolean {
+  return (
+    invite.pairing_hash !== null
+    || invite.pairing_expires_at !== null
+    || invite.project_id !== null
+  )
+}
+
 export async function acceptInvite(
   env: Env,
   inviteId: string,
@@ -241,12 +259,10 @@ export async function acceptInvite(
     .first<InviteRow>()
 
   if (!invite) return { ok: false, error: 'invite_not_found' }
-  if (
-    invite.project_id !== null
-    || invite.squad_id !== null
-    || invite.pairing_hash !== null
-    || invite.pairing_expires_at !== null
-  ) {
+  // A3-1: pairing_hash or pairing_expires_at is the Telegram door. A3-2:
+  // project_id without a web project-bind path stays 409 (filed separately).
+  // squad_id alone is a web accept after 0156.
+  if (isTelegramDoorInvite(invite)) {
     return { ok: false, error: 'project_invite_requires_telegram' }
   }
   if (invite.accepted_at) return { ok: false, error: 'invite_already_accepted' }
@@ -270,10 +286,15 @@ export async function acceptInvite(
     created_at: new Date().toISOString(),
   }
 
-  // The scope the invite's capability is granted on: org-wide when no department,
-  // otherwise that department.
-  const scopeType: CapabilityScopeType = invite.department_id ? 'department' : 'org'
-  const scopeId: string | null = invite.department_id
+  // A3-2: squad-first. The grant is the same capabilities INSERT this
+  // function already owns for org/department — not a memberships-table
+  // write (that table is the #1161 agent plane).
+  const scopeType: CapabilityScopeType = invite.squad_id
+    ? 'squad'
+    : invite.department_id
+      ? 'department'
+      : 'org'
+  const scopeId: string | null = invite.squad_id ?? invite.department_id
 
   // Mint the workspace token now (unless the caller opted out, WARN-C) so we
   // can hand it back exactly once.
@@ -325,6 +346,15 @@ export async function acceptInvite(
         ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
       )
     }
+    // A2: D1 is the callback's authority for which member this accept minted.
+    // 0156 allows this stamp on a legacy/plain-squad row; the KV marker's
+    // member_id is only a pointer and must not be trusted blind.
+    writes.push(
+      env.DB.prepare('UPDATE invites SET member_id = ? WHERE id = ? AND accepted_at IS NOT NULL').bind(
+        member.id,
+        inviteId,
+      ),
+    )
     const acceptWrites = await env.DB.batch(writes)
     // Receipt (#186): every mint row (member + capability, plus the token row
     // when minted) must land before we return `raw`. A 0-row INSERT does not
@@ -335,7 +365,7 @@ export async function acceptInvite(
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
     // on members.email UNIQUE). The conditional claim above already serialized us.
-    await env.DB.prepare('UPDATE invites SET accepted_at = NULL WHERE id = ?')
+    await env.DB.prepare('UPDATE invites SET accepted_at = NULL, member_id = NULL WHERE id = ?')
       .bind(inviteId)
       .run()
     if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
@@ -456,7 +486,7 @@ const inviteScope = (c: Context): { type: CapabilityScopeType; id: string | null
   // The frozen requireCapability types its scope arg as (c: Context) => …, so we
   // read our stashed variable through the typed view of the same context.
   const parsed = (c as Context<AppEnv>).get('inviteBody')
-  if (parsed?.kind === 'project' && parsed.squad_id) {
+  if ((parsed?.kind === 'project' || parsed?.kind === 'squad') && parsed.squad_id) {
     return { type: 'squad', id: parsed.squad_id }
   }
   const dept = parsed?.department_id ?? null
@@ -490,10 +520,11 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (!isEmail(body.email)) return c.json({ error: 'invalid_email' }, 400)
   }
 
+  // squad_id alone is the plain-squad producer (P1-C / A3). project_id,
+  // expires_in_seconds, or member_id still mark the Telegram/project shape.
   const hasProjectFields =
     hasMemberId
     || body.project_id !== undefined
-    || body.squad_id !== undefined
     || body.expires_in_seconds !== undefined
 
   const capability: Capability =
@@ -525,6 +556,30 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
       squad_id: body.squad_id.trim(),
       capability,
       expires_in_seconds: body.expires_in_seconds,
+    })
+    await next()
+    return
+  }
+
+  if (body.squad_id !== undefined && body.squad_id !== null) {
+    if (body.department_id !== undefined && body.department_id !== null) {
+      return c.json({ error: 'invalid_invite_scope' }, 400)
+    }
+    if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
+    const squadId = body.squad_id.trim()
+    const squad = await c.env.DB.prepare('SELECT id FROM squads WHERE id = ? LIMIT 1')
+      .bind(squadId)
+      .first<{ id: string }>()
+    if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+    c.set('inviteBody', {
+      kind: 'squad',
+      email: body.email as string,
+      member_id: null,
+      department_id: null,
+      project_id: null,
+      squad_id: squadId,
+      capability,
+      expires_in_seconds: null,
     })
     await next()
     return
@@ -567,7 +622,7 @@ const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     await next()
     return
   }
-  await requireCapability(inviteScope, 'admin')(c, next)
+  return requireCapability(inviteScope, 'admin')(c, next)
 }
 
 function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 404 | 409 {
@@ -630,9 +685,9 @@ membersApp.post(
 
     try {
       await c.env.DB.prepare(
-        'INSERT INTO invites (id, email, department_id, capability, invited_by, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-        .bind(id, body.email, body.department_id, body.capability, invitedBy, createdAt)
+        .bind(id, body.email, body.department_id, body.squad_id, body.capability, invitedBy, createdAt)
         .run()
     } catch (err) {
       if (isUniqueViolation(err)) return c.json({ error: 'invite_exists' }, 409)
@@ -645,6 +700,7 @@ membersApp.post(
           id,
           email: body.email,
           department_id: body.department_id,
+          squad_id: body.squad_id,
           capability: body.capability,
           invited_by: invitedBy,
           accepted_at: null,
