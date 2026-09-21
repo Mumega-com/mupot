@@ -113,8 +113,12 @@ orgApp.use('*', async (c, next) => {
 // ── departments ──────────────────────────────────────────────────────────────
 
 orgApp.get('/departments', async (c) => {
+  // mupot#1452 P1-6 (Athena's ruling): a kind='home' department (a member's
+  // private room) stays out of every work-tree rollup, this listing included —
+  // this route has no per-row authz beyond tenant scope, so filtering the
+  // ENUMERATION itself is the only place this can be enforced.
   const rows = await c.env.DB.prepare(
-    'SELECT id, slug, name, created_at FROM departments ORDER BY created_at ASC, slug ASC',
+    "SELECT id, slug, name, created_at FROM departments WHERE kind != 'home' ORDER BY created_at ASC, slug ASC",
   ).all<Department>()
   return c.json({ departments: rows.results ?? [] })
 })
@@ -161,8 +165,10 @@ orgApp.get('/departments/:id/squads', async (c) => {
   const dept = await getById<Department>(c.env, 'departments', departmentId)
   if (!dept) return c.json({ error: 'department_not_found' }, 404)
 
+  // mupot#1452 P1-6: same exclusion as GET /departments — a home squad is never
+  // enumerated, even under its own (home) department.
   const rows = await c.env.DB.prepare(
-    'SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE department_id = ? ORDER BY created_at ASC, slug ASC',
+    "SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE department_id = ? AND kind != 'home' ORDER BY created_at ASC, slug ASC",
   )
     .bind(departmentId)
     .all<Squad>()
@@ -339,10 +345,18 @@ interface DepartmentNode extends Department {
 orgApp.get('/tree', async (c) => {
   // Pull every table once, then assemble in-memory. The pot is small (one org),
   // so four scans beat N+1 round-trips.
+  //
+  // mupot#1452 P1-6 (Athena's ruling): kind='home' departments AND squads (a
+  // member's private room) are excluded from BOTH source queries — filtering
+  // squads alone would still leak the department's own name/slug (with an
+  // empty squads:[] list), and filtering departments alone would still show a
+  // home squad orphaned under no department. Agents living on an excluded
+  // home squad are never attached to any tree node (agentsBySquad below is
+  // only ever walked FROM a squad node), so they need no filter of their own.
   const [depts, squads, agents, memberships] = await Promise.all([
-    c.env.DB.prepare('SELECT id, slug, name, created_at FROM departments').all<Department>(),
+    c.env.DB.prepare("SELECT id, slug, name, created_at FROM departments WHERE kind != 'home'").all<Department>(),
     c.env.DB.prepare(
-      'SELECT id, department_id, slug, name, charter, created_at FROM squads',
+      "SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE kind != 'home'",
     ).all<Squad>(),
     c.env.DB.prepare(
       'SELECT id, squad_id, slug, name, role, model, status, created_at FROM agents',

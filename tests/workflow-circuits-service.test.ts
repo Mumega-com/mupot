@@ -33,6 +33,11 @@ const migrations = [
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
   '../migrations/0075_workflow_circuits.sql',
+  // mupot#1452 Round 2 (CI collateral): 0093 adds squads/departments/agents.kind,
+  // which src/departments/registry.ts's addon-activation entitlement gate now
+  // reads (P1-7) — a curated migration list without it is a second schema
+  // that silently drifts from the real one.
+  '../migrations/0093_org_kind_home_exemption.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'

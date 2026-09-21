@@ -57,6 +57,11 @@ const migrations = [
   '../migrations/0054_marketing_recommendations.sql',
   '../migrations/0055_projects.sql',
   '../migrations/0064_marketing_recommendation_channel_kinds.sql',
+  // mupot#1452 Round 2 (CI collateral): 0093 adds squads/departments/agents.kind,
+  // which src/departments/registry.ts's addon-activation entitlement gate now
+  // reads (P1-7) — omitting it here is the same "curated migration list is a
+  // second schema" trap 0099's comment below already warns about.
+  '../migrations/0093_org_kind_home_exemption.sql',
   '../migrations/0094_flight_dispatched_by.sql',
   // 0099 adds member_tokens.expires_at/last_used_at, which the bearer lookup now
   // references. Omitting it here does not skip a feature — it makes the auth query

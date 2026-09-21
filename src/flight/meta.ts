@@ -99,7 +99,14 @@ export async function loadFlightSquads(env: Env, squadIds: string[]): Promise<Sq
     const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
     stmts.push(
       env.DB.prepare(
-        `SELECT id, department_id, slug, name, charter, budget_cap_cents, budget_window, created_at
+        // mupot#1452 P0-1: `kind` MUST be selected — src/mcp/index.ts's
+        // flight_dispatch referenced-squares loop and memberCanAccessFlight
+        // both read `.kind` off these rows to exclude a kind='home' squad from
+        // the org-admin/legacy-role bypass. Without it here, `.kind` is
+        // silently `undefined` at runtime (TypeScript's `Squad` return type
+        // does not catch a column missing from the SQL text), and the home
+        // exclusion those two callers implement never actually triggers.
+        `SELECT id, department_id, slug, name, charter, kind, budget_cap_cents, budget_window, created_at
          FROM squads WHERE id IN (${placeholders})`,
       ).bind(...chunk),
     )

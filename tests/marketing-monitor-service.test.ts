@@ -33,6 +33,16 @@ const migrations = [
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
   '../migrations/0053_marketing_monitor_runs.sql',
+  // mupot#1452 Round 2 (CI collateral): 0093 adds squads/departments/agents.kind
+  // (default 'work', backfilled NOT NULL) — src/departments/registry.ts's
+  // addon-activation entitlement gate now runs `SELECT COUNT(*) ... FROM squads
+  // WHERE kind = 'work'` (P1-7, matching its three siblings in
+  // src/org/service.ts). Omitting it here is the exact "curated migration list
+  // is a second schema that silently drifts" trap this file's own comment (see
+  // 0099 below) warns about: activateAddon's squad count query referenced a
+  // column this fixture's squads table never had, so activation failed closed
+  // with write_failed for every test in this file that calls activateMarketing.
+  '../migrations/0093_org_kind_home_exemption.sql',
   // 0099 adds member_tokens.expires_at/last_used_at, which the bearer lookup now
   // references. Omitting it here does not skip a feature — it makes the auth query
   // reference a column this fixture never created, so every authenticated request in

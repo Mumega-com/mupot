@@ -127,10 +127,28 @@ describe('BLOCK-1: POST /departments, POST /departments/:id/squads, POST /squads
   })
 
   it('the planted-row-would-be-invisible aggravation: even if the gate WERE skipped, GET /departments never selects kind — pinned so a future column addition does not quietly reopen the visibility gap', async () => {
+    // mupot#1452 P1-6 (Athena's ruling, Round 2): GET /departments now
+    // excludes kind='home' rows OUTRIGHT (tests/org-home-squad-listing.test.ts
+    // covers that exclusion directly) — a home department no longer merely
+    // has its `kind` field hidden, it is absent from the listing entirely.
+    // This test's original concern (a future column addition on a row that
+    // DOES appear must never leak `kind`) still matters, so it is re-pinned
+    // here against an ordinary WORK department instead.
+    harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('d-work-ish', 'work-ish', 'Work-ish', 'work')`)
+    const res = await orgApp.fetch(new Request('https://pot.example/departments'), env)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { departments: Record<string, unknown>[] }
+    expect(body.departments.map((d) => d.id)).toContain('d-work-ish')
+    for (const dept of body.departments) {
+      expect(dept).not.toHaveProperty('kind')
+    }
+  })
+
+  it('mupot#1452 P1-6: a kind=\'home\' department is absent from GET /departments outright, not merely field-redacted', async () => {
     harness.sqlite.exec(`INSERT INTO departments (id, slug, name, kind) VALUES ('d-home', 'home-ish', 'Home-ish', 'home')`)
     const res = await orgApp.fetch(new Request('https://pot.example/departments'), env)
     expect(res.status).toBe(200)
     const body = await res.json() as { departments: Record<string, unknown>[] }
-    expect(body.departments[0]).not.toHaveProperty('kind')
+    expect(body.departments.map((d) => d.id)).not.toContain('d-home')
   })
 })

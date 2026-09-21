@@ -25,6 +25,13 @@ const migrations = [
   'migrations/0050_addons.sql',
   'migrations/0052_addon_bindings.sql',
   'migrations/0053_marketing_monitor_runs.sql',
+  // mupot#1452 Round 2 (CI collateral, same root cause as
+  // tests/marketing-monitor-service.test.ts): 0093 adds
+  // squads/departments/agents.kind, which src/departments/registry.ts's
+  // addon-activation entitlement gate now reads (P1-7). This fixture spawns
+  // its own child-process harness with its own curated migration list —
+  // copied from the parent test file — so it needed the identical fix.
+  'migrations/0093_org_kind_home_exemption.sql',
 ]
 
 const owner = { id: 'owner-1', role: 'owner' as const }
