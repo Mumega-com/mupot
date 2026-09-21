@@ -25,13 +25,29 @@
 //      owner (rank 5) can mint admin (rank 4 < 5). This is enforced at the
 //      service layer, not just by the preset list, so it holds even if a new
 //      preset is added that assigns rank 4.
+//   6. TARGET-RANK CEILING (mupot#1453). The preset's rank alone is not the
+//      whole story: the preset is only a floor on what the KEY itself claims
+//      to be. The mint always resolves the token to the MEMBER'S OWN standing
+//      (see step 4/S1 below) — so a target member whose REAL standing (across
+//      every scope + the legacy role plane, i.e. targetMaxRankAcrossScopes)
+//      already exceeds the minter's own rank must be refused regardless of
+//      which (lower) preset was picked, the same way the sibling HTTP route
+//      (POST /api/members/:id/tokens, mupot#1337) already refuses. Without
+//      this, an org admin (rank 4) could mint an 'observer' preset key for a
+//      member who separately holds org→owner and authenticate as owner.
 
 import { html, raw as honoRaw } from 'hono/html'
 import type { Env } from '../types'
 import { mintMemberToken } from '../members/service'
 import { ROLE_PRESETS, findPreset } from '../auth/role-presets'
 import type { RolePreset } from '../auth/role-presets'
-import { capabilityRank, resolveCapabilities, hasCapability } from '../auth/capability'
+import {
+  capabilityRank,
+  resolveCapabilities,
+  hasCapability,
+  targetMaxRankAcrossScopes,
+  exceedsTargetRankCeilingGivenRanks,
+} from '../auth/capability'
 
 // ── shapes ────────────────────────────────────────────────────────────────────
 
@@ -119,6 +135,15 @@ export interface MintParams {
    * legacy web-login) — the route handler is responsible for resolving it.
    */
   minterRank: number
+  /**
+   * The minter's OWN member id, if they have one (mupot#1454 round 2, F2).
+   * Used ONLY for the target-rank ceiling's self-exemption via
+   * `exceedsTargetRankCeilingGivenRanks` — a principal can never outrank
+   * themselves. Optional: omitting it (or passing null) never allows an
+   * unsafe mint, it can only deny a legitimate self-mint, so this is
+   * backward-compatible with every existing caller.
+   */
+  minterMemberId?: string | null
 }
 
 export type MintResult =
@@ -151,7 +176,7 @@ export type MintResult =
  *  6. Return raw once; never persisted.
  */
 export async function mintScopedKey(env: Env, params: MintParams): Promise<MintResult> {
-  const { memberId, presetId, scopeId, minterRank } = params
+  const { memberId, presetId, scopeId, minterRank, minterMemberId = null } = params
 
   // 1. Validate preset.
   const preset = findPreset(presetId)
@@ -177,6 +202,23 @@ export async function mintScopedKey(env: Env, params: MintParams): Promise<MintR
     .bind(memberId, env.TENANT_SLUG)
     .first<{ id: string }>()
   if (!member) return { ok: false, error: 'member_not_found' }
+
+  // 2b. Target-rank ceiling (mupot#1453, mirrors #1337's targetRankCeiling on
+  //     POST /api/members/:id/tokens). The mint below resolves the token to
+  //     the target's OWN capabilities at auth time (step 4/S1), so a target
+  //     whose real standing on ANY scope — or the legacy role plane —
+  //     outranks the minter must be refused, independent of which (lower)
+  //     preset was picked. mupot#1454 round 2 (F2/P2): this used to hand-roll
+  //     `targetRank > minterRank` directly, WITHOUT the self-exemption
+  //     `exceedsTargetRankCeiling` carries — an org admin minting for
+  //     THEMSELVES could be refused if their global rank (via an unrelated
+  //     grant) exceeded their org-scope-local minterRank. Now calls the
+  //     shared pure predicate (`exceedsTargetRankCeilingGivenRanks`) so this
+  //     can never drift from the HTTP sibling's rule again.
+  const targetRank = await targetMaxRankAcrossScopes(env, memberId)
+  if (exceedsTargetRankCeilingGivenRanks(minterMemberId, minterRank, memberId, targetRank)) {
+    return { ok: false, error: 'target_rank_ceiling' }
+  }
 
   // 3. Validate scope_id when required (tenant-scoped — the rows must exist in this DB).
   if (preset.scopeHint === 'squad' && !scopeId) {

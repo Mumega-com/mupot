@@ -54,6 +54,7 @@ import {
   hasSurfaceCap,
   isOrgAdmin,
   holdsCapabilityFloor,
+  exceedsTargetRankCeiling,
 } from '../auth/capability'
 // Legible refusals (#530 follow-on): a 403 that names the signed-in principal and
 // their actual standing, not just the requirement they failed. See src/auth/refusal.ts.
@@ -1893,12 +1894,17 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
     presetId: presetIdRaw,
     scopeId: scopeIdRaw || null,
     minterRank,
+    // mupot#1454 round 2 (F2): lets the target-rank ceiling self-exempt a
+    // minter who is minting a key for themselves.
+    minterMemberId: auth.memberId ?? null,
   })
 
   if (!result.ok) {
     const view = await loadKeysView(c.env)
     const msg = result.error === 'rank_ceiling'
       ? 'You cannot mint a key at or above your own capability rank. An admin cannot mint another admin; only an owner can.'
+      : result.error === 'target_rank_ceiling'
+      ? 'This member already outranks you (on some scope, or the legacy role plane). You cannot mint a key for a member who outranks you.'
       : result.error === 'member_not_found'
       ? 'Member not found or inactive.'
       : result.error === 'squad_not_found'
@@ -1913,7 +1919,11 @@ dashboardApp.post('/admin/keys/mint', async (c) => {
       ? 'This member does not hold the capability this preset attests. Minting a key never elevates a member — grant the capability to the member first, then mint an attesting key.'
       : `Mint failed: ${result.error}`
     const statusCode =
-      result.error === 'rank_ceiling' || result.error === 'member_lacks_capability' ? 403 : 400
+      result.error === 'rank_ceiling' ||
+      result.error === 'target_rank_ceiling' ||
+      result.error === 'member_lacks_capability'
+        ? 403
+        : 400
     return c.html(
       shell(c.env, 'Scoped API Keys', keysPageBody(view, presetIdRaw, scopeIdRaw ?? undefined, msg)),
       statusCode,
@@ -2611,17 +2621,40 @@ dashboardApp.get('/members', async (c) => {
 
 // POST /members/:id/tokens — mint a scoped token, then render the SHOW-ONCE page.
 // We do NOT redirect (the raw token must not survive past this one response).
+//
+// mupot#1454 round 2 (F1, same class as #1453): this route minted via
+// mintMemberToken for an ARBITRARY member id, with no target-rank ceiling
+// (unlike its dashboard twin, mintScopedKey in ./keys.ts), no status filter
+// (a suspended member could still receive a fresh credential), and no tenant
+// filter (a cross-tenant member row could be minted against, same #1330-class
+// gap keys.ts already closed) — reachable from a form rendered on every row
+// of /members. Both checks below mirror keys.ts's mintScopedKey exactly.
 dashboardApp.post('/members/:id/tokens', async (c) => {
   const auth = c.get('auth')
   if (!(await canOnOrg(c.env, auth, 'admin'))) {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Provisioning a token requires admin.')), 403)
   }
   const memberId = c.req.param('id')
-  const member = await c.env.DB.prepare('SELECT id, display_name FROM members WHERE id = ? LIMIT 1')
-    .bind(memberId)
+  const member = await c.env.DB.prepare(
+    `SELECT id, display_name FROM members WHERE id = ?1 AND status = 'active' AND (tenant = ?2 OR tenant IS NULL) LIMIT 1`,
+  )
+    .bind(memberId, c.env.TENANT_SLUG)
     .first<{ id: string; display_name: string }>()
   if (!member) {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Person not found.')), 404)
+  }
+
+  // Target-rank ceiling — the same guard mintScopedKey (./keys.ts, mupot#1453)
+  // and the JSON API sibling (POST /api/members/:id/tokens, mupot#1337,
+  // src/members/index.ts) enforce: minting a token for a member yields a
+  // credential that authenticates AS that member, so a target whose real
+  // standing (any scope, or the legacy role plane) already outranks the
+  // minter must be refused regardless of who is minting. Full AuthContext is
+  // already in hand here, so this calls exceedsTargetRankCeiling directly —
+  // the same predicate mintScopedKey's `exceedsTargetRankCeilingGivenRanks`
+  // is a DB-free variant of, so the two can never drift.
+  if (await exceedsTargetRankCeiling(c.env, auth, memberId)) {
+    return c.html(shell(c.env, 'Access Tokens', errorBody('This member already outranks you (on some scope, or the legacy role plane). You cannot mint a token for a member who outranks you.')), 403)
   }
 
   const form = await c.req.parseBody()

@@ -1,6 +1,7 @@
 // src/auth/sso-routes.ts — Enterprise SSO Configuration & Domain Verification REST Endpoints.
 
 import { Hono } from 'hono'
+import { z } from 'zod'
 import type { Env, AuthContext } from '../types'
 // requireAuth is owned by the auth component; it sets c.get('auth').
 import { requireAuth } from './index'
@@ -11,10 +12,34 @@ import {
   setSsoConfig,
   isDomainAllowed,
   autoEnrollSsoMember,
-  type SsoConfig,
+  SSO_ALLOWED_DEFAULT_ROLES,
 } from './sso'
 
 export const ssoApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
+
+// mupot#1454: POST /config used to pass req.json() straight into setSsoConfig,
+// which spreads {...current, ...config} onto the stored blob with NO runtime
+// check — the SsoConfig TS type said default_role was 'member'|'admin' (now
+// narrowed further, see sso.ts), but a type is compile-time only; the actual
+// runtime value was whatever the caller sent. An org admin (the only principal
+// this route ever admitted, even before this fix) could set
+// default_role:'admin' (or any other string) and then have POST /enroll mint
+// an org-admin capability for an email they control the moment it logs in —
+// no ceiling, no re-check. This schema is the enforcement: an unknown
+// default_role is refused here so a bad value can never reach org_settings in
+// the first place, and `.strict()` refuses any key this config does not
+// declare. autoEnrollSsoMember (sso.ts) re-validates default_role again at
+// enroll time against the SAME allowlist, in case a value written before this
+// fix (or via direct D1 access) is already sitting in org_settings.
+const SsoConfigBody = z
+  .object({
+    enabled: z.boolean().optional(),
+    allowed_domains: z.array(z.string()).optional(),
+    default_role: z.enum(SSO_ALLOWED_DEFAULT_ROLES).optional(),
+    enforce_sso: z.boolean().optional(),
+    idp_provider: z.enum(['google', 'saml', 'generic']).optional(),
+  })
+  .strict()
 
 // P0 (2026-09-02): every route on this app was mounted at /api/auth/sso with no
 // middleware and no inline check. Unauthenticated callers could read AND write
@@ -49,14 +74,23 @@ ssoApp.get('/config', requireOrgCapability('admin'), async (c) => {
  * POST /api/auth/sso/config — Update SSO domain whitelist and enforcement policies.
  */
 ssoApp.post('/config', requireOrgCapability('admin'), async (c) => {
-  let body: Partial<SsoConfig>
+  let rawBody: unknown
   try {
-    body = await c.req.json()
+    rawBody = await c.req.json()
   } catch {
     return c.json({ ok: false, error: 'invalid_json' }, 400)
   }
 
-  const updated = await setSsoConfig(c.env, body)
+  const parsed = SsoConfigBody.safeParse(rawBody)
+  if (!parsed.success) {
+    const invalidDefaultRole = parsed.error.issues.some((issue) => issue.path[0] === 'default_role')
+    if (invalidDefaultRole) {
+      return c.json({ ok: false, error: 'invalid_default_role' }, 400)
+    }
+    return c.json({ ok: false, error: 'invalid_body', issues: parsed.error.issues }, 400)
+  }
+
+  const updated = await setSsoConfig(c.env, parsed.data)
   return c.json({ ok: true, config: updated })
 })
 
