@@ -352,3 +352,103 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     expect(await listLoops(env, { squadIds: [] })).toEqual([])
   })
 })
+
+// resolveAccessibleSquadIds consumer audit (adversarial round on G-FP1b): the
+// org-scope tests above prove "unrestricted (null) sees BOTH squad-a and
+// squad-b" — the correct behavior for two ordinary WORK squads. That same
+// "sees everything" property must NOT extend to a THIRD member's home
+// squad. This block adds a home squad/agent/loop/presence row on top of the
+// SAME two-squad fixture and re-asserts the org-scope viewer's "sees
+// everything" claims from above still hold for squad-a/squad-b while now
+// ALSO excluding the home fixtures — the fix is in each consumer's own SQL
+// (dashboard/brain.ts's listLoops excludeHome, fleet/presence.ts's
+// listPresence excludeHome, dashboard/radar.ts's loadFleetRadar kind
+// filter), not in resolveAccessibleSquadIds itself (which correctly still
+// returns null/unrestricted for org-admin — that part is unchanged).
+describe('resolveAccessibleSquadIds consumers — home squad exclusion for an unrestricted (org-scope) viewer', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  async function makeHarnessWithHome(): Promise<SqliteD1Harness> {
+    const h = await makeHarness()
+    h.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-home-c', 'dept-home-c', 'Home Dept C');
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES
+        ('squad-home-c', 'dept-home-c', 'home-c', 'Home C', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES
+        ('agent-home-c', 'squad-home-c', 'agent-home-c', 'Agent Home C', 'operator', 'test', 'active');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES
+        ('member-home-c', 'home-c@pot.test', 'Home C Member', 'active', 'pot-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-home-c', 'member-home-c', 'squad', 'squad-home-c', 'admin');
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, last_reported_at, updated_at) VALUES
+        ('host-home-c', 'pot-a', 'Host Home C SECRET', 'tmux', '["home-c"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now'));
+      INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES
+        ('pot-a', 'member-home-c', 'Home C Member SECRET', 'claude-code', 'build', 'agent-home-c', datetime('now'), datetime('now'));
+    `)
+    const env = { DB: h.db, TENANT_SLUG: 'pot-a' } as unknown as Env
+    await createLoop(env, { ...VALID_SPEC, squad_id: 'squad-home-c', agent_id: null, okr: 'HOME-C-SECRET-OKR-TEXT' })
+    return h
+  }
+
+  it('org-scope capability: GET /brain still sees BOTH work OKRs but NOT the home squad\'s loop OKR', async () => {
+    harness = await makeHarnessWithHome()
+    const env = envFor(harness, { 'sess:s-org': sessionRecord('org@pot.test') })
+    const res = await dashboardApp.fetch(req('/brain', 's-org'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('SQUAD-A-ONLY-OKR-TEXT')
+    expect(body).toContain('SQUAD-B-ONLY-OKR-TEXT')
+    expect(body).not.toContain('HOME-C-SECRET-OKR-TEXT')
+  })
+
+  it('org-scope capability: GET /radar?tab=fleet still sees BOTH work hosts but NOT the home squad\'s host/presence', async () => {
+    harness = await makeHarnessWithHome()
+    const env = envFor(harness, { 'sess:s-org': sessionRecord('org@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?tab=fleet', 's-org'), env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('Host A')
+    expect(body).toContain('Host B')
+    expect(body).not.toContain('Host Home C SECRET')
+    expect(body).not.toContain('Home C Member SECRET')
+  })
+
+  it('org-scope capability: GET /radar?format=json still returns BOTH work agents/squads but NOT the home agent/squad', async () => {
+    harness = await makeHarnessWithHome()
+    const env = envFor(harness, { 'sess:s-org': sessionRecord('org@pot.test') })
+    const res = await dashboardApp.fetch(req('/radar?format=json', 's-org'), env)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { agents: Array<{ agent_id: string }>; squads: Array<{ squad_id: string }> }
+    expect(data.agents.map(a => a.agent_id)).toContain('agent-a')
+    expect(data.agents.map(a => a.agent_id)).toContain('agent-b')
+    expect(data.agents.map(a => a.agent_id)).not.toContain('agent-home-c')
+    expect(data.squads.map(s => s.squad_id)).toContain('squad-a')
+    expect(data.squads.map(s => s.squad_id)).toContain('squad-b')
+    expect(data.squads.map(s => s.squad_id)).not.toContain('squad-home-c')
+  })
+
+  it('listLoops: excludeHome=true drops the home loop even for an unrestricted (null) caller', async () => {
+    harness = await makeHarnessWithHome()
+    const env = { DB: harness.db, TENANT_SLUG: 'pot-a' } as unknown as Env
+    const unrestrictedNoFlag = await listLoops(env, { squadIds: null })
+    const unrestrictedExcludingHome = await listLoops(env, { squadIds: null, excludeHome: true })
+    expect(unrestrictedNoFlag.map((l) => l.okr)).toContain('HOME-C-SECRET-OKR-TEXT')
+    expect(unrestrictedExcludingHome.map((l) => l.okr)).not.toContain('HOME-C-SECRET-OKR-TEXT')
+    expect(unrestrictedExcludingHome.map((l) => l.okr).sort()).toEqual(['SQUAD-A-ONLY-OKR-TEXT', 'SQUAD-B-ONLY-OKR-TEXT'])
+  })
+
+  it('listPresence: excludeHome=true drops the home member\'s presence row even for an unrestricted (null) caller', async () => {
+    harness = await makeHarnessWithHome()
+    const env = { DB: harness.db, TENANT_SLUG: 'pot-a' } as unknown as Env
+    const unrestrictedNoFlag = await listPresence(env, NOW, null)
+    const unrestrictedExcludingHome = await listPresence(env, NOW, null, true)
+    expect(unrestrictedNoFlag.map((p) => p.member_id)).toContain('member-home-c')
+    expect(unrestrictedExcludingHome.map((p) => p.member_id)).not.toContain('member-home-c')
+    expect(unrestrictedExcludingHome.map((p) => p.member_id).sort()).toEqual(['member-squad-a', 'member-squad-b'])
+  })
+})

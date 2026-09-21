@@ -133,12 +133,24 @@ export async function recordRunner(
   return row
 }
 
+/**
+ * listRunners — both existing callers (mcp/runners.ts's `runner_list` tool,
+ * dashboard/mission-control-routes.ts's /radar) are viewer-facing, so the
+ * home-squad exclusion below is UNCONDITIONAL, matching every other
+ * resolveAccessibleSquadIds-consumer query in this codebase (agents-admin.ts,
+ * kanban-routes.ts, fleet/registry.ts) — an org-admin/unrestricted caller
+ * (squad_ids: null) must not see a runner receipt recorded against a
+ * member's home squad (resolveAccessibleSquadIds consumer audit, G-FP1b).
+ */
 export async function listRunners(
   env: Env,
   filter: ListRunnersFilter = {},
 ): Promise<RunnerReceipt[]> {
   const tenant = env.TENANT_SLUG || 'mumega'
-  const conditions: string[] = ['tenant = ?1']
+  const conditions: string[] = [
+    'tenant = ?1',
+    `(squad_id IS NULL OR NOT EXISTS (SELECT 1 FROM squads s WHERE s.id = runner_receipts.squad_id AND s.kind = 'home'))`,
+  ]
   const params: unknown[] = [tenant]
   let pIdx = 2
 

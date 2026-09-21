@@ -49,12 +49,23 @@ export const toolRunnerRecord: ToolSpec = {
         return fail(403, 'forbidden: seat_agent_id required for unbound caller')
       }
       const accessibleSquads = await resolveAccessibleSquadIds(env, auth)
-      // Check if targetSeat belongs to an accessible squad
-      const agentRow = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 1')
+      // Check if targetSeat belongs to an accessible squad. `s.kind` is
+      // joined in even for an UNRESTRICTED (org-admin, accessibleSquads ===
+      // null) caller — resolveAccessibleSquadIds consumer audit (G-FP1b):
+      // an org-admin's unbound-caller standing must not reach into recording
+      // a runner receipt AS an agent living in someone's home squad, the
+      // same "org-scope never covers home" rule every other consumer of
+      // this resolver enforces.
+      const agentRow = await env.DB.prepare(
+        'SELECT a.squad_id, s.kind FROM agents a JOIN squads s ON s.id = a.squad_id WHERE a.id = ?1 OR a.slug = ?1 LIMIT 1',
+      )
         .bind(targetSeat)
-        .first<{ squad_id: string | null }>()
+        .first<{ squad_id: string | null; kind: string }>()
       if (!agentRow) {
         return fail(404, 'agent_not_found')
+      }
+      if (agentRow.kind === 'home') {
+        return fail(403, 'home_scope_not_grantable')
       }
       if (accessibleSquads !== null) {
         if (!agentRow.squad_id || !accessibleSquads.includes(agentRow.squad_id)) {

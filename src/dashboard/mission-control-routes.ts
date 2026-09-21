@@ -55,7 +55,7 @@ export function makeMissionControlApp(shell: ShellFn) {
     const [radar, hostAgents, presence, motherboard, journeys, physics, spend, runners] = await Promise.all([
       loadFleetRadar(c.env, Date.now(), squadIds),
       listFleetAgentRuntimeView(c.env, Date.now(), squadIds),
-      listPresence(c.env, Date.now(), squadIds),
+      listPresence(c.env, Date.now(), squadIds, true),
       loadMotherboardData(c.env, tenant, auth),
       listJourneys(c.env, { scope: 'live' }).catch(() => []),
       loadBrainPhysics(c.env),
