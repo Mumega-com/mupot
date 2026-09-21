@@ -434,6 +434,25 @@ export async function findHomeSquadByDepartment(env: Env, departmentId: string):
     .first<Squad>()
 }
 
+/**
+ * getMemberHomeSquad — FP-01 Slice 2 (mupot#1443, brief §2 Task A): the ONE
+ * read-only lookup a project-access grant executor uses to find "this
+ * member's own room" — the ONLY squad a project_access proposal's grant may
+ * ever land on (never an arbitrary squad_id from the payload). Reuses the
+ * SAME department-keyed join createHomeForMember/bootstrapSelf already share
+ * (homeDepartmentSlug + findHomeSquadByDepartment, G-FP1b point 5) rather
+ * than inventing a second lookup — a member with no home yet (createHomeForMember
+ * never ran) returns null, and the caller must fail closed rather than create
+ * one on the fly: creating a home is createHomeForMember's job alone, gated by
+ * the member's own first contact (brief §2f(a)), never a side effect of a
+ * grant executor.
+ */
+export async function getMemberHomeSquad(env: Env, memberId: string): Promise<Squad | null> {
+  const department = await findHomeDepartmentBySlug(env, homeDepartmentSlug(memberId))
+  if (!department) return null
+  return findHomeSquadByDepartment(env, department.id)
+}
+
 async function findExistingHomeSquad(env: Env, memberId: string, squadSlug: string): Promise<HomeSquadRow | null> {
   // Joined on the member's OWN capability row, not slug alone — a slug match
   // is never proof of provenance by itself (see bootstrap-self.ts's WARN-1

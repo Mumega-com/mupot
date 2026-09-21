@@ -858,24 +858,106 @@ function sanitizeTelegramDisplayName(candidate: string | undefined): string {
   return trimmed && trimmed.length > 0 ? trimmed.slice(0, 100) : 'Telegram member'
 }
 
-function storedTelegramReply(responseText: string): { ok: true; reply: string } | null {
+// StoredTelegramReplyValue — the webhook's JSON response shape. `bound`,
+// `member_id`, `home_squad_id` and `intake_state` are ADDITIVE (mupot-plugin
+// PR #17 contract, FP-01 Slice 2): a caller (the mupot-plugin's
+// first-person skill) needs the chat's bound/home/intake state as TYPED
+// fields, never by string-matching the prose in `reply` — that
+// string-matching anti-pattern is exactly what BLOCKed mupot-plugin PR #15
+// round 1, and the plugin must never decide "is this a new member" locally.
+export type IntakeState = 'none' | 'pending' | 'complete'
+
+interface StoredTelegramReplyValue {
+  ok: true
+  reply: string
+  bound: boolean
+  member_id: string | null
+  home_squad_id: string | null
+  intake_state: IntakeState
+}
+
+// memberIntakeEnvelope — the ONE place bound/member_id/home_squad_id/intake_state
+// are computed, shared by the webhook's per-message reply AND any other
+// per-message status surface (same fields, same cost — a plugin polling for
+// status gets byte-identical semantics to the webhook reply). All THREE
+// reads are indexed point/EXISTS lookups (memberForChat: telegram_chat_id
+// unique index; getMemberHomeSquad: department slug lookup then a
+// department_id-indexed squad SELECT; the intake EXISTS below: a single
+// json_extract EXISTS over routine_run_actions) — cheap enough for a
+// rate-limited per-message poll, never a table scan.
+//
+// intake_state is entirely SERVER-derived, never left for a caller to infer:
+//   'none'    — chatId maps to no member at all (memberForChat returned null).
+//   'pending' — bound, but the project_access proposal chain (FP-01 Slice 2
+//               Task A) has not yet been submitted for this member.
+//   'complete'— a project_access routine proposal naming this member EXISTS
+//               (routine_run_actions.kind='project_access', regardless of
+//               its own approved/rejected/waiting outcome — "complete" names
+//               the INTAKE conversation having produced a proposal, not the
+//               grant's own verdict, which is a separate, later fact the
+//               grant chain itself already tracks via task_verdicts/
+//               project_access_grant_receipts).
+// NO MIGRATION: this reuses routine_run_actions.input_json (already storing
+// member_id on a project_access action's own input, migrations/0073+0158) —
+// deliberately not a new members column/engram marker, since one already
+// existed that needed no schema change at all.
+export async function memberIntakeEnvelope(
+  env: Env,
+  member: Member | null,
+): Promise<{ bound: boolean; member_id: string | null; home_squad_id: string | null; intake_state: IntakeState }> {
+  if (!member) return { bound: false, member_id: null, home_squad_id: null, intake_state: 'none' }
+  const { getMemberHomeSquad } = await import('../org/service')
+  const home = await getMemberHomeSquad(env, member.id)
+  const proposed = await env.DB.prepare(
+    `SELECT 1 FROM routine_run_actions
+      WHERE tenant = ?1 AND kind = 'project_access'
+        AND json_extract(input_json, '$.member_id') = ?2
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, member.id).first()
+  return {
+    bound: true,
+    member_id: member.id,
+    home_squad_id: home?.id ?? null,
+    intake_state: proposed ? 'complete' : 'pending',
+  }
+}
+
+function storedTelegramReply(responseText: string): StoredTelegramReplyValue | null {
   try {
     const value = JSON.parse(responseText) as Record<string, unknown> | null
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-    if (value.ok === true && typeof value.reply === 'string') return { ok: true, reply: value.reply }
+    const bound = value.bound === true
+    const memberId = typeof value.member_id === 'string' ? value.member_id : null
+    const homeSquadId = typeof value.home_squad_id === 'string' ? value.home_squad_id : null
+    const intakeState: IntakeState = value.intake_state === 'complete'
+      ? 'complete'
+      : value.intake_state === 'pending' ? 'pending' : (bound ? 'pending' : 'none')
+    if (value.ok === true && typeof value.reply === 'string') {
+      return { ok: true, reply: value.reply, bound, member_id: memberId, home_squad_id: homeSquadId, intake_state: intakeState }
+    }
     // Project redemption completes this receipt in its atomic membership batch.
     if (typeof value.member_id === 'string' && typeof value.project_id === 'string'
       && typeof value.squad_id === 'string' && typeof value.capability === 'string') {
-      return { ok: true, reply: joinedReply(value.project_id) }
+      return {
+        ok: true, reply: joinedReply(value.project_id), bound: true, member_id: value.member_id,
+        // This legacy receipt shape predates home_squad_id/intake_state — a
+        // replay of one of these rows reports the conservative unknown
+        // state rather than fabricating a home id it never recorded.
+        home_squad_id: null, intake_state: 'pending',
+      }
     }
   } catch { /* An unreadable result is uncertain, never permission to retry. */ }
   return null
 }
 
 // POST /webhook — accept a Telegram-style update, resolve + act, reply.
-// Returns { ok, reply } so the Hermes relay can echo `reply` back into the chat.
-// We always answer 200 with a reply string (even for refusals) so the relay has
-// a clear message to deliver; transport-level problems are the only non-200s.
+// Returns { ok, reply, bound, member_id, home_squad_id, intake_state } so the
+// Hermes relay can echo `reply` back into the chat AND (mupot-plugin PR #17
+// contract) a caller like the first-person skill can read the other four as
+// TYPED, server-derived fields — never by string-matching `reply`'s prose,
+// and never by deciding "is this member new" locally. We always answer 200
+// with a reply string (even for refusals) so the relay has a clear message
+// to deliver; transport-level problems are the only non-200s.
 imApp.post('/webhook', async (c) => {
   const body = await readCappedBody(c.req.raw, IM_WEBHOOK_MAX_BODY_BYTES)
   if (!body.ok) {
@@ -939,7 +1021,19 @@ imApp.post('/webhook', async (c) => {
     telegram: identity,
     displayName: telegramDisplayName(update.message?.from),
   })
-  const stored = await completeTelegramUpdate(c.env, identity, JSON.stringify({ ok: true, reply }))
+  // Resolved AFTER handleImMessage so a `/start <code>` that just redeemed an
+  // invite in THIS call reports its own new bound state, not a pre-handling
+  // snapshot. Read-only — safe to call a second time; the mupot-plugin
+  // contract (PR #17) needs bound/member_id/home_squad_id/intake_state as
+  // typed fields on every webhook reply, not only /start, so the plugin
+  // never has to infer them from `reply`'s prose or decide "is this new"
+  // locally.
+  const member = await memberForChat(c.env, chatId)
+  const envelope = await memberIntakeEnvelope(c.env, member)
+  const stored = await completeTelegramUpdate(
+    c.env, identity,
+    JSON.stringify({ ok: true, reply, ...envelope }),
+  )
   const response = stored === null ? null : storedTelegramReply(stored)
   return response ? c.json(response) : c.json({ error: 'update_in_progress' }, 409)
 })

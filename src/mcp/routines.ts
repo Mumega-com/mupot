@@ -203,6 +203,26 @@ const proposalActionSchemas = [
     required: ['key', 'kind', 'input'],
     additionalProperties: false,
   },
+  {
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
+      kind: { const: 'project_access' },
+      input: {
+        type: 'object',
+        properties: {
+          member_id: string(200),
+          project_id: string(200),
+          access_level: { type: 'string', enum: ['read', 'write', 'admin'] },
+          reason: string(2000),
+        },
+        required: ['member_id', 'project_id', 'access_level', 'reason'],
+        additionalProperties: false,
+      },
+    },
+    required: ['key', 'kind', 'input'],
+    additionalProperties: false,
+  },
 ]
 
 const routineList: ToolSpec = {
@@ -372,7 +392,7 @@ const routineProposalSubmit: ToolSpec = {
         type: 'object',
         properties: {
           key: { type: 'string', pattern: IDEMPOTENCY_KEY, maxLength: 200 },
-          kind: { type: 'string', enum: ['create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action'] },
+          kind: { type: 'string', enum: ['create_task', 'dispatch_flight', 'request_review', 'ask_human', 'no_action', 'project_access'] },
           input: { type: 'object' },
         },
         required: ['key', 'kind', 'input'],
