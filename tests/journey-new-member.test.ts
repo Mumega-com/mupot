@@ -13,17 +13,19 @@
 // called out in a comment at the point of divergence (do not "fix" the test to
 // hide these — they are findings for #1442, not test bugs):
 //
-//   FINDING A — legacy department-scoped invites (the only invite kind the public
-//     GET/POST /invite/:id web-accept page will accept) can never carry a squad_id:
-//     the ONLY invite kind with squad_id is the Telegram/project pairing kind, which
-//     the web POST handler explicitly REFUSES with 409 "redeemed in Telegram". So
-//     step 2/3's squad_id-carrying, web-completable invite does not exist as one
-//     path today — this file drives the department-scoped invite (which the code
-//     DOES support end-to-end) and relies on department→squad capability
-//     inheritance (src/auth/capability.ts hasCapability) to give NEW real access to
-//     the squad created in step 1. GET /invite/:id for this invite kind shows
-//     org/department/capability/inviter — never a squad name, because the code has
-//     no squad to show on this branch.
+//   FINDING A (RESOLVED by #1436 A3, mupot#1458/ad5fe58e) — a "plain squad
+//     invite" (squad_id set, no project_id/expires_in_seconds/member_id) is now a
+//     real, web-completable invite kind: src/members/index.ts's parseInvite treats
+//     bare squad_id as the plain-squad producer (kind:'squad'), acceptInvite grants
+//     the human-plane capability directly at squad scope (A3-2, not department
+//     inheritance), and src/dashboard/invite.ts's loadInviteLanding renders the
+//     squad's own name (never a department, since this invite kind carries none).
+//     The only invite kind the web accept page still refuses (409 "redeemed in
+//     Telegram") is the Telegram/project PAIRING kind (pairing_hash or
+//     pairing_expires_at set) — isTelegramDoorInvite, unaffected by A3. This file
+//     therefore drives a plain-squad invite straight at the squad created in step 1
+//     (not a department), matching the spec table's step 2/3 literally instead of
+//     working around a since-fixed gap.
 //
 //   FINDING B — /admin/members' "copyable /invite/<id> link" (step 2) is built
 //     entirely CLIENT-SIDE (src/dashboard/index.ts, the inline <script> at the
@@ -68,6 +70,7 @@ import { inviteApp } from '../src/dashboard/invite'
 import { membersApp } from '../src/members'
 import { dashboardApp } from '../src/dashboard/index'
 import { authApp } from '../src/auth'
+import { PENDING_INVITE_COOKIE, PENDING_INVITE_KV_PREFIX } from '../src/auth/pending-invite-link'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'pot-a'
@@ -88,6 +91,7 @@ let squadId: string
 let projectId: string
 let inviteId: string
 let newMemberId: string
+let pendingInviteId: string
 let newSessionId: string
 let agentId: string
 let agentMemberId: string
@@ -124,6 +128,50 @@ function extractSessionId(res: Response): string {
   return match[1]
 }
 
+// mupot#1436 A2 — same extraction/stub pattern as tests/invite-login-link.test.ts,
+// reused (not reinvented) for step 5's real Google callback.
+function extractPendingInviteId(res: Response): string {
+  const setCookie = res.headers.get('set-cookie') ?? ''
+  const match = new RegExp(`${PENDING_INVITE_COOKIE}=([^;]+)`).exec(setCookie)
+  if (!match) throw new Error(`no pending-invite cookie in response: ${setCookie}`)
+  return match[1]
+}
+
+function stubGoogleUserinfo(email: string, sub: string): void {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
+      }
+      if (url.includes('openidconnect.googleapis.com/v1/userinfo')) {
+        return new Response(JSON.stringify({ sub, email, email_verified: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }),
+  )
+}
+
+async function startGoogleLogin(pendingId: string): Promise<string> {
+  const res = await authApp.request(
+    `${ORIGIN}/login`,
+    { headers: { cookie: `${PENDING_INVITE_COOKIE}=${pendingId}` } },
+    env,
+  )
+  expect(res.status).toBe(302)
+  const location = new URL(res.headers.get('location') ?? '')
+  const state = location.searchParams.get('state')
+  if (!state) throw new Error('login redirect missing state')
+  return state
+}
+
+function googleCallbackReq(state: string, pendingId: string): Request {
+  return new Request(`${ORIGIN}/callback?code=abc&state=${encodeURIComponent(state)}`, {
+    headers: { cookie: `${PENDING_INVITE_COOKIE}=${pendingId}` },
+  })
+}
+
 function get(path: string, headers: Record<string, string> = {}): Request {
   return new Request(`${ORIGIN}${path}`, { headers })
 }
@@ -150,6 +198,10 @@ beforeAll(() => {
     TENANT_SLUG: TENANT,
     BRAND: 'Test Pot',
     PUBLIC_ORIGIN: ORIGIN,
+    // Step 5's real Google callback (#1436 A2) needs a configured provider;
+    // token/userinfo fetches are stubbed per-test via stubGoogleUserinfo.
+    OAUTH_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    OAUTH_CLIENT_SECRET: 'test-client-secret',
     BUS: { send: vi.fn(async () => {}) },
     SESSIONS: {
       get: async (key: string, type?: string) => {
@@ -239,19 +291,24 @@ describe('Step 1 — ADMIN creates a project and a squad, links them at write', 
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-// Step 2 — Invite NEW as 'lead' (ADMIN, HTTP POST /api/members/invites)
+// Step 2 — Invite NEW as 'lead' on the squad (ADMIN, HTTP POST /api/members/invites)
 // ════════════════════════════════════════════════════════════════════════════
-describe('Step 2 — ADMIN invites NEW at department scope (FINDING A/B)', () => {
+describe('Step 2 — ADMIN invites NEW at squad scope (FINDING A resolved by A3/FINDING B)', () => {
   it('POST /invites returns an id, and /admin/members carries the copyable-link wiring', async () => {
     sessions.set('sess:admin-session', JSON.stringify({
       userId: 'admin-user', email: ADMIN_EMAIL, role: 'member', createdAt: new Date().toISOString(),
     }))
 
+    // A3: squad_id alone (no project_id/expires_in_seconds/member_id) is the
+    // plain-squad producer — parseInvite (src/members/index.ts) routes it to
+    // kind:'squad', authorized against 'admin' on THIS squad (ADMIN's org-wide
+    // admin capability covers it via planeCoversScope, since uc1-squad is not a
+    // home squad).
     const inviteRes = await membersApp.request(
       '/invites',
       { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieFor('admin-session') }, body: JSON.stringify({
         email: NEW_EMAIL,
-        department_id: DEPT_ID,
+        squad_id: squadId,
         capability: 'lead',
       }) },
       env,
@@ -275,8 +332,8 @@ describe('Step 2 — ADMIN invites NEW at department scope (FINDING A/B)', () =>
 // ════════════════════════════════════════════════════════════════════════════
 // Step 3 — GET /invite/:id, unauthenticated
 // ════════════════════════════════════════════════════════════════════════════
-describe('Step 3 — GET /invite/:id unauthenticated (FINDING A: no squad shown)', () => {
-  it('200s, shows org/department/capability/inviter, no email anywhere in <body>', async () => {
+describe('Step 3 — GET /invite/:id unauthenticated (A3: shows the squad, not a department)', () => {
+  it('200s, shows org/squad/capability/inviter, no email anywhere in <body>', async () => {
     // inviteApp is mounted at /invite by src/index.ts; fetching it directly (not
     // through the parent app) uses its OWN root-relative routes, matching
     // tests/invite-landing-page.test.ts's exact convention.
@@ -284,7 +341,8 @@ describe('Step 3 — GET /invite/:id unauthenticated (FINDING A: no squad shown)
     expect(res.status).toBe(200)
     const body = await res.text()
     expect(body).toContain('Test Pot') // org (BRAND)
-    expect(body).toContain('UC1 Department') // department — no squad name exists on this invite kind
+    expect(body).toContain('UC1 Squad') // A3: the invite's own squad, not a department
+    expect(body).not.toContain('UC1 Department') // this invite kind carries no department_id
     expect(body).toContain('lead') // capability
     expect(body).toContain('Ada Admin') // inviter display name
     const rendered = body.slice(body.indexOf('<body>'))
@@ -300,6 +358,9 @@ describe('Step 4 — NEW accepts the invite', () => {
     const res = await inviteApp.fetch(postForm(`/${inviteId}`, { display_name: 'Nadia Newcomer' }), env)
     expect(res.status).toBe(302)
     expect(res.headers.get('location')).toBe('/auth/login')
+    // A2: the accept response also plants the short-lived pending-invite pointer
+    // (KV + cookie) that step 5's real Google callback consumes.
+    pendingInviteId = extractPendingInviteId(res)
 
     const member = harness.sqlite
       .prepare(`SELECT id, email, display_name, status FROM members WHERE email = ?`)
@@ -309,10 +370,13 @@ describe('Step 4 — NEW accepts the invite', () => {
     expect(member!.status).toBe('active')
     newMemberId = member!.id
 
+    // A3: a plain squad invite grants the human-plane capability directly at
+    // squad scope (acceptInvite's scope-first logic) — not department
+    // inheritance, since this invite carries squad_id, not department_id.
     const cap = harness.sqlite
       .prepare(`SELECT capability, scope_type, scope_id FROM capabilities WHERE member_id = ?`)
       .get(newMemberId) as { capability: string; scope_type: string; scope_id: string } | undefined
-    expect(cap).toEqual({ capability: 'lead', scope_type: 'department', scope_id: DEPT_ID })
+    expect(cap).toEqual({ capability: 'lead', scope_type: 'squad', scope_id: squadId })
 
     const tokenCount = harness.sqlite
       .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?`)
@@ -320,14 +384,23 @@ describe('Step 4 — NEW accepts the invite', () => {
     expect(tokenCount.n).toBe(0)
 
     const invite = harness.sqlite
-      .prepare(`SELECT accepted_at FROM invites WHERE id = ?`)
-      .get(inviteId) as { accepted_at: string | null }
+      .prepare(`SELECT accepted_at, member_id FROM invites WHERE id = ?`)
+      .get(inviteId) as { accepted_at: string | null; member_id: string | null }
     expect(invite.accepted_at).not.toBeNull()
+    // A2: the D1 invite row's own member_id stamp is the authority step 5's
+    // callback links against — never the KV marker's copy.
+    expect(invite.member_id).toBe(newMemberId)
   })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-// Step 5 — Sign in (LOCAL_TEST_AUTH dev-login door, until A2/#1436 task 5c42e0ff)
+// Step 5 — Sign in. The dev-login door mints the WORKSPACE session steps 6-9
+// use downstream (kept exactly as before); the real assertion this step now
+// makes is the Google OAuth callback linking NEW's IdP identity to the D1
+// invite's own member stamp (#1436 A2, task 5c42e0ff — closed by mupot#1458 /
+// ad5fe58e). Harness reused verbatim from tests/invite-login-link.test.ts:
+// stub Google's token/userinfo endpoints, drive /auth/login to capture the
+// state it plants, then /auth/callback.
 // ════════════════════════════════════════════════════════════════════════════
 describe('Step 5 — NEW signs in', () => {
   it('mints a session cookie for the invited email via the dev-login door', async () => {
@@ -338,10 +411,85 @@ describe('Step 5 — NEW signs in', () => {
     expect(newSessionId).toBeTruthy()
   })
 
-  // #1436 A2 (task 5c42e0ff): human_login_identities does not yet link a real
-  // Google subject to the invited member — the dev-login door mints a session by
-  // email only, which is not the same guarantee. Do not fake this link.
-  it.todo('#1436 A2, task 5c42e0ff')
+  it('#1436 A2 (task 5c42e0ff): Google callback links THAT subject to the invite\'s D1 member stamp, and consumes the KV marker', async () => {
+    stubGoogleUserinfo(NEW_EMAIL, 'google-sub-newcomer')
+    try {
+      const state = await startGoogleLogin(pendingInviteId)
+      const res = await authApp.fetch(googleCallbackReq(state, pendingInviteId), env)
+      expect(res.status).toBe(302)
+      expect(res.headers.get('location')).toBe('/')
+
+      // The invite row's OWN member_id (stamped at accept time, step 4) is the
+      // link target — never the KV marker's copy (mupot#1436 A2 design gate).
+      const invite = harness.sqlite
+        .prepare(`SELECT member_id FROM invites WHERE id = ?`)
+        .get(inviteId) as { member_id: string }
+      expect(invite.member_id).toBe(newMemberId)
+
+      // NOTE: the FIRST test in this describe already minted a dev-login
+      // ('local-test' provider) session for the same email, which also writes
+      // a human_login_identities row for newMemberId — filter to 'google' so
+      // this assertion is about the REAL callback link, not that fixture row.
+      const identity = harness.sqlite
+        .prepare(
+          `SELECT provider, provider_subject, member_id FROM human_login_identities WHERE member_id = ? AND provider = 'google'`,
+        )
+        .get(newMemberId) as { provider: string; provider_subject: string; member_id: string } | undefined
+      expect(identity).toEqual({
+        provider: 'google',
+        provider_subject: 'google-sub-newcomer',
+        member_id: newMemberId,
+      })
+
+      // Get-then-delete: the pointer is single-use.
+      expect(sessions.has(`${PENDING_INVITE_KV_PREFIX}${pendingInviteId}`)).toBe(false)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('a mismatched IdP email refuses — no email leak in the body, no login-identity row linked', async () => {
+    // A fresh, dedicated invite/accept for the negative case (mirrors step 8's
+    // own convention of a small isolated fixture rather than reusing NEW's
+    // already-linked member) — the journey's single shared D1 can't replay the
+    // main invite's already-consumed marker/state to prove the email-mismatch
+    // gate specifically, and this is exactly what should refuse: a different
+    // human completing SOME OTHER accepted invite's OAuth round trip.
+    const mismatchInviteId = 'inv-uc1-mismatch'
+    const mismatchEmail = 'mismatch@uc1.test'
+    harness.sqlite.exec(`
+      INSERT INTO invites (id, email, department_id, capability, invited_by)
+        VALUES ('${mismatchInviteId}', '${mismatchEmail}', '${DEPT_ID}', 'member', '${ADMIN_MEMBER_ID}');
+    `)
+    const accept = await inviteApp.fetch(postForm(`/${mismatchInviteId}`, { display_name: 'Mia Mismatch' }), env)
+    expect(accept.status).toBe(302)
+    const mismatchPendingId = extractPendingInviteId(accept)
+    const mismatchInvite = harness.sqlite
+      .prepare(`SELECT member_id FROM invites WHERE id = ?`)
+      .get(mismatchInviteId) as { member_id: string }
+    expect(mismatchInvite.member_id).toBeTruthy()
+
+    stubGoogleUserinfo('someone-else@uc1.test', 'google-sub-mismatch')
+    try {
+      const state = await startGoogleLogin(mismatchPendingId)
+      const res = await authApp.fetch(googleCallbackReq(state, mismatchPendingId), env)
+      expect(res.status).toBe(403)
+      const body = await res.text()
+      const rendered = body.slice(body.indexOf('<body>'))
+      expect(rendered).not.toContain('@')
+
+      const linkCount = harness.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE member_id = ?`)
+        .get(mismatchInvite.member_id) as { n: number }
+      expect(linkCount.n).toBe(0)
+      const bySubject = harness.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE provider_subject = ?`)
+        .get('google-sub-mismatch') as { n: number }
+      expect(bySubject.n).toBe(0)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
 })
 
 // ════════════════════════════════════════════════════════════════════════════
