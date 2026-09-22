@@ -551,12 +551,15 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         attempt: 1,
         reason: 'Runtime failed before consumption.',
       })
-      // mupot#1494 v4 round 2 (P1-2) — this used to fall all the way through to the DB
-      // mutation and surface as `runtime_receipt_transition_conflict`. The new early
-      // terminal-receipt check (any stage IN completed/failed/reset_terminated already
-      // recorded for this dispatch, excluding only an exact idempotent replay of THIS
-      // call's own stage+attempt) now catches it first with the more specific
-      // `dispatch_terminated` — same refusal, clearer reason, zero wasted work.
+      // mupot#1494 v4 round 2 (P1-2) briefly reclassified this as `dispatch_terminated` by
+      // checking the FULL terminal-stage set (completed/failed/reset_terminated) here —
+      // round 3 (P1-A, adversarial regression) found that too broad: it also refused the
+      // OPERATOR's own `task_dispatch_lease_reset({override:true})` repair on a `failed`
+      // dispatch, breaking the normal "runner failed, let it retry" flow. Narrowed back to
+      // `reset_terminated` only — this scenario (a genuine `failed`, no operator
+      // termination) is unaffected by that check either way and falls through to its
+      // ORIGINAL, pre-round-2 enforcement: the `runtime_consumed` mutation's own
+      // `NOT EXISTS (... stage = 'failed')` fence, surfaced as `runtime_receipt_transition_conflict`.
       await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
@@ -564,7 +567,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         stage: 'runtime_consumed',
         runtimeReceiptHash: '4'.repeat(64),
         attempt: 1,
-      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
+      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
       expect(fixture.harness.sqlite.prepare(
@@ -591,8 +594,8 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         'UPDATE agent_messages SET read_at = NULL, lease_expires_at = ?, delivery_attempts = 2 WHERE id = ?',
       ).run('2099-01-01T00:00:00.000Z', MESSAGE_ID)
       const restartedEnv = { ...fixture.env }
-      // mupot#1494 v4 round 2 (P1-2) — same reclassification as the test above: the early
-      // terminal-receipt check now catches this before the DB mutation runs.
+      // mupot#1494 v4 round 3 (P1-A) — same reversion as the test above: `failed` alone
+      // (no operator `terminate: true`) is repairable/retryable, not `dispatch_terminated`.
       await expect(recordTaskDispatchRuntimeReceipt(restartedEnv, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
@@ -600,7 +603,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         stage: 'runtime_consumed',
         runtimeReceiptHash: '6'.repeat(64),
         attempt: 2,
-      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
+      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
     } finally {
@@ -2024,6 +2027,29 @@ describe('adminResetDispatchLease terminate:true — the wedge now has an exit (
     }
   })
 
+  // mupot#1494 v4 round 3 (P3, adversarial regression) — a caller that never asked to
+  // terminate anything must never be told `terminated: true`, even when the dispatch
+  // happens to ALREADY be reset_terminated for some other reason (an earlier call, an
+  // operator elsewhere). `terminated` answers "did THIS call terminate it", not "is it
+  // terminal".
+  it('an already reset_terminated dispatch: a follow-up call with terminate:false (or omitted) is refused with terminated:false, never true', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'first terminate', terminate: true,
+      })
+      const followUp = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'plain reset, no terminate this time',
+        // terminate omitted — defaults to false.
+      })
+      expect(followUp).toMatchObject({
+        reset: false, code: 'reset_refused_already_terminal', terminated: false,
+      })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('terminate:true refuses (409, receipted, zero side effects) for a directory-session org-admin with no bearer credential', async () => {
     const fixture = runtimeFixture({ unleased: true })
     try {
@@ -2182,39 +2208,61 @@ describe('adminResetDispatchLease terminate:true — the terminated dispatch can
     }
   })
 
-  it('reset(override:true, terminate:true) on a dispatch a runner ALREADY genuinely completed is refused — reset_refused_already_terminal, zero side effects', async () => {
+  // mupot#1494 v4 round 3 (P1-A, adversarial regression) — round 2 refused this outright
+  // (`reset_refused_already_terminal`) for ANY terminal receipt, including a genuine
+  // `failed`. PROVED wrong: this is EXACTLY the "runner failed, operator wants to reset the
+  // lease so it (or a redelivered attempt) can retry" repair the tool exists for — a
+  // `failed` settle does NOT, by itself, permanently fence the underlying message (only a
+  // `reset_terminated` — an OPERATOR's own explicit declaration — does that). Renamed and
+  // re-asserted for the CORRECT behavior: a genuinely `failed` dispatch remains repairable.
+  it('reset(override:true, terminate:true) on a dispatch a runner genuinely FAILED (not operator-terminated) is REPAIRABLE — completed/failed are not permanently fenced', async () => {
     const fixture = runtimeFixture({ unleased: true })
     try {
-      // A REAL, honest terminal settle through the normal path: runtime_consumed then
-      // failed (same shape the pre-existing reassignment-guard test above uses — 'completed'
-      // additionally requires an independent-gate grant this fixture's simplest path doesn't
-      // exercise; 'failed' is equally terminal for this test's purpose).
+      // A REAL, honest settle through the normal path: runtime_consumed then failed (same
+      // shape the pre-existing reassignment-guard test above uses — 'completed'
+      // additionally requires an independent-gate grant this fixture's simplest path
+      // doesn't exercise; 'failed' exercises the SAME class this test is about).
       await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: '',
         stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
       })
       await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: '',
-        stage: 'failed', runtimeReceiptHash: 'e'.repeat(64), attempt: 1, reason: 'genuinely done, failed for real',
+        stage: 'failed', runtimeReceiptHash: 'e'.repeat(64), attempt: 1, reason: 'genuinely failed, wants a retry',
       })
+      // The pair-correlator claim from the FIRST call above left a genuinely LIVE 1-hour
+      // lease on the message (attempt 1, never acked) — the exact "wedge" shape an
+      // operator's repair call would encounter after a runner reports failure.
       const before = fixture.harness.sqlite.prepare(
-        'SELECT delivery_attempts, read_at FROM agent_messages WHERE id = ?',
-      ).get(MESSAGE_ID)
+        'SELECT delivery_attempts, read_at, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; read_at: string | null; lease_expires_at: string | null }
+      expect(before).toMatchObject({ delivery_attempts: 1, read_at: null })
+      expect(before.lease_expires_at).not.toBeNull()
 
       const result = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
-        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'operator mistakenly thinks it is stuck',
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'runner failed, resetting so it can retry',
         override: true, terminate: true,
       })
-      expect(result).toMatchObject({ reset: false, code: 'reset_refused_already_terminal', terminated: true })
+      // reset succeeds (the message's own live lease required override, which was given);
+      // overrode is true (it really was live); terminated is FALSE — a `reset_terminated`
+      // row is NOT written on top of the already-genuine `failed` receipt (the terminal-
+      // receipt insert's own idempotency guard correctly refuses a redundant/contradictory
+      // second terminal marker for the same dispatch).
+      expect(result).toMatchObject({ reset: true, code: 'reset', overrode: true, terminated: false })
 
-      // Zero side effects on the message — a genuinely completed dispatch is untouched.
-      expect(fixture.harness.sqlite.prepare(
-        'SELECT delivery_attempts, read_at FROM agent_messages WHERE id = ?',
-      ).get(MESSAGE_ID)).toEqual(before)
+      // The message is genuinely reset — repair worked. delivery_attempts/lease are
+      // cleared either way; read_at is set here ONLY because this call itself passed
+      // terminate:true (the caller's own request to mark it consumed going forward),
+      // not because completed/failed are fenced — that's the thing this test disproves.
+      const after = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; read_at: string | null; lease_expires_at: string | null }
+      expect(after).toMatchObject({ delivery_attempts: 0, lease_expires_at: null })
+      expect(after.read_at).not.toBeNull()
 
-      // No duplicate/contradictory reset_terminated row was manufactured — exactly the two
-      // genuine receipts, no reset_terminated row at all (order-independent: both genuine
-      // calls happen back-to-back and can tie on created_at's second-resolution timestamp).
+      // No reset_terminated row was manufactured on top of the genuine failed receipt —
+      // exactly the two genuine receipts (order-independent: both happen back-to-back and
+      // can tie on created_at's second-resolution timestamp).
       const stages = fixture.harness.sqlite.prepare(
         `SELECT stage FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ?`,
       ).all(DISPATCH_ID) as Array<{ stage: string }>
@@ -2223,7 +2271,7 @@ describe('adminResetDispatchLease terminate:true — the terminated dispatch can
       const audit = fixture.harness.sqlite.prepare(
         `SELECT operation FROM mutation_audit_entries WHERE id = ?`,
       ).get(result.audit_id) as { operation: string }
-      expect(audit.operation).toBe('reset_refused_already_terminal')
+      expect(audit.operation).toBe('reset_override')
     } finally {
       fixture.harness.close()
     }
@@ -2400,44 +2448,35 @@ describe('task_update refuses reassignment while a dispatch is in flight (mupot#
   })
 })
 
-// mupot#1494 v4 round 2 (P2-c, adversarial regression — M-WHERE2 survived) — the override
-// guard's freshness re-check lives inside two UPDATE statements' own WHERE clauses
-// (src/tasks/runtime-receipts.ts, adminResetDispatchLease's two-attempt design). A mutation
-// that widens or removes either clause's guard doesn't necessarily change any BEHAVIORAL
-// test's outcome for the sequential (non-concurrent) scenarios this suite can construct —
-// "receipts are blind to real concurrency" is a documented, structural limitation of every
-// test in this file, not something a cleverer assertion fixes. A SOURCE-level pin closes the
-// gap the behavioral suite structurally cannot: it fails the instant either fragment is
-// edited away, independent of whether a sequential test happens to notice.
-describe('source-assert: adminResetDispatchLease\'s two-attempt WHERE guards (mupot#1494 v4 round 2, P2-c)', () => {
+// mupot#1494 v4 round 2 (P2-c, adversarial regression — M-WHERE2 survived), RESTRUCTURED
+// round 3 (P1-B) — the override guard used to live inside TWO separate, sequentially-run
+// UPDATE statements. Round 3 combined them into ONE lease UPDATE (chosen via `useOverride`)
+// so it can be batched atomically with the audit + terminal-receipt writes (see the
+// behavioral batch-atomicity tests below) — the "two-attempt" shape this block originally
+// pinned no longer exists as written SQL, so pinning it by counting inlined WHERE-clause
+// occurrences no longer applies. What still needs pinning: the negated and un-negated
+// guard fragments both still exist as their OWN named `const`s, and the lease UPDATE's
+// WHERE genuinely branches between them via `useOverride` rather than hard-coding one.
+describe('source-assert: adminResetDispatchLease\'s not-live/live guard fragments (mupot#1494 v4 round 3, P1-B)', () => {
   const SOURCE = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'tasks', 'runtime-receipts.ts'),
     'utf8',
   )
 
-  // Counting exact occurrences, not `.indexOf()`/`.toContain()`: `loadMessage`'s own SELECT
-  // (the initial liveness read AND the fresh re-read before attempt 2) carries the SAME
-  // un-negated `AND ${LEASE_LIVE_PREDICATE(...)}` substring attempt 2's WHERE does — a first-
-  // match-only assertion would silently pass by matching `loadMessage`'s copy even if attempt
-  // 2's OWN guard were deleted entirely (caught by hand: an early draft of this test did
-  // exactly that and stayed green under that mutation).
-  const NEGATED_GUARD = "AND NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})"
-  const UNNEGATED_GUARD = "AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}"
-
-  it('attempt 1 (not-live) pins LEASE_LIVE_PREDICATE fresh, negated, inside its own UPDATE WHERE — exactly once in the file', () => {
-    expect(SOURCE.split(NEGATED_GUARD).length - 1).toBe(1)
+  it('the not-live guard is defined negated', () => {
+    expect(SOURCE).toContain("const notLiveGuard = `NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})`")
   })
 
-  it('attempt 2 (override, must-be-live) pins the SAME predicate, UN-negated — exactly twice in the file (loadMessage\'s own read + attempt 2\'s WHERE)', () => {
-    // Deliberately a COUNT, not a containment check: if attempt 2's own copy is deleted,
-    // `loadMessage`'s identical substring still matches a plain `.toContain()`, so the count
-    // must drop from 2 to 1 for this assertion to catch the regression.
-    expect(SOURCE.split(UNNEGATED_GUARD).length - 1).toBe(2)
+  it('the live (override) guard is defined UN-negated — a distinct const, not a copy of the not-live one', () => {
+    expect(SOURCE).toContain("const liveGuard = LEASE_LIVE_PREDICATE('lease_expires_at', '?3')")
   })
 
-  it('both attempts require read_at IS NULL AND dead_lettered_at IS NULL — a terminal message can never be reset via either branch', () => {
-    const occurrences = SOURCE.split('read_at IS NULL AND dead_lettered_at IS NULL').length - 1
-    expect(occurrences).toBeGreaterThanOrEqual(2) // notLiveAttempt + liveOverrideAttempt
+  it('the lease UPDATE\'s WHERE genuinely branches on useOverride between the two guards, rather than hard-coding one', () => {
+    expect(SOURCE).toContain('AND ${useOverride ? liveGuard : notLiveGuard}')
+  })
+
+  it('the lease UPDATE requires read_at IS NULL AND dead_lettered_at IS NULL — a terminal message can never be reset', () => {
+    expect(SOURCE).toContain('WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL')
   })
 })
 

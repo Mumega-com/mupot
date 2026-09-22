@@ -421,16 +421,27 @@ async function claimUnleasedForPairSettlement(
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
        )
-       -- mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
-       -- already declared TERMINAL (reset(terminate:true)) must never be resurrected through
-       -- this claim, even if the message itself still reads pristine (delivery_attempts=0,
-       -- read_at NULL). Embedded in the WHERE, not a separate check-then-write: a race
-       -- between "operator terminates" and "runner claims" resolves atomically, same
-       -- discipline as the ownership EXISTS clause above.
+       -- mupot#1494 v4 round 2 (P1-2, adversarial regression), NARROWED round 3 (P1-A) — a
+       -- dispatch an operator has EXPLICITLY declared dead (reset(terminate:true), stage
+       -- 'reset_terminated') must never be resurrected through this claim, even if the
+       -- message itself still reads pristine (delivery_attempts=0, read_at NULL). Embedded
+       -- in the WHERE, not a separate check-then-write: a race between "operator
+       -- terminates" and "runner claims" resolves atomically, same discipline as the
+       -- ownership EXISTS clause above.
+       --
+       -- Deliberately stage = 'reset_terminated' ONLY, not the full
+       -- TERMINAL_RUNTIME_RECEIPT_STAGES set (completed/failed too). Round 2 blocked
+       -- ALL three here, which was too broad: completed/failed are genuine RUNNER
+       -- OUTCOMES with their OWN pre-existing enforcement (the runtime_consumed
+       -- mutation's own NOT EXISTS (... stage = 'failed') fence, and a completed task's
+       -- status moving past 'in_progress', both of which independently refuse a
+       -- resurrected claim without this predicate's help) -- reset_terminated is the ONLY
+       -- stage with no such mutation-level guard of its own (it never touches tasks at
+       -- all), which is why P1-2 needed a new check specifically for it.
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_runtime_receipts term
           WHERE term.tenant = ?1 AND term.dispatch_receipt_id = ?5
-            AND term.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+            AND term.stage = 'reset_terminated'
        )
   `).bind(
     env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
@@ -550,24 +561,33 @@ export async function recordTaskDispatchRuntimeReceipt(
     || !SHA256_RE.test(text(input.runtimeReceiptHash, 64))
   ) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
   text(input.taskId, 200); text(input.dispatchReceiptId, 200)
-  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
-  // already declared TERMINAL (`reset(terminate: true)` writes `stage: 'reset_terminated'`
-  // — never a value `STAGES` accepts as caller input, so it can NEVER be "this same call
-  // replayed") must refuse EVERY settle attempt, unconditionally. A genuine `completed`/
-  // `failed` terminal row still allows its OWN idempotent replay (the exact same
-  // stage+attempt, matched below) to return the cached receipt as before — this check
-  // excludes only that one row, so it never blocks the tested idempotency property, but
-  // refuses any OTHER stage/attempt once the dispatch has already resolved. Checked FIRST,
-  // before any lease/message work, so a terminated dispatch fails fast; the embedded
-  // `NOT EXISTS` inside `claimUnleasedForPairSettlement`'s own UPDATE (below) is the
-  // atomic, race-closing second layer — this early check is the cheap, common-case one.
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression), NARROWED round 3 (P1-A,
+  // adversarial regression on round 2's own fix) — a dispatch an operator has EXPLICITLY
+  // declared dead (`reset(terminate: true)` writes `stage: 'reset_terminated'`) must
+  // refuse EVERY settle attempt, unconditionally. Round 2 checked the FULL
+  // `TERMINAL_RUNTIME_RECEIPT_STAGES` set (`completed`/`failed` too), which was too broad
+  // and BROKE a normal, previously-working flow: `failed@1` → lease expires →
+  // `leaseAgentInbox` naturally redelivers (`delivery_attempts=2`, the intended retry
+  // path) → round 2's check refused the attempt-2 settle as `dispatch_terminated`, AND
+  // separately refused the operator's own `task_dispatch_lease_reset({override:true})`
+  // repair as `reset_refused_already_terminal` — the retry path had NO way out. Fixed:
+  // this check now looks ONLY for `stage = 'reset_terminated'` — never a value `STAGES`
+  // accepts as caller input, so it can never collide with a legitimate replay of a
+  // `completed`/`failed` call, and the `NOT (stage AND attempt)` carve-out round 2 needed
+  // for that collision is gone (nothing to carve out). `completed`/`failed` keep their OWN
+  // pre-existing enforcement (the `runtime_consumed` mutation's `NOT EXISTS (stage =
+  // 'failed')` fence; a `completed` task's `status` moving past `'in_progress'`) — see the
+  // matching comment on `claimUnleasedForPairSettlement`'s embedded check below for why
+  // `reset_terminated` alone needed a NEW check in the first place (it never touches
+  // `tasks`, so nothing else would have caught its resurrection). Checked FIRST, before any
+  // lease/message work, so a terminated dispatch fails fast; the embedded `NOT EXISTS`
+  // inside `claimUnleasedForPairSettlement`'s own UPDATE (below) is the atomic, race-closing
+  // second layer — this early check is the cheap, common-case one.
   const existingTerminal = await env.DB.prepare(`
     SELECT 1 FROM task_dispatch_runtime_receipts
-     WHERE tenant = ?1 AND dispatch_receipt_id = ?2
-       AND stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
-       AND NOT (stage = ?3 AND attempt = ?4)
+     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = 'reset_terminated'
      LIMIT 1
-  `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<{ 1: number }>()
+  `).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ 1: number }>()
   if (existingTerminal) throw new TaskDispatchRuntimeReceiptError('dispatch_terminated')
   // mupot#1494 round 2 (P1-a) — captured BEFORE resolution: true iff the caller used the
   // {task_id, dispatch_receipt_id} correlator (a task_list-only runner never has a raw
@@ -1165,24 +1185,35 @@ export async function adminResetDispatchLease(
     }
   }
 
-  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch that already carries
-  // ANY terminal runtime receipt (a genuine settle, or an earlier terminate:true) has
-  // nothing to repair; refuse unconditionally, even under override:true, before touching
-  // the message at all. PROVED gap this closes: `reset(override:true, terminate:true)` on a
-  // dispatch a runner had ALREADY genuinely completed used to succeed anyway — resetting a
-  // message that settle may never have touched (recordTaskDispatchRuntimeReceipt does not
-  // itself ack the underlying agent_messages row) — manufacturing a second, contradictory
-  // terminal marker on an already-closed dispatch.
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression), NARROWED round 3 (P1-A,
+  // adversarial regression on round 2's own fix) — a dispatch the OPERATOR has already
+  // declared dead (`stage = 'reset_terminated'`) has nothing left to repair; refuse
+  // unconditionally, even under `override: true`, before touching the message at all.
+  // Round 2 refused on ANY terminal receipt (`completed`/`failed` too), which broke the
+  // routine "a runner genuinely failed, an operator wants to reset its lease so it can
+  // retry" repair — PROVED: `task_dispatch_lease_reset({override:true})` on a `failed@1`
+  // dispatch that had already been naturally redelivered (`leaseAgentInbox`, attempt 2)
+  // used to succeed and let the runner retry; round 2 made it refuse
+  // `reset_refused_already_terminal` instead, with no operator path out. Fixed: only a
+  // dispatch the operator has EXPLICITLY terminated is unconditionally unrepairable — a
+  // `completed`/`failed` dispatch remains repairable (the reset still only proceeds if the
+  // underlying message's own state allows it — this predicate is not the only guard).
   const existingTerminal = await env.DB.prepare(`
     SELECT 1 FROM task_dispatch_runtime_receipts
-     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = 'reset_terminated'
      LIMIT 1
   `).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ 1: number }>()
   if (existingTerminal) {
     await writeAudit('reset_refused_already_terminal', 'dispatch_receipt', input.dispatchReceiptId, evidence())
     return {
       reset: false, code: 'reset_refused_already_terminal', message_id: null, audit_id: auditId,
-      overrode: false, terminated: true,
+      // mupot#1494 v4 round 3 (P3, adversarial regression) — this reports whether TERMINATION
+      // (as the CALLER asked for it) is the outcome, not whether the dispatch happens to
+      // already be terminal in the DB regardless of what was requested. A caller that never
+      // passed `terminate: true` gets `terminated: false` here, even though the dispatch IS,
+      // in fact, terminal — `terminated` answers "did this call terminate it", not "is it
+      // terminal".
+      overrode: false, terminated: terminate,
     }
   }
 
@@ -1258,110 +1289,135 @@ export async function adminResetDispatchLease(
   // redelivered via `inbox`/`inbox_lease` (`leaseAvailableClause` doesn't even apply to a
   // read message — the row is simply gone from every consuming surface).
   //
-  // attempt 1: succeeds ONLY if the lease is NOT live, freshly re-evaluated at write time
-  // (not the earlier SELECT's snapshot). Its success is proof the row was not live —
-  // `overrode` can never be wrongly true out of this branch.
-  const notLiveAttempt = await env.DB.prepare(`
+  // mupot#1494 v4 round 3 (P1-B, adversarial regression) — round 2 ran this lease/read_at
+  // UPDATE via a bare `.run()`, entirely OUTSIDE the `env.DB.batch([auditStmt,
+  // terminalReceiptStmt])` a few lines below. PROVED: if that batch throws (a genuine
+  // constraint violation, a transient D1 error — anything), the message is ALREADY
+  // consumed and its lease ALREADY cleared, but ZERO audit rows and ZERO receipt rows
+  // exist anywhere — an unrepairable, silently-corrupted state, WORSE than having no fix
+  // at all. Fixed: the lease/read_at UPDATE is now the FIRST statement in the SAME
+  // `env.DB.batch` as the audit insert (and, when `terminate`, the terminal receipt
+  // insert) — all statements succeed or all roll back together, every time.
+  //
+  // This also simplifies `reset`/`overrode` determination: the two guards (`NOT (live)` /
+  // `(live)`) are mutually exclusive by construction (a row cannot be both), so exactly
+  // ONE needs to actually run — chosen HERE, once, from the already-fresh
+  // `message.lease_live` read above (no second round trip, no separate "attempt 1 then
+  // maybe attempt 2" sequence). `useOverride` can only be true when the early refusal
+  // above already confirmed genuine liveness AND the caller passed `override: true`.
+  const useOverride = override && message.lease_live === 1
+  // Two literal fragments, always both present in this file's source regardless of which
+  // one is chosen at runtime — `NOT (...)` (not-live) and the same predicate un-negated
+  // (must-be-live). Exactly one is spliced into the single UPDATE below.
+  const notLiveGuard = `NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})`
+  const liveGuard = LEASE_LIVE_PREDICATE('lease_expires_at', '?3')
+  const leaseUpdateStmt = env.DB.prepare(`
     UPDATE agent_messages
        SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL,
            read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
      WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
-       AND NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})
-  `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0).run()
+       AND ${useOverride ? liveGuard : notLiveGuard}
+  `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0)
 
-  let reset = notLiveAttempt.meta?.changes === 1
-  let overrode = false
-  let overriddenHolder: { to_agent: string; delivery_attempts: number; lease_expires_at: string | null; lease_attempt_id: string | null } | null = null
-
-  if (!reset && override) {
-    // Re-read immediately before the override attempt — narrows (does not fully eliminate;
-    // no plain UPDATE can see its own pre-image for columns it overwrites) the window
-    // between "what override_of describes" and "what was actually overridden". The WRITE
-    // itself is still fully race-safe: attempt 2's own WHERE re-checks liveness fresh.
-    const fresh = await loadMessage()
-    if (fresh && fresh.read_at === null && fresh.dead_lettered_at === null) {
-      // Attempt 2: succeeds ONLY if the lease IS live, freshly re-evaluated at write time.
-      // Its success is proof the row WAS live — override_of never names a holder that held
-      // nothing, because this branch cannot fire unless the guard just proved otherwise.
-      // Same `terminate` -> `read_at` closure as attempt 1 above — one atomic write, zero
-      // window where a stolen-and-terminated lease reads as pristine again.
-      const liveOverrideAttempt = await env.DB.prepare(`
-        UPDATE agent_messages
-           SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL,
-               read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
-         WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
-           AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}
-      `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0).run()
-      reset = liveOverrideAttempt.meta?.changes === 1
-      overrode = reset
-      if (reset) {
-        overriddenHolder = {
-          to_agent: fresh.to_agent,
-          delivery_attempts: fresh.delivery_attempts,
-          lease_expires_at: fresh.lease_expires_at,
-          lease_attempt_id: fresh.lease_attempt_id,
-        }
-      }
-    }
-  }
-
-  const finalAuditStmt = buildAuditStmt(
-    reset ? (overrode ? 'reset_override' : 'reset') : 'reset_refused_terminal',
-    'agent_message',
-    message.id,
-    overrode && overriddenHolder
-      ? evidence({
-          override_of: {
-            holder: overriddenHolder.to_agent,
-            delivery_attempts: overriddenHolder.delivery_attempts,
-            lease_expires_at: overriddenHolder.lease_expires_at,
-            lease_attempt_id: overriddenHolder.lease_attempt_id,
-          },
-        })
-      : evidence(),
+  // The audit row's own content (which `operation`, whether `override_of` appears) is
+  // decided via `CASE WHEN changes() = 1 ...`, referencing the lease UPDATE that
+  // IMMEDIATELY precedes it in the SAME batch — unambiguous, since exactly one DML
+  // statement runs before it in this transaction. Never written speculatively before the
+  // real outcome is known: if the UPDATE's WHERE does not match (a race, or the row was
+  // never live to begin with), `changes() = 0` and the audit falls through to
+  // `reset_refused_terminal` regardless of which branch we guessed.
+  const successOperation = useOverride ? 'reset_override' : 'reset'
+  const successEvidence = useOverride
+    ? evidence({
+        override_of: {
+          holder: message.to_agent,
+          delivery_attempts: message.delivery_attempts,
+          lease_expires_at: message.lease_expires_at,
+          lease_attempt_id: message.lease_attempt_id,
+        },
+      })
+    : evidence()
+  const failureEvidence = evidence()
+  const auditStmt = env.DB.prepare(`
+    INSERT INTO mutation_audit_entries (
+      id, tenant, principal_kind, principal_id, member_id, agent_id,
+      credential_id, origin, handler, operation, target_kind, target_id,
+      task_id, request_id, idempotency_key, evidence_json, recorded_at
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5, ?6,
+      ?7, 'mcp', 'task_dispatch_lease_reset',
+      CASE WHEN changes() = 1 THEN ?8 ELSE 'reset_refused_terminal' END,
+      ?9, ?10,
+      ?11, ?12, ?12,
+      CASE WHEN changes() = 1 THEN ?13 ELSE ?14 END,
+      ?15
+    )
+  `).bind(
+    auditId, env.TENANT_SLUG,
+    agentId ? 'agent' : 'member', agentId ?? memberId, memberId, agentId,
+    credentialId, successOperation, 'agent_message', message.id,
+    input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`,
+    successEvidence, failureEvidence, now,
   )
 
-  let terminated = false
-  if (reset && terminate) {
-    // mupot#1494 v4 (P1-a) — idempotent: WHERE NOT EXISTS means a dispatch that already
-    // carries ANY terminal receipt (a genuine completed/failed settle, or an earlier
-    // `terminate: true` call) gets no duplicate row.
-    const terminateReceiptId = crypto.randomUUID()
-    const runtimeReceiptHash = await sha256Hex(canonicalJson({ kind: 'reset_terminated', audit_id: auditId, message_id: message.id }))
-    const requestDigest = await sha256Hex(canonicalJson({
-      operation: 'reset_terminated', dispatch_receipt_id: input.dispatchReceiptId, audit_id: auditId,
-    }))
-    const attempt = Math.min(5, Math.max(1, message.delivery_attempts || 1))
-    const terminalReceiptStmt = env.DB.prepare(`
-      INSERT INTO task_dispatch_runtime_receipts (
-        id, tenant, dispatch_receipt_id, task_id, agent_id, message_id,
-        member_id, credential_id, stage, attempt, runtime_address,
-        runtime_receipt_hash, request_digest, artifact_refs_json,
-        artifact_sha256, result, reason, audit_entry_id, created_at
-      )
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reset_terminated', ?9, ?10, ?11, ?12, '[]', NULL, NULL, ?13, ?14, ?15
-       WHERE NOT EXISTS (
-         SELECT 1 FROM task_dispatch_runtime_receipts existing
-          WHERE existing.tenant = ?2 AND existing.dispatch_receipt_id = ?3
-            AND existing.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
-       )
-    `).bind(
-      terminateReceiptId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, dispatch.agent_id, message.id,
-      memberId, credentialId, attempt, message.to_agent, runtimeReceiptHash, requestDigest,
-      sanitizeReceiptText(text(input.reason, 500)), auditId, now,
-    )
-    // mupot#1494 v4 round 2 (P2-c/batching, adversarial finding) — the audit row and the
-    // terminal receipt land in ONE env.DB.batch, atomically: never "the audit says
-    // reset_terminated but no terminal receipt exists" or the reverse.
-    await env.DB.batch([finalAuditStmt, terminalReceiptStmt])
-    terminated = true
-  } else {
-    await finalAuditStmt.run()
-  }
-  // No `else if (terminate)` re-check needed: the early `reset_refused_already_terminal`
-  // guard above already proved no terminal receipt exists for this dispatch before this
-  // point runs, so a `reset` that fails here (terminal message state, or a lease race) is
-  // never "actually already terminated" — `terminated` correctly stays `false`.
+  // mupot#1494 v4 (P1-a) — idempotent: WHERE NOT EXISTS means a dispatch that already
+  // carries ANY terminal receipt (a genuine completed/failed settle, or an earlier
+  // `terminate: true` call) gets no duplicate row. Also gated on the audit row (JUST
+  // inserted, in the SAME transaction, by the statement immediately above) actually
+  // reporting success — reads back its own `operation`, which the CASE above already
+  // derived from `changes()`, rather than re-deriving success a second, differently-timed
+  // way.
+  const terminateReceiptId = crypto.randomUUID()
+  const terminalReceiptStmt = terminate
+    ? (async () => {
+        const runtimeReceiptHash = await sha256Hex(canonicalJson({ kind: 'reset_terminated', audit_id: auditId, message_id: message.id }))
+        const requestDigest = await sha256Hex(canonicalJson({
+          operation: 'reset_terminated', dispatch_receipt_id: input.dispatchReceiptId, audit_id: auditId,
+        }))
+        const attempt = Math.min(5, Math.max(1, message.delivery_attempts || 1))
+        return env.DB.prepare(`
+          INSERT INTO task_dispatch_runtime_receipts (
+            id, tenant, dispatch_receipt_id, task_id, agent_id, message_id,
+            member_id, credential_id, stage, attempt, runtime_address,
+            runtime_receipt_hash, request_digest, artifact_refs_json,
+            artifact_sha256, result, reason, audit_entry_id, created_at
+          )
+          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reset_terminated', ?9, ?10, ?11, ?12, '[]', NULL, NULL, ?13, ?14, ?15
+           WHERE EXISTS (
+             SELECT 1 FROM mutation_audit_entries WHERE id = ?14 AND operation != 'reset_refused_terminal'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM task_dispatch_runtime_receipts existing
+              WHERE existing.tenant = ?2 AND existing.dispatch_receipt_id = ?3
+                AND existing.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+           )
+        `).bind(
+          terminateReceiptId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, dispatch.agent_id, message.id,
+          memberId, credentialId, attempt, message.to_agent, runtimeReceiptHash, requestDigest,
+          sanitizeReceiptText(text(input.reason, 500)), auditId, now,
+        )
+      })()
+    : null
+
+  // mupot#1494 v4 round 3 (P1-B) — ONE batch: the lease/read_at UPDATE, the audit INSERT,
+  // and (when requested) the terminal receipt INSERT all succeed or all roll back
+  // together. `results[0]` is the lease UPDATE's own D1Result — its `.meta.changes` is
+  // authoritative for `reset`/`overrode`/`terminated` below, independent of the CASE/EXISTS
+  // logic embedded in the other statements' SQL (which exists so THEIR content is correct
+  // even if something inspects the DB directly, not so this function has to trust it).
+  const resolvedTerminalReceiptStmt = terminalReceiptStmt ? await terminalReceiptStmt : null
+  const batchStmts = [leaseUpdateStmt, auditStmt, ...(resolvedTerminalReceiptStmt ? [resolvedTerminalReceiptStmt] : [])]
+  const results = await env.DB.batch(batchStmts)
+  const reset = (results[0].meta as { changes?: number }).changes === 1
+  const overrode = reset && useOverride
+  // `terminated` reflects whether a `reset_terminated` row was ACTUALLY inserted (its own
+  // INSERT...SELECT WHERE EXISTS/NOT EXISTS may still no-op even when `reset` succeeded —
+  // e.g. a `completed`/`failed` dispatch that was already terminal for some OTHER reason,
+  // whose idempotency guard correctly refuses a redundant/contradictory second marker) —
+  // never a blind `reset && terminate`, which would claim termination happened when it
+  // silently didn't.
+  const terminated = resolvedTerminalReceiptStmt !== null
+    && (results[2]?.meta as { changes?: number } | undefined)?.changes === 1
 
   return {
     reset,
