@@ -18,26 +18,50 @@
 // project_remember seed are NOT written here — see the doc comment below on
 // why, and src/mcp/team-bootstrap.ts for where they happen.
 //
-// ATOMICITY — ONE D1 BATCH WHERE POSSIBLE, same doctrine as
-// createHomeForMember (src/org/service.ts): department/project/squad
-// resolution happens BEFORE the batch (each is its OWN independently
+// ATOMICITY — NOT one giant transaction, deliberately (Athena round-1 gate on
+// PR #1510, 2026-09-22, resumability requirement). Department/project/squad
+// resolution happens BEFORE any of the below (each is its OWN independently
 // committing, entitlement-gated create — createProject/createSquad already
-// own that discipline and this function does not fork it), and everything
-// that is a plain row write with no side channel of its own — the ADMIN
-// edge, the bot agent + its home membership row, the human invites, and the
-// receipt — lands in exactly ONE env.DB.batch() call: either all of them
-// land or none do. Two things are deliberately NOT in that batch because
-// they are not D1 writes at all and each already owns its own atomic unit:
-// mintAgentBoundToken (members/service.ts — its own D1 writes) and
-// createMemory().remember() (D1 + Vectorize, two systems D1.batch() cannot
-// span). Both run AFTER this batch commits — see src/mcp/team-bootstrap.ts.
+// own that discipline and this function does not fork it). After that, the
+// write phase has THREE stages, in order:
+//
+//   1. ONE env.DB.batch(): the ADMIN project<->squad edge + the bot agent's
+//      two prepareAgentCreate statements (only when a bot needs creating).
+//      All-or-nothing — a failure here (a genuine D1 error, a trigger abort)
+//      rolls back both, and neither is left half-wired.
+//   2. Per-human invite inserts, ONE AT A TIME, not batched together. A
+//      failure on invite N of M does NOT undo invites 1..N-1 — they already
+//      committed as their own statements. The loop stops at the first
+//      failure rather than skipping ahead, so a systemic fault (not a
+//      one-off) does not spray partial state across every remaining human.
+//   3. The team_bootstrap_receipts write — ALWAYS attempted, whether stage 1
+//      or 2 succeeded or failed (migration 0166's `failed` disposition is
+//      exactly for this). This is a separate write from whatever failed, by
+//      construction: it never shares a transaction with stage 1's batch or
+//      any stage-2 insert, so it survives their failure.
+//
+// This means a genuinely partial, real state — project+squad+maybe-bot+
+// SOME invites, with the composite call itself incomplete — is an EXPECTED
+// resting state, not corruption: see migration 0166's "FAILED ATTEMPTS ARE
+// RECEIPTED, AND RESUMABLE" section. A retry with the same slug_base adopts
+// every already-committed piece (project, squad, bot, and each invite that
+// already landed) and only attempts what is left.
+//
+// Two things are NOT written here at all because they are not D1 writes and
+// each already owns its own atomic unit: mintAgentBoundToken
+// (members/service.ts — its own D1 writes) and createMemory().remember()
+// (D1 + Vectorize, two systems D1.batch() cannot span). Both run AFTER stage
+// 3 commits, and only on full success — see src/mcp/team-bootstrap.ts.
 //
 // IDEMPOTENT ON slug_base: a second call with the same slug_base finds the
 // existing project/squad/bot (reads before every create), sends no duplicate
 // invite for an email that already has a live invite into this squad, and
-// mints no second bot. The receipt row is UNIQUE(tenant, slug_base) — a
-// replay updates invited_count on the SAME row rather than inserting a
-// second one.
+// mints no second bot. The receipt row is UNIQUE(tenant, slug_base) — every
+// call for the same team UPDATEs the SAME row (disposition, invited_count,
+// and on a stage-2 failure, failed_step/failure_reason) rather than
+// inserting a second one; see migration 0166 for exactly which columns are
+// immutable (tenant/slug_base/project_id/squad_id/created_at only) versus
+// which reflect the latest attempt.
 //
 // AUTHZ — NO AUTHZ INSIDE for the ADMIN gate itself, same doctrine as
 // createDepartment/createSquad/createHomeForMember (src/org/service.ts's own
@@ -55,7 +79,7 @@ import type { Agent, AuthContext, Capability, Env, Project, Squad } from '../typ
 import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
 import { projectSelectSql } from '../projects/columns'
 import { createProject } from '../projects/service'
-import { assertBatchWritten } from '../lib/receipt'
+import { assertBatchWritten, assertWritten } from '../lib/receipt'
 import { createSquad, isValidSlug, isNonEmptyString, prepareAgentCreate } from './service'
 import { resolveDepartmentRef } from './resolve'
 
@@ -185,6 +209,87 @@ async function findReceipt(env: Env, tenant: string, slugBase: string): Promise<
     .first<ReceiptRow>()
 }
 
+/** Where the write phase stopped, for a 'failed' receipt row (migration 0166). */
+export type TeamBootstrapFailedStep = 'edge_or_bot' | 'invite_insert'
+/** A short, STRUCTURAL classification — never the raw driver error text, never an
+ *  email or other human PII (migration 0166's header explains why). */
+export type TeamBootstrapFailureReason = 'unique_violation' | 'write_failed'
+
+function classifyWriteFailure(err: unknown): TeamBootstrapFailureReason {
+  return isUniqueViolation(err) ? 'unique_violation' : 'write_failed'
+}
+
+interface WriteReceiptOutcomeInput {
+  existingReceipt: ReceiptRow | null
+  tenant: string
+  actorMemberId: string | null
+  slugBase: string
+  projectId: string
+  squadId: string
+  botAgentId: string | null
+  disposition: 'created' | 'existing' | 'failed'
+  invitedCount: number
+  failedStep: TeamBootstrapFailedStep | null
+  failureReason: TeamBootstrapFailureReason | null
+}
+
+/**
+ * The ONE place team_bootstrap writes its receipt — on success (a fresh
+ * 'created'/'existing' row, or an update to invited_count on a replay) AND
+ * on a stage-1/stage-2 write-phase failure (a 'failed' row, migration
+ * 0166). Always its own statement, never sharing a transaction with the
+ * thing that may have just failed — see this file's ATOMICITY doc comment.
+ * A retry finds the SAME row (UNIQUE(tenant, slug_base)) and UPDATEs it —
+ * the row is the CURRENT state of this team's bootstrap attempts, not a
+ * historical log entry (migration 0166's "RESUMABILITY" section).
+ */
+async function writeReceiptOutcome(env: Env, input: WriteReceiptOutcomeInput): Promise<string> {
+  if (input.existingReceipt) {
+    await env.DB.prepare(
+      `UPDATE team_bootstrap_receipts
+          SET actor_member_id = ?1, bot_agent_id = ?2, disposition = ?3,
+              invited_count = ?4, failed_step = ?5, failure_reason = ?6
+        WHERE id = ?7`,
+    )
+      .bind(
+        input.actorMemberId,
+        input.botAgentId,
+        input.disposition,
+        input.invitedCount,
+        input.failedStep,
+        input.failureReason,
+        input.existingReceipt.id,
+      )
+      .run()
+    return input.existingReceipt.id
+  }
+
+  const id = crypto.randomUUID()
+  const now = new Date().toISOString()
+  await env.DB.prepare(
+    `INSERT INTO team_bootstrap_receipts
+      (id, tenant, actor_member_id, slug_base, project_id, squad_id, bot_agent_id,
+       disposition, invited_count, failed_step, failure_reason, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+  )
+    .bind(
+      id,
+      input.tenant,
+      input.actorMemberId,
+      input.slugBase,
+      input.projectId,
+      input.squadId,
+      input.botAgentId,
+      input.disposition,
+      input.invitedCount,
+      input.failedStep,
+      input.failureReason,
+      now,
+    )
+    .run()
+  return id
+}
+
 export async function teamBootstrap(
   env: Env,
   auth: AuthContext,
@@ -302,75 +407,108 @@ export async function teamBootstrap(
   }
 
   const existingReceipt = await findReceipt(env, auth.tenant, slugBase)
-  const disposition: TeamBootstrapDisposition =
-    projectCreated || squadCreated || preparedAgent !== null || invitesToInsert.length > 0 ? 'created' : 'existing'
-
-  // ── the ONE atomic batch: edge + bot + invites + receipt, together or not at all ──
-  const statements: D1PreparedStatement[] = []
   const now = new Date().toISOString()
 
-  statements.push(
+  // ── stage 1: ONE atomic batch — the ADMIN edge + the bot (if any) ─────────
+  const structuralStatements: D1PreparedStatement[] = [
     env.DB.prepare(
       `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
        VALUES (?1, ?2, 'admin', ?3)
        ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = 'admin'`,
     ).bind(project.id, squad.id, now),
-  )
-
+  ]
   if (preparedAgent) {
-    statements.push(preparedAgent.statements[0], preparedAgent.statements[1])
-  }
-
-  for (const invite of invitesToInsert) {
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-      ).bind(invite.id, invite.email, departmentId, squad.id, invite.capability, auth.memberId ?? null, now),
-    )
-  }
-
-  const totalInvitedCount = (existingReceipt?.invited_count ?? 0) + invitesToInsert.length
-  const receiptId = existingReceipt?.id ?? crypto.randomUUID()
-  if (existingReceipt) {
-    statements.push(
-      env.DB.prepare(`UPDATE team_bootstrap_receipts SET invited_count = ?1 WHERE id = ?2`)
-        .bind(totalInvitedCount, receiptId),
-    )
-  } else {
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO team_bootstrap_receipts
-          (id, tenant, actor_member_id, slug_base, project_id, squad_id, bot_agent_id, disposition, invited_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
-      ).bind(
-        receiptId,
-        auth.tenant,
-        auth.memberId ?? null,
-        slugBase,
-        project.id,
-        squad.id,
-        preparedAgent?.agent.id ?? existingAgent?.id ?? null,
-        disposition,
-        totalInvitedCount,
-        now,
-      ),
-    )
+    structuralStatements.push(preparedAgent.statements[0], preparedAgent.statements[1])
   }
 
   try {
-    const results = await env.DB.batch(statements)
-    assertBatchWritten(results, 'team_bootstrap', 1)
+    const results = await env.DB.batch(structuralStatements)
+    assertBatchWritten(results, 'team_bootstrap.structural', 1)
   } catch (err) {
-    if (isUniqueViolation(err)) {
-      // Race: a concurrent identical call won underneath us. D1.batch() is one
-      // transaction — nothing from THIS call's batch landed (no partial rows) —
-      // so surface a clean failure rather than a mixed result; the caller retries
-      // and the idempotent reads above adopt the winner's rows.
-      return { ok: false, error: 'provisioning_failed', detail: { stage: 'batch', reason: 'race' } }
-    }
-    throw err
+    // Stage 1 failed — the ADMIN edge and/or the bot did not land. Nothing
+    // from stage 2 (invites) has run yet. Receipt the failure as its own,
+    // separate write (never inside the batch that just rolled back) so a
+    // retry — and any operator watching this table — sees it.
+    await writeReceiptOutcome(env, {
+      existingReceipt,
+      tenant: auth.tenant,
+      actorMemberId: auth.memberId ?? null,
+      slugBase,
+      projectId: project.id,
+      squadId: squad.id,
+      botAgentId: existingAgent?.id ?? null,
+      disposition: 'failed',
+      invitedCount: existingReceipt?.invited_count ?? 0,
+      failedStep: 'edge_or_bot',
+      failureReason: classifyWriteFailure(err),
+    })
+    return { ok: false, error: 'provisioning_failed', detail: { stage: 'edge_or_bot', reason: classifyWriteFailure(err) } }
   }
+
+  const botAgentId = preparedAgent?.agent.id ?? existingAgent?.id ?? null
+
+  // ── stage 2: per-human invite inserts, ONE AT A TIME (never batched) ──────
+  // A failure on invite N does not touch invites 1..N-1 — they are already
+  // separate, already-committed statements. Stop at the first failure rather
+  // than skipping ahead: a systemic fault should not scatter partial state
+  // across every remaining human.
+  let insertedInviteCount = 0
+  let inviteFailure: unknown = null
+  for (const invite of invitesToInsert) {
+    try {
+      const result = await env.DB.prepare(
+        `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      )
+        .bind(invite.id, invite.email, departmentId, squad.id, invite.capability, auth.memberId ?? null, now)
+        .run()
+      assertWritten(result, 'team_bootstrap.invite_insert', 1)
+      insertedInviteCount += 1
+    } catch (err) {
+      inviteFailure = err
+      break
+    }
+  }
+
+  const totalInvitedCount = (existingReceipt?.invited_count ?? 0) + insertedInviteCount
+
+  if (inviteFailure) {
+    await writeReceiptOutcome(env, {
+      existingReceipt,
+      tenant: auth.tenant,
+      actorMemberId: auth.memberId ?? null,
+      slugBase,
+      projectId: project.id,
+      squadId: squad.id,
+      botAgentId,
+      disposition: 'failed',
+      invitedCount: totalInvitedCount,
+      failedStep: 'invite_insert',
+      failureReason: classifyWriteFailure(inviteFailure),
+    })
+    return {
+      ok: false,
+      error: 'provisioning_failed',
+      detail: { stage: 'invite_insert', reason: classifyWriteFailure(inviteFailure) },
+    }
+  }
+
+  // ── stage 3: the success receipt ──────────────────────────────────────────
+  const disposition: TeamBootstrapDisposition =
+    projectCreated || squadCreated || preparedAgent !== null || invitesToInsert.length > 0 ? 'created' : 'existing'
+  const receiptId = await writeReceiptOutcome(env, {
+    existingReceipt,
+    tenant: auth.tenant,
+    actorMemberId: auth.memberId ?? null,
+    slugBase,
+    projectId: project.id,
+    squadId: squad.id,
+    botAgentId,
+    disposition,
+    invitedCount: totalInvitedCount,
+    failedStep: null,
+    failureReason: null,
+  })
 
   const botResult: TeamBootstrapBotResult | null = preparedAgent
     ? { agent: preparedAgent.agent, created: true }

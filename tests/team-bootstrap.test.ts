@@ -310,14 +310,16 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(outcome.error).toBe('forbidden')
   })
 
-  it('batch failure leaves NO partial rows — edge, bot, invites, and receipt all roll back together', async () => {
+  it('stage-1 (edge+bot) batch failure leaves no edge/bot/invite rows, but IS receipted as failed', async () => {
     // Pre-seed an ARCHIVED project under the slug this call will resolve to.
     // findProjectBySlug adopts it as "existing" (no createProject call), but
-    // the ADMIN-edge INSERT inside the one D1 batch then hits
-    // validate_project_squad_access_insert (migration 0055) and the whole
-    // transaction — edge, bot statements, invite inserts, and the receipt —
-    // rolls back together (tests/helpers/sqlite-d1.ts wraps every batch in
-    // BEGIN IMMEDIATE/COMMIT/ROLLBACK).
+    // the ADMIN-edge INSERT inside stage 1's batch then hits
+    // validate_project_squad_access_insert (migration 0055) and that whole
+    // transaction — edge + bot statements — rolls back together
+    // (tests/helpers/sqlite-d1.ts wraps every batch in BEGIN IMMEDIATE/
+    // COMMIT/ROLLBACK). Stage 2 (invites) is never reached. The failure is
+    // still receipted — migration 0166's 'failed' disposition exists exactly
+    // for this (Athena round-1 gate on PR #1510).
     harness.sqlite.exec(`
       INSERT INTO projects (id, slug, name, status) VALUES ('proj-archived', 'batchfail-prj', 'Batch Fail', 'archived');
     `)
@@ -336,10 +338,12 @@ describe('team_bootstrap — mupot#1498', () => {
       CTX,
     )
     expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('provisioning_failed')
+    expect((outcome.detail as Record<string, unknown>).stage).toBe('edge_or_bot')
 
-    // The squad WAS created before the batch (its own independent commit —
-    // see the file header on why project/squad resolution is not IN the
-    // batch) — but nothing from the batch itself landed.
+    // The squad WAS created before the write phase (its own independent
+    // commit — see the file header) — but nothing from stage 1 landed.
     const squad = await env.DB.prepare('SELECT id FROM squads WHERE slug = ?').bind('batchfail-sqd').first<{ id: string }>()
     expect(squad).toBeTruthy()
 
@@ -351,10 +355,30 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(bot).toBeNull()
     const invite = await env.DB.prepare('SELECT 1 FROM invites WHERE email = ?').bind('victim@example.com').first()
     expect(invite).toBeNull()
-    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
+
+    // The failure itself is receipted — no PII in the reason, a real
+    // structural classification instead.
+    const receipt = await env.DB.prepare(
+      'SELECT disposition, failed_step, failure_reason, invited_count, project_id, squad_id, bot_agent_id FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
       .bind('batchfail')
-      .first()
-    expect(receipt).toBeNull()
+      .first<{
+        disposition: string
+        failed_step: string | null
+        failure_reason: string | null
+        invited_count: number
+        project_id: string
+        squad_id: string
+        bot_agent_id: string | null
+      }>()
+    expect(receipt?.disposition).toBe('failed')
+    expect(receipt?.failed_step).toBe('edge_or_bot')
+    expect(['unique_violation', 'write_failed']).toContain(receipt?.failure_reason)
+    expect(receipt?.failure_reason).not.toMatch(/@/) // no email/PII leaked into the reason
+    expect(receipt?.invited_count).toBe(0)
+    expect(receipt?.project_id).toBe('proj-archived')
+    expect(receipt?.squad_id).toBe(squad?.id)
+    expect(receipt?.bot_agent_id).toBeNull()
   })
 
   it('suffix validation: rejects a slug_base that already carries a kind suffix', async () => {
@@ -420,5 +444,176 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(outcome.error).toBe('department_not_found')
     const project = await env.DB.prepare('SELECT 1 FROM projects WHERE slug = ?').bind('ghost-prj').first()
     expect(project).toBeNull()
+  })
+
+  // ── partial-failure retry (Athena round-1 gate on PR #1510, 2026-09-22) ──
+  //
+  // Wraps the REAL D1 harness's prepare() so exactly ONE targeted invite
+  // INSERT throws a synthetic unique-violation-shaped error — every other
+  // statement (project/squad/edge/bot/every other invite) goes through the
+  // genuine SQLite engine untouched. This is not a hand-rolled D1 mock: the
+  // whole file calls applyAllMigrations() (see the top-of-file note and
+  // scripts/check-test-schema-source.mjs), so every read this test makes is
+  // a real query against the real schema — only the ONE write this test
+  // needs to fail is intercepted.
+  function envWithInjectedInviteFailure(base: Env, failOnEmail: string, active: { value: boolean }): Env {
+    const realDb = base.DB
+    return {
+      ...base,
+      DB: {
+        ...realDb,
+        prepare(sql: string) {
+          const real = realDb.prepare(sql)
+          if (!sql.includes('INSERT INTO invites')) return real
+          return {
+            bind(...values: unknown[]) {
+              const boundReal = real.bind(...values)
+              const email = values[1]
+              const shouldFail = active.value && typeof email === 'string' && email.toLowerCase() === failOnEmail
+              if (!shouldFail) return boundReal
+              return {
+                run: async () => {
+                  throw new Error('UNIQUE constraint failed: invites.email (injected for test)')
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+  }
+
+  it('partial-failure retry: batch fails on invite 3 of 5, orphan project+squad+bot persist, retry adopts and finishes — zero duplicate invites, one bot, one ADMIN edge', async () => {
+    const humans = [
+      { email: 'a@example.com', capability: 'member' as const },
+      { email: 'b@example.com', capability: 'member' as const },
+      { email: 'c@example.com', capability: 'member' as const }, // this one is made to fail on attempt 1
+      { email: 'd@example.com', capability: 'member' as const },
+      { email: 'e@example.com', capability: 'member' as const },
+    ]
+    const injection = { value: true }
+    const injectedEnv = envWithInjectedInviteFailure(env, 'c@example.com', injection)
+
+    const first = await invokeTool(
+      orgAdminAuth(),
+      injectedEnv,
+      'team_bootstrap',
+      { slug_base: 'partial', name: 'Partial Team', department: DEPT_ID, humans, bot: { name: 'Partial Bot' } },
+      CTX,
+    )
+    expect(first.ok).toBe(false)
+    if (first.ok) return
+    expect(first.error).toBe('provisioning_failed')
+    expect((first.detail as Record<string, unknown>).stage).toBe('invite_insert')
+
+    // ORPHAN, RESUMABLE state after attempt 1: project + squad + bot + edge
+    // + invites a/b are all real, already-committed rows.
+    const project = await env.DB.prepare('SELECT id FROM projects WHERE slug = ?').bind('partial-prj').first<{ id: string }>()
+    const squad = await env.DB.prepare('SELECT id FROM squads WHERE slug = ?').bind('partial-sqd').first<{ id: string }>()
+    expect(project).toBeTruthy()
+    expect(squad).toBeTruthy()
+
+    const edgeAfterFirst = await env.DB.prepare(
+      'SELECT access_level FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
+    ).bind(project!.id, squad!.id).first<{ access_level: string }>()
+    expect(edgeAfterFirst?.access_level).toBe('admin')
+
+    const botAfterFirst = await env.DB.prepare('SELECT id FROM agents WHERE squad_id = ? AND slug = ?')
+      .bind(squad!.id, 'partial-bot')
+      .first<{ id: string }>()
+    expect(botAfterFirst).toBeTruthy()
+
+    const invitedEmailsAfterFirst = await env.DB.prepare('SELECT email FROM invites WHERE squad_id = ? ORDER BY email')
+      .bind(squad!.id)
+      .all<{ email: string }>()
+    expect((invitedEmailsAfterFirst.results ?? []).map((r) => r.email)).toEqual(['a@example.com', 'b@example.com'])
+
+    // The failed attempt is receipted: invited_count=2 (a, b landed before c failed).
+    const failedReceipt = await env.DB.prepare(
+      'SELECT id, disposition, failed_step, failure_reason, invited_count, project_id, squad_id, bot_agent_id FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
+      .bind('partial')
+      .first<{
+        id: string
+        disposition: string
+        failed_step: string | null
+        failure_reason: string | null
+        invited_count: number
+        project_id: string
+        squad_id: string
+        bot_agent_id: string | null
+      }>()
+    expect(failedReceipt?.disposition).toBe('failed')
+    expect(failedReceipt?.failed_step).toBe('invite_insert')
+    expect(failedReceipt?.failure_reason).toBe('unique_violation')
+    expect(failedReceipt?.failure_reason).not.toMatch(/@/)
+    expect(failedReceipt?.invited_count).toBe(2)
+    expect(failedReceipt?.project_id).toBe(project!.id)
+    expect(failedReceipt?.squad_id).toBe(squad!.id)
+    expect(failedReceipt?.bot_agent_id).toBe(botAfterFirst!.id)
+
+    // Retry: same slug_base, same 5 humans, injection turned OFF.
+    injection.value = false
+    const second = await invokeTool(
+      orgAdminAuth(),
+      injectedEnv, // same wrapper, but injection.value is now false — every insert goes through
+      'team_bootstrap',
+      { slug_base: 'partial', name: 'Partial Team', department: DEPT_ID, humans, bot: { name: 'Partial Bot' } },
+      CTX,
+    )
+    expect(second.ok).toBe(true)
+    if (!second.ok) return
+    const secondResult = second.result as Record<string, unknown>
+
+    // MUTATION TARGET: breaking the adopt path (e.g. always creating a new
+    // project/squad instead of finding-then-creating) turns this red.
+    expect((secondResult.project as Record<string, unknown>).id).toBe(project!.id)
+    expect((secondResult.squad as Record<string, unknown>).id).toBe(squad!.id)
+
+    const invites = secondResult.invites as Array<Record<string, unknown>>
+    expect(invites).toHaveLength(5)
+    const byEmail = Object.fromEntries(invites.map((i) => [i.email, i]))
+    expect(byEmail['a@example.com'].created).toBe(false)
+    expect(byEmail['b@example.com'].created).toBe(false)
+    expect(byEmail['c@example.com'].created).toBe(true)
+    expect(byEmail['d@example.com'].created).toBe(true)
+    expect(byEmail['e@example.com'].created).toBe(true)
+
+    // Zero duplicate invites per email.
+    const allInvites = await env.DB.prepare('SELECT email, COUNT(*) AS n FROM invites WHERE squad_id = ? GROUP BY email')
+      .bind(squad!.id)
+      .all<{ email: string; n: number }>()
+    expect(allInvites.results ?? []).toHaveLength(5)
+    for (const row of allInvites.results ?? []) expect(row.n).toBe(1)
+
+    // One bot — no second agent minted on retry.
+    const botCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ? AND slug = ?')
+      .bind(squad!.id, 'partial-bot')
+      .first<{ n: number }>()
+    expect(botCount?.n).toBe(1)
+    expect((secondResult.bot as Record<string, unknown>).created).toBe(false)
+
+    // One ADMIN edge — no duplicate, still admin.
+    const edgeCount = await env.DB.prepare('SELECT COUNT(*) AS n, MAX(access_level) AS lvl FROM project_squad_access WHERE project_id = ? AND squad_id = ?')
+      .bind(project!.id, squad!.id)
+      .first<{ n: number; lvl: string }>()
+    expect(edgeCount?.n).toBe(1)
+    expect(edgeCount?.lvl).toBe('admin')
+
+    // The SAME receipt row transitions failed -> created; still one row.
+    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('partial')
+      .first<{ n: number }>()
+    expect(receiptCount?.n).toBe(1)
+    const finalReceipt = await env.DB.prepare(
+      'SELECT id, disposition, failed_step, failure_reason, invited_count FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
+      .bind('partial')
+      .first<{ id: string; disposition: string; failed_step: string | null; failure_reason: string | null; invited_count: number }>()
+    expect(finalReceipt?.id).toBe(failedReceipt!.id) // same row, not a second one
+    expect(finalReceipt?.disposition).toBe('created')
+    expect(finalReceipt?.failed_step).toBeNull()
+    expect(finalReceipt?.failure_reason).toBeNull()
+    expect(finalReceipt?.invited_count).toBe(5)
   })
 })
