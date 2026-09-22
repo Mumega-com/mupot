@@ -486,11 +486,36 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(result.releaseShaMatch).toBe(false)
     })
 
-    it('release_sha check is trivially satisfied (not a failure) when this deployment has no RELEASE_SHA configured', async () => {
+    it('release_sha check is trivially satisfied (not a failure, not asserted true) when this deployment has no RELEASE_SHA configured', async () => {
       const env = { DISPATCHER: fakeDispatcher({ tenant: 'gaf', releaseSha: null as any }) as any } as unknown as Env
       const result = await verifyPotReachable(env, 'gaf', 'mupot.mumega.com')
       expect(result.ok).toBe(true)
-      expect(result.releaseShaMatch).toBe(true)
+      // null, never true — "nothing configured" is "not verified," not "verified and matched".
+      expect(result.releaseShaMatch).toBeNull()
+    })
+
+    it('M-RELEASESHA (mupot#1507-v2 P1 pin): a non-40-hex RELEASE_SHA (configured but malformed) records release_sha_match: null, never true — and still does not block ok:true', async () => {
+      const env = {
+        DISPATCHER: fakeDispatcher({ tenant: 'gaf', releaseSha: undefined }) as any,
+        RELEASE_SHA: 'unknown', // exactly what uploadUserWorkerToDispatch stamps when it has no real sha
+      } as unknown as Env
+      const result = await verifyPotReachable(env, 'gaf', 'mupot.mumega.com')
+      expect(result.releaseShaMatch).toBeNull()
+      expect(result.ok).toBe(true)
+    })
+
+    it('MUTATION-EQUIVALENT: a REAL release_sha mismatch (both configured, both 40-hex) is still `false` (blocking), never swallowed by the null-is-non-blocking rule', async () => {
+      // Distinct from the existing "fails when the health body reports a DIFFERENT commit"
+      // test above (a fresh named assertion so a mutation collapsing `false` into `null` in
+      // the caller's ok-gate — `releaseShaMatch === false` back to `!releaseShaMatch` — is
+      // pinned at BOTH the field value and the resulting `ok`).
+      const env = {
+        DISPATCHER: fakeDispatcher({ tenant: 'gaf', releaseSha: 'b'.repeat(40) }) as any,
+        RELEASE_SHA: 'a'.repeat(40),
+      } as unknown as Env
+      const result = await verifyPotReachable(env, 'gaf', 'mupot.mumega.com')
+      expect(result.releaseShaMatch).toBe(false)
+      expect(result.ok).toBe(false)
     })
 
     it('never stores the raw /health body — only its sha256', async () => {
@@ -1137,6 +1162,122 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(result.not_completed).toContain('deploy_worker')
       expect(result.orphaned_resources).not.toBeNull()
       expect(result.public_origin).toBe('https://mupot.mumega.com/t/neuraya')
+    })
+
+    it("M-LOWER: a mixed-case slug normalizes to the SAME registry row a lowercase retry sees — a different actor cannot squat the differently-cased name", async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+      const env = makeEnv({ harnessDb: harness.db, DISPATCHER: fakeDispatcher({ tenant: 'mixedcase', releaseSha: null as any }) as any })
+
+      const first = await provisionSovereignPot(
+        env, { slug: 'MixedCase', brand_name: 'Mixed Case Co', admin_email: 'admin@mixedcase.test', minted_by_member_id: 'owner-1', caller_tenant: 'mumega' }, '// bundle',
+      )
+      expect(first.ok).toBe(true)
+      expect(first.slug).toBe('mixedcase') // normalized
+
+      // Exactly ONE row — the mixed-case input landed on the same normalized slug.
+      const rowCount = harness.sqlite.prepare("SELECT COUNT(*) as c FROM pots WHERE slug = 'mixedcase'").get() as { c: number }
+      expect(rowCount.c).toBe(1)
+
+      // A DIFFERENT actor supplying the already-lowercase form is refused — it is the SAME
+      // slug, not a fresh one a case mismatch would let them squat.
+      await expect(provisionSovereignPot(
+        env, { slug: 'mixedcase', brand_name: 'Squatter Co', admin_email: 'squatter@evil.test', minted_by_member_id: 'attacker', caller_tenant: 'mumega' },
+      )).rejects.toThrow(PotSlugTakenError)
+    })
+
+    it('M-BODYHASH: the verify_reachable RECEIPT (not just the return value) never contains the raw /health body', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+      const env = makeEnv({ harnessDb: harness.db, DISPATCHER: fakeDispatcher({ tenant: 'bodyhash', releaseSha: null as any }) as any })
+
+      const result = await provisionSovereignPot(env, { slug: 'bodyhash', brand_name: 'Body Hash Co', admin_email: 'admin@bodyhash.test' }, '// bundle')
+      expect(result.ok).toBe(true)
+
+      const rows = receiptRows(harness.sqlite, 'bodyhash')
+      const verifyRow = rows.find((r) => r.step === 'verify_reachable')!
+      expect(verifyRow.detail).not.toContain('"service"')
+      expect(verifyRow.detail).not.toContain('"clean"')
+      const parsed = JSON.parse(verifyRow.detail!)
+      expect(parsed.body_sha256).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    it("M-REGACTIVATE: a registry-activation write failure after all six steps still succeeded is ok:false, not a silent ok:true", async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      const sabotagedDb = {
+        ...harness.db,
+        prepare(sql: string) {
+          if (sql.includes("UPDATE pots SET status = 'active'")) {
+            return { bind: () => ({ run: async () => { throw new Error('pots table is locked') } }) }
+          }
+          return realPrepare(sql)
+        },
+      } as unknown as Env['DB']
+
+      const env = makeEnv({
+        harnessDb: sabotagedDb,
+        DISPATCHER: fakeDispatcher({ tenant: 'regactivate', releaseSha: null as any }) as any,
+      })
+
+      const result = await provisionSovereignPot(env, { slug: 'regactivate', brand_name: 'Reg Activate Co', admin_email: 'admin@regactivate.test' }, '// bundle')
+
+      expect(result.ok).toBe(false)
+      expect(result.status).toBe('incomplete')
+      // All six steps DID complete — this is the one documented edge where not_completed
+      // reads [] under status:'incomplete' (see the code comment on this exact branch).
+      expect(result.completed).toEqual(['create_d1', 'create_kv', 'apply_schema', 'deploy_worker', 'seed_identities', 'verify_reachable'])
+      expect(result.not_completed).toEqual([])
+      expect(result.incomplete_reason).toContain('registry activation failed')
+    })
+
+    describe('P1-C: a GENUINE concurrent race for a brand-new slug (no pre-inserted winner)', () => {
+      it('two truly concurrent calls for the SAME brand-new slug: exactly one wins, the loser is refused BEFORE any CF call it would otherwise make, and only ONE D1 is created', async () => {
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        const { fetchMock, calls } = createRealisticFakeCf({})
+        global.fetch = fetchMock as any
+        const env = makeEnv({ harnessDb: harness.db, DISPATCHER: fakeDispatcher({ tenant: 'racer2', releaseSha: null as any }) as any })
+
+        // NEITHER call pre-inserts anything — both start from a genuinely empty `pots`
+        // table for this slug and race through the SAME registry gate. Node's single
+        // event loop interleaves the two async call chains at their own await points
+        // (the SELECT, then checkSlugAvailability's own await, THEN the INSERT) — this
+        // is what actually reaches the INSERT's try/catch under real contention, unlike
+        // a test that pre-seeds the "winner" row and only ever exercises the
+        // already-existing-row branch.
+        const [a, b] = await Promise.allSettled([
+          provisionSovereignPot(env, { slug: 'racer2', brand_name: 'Racer A', admin_email: 'a@racer2.test', minted_by_member_id: 'caller-a', caller_tenant: 'mumega' }, '// bundle'),
+          provisionSovereignPot(env, { slug: 'racer2', brand_name: 'Racer B', admin_email: 'b@racer2.test', minted_by_member_id: 'caller-b', caller_tenant: 'mumega' }, '// bundle'),
+        ])
+
+        const outcomes = [a, b]
+        const fulfilledOk = outcomes.filter((r) => r.status === 'fulfilled' && (r.value as any).ok === true)
+        const rejectedAsTaken = outcomes.filter((r) => r.status === 'rejected' && (r.reason instanceof PotSlugTakenError))
+
+        // Exactly one winner, exactly one loser — never both succeeding, never both
+        // failing, and the loser fails with the NAMED refusal, not a generic error.
+        expect(fulfilledOk.length, JSON.stringify(outcomes.map((o) => o.status))).toBe(1)
+        expect(rejectedAsTaken.length).toBe(1)
+
+        // The defining proof: only ONE D1 database was ever created for this slug — the
+        // loser never reached create_d1 at all. A "swallow the INSERT failure and
+        // continue" mutation would let BOTH callers through to create_d1, and this count
+        // would be 2.
+        const d1CreateCalls = calls.filter((c) => c.method === 'POST' && /\/d1\/database$/.test(c.url))
+        expect(d1CreateCalls).toHaveLength(1)
+
+        const rowCount = harness.sqlite.prepare("SELECT COUNT(*) as c FROM pots WHERE slug = 'racer2'").get() as { c: number }
+        expect(rowCount.c).toBe(1)
+      })
     })
   })
 

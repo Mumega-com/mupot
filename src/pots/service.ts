@@ -788,9 +788,14 @@ export interface ReachabilityCheckResult {
   status: number | null
   /** null when there was nothing to compare (non-200, unparseable body, or no DISPATCHER). */
   tenantMatch: boolean | null
-  /** null ONLY when this deployment has no RELEASE_SHA configured at all (dev/test) — a
-   *  trivially-satisfied "nothing to compare" state, not a failure. See
-   *  `expectedHealthCommit`'s doc comment. */
+  /** `null` whenever `expectedHealthCommit` has nothing REAL to compare against — either
+   *  this deployment's `RELEASE_SHA` is unset entirely, or it is set to something that is
+   *  not a genuine 40-hex commit sha (e.g. the `'unknown'` this Worker uploads when it has
+   *  none). NEITHER case is a verified match, so neither is ever recorded as `true`
+   *  (mupot#1507-v2 P1 pin — a prior version of this function collapsed BOTH into `true`,
+   *  which reads as "checked and matched" when nothing was actually checked at all).
+   *  `null` is a non-blocking, honest "not verified" — distinct from `false`, a REAL,
+   *  asserted mismatch. See `expectedHealthCommit`'s doc comment. */
   releaseShaMatch: boolean | null
   /** sha256 of the raw response body — NEVER the body itself (mupot#1507 round-2 P2: a
    *  verbatim /health body in a receipt is exactly the kind of incidental data a ledger
@@ -879,14 +884,20 @@ export async function verifyPotReachable(
     }
     const tenantMatch = parsed !== null && parsed.tenant === slug
     const expectedCommit = expectedHealthCommit(env.RELEASE_SHA)
-    const releaseShaMatch = expectedCommit === null ? true : parsed !== null && parsed.commit === expectedCommit
+    // `null` (never `true`) whenever there is nothing REAL to compare against — unset
+    // RELEASE_SHA and a configured-but-malformed one are both "not verified," not "verified
+    // and matched." Only a genuine comparison can produce `true` or `false`. See the field's
+    // doc comment on `ReachabilityCheckResult`.
+    const releaseShaMatch = expectedCommit === null ? null : parsed !== null && parsed.commit === expectedCommit
     if (parsed === null) {
       return {
         ok: false, status: response.status, tenantMatch: false, releaseShaMatch: false, bodySha256,
         detail: 'response body was not parseable JSON — cannot verify tenant/commit identity',
       }
     }
-    if (!tenantMatch || !releaseShaMatch) {
+    // `releaseShaMatch === false` is the only value of the three that BLOCKS — `null`
+    // ("nothing to verify") is treated exactly like `true` here, never like a failure.
+    if (!tenantMatch || releaseShaMatch === false) {
       return {
         ok: false, status: response.status, tenantMatch, releaseShaMatch, bodySha256,
         detail: `identity mismatch: tenant_match=${tenantMatch} release_sha_match=${releaseShaMatch}`,
