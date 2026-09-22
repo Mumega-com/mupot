@@ -316,6 +316,34 @@ describe('putPotWorkerBundleObject', () => {
   // uncapped. An HTML error page from an intermediary in front of R2 (a CDN, a load
   // balancer returning a 502) is not R2's own S3 XML schema at all — it can carry a
   // lowercase `<code>` HTML tag with completely unrelated content, including a hostname.
+  it('an HTML 502 body with a 32-hex account id inside a lowercase <code> tag never leaks it — pins the case-SENSITIVE match alone (the value satisfies the PascalCase grammar)', async () => {
+    const sha = 'e'.repeat(40)
+    const signingClient = fakeSigningClient()
+    const accountId = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+    const fetchImpl = withNotYetPublishedPreCheck(
+      () => new Response(`<html><body><p><code>${accountId}</code></p></body></html>`, { status: 502 }),
+    )
+    let thrown: unknown
+    try {
+      await putPotWorkerBundleObject({
+        accountId,
+        bucket: 'mupot-pot-bundles',
+        releaseSha: sha,
+        bodyText: 'x',
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    const message = (thrown as Error).message
+    expect(message).not.toContain(accountId)
+    expect(message).toContain('502')
+  })
+
   it('an HTML 502 body with a hostname inside a lowercase <code> tag never leaks it — case-sensitive match, HTTP <status> only', async () => {
     const sha = 'd'.repeat(40)
     const signingClient = fakeSigningClient()
@@ -516,6 +544,25 @@ describe('putPotWorkerBundleObject', () => {
           if (r.ok) throw new Error('expected throw')
           expect(r.error).toBeInstanceOf(BundleShaConflictError)
           expect((r.error as { existingSha256?: string }).existingSha256).toBe(differentDigest)
+        },
+      },
+      {
+        name: 'PRESENT, SAME bytes, NO metadata → BundlePublishUnconfirmedError (verify would refuse; never already_published), 0 PUTs',
+        getResponse: () => new Response(bodyText, { status: 200 }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundlePublishUnconfirmedError)
+          expect((r.error as Error).message).toContain('IDENTICAL bytes')
+        },
+      },
+      {
+        name: 'PRESENT, SAME bytes, WRONG metadata → BundlePublishUnconfirmedError (verify would refuse; never already_published), 0 PUTs',
+        getResponse: () => new Response(bodyText, { status: 200, headers: { [metaKey]: 'deadbeef'.repeat(8) } }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundlePublishUnconfirmedError)
         },
       },
       {

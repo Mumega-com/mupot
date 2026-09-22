@@ -246,6 +246,24 @@ export class BundlePublishUnconfirmedError extends Error {
   }
 }
 
+/** An object with IDENTICAL bytes already sits at the key but its `sha256` metadata is
+ *  missing or does not match its own bytes — the state a dashboard/`wrangler r2 object put`
+ *  upload leaves behind. Nothing here can repair it (a published key is immutable and a
+ *  PUT would 412), and `verifyPotWorkerBundleObject` / the pot loader WILL refuse it, so
+ *  `alreadyPublished: true` would be a claim about a state never established. Refuse with
+ *  zero PUTs and name the recovery procedure (mupot#1529 round-2 P1). */
+function unverifiedIdenticalObjectError(key, readResult) {
+  return new BundlePublishUnconfirmedError(
+    `refusing to report '${key}' as already published: an object with IDENTICAL bytes exists ` +
+      'there but its sha256 metadata is missing or does not match its own bytes, so verify ' +
+      `(and the pot loader) will refuse it (${readResult.reason ?? 'no reason given'}). Zero ` +
+      'PUTs were made — a published key is immutable. Recover per ' +
+      'docs/workflows/tenant-provision.md "Recovering from a digest mismatch" (delete the ' +
+      'object with `wrangler r2 object delete --remote`, then republish).',
+    { key, getStatus: readResult.status, reason: readResult.reason },
+  )
+}
+
 /**
  * Classifies a `verifyPotWorkerBundleObject` result into what it actually PROVES about
  * whether the object exists, rather than trusting `.ok` alone (mupot#1529 round-1 P1-2).
@@ -271,7 +289,12 @@ export class BundlePublishUnconfirmedError extends Error {
  */
 function classifyExistingObject(result) {
   if (result.status === 200) {
-    return { state: 'present', actualSha256: result.ok ? result.sha256 : result.actualSha256 }
+    // `verified` is whether the object's OWN recorded metadata agrees with its bytes — the
+    // exact predicate `verifyPotWorkerBundleObject` (and the pot loader) will apply later.
+    // A present object whose bytes match but whose metadata is missing/wrong is NOT
+    // "already published" (mupot#1529 round-2 P1: two CLIs in one PR disagreed about the
+    // same object — publish said already_published:true, verify exited 1).
+    return { state: 'present', verified: result.ok === true, actualSha256: result.ok ? result.sha256 : result.actualSha256 }
   }
   if (result.status === 404) {
     return { state: 'absent' }
@@ -364,6 +387,7 @@ export async function putPotWorkerBundleObject({
   const preClass = classifyExistingObject(preCheck)
   if (preClass.state === 'present') {
     if (preClass.actualSha256 === sha256) {
+      if (!preClass.verified) throw unverifiedIdenticalObjectError(key, preCheck)
       return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: true }
     }
     throw new BundleShaConflictError(
@@ -415,6 +439,7 @@ export async function putPotWorkerBundleObject({
     const existingClass = classifyExistingObject(existing)
     if (existingClass.state === 'present') {
       if (existingClass.actualSha256 === sha256) {
+        if (!existingClass.verified) throw unverifiedIdenticalObjectError(key, existing)
         return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: true }
       }
       throw new BundleShaConflictError(
