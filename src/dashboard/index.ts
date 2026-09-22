@@ -508,11 +508,16 @@ dashboardApp.get('/projects/new', async (c) => {
 })
 
 dashboardApp.post('/projects', async (c) => {
-  if (!await canManageProjects(c.env, c.get('auth'))) {
+  const auth = c.get('auth')
+  if (!await canManageProjects(c.env, auth)) {
     return c.html(shell(c.env, 'Projects', errorBody('Creating a project requires workspace admin.')), 403)
   }
   const values = submittedProjectFormValues(await c.req.parseBody())
-  const result = await createProject(c.env, { ...projectMutationInput(values), status: 'planned' })
+  const result = await createProject(
+    c.env,
+    { ...projectMutationInput(values), status: 'planned' },
+    { createdByMemberId: auth.memberId ?? undefined },
+  )
   if (!result.ok) {
     const view = { values, parentOptions: await loadProjectParentOptions(c.env), error: result.error }
     return c.html(shell(c.env, 'Create project', projectCreateBody(view)), projectMutationStatus(result.error))
@@ -2747,11 +2752,16 @@ dashboardApp.post('/squads', async (c) => {
       403,
     )
   }
-  const result = await createSquad(c.env, departmentId, {
-    slug: form.slug,
-    name: form.name,
-    charter: form.charter,
-  })
+  const result = await createSquad(
+    c.env,
+    departmentId,
+    {
+      slug: form.slug,
+      name: form.name,
+      charter: form.charter,
+    },
+    { createdByMemberId: auth.memberId ?? undefined },
+  )
   if (!result.ok) {
     return c.html(
       shell(c.env, 'Overview', errorBody(`Could not create squad: ${result.error}.`)),

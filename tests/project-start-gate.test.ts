@@ -394,6 +394,33 @@ describe('startProject resource-fail stays planned (blocked-start)', () => {
     }
   })
 
+  // mupot#1498 successor (P3-2): the auto-created squad stamps
+  // created_by_member_id with the actor who triggered the start-gate — the
+  // SAME provenance column team_bootstrap's adoption check reads (migration
+  // 0166). Without this, a later team_bootstrap call adopting this exact
+  // squad by derived slug would fall through to the org-admin adopt:true
+  // override on every single call instead of recognizing its own actor's
+  // prior work.
+  it('stamps created_by_member_id on the auto-created squad with the start-gate actor', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      harness.sqlite.exec(
+        `INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', '{"tier":"scale"}', '2026-07-22 00:00:00')`,
+      )
+      insertPlannedProject(harness, { id: 'proj-nosquad-provenance' })
+
+      await startProject(env, 'proj-nosquad-provenance', makeDeps({ actorMemberId: 'member-start-gate-actor' }))
+
+      const squad = await env.DB.prepare('SELECT created_by_member_id FROM squads WHERE slug = ?')
+        .bind('proj-nosquad-provenance-sqd')
+        .first<{ created_by_member_id: string | null }>()
+      expect(squad?.created_by_member_id).toBe('member-start-gate-actor')
+    } finally {
+      harness.close()
+    }
+  })
+
   it('a second project with no squad edge reuses the SAME auto-provisioned department, not a new one', async () => {
     const harness = makeHarness()
     const env = envFor(harness)

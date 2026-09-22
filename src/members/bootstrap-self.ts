@@ -667,7 +667,12 @@ export async function bootstrapSelf(
   if (byDepartment) {
     squad = byDepartment
   } else {
-    const squadResult = await deps.createSquad(env, departmentId, { slug: squadSlug, name: homeName }, { kind: 'home' })
+    const squadResult = await deps.createSquad(
+      env,
+      departmentId,
+      { slug: squadSlug, name: homeName },
+      { kind: 'home', createdByMemberId: consentingMemberId },
+    )
     if (squadResult.ok) {
       squad = squadResult.value
       squadCreatedHere = true

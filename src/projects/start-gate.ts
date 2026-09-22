@@ -385,7 +385,16 @@ async function autoCreateWritableSquad(
   if (existing) {
     squadId = existing.id
   } else {
-    const created = await createSquad(env, departmentId, { slug: squadSlug, name: `${project.name} Squad` })
+    const created = await createSquad(
+      env,
+      departmentId,
+      { slug: squadSlug, name: `${project.name} Squad` },
+      // P3-2 (mupot#1498 successor to PR #1510): stamp provenance so a LATER
+      // team_bootstrap call adopting this exact squad by derived slug can
+      // recognize it as created by the acting admin, rather than falling
+      // through to the org-admin adopt:true override every time.
+      { createdByMemberId: actorMemberId ?? undefined },
+    )
     if (created.ok) {
       squadId = created.value.id
       // P2-4: same org.provisioned event create_squad's own MCP tool emits.

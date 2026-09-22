@@ -55,9 +55,9 @@ function errorStatus(error: TeamBootstrapError): 400 | 403 | 404 | 409 {
   if (error === 'department_not_found') return 404
   if (error === 'ambiguous_department') return 409
   if (error === 'squad_limit_reached' || error === 'agent_limit_reached') return 409
-  if (error === 'squad_slug_taken') return 409
+  if (error === 'squad_slug_taken' || error === 'project_slug_taken') return 409
   if (error === 'project_archived') return 409
-  if (error === 'cannot_invite_above_own_rank') return 403
+  if (error === 'cannot_adopt_home_squad') return 403
   return 400
 }
 
@@ -154,7 +154,7 @@ export const toolTeamBootstrap: ToolSpec = {
   scope: 'org — composite project + squad + bot + invites bootstrap',
   min: 'admin',
   args:
-    '{ slug_base: string, name: string, department: string (id|slug), humans?: [{email, capability: "observer"|"member"}], bot?: { enabled?: boolean, name?, role?, model? }, seed_memory?: string, adopt?: boolean (org:admin only — see squad_slug_taken) }',
+    '{ slug_base: string, name: string, department: string (id|slug), humans?: [{email, capability: "observer"|"member"}], bot?: { enabled?: boolean, name?, role?, model? }, seed_memory?: string, adopt?: boolean (org:admin only — see project_slug_taken/squad_slug_taken; never overrides the kind=home fence) }',
   inputSchema: {
     type: 'object',
     properties: {

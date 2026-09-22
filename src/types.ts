@@ -345,6 +345,24 @@ export interface Squad {
   autonomy: Autonomy
   budget_cap_cents: number | null
   budget_window: BudgetWindow
+  /**
+   * Who created this row (migration 0166) — NULL for every row created
+   * before this column existed. Provenance ground for team_bootstrap's
+   * squad-adoption check (mupot#1498 P0(b) — replaces the old "empty squad"
+   * emptiness ground entirely, since createSquad grants its creator no
+   * capability row and every fresh squad satisfied that test). Stamped via
+   * createSquad's opts parameter, never from a request body field (same
+   * discipline as CreateOpts.kind).
+   */
+  created_by_member_id: string | null
+  /**
+   * elevation_grants.id that authorized this create, when created under a
+   * bounded action:* elevation rather than standing capability (migration
+   * 0166) — NULL otherwise (the common case) or for a pre-migration row.
+   * No FK — see migration 0166's comment. Stamped via createSquad's opts
+   * parameter, never from a request body field.
+   */
+  created_via_receipt: string | null
   created_at: string
 }
 
@@ -511,6 +529,25 @@ export interface Project {
   assigned_squad_id: string | null
   /** Latest deploy pipeline status (migration 0129). Receipts live in project_deployments. */
   deploy_status: ProjectDeployStatus
+  /**
+   * Who created this row (migration 0166) — NULL for every row created
+   * before this column existed. Provenance ground for team_bootstrap's
+   * project-adoption check (mupot#1498 P0(a)): a caller may adopt a
+   * pre-existing project by derived slug only if they made it themselves,
+   * a prior team_bootstrap attempt already named it, or an org-admin
+   * explicitly overrides (adopt:true) — never merely because the slug
+   * matches. Stamped via createProject's opts parameter, never from a
+   * request body field (same discipline as org/service.ts's CreateOpts.kind).
+   */
+  created_by_member_id: string | null
+  /**
+   * elevation_grants.id that authorized this create, when created under a
+   * bounded action:* elevation rather than standing capability (migration
+   * 0166) — NULL otherwise (the common case) or for a pre-migration row.
+   * No FK — see migration 0166's comment. Stamped via createProject's opts
+   * parameter, never from a request body field.
+   */
+  created_via_receipt: string | null
   created_at: string
   updated_at: string
 }

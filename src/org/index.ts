@@ -222,11 +222,17 @@ orgApp.post('/departments/:id/squads', async (c) => {
 
   // Same boundary fix as departments (re-gate condition 2026-08-12): construct
   // from known fields; kind is internal-only.
-  const result = await createSquad(c.env, departmentId, {
-    slug: body.slug,
-    name: body.name,
-    charter: body.charter,
-  })
+  const auth = c.get('auth')
+  const result = await createSquad(
+    c.env,
+    departmentId,
+    {
+      slug: body.slug,
+      name: body.name,
+      charter: body.charter,
+    },
+    { createdByMemberId: auth.memberId ?? undefined },
+  )
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }

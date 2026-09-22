@@ -1,15 +1,17 @@
 # Team bootstrap
 
 Source: mupot#1498 ("team_bootstrap: one call creates project-prj + squad-sqd + project bot +
-token claim + Hermes profile scaffold — new teams in one step"). Built in PR #1510
-(`kasra/team-bootstrap-tool`), not yet merged as of this writing — code checked against that
-branch after its adversarial round-2 fixes, rebased onto `origin/main` `9b46799c`.
+token claim + Hermes profile scaffold — new teams in one step"). Originally built in PR #1510
+(`kasra/team-bootstrap-tool`). **PR #1510's round-2 adversarial gate on
+`29728793a300970c4f351e7c5817e63daa01cfb3` found a surviving P0 (kasra-review, 2026-09-22) —
+the round-2 fix built an ownership ground for only ONE of this function's TWO find-or-creates
+(the squad; the project got nothing). Per the "P0 blocks, two gate rounds max" rule, PR #1510
+is superseded by a new branch/PR (`kasra/team-bootstrap-v2`) rather than a third round on the
+same PR. This doc reflects the SUCCESSOR shape.**
 
-**Status: built, not yet merged.** Round 1 of Athena's gate on PR #1510 was GREEN-to-round-2;
-round 2's own adversarial pass found 1 P0, 4 P1, and 5 P2 findings, all fixed on the same
-branch (this doc reflects the fixed shape, not the original PR #1510 push). This supersedes
-this doc's original "unimplemented" version (written against `3c706069`, before PR #1510
-existed).
+**Status: built, not yet merged.** Not yet gated by an independent adversarial pass as of this
+writing — see the successor PR for current gate status before assuming this is production-safe
+or that migration `0166` (still unapplied) has landed.
 
 ## Trigger
 
@@ -23,7 +25,9 @@ A member principal holding org-scope `admin` (or coarse role `owner`/`admin`), w
 `auth.memberId` (refused `actor_required` otherwise — P2-3, below). Never an agent-bound
 token: `auth.boundAgentId` is refused outright with `operator_principal_required` before any
 other check — the same rule `mint_agent_token`/`update_squad` already enforce for every other
-grant tool. There is no lighter lead-proposal variant in this PR (see Known gaps).
+grant tool. There is no lighter lead-proposal variant in this PR (see Known gaps). **There is
+no per-human rank ceiling either** (round 2 built one; the successor DELETES it — see step 4
+below for why it was provably unreachable, not merely undertested).
 
 ## Tool/route sequence
 
@@ -45,43 +49,51 @@ grant tool. There is no lighter lead-proposal variant in this PR (see Known gaps
       write; the SAME email (case-insensitive) appearing twice in one call keeps only the
       FIRST occurrence — the dropped duplicate is reported back in
       `duplicate_emails_in_request`.
-   4. **Per-human rank ceiling, on DEPARTMENT scope, BEFORE any create** (`:477` — P1-4):
+   4. **The per-human rank ceiling is GONE — deleted, not fixed.** Round 2 ran
       `capabilityRank(human.capability) > actorRankOnScopeFor(env, auth, 'department',
-      departmentId)` → `cannot_invite_above_own_rank`. Department scope, not squad — the
-      squad may not exist yet, and an org/department grant inherits down to it regardless
-      (`capability.ts`'s own invariant). Running this before `createProject`/`createSquad`
-      means a call that was always going to be refused never burns an entitlement slot on a
-      squad/project nobody gets to keep. (Round-1's version ran this on squad scope, AFTER
-      the creates — a real, but unreachable-through-the-tool ordering bug, since the tool's
-      own org-admin floor always outranks the two invitable capabilities. Fixed regardless:
-      defense in depth must hold its OWN invariant even when today's floor makes it
-      unreachable.)
-   5. Find-or-create `<slug_base>-prj` — its own commit, its own slug validation
-      (`createProject`, `src/projects/service.ts`).
-   6. **Project status checked BEFORE the squad is ever created** (`:515` — P1-1): an adopted
-      `archived` project refuses `project_archived` (409) immediately — before spending a
-      free-tier squad-entitlement slot on a squad this call could never finish wiring. A
-      RACE that archives the project AFTER this check but before stage 1's edge INSERT
-      (below) is still caught: the trigger's own abort text is mapped to the SAME
+      departmentId)` on department scope before any create. kasra-review's round-2 gate
+      (finding 6) proved it structurally unreachable: this tool's own floor
+      (`hasWorkspaceAdmin`, step 2 above) means every caller that ever reaches this function
+      is already org:admin, whose rank always dominates the `'observer'`/`'member'` ranks the
+      ceiling compared against — it could never fire. Its only test proved this by calling
+      `teamBootstrap()` directly with `capabilities: []`, a principal `invokeTool` itself
+      refuses before reaching this function at all. Deleted along with that test. If a
+      lower-privilege path into this tool is ever added, a per-human rank ceiling belongs
+      back here, made real against THAT path's floor and proven with a principal `invokeTool`
+      actually admits.
+   5. **Resolve BOTH `<slug_base>-prj` and `<slug_base>-sqd` by READ ONLY — neither is
+      created yet** (P1-A, successor to PR #1510's round-2 P0). Round 2 created the project
+      FIRST, then discovered the squad name was taken — an orphan project, zero receipt, a
+      permanent name reservation, no retry path. The successor finds both first.
+   6. **Project status checked immediately if found** (P1-1, carried forward): an `archived`
+      project refuses `project_archived` (409) before either name's adoptability is even
+      checked. A RACE that archives the project AFTER this check but before stage 1's edge
+      INSERT (below) is still caught: the trigger's own abort text maps to the SAME
       `'archived_project'` structural classification, not a generic `'write_failed'`.
-   7. **Find-or-create `<slug_base>-sqd`, ownership-checked before adoption** (`:524` — P0,
-      see the dedicated section below).
-   8. Reads whether each human already has a live invite into this squad, reporting the
+   7. **BOTH the project and the squad limb run the SAME ownership check before either is
+      created** (P0, see the dedicated section below) — a squad `kind='home'` is fenced
+      unconditionally first (P2-4). A refusal on EITHER limb writes a `'failed'` attempt
+      receipt (`failed_step: 'name_resolution'`) and creates NOTHING — not even the limb that
+      would have been fine on its own.
+   8. Only once both names clear does either get CREATED (find-or-create proper) — its own
+      commit, its own slug validation, its own entitlement gate
+      (`createProject`/`createSquad`), stamping `created_by_member_id` with the acting admin.
+   9. Reads whether each human already has a live invite into this squad, reporting the
       STORED capability for one that exists — NEVER the newly requested one (P2-2: a replay
       requesting a different capability for an already-invited email does not silently imply
       the request changed what was granted).
-   9. Finds or prepares the bot agent (`<slug_base>-bot`) — unchanged from round 1.
-   10. **Reads the current project<->squad edge and NEVER raises it** (`:597` — P1-2, see the
+   10. Finds or prepares the bot agent (`<slug_base>-bot`) — unchanged from round 2.
+   11. **Reads the current project<->squad edge and NEVER raises it** (P1-2, see the
        dedicated section below).
-   11. **Stage 1** (`:609`, one `env.DB.batch()`, only when there is something to write): the
+   12. **Stage 1** (one `env.DB.batch()`, only when there is something to write): the
        ADMIN edge INSERT (skipped entirely if an edge already exists — see P1-2) + the bot
        agent's two `prepareAgentCreate` statements (only when a bot needs creating).
        All-or-nothing.
-   12. **Stage 2** (`:651`): one `invites` row per human with no existing live invite —
+   13. **Stage 2**: one `invites` row per human with no existing live invite —
        inserted ONE AT A TIME, not batched. A failure on invite N does not undo invites
        1..N-1; the loop stops at the first failure.
-   13. **Stage 3** (`:694`, `writeReceipt` at `:392`): ONE INSERT per ATTEMPT into
-       `team_bootstrap_receipts` — ALWAYS attempted, whether stages 11-12 succeeded or
+   14. **Stage 3** (`writeReceipt`): ONE INSERT per ATTEMPT into
+       `team_bootstrap_receipts` — ALWAYS attempted, whether stages 12-13 succeeded or
        failed (see Receipt(s) written, below, for why this is an INSERT and not the
        update-in-place design round 1 shipped).
 4. Back in the tool (`src/mcp/team-bootstrap.ts`): if a bot was freshly created this call,
@@ -114,40 +126,109 @@ grant tool. There is no lighter lead-proposal variant in this PR (see Known gaps
      `create_department`/`create_squad`'s own MCP tools emit (P2-4) — a duplicate helper
      (`emitOrgProvisioned`, `src/projects/start-gate.ts`), not an import, to avoid closing a
      new module cycle (see that function's own comment for the exact cycle it would create).
+     **Successor addition (P3-2): the auto-created squad now also stamps
+     `created_by_member_id` with the start-gate's acting admin** — the SAME provenance column
+     `team_bootstrap`'s adoption check reads (below), so a LATER `team_bootstrap` call
+     adopting this exact squad by derived slug recognizes it as that actor's own prior work
+     instead of falling through to the `adopt: true` override every time. The existing "zero
+     `project_squad_access` rows" gate already prevents a SECOND admin-edge squad from ever
+     being auto-created for a project that has one — unchanged, not a new fix.
 
 ## THE CENTRAL RULE: find-or-create is create + explicit adopt
 
 (Athena, round-2 gate on PR #1510, 2026-09-22 — quoted verbatim because it is the rule this
-whole section enforces.) **Adopting a pre-existing squad is a privilege grant** to whoever
-already controls it: an ADMIN project<->squad edge, plus a mintable bot placed inside it, plus
-(that squad admin already holding `mint_agent_token`'s own floor) a live credential for that
-bot. `squadIsAdoptable` (`src/org/team-bootstrap.ts:317`) therefore requires ONE of two
-grounds before adopting any pre-existing squad found by `(department_id, slug)`:
+whole section enforces, and the exact rule PR #1510's round 2 applied to only ONE of the two
+find-or-creates below — the surviving P0 that made this doc's PR a successor rather than a
+third round.) **Adopting a pre-existing project OR squad is a privilege grant** to whoever
+already controls it: for the squad, an ADMIN project<->squad edge plus a mintable bot placed
+inside it plus (that principal already holding `mint_agent_token`'s own floor) a live
+credential for that bot; for the project, the SAME edge and bot, onto a row whose `name`,
+`repo_url`, and `worker_name` (`project_deploy`'s own deploy target) the caller never chose.
 
-- **(a) a PRIOR team_bootstrap attempt already named this exact `squad_id` for this exact
+`findAdoptGround` (`src/org/team-bootstrap.ts`) is the ONE adoptability check for BOTH limbs —
+called once for the resolved project, once for the resolved squad, each independently. Either
+ground is sufficient to adopt:
+
+- **(i) a PRIOR team_bootstrap attempt already named this exact resource id for this exact
   `slug_base`** — a genuine resumed retry, checked against the append-only receipt trail
-  (`team_bootstrap_receipts`), never against the squad's CURRENT state, which whoever
-  controls the squad can freely change (renaming it, adding a capability row) to fake
-  legitimacy.
-- **(b) the squad is genuinely EMPTY right now** — zero `agents` rows, zero `capabilities`
-  rows scoped to it — so adopting it hands nobody standing they did not already have.
+  (`team_bootstrap_receipts`), never against the resource's CURRENT state, which whoever
+  controls it can freely change to fake legitimacy.
+- **(ii) `created_by_member_id` on the row equals the calling actor** — they made it
+  themselves, through whatever tool, before this call.
 
-Neither holding means someone OTHER than a prior bootstrap of this exact team put this squad
-here. **Round 1's find-or-create adopted whatever answered, unconditionally** — combined with
-`update_squad`'s new `slug` field being gated at squad:admin, ANY squad admin could rename
-their own squad to `<future-slug_base>-sqd` and wait: the next legitimate `team_bootstrap`
-call for that `slug_base` would grant THEIR squad an ADMIN edge onto a brand-new project and
-place a mintable bot inside it, which they — already holding squad:admin — could mint a
-token for via `mint_agent_token`. Full takeover of a future team's project, no exploit beyond
-"rename a squad and wait."
+Neither holding means someone OTHER than this actor's own prior work put the resource here —
+refused, UNLESS the caller passes `adopt: true` AND is `isOrgAdmin` (checked INSIDE
+`teamBootstrap` itself, never trusted from a caller whose own floor might one day be lowered).
 
-**The fix**: refused `squad_slug_taken` (409) with the squad's current capability holders in
-the detail (`{squad_id, department_id, owners: [{member_id, capability}]}`) UNLESS the caller
-passes `adopt: true` AND is `isOrgAdmin` — checked INSIDE `teamBootstrap` itself
-(`src/org/team-bootstrap.ts:524`), never trusted from a caller whose own floor might one day
-be lowered. An explicit, informed override is not the same act as an accidental adoption:
-**exercising it is receipted as its own disposition, `'adopted'`** (not silently folded into
-`'existing'`, where it would read as unremarkable) — see Receipt(s) written, below.
+**"Empty" is NOT a ground, on either limb, deliberately.** PR #1510's round 2 gave the squad
+limb a THIRD ground — zero `agents` rows, zero `capabilities` rows scoped to it — reasoning
+that adopting an empty squad "hands nobody standing they did not already have." kasra-review's
+round-2 gate on that fix (finding 2) measured the hole directly: `createSquad` grants its
+creator NO capability row at all, so **every freshly created squad satisfied that test** —
+the round-1 squat this ground was meant to close was trivially reproducible by a strictly
+LOWER principal than round 2 assumed (measured with the repo's own elevation fixture, `tests/
+elevation-squad-lead-e2e.test.ts`: a squad lead holding `lead` on its own squad, no admin
+anywhere, under a 60-minute human-approved `action:project_lifecycle` elevation). Provenance
+replaces emptiness outright rather than widening it; a pre-existing row with NULL
+`created_by_member_id` (everything created before migration 0166 added the column) is
+adoptable only via the explicit `adopt: true` override, never via emptiness.
+
+**The PROJECT limb had NO ground at all in round 2** (finding 1, the P0). Measured: a squad
+lead under an org-scoped `action:workspace_project` elevation created `payroll-prj` via
+`project_create`; the org admin's LATER `team_bootstrap {slug_base:'payroll'}` adopted that
+exact row — id-match true — keeping the planter's `name`/`repo_url`/`worker_name`, wiring an
+ADMIN edge onto it, and minting a bot inside the admin's new squad, reported
+`disposition:'created'`. `findAdoptGround` now runs identically on the project.
+
+**Resolve BOTH names before creating EITHER (P1-A).** Round 2 created the project FIRST, then
+discovered the squad name was taken (finding 4) — an orphan project, ZERO receipt, a
+permanent name reservation, no retry path. The successor finds both `<slug_base>-prj` and
+`<slug_base>-sqd` (read only) and clears both adoptability checks before creating anything. A
+refusal on EITHER limb writes a `'failed'` attempt receipt (`failed_step: 'name_resolution'`,
+`failure_reason: 'project_slug_taken'` or `'squad_slug_taken'`) instead of returning silently
+— `project_id`/`squad_id` on that row are the FOUND resource if one exists, else `NULL`
+(migration 0166 made both columns nullable for exactly this case).
+
+**Release path, documented rather than built as a tool.** A `'failed'` receipt now reserves a
+`slug_base` for `update_squad`'s rename floor (`isSlugBaseReserved`) — but only WHILE the
+project it names still exists: `isSlugBaseReserved` joins each candidate receipt against a
+live `projects` row and ignores receipts whose project has been deleted (or that never named
+one). Deleting the orphaned project IS the release action; no dedicated `team_bootstrap_release`
+tool was built.
+
+**Home fence (P2-4).** A resolved squad with `kind === 'home'` is refused unconditionally —
+`adopt: true` cannot override it, checked before the ordinary adoptability check even runs.
+Latent-only in production (the canonical home slug `home-<8hex>` can never end in `-sqd`), but
+no longer depends on that coincidence of naming.
+
+**The fix (unchanged from round 2 in shape, now on both limbs)**: refused `squad_slug_taken` /
+`project_slug_taken` (409) with the resource's `created_by_member_id` (and, for the squad, its
+current capability holders) in the detail, UNLESS the caller passes `adopt: true` AND is
+`isOrgAdmin`. An explicit, informed override is not the same act as an accidental adoption:
+**exercising it is receipted, and disposition is `'adopted'` on EVERY path that adopted rather
+than created something** — not folded into `'created'` the way round 2 did for every ground
+except the explicit-override branch (finding 7). `'created'` fires ONLY when BOTH the project
+and the squad were newly made by this attempt; `'existing'` is reserved for the narrowest
+case — both matched a PRIOR team_bootstrap attempt (a true resumed retry) and this call made
+no bot and sent no new invite either. See Receipt(s) written, below.
+
+**`created_via_receipt` (Athena ruling relayed 2026-09-22, mupot seq 5238).** A second,
+narrower provenance column alongside `created_by_member_id`: `elevation_grants.id` when the
+row was created under a bounded `action:*` elevation rather than standing capability — `NULL`
+in the common case (standing admin) or for a pre-migration row. Stamped at both call sites
+that can create under an elevation (`project_create`'s `action:workspace_project` check,
+`create_squad`'s `action:project_lifecycle` check — `src/mcp/projects.ts`/`src/mcp/
+provision.ts`, capturing `hasElevatedAction`'s returned `grant.id`); `team_bootstrap`'s own two
+creates and `start-gate`'s `autoCreateWritableSquad` have no elevation path today, so this
+column is simply always `NULL` on rows they create — nothing to stamp, not a gap. A
+`project_slug_taken`/`squad_slug_taken` refusal's `detail` now carries `created_via_receipt`
+plus a `summary` string ("created by member X under elevation receipt Y", or just "created by
+member X" when no elevation was involved, or a plain "no recorded creator" marker for a
+pre-migration row) so an admin sees the FULL provenance picture — including the project's
+`worker_name` in the project-limb detail, since that is the deploy target the planter chose —
+before deciding whether to override. No FK to `elevation_grants`: consistent with every other
+provenance column in this migration, not because the table is ever deleted (it isn't — only
+`revoked_at` is set).
 
 ## THE ADMIN EDGE IS NEVER SILENTLY RAISED (P1-2)
 
@@ -179,6 +260,12 @@ failed_step, failure_reason, invited_count, created_at` —
 `UNIQUE(tenant, slug_base, attempt_no)`. Migration `0166` carries the repo's standard "NOT
 applied by this build — a human applies it" header (same as `0157`-`0165`); confirm
 migration state operationally before assuming this table exists on a given deployment.
+**`project_id` and `squad_id` are nullable as of the successor rewrite** — `NULL` only on a
+`'name_resolution'` failure for whichever limb was never found or created (every other
+disposition still always carries both, exactly as round 2 shipped). The SAME migration also
+adds `projects.created_by_member_id` and `squads.created_by_member_id` (additive, nullable —
+every pre-existing row lands `NULL`) — these are NOT columns on this receipts table; they live
+on the resource tables themselves and are what `findAdoptGround` reads (see above).
 
 **ONE ROW PER ATTEMPT, NEVER UPDATED** (P1-3, kasra-review adversarial round-1 gate on PR
 #1510). Round 1 kept exactly one row per `(tenant, slug_base)`, continuously UPDATEd across
@@ -202,20 +289,26 @@ adopted — ownership-checked — by the next attempt) is a property of team_boo
 find-or-create reads against the real resource tables, never of this receipt table, which
 merely records what each attempt observed and did.
 
-**`disposition` has FOUR values**:
-- `'created'` — this attempt did something new.
-- `'existing'` — a pure no-op replay; every row it names was already there.
-- **`'adopted'`** — an `adopt: true` override claimed a pre-existing, non-empty squad no
-  prior attempt had named (see "find-or-create is create + explicit adopt", above). An
-  AUDITED operator decision, always distinguishable from an ordinary replay.
-- `'failed'` — the write phase (stage 11 or 12, above) did not finish this attempt;
-  `project_id`/`squad_id` are still real, already-committed rows — only the composite
-  outcome of THIS attempt is incomplete. `failed_step` names where it stopped
-  (`'edge_or_bot'` | `'invite_insert'`); `failure_reason` is a short, STRUCTURAL
-  classification (`'unique_violation'` | `'write_failed'` | `'archived_project'`) —
-  deliberately NOT the raw driver error text and NEVER an email address or other human PII,
-  so this table stays safe to page through operationally without becoming a second place
-  secrets/PII could leak from.
+**`disposition` has FOUR values (redefined by the successor — round 2's `'adopted'` covered
+only the explicit-override branch; this fixes finding 7)**:
+- `'created'` — BOTH the project AND the squad were newly created by THIS attempt. Narrower
+  than round 2, which said `'created'` whenever project OR squad OR bot OR any invite was new.
+- `'existing'` — the NARROWEST bucket: both resources matched a PRIOR team_bootstrap attempt
+  (a genuine resumed retry of this team's own prior work), and this call made no bot and sent
+  no new invite either — a true no-op replay.
+- **`'adopted'`** — every other combination: a provenance-owned pre-existing row, an
+  `adopt: true` override, a mixed create-one/adopt-the-other attempt, a cross-department
+  project reuse, or a start-gate auto-created squad found by slug. An AUDITED or provenance
+  outcome, always distinguishable from a genuine no-op replay.
+- `'failed'` — the write phase did not finish this attempt, OR name resolution refused before
+  any write. `project_id`/`squad_id` are real, already-committed rows for every disposition
+  EXCEPT a `'name_resolution'` failure, where either can be `NULL` (see above). `failed_step`
+  names where it stopped (`'edge_or_bot'` | `'invite_insert'` | `'name_resolution'`, the last
+  added by the successor); `failure_reason` is a short, STRUCTURAL classification
+  (`'unique_violation'` | `'write_failed'` | `'archived_project'` | `'project_slug_taken'` |
+  `'squad_slug_taken'`, the last two added by the successor) — deliberately NOT the raw driver
+  error text and NEVER an email address or other human PII, so this table stays safe to page
+  through operationally without becoming a second place secrets/PII could leak from.
 
 ## What the person sees
 
@@ -224,9 +317,10 @@ squad: {...Squad fields, created}, edge_kept, bot: {id, slug, name, created} | n
 [{id, url, email, capability, created}], duplicate_emails_in_request, credential_claim,
 hermes_scaffold }`.
 
-- **`project` and `squad` carry `created: boolean`** (P0(b), same shape `bot` and each
-  `invites[]` entry already used) — `false` on every adopted/idempotent-replay path, `true`
-  only when THIS call minted the row.
+- **`project` and `squad` carry `created: boolean`** (same shape `bot` and each `invites[]`
+  entry already used) — `false` on every adopted/idempotent-replay path, `true` only when THIS
+  call minted the row. Both also carry `created_by_member_id` (successor addition) — `null`
+  for a row created before migration 0166.
 - `edge_kept` — see "THE ADMIN EDGE IS NEVER SILENTLY RAISED", above.
 - `duplicate_emails_in_request` — lowercased emails that appeared more than once in this
   call's `humans[]`; only the first occurrence was used.
@@ -244,46 +338,76 @@ hermes_scaffold }`.
 
 ## Tests that pin it
 
-`tests/team-bootstrap.test.ts` (22 cases) — registration; the happy path (project/squad
-`created: true`, `edge_kept: null`, `duplicate_emails_in_request: []`, bot/invites/receipt/
-claim/scaffold all present); idempotency on `slug_base` (adopted project/squad report
-`created: false`, no duplicate invite, no second bot, TWO separate receipt rows — one per
-attempt — each with its own `invited_count`); the per-human rank ceiling AND its ORDERING
-(a mutation moving the check back after the creates turns the "no project/squad exist"
-assertions red — P1-4); the agent-bound refusal; the AAGATE floor refusal; **the squad-squat
-scenario end-to-end** (a capability-holding "attacker" squad matching a future slug_base is
-refused `squad_slug_taken` with the owner in the detail, zero edges, zero agents, no receipt
-— P0); **`adopt: true` + org:admin** claiming that same squad, disposition `'adopted'`,
-receipted with the claiming actor (Athena's round-2 sharpening); **`edge_kept`** preserving a
-deliberate `'read'` edge, never raised (P1-2); **`project_archived`** refused before the
-squad is ever created, AND a race-window variant that archives the project between the
-upfront check and the edge INSERT, proving the trigger-error mapping to `'archived_project'`
-(P1-1); a stage-1 batch-failure case (injected failure on the edge INSERT, not archived-status
-— that is the dedicated case above) asserting the edge/bot/invite are ALL absent but the
-failure IS receipted; a partial-failure retry (batch fails on invite 3 of 5, injected) proving
-invites 1-2 persist, the failed attempt is its OWN receipt row (never rewritten), and the
-retry's success is a SECOND, new row with `invited_count` counting only what THAT attempt
-inserted (not a cumulative 5); within-call email dedupe (P2-1); a replay requesting a
+`tests/team-bootstrap.test.ts` — TWO `describe` blocks, every case through `invokeTool` on a
+real SQLite D1 with the FULL migration chain applied (never a ToolSpec's `.run()` directly, and
+never `teamBootstrap()` the core function called with a hand-built `AuthContext` `invokeTool`
+would itself refuse — see the successor block's own header comment for why).
+
+The original block (24 cases): registration; the happy path (project/squad `created: true`,
+`edge_kept: null`, `duplicate_emails_in_request: []`, bot/invites/receipt/claim/scaffold all
+present); idempotency on `slug_base` (adopted project/squad report `created: false`, no
+duplicate invite, no second bot, disposition `'adopted'` on the second call — a new human was
+invited, so it is not the narrower `'existing'` no-op case — TWO separate receipt rows, each
+with its own `invited_count`); the agent-bound refusal; the AAGATE floor refusal; **the
+squad-squat scenario end-to-end** (a capability-holding "attacker" squad matching a future
+slug_base is refused `squad_slug_taken` with the owner AND `created_by_member_id` in the
+detail, zero edges, zero agents, AND — successor addition — a `'failed'`/`'name_resolution'`
+receipt IS now written, with `project_id: null` since the project limb was never attempted);
+**`adopt: true` + org:admin** claiming that same squad, disposition `'adopted'`, receipted with
+the claiming actor (Athena's round-2 sharpening; the receipt query orders by `attempt_no DESC`
+to select the SECOND, successful attempt over the first refused one); **`edge_kept`**
+preserving a deliberate `'read'` edge, never raised (P1-2); **`project_archived`** refused
+before the squad is ever created, AND a race-window variant that archives the project between
+the upfront check and the edge INSERT, proving the trigger-error mapping to
+`'archived_project'` (P1-1); a stage-1 batch-failure case (injected failure on the edge INSERT,
+not archived-status) asserting the edge/bot/invite are ALL absent but the failure IS receipted;
+a partial-failure retry (batch fails on invite 3 of 5, injected) proving invites 1-2 persist,
+the failed attempt is its OWN receipt row (never rewritten), and the retry's success is a
+SECOND, new row disposition `'adopted'` (both project and squad already existed — `'created'`
+fires ONLY when both are new by the SAME attempt) with `invited_count` counting only what THAT
+attempt inserted (not a cumulative 5); within-call email dedupe (P2-1); a replay requesting a
 DIFFERENT capability for a live invite reporting the STORED one (P2-2); a caller with no
 `memberId` refused `actor_required` before any write (P2-3); `slug_base` length ceiling (44
-chars — P2-6) and `name` length ceiling (P2-8); `slug_base` suffix validation; invalid human
-capability; `bot.enabled: false` skipping bot creation and credential mint;
-`department_not_found` before any write. `tests/update-squad-tool.test.ts`'s slug-field
-`describe` blocks — rename, missing-suffix rejection, in-department collision,
-existing-unsuffixed-slug left alone, AND the reserved-name-rename requiring department:admin
-(squad-admin-only → 403; department-admin → allowed; an UNRESERVED name still needs only
-squad:admin — P0c). `tests/project-start-gate.test.ts` — the auto-create-squad case (and its
+chars) and `name` length ceiling; `slug_base` suffix validation; invalid human capability;
+`bot.enabled: false` skipping bot creation and credential mint; `department_not_found` before
+any write. The old rank-ceiling test (which called `teamBootstrap()` directly with
+`capabilities: []`) is DELETED along with the guard it pinned — see the actor/step-4 sections
+above for why.
+
+The successor `describe` block (`'team_bootstrap successor …'`, 3 cases) reproduces
+kasra-review's OWN round-2 reproduction end-to-end: a principal whose ENTIRE standing is
+`lead` on its own squad (no admin anywhere, fixture cloned from `tests/
+elevation-squad-lead-e2e.test.ts`) calls `check_in`, requests and receives a human-approved,
+time-boxed elevation (`createElevationRequest`/`decideElevationRequest`), then plants a
+project (`action:workspace_project`, org scope) or a squad (`action:project_lifecycle`,
+department scope) through the REAL `project_create`/`create_squad` tools — never a hand-built
+`AuthContext`. **P0(a)**: the org-admin's later `team_bootstrap` on the planted project's
+`slug_base` is refused `project_slug_taken` naming the planter, the project's `name` is
+unchanged, and — proving P1-A — no squad or edge was ever created either. **P0(b)**: same
+shape for the squad, additionally asserting the planted squad is measurably EMPTY (zero
+`agents`, zero `capabilities` rows) yet still refused — proving provenance, not emptiness, is
+what gates adoption now. **P2-4**: a hand-planted `kind='home'` squad matching the derived slug
+is refused `cannot_adopt_home_squad` even with `adopt: true` by org:admin, with a `'failed'`
+receipt written. Both the provenance equality conjunct and the home-fence check are
+mutation-proven load-bearing (each, independently weakened, turns the corresponding test RED).
+
+`tests/update-squad-tool.test.ts`'s slug-field `describe` blocks — rename, missing-suffix
+rejection, in-department collision, existing-unsuffixed-slug left alone, AND the
+reserved-name-rename requiring department:admin (squad-admin-only → 403; department-admin →
+allowed; an UNRESERVED name still needs only squad:admin — P0c) — unaffected by the successor
+rewrite, still green. `tests/project-start-gate.test.ts` — the auto-create-squad case (and its
 retry-after-adding-an-agent), a second project reusing the same auto-provisioned department,
-and the pre-existing "a non-writable edge still refuses" case (unchanged, still green).
+the pre-existing "a non-writable edge still refuses" case, and a NEW case (P3-2) asserting the
+auto-created squad's `created_by_member_id` is stamped with the start-gate's acting member.
 
 ## Known gaps
 
 - **No elevation/proposal path.** Unlike `create_squad`/`project_create`'s bounded-window
-  `action:*` elevation limb, `team_bootstrap` is gated at standing org-admin only. The
-  per-human rank ceiling defends against a future lowered floor, but the elevation limb itself
-  is a scope decision for Kasra-core/Hadi, not built here. The issue's own lighter
-  lead-proposal variant (routing through mupot#1497's agent-proposed-invite machinery) is
-  correspondingly also not built.
+  `action:*` elevation limb, `team_bootstrap` is gated at standing org-admin only, and (as of
+  the successor) has no per-human rank ceiling either — see the actor/step-4 sections above for
+  why that guard was deleted rather than fixed. The elevation limb itself is a scope decision
+  for Kasra-core/Hadi, not built here. The issue's own lighter lead-proposal variant (routing
+  through mupot#1497's agent-proposed-invite machinery) is correspondingly also not built.
 - **`humans[].capability` is `observer`\|`member` only** — narrower than the full `Capability`
   ladder, by design (a team_bootstrap invite seats someone on a brand-new squad; `lead`/
   `admin`/`owner` go through `update_squad`/a direct invite instead).
@@ -309,5 +433,21 @@ and the pre-existing "a non-writable edge still refuses" case (unchanged, still 
 - **mupot#1495's own broader sweep is untouched**: `project_create`/`update`,
   `create_squad`, `create_department`, `create_agent`/`update_agent` suffix enforcement, and
   the existing-row backfill migration are explicitly a separate, later PR.
-- **PR #1510 is not yet merged** as of this writing — confirm it has landed (and migration
-  `0166` has been applied) before assuming any of this is live on a given deployment.
+- **The `&& isOrgAdmin(auth)` conjunct on the `adopt: true` override is currently unreachable
+  through the tool, same as the deleted rank ceiling** — `team_bootstrap`'s own floor
+  (`hasWorkspaceAdmin`) provably entails `isOrgAdmin` on every path that reaches the core
+  function (verified: every branch where `hasWorkspaceAdmin` is true also satisfies
+  `isOrgAdmin`'s own logic). Unlike the rank ceiling, it is KEPT rather than deleted — Athena's
+  stated reasoning for it ("never trusted from a caller whose own floor might one day be
+  lowered") is a distinct, forward-looking justification the rank ceiling never had, and
+  removing it changes no reachable behavior either way. No test claims to "pin" this conjunct:
+  fabricating one would require calling `teamBootstrap()` with a principal `invokeTool` itself
+  refuses — the exact defect class this successor exists to stop committing.
+- **`seedSquadPack` (dashboard squad-pack seeding) and `src/projects/provisioner.ts`'s
+  `createProject` call do NOT stamp `created_by_member_id`** — out of scope for this successor
+  (neither was named in the review), so a squad/project created through either path lands with
+  `created_by_member_id: NULL` and is adoptable by `team_bootstrap` only via the `adopt: true`
+  override, same as any other pre-migration row.
+- **PR #1510 is superseded, not merged.** This doc reflects `kasra/team-bootstrap-v2` — confirm
+  that branch (or its successor) has landed, and migration `0166` has been applied, before
+  assuming any of this is live on a given deployment.

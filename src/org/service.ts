@@ -48,6 +48,20 @@ export interface CreateOpts {
   // 'work' (default) | 'home'. Omit entirely on every call site except
   // src/members/bootstrap-self.ts — see the block comment above.
   kind?: OrgKind
+  // Provenance stamp for squads.created_by_member_id (migration 0166,
+  // mupot#1498 P0(b)) — the caller's own member id, when known. SAME
+  // discipline as `kind` above: never a field any *Input interface can
+  // carry, so no JSON body can spoof it; only a caller with a TypeScript
+  // reference to createSquad can pass it. Every production call site should
+  // pass its own auth.memberId here so team_bootstrap's provenance-based
+  // squad-adoption check (which replaced the old "empty squad" ground
+  // entirely — createSquad grants its creator no capability row, so every
+  // fresh squad satisfied that test) has something to compare against.
+  createdByMemberId?: string
+  // Same discipline, one level up: the elevation_grants.id that authorized
+  // this create, when it ran under a bounded action:* elevation rather than
+  // standing capability (migration 0166). Never a request-body field.
+  createdViaReceipt?: string
 }
 
 const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
@@ -246,6 +260,8 @@ export async function createSquad(
     autonomy,
     budget_cap_cents,
     budget_window,
+    created_by_member_id: opts.createdByMemberId ?? null,
+    created_via_receipt: opts.createdViaReceipt ?? null,
     created_at: new Date().toISOString(),
   }
 
@@ -254,8 +270,8 @@ export async function createSquad(
       `INSERT INTO squads
         (id, department_id, slug, name, charter, kind,
          role, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-         created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         created_by_member_id, created_via_receipt, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         squad.id,
@@ -272,6 +288,8 @@ export async function createSquad(
         squad.autonomy,
         squad.budget_cap_cents,
         squad.budget_window,
+        squad.created_by_member_id,
+        squad.created_via_receipt,
         squad.created_at,
       )
       .run()

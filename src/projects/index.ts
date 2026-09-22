@@ -372,7 +372,7 @@ projectsApp.post('/', async (c) => {
     if (prepared.error === 'invalid_template') return c.json({ error: prepared.error }, 400)
     return c.json({ error: prepared.error }, mutationStatus(prepared.error))
   }
-  const result = await createProject(c.env, prepared.value)
+  const result = await createProject(c.env, prepared.value, { createdByMemberId: auth.memberId ?? undefined })
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({
     ok: true,

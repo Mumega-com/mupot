@@ -13,10 +13,11 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool, TOOLS } from '../src/mcp'
-import { teamBootstrap } from '../src/org/team-bootstrap'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { createElevationRequest, decideElevationRequest } from '../src/auth/elevation'
+import { createWebSession } from '../src/auth/web-sessions'
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -240,57 +241,25 @@ describe('team_bootstrap — mupot#1498', () => {
     const rows = receipts.results ?? []
     expect(rows).toHaveLength(2)
     expect(rows[0]).toMatchObject({ attempt_no: 1, disposition: 'created', invited_count: 1 })
-    expect(rows[1]).toMatchObject({ attempt_no: 2, disposition: 'created', invited_count: 1 })
+    // 'adopted', not 'created' (P2-1 successor fix): the second call adopted
+    // the already-existing project AND squad — 'created' fires only when
+    // BOTH are newly made by the SAME attempt.
+    expect(rows[1]).toMatchObject({ attempt_no: 2, disposition: 'adopted', invited_count: 1 })
   })
 
-  it('rank ceiling: cannot invite a human above the caller\'s own rank on the (new) squad', async () => {
-    // Calls the core function directly with a ZERO-standing actor — this is
-    // the defense-in-depth check documented in src/org/team-bootstrap.ts's
-    // file header (the MCP tool's own org-admin gate is a SEPARATE line of
-    // defense, exercised by the 'agent-bound token refused' + 'requires org
-    // admin' cases below).
-    const noStandingAuth: AuthContext = {
-      userId: 'member-nobody',
-      memberId: 'member-nobody',
-      email: null,
-      role: 'member',
-      tenant: TENANT,
-      channel: 'workspace',
-      boundAgentId: null,
-      capabilities: [],
-    }
-    harness.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant)
-      VALUES ('member-nobody', 'nobody@pot.test', 'Nobody', 'active', '${TENANT}')`)
-
-    const result = await teamBootstrap(env, noStandingAuth, {
-      slug_base: 'ceiling-test',
-      name: 'Ceiling Test',
-      department: DEPT_ID,
-      humans: [{ email: 'someone@example.com', capability: 'observer' }],
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error).toBe('cannot_invite_above_own_rank')
-
-    // MUTATION TARGET (P1-4, kasra-review adversarial round-1 gate on PR
-    // #1510): the ceiling now runs on DEPARTMENT scope BEFORE project/squad
-    // are ever created — a mutation that moves it back to AFTER the creates
-    // (its old position) turns these two assertions red, because the
-    // project/squad would then exist despite the refusal.
-    const project = await env.DB.prepare('SELECT 1 FROM projects WHERE slug = ?').bind('ceiling-test-prj').first()
-    expect(project).toBeNull()
-    const squad = await env.DB.prepare('SELECT 1 FROM squads WHERE slug = ?').bind('ceiling-test-sqd').first()
-    expect(squad).toBeNull()
-
-    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
-      .bind('ceiling-test')
-      .first()
-    expect(receipt).toBeNull()
-    const invite = await env.DB.prepare('SELECT 1 FROM invites WHERE email = ?')
-      .bind('someone@example.com')
-      .first()
-    expect(invite).toBeNull()
-  })
+  // The old "rank ceiling" test that lived here called teamBootstrap() the
+  // CORE FUNCTION directly with `capabilities: []` — a principal invokeTool
+  // itself refuses (team_bootstrap's floor is org:admin, checked both at the
+  // AAGATE and again by the ToolSpec's own hasWorkspaceAdmin re-check; there
+  // is no lower-privilege path into this tool at all). That is exactly the
+  // "no fixture may pre-state a precondition production cannot reach" defect
+  // — kasra-review adversarial round-2 gate on PR #1510, finding 6,
+  // 2026-09-22, which also proved the ceiling itself was unreachable in
+  // production: org:admin's rank always dominates the 'observer'/'member'
+  // ranks it compared against. The guard AND this test are deleted together
+  // (successor decision — see src/org/team-bootstrap.ts's file header); if a
+  // lower-privilege path into team_bootstrap is ever added, a per-human rank
+  // ceiling belongs back here, proven with a principal invokeTool admits.
 
   it('refuses an agent-bound principal — grant tools never run as an agent', async () => {
     const outcome = await invokeTool(
@@ -701,7 +670,11 @@ describe('team_bootstrap — mupot#1498', () => {
 
     expect(receiptRows[1].attempt_no).toBe(2)
     expect(receiptRows[1].id).not.toBe(failedReceipt!.id) // a NEW row, not the same one rewritten
-    expect(receiptRows[1].disposition).toBe('created')
+    // 'adopted', not 'created' (P2-1 successor fix): both project and squad
+    // already existed when this attempt ran — it only finished the
+    // remaining invites. 'created' fires ONLY when BOTH are newly made by
+    // the SAME attempt.
+    expect(receiptRows[1].disposition).toBe('adopted')
     expect(receiptRows[1].failed_step).toBeNull()
     expect(receiptRows[1].failure_reason).toBeNull()
     expect(receiptRows[1].invited_count).toBe(3)
@@ -746,11 +719,21 @@ describe('team_bootstrap — mupot#1498', () => {
       .bind('squad-hijack')
       .first<{ n: number }>()
     expect(agentCount?.n).toBe(0)
-    // No receipt for this refused attempt.
-    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
+    // A 'failed' attempt receipt IS now written for this refusal (P1-A
+    // successor fix: round-2 silently returned with zero receipt, leaving no
+    // retry-surface trail; see migration 0166's `name_resolution` step). The
+    // project was never created either — both names are resolved and
+    // checked before any create — so project_id on this row is NULL.
+    const receipt = await env.DB.prepare(
+      'SELECT disposition, failed_step, failure_reason, project_id, squad_id FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
       .bind('hijack')
-      .first()
-    expect(receipt).toBeNull()
+      .first<{ disposition: string; failed_step: string; failure_reason: string; project_id: string | null; squad_id: string | null }>()
+    expect(receipt?.disposition).toBe('failed')
+    expect(receipt?.failed_step).toBe('name_resolution')
+    expect(receipt?.failure_reason).toBe('squad_slug_taken')
+    expect(receipt?.project_id).toBeNull()
+    expect(receipt?.squad_id).toBe('squad-hijack')
   })
 
   it('adopt:true + org:admin is an EXPLICIT, RECEIPTED override — disposition \'adopted\', actor recorded', async () => {
@@ -788,8 +771,12 @@ describe('team_bootstrap — mupot#1498', () => {
     expect((result.squad as Record<string, unknown>).id).toBe('squad-claim')
     expect((result.squad as Record<string, unknown>).created).toBe(false)
 
+    // The FIRST (refused) call also wrote a 'failed' name_resolution receipt
+    // naming this same squad_id (P1-A successor fix) — order by attempt_no
+    // to fetch the SECOND, successful attempt's row, not whichever the
+    // unordered query happens to return first.
     const receipt = await env.DB.prepare(
-      'SELECT disposition, actor_member_id, squad_id FROM team_bootstrap_receipts WHERE slug_base = ? AND squad_id = ?',
+      'SELECT disposition, actor_member_id, squad_id FROM team_bootstrap_receipts WHERE slug_base = ? AND squad_id = ? ORDER BY attempt_no DESC LIMIT 1',
     )
       .bind('claimed', 'squad-claim')
       .first<{ disposition: string; actor_member_id: string; squad_id: string }>()
@@ -802,9 +789,12 @@ describe('team_bootstrap — mupot#1498', () => {
   it('edge_kept: a deliberate non-admin edge is preserved, never raised to admin', async () => {
     // Pre-seed the project, squad, AND a deliberate 'read' edge between them
     // — team_bootstrap must adopt both but leave the edge exactly as it was.
+    // created_by_member_id = the calling admin — this test is about edge_kept
+    // preservation, not adoption, so the pre-seeded rows are provenance-owned
+    // by the same caller that will run team_bootstrap on them.
     harness.sqlite.exec(`
-      INSERT INTO projects (id, slug, name, status) VALUES ('proj-readonly', 'readonly-prj', 'Read Only', 'active');
-      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-readonly', '${DEPT_ID}', 'readonly-sqd', 'Read Only Squad');
+      INSERT INTO projects (id, slug, name, status, created_by_member_id) VALUES ('proj-readonly', 'readonly-prj', 'Read Only', 'active', '${ADMIN_MEMBER_ID}');
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id) VALUES ('squad-readonly', '${DEPT_ID}', 'readonly-sqd', 'Read Only Squad', '${ADMIN_MEMBER_ID}');
       INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-readonly', 'squad-readonly', 'read');
     `)
 
@@ -833,8 +823,11 @@ describe('team_bootstrap — mupot#1498', () => {
     // resolve project active, then archive it before stage 1's edge INSERT
     // runs, by hooking the SAME injection wrapper to archive the project on
     // the first statement touching project_squad_access.
+    // created_by_member_id = the calling admin — provenance-adoptable, so
+    // this test exercises the archived-race path rather than tripping the
+    // project_slug_taken refusal instead.
     harness.sqlite.exec(`
-      INSERT INTO projects (id, slug, name, status) VALUES ('proj-race', 'race-prj', 'Race', 'active');
+      INSERT INTO projects (id, slug, name, status, created_by_member_id) VALUES ('proj-race', 'race-prj', 'Race', 'active', '${ADMIN_MEMBER_ID}');
     `)
     const base = env
     let armed = true
@@ -1009,5 +1002,288 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(outcome.ok).toBe(false)
     if (outcome.ok) return
     expect(outcome.error).toBe('invalid_name')
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUCCESSOR TO PR #1510 — kasra-review adversarial round-2 gate on
+// 29728793a300970c4f351e7c5817e63daa01cfb3, 2026-09-22, P0 (two limbs):
+// round-2 built an ownership ground ONLY for the squad find-or-create,
+// leaving the PROJECT find-or-create with none. These tests reproduce the
+// review's OWN reproduction — a principal whose ENTIRE standing is 'lead' on
+// its own squad, no admin anywhere, acting under a time-boxed human-approved
+// elevation — through invokeTool end-to-end (check_in, elevation request,
+// elevation decision, the planting call, then the admin's team_bootstrap),
+// never by hand-constructing an AuthContext the tool itself would refuse.
+// ═══════════════════════════════════════════════════════════════════════════
+describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gate) — provenance, resolve-before-create, home fence', () => {
+  const LEAD_SQUAD_ID = 'squad-lead-own-tb'
+  const LEAD_AGENT_ID = 'agent-lead-tb'
+  const LEAD_MEMBER_ID = 'member-lead-tb'
+  const LEAD_TOKEN_ID = 'tok-lead-tb'
+  const APPROVER_MEMBER_ID = 'member-approver-tb'
+  const APPROVER_IDENTITY_ID = 'identity-approver-tb'
+
+  let harness: SqliteD1Harness
+  let env: Env
+
+  function seedLeadFixture(sqlite: SqliteD1Harness['sqlite']): void {
+    sqlite.exec(`
+      -- Lift the plan quota — free tier's maxSquads:1 would otherwise make
+      -- the lead's OWN pre-existing squad below count as the whole budget,
+      -- and every "cannot" in this file has to fail for the right reason.
+      INSERT INTO org_settings (key, value) VALUES ('billing_state', '{"tier":"scale"}')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('${LEAD_SQUAD_ID}', '${DEPT_ID}', 'lead-own-tb', 'Lead Own Squad');
+      INSERT INTO agents (id, squad_id, slug, name, status)
+        VALUES ('${LEAD_AGENT_ID}', '${LEAD_SQUAD_ID}', 'lead-agent-tb', 'Lead Agent', 'active');
+      INSERT INTO members (id, display_name, status, tenant) VALUES
+        ('${LEAD_MEMBER_ID}', 'Lead Member', 'active', '${TENANT}'),
+        ('${APPROVER_MEMBER_ID}', 'Approver', 'active', '${TENANT}');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '${LEAD_AGENT_ID}', '${LEAD_MEMBER_ID}', '2026-09-01T00:00:00Z');
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at)
+        VALUES ('${LEAD_TOKEN_ID}', '${LEAD_MEMBER_ID}', 'hash-lead-tb-1', 'primary', 'workspace', '${TENANT}', '${LEAD_AGENT_ID}', datetime('now'));
+
+      -- THE ENTIRE STANDING AUTHORITY OF THE LEAD: 'lead' on its OWN squad.
+      -- No org row. No department row. No admin anywhere.
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-lead-own-tb', '${LEAD_MEMBER_ID}', 'squad', '${LEAD_SQUAD_ID}', 'lead');
+
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-approver-tb', '${APPROVER_MEMBER_ID}', 'org', NULL, 'admin');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('${APPROVER_IDENTITY_ID}', '${TENANT}', 'google', '${APPROVER_MEMBER_ID}', 'approver-tb@x.test', '${APPROVER_MEMBER_ID}', datetime('now'));
+    `)
+  }
+
+  function leadAuth(): AuthContext {
+    return {
+      userId: LEAD_MEMBER_ID,
+      memberId: LEAD_MEMBER_ID,
+      email: null,
+      role: 'member',
+      tenant: TENANT,
+      channel: 'workspace',
+      boundAgentId: LEAD_AGENT_ID,
+      tokenId: LEAD_TOKEN_ID,
+      capabilities: [
+        { member_id: LEAD_MEMBER_ID, scope_type: 'squad', scope_id: LEAD_SQUAD_ID, capability: 'lead' },
+      ],
+    } as unknown as AuthContext
+  }
+
+  async function checkIn(): Promise<string> {
+    const res = await invokeTool(leadAuth(), env, 'check_in', {}, CTX)
+    if (!res.ok) throw new Error(`setup: check_in failed: ${JSON.stringify(res)}`)
+    return (res.result as { agent_session: { id: string } }).agent_session.id
+  }
+
+  /** Returns the elevation_grants.id — the "receipt" a create under this
+   *  elevation should end up stamped with (Athena ruling, mupot seq 5238). */
+  async function approve(
+    sessionId: string,
+    actions: string[],
+    scopeType: 'org' | 'department' | 'squad',
+    scopeId: string,
+    nowMs: number,
+  ): Promise<string> {
+    const approverSession = await createWebSession(
+      env,
+      `raw-approver-tb-${scopeType}-${scopeId}-${nowMs}`,
+      { tenant: TENANT, memberId: APPROVER_MEMBER_ID, loginIdentityId: APPROVER_IDENTITY_ID },
+      nowMs,
+    )
+    const created = await createElevationRequest(
+      env,
+      {
+        tenant: TENANT,
+        agentSessionId: sessionId,
+        agentId: LEAD_AGENT_ID,
+        memberId: LEAD_MEMBER_ID,
+        actions,
+        scopeType,
+        scopeId,
+        durationMinutes: 60,
+        reason: 'team-bootstrap successor test — standing up my own squad/project',
+      },
+      nowMs,
+    )
+    if (!created.ok) throw new Error(`approve: request failed: ${JSON.stringify(created)}`)
+    const decision = await decideElevationRequest(
+      env,
+      {
+        tenant: TENANT,
+        requestId: created.request.id,
+        decision: 'approve',
+        selectedActions: actions,
+        decidedByMemberId: APPROVER_MEMBER_ID,
+        decidedByCapabilities: [
+          { member_id: APPROVER_MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' },
+        ],
+        decidedByWebSessionHash: approverSession.id_hash,
+        recentReauthOk: true,
+      },
+      nowMs,
+    )
+    if (!decision.ok) throw new Error(`approve: decision failed: ${JSON.stringify(decision)}`)
+    return decision.grants[0].id
+  }
+
+  beforeEach(() => {
+    harness = makeHarness()
+    seedLeadFixture(harness.sqlite)
+    env = makeEnv(harness)
+  })
+
+  it('P0(a): a project planted by a squad lead under an org-scoped elevation is NOT silently adopted by the admin\'s later team_bootstrap — refused project_slug_taken, naming the planter', async () => {
+    const sessionId = await checkIn()
+    const nowMs = Date.now()
+    const grantId = await approve(sessionId, ['action:workspace_project'], 'org', '', nowMs)
+
+    const planted = await invokeTool(
+      leadAuth(),
+      env,
+      'project_create',
+      { slug: 'leadproj-prj', name: 'Lead Planted Project' },
+      CTX,
+    )
+    expect(planted.ok).toBe(true)
+    if (!planted.ok) return
+    const plantedProject = planted.result as {
+      project: { id: string; name: string; created_by_member_id: string | null; created_via_receipt: string | null }
+    }
+    expect(plantedProject.project.created_by_member_id).toBe(LEAD_MEMBER_ID)
+    // Athena ruling (mupot seq 5238): stamped with the elevation_grants.id
+    // that authorized this create, not just the actor.
+    expect(plantedProject.project.created_via_receipt).toBe(grantId)
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'leadproj', name: 'Admin Team', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('project_slug_taken')
+    expect(outcome.status).toBe(409)
+    const detail = outcome.detail as Record<string, unknown>
+    expect(detail.project_id).toBe(plantedProject.project.id)
+    expect(detail.created_by_member_id).toBe(LEAD_MEMBER_ID)
+    expect(detail.created_via_receipt).toBe(grantId)
+    expect(detail.summary).toBe(`created by member ${LEAD_MEMBER_ID} under elevation receipt ${grantId}`)
+
+    // The planter's own fields survive untouched — never adopted, never
+    // silently claimed by the admin's call.
+    const projectRow = await env.DB.prepare('SELECT name, created_by_member_id FROM projects WHERE id = ?')
+      .bind(plantedProject.project.id)
+      .first<{ name: string; created_by_member_id: string }>()
+    expect(projectRow?.name).toBe('Lead Planted Project')
+    expect(projectRow?.created_by_member_id).toBe(LEAD_MEMBER_ID)
+
+    // P1-A: resolve BOTH names before creating EITHER — the squad limb was
+    // never even attempted once the project limb refused, so no orphan squad.
+    const squad = await env.DB.prepare("SELECT 1 FROM squads WHERE slug = 'leadproj-sqd'").first()
+    expect(squad).toBeNull()
+    // No edge, no receipt claiming this project as team_bootstrap's own.
+    const edge = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE project_id = ?')
+      .bind(plantedProject.project.id)
+      .first<{ n: number }>()
+    expect(edge?.n).toBe(0)
+  })
+
+  it('P0(b): a squad planted by a squad lead under a department-scoped elevation is EMPTY (zero agents, zero capabilities) yet still refused — provenance replaced emptiness as the adoption ground', async () => {
+    const sessionId = await checkIn()
+    const nowMs = Date.now()
+    const grantId = await approve(sessionId, ['action:project_lifecycle'], 'department', DEPT_ID, nowMs)
+
+    const planted = await invokeTool(
+      leadAuth(),
+      env,
+      'create_squad',
+      { department: DEPT_ID, slug: 'leadsqd-sqd', name: 'Lead Planted Squad' },
+      CTX,
+    )
+    expect(planted.ok).toBe(true)
+    if (!planted.ok) return
+    const plantedSquad = planted.result as {
+      squad: { id: string; created_by_member_id: string | null; created_via_receipt: string | null }
+    }
+    expect(plantedSquad.squad.created_by_member_id).toBe(LEAD_MEMBER_ID)
+    expect(plantedSquad.squad.created_via_receipt).toBe(grantId)
+
+    // Confirm it really is EMPTY — the exact ground round-2 wrongly trusted.
+    const agentCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ?')
+      .bind(plantedSquad.squad.id)
+      .first<{ n: number }>()
+    expect(agentCount?.n).toBe(0)
+    const capCount = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM capabilities WHERE scope_type = 'squad' AND scope_id = ?",
+    )
+      .bind(plantedSquad.squad.id)
+      .first<{ n: number }>()
+    expect(capCount?.n).toBe(0)
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'leadsqd', name: 'Admin Team', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('squad_slug_taken')
+    const detail = outcome.detail as Record<string, unknown>
+    expect(detail.squad_id).toBe(plantedSquad.squad.id)
+    expect(detail.created_by_member_id).toBe(LEAD_MEMBER_ID)
+    expect(detail.created_via_receipt).toBe(grantId)
+    expect(detail.summary).toBe(`created by member ${LEAD_MEMBER_ID} under elevation receipt ${grantId}`)
+
+    // P1-A: the project limb was never attempted either — no orphan project
+    // reserving `leadsqd-prj` forever.
+    const project = await env.DB.prepare("SELECT 1 FROM projects WHERE slug = 'leadsqd-prj'").first()
+    expect(project).toBeNull()
+
+    // No edge, no bot placed in the planted squad.
+    const edgeCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = ?')
+      .bind(plantedSquad.squad.id)
+      .first<{ n: number }>()
+    expect(edgeCount?.n).toBe(0)
+  })
+
+  // ── P2-4: home fence — never adoptable, even with adopt:true ──────────────
+  it('never adopts a kind=home squad, even with adopt:true by org:admin (latent-only in production — the canonical home slug cannot end in -sqd — but fenced explicitly here)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind, created_by_member_id)
+        VALUES ('squad-home-plant-tb', '${DEPT_ID}', 'homefence-sqd', 'Planted Home', 'home', '${ADMIN_MEMBER_ID}');
+    `)
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'homefence', name: 'Home Fence Test', department: DEPT_ID, adopt: true },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('cannot_adopt_home_squad')
+    expect(outcome.status).toBe(403)
+
+    const edgeCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = ?')
+      .bind('squad-home-plant-tb')
+      .first<{ n: number }>()
+    expect(edgeCount?.n).toBe(0)
+    const receipt = await env.DB.prepare(
+      'SELECT disposition, failed_step FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
+      .bind('homefence')
+      .first<{ disposition: string; failed_step: string }>()
+    expect(receipt?.disposition).toBe('failed')
+    expect(receipt?.failed_step).toBe('name_resolution')
   })
 })
