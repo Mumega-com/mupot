@@ -352,6 +352,124 @@ a lead inside its own pot; it cannot mint tokens, grant capabilities, or create 
 without a separate, later elevation to admin — the same ladder every other member in this
 schema climbs.
 
+## Round 3 (mupot#1516): the release path's own edges, and the tools that model D1
+
+Adversarial round 1 on the round-2-v2 fix (head `215c45e4`) came back AMBER — 0 P0, every
+round-2-v2 P0 confirmed closed by execution — with four P1s and five P2s on code round-2-v2
+itself introduced. Round 2 is the last round for this PR.
+
+**P1-1/P1-2 (`releaseStalePot` fail-open on its own write).** Two bugs in the function meant
+to be the SAFE, receipted alternative to blindly reassigning a slug: (1) its receipt write's
+returned boolean was discarded — a receipt-write failure left `ok: true`, the `pots` row
+durably `'released'`, and ZERO rows on the append-only ledger explaining who released it or
+why; (2) the status-flip `UPDATE ... WHERE status = ?2` never checked `meta.changes` — a row
+reclaimed (by its own provisioner completing a retry) between this function's own SELECT and
+its UPDATE could report `ok: true` for a write that changed 0 rows, receipting a `'release'`
+event against a slug that was, by the time the receipt landed, active again. **Fixed:**
+`meta.changes === 0` is now a named `release_lost_race` refusal with no receipt; a
+receipt-write failure now reverts the status flip via a compensating UPDATE (same
+fail-closed discipline `provisionSovereignPot`'s own `recordStep` already established) and
+reports `receipt_write_failed`.
+
+**P1-3/P1-4 (`pot_release` fences).** The MCP tool had `operator_principal_required` but no
+`tenant_mismatch` check at all — a foreign-tenant org:admin could release a slug and have it
+receipted under `actor_tenant: 'someone-else'` on THIS deployment's own ledger. Added the
+identical fence `pot_provision` already uses. The existing bound-agent refusal was real but
+had no test at all (a silent "M7" survivor) — both fences are now pinned through `invokeTool`.
+
+**P3 (final registry activation).** `UPDATE pots SET status = 'active' WHERE slug = ?1` — no
+ownership check, no `meta.changes` read. The six steps before it can take real wall-clock
+time (up to ~970 sequential D1 REST calls for a fresh schema chain) — long enough for the
+slug to be released and reclaimed by a DIFFERENT provisioner before this run's own activation
+write lands. The unconditional UPDATE would mark that other provisioner's row `'active'` on
+this run's say-so — a false success for a pot this run no longer owns. Now guarded by this
+run's own ownership claim (checkout-session match, or member+tenant match) AND `status IN
+('provisioning', 'active')` — the latter so an idempotent retry of an already-active run
+(e.g. a replayed Stripe webhook) still succeeds — with a `meta.changes` check.
+
+**ENABLEMENT GATE (new step, not a fix to an existing one).** A deployment with neither
+`POT_WORKER_BUNDLE_BUCKET` configured nor a `workerJsCode` argument used to burn a real,
+billable D1 (step 1) and KV namespace (step 2), and apply the ENTIRE schema chain (step 3),
+before discovering at step 4 that there was never anything to deploy — the exact `#1285`
+orphan class this whole file exists to close, for a failure mode that is knowable BEFORE the
+first Cloudflare call (whether a bundle source exists depends on neither the slug, the D1,
+nor the schema). The bundle source is now resolved ONCE, as a preflight, immediately after
+the registry gate and before `create_d1` — a missing source refuses `no_bundle_source` with
+**zero** Cloudflare calls, receipted under the `deploy_worker` step. The resolved bundle is
+reused (never re-resolved) at the real `deploy_worker` step later in the run.
+
+**P2-1 (the D1 REST double is now a closer cousin of the real thing —
+`tests/helpers/d1-rest-double.ts`).** The transaction-control check only tested
+`^\s*(BEGIN|COMMIT|ROLLBACK)` against the WHOLE multi-statement string with no `m` flag —
+`^` without `m` matches only the very start of the string, so a transaction-control
+statement anywhere but the FIRST line of a batch slipped through undetected. Making that
+check correct is NOT as simple as adding the `m` flag to a whole-batch regex, though: a
+`CREATE TRIGGER ... BEGIN ... END` body legitimately contains a bare `BEGIN` on its own
+line, and a per-line regex cannot tell that apart from real transaction control without
+understanding block nesting — getting this wrong would refuse every trigger-bearing
+migration in the real schema chain (45+ files). The double now SPLITS the batch into real
+top-level statements via this repo's own battle-tested `splitSqlStatements`
+(`scripts/gen-schema-chain.mjs` — already used by `tests/schema-chain.test.ts`, and already
+correctly tracks BEGIN/CASE/END nesting and throws on transaction-control BEGIN) and checks
+each resulting statement's own leading keyword. Also added: D1's documented 100
+bound-parameter cap and ~100KB per-statement cap; `ATTACH` refusal (per Cloudflare's D1
+documentation — not independently re-verified live this session) and `CREATE TEMP TABLE`
+refusal (EMPIRICALLY VERIFIED already, per `migrations/0049_agent_status_inactive.sql`'s own
+header); and one result element per statement in the response (previously always one,
+regardless of how many statements were in the call — nothing in this codebase currently
+reads past `result[0]`, but a double that lies about a real API's response SHAPE will
+mislead the next caller who does need element N). Each refusal is documented with its source
+in the double's own file header; each has its own test.
+
+**P2-2.** `executeD1Query`'s doc comment claimed "this module always sends exactly one
+statement per call" — stale since `seedPotIdentities`' own atomic batch. Corrected.
+
+**P2-3 (redaction coverage).** `receiptOk`'s `fields` and `receiptError`'s `extraFields`
+were spread into the JSON verbatim — completely unredacted and unbounded; only the
+top-level `message` argument to `receiptError` ever went through `redactAndBound`. Every
+field on today's actual call sites happens to be a safe id/count/enum, but the function
+SIGNATURES placed no limit on what a future call site passes there. New `redactFields`/
+`redactDeep` apply the same redaction and length bound recursively to every string value
+reachable from either parameter.
+
+**P2-4 (the email-redaction regex itself was too wide).** `/[^\s@]+@[^\s@]+\.[^\s@]+/g`
+matched ANY run of non-space-non-`@` characters before an `@` — wide enough to swallow
+`binding=@cf/meta/llama-3.3` whole (`binding=` as a fake local part, `cf/meta/llama-3` as a
+fake domain, `.3` as a fake TLD), redacting a Workers AI binding name that contains no email
+at all — the exact false positive this rule exists to avoid. Replaced with an RFC-ish
+`[\w.+-]+@[\w-]+\.[\w.-]+`, which requires a word-character local part immediately before
+the `@` (never `=`, `:`, or `/`) — verified against both the false-positive example and a
+real email in the same string.
+
+**P2-5 (caller-suppliable string bounds, `src/pots/validate.ts`).** `brand_name`/
+`admin_name` are now capped at 200 characters, `admin_email` at 254 (RFC 5321 §4.5.3.1.3) —
+shared by both the HTTP route and the MCP tool (one validator, same as the field allow-list
+itself). A new `field_too_long` error surfaces as 400. A maximal-length seed (all three
+fields at their cap) was verified to still land comfortably under the D1 double's own 100KB
+per-statement cap — the two bounds do not fight each other for an ordinary caller.
+
+**Known, documented, NOT fixed this round:**
+- **`user@localhost`-shaped and punycode (`xn--...`) inputs.** `admin_email`'s only
+  validation is presence + the 254-char bound above — no format check exists at all (a
+  malformed but short address like `user@localhost`, with no dot in the domain part, passes
+  cleanly through `validateProvisionRequestBody` and only fails later, if at all, when
+  Stripe/the credential-claim flow tries to use it as a real mailbox). Slugs accept only
+  `[a-z0-9-]` (`validateSlug`) — a punycode-encoded internationalized domain label like
+  `xn--wgv71a` would pass THAT format check today, but nothing in this file has been tested
+  against one, and the reserved-word list and the `pots`/`projects` collision checks have
+  never been exercised with punycode input either. Neither is exploitable (both paths stay
+  fail-closed on anything that doesn't parse), but neither is validated for CORRECTNESS —
+  flagged here rather than asserted true by omission.
+- **`handlePotCreationCompleted` has no production caller.** `src/billing/stripe.ts`'s
+  `handleStripeWebhookEvent`'s own `checkout.session.completed` branch never inspects
+  `session.metadata.action` or routes to `handlePotCreationCompleted` at all — it only
+  handles THIS deployment's own plan-tier upgrade (`applyPlanEvent`). Every test in
+  `tests/pot-checkout-provisioning.test.ts` and this PR's own P0-C tests calls
+  `handlePotCreationCompleted` DIRECTLY; nothing in the real webhook-receiving path ever
+  reaches it. This is a real, standing gap — self-serve checkout completion currently does
+  not provision anything in production — tracked as a separate issue (Kasra-core), not wired
+  up as part of this PR.
+
 ## What Kasra-core still needs to do (this session cannot)
 
 - Confirm the D1 list-by-name (`GET .../d1/database?name=`) and KV-list pagination against
