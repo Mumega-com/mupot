@@ -940,3 +940,137 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     })
   })
 })
+
+// mupot#1494 — task_id + dispatch_receipt_id as an alternative correlator to message_id. A
+// runner that polls task_list rather than inbox/inbox_lease never observes a raw
+// agent_messages.id — only the task and the receipt it was dispatched under (see the runner
+// onboarding playbook). recordTaskDispatchRuntimeReceipt resolves message_id itself, from the
+// SAME convention deliverDispatchToInbox used to write the message
+// (from_agent='mupot-dispatch', request_id='dispatch-inbox:<receipt id>') — exercised here
+// against the fixture's real INSERT INTO agent_messages row (see runtimeFixture() above), not a
+// restatement of the query.
+describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alternative correlator (mupot#1494)', () => {
+  it('settles with message_id OMITTED — resolves it from {task_id, dispatch_receipt_id} and produces an IDENTICAL receipt to the explicit-message_id path', async () => {
+    const explicit = runtimeFixture()
+    const implicit = runtimeFixture()
+    try {
+      const explicitResult = await recordTaskDispatchRuntimeReceipt(explicit.env, explicit.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      const implicitResult = await recordTaskDispatchRuntimeReceipt(implicit.env, implicit.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+
+      expect(implicitResult).toEqual(explicitResult)
+      expect(implicit.harness.sqlite.prepare(
+        'SELECT message_id FROM task_dispatch_runtime_receipts LIMIT 1',
+      ).get()).toEqual({ message_id: MESSAGE_ID })
+      expect(implicit.harness.sqlite.prepare(
+        'SELECT status, execution_receipt_id FROM tasks WHERE id = ?',
+      ).get(TASK_ID)).toEqual({ status: 'in_progress', execution_receipt_id: DISPATCH_ID })
+    } finally {
+      explicit.harness.close()
+      implicit.harness.close()
+    }
+  })
+
+  it('settles a full runtime_consumed -> completed sequence with message_id omitted on BOTH calls (the shape a task_list-only runner actually uses)', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      const completed = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'completed',
+        runtimeReceiptHash: 'd'.repeat(64),
+        attempt: 1,
+        result: 'done',
+      })
+      expect(completed).toMatchObject({ receipt: { stage: 'completed' }, task_status: 'review' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('is refused for a MISMATCHED pair: a real dispatch_receipt_id whose message resolves fine, but the wrong task_id', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: 'some-other-task-id',
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_not_found' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('is refused when dispatch_receipt_id does not correlate to ANY delivered inbox message (nothing to resolve message_id from)', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: 'never-dispatched-receipt',
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_not_found' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('same authz as today: an unbound credential is refused before message_id resolution is ever attempted', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, { ...fixture.auth, boundAgentId: undefined }, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'agent_bound_workspace_credential_required' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('an explicit message_id for a DIFFERENT dispatch_receipt_id is still refused (the alternative correlator does not weaken the explicit path)', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: 'never-dispatched-receipt',
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_not_found' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
