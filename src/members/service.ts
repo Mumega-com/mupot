@@ -1158,3 +1158,164 @@ export async function upsertCapabilityGrant(
 
   return { grant, result }
 }
+
+// ── home-on-first-contact, channel-agnostic (mupot#1504) ──────────────────────
+//
+// provisionHomeForMember — the ONE write path for a member's home-squad
+// provisioning, callable from ANY channel that can observe an unambiguous
+// "this member now exists / just made first contact" event. Originally
+// `provisionHomeOnFirstContact` (FP-01 Slice 2 v2 round 2, P1-a), scoped to
+// IM only and living in src/im/index.ts; mupot#1504 renamed and moved it
+// here — src/members is the shared members-service home both the JSON API
+// and the server-rendered dashboard already import from (see this file's own
+// header) — and added a `channel` argument so the SAME function, not a
+// second copy of its idempotency/receipt logic, covers the web invite-accept
+// door too. "Web onboarding door never creates the member's home squad — a
+// web-only member has no private space" is exactly the bug this closes.
+//
+// CALLERS (exactly three, all after the member row + its capability grant are
+// already durably committed):
+//   (a) src/dashboard/invite.ts's POST /invite/:id handler, right after
+//       acceptInvite(...) succeeds — the browser web onboarding door.
+//   (b) src/members/index.ts's POST /invites/:id/accept (the JSON API accept
+//       route — CLI/non-browser callers), right after the same
+//       acceptInvite(...) succeeds. Added in the same gate round as (c)'s
+//       fact correction: a member minted here alone previously got no home
+//       until they happened to also touch one of the other two channels.
+//       Same 'web' channel value as (a) — this route mints over the
+//       web/API plane, not IM.
+//   (c) src/im/index.ts's handleImMessage 'join' case, right after a
+//       Telegram project-invite redemption succeeds — unchanged behaviour,
+//       same call shape as before the move, just renamed and re-imported.
+// Never call this from a read-only/status path (memberIntakeEnvelope's own
+// doc comment explains why: an unauthenticated-adjacent probe replayed
+// against a homeless member must never be able to mint repeated 'failed'
+// rows into an append-only audit table).
+//
+// IDEMPOTENT (in home count, not in receipt count — see below): an existing
+// home is a pure read (getMemberHomeSquad), no write attempted, no receipt
+// written — a SEQUENTIAL second caller (whichever channel a member touches
+// second) is a guaranteed no-op, never a second home (see
+// createHomeForMember's own doc comment for why two homes per human is
+// structurally impossible regardless of caller). A CONCURRENT second caller
+// (both read getMemberHomeSquad before either has committed) still
+// converges on ONE home and ONE capability grant (createHomeForMember's own
+// unique-violation race-recovery adopts the winner's row for the loser
+// too) — but see "OVER-RECORDING UNDER A RACE IS ACCEPTED", next.
+//
+// RECEIPTED ON EVERY REAL DISPOSITION, INCLUDING 'existing' (Athena's
+// ruling on adversarial round 1's P2-b, 2026-09-22): migrations/0161
+// (member_home_provisioning_receipts, widened by 0165 to admit `channel IN
+// ('web','im','telegram')`) gets a row whenever createHomeForMember returns
+// `ok: true` — disposition `'created'` (this call actually inserted the
+// squad + capability rows) OR `'existing'` (this call found a home already
+// there via createHomeForMember's own department-keyed lookup or its
+// race-recovery path — NOT the ordinary already-homed short-circuit above,
+// which returns before ever calling createHomeForMember and so never
+// reaches this write at all). Only a FAILED provisioning attempt (`ok:
+// false`) writes nothing — a transient failure can never accumulate
+// unbounded rows in an append-only table.
+//
+// OVER-RECORDING UNDER A RACE IS ACCEPTED, NOT A BUG (Athena's ruling,
+// 2026-09-22): a genuine concurrent web+im race can make BOTH callers reach
+// createHomeForMember with a real disposition — the winner gets 'created',
+// the loser gets 'existing' via race-recovery — and BOTH write their own
+// receipt row. Two rows for one home, one capability grant. Deliberately
+// NOT gated on disposition and NOT serialized: the ledger records
+// PROVISIONING ATTEMPTS THAT REACHED A REAL OUTCOME, not a 1:1 mapping to
+// homes. It will never contain a row for a home that does not exist, and it
+// will never under-count — over-counting under a genuine race is the
+// accepted trade against adding either a disposition filter (which would
+// make the ledger blind to the loser's channel entirely) or a serialization
+// lock (which this Worker has no cheap primitive for).
+//
+// NEVER THROWS: every step below — including the dynamic import — is
+// wrapped so NO exception this function can encounter propagates to the
+// caller; the CALLER's own success (accepting the invite / joining the
+// project) is never blocked, delayed, or rolled back by a provisioning
+// failure. Each of the three call sites additionally wraps ITS OWN call in
+// `.catch(...)` as defense in depth (adversarial round 1, P2-a) — belt and
+// braces, not a claim that this function can still reject.
+export type HomeProvisioningChannel = 'web' | 'im'
+
+export async function provisionHomeForMember(
+  env: Env,
+  memberId: string,
+  channel: HomeProvisioningChannel,
+): Promise<void> {
+  // Adversarial round 1, P2-a: the dynamic import itself used to sit OUTSIDE
+  // every try/catch below — a module-load rejection (however unlikely) would
+  // have propagated straight out of this function, past both inner guards,
+  // and into whichever caller forgot its own `.catch`. The whole function
+  // body is now one try/catch so NOTHING it does can ever reject; the inner
+  // try/catches stay too, purely so a home-lookup failure and a
+  // createHomeForMember failure get their OWN distinct log lines instead of
+  // one generic "something failed" message.
+  try {
+    // Dynamic import: src/org/service.ts does not import this module, so a
+    // static import would be safe today, but the original (src/im/index.ts)
+    // used a dynamic import to keep src/members/service.ts free of a
+    // compile-time dependency on the org component from a module several
+    // other files (agent-access.ts, index.ts) already import type-only from —
+    // kept identical here rather than changing a working, reviewed pattern as
+    // a side effect of the move.
+    const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
+
+    let home: Awaited<ReturnType<typeof getMemberHomeSquad>>
+    try {
+      home = await getMemberHomeSquad(env, memberId)
+    } catch (err) {
+      console.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', {
+        member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+      return
+    }
+    if (home) return // idempotent: already has one — no write, no receipt.
+
+    let created: Awaited<ReturnType<typeof createHomeForMember>>
+    try {
+      created = await createHomeForMember(env, memberId)
+    } catch (err) {
+      console.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', {
+        member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+      return
+    }
+    if (!created.ok) return // failed provisioning (e.g. member_not_found) — no receipt row, caller still succeeds.
+    // Athena's ruling on adversarial round 1's P2-b (2026-09-22): a
+    // concurrent web+im race can make BOTH callers reach a real disposition
+    // ('created' for the winner, 'existing' for the loser adopting its row
+    // via createHomeForMember's own race recovery) and each writes its OWN
+    // receipt — over-recording, not corruption (one home, one capability
+    // grant, either way). ACCEPTED AS-IS: no gating on disposition, no
+    // serialization. The ledger can contain more than one row per home
+    // under a genuine race; it will never contain a row for a home that
+    // does not exist. See the doc comment above this function.
+
+    try {
+      await env.DB.prepare(
+        `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, channel, created.disposition).run()
+    } catch (err) {
+      // Athena's ruling on adversarial round 1's P1 (2026-09-22): this used
+      // to be a bare `catch {}` — a failed receipt write was not just
+      // non-fatal, it was INVISIBLE. Home provisioning itself already
+      // succeeded by this point (the squad + capability rows are
+      // committed), so this stays non-blocking for the caller — but a
+      // logged-and-dropped attempt is honest, a swallowed one is not.
+      // console.warn (not .error): the home is safely provisioned either
+      // way; this is a degraded-but-recovered audit write, the same
+      // severity class as src/addons/mirror.ts's "Vector index write
+      // failed (relational engram preserved)".
+      console.warn('members/service: provisionHomeForMember receipt write failed (non-fatal, home already provisioned)', {
+        member_id: memberId, channel, squad_id: created.squad.id, disposition: created.disposition,
+        error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+    }
+  } catch (err) {
+    console.error('members/service: provisionHomeForMember failed unexpectedly (non-fatal)', {
+      member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+    })
+  }
+}

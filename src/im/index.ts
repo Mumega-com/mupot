@@ -55,6 +55,7 @@ import { timingSafeEqual } from '../lib/crypto'
 import { routeAgentWake } from '../agents/wake-routing'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { redeemTelegramProjectInvite } from '../members/project-invites'
+import { provisionHomeForMember } from '../members/service'
 import { listNeedsYou } from '../attention/service'
 import { answerRoutineRun, getRoutinePendingQuestion, getRoutineProjectAccessRequest } from '../routines/actions'
 import { routinePrincipal } from '../routines/access'
@@ -349,11 +350,23 @@ export async function handleImMessage(
     // event this webhook can observe — provisioning happens HERE, exactly
     // once per redemption, never on any later or unrelated message (see
     // memberIntakeEnvelope's own doc comment for why it moved out of the
-    // per-message read path). Members bound through a different channel
-    // (e.g. the /account web Connect Telegram flow) are not provisioned by
-    // this call site — a known, narrower scope than "any first message",
-    // tracked as a follow-up rather than solved here.
-    if (result.ok) await provisionHomeOnFirstContact(env, result.value.member_id)
+    // per-message read path). mupot#1504: provisionHomeForMember
+    // (src/members/service.ts) is the SAME channel-agnostic function the
+    // web invite-accept path now also calls — this is call site (c), the
+    // 'im' channel, unchanged behaviour from before the move/rename.
+    //
+    // Adversarial round 1, P2-a: `.catch` is defense in depth on top of
+    // provisionHomeForMember's own internal never-throws guarantee — an
+    // uncaught rejection here must never cost the human their "Joined
+    // project ..." reply for a join that already durably happened.
+    if (result.ok) {
+      await provisionHomeForMember(env, result.value.member_id, 'im').catch((err: unknown) => {
+        console.error('im/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+          member_id: result.value.member_id, channel: 'im',
+          error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+        })
+      })
+    }
     return result.ok ? joinedReply(result.value.project_id) : 'Could not join. Ask an admin for a new invitation.'
   }
 
@@ -400,31 +413,6 @@ export async function handleImMessage(
     case 'task':
       return taskReply(env, member, grants, intent.title, intent.squadRef)
   }
-}
-
-// provisionHomeOnFirstContact — FP-01 Slice 2 v2 round 2 (P1-a): the ONE
-// write path for a bound member's home-squad provisioning over IM. Called
-// EXACTLY once, from handleImMessage's 'join' case, right after a Telegram
-// project-invite redemption succeeds — never from the per-message
-// read-only envelope (memberIntakeEnvelope). Idempotent: an existing home
-// is a pure read, no write attempted, no receipt written. On an actual
-// provisioning attempt, a receipt (migrations/0161,
-// member_home_provisioning_receipts) is written ONLY on success
-// (created/existing) — a FAILED attempt writes nothing, so a transient
-// failure can never accumulate unbounded rows in an append-only table; the
-// next successful join (if the member ever retries) is what gets audited.
-async function provisionHomeOnFirstContact(env: Env, memberId: string): Promise<void> {
-  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
-  const home = await getMemberHomeSquad(env, memberId)
-  if (home) return // idempotent: already has one — no write, no receipt.
-  const created = await createHomeForMember(env, memberId)
-  if (!created.ok) return // failed provisioning — no receipt row.
-  try {
-    await env.DB.prepare(
-      `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
-       VALUES (?, ?, ?, ?, 'telegram', ?)`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, created.disposition).run()
-  } catch { /* best-effort audit write; never blocks the join reply */ }
 }
 
 function joinedReply(projectId: string): string {
@@ -1156,8 +1144,9 @@ export async function memberIntakeEnvelope(
   // called at the END of EVERY /im/webhook request — including a bare
   // status probe with no actionable intent at all — purely to compute the
   // response envelope. It must never itself provision a home; that is
-  // provisionHomeOnFirstContact's job, called ONLY from handleImMessage's
-  // 'join' case (the one unambiguous first-contact event), never here. A
+  // provisionHomeForMember's job (src/members/service.ts), called ONLY from
+  // handleImMessage's 'join' case (the one unambiguous first-contact event),
+  // never here. A
   // prior version of this function called createHomeForMember whenever a
   // bound member had no home, on EVERY message — under IM_WEBHOOK_SECRET
   // alone (no rate limit, no idempotency beyond createHomeForMember's own),

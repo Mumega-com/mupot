@@ -54,6 +54,7 @@ import {
   sha256Hex,
   mintRawToken,
   upsertCapabilityGrant,
+  provisionHomeForMember,
 } from './service'
 import { createProjectInvite, type CreateProjectInviteError } from './project-invites'
 import {
@@ -426,6 +427,27 @@ membersApp.post('/invites/:id/accept', async (c) => {
   if (!result.ok) {
     return c.json({ error: result.error }, acceptInviteErrorStatus(result.error))
   }
+
+  // mupot#1504 (gate round 2, coordinator addendum): this JSON API accept
+  // route is a THIRD caller of provisionHomeForMember — a member minted
+  // here (no browser, no Telegram — e.g. a CLI or non-browser integration)
+  // was otherwise a member with no home until they happened to touch one of
+  // the other two channels. Same function, same 'web' channel value as the
+  // dashboard's own /invite/:id door (this route mints over the web/API
+  // plane, not IM), same receipt table, same idempotent/best-effort
+  // contract — never blocks or is reflected in this response either way.
+  //
+  // Adversarial round 1, P2-a: this call sits BEFORE the raw token response
+  // below — the token is returned EXACTLY ONCE, so an uncaught rejection
+  // here would burn it with no way to ever hand it back. `.catch` is
+  // defense in depth on top of provisionHomeForMember's own internal
+  // never-throws guarantee (src/members/service.ts).
+  await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
+    console.error('members/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+      member_id: result.value.member_id, channel: 'web',
+      error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+    })
+  })
 
   // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
   protectRawTokenResponse(c)
