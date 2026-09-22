@@ -22,8 +22,8 @@ exactly where it stopped — every time, not just on the happy path.
 | 1 | `create_d1` | `GET .../d1/database?name=` to find an existing database named `mupot-pot-<slug>`; adopt it if found, else `POST` to create. | Reuse-by-name — a prior partial run's orphan is adopted, never duplicated. |
 | 2 | `create_kv` | Same pattern against `.../storage/kv/namespaces` (paginated list + title match, since the list endpoint has no documented title filter) for `mupot-pot-<slug>-kv`. | Reuse-by-name. |
 | 3 | `apply_schema` | Runs `applySchemaChain` (`src/pots/schema-chain.ts`) — the SAME generated chain (`src/pots/schema-chain.generated.ts`, regenerated from `migrations/*.sql` via `npm run gen:schema-chain`) the main pot's schema comes from — against the new D1 via the D1 REST `/query` API, one statement per HTTP call. | `pot_schema_applied` bookkeeping (read from the pot's own D1 first) — a fresh D1 has no such table yet, read as "nothing applied." |
-| 4 | `deploy_worker` | Uploads the tenant worker script into the `mupot-pots` dispatch namespace with D1/KV/`TENANT_SLUG`/`BRAND`/`PUBLIC_ORIGIN`/`RELEASE_SHA` bindings. | Not step-idempotent in the sense of avoiding a re-upload — a WFP script upload is already an overwrite-by-name PUT, so retrying is safe by construction. |
-| 5 | `seed_identities` | Seeds one `core` department + squad, an org-owner admin `members` row, and the seed-seat lead agent (`<slug>-bot`) with its own home member — tokens hashed with the exact `sha256Hex` (`src/members/service.ts`) the main pot's token-verification path uses. | Checks for an existing admin member by email FIRST; a retry against an already-seeded pot mints no new rows or tokens. |
+| 4 | `deploy_worker` | Uploads the tenant worker script into the `mupot-pots` dispatch namespace with D1/KV/`TENANT_SLUG`/`BRAND`/`PUBLIC_ORIGIN`/`RELEASE_SHA` bindings, after digest-verifying the R2-sourced bundle (round 2, see below). Receipt detail is JSON: `{source, sha256, r2_object_key?}` — every deploy is receipted with exactly which bytes it shipped. | Not step-idempotent in the sense of avoiding a re-upload — a WFP script upload is already an overwrite-by-name PUT, so retrying is safe by construction. |
+| 5 | `seed_identities` | Seeds one `core` department + squad, an org-owner admin `members` row, and the seed-seat lead agent (`<slug>-bot`) with its own home member — tokens hashed with the exact `sha256Hex` (`src/members/service.ts`) the main pot's token-verification path uses. Receipt detail is JSON: `{already_seeded, admin_member_id, admin_token_fingerprint, lead_agent_id, lead_agent_member_id, lead_agent_token_fingerprint}` — identity references + one-way fingerprints, never a raw token (round 2, see "the provisioner's authority ends at the handover" below). | Checks for an existing admin member by email FIRST; a retry against an already-seeded pot mints no new rows or tokens, and its receipt still reports the EXISTING admin's id + fingerprint (read back from the stored hash, not re-derived from a raw value). |
 | 6 | `verify_reachable` | `GET /health` through the SAME internal path production traffic uses — `env.DISPATCHER.get(slug).fetch(request)` — never a real network `fetch()` to the public hostname. | N/A (a read). |
 
 `ok` is `true` **only** when all six steps ran to completion, in order, and step 6 answered
@@ -86,6 +86,31 @@ implemented in this PR**: `scripts/deploy.mjs` does not yet write to this bucket
 PR) produces the bundle text via `wrangler deploy --dry-run --outdir` — the actual "PUT it
 to R2 after a successful deploy" step in `scripts/deploy.mjs` is the follow-up.
 
+**CI publish output contract (round 2 — required, not optional).** An R2 GET returning 200
+only proves the bytes were *readable*, not that they are the bytes CI actually built —
+silent corruption, a partial multipart write, or a stale key left over from a previous
+release would all read back successfully. `loadPotWorkerBundle` therefore treats an R2
+object as untrusted unless the CI publish step (once built) satisfies this exact contract:
+
+- **Object key:** `${RELEASE_SHA}/worker.js` (unchanged from the design above; `RELEASE_SHA`
+  is the same value `scripts/deploy.mjs` already stamps for the colony worker, mupot#443).
+- **Custom metadata:** an R2 `sha256` key (`POT_WORKER_BUNDLE_SHA256_METADATA_KEY` in
+  `src/pots/service.ts`) whose value is the lowercase hex sha256 digest of the EXACT bytes
+  in the object body — i.e. `sha256 === sha256Hex(await fs.readFile(bundlePath, 'utf8'))`
+  for whatever bundle text `scripts/build-pot-worker-bundle.mjs` produced, computed and set
+  in the SAME publish step that does the R2 `put()` (`{ customMetadata: { sha256 } }`), not
+  read back and hoped to match.
+
+`loadPotWorkerBundle` recomputes the digest of what it reads and compares it to this custom
+metadata field. Missing metadata or a mismatch is a hard `deploy_worker` failure — never a
+silent fallback to `worker_js_code`, since falling back would mask the exact
+tampering/corruption this check exists to catch. The `worker_js_code` fallback path has
+nothing to verify against (nothing publishes it anywhere), so it is not gated the same way —
+but its own digest is still computed and written into the `deploy_worker` receipt
+unconditionally, so exactly which bytes were deployed is always auditable after the fact
+regardless of which source won ("an unpinned fallback is an unsigned binary on the control
+plane" — every deploy is receipted, even the ones nothing can independently verify).
+
 **C — the caller passes the bundle text directly (`worker_js_code` on
 `SovereignPotProvisionInput`, or the legacy positional `workerJsCode` argument).** Works
 TODAY with zero new Cloudflare resources. `loadPotWorkerBundle` falls back to this when R2
@@ -130,6 +155,47 @@ today, self-serve checkout provisions a pot with a real seeded admin but deliver
 credential to the buyer at all. Fixing that is a credential-DELIVERY problem (magic-link
 email, or a first-login flow keyed by `admin_email`), not a provisioning-completeness
 problem — tracked separately, not bundled into this already-large change.
+
+### The provisioner's authority ends at the handover
+
+This is the property the whole credential-claim design (above) and the receipt-fingerprint
+design (below) both exist to hold, stated once, plainly, so it can be checked against
+directly rather than re-derived from the mechanism each time:
+
+**Post-bootstrap, the child pot's own RBAC governs its own credentials. The parent
+(orchestrator) admin cannot reach into the child's credential plane.**
+
+What the parent legitimately keeps, forever, in its OWN `pot_provision_receipts` ledger:
+- The seeded admin's `member_id` and lead agent's `agent_id`/`member_id` — identity
+  references, not credentials. Knowing an id lets you ask the CHILD "who is this," it does
+  not let you authenticate as them.
+- A **fingerprint** of each minted token (`sha256(raw).slice(0, 16)`, `src/pots/service.ts`
+  `SeedIdentitiesResult`) — the SAME one-way, non-reversible value
+  `CredentialClaimHandle.fingerprint` already uses (`src/auth/credential-claim.ts`).
+  Fingerprints are safe to log, persist, and compare; they are cryptographically useless for
+  reconstructing or replaying the credential they were derived from.
+
+What the parent does NOT keep, anywhere durable:
+- The raw token itself. `admin_token`/`lead_agent_token` in `SovereignPotProvisionResult`
+  are typed `null`, always. The only place a raw value ever exists in the RESPONSE path is
+  the SESSIONS-KV-backed, single-redemption, 10-minute `CredentialClaimHandle` — and that
+  mechanism is scoped to the ONE interactive caller who supplied `minted_by_member_id`, not
+  to "the parent" as a standing capability. Once redeemed (or expired), it is gone; nothing
+  about the parent's own database, code path, or RBAC lets it be reconstructed.
+- Any standing read/write access to the child pot's own D1. Provisioning talks to the
+  child's D1 purely over the Cloudflare D1 REST API using the SAME account-level
+  `cf_api_token` used to create it in the first place — this is Cloudflare-account-owner
+  authority (already held before provisioning ever ran), not a credential the child's own
+  RBAC granted the parent. The child's `member_tokens`/`capabilities` tables — the actual
+  authorization surface a human or agent authenticates against inside that pot — are never
+  read by anything in `src/pots/service.ts` after seeding, and nothing here mints a
+  standing session, API key, or capability grant that would let the parent's own operators
+  act AS a principal inside the child once the six steps finish.
+
+In short: the receipt is an audit trail of what was minted, not a spare key to what was
+minted. A parent operator who wants to act inside a provisioned pot goes through that pot's
+OWN login/token surface, exactly like any other member of it — the same door the seeded
+admin uses.
 
 ## What Kasra-core still needs to do (this session cannot)
 
