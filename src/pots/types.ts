@@ -60,7 +60,7 @@ export interface OrphanedResources {
   kv_adopted: boolean
 }
 
-/** One step's outcome, exactly as written to `pot_provision_receipts` (migration 0163). */
+/** One step's outcome, exactly as written to `pot_provision_receipts` (migration 0164). */
 export interface ProvisionStepReceipt {
   step: ProvisionStep
   ok: boolean
@@ -79,7 +79,7 @@ export interface SovereignPotProvisionResult {
   orphaned_resources: OrphanedResources | null
   /** Why it stopped, in words an operator can act on. */
   incomplete_reason: string | null
-  /** Groups this call's `pot_provision_receipts` rows (migration 0163). */
+  /** Groups this call's `pot_provision_receipts` rows (migration 0164). */
   run_id: string
   /** Every step's receipt, in the order it was attempted — mirrors what was written to
    *  `pot_provision_receipts`, so a caller doesn't have to query the ledger separately
