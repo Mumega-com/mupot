@@ -50,6 +50,14 @@ export interface Env {
   // Declared in [[kv_namespaces]] binding="OAUTH_KV" in wrangler.toml.
   OAUTH_KV: KVNamespace
   BLOBS: R2Bucket
+  // Sovereign-pot worker bundles, keyed `${RELEASE_SHA}/worker.js` (mupot#1285). Written
+  // by a future CI step at deploy time (not yet implemented — see
+  // docs/workflows/tenant-provision.md "bundle source"); provisionSovereignPot checks
+  // this FIRST and falls back to an explicit `worker_js_code` argument when it is absent
+  // or the bucket has no object for the current RELEASE_SHA. Optional and separate from
+  // BLOBS (a different retention/access shape — release artifacts, not tenant content) so
+  // a colony that has not wired the CI step yet simply runs the fallback path, unchanged.
+  POT_WORKER_BUNDLE_BUCKET?: R2Bucket
   AI: Ai
   AGENT: DurableObjectNamespace
   SQUAD: DurableObjectNamespace

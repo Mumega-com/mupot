@@ -319,6 +319,8 @@ describe('every bearer door consumes the shared predicate', () => {
     { fingerprint: 'c5f8c11a05f4', why: 'credential REPLACE target. Reached only after authorize() has required admin on the home squad; the new credential a grants come from the request and are ceilinged against the ACTOR, never inherited from this row. Replacing an expired token is legitimate recovery.' },
     { fingerprint: '768c3883fe85', why: 'members service: token inventory listing. Display only.' },
     { fingerprint: '213bb53402c3', why: 'the expiry SWEEP itself (token-lifecycle.ts) — it exists to find tokens BY their expiry, so the live-only predicate would make it return nothing.' },
+    { fingerprint: '05aee212eb22', why: "cross-DB bootstrap writes the CHILD pot's token plane via D1 REST; not a parent bearer door; the child has no shared-predicate surface yet (pots/service.ts readFullSeedIdentityState, admin-token existence check, provisionSovereignPot's idempotent-retry gate, mupot#1507 P0-2)." },
+    { fingerprint: 'bba50cbd88a9', why: "cross-DB bootstrap writes the CHILD pot's token plane via D1 REST; not a parent bearer door; the child has no shared-predicate surface yet (pots/service.ts readFullSeedIdentityState, lead-agent seed-seat token existence check, same gate as fingerprint 05aee212eb22 immediately above)." },
   ]
 
   it('EVERY SELECT over member_tokens in src/ consumes the shared predicate or is fingerprint-exempt', () => {

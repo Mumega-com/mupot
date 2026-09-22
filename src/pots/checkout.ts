@@ -3,20 +3,15 @@
 import type { Env } from '../types'
 import { isPotTier, type PotTier } from '../billing/plans'
 import { TIER_PRICING } from '../billing/stripe'
-import { provisionSovereignPot } from './service'
+import { provisionSovereignPot, checkSlugAvailability, type SlugCheckResult } from './service'
 import { createBus } from '../bus'
 
-const RESERVED_SLUGS = new Set([
-  'admin', 'api', 'app', 'auth', 'billing', 'blog', 'dashboard', 'dev',
-  'docs', 'help', 'mail', 'mupot', 'mumega', 'root', 'sos', 'static',
-  'status', 'studio', 'support', 'test', 'www',
-])
-
-export interface SlugCheckResult {
-  available: boolean
-  slug: string
-  reason?: string
-}
+// checkSlugAvailability / SlugCheckResult moved to src/pots/service.ts in mupot#1507
+// round-2 (P0-4) — provisionSovereignPot needed to call it directly without a circular
+// import (this file already imports provisionSovereignPot FROM service.ts). Re-exported
+// here so nothing importing them FROM checkout.ts (this file's own established public
+// surface) breaks.
+export { checkSlugAvailability, type SlugCheckResult }
 
 export interface CreatePotCheckoutParams {
   slug: string
@@ -24,71 +19,6 @@ export interface CreatePotCheckoutParams {
   tier: PotTier
   ownerEmail: string
   origin: string
-}
-
-/**
- * Validates whether a requested subdomain slug is available and valid.
- */
-export async function checkSlugAvailability(env: Env, rawSlug: string): Promise<SlugCheckResult> {
-  const slug = (rawSlug || '').toLowerCase().trim()
-
-  if (!/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(slug)) {
-    return {
-      available: false,
-      slug,
-      reason: 'Slug must be 3-32 lowercase alphanumeric characters and cannot start or end with a hyphen.',
-    }
-  }
-
-  if (RESERVED_SLUGS.has(slug)) {
-    return { available: false, slug, reason: 'This pot subdomain is reserved.' }
-  }
-
-  // FAIL CLOSED (mupot#1303). The previous version wrapped this lookup in
-  // `catch { /* proceed fail-safe */ }` and then returned `available: true`. That comment
-  // was wrong in the load-bearing word: returning "available" when the check could not run
-  // is fail-OPEN. "I could not determine whether this is taken" was being answered as
-  // "this is not taken".
-  //
-  // It was not a rare error path either. The `pots` table did not exist in the migration
-  // chain at all, so the query threw on every call and the "already taken" branch had never
-  // once executed in production. Measured 2026-09-04, while `gaf` was a live Worker serving
-  // traffic in the mupot-pots dispatch namespace:
-  //
-  //     GET /api/pots/slug-available?slug=gaf -> {"available":true}
-  //
-  // Migration 0145 creates the table and seeds it from a real read of that namespace.
-  //
-  // Two sources are consulted because BOTH occupy the same dispatch namespace: tenant pots
-  // and project sub-workers (src/platform/dispatcher.ts dispatches `worker_name || slug`
-  // into it). A name taken by either is not available to a new pot.
-  try {
-    const takenByPot = await env.DB.prepare('SELECT id FROM pots WHERE slug = ?1 LIMIT 1')
-      .bind(slug)
-      .first<{ id: string }>()
-    if (takenByPot) {
-      return { available: false, slug, reason: 'This pot subdomain is already taken.' }
-    }
-
-    const takenByProject = await env.DB.prepare(
-      'SELECT id FROM projects WHERE slug = ?1 OR worker_name = ?1 LIMIT 1',
-    )
-      .bind(slug)
-      .first<{ id: string }>()
-    if (takenByProject) {
-      return { available: false, slug, reason: 'This pot subdomain is already taken.' }
-    }
-  } catch {
-    // An unanswerable check is NOT an available slug. Refusing a legitimate signup is
-    // recoverable by retrying; selling a slug that already has a Worker behind it is not.
-    return {
-      available: false,
-      slug,
-      reason: 'Availability could not be verified right now. Please try again.',
-    }
-  }
-
-  return { available: true, slug }
 }
 
 /**
@@ -169,12 +99,24 @@ export async function handlePotCreationCompleted(
   const brand = metadata.brand || slug.toUpperCase()
   const tier = isPotTier(metadata.tier) ? (metadata.tier as PotTier) : 'starter'
   const ownerEmail = metadata.owner_email || session.customer_email
+  // The Stripe Checkout Session's OWN id — the per-checkout-session claim
+  // (mupot#1507-v2 P0-C). This self-serve path has no interactive member
+  // (`minted_by_member_id` is never set here), so without a claim scoped to the exact
+  // session, "ownership" of the `pots` row would degrade to matching this deployment's
+  // own `TENANT_SLUG` alone — the SAME value for every self-serve buyer, letting a second
+  // session for the same slug (a retry, a different customer, an attacker) silently adopt
+  // whatever the first session claimed. Scoping to `session.id` makes a webhook RETRY of
+  // the SAME session idempotent (same id => same claim => adopt) while a genuinely
+  // DIFFERENT session on the same slug is refused outright by
+  // `provisionSovereignPot`'s registry gate, before any Cloudflare call.
+  const checkoutSessionId = typeof session.id === 'string' ? session.id : undefined
 
   try {
     const result = await provisionSovereignPot(env, {
       slug,
       brand_name: brand,
       admin_email: ownerEmail,
+      checkout_session_id: checkoutSessionId,
     })
 
     // MONEY PATH. This runs after Stripe checkout completes. Emitting
