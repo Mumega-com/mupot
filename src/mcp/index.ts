@@ -102,6 +102,7 @@ import {
   TaskDispatchRuntimeReceiptError,
   loadLatestDispatchReceiptsForTasks,
   adminResetDispatchLease,
+  hasInFlightDispatchReceipt,
   type TaskDispatchRuntimeStage,
 } from '../tasks/runtime-receipts'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
@@ -1066,12 +1067,18 @@ const toolTaskList: ToolSpec = {
     // dispatch_receipt_id it needs to settle with, and delivered_via must be READABLE, not
     // just recorded, to be "never silent". Attached post-ranking: it never affects order.
     const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
-    // mupot#1494 round 3 (P0, part b) — `assignee_agent_id` on task_list is an optional
-    // FILTER, not a restriction: a squad member listing another agent's tasks must never
-    // read that other agent's dispatch_receipt_id (the capability token
-    // recordTaskDispatchRuntimeReceipt's pair correlator accepts). Attach ONLY to a row
-    // whose assignee is the CALLER — every other row gets neither field, exactly as if no
-    // dispatch had ever been recorded for it.
+    // mupot#1494 round 3 (P0, part b; comment corrected round 2 of adversarial review) —
+    // `assignee_agent_id` on task_list is an optional FILTER, not a restriction: a squad
+    // member listing another agent's tasks must never read that other agent's
+    // dispatch_receipt_id. NOT because the id is a secret/capability token — it is a bare
+    // correlator, and other legitimate projections (dashboards, receipts) may show it too;
+    // `claimUnleasedForPairSettlement`'s ownership predicate (src/tasks/runtime-receipts.ts)
+    // is what actually gates settlement, keyed on the caller's REAL identity, never on
+    // knowledge of this id alone. This filter is about need-to-know noise reduction (a
+    // non-assignee has no legitimate use for another agent's receipt id), not a security
+    // boundary the id's secrecy is load-bearing for. Attach ONLY to a row whose assignee is
+    // the CALLER — every other row gets neither field, exactly as if no dispatch had ever
+    // been recorded for it.
     const rankedTasks = rankTasks(visibleTaskRows, agentStates).map((t) => {
       const info = t.assignee_agent_id === auth.boundAgentId ? dispatchInfo.get(t.id) : undefined
       return info ? { ...t, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : t
@@ -1473,6 +1480,17 @@ const toolTaskUpdate: ToolSpec = {
       if (args.assignee_agent_id !== undefined) {
         const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
         if (check.error) return fail(400, check.error)
+        // mupot#1494 round 3 (P2-5, adversarial round 2) — reassigning (or unassigning)
+        // AWAY from the agent a dispatch is currently mid-flight to orphans that dispatch:
+        // the old agent's eventual settle fails ownership, the new agent has nothing of its
+        // own to settle, and a fresh dispatch is itself refused while the stale one is
+        // unsettled. Refuse the reassignment outright rather than create that wedge. Only
+        // checked when the assignee is actually CHANGING (a same-value no-op "reassignment"
+        // is harmless) — see hasInFlightDispatchReceipt's own doc comment for the exact
+        // in-flight definition.
+        if (check.value !== existing.assignee_agent_id && await hasInFlightDispatchReceipt(env, existing.id)) {
+          return fail(409, 'task_dispatch_in_flight', 'this task has an undelivered/unsettled dispatch — wait for it to settle or fail, or have an operator repair the lease, before reassigning')
+        }
         next.assignee_agent_id = check.value
         // Naming one owner clears the other. The alternative — making the caller
         // null the previous field first — turns an ordinary handoff into a
@@ -4296,31 +4314,57 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
   name: 'task_dispatch_lease_reset',
   scope: 'org (workspace admin repairs a wedged/desynchronised dispatch lease)',
   min: 'admin',
-  args: '{ task_id: string, dispatch_receipt_id: string, reason: string }',
+  args: '{ task_id: string, dispatch_receipt_id: string, reason: string, override?: boolean }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       dispatch_receipt_id: STRING_SCHEMA,
       reason: STRING_SCHEMA,
+      override: { type: 'boolean' },
     },
     required: ['task_id', 'dispatch_receipt_id', 'reason'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'org:admin' })
+    // mupot#1494 round 3 (P1-B, adversarial round 2) — this repair is org-admin ONLY, and
+    // that must be provable from the CAPABILITY GRANT alone, never `hasWorkspaceAdmin`'s
+    // legacy-`role` fallback (which fires whenever `auth.capabilities` is absent — the exact
+    // gap a squad-scoped admin passed through, M9). Uses `hasCapability` directly against an
+    // explicit `'org'` scope grant. Also refuses any agent-bound token outright
+    // (`operator_principal_required`, same pattern as src/mcp/provision.ts) — an agent
+    // acting on its own member's org:admin standing is not a human operator invoking this
+    // repair directly, and this tool's receipt must always be attributable to a human call.
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (!hasCapability(auth.capabilities ?? [], 'org', null, 'admin')) {
+      return fail(403, 'forbidden', { need: 'org:admin' })
+    }
     const taskId = str(args.task_id)
     const dispatchReceiptId = str(args.dispatch_receipt_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
     if (!dispatchReceiptId) return fail(400, 'invalid_args', 'dispatch_receipt_id required')
     const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
     if (reason.length < 1 || reason.length > 500) return fail(400, 'invalid_args', 'reason must be 1-500 characters')
+    if (args.override !== undefined && typeof args.override !== 'boolean') {
+      return fail(400, 'invalid_args', 'override must be a boolean')
+    }
     if (!auth.memberId) return fail(403, 'forbidden', { need: 'member identity' })
-    const result = await adminResetDispatchLease(env, auth, { taskId, dispatchReceiptId, reason })
+    const result = await adminResetDispatchLease(env, auth, {
+      taskId, dispatchReceiptId, reason, override: args.override === true,
+    })
+    if (result.code === 'reset_refused_lease_live') {
+      // mupot#1494 round 3 (P1-A) — typed refusal naming the current holder + expiry, so an
+      // operator can decide (find/confirm the holder is actually gone, then retry with
+      // `override: true`) rather than the tool silently stealing an in-flight lease.
+      return fail(409, 'lease_live', { message_id: result.message_id, audit_id: result.audit_id, ...result.lease_live })
+    }
+    if (result.code === 'reset_refused_task_mismatch') {
+      return fail(409, 'task_mismatch', { message_id: result.message_id, audit_id: result.audit_id })
+    }
     if (!result.reset) {
       return fail(409, 'lease_reset_refused', { message_id: result.message_id, audit_id: result.audit_id })
     }
-    return done({ reset: true, message_id: result.message_id, audit_id: result.audit_id })
+    return done({ reset: true, overrode: result.overrode, message_id: result.message_id, audit_id: result.audit_id })
   },
 }
 
@@ -4968,7 +5012,14 @@ const toolFleetAgentGet: ToolSpec = {
       runtime: routeInfo.runtime,
       status: row?.status ?? null,
       last_reported_at: row?.last_reported_at ?? null,
-      presence_mode: row?.presence_mode || '',
+      // mupot#1494 round 3 (P3, adversarial round 2) — reads `routeInfo.presenceMode`
+      // (getFleetAgentLiveness's OWN isActivePollPresenceMode-filtered value), never the
+      // raw `row.presence_mode` column: an operator-stopped row's column can still
+      // literally read 'poll' (see isActivePollPresenceMode's doc comment,
+      // src/fleet/registry.ts) even though routing has already stopped treating it as
+      // poll-active — this read-only view must agree with the routing decision, not the
+      // raw storage.
+      presence_mode: routeInfo.presenceMode || '',
       presence_ttl_sec: ttlSec,
       derived_presence: derivedPresence,
       live: routeInfo.live,

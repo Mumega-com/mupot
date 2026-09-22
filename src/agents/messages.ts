@@ -1180,7 +1180,19 @@ export function bearerFencePredicate(tenantParam: string, agentParam: string): s
  */
 function leaseAvailableClause(nowParam: string, opts: { allowAttemptHeld?: boolean } = {}): string {
   const base = `(lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})`
-  return opts.allowAttemptHeld ? `(${base} OR lease_attempt_id IS NOT NULL)` : base
+  // mupot#1494 round 3 (P2-3, adversarial round 2) — the `allowAttemptHeld` carve-out
+  // exists for the pre-existing, deliberately-tested "legacy inbox consume during an
+  // attempt lease" reconciliation property (tests/inbox-lease-attempt-ack.test.ts). That
+  // property was never meant to cover a DISPATCH message: a dispatch's settle contract
+  // (src/tasks/runtime-receipts.ts validateEnvelope) requires `read_at IS NULL` and its
+  // OWN live lease — `inbox` consuming a dispatch message out from under an attempt
+  // holder sets `read_at`, which permanently fails that holder's subsequent settle as
+  // stale, exactly the double-processing/wedge class P1-i exists to close. Excluding
+  // `from_agent = 'mupot-dispatch'` rows from the carve-out closes that gap without
+  // touching the legacy (non-dispatch) reconciliation behavior the carve-out exists for.
+  return opts.allowAttemptHeld
+    ? `(${base} OR (lease_attempt_id IS NOT NULL AND from_agent <> 'mupot-dispatch'))`
+    : base
 }
 
 async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promise<boolean> {

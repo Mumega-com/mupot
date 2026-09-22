@@ -71,11 +71,20 @@ export interface LatestDispatchReceiptInfo {
  * loadLatestDispatchReceiptsForTasks — one bounded query, the MOST RECENT
  * task_dispatch_receipts row per task_id (by created_at, tie-broken by rowid — the table has
  * no INTEGER PRIMARY KEY alias, but every SQLite table carries an implicit rowid unless
- * declared WITHOUT ROWID, and this one is not). Deliberately does NOT filter by the task's
- * CURRENT assignee_agent_id: recordTaskDispatchRuntimeReceipt already fails closed
- * (`runtime_receipt_forbidden`) if the settling agent does not match the receipt's own
- * `agent_id`, so exposing a possibly-stale receipt here cannot be used to settle as someone
- * else — it can only ever correctly settle the caller's OWN dispatch.
+ * declared WITHOUT ROWID, and this one is not).
+ *
+ * mupot#1494 round 3 (P2-1, adversarial round 2) — NOW filters to a receipt whose
+ * `dispatch.agent_id` still equals the task's CURRENT `assignee_agent_id`
+ * (`d.agent_id = t.assignee_agent_id`). Round 2's own reasoning ("cannot be used to settle
+ * as someone else, so exposing a stale receipt is harmless") was true for the SETTLE path
+ * (`recordTaskDispatchRuntimeReceipt` does fail closed on a mismatch) but not for this READ
+ * path: after a task is reassigned, the NEW assignee's own `task_list`/`task_board` row
+ * (gated by `assignee_agent_id === auth.boundAgentId` at the call site, src/mcp/index.ts)
+ * would still surface the OLD agent's `dispatch_receipt_id` — an identifier for a dispatch
+ * that was never theirs, disclosed for no operational reason (the new assignee cannot
+ * settle it; the ownership check inside `claimUnleasedForPairSettlement`'s ownership predicate
+ * refuses it as it should). Filtering here means a reassigned task simply shows no
+ * dispatch_receipt_id at all until the CURRENT assignee gets a fresh one of their own.
  */
 export async function loadLatestDispatchReceiptsForTasks(
   env: Env,
@@ -87,10 +96,13 @@ export async function loadLatestDispatchReceiptsForTasks(
   const rows = await env.DB.prepare(`
     SELECT d.task_id AS task_id, d.id AS dispatch_receipt_id, d.delivered_via AS delivered_via
       FROM task_dispatch_receipts d
+      JOIN tasks t ON t.id = d.task_id
      WHERE d.tenant = ?1 AND d.task_id IN (${placeholders})
+       AND d.agent_id = t.assignee_agent_id
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_receipts newer
           WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
+            AND newer.agent_id = t.assignee_agent_id
             AND (newer.created_at > d.created_at
                  OR (newer.created_at = d.created_at AND newer.rowid > d.rowid))
        )
@@ -103,6 +115,40 @@ export async function loadLatestDispatchReceiptsForTasks(
     })
   }
   return map
+}
+
+/**
+ * hasInFlightDispatchReceipt — mupot#1494 round 3 (P2-5, adversarial round 2). True iff a
+ * task's MOST RECENT dispatch has no terminal runtime receipt (`completed`/`failed`) yet —
+ * i.e. it is genuinely mid-flight: dispatched, possibly consumed, but not yet settled either
+ * way. Reassigning `assignee_agent_id` while this is true orphans the dispatch: the OLD
+ * agent's in-flight settle (`recordTaskDispatchRuntimeReceipt`) will fail
+ * `runtime_receipt_forbidden` the moment `task.assignee_agent_id` no longer matches it (the
+ * ownership check both the direct path and `claimUnleasedForPairSettlement`'s claim
+ * predicate enforce), and the NEW assignee has no dispatch of their own to settle — the task
+ * is wedged until a fresh `task_dispatch` (itself refused while the old one is still
+ * unsettled — see `toolTaskDispatch`'s own `task_not_dispatchable` gate) or an operator
+ * intervenes. `task_update`'s reassignment path refuses outright while this is true
+ * (`task_dispatch_in_flight`) rather than silently creating the wedge.
+ */
+export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT 1
+      FROM task_dispatch_receipts d
+     WHERE d.tenant = ?1 AND d.task_id = ?2
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_receipts newer
+          WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
+            AND (newer.created_at > d.created_at
+                 OR (newer.created_at = d.created_at AND newer.rowid > d.rowid))
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts r
+          WHERE r.tenant = ?1 AND r.dispatch_receipt_id = d.id AND r.stage IN ('completed', 'failed')
+       )
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, taskId).first<{ 1: number }>()
+  return row !== null
 }
 
 export type TaskDispatchRuntimeReceiptErrorCode =
@@ -852,12 +898,26 @@ export async function listTaskDispatchReceiptTimeline(
 // delivery_attempts counter) leaves behind — a receipted, org-admin-only repair, never a
 // silent DB patch.
 
+export type AdminResetDispatchLeaseCode =
+  | 'reset'
+  | 'reset_refused_terminal'
+  | 'reset_not_found'
+  | 'reset_refused_lease_live'
+  | 'reset_refused_task_mismatch'
+
 export interface AdminResetDispatchLeaseResult {
-  /** True iff the row was reset to pristine. False means "not found" or "refused" (already
-   *  consumed or dead-lettered) — never a side effect either way. */
+  /** True iff the row was reset to pristine. False means "not found", "refused" (already
+   *  consumed or dead-lettered, a live lease with no override, or a task_id mismatch) —
+   *  never a side effect either way when false. */
   reset: boolean
+  code: AdminResetDispatchLeaseCode
   message_id: string | null
   audit_id: string
+  /** True iff this reset stole a LIVE, unexpired lease under an explicit `override`. The
+   *  prior holder's state is in the audit receipt's `override_of`, never lost. */
+  overrode: boolean
+  /** Present only when `code === 'reset_refused_lease_live'` — who holds it and until when. */
+  lease_live?: { holder: string; lease_expires_at: string; delivery_attempts: number }
 }
 
 /**
@@ -868,46 +928,128 @@ export interface AdminResetDispatchLeaseResult {
  * dispatch_receipt_id}` pair correlator) proceeds exactly as if the message had just been
  * delivered. Refuses (0 rows, `reset: false`) once the row is `read_at` (already consumed) or
  * `dead_lettered_at` (already terminally failed) — this is a lease/attempt REPAIR, never an
- * un-delete or a bypass of a genuine terminal state. Every call — found or not, reset or
- * refused — writes one `mutation_audit_entries` row, so a reset is always an auditable fact.
- * Callers MUST have already verified `hasWorkspaceAdmin(auth)` — this function does not
- * re-check authority, only records who acted.
+ * un-delete or a bypass of a genuine terminal state.
+ *
+ * mupot#1494 round 3 (P1-A, adversarial round 2) — a row can ALSO be wedged while a
+ * legitimate resident holds a genuinely LIVE, unexpired lease on it (mid-flight, not stuck
+ * at all from that holder's point of view). Resetting THAT unconditionally is its own new
+ * defect: the row goes pristine, a second `inbox_lease` hands the same dispatch to a
+ * DIFFERENT consumer, and the original holder's eventual settle fails
+ * `runtime_delivery_stale` — the repair tool would have manufactured the exact
+ * double-processing wedge it exists to fix. So: a live, unexpired lease (not already
+ * consumed/dead-lettered) refuses by default with a typed `reset_refused_lease_live`,
+ * carrying the current holder (`to_agent`) and its expiry — an operator who has confirmed
+ * the holder is actually gone (crashed, never going to settle) can pass `override: true` to
+ * proceed anyway; the PRIOR lease state (holder, attempts, expiry, attempt id) is written
+ * into the audit receipt's `override_of` as an explicit, visible override, never silently
+ * discarded.
+ *
+ * mupot#1494 round 3 (P2-4) — `input.taskId` is validated against the dispatch receipt's
+ * OWN `task_id` before anything else: a mismatch is refused (`reset_refused_task_mismatch`,
+ * receipted, zero side effects) rather than silently resetting a lease under the wrong
+ * task's authority. The audit receipt's `principal_kind`/`agent_id` reflect the ACTUAL
+ * calling principal (an agent-bound token shows as `'agent'` with its real `agent_id`) —
+ * never hardcoded to `'member'` regardless of who really called. Every call — found or not,
+ * reset or refused, override or not — writes exactly one `mutation_audit_entries` row.
+ *
+ * Callers MUST have already verified authority (see `toolTaskDispatchLeaseReset`'s
+ * org:admin + operator-principal checks) — this function does not re-check authority, only
+ * records who acted.
  */
 export async function adminResetDispatchLease(
   env: Env,
   auth: AuthContext,
-  input: { taskId: string; dispatchReceiptId: string; reason: string },
+  input: { taskId: string; dispatchReceiptId: string; reason: string; override?: boolean },
 ): Promise<AdminResetDispatchLeaseResult> {
   const memberId = auth.memberId?.trim() ?? ''
   const credentialId = auth.tokenId?.trim() ?? ''
+  // P2-4: actor-faithful — an agent-bound token is receipted as the agent that actually
+  // acted, never masked as a bare member action.
+  const agentId = auth.boundAgentId?.trim() || null
+  const override = input.override === true
   const auditId = crypto.randomUUID()
   const now = nowSqlUtc()
-  const evidence = canonicalJson({
+
+  const evidence = (extra: Record<string, unknown> = {}): string => canonicalJson({
     task_id: input.taskId,
     dispatch_receipt_id: input.dispatchReceiptId,
     reason: text(input.reason, 500),
+    override,
+    ...extra,
   })
 
-  const message = await env.DB.prepare(
-    `SELECT id FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1`,
-  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId)).first<{ id: string }>()
-
-  if (!message) {
+  const writeAudit = async (operation: string, targetKind: string, targetId: string, evidenceJson: string): Promise<void> => {
     await env.DB.prepare(`
       INSERT INTO mutation_audit_entries (
         id, tenant, principal_kind, principal_id, member_id, agent_id,
         credential_id, origin, handler, operation, target_kind, target_id,
         task_id, request_id, idempotency_key, evidence_json, recorded_at
       ) VALUES (
-        ?1, ?2, 'member', ?3, ?3, NULL,
-        ?4, 'mcp', 'task_dispatch_lease_reset', 'reset_not_found', 'dispatch_receipt', ?5,
-        ?6, ?7, ?7, ?8, ?9
+        ?1, ?2, ?3, ?4, ?5, ?6,
+        ?7, 'mcp', 'task_dispatch_lease_reset', ?8, ?9, ?10,
+        ?11, ?12, ?12, ?13, ?14
       )
     `).bind(
-      auditId, env.TENANT_SLUG, memberId, credentialId, input.dispatchReceiptId,
-      input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence, now,
+      auditId, env.TENANT_SLUG,
+      agentId ? 'agent' : 'member', agentId ?? memberId, memberId, agentId,
+      credentialId, operation, targetKind, targetId,
+      input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidenceJson, now,
     ).run()
-    return { reset: false, message_id: null, audit_id: auditId }
+  }
+
+  // P2-4: taskId must match the dispatch's OWN task before any read/write on the message.
+  const dispatch = await env.DB.prepare(
+    `SELECT task_id FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ task_id: string }>()
+  if (!dispatch) {
+    await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
+    return { reset: false, code: 'reset_not_found', message_id: null, audit_id: auditId, overrode: false }
+  }
+  if (dispatch.task_id !== input.taskId) {
+    await writeAudit(
+      'reset_refused_task_mismatch', 'dispatch_receipt', input.dispatchReceiptId,
+      evidence({ actual_task_id: dispatch.task_id }),
+    )
+    return { reset: false, code: 'reset_refused_task_mismatch', message_id: null, audit_id: auditId, overrode: false }
+  }
+
+  const message = await env.DB.prepare(
+    `SELECT id, delivery_attempts, lease_expires_at, lease_attempt_id, read_at, dead_lettered_at, to_agent
+       FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId)).first<{
+    id: string
+    delivery_attempts: number
+    lease_expires_at: string | null
+    lease_attempt_id: string | null
+    read_at: string | null
+    dead_lettered_at: string | null
+    to_agent: string
+  }>()
+
+  if (!message) {
+    await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
+    return { reset: false, code: 'reset_not_found', message_id: null, audit_id: auditId, overrode: false }
+  }
+
+  // P1-A: a LIVE, unexpired lease on a row that is neither consumed nor dead-lettered is a
+  // genuinely in-flight hand-out, not a wedge — refuse unless explicitly overridden.
+  const leaseLive =
+    message.read_at === null && message.dead_lettered_at === null &&
+    message.lease_expires_at !== null && message.lease_expires_at > now
+  if (leaseLive && !override) {
+    await writeAudit('reset_refused_lease_live', 'agent_message', message.id, evidence({
+      holder: message.to_agent,
+      lease_expires_at: message.lease_expires_at,
+      delivery_attempts: message.delivery_attempts,
+    }))
+    return {
+      reset: false, code: 'reset_refused_lease_live', message_id: message.id, audit_id: auditId, overrode: false,
+      lease_live: {
+        holder: message.to_agent,
+        lease_expires_at: message.lease_expires_at as string,
+        delivery_attempts: message.delivery_attempts,
+      },
+    }
   }
 
   const result = await env.DB.prepare(`
@@ -916,22 +1058,29 @@ export async function adminResetDispatchLease(
      WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
   `).bind(env.TENANT_SLUG, message.id).run()
   const reset = result.meta?.changes === 1
+  const overrode = reset && leaseLive
 
-  await env.DB.prepare(`
-    INSERT INTO mutation_audit_entries (
-      id, tenant, principal_kind, principal_id, member_id, agent_id,
-      credential_id, origin, handler, operation, target_kind, target_id,
-      task_id, request_id, idempotency_key, evidence_json, recorded_at
-    ) VALUES (
-      ?1, ?2, 'member', ?3, ?3, NULL,
-      ?4, 'mcp', 'task_dispatch_lease_reset', ?5, 'agent_message', ?6,
-      ?7, ?8, ?8, ?9, ?10
-    )
-  `).bind(
-    auditId, env.TENANT_SLUG, memberId, credentialId,
-    reset ? 'reset' : 'reset_refused_terminal', message.id,
-    input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence, now,
-  ).run()
+  await writeAudit(
+    reset ? (overrode ? 'reset_override' : 'reset') : 'reset_refused_terminal',
+    'agent_message',
+    message.id,
+    overrode
+      ? evidence({
+          override_of: {
+            holder: message.to_agent,
+            delivery_attempts: message.delivery_attempts,
+            lease_expires_at: message.lease_expires_at,
+            lease_attempt_id: message.lease_attempt_id,
+          },
+        })
+      : evidence(),
+  )
 
-  return { reset, message_id: message.id, audit_id: auditId }
+  return {
+    reset,
+    code: reset ? 'reset' : 'reset_refused_terminal',
+    message_id: message.id,
+    audit_id: auditId,
+    overrode,
+  }
 }
