@@ -197,6 +197,71 @@ minted. A parent operator who wants to act inside a provisioned pot goes through
 OWN login/token surface, exactly like any other member of it — the same door the seeded
 admin uses.
 
+## Round 2: adversarial gate findings and fixes (mupot#1507)
+
+Athena's round-1 adversarial pass on the first version of this feature found 4 P0s, 3 P1s,
+and 4 P2s — all real, all fixed on the same branch (round 2 is the last round for this PR).
+Four load-bearing semantics changed as a result:
+
+- **`ok` semantics.** `ok: true` now requires all six steps AND the `pots` registry row
+  being marked `status: 'active'` — a run that finished all six steps but failed the
+  registry write is still `ok: false` (see the code comment on that specific edge case;
+  it is the one place `not_completed` can read `[]` under `status: 'incomplete'`).
+- **Adoption rule.** A slug is claimed in the `pots` registry (`provisioner_member_id` +
+  `provisioner_tenant`, migration 0165) BEFORE any Cloudflare call. Reuse-by-name is
+  allowed ONLY when the caller matches that claim; anyone else gets `pot_slug_taken`
+  (409) with zero CF calls made, even if the D1/KV/worker CF resources for that slug
+  already exist under a different provisioner.
+- **R2 trust boundary.** Once `POT_WORKER_BUNDLE_BUCKET` is configured on a deployment at
+  all, it is the ONLY trusted bundle source — a transport failure reading it is a hard
+  `deploy_worker` failure, never a silent fallback to `worker_js_code`. Only "no object
+  published yet for this RELEASE_SHA" (a clean 404-shaped absence, not an error) still
+  falls through to the explicit path.
+- **HTTP field set.** `POST /api/pots/provision` now validates the body against the exact
+  same allow-list (`src/pots/validate.ts`) the MCP tool's `additionalProperties: false`
+  schema already enforced — `slug`, `brand_name`, `admin_email`, `admin_name`, `plan_tier`,
+  `custom_domain`, nothing else. `worker_js_code`/`cf_api_token`/`account_id` are refused
+  with a named 400, and `provisionSovereignPot` itself refuses them again at runtime
+  regardless of caller (defense in depth against a bypass of either surface).
+
+Full findings, by severity:
+
+**P0 (all fixed):**
+1. The seed's `member_tokens` insert for the lead agent's seed-seat token was aborted by
+   migration 0071's real `member_tokens_agent_binding_insert` trigger — no
+   `agent_member_bindings` row existed yet. Fixed by inserting the binding first and
+   sending the whole seed as one atomic `BEGIN`/`COMMIT` batch.
+2. "Already seeded" was checked by member-email existence alone, certifying a
+   half-seeded pot (admin exists, no capability/token/agent/binding) as fully ready.
+   Fixed with `readFullSeedIdentityState` — every piece must exist or it is a named,
+   hard failure.
+3. `POST /api/pots/provision` spread the raw JSON body into the provisioner, letting a
+   caller supply `worker_js_code`/`cf_api_token`/`account_id`. Fixed at the type, the
+   shared validator, and the function itself (three layers).
+4. A slug could be adopted by any caller with no ownership check. Fixed with the `pots`
+   registry claim described above.
+
+**P1 (all fixed):** `verifyPotReachable` now asserts `/health`'s `tenant` and `commit`
+match what was actually deployed (P1-1); an R2 read failure is a hard failure, never a
+fallback (P1-2); the reserved-slug refusal and the no-claim-without-a-minter rule are both
+pinned by dedicated tests at the `provisionSovereignPot` entry (P1-3, "M5"/"M8").
+
+**P2 (all addressed):** receipts carry `actor_member_id`/`actor_tenant` (migration 0164);
+a database `CHECK` constraint refuses any receipt `detail` containing `@` and requires
+valid JSON for the three structured steps — enforced by SQLite itself, not just
+application code (verified empirically against a real engine); `verify_reachable`'s
+receipt stores a sha256 of the `/health` body, never the body; the HTTP route and MCP tool
+both refuse a bound-agent session (`operator_principal_required`) and a caller whose
+tenant doesn't match the deployment's own `TENANT_SLUG`.
+
+**Test harness fix (prerequisite to trusting any of the above):** the original test
+suite's fake Cloudflare backend answered `success: true` to every D1 `/query` call,
+so the seed step's real triggers (migration 0071's whole identity-weld invariant set)
+never actually ran against it — which is exactly how the P0-1 defect shipped in the
+first place. The suite now routes `/query` calls to a REAL SQLite database
+(`tests/helpers/sqlite-d1.ts`) with the full committed migration chain applied, so every
+insert in this document runs against the real constraint set.
+
 ## What Kasra-core still needs to do (this session cannot)
 
 - Confirm the D1 list-by-name (`GET .../d1/database?name=`) and KV-list pagination against
