@@ -98,7 +98,7 @@ describe('migration 0171 — fleet_agents dedup backfill (mupot#1494 v4 round 2,
     })
   })
 
-  it('Case B: never overwrites a NON-EMPTY value the surviving uuid row already carries', () => {
+  it('Case B: rich-uuid/stale-slug — never overwrites a NON-EMPTY value AND never receipts a false merge (mupot#1494 round 3, P2-B)', () => {
     harness = createSqliteD1()
     applyMigrationsBefore0171(harness.sqlite)
 
@@ -126,6 +126,61 @@ describe('migration 0171 — fleet_agents dedup backfill (mupot#1494 v4 round 2,
     expect(rows[0]).toEqual({
       agent_id: 'agent-uuid-p2b2', display: 'Real Display', runtime: 'claude-code',
       squads: '["already-real"]', host: 'real-host',
+    })
+
+    // mupot#1494 round 3 (P2-B, adversarial round 2) — round 2's Part 2 receipted a "merge"
+    // for EVERY uuid/slug pair unconditionally, so this rich-uuid/stale-slug case (nothing
+    // was actually copied — every field above stayed at its own real value) got a false
+    // receipt claiming the STALE slug values had been merged in. Fixed: no receipt row at
+    // all when nothing was actually merged forward.
+    const receipts = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM mutation_audit_entries WHERE operation = 'fleet_agents_dedup_merge'`,
+    ).get() as { n: number }
+    expect(receipts.n).toBe(0)
+  })
+
+  it('Case B: a PARTIAL merge (some fields real, some empty) receipts only the fields actually copied — the rest NULL, never the stale slug value', () => {
+    harness = createSqliteD1()
+    applyMigrationsBefore0171(harness.sqlite)
+
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-p2b4', 'dept-p2b4', 'Dept P2B4');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-p2b4', 'dept-p2b4', 'squad-p2b4', 'Squad P2B4');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-uuid-p2b4', 'squad-p2b4', 'p2b4-runner', 'P2B4 Runner', 'active');
+    `)
+    harness.sqlite.exec(`
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, host, last_reported_at, updated_at)
+      VALUES ('p2b4-runner', 'mumega', 'Slug Display', 'codex', '["squad-p2b4"]', 'on_demand', 'running', 'daemon', 'slug-host', '${now()}', '${now()}')
+    `)
+    // uuid row already has a real `display`, but empty `runtime`/`squads`/`host` —
+    // only those three should be merged forward and receipted.
+    harness.sqlite.exec(`
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, host, last_reported_at, updated_at)
+      VALUES ('agent-uuid-p2b4', 'mumega', 'Already Real Display', '', '[]', '', 'running', 'poll-writer', '', '${now()}', '${now()}')
+    `)
+
+    apply0171(harness.sqlite)
+
+    const row = harness.sqlite.prepare(
+      `SELECT display, runtime, squads, host FROM fleet_agents WHERE agent_id = 'agent-uuid-p2b4'`,
+    ).get() as { display: string; runtime: string; squads: string; host: string }
+    expect(row).toEqual({
+      display: 'Already Real Display', // untouched
+      runtime: 'codex', // merged
+      squads: '["squad-p2b4"]', // merged
+      host: 'slug-host', // merged
+    })
+
+    const receipts = harness.sqlite.prepare(
+      `SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'fleet_agents_dedup_merge' AND target_id = 'agent-uuid-p2b4'`,
+    ).all() as Array<{ evidence_json: string }>
+    expect(receipts).toHaveLength(1)
+    const evidence = JSON.parse(receipts[0].evidence_json) as Record<string, unknown>
+    expect(evidence).toMatchObject({
+      merged_display: null, // NOT merged — must not claim the stale slug value
+      merged_runtime: 'codex',
+      merged_squads: '["squad-p2b4"]',
+      merged_host: 'slug-host',
     })
   })
 

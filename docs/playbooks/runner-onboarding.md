@@ -159,15 +159,30 @@ refuses (`409`, receipted, zero side effects) if your session has no live bearer
 to anchor the new receipt to — a directory-OAuth org-admin session can still reset without
 `terminate`, just not terminate in the same call. It also refuses outright
 (`reset_refused_already_terminal`) — even with `override: true` — if the dispatch already
-has a genuine `completed`/`failed` receipt: there is nothing left to repair.
+has an **operator-declared** `reset_terminated` marker from an earlier `terminate: true`
+call: that specific declaration is permanent and cannot be re-opened.
 
-**Once a dispatch is terminated, it is terminated everywhere, permanently.** The underlying
-message is marked consumed in the SAME atomic write that clears its lease — it can never
-again be leased, pair-settled, or redelivered via `inbox`/`inbox_lease` — and
-`task_dispatch_runtime_receipt` refuses (`dispatch_terminated`, 409, no write) any further
-settle attempt on that dispatch, from any runner, through any correlator. A runner that was
-declared dead but was not actually dead simply gets refused when it resurfaces; it does not
-corrupt task state.
+**A genuine `completed`/`failed` receipt is NOT a permanent fence — it is repairable.**
+Earlier revisions of this doc claimed a dispatch a runner had already completed or failed
+had "nothing left to repair"; that was wrong, and briefly implemented as `dispatch_terminated`/
+`reset_refused_already_terminal` firing for `failed` too — which broke the ordinary "runner
+failed, reset so it can retry" workflow (a lease-expiry redelivery after a `failed` settle
+made every subsequent settle attempt throw `dispatch_terminated`, and the operator's own
+`override: true` repair was then refused as if it were permanent). `completed`/`failed` keep
+their own, older, orthogonal enforcement instead (the `runtime_consumed` mutation's fence
+against a dispatch-scoped `failed` row, and a `completed` task's `status` moving past
+`in_progress`) — `task_dispatch_lease_reset({ override: true })` on either remains a normal,
+repairable reset; only an explicit `terminate: true` call's own `reset_terminated` marker is
+final.
+
+**Once a dispatch is `reset_terminated`, that dispatch is terminated everywhere,
+permanently — this is true ONLY for `reset_terminated`, not for a plain `completed`/`failed`
+settle.** The underlying message is marked consumed in the SAME atomic write that clears its
+lease — it can never again be leased, pair-settled, or redelivered via
+`inbox`/`inbox_lease` — and `task_dispatch_runtime_receipt` refuses (`dispatch_terminated`,
+409, no write) any further settle attempt on that dispatch, from any runner, through any
+correlator. A runner that was declared dead but was not actually dead simply gets refused
+when it resurfaces; it does not corrupt task state.
 
 ## Worked example (poll every 5 minutes)
 

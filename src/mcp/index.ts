@@ -4391,6 +4391,15 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       // without terminate.
       return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
     }
+    if (result.code === 'reset_refused_already_terminal') {
+      // mupot#1494 v4 round 3 (P1-A) — an explicit, named refusal distinct from the generic
+      // lease_reset_refused: this dispatch was already operator-terminated
+      // (reset_terminated), never a plain completed/failed settle (those are repairable and
+      // never reach this code — see adminResetDispatchLease's narrowed terminal check).
+      // Without this branch the caller only sees the opaque lease_reset_refused 409 and has
+      // no way to distinguish "already terminated, this is final" from an ordinary refusal.
+      return fail(409, 'already_terminated', { message_id: result.message_id, audit_id: result.audit_id })
+    }
     if (!result.reset) {
       return fail(409, 'lease_reset_refused', { message_id: result.message_id, audit_id: result.audit_id })
     }

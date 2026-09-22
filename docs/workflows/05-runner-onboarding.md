@@ -204,8 +204,9 @@ regression in round 1's own P1-b fix, plus a class round 1 left open on its own 
   true`'s lease-clearing UPDATE now ALSO sets `read_at` in the SAME atomic statement (never
   a separate step, never a window where the message reads pristine again); and
   `adminResetDispatchLease` itself now refuses (`reset_refused_already_terminal`) outright,
-  even under `override: true`, when the dispatch already carries any terminal receipt — a
-  genuinely completed dispatch has nothing left to repair.
+  even under `override: true`, when the dispatch already carries any terminal receipt.
+  **Corrected in round 3 below — this over-broadened the refusal to `completed`/`failed`
+  too, which are repairable; only an operator's own `reset_terminated` is permanent.**
 - **P2-a:** the squad-SCOPED view's own INCLUSION test had the SAME self-report-trust bug
   step 6's P1-c exclusion fix already closed — it read `fleet_agents.squads` instead of the
   agent's real `agents.squad_id`. Fixed the same way, and the slug-translation query this
@@ -223,9 +224,53 @@ regression in round 1's own P1-b fix, plus a class round 1 left open on its own 
   fixable by a cleverer assertion); `reason` sanitization is pinned behaviorally (hostile
   control/bidi/zero-width characters, checked against both the persisted audit evidence and
   the terminal receipt row); and the reset tool's audit-write + terminal-receipt-write now
-  land in ONE `env.DB.batch` when both apply (the two-attempt lease UPDATE stays a separate
-  statement by necessity — see the code comment on `adminResetDispatchLease` for why
-  batching it too would trade away the provable `overrode` determination).
+  land in ONE `env.DB.batch` (the lease UPDATE stayed a SEPARATE statement here in round 2 —
+  round 3 (P1-B, below) found that left an atomicity gap and folded it into the same batch;
+  see the code comment on `adminResetDispatchLease` for how `reset`/`overrode` are still
+  determined provably from each statement's own `D1Result.meta.changes`).
+
+## v4 round 3: narrowing the terminal fence, and closing the batch gap
+
+A third adversarial round on v4 itself (pinned `cc2d49ec`) found round 2's own `P1-2` fix
+(`dispatch_terminated` / `reset_refused_already_terminal`) had over-broadened: it fenced
+the FULL terminal-stage set — `completed`/`failed`/`reset_terminated`
+(`TERMINAL_RUNTIME_RECEIPT_STAGES`) — when only `reset_terminated` (an operator's explicit
+declaration) needed this new enforcement at all. `completed`/`failed` already had their
+own, older, orthogonal fences (the `runtime_consumed` mutation's `NOT EXISTS (... stage =
+'failed')` check; a `completed` task's `status` moving past `in_progress`), so blocking
+them here too was both redundant AND harmful: **PROVED** — a runner settles `failed` at
+attempt 1 → its lease expires → `leaseAgentInbox` redelivers the SAME dispatch (attempt 2)
+→ every subsequent settle attempt now throws `dispatch_terminated` → the operator's own
+`task_dispatch_lease_reset({ override: true })` repair is refused
+`reset_refused_already_terminal` → the runner has no way back in, even though nothing was
+ever operator-terminated. **Fix:** all three checks (`claimUnleasedForPairSettlement`'s
+embedded terminal guard, `recordTaskDispatchRuntimeReceipt`'s early refusal, and
+`adminResetDispatchLease`'s early refusal) narrowed to `stage = 'reset_terminated'` only —
+`completed`/`failed` are repairable again, exactly as they always were. Also fixed:
+`adminResetDispatchLease`'s already-terminal refusal branch had hardcoded `terminated:
+true` regardless of the CALLER's own `terminate` input; it now reports `terminated:
+terminate` (did THIS call terminate it, never "is it terminal in the DB regardless of
+intent"). The MCP seam (`src/mcp/index.ts`, `toolTaskDispatchLeaseReset`) gained an
+explicit `reset_refused_already_terminal` → `409 already_terminated` mapping (it used to
+fall through to the generic `lease_reset_refused`), plus a seam-level test (via
+`invokeTool`) proving `dispatch_terminated` → `409` at the actual tool layer, not only via
+a direct function call.
+
+**Separately (P1-B):** the lease/`read_at` UPDATE ran OUTSIDE the `env.DB.batch` that wrote
+the audit + terminal-receipt rows. If the batch threw, the message was left
+`read_at`-set / lease-cleared with ZERO receipt and ZERO audit rows — an unrepairable ghost
+state (worse than round 1's own already-fixed audit-write ordering, since here NOTHING
+survived the throw). **Fix:** the lease UPDATE now lands in the SAME batch as the audit and
+terminal-receipt statements (see the corrected P2-c/P3 bullet above) — all three commit or
+none do.
+
+**Also (P2-B):** migration `0171`'s Part 2 (`fleet_agents_dedup_merge` receipt) used to
+insert a receipt for EVERY uuid/slug pair unconditionally — a rich-uuid/stale-slug pair
+(nothing actually merged, since the uuid row already carried real values) still got a
+receipt claiming the STALE slug values had been merged in. Fixed: the receipt INSERT now
+runs against the pre-merge snapshot, gated on the exact same per-field emptiness test the
+merge UPDATE itself uses, and records `NULL` (never the stale value) for any field that was
+not actually copied — a pair where nothing merges gets no receipt row at all.
 
 ## Human gate
 
@@ -293,7 +338,14 @@ same-day timestamp format split" describe block — same-day expired-lease reset
 override, a live-lease CONTROL, and validateEnvelope's fail-closed settle refusal — plus a
 new "terminate:true — the wedge now has an exit" describe block covering the pre-fix bypass
 repro, the full dead-runner recovery path end to end via `invokeTool`, `terminate`'s
-idempotency, and the no-credential refusal),
+idempotency, and the no-credential refusal; **round 3:** the "terminated dispatch cannot be
+resurrected" describe block's `failed`-is-repairable rewrite, a `terminated:false`-on-
+follow-up regression test, an MCP-seam describe block pinning `dispatch_terminated`/
+`reset_refused_already_terminal` → 409 through `invokeTool` (mutation M20), and an
+`env.DB.batch`-throws-untouched-message describe block (mutation M22)),
+`tests/migration-0171-fleet-agents-dedup.test.ts` (**round 3:** rich-uuid/stale-slug now
+also asserts zero merge receipts, plus a new partial-merge case asserting `merged_*` is
+`NULL` for every field that was not actually copied),
 `tests/mcp-task-runtime-receipts.test.ts`, `tests/mcp-task-tools.test.ts`,
 `tests/task-dispatch-force-inbox-eligibility.test.ts`, `tests/agent-inbox-lease-sqlite.test.ts`
 (attempt-lease/inbox parity, P2-2/P2-3 carve-out scoping), `tests/inbox-fence-sqlite.test.ts`,

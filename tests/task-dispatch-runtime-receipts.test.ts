@@ -2362,6 +2362,48 @@ describe('task_dispatch_lease_reset — org-admin gate (mupot#1494 round 3, P1-B
   })
 })
 
+// mupot#1494 round 3 (P1-A, adversarial round 2) — the 409 mapping for `dispatch_terminated`
+// and `reset_refused_already_terminal` must be proven at the actual MCP tool seam
+// (invokeTool), not only via a direct function call. Adversarial finding: mutation M20
+// (dropping dispatch_terminated from runtimeReceiptFailure's 409 map) survived because no
+// existing test exercised that mapping through the tool layer — 184/184 stayed green.
+describe('MCP seam: dispatch_terminated / reset_refused_already_terminal map to 409 (mupot#1494 round 3, P1-A, pins M20)', () => {
+  it('task_dispatch_runtime_receipt: a settle attempt against a reset_terminated dispatch is refused 409 dispatch_terminated', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const terminate = await invokeTool(adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), fixture.env, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'operator declares this dispatch dead', terminate: true,
+      }, 'https://pot.test')
+      expect(terminate).toMatchObject({ ok: true, result: { reset: true, terminated: true } })
+
+      const res = await invokeTool(fixture.auth, fixture.env, 'task_dispatch_runtime_receipt', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, stage: 'runtime_consumed',
+        runtime_receipt_hash: RUNTIME_HASH, attempt: 1,
+      }, 'https://pot.test')
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'dispatch_terminated' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('task_dispatch_lease_reset: a follow-up reset attempt against an already reset_terminated dispatch is refused 409 already_terminated', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const terminate = await invokeTool(adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), fixture.env, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'first terminate', terminate: true,
+      }, 'https://pot.test')
+      expect(terminate).toMatchObject({ ok: true, result: { reset: true, terminated: true } })
+
+      const followUp = await invokeTool(adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), fixture.env, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'second attempt, already terminal',
+      }, 'https://pot.test')
+      expect(followUp).toMatchObject({ ok: false, status: 409, error: 'already_terminated' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
 // mupot#1494 round 3 (P2-5, adversarial round 2) — reassigning a task while its dispatch is
 // genuinely mid-flight (dispatched/consumed, not yet settled either way) orphans it: the old
 // assignee's eventual settle fails ownership, the new assignee has nothing of its own to
@@ -2442,6 +2484,57 @@ describe('task_update refuses reassignment while a dispatch is in flight (mupot#
 
       const row = fixture.harness.sqlite.prepare('SELECT assignee_agent_id, status FROM tasks WHERE id = ?').get(TASK_ID) as { assignee_agent_id: string; status: string }
       expect(row).toEqual({ assignee_agent_id: AGENT_ID, status: 'in_progress' }) // assignee untouched, status changed
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 round 3 (P1-B, adversarial round 2) — the lease/read_at UPDATE used to run
+// OUTSIDE the env.DB.batch that wrote the audit + terminal receipt rows. If the batch threw,
+// the message was left read_at-set / lease-cleared with ZERO receipt and ZERO audit rows —
+// an unrepairable ghost state. Round 3 folded the lease UPDATE into the same batch. Pin it:
+// proxy env.DB.batch to throw and assert the message row is completely untouched (mutation
+// M22 — un-batching the lease UPDATE — must go red against this test).
+describe('adminResetDispatchLease — the lease UPDATE is atomic with the audit/receipt writes (mupot#1494 round 3, P1-B, pins M22)', () => {
+  it('when env.DB.batch throws, the message row (delivery_attempts/read_at/lease_expires_at) is completely untouched', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const before = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID)
+
+      const throwingDb = {
+        ...fixture.env.DB,
+        prepare: fixture.env.DB.prepare.bind(fixture.env.DB),
+        batch: async () => {
+          throw new Error('simulated D1 batch failure')
+        },
+      } as Env['DB']
+
+      await expect(adminResetDispatchLease(
+        { ...fixture.env, DB: throwingDb },
+        adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID),
+        {
+          taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'batch will fail',
+          terminate: true,
+        },
+      )).rejects.toThrow('simulated D1 batch failure')
+
+      // If the lease UPDATE were NOT in the same batch (M22), this row would already show
+      // delivery_attempts: 0 / read_at set / lease_expires_at: null despite the batch (and
+      // therefore the audit + terminal receipt) never having committed anything.
+      const after = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID)
+      expect(after).toEqual(before)
+
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT COUNT(*) AS count FROM mutation_audit_entries WHERE handler = ?',
+      ).get('task_dispatch_lease_reset')).toEqual({ count: 0 })
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS count FROM task_dispatch_runtime_receipts WHERE stage = 'reset_terminated'",
+      ).get()).toEqual({ count: 0 })
     } finally {
       fixture.harness.close()
     }
