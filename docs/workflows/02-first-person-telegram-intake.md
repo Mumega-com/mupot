@@ -30,9 +30,18 @@ manage_access]` (`skills/first-person/SKILL.md`).
 1. **Status probe** — `resolve_member_status` (`first_person.py:863`) calls the
    authenticated `/im/webhook` surface with the probe body above. mupot's
    `memberIntakeEnvelope` (`src/im/index.ts:1109-1145`) is the one place that computes
-   `bound`/`member_id`/`home_squad_id`/`intake_state` from three indexed reads: a
-   `telegram_chat_id` lookup, a home-squad lookup, and an `EXISTS` over
-   `routine_run_actions` for a completed intake decision. Fail-safe by construction: any
+   `bound`/`member_id`/`home_squad_id`/`intake_state` from a `telegram_chat_id` lookup, a
+   home-squad lookup, and one completion query. `intake_state` is `"complete"` only on a
+   **decided** outcome: a `task_verdicts` row bound via `proposal_id` (migration 0159) to a
+   `project_access` proposal naming this member, **or** a `project_access_grant_receipts`
+   row with `kind = 'grant'` (`src/im/index.ts:1207-1222`). A *rejected* verdict still counts
+   as complete (it is a decision, not a grant); a merely-existing, undecided proposal does
+   not — the earlier existence-based derivation was a cross-member denial of service, since
+   any proposer could lock a victim's intake to `"complete"` before any human decided
+   (comment, `src/im/index.ts:1171-1180`). A later `kind = 'reintake_authorized'` receipt
+   flips the state back to `"pending"` (`:1220,1226-1227`). If migrations 0159/0160 are not
+   yet applied, the query is caught and the state degrades to the conservative `"pending"`
+   default, never a fabricated `"complete"` (`:1224,1232`). Plugin-side, any
    missing/malformed field resolves to `intake_state: "unknown"`, treated identically to
    "not pending" (`first_person.py:887-891`).
 2. **Home squad** — created by mupot alone (see [01 — human onboarding
