@@ -312,6 +312,76 @@ describe('putPotWorkerBundleObject', () => {
     expect(message).toContain('403')
   })
 
+  // mupot#1529 round-1 P2(1): the allow-list's `<Code>` match was case-INSENSITIVE and
+  // uncapped. An HTML error page from an intermediary in front of R2 (a CDN, a load
+  // balancer returning a 502) is not R2's own S3 XML schema at all — it can carry a
+  // lowercase `<code>` HTML tag with completely unrelated content, including a hostname.
+  it('an HTML 502 body with a hostname inside a lowercase <code> tag never leaks it — case-sensitive match, HTTP <status> only', async () => {
+    const sha = 'd'.repeat(40)
+    const signingClient = fakeSigningClient()
+    const hostname = 'internal-lb-07.acct123.r2.cloudflarestorage.com'
+    const fetchImpl = withNotYetPublishedPreCheck(
+      () =>
+        new Response(
+          `<html><body><h1>502 Bad Gateway</h1><p>host: <code>${hostname}</code></p></body></html>`,
+          { status: 502 },
+        ),
+    )
+    let thrown: unknown
+    try {
+      await putPotWorkerBundleObject({
+        accountId: 'acct',
+        bucket: 'mupot-pot-bundles',
+        releaseSha: sha,
+        bodyText: 'x',
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    const message = (thrown as Error).message
+    expect(message).not.toContain(hostname)
+    expect(message).not.toContain('acct123')
+    expect(message).not.toContain('<code>')
+    expect(message).toContain('502')
+    // No S3 <Code> element exists in this body at all — the message must be HTTP <status>
+    // alone, no parenthesized code of any kind.
+    expect(message).not.toMatch(/\(\w+\)/)
+  })
+
+  // mupot#1529 round-1 P2(1): an uncapped match let a hostile/corrupted multi-megabyte
+  // <Code> value roughly double the thrown message's size for zero diagnostic benefit.
+  it('a 2 MB <Code> value is refused by the grammar check — never embedded in the thrown message', async () => {
+    const sha = 'e'.repeat(40)
+    const signingClient = fakeSigningClient()
+    const hugeCode = 'A'.repeat(2 * 1024 * 1024)
+    const fetchImpl = withNotYetPublishedPreCheck(() => new Response(`<Error><Code>${hugeCode}</Code></Error>`, { status: 500 }))
+    let thrown: unknown
+    try {
+      await putPotWorkerBundleObject({
+        accountId: 'acct',
+        bucket: 'mupot-pot-bundles',
+        releaseSha: sha,
+        bodyText: 'x',
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    const message = (thrown as Error).message
+    expect(message.length).toBeLessThan(200) // nowhere near 2 MB
+    expect(message).not.toContain(hugeCode)
+    expect(message).toBe(`R2 PUT '${sha}/worker.js' failed: HTTP 500`)
+  })
+
   // mupot#1524 round-2 P2-1: `If-None-Match: '*'` alone trusts the SERVER to enforce the
   // conditional write. This describe block covers the PRE-PUT read layer, which does not
   // depend on server enforcement at all.
