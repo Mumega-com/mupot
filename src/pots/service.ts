@@ -4,7 +4,7 @@
 // never wrote anywhere, and return `ok:true` — a success-shaped response for a tenant that
 // could not be reached, logged into, or queried (no schema). This file is the completion:
 // every step below is actually attempted, in order, fail-closed on the first failure, with
-// a receipt written for each one (`pot_provision_receipts`, migration 0163) and returned in
+// a receipt written for each one (`pot_provision_receipts`, migration 0164) and returned in
 // the response so a caller does not have to query the ledger separately to know what
 // happened on THIS call. `ok` is true if and only if every step below ran and the tenant
 // answered `/health` through the real dispatch path.
@@ -576,7 +576,7 @@ export async function verifyPotReachable(
   }
 }
 
-/** Best-effort append to `pot_provision_receipts` (migration 0163) on the ORCHESTRATOR's
+/** Best-effort append to `pot_provision_receipts` (migration 0164) on the ORCHESTRATOR's
  *  own D1 (`env.DB` — the same database that carries `pots`, migration 0145), never the
  *  tenant's new pot D1. A write failure here must not itself brick provisioning — the
  *  ledger is a durable AUDIT TRAIL, not a gate — but it never silently disappears from

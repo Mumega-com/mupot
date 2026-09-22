@@ -29,7 +29,7 @@ exactly where it stopped — every time, not just on the happy path.
 `ok` is `true` **only** when all six steps ran to completion, in order, and step 6 answered
 `200`. Any failure returns `status: 'incomplete'` with `completed` / `not_completed` /
 `orphaned_resources` naming exactly what happened, and a `pot_provision_receipts` row
-(migration `0163`, on the ORCHESTRATOR's own D1 — not the tenant's) per step, grouped by
+(migration `0164`, on the ORCHESTRATOR's own D1 — not the tenant's) per step, grouped by
 `run_id`. The in-call response's `receipts` array mirrors those rows, so a caller does not
 need to query the ledger separately.
 
