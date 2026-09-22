@@ -6,8 +6,8 @@ Mint a runner token → `check_in` in poll-mode → receive dispatched work via 
 resident daemon) can never receive dispatched work — need poll-mode presence + inbox
 delivery without a 180s heartbeat."
 
-**Status: NOT on `main`.** The implementation lives on open draft PR **kasra/poll-mode-runner-dispatch-v4**
-(branch `kasra/poll-mode-runner-dispatch-v4`, head `4cab640b`). **This branch supersedes
+**Status: NOT on `main`.** The implementation lives on open draft PR **#1522**,
+branch `kasra/poll-mode-runner-dispatch-v4`, head `4cab640b` (base). **#1522 supersedes
 #1514** ("fix(s1494): round 3 — pair-settlement is not a pre-authorization write", branch
 `kasra/poll-mode-runner-dispatch-v3`), which itself superseded #1501 ("Poll-mode presence +
 inbox delivery for runner onboarding (#1494)", branch `kasra/poll-mode-runner-dispatch-1494`,
