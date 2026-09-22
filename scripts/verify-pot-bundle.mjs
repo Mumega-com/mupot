@@ -18,12 +18,18 @@
 // which may be the current HEAD, a past release, or a release built on a different
 // machine entirely.
 //
-// Exit 0 + prints a `{"ok":true,...}` receipt on a verified match. Exit 1 + a
-// `{"ok":false,"reason":...}` receipt on any failure (missing object, missing metadata,
-// digest mismatch, transport error) — never a silent "looks fine" for a 200 that merely
-// proves the bytes were readable.
+// Exit 0 + prints a `{"ok":true,"key","sha256","size","timestamp"}` receipt on a verified
+// match. Exit 1 + a `{"ok":false,"reason":...}` receipt on any failure (missing object,
+// missing metadata, digest mismatch, transport error) — never a silent "looks fine" for a
+// 200 that merely proves the bytes were readable.
+//
+// The printed receipt NEVER includes `bucket`, `url`, or any other value that can trace
+// back to an environment variable (CodeQL js/clear-text-logging, 2026-09-22 — this file
+// used to blindly print the full result object, which carried a `CLOUDFLARE_ACCOUNT_ID`-
+// derived URL) — see `buildVerifyReceipt` in scripts/lib/pot-bundle-r2.mjs for the exact
+// allow-list.
 
-import { readR2PotBundlesCredentials, verifyPotWorkerBundleObject, POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT } from './lib/pot-bundle-r2.mjs'
+import { readR2PotBundlesCredentials, verifyPotWorkerBundleObject, buildVerifyReceipt, POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT } from './lib/pot-bundle-r2.mjs'
 
 function parseArgs(argv) {
   const opts = { releaseSha: null, bucket: null }
@@ -67,7 +73,7 @@ async function main() {
     secretAccessKey: creds.secretAccessKey,
   })
 
-  console.log(JSON.stringify(result))
+  console.log(JSON.stringify(buildVerifyReceipt(result)))
   process.exit(result.ok ? 0 : 1)
 }
 

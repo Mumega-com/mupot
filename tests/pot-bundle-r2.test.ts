@@ -23,6 +23,8 @@ import {
   readR2PotBundlesCredentials,
   putPotWorkerBundleObject,
   verifyPotWorkerBundleObject,
+  buildVerifyReceipt,
+  buildPublishReceipt,
 } from '../scripts/lib/pot-bundle-r2.mjs'
 
 // The digest/metadata-key contract this whole module exists to satisfy is defined in
@@ -216,7 +218,7 @@ describe('putPotWorkerBundleObject', () => {
       sha256: sha256HexOfUtf8Text('console.log(1)'),
       size: Buffer.byteLength('console.log(1)', 'utf8'),
       bucket: 'mupot-pot-bundles',
-      url: `https://acct.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
+      url: `https://<redacted-account>.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
       alreadyPublished: false,
     })
     expect(signingClient.sign).toHaveBeenCalledOnce()
@@ -415,7 +417,7 @@ describe('verifyPotWorkerBundleObject', () => {
       sha256: goodDigest,
       size: Buffer.byteLength(bodyText, 'utf8'),
       bucket: 'mupot-pot-bundles',
-      url: `https://acct.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
+      url: `https://<redacted-account>.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
     })
   })
 
@@ -522,5 +524,167 @@ describe('POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT', () => {
       /binding = "POT_WORKER_BUNDLE_BUCKET"\s*\n\s*bucket_name = "([^"]+)"/.exec(wranglerExample)
     expect(bindingBlockMatch, 'wrangler.example.toml must still declare the POT_WORKER_BUNDLE_BUCKET r2_buckets binding').not.toBeNull()
     expect(POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT).toBe(bindingBlockMatch![1])
+  })
+})
+
+// CodeQL js/clear-text-logging (high), 2026-09-22 — flagged scripts/verify-pot-bundle.mjs:70
+// (`console.log(JSON.stringify(result))`), where `result.url` was built directly from
+// `CLOUDFLARE_ACCOUNT_ID`. Covers both the redaction at the source (r2ObjectUrl's raw
+// output never reaching a returned receipt) and the printed-receipt allow-list functions
+// the two CLI scripts now use instead of ever printing a raw result/receipt object.
+describe('CodeQL js/clear-text-logging fix — no process.env value ever reaches a receipt', () => {
+  // Lowercase deliberately — a real Cloudflare account id is lowercase hex, and the WHATWG
+  // URL parser lowercases the hostname regardless, which would otherwise make the "the REAL
+  // request still carries it" assertion below fail on a case mismatch that has nothing to
+  // do with the redaction this test is actually proving.
+  const SENTINEL_ACCOUNT_ID = 'sentinel-account-id-9f8e7d6c5b4a'
+  const SENTINEL_BUCKET = 'sentinel-bucket-3d2c1b0a'
+
+  describe('redactedR2ObjectUrl (via putPotWorkerBundleObject / verifyPotWorkerBundleObject)', () => {
+    it('putPotWorkerBundleObject never returns the real accountId in its url field', async () => {
+      const sha = '5'.repeat(40)
+      const signingClient = { sign: vi.fn(async (req: Request) => req) }
+      const fetchImpl = vi.fn(async () => new Response('', { status: 200 }))
+      const receipt = await putPotWorkerBundleObject({
+        accountId: SENTINEL_ACCOUNT_ID,
+        bucket: SENTINEL_BUCKET,
+        releaseSha: sha,
+        bodyText: 'x',
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+      expect(receipt.url).not.toContain(SENTINEL_ACCOUNT_ID)
+      expect(receipt.url).toContain('<redacted-account>')
+      // The REAL fetch call must still go to the real, un-redacted endpoint — only the
+      // RETURNED receipt is redacted, never the actual request.
+      const signedReq = (signingClient.sign.mock.calls[0] as [Request])[0]
+      expect(signedReq.url).toContain(SENTINEL_ACCOUNT_ID)
+    })
+
+    it('verifyPotWorkerBundleObject never returns the real accountId in its url field', async () => {
+      const sha = '6'.repeat(40)
+      const bodyText = 'export default {}'
+      const digest = sha256HexOfUtf8Text(bodyText)
+      const signingClient = { sign: vi.fn(async (req: Request) => req) }
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(bodyText, {
+            status: 200,
+            headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: digest },
+          }),
+      )
+      const result = await verifyPotWorkerBundleObject({
+        accountId: SENTINEL_ACCOUNT_ID,
+        bucket: SENTINEL_BUCKET,
+        releaseSha: sha,
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+      expect(result.ok).toBe(true)
+      expect((result as { url: string }).url).not.toContain(SENTINEL_ACCOUNT_ID)
+      const signedReq = (signingClient.sign.mock.calls[0] as [Request])[0]
+      expect(signedReq.url).toContain(SENTINEL_ACCOUNT_ID)
+    })
+  })
+
+  describe('buildVerifyReceipt (scripts/verify-pot-bundle.mjs\'s printed receipt)', () => {
+    it('success: prints ONLY ok/key/sha256/size/timestamp — no bucket, no url, no account', () => {
+      const fakeResult = {
+        ok: true,
+        key: 'abc/worker.js',
+        sha256: 'deadbeef',
+        size: 123,
+        bucket: SENTINEL_BUCKET,
+        url: `https://${SENTINEL_ACCOUNT_ID}.r2.cloudflarestorage.com/${SENTINEL_BUCKET}/abc/worker.js`,
+      }
+      const receipt = buildVerifyReceipt(fakeResult, { now: () => '2026-09-22T00:00:00.000Z' })
+      expect(receipt).toEqual({ ok: true, key: 'abc/worker.js', sha256: 'deadbeef', size: 123, timestamp: '2026-09-22T00:00:00.000Z' })
+      const printed = JSON.stringify(receipt)
+      expect(printed).not.toContain(SENTINEL_ACCOUNT_ID)
+      expect(printed).not.toContain(SENTINEL_BUCKET)
+      expect(printed).not.toContain('bucket')
+      expect(printed).not.toContain('url')
+    })
+
+    it('failure: prints ONLY ok/reason — a reason string that happens to carry a sentinel still surfaces (this function trusts its caller\'s reason text; the library-level reason strings are separately tested to never carry an env value)', () => {
+      const receipt = buildVerifyReceipt({ ok: false, key: 'abc/worker.js', reason: 'no object published' })
+      expect(receipt).toEqual({ ok: false, reason: 'no object published' })
+    })
+  })
+
+  describe('buildPublishReceipt (scripts/publish-pot-bundle.mjs\'s printed receipt)', () => {
+    it('prints ONLY ok/key/sha256/size/already_published/timestamp — no bucket, no url, no account', () => {
+      const fakeReceipt = {
+        key: 'abc/worker.js',
+        sha256: 'deadbeef',
+        size: 123,
+        bucket: SENTINEL_BUCKET,
+        url: `https://${SENTINEL_ACCOUNT_ID}.r2.cloudflarestorage.com/${SENTINEL_BUCKET}/abc/worker.js`,
+        alreadyPublished: false,
+      }
+      const receipt = buildPublishReceipt(fakeReceipt, { now: () => '2026-09-22T00:00:00.000Z' })
+      expect(receipt).toEqual({
+        ok: true,
+        key: 'abc/worker.js',
+        sha256: 'deadbeef',
+        size: 123,
+        already_published: false,
+        timestamp: '2026-09-22T00:00:00.000Z',
+      })
+      const printed = JSON.stringify(receipt)
+      expect(printed).not.toContain(SENTINEL_ACCOUNT_ID)
+      expect(printed).not.toContain(SENTINEL_BUCKET)
+      expect(printed).not.toContain('bucket')
+      expect(printed).not.toContain('url')
+    })
+  })
+
+  it('end-to-end: a full publish-shaped call with sentinel accountId/bucket never leaks either through the printed receipt', async () => {
+    const sha = '7'.repeat(40)
+    const signingClient = { sign: vi.fn(async (req: Request) => req) }
+    const fetchImpl = vi.fn(async () => new Response('', { status: 200 }))
+    const receipt = await putPotWorkerBundleObject({
+      accountId: SENTINEL_ACCOUNT_ID,
+      bucket: SENTINEL_BUCKET,
+      releaseSha: sha,
+      bodyText: 'console.log("hi")',
+      accessKeyId: 'ak',
+      secretAccessKey: 'sk',
+      signingClient,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })
+    const printedReceipt = JSON.stringify(buildPublishReceipt(receipt, { now: () => '2026-09-22T00:00:00.000Z' }))
+    expect(printedReceipt).not.toContain(SENTINEL_ACCOUNT_ID)
+    expect(printedReceipt).not.toContain(SENTINEL_BUCKET)
+  })
+
+  it('end-to-end: a full verify-shaped call with sentinel accountId/bucket never leaks either through the printed receipt', async () => {
+    const sha = '8'.repeat(40)
+    const bodyText = 'console.log("hi")'
+    const digest = sha256HexOfUtf8Text(bodyText)
+    const signingClient = { sign: vi.fn(async (req: Request) => req) }
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(bodyText, {
+          status: 200,
+          headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: digest },
+        }),
+    )
+    const result = await verifyPotWorkerBundleObject({
+      accountId: SENTINEL_ACCOUNT_ID,
+      bucket: SENTINEL_BUCKET,
+      releaseSha: sha,
+      accessKeyId: 'ak',
+      secretAccessKey: 'sk',
+      signingClient,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })
+    const printedReceipt = JSON.stringify(buildVerifyReceipt(result, { now: () => '2026-09-22T00:00:00.000Z' }))
+    expect(printedReceipt).not.toContain(SENTINEL_ACCOUNT_ID)
+    expect(printedReceipt).not.toContain(SENTINEL_BUCKET)
   })
 })

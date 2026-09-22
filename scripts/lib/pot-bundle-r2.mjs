@@ -138,9 +138,26 @@ export function readR2PotBundlesCredentials(env = process.env) {
 }
 
 /** https://<account_id>.r2.cloudflarestorage.com/<bucket>/<key> — the R2 S3-compatible
- *  endpoint, path-style (account id as host, bucket as the first path segment). */
+ *  endpoint, path-style (account id as host, bucket as the first path segment). Used ONLY
+ *  to build the real request URL for signing/fetching — NEVER put into a returned receipt
+ *  object or a log line (see `REDACTED_ENDPOINT_HOST` below for the value that goes there
+ *  instead; CodeQL js/clear-text-logging, 2026-09-22, flagged `CLOUDFLARE_ACCOUNT_ID`
+ *  reaching `console.log` via exactly this path — `scripts/verify-pot-bundle.mjs` was
+ *  blindly `JSON.stringify`-ing a result object that carried this real URL). */
 export function r2ObjectUrl({ accountId, bucket, key }) {
   return `https://${accountId}.r2.cloudflarestorage.com/${bucket}/${encodeURIComponent(key).replace(/%2F/g, '/')}`
+}
+
+/** The account-id host segment, redacted — this is the ONLY form of the R2 endpoint that
+ *  may ever appear on a returned receipt object, in a thrown/logged message, or anywhere
+ *  else outside the one signed `Request` this module builds and hands to `fetchImpl`. */
+const REDACTED_ENDPOINT_HOST = '<redacted-account>.r2.cloudflarestorage.com'
+
+/** Same shape as `r2ObjectUrl`, with the account id replaced — this is what
+ *  `putPotWorkerBundleObject`/`verifyPotWorkerBundleObject` put on their RETURNED receipt
+ *  objects, never the real, account-bearing URL. */
+function redactedR2ObjectUrl({ bucket, key }) {
+  return `https://${REDACTED_ENDPOINT_HOST}/${bucket}/${encodeURIComponent(key).replace(/%2F/g, '/')}`
 }
 
 /** Builds the SigV4 signing client. Isolated behind a function (rather than constructed
@@ -244,7 +261,7 @@ export async function putPotWorkerBundleObject({
       fetchImpl,
     })
     if (existing.ok && existing.sha256 === sha256) {
-      return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url, alreadyPublished: true }
+      return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: true }
     }
     throw new BundleShaConflictError(
       `refusing to publish '${key}': an object already exists there with a DIFFERENT digest ` +
@@ -259,7 +276,7 @@ export async function putPotWorkerBundleObject({
     const text = redactS3ErrorBody(await res.text().catch(() => ''))
     throw new Error(`R2 PUT '${key}' failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 500)}` : ''}`)
   }
-  return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url, alreadyPublished: false }
+  return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: false }
 }
 
 /**
@@ -312,5 +329,44 @@ export async function verifyPotWorkerBundleObject({
       actualSha256,
     }
   }
-  return { ok: true, key, sha256: actualSha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url }
+  return { ok: true, key, sha256: actualSha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }) }
+}
+
+// ── Printed-receipt shaping (CodeQL js/clear-text-logging, 2026-09-22) ──
+//
+// scripts/verify-pot-bundle.mjs used to `console.log(JSON.stringify(result))` — the FULL
+// object `verifyPotWorkerBundleObject` returns, which (before this fix) carried a `url`
+// field built directly from `CLOUDFLARE_ACCOUNT_ID`. CodeQL's js/clear-text-logging flagged
+// exactly that data flow: an environment-derived value reaching a log sink. Redacting the
+// account id inside `url` (above) closes the immediate hole, but the durable fix is that
+// NEITHER CLI script ever prints a whole result/receipt object again — each builds its
+// printed JSON from an explicit field allow-list instead. On success: object key, sha256,
+// size, and a timestamp — never `bucket` (can carry `POT_WORKER_BUNDLE_R2_BUCKET`) and
+// never `url`/`endpoint` (even redacted — simplest to just not print it at all). On
+// failure: the `reason` string only, which this module's own functions already keep free
+// of every environment-derived value (grepped and tested).
+
+/** Builds the JSON receipt `scripts/verify-pot-bundle.mjs` prints, from an explicit
+ *  allow-list of fields on `result` (the return value of `verifyPotWorkerBundleObject`) —
+ *  never the raw `result` object itself. `now` is injectable for deterministic tests. */
+export function buildVerifyReceipt(result, { now = () => new Date().toISOString() } = {}) {
+  if (result.ok) {
+    return { ok: true, key: result.key, sha256: result.sha256, size: result.size, timestamp: now() }
+  }
+  return { ok: false, reason: result.reason }
+}
+
+/** Builds the JSON receipt `scripts/publish-pot-bundle.mjs` prints on a successful publish,
+ *  from an explicit allow-list of fields on `receipt` (the return value of
+ *  `putPotWorkerBundleObject`) — never the raw `receipt` object itself. `now` is injectable
+ *  for deterministic tests. */
+export function buildPublishReceipt(receipt, { now = () => new Date().toISOString() } = {}) {
+  return {
+    ok: true,
+    key: receipt.key,
+    sha256: receipt.sha256,
+    size: receipt.size,
+    already_published: receipt.alreadyPublished,
+    timestamp: now(),
+  }
 }

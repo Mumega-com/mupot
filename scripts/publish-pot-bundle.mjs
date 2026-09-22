@@ -17,7 +17,11 @@
 // docs/workflows/tenant-provision.md "Minting the R2 credential pair" for why (Athena
 // round-1 ruling, 2026-09-22) and exactly how an operator mints and stores the pair.
 // Neither credential value ever appears in argv or in any printed/logged output — a
-// missing/blank var is refused by NAME only, before the bundle is even built.
+// missing/blank var is refused by NAME only, before the bundle is even built. The success
+// receipt is likewise built from an explicit field allow-list (object key, sha256, size,
+// already_published, timestamp) — NEVER `bucket` or the endpoint URL, both of which can
+// trace back to an environment variable (CodeQL js/clear-text-logging, 2026-09-22 — see
+// buildPublishReceipt in scripts/lib/pot-bundle-r2.mjs).
 //
 // Refuses to publish from a dirty working tree, or when --release-sha/RELEASE_SHA does not
 // exactly match `git rev-parse HEAD` — the same discipline scripts/deploy.mjs applies
@@ -42,6 +46,7 @@ import {
   assertPublishPreconditions,
   readR2PotBundlesCredentials,
   putPotWorkerBundleObject,
+  buildPublishReceipt,
 } from './lib/pot-bundle-r2.mjs'
 import { matchConfigFlag } from './lib/wrangler-config-arg.mjs'
 
@@ -136,7 +141,9 @@ async function main() {
   }
   const bodyText = readBuiltBundle(outdir)
 
-  console.error(`→ publishing to r2://${bucket}/${releaseSha}/worker.js ...`)
+  // Never echo `bucket` (can carry POT_WORKER_BUNDLE_R2_BUCKET) — CodeQL js/clear-text-
+  // logging, 2026-09-22. The release sha alone is enough to identify which publish this is.
+  console.error(`→ publishing bundle for release ${releaseSha} ...`)
   let receipt
   try {
     receipt = await putPotWorkerBundleObject({
@@ -159,16 +166,10 @@ async function main() {
     process.exit(1)
   }
 
-  console.log(
-    JSON.stringify({
-      ok: true,
-      bucket: receipt.bucket,
-      key: receipt.key,
-      sha256: receipt.sha256,
-      size: receipt.size,
-      already_published: receipt.alreadyPublished,
-    }),
-  )
+  // Never print `receipt.bucket` or `receipt.url` — see buildPublishReceipt's own doc
+  // comment (scripts/lib/pot-bundle-r2.mjs) for why (CodeQL js/clear-text-logging,
+  // 2026-09-22): only an explicit field allow-list is printed, never the raw receipt.
+  console.log(JSON.stringify(buildPublishReceipt(receipt)))
 }
 
 main().catch((err) => {
