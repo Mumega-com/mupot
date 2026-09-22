@@ -1158,3 +1158,93 @@ export async function upsertCapabilityGrant(
 
   return { grant, result }
 }
+
+// ── home-on-first-contact, channel-agnostic (mupot#1504) ──────────────────────
+//
+// provisionHomeForMember — the ONE write path for a member's home-squad
+// provisioning, callable from ANY channel that can observe an unambiguous
+// "this member now exists / just made first contact" event. Originally
+// `provisionHomeOnFirstContact` (FP-01 Slice 2 v2 round 2, P1-a), scoped to
+// IM only and living in src/im/index.ts; mupot#1504 renamed and moved it
+// here — src/members is the shared members-service home both the JSON API
+// and the server-rendered dashboard already import from (see this file's own
+// header) — and added a `channel` argument so the SAME function, not a
+// second copy of its idempotency/receipt logic, covers the web invite-accept
+// door too. "Web onboarding door never creates the member's home squad — a
+// web-only member has no private space" is exactly the bug this closes.
+//
+// CALLERS (exactly two, both after the member row + its capability grant are
+// already durably committed):
+//   (a) src/dashboard/invite.ts's POST /invite/:id handler, right after
+//       acceptInvite(...) succeeds — the web onboarding door.
+//   (b) src/im/index.ts's handleImMessage 'join' case, right after a
+//       Telegram project-invite redemption succeeds — unchanged behaviour,
+//       same call shape as before the move, just renamed and re-imported.
+// Never call this from a read-only/status path (memberIntakeEnvelope's own
+// doc comment explains why: an unauthenticated-adjacent probe replayed
+// against a homeless member must never be able to mint repeated 'failed'
+// rows into an append-only audit table).
+//
+// IDEMPOTENT: an existing home is a pure read (getMemberHomeSquad), no write
+// attempted, no receipt written — the second caller (whichever channel a
+// member touches second) is a guaranteed no-op, never a second home or a
+// second receipt row (see createHomeForMember's own doc comment for why two
+// homes per human is structurally impossible regardless of caller).
+//
+// RECEIPTED ONLY ON SUCCESS: migrations/0161 (member_home_provisioning_receipts,
+// widened by 0163 to admit `channel IN ('web','im')`) gets a row on
+// disposition 'created' or 'existing' — i.e. only when createHomeForMember
+// itself returned ok:true. A FAILED provisioning attempt writes nothing (no
+// receipt, no partial row) — same "audit success, not attempts" doctrine the
+// original IM-only version established, so a transient failure can never
+// accumulate unbounded rows in an append-only table, and the CALLER's own
+// success (accepting the invite / joining the project) is never blocked or
+// rolled back by a provisioning failure — see both call sites: neither
+// awaits this function's result as a gate on their own response.
+export type HomeProvisioningChannel = 'web' | 'im'
+
+export async function provisionHomeForMember(
+  env: Env,
+  memberId: string,
+  channel: HomeProvisioningChannel,
+): Promise<void> {
+  // Dynamic import: src/org/service.ts does not import this module, so a
+  // static import would be safe today, but the original (src/im/index.ts)
+  // used a dynamic import to keep src/members/service.ts free of a
+  // compile-time dependency on the org component from a module several
+  // other files (agent-access.ts, index.ts) already import type-only from —
+  // kept identical here rather than changing a working, reviewed pattern as
+  // a side effect of the move.
+  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
+
+  // Both lookup steps are wrapped so a genuine (non-'member_not_found'-shaped)
+  // failure — e.g. createHomeForMember's own re-thrown non-unique-violation
+  // batch error — is LOGGED but never propagates into the caller: neither
+  // the web accept response nor the IM join reply is allowed to fail
+  // because home provisioning did. This is the "failure → caller still
+  // succeeds, zero receipts" contract mupot#1504 requires of both callers.
+  let home: Awaited<ReturnType<typeof getMemberHomeSquad>>
+  try {
+    home = await getMemberHomeSquad(env, memberId)
+  } catch (err) {
+    console.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', { memberId, channel, err })
+    return
+  }
+  if (home) return // idempotent: already has one — no write, no receipt.
+
+  let created: Awaited<ReturnType<typeof createHomeForMember>>
+  try {
+    created = await createHomeForMember(env, memberId)
+  } catch (err) {
+    console.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', { memberId, channel, err })
+    return
+  }
+  if (!created.ok) return // failed provisioning (e.g. member_not_found) — no receipt row, caller still succeeds.
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, channel, created.disposition).run()
+  } catch { /* best-effort audit write; never blocks the caller's own reply */ }
+}

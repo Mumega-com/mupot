@@ -3000,9 +3000,30 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_verdicts_no_update" },
     ],
   },
+  {
+    file: "0163_member_home_provisioning_receipts_web_channel.sql",
+    sha256: "e9bf339c4cab07f7077ef1fb0cf83410d8dfe454520810a46284ca0eb7a04e25",
+    statements: [
+      "-- 0163_member_home_provisioning_receipts_web_channel.sql — widen\n-- member_home_provisioning_receipts.channel to admit 'web' alongside the IM\n-- channel (mupot#1504: \"Web onboarding door never creates the member's home\n-- squad\"). NOT applied by this build — branch/schema only, exactly like\n-- 0143/.../0162 before it; a human applies it.\n--\n-- THE BUG THIS CLOSES\n--\n-- 0161 shipped member_home_provisioning_receipts with\n-- `channel TEXT NOT NULL DEFAULT 'telegram' CHECK (channel IN ('telegram'))`\n-- — a column that exists but a CHECK that hard-refuses every value except\n-- the one IM caller. #1504's fix makes createHomeForMember's caller-side\n-- wrapper (renamed provisionHomeOnFirstContact -> provisionHomeForMember,\n-- src/members/service.ts) channel-agnostic and calls it from the web invite-\n-- accept path too (src/dashboard/invite.ts) — that INSERT would raise\n-- CHECK constraint failed the instant a web accept tried to write 'web'.\n-- Since 0161 is unapplied everywhere (branch/schema only, per its own\n-- header) there is no live data to migrate; this widens the constraint\n-- before anyone ever depends on the narrower one.\n--\n-- Also RENAMES the IM channel's own literal from 'telegram' to 'im' —\n-- provisionHomeForMember's whole point is that the write path no longer\n-- knows or cares which specific IM provider redeemed the invite (Telegram\n-- today, something else tomorrow); 'im' names the CHANNEL, not the vendor,\n-- matching ConnectionChannel's own 'im' literal (src/types.ts) used\n-- everywhere else a channel is recorded for a human principal.\n--\n-- SQLite has no ALTER COLUMN / ALTER CONSTRAINT, so the fix is the same\n-- table-rebuild migrations/0042 (tasks.status) and 0158 (routine_run_actions\n-- .kind) already used for exactly this shape of change: rebuild the table\n-- with every column, index, and trigger unchanged except the widened CHECK\n-- and the new default. No other migration has touched\n-- member_home_provisioning_receipts since it was created in 0161 (verified:\n-- grep for \"ALTER TABLE member_home_provisioning_receipts\" or\n-- \"member_home_provisioning_receipts_new\" across migrations/ returns\n-- nothing before this file), so the rebuild's column list is a straight\n-- copy of 0161's.\n\nPRAGMA foreign_keys = off;",
+      "\n\nCREATE TABLE member_home_provisioning_receipts_new (\n  id           TEXT NOT NULL PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  member_id    TEXT NOT NULL,\n  squad_id     TEXT,                          -- the home squad id; NULL when disposition = 'failed'\n  channel      TEXT NOT NULL DEFAULT 'im' CHECK (channel IN ('web', 'im')),\n  disposition  TEXT NOT NULL CHECK (disposition IN ('created', 'existing', 'failed')),\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nINSERT INTO member_home_provisioning_receipts_new (\n  id, tenant, member_id, squad_id, channel, disposition, created_at\n)\nSELECT\n  id, tenant, member_id, squad_id,\n  CASE WHEN channel = 'telegram' THEN 'im' ELSE channel END,\n  disposition, created_at\nFROM member_home_provisioning_receipts;",
+      "\n\nDROP TABLE member_home_provisioning_receipts;",
+      "\nALTER TABLE member_home_provisioning_receipts_new RENAME TO member_home_provisioning_receipts;",
+      "\n\n-- Index dropped with the table above — recreated verbatim from 0161.\nCREATE INDEX IF NOT EXISTS idx_member_home_provisioning_receipts_member\n  ON member_home_provisioning_receipts(member_id, created_at DESC);",
+      "\n\n-- Triggers dropped with the table above — recreated verbatim from 0161.\nCREATE TRIGGER IF NOT EXISTS member_home_provisioning_receipts_no_update\n  BEFORE UPDATE ON member_home_provisioning_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'member_home_provisioning_receipts is append-only');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS member_home_provisioning_receipts_no_delete\n  BEFORE DELETE ON member_home_provisioning_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'member_home_provisioning_receipts is append-only');\nEND;",
+      "\n\nPRAGMA foreign_keys = on;",
+    ],
+    objects: [
+      { type: "table", name: "member_home_provisioning_receipts_new" },
+      { type: "index", name: "idx_member_home_provisioning_receipts_member" },
+      { type: "trigger", name: "member_home_provisioning_receipts_no_update" },
+      { type: "trigger", name: "member_home_provisioning_receipts_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "4f0376452a4710a1d3a56d7067594bfab061a484cc8f294e051e7152d4c866b9"
+export const SCHEMA_CHAIN_DIGEST: string = "cb55d79989166c1eb9103b813724f1bc1cdd8570e527dac17a3501bdf652275c"

@@ -24,6 +24,7 @@ import { html, raw as honoRaw } from 'hono/html'
 import { setCookie } from 'hono/cookie'
 import type { Env, Capability } from '../types'
 import { acceptInvite, protectRawTokenResponse } from '../members'
+import { provisionHomeForMember } from '../members/service'
 import {
   PENDING_INVITE_COOKIE,
   PENDING_INVITE_KV_PREFIX,
@@ -305,6 +306,19 @@ inviteApp.post('/:id', async (c) => {
       409,
     )
   }
+
+  // mupot#1504: "Web onboarding door never creates the member's home
+  // squad" — the member row + capability grant are now durably committed
+  // (acceptInvite's own atomic batch, above), so this is the ONE
+  // unambiguous first-contact event the web door can observe. Same
+  // channel-agnostic function IM's 'join' case calls (src/members/service.ts,
+  // src/im/index.ts) — idempotent (a member who later also joins via
+  // Telegram gets no second home, no second receipt) and best-effort: a
+  // provisioning failure never blocks or rolls back this accept, and writes
+  // no receipt row (member_home_provisioning_receipts is receipted on
+  // success only). Not awaited-for-effect on the response below — the
+  // redirect to /auth/login happens regardless of provisioning outcome.
+  await provisionHomeForMember(c.env, result.value.member_id, 'web')
 
   // mupot#1436 A2 (gated, not built here): stash a short-lived pointer to the
   // just-minted member so a follow-on login can link the two.
