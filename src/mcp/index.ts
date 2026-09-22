@@ -146,6 +146,12 @@ import {
   getFleetAgentLiveness,
   derivePresence,
   presenceTtlSec,
+  clampPollIntervalSec,
+  pollPresenceTtlSec,
+  upsertPollFleetPresence,
+  touchPollFleetPresence,
+  POLL_PRESENCE_MODE,
+  RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
@@ -957,6 +963,9 @@ const toolTaskList: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // mupot#1494 — a polling runner lives on task_list; refresh its fleet presence window on
+    // every call, valid or not (the caller genuinely polled). No-op for every non-poll agent.
+    await touchPollFleetPresence(env, auth.boundAgentId)
     const squadRes = await resolveTaskSquad(env, auth, args)
     if (!squadRes.ok) return squadRes
     const status = args.status
@@ -2141,16 +2150,28 @@ const toolTaskDispatch: ToolSpec = {
   name: 'task_dispatch',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string }',
+  args: '{ task_id: string, delivery?: "inbox" }',
   inputSchema: {
     type: 'object',
-    properties: { task_id: STRING_SCHEMA },
+    properties: {
+      task_id: STRING_SCHEMA,
+      // mupot#1494 — force the inbox route regardless of the target's registered/derived
+      // liveness. Consulted by src/bus/consumer.ts's resolveDispatchDeliveryMode.
+      delivery: { type: 'string', enum: ['inbox'] },
+    },
     required: ['task_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    // validateArgs (the shared dispatcher gate) does not enforce inputSchema `enum` — a
+    // decision-branching field like `delivery` is rejected here rather than silently ignored,
+    // so a caller's typo can never be mistaken for "delivery not forced".
+    if (args.delivery !== undefined && args.delivery !== null && args.delivery !== 'inbox') {
+      return fail(400, 'invalid_args', 'delivery must be "inbox"')
+    }
+    const forceInboxDelivery = args.delivery === 'inbox'
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
 
@@ -2185,13 +2206,18 @@ const toolTaskDispatch: ToolSpec = {
       dispatchedAt,
     ).run()
 
-    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; delivery?: 'inbox' }> = {
       type: 'agent.wake',
       tenant: env.TENANT_SLUG,
       squad_id: task.squad_id,
       agent_id: task.assignee_agent_id,
       actor: memberActor(memberId),
-      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
+      payload: {
+        task_id: task.id,
+        by: memberId,
+        dispatch_receipt_id: receiptId,
+        ...(forceInboxDelivery ? { delivery: 'inbox' as const } : {}),
+      },
       ts: dispatchedAt,
     }
     try {
@@ -2251,12 +2277,16 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
   name: 'task_dispatch_runtime_receipt',
   scope: 'assigned task runtime receipt',
   min: 'member',
-  args: '{ task_id, dispatch_receipt_id, message_id, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
+  args: '{ task_id, dispatch_receipt_id, message_id?, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       dispatch_receipt_id: STRING_SCHEMA,
+      // mupot#1494 — optional: a task_list-polling runner never observes a raw agent_messages
+      // id. When omitted, recordTaskDispatchRuntimeReceipt resolves it from
+      // {task_id, dispatch_receipt_id} via the same convention deliverDispatchToInbox used to
+      // write the message (src/tasks/runtime-receipts.ts resolveMessageId).
       message_id: STRING_SCHEMA,
       stage: { type: 'string', enum: ['runtime_consumed', 'completed', 'failed'] },
       runtime_receipt_hash: STRING_SCHEMA,
@@ -2269,7 +2299,6 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
     required: [
       'task_id',
       'dispatch_receipt_id',
-      'message_id',
       'stage',
       'runtime_receipt_hash',
       'attempt',
@@ -3677,6 +3706,9 @@ const toolInbox: ToolSpec = {
         enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
       })
     }
+    // mupot#1494 — a polling runner lives on inbox; refresh its fleet presence window on every
+    // poll. No-op for every non-poll agent (touchPollFleetPresence's WHERE clause).
+    await touchPollFleetPresence(env, agent)
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3811,6 +3843,9 @@ const toolInboxLease: ToolSpec = {
         enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
       })
     }
+    // mupot#1494 — a polling runner lives on inbox_lease; refresh its fleet presence window on
+    // every poll. No-op for every non-poll agent (touchPollFleetPresence's WHERE clause).
+    await touchPollFleetPresence(env, agent)
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -4290,7 +4325,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string }',
+  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4304,6 +4339,10 @@ const toolCheckIn: ToolSpec = {
       provider: STRING_SCHEMA,
       effort: { type: 'string', enum: [...SEVEN_AXIS_EFFORTS] },
       flight_id: STRING_SCHEMA,
+      // mupot#1494 — a polling runner (no resident heartbeat daemon) declares its own delivery
+      // cadence so task_dispatch can route it an inbox envelope without a 180s heartbeat.
+      presence_mode: { type: 'string', enum: [POLL_PRESENCE_MODE, RESIDENT_PRESENCE_MODE] },
+      poll_interval_sec: { type: 'number' },
     },
     additionalProperties: false,
   },
@@ -4313,9 +4352,48 @@ const toolCheckIn: ToolSpec = {
         return fail(400, 'invalid_args', `${key} must be a string`)
       }
     }
+    if (args.poll_interval_sec !== undefined && args.poll_interval_sec !== null && typeof args.poll_interval_sec !== 'number') {
+      return fail(400, 'invalid_args', 'poll_interval_sec must be a number')
+    }
+    // validateArgs (the shared dispatcher gate) does not enforce inputSchema `enum` — every
+    // enum-shaped field in this codebase is hand-validated in its own tool's run() (see
+    // `harness`/`effort` above, normalized rather than rejected). presence_mode is a real branch
+    // point (it decides whether a fleet row gets created/updated), so an unrecognized value is
+    // REJECTED here rather than silently normalized.
+    if (
+      args.presence_mode !== undefined && args.presence_mode !== null
+      && args.presence_mode !== POLL_PRESENCE_MODE && args.presence_mode !== RESIDENT_PRESENCE_MODE
+    ) {
+      return fail(400, 'invalid_args', `presence_mode must be "${POLL_PRESENCE_MODE}" or "${RESIDENT_PRESENCE_MODE}"`)
+    }
 
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
+
+    // mupot#1494 — establish/refresh poll-mode fleet presence BEFORE the debounce return below:
+    // this is a completely separate write path (fleet_agents, not the presence table the KV key
+    // debounces), and a caller polling every poll_interval_sec must have its TTL genuinely reset
+    // on every call, never silently skipped by the presence-table's unrelated 30s debounce.
+    let pollPresence: { presence_mode: 'poll'; poll_interval_sec: number; presence_ttl_sec: number } | undefined
+    if (args.presence_mode === POLL_PRESENCE_MODE) {
+      if (!auth.boundAgentId) {
+        return fail(400, 'invalid_args', 'presence_mode: poll requires an agent-bound credential')
+      }
+      const pollIntervalSec = clampPollIntervalSec(args.poll_interval_sec)
+      const ttlSec = pollPresenceTtlSec(pollIntervalSec)
+      await upsertPollFleetPresence(env, {
+        agentId: auth.boundAgentId,
+        display: id.displayName,
+        memberId: id.memberId,
+        ttlSec,
+      })
+      pollPresence = { presence_mode: 'poll', poll_interval_sec: pollIntervalSec, presence_ttl_sec: ttlSec }
+    } else {
+      // Not (re-)establishing this call — still slide the TTL window forward if this agent is
+      // ALREADY poll-registered from an earlier check_in (cheap: touchPollFleetPresence's WHERE
+      // clause makes this a no-op for every other agent, including every resident one).
+      await touchPollFleetPresence(env, auth.boundAgentId)
+    }
 
     const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
     const axis = normalizeSevenAxis({
@@ -4381,6 +4459,7 @@ const toolCheckIn: ToolSpec = {
             },
           }
         : {}),
+      ...(pollPresence ?? {}),
     }
 
     try {
@@ -4764,7 +4843,13 @@ const toolFleetAgentGet: ToolSpec = {
 
     const routeInfo = await getFleetAgentLiveness(env, targetAgent.id)
     const row = await readFleetAgentRow(env, targetAgent.id)
-    const ttlSec = presenceTtlSec(env)
+    // Per-row TTL (poll-mode, mupot#1494) wins when the row declares one — mirrors
+    // getFleetAgentLiveness exactly, so this read-only view never disagrees with the actual
+    // dispatch-routing decision. Resident/legacy rows (presence_ttl_sec unset) keep reading the
+    // one global window, unchanged.
+    const ttlSec = typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
+      ? row.presence_ttl_sec
+      : presenceTtlSec(env)
     const status = String(row?.status ?? 'unknown')
     const lastReportedAt = String(row?.last_reported_at ?? '')
     const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
@@ -4776,6 +4861,7 @@ const toolFleetAgentGet: ToolSpec = {
       runtime: routeInfo.runtime,
       status: row?.status ?? null,
       last_reported_at: row?.last_reported_at ?? null,
+      presence_mode: row?.presence_mode || '',
       presence_ttl_sec: ttlSec,
       derived_presence: derivedPresence,
       live: routeInfo.live,
@@ -5667,6 +5753,14 @@ export async function invokeTool(
       ctx.waitUntil(touchPromise)
     }
   }
+
+  // Poll-mode fleet presence (mupot#1494): a poll-registered agent's fleet_agents.last_reported_at
+  // is also refreshed inline by the specific tools a polling runner actually lives on — inbox,
+  // inbox_lease and task_list (see each tool's own run()) — so this dispatcher-level chokepoint
+  // does not need its own copy of that write. Kept narrow (named tools only, not every tool call)
+  // deliberately: touchPollFleetPresence is cheap and self-guarding, but the SMALLEST correct
+  // surface is the one a polling runner's actual poll loop exercises, not every MCP call site in
+  // the codebase.
 
   return { ...outcome, tool: spec.name }
 }

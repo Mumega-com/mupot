@@ -22,10 +22,12 @@ describe('task_dispatch_runtime_receipt MCP contract', () => {
         result: { type: ['string', 'null'] },
         reason: { type: ['string', 'null'] },
       },
+      // mupot#1494 — message_id is now OPTIONAL: {task_id, dispatch_receipt_id} alone is
+      // sufficient (recordTaskDispatchRuntimeReceipt resolves the message from the same
+      // dispatch-inbox:<receipt id> convention deliverDispatchToInbox writes it under).
       required: [
         'task_id',
         'dispatch_receipt_id',
-        'message_id',
         'stage',
         'runtime_receipt_hash',
         'attempt',

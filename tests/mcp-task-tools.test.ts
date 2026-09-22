@@ -1385,6 +1385,41 @@ describe('MCP task cutover tools', () => {
     expect(updates.filter((update) => update.sql.includes('INSERT INTO task_dispatch_receipts'))).toHaveLength(1)
   })
 
+  // mupot#1494 — task_dispatch({ delivery: 'inbox' }) forces the bus consumer's routing
+  // decision (src/bus/consumer.ts resolveDispatchDeliveryMode) regardless of the target's
+  // derived liveness. The tool itself only needs to thread the flag onto the emitted event.
+  it("task_dispatch({ delivery: 'inbox' }) threads delivery:'inbox' onto the emitted wake event", async () => {
+    const { env, events } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1', delivery: 'inbox' }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'agent.wake',
+        payload: expect.objectContaining({ task_id: 'task-1', delivery: 'inbox' }),
+      }),
+    ])
+  })
+
+  it('task_dispatch WITHOUT delivery does not add a delivery key to the emitted payload at all (never a stray undefined/false)', async () => {
+    const { env, events } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    const payload = (events[0] as { payload: Record<string, unknown> }).payload
+    expect(Object.prototype.hasOwnProperty.call(payload, 'delivery')).toBe(false)
+  })
+
+  it('task_dispatch rejects an unrecognized delivery value', async () => {
+    const { env } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1', delivery: 'carrier-pigeon' }, 'https://pot.example')
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('invalid_args')
+  })
+
   it('task_dispatch refuses an unassigned task without emitting a wake', async () => {
     const { env, events } = makeEnv([task()])
 

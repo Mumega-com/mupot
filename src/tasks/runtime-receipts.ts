@@ -2,6 +2,7 @@ import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
+import { dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
@@ -201,9 +202,38 @@ function publicTimelineReceipt(row: ReceiptRow): PublicTaskDispatchRuntimeReceip
   }
 }
 
+/**
+ * resolveMessageId — mupot#1494: accept `{task_id, dispatch_receipt_id}` as an alternative
+ * correlator to `message_id`. A runner that polls `task_list` (see the runner-onboarding
+ * playbook) rather than `inbox`/`inbox_lease` never observes a raw `agent_messages.id` — only
+ * the task and the receipt it was dispatched under — so `message_id` may be omitted and is
+ * resolved here from the SAME convention `deliverDispatchToInbox` (src/bus/fleet-bridge.ts)
+ * used to WRITE the message: `from_agent='mupot-dispatch'`, `request_id='dispatch-inbox:<receipt
+ * id>'`. This is not a shortcut around validation — `validateEnvelope` below re-checks that
+ * exact `message_request_id` invariant regardless of which path supplied the id, and the
+ * subsequent JOIN in `loadDelivery` still requires the resolved message to belong to THIS
+ * task_id/dispatch_receipt_id pair (a mismatched pair — a real receipt whose task_id disagrees
+ * with the caller's — fails that JOIN and surfaces as `runtime_delivery_not_found`, same as
+ * today). Same authz as today: this only changes how the delivery row is FOUND, never who may
+ * call recordTaskDispatchRuntimeReceipt.
+ */
+async function resolveMessageId(
+  env: Env,
+  dispatchReceiptId: string,
+  providedMessageId: string,
+): Promise<string> {
+  if (providedMessageId) return providedMessageId
+  const row = await env.DB.prepare(
+    `SELECT id FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(dispatchReceiptId)).first<{ id: string }>()
+  if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
+  return row.id
+}
+
 async function loadDelivery(
   env: Env,
   input: RecordTaskDispatchRuntimeReceiptInput,
+  messageId: string,
 ): Promise<DeliveryRow> {
   const row = await env.DB.prepare(`
     SELECT
@@ -235,7 +265,7 @@ async function loadDelivery(
       AND dispatch.agent_id = task.assignee_agent_id
       AND dispatch.squad_id = task.squad_id
     LIMIT 1
-  `).bind(input.messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId)
+  `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId)
     .first<DeliveryRow>()
   if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   return row
@@ -301,7 +331,13 @@ export async function recordTaskDispatchRuntimeReceipt(
     || !Number.isInteger(input.attempt) || input.attempt < 1 || input.attempt > 5
     || !SHA256_RE.test(text(input.runtimeReceiptHash, 64))
   ) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
-  text(input.taskId, 200); text(input.dispatchReceiptId, 200); text(input.messageId, 200)
+  text(input.taskId, 200); text(input.dispatchReceiptId, 200)
+  // mupot#1494 — message_id is now OPTIONAL: a caller that only knows {task_id,
+  // dispatch_receipt_id} (a task_list-polling runner — see resolveMessageId's doc comment)
+  // resolves it here, once, and every use below (the delivery JOIN, the request digest, the
+  // audit evidence, the stored receipt row) is consistent on the SAME resolved id regardless of
+  // which correlator the caller actually supplied.
+  const messageId = text(await resolveMessageId(env, input.dispatchReceiptId, input.messageId), 200)
   const artifactRefs = (input.artifactRefs ?? []).map((value) => text(value, 2000))
   if (artifactRefs.length > 20 || new Set(artifactRefs).size !== artifactRefs.length) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
@@ -318,7 +354,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   const requestJson = canonicalJson({
     task_id: input.taskId,
     dispatch_receipt_id: input.dispatchReceiptId,
-    message_id: input.messageId,
+    message_id: messageId,
     stage: input.stage,
     runtime_receipt_hash: input.runtimeReceiptHash,
     attempt: input.attempt,
@@ -350,7 +386,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   `).bind(credentialId, memberId, agentId, env.TENANT_SLUG, now).first<{ id: string }>()
   if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
 
-  const delivery = await loadDelivery(env, input)
+  const delivery = await loadDelivery(env, input, messageId)
   if (delivery.dispatch_agent_id !== agentId || delivery.task_assignee_agent_id !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
@@ -396,7 +432,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   const requestId = `task-runtime-receipt:${input.dispatchReceiptId}:${input.stage}:${input.attempt}`
   const evidence = canonicalJson({
     dispatch_receipt_id: input.dispatchReceiptId,
-    message_id: input.messageId,
+    message_id: messageId,
     stage: input.stage,
     attempt: input.attempt,
     request_digest: requestDigest,
@@ -513,7 +549,7 @@ export async function recordTaskDispatchRuntimeReceipt(
           artifact_sha256, result, reason, audit_entry_id, created_at
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
       `).bind(receiptId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId,
-        agentId, input.messageId, memberId, credentialId, input.stage, input.attempt,
+        agentId, messageId, memberId, credentialId, input.stage, input.attempt,
         runtimeAddress, input.runtimeReceiptHash, requestDigest, JSON.stringify(artifactRefs),
         artifactSha256, result, reason, auditId, now),
     ])
