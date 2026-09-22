@@ -933,7 +933,17 @@ export async function verifyPotReachable(
  * is every call site's shape, by construction, not by convention.
  */
 export function receiptOk(fields: Record<string, unknown> = {}): string {
-  return boundSerializedDetail({ ok: true, ...redactFields(fields) })
+  // mupot#1523 round-2 P1 (item 5): receiptOk/receiptError must be TOTAL — a call site
+  // building a receipt has already failed once (or is about to report success); it must
+  // never ALSO throw while doing so. redactDeep is defensive on its own (Invalid Date,
+  // BigInt, circular references, throwing getters), but this catch is the backstop for
+  // whatever that defense missed — an oversized/malformed receipt is still better than an
+  // uncaught exception replacing the step's actual outcome.
+  try {
+    return boundSerializedDetail({ ok: true, ...redactFields(fields) })
+  } catch (err) {
+    return JSON.stringify({ ok: true, truncated: true, note: `receipt detail construction failed: ${errMsg(err)}` })
+  }
 }
 
 /** Maximum length of a `receiptError` message AFTER redaction — see `redactAndBound`. */
@@ -981,26 +991,39 @@ const MAX_DETAIL_SERIALIZED_LENGTH = 64 * 1024
 // change — they are still absent from every character class below.
 const EMAIL_RE = /[\p{L}\p{N}_.+-]+@[\p{L}\p{N}_-]+\.[\p{L}\p{N}_.-]+/gu
 
-// mupot#1520 P1-A: Unicode "format" characters (general category Cf) — the soft hyphen
-// (U+00AD), zero-width space (U+200B), zero-width joiner, bidi control marks, and similar —
-// render as INVISIBLE but sit inside what looks like one continuous run of letters. A domain
-// obfuscated as `exa­mple.com` (soft hyphen inside "example") renders identically to
-// `example.com` but silently breaks any greedy letter-run match in the middle, which is
-// exactly the "soft-hyphen domain" bypass proven against the round-2 regex (P1-A). Stripping
-// every Cf character before matching closes this class of bypass rather than the one
-// example — a receipt message has no legitimate need for invisible formatting characters, so
-// dropping them everywhere in the message (not just inside the part that turns out to be an
-// email) is a fine trade for a machine-readable audit ledger.
-const FORMAT_CHAR_RE = /\p{Cf}/gu
+// mupot#1523 round-2 P1 (item 1): Unicode "format" (Cf) and "control" (Cc) categories cover
+// the soft hyphen (U+00AD), zero-width space, zero-width joiner, and bidi control marks — but
+// NOT the braille blank (U+2800, category So — a "symbol", not a format character), the
+// Hangul filler quartet (U+115F/U+1160/U+3164/U+FFA0 — categories Lo/Lo/Lo/Lo, they are
+// LETTERS that happen to render as nothing), or the Khmer inherent-vowel signs (U+17B4/
+// U+17B5, category Mn — invisible combining marks). Each renders as blank/invisible but sits
+// inside what looks like one continuous run of letters, breaking a greedy letter-run match in
+// the middle exactly like the soft hyphen does — proven against the round-1 `/\p{Cf}/gu`-only
+// version of this line. Listed explicitly alongside `\p{Cf}`/`\p{Cc}` because none of them
+// share a Unicode general category with the others; there is no single category that covers
+// "renders as blank" the way there almost is for "is a format character."
+const FORMAT_CHAR_RE = /[\p{Cf}\p{Cc}⠀ᅟᅠㅤﾠ឴឵]/gu
 
 /** Redacts anything email-shaped and bounds the length of a string. Applied to EVERY
- *  `receiptError` message AND recursively to every string value AND object key in
- *  `receiptOk`'s `fields`/`receiptError`'s `extraFields` (via `redactFields`, mupot#1516
- *  round-2 P2-3; keys added mupot#1520 P2-B) — there is no path to a `pot_provision_receipts`
- *  row that skips it, regardless of which of the two functions' parameters a string arrives
- *  through, or whether it arrives as a value or a key. */
+ *  `receiptError` message AND `errorClass` AND recursively to every string value AND object
+ *  key in `receiptOk`'s `fields`/`receiptError`'s `extraFields` (via `redactFields`,
+ *  mupot#1516 round-2 P2-3; keys added mupot#1520 P2-B; `errorClass` added mupot#1523 round-2
+ *  P1 item 2 — the doc comment on `receiptError` below claimed EVERY string on the detail
+ *  went through this path, but `errorClass` was spliced into the JSON raw) — there is no path
+ *  to a `pot_provision_receipts` row that skips it, regardless of which parameter a string
+ *  arrives through, or whether it arrives as a value or a key.
+ *
+ *  mupot#1523 round-2 P1 item 1: `message.normalize('NFKC')` runs BEFORE anything else, for
+ *  two reasons proven by the round-2 gate. (1) An NFD-decomposed unicode string represents an
+ *  accented letter as TWO codepoints — a base letter (category `L`, matches `EMAIL_RE`) plus
+ *  a combining mark (category `Mn`, matches NEITHER `\p{L}` nor `\p{N}`) — which breaks the
+ *  same greedy letter-run match the soft-hyphen bypass breaks, just via a different Unicode
+ *  mechanism; NFKC recomposes the pair back into one precomposed codepoint before matching
+ *  ever runs. (2) NFKC also maps compatibility characters to their canonical form, which
+ *  folds the FULLWIDTH commercial at sign (U+FF20, `＠`) down to ASCII `@` — closing a
+ *  fullwidth-`@` bypass the literal `@` in `EMAIL_RE` cannot see on its own. */
 function redactAndBound(message: string): string {
-  const redacted = message.replace(FORMAT_CHAR_RE, '').replace(EMAIL_RE, '[redacted-email]')
+  const redacted = message.normalize('NFKC').replace(FORMAT_CHAR_RE, '').replace(EMAIL_RE, '[redacted-email]')
   return redacted.length > RECEIPT_MESSAGE_MAX_LENGTH
     ? `${redacted.slice(0, RECEIPT_MESSAGE_MAX_LENGTH)}…(truncated)`
     : redacted
@@ -1027,15 +1050,68 @@ function redactAndBound(message: string): string {
  *  OWN enumerable properties — its value lives behind `.getTime()`/`.toISOString()`, not an
  *  enumerable field) — so the pre-1520 generic object branch turned `receiptOk({at: new
  *  Date()})` into `{"at":{}}`, silently discarding the timestamp. Checking `instanceof Date`
- *  first and returning `.toISOString()` preserves it as a proper JSON string instead. */
-function redactDeep(value: unknown): unknown {
-  if (value instanceof Date) return value.toISOString()
+ *  first and returning `.toISOString()` preserves it as a proper JSON string instead.
+ *
+ *  mupot#1523 round-2 P1, items 3 and 5 — four more gaps closed on THIS function:
+ *
+ *  (3) KEY REDACTION MUST BE INJECTIVE. Two distinct keys can redact to the SAME string
+ *  (`'victim1@x.com'` and `'victim2@x.com'` both become `'[redacted-email]'`) — naively
+ *  building the result via `Object.fromEntries` would let the second silently overwrite the
+ *  first, DROPPING a field with no trace it ever existed. `seenKeys` counts collisions per
+ *  object and suffixes every repeat (`'[redacted-email]#2'`, `'#3'`, ...) so every original
+ *  field survives under a distinguishable name.
+ *
+ *  (5) TOTAL, NEVER THROWS — a receipt is built to record what ALREADY went wrong (or that
+ *  something succeeded); it must not itself become a NEW, unhandled failure. `ancestors`
+ *  tracks the current recursion path (added before descending into an object/array's
+ *  children, removed after) so a CIRCULAR reference returns `'[circular]'` instead of
+ *  recursing forever — a plain "have I ever seen this object" set would also be wrong here,
+ *  since it would misfire on a non-circular DAG (the same object legitimately reachable via
+ *  two different fields). Reading a property via `Object.keys` then indexing it can THROW if
+ *  the property is a getter that throws — caught per-property and replaced with
+ *  `'[unreadable]'` rather than aborting the whole receipt. An `Invalid Date` (`new
+ *  Date('bad')`, `isNaN(.getTime())`) serializes as `'invalid-date'` rather than `'Invalid
+ *  Date'` leaking through `.toISOString()` (which itself throws on an Invalid Date — the
+ *  ORIGINAL reason this needed a separate branch, not just "call toISOString and catch"). A
+ *  `bigint` is converted via `.toString()` — `JSON.stringify` throws `TypeError: Do not know
+ *  how to serialize a BigInt` on a raw one, which would otherwise take down the entire
+ *  receipt over a single numeric field. */
+function redactDeep(value: unknown, ancestors: Set<unknown> = new Set()): unknown {
+  if (value instanceof Date) return isNaN(value.getTime()) ? 'invalid-date' : value.toISOString()
+  if (typeof value === 'bigint') return value.toString()
   if (typeof value === 'string') return redactAndBound(value)
-  if (Array.isArray(value)) return value.map(redactDeep)
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) return '[circular]'
+    ancestors.add(value)
+    try {
+      return value.map((v) => redactDeep(v, ancestors))
+    } finally {
+      ancestors.delete(value)
+    }
+  }
   if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [redactAndBound(k), redactDeep(v)]),
-    )
+    if (ancestors.has(value)) return '[circular]'
+    ancestors.add(value)
+    try {
+      const seenKeys = new Map<string, number>()
+      const entries: [string, unknown][] = []
+      for (const k of Object.keys(value as Record<string, unknown>)) {
+        let v: unknown
+        try {
+          v = (value as Record<string, unknown>)[k]
+        } catch {
+          v = '[unreadable]' // a getter that throws on access
+        }
+        let redactedKey = redactAndBound(k)
+        const occurrence = (seenKeys.get(redactedKey) ?? 0) + 1
+        seenKeys.set(redactedKey, occurrence)
+        if (occurrence > 1) redactedKey = `${redactedKey}#${occurrence}` // never silently drop a colliding key
+        entries.push([redactedKey, redactDeep(v, ancestors)])
+      }
+      return Object.fromEntries(entries)
+    } finally {
+      ancestors.delete(value)
+    }
   }
   return value
 }
@@ -1052,18 +1128,25 @@ function redactFields(fields: Record<string, unknown>): Record<string, unknown> 
  *  turning an oversized receipt into NO receipt at all, the exact `writeProvisionReceipt`
  *  fail-closed trap `redactAndBound`'s own history exists to avoid), an oversized document is
  *  replaced wholesale with a small, always-valid fallback that still names what happened and
- *  by how much it overflowed. */
+ *  by how much it overflowed.
+ *
+ *  mupot#1523 round-2 P1 item 4: the round-1 fallback hardcoded `ok: false` — an oversized
+ *  `receiptOk` (a SUCCESSFUL step whose fields just happened to be too big) was misreported
+ *  as a failure, which is itself false information on an append-only ledger. The fallback now
+ *  preserves the caller's actual `ok` value and adds `truncated: true` so a reader can tell
+ *  "this step succeeded/failed AND its detail was too big to keep" apart from an ordinary
+ *  success/failure — the two facts are independent and neither should erase the other. The
+ *  ok:true and ok:false shapes stay distinct (no `error` object when `ok:true`), matching the
+ *  "one JSON shape per outcome" contract this file's header comment describes. */
 function boundSerializedDetail(detail: Record<string, unknown>): string {
   const json = JSON.stringify(detail)
   if (json.length <= MAX_DETAIL_SERIALIZED_LENGTH) return json
-  return JSON.stringify({
-    ok: false,
-    error: {
-      class: 'detail_too_large',
-      message: `receipt detail exceeded ${MAX_DETAIL_SERIALIZED_LENGTH} chars after redaction ` +
-        `(${json.length} chars) and was dropped`,
-    },
-  })
+  const ok = detail.ok === true
+  const message = `receipt detail exceeded ${MAX_DETAIL_SERIALIZED_LENGTH} chars after redaction ` +
+    `(${json.length} chars) and was dropped`
+  return ok
+    ? JSON.stringify({ ok: true, truncated: true, note: message })
+    : JSON.stringify({ ok: false, truncated: true, error: { class: 'detail_too_large', message } })
 }
 
 /** Builds a failure `detail` — `{ok:false, error:{class, message}}`. `errorClass` is a
@@ -1072,9 +1155,19 @@ function boundSerializedDetail(detail: Record<string, unknown>): string {
  *  never the raw message alone, so a receipt reader can group failures without parsing
  *  prose. `extraFields` carries structured, queryable context (e.g. `apply_schema`'s
  *  `file`/`statement_index`/`kind`) alongside the error, same as `receiptOk`'s fields — and
- *  is redacted the same way. */
+ *  is redacted the same way. Both `errorClass` and `message` go through `redactAndBound`
+ *  (mupot#1523 round-2 P1 item 2 — `errorClass` did not, before this). See `receiptOk` for
+ *  why this whole function is wrapped in a `try`/`catch` (item 5: never throw). */
 export function receiptError(errorClass: string, message: string, extraFields: Record<string, unknown> = {}): string {
-  return boundSerializedDetail({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...redactFields(extraFields) })
+  try {
+    return boundSerializedDetail({
+      ok: false,
+      error: { class: redactAndBound(errorClass), message: redactAndBound(message) },
+      ...redactFields(extraFields),
+    })
+  } catch (err) {
+    return JSON.stringify({ ok: false, truncated: true, error: { class: 'detail_construction_failed', message: errMsg(err) } })
+  }
 }
 
 /** Appends one row to `pot_provision_receipts` (migration 0169) on the ORCHESTRATOR's own

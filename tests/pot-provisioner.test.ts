@@ -1176,7 +1176,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         expect(parsed.at).toBe('2026-01-01T00:00:00.000Z')
       })
 
-      it('P2-B: a 200-field detail (each field ~499 chars, individually under the per-leaf 500-char cap) is bounded as a WHOLE document, not just per-leaf', () => {
+      it('P2-B / mupot#1523 item 4: a 200-field SUCCESS detail (each field ~499 chars, individually under the per-leaf 500-char cap) is bounded as a WHOLE document, and the fallback preserves ok:true (a successful step is not misreported as failed)', () => {
         const fields: Record<string, string> = {}
         for (let i = 0; i < 200; i++) {
           fields[`field_${i}`] = 'x'.repeat(499)
@@ -1188,8 +1188,105 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         expect(detail.length).toBeLessThanOrEqual(64 * 1024)
         expect(() => JSON.parse(detail)).not.toThrow() // the CHECK constraint's json_valid(detail) must still pass
         const parsed = JSON.parse(detail)
+        expect(parsed.ok).toBe(true) // NOT hardcoded false — this step actually succeeded
+        expect(parsed.truncated).toBe(true)
+        expect(parsed.error).toBeUndefined() // ok:true shape never carries an `error` object
+      })
+
+      it('mupot#1523 item 4: a 200-field FAILURE detail bounds the same way and keeps ok:false + a named error class', () => {
+        const extraFields: Record<string, string> = {}
+        for (let i = 0; i < 200; i++) {
+          extraFields[`field_${i}`] = 'x'.repeat(499)
+        }
+        const detail = receiptError('sql_error', 'boom', extraFields)
+        expect(detail.length).toBeLessThanOrEqual(64 * 1024)
+        const parsed = JSON.parse(detail)
         expect(parsed.ok).toBe(false)
+        expect(parsed.truncated).toBe(true)
         expect(parsed.error.class).toBe('detail_too_large')
+      })
+
+      it("mupot#1523 item 2: errorClass itself is redacted and bounded the same way as message — an email-shaped errorClass doesn't reach the ledger", () => {
+        const detail = receiptError('contact-admin@example.com', 'boom')
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.class).toBe('[redacted-email]')
+        expect(parsed.error.class).not.toContain('admin@example.com')
+      })
+
+      it('mupot#1523 item 1: an NFD-decomposed unicode email (combining marks, not precomposed letters) is still redacted', () => {
+        // 'é' as NFD is 'e' + COMBINING ACUTE ACCENT (U+0301); as NFC it is the single
+        // precomposed codepoint U+00E9. Confirm the fixture is actually decomposed before
+        // relying on it to exercise the NFKC-normalization fix.
+        const nfdEmail = 'hédi.sérvat@exämple.com' // é / é via combining marks
+        expect(nfdEmail.normalize('NFC')).toBe('hédi.sérvat@exämple.com')
+        expect(nfdEmail).not.toBe(nfdEmail.normalize('NFC')) // sanity: the fixture really is decomposed
+
+        const detail = receiptError('sql_error', `contact ${nfdEmail} for help`)
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+      })
+
+      it('mupot#1523 item 1: a braille-blank (U+2800) obfuscated domain is still redacted, and binding=/model: still survive', () => {
+        const BRAILLE_BLANK = '⠀'
+        const obfuscated = `hedi@exa${BRAILLE_BLANK}mple.com`
+        const detail = receiptError(
+          'sql_error',
+          `contact ${obfuscated} for help — binding=@cf/meta/llama-3.3 and model:@cf/meta/llama-3.3 are not emails`,
+        )
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toContain('contact [redacted-email] for help')
+        expect(parsed.error.message).toContain('binding=@cf/meta/llama-3.3')
+        expect(parsed.error.message).toContain('model:@cf/meta/llama-3.3')
+        // exactly one redaction happened — the binding/model mentions were not touched
+        expect((parsed.error.message.match(/\[redacted-email\]/g) ?? []).length).toBe(1)
+      })
+
+      it('mupot#1523 item 3: two keys that redact to the SAME string are both preserved, suffixed, never silently dropped', () => {
+        const detail = receiptOk({ 'victim1@example.com': 'a', 'victim2@example.com': 'b', 'victim3@example.com': 'c' })
+        const parsed = JSON.parse(detail)
+        expect(parsed['[redacted-email]']).toBe('a')
+        expect(parsed['[redacted-email]#2']).toBe('b')
+        expect(parsed['[redacted-email]#3']).toBe('c')
+        expect(Object.keys(parsed).filter((k) => k.startsWith('[redacted-email]'))).toHaveLength(3)
+      })
+
+      describe('mupot#1523 item 5: receiptOk/receiptError are TOTAL — never throw', () => {
+        it('an Invalid Date serializes as the string "invalid-date"', () => {
+          const detail = receiptOk({ at: new Date('this is not a valid date') })
+          const parsed = JSON.parse(detail)
+          expect(parsed.at).toBe('invalid-date')
+        })
+
+        it('a BigInt serializes as a string (JSON.stringify cannot serialize a raw BigInt)', () => {
+          const detail = receiptOk({ count: 9007199254740993n })
+          const parsed = JSON.parse(detail)
+          expect(parsed.count).toBe('9007199254740993')
+        })
+
+        it('a circular reference is replaced with "[circular]" instead of throwing/looping forever', () => {
+          const cyclic: Record<string, unknown> = { name: 'cyclic' }
+          cyclic.self = cyclic
+          expect(() => receiptOk({ nested: cyclic })).not.toThrow()
+          const parsed = JSON.parse(receiptOk({ nested: cyclic }))
+          expect(parsed.nested.name).toBe('cyclic')
+          expect(parsed.nested.self).toBe('[circular]')
+        })
+
+        it('a throwing getter is replaced with "[unreadable]" instead of propagating the throw', () => {
+          const landmine: Record<string, unknown> = {}
+          Object.defineProperty(landmine, 'boom', { enumerable: true, get() { throw new Error('nope') } })
+          expect(() => receiptOk({ landmine })).not.toThrow()
+          const parsed = JSON.parse(receiptOk({ landmine }))
+          expect(parsed.landmine.boom).toBe('[unreadable]')
+        })
+
+        it('a non-circular DAG (same object reachable via two different fields) is NOT misreported as circular', () => {
+          const shared = { note: 'shared@example.com' }
+          const detail = receiptOk({ a: shared, b: shared })
+          const parsed = JSON.parse(detail)
+          expect(parsed.a.note).toBe('[redacted-email]')
+          expect(parsed.b.note).toBe('[redacted-email]')
+        })
       })
     })
 
@@ -1295,6 +1392,30 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         it('accepts a plausible unicode email', () => {
           const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'hédi.sérvat@exämple.com' })
           expect(result.ok).toBe(true)
+        })
+
+        it("mupot#1523 item 6: refuses an internal empty domain segment ('a@b..c') — the round-1 check only looked at the FIRST/LAST segment", () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'a@b..c' })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
+        })
+
+        it("mupot#1523 item 6: refuses whitespace INSIDE admin_email (leading/trailing whitespace is already trimmed upstream by validateProvisionRequestBody's own str(), so these are all internal)", () => {
+          for (const bad of ['admin @example.com', 'admin@exa mple.com', 'admin@ex\tample.com', 'admin@example\t.com']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+            expect(result.ok, JSON.stringify(bad)).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error, JSON.stringify(bad)).toBe('invalid_email')
+          }
+        })
+
+        it('mupot#1523 item 6: refuses a Unicode CONTROL character (category Cc, e.g. NUL) inside admin_email even though it is not `\\s`', () => {
+          const bad = 'admin@ex' + String.fromCharCode(0) + 'ample.com'
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
         })
       })
 

@@ -68,21 +68,32 @@ const MAX_BRAND_NAME_LENGTH = 200
 const MAX_ADMIN_NAME_LENGTH = 200
 const MAX_ADMIN_EMAIL_LENGTH = 254
 
+// mupot#1523 round-2 P1 item 6: whitespace (space, tab, newline, ...) and Unicode control
+// characters (category Cc — the C0/C1 ranges, which `\s` does not fully cover: e.g. NUL
+// U+0000 is Cc but not `\s`) never legitimately appear in a mailbox address; a caller-supplied
+// `admin_email` containing one is refused outright rather than silently accepted and passed
+// through to an inlined seed-batch SQL statement.
+const EMAIL_WHITESPACE_OR_CONTROL_RE = /[\s\p{Cc}]/u
+
 /** Basic `admin_email` SHAPE validation (mupot#1520 P1-A) — not a full RFC 5322 validator (no
  *  attempt at quoted local parts, IP-literal domains, or IDNA percent-encoding), just enough
  *  to close the round-2 gate's proof that `notanemail` sailed through unchallenged all the
- *  way to an inlined seed-batch SQL statement and a `pot_provision_receipts` row. Requires
- *  exactly one '@', a non-empty local part before it, and a domain after it that itself
- *  contains at least one '.' with a non-empty segment on both sides — so `notanemail`,
- *  `admin@localhost`, and `admin@.com` are all refused, while `admin@example.com` and a
+ *  way to an inlined seed-batch SQL statement and a `pot_provision_receipts` row. Requires:
+ *  no whitespace or control character anywhere (mupot#1523 round-2 P1 item 6); exactly one
+ *  '@'; a non-empty local part before it; and a domain after it split on '.' into two or more
+ *  segments, EVERY one of them non-empty (mupot#1523 round-2 P1 item 6 — the round-1 version
+ *  only checked the FIRST and LAST segment via `lastIndexOf('.')`, so `a@b..c` — an empty
+ *  segment in the MIDDLE — slipped through). So `notanemail`, `admin@localhost`,
+ *  `admin@.com`, `admin@b.`, and `a@b..c` are all refused, while `admin@example.com` and a
  *  unicode domain like `admin@exämple.com` are both accepted. Length is bounded separately,
  *  above (`MAX_ADMIN_EMAIL_LENGTH`, RFC 5321 §4.5.3.1.3's 254). */
 function isPlausibleEmailShape(email: string): boolean {
+  if (EMAIL_WHITESPACE_OR_CONTROL_RE.test(email)) return false
   const at = email.indexOf('@')
   if (at <= 0 || at !== email.lastIndexOf('@')) return false // exactly one '@', non-empty local part
   const domain = email.slice(at + 1)
-  const dot = domain.lastIndexOf('.')
-  if (dot <= 0 || dot === domain.length - 1) return false // domain has a '.' with non-empty segments either side
+  const domainSegments = domain.split('.')
+  if (domainSegments.length < 2 || domainSegments.some((segment) => segment.length === 0)) return false
   return true
 }
 
