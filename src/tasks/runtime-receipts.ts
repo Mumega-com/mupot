@@ -3,6 +3,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
 import { dispatchInboxRequestId } from '../bus/fleet-bridge'
+import { MAX_LEASE_SECONDS } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
@@ -54,6 +55,54 @@ export interface PublicTaskDispatchRuntimeReceipt {
   result: string | null
   reason: string | null
   created_at: string
+}
+
+/** mupot#1494/#1502 — the LATEST task_dispatch_receipts row for a task, as exposed on
+ *  task_list/task_board rows. A task_list-only runner has no other way to learn the
+ *  dispatch_receipt_id it needs to settle via recordTaskDispatchRuntimeReceipt's
+ *  {task_id, dispatch_receipt_id} correlator (P1-a); `delivered_via` closes #1502's read side
+ *  — "never silent" means the routing decision must be READABLE, not just recorded. */
+export interface LatestDispatchReceiptInfo {
+  dispatch_receipt_id: string
+  delivered_via: 'inbox' | 'in_worker' | null
+}
+
+/**
+ * loadLatestDispatchReceiptsForTasks — one bounded query, the MOST RECENT
+ * task_dispatch_receipts row per task_id (by created_at, tie-broken by rowid — the table has
+ * no INTEGER PRIMARY KEY alias, but every SQLite table carries an implicit rowid unless
+ * declared WITHOUT ROWID, and this one is not). Deliberately does NOT filter by the task's
+ * CURRENT assignee_agent_id: recordTaskDispatchRuntimeReceipt already fails closed
+ * (`runtime_receipt_forbidden`) if the settling agent does not match the receipt's own
+ * `agent_id`, so exposing a possibly-stale receipt here cannot be used to settle as someone
+ * else — it can only ever correctly settle the caller's OWN dispatch.
+ */
+export async function loadLatestDispatchReceiptsForTasks(
+  env: Env,
+  taskIds: readonly string[],
+): Promise<Map<string, LatestDispatchReceiptInfo>> {
+  const map = new Map<string, LatestDispatchReceiptInfo>()
+  if (taskIds.length === 0) return map
+  const placeholders = taskIds.map((_, i) => `?${i + 2}`).join(', ')
+  const rows = await env.DB.prepare(`
+    SELECT d.task_id AS task_id, d.id AS dispatch_receipt_id, d.delivered_via AS delivered_via
+      FROM task_dispatch_receipts d
+     WHERE d.tenant = ?1 AND d.task_id IN (${placeholders})
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_receipts newer
+          WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
+            AND (newer.created_at > d.created_at
+                 OR (newer.created_at = d.created_at AND newer.rowid > d.rowid))
+       )
+  `).bind(env.TENANT_SLUG, ...taskIds)
+    .all<{ task_id: string; dispatch_receipt_id: string; delivered_via: string | null }>()
+  for (const row of rows.results ?? []) {
+    map.set(row.task_id, {
+      dispatch_receipt_id: row.dispatch_receipt_id,
+      delivered_via: row.delivered_via === 'inbox' || row.delivered_via === 'in_worker' ? row.delivered_via : null,
+    })
+  }
+  return map
 }
 
 export type TaskDispatchRuntimeReceiptErrorCode =
@@ -230,6 +279,43 @@ async function resolveMessageId(
   return row.id
 }
 
+/**
+ * claimUnleasedForPairSettlement — mupot#1494 round 2 (P1-a). A task_list-only runner never
+ * calls `inbox_lease`, so its dispatch message is stuck at its pristine, never-touched state
+ * (`delivery_attempts=0, lease_expires_at=NULL, read_at=NULL`) — which `validateEnvelope`
+ * refuses outright (no live lease). Settling via the `{task_id, dispatch_receipt_id}` pair
+ * performs the SAME hand-out `leaseAgentInbox` would have (bump `delivery_attempts` to 1 — the
+ * "generation" a first delivery attempt always is — and stamp a `lease_expires_at` window),
+ * atomically, gated on the row still being in that pristine state. The row this produces is
+ * BYTE-IDENTICAL in shape to a resident agent's freshly-`inbox_lease`d message
+ * (`read_at` still NULL, a live future lease) — `validateEnvelope`'s existing, UNCHANGED checks
+ * pass through the ordinary (non-replay) branch, exactly as they do for a resident.
+ *
+ * Only fires for `attempt === 1` (caller-side gate, see the call site) — a task_list-only
+ * runner has no lease to have retried, so any OTHER attempt number can only mean the row is
+ * NOT pristine, and `validateEnvelope`'s `delivery_attempts !== attempt` check refuses it on
+ * its own merits without this function's help.
+ *
+ * A second stage transition on the SAME message (e.g. `runtime_consumed` then `completed`)
+ * finds the row already claimed (`delivery_attempts=1`, not `0`) — this function is a no-op
+ * (0 rows changed) and the existing lease from the FIRST claim is what `validateEnvelope`
+ * checks against; no special-casing needed. And because a later `inbox_lease` call requires
+ * `read_at IS NULL AND lease_expires_at <= now` to hand a message out, this claim's live lease
+ * blocks exactly that redelivery for its window (mirrors — not exceeds — the crash-recovery
+ * property every resident lease already has: an abandoned settlement eventually becomes
+ * re-leasable again, by design, the same as an abandoned resident lease does).
+ */
+async function claimUnleasedForPairSettlement(env: Env, messageId: string): Promise<boolean> {
+  const leaseExpiresAt = new Date(Date.now() + MAX_LEASE_SECONDS * 1000).toISOString()
+  const result = await env.DB.prepare(`
+    UPDATE agent_messages
+       SET delivery_attempts = 1, lease_expires_at = ?3
+     WHERE tenant = ?1 AND id = ?2
+       AND delivery_attempts = 0 AND lease_expires_at IS NULL AND read_at IS NULL AND dead_lettered_at IS NULL
+  `).bind(env.TENANT_SLUG, messageId, leaseExpiresAt).run()
+  return result.meta?.changes === 1
+}
+
 async function loadDelivery(
   env: Env,
   input: RecordTaskDispatchRuntimeReceiptInput,
@@ -332,6 +418,10 @@ export async function recordTaskDispatchRuntimeReceipt(
     || !SHA256_RE.test(text(input.runtimeReceiptHash, 64))
   ) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
   text(input.taskId, 200); text(input.dispatchReceiptId, 200)
+  // mupot#1494 round 2 (P1-a) — captured BEFORE resolution: true iff the caller used the
+  // {task_id, dispatch_receipt_id} correlator (a task_list-only runner never has a raw
+  // agent_messages id to pass — see resolveMessageId's doc comment).
+  const usedPairCorrelator = !input.messageId
   // mupot#1494 — message_id is now OPTIONAL: a caller that only knows {task_id,
   // dispatch_receipt_id} (a task_list-polling runner — see resolveMessageId's doc comment)
   // resolves it here, once, and every use below (the delivery JOIN, the request digest, the
@@ -385,6 +475,14 @@ export async function recordTaskDispatchRuntimeReceipt(
        AND ${TOKEN_LIVE_PREDICATE('?5')}
   `).bind(credentialId, memberId, agentId, env.TENANT_SLUG, now).first<{ id: string }>()
   if (!token) throw new TaskDispatchRuntimeReceiptError('agent_bound_workspace_credential_required')
+
+  // mupot#1494 round 2 (P1-a) — a task_list-only runner's message has never been leased; give
+  // it the lease-equivalent atomically, once, so validateEnvelope below sees exactly the shape
+  // a resident agent's inbox_lease() would have produced. See claimUnleasedForPairSettlement's
+  // doc comment. Credential-gated: this runs only after the token check above succeeds.
+  if (usedPairCorrelator && input.attempt === 1) {
+    await claimUnleasedForPairSettlement(env, messageId)
+  }
 
   const delivery = await loadDelivery(env, input, messageId)
   if (delivery.dispatch_agent_id !== agentId || delivery.task_assignee_agent_id !== agentId) {

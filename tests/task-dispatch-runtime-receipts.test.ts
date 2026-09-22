@@ -4,6 +4,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { listTaskDispatchReceiptTimeline, recordTaskDispatchRuntimeReceipt } from '../src/tasks/runtime-receipts'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
+import { leaseAgentInbox } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'tenant-runtime-receipt'
@@ -21,7 +22,15 @@ const SQUAD_ID = 'squad-runtime-1'
 const RUNTIME_ADDRESS = 'hadi-codex'
 const RUNTIME_HASH = 'a'.repeat(64)
 
-function runtimeFixture() {
+// mupot#1494 round 2 (P1-a, adversarial gate note) — `unleased: true` seeds the agent_messages
+// row in the state `deliverDispatchToInbox`/`sendAgentMessage` ACTUALLY produces at write time
+// (delivery_attempts=0, lease_expires_at=NULL — the 0090 migration's real INSERT defaults),
+// not the pre-leased state (delivery_attempts=1, a 2099 lease) the default fixture below uses
+// to simulate "a resident agent already called inbox_lease". A task_list-only runner NEVER
+// calls inbox_lease, so its message is genuinely, exactly in this unleased state — the earlier
+// (round-1) task_id+dispatch_receipt_id tests all built on the pre-leased default, which is
+// why they passed while the real production path (never leased) still failed.
+function runtimeFixture(opts: { unleased?: boolean } = {}) {
   const harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
@@ -73,7 +82,8 @@ function runtimeFixture() {
       '${MESSAGE_ID}', '${TENANT}', '${RUNTIME_ADDRESS}', 'mupot-dispatch', '${MEMBER_ID}',
       'request',
       '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"${TASK_ID}","dispatch_receipt_id":"${DISPATCH_ID}","squad_id":"${SQUAD_ID}","runtime_address":"${RUNTIME_ADDRESS}"}',
-      'dispatch-inbox:${DISPATCH_ID}', '${T0}', 1, '2099-01-01T00:00:00.000Z'
+      'dispatch-inbox:${DISPATCH_ID}', '${T0}',
+      ${opts.unleased ? '0' : '1'}, ${opts.unleased ? 'NULL' : "'2099-01-01T00:00:00.000Z'"}
     );
   `)
 
@@ -952,7 +962,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
 describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alternative correlator (mupot#1494)', () => {
   it('settles with message_id OMITTED — resolves it from {task_id, dispatch_receipt_id} and produces an IDENTICAL receipt to the explicit-message_id path', async () => {
     const explicit = runtimeFixture()
-    const implicit = runtimeFixture()
+    const implicit = runtimeFixture({ unleased: true })
     try {
       const explicitResult = await recordTaskDispatchRuntimeReceipt(explicit.env, explicit.auth, {
         taskId: TASK_ID,
@@ -985,7 +995,7 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
   })
 
   it('settles a full runtime_consumed -> completed sequence with message_id omitted on BOTH calls (the shape a task_list-only runner actually uses)', async () => {
-    const fixture = runtimeFixture()
+    const fixture = runtimeFixture({ unleased: true })
     try {
       await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
@@ -1011,7 +1021,7 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
   })
 
   it('is refused for a MISMATCHED pair: a real dispatch_receipt_id whose message resolves fine, but the wrong task_id', async () => {
-    const fixture = runtimeFixture()
+    const fixture = runtimeFixture({ unleased: true })
     try {
       await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: 'some-other-task-id',
@@ -1027,7 +1037,7 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
   })
 
   it('is refused when dispatch_receipt_id does not correlate to ANY delivered inbox message (nothing to resolve message_id from)', async () => {
-    const fixture = runtimeFixture()
+    const fixture = runtimeFixture({ unleased: true })
     try {
       await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
@@ -1043,7 +1053,7 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
   })
 
   it('same authz as today: an unbound credential is refused before message_id resolution is ever attempted', async () => {
-    const fixture = runtimeFixture()
+    const fixture = runtimeFixture({ unleased: true })
     try {
       await expect(recordTaskDispatchRuntimeReceipt(fixture.env, { ...fixture.auth, boundAgentId: undefined }, {
         taskId: TASK_ID,
@@ -1069,6 +1079,156 @@ describe('recordTaskDispatchRuntimeReceipt — task_id+dispatch_receipt_id alter
         runtimeReceiptHash: RUNTIME_HASH,
         attempt: 1,
       })).rejects.toMatchObject({ code: 'runtime_delivery_not_found' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  // mupot#1494 round 2 (P1-a, adversarial gate) — the "lease-equivalent" claim itself,
+  // pinned directly against the REAL agent_messages row and the REAL leaseAgentInbox function
+  // (not just the receipt outcome). Starts UNLEASED, exactly like a real never-inbox_lease'd
+  // dispatch.
+  it('settling via the pair correlator performs the SAME hand-out leaseAgentInbox would (delivery_attempts bumped to 1, a live lease stamped)', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const before = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string | null; read_at: string | null }
+      expect(before).toEqual({ delivery_attempts: 0, lease_expires_at: null, read_at: null })
+
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+
+      const after = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string | null; read_at: string | null }
+      expect(after.delivery_attempts).toBe(1)
+      expect(after.read_at).toBeNull() // NOT acked — mirrors a resident's freshly-leased row exactly
+      expect(after.lease_expires_at).not.toBeNull()
+      expect(Date.parse(after.lease_expires_at!)).toBeGreaterThan(Date.now())
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a REAL leaseAgentInbox call cannot hand out the message WHILE the pair-settlement claim holds its lease', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+
+      const leaseResult = await leaseAgentInbox(fixture.env, { agent: RUNTIME_ADDRESS })
+      expect(leaseResult.ok).toBe(true)
+      if (leaseResult.ok) {
+        expect((leaseResult as { messages: unknown[] }).messages).toHaveLength(0)
+      }
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a second stage transition (completed) on the SAME message needs no fresh claim — the first claim\'s lease already covers it', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      const afterFirst = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string }
+
+      const completed = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'completed',
+        runtimeReceiptHash: 'd'.repeat(64),
+        attempt: 1,
+        result: 'done',
+      })
+      expect(completed).toMatchObject({ receipt: { stage: 'completed' } })
+
+      const afterSecond = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string }
+      // The claim is a no-op the second time (row no longer pristine) — same lease, untouched.
+      expect(afterSecond).toEqual(afterFirst)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('attempt !== 1 on a never-leased (pristine) message is refused — the claim only ever fires for attempt 1', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 2,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+
+      const row = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number }
+      expect(row.delivery_attempts).toBe(0) // untouched — no claim fired
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 round 2 (M4) — resolveMessageId's from_agent='mupot-dispatch' scoping. agent_messages'
+// own replay-once index is UNIQUE(tenant, from_agent, request_id) — scoped per sender precisely
+// so two different senders can't collide on the same request_id string. resolveMessageId's query
+// filters on from_agent='mupot-dispatch' for the exact same reason: a message from a DIFFERENT
+// sender that happens to carry the same request_id text must never be mistaken for the dispatch
+// bridge's own delivery.
+describe('resolveMessageId — from_agent scoping (mupot#1494 round 2, M4)', () => {
+  it('does NOT match a message with the SAME request_id text from a DIFFERENT sender', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      // A distinct message, same request_id STRING, but from_agent is NOT 'mupot-dispatch'.
+      // request_id uniqueness is scoped PER SENDER (tenant, from_agent, request_id), so this
+      // is a legal, independent row that must not be confused with the real dispatch message.
+      fixture.harness.sqlite.exec(`
+        INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, created_at, delivery_attempts, lease_expires_at)
+        VALUES ('impostor-message-1', '${TENANT}', '${RUNTIME_ADDRESS}', 'some-other-agent', '${MEMBER_ID}',
+                'request', 'not a real dispatch envelope', 'dispatch-inbox:${DISPATCH_ID}', '${T0}', 0, NULL);
+      `)
+
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+
+      // Settles against the REAL dispatch message (MESSAGE_ID), never the impostor.
+      const stored = fixture.harness.sqlite.prepare('SELECT message_id FROM task_dispatch_runtime_receipts LIMIT 1').get() as { message_id: string }
+      expect(stored.message_id).toBe(MESSAGE_ID)
+      expect(stored.message_id).not.toBe('impostor-message-1')
     } finally {
       fixture.harness.close()
     }
