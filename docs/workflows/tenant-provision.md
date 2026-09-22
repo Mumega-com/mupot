@@ -316,7 +316,9 @@ publish left something behind that needs to go. Recovery:
 2. **An operator** (this is a deliberate, receipted human action — not something either CLI
    script does for you) deletes the object at the exact receipted key, via the Cloudflare
    dashboard (R2 → the bucket → `<release-sha>/worker.js` → Delete) or
-   `wrangler r2 object delete <bucket>/<release-sha>/worker.js`.
+   `wrangler r2 object delete --remote <bucket>/<release-sha>/worker.js` — **`--remote` is
+   required**; never rely on which of `--local`/`--remote` wrangler defaults to for this
+   command (mupot#1529 round-1 P3).
 3. Log a receipt line naming who deleted it, when, and why (the same PR-comment discipline
    as the live-verify-before-merge receipt above).
 4. Re-run `node scripts/publish-pot-bundle.mjs --release-sha <release-sha> [--config ...]`

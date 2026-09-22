@@ -57,6 +57,23 @@ function capture(cmd, args) {
   return (r.stdout || '').trim()
 }
 
+/** `--release-sha`/`--bucket`/`--outdir` all require a real value — mupot#1529 round-1
+ *  P2(4): the previous `argv[++i]` was unguarded, the SAME defect class as the round-2 P0
+ *  (mupot#1524/#1529): a missing value (flag at the end of argv, or immediately followed
+ *  by ANOTHER recognized flag) silently became `undefined`, which for `--release-sha`
+ *  falls through to `process.env.RELEASE_SHA || headSha` — a silent, wrong default instead
+ *  of a loud refusal. Refuses (never defaults) on a missing value OR a value that itself
+ *  looks like a flag (same dash-value discipline as `--config`, `--outdir`, `--skip-reason`
+ *  elsewhere in this PR). */
+function requireFlagValue(argv, i, flagName) {
+  const value = argv[i + 1]
+  if (typeof value !== 'string' || value.length === 0 || value.startsWith('-')) {
+    console.error(`✘ ${flagName} requires a value (got none, or a value starting with "-", which is refused as a likely flag).`)
+    process.exit(1)
+  }
+  return value
+}
+
 function parseArgs(argv) {
   const opts = { config: null, releaseSha: null, bucket: null, outdir: null }
   for (let i = 0; i < argv.length; i++) {
@@ -67,10 +84,16 @@ function parseArgs(argv) {
       i += configMatch.consumed - 1
       continue
     }
-    if (a === '--release-sha') opts.releaseSha = argv[++i]
-    else if (a === '--bucket') opts.bucket = argv[++i]
-    else if (a === '--outdir') opts.outdir = argv[++i]
-    else {
+    if (a === '--release-sha') {
+      opts.releaseSha = requireFlagValue(argv, i, '--release-sha')
+      i++
+    } else if (a === '--bucket') {
+      opts.bucket = requireFlagValue(argv, i, '--bucket')
+      i++
+    } else if (a === '--outdir') {
+      opts.outdir = requireFlagValue(argv, i, '--outdir')
+      i++
+    } else {
       console.error(`✘ unrecognized argument '${a}'`)
       process.exit(1)
     }

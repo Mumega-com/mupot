@@ -13,7 +13,9 @@
 //   npm run deploy                     # deploy the repo-default wrangler.toml (mumega)
 //   npm run deploy -- --config wrangler.acme.toml --message "..."
 //
-// (any extra args are forwarded to `wrangler deploy` verbatim)
+// (any extra args are forwarded to `wrangler deploy` verbatim, EXCEPT the config flag,
+// which is resolved once — any spelling wrangler accepts — and re-emitted as a single
+// canonical `--config <path>`; see the P1-1 note below)
 //
 // Refuses a dirty working tree by default — the bundle wouldn't correspond to
 // any single commit, so the RELEASE_SHA stamp would misreport what's actually
@@ -51,15 +53,17 @@
 // publish step exiting 0 is not itself proof the object is live and byte-correct; the
 // receipt is only as honest as an independent re-GET + digest check makes it.
 //
-// `--config`/`-c <file>`/`--config=<file>` are all recognized via the SAME
-// `scripts/lib/wrangler-config-arg.mjs` matcher `scripts/build-pot-worker-bundle.mjs` uses
-// (Kasra-core round-2 finding, 2026-09-22) — matching only the long `--config <file>` form
-// let a `-c`/`--config=` deploy silently publish the DEFAULT config's bundle under the
-// RELEASE_SHA the RIGHT config's deploy actually stamped.
+// `--config <file>`/`--config=<file>`/`-c <file>`/`-c=<file>`/`-c<file>` — every spelling
+// real wrangler accepts — are all resolved via the SAME `scripts/lib/wrangler-config-arg.mjs`
+// matcher `scripts/build-pot-worker-bundle.mjs` and `scripts/publish-pot-bundle.mjs` use
+// (mupot#1524 round-2 P1-2, mupot#1529 round-1 P1-1). This script resolves the config path
+// ONCE, strips it out of the argv forwarded to wrangler, and re-emits it as a single
+// canonical `--config <path>` to wrangler AND to the downstream publish step alike — never
+// two independent readings of the same argv that can silently disagree.
 
 import { spawnSync } from 'node:child_process'
 import { assertNoCallerReleaseSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
-import { peekConfigArg } from './lib/wrangler-config-arg.mjs'
+import { resolveAndStripConfigArg } from './lib/wrangler-config-arg.mjs'
 import { parseDeployArgs } from './lib/deploy-args.mjs'
 import {
   BUNDLE_SHA_CONFLICT_EXIT_CODE,
@@ -115,12 +119,19 @@ const rawArgs = process.argv.slice(2)
 // earlier inline version derived a "skip this index" position from
 // `rawArgs.indexOf('--skip-reason')`, which is `-1` when the flag is absent — `-1 + 1 ===
 // 0` silently dropped rawArgs[0] on every deploy that didn't pass --skip-reason.
-const { skipBundlePublish, skipReason, extra } = parseDeployArgs(rawArgs)
-// Peek-only — NEVER strips --config/-c/--config=<path> from `extra`, which is forwarded to
-// `wrangler deploy` byte-for-byte below. Recognizes all three spellings (mupot round-2
-// finding, 2026-09-22): matching only the first ('--config') let a `-c`/`--config=` deploy
-// silently build+publish the DEFAULT config's bundle instead of the one actually deployed.
-const configPath = peekConfigArg(extra)
+const { skipBundlePublish, skipReason, extra: extraWithConfig } = parseDeployArgs(rawArgs)
+// mupot#1529 round-1 P1-1: resolve the config path ONCE, in whatever spelling the caller
+// used (all five wrangler accepts — see scripts/lib/wrangler-config-arg.mjs), STRIP it out
+// of the forwarded argv, and re-emit a single canonical `--config <path>` below to every
+// downstream consumer (wrangler itself, then build/publish/verify via publishArgs) — never
+// two independent readings of the same argv (a byte-forward AND a separate peek) that can
+// silently disagree whenever one misses a spelling the other still understands. That
+// disagreement was exactly the round-1 finding: `-c=<path>`/`-c<path>` both worked against
+// real wrangler while the old peek-only matcher returned null, so the post-deploy publish
+// step built and published the REPO-DEFAULT config's bundle under the RIGHT config's
+// just-stamped RELEASE_SHA.
+const { configPath, rest: extra } = resolveAndStripConfigArg(extraWithConfig)
+const configArgs = configPath ? ['--config', configPath] : []
 
 if (skipBundlePublish && (!skipReason || !skipReason.trim())) {
   console.error(
@@ -151,6 +162,11 @@ if (dirty && process.env.MUPOT_ALLOW_DIRTY_DEPLOY !== '1') {
 const fullSha = capture('git', ['rev-parse', 'HEAD'])
 const onMain = isMainDescendant(fullSha)
 const clean = !dirty && onMain
+// mupot#1529 round-1 P3: the EXACT value releaseShaDeployArgs stamps into the wrangler
+// build below — every operator-facing message that names "the RELEASE_SHA this deploy
+// stamped" must use THIS, never a bare `fullSha`, or a not-clean deploy's warning claims a
+// stamp (looks clean) that isn't what was actually built.
+const releaseShaStamp = clean ? fullSha : `${fullSha}-dirty`
 
 if (!clean) {
   console.error(
@@ -167,7 +183,7 @@ try {
   process.exit(1)
 }
 
-const res = spawnSync('npx', ['wrangler', 'deploy', ...releaseArgs, ...extra], {
+const res = spawnSync('npx', ['wrangler', 'deploy', ...releaseArgs, ...configArgs, ...extra], {
   stdio: 'inherit',
   env: envWithoutR2PotBundlesCreds(),
 })
@@ -179,8 +195,8 @@ if (res.status !== 0) {
 if (skipBundlePublish) {
   console.error(
     `⚠ bundle publish skipped by explicit flag — pot_provision will refuse this RELEASE_SHA ` +
-      `(${fullSha}) with 'no_bundle_source' until a bundle is published for it (unless an ` +
-      'explicit worker_js_code fallback is supplied per-call).',
+      `(${releaseShaStamp}) with 'no_bundle_source' until a bundle is published for it ` +
+      '(unless an explicit worker_js_code fallback is supplied per-call).',
   )
   printBundlePublishSkipReceipt(skipReason)
   process.exit(0)
@@ -193,11 +209,11 @@ if (!clean) {
   // that pot_provision will refuse the RELEASE_SHA just deployed until it actually happens.
   console.error(
     `⚠ bundle publish skipped automatically (not a clean release) — pot_provision will ` +
-      `refuse this RELEASE_SHA (${fullSha}-dirty) with 'no_bundle_source' until a bundle is ` +
-      'published for it (unless an explicit worker_js_code fallback is supplied per-call).',
+      `refuse this RELEASE_SHA (${releaseShaStamp}) with 'no_bundle_source' until a bundle ` +
+      'is published for it (unless an explicit worker_js_code fallback is supplied per-call).',
   )
   printBundlePublishSkipReceipt(
-    `not-a-clean-release (RELEASE_SHA stamped as '${fullSha}-dirty'; publish-pot-bundle.mjs ` +
+    `not-a-clean-release (RELEASE_SHA stamped as '${releaseShaStamp}'; publish-pot-bundle.mjs ` +
       'only ever publishes an exact HEAD commit from a clean tree)',
   )
   process.exit(0)
@@ -227,7 +243,9 @@ if (publish.status !== 0) {
         `by re-running \`${retryCmd}\` — a published RELEASE_SHA bundle is immutable, so ` +
         'publish will refuse again, identically, every time. Recovery: an operator deletes ' +
         'the object at the receipted key (Cloudflare dashboard → R2 → the bucket → the key, ' +
-        'or `wrangler r2 object delete <bucket>/<key>`), logs a receipt line naming who/why/' +
+        'or `wrangler r2 object delete --remote <bucket>/<key>` — always pass `--remote` ' +
+        'explicitly, never rely on which of --local/--remote wrangler defaults to), logs a ' +
+        'receipt line naming who/why/' +
         `when, THEN re-runs \`${retryCmd}\`. See docs/workflows/tenant-provision.md ` +
         '"Recovering from a digest mismatch" for the full procedure.',
     )

@@ -382,6 +382,122 @@ describe('putPotWorkerBundleObject', () => {
     })
   })
 
+  // mupot#1529 round-1 P1-2: the pre-PUT read previously failed OPEN on 5 of 6 possible
+  // outcomes — only a clean `ok:true` read refused; 404/403/500/no-metadata/bad-metadata
+  // ALL fell through to a real PUT attempt. Against a server that ignores `If-None-Match`
+  // (silently accepts an overwrite), that PUT "succeeds" and CLOBBERS whatever was really
+  // there. This six-row matrix drives every outcome `verifyPotWorkerBundleObject` can
+  // return through `putPotWorkerBundleObject` and asserts: exactly the ABSENT (404) row
+  // issues a PUT (a legitimate new publish — not a clobber, since nothing existed); every
+  // other row issues ZERO PUTs (CLOBBERED=false), because either a real digest was
+  // established from the actual bytes read (PRESENT — including the no-metadata/
+  // bad-metadata rows, which the OLD `.ok`-only check treated as failures instead of proof
+  // of existence) or the read was genuinely inconclusive (UNKNOWN — fails closed, never
+  // treated as absent).
+  describe('six-row pre-PUT classification matrix (P1-2) — a server that ignores If-None-Match must still show 0 PUTs on every non-absent row', () => {
+    const sha = 'c'.repeat(40)
+    const bodyText = 'export default { fetch() {} }'
+    const digest = sha256HexOfUtf8Text(bodyText)
+    const differentBody = 'a completely different bundle'
+    const differentDigest = sha256HexOfUtf8Text(differentBody)
+    const metaKey = `x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`
+
+    type Row = {
+      name: string
+      getResponse: () => Response
+      expectPut: boolean
+      expect: (result: { ok: true; alreadyPublished: boolean } | { ok: false; error: unknown }) => void
+    }
+
+    const rows: Row[] = [
+      {
+        name: 'PRESENT, same digest, valid metadata → alreadyPublished, 0 PUTs',
+        getResponse: () => new Response(bodyText, { status: 200, headers: { [metaKey]: digest } }),
+        expectPut: false,
+        expect: (r) => {
+          if (!r.ok) throw new Error('expected success')
+          expect(r.alreadyPublished).toBe(true)
+        },
+      },
+      {
+        name: 'PRESENT, DIFFERENT digest, valid metadata → BundleShaConflictError, 0 PUTs',
+        getResponse: () => new Response(differentBody, { status: 200, headers: { [metaKey]: differentDigest } }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundleShaConflictError)
+        },
+      },
+      {
+        name: 'PRESENT, DIFFERENT bytes, NO metadata at all → BundleShaConflictError from the REAL bytes digest, 0 PUTs',
+        getResponse: () => new Response(differentBody, { status: 200 }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundleShaConflictError)
+          expect((r.error as { existingSha256?: string }).existingSha256).toBe(differentDigest)
+        },
+      },
+      {
+        name: 'PRESENT, DIFFERENT bytes, WRONG/self-inconsistent metadata → BundleShaConflictError from the REAL bytes digest, 0 PUTs',
+        getResponse: () => new Response(differentBody, { status: 200, headers: { [metaKey]: 'deadbeef'.repeat(8) } }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundleShaConflictError)
+          expect((r.error as { existingSha256?: string }).existingSha256).toBe(differentDigest)
+        },
+      },
+      {
+        name: 'ABSENT (404) → proceeds to a real PUT (the ONLY row where a PUT happens)',
+        getResponse: () => new Response('', { status: 404 }),
+        expectPut: true,
+        expect: (r) => {
+          if (!r.ok) throw new Error('expected success')
+          expect(r.alreadyPublished).toBe(false)
+        },
+      },
+      {
+        name: 'UNKNOWN (403) → BundlePublishUnconfirmedError, fails CLOSED, 0 PUTs',
+        getResponse: () => new Response('<Error><Code>AccessDenied</Code></Error>', { status: 403 }),
+        expectPut: false,
+        expect: (r) => {
+          if (r.ok) throw new Error('expected throw')
+          expect(r.error).toBeInstanceOf(BundlePublishUnconfirmedError)
+        },
+      },
+    ]
+
+    it.each(rows.map((row) => [row.name, row] as const))('%s', async (_name, row) => {
+      const signingClient = fakeSigningClient()
+      // The fake IGNORES If-None-Match: any PUT it receives "succeeds" (200) — CLOBBERING
+      // whatever the pre-check GET reported, if the code were ever to reach a PUT here.
+      const fetchImpl = vi.fn(async (req: Request) => {
+        if (req.method === 'PUT') return new Response('', { status: 200 })
+        return row.getResponse()
+      })
+      let outcome: { ok: true; alreadyPublished: boolean } | { ok: false; error: unknown }
+      try {
+        const receipt = await putPotWorkerBundleObject({
+          accountId: 'acct',
+          bucket: 'mupot-pot-bundles',
+          releaseSha: sha,
+          bodyText,
+          accessKeyId: 'ak',
+          secretAccessKey: 'sk',
+          signingClient,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+        })
+        outcome = { ok: true, alreadyPublished: receipt.alreadyPublished }
+      } catch (error) {
+        outcome = { ok: false, error }
+      }
+      row.expect(outcome)
+      const putCalls = fetchImpl.mock.calls.filter((call) => (call[0] as Request).method === 'PUT')
+      expect(putCalls.length).toBe(row.expectPut ? 1 : 0)
+    })
+  })
+
   // Kasra-core round-2 finding (2026-09-22): a plain overwrite-by-key PUT could silently
   // replace an already-published RELEASE_SHA's bundle with DIFFERENT bytes (a stale local
   // tree, a non-reproducible build, two colonies racing the same commit). Conditional write
@@ -701,7 +817,15 @@ describe('CodeQL js/clear-text-logging fix — no process.env value ever reaches
     it('putPotWorkerBundleObject never returns the real accountId in its url field', async () => {
       const sha = '5'.repeat(40)
       const signingClient = { sign: vi.fn(async (req: Request) => req) }
-      const fetchImpl = vi.fn(async () => new Response('', { status: 200 }))
+      // First call is the pre-PUT precheck (P2-1/P1-2) — 404 so it falls through to a real
+      // PUT, which the second call answers with success. A bare 200-for-everything mock
+      // would now (correctly) be classified as an already-PRESENT object and short-circuit
+      // before ever reaching a PUT, which is not what this test is exercising.
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call++
+        return new Response('', { status: call === 1 ? 404 : 200 })
+      })
       const receipt = await putPotWorkerBundleObject({
         accountId: SENTINEL_ACCOUNT_ID,
         bucket: SENTINEL_BUCKET,
@@ -818,7 +942,12 @@ describe('CodeQL js/clear-text-logging fix — no process.env value ever reaches
   it('end-to-end: a full publish-shaped call with sentinel accountId/bucket never leaks either through the printed receipt', async () => {
     const sha = '7'.repeat(40)
     const signingClient = { sign: vi.fn(async (req: Request) => req) }
-    const fetchImpl = vi.fn(async () => new Response('', { status: 200 }))
+    // Same fix as the redaction test above: 404 on the pre-PUT precheck, 200 on the PUT.
+    let call = 0
+    const fetchImpl = vi.fn(async () => {
+      call++
+      return new Response('', { status: call === 1 ? 404 : 200 })
+    })
     const receipt = await putPotWorkerBundleObject({
       accountId: SENTINEL_ACCOUNT_ID,
       bucket: SENTINEL_BUCKET,
@@ -947,5 +1076,74 @@ describe('real CLI process — sentinel account id/bucket never leak through std
     expect(combined).toContain('PermanentRedirect')
     expect(combined).toContain('403')
     expect(result.status).not.toBe(0)
+  }, 60_000)
+})
+
+// mupot#1529 round-1 P1-2: the six-row matrix above proves the classification at the
+// LIBRARY level (injected fetchImpl). This exercises the SAME pre-PUT layer through the
+// REAL `scripts/publish-pot-bundle.mjs` CLI process, using the fixture's per-request
+// scripting (FAKE_R2_SCRIPT_JSON) to answer the pre-check GET and the subsequent PUT
+// differently — proving the wiring (the CLI script's own argv/env handling, not just the
+// exported function) also gets this right.
+//
+// NOTE ON SCOPE: like every other real publish-pot-bundle.mjs spawn in this file, this
+// needs a clean, committed tree and a real (network-free) wrangler dry-run build — see the
+// other "NOTE ON SCOPE" comments in this file for why.
+describe('real CLI process — pre-PUT classification (P1-2) through scripts/publish-pot-bundle.mjs', () => {
+  it('GET-404-then-PUT-200: a genuinely new bundle publishes successfully (the one row that DOES PUT)', () => {
+    const result = spawnSync(
+      process.execPath,
+      ['--import', fakeR2FetchPreload, 'scripts/publish-pot-bundle.mjs', '--config', 'wrangler.example.toml'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          CLOUDFLARE_ACCOUNT_ID: 'test-account',
+          POT_WORKER_BUNDLE_R2_BUCKET: 'test-bucket',
+          R2_POT_BUNDLES_ACCESS_KEY_ID: 'ak-test',
+          R2_POT_BUNDLES_SECRET_ACCESS_KEY: 'sk-test',
+          FAKE_R2_SCRIPT_JSON: JSON.stringify([
+            { status: 404 }, // pre-check: nothing published yet
+            { status: 200 }, // the PUT itself succeeds
+          ]),
+        },
+      },
+    )
+    expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0)
+    const receipt = JSON.parse(result.stdout.trim().split('\n').pop()!)
+    expect(receipt.ok).toBe(true)
+    expect(receipt.already_published).toBe(false)
+  }, 60_000)
+
+  it('GET-200-different-bytes: refuses with BundleShaConflictError and makes NO second (PUT) request', () => {
+    const differentBody = 'export default { fetch() { return new Response("old") } }'
+    const differentDigest = sha256HexOfUtf8Text(differentBody)
+    const result = spawnSync(
+      process.execPath,
+      ['--import', fakeR2FetchPreload, 'scripts/publish-pot-bundle.mjs', '--config', 'wrangler.example.toml'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          CLOUDFLARE_ACCOUNT_ID: 'test-account',
+          POT_WORKER_BUNDLE_R2_BUCKET: 'test-bucket',
+          R2_POT_BUNDLES_ACCESS_KEY_ID: 'ak-test',
+          R2_POT_BUNDLES_SECRET_ACCESS_KEY: 'sk-test',
+          // A SINGLE scripted step: if the code (incorrectly) made a second (PUT) request,
+          // the script would repeat this same 200-different-bytes response for it too —
+          // which would look like a successful overwrite. The assertion below on the
+          // process's own behavior (refused, never "published") is what actually proves
+          // no PUT was attempted, matching the library-level six-row matrix's stricter
+          // fetchImpl-call-count assertion for the same row.
+          FAKE_R2_SCRIPT_JSON: JSON.stringify([{ status: 200, body: differentBody }]),
+        },
+      },
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('DIFFERENT digest')
+    expect(result.stderr).toContain(differentDigest)
+    expect(result.stdout).toBe('') // never prints a success receipt
   }, 60_000)
 })
