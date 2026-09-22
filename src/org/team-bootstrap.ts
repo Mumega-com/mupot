@@ -14,9 +14,25 @@
 // (type-safe suffixes, mupot#1495), an ADMIN project<->squad edge, an
 // optional `<slug_base>-bot` agent in that squad, plain-squad invites (0156
 // shape) for each named human, and one append-only team_bootstrap_receipts
-// row (migration 0166). The bot's credential claim and the optional
-// project_remember seed are NOT written here — see the doc comment below on
-// why, and src/mcp/team-bootstrap.ts for where they happen.
+// row PER ATTEMPT (migration 0166). The bot's credential claim and the
+// optional project_remember seed are NOT written here — see the doc comment
+// below on why, and src/mcp/team-bootstrap.ts for where they happen.
+//
+// SQUAD ADOPTION IS NOT FREE (kasra-review adversarial round-1 gate on PR
+// #1510, P0, 2026-09-22 — "adoption without ownership", the same class as
+// #1507's P0-4). Finding an existing squad by (department_id, slug) and
+// wiring it an ADMIN edge onto a NEW project — plus placing a mintable bot
+// inside it — is a PRIVILEGE GRANT to whoever already controls that squad.
+// Before adopting any pre-existing squad, squadIsAdoptable (below) requires
+// EITHER (a) a prior team_bootstrap attempt already named this exact
+// squad_id for this exact slug_base (a genuine resumed retry — checked
+// against team_bootstrap_receipts, never against the squad's CURRENT state,
+// which an attacker controls), OR (b) the squad is genuinely EMPTY — zero
+// agents, zero capability grants — so adopting it hands nobody standing they
+// did not already have. Neither holding: refused `squad_slug_taken` (with
+// the squad's current capability holders in the detail) UNLESS the caller
+// passes `adopt: true` AND is org:admin (isOrgAdmin, checked HERE — an
+// explicit, informed override, never implicit).
 //
 // ATOMICITY — NOT one giant transaction, deliberately (Athena round-1 gate on
 // PR #1510, 2026-09-22, resumability requirement). Department/project/squad
@@ -25,8 +41,10 @@
 // own that discipline and this function does not fork it). After that, the
 // write phase has THREE stages, in order:
 //
-//   1. ONE env.DB.batch(): the ADMIN project<->squad edge + the bot agent's
-//      two prepareAgentCreate statements (only when a bot needs creating).
+//   1. ONE env.DB.batch(): the ADMIN project<->squad edge (only when no edge
+//      exists yet — an existing edge below admin is NEVER silently raised,
+//      see "THE EDGE IS NEVER SILENTLY RAISED" below) + the bot agent's two
+//      prepareAgentCreate statements (only when a bot needs creating).
 //      All-or-nothing — a failure here (a genuine D1 error, a trigger abort)
 //      rolls back both, and neither is left half-wired.
 //   2. Per-human invite inserts, ONE AT A TIME, not batched together. A
@@ -36,16 +54,32 @@
 //      one-off) does not spray partial state across every remaining human.
 //   3. The team_bootstrap_receipts write — ALWAYS attempted, whether stage 1
 //      or 2 succeeded or failed (migration 0166's `failed` disposition is
-//      exactly for this). This is a separate write from whatever failed, by
+//      exactly for this). ONE INSERT per attempt (never an UPDATE — see
+//      migration 0166's header for why the earlier update-in-place design
+//      was falsifiable), so it is a separate write from whatever failed by
 //      construction: it never shares a transaction with stage 1's batch or
 //      any stage-2 insert, so it survives their failure.
 //
 // This means a genuinely partial, real state — project+squad+maybe-bot+
 // SOME invites, with the composite call itself incomplete — is an EXPECTED
-// resting state, not corruption: see migration 0166's "FAILED ATTEMPTS ARE
-// RECEIPTED, AND RESUMABLE" section. A retry with the same slug_base adopts
-// every already-committed piece (project, squad, bot, and each invite that
-// already landed) and only attempts what is left.
+// resting state, not corruption. A retry with the same slug_base adopts
+// every already-committed piece (project, an OWNED squad, bot, and each
+// invite that already landed, via the SAME find-or-create reads every call
+// already does) and only attempts what is left.
+//
+// THE EDGE IS NEVER SILENTLY RAISED (P1-2, same gate): if a project<->squad
+// edge already exists below 'admin' (a deliberate 'read' or 'write' link —
+// see start-gate.ts's own doctrine on a deliberate non-writable edge), this
+// call NEVER overwrites it to 'admin'. The response's `edge_kept` field
+// names the level that was preserved (`null` when this call set, or found,
+// a genuine admin edge).
+//
+// PROJECT STATUS IS CHECKED BEFORE ANY CREATE (P1-1, same gate): an adopted
+// project that turns out to be `archived` is refused `project_archived`
+// immediately — before the squad is ever created — rather than burning a
+// free-tier squad-entitlement slot on a project that cannot use it and
+// discovering the problem only when the ADMIN-edge INSERT hits migration
+// 0055's `validate_project_squad_access_insert` trigger.
 //
 // Two things are NOT written here at all because they are not D1 writes and
 // each already owns its own atomic unit: mintAgentBoundToken
@@ -53,30 +87,30 @@
 // (D1 + Vectorize, two systems D1.batch() cannot span). Both run AFTER stage
 // 3 commits, and only on full success — see src/mcp/team-bootstrap.ts.
 //
-// IDEMPOTENT ON slug_base: a second call with the same slug_base finds the
-// existing project/squad/bot (reads before every create), sends no duplicate
-// invite for an email that already has a live invite into this squad, and
-// mints no second bot. The receipt row is UNIQUE(tenant, slug_base) — every
-// call for the same team UPDATEs the SAME row (disposition, invited_count,
-// and on a stage-2 failure, failed_step/failure_reason) rather than
-// inserting a second one; see migration 0166 for exactly which columns are
-// immutable (tenant/slug_base/project_id/squad_id/created_at only) versus
-// which reflect the latest attempt.
+// IDEMPOTENT ON slug_base: a second call with the same slug_base finds and
+// (ownership-checked) adopts the existing project/squad/bot, sends no
+// duplicate invite for an email that already has a live invite into this
+// squad (and reports that invite's STORED capability, never the newly
+// requested one — a replay does not silently change what was already
+// granted), and mints no second bot.
 //
 // AUTHZ — NO AUTHZ INSIDE for the ADMIN gate itself, same doctrine as
 // createDepartment/createSquad/createHomeForMember (src/org/service.ts's own
 // file header): the caller (src/mcp/team-bootstrap.ts's ToolSpec) gates
 // org-admin and refuses an agent-bound principal outright (grant tools never
 // run as an agent — the same rule mint_agent_token/update_squad already
-// enforce). The PER-HUMAN rank ceiling below, however, IS enforced here, not
-// left to the caller — so a future elevation path that lowers team_bootstrap's
-// own floor cannot silently skip it (defense in depth; same pattern
-// project-invites.ts's POST /invites applies to the legacy plain-squad
-// invite route).
+// enforce). Two checks below ARE enforced here regardless, not left to the
+// caller — defense in depth, same pattern project-invites.ts's POST
+// /invites applies to the legacy plain-squad invite route:
+//   - the PER-HUMAN rank ceiling, run BEFORE project/squad are created
+//     (P1-4, same gate — it used to run after, wasting a create on a call
+//     that was always going to be refused);
+//   - the squad-adoption `adopt: true` override, gated on isOrgAdmin here,
+//     never trusted from a caller whose own floor might one day be lowered.
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { Agent, AuthContext, Capability, Env, Project, Squad } from '../types'
-import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
+import type { Agent, AuthContext, Capability, Env, Project, ProjectAccessLevel, Squad } from '../types'
+import { actorRankOnScopeFor, capabilityRank, isOrgAdmin } from '../auth/capability'
 import { projectSelectSql } from '../projects/columns'
 import { createProject } from '../projects/service'
 import { assertBatchWritten, assertWritten } from '../lib/receipt'
@@ -87,9 +121,21 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const PROJECT_SLUG_SUFFIX = '-prj'
 const SQUAD_SLUG_SUFFIX = '-sqd'
 const AGENT_SLUG_SUFFIX = '-bot'
+// isValidSlug's own ceiling is 48 chars; every derived slug appends a 4-char
+// suffix (`-prj`/`-sqd`/`-bot`, all exactly 4), so slug_base itself must
+// leave room or the DERIVED slug silently fails createProject/createSquad/
+// prepareAgentCreate's OWN validation with a confusing 'invalid_slug' for a
+// string the caller never typed (P2-6, kasra-review adversarial round-1 gate
+// on PR #1510).
+const MAX_SLUG_BASE_LENGTH = 48 - 4
+const MAX_NAME_LENGTH = 200
 
 function isUniqueViolation(err: unknown): boolean {
   return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
+}
+
+function isArchivedProjectTrigger(err: unknown): boolean {
+  return err instanceof Error && /archived project/i.test(err.message)
 }
 
 /**
@@ -97,12 +143,18 @@ function isUniqueViolation(err: unknown): boolean {
  * It must pass isValidSlug's own charset rules (lowercase alphanumeric +
  * single hyphens, 1-48 chars) AND must not already carry one of the three
  * kind suffixes — a caller passing `psychonom-prj` as slug_base would
- * otherwise mint `psychonom-prj-prj`.
+ * otherwise mint `psychonom-prj-prj` — AND must be short enough that every
+ * derived slug still fits isValidSlug's own 48-char ceiling.
  */
 export function isValidSlugBase(v: unknown): v is string {
   if (!isValidSlug(v)) return false
   const s = v as string
+  if (s.length > MAX_SLUG_BASE_LENGTH) return false
   return !s.endsWith(PROJECT_SLUG_SUFFIX) && !s.endsWith(SQUAD_SLUG_SUFFIX) && !s.endsWith(AGENT_SLUG_SUFFIX)
+}
+
+function isValidName(v: unknown): v is string {
+  return isNonEmptyString(v) && (v as string).trim().length <= MAX_NAME_LENGTH
 }
 
 export interface TeamBootstrapHumanInput {
@@ -126,6 +178,12 @@ export interface TeamBootstrapInput {
   humans?: TeamBootstrapHumanInput[]
   bot?: TeamBootstrapBotInput
   seed_memory?: string
+  /**
+   * Explicit, informed override to adopt a pre-existing, non-empty squad
+   * that a prior team_bootstrap attempt did NOT name (P0, see file header).
+   * Ignored unless the caller is org:admin (isOrgAdmin, checked here).
+   */
+  adopt?: boolean
 }
 
 export interface TeamBootstrapInvite {
@@ -142,15 +200,37 @@ export interface TeamBootstrapBotResult {
   created: boolean
 }
 
-export type TeamBootstrapDisposition = 'created' | 'existing'
+export interface TeamBootstrapProjectResult {
+  project: Project
+  created: boolean
+}
+
+export interface TeamBootstrapSquadResult {
+  squad: Squad
+  created: boolean
+}
+
+// 'adopted' (Athena, round-2 sharpening on PR #1510, 2026-09-22): "find-or-
+// create is create + explicit adopt" — claiming a pre-existing, non-empty
+// squad via `adopt: true` is an AUDITED operator decision, not an ordinary
+// idempotent replay. It gets its own disposition rather than folding into
+// 'created' so the receipt trail can never conflate "I made something new"
+// with "I claimed something someone else already built."
+export type TeamBootstrapDisposition = 'created' | 'existing' | 'adopted'
 
 export interface TeamBootstrapOk {
   ok: true
   disposition: TeamBootstrapDisposition
-  project: Project
-  squad: Squad
+  project: TeamBootstrapProjectResult
+  squad: TeamBootstrapSquadResult
+  /** the access level a pre-existing, deliberately-below-admin edge was left
+   *  at (P1-2) — null when this call set, or found, a genuine admin edge. */
+  edge_kept: ProjectAccessLevel | null
   bot: TeamBootstrapBotResult | null
   invites: TeamBootstrapInvite[]
+  /** lowercased emails that appeared more than once in this call's `humans`
+   *  list — only the FIRST occurrence was used (P2-1). */
+  duplicate_emails_in_request: string[]
   receipt_id: string
 }
 
@@ -158,6 +238,7 @@ export type TeamBootstrapError =
   | 'invalid_slug_base'
   | 'invalid_name'
   | 'invalid_department'
+  | 'actor_required'
   | 'department_not_found'
   | 'ambiguous_department'
   | 'invalid_human_email'
@@ -166,6 +247,8 @@ export type TeamBootstrapError =
   | 'invalid_bot_name'
   | 'squad_limit_reached'
   | 'agent_limit_reached'
+  | 'squad_slug_taken'
+  | 'project_archived'
   | 'provisioning_failed'
 
 export type TeamBootstrapResult = TeamBootstrapOk | { ok: false; error: TeamBootstrapError; detail?: unknown }
@@ -188,95 +271,147 @@ async function findAgentBySquadAndSlug(env: Env, squadId: string, slug: string):
     .first<Agent>()
 }
 
-async function findLiveInvite(env: Env, squadId: string, email: string): Promise<{ id: string } | null> {
+/** The invite's id AND its STORED capability — P2-2: a replay that requests a
+ *  DIFFERENT capability for an email with a live invite must report what was
+ *  actually granted, never silently imply the request changed it. */
+async function findLiveInvite(
+  env: Env,
+  squadId: string,
+  email: string,
+): Promise<{ id: string; capability: Capability } | null> {
   return env.DB.prepare(
-    `SELECT id FROM invites WHERE squad_id = ?1 AND lower(email) = lower(?2) AND accepted_at IS NULL LIMIT 1`,
+    `SELECT id, capability FROM invites WHERE squad_id = ?1 AND lower(email) = lower(?2) AND accepted_at IS NULL LIMIT 1`,
   )
     .bind(squadId, email)
-    .first<{ id: string }>()
+    .first<{ id: string; capability: Capability }>()
 }
 
-interface ReceiptRow {
-  id: string
-  invited_count: number
+interface CapabilityHolder {
+  member_id: string
+  capability: Capability
 }
 
-async function findReceipt(env: Env, tenant: string, slugBase: string): Promise<ReceiptRow | null> {
-  return env.DB.prepare(
-    `SELECT id, invited_count FROM team_bootstrap_receipts WHERE tenant = ?1 AND slug_base = ?2 LIMIT 1`,
+async function listSquadCapabilityHolders(env: Env, squadId: string): Promise<CapabilityHolder[]> {
+  const rows = await env.DB.prepare(
+    `SELECT member_id, capability FROM capabilities WHERE scope_type = 'squad' AND scope_id = ?1`,
+  )
+    .bind(squadId)
+    .all<CapabilityHolder>()
+  return rows.results ?? []
+}
+
+/**
+ * P0 (kasra-review adversarial round-1 gate on PR #1510): true when it is
+ * safe to wire an ADMIN project edge onto this pre-existing squad and place
+ * a mintable bot inside it. Two independent grounds, either is sufficient:
+ *   (a) a PRIOR team_bootstrap attempt already named this exact squad_id for
+ *       this exact slug_base — a genuine resumed retry, checked against the
+ *       append-only receipt trail, never against the squad's CURRENT state
+ *       (which whoever controls the squad can freely change).
+ *   (b) the squad is genuinely EMPTY right now — zero agents, zero
+ *       capability grants — so adopting it hands nobody standing they did
+ *       not already have.
+ * Neither holding means someone OTHER than a prior bootstrap of this exact
+ * team put this squad here — refuse unless the caller explicitly overrides.
+ */
+async function squadIsAdoptable(env: Env, squadId: string, tenant: string, slugBase: string): Promise<boolean> {
+  const priorAttempt = await env.DB.prepare(
+    `SELECT 1 FROM team_bootstrap_receipts WHERE tenant = ?1 AND squad_id = ?2 AND slug_base = ?3 LIMIT 1`,
+  )
+    .bind(tenant, squadId, slugBase)
+    .first()
+  if (priorAttempt) return true
+
+  const hasAgent = await env.DB.prepare(`SELECT 1 FROM agents WHERE squad_id = ?1 LIMIT 1`).bind(squadId).first()
+  if (hasAgent) return false
+  const hasCapabilityRow = await env.DB.prepare(
+    `SELECT 1 FROM capabilities WHERE scope_type = 'squad' AND scope_id = ?1 LIMIT 1`,
+  )
+    .bind(squadId)
+    .first()
+  return !hasCapabilityRow
+}
+
+/**
+ * P0(c) helper, consumed by src/mcp/provision.ts's update_squad — NOT called
+ * from teamBootstrap itself. A rename INTO a `<x>-sqd` slug that some
+ * OTHER project or team_bootstrap attempt has already claimed for `x` needs
+ * the OLD create_squad floor (department:admin), not the ordinary squad:admin
+ * update_squad otherwise runs at — see toolUpdateSquad's own comment for why.
+ */
+export async function isSlugBaseReserved(env: Env, tenant: string, slugBase: string): Promise<boolean> {
+  const project = await findProjectBySlug(env, `${slugBase}${PROJECT_SLUG_SUFFIX}`)
+  if (project) return true
+  const receipt = await env.DB.prepare(
+    `SELECT 1 FROM team_bootstrap_receipts WHERE tenant = ?1 AND slug_base = ?2 LIMIT 1`,
   )
     .bind(tenant, slugBase)
-    .first<ReceiptRow>()
+    .first()
+  return receipt !== null
+}
+
+/** slugBase derived from a squad slug ending in `-sqd`, or null if it doesn't. */
+export function slugBaseFromSquadSlug(slug: string): string | null {
+  return slug.endsWith(SQUAD_SLUG_SUFFIX) ? slug.slice(0, -SQUAD_SLUG_SUFFIX.length) : null
 }
 
 /** Where the write phase stopped, for a 'failed' receipt row (migration 0166). */
 export type TeamBootstrapFailedStep = 'edge_or_bot' | 'invite_insert'
 /** A short, STRUCTURAL classification — never the raw driver error text, never an
  *  email or other human PII (migration 0166's header explains why). */
-export type TeamBootstrapFailureReason = 'unique_violation' | 'write_failed'
+export type TeamBootstrapFailureReason = 'unique_violation' | 'write_failed' | 'archived_project'
 
 function classifyWriteFailure(err: unknown): TeamBootstrapFailureReason {
-  return isUniqueViolation(err) ? 'unique_violation' : 'write_failed'
+  if (isUniqueViolation(err)) return 'unique_violation'
+  if (isArchivedProjectTrigger(err)) return 'archived_project'
+  return 'write_failed'
 }
 
-interface WriteReceiptOutcomeInput {
-  existingReceipt: ReceiptRow | null
+interface WriteReceiptInput {
   tenant: string
-  actorMemberId: string | null
+  actorMemberId: string
   slugBase: string
   projectId: string
   squadId: string
   botAgentId: string | null
-  disposition: 'created' | 'existing' | 'failed'
+  disposition: TeamBootstrapDisposition | 'failed'
   invitedCount: number
   failedStep: TeamBootstrapFailedStep | null
   failureReason: TeamBootstrapFailureReason | null
 }
 
 /**
- * The ONE place team_bootstrap writes its receipt — on success (a fresh
- * 'created'/'existing' row, or an update to invited_count on a replay) AND
- * on a stage-1/stage-2 write-phase failure (a 'failed' row, migration
- * 0166). Always its own statement, never sharing a transaction with the
- * thing that may have just failed — see this file's ATOMICITY doc comment.
- * A retry finds the SAME row (UNIQUE(tenant, slug_base)) and UPDATEs it —
- * the row is the CURRENT state of this team's bootstrap attempts, not a
- * historical log entry (migration 0166's "RESUMABILITY" section).
+ * ONE INSERT per team_bootstrap ATTEMPT — never an UPDATE (P1-3, kasra-review
+ * adversarial round-1 gate on PR #1510: the prior update-in-place design was
+ * falsifiable three separate ways — see migration 0166's header). Called on
+ * success AND on a stage-1/stage-2 write-phase failure (migration 0166's
+ * `failed` disposition). Always its own statement, never sharing a
+ * transaction with the thing that may have just failed — see this file's
+ * ATOMICITY doc comment.
  */
-async function writeReceiptOutcome(env: Env, input: WriteReceiptOutcomeInput): Promise<string> {
-  if (input.existingReceipt) {
-    await env.DB.prepare(
-      `UPDATE team_bootstrap_receipts
-          SET actor_member_id = ?1, bot_agent_id = ?2, disposition = ?3,
-              invited_count = ?4, failed_step = ?5, failure_reason = ?6
-        WHERE id = ?7`,
-    )
-      .bind(
-        input.actorMemberId,
-        input.botAgentId,
-        input.disposition,
-        input.invitedCount,
-        input.failedStep,
-        input.failureReason,
-        input.existingReceipt.id,
-      )
-      .run()
-    return input.existingReceipt.id
-  }
+async function writeReceipt(env: Env, input: WriteReceiptInput): Promise<string> {
+  const attemptRow = await env.DB.prepare(
+    `SELECT COALESCE(MAX(attempt_no), 0) AS max_attempt
+       FROM team_bootstrap_receipts WHERE tenant = ?1 AND slug_base = ?2`,
+  )
+    .bind(input.tenant, input.slugBase)
+    .first<{ max_attempt: number }>()
+  const attemptNo = (attemptRow?.max_attempt ?? 0) + 1
 
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
   await env.DB.prepare(
     `INSERT INTO team_bootstrap_receipts
-      (id, tenant, actor_member_id, slug_base, project_id, squad_id, bot_agent_id,
+      (id, tenant, actor_member_id, slug_base, attempt_no, project_id, squad_id, bot_agent_id,
        disposition, invited_count, failed_step, failure_reason, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
   )
     .bind(
       id,
       input.tenant,
       input.actorMemberId,
       input.slugBase,
+      attemptNo,
       input.projectId,
       input.squadId,
       input.botAgentId,
@@ -295,10 +430,17 @@ export async function teamBootstrap(
   auth: AuthContext,
   input: TeamBootstrapInput,
 ): Promise<TeamBootstrapResult> {
+  // ── boundary guards, before any read or write (P2-3) ──────────────────────
+  if (!auth.memberId) return { ok: false, error: 'actor_required' }
   if (!isValidSlugBase(input.slug_base)) return { ok: false, error: 'invalid_slug_base' }
-  if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
+  if (!isValidName(input.name)) return { ok: false, error: 'invalid_name' }
   const slugBase = input.slug_base
   const name = input.name.trim()
+  // Tenant is environment-derived, never from the caller's own claimed
+  // AuthContext.tenant (P2-7 — same doctrine src/mcp/index.ts's file header
+  // states for every MCP tool: "Tenant is environment-derived
+  // (env.TENANT_SLUG), never client-supplied").
+  const tenant = env.TENANT_SLUG
 
   if (!isNonEmptyString(input.department)) return { ok: false, error: 'invalid_department' }
   const deptResult = await resolveDepartmentRef(env, input.department)
@@ -307,17 +449,44 @@ export async function teamBootstrap(
   }
   const departmentId = deptResult.value.id
 
-  // Validate every human BEFORE any write — a bad email/capability in the
-  // list must not leave the project/squad half-provisioned.
-  const humans = input.humans ?? []
-  for (const h of humans) {
+  // ── validate + dedupe humans BEFORE any write (P2-1) ──────────────────────
+  // A bad email/capability, or a duplicate email, must not leave the
+  // project/squad half-provisioned, and must not attempt two invite inserts
+  // for the same address in one call.
+  const rawHumans = input.humans ?? []
+  const seenEmails = new Set<string>()
+  const duplicateEmails = new Set<string>()
+  const humans: TeamBootstrapHumanInput[] = []
+  for (const h of rawHumans) {
     if (!isNonEmptyString(h.email) || !EMAIL_RE.test(h.email.trim())) return { ok: false, error: 'invalid_human_email' }
     if (h.capability !== 'observer' && h.capability !== 'member') return { ok: false, error: 'invalid_human_capability' }
+    const lower = h.email.trim().toLowerCase()
+    if (seenEmails.has(lower)) {
+      duplicateEmails.add(lower)
+      continue // first occurrence wins
+    }
+    seenEmails.add(lower)
+    humans.push(h)
   }
 
   const botEnabled = input.bot?.enabled !== false
   if (input.bot?.name !== undefined && !isNonEmptyString(input.bot.name)) {
     return { ok: false, error: 'invalid_bot_name' }
+  }
+
+  // ── rank ceiling, BEFORE any create (P1-4) ────────────────────────────────
+  // Department scope, not squad — the squad may not exist yet, and an
+  // org/department grant inherits down to it regardless (capability.ts's own
+  // invariant). Running this before createProject/createSquad means a call
+  // that was always going to be refused never burns an entitlement slot on
+  // a squad/project nobody gets to keep.
+  if (humans.length > 0) {
+    const actorRank = await actorRankOnScopeFor(env, auth, 'department', departmentId)
+    for (const h of humans) {
+      if (capabilityRank(h.capability) > actorRank) {
+        return { ok: false, error: 'cannot_invite_above_own_rank', detail: { email: h.email, capability: h.capability } }
+      }
+    }
   }
 
   const projectSlug = `${slugBase}${PROJECT_SLUG_SUFFIX}`
@@ -343,10 +512,38 @@ export async function teamBootstrap(
     }
   }
 
-  // ── resolve-or-create SQUAD — its own commit, its own entitlement gate ────
+  // ── project status checked BEFORE the squad is ever created (P1-1) ───────
+  // An adopted, archived project can never take an ADMIN edge (migration
+  // 0055's validate_project_squad_access_insert trigger) — refuse NOW,
+  // before spending a free-tier squad-entitlement slot on a squad this call
+  // could never finish wiring.
+  if (project.status === 'archived') {
+    return { ok: false, error: 'project_archived', detail: { project_id: project.id } }
+  }
+
+  // ── resolve-or-create SQUAD — its own commit, its own entitlement gate,
+  //    ownership-checked before adoption (P0) ───────────────────────────────
   let squad = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
   let squadCreated = false
-  if (!squad) {
+  let adoptedViaOverride = false
+  if (squad) {
+    const adoptable = await squadIsAdoptable(env, squad.id, tenant, slugBase)
+    if (!adoptable) {
+      if (!(input.adopt === true && isOrgAdmin(auth))) {
+        const owners = await listSquadCapabilityHolders(env, squad.id)
+        return {
+          ok: false,
+          error: 'squad_slug_taken',
+          detail: { squad_id: squad.id, department_id: departmentId, owners },
+        }
+      }
+      // Athena, round-2 sharpening on PR #1510: "find-or-create is create +
+      // explicit adopt" — an org-admin's `adopt: true` override is an
+      // AUDITED operator decision, receipted as its own disposition
+      // ('adopted', below) rather than silently folded into 'existing'.
+      adoptedViaOverride = true
+    }
+  } else {
     const created = await createSquad(env, departmentId, { slug: squadSlug, name })
     if (created.ok) {
       squad = created.value
@@ -361,24 +558,15 @@ export async function teamBootstrap(
     }
   }
 
-  // ── rank ceiling: cannot invite above the caller's own rank on THIS squad ─
-  if (humans.length > 0) {
-    const actorRank = await actorRankOnScopeFor(env, auth, 'squad', squad.id)
-    for (const h of humans) {
-      if (capabilityRank(h.capability) > actorRank) {
-        return { ok: false, error: 'cannot_invite_above_own_rank', detail: { email: h.email, capability: h.capability } }
-      }
-    }
-  }
-
-  // ── which humans still need a fresh invite (idempotency) ──────────────────
+  // ── which humans still need a fresh invite (idempotency), reporting the
+  //    STORED capability for one that already exists (P2-2) ────────────────
   const inviteRows: TeamBootstrapInvite[] = []
   const invitesToInsert: { id: string; email: string; capability: Capability }[] = []
   for (const h of humans) {
     const email = h.email.trim()
     const existing = await findLiveInvite(env, squad.id, email)
     if (existing) {
-      inviteRows.push({ id: existing.id, email, capability: h.capability, created: false })
+      inviteRows.push({ id: existing.id, email, capability: existing.capability, created: false })
     } else {
       const id = crypto.randomUUID()
       invitesToInsert.push({ id, email, capability: h.capability })
@@ -406,43 +594,56 @@ export async function teamBootstrap(
     }
   }
 
-  const existingReceipt = await findReceipt(env, auth.tenant, slugBase)
+  // ── the ADMIN edge is never silently raised (P1-2) ────────────────────────
+  const existingEdge = await env.DB.prepare(
+    `SELECT access_level FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2`,
+  )
+    .bind(project.id, squad.id)
+    .first<{ access_level: ProjectAccessLevel }>()
+  const edgeKept: ProjectAccessLevel | null =
+    existingEdge && existingEdge.access_level !== 'admin' ? existingEdge.access_level : null
+  const needsEdgeInsert = !existingEdge
+
   const now = new Date().toISOString()
 
-  // ── stage 1: ONE atomic batch — the ADMIN edge + the bot (if any) ─────────
-  const structuralStatements: D1PreparedStatement[] = [
-    env.DB.prepare(
-      `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
-       VALUES (?1, ?2, 'admin', ?3)
-       ON CONFLICT(project_id, squad_id) DO UPDATE SET access_level = 'admin'`,
-    ).bind(project.id, squad.id, now),
-  ]
+  // ── stage 1: ONE atomic batch — the ADMIN edge (if needed) + the bot ─────
+  const structuralStatements: D1PreparedStatement[] = []
+  if (needsEdgeInsert) {
+    structuralStatements.push(
+      env.DB.prepare(
+        `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+         VALUES (?1, ?2, 'admin', ?3)
+         ON CONFLICT(project_id, squad_id) DO NOTHING`,
+      ).bind(project.id, squad.id, now),
+    )
+  }
   if (preparedAgent) {
     structuralStatements.push(preparedAgent.statements[0], preparedAgent.statements[1])
   }
 
-  try {
-    const results = await env.DB.batch(structuralStatements)
-    assertBatchWritten(results, 'team_bootstrap.structural', 1)
-  } catch (err) {
-    // Stage 1 failed — the ADMIN edge and/or the bot did not land. Nothing
-    // from stage 2 (invites) has run yet. Receipt the failure as its own,
-    // separate write (never inside the batch that just rolled back) so a
-    // retry — and any operator watching this table — sees it.
-    await writeReceiptOutcome(env, {
-      existingReceipt,
-      tenant: auth.tenant,
-      actorMemberId: auth.memberId ?? null,
-      slugBase,
-      projectId: project.id,
-      squadId: squad.id,
-      botAgentId: existingAgent?.id ?? null,
-      disposition: 'failed',
-      invitedCount: existingReceipt?.invited_count ?? 0,
-      failedStep: 'edge_or_bot',
-      failureReason: classifyWriteFailure(err),
-    })
-    return { ok: false, error: 'provisioning_failed', detail: { stage: 'edge_or_bot', reason: classifyWriteFailure(err) } }
+  if (structuralStatements.length > 0) {
+    try {
+      const results = await env.DB.batch(structuralStatements)
+      assertBatchWritten(results, 'team_bootstrap.structural', 1)
+    } catch (err) {
+      // Stage 1 failed — the ADMIN edge and/or the bot did not land. Nothing
+      // from stage 2 (invites) has run yet. Receipt the failure as its own,
+      // separate write (never inside the batch that just rolled back) so a
+      // retry — and any operator watching this table — sees it.
+      await writeReceipt(env, {
+        tenant,
+        actorMemberId: auth.memberId,
+        slugBase,
+        projectId: project.id,
+        squadId: squad.id,
+        botAgentId: existingAgent?.id ?? null,
+        disposition: 'failed',
+        invitedCount: 0,
+        failedStep: 'edge_or_bot',
+        failureReason: classifyWriteFailure(err),
+      })
+      return { ok: false, error: 'provisioning_failed', detail: { stage: 'edge_or_bot', reason: classifyWriteFailure(err) } }
+    }
   }
 
   const botAgentId = preparedAgent?.agent.id ?? existingAgent?.id ?? null
@@ -460,7 +661,7 @@ export async function teamBootstrap(
         `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
       )
-        .bind(invite.id, invite.email, departmentId, squad.id, invite.capability, auth.memberId ?? null, now)
+        .bind(invite.id, invite.email, departmentId, squad.id, invite.capability, auth.memberId, now)
         .run()
       assertWritten(result, 'team_bootstrap.invite_insert', 1)
       insertedInviteCount += 1
@@ -470,42 +671,41 @@ export async function teamBootstrap(
     }
   }
 
-  const totalInvitedCount = (existingReceipt?.invited_count ?? 0) + insertedInviteCount
-
   if (inviteFailure) {
-    await writeReceiptOutcome(env, {
-      existingReceipt,
-      tenant: auth.tenant,
-      actorMemberId: auth.memberId ?? null,
+    const receiptId = await writeReceipt(env, {
+      tenant,
+      actorMemberId: auth.memberId,
       slugBase,
       projectId: project.id,
       squadId: squad.id,
       botAgentId,
       disposition: 'failed',
-      invitedCount: totalInvitedCount,
+      invitedCount: insertedInviteCount,
       failedStep: 'invite_insert',
       failureReason: classifyWriteFailure(inviteFailure),
     })
     return {
       ok: false,
       error: 'provisioning_failed',
-      detail: { stage: 'invite_insert', reason: classifyWriteFailure(inviteFailure) },
+      detail: { stage: 'invite_insert', reason: classifyWriteFailure(inviteFailure), receipt_id: receiptId },
     }
   }
 
-  // ── stage 3: the success receipt ──────────────────────────────────────────
-  const disposition: TeamBootstrapDisposition =
-    projectCreated || squadCreated || preparedAgent !== null || invitesToInsert.length > 0 ? 'created' : 'existing'
-  const receiptId = await writeReceiptOutcome(env, {
-    existingReceipt,
-    tenant: auth.tenant,
-    actorMemberId: auth.memberId ?? null,
+  // ── stage 3: the success receipt — one INSERT, this attempt only ─────────
+  const disposition: TeamBootstrapDisposition = adoptedViaOverride
+    ? 'adopted'
+    : projectCreated || squadCreated || preparedAgent !== null || invitesToInsert.length > 0
+      ? 'created'
+      : 'existing'
+  const receiptId = await writeReceipt(env, {
+    tenant,
+    actorMemberId: auth.memberId,
     slugBase,
     projectId: project.id,
     squadId: squad.id,
     botAgentId,
     disposition,
-    invitedCount: totalInvitedCount,
+    invitedCount: insertedInviteCount,
     failedStep: null,
     failureReason: null,
   })
@@ -519,10 +719,12 @@ export async function teamBootstrap(
   return {
     ok: true,
     disposition,
-    project,
-    squad,
+    project: { project, created: projectCreated },
+    squad: { squad, created: squadCreated },
+    edge_kept: edgeKept,
     bot: botResult,
     invites: inviteRows,
+    duplicate_emails_in_request: [...duplicateEmails],
     receipt_id: receiptId,
   }
 }

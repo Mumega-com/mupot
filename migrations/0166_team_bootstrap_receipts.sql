@@ -42,107 +42,99 @@
 --     fit "a project, a squad, and a brand-new agent were created together."
 -- A fifth, purpose-built table is narrower than stretching any of these.
 --
--- SHAPE follows the SAME append-only-ROWS receipt idiom as 0086/0115/0157/
--- 0161 (a row, once written, is never DELETEd) — but is DELIBERATELY NOT
--- append-only on every COLUMN, unlike those tables. See "FAILED ATTEMPTS
--- ARE RECEIPTED, AND RESUMABLE" below for why.
---   * TEXT id (UUID), no AUTOINCREMENT surrogate.
+-- ONE ROW PER ATTEMPT, NOT PER TEAM (kasra-review adversarial round-1 gate on
+-- PR #1510, P1-3, 2026-09-22). An earlier version of this migration kept
+-- exactly one row per (tenant, slug_base), continuously UPDATEd across
+-- retries — and every update-in-place path turned out falsifiable: a squad
+-- renamed out from under a slug_base leaves the "pinned" squad_id pointing
+-- at a squad that no longer represents that team (the pin then either wedges
+-- every future write, or the trigger silently permits drift); a bot created
+-- on attempt 2 could be recorded as if it existed on attempt 1;
+-- `invited_count` accumulated onto ONE row regardless of which admin
+-- actually placed which invites, misattributing a second admin's invites to
+-- the first admin's `actor_member_id`. Every one of these is a symptom of
+-- the same mistake: treating a MUTABLE "current state of this team" row as
+-- if it were a historical log. It is not — this table now matches every
+-- OTHER receipt table's actual append-only-COLUMN idiom (0086/0115/0157/
+-- 0161): one INSERT per team_bootstrap call, NEVER an UPDATE. `attempt_no`
+-- (1, 2, 3, ... per (tenant, slug_base)) orders a team's attempts without
+-- needing a mutable "latest" row; `invited_count` on any one row is what
+-- THAT call itself inserted, not a running total (sum across
+-- `WHERE tenant=? AND slug_base=?` for the team's lifetime total, if ever
+-- needed operationally). Resumability (an orphan project+squad+bot pair
+-- surviving a failed attempt, adopted by the next attempt) is now a property
+-- of team_bootstrap's OWN find-or-create reads against the real resource
+-- tables (projects/squads/agents/invites) — never of this receipt table,
+-- which merely records what each attempt observed and did.
+--
+-- SHAPE follows the SAME append-only receipt idiom as 0086/0115/0157/0161:
+--   * TEXT id (UUID), no AUTOINCREMENT surrogate — one per ATTEMPT.
+--   * actor_member_id is a frozen copy of who made THIS attempt — never
+--     overwritten by a later attempt from a different admin, because there
+--     is no later write to this row at all.
 --   * NO foreign keys to projects/squads/agents/members — 0086/0113 learned
 --     this the hard way: a CASCADE erases the receipt exactly when the
 --     resource it documents is retired, which is precisely when the audit
 --     trail is most needed. Orphan rows are the acceptable price (same
 --     reasoning as 0157's header).
---   * bot_agent_id is NULL when the call declined to create a bot
---     (`bot.enabled === false`), or when no bot has been successfully
---     created YET (a 'failed' row whose failure happened before the bot
---     step ran) — disposition never fabricates an agent id that does not
---     exist.
---
--- FAILED ATTEMPTS ARE RECEIPTED, AND RESUMABLE (Athena round-1 gate on PR
--- #1510, 2026-09-22). team_bootstrap's write phase after project/squad
--- resolution is NOT one all-or-nothing unit — see src/org/team-bootstrap.ts's
--- file header: the ADMIN-edge+bot batch is atomic, but the per-human invite
--- inserts run ONE AT A TIME so a failure partway (an injected/transient D1
--- error on invite N of M) does not erase invites 1..N-1 that already landed.
--- The natural consequence: a team_bootstrap call can end in a state that is
--- neither "nothing happened" nor "everything happened" — a REAL, already-
--- committed project+squad (+bot, +some invites) with the composite call
--- itself unfinished. That state must be BOTH recorded (an operator watching
--- this table should see the failed attempt, not silence) AND resumable (a
--- retry with the same slug_base must adopt the existing project/squad/bot
--- and finish only what is left) — an orphan pair is a DESIGNED, expected
--- resting state, not corruption to clean up by hand.
---
--- disposition therefore has THREE values: 'created' (this call did
--- something new), 'existing' (a pure no-op replay — every row it names was
--- already there), or 'failed' (the write phase did not finish; project_id/
--- squad_id are still real, already-committed rows — only the FULL composite
--- outcome is incomplete). failed_step names WHERE it stopped
--- ('edge_or_bot' | 'invite_insert'); failure_reason is a short, STRUCTURAL
--- classification ('unique_violation' | 'write_failed') — deliberately NOT
--- the raw driver error text and NEVER an email address or other human PII,
--- so this table stays safe to page through operationally without becoming a
--- second place secrets/PII could leak from.
---
--- RESUMABILITY is why this table breaks from the append-only-COLUMN idiom
--- its siblings use: a retry for the SAME (tenant, slug_base) must UPDATE the
--- SAME row (never insert a second one — the UNIQUE constraint below is the
--- idempotency key both the service layer and this schema rely on), because
--- the row IS the current state of that team's bootstrap attempts, not a
--- historical log entry. What is genuinely IMMUTABLE — enforced below, not by
--- convention — is the row's IDENTITY: which tenant, which slug_base, and
--- (once first written) which concrete project_id/squad_id this receipt is
--- about, plus its created_at. Every other column (disposition,
--- actor_member_id, bot_agent_id, invited_count, failed_step, failure_reason)
--- reflects the LATEST call's outcome by design — a 'failed' row transitions
--- to 'created' the moment a retry finishes the job, and invited_count keeps
--- accumulating across calls the same way it always has.
+--   * bot_agent_id is NULL when this attempt declined to create a bot
+--     (`bot.enabled === false`) or never reached the bot step (a
+--     stage-1-or-earlier failure) — never fabricates an agent id that does
+--     not exist AT THE TIME of this attempt.
+--   * disposition: `'created'` (this attempt did something new),
+--     `'existing'` (a pure no-op replay — every row it names was already
+--     there), `'adopted'` (Athena, round-2 sharpening on PR #1510,
+--     2026-09-22 — "find-or-create is create + explicit adopt": the
+--     `adopt: true` override claimed a pre-existing, NON-EMPTY squad that no
+--     prior team_bootstrap attempt had named — an org-admin's AUDITED
+--     decision, not an ordinary idempotent replay, so it gets its own
+--     disposition rather than folding into 'existing' where it would read
+--     as unremarkable), or `'failed'` (the write phase did not finish this
+--     attempt; `project_id`/`squad_id` are still real, already-committed
+--     rows — only the composite outcome of THIS attempt is incomplete).
+--     `failed_step` names where it stopped (`'edge_or_bot'` |
+--     `'invite_insert'`); `failure_reason` is a short, STRUCTURAL
+--     classification (`'unique_violation'` | `'write_failed'` |
+--     `'archived_project'`) — deliberately NOT the raw driver error text
+--     and NEVER an email address or other human PII, so this table stays
+--     safe to page through operationally without becoming a second place
+--     secrets/PII could leak from.
+--   * append-only, enforced by trigger, not convention — no exceptions this
+--     time, unlike the prior version of this migration.
 
 CREATE TABLE IF NOT EXISTS team_bootstrap_receipts (
   id                TEXT NOT NULL PRIMARY KEY,
   tenant            TEXT NOT NULL,
-  actor_member_id   TEXT NOT NULL,          -- the caller of the MOST RECENT attempt (see header)
+  actor_member_id   TEXT NOT NULL,          -- frozen copy of who made THIS attempt
   slug_base         TEXT NOT NULL,
+  attempt_no        INTEGER NOT NULL,       -- 1, 2, 3... per (tenant, slug_base)
   project_id        TEXT NOT NULL,
   squad_id          TEXT NOT NULL,
-  bot_agent_id      TEXT,                    -- NULL when no bot exists yet (disabled, or not reached)
-  disposition       TEXT NOT NULL CHECK (disposition IN ('created', 'existing', 'failed')),
+  bot_agent_id      TEXT,                    -- NULL when no bot exists as of THIS attempt
+  disposition       TEXT NOT NULL CHECK (disposition IN ('created', 'existing', 'adopted', 'failed')),
   failed_step       TEXT CHECK (failed_step IS NULL OR failed_step IN ('edge_or_bot', 'invite_insert')),
-  failure_reason    TEXT CHECK (failure_reason IS NULL OR failure_reason IN ('unique_violation', 'write_failed')),
-  invited_count     INTEGER NOT NULL DEFAULT 0,
+  failure_reason    TEXT CHECK (failure_reason IS NULL OR failure_reason IN ('unique_violation', 'write_failed', 'archived_project')),
+  invited_count     INTEGER NOT NULL DEFAULT 0,  -- invites inserted BY THIS ATTEMPT ONLY
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  UNIQUE (tenant, slug_base),                -- one row per (tenant, slug_base), forever — see header
+  UNIQUE (tenant, slug_base, attempt_no),
   CHECK ((disposition = 'failed') = (failed_step IS NOT NULL))
 );
 
+CREATE INDEX IF NOT EXISTS idx_team_bootstrap_receipts_slug_base
+  ON team_bootstrap_receipts(tenant, slug_base, attempt_no DESC);
 CREATE INDEX IF NOT EXISTS idx_team_bootstrap_receipts_project
   ON team_bootstrap_receipts(project_id);
 CREATE INDEX IF NOT EXISTS idx_team_bootstrap_receipts_squad
   ON team_bootstrap_receipts(squad_id);
 
+CREATE TRIGGER IF NOT EXISTS team_bootstrap_receipts_no_update
+  BEFORE UPDATE ON team_bootstrap_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'team_bootstrap_receipts is append-only — one row per attempt, never updated');
+END;
+
 CREATE TRIGGER IF NOT EXISTS team_bootstrap_receipts_no_delete
   BEFORE DELETE ON team_bootstrap_receipts
 BEGIN
   SELECT RAISE(ABORT, 'team_bootstrap_receipts is append-only (rows are never deleted)');
-END;
-
--- The row's IDENTITY — which team, and (once set) which concrete project/
--- squad it names — is permanently pinned. Every other column tracks the
--- latest attempt's outcome (see the file header's "RESUMABILITY" section)
--- and is deliberately left mutable: disposition/bot_agent_id/invited_count/
--- failed_step/failure_reason all change as a bootstrap attempt is retried
--- and completed, and actor_member_id reflects whoever made the most recent
--- call. tenant/slug_base can never legitimately change (they are the
--- UNIQUE key a retry looks itself up by); project_id/squad_id can never
--- legitimately change either — once resolved, this receipt is about THOSE
--- rows, permanently, even across a failed-then-retried sequence.
-CREATE TRIGGER IF NOT EXISTS team_bootstrap_receipts_pinned_identity
-  BEFORE UPDATE ON team_bootstrap_receipts
-BEGIN
-  SELECT RAISE(ABORT, 'team_bootstrap_receipts.tenant/slug_base/project_id/squad_id/created_at are immutable')
-  WHERE NEW.tenant <> OLD.tenant
-     OR NEW.slug_base <> OLD.slug_base
-     OR NEW.project_id <> OLD.project_id
-     OR NEW.squad_id <> OLD.squad_id
-     OR NEW.created_at <> OLD.created_at;
 END;

@@ -572,7 +572,7 @@ dashboardApp.post('/projects/:id/status', async (c) => {
 
   // Slice 3: planned→active must authorize + provision via start-gate.
   if (transition?.status === 'active' && currentProject.status === 'planned') {
-    const started = await startProject(c.env, projectId, defaultStartGateDeps())
+    const started = await startProject(c.env, projectId, defaultStartGateDeps(c.get('auth').memberId ?? null))
     if (!started.ok) {
       const body = projectSettingsBody({
         project: currentProject,

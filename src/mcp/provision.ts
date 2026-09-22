@@ -99,6 +99,7 @@ import {
   revokeAllAgentSessionsForAgent,
 } from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
+import { isSlugBaseReserved, slugBaseFromSquadSlug } from '../org/team-bootstrap'
 import {
   type ToolSpec,
   fail,
@@ -140,6 +141,12 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 // Emit an attributed provision event so the activity feed/consumer knows a member
 // caused a structural change (kasra-review W2 — the mint was previously unattributed
 // on the bus). One event type carries the kind; payload names what was created.
+// See src/projects/start-gate.ts's emitOrgProvisioned for a deliberate, small
+// duplicate of this same "org.provisioned" event shape (mupot#1498, P2-4) — NOT
+// imported from here, because src/mcp/provision.ts <-> src/mcp/index.ts <->
+// src/mcp/projects.ts <-> src/projects/start-gate.ts would close a NEW import
+// cycle through a module that is not already part of the existing, carefully-
+// entered index/provision cycle.
 async function emitProvisioned(
   env: Env,
   memberId: string,
@@ -2402,6 +2409,31 @@ const toolUpdateSquad: ToolSpec = {
     }
     if (!Object.keys(patch).length) {
       return fail(400, 'invalid_args', 'at least one field to update is required')
+    }
+
+    // mupot#1498, P0(c) (kasra-review adversarial round-1 gate on PR #1510,
+    // Athena's round-2 confirmation): renaming a squad INTO a `<x>-sqd` slug
+    // that team_bootstrap has already claimed for `x` (a `<x>-prj` project
+    // exists, or a team_bootstrap_receipts row names slug_base `x`) is the
+    // EXACT squat this fix closes on the create side — a squad admin (this
+    // tool's ordinary floor) renaming their OWN squad to steal a future
+    // team_bootstrap call's ADMIN edge + mintable bot. The rename into a
+    // reserved name needs create_squad's OLD floor, department:admin, not
+    // squad:admin — checked here, on the UPDATE path itself (the squat IS a
+    // rename), before the write, for every caller regardless of how they
+    // otherwise qualify for the ordinary squad:admin floor above.
+    if ('slug' in patch) {
+      const newSlug = str(patch.slug)
+      const reservedSlugBase = newSlug ? slugBaseFromSquadSlug(newSlug) : null
+      if (reservedSlugBase && (await isSlugBaseReserved(env, env.TENANT_SLUG, reservedSlugBase))) {
+        if (!hasCapability(grants, 'department', squad.department_id, 'admin')) {
+          return fail(403, 'forbidden', {
+            need: 'admin',
+            scope: 'department',
+            reason: 'slug_reserved_by_team_bootstrap',
+          })
+        }
+      }
     }
 
     // Before-image, read outside the UPDATE transaction — see the race caveat in
