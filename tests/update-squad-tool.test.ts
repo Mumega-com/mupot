@@ -19,7 +19,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 // and Node's ESM circular resolution only completes that safely when index.ts
 // is the FIRST module entered. tests/provision-tools.test.ts and
 // tests/agent-messages.test.ts both enter this way for the same reason.
-import { TOOLS } from '../src/mcp/index'
+import { TOOLS, invokeTool } from '../src/mcp/index'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -230,5 +230,76 @@ describe('update_agent — budget fields wired through the MCP tool (mupot#611 i
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.status).toBe(400)
+  })
+})
+
+// mupot#1495 "type-safe slugs" — update_squad had NO slug field at all
+// before this (a rename needed a raw D1 UPDATE by hand, per mupot#1498's
+// own account of the Psychonom bootstrap). These go through invokeTool
+// (not toolUpdateSquad.run() directly, unlike the rest of this file, which
+// predates and is baselined against scripts/check-mcp-tool-seam.mjs) so a
+// NEW test in this file cannot itself become a fresh seam violation.
+describe('update_squad — slug field (mupot#1495)', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+  const CTX2 = { origin: 'https://pot.test', transport: 'mcp' as const }
+
+  beforeEach(async () => {
+    harness = createSqliteD1()
+    for (const file of allMigrations()) {
+      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('sq-a', 'dept-1', 'sqa', 'Squad A'),
+        ('sq-b', 'dept-1', 'existing-sqd', 'Squad B');
+      INSERT INTO org_settings (key, value, updated_at)
+        VALUES ('billing_state', '{"tier":"scale"}', '2026-07-22 00:00:00');
+    `)
+    env = { DB: harness.db, TENANT_SLUG: 'test' } as unknown as Env
+  })
+
+  function orgAdminAuth(): AuthContext {
+    return {
+      userId: 'u1', email: 'operator@example.com', role: 'member', tenant: 'test',
+      memberId: 'member-operator', boundAgentId: null,
+      capabilities: [{ member_id: 'member-operator', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    } as AuthContext
+  }
+
+  it('renames a squad slug when the new slug carries the -sqd suffix', async () => {
+    const outcome = await invokeTool(orgAdminAuth(), env, 'update_squad', { squad: 'sq-a', slug: 'psychonom-sqd' }, CTX2)
+    expect(outcome.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+    expect(row?.slug).toBe('psychonom-sqd')
+  })
+
+  it('rejects a new slug with no -sqd suffix', async () => {
+    const outcome = await invokeTool(orgAdminAuth(), env, 'update_squad', { squad: 'sq-a', slug: 'psychonom' }, CTX2)
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.status).toBe(400)
+    const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+    expect(row?.slug).toBe('sqa') // untouched
+  })
+
+  it('409s on a slug collision within the same department', async () => {
+    const outcome = await invokeTool(orgAdminAuth(), env, 'update_squad', { squad: 'sq-a', slug: 'existing-sqd' }, CTX2)
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.status).toBe(409)
+    expect(outcome.error).toBe('slug_taken')
+    const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+    expect(row?.slug).toBe('sqa') // untouched
+  })
+
+  it('an EXISTING unsuffixed squad slug is left alone by every other field patch — #1495 backfill is separate', async () => {
+    // 'sqa' has no -sqd suffix and was never touched by this migration —
+    // patching budget_cap_cents alone must not force a slug rewrite.
+    const outcome = await invokeTool(orgAdminAuth(), env, 'update_squad', { squad: 'sq-a', budget_cap_cents: 500 }, CTX2)
+    expect(outcome.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+    expect(row?.slug).toBe('sqa')
   })
 })

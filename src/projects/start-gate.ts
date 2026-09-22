@@ -20,8 +20,9 @@ import {
 import { setAgentSquadAccess } from '../members/agent-access'
 import { createTask } from '../tasks/service'
 import { writeReceiptToD1 } from '../workflows/pipeline'
+import { createDepartment, createSquad } from '../org/service'
 import { lifecycleTaskId } from './circuit-breaker'
-import { getProject, updateProject, type ProjectMutationResult } from './service'
+import { getProject, updateProject, upsertProjectSquadAccess, type ProjectMutationResult } from './service'
 
 export const START_GATE_STEP = 'project_start_gate'
 export const START_GATE_SCHEMA = 'mupot.project_start_gate/v1'
@@ -251,6 +252,102 @@ async function pickWritableSquad(
     .bind(projectId)
     .first<WritableSquadRow>()
   return row ?? null
+}
+
+// mupot#1498: "project_update on a project without any squad should
+// auto-create `<slug>-sqd` + ADMIN edge instead of refusing no_writable_squad".
+//
+// WHY THIS IS SAFE TO DO INSIDE startProject, NOT JUST INSIDE the MCP
+// project_update tool: every caller of startProject
+// (src/mcp/projects.ts's toolProjectUpdate, src/dashboard/index.ts's
+// POST /projects/:id/status, src/projects/index.ts's PATCH /:id) already
+// gates workspace/org admin BEFORE calling — requireWorkspaceAdmin,
+// canManageProjects, access.workspaceAdmin respectively. "keep the refusal
+// for non-admins" therefore holds by CONSTRUCTION: a non-admin caller never
+// reaches this function at all, so there is nothing to keep refusing here
+// beyond what the three call sites already refuse before this line runs.
+//
+// WHICH DEPARTMENT: a project carries no department of its own (projects
+// are workspace objects — see src/projects/service.ts), so a brand-new
+// squad needs somewhere to live. Rather than invent a per-project
+// department (churning one new department row per project with no writable
+// squad), this reuses ONE well-known department for every auto-created
+// project squad — the same "adopt, don't fork" discipline
+// createHomeForMember applies to a member's home department
+// (src/org/service.ts). A second project with no squad reuses the SAME
+// department; only the squad itself is per-project.
+const PROJECT_SQUAD_DEPARTMENT_SLUG = 'dept-projects'
+const PROJECT_SQUAD_DEPARTMENT_NAME = 'Projects'
+const AUTO_SQUAD_SLUG_SUFFIX = '-sqd'
+
+async function findProjectSquadDepartment(env: Env): Promise<{ id: string } | null> {
+  return env.DB.prepare(`SELECT id FROM departments WHERE slug = ?1 LIMIT 1`)
+    .bind(PROJECT_SQUAD_DEPARTMENT_SLUG)
+    .first<{ id: string }>()
+}
+
+async function resolveProjectSquadDepartmentId(env: Env): Promise<string | null> {
+  const existing = await findProjectSquadDepartment(env)
+  if (existing) return existing.id
+  const created = await createDepartment(env, {
+    slug: PROJECT_SQUAD_DEPARTMENT_SLUG,
+    name: PROJECT_SQUAD_DEPARTMENT_NAME,
+  })
+  if (created.ok) return created.value.id
+  if (created.error === 'slug_taken') {
+    // Race: a concurrent start-gate call for a DIFFERENT project won this
+    // exact department between our read and this insert. Adopt it — same
+    // "classify, don't compensate a real winner" doctrine createHomeForMember
+    // documents for its own department race.
+    const raced = await findProjectSquadDepartment(env)
+    if (raced) return raced.id
+  }
+  return null
+}
+
+/**
+ * Auto-create `<project.slug>-sqd` under the shared projects department, wire
+ * an ADMIN project<->squad edge, and return it in the same shape
+ * pickWritableSquad returns — so the caller below cannot tell an
+ * already-writable project from a freshly-provisioned one. Returns null on
+ * any failure (entitlement limit, a genuine D1 error) — the caller then
+ * fails closed with 'no_writable_squad', exactly as it did before this
+ * function existed.
+ */
+async function autoCreateWritableSquad(env: Env, project: Project): Promise<WritableSquadRow | null> {
+  const departmentId = await resolveProjectSquadDepartmentId(env)
+  if (!departmentId) return null
+
+  const squadSlug = `${project.slug}${AUTO_SQUAD_SLUG_SUFFIX}`
+  const existing = await env.DB.prepare(
+    `SELECT id FROM squads WHERE department_id = ?1 AND slug = ?2 LIMIT 1`,
+  )
+    .bind(departmentId, squadSlug)
+    .first<{ id: string }>()
+
+  let squadId: string
+  if (existing) {
+    squadId = existing.id
+  } else {
+    const created = await createSquad(env, departmentId, { slug: squadSlug, name: `${project.name} Squad` })
+    if (created.ok) {
+      squadId = created.value.id
+    } else if (created.error === 'slug_taken') {
+      const raced = await env.DB.prepare(
+        `SELECT id FROM squads WHERE department_id = ?1 AND slug = ?2 LIMIT 1`,
+      )
+        .bind(departmentId, squadSlug)
+        .first<{ id: string }>()
+      if (!raced) return null
+      squadId = raced.id
+    } else {
+      return null
+    }
+  }
+
+  const edge = await upsertProjectSquadAccess(env, project.id, squadId, 'admin')
+  if (!edge.ok) return null
+  return { squad_id: squadId, access_level: 'admin' }
 }
 
 async function pickSquadAgent(env: Env, squadId: string): Promise<SquadAgentRow | null> {
@@ -504,8 +601,28 @@ export async function startProject(
     return { ok: false, error, project: current ?? project }
   }
 
-  const squad = await pickWritableSquad(env, projectId)
-  if (!squad) return fail('no_writable_squad')
+  let squad = await pickWritableSquad(env, projectId)
+  if (!squad) {
+    // mupot#1498: "a project WITHOUT ANY SQUAD" auto-creates `<slug>-sqd` +
+    // an ADMIN edge instead of refusing. A project that already has a squad
+    // edge — just not a write/admin one (e.g. a deliberate read-only link) —
+    // is a DIFFERENT case: an operator chose that edge on purpose, and
+    // auto-creating a second squad behind their back would be a surprise
+    // write, not a convenience. Only the true "zero edges at all" case
+    // auto-provisions; see autoCreateWritableSquad's doc comment for why
+    // this is safe here regardless (every caller of startProject already
+    // gates admin before reaching this line, so "keep the refusal for
+    // non-admins" holds by construction).
+    const hasAnyEdge = await env.DB.prepare(
+      `SELECT 1 FROM project_squad_access WHERE project_id = ?1 LIMIT 1`,
+    )
+      .bind(projectId)
+      .first()
+    if (!hasAnyEdge) {
+      squad = await autoCreateWritableSquad(env, project)
+    }
+    if (!squad) return fail('no_writable_squad')
+  }
 
   const agentRow = await pickSquadAgent(env, squad.squad_id)
   if (!agentRow) return fail('no_squad_agent')

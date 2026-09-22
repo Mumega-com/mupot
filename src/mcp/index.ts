@@ -154,6 +154,7 @@ import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
+import { toolTeamBootstrap } from './team-bootstrap'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -5417,6 +5418,7 @@ export const TOOLS: ToolSpec[] = [
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  toolTeamBootstrap,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,

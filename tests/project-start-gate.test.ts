@@ -342,6 +342,87 @@ describe('startProject resource-fail stays planned (blocked-start)', () => {
       harness.close()
     }
   })
+
+  // mupot#1498: a project with ZERO squad edges (not merely a non-writable
+  // one — see the test above) auto-creates `<slug>-sqd` + an ADMIN edge
+  // instead of refusing no_writable_squad. The auto-created squad starts
+  // with no agent in it (nothing to auto-create one FROM), so the overall
+  // start still blocks — but on the more specific, honest 'no_squad_agent'
+  // reason, and with a real, reusable squad now in place for next time
+  // (an operator adds an agent to it, or calls team_bootstrap next time
+  // instead) rather than a dead end.
+  it('auto-creates <slug>-sqd + an ADMIN edge when the project has NO squad edge at all', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      // free tier's maxDepartments=1/maxSquads=1 (src/billing/plans.ts) is
+      // already spent by makeHarness's dept-a/squad-a fixture — raise the
+      // tier so THIS test is about the auto-create path, not the entitlement
+      // gate createDepartment/createSquad already enforce independently.
+      harness.sqlite.exec(
+        `INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', '{"tier":"scale"}', '2026-07-22 00:00:00')`,
+      )
+      insertPlannedProject(harness, { id: 'proj-nosquad-at-all' })
+      // Deliberately NO project_squad_access row and NO pre-existing squad
+      // named 'proj-nosquad-at-all-sqd' — this is the true "without any
+      // squad" case. No agent either — the newly-created squad starts empty.
+
+      const result = await startProject(env, 'proj-nosquad-at-all', makeDeps())
+      expect(result).toMatchObject({ ok: false, error: 'no_squad_agent' })
+      expect((await getProject(env, 'proj-nosquad-at-all'))?.status).toBe('planned')
+
+      const squad = await env.DB.prepare('SELECT id, slug, department_id FROM squads WHERE slug = ?')
+        .bind('proj-nosquad-at-all-sqd')
+        .first<{ id: string; slug: string; department_id: string }>()
+      expect(squad).toBeTruthy()
+
+      const edge = await env.DB.prepare(
+        'SELECT access_level FROM project_squad_access WHERE project_id = ? AND squad_id = ?',
+      )
+        .bind('proj-nosquad-at-all', squad!.id)
+        .first<{ access_level: string }>()
+      expect(edge?.access_level).toBe('admin')
+
+      // A RETRY after an agent is added to the now-real squad succeeds.
+      insertAgent(harness, 'agent-nosquad-at-all')
+      harness.sqlite.exec(`UPDATE agents SET squad_id = '${squad!.id}' WHERE id = 'agent-nosquad-at-all'`)
+      const retry = await startProject(env, 'proj-nosquad-at-all', makeDeps())
+      expect(retry.ok).toBe(true)
+      if (retry.ok) expect(retry.squad_id).toBe(squad!.id)
+    } finally {
+      harness.close()
+    }
+  })
+
+  it('a second project with no squad edge reuses the SAME auto-provisioned department, not a new one', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      harness.sqlite.exec(
+        `INSERT INTO org_settings (key, value, updated_at) VALUES ('billing_state', '{"tier":"scale"}', '2026-07-22 00:00:00')`,
+      )
+      insertPlannedProject(harness, { id: 'proj-auto-a' })
+      insertPlannedProject(harness, { id: 'proj-auto-b' })
+
+      await startProject(env, 'proj-auto-a', makeDeps())
+      await startProject(env, 'proj-auto-b', makeDeps())
+
+      const squadA = await env.DB.prepare('SELECT department_id FROM squads WHERE slug = ?')
+        .bind('proj-auto-a-sqd')
+        .first<{ department_id: string }>()
+      const squadB = await env.DB.prepare('SELECT department_id FROM squads WHERE slug = ?')
+        .bind('proj-auto-b-sqd')
+        .first<{ department_id: string }>()
+      expect(squadA).toBeTruthy()
+      expect(squadB).toBeTruthy()
+      expect(squadA?.department_id).toBe(squadB?.department_id)
+
+      const deptCount = await env.DB.prepare(`SELECT COUNT(*) AS n FROM departments WHERE slug = 'dept-projects'`).first<{ n: number }>()
+      expect(deptCount?.n).toBe(1)
+    } finally {
+      harness.close()
+    }
+  })
 })
 
 describe('ghost-start alarm', () => {
