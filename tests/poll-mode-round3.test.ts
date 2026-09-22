@@ -165,7 +165,15 @@ describe('mupot#1494 round 3 (P2-a) — fleet_agents.squads UNION, never overwri
   })
 })
 
-describe('mupot#1494 round 3 (P2-b) — home-squad exclusion applies ONLY to a squad-scoped read', () => {
+// mupot#1494 round 3 (P2-b), CORRECTED 2026-09-22 per #1472's pinned isolation invariant:
+// home squads and their agents/hosts/presence are hidden from EVERY unrestricted
+// org/department view — that invariant WINS over round 3's original P2-b finding, which
+// had this backwards (it made the UNRESTRICTED view the one that showed a home-squad-only
+// agent, which is exactly the leak #1472 exists to prevent — caught by
+// tests/dashboard-fleet-brain-agent-scope.test.ts's own isolation test). A home-only agent
+// is visible ONLY inside a squad-scoped read of its own home squad, to a principal with
+// real standing there (the member; elevation-with-receipt) — never in an unrestricted read.
+describe('mupot#1494 round 3 (P2-b) — home squads hidden from every unrestricted view; visible only in their own scoped view', () => {
   const HOME_SQUAD_ID = 'squad-round3-home'
   const OTHER_SQUAD_ID = 'squad-round3-other'
 
@@ -181,24 +189,27 @@ describe('mupot#1494 round 3 (P2-b) — home-squad exclusion applies ONLY to a s
     `)
     env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
     // The agent's ONLY squad membership is its own home squad.
-    harness.sqlite.prepare(
-      `UPDATE fleet_agents SET squads = ? WHERE tenant = ? AND agent_id = ?`,
-    ) // no-op if row absent; the INSERT below creates it
     harness.sqlite.exec(`
-      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, last_reported_at, updated_at)
-      VALUES ('${AGENT_ID}', '${TENANT}', 'Round3 Runner', 'claude-code', '["round3-home"]', 'on_demand', 'running', '${AGENT_ID}', 'generic', datetime('now'), datetime('now'));
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, host, last_reported_at, updated_at)
+      VALUES ('${AGENT_ID}', '${TENANT}', 'Round3 Runner', 'claude-code', '["round3-home"]', 'on_demand', 'running', '${AGENT_ID}', 'generic', 'Home Host SECRET', datetime('now'), datetime('now'));
     `)
   })
   afterEach(() => harness.close())
 
-  it('the unrestricted (org-admin) read still surfaces a home-squad-only agent', async () => {
+  it('the unrestricted (org-admin) read hides a home-squad-only agent — #1472 isolation invariant', async () => {
     const rows = await listFleetAgentRuntimeView(env, Date.now(), undefined)
-    expect(rows.map((r) => r.agent_id)).toContain(AGENT_ID)
-  })
-
-  it('a squad-SCOPED read hides that same agent — its only membership there is a home squad', async () => {
-    const rows = await listFleetAgentRuntimeView(env, Date.now(), [HOME_SQUAD_ID])
     expect(rows.map((r) => r.agent_id)).not.toContain(AGENT_ID)
   })
 
+  it('a read scoped to some OTHER squad (not the agent\'s home) also hides it', async () => {
+    const rows = await listFleetAgentRuntimeView(env, Date.now(), [OTHER_SQUAD_ID])
+    expect(rows.map((r) => r.agent_id)).not.toContain(AGENT_ID)
+  })
+
+  it('a read scoped to the agent\'s OWN home squad (the member\'s home-scoped view) shows it, host included', async () => {
+    const rows = await listFleetAgentRuntimeView(env, Date.now(), [HOME_SQUAD_ID])
+    const row = rows.find((r) => r.agent_id === AGENT_ID)
+    expect(row).toBeDefined()
+    expect(row!.host).toBe('Home Host SECRET')
+  })
 })
