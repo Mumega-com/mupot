@@ -37,7 +37,7 @@ own coverage is honest about what exists vs. what is only proposed.
 | 2 | First-person intake on Telegram (Mubot's five questions → home memory) | Built, code lives in `mupot-plugin` | [02-first-person-telegram-intake.md](./02-first-person-telegram-intake.md) |
 | 3 | Project access chain (proposal → human verdict → grant + receipt) | Built | [03-project-access-chain.md](./03-project-access-chain.md) |
 | 4 | Agent-proposed member invite | Not implemented (#1497) | [04-agent-proposed-member-invite.md](./04-agent-proposed-member-invite.md) |
-| 5 | Runner onboarding (mint → check_in poll-mode → receive → report → settle) | Broken for poll-mode runners; fix open (#1494/#1501) | [05-runner-onboarding.md](./05-runner-onboarding.md) |
+| 5 | Runner onboarding (mint → check_in poll-mode → receive → report → settle) | Broken for poll-mode runners; fix open (#1494, branch `kasra/poll-mode-runner-dispatch-v4`, supersedes #1514 which supersedes #1501) | [05-runner-onboarding.md](./05-runner-onboarding.md) |
 | 6 | Team bootstrap | Built, not yet merged (#1498, PR #1515 — supersedes #1510, round-2 P0) | [06-team-bootstrap.md](./06-team-bootstrap.md) |
 | 7 | Human decision channel (Telegram approve with harness-attested origin) | Built | [07-human-decision-channel.md](./07-human-decision-channel.md) |
 | 8 | Home squads and admin-in by receipt | Built (dashboard-operator path missing, #1474) | [08-home-squads-admin-in-by-receipt.md](./08-home-squads-admin-in-by-receipt.md) |

@@ -24,7 +24,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
-import { getAgentView } from './registry'
+import { getAgentView, resolveFleetWriteAgentId } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
 import { isValidRuntime, runtimeVocabulary, RUNTIME_SET } from './runtimes'
@@ -302,11 +302,19 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   // 3. Upsert — every AUTH-RELEVANT field is signature-covered: agent_id/type/runtime/
   //    lifecycle are in the signed bytes; member_id is key-bound (from agent_keys), never
   //    the body. `host` is the one unsigned, display-only exception (untrusted by design).
-  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id, host)
+  //
+  //    mupot#1494 v4 (P1-b) — `agent_keys.agent_id` (and so `v.agent_id`, the signed
+  //    identity) is keyed by SLUG (see the identifier-space-bridge note in registry.ts),
+  //    while the poll writer (`upsertPollFleetPresence`) keys on `agents.id` (a uuid). Left
+  //    unresolved, the SAME real agent gets two fleet_agents rows depending on which surface
+  //    last wrote it. Resolve to the canonical `agents.id` FIRST, same helper + same
+  //    ambiguity-refusal rule reportFleetAgents now uses.
+  const writeAgentId = await resolveFleetWriteAgentId(c.env, v.agent_id)
+  await upsertRunning(c.env, writeAgentId, v.runtime, v.lifecycle, v.type, v.member_id, host)
 
   // 4. Boot-ack.
   const views = await getAgentView(c.env)
-  const agent = views.find((view) => view.agent_id === v.agent_id) ?? null
+  const agent = views.find((view) => view.agent_id === writeAgentId) ?? null
   return c.json({ ok: true, agent })
 })
 

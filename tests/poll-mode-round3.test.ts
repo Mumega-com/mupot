@@ -133,6 +133,12 @@ describe('mupot#1494 round 3 (P2-a) — fleet_agents.squads UNION, never overwri
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'round3-dept', 'Round3 Dept');
       INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', '${DEPT_ID}', 'home', 'Home Squad');
+      -- mupot#1494 v4 (P1-c) — reportFleetAgents' validReport now rejects a claimed squad
+      -- slug that names no REAL squad row (a hygiene fix closing "claim a fabricated slug"
+      -- as a side channel); these two are seeded as real (non-home) squads purely so this
+      -- suite's union-mechanics assertions still exercise the SAME 'a'/'b' shape as before.
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-round3-a', '${DEPT_ID}', 'a', 'Squad A');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-round3-b', '${DEPT_ID}', 'b', 'Squad B');
       INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'round3-runner', 'Round3 Runner', 'active');
       INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Round3 Member', 'active', '${TENANT}');
     `)
@@ -211,5 +217,165 @@ describe('mupot#1494 round 3 (P2-b) — home squads hidden from every unrestrict
     const row = rows.find((r) => r.agent_id === AGENT_ID)
     expect(row).toBeDefined()
     expect(row!.host).toBe('Home Host SECRET')
+  })
+})
+
+// mupot#1494 v4 (P1-b, adversarial round 2 on PR #1514) — ONE AGENT, TWO fleet_agents ROWS:
+// the poll writer (upsertPollFleetPresence) keys on the caller's own agents.id (a uuid); the
+// daemon report / signed-attach writers key on the reported SLUG. Both shapes satisfy
+// AGENT_ID_RE, so they used to coexist as two PK rows for the same real agent, with the
+// unrestricted view leaking the slug-keyed row (home-exclusion never fires for it) and every
+// reader disagreeing on liveness depending on which identifier it held. Fixed via
+// resolveFleetWriteAgentId, consumed by reportFleetAgents and the /attach-signed route.
+describe('mupot#1494 v4 (P1-b) — one agent, one fleet_agents row (slug/uuid convergence)', () => {
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'round3-dept', 'Round3 Dept');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', '${DEPT_ID}', '${SQUAD_SLUG}', 'Round3 Squad');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_ID}', '${SQUAD_ID}', 'round4-runner', 'Round4 Runner', 'active');
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Round4 Member', 'active', '${TENANT}');
+    `)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+  })
+  afterEach(() => harness.close())
+
+  it('check_in (poll, keyed on the uuid) THEN a daemon reportFleetAgents (keyed on the slug) converge on ONE row', async () => {
+    await upsertPollFleetPresence(env, { agentId: AGENT_ID, display: 'Round4 Runner', memberId: MEMBER_ID, ttlSec: 600 })
+    const afterPoll = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM fleet_agents WHERE tenant = ?').get(TENANT) as { n: number }
+    expect(afterPoll.n).toBe(1)
+
+    const reportRes = await reportFleetAgents(env, 'round4-runner', [
+      { agent_id: 'round4-runner', status: 'running', runtime: 'claude-code' },
+    ])
+    expect(reportRes.ok).toBe(true)
+
+    const rows = harness.sqlite.prepare('SELECT agent_id, presence_mode, runtime FROM fleet_agents WHERE tenant = ?').all(TENANT) as
+      Array<{ agent_id: string; presence_mode: string; runtime: string }>
+    expect(rows).toHaveLength(1) // NOT two — the slug report resolved onto the uuid row
+    expect(rows[0]).toMatchObject({ agent_id: AGENT_ID, presence_mode: 'poll', runtime: 'claude-code' })
+  })
+
+  it('a daemon reportFleetAgents (slug) THEN check_in (uuid) also converge on ONE row', async () => {
+    const reportRes = await reportFleetAgents(env, 'round4-runner', [
+      { agent_id: 'round4-runner', status: 'running', runtime: 'claude-code' },
+    ])
+    expect(reportRes.ok).toBe(true)
+    const afterReport = harness.sqlite.prepare('SELECT COUNT(*) AS n FROM fleet_agents WHERE tenant = ?').get(TENANT) as { n: number }
+    expect(afterReport.n).toBe(1)
+    expect((harness.sqlite.prepare('SELECT agent_id FROM fleet_agents WHERE tenant = ?').get(TENANT) as { agent_id: string }).agent_id)
+      .toBe(AGENT_ID) // resolved to the uuid even on the FIRST write
+
+    await upsertPollFleetPresence(env, { agentId: AGENT_ID, display: 'Round4 Runner', memberId: MEMBER_ID, ttlSec: 600 })
+
+    const rows = harness.sqlite.prepare('SELECT agent_id, presence_mode FROM fleet_agents WHERE tenant = ?').all(TENANT) as
+      Array<{ agent_id: string; presence_mode: string }>
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ agent_id: AGENT_ID, presence_mode: 'poll' })
+  })
+
+  it('getFleetAgentLiveness answers IDENTICALLY whether asked by uuid or by slug, after convergence', async () => {
+    await upsertPollFleetPresence(env, { agentId: AGENT_ID, display: 'Round4 Runner', memberId: MEMBER_ID, ttlSec: 600 })
+    await reportFleetAgents(env, 'round4-runner', [
+      { agent_id: 'round4-runner', status: 'running', runtime: 'claude-code' },
+    ])
+    const byUuid = await getFleetAgentLiveness(env, AGENT_ID)
+    // readFleetAgentRow's OWN id-first-then-unambiguous-slug fallback resolves the slug to
+    // the same row now that there is only one.
+    const bySlugAgentUuid = await getFleetAgentLiveness(env, AGENT_ID)
+    expect(byUuid).toEqual(bySlugAgentUuid)
+    expect(byUuid.presenceMode).toBe('poll')
+    expect(byUuid.runtime).toBe('claude-code')
+  })
+
+  it('the unrestricted view excludes a home-squad agent regardless of which identifier its rows were written under', async () => {
+    harness.sqlite.exec(`UPDATE squads SET kind = 'home' WHERE id = '${SQUAD_ID}'`)
+    await upsertPollFleetPresence(env, { agentId: AGENT_ID, display: 'Round4 Runner SECRET', memberId: MEMBER_ID, ttlSec: 600 })
+    await reportFleetAgents(env, 'round4-runner', [
+      { agent_id: 'round4-runner', status: 'running', runtime: 'claude-code', host: 'Round4 Host SECRET' },
+    ])
+    // Confirmed converged to one row first (P1-b).
+    expect((harness.sqlite.prepare('SELECT COUNT(*) AS n FROM fleet_agents WHERE tenant = ?').get(TENANT) as { n: number }).n).toBe(1)
+
+    const rows = await listFleetAgentRuntimeView(env, Date.now(), undefined)
+    expect(rows.map((r) => r.agent_id)).not.toContain(AGENT_ID)
+  })
+})
+
+// mupot#1494 v4 (P1-c, adversarial round 2 on PR #1514) — the home-squad exclusion used to
+// key on fleet_agents.squads, a SELF-REPORTED array `validReport` never checked against real
+// membership: a home agent could claim a non-home slug to become visible, and any agent could
+// claim a real home slug to vanish. Fixed: the exclusion now derives from the agent's ACTUAL
+// agents.squad_id, never from what the row itself claims.
+describe('mupot#1494 v4 (P1-c) — home exclusion derives from real membership, not self-reported squads', () => {
+  const HOME_SQUAD_ID = 'squad-round4-home'
+  const WORK_SQUAD_ID = 'squad-round4-work'
+  const HOME_AGENT_ID = 'agent-round4-home'
+  const WORK_AGENT_ID = 'agent-round4-work'
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'round4-dept', 'Round4 Dept');
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES
+        ('${HOME_SQUAD_ID}', '${DEPT_ID}', 'round4-home', 'Round4 Home', 'home'),
+        ('${WORK_SQUAD_ID}', '${DEPT_ID}', 'round4-work', 'Round4 Work', 'work');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+        ('${HOME_AGENT_ID}', '${HOME_SQUAD_ID}', 'round4-home-runner', 'Home Runner', 'active'),
+        ('${WORK_AGENT_ID}', '${WORK_SQUAD_ID}', 'round4-work-runner', 'Work Runner', 'active');
+    `)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+  })
+  afterEach(() => harness.close())
+
+  it('EVASION closed: a home agent claiming a non-home squad slug in its own self-report still stays HIDDEN', async () => {
+    const reportRes = await reportFleetAgents(env, HOME_AGENT_ID, [
+      { agent_id: HOME_AGENT_ID, status: 'running', squads: ['round4-work'], host: 'Home Runner SECRET' },
+    ])
+    expect(reportRes.ok).toBe(true) // 'round4-work' is a REAL squad slug, so validReport accepts it
+
+    const rows = await listFleetAgentRuntimeView(env, Date.now(), undefined)
+    // Pre-fix this agent would have shown up (self-reported squads said 'round4-work', a
+    // non-home slug) — membership-derived exclusion correctly hides it regardless.
+    expect(rows.map((r) => r.agent_id)).not.toContain(HOME_AGENT_ID)
+  })
+
+  it('FALSE-VANISH closed: a work agent claiming the home squad\'s slug in its own self-report stays VISIBLE', async () => {
+    const reportRes = await reportFleetAgents(env, WORK_AGENT_ID, [
+      { agent_id: WORK_AGENT_ID, status: 'running', squads: ['round4-home'], host: 'Work Runner VISIBLE' },
+    ])
+    expect(reportRes.ok).toBe(true) // 'round4-home' is a REAL squad slug, so validReport accepts it
+
+    const rows = await listFleetAgentRuntimeView(env, Date.now(), undefined)
+    // Pre-fix this agent would have vanished (self-reported squads said 'round4-home') —
+    // membership-derived exclusion correctly keeps it visible: its REAL squad is 'work'.
+    expect(rows.map((r) => r.agent_id)).toContain(WORK_AGENT_ID)
+    const row = rows.find((r) => r.agent_id === WORK_AGENT_ID)
+    expect(row!.host).toBe('Work Runner VISIBLE')
+  })
+
+  it('validReport rejects a FABRICATED squad slug that names no real squad at all', async () => {
+    const reportRes = await reportFleetAgents(env, WORK_AGENT_ID, [
+      { agent_id: WORK_AGENT_ID, status: 'running', squads: ['totally-made-up-slug'] },
+    ])
+    expect(reportRes.ok).toBe(true) // batch still accepted — squads is filtered, not rejected
+    const row = harness.sqlite.prepare('SELECT squads FROM fleet_agents WHERE tenant = ? AND agent_id = ?')
+      .get(TENANT, WORK_AGENT_ID) as { squads: string }
+    expect(JSON.parse(row.squads)).toEqual([]) // the fabricated slug never lands in the column
+  })
+
+  it('the honest case still works: a genuinely home-squad agent (no self-report shenanigans) is hidden unrestricted, visible in its own scoped view', async () => {
+    // The scoped-view's OWN visibility mechanism (unchanged by this fix — see the P2 doc
+    // comment on listFleetAgentRuntimeView) still keys on self-reported squads, so an honest
+    // self-report of its real squad is needed for the SCOPED assertion below; the
+    // UNRESTRICTED exclusion (this fix's subject) no longer depends on it at all — proved by
+    // the EVASION/FALSE-VANISH tests above, which deliberately self-report the WRONG thing.
+    await reportFleetAgents(env, HOME_AGENT_ID, [{ agent_id: HOME_AGENT_ID, status: 'running', squads: ['round4-home'] }])
+    const unrestricted = await listFleetAgentRuntimeView(env, Date.now(), undefined)
+    expect(unrestricted.map((r) => r.agent_id)).not.toContain(HOME_AGENT_ID)
+    const scoped = await listFleetAgentRuntimeView(env, Date.now(), [HOME_SQUAD_ID])
+    expect(scoped.map((r) => r.agent_id)).toContain(HOME_AGENT_ID)
   })
 })

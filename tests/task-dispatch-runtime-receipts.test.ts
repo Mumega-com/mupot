@@ -124,6 +124,24 @@ function runtimeFixture(opts: { unleased?: boolean } = {}) {
   return { harness, env: { TENANT_SLUG: TENANT, DB: harness.db } as Env, auth, gateAuth }
 }
 
+/** Shared org-admin auth builder for adminResetDispatchLease tests (mupot#1494 v4) — same
+ *  shape as the local `adminAuth` defined inside the "operator repair" describe block below,
+ *  hoisted to module scope so the new P0/P1-a describe blocks can use it too without
+ *  duplicating the fixture's own GATE_MEMBER_ID/GATE_TOKEN_ID wiring. */
+function adminAuthFor(memberId: string, tokenId: string, overrides: Partial<AuthContext> = {}): AuthContext {
+  return {
+    userId: memberId,
+    tenant: TENANT,
+    channel: 'workspace',
+    role: 'owner',
+    memberId,
+    tokenId,
+    boundAgentId: undefined,
+    capabilities: [{ member_id: memberId, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    ...overrides,
+  }
+}
+
 describe('task dispatch runtime receipt schema', () => {
   it('anchors each append-only stage to the exact dispatch, task, agent, and inbox message', () => {
     const harness = createSqliteD1()
@@ -1796,6 +1814,228 @@ describe('adminResetDispatchLease — operator repair for a wedged lease (mupot#
       expect(audit).toEqual({
         principal_kind: 'agent', principal_id: GATE_AGENT_ID, member_id: GATE_MEMBER_ID, agent_id: GATE_AGENT_ID,
       })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 v4 (P0 successor, adversarial round 2 on PR #1514) — a SAME-UTC-DAY expired
+// lease read as LIVE because the reset tool compared `lease_expires_at` (ISO, 'T' separator)
+// against `nowSqlUtc()` (space separator) as a plain JS string: 'T' (0x54) sorts above ' '
+// (0x20), so the ISO value always compared greater for any same-day instant. Fixed via
+// LEASE_LIVE_PREDICATE (julianday on both sides, src/agents/messages.ts) — this block proves
+// the fix on the exact repro shape (real, small offsets from `Date.now()`, not the fixture's
+// usual 2099/T0 far-future/far-past constants, which never exercised the bug either way).
+describe('adminResetDispatchLease — P0 successor: same-day timestamp format split (mupot#1494 v4)', () => {
+  it('an expired-by-60-seconds SAME-DAY lease resets WITHOUT override — the exact case the tool exists for', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      const result = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        reason: 'dead runner, lease expired a minute ago',
+        // Deliberately NO override — a same-day expired lease must reset on its own merits.
+        // Under the pre-fix JS string compare this call was WRONGLY refused
+        // reset_refused_lease_live, and the only workaround (override:true) would have
+        // written a FALSE override_of record naming a holder that held nothing.
+      })
+      expect(result.reset).toBe(true)
+      expect(result.overrode).toBe(false)
+      expect(result.code).toBe('reset')
+
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT operation, evidence_json FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { operation: string; evidence_json: string }
+      expect(audit.operation).toBe('reset') // never 'reset_override' — nothing was overridden
+      expect(JSON.parse(audit.evidence_json).override_of).toBeUndefined()
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('CONTROL: a genuinely LIVE same-day lease (expires 5 minutes from now) is still refused without override', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const liveSameDay = new Date(Date.now() + 5 * 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(liveSameDay, MESSAGE_ID)
+
+      const result = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        reason: 'control: this one really is still live',
+      })
+      expect(result.reset).toBe(false)
+      expect(result.code).toBe('reset_refused_lease_live')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('validateEnvelope (via recordTaskDispatchRuntimeReceipt) refuses a settle on a lease that expired 10 minutes ago, same day — fail-CLOSED, not fail-open', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 10 * 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      // Pre-fix, src/tasks/runtime-receipts.ts:452-453's own JS string compare
+      // (`row.message_lease_expires_at <= now`) was oriented the OPPOSITE way — fail-OPEN —
+      // so this settle SUCCEEDED despite the lease having expired 10 minutes ago. Fixed: it
+      // must now throw runtime_delivery_stale, same as any other expired-lease settle.
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 v4 (P1-a, adversarial round 2 on PR #1514) — a lease reset alone left no exit
+// from the wedge: hasInFlightDispatchReceipt keyed only on a terminal completed/failed
+// runtime receipt, adminResetDispatchLease wrote neither, and task_dispatch had no in-flight
+// guard of its own at all. This block proves the FULL dead-runner recovery path end to end:
+// dispatch -> runner dies -> reset(terminate) -> reassign -> new dispatch -> settle.
+describe('adminResetDispatchLease terminate:true — the wedge now has an exit (mupot#1494 v4, P1-a)', () => {
+  it('PRE-FIX repro: reset alone (no terminate) leaves reassign/unassign refused AND a fresh dispatch succeeds anyway (the bypass)', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      const reset = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'dead runner', override: true,
+      })
+      expect(reset.reset).toBe(true)
+      expect(reset.terminated).toBe(false) // terminate was not requested
+
+      // Reassignment still refused — the dispatch has no terminal runtime receipt.
+      const reassign = await invokeTool(fixture.gateAuth, fixture.env, 'task_update', {
+        task_id: TASK_ID, assignee_agent_id: GATE_AGENT_ID,
+      }, 'https://pot.test')
+      expect(reassign).toMatchObject({ ok: false, status: 409, error: 'task_dispatch_in_flight' })
+
+      // Unassignment (null) is ALSO refused — same in-flight guard.
+      const unassign = await invokeTool(fixture.gateAuth, fixture.env, 'task_update', {
+        task_id: TASK_ID, assignee_agent_id: null,
+      }, 'https://pot.test')
+      expect(unassign).toMatchObject({ ok: false, status: 409, error: 'task_dispatch_in_flight' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('dead-runner recovery end to end: dispatch already in flight -> reset(terminate:true) -> reassign -> fresh dispatch -> settle', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      // A fresh task_dispatch is refused while the fixture's own dispatch is still in flight
+      // (P1-a's new guard) — even BEFORE any reset.
+      const blockedDispatch = await invokeTool(fixture.gateAuth, fixture.env, 'task_dispatch', {
+        task_id: TASK_ID,
+      }, 'https://pot.test')
+      expect(blockedDispatch).toMatchObject({ ok: false, status: 409, error: 'task_not_dispatchable' })
+
+      // Operator repairs AND terminates in one call.
+      const reset = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'dead runner, terminating', override: true, terminate: true,
+      })
+      expect(reset).toMatchObject({ reset: true, terminated: true })
+
+      const terminalReceipt = fixture.harness.sqlite.prepare(
+        `SELECT stage, agent_id, message_id FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? AND stage = 'reset_terminated'`,
+      ).get(DISPATCH_ID) as { stage: string; agent_id: string; message_id: string }
+      expect(terminalReceipt).toMatchObject({ stage: 'reset_terminated', agent_id: AGENT_ID, message_id: MESSAGE_ID })
+
+      // Reassignment now succeeds — hasInFlightDispatchReceipt sees the terminal marker.
+      const reassign = await invokeTool(fixture.gateAuth, fixture.env, 'task_update', {
+        task_id: TASK_ID, assignee_agent_id: GATE_AGENT_ID,
+      }, 'https://pot.test')
+      expect(reassign.ok).toBe(true)
+
+      // A fresh dispatch to the new assignee now succeeds (task must be open/blocked/rejected
+      // again first, and assignee resolved via GATE_AGENT_ID which the fixture's own squad
+      // capability already covers).
+      fixture.harness.sqlite.prepare(`UPDATE tasks SET status = 'open' WHERE id = ?`).run(TASK_ID)
+      const freshDispatch = await invokeTool(fixture.gateAuth, fixture.env, 'task_dispatch', {
+        task_id: TASK_ID,
+      }, 'https://pot.test') as { ok: boolean; result?: { dispatched?: boolean; receipt?: { id: string } } }
+      expect(freshDispatch.ok).toBe(true)
+      expect(freshDispatch.result?.receipt?.id).toBeDefined()
+      expect(freshDispatch.result?.receipt?.id).not.toBe(DISPATCH_ID)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('terminate:true is idempotent — a second call never writes a duplicate reset_terminated row', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'first terminate', terminate: true,
+      })
+      const second = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'second terminate, already terminal', terminate: true,
+      })
+      expect(second.terminated).toBe(true) // idempotently "already terminal", no throw
+
+      const count = fixture.harness.sqlite.prepare(
+        `SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? AND stage = 'reset_terminated'`,
+      ).get(DISPATCH_ID) as { n: number }
+      expect(count.n).toBe(1)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('terminate:true refuses (409, receipted, zero side effects) for a directory-session org-admin with no bearer credential', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const noCredentialAuth: AuthContext = {
+        userId: GATE_MEMBER_ID,
+        tenant: TENANT,
+        channel: 'workspace',
+        role: 'owner',
+        memberId: GATE_MEMBER_ID,
+        tokenId: undefined, // no live bearer token
+        boundAgentId: undefined,
+        capabilities: [{ member_id: GATE_MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+      }
+      const result = await adminResetDispatchLease(fixture.env, noCredentialAuth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'no credential', terminate: true,
+      })
+      expect(result).toMatchObject({ reset: false, code: 'reset_refused_credential_required', terminated: false })
+
+      // Zero side effects — the message is untouched (unleased fixture default: 0).
+      const row = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number }
+      expect(row.delivery_attempts).toBe(0)
     } finally {
       fixture.harness.close()
     }

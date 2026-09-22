@@ -356,7 +356,27 @@ function cleanStr(v: unknown, max = MAX_STR): string {
   return typeof v === 'string' ? v.slice(0, max) : ''
 }
 
-function validReport(a: unknown): FleetAgentReport | null {
+/**
+ * mupot#1494 v4 (P1-c) — `validReport`'s `squads` filter used to check ONLY shape
+ * (`AGENT_ID_RE`) + a count cap, never whether a claimed slug names a REAL squad. That let
+ * any agent report a fabricated slug — including one belonging to `kind='home'` — into
+ * `fleet_agents.squads`. The HOME-EXCLUSION fix below (`listFleetAgentRuntimeView`) no
+ * longer reads this self-reported array for the exclusion decision at all (it now joins the
+ * agent's REAL `agents.squad_id`), which is what actually closes the "claim a home slug to
+ * vanish from the radar" / "claim a non-home slug to appear as one" exploit. This
+ * `knownSquadSlugs` filter is a second, independent layer of hygiene: it stops a garbage or
+ * fabricated slug from ever landing in the self-reported array at all, which also matters
+ * for the (unrelated, pre-existing, unchanged) squad-SCOPED dashboard view's own
+ * `json_each(fleet_agents.squads)` membership test — an unknown slug can never satisfy a
+ * real caller's `EXISTS` check either way, but rejecting it here means the stored row
+ * doesn't carry a slug that names nothing.
+ */
+async function loadKnownSquadSlugs(env: Env): Promise<Set<string>> {
+  const rows = await env.DB.prepare('SELECT slug FROM squads').all<{ slug: string }>()
+  return new Set((rows.results ?? []).map((r) => r.slug))
+}
+
+function validReport(a: unknown, knownSquadSlugs: ReadonlySet<string>): FleetAgentReport | null {
   if (!a || typeof a !== 'object') return null
   const r = a as Record<string, unknown>
   if (typeof r.agent_id !== 'string' || !AGENT_ID_RE.test(r.agent_id)) return null
@@ -364,7 +384,9 @@ function validReport(a: unknown): FleetAgentReport | null {
   const runtime = isValidRuntimeOrUnset(r.runtime) ? r.runtime : ''
   const lifecycle = typeof r.lifecycle === 'string' && LIFECYCLES.has(r.lifecycle) ? r.lifecycle : ''
   const squads = Array.isArray(r.squads)
-    ? r.squads.filter((s): s is string => typeof s === 'string' && AGENT_ID_RE.test(s)).slice(0, MAX_SQUADS)
+    ? r.squads
+        .filter((s): s is string => typeof s === 'string' && AGENT_ID_RE.test(s) && knownSquadSlugs.has(s))
+        .slice(0, MAX_SQUADS)
     : []
   const pc = typeof r.provider_contract === 'string' && AGENT_ID_RE.test(r.provider_contract) ? r.provider_contract : null
   // agent_type: if provided must be a known value; omitted → 'generic'. Unknown value rejects the batch.
@@ -412,9 +434,10 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
   if (!env.TENANT_SLUG) return { ok: false, reason: 'no_tenant' }
   if (!Array.isArray(agents)) return { ok: false, reason: 'agents must be an array' }
   if (agents.length > MAX_AGENTS) return { ok: false, reason: `too many agents (>${MAX_AGENTS})` }
+  const knownSquadSlugs = await loadKnownSquadSlugs(env)
   const valid: FleetAgentReport[] = []
   for (const a of agents) {
-    const v = validReport(a)
+    const v = validReport(a, knownSquadSlugs)
     if (!v) return { ok: false, reason: 'invalid agent in batch' } // fail the batch, never silently drop
     valid.push(v)
   }
@@ -452,6 +475,11 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 
   let written = 0
   for (const v of toWrite) {
+    // mupot#1494 v4 (P1-b) — resolve a SLUG-shaped report to its canonical `agents.id`
+    // BEFORE it becomes the `fleet_agents.agent_id` key, so this writer and
+    // `upsertPollFleetPresence` (keyed on `auth.boundAgentId`, always a uuid) can never
+    // create two rows for the same real agent. See resolveFleetWriteAgentId's doc comment.
+    const writeAgentId = await resolveFleetWriteAgentId(env, v.agent_id)
     await env.DB.prepare(
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
@@ -467,7 +495,7 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
             host=excluded.host,
             last_reported_at=excluded.last_reported_at, updated_at=excluded.updated_at`,
     )
-      .bind(v.agent_id, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null, v.host ?? '')
+      .bind(writeAgentId, env.TENANT_SLUG, v.display, v.runtime, JSON.stringify(v.squads), v.lifecycle, v.provider_contract, v.status, reportedBy, v.agent_type ?? 'generic', v.member_id ?? null, v.host ?? '')
       .run()
     written++
   }
@@ -552,6 +580,46 @@ export function resolveFleetPresenceTtlSec(
   return typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
     ? row.presence_ttl_sec
     : presenceTtlSec(env)
+}
+
+/**
+ * resolveFleetWriteAgentId — mupot#1494 v4 (P1-b, adversarial round 2). ONE AGENT, TWO
+ * fleet_agents ROWS: the poll writer (`upsertPollFleetPresence`, keyed on the caller's own
+ * `auth.boundAgentId` — an `agents.id` uuid) and the daemon/signed-attach writers (which
+ * report the SLUG they know the agent by, e.g. `runner-1`) both satisfy `AGENT_ID_RE` (a
+ * lowercase uuid matches the same regex a slug does), so they land as two DIFFERENT primary
+ * keys — `fleet_agents.PRIMARY KEY (tenant, agent_id)` never collides them. Every reader that
+ * resolves ONE fact ("is this agent live", "what squads does it belong to") then gets two
+ * different answers depending on which identifier it happens to hold, and the P2-a
+ * squads-union machinery (`poll_home_squad_slug`, `pollSquadsMergeSql`/`daemonSquadsMergeSql`)
+ * never fires for a real agent because the two writers never touch the same row.
+ *
+ * Fix: resolve a REPORTED identifier to its canonical `agents.id` BEFORE it is ever used as
+ * `fleet_agents.agent_id`, so every writer keys the SAME row for the SAME agent:
+ *   1. If `reported` already IS a real `agents.id`, use it as-is (the poll writer's shape,
+ *      and the steady state after this fix runs once).
+ *   2. Otherwise, treat it as a slug — but ONLY resolve it when EXACTLY ONE agent tenant-wide
+ *      carries that slug. `agents.slug` is `UNIQUE(squad_id, slug)` (migration 0001), i.e.
+ *      unique PER SQUAD, not tenant-wide — the same ambiguity `readFleetAgentRow` above
+ *      already refuses to guess through for the READ side. Two different agents in two
+ *      different squads sharing a slug must not be silently collapsed onto one uuid on the
+ *      WRITE side either (that would attribute one real agent's report to the other's row).
+ *   3. Ambiguous or unresolvable (0 or >1 matches) → return the reported identifier
+ *      UNCHANGED. This is a safe degrade, not a silent failure: the row this writes is
+ *      exactly what every writer already produced before this fix (still a real,
+ *      readable — if potentially duplicate — fleet_agents row), never a rejected report.
+ */
+export async function resolveFleetWriteAgentId(env: Env, reported: string): Promise<string> {
+  const byId = await env.DB.prepare('SELECT 1 FROM agents WHERE id = ?1 LIMIT 1')
+    .bind(reported)
+    .first<{ 1: number }>()
+  if (byId) return reported
+
+  const matches = await env.DB.prepare('SELECT id FROM agents WHERE slug = ?1')
+    .bind(reported)
+    .all<{ id: string }>()
+  const rows = matches.results ?? []
+  return rows.length === 1 ? rows[0].id : reported
 }
 
 export async function readFleetAgentRow(
@@ -960,6 +1028,20 @@ export async function listFleetAgentRuntimeView(
     scopeClause =
       ` AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))`
   }
+  // mupot#1494 v4 (P1-c, adversarial round 2) — this used to read `fleet_agents.squads`,
+  // the SELF-REPORTED array `validReport` accepts from the reporting agent itself. An
+  // honour system, not a boundary: a home agent could claim `squads:['openwork']` and
+  // become visible in the unrestricted view, or ANY agent could claim `squads:['home-m1']`
+  // (any real home squad's slug — `validReport` now rejects a slug that names no real
+  // squad at all, but a REAL home slug it is not actually a member of was always
+  // accepted) and vanish from operator observability entirely. Fixed by deriving the
+  // exclusion from the agent's ACTUAL membership — `agents.squad_id` joined to
+  // `squads.kind = 'home'` — never from anything the agent itself reported. Resolves
+  // `fleet_agents.agent_id` the SAME safe way `readFleetAgentRow` above does (exact id
+  // match first; a slug match ONLY when it is unambiguous tenant-wide) — an agent_id this
+  // can't safely resolve to a real agent has no real home squad to hide behind, so it is
+  // never excluded on that account either.
+  //
   // mupot#1494 round 3 (P2-b), CORRECTED per #1472's pinned isolation invariant
   // (2026-09-22): home squads and their agents/hosts must be hidden from EVERY
   // unrestricted org/department view — that invariant WINS over round 3's original
@@ -972,10 +1054,32 @@ export async function listFleetAgentRuntimeView(
   // already restricted to squads the caller has real standing on by the EXISTS clause
   // above, so if that includes a home squad the caller is entitled to see it (the
   // home's own member, or an elevation-with-receipt) — no separate check needed there.
+  //
+  // mupot#1494 v4 (P2, adversarial round 2) — that same round flagged this
+  // `scopeClause === ''` gating as "defense in depth removed... safety rests entirely on
+  // every caller deriving squadIds from real grants, with no backstop", and asked for the
+  // exclusion to run unconditionally. NOT done here: every audited caller of this
+  // function (src/dashboard/radar.ts, fleet.ts, mission-control-routes.ts) already derives
+  // `squadIds` from a real capability grant, and src/im/index.ts calls unscoped — so there
+  // is no LIVE gap today. Making the exclusion itself unconditional would re-open the
+  // EXACT regression `be955ff3` fixed (a home-squad member's OWN scoped view hiding its
+  // own agent) unless the exclusion is ALSO taught to carve out "the caller's real home
+  // squad is inside its own accessible `slugs`" — a second, independent piece of logic
+  // this round did not have room to design AND prove against the pinned #1472 test with
+  // confidence. Left as a named follow-up rather than a speculative change to a
+  // twice-regressed invariant.
   const homeExclusion = scopeClause === ''
     ? ` AND NOT EXISTS (
-          SELECT 1 FROM json_each(fleet_agents.squads) je
-           WHERE je.value IN (SELECT slug FROM squads WHERE kind = 'home')
+          SELECT 1
+            FROM agents real_agent
+            JOIN squads home_squad
+              ON home_squad.id = real_agent.squad_id AND home_squad.kind = 'home'
+           WHERE real_agent.id = fleet_agents.agent_id
+              OR (
+                real_agent.slug = fleet_agents.agent_id
+                AND NOT EXISTS (SELECT 1 FROM agents canonical WHERE canonical.id = fleet_agents.agent_id)
+                AND (SELECT COUNT(*) FROM agents dupe WHERE dupe.slug = fleet_agents.agent_id) = 1
+              )
         )`
     : ''
   const statement = env.DB.prepare(

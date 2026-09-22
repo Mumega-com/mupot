@@ -132,12 +132,32 @@ genuinely LIVE and unexpired (a real resident is mid-flight, not stuck) — that
 names the current holder and its expiry, and only proceeds if the operator confirms the
 holder is actually gone and passes `override: true`, in which case the prior lease state is
 preserved in the audit receipt, never silently discarded. Your next `attempt: 1` settle then
-proceeds normally.
+proceeds normally. Liveness here is compared via `julianday()` on both sides
+(`LEASE_LIVE_PREDICATE`, `src/agents/messages.ts`), never a plain string compare — the two
+timestamp formats this table has seen (`agent_messages.lease_expires_at` written as ISO;
+this tool's own "now" as `'YYYY-MM-DD HH:MM:SS'`) sort in the WRONG order for a plain `>`
+on any same-UTC-day value, which once made a same-day expired lease read as still live.
 
 **Reassigning a task while its dispatch is still mid-flight is refused**
 (`task_update({ task_id, assignee_agent_id })` → `409 task_dispatch_in_flight`) rather than
 silently orphaning it — wait for the dispatch to settle (or fail) first, or have an operator
-resolve it via the repair above before reassigning.
+resolve it via the repair above before reassigning. **A fresh `task_dispatch` on the same
+task is refused the same way** (`409 task_not_dispatchable`) while an earlier dispatch is
+still unsettled — dispatching again is not a way around the reassignment guard.
+
+**For a genuinely dead runner (the exact scenario the repair tool exists for), a lease
+reset alone is not enough** — resetting the lease does not, by itself, make the guards
+above let go, because they check for a settled (`completed`/`failed`) runtime receipt and a
+reset writes neither. Pass `terminate: true` on the SAME repair call:
+`task_dispatch_lease_reset({ task_id, dispatch_receipt_id, reason, override: true, terminate: true })`.
+This additionally writes a real terminal marker (`reset_terminated`) for the dispatch, so
+the reassignment guard and `task_dispatch`'s own guard both see it as settled. The full
+dead-runner recovery is then: **reset(terminate) → reassign (or unassign) → a fresh
+`task_dispatch` to the new/no assignee → that new dispatch settles normally.** `terminate`
+is idempotent (a second call on an already-terminal dispatch writes no duplicate row) and
+refuses (`409`, receipted, zero side effects) if your session has no live bearer credential
+to anchor the new receipt to — a directory-OAuth org-admin session can still reset without
+`terminate`, just not terminate in the same call.
 
 ## Worked example (poll every 5 minutes)
 
@@ -171,16 +191,28 @@ task_dispatch_runtime_receipt({
   how-to; that doc is the code-cited record of what shipped and what didn't.
 - `src/fleet/registry.ts` — `clampPollIntervalSec`, `pollPresenceTtlSec`,
   `upsertPollFleetPresence`, `touchPollFleetPresence`, `clearPollFleetPresence`,
-  `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`, `isActivePollPresenceMode`.
+  `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`, `isActivePollPresenceMode`,
+  `resolveFleetWriteAgentId` (v4 — the slug→`agents.id` resolution every `fleet_agents`
+  writer now goes through before its upsert).
 - `src/tasks/runtime-receipts.ts` — `claimUnleasedForPairSettlement`,
-  `loadLatestDispatchReceiptsForTasks`, `adminResetDispatchLease`, `hasInFlightDispatchReceipt`.
-- `src/agents/messages.ts` — `leaseAvailableClause`, `bearerFencePredicate`.
+  `loadLatestDispatchReceiptsForTasks`, `adminResetDispatchLease`, `hasInFlightDispatchReceipt`,
+  `TERMINAL_RUNTIME_RECEIPT_STAGES` (v4).
+- `src/agents/messages.ts` — `leaseAvailableClause`, `bearerFencePredicate`,
+  `LEASE_LIVE_PREDICATE` (v4 — the single `julianday()`-based lease-liveness check).
 - `src/bus/consumer.ts` — `resolveDispatchDeliveryMode` + `hasRegisteredDeliverySurface`
   (the routing rule and the force-eligibility check).
 - `src/tasks/runtime-receipts.ts` — `resolveMessageId` (the alternative correlator),
   `claimUnleasedForPairSettlement` (the lease-equivalent), `loadLatestDispatchReceiptsForTasks`
   (what `task_list`/`task_board` read).
+- **mupot#1506 is CLOSED (v4):** a poll row keyed by an agent's uuid and a daemon/signed-
+  attach row for the same agent keyed by its slug used to be two independent rows that
+  never reconciled — `resolveFleetWriteAgentId` now converges every writer onto the
+  canonical `agents.id`, and a `migrations/0168` addendum backfills any pre-existing
+  duplicate pair. The home-squad exclusion (`listFleetAgentRuntimeView`) also no longer
+  trusts a `fleet_agents` row's own self-reported `squads` array — it derives from the
+  agent's REAL `agents.squad_id` membership instead, closing a separate self-report-honesty
+  gap (a home agent could claim a non-home slug to become visible; any agent could claim a
+  real home slug to vanish).
 - Known residual, tracked separately, not fixed by this work: mupot#1505 (no `UNIQUE` on an
   unconsumed `(tenant, task_id)` receipt — two concurrent `task_dispatch` calls can produce
-  two inbox envelopes) and mupot#1506 (a poll row keyed by an agent's uuid and a resident row
-  for the same agent keyed by its slug are two independent rows that never reconcile).
+  two inbox envelopes).

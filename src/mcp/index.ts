@@ -2233,6 +2233,20 @@ const toolTaskDispatch: ToolSpec = {
       return fail(409, 'task_not_dispatchable')
     }
 
+    // mupot#1494 v4 (P1-a, adversarial round 2) — hasInFlightDispatchReceipt's OWN doc
+    // comment already claimed this task's reassignment guard "see toolTaskDispatch's own
+    // task_not_dispatchable gate" — a gate that did not actually exist here. PROVED: a
+    // fresh dispatch succeeded even while an earlier one on the same task was still
+    // genuinely unsettled, which both contradicted that doc comment and let an operator
+    // bypass P2-5's reassignment refusal by dispatching again, settling the NEW receipt,
+    // then reassigning while the OLD one stayed unsettled — the exact orphan P2-5 exists to
+    // prevent. Refuse while any earlier dispatch on this task is still in flight; a
+    // `task_dispatch_lease_reset(terminate: true)` repair (or a real completed/failed
+    // settle) clears this the same way it clears the reassignment guard.
+    if (await hasInFlightDispatchReceipt(env, task.id)) {
+      return fail(409, 'task_not_dispatchable')
+    }
+
     // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` must not strand a task in an inbox
     // nothing is known to poll. Run the SAME eligibility check consumer.ts's
     // resolveDispatchDeliveryMode will run asynchronously, synchronously, here, so an
@@ -4315,7 +4329,7 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
   name: 'task_dispatch_lease_reset',
   scope: 'org (workspace admin repairs a wedged/desynchronised dispatch lease)',
   min: 'admin',
-  args: '{ task_id: string, dispatch_receipt_id: string, reason: string, override?: boolean }',
+  args: '{ task_id: string, dispatch_receipt_id: string, reason: string, override?: boolean, terminate?: boolean }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4323,6 +4337,11 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       dispatch_receipt_id: STRING_SCHEMA,
       reason: STRING_SCHEMA,
       override: { type: 'boolean' },
+      // mupot#1494 v4 (P1-a) — also mark the dispatch's runtime receipt TERMINAL
+      // ('reset_terminated'), so hasInFlightDispatchReceipt sees it as settled and
+      // reassignment/unassignment/re-dispatch stop refusing a genuinely dead runner's task
+      // forever. See adminResetDispatchLease's doc comment for the exact repair semantics.
+      terminate: { type: 'boolean' },
     },
     required: ['task_id', 'dispatch_receipt_id', 'reason'],
     additionalProperties: false,
@@ -4349,9 +4368,12 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
     if (args.override !== undefined && typeof args.override !== 'boolean') {
       return fail(400, 'invalid_args', 'override must be a boolean')
     }
+    if (args.terminate !== undefined && typeof args.terminate !== 'boolean') {
+      return fail(400, 'invalid_args', 'terminate must be a boolean')
+    }
     if (!auth.memberId) return fail(403, 'forbidden', { need: 'member identity' })
     const result = await adminResetDispatchLease(env, auth, {
-      taskId, dispatchReceiptId, reason, override: args.override === true,
+      taskId, dispatchReceiptId, reason, override: args.override === true, terminate: args.terminate === true,
     })
     if (result.code === 'reset_refused_lease_live') {
       // mupot#1494 round 3 (P1-A) — typed refusal naming the current holder + expiry, so an
@@ -4362,10 +4384,19 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
     if (result.code === 'reset_refused_task_mismatch') {
       return fail(409, 'task_mismatch', { message_id: result.message_id, audit_id: result.audit_id })
     }
+    if (result.code === 'reset_refused_credential_required') {
+      // mupot#1494 v4 (P1-a) — terminate:true needs a real bearer credential to anchor the
+      // terminal receipt to; a directory-OAuth org-admin session with none can still reset
+      // without terminate.
+      return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
+    }
     if (!result.reset) {
       return fail(409, 'lease_reset_refused', { message_id: result.message_id, audit_id: result.audit_id })
     }
-    return done({ reset: true, overrode: result.overrode, message_id: result.message_id, audit_id: result.audit_id })
+    return done({
+      reset: true, overrode: result.overrode, terminated: result.terminated,
+      message_id: result.message_id, audit_id: result.audit_id,
+    })
   },
 }
 

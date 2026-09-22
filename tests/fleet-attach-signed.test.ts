@@ -59,6 +59,12 @@ function makeDb(opts: {
     }
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
     if (sql.includes('FROM members WHERE id')) return null
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's exact-id probe, now run before
+    // /attach-signed's upsertRunning. No real agents table in this mock; 'kasra' (the
+    // identifier every fixture in this file signs) never matches a real agents.id, so
+    // "no match" is correct — falls through to the slug lookup below, also unmatched,
+    // returning the identifier unchanged (preserving every existing `db._fleet.get('mumega:kasra')` assertion).
+    if (sql.includes('SELECT 1 FROM agents WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
   function all(sql: string, b: unknown[]) {
@@ -70,6 +76,9 @@ function makeDb(opts: {
       }))
     }
     if (sql.includes('capabilities')) return []
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's slug lookup, reached only when the
+    // id probe above already missed. No real agents table in this mock — always unmatched.
+    if (sql.includes('SELECT id FROM agents WHERE slug')) return []
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {

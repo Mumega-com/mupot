@@ -24,6 +24,13 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
     // member_id existence check added in 0039 — no members seeded in this fixture, always null
     if (sql.includes('FROM members WHERE id')) return null
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's exact-id probe. This mock has no
+    // real agents table; every reported agent_id in this file is a bare slug-shaped string
+    // that never matches a real agents.id, so the safe/degrade answer is "no match" —
+    // resolveFleetWriteAgentId then falls through to its slug lookup (also unmatched here,
+    // see `all()` below) and returns the reported identifier UNCHANGED, preserving every
+    // existing assertion in this file (which predates the id/slug resolution feature).
+    if (sql.includes('SELECT 1 FROM agents WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
   function all(sql: string, b: unknown[]) {
@@ -44,6 +51,14 @@ function makeDb(tokens: Record<string, TokenRow> = {}, caps: Record<string, CapR
     }
     // reportFleetAgents keyed-agent skip check — keyed agents own their row via signed attach.
     if (sql.includes('FROM agent_keys')) return keyedAgents.map((a) => ({ agent_id: a }))
+    // mupot#1494 v4 (P1-c) — loadKnownSquadSlugs' allow-list for validReport's squads
+    // filter. This mock has no real squads table; 'media' is the only slug any fixture in
+    // this file reports (GOOD.squads), so it is the only one that needs to validate.
+    if (sql.includes('FROM squads')) return [{ slug: 'media' }]
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's slug lookup, reached only when the
+    // id probe above already missed. No real agents table in this mock — always unmatched
+    // (see that probe's comment for why "unchanged identifier" is the correct answer here).
+    if (sql.includes('SELECT id FROM agents WHERE slug')) return []
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {

@@ -385,8 +385,14 @@ describe('resolveAccessibleSquadIds consumers — home squad exclusion for an un
         ('member-home-c', 'home-c@pot.test', 'Home C Member', 'active', 'pot-a');
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
         ('cap-home-c', 'member-home-c', 'squad', 'squad-home-c', 'admin');
+      -- mupot#1494 v4 (P1-c) — keyed on the REAL agent's id/slug ('agent-home-c'), not an
+      -- unrelated host string: the home-squad exclusion now derives from ACTUAL
+      -- agents.squad_id membership (never from this row's own self-reported \`squads\`
+      -- column), so a fleet_agents row this can't resolve to a real agent has no real home
+      -- squad to hide behind — this is the shape every real writer (reportFleetAgents,
+      -- upsertPollFleetPresence, attach-signed) actually produces.
       INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, last_reported_at, updated_at) VALUES
-        ('host-home-c', 'pot-a', 'Host Home C SECRET', 'tmux', '["home-c"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now'));
+        ('agent-home-c', 'pot-a', 'Host Home C SECRET', 'tmux', '["home-c"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now'));
       INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES
         ('pot-a', 'member-home-c', 'Home C Member SECRET', 'claude-code', 'build', 'agent-home-c', datetime('now'), datetime('now'));
     `)

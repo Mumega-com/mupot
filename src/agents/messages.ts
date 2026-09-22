@@ -931,6 +931,34 @@ export const DEFAULT_LEASE_SECONDS = 300
  *  pick the message up until it expires, and there is no unlease call. */
 export const MAX_LEASE_SECONDS = 3600
 const MIN_LEASE_SECONDS = 1
+
+/**
+ * LEASE_LIVE_PREDICATE — mupot#1494 v4 (P0 successor, Athena's ruling). THE single SQL
+ * fragment for "is this lease currently LIVE" — not NULL, not expired — evaluated via
+ * `julianday()` on BOTH sides, same discipline and same reason as `TOKEN_LIVE_PREDICATE`
+ * (src/auth/token-lifecycle.ts): `agent_messages.lease_expires_at` is written as
+ * `new Date().toISOString()` (this file, e.g. `leaseAgentInbox`,
+ * `claimUnleasedForPairSettlement` in src/tasks/runtime-receipts.ts) but round-2's own P1-A
+ * repair fix (src/tasks/runtime-receipts.ts, since replaced) compared it against
+ * `nowSqlUtc()` (`'YYYY-MM-DD HH:MM:SS'`, no `T`, no ms) with a plain JS `>` string compare.
+ * `'T'` (0x54) sorts above `' '` (0x20), so for any same-UTC-day value the ISO string always
+ * compares greater than the space-shaped `now` — every same-day EXPIRED lease read as LIVE.
+ * `julianday()` parses both shapes and compares the actual instants, so this predicate gives
+ * the same, correct answer regardless of which format `nowParam` happens to be bound in.
+ *
+ * Consumed by `leaseAvailableClause` below, and by `adminResetDispatchLease` +
+ * `validateEnvelope` in src/tasks/runtime-receipts.ts — ONE predicate, three call sites, so
+ * "is this lease live" can never again mean two different things depending on which file
+ * asks. `claimUnleasedForPairSettlement` does NOT need it: it gates on
+ * `lease_expires_at IS NULL` (an exact-NULL pristine-state check, not a magnitude compare),
+ * which no timestamp format can make ambiguous.
+ *
+ * Bind: `column` is a verbatim SQL column reference (e.g. `'lease_expires_at'` or a
+ * qualified `'m.lease_expires_at'`), NEVER user input. `nowParam` is the bound parameter
+ * placeholder for "now" (any format `julianday()` can parse — ISO or `nowSqlUtc()`'s shape).
+ */
+export const LEASE_LIVE_PREDICATE = (column: string, nowParam: string): string =>
+  `${column} IS NOT NULL AND julianday(${column}) > julianday(${nowParam})`
 /** Ids accepted by one inbox_ack call — the lease cap is MAX_INBOX_LIMIT, so a caller can
  *  always ack a full lease in one shot. */
 const MAX_ACK_IDS = MAX_INBOX_LIMIT
@@ -1179,7 +1207,17 @@ export function bearerFencePredicate(tenantParam: string, agentParam: string): s
  * holds.
  */
 function leaseAvailableClause(nowParam: string, opts: { allowAttemptHeld?: boolean } = {}): string {
-  const base = `(lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})`
+  // mupot#1494 v4 (P0 successor, Athena's ruling) — derived from LEASE_LIVE_PREDICATE
+  // rather than a standalone `lease_expires_at <= nowParam` string compare. Every writer
+  // of `lease_expires_at` in THIS file stamps ISO-8601 (`new Date().toISOString()`), so a
+  // plain lexicographic compare against an ISO `nowParam` was never actually wrong here —
+  // but `julianday()` on both sides costs nothing, makes this clause format-agnostic
+  // against whatever shape a future caller binds for `nowParam`, and — the concrete reason
+  // this changed now — guarantees this clause can NEVER diverge from the same liveness
+  // definition `adminResetDispatchLease` and `validateEnvelope`
+  // (src/tasks/runtime-receipts.ts) consume, which cannot assume an ISO `now` (see
+  // LEASE_LIVE_PREDICATE's own doc comment).
+  const base = `NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', nowParam)})`
   // mupot#1494 round 3 (P2-3, adversarial round 2) — the `allowAttemptHeld` carve-out
   // exists for the pre-existing, deliberately-tested "legacy inbox consume during an
   // attempt lease" reconciliation property (tests/inbox-lease-attempt-ack.test.ts). That
