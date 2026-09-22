@@ -15,7 +15,7 @@ import type {
   ProvisionStep, ProvisionStepReceipt,
   OrphanedResources, SovereignPotProvisionInput, SovereignPotProvisionResult, SovereignPotSummary } from './types'
 import {
-  applySchemaChain, recordedKey,
+  applySchemaChain, recordedKey, escapeSqlLiteral,
   type ApplySchemaChainResult,
 } from './schema-chain'
 import { sha256Hex } from '../members/service'
@@ -26,6 +26,12 @@ export const DEFAULT_ROOT_DOMAIN = 'mupot.mumega.com'
 
 // Slugs that can never name a tenant worker. Mirrored by the apex path router
 // (src/dispatcher.ts) so reserved names fail fast instead of dispatching.
+// Union of the two independently-maintained reserved-word lists this codebase had
+// (this file's own, plus src/pots/checkout.ts's — checkSlugAvailability moved here in
+// mupot#1507 round-2, and its list was WIDER: billing/blog/dev/docs/help/mail/root/sos/
+// static/support/test/www were refused by the self-serve checkout path but NOT by
+// validateSlug/the dispatcher's routing reservation. Merging avoids silently narrowing
+// what checkout.ts used to refuse.
 export const RESERVED_TENANT_SLUGS = new Set([
   'mumega',
   'mupot',
@@ -37,6 +43,18 @@ export const RESERVED_TENANT_SLUGS = new Set([
   'app',
   'studio',
   'copilot',
+  'billing',
+  'blog',
+  'dev',
+  'docs',
+  'help',
+  'mail',
+  'root',
+  'sos',
+  'static',
+  'support',
+  'test',
+  'www',
 ])
 
 export function sanitizeSlug(input: string): string {
@@ -325,12 +343,24 @@ export async function loadPotWorkerBundle(
   explicitCode?: string,
 ): Promise<LoadPotWorkerBundleResult> {
   if (env.POT_WORKER_BUNDLE_BUCKET) {
+    // NO fallback to worker_js_code on an R2 FAILURE (mupot#1507 round-2 P1-2) — a GET
+    // call that THROWS is not the same signal as "nothing published for this RELEASE_SHA
+    // yet" (obj === null, no throw, handled further below and still allowed to fall
+    // through — CI publishing every release is a follow-up, not built in this PR; treating
+    // every not-yet-published release as a hard failure would make the bucket binding
+    // unusable before that lands). A transport error, by contrast, means something is
+    // WRONG with infrastructure this deployment has declared authoritative by configuring
+    // the binding at all — falling back would silently ship whatever `worker_js_code`
+    // happens to be supplied instead of surfacing that problem.
     const key = `${env.RELEASE_SHA || 'unknown'}/worker.js`
-    let obj: Awaited<ReturnType<R2Bucket['get']>> = null
+    let obj: Awaited<ReturnType<R2Bucket['get']>>
     try {
       obj = await env.POT_WORKER_BUNDLE_BUCKET.get(key)
-    } catch {
-      obj = null // Transport failure — fall through to the explicit path below.
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `R2 GET '${key}' failed: ${errMsg(error)} — POT_WORKER_BUNDLE_BUCKET is configured, so this is a hard failure, not a signal to fall back to worker_js_code.`,
+      }
     }
     if (obj) {
       const code = await obj.text()
@@ -438,6 +468,14 @@ export interface SeedIdentitiesInput {
   adminName?: string
 }
 
+/** Inline SQL literal — see the atomic-batch doc comment on `seedPotIdentities` for why
+ *  this seed step does not use `?N` bound params. */
+function lit(value: string | number | null): string {
+  if (value === null) return 'NULL'
+  if (typeof value === 'number') return String(value)
+  return `'${escapeSqlLiteral(value)}'`
+}
+
 export interface SeedIdentitiesResult {
   ok: boolean
   /** True when an admin member with this email already existed — this call minted NO new
@@ -467,6 +505,74 @@ export interface SeedIdentitiesResult {
   detail?: string
 }
 
+interface FullSeedIdentityState {
+  adminMemberId: string | null
+  adminHasOwnerCapability: boolean
+  adminTokenHash: string | null
+  leadAgentId: string | null
+  leadAgentMemberId: string | null
+  leadAgentHasBinding: boolean
+  leadAgentTokenHash: string | null
+}
+
+/** Reads the FULL set of facts a "this pot is already seeded" claim depends on — never
+ *  just "does a member with this email exist" (mupot#1507 round-2 P0-2: that check alone
+ *  reported `ok:true`/`alreadySeeded` for a pot where the admin member existed but its
+ *  org:owner capability, token, or the lead agent's binding did not — a half-seeded pot
+ *  that LOOKED fully provisioned to every caller after it). Two round trips (admin side,
+ *  lead-agent side); both read-only. */
+async function readFullSeedIdentityState(
+  cf: CloudflareApiConfig,
+  databaseId: string,
+  normalizedAdminEmail: string,
+  leadAgentSlug: string,
+): Promise<FullSeedIdentityState> {
+  const adminRows = await executeD1Query(
+    cf,
+    databaseId,
+    `SELECT m.id AS id,
+            (SELECT COUNT(*) FROM capabilities
+              WHERE member_id = m.id AND scope_type = 'org' AND scope_id IS NULL AND capability = 'owner'
+            ) AS owner_count,
+            (SELECT token_hash FROM member_tokens
+              WHERE member_id = m.id AND label = 'admin' AND revoked_at IS NULL
+              ORDER BY created_at DESC LIMIT 1
+            ) AS token_hash
+       FROM members m
+      WHERE lower(m.email) = ?1
+      LIMIT 1`,
+    [normalizedAdminEmail],
+  )
+  const admin = adminRows[0]?.results?.[0] as { id?: string; owner_count?: number; token_hash?: string } | undefined
+
+  const agentRows = await executeD1Query(
+    cf,
+    databaseId,
+    `SELECT a.id AS id,
+            (SELECT b.member_id FROM agent_member_bindings b WHERE b.agent_id = a.id LIMIT 1) AS member_id,
+            (SELECT mt.token_hash FROM member_tokens mt
+              JOIN agent_member_bindings b ON b.agent_id = a.id AND b.member_id = mt.member_id
+              WHERE mt.agent_id = a.id AND mt.label = 'seed-seat' AND mt.revoked_at IS NULL
+              ORDER BY mt.created_at DESC LIMIT 1
+            ) AS token_hash
+       FROM agents a
+      WHERE a.slug = ?1
+      LIMIT 1`,
+    [leadAgentSlug],
+  )
+  const agent = agentRows[0]?.results?.[0] as { id?: string; member_id?: string; token_hash?: string } | undefined
+
+  return {
+    adminMemberId: admin?.id ?? null,
+    adminHasOwnerCapability: Number(admin?.owner_count ?? 0) > 0,
+    adminTokenHash: admin?.token_hash ?? null,
+    leadAgentId: agent?.id ?? null,
+    leadAgentMemberId: agent?.member_id ?? null,
+    leadAgentHasBinding: Boolean(agent?.member_id),
+    leadAgentTokenHash: agent?.token_hash ?? null,
+  }
+}
+
 /**
  * Seeds the MINIMAL identities a freshly-schema'd pot needs to be operable (mupot#1285
  * requirement 4): one core department + squad, an org-owner admin member, and the
@@ -474,68 +580,113 @@ export interface SeedIdentitiesResult {
  * own home member (member_tokens.member_id is NOT NULL — a token bound to an agent still
  * needs an owning member row; agents.owner_member_id records which one). Tokens are
  * stored HASHED with the exact same `sha256Hex` (src/members/service.ts) the main pot's
- * token verification path uses — a pot's dashboard login checks a sha256 hex digest
- * against `member_tokens.token_hash`, so seeding with any other digest would silently
- * mint a credential that could never authenticate.
+ * token verification path uses.
  *
- * Idempotent on `adminEmail`: a retried provisioning call (the D1 already has a schema
- * and may already be seeded from an earlier attempt) checks for an existing admin member
- * FIRST and returns early rather than inserting a second department/squad/member set.
+ * ATOMIC BATCH (mupot#1507 round-2 P0-1). The schema this seed runs against (migration
+ * 0071) enforces a real invariant: `member_tokens_agent_binding_insert` aborts ANY
+ * `member_tokens` insert carrying a non-null `agent_id` unless a matching row already
+ * exists in `agent_member_bindings` — an agent cannot hold a credential without a
+ * recorded human-readable identity weld to a member. The seed-seat token insert MUST
+ * therefore be preceded by an `agent_member_bindings` insert for that exact
+ * (tenant, agent_id, member_id) triple, in the SAME statement sequence — never added
+ * around the trigger (a `catch` that swallows the abort and retries some other way would
+ * be exactly the kind of workaround this trigger exists to make impossible).
+ *
+ * All nine writes below (department, squad, admin member, admin capability, admin token,
+ * lead-agent member, lead agent, the binding, lead-agent capability, lead-agent token —
+ * ten, counting both member rows) are sent as ONE D1 REST `/query` call: a single
+ * `BEGIN; ...; COMMIT;` script with every value inlined via `escapeSqlLiteral` rather than
+ * bound `?N` params. This is deliberate, not a shortcut: D1 REST's per-statement param
+ * binding for a MULTI-statement string in one call is undocumented (would every
+ * statement's own `?1, ?2, ...` need to be renumbered globally across the whole script, or
+ * does each statement get its own local numbering? Cloudflare does not say), so inlining
+ * avoids relying on unverified behavior for the one write path where getting it wrong
+ * means a passing statement 3 that actually wrote statement 7's values. The `BEGIN`/
+ * `COMMIT` wrapper gives real SQLite transaction semantics — D1 is built on SQLite, and a
+ * script that errors before reaching `COMMIT` never persists any of it — closing the
+ * exact "admin member + org:owner capability + orphan token, no lead agent" partial state
+ * requirement 1 names. NOT verified against the LIVE Cloudflare D1 REST API in this
+ * session (no live CF calls permitted) — this session's own real-SQLite test harness
+ * (tests/pot-provisioner.test.ts) proves the SQL text itself is correct and atomic against
+ * a real engine with the real trigger set; Kasra-core should confirm D1 REST honors the
+ * same BEGIN/COMMIT semantics live before this ships broadly.
+ *
+ * A LEAD AGENT'S HOME MEMBER GETS `capability = 'member'`, NEVER anything higher — migration
+ * 0071's `agent_member_bindings_home_capability_ceiling` / `agent_home_capability_ceiling_insert`
+ * triggers hard-cap ANY member holding an agent binding at `observer`/`member`. An earlier
+ * draft of this function granted the home member a `'lead'` capability matching the agent's
+ * OWN `role` column — that is two different standing systems (the `agents.role` column is
+ * the agent's own operational role; `capabilities` is human/member RBAC) and the schema
+ * itself refuses to let them conflate: inserting the binding after a `'lead'` capability
+ * grant, or the grant after the binding, both abort under the real chain. `'member'` is the
+ * correct, schema-sanctioned floor for an agent's own identity-weld member.
+ *
+ * Idempotent on `adminEmail` (case-insensitively — `lower()` on both sides of the compare,
+ * closing a duplicate-org:owner-capability injection an exact-match compare would have let
+ * through via `Admin@x.com` vs `admin@x.com`) — a retried provisioning call checks the FULL
+ * identity state first (`readFullSeedIdentityState`) and only returns `alreadySeeded` when
+ * EVERY piece already exists; a genuinely partial state (which the atomic batch should make
+ * unreachable in the happy case, but a REST-layer atomicity surprise is exactly the kind of
+ * thing worth failing loudly on rather than silently trusting) is a hard, named failure —
+ * the SAME fail-closed-never-resume precedent `applySchemaChain` already established for
+ * partial migration state (src/pots/schema-chain.ts), applied here for the same reason: a
+ * repair engine for a state the atomic batch is designed not to produce is untested surface
+ * for a rare path, not a safety improvement.
  */
 export async function seedPotIdentities(
   cf: CloudflareApiConfig,
   databaseId: string,
   input: SeedIdentitiesInput,
 ): Promise<SeedIdentitiesResult> {
-  const existing = await executeD1Query(
-    cf,
-    databaseId,
-    'SELECT id FROM members WHERE email = ?1 LIMIT 1',
-    [input.adminEmail],
-  )
-  const existingAdmin = existing[0]?.results?.[0] as { id?: string } | undefined
-  if (existingAdmin?.id) {
-    const agentRows = await executeD1Query(
-      cf,
-      databaseId,
-      'SELECT id FROM agents WHERE slug = ?1 LIMIT 1',
-      [`${input.slug}-bot`],
-    )
-    const existingAgent = agentRows[0]?.results?.[0] as { id?: string } | undefined
+  const normalizedEmail = input.adminEmail.trim().toLowerCase()
+  const leadAgentSlug = `${input.slug}-bot`
+  const state = await readFullSeedIdentityState(cf, databaseId, normalizedEmail, leadAgentSlug)
 
-    // Fingerprints are recoverable from the STORED hash — no raw value needed, and none
-    // exists to recover (sha256Hex is one-way by design). Missing rows (e.g. a schema
-    // that predates the seed-seat token) fingerprint as null rather than throwing.
-    const adminTokenRows = await executeD1Query(
-      cf,
-      databaseId,
-      "SELECT token_hash FROM member_tokens WHERE member_id = ?1 AND label = 'admin' ORDER BY created_at DESC LIMIT 1",
-      [existingAdmin.id],
-    )
-    const adminTokenHash = (adminTokenRows[0]?.results?.[0] as { token_hash?: string } | undefined)?.token_hash ?? null
+  const nothingSeededYet =
+    state.adminMemberId === null &&
+    state.leadAgentId === null
 
-    let leadAgentTokenHash: string | null = null
-    if (existingAgent?.id) {
-      const leadAgentTokenRows = await executeD1Query(
-        cf,
-        databaseId,
-        "SELECT token_hash FROM member_tokens WHERE agent_id = ?1 AND label = 'seed-seat' ORDER BY created_at DESC LIMIT 1",
-        [existingAgent.id],
-      )
-      leadAgentTokenHash = (leadAgentTokenRows[0]?.results?.[0] as { token_hash?: string } | undefined)?.token_hash ?? null
+  if (!nothingSeededYet) {
+    const missing: string[] = []
+    if (!state.adminMemberId) missing.push('admin_member')
+    if (!state.adminHasOwnerCapability) missing.push('admin_owner_capability')
+    if (!state.adminTokenHash) missing.push('admin_token')
+    if (!state.leadAgentId) missing.push('lead_agent')
+    if (!state.leadAgentHasBinding) missing.push('lead_agent_binding')
+    if (!state.leadAgentTokenHash) missing.push('lead_agent_token')
+
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        alreadySeeded: false,
+        adminMemberId: state.adminMemberId ?? '',
+        adminRawToken: null,
+        adminTokenFingerprint: null,
+        leadAgentId: state.leadAgentId ?? '',
+        leadAgentMemberId: state.leadAgentMemberId ?? '',
+        leadAgentRawToken: null,
+        leadAgentTokenFingerprint: null,
+        detail:
+          `partial seed state detected — missing: ${missing.join(', ')}. This module does ` +
+          'not repair partial identity state (same fail-closed precedent as ' +
+          'applySchemaChain\'s partial-migration handling) — inspect the pot\'s own ' +
+          'members/capabilities/agent_member_bindings/member_tokens rows directly.',
+      }
     }
 
+    // FULLY seeded — every piece is present. Fingerprints recovered from the stored hash,
+    // never a raw value (none exists to recover; sha256Hex is one-way by design).
     return {
       ok: true,
       alreadySeeded: true,
-      adminMemberId: existingAdmin.id,
+      adminMemberId: state.adminMemberId!,
       adminRawToken: null,
-      adminTokenFingerprint: adminTokenHash ? adminTokenHash.slice(0, 16) : null,
-      leadAgentId: existingAgent?.id ?? '',
-      leadAgentMemberId: '',
+      adminTokenFingerprint: state.adminTokenHash!.slice(0, 16),
+      leadAgentId: state.leadAgentId!,
+      leadAgentMemberId: state.leadAgentMemberId!,
       leadAgentRawToken: null,
-      leadAgentTokenFingerprint: leadAgentTokenHash ? leadAgentTokenHash.slice(0, 16) : null,
-      detail: `admin member already exists for ${input.adminEmail} — seeding skipped, no new tokens minted`,
+      leadAgentTokenFingerprint: state.leadAgentTokenHash!.slice(0, 16),
+      detail: `admin member already exists for this email — seeding skipped, no new tokens minted`,
     }
   }
 
@@ -551,65 +702,51 @@ export async function seedPotIdentities(
   const leadAgentTokenHash = await sha256Hex(leadAgentRawToken)
   const brandName = input.brandName
   const leadAgentName = `${brandName} Lead Agent`
+  const adminName = input.adminName || brandName
 
-  const steps: Array<{ sql: string; params: unknown[] }> = [
-    {
-      sql: 'INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [departmentId, 'core', brandName, 'work', 1, now],
-    },
-    {
-      sql: 'INSERT INTO squads (id, department_id, slug, name, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [squadId, departmentId, 'core', 'Core', 'work', now],
-    },
-    {
-      sql: 'INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [adminMemberId, input.adminEmail, input.adminName || brandName, 'active', input.slug, now],
-    },
-    {
-      sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [crypto.randomUUID(), adminMemberId, 'org', null, 'owner', now],
-    },
-    {
-      sql: 'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)',
-      params: [crypto.randomUUID(), adminMemberId, adminTokenHash, 'admin', 'dashboard', now, input.slug],
-    },
-    {
-      // The seed-seat agent's own "home" identity — see the function doc comment for why
-      // an agent still needs a member row to hold a token.
-      sql: 'INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [leadAgentMemberId, null, leadAgentName, 'active', input.slug, now],
-    },
-    {
-      sql: 'INSERT INTO agents (id, squad_id, slug, name, role, status, kind, owner_member_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)',
-      params: [leadAgentId, squadId, `${input.slug}-bot`, leadAgentName, 'lead', 'active', 'work', leadAgentMemberId, now],
-    },
-    {
-      sql: 'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)',
-      params: [crypto.randomUUID(), leadAgentMemberId, 'squad', squadId, 'lead', now],
-    },
-    {
-      sql: 'INSERT INTO member_tokens (id, member_id, agent_id, token_hash, label, channel, created_at, tenant) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)',
-      params: [crypto.randomUUID(), leadAgentMemberId, leadAgentId, leadAgentTokenHash, 'seed-seat', 'workspace', now, input.slug],
-    },
-  ]
+  const batchSql = [
+    'BEGIN;',
+    `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES (${lit(departmentId)}, 'core', ${lit(brandName)}, 'work', 1, ${lit(now)});`,
+    `INSERT INTO squads (id, department_id, slug, name, kind, created_at) VALUES (${lit(squadId)}, ${lit(departmentId)}, 'core', 'Core', 'work', ${lit(now)});`,
+    `INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (${lit(adminMemberId)}, ${lit(normalizedEmail)}, ${lit(adminName)}, 'active', ${lit(input.slug)}, ${lit(now)});`,
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(adminMemberId)}, 'org', NULL, 'owner', ${lit(now)});`,
+    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(adminMemberId)}, ${lit(adminTokenHash)}, 'admin', 'dashboard', ${lit(now)}, ${lit(input.slug)});`,
+    // The seed-seat agent's own "home" identity — see the function doc comment for why an
+    // agent still needs a member row to hold a token.
+    `INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (${lit(leadAgentMemberId)}, NULL, ${lit(leadAgentName)}, 'active', ${lit(input.slug)}, ${lit(now)});`,
+    `INSERT INTO agents (id, squad_id, slug, name, role, status, kind, owner_member_id, created_at) VALUES (${lit(leadAgentId)}, ${lit(squadId)}, ${lit(leadAgentSlug)}, ${lit(leadAgentName)}, 'lead', 'active', 'work', ${lit(leadAgentMemberId)}, ${lit(now)});`,
+    // MUST precede the seed-seat member_tokens insert below — member_tokens_agent_binding_insert
+    // (migration 0071) aborts that insert otherwise. See the function doc comment.
+    `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (${lit(input.slug)}, ${lit(leadAgentId)}, ${lit(leadAgentMemberId)}, ${lit(now)});`,
+    // 'member', never 'lead' — the home-capability ceiling triggers (migration 0071) cap
+    // ANY member holding an agent binding at observer/member. See the function doc comment.
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'member', ${lit(now)});`,
+    `INSERT INTO member_tokens (id, member_id, agent_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, ${lit(leadAgentId)}, ${lit(leadAgentTokenHash)}, 'seed-seat', 'workspace', ${lit(now)}, ${lit(input.slug)});`,
+    'COMMIT;',
+  ].join('\n')
 
-  for (let i = 0; i < steps.length; i += 1) {
+  try {
+    await executeD1Query(cf, databaseId, batchSql)
+  } catch (error) {
+    // Best-effort rollback in case the REST connection's transaction survives the failed
+    // request (documented uncertainty — see the function doc comment). Swallowed: a
+    // failure here must not replace the real, load-bearing diagnostic below.
     try {
-      // eslint-disable-next-line no-await-in-loop -- later inserts reference earlier rows (FKs)
-      await executeD1Query(cf, databaseId, steps[i].sql, steps[i].params)
-    } catch (error) {
-      return {
-        ok: false,
-        alreadySeeded: false,
-        adminMemberId,
-        adminRawToken: null,
-        adminTokenFingerprint: null,
-        leadAgentId,
-        leadAgentMemberId,
-        leadAgentRawToken: null,
-        leadAgentTokenFingerprint: null,
-        detail: `seed statement ${i} (${steps[i].sql.slice(0, 40)}...) failed: ${errMsg(error)}`,
-      }
+      await executeD1Query(cf, databaseId, 'ROLLBACK;')
+    } catch {
+      // Nothing to do — either it wasn't needed or the connection is already gone.
+    }
+    return {
+      ok: false,
+      alreadySeeded: false,
+      adminMemberId,
+      adminRawToken: null,
+      adminTokenFingerprint: null,
+      leadAgentId,
+      leadAgentMemberId,
+      leadAgentRawToken: null,
+      leadAgentTokenFingerprint: null,
+      detail: `atomic seed batch failed: ${errMsg(error)}`,
     }
   }
 
@@ -629,7 +766,35 @@ export async function seedPotIdentities(
 export interface ReachabilityCheckResult {
   ok: boolean
   status: number | null
+  /** null when there was nothing to compare (non-200, unparseable body, or no DISPATCHER). */
+  tenantMatch: boolean | null
+  /** null ONLY when this deployment has no RELEASE_SHA configured at all (dev/test) — a
+   *  trivially-satisfied "nothing to compare" state, not a failure. See
+   *  `expectedHealthCommit`'s doc comment. */
+  releaseShaMatch: boolean | null
+  /** sha256 of the raw response body — NEVER the body itself (mupot#1507 round-2 P2: a
+   *  verbatim /health body in a receipt is exactly the kind of incidental data a ledger
+   *  should not accumulate; the hash is enough to notice "the response changed" without
+   *  storing whatever it happened to contain). */
+  bodySha256: string | null
   detail: string
+}
+
+/** The child pot's `/health` (src/health.ts `publicHealth`) reports `commit` — parsed from
+ *  whatever `RELEASE_SHA` var it was deployed with, stripping a `-dirty` suffix the SAME
+ *  way `publicHealth` itself does, WITHOUT publicHealth's fallback to this (the
+ *  ORCHESTRATOR's) own `BUILD_INFO.commit` when the input is empty — that fallback exists
+ *  for the orchestrator's OWN health endpoint reporting on itself, and reusing it here
+ *  would compare the child's real deployed identity against an unrelated value. Returns
+ *  `null` when there is genuinely nothing to compare (`RELEASE_SHA` unset/not a real sha
+ *  shape, e.g. the `'unknown'` this Worker uploads when it has none) — a deployment with
+ *  no configured RELEASE_SHA cannot assert what its children should report, and that is a
+ *  distinct, honest state from "asserted and wrong." */
+function expectedHealthCommit(releaseSha: string | undefined): string | null {
+  if (typeof releaseSha !== 'string' || releaseSha.trim().length === 0) return null
+  if (/^[0-9a-f]{40}$/i.test(releaseSha)) return releaseSha.toLowerCase()
+  const dirty = releaseSha.match(/^([0-9a-f]{40})-dirty$/i)
+  return dirty ? dirty[1].toLowerCase() : null
 }
 
 /**
@@ -648,6 +813,14 @@ export interface ReachabilityCheckResult {
  * calling the same `dispatcher.fetch`. This is the answer to the open question of why
  * `gaf.mupot.mumega.com` returns HTTP 000 from outside while `/t/gaf/health` answers 200
  * in production: the internal call never leaves the Worker.
+ *
+ * IDENTITY CHECK (mupot#1507 round-2 P1-1): HTTP 200 alone used to be enough. It is not —
+ * a 200 from the WRONG tenant (a routing bug resolving to some other pot) or a stale
+ * `commit` (the dispatch upload silently failed to take effect, and the dispatcher is
+ * still serving whatever script previously held that name) both look identical to success
+ * at the status-code level. `verifyPotReachable` now also asserts the response body's
+ * `tenant` field equals `slug` and its `commit` field equals what THIS call uploaded — a
+ * mismatch on either is `ok: false`, never just a warning.
  */
 export async function verifyPotReachable(
   env: Env,
@@ -655,7 +828,10 @@ export async function verifyPotReachable(
   rootDomain: string,
 ): Promise<ReachabilityCheckResult> {
   if (!env.DISPATCHER) {
-    return { ok: false, status: null, detail: 'DISPATCHER binding not configured on this Worker — cannot verify reachability.' }
+    return {
+      ok: false, status: null, tenantMatch: null, releaseShaMatch: null, bodySha256: null,
+      detail: 'DISPATCHER binding not configured on this Worker — cannot verify reachability.',
+    }
   }
   const healthUrl = `https://${slug}.${rootDomain}/health`
   const request = new Request(healthUrl, { method: 'GET', headers: { accept: 'application/json' } })
@@ -668,16 +844,40 @@ export async function verifyPotReachable(
       ROOT_DOMAIN: rootDomain,
     })
     const bodyText = await response.text().catch(() => '')
+    const bodySha256 = await sha256Hex(bodyText)
     if (response.status !== 200) {
       return {
-        ok: false,
-        status: response.status,
-        detail: `GET /t/${slug}/health returned HTTP ${response.status}: ${bodyText.slice(0, 500)}`,
+        ok: false, status: response.status, tenantMatch: null, releaseShaMatch: null, bodySha256,
+        detail: `non-200 response: HTTP ${response.status}`,
       }
     }
-    return { ok: true, status: response.status, detail: bodyText.slice(0, 500) }
+    let parsed: { tenant?: unknown; commit?: unknown } | null = null
+    try {
+      parsed = JSON.parse(bodyText) as { tenant?: unknown; commit?: unknown }
+    } catch {
+      parsed = null
+    }
+    const tenantMatch = parsed !== null && parsed.tenant === slug
+    const expectedCommit = expectedHealthCommit(env.RELEASE_SHA)
+    const releaseShaMatch = expectedCommit === null ? true : parsed !== null && parsed.commit === expectedCommit
+    if (parsed === null) {
+      return {
+        ok: false, status: response.status, tenantMatch: false, releaseShaMatch: false, bodySha256,
+        detail: 'response body was not parseable JSON — cannot verify tenant/commit identity',
+      }
+    }
+    if (!tenantMatch || !releaseShaMatch) {
+      return {
+        ok: false, status: response.status, tenantMatch, releaseShaMatch, bodySha256,
+        detail: `identity mismatch: tenant_match=${tenantMatch} release_sha_match=${releaseShaMatch}`,
+      }
+    }
+    return { ok: true, status: response.status, tenantMatch, releaseShaMatch, bodySha256, detail: 'ok' }
   } catch (error) {
-    return { ok: false, status: null, detail: `dispatch to '${slug}' threw: ${errMsg(error)}` }
+    return {
+      ok: false, status: null, tenantMatch: null, releaseShaMatch: null, bodySha256: null,
+      detail: `dispatch to '${slug}' threw: ${errMsg(error)}`,
+    }
   }
 }
 
@@ -694,15 +894,120 @@ async function writeProvisionReceipt(
   step: ProvisionStep,
   ok: boolean,
   detail: string | null,
+  actorMemberId: string | null,
+  actorTenant: string | null,
 ): Promise<void> {
   try {
     await env.DB.prepare(
-      'INSERT INTO pot_provision_receipts (id, tenant, slug, run_id, step, ok, detail, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)',
+      'INSERT INTO pot_provision_receipts (id, tenant, slug, run_id, step, ok, detail, actor_member_id, actor_tenant, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)',
     )
-      .bind(crypto.randomUUID(), env.TENANT_SLUG ?? 'mumega', slug, runId, step, ok ? 1 : 0, detail, new Date().toISOString())
+      .bind(
+        crypto.randomUUID(), env.TENANT_SLUG ?? 'mumega', slug, runId, step, ok ? 1 : 0, detail,
+        actorMemberId, actorTenant, new Date().toISOString(),
+      )
       .run()
   } catch {
     // Swallowed deliberately — see doc comment above.
+  }
+}
+
+export interface SlugCheckResult {
+  available: boolean
+  slug: string
+  reason?: string
+}
+
+/**
+ * Validates whether a requested subdomain slug is available and valid. Moved here from
+ * src/pots/checkout.ts (mupot#1507 round-2 P0-4) so `provisionSovereignPot` can call it
+ * directly without a circular import (checkout.ts already imports
+ * `provisionSovereignPot` FROM this file) — this module is the lower-level "pot mechanics"
+ * layer, checkout.ts the higher-level self-serve flow built on it, so owning the
+ * availability predicate here is also the more sensible dependency direction.
+ *
+ * FAIL CLOSED (mupot#1303). An unanswerable check is NOT an available slug — "I could not
+ * determine whether this is taken" must never be answered as "this is not taken".
+ *
+ * Two sources are consulted because BOTH occupy the same `mupot-pots` dispatch namespace:
+ * tenant pots (`pots`, migration 0145) and project sub-workers (`src/platform/dispatcher.ts`
+ * dispatches `worker_name || slug` into it). A name taken by either is not available to a
+ * new pot.
+ */
+export async function checkSlugAvailability(env: Env, rawSlug: string): Promise<SlugCheckResult> {
+  const slug = (rawSlug || '').toLowerCase().trim()
+
+  if (!/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(slug)) {
+    return {
+      available: false,
+      slug,
+      reason: 'Slug must be 3-32 lowercase alphanumeric characters and cannot start or end with a hyphen.',
+    }
+  }
+
+  if (RESERVED_TENANT_SLUGS.has(slug)) {
+    return { available: false, slug, reason: 'This pot subdomain is reserved.' }
+  }
+
+  try {
+    const takenByPot = await env.DB.prepare('SELECT id FROM pots WHERE slug = ?1 LIMIT 1')
+      .bind(slug)
+      .first<{ id: string }>()
+    if (takenByPot) {
+      return { available: false, slug, reason: 'This pot subdomain is already taken.' }
+    }
+
+    const takenByProject = await env.DB.prepare(
+      'SELECT id FROM projects WHERE slug = ?1 OR worker_name = ?1 LIMIT 1',
+    )
+      .bind(slug)
+      .first<{ id: string }>()
+    if (takenByProject) {
+      return { available: false, slug, reason: 'This pot subdomain is already taken.' }
+    }
+  } catch {
+    // An unanswerable check is NOT an available slug. Refusing a legitimate signup is
+    // recoverable by retrying; selling a slug that already has a Worker behind it is not.
+    return {
+      available: false,
+      slug,
+      reason: 'Availability could not be verified right now. Please try again.',
+    }
+  }
+
+  return { available: true, slug }
+}
+
+/** Thrown by `provisionSovereignPot` when the requested slug is registered to a DIFFERENT
+ *  provisioner (mupot#1507 round-2, Athena condition i: "reuse-by-name is allowed ONLY
+ *  when the caller is the pot's registered provisioner"). Callers (src/pots/routes.ts,
+ *  src/mcp/pots.ts) catch this specifically to answer 409/`pot_slug_taken` rather than a
+ *  generic 500 — this is a NAMED, expected refusal, not an internal error. */
+export class PotSlugTakenError extends Error {
+  readonly code = 'pot_slug_taken' as const
+  constructor(readonly slug: string, reason?: string) {
+    super(reason ? `Slug '${slug}' is not available: ${reason}` : `Slug '${slug}' is already provisioned by a different caller.`)
+    this.name = 'PotSlugTakenError'
+  }
+}
+
+/** mupot#1507 round-2 P0-3, Athena condition iii: the provisioner function itself refuses
+ *  these fields regardless of surface, structurally and at runtime — defense in depth
+ *  against a caller that reaches this function with an object built outside the
+ *  `SovereignPotProvisionInput` type (an `as any` cast, a stale internal caller, a future
+ *  regression that re-adds a spread). The type no longer even DECLARES these fields (see
+ *  `SovereignPotProvisionInput`'s doc comment) — this is the runtime half of that fix,
+ *  checking the actual object's own keys rather than trusting the type checker alone. */
+const FORBIDDEN_PROVISION_INPUT_KEYS = ['cf_api_token', 'account_id', 'worker_js_code'] as const
+
+function assertNoForbiddenProvisionInputKeys(input: object): void {
+  for (const key of FORBIDDEN_PROVISION_INPUT_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) {
+      throw new Error(
+        `provisionSovereignPot: '${key}' is not an accepted field on the provisioning input — ` +
+          'Cloudflare credentials and the worker bundle must never be caller-suppliable ' +
+          '(mupot#1507 P0-3). Refusing regardless of caller or call surface.',
+      )
+    }
   }
 }
 
@@ -743,19 +1048,26 @@ export async function provisionSovereignPot(
   input: SovereignPotProvisionInput,
   workerJsCode?: string,
 ): Promise<SovereignPotProvisionResult> {
+  assertNoForbiddenProvisionInputKeys(input)
+
   const slug = sanitizeSlug(input.slug)
   const valid = validateSlug(slug)
   if (!valid.ok) {
     throw new Error(valid.error)
   }
 
-  const accountId = input.account_id || env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
-  const apiToken = input.cf_api_token || env.SECRET_ENV_CF_API_TOKEN
+  // Cloudflare credentials come ONLY from env — never the caller (mupot#1507 P0-3; the
+  // type no longer even has `account_id`/`cf_api_token` fields, see
+  // SovereignPotProvisionInput's doc comment and `assertNoForbiddenProvisionInputKeys` above).
+  const accountId = env.SECRET_ENV_CF_ACCOUNT_ID || 'e39eaf94f33092c4efd029d94ae1e9dd'
+  const apiToken = env.SECRET_ENV_CF_API_TOKEN
   if (!apiToken) {
     throw new Error('Cloudflare API Token not configured for pot provisioning.')
   }
 
   const cf: CloudflareApiConfig = { accountId, apiToken }
+  const actorMemberId = input.minted_by_member_id ?? null
+  const actorTenant = input.caller_tenant ?? env.TENANT_SLUG ?? null
 
   const runId = crypto.randomUUID()
   const completed: ProvisionStep[] = []
@@ -767,8 +1079,58 @@ export async function provisionSovereignPot(
 
   const recordStep = async (step: ProvisionStep, ok: boolean, detail: string | null): Promise<void> => {
     receipts.push({ step, ok, detail })
-    await writeProvisionReceipt(env, runId, slug, step, ok, detail)
+    await writeProvisionReceipt(env, runId, slug, step, ok, detail, actorMemberId, actorTenant)
     if (ok) completed.push(step)
+  }
+
+  // 0. Registry gate — BEFORE any Cloudflare call (mupot#1507 round-2 P0-4, Athena
+  // condition i). `pots` (migration 0145) plus its round-2 `provisioner_member_id`/
+  // `provisioner_tenant` columns (migration 0165) is the account-wide ownership record: a
+  // slug already claimed by a DIFFERENT (member, tenant) pair is refused outright, never
+  // silently adopted. A brand-new slug is claimed HERE, before create_d1 — the INSERT's
+  // own UNIQUE(slug) constraint is the concurrency guard: if two calls race for the same
+  // fresh slug, the loser's INSERT throws and it is refused exactly like a pre-existing
+  // claim would be, never adopts what the winner is mid-creating.
+  //
+  // KNOWN, DOCUMENTED GAP: `checkout.ts`'s self-serve path has no interactive member
+  // (`actorMemberId` is always null there), so "ownership" for that path degrades to
+  // matching on `actorTenant` alone (this deployment's own TENANT_SLUG) — two different
+  // anonymous customers racing the EXACT same slug within this narrow window are not
+  // distinguished by identity, only by `checkSlugAvailability`'s pre-existing gate at
+  // Stripe-session-creation time. Closing that fully needs a per-checkout-session claim
+  // token, tracked separately, not built in this round (docs/workflows/tenant-provision.md).
+  const existingPotRow = await env.DB.prepare(
+    'SELECT provisioner_member_id, provisioner_tenant FROM pots WHERE slug = ?1 LIMIT 1',
+  )
+    .bind(slug)
+    .first<{ provisioner_member_id: string | null; provisioner_tenant: string | null }>()
+
+  if (existingPotRow) {
+    const isOwner =
+      existingPotRow.provisioner_member_id === actorMemberId &&
+      existingPotRow.provisioner_tenant === actorTenant
+    if (!isOwner) {
+      throw new PotSlugTakenError(slug)
+    }
+    // Owner retry — falls through to the normal reuse-by-name flow below (create_d1 etc.
+    // adopt the existing CF resources by name, exactly as before this gate existed).
+  } else {
+    const availability = await checkSlugAvailability(env, slug)
+    if (!availability.available) {
+      throw new PotSlugTakenError(slug, availability.reason)
+    }
+    try {
+      await env.DB.prepare(
+        'INSERT INTO pots (id, slug, worker_script, status, source, created_at, provisioner_member_id, provisioner_tenant) ' +
+          'VALUES (?1,?2,?3,?4,?5,?6,?7,?8)',
+      )
+        .bind(crypto.randomUUID(), slug, slug, 'provisioning', 'provision', new Date().toISOString(), actorMemberId, actorTenant)
+        .run()
+    } catch {
+      // Lost a race to a concurrent claim of the same slug — refuse exactly like a
+      // pre-existing claim, never proceed to adopt whatever the winner is creating.
+      throw new PotSlugTakenError(slug)
+    }
   }
 
   // PATH, NOT SUBDOMAIN — see verifyPotReachable's doc comment for the full TLS story.
@@ -876,7 +1238,7 @@ export async function provisionSovereignPot(
 
   // 4. Deploy the tenant worker into the dispatch namespace. Digest-verified (mupot#1507
   // round 2 requirement 4) — see loadPotWorkerBundle's doc comment.
-  const bundleResult = await loadPotWorkerBundle(env, workerJsCode ?? input.worker_js_code)
+  const bundleResult = await loadPotWorkerBundle(env, workerJsCode)
   if (!bundleResult.ok) {
     await recordStep('deploy_worker', false, bundleResult.reason)
     return bail(`deploy_worker failed: ${bundleResult.reason}`)
@@ -943,16 +1305,42 @@ export async function provisionSovereignPot(
   )
 
   // 6. Verify reachability through the real dispatch path BEFORE claiming success.
+  // Structured JSON, never the raw /health body — mupot#1507 round-2 P2. `bodySha256`
+  // lets an operator notice "the response changed" without the body itself ever landing
+  // in a receipt.
   const reach = await verifyPotReachable(env, slug, rootDomain)
-  await recordStep('verify_reachable', reach.ok, reach.detail)
+  await recordStep(
+    'verify_reachable',
+    reach.ok,
+    JSON.stringify({
+      status: reach.status,
+      tenant_match: reach.tenantMatch,
+      release_sha_match: reach.releaseShaMatch,
+      body_sha256: reach.bodySha256,
+    }),
+  )
   if (!reach.ok) {
     return bail(`verify_reachable failed: ${reach.detail}`)
   }
 
-  // Every step passed. Mint one-time credential CLAIMS (src/auth/credential-claim.ts,
-  // mupot#987) — never the raw token itself in this response. Only possible when the
-  // caller told us who will redeem it (`minted_by_member_id`, an interactive org-admin
-  // caller) AND a raw token actually exists (nothing to claim on an `alreadySeeded` retry).
+  // Every step passed. Finalize the registry row (mupot#1507 round-2 P0-2/P0-4) — `ok` /
+  // `status: 'provisioned'` requires this write to land too, not just the six steps above.
+  // NOTE: this is not itself one of the six named `ProvisionStep`s, so a failure here is
+  // the one case where `bail()`'s `not_completed` reads `[]` under `status: 'incomplete'`
+  // — `incomplete_reason` is the authoritative signal for this specific edge, not the
+  // (otherwise reliable) empty-array-means-provisioned convention. The `pots` row itself
+  // is left at `status: 'provisioning'`, which is accurate: every step ran, but the
+  // registry does not yet agree, so a retry by the SAME provisioner still adopts correctly.
+  try {
+    await env.DB.prepare("UPDATE pots SET status = 'active' WHERE slug = ?1").bind(slug).run()
+  } catch (error) {
+    return bail(`registry activation failed: ${errMsg(error)} — all six steps completed, but the pots registry row could not be marked active`)
+  }
+
+  // Mint one-time credential CLAIMS (src/auth/credential-claim.ts, mupot#987) — never the
+  // raw token itself in this response. Only possible when the caller told us who will
+  // redeem it (`minted_by_member_id`, an interactive org-admin caller) AND a raw token
+  // actually exists (nothing to claim on an `alreadySeeded` retry — M8, pinned by test).
   let adminClaim: CredentialClaimHandle | null = null
   let leadAgentClaim: CredentialClaimHandle | null = null
   if (input.minted_by_member_id) {

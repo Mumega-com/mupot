@@ -6,8 +6,8 @@ import { requireAuth } from '../auth'
 import { csrf } from 'hono/csrf'
 import { isOrgAdmin } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { provisionSovereignPot, listSovereignPots } from './service'
-import type { SovereignPotProvisionInput } from './types'
+import { provisionSovereignPot, listSovereignPots, PotSlugTakenError } from './service'
+import { validateProvisionRequestBody } from './validate'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -27,22 +27,35 @@ potsApp.post('/provision', async (c) => {
   if (!isOrgAdmin(auth)) {
     return c.json(orgAdminForbiddenPayload('Provisioning a sovereign tenant pot', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
   }
+  // mupot#1507 round-2 P2 (Athena condition v): a bound-agent session is refused at this
+  // route, same `operator_principal_required` shape src/org/index.ts and src/mcp/provision.ts
+  // already use — provisioning a sovereign pot is an operator action, not something an
+  // agent's own weld token should be able to trigger on its own.
+  if (auth.boundAgentId) {
+    return c.json({ error: 'operator_principal_required' }, 403)
+  }
+  // The caller's OWN tenant must be this Worker's tenant — a cross-tenant auth context
+  // reaching this route (e.g. a misrouted or forged session) must never provision on this
+  // colony's behalf.
+  if (auth.tenant !== c.env.TENANT_SLUG) {
+    return c.json({ error: 'tenant_mismatch' }, 403)
+  }
 
-  let body: SovereignPotProvisionInput
+  let rawBody: unknown
   try {
-    body = await c.req.json()
+    rawBody = await c.req.json()
   } catch {
     return c.json({ error: 'invalid_json', message: 'Request body must be valid JSON.' }, 400)
   }
 
-  if (!body.slug || !body.brand_name || !body.admin_email) {
-    return c.json(
-      {
-        error: 'missing_required_fields',
-        message: 'Required fields: slug, brand_name, admin_email.',
-      },
-      400,
-    )
+  // mupot#1507 round-2 P0-3: the EXACT same allow-list the MCP tool's `additionalProperties:
+  // false` schema already enforces — see src/pots/validate.ts. Anything outside it
+  // (`worker_js_code`, `cf_api_token`, `account_id` included) is refused, never silently
+  // dropped or forwarded.
+  const validated = validateProvisionRequestBody(rawBody)
+  if (!validated.ok) {
+    const status = validated.error === 'invalid_body' ? 400 : validated.error === 'missing_required_fields' ? 400 : 400
+    return c.json({ error: validated.error, message: validated.message }, status)
   }
 
   if (!c.env.SECRET_ENV_CF_API_TOKEN) {
@@ -56,12 +69,24 @@ potsApp.post('/provision', async (c) => {
   }
 
   try {
-    const result = await provisionSovereignPot(c.env, { ...body, minted_by_member_id: auth.memberId })
+    const result = await provisionSovereignPot(c.env, {
+      ...validated.value,
+      // validateProvisionRequestBody keeps plan_tier as a plain trimmed string (it has
+      // no opinion on the SovereignPotTier union); provisionSovereignPot's own
+      // `input.plan_tier || 'enterprise'` fallback treats any non-recognized value the
+      // same as absent, so a narrowing cast here is safe.
+      plan_tier: validated.value.plan_tier as import('../pots/types').SovereignPotTier | undefined,
+      minted_by_member_id: auth.memberId,
+      caller_tenant: auth.tenant,
+    })
     // 201 Created is a claim that the thing now exists. It does not, unless every step ran
     // and it was verified reachable. 202 Accepted is the honest code for "we started, and
     // here is exactly how far we got".
     return c.json({ ok: result.ok, pot: result }, result.ok ? 201 : 202)
   } catch (err) {
+    if (err instanceof PotSlugTakenError) {
+      return c.json({ error: err.code, message: err.message }, 409)
+    }
     return c.json(
       {
         error: 'provisioning_failed',
@@ -102,7 +127,7 @@ export const publicPotsApp = new Hono<{ Bindings: Env }>()
 
 publicPotsApp.get('/slug-available', async (c) => {
   const slug = c.req.query('slug') || ''
-  const { checkSlugAvailability } = await import('./checkout')
+  const { checkSlugAvailability } = await import('./service')
   const result = await checkSlugAvailability(c.env, slug)
   return c.json({ ok: true, result })
 })
