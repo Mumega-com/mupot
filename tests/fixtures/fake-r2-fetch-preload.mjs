@@ -45,7 +45,16 @@ let scriptCallIndex = 0
 
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input?.url
-  if (typeof url === 'string' && url.includes('.r2.cloudflarestorage.com')) {
+  // Match on the PARSED hostname, never a substring of the whole URL (CodeQL
+  // js/incomplete-url-substring-sanitization): `https://evil.example/?x=.r2.cloudflarestorage.com`
+  // must fall through to the real fetch, not be answered by the fake.
+  let hostname = ''
+  try {
+    hostname = typeof url === 'string' ? new URL(url).hostname : ''
+  } catch {
+    hostname = ''
+  }
+  if (hostname.endsWith('.r2.cloudflarestorage.com')) {
     if (script) {
       const step = script[Math.min(scriptCallIndex, script.length - 1)]
       scriptCallIndex++
