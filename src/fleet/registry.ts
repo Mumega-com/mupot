@@ -182,29 +182,71 @@ export function pollPresenceTtlSec(pollIntervalSec: number): number {
  * "identity from authentication, never request text" invariant every other self-lane tool in
  * this file already holds.
  */
+export interface UpsertPollFleetPresenceResult {
+  /** True iff an operator (or the agent's own prior self-detach) had set this row's status
+   *  to 'stopped' and this call correctly left it stopped rather than resurrecting it — see
+   *  the doc comment below (P2-f). The caller (check_in) surfaces this as a typed
+   *  `presence_stopped_by_operator` note rather than silently reporting success. */
+  stoppedByOperator: boolean
+}
+
 export async function upsertPollFleetPresence(
   env: Env,
   input: { agentId: string; display: string; memberId: string | null; ttlSec: number },
-): Promise<void> {
-  await env.DB.prepare(
+): Promise<UpsertPollFleetPresenceResult> {
+  // mupot#1494 round 2 (P1-c) — populate `squads` from the agent's ACTUAL home squad, not a
+  // permanent '[]'. A poll-mode agent has no resident daemon ever calling reportFleetAgents()
+  // to self-report which squads it's in (the ONLY other writer of this column), so without
+  // this a poll-mode row would NEVER appear in a squad-scoped fleet view no matter how long it
+  // polls. Re-resolved on EVERY upsert (not just the first), so a later squad reassignment is
+  // reflected the next time the agent checks in — never a one-time snapshot.
+  const squadRow = await env.DB.prepare(
+    `SELECT s.slug AS slug FROM agents a JOIN squads s ON s.id = a.squad_id WHERE a.id = ?1`,
+  ).bind(input.agentId).first<{ slug: string }>()
+  const squadsJson = JSON.stringify(squadRow?.slug ? [squadRow.slug] : [])
+
+  // mupot#1494 round 2 (P2-h) — runtime stays '' (unset), NOT 'poll'. `runtime` names a
+  // harness/engine (codex, claude-code, systemd-user, …) — the ONE closed vocabulary in
+  // src/fleet/runtimes.ts — and 'poll' is not a harness, it is a DELIVERY CADENCE
+  // (presence_mode already carries that fact). Writing 'poll' there would have been a category
+  // error, and would have required teaching every daemon/attach validator a vocabulary entry
+  // that means something different from every other entry. A poll-mode agent that ALSO knows
+  // its own real harness can report it later via the normal daemon-report path
+  // (reportFleetAgents) without conflict — this column is deliberately left for that, not
+  // claimed here. hasRegisteredDeliverySurface/resolveDispatchDeliveryMode both already treat
+  // `presence_mode==='poll'` as sufficient on its own, independent of `runtime` — an empty
+  // runtime here does not weaken poll-mode dispatch routing (see getFleetAgentLiveness's early
+  // return, corrected in the same round to stop treating empty-runtime-plus-poll-mode as "no
+  // row at all").
+  const row = await env.DB.prepare(
     `INSERT INTO fleet_agents
         (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status,
          reported_by, agent_type, member_id, host, presence_mode, presence_ttl_sec,
          last_reported_at, updated_at)
-      VALUES (?1, ?2, ?3, 'poll', '[]', 'on_demand', NULL, 'running',
+      VALUES (?1, ?2, ?3, '', ?6, 'on_demand', NULL, 'running',
               ?1, 'generic', ?4, '', 'poll', ?5,
               datetime('now'), datetime('now'))
       ON CONFLICT(tenant, agent_id) DO UPDATE SET
         display           = excluded.display,
-        status            = 'running',
+        squads            = excluded.squads,
+        -- mupot#1494 round 2 (P2-f) — operator detach wins. A row an operator (or the agent's
+        -- own prior self-detach — /api/fleet/detach requires the SAME token.boundAgentId as
+        -- the target agent_id, which for a poll row IS the agent's own uuid, so self-detach is
+        -- a real reachable path here, not hypothetical) explicitly stopped must not be
+        -- silently resurrected just because the agent keeps polling. No refresh at all for a
+        -- stopped row — last_reported_at/updated_at stay exactly as the detach left them.
+        status            = CASE WHEN fleet_agents.status = 'stopped' THEN fleet_agents.status ELSE 'running' END,
         member_id         = excluded.member_id,
         presence_mode     = 'poll',
         presence_ttl_sec  = excluded.presence_ttl_sec,
-        last_reported_at  = datetime('now'),
-        updated_at        = datetime('now')`,
+        last_reported_at  = CASE WHEN fleet_agents.status = 'stopped' THEN fleet_agents.last_reported_at ELSE datetime('now') END,
+        updated_at        = CASE WHEN fleet_agents.status = 'stopped' THEN fleet_agents.updated_at ELSE datetime('now') END
+      RETURNING status`,
   )
-    .bind(input.agentId, env.TENANT_SLUG, input.display, input.memberId, input.ttlSec)
-    .run()
+    .bind(input.agentId, env.TENANT_SLUG, input.display, input.memberId, input.ttlSec, squadsJson)
+    .first<{ status: string }>()
+
+  return { stoppedByOperator: row?.status === 'stopped' }
 }
 
 /**
@@ -218,12 +260,37 @@ export async function touchPollFleetPresence(env: Env, agentId: string | null | 
   if (!agentId) return
   try {
     await env.DB.prepare(
+      // mupot#1494 round 2 (P2-f) — `status != 'stopped'` alongside the existing
+      // presence_mode='poll' gate: an operator-stopped row gets NO refresh from a poll-mode
+      // agent's ordinary tool calls either, matching upsertPollFleetPresence's own guard.
       `UPDATE fleet_agents SET last_reported_at = datetime('now'), updated_at = datetime('now')
-        WHERE tenant = ?1 AND agent_id = ?2 AND presence_mode = 'poll'`,
+        WHERE tenant = ?1 AND agent_id = ?2 AND presence_mode = 'poll' AND status != 'stopped'`,
     ).bind(env.TENANT_SLUG, agentId).run()
   } catch {
     // best-effort — never fail the caller's real request over a presence touch
   }
+}
+
+/**
+ * clearPollFleetPresence — mupot#1494 round 2 (P2-g). `check_in({ presence_mode: 'resident' })`
+ * is the explicit de-registration path: an agent that was poll-registered and is now switching
+ * to a resident daemon (or simply wants to stop being treated as poll-mode) clears its OWN
+ * `presence_mode`/`presence_ttl_sec` back to the unregistered default. After this call,
+ * getFleetAgentLiveness/resolveDispatchDeliveryMode fall back to ordinary resident rules for
+ * this row (global TTL, `runtime && live`) — exactly as if it had never poll-registered.
+ * Scoped to `presence_mode = 'poll'` so it is a safe no-op against a resident/signed-attach row
+ * this agent does not own the poll-registration of (there should never be one, since a poll
+ * row is keyed by the caller's own uuid, but the guard costs nothing and documents the
+ * invariant). Does NOT touch `status`/`squads`/`runtime` — de-registering presence mode is not
+ * the same act as detaching.
+ */
+export async function clearPollFleetPresence(env: Env, agentId: string | null | undefined): Promise<void> {
+  if (!agentId) return
+  await env.DB.prepare(
+    `UPDATE fleet_agents
+        SET presence_mode = '', presence_ttl_sec = NULL, updated_at = datetime('now')
+      WHERE tenant = ?1 AND agent_id = ?2 AND presence_mode = 'poll'`,
+  ).bind(env.TENANT_SLUG, agentId).run()
 }
 
 export type ReportResult =
@@ -401,6 +468,33 @@ export interface FleetAgentRowIdentity {
   presence_ttl_sec?: number | null
 }
 
+/**
+ * resolveFleetPresenceTtlSec — mupot#1494 round 2 (P1-b). THE single per-row TTL resolution,
+ * called by EVERY fleet_agents-presence reader in this codebase (getFleetAgentLiveness,
+ * getFleetAgentRuntimeStates, listFleetAgentRuntimeView, getAgentView,
+ * src/dashboard/observatory.ts's loadAgentRuntimeStates, and the fleet_agent_get MCP tool) —
+ * never re-derived as a local ternary per call site. Round 1 fixed this ONLY in
+ * getFleetAgentLiveness (the dispatch-routing reader); every OTHER reader kept computing a
+ * single batch-level `presenceTtlSec(env)` and applying it to every row, so a poll-mode agent
+ * with a real per-row TTL could read `live` for dispatch but `stale`/`offline` on the
+ * dashboard, in a routine's `selectAgent`, and on its own agent-view row — six readers of ONE
+ * fact, disagreeing. A row without its own override (`presence_ttl_sec` NULL/non-positive —
+ * every resident/legacy row) resolves to the exact same global window as before; this is a
+ * refactor of WHERE the ternary lives, not a behavior change for anyone but a poll-mode row.
+ */
+export function resolveFleetPresenceTtlSec(
+  env: Env,
+  // `unknown` deliberately, not `number | null`: several callers read this straight out of a
+  // `Record<string, unknown>` D1 row (r.presence_ttl_sec) and this function's own runtime
+  // `typeof` check is the real validation — accepting `unknown` here means no caller needs an
+  // `as` cast just to call it.
+  row: { presence_ttl_sec?: unknown } | null | undefined,
+): number {
+  return typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
+    ? row.presence_ttl_sec
+    : presenceTtlSec(env)
+}
+
 export async function readFleetAgentRow(
   env: Env,
   agentId: string,
@@ -521,6 +615,8 @@ export async function getFleetAgentRuntimeStates(
     status: string | null
     host: string | null
     last_reported_at: string | null
+    // mupot#1494 round 2 (P1-b) — per-row TTL override, resolved via resolveFleetPresenceTtlSec.
+    presence_ttl_sec: number | null
   }
   const identities = [...new Set([...unique.values()].flatMap((agent) => (
     agent.slug ? [agent.agent_id, agent.slug] : [agent.agent_id]
@@ -530,13 +626,13 @@ export async function getFleetAgentRuntimeStates(
   // partitioned in memory. `host` exists only on fleet_agents, so module rows carry ''.
   type UnionRow = FleetRow & { src: 'fleet' | 'module' }
   const presenceRowsPromise = env.DB.prepare(
-    `SELECT 'fleet' AS src, agent_id, runtime, status, host, last_reported_at
+    `SELECT 'fleet' AS src, agent_id, runtime, status, host, last_reported_at, presence_ttl_sec
        FROM fleet_agents
       WHERE tenant = ?1
         AND agent_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
      UNION ALL
      SELECT 'module' AS src, identity AS agent_id, adapter AS runtime, status, '' AS host,
-            last_heartbeat AS last_reported_at
+            last_heartbeat AS last_reported_at, NULL AS presence_ttl_sec
        FROM module_registry
       WHERE tenant = ?1
         AND identity IN (SELECT CAST(value AS TEXT) FROM json_each(?2))`,
@@ -600,7 +696,13 @@ export async function getFleetAgentRuntimeStates(
     })
   }
 
-  const ttlSec = presenceTtlSec(env)
+  // module_registry rows carry no per-row TTL concept (that surface is a wholly separate
+  // presence store, mupot#732) — the global window is the correct one for it. The FLEET
+  // surface uses resolveFleetPresenceTtlSec PER ROW below (round 2 P1-b: this used to be one
+  // batch-level ttlSec applied to every row, which is exactly what silently disagreed with
+  // getFleetAgentLiveness for a poll-mode agent's own per-row TTL — `selectAgent`, the routine
+  // dispatcher's read of THIS function, is one of the six readers that must now agree).
+  const moduleTtlSec = presenceTtlSec(env)
   const resolved = new Map<string, FleetAgentRuntimeState>()
 
   for (const agent of unique.values()) {
@@ -610,10 +712,10 @@ export async function getFleetAgentRuntimeStates(
       ?? (cardinality.get(agent.slug) === 1 ? freshestModule.get(agent.slug) : undefined)
 
     const fleetPresence = row
-      ? derivePresence(String(row.status ?? 'unknown'), String(row.last_reported_at ?? ''), ttlSec, nowMs)
+      ? derivePresence(String(row.status ?? 'unknown'), String(row.last_reported_at ?? ''), resolveFleetPresenceTtlSec(env, row), nowMs)
       : undefined
     const modulePresence = mod
-      ? derivePresence(mod.status, mod.lastSeen, ttlSec, nowMs)
+      ? derivePresence(mod.status, mod.lastSeen, moduleTtlSec, nowMs)
       : undefined
 
     // Neither surface knows this agent — unchanged behaviour, it is simply absent.
@@ -676,13 +778,17 @@ export async function getFleetAgentLiveness(
   const row = await readFleetAgentRow(env, agentId)
   const presenceMode = row?.presence_mode ? String(row.presence_mode) : ''
   const runtime = row?.runtime ? String(row.runtime) : ''
-  if (!runtime) return { runtime: '', live: false, agentId: '', presenceMode: '' }
-  // Per-row TTL (poll-mode, mupot#1494) wins when the row declares one; otherwise fall back to
-  // the ONE global window every resident/daemon row has always used — resident semantics
-  // unchanged. See pollPresenceTtlSec for how a poll-mode row's TTL is derived at check_in time.
-  const ttlSec = typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
-    ? row.presence_ttl_sec
-    : presenceTtlSec(env)
+  // mupot#1494 round 2 (P2-h fallout) — an empty `runtime` used to mean "no row / nothing to
+  // route to" UNCONDITIONALLY, which was true before poll-mode existed but stopped being true
+  // the moment a poll-mode row could legitimately carry an empty runtime (its harness is not
+  // this column's business — see upsertPollFleetPresence's doc comment). Bailing out here
+  // regardless of `presenceMode` would have silently zeroed OUT the entire poll-mode dispatch
+  // fix for every poll agent that never separately reported a runtime. Only bail when NEITHER
+  // signal is present.
+  if (!runtime && presenceMode !== 'poll') return { runtime: '', live: false, agentId: '', presenceMode: '' }
+  // Per-row TTL (poll-mode, mupot#1494) via resolveFleetPresenceTtlSec — THE ONE shared
+  // resolution every fleet_agents presence reader now calls (round 2 P1-b).
+  const ttlSec = resolveFleetPresenceTtlSec(env, row)
   const status = String(row?.status ?? 'unknown')
   const lastReportedAt = String(row?.last_reported_at ?? '')
   const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
@@ -775,7 +881,7 @@ export async function listFleetAgentRuntimeView(
       ' AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))'
   }
   const statement = env.DB.prepare(
-    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host
+    `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host, presence_ttl_sec
        FROM fleet_agents
       WHERE tenant = ?1
         -- G-FP1b point 2/3: applied UNCONDITIONALLY — an unrestricted
@@ -792,10 +898,12 @@ export async function listFleetAgentRuntimeView(
   const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)
   const rows = await bound.all<Record<string, unknown>>()
 
-  const ttlSec = presenceTtlSec(env)
+  // mupot#1494 round 2 (P1-b) — per-row TTL, resolved per row via resolveFleetPresenceTtlSec
+  // (the same function getFleetAgentLiveness uses), not one batch-level window.
   return (rows.results ?? []).map((r) => {
     const status = String(r.status ?? 'unknown')
     const lastSeen = String(r.last_reported_at ?? '')
+    const ttlSec = resolveFleetPresenceTtlSec(env, { presence_ttl_sec: r.presence_ttl_sec })
     return {
       agent_id: String(r.agent_id),
       display: String(r.display ?? ''),
@@ -835,7 +943,7 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
 
   const rows = await env.DB.prepare(
     `SELECT fa.agent_id, fa.display, fa.agent_type, fa.runtime, fa.squads, fa.status, fa.lifecycle,
-            fa.last_reported_at, fa.member_id, fa.host,
+            fa.last_reported_at, fa.member_id, fa.host, fa.presence_ttl_sec,
             m.id AS m_id, m.email AS m_email, m.display_name AS m_display
        FROM fleet_agents fa
        LEFT JOIN members m ON m.id = fa.member_id AND m.tenant = fa.tenant
@@ -846,7 +954,6 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
     .all<Record<string, unknown>>()
 
   const out: AgentView[] = []
-  const ttlSec = presenceTtlSec(env)
   const nowMs = Date.now()
   for (const r of rows.results ?? []) {
     // BLOCK-2 fix: derive everything from the JOINED column (m_id), not the raw fleet row's
@@ -863,6 +970,8 @@ export async function getAgentView(env: Env): Promise<AgentView[]> {
     })) : []
     const status = String(r.status ?? 'unknown')
     const lastSeen = String(r.last_reported_at ?? '')
+    // mupot#1494 round 2 (P1-b) — per-row TTL, resolved the SAME way getFleetAgentLiveness does.
+    const ttlSec = resolveFleetPresenceTtlSec(env, { presence_ttl_sec: r.presence_ttl_sec })
     out.push({
       agent_id: String(r.agent_id),
       display: String(r.display ?? ''),

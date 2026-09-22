@@ -674,8 +674,24 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(db._receipt.deliveredVia).toBe('inbox')
   })
 
-  it("delivery:'inbox' forces the inbox route even with NO fleet row at all", async () => {
+  // Round 2 (P1-e) correction: force used to win UNCONDITIONALLY (round 1), which could
+  // strand a task in an inbox nobody is known to poll. It is now REFUSED against a target
+  // with no registered delivery surface at all — falls back to in_worker exactly like an
+  // unforced dispatch would, and is recorded as such (delivered_via:'in_worker'), never silent.
+  it("delivery:'inbox' is IGNORED (falls back to in_worker) against a target with NO fleet row at all — force must not strand a task", async () => {
     const db = makeWorld({ fleet: null })
+    const { env, fetch } = envWith(db)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(db._messages).toHaveLength(0)
+    expect(db._receipt.deliveredVia).toBe('in_worker')
+  })
+
+  it("delivery:'inbox' IS honored against a STALE-but-registered resident (runtime declared, heartbeat stale) — this is what force is for", async () => {
+    const db = makeWorld({ fleet: STALE_RUNTIME })
     const { env, fetch } = envWith(db)
     const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
 
@@ -683,8 +699,7 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
 
     expect(fetch).not.toHaveBeenCalled()
     expect(db._messages).toHaveLength(1)
-    // No fleet row at all -> route.agentId is '' -> deliveryTarget falls back to event.agent_id.
-    expect(db._messages[0].to_agent).toBe('agent-1')
+    expect(db._messages[0].to_agent).toBe('agent-1-ext')
     expect(db._receipt.deliveredVia).toBe('inbox')
   })
 

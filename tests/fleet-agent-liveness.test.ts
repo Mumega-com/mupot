@@ -25,6 +25,7 @@ import {
   DEFAULT_PRESENCE_TTL_SEC,
   upsertPollFleetPresence,
   touchPollFleetPresence,
+  clearPollFleetPresence,
   clampPollIntervalSec,
   pollPresenceTtlSec,
   POLL_INTERVAL_MIN_SEC,
@@ -40,6 +41,7 @@ const KASRA_UUID = 'ea2b0370-ff27-4371-9581-5bcaf322baa7'
 function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
     CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL);
+    CREATE TABLE squads (id TEXT PRIMARY KEY, slug TEXT NOT NULL);
     CREATE TABLE fleet_agents (
       tenant TEXT NOT NULL,
       agent_id TEXT NOT NULL,
@@ -64,6 +66,10 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
 
 function addAgent(sqlite: SqliteD1Harness['sqlite'], id: string, squadId: string, slug: string): void {
   sqlite.prepare('INSERT INTO agents (id, squad_id, slug) VALUES (?, ?, ?)').run(id, squadId, slug)
+}
+
+function addSquad(sqlite: SqliteD1Harness['sqlite'], id: string, slug: string): void {
+  sqlite.prepare('INSERT INTO squads (id, slug) VALUES (?, ?)').run(id, slug)
 }
 
 function addFleetRow(
@@ -304,11 +310,106 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
     })
 
     it('upsertPollFleetPresence creates a row keyed by the caller\'s OWN uuid — an exact-id match, never the slug-fallback path', async () => {
+      addSquad(harness.sqlite, 'squad-1', 'orca-squad')
       addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
       await upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 })
 
       const result = await getFleetAgentLiveness(env, KASRA_UUID)
-      expect(result).toEqual({ runtime: 'poll', live: true, agentId: KASRA_UUID, presenceMode: 'poll' })
+      // mupot#1494 round 2 (P2-h) — runtime stays '' (unset), never 'poll': 'poll' is a
+      // delivery CADENCE (presence_mode), not a harness/engine, and getFleetAgentLiveness's
+      // early return no longer treats empty-runtime-plus-poll-mode as "no row at all".
+      expect(result).toEqual({ runtime: '', live: true, agentId: KASRA_UUID, presenceMode: 'poll' })
+    })
+
+    // mupot#1494 round 2 (P1-c) — a poll-mode agent has no resident daemon ever calling
+    // reportFleetAgents() to self-report which squads it's in (the only OTHER writer of
+    // fleet_agents.squads), so without this fix a poll-mode row would NEVER appear in a
+    // squad-scoped fleet view. Populated from the agent's REAL home squad, re-resolved on
+    // every upsert.
+    it('upsertPollFleetPresence populates squads from the agent\'s ACTUAL home squad — a squad-scoped fleet view lists it', async () => {
+      addSquad(harness.sqlite, 'squad-1', 'orca-squad')
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      await upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 })
+
+      const row = harness.sqlite.prepare('SELECT squads FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { squads: string }
+      expect(JSON.parse(row.squads)).toEqual(['orca-squad'])
+    })
+
+    it('upsertPollFleetPresence tolerates an agent with no resolvable squad (fails open to squads: [], never throws)', async () => {
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-does-not-exist', 'kasra')
+      await expect(upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 }))
+        .resolves.toEqual({ stoppedByOperator: false })
+
+      const row = harness.sqlite.prepare('SELECT squads FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { squads: string }
+      expect(JSON.parse(row.squads)).toEqual([])
+    })
+
+    it('upsertPollFleetPresence re-resolves squads on EVERY call — a later reassignment is reflected, not a one-time snapshot', async () => {
+      addSquad(harness.sqlite, 'squad-1', 'squad-one')
+      addSquad(harness.sqlite, 'squad-2', 'squad-two')
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      await upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 })
+
+      harness.sqlite.prepare('UPDATE agents SET squad_id = ? WHERE id = ?').run('squad-2', KASRA_UUID)
+      await upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 })
+
+      const row = harness.sqlite.prepare('SELECT squads FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { squads: string }
+      expect(JSON.parse(row.squads)).toEqual(['squad-two'])
+    })
+
+    // mupot#1494 round 2 (P2-f) — operator detach wins. /api/fleet/detach requires the SAME
+    // token.boundAgentId as the target agent_id, which for a poll row IS the agent's own
+    // uuid — self-detach is a real reachable path here, not hypothetical.
+    it('upsertPollFleetPresence does NOT resurrect a row an operator (or the agent\'s own detach) stopped — no refresh at all', async () => {
+      addSquad(harness.sqlite, 'squad-1', 'orca-squad')
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      const stoppedAt = utcStamp(Date.now() - 3_600_000)
+      addFleetRow(harness.sqlite, KASRA_UUID, {
+        presenceMode: 'poll', presenceTtlSec: 600, status: 'stopped', lastReportedAt: stoppedAt,
+      })
+
+      const result = await upsertPollFleetPresence(env, { agentId: KASRA_UUID, display: 'Orca Runner', memberId: 'member-1', ttlSec: 600 })
+      expect(result).toEqual({ stoppedByOperator: true })
+
+      const row = harness.sqlite.prepare('SELECT status, last_reported_at FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { status: string; last_reported_at: string }
+      expect(row.status).toBe('stopped')
+      expect(row.last_reported_at).toBe(stoppedAt) // untouched — no refresh
+      expect((await getFleetAgentLiveness(env, KASRA_UUID)).live).toBe(false)
+    })
+
+    // mupot#1494 round 2 (P2-g) — explicit de-registration: check_in({presence_mode:'resident'})
+    // clears presence_mode/presence_ttl_sec so the row falls back to ordinary resident rules.
+    it('clearPollFleetPresence de-registers a poll row back to resident rules', async () => {
+      addSquad(harness.sqlite, 'squad-1', 'orca-squad')
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      // A poll-mode row, LIVE only because of its generous per-row TTL — well past the 180s
+      // global default, so this proves the fallback to global rules actually takes effect.
+      addFleetRow(harness.sqlite, KASRA_UUID, {
+        presenceMode: 'poll', presenceTtlSec: 1200, status: 'running',
+        lastReportedAt: utcStamp(Date.now() - 600_000),
+      })
+      expect((await getFleetAgentLiveness(env, KASRA_UUID)).live).toBe(true)
+
+      await clearPollFleetPresence(env, KASRA_UUID)
+
+      const row = harness.sqlite.prepare('SELECT presence_mode, presence_ttl_sec FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { presence_mode: string; presence_ttl_sec: number | null }
+      expect(row.presence_mode).toBe('')
+      expect(row.presence_ttl_sec).toBeNull()
+      // Falls back to resident rules: same 10-minute-old heartbeat, now judged against the
+      // 180s global window instead of the cleared 1200s per-row one -> stale.
+      const result = await getFleetAgentLiveness(env, KASRA_UUID)
+      expect(result.live).toBe(false)
+      expect(result.presenceMode).toBe('')
+    })
+
+    it('clearPollFleetPresence is a safe no-op for a resident row and for no row at all', async () => {
+      await expect(clearPollFleetPresence(env, 'ghost-uuid')).resolves.toBeUndefined()
+      await expect(clearPollFleetPresence(env, null)).resolves.toBeUndefined()
+
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      addFleetRow(harness.sqlite, KASRA_UUID, { runtime: 'claude-code', status: 'running', lastReportedAt: utcStamp(Date.now()) })
+      await clearPollFleetPresence(env, KASRA_UUID)
+      expect((await getFleetAgentLiveness(env, KASRA_UUID)).live).toBe(true) // untouched
     })
 
     it('a poll-mode row uses its OWN per-row TTL, not the global presenceTtlSec window', async () => {
@@ -316,18 +417,18 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
       // Established 10 minutes ago with a 20-minute (1200s) TTL — well past the 180s global
       // default, so this proves the per-row TTL is actually consulted, not just stored.
       addFleetRow(harness.sqlite, KASRA_UUID, {
-        runtime: 'poll', status: 'running', presenceMode: 'poll', presenceTtlSec: 1200,
+        runtime: '', status: 'running', presenceMode: 'poll', presenceTtlSec: 1200,
         lastReportedAt: utcStamp(Date.now() - 600_000),
       })
 
       const result = await getFleetAgentLiveness(env, KASRA_UUID)
-      expect(result).toEqual({ runtime: 'poll', live: true, agentId: KASRA_UUID, presenceMode: 'poll' })
+      expect(result).toEqual({ runtime: '', live: true, agentId: KASRA_UUID, presenceMode: 'poll' })
     })
 
     it('a poll-mode row past its OWN TTL reads stale, even though 10 minutes is still inside the global 180s-derived default window some callers might assume', async () => {
       addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
       addFleetRow(harness.sqlite, KASRA_UUID, {
-        runtime: 'poll', status: 'running', presenceMode: 'poll', presenceTtlSec: 120,
+        runtime: '', status: 'running', presenceMode: 'poll', presenceTtlSec: 120,
         lastReportedAt: utcStamp(Date.now() - 300_000), // 5 min ago, TTL is 120s
       })
 
@@ -340,7 +441,7 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
       addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
       const staleMs = Date.now() - (DEFAULT_PRESENCE_TTL_SEC + 60) * 1000
       addFleetRow(harness.sqlite, KASRA_UUID, {
-        runtime: 'poll', status: 'running', presenceMode: 'poll', presenceTtlSec: 600,
+        runtime: '', status: 'running', presenceMode: 'poll', presenceTtlSec: 600,
         lastReportedAt: utcStamp(staleMs),
       })
       // A RESIDENT row (no presence_mode) at the same staleness — touch must leave it untouched.
@@ -354,6 +455,19 @@ describe('getFleetAgentRuntime / getFleetAgentLiveness — real SQLite', () => {
       expect((await getFleetAgentLiveness(env, KASRA_UUID)).live).toBe(true)
       // Resident semantics UNCHANGED: still stale, the touch never matched its row.
       expect((await getFleetAgentLiveness(env, residentUuid)).live).toBe(false)
+    })
+
+    it('touchPollFleetPresence does NOT refresh a row an operator stopped (mupot#1494 round 2, P2-f)', async () => {
+      addAgent(harness.sqlite, KASRA_UUID, 'squad-1', 'kasra')
+      const stoppedAt = utcStamp(Date.now() - 3_600_000)
+      addFleetRow(harness.sqlite, KASRA_UUID, {
+        runtime: '', status: 'stopped', presenceMode: 'poll', presenceTtlSec: 600, lastReportedAt: stoppedAt,
+      })
+
+      await touchPollFleetPresence(env, KASRA_UUID)
+
+      const row = harness.sqlite.prepare('SELECT last_reported_at FROM fleet_agents WHERE agent_id = ?').get(KASRA_UUID) as { last_reported_at: string }
+      expect(row.last_reported_at).toBe(stoppedAt)
     })
 
     it('touchPollFleetPresence is a safe no-op for an agent with no fleet row at all', async () => {
