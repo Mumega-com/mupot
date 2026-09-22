@@ -211,7 +211,14 @@ export async function getOrCreateKVNamespace(
 }
 
 /** D1 REST `/query` result shape: an array, one element per statement in the request body.
- *  This module always sends exactly one statement per call, so callers read `result[0]`. */
+ *  mupot#1516 round-2 P2-2: this doc comment used to claim "this module always sends
+ *  exactly one statement per call, so callers read `result[0]`" — true for every call site
+ *  EXCEPT `seedPotIdentities`' own atomic seed batch, which sends nine semicolon-joined
+ *  statements in ONE call (see that function's doc comment). No current caller reads past
+ *  `result[0]` (the seed batch's own caller never inspects `result` at all, only whether the
+ *  call threw), so this was a stale, no-longer-accurate claim rather than a bug in behavior
+ *  — corrected here so it does not mislead the next caller into assuming single-statement
+ *  calls are the only shape this function ever sends. */
 type D1QueryStatementResult = { results?: Array<Record<string, unknown>>; success?: boolean }
 
 export async function executeD1Query(
@@ -926,7 +933,7 @@ export async function verifyPotReachable(
  * is every call site's shape, by construction, not by convention.
  */
 export function receiptOk(fields: Record<string, unknown> = {}): string {
-  return JSON.stringify({ ok: true, ...fields })
+  return JSON.stringify({ ok: true, ...redactFields(fields) })
 }
 
 /** Maximum length of a `receiptError` message AFTER redaction — see `redactAndBound`. */
@@ -942,11 +949,25 @@ const RECEIPT_MESSAGE_MAX_LENGTH = 500
  *  leaving the DB CHECK to enforce only `json_valid` (structure, which SQLite can actually
  *  verify) separates "is this shaped right" (the database's job) from "does this contain
  *  PII" (a judgment call belonging in code, where it can be precise about what it matches). */
-const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/g
+// mupot#1516 round-2 P2-4: the round-2 version of this regex — `/[^\s@]+@[^\s@]+\.[^\s@]+/g`
+// — matched ANY run of non-space-non-'@' characters before an '@', which is exactly wide
+// enough to swallow `binding=@cf/meta/llama-3.3` whole: `[^\s@]+` greedily consumes
+// `binding=` as a fake "local part", `cf/meta/llama-3` as a fake "domain", and `.3` as a
+// fake "TLD" — redacting a Workers AI binding name that contains no email at all, the exact
+// false-positive this rule exists to avoid (see the doc comment above). This version
+// requires an RFC-ish local-part character class (`[\w.+-]+` — word characters, dots, plus
+// signs, hyphens; notably NOT '=', ':', or '/') immediately before the '@', so a prefix like
+// `binding=` or a path segment like `meta/llama-3` can never join the match. Verified
+// against both cited examples: `binding=@cf/meta/llama-3.3` has no substring matching
+// `[\w.+-]+@[\w-]+\.[\w.-]+` (no character run ending in '=' or '/' is a `\w`-only run, and
+// there is only one '@' in the whole token); `admin@example.com` matches cleanly.
+const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g
 
-/** Redacts anything email-shaped and bounds the length of a receipt error message. Applied
- *  to EVERY `receiptError` call — there is no path to a `pot_provision_receipts` row that
- *  skips it. */
+/** Redacts anything email-shaped and bounds the length of a string. Applied to EVERY
+ *  `receiptError` message AND recursively to every string value in `receiptOk`'s `fields`/
+ *  `receiptError`'s `extraFields` (via `redactFields`, mupot#1516 round-2 P2-3) — there is
+ *  no path to a `pot_provision_receipts` row that skips it, regardless of which of the two
+ *  functions' parameters a string arrives through. */
 function redactAndBound(message: string): string {
   const redacted = message.replace(EMAIL_RE, '[redacted-email]')
   return redacted.length > RECEIPT_MESSAGE_MAX_LENGTH
@@ -954,14 +975,38 @@ function redactAndBound(message: string): string {
     : redacted
 }
 
+/** Recursively applies `redactAndBound` to every STRING leaf reachable from `value` —
+ *  through plain objects and arrays — leaving numbers/booleans/null untouched (they cannot
+ *  carry an email address or need length-bounding in this schema). mupot#1516 round-2
+ *  P2-3: the round-2 version of `receiptOk`/`receiptError` redacted/bounded ONLY the
+ *  `message` argument to `receiptError` — `fields`/`extraFields` on BOTH functions were
+ *  spread into the JSON verbatim, unredacted and unbounded. Every field on today's actual
+ *  call sites happens to be a safe id/count/enum, but the function signatures place no
+ *  limit on what a future call site passes there — the redaction guarantee this schema's
+ *  own CHECK-constraint history exists to hold must cover the WHOLE detail value, not just
+ *  the one argument that happened to be the source of the round-1/round-2 defects. */
+function redactDeep(value: unknown): unknown {
+  if (typeof value === 'string') return redactAndBound(value)
+  if (Array.isArray(value)) return value.map(redactDeep)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactDeep(v)]))
+  }
+  return value
+}
+
+function redactFields(fields: Record<string, unknown>): Record<string, unknown> {
+  return redactDeep(fields) as Record<string, unknown>
+}
+
 /** Builds a failure `detail` — `{ok:false, error:{class, message}}`. `errorClass` is a
  *  short, stable, machine-groupable string (`'sql_error'`, `'http_error'`,
  *  `'transport_error'`, `'seed_failed'`, `'unreachable'`, `'receipt_write_failed'`, ...) —
  *  never the raw message alone, so a receipt reader can group failures without parsing
  *  prose. `extraFields` carries structured, queryable context (e.g. `apply_schema`'s
- *  `file`/`statement_index`/`kind`) alongside the error, same as `receiptOk`'s fields. */
+ *  `file`/`statement_index`/`kind`) alongside the error, same as `receiptOk`'s fields — and
+ *  is redacted the same way. */
 export function receiptError(errorClass: string, message: string, extraFields: Record<string, unknown> = {}): string {
-  return JSON.stringify({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...extraFields })
+  return JSON.stringify({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...redactFields(extraFields) })
 }
 
 /** Appends one row to `pot_provision_receipts` (migration 0169) on the ORCHESTRATOR's own

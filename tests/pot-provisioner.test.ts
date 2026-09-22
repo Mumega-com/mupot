@@ -31,7 +31,17 @@ import { invokeTool } from '../src/mcp/index'
 import type { Env, AuthContext } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { execD1RestQuery, D1_TRANSACTION_CONTROL_ERROR, D1_MULTI_STATEMENT_PARAMS_ERROR } from './helpers/d1-rest-double'
+import {
+  execD1RestQuery,
+  D1_TRANSACTION_CONTROL_ERROR,
+  D1_MULTI_STATEMENT_PARAMS_ERROR,
+  D1_TOO_MANY_PARAMS_ERROR,
+  D1_STATEMENT_TOO_LARGE_ERROR,
+  D1_ATTACH_REFUSED_ERROR,
+  D1_TEMP_TABLE_REFUSED_ERROR,
+  D1_MAX_BOUND_PARAMS,
+  D1_MAX_STATEMENT_BYTES,
+} from './helpers/d1-rest-double'
 import { fakeSessionsKv, fakeDispatcher, createRealisticFakeCf } from './helpers/fake-cf-provisioner'
 
 const orgAdmin: AuthContext = {
@@ -389,6 +399,76 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       const res = await execD1RestQuery(harness, "SELECT 1; SELECT 2;", [1])
       expect(res.success).toBe(false)
       expect(res.errors?.[0]?.message).toBe(D1_MULTI_STATEMENT_PARAMS_ERROR)
+    })
+
+    it('P2-1: the double catches transaction control that is NOT the first statement in the batch (per-statement, not per-batch)', async () => {
+      const harness = seededChildHarness()
+      const batch = [
+        `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES ('d-x', 'core', 'X', 'work', 1, '2026-01-01T00:00:00.000Z');`,
+        'COMMIT;', // hidden mid-batch — NOT the first line, which a batch-level ^-anchored check would miss
+      ].join('\n')
+      const res = await execD1RestQuery(harness, batch, [])
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_TRANSACTION_CONTROL_ERROR)
+      // Refused before anything in the batch landed — including the statement BEFORE the
+      // hidden COMMIT (the whole call is refused, same as a real D1 authorizer rejection).
+      expect(harness.sqlite.prepare("SELECT COUNT(*) as c FROM departments WHERE id = 'd-x'").get()).toEqual({ c: 0 })
+    })
+
+    it('P2-1: a CREATE TRIGGER statement (a legitimate bare BEGIN inside its own body) is NEVER mistaken for transaction control', async () => {
+      const harness = seededChildHarness()
+      const triggerSql = [
+        'CREATE TRIGGER IF NOT EXISTS d1_double_trigger_probe',
+        '  AFTER INSERT ON departments',
+        'BEGIN',
+        "  SELECT 1;",
+        'END;',
+      ].join('\n')
+      const res = await execD1RestQuery(harness, triggerSql, [])
+      expect(res.success, JSON.stringify(res)).toBe(true)
+      const row = harness.sqlite.prepare("SELECT COUNT(*) as c FROM sqlite_master WHERE type='trigger' AND name='d1_double_trigger_probe'").get()
+      expect(row).toEqual({ c: 1 })
+    })
+
+    it('P2-1: refuses more than 100 bound parameters', async () => {
+      const harness = seededChildHarness()
+      const params = Array.from({ length: D1_MAX_BOUND_PARAMS + 1 }, (_, i) => i)
+      const res = await execD1RestQuery(harness, 'SELECT 1 WHERE 1 = ?1', params)
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_TOO_MANY_PARAMS_ERROR)
+    })
+
+    it('P2-1: refuses a single statement over the ~100KB cap', async () => {
+      const harness = seededChildHarness()
+      const oversized = `SELECT '${'a'.repeat(D1_MAX_STATEMENT_BYTES)}';`
+      const res = await execD1RestQuery(harness, oversized, [])
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_STATEMENT_TOO_LARGE_ERROR)
+    })
+
+    it("P2-1: refuses ATTACH (Cloudflare D1's documented restriction)", async () => {
+      const harness = seededChildHarness()
+      const res = await execD1RestQuery(harness, "ATTACH DATABASE 'other.db' AS other;", [])
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_ATTACH_REFUSED_ERROR)
+    })
+
+    it("P2-1: refuses CREATE TEMP TABLE (empirically verified per migrations/0049's own header)", async () => {
+      const harness = seededChildHarness()
+      const res = await execD1RestQuery(harness, 'CREATE TEMP TABLE d1_double_temp_probe (id TEXT);', [])
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_TEMP_TABLE_REFUSED_ERROR)
+    })
+
+    it('P2-1: returns ONE result element PER STATEMENT in a multi-statement zero-param batch', async () => {
+      const harness = seededChildHarness()
+      const batch = [
+        `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES ('d-y', 'dept-y', 'Y', 'work', 1, '2026-01-01T00:00:00.000Z');`,
+        `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES ('d-z', 'dept-z', 'Z', 'work', 1, '2026-01-01T00:00:00.000Z');`,
+      ].join('\n')
+      const res = await execD1RestQuery(harness, batch, [])
+      expect(res.success).toBe(true)
+      expect(res.result).toHaveLength(2)
     })
 
     it('seedPotIdentities sends NO transaction-control statement — the batch it builds passes the double clean', async () => {
@@ -1025,6 +1105,31 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(row.c).toBe(0)
     })
 
+    it("P2-4: a Workers AI binding name like '@cf/meta/llama-3.3' survives redaction untouched — it is NOT email-shaped", () => {
+      const detail = receiptError('sql_error', "schema statement referenced binding=@cf/meta/llama-3.3 which does not exist")
+      expect(detail).toContain('@cf/meta/llama-3.3')
+      expect(detail).not.toContain('[redacted-email]')
+    })
+
+    it('P2-4 positive control: a real email address in the SAME message IS redacted', () => {
+      const detail = receiptError('sql_error', 'boom @cf/meta/llama-3.3 failed, contact admin@example.com for help')
+      expect(detail).toContain('@cf/meta/llama-3.3') // non-email survives
+      expect(detail).not.toContain('admin@example.com') // real email redacted
+      expect(detail).toContain('[redacted-email]')
+    })
+
+    it('P2-3: redaction covers extraFields/fields too, not just the top-level message', () => {
+      const errorDetail = receiptError('sql_error', 'boom', { hint: 'contact admin@example.com', file: 'x.sql' })
+      const parsedError = JSON.parse(errorDetail)
+      expect(parsedError.hint).toBe('contact [redacted-email]')
+      expect(parsedError.file).toBe('x.sql') // untouched, no email in it
+
+      const okDetail = receiptOk({ note: 'operator is admin@example.com', count: 3 })
+      const parsedOk = JSON.parse(okDetail)
+      expect(parsedOk.note).toBe('operator is [redacted-email]')
+      expect(parsedOk.count).toBe(3) // non-string values pass through unchanged
+    })
+
     it('FAIL CLOSED: a receipt write failure is treated as a FAILED STEP even when the underlying operation succeeded', async () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
@@ -1069,6 +1174,84 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     it('accepts exactly the allowed fields', () => {
       const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'a@b.com' })
       expect(result.ok).toBe(true)
+    })
+
+    describe('P2-5: caller-suppliable string bounds', () => {
+      it('accepts brand_name/admin_name at exactly 200 chars and admin_email at exactly 254', () => {
+        const email254 = `${'a'.repeat(254 - '@b.com'.length)}@b.com`
+        expect(email254).toHaveLength(254)
+        const result = validateProvisionRequestBody({
+          slug: 'gaf', brand_name: 'B'.repeat(200), admin_name: 'N'.repeat(200), admin_email: email254,
+        })
+        expect(result.ok).toBe(true)
+      })
+
+      it('refuses brand_name over 200 chars with a named field_too_long error', () => {
+        const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'B'.repeat(201), admin_email: 'a@b.com' })
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('expected failure')
+        expect(result.error).toBe('field_too_long')
+        expect(result.message).toContain('brand_name')
+      })
+
+      it('refuses admin_name over 200 chars', () => {
+        const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'a@b.com', admin_name: 'N'.repeat(201) })
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('expected failure')
+        expect(result.error).toBe('field_too_long')
+        expect(result.message).toContain('admin_name')
+      })
+
+      it('refuses admin_email over 254 chars', () => {
+        const longEmail = `${'a'.repeat(250)}@b.com` // well over 254 total
+        const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: longEmail })
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('expected failure')
+        expect(result.error).toBe('field_too_long')
+        expect(result.message).toContain('admin_email')
+      })
+
+      it('the HTTP route surfaces field_too_long as 400, not a 500 from downstream string interpolation', async () => {
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        const owner = JSON.stringify({ userId: 'u-owner', email: 'owner@local.test', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' })
+        const env = {
+          TENANT_SLUG: 'local', DB: harness.db,
+          SESSIONS: { get: async (k: string) => (k === 'sess:owner-s' ? owner : null), put: async () => undefined, delete: async () => undefined },
+          SECRET_ENV_CF_API_TOKEN: 'cf-tok',
+        } as unknown as Env
+        await env.DB.prepare(
+          `INSERT INTO members (id, tenant, email, display_name, status, created_at) VALUES ('mem-owner', 'local', 'owner@local.test', 'Owner', 'active', datetime('now'))`,
+        ).run()
+        const res = await potsApp.request('/provision', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', origin: 'http://localhost', cookie: 'mupot_session=owner-s' },
+          body: JSON.stringify({ slug: 'toolongbrand', brand_name: 'X'.repeat(300), admin_email: 'a@b.com' }),
+        }, env)
+        expect(res.status).toBe(400)
+        const json = await res.json() as { error: string }
+        expect(json.error).toBe('field_too_long')
+      })
+
+      it("P2-5/P2-1: a MAXIMAL-length seed (200-char brand_name/admin_name, 254-char admin_email) stays comfortably under the D1 double's 100KB per-statement cap — the bounds don't fight each other", async () => {
+        const email254 = `${'a'.repeat(254 - '@maximal-length-test-domain.example.com'.length)}@maximal-length-test-domain.example.com`
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        global.fetch = vi.fn(async (url: string, init: RequestInit) => {
+          const body = JSON.parse(init.body as string)
+          return { status: 200, json: async () => execD1RestQuery(harness, body.sql, body.params ?? []) }
+        }) as any
+
+        const result = await seedPotIdentities(
+          { accountId: 'acc-123', apiToken: 'cf-tok-abc' },
+          'child-db',
+          { slug: 'maximal', brandName: 'B'.repeat(200), adminEmail: email254, adminName: 'N'.repeat(200) },
+        )
+        // If any inlined statement in the batch had exceeded the double's 100KB cap, this
+        // would come back ok:false with a D1_STATEMENT_TOO_LARGE_ERROR-shaped detail —
+        // ok:true here IS the proof the two bounds coexist correctly.
+        expect(result.ok).toBe(true)
+      })
     })
 
     for (const forbidden of ['worker_js_code', 'cf_api_token', 'account_id']) {
