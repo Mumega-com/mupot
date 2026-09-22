@@ -22,22 +22,29 @@
 // R2 — https://developers.cloudflare.com/r2/examples/authenticate-r2-auth-tokens/)
 // against `https://<account_id>.r2.cloudflarestorage.com/<bucket>/<key>`.
 //
-// CREDENTIAL DERIVATION: per https://developers.cloudflare.com/r2/api/tokens/, an S3
-// Access Key ID is "the `id` of the API token" and the Secret Access Key is "the SHA-256
-// hash of the API token `value`". A caller normally captures the `id` at token-creation
-// time; this module instead resolves it from the token itself via the standard, minimal-
-// permission `GET /user/tokens/verify` endpoint (works for any valid token, requires no
-// extra scope) so the ONLY secret an operator has to hold is the same `CLOUDFLARE_API_TOKEN`
-// wrangler itself already reads from the environment for `wrangler deploy` — no separate
-// R2-specific Access Key ID / Secret Access Key pair to provision and rotate.
+// CREDENTIALS: a DEDICATED, bucket-scoped R2 API token pair, read from
+// `R2_POT_BUNDLES_ACCESS_KEY_ID` / `R2_POT_BUNDLES_SECRET_ACCESS_KEY` — never derived from
+// the deploy's own `CLOUDFLARE_API_TOKEN`. Athena's round-1 ruling on this PR (2026-09-22)
+// rejected an earlier version of this module that derived S3 credentials from that deploy
+// token itself: that derivation is not a documented Cloudflare pattern, it hands this
+// script the FULL scope of whatever broker minted the deploy token (that token is
+// account-owned, not scoped to this one bucket), and the account-owned token rejects that
+// derivation path in practice anyway. See docs/workflows/tenant-provision.md's "Minting
+// the R2 credential pair" section for exactly how an operator mints the pair (Cloudflare
+// dashboard → R2 → Manage R2 API Tokens → Object Read & Write, scoped to bucket
+// `mupot-pot-bundles`) and where it lives on the deploy host. Both values are read from the
+// environment only, checked for presence before any network call
+// (`readR2PotBundlesCredentials` below), and never appear in any thrown message, log line,
+// or printed receipt — only the two ENV VAR NAMES do.
 //
 // UNVERIFIED LIVE (same discipline as scripts/build-pot-worker-bundle.mjs and
 // docs/workflows/tenant-provision.md's other "this session cannot touch live CF" notes):
-// this session never calls the real Cloudflare API. The endpoint shapes above are sourced
-// from developers.cloudflare.com and the published `cloudflare` npm package's own type
-// definitions, not exercised against a live account. Kasra-core should smoke-test
-// `deriveR2S3Credentials` + `putPotWorkerBundleObject` against a real token once the
-// `mupot-pot-bundles` bucket and a scoped token are available.
+// this session never calls the real Cloudflare API. The S3-compatible endpoint shape above
+// is sourced from developers.cloudflare.com and the published `cloudflare` npm package's
+// own type definitions, not exercised against a live account. Kasra-core should
+// smoke-test `putPotWorkerBundleObject` / `verifyPotWorkerBundleObject` against a real,
+// scoped R2 credential pair once one is minted — see the doc section named above for the
+// live-verify-before-merge receipt format to capture when that happens.
 
 import { createHash } from 'node:crypto'
 import { AwsClient } from 'aws4fetch'
@@ -99,37 +106,35 @@ export function assertPublishPreconditions({ dirty, headSha, releaseSha }) {
   }
 }
 
-/** https://developers.cloudflare.com/r2/api/tokens/ — Access Key ID is the API token's own
- *  `id`, resolved via the minimal-permission `GET /user/tokens/verify` (works for any valid
- *  token); Secret Access Key is the SHA-256 hash of the token's raw value. Never logs or
- *  returns the raw `apiToken` itself. */
-export async function deriveR2S3Credentials({ apiToken, fetchImpl = fetch }) {
-  if (!apiToken || !apiToken.trim()) {
-    throw new Error('deriveR2S3Credentials: apiToken is required (read CLOUDFLARE_API_TOKEN from the environment)')
-  }
-  const res = await fetchImpl('https://api.cloudflare.com/client/v4/user/tokens/verify', {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${apiToken}` },
-  })
-  let body = null
-  try {
-    body = await res.json()
-  } catch {
-    // non-JSON error body — body stays null, handled below
-  }
-  if (!res.ok || !body?.success || !body?.result?.id) {
-    const errCode = body?.errors?.[0]?.code
-    const errMessage = body?.errors?.[0]?.message
+/** Env var names for the dedicated, bucket-scoped R2 credential pair — named exports (not
+ *  just string literals) so a caller printing a refusal message and a test asserting on it
+ *  can never drift apart on the exact spelling. */
+export const R2_POT_BUNDLES_ACCESS_KEY_ID_ENV = 'R2_POT_BUNDLES_ACCESS_KEY_ID'
+export const R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV = 'R2_POT_BUNDLES_SECRET_ACCESS_KEY'
+
+/**
+ * Reads the dedicated R2 credential pair from the environment (default `process.env`,
+ * injectable for tests). Pure and synchronous — makes no network call, so this always runs
+ * BEFORE any request is signed or sent. Throws a message naming exactly which of the two
+ * env vars is missing/blank — NEVER the values themselves, and never the value of any OTHER
+ * env var either. See this file's header for why these two, and not `CLOUDFLARE_API_TOKEN`.
+ */
+export function readR2PotBundlesCredentials(env = process.env) {
+  const accessKeyId = env[R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]
+  const secretAccessKey = env[R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]
+  const missing = []
+  if (!accessKeyId || !accessKeyId.trim()) missing.push(R2_POT_BUNDLES_ACCESS_KEY_ID_ENV)
+  if (!secretAccessKey || !secretAccessKey.trim()) missing.push(R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV)
+  if (missing.length > 0) {
     throw new Error(
-      `CLOUDFLARE_API_TOKEN verification failed (GET /user/tokens/verify): HTTP ${res.status}` +
-        (errCode ? ` code:${errCode}` : '') +
-        (errMessage ? ` — ${errMessage}` : ''),
+      `refusing to publish/verify: missing required environment variable(s): ${missing.join(', ')} — ` +
+        'mint a scoped R2 API token pair (Cloudflare dashboard → R2 → Manage R2 API Tokens → ' +
+        "Object Read & Write, scoped to bucket 'mupot-pot-bundles') and set both before " +
+        'running this script. This is deliberately NOT CLOUDFLARE_API_TOKEN — see ' +
+        'docs/workflows/tenant-provision.md "Minting the R2 credential pair".',
     )
   }
-  return {
-    accessKeyId: body.result.id,
-    secretAccessKey: sha256HexOfUtf8Text(apiToken),
-  }
+  return { accessKeyId, secretAccessKey }
 }
 
 /** https://<account_id>.r2.cloudflarestorage.com/<bucket>/<key> — the R2 S3-compatible
@@ -145,13 +150,57 @@ export function makeR2SigningClient({ accessKeyId, secretAccessKey }) {
   return new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto' })
 }
 
+/** An S3-shaped XML error body can carry `<AWSAccessKeyId>...</AWSAccessKeyId>` — scrub the
+ *  VALUE before any error body text is thrown, logged, or printed. Never a full redaction of
+ *  the body (the rest of the XML is diagnostic and not secret), just this one field. */
+function redactS3ErrorBody(text) {
+  return text.replace(/(<AWSAccessKeyId>)[^<]*(<\/AWSAccessKeyId>)/gi, '$1REDACTED$2')
+}
+
+/**
+ * Thrown by `putPotWorkerBundleObject` when a PUT under an existing `${releaseSha}/worker.js`
+ * key would silently overwrite DIFFERENT bytes than what is already published there. A
+ * given RELEASE_SHA's bundle must be immutable once published — `code: 'bundle_sha_conflict'`
+ * lets a caller (scripts/publish-pot-bundle.mjs) detect this specific case and print a
+ * targeted message rather than a generic transport failure.
+ */
+export class BundleShaConflictError extends Error {
+  constructor(message, { key, existingSha256, attemptedSha256 } = {}) {
+    super(message)
+    this.name = 'BundleShaConflictError'
+    this.code = 'bundle_sha_conflict'
+    this.key = key
+    this.existingSha256 = existingSha256
+    this.attemptedSha256 = attemptedSha256
+  }
+}
+
 /**
  * PUTs the bundle text to `${releaseSha}/worker.js`, with the digest recorded as the
  * `POT_WORKER_BUNDLE_SHA256_METADATA_KEY` custom-metadata field via the S3-compatible
  * `x-amz-meta-sha256` header — the exact contract `loadPotWorkerBundle` verifies against.
- * PUT-by-key is naturally idempotent: re-running for the same commit re-uploads (and
- * re-signs) the same bytes and the same digest, overwriting the object in place — there is
- * no separate "already published" branch to keep in sync with the digest check.
+ *
+ * SIGNED PAYLOAD (Kasra-core round-2 finding, 2026-09-22): `aws4fetch`'s `AwsClient`
+ * defaults an s3-service request to `X-Amz-Content-Sha256: UNSIGNED-PAYLOAD` unless that
+ * header is already set on the request BEFORE signing — under that default, the SigV4
+ * signature does not cover the body at all, so a tampered body would still verify against
+ * an untampered signature. This function sets the header itself to the SAME digest it
+ * records as `x-amz-meta-sha256`, computed from the exact bytes in `bodyText` — the body is
+ * therefore genuinely signature-covered, not merely accompanied by an unverified claim.
+ *
+ * CONDITIONAL WRITE (Kasra-core round-2 finding — a given RELEASE_SHA's bundle must be
+ * IMMUTABLE once published, never silently overwritten by different bytes under a retry,
+ * a re-run with a stale local tree, or two colonies racing the same commit). PUTs with
+ * `If-None-Match: '*'` (R2's S3-compatible API conditional-write extension — write only if
+ * the key does not already exist). A `412 Precondition Failed` means the key already
+ * exists: this function then GETs the existing object and compares digests — an IDENTICAL
+ * digest is treated as a successful, idempotent re-publish (`alreadyPublished: true` on the
+ * result, no error); a DIFFERENT digest throws `BundleShaConflictError`
+ * (`code: 'bundle_sha_conflict'`) rather than ever silently replacing what is already live
+ * for that commit. UNVERIFIED LIVE (same discipline as the rest of this module): this
+ * session cannot confirm R2's S3-compatible PutObject actually honors `If-None-Match: '*'`
+ * with a `412` on conflict — see docs/workflows/tenant-provision.md's live-verify-before-
+ * merge receipt for where this gets confirmed against a real bucket.
  *
  * `signingClient` defaults to a real `makeR2SigningClient` instance; `fetchImpl` defaults
  * to the global `fetch` used to actually send the already-signed request. Both are
@@ -175,17 +224,42 @@ export async function putPotWorkerBundleObject({
     method: 'PUT',
     headers: {
       'Content-Type': 'application/javascript; charset=utf-8',
+      'If-None-Match': '*',
+      'X-Amz-Content-Sha256': sha256,
       [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: sha256,
     },
     body: bodyText,
   })
   const signed = await client.sign(request)
   const res = await fetchImpl(signed)
+
+  if (res.status === 412) {
+    const existing = await verifyPotWorkerBundleObject({
+      accountId,
+      bucket,
+      releaseSha,
+      accessKeyId,
+      secretAccessKey,
+      signingClient: client,
+      fetchImpl,
+    })
+    if (existing.ok && existing.sha256 === sha256) {
+      return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url, alreadyPublished: true }
+    }
+    throw new BundleShaConflictError(
+      `refusing to publish '${key}': an object already exists there with a DIFFERENT digest ` +
+        `(existing ${existing.ok ? existing.sha256 : 'unreadable: ' + existing.reason}, attempted ${sha256}) — ` +
+        'a published RELEASE_SHA bundle is immutable; this commit must never resolve to two ' +
+        'different bundles.',
+      { key, existingSha256: existing.ok ? existing.sha256 : undefined, attemptedSha256: sha256 },
+    )
+  }
+
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
+    const text = redactS3ErrorBody(await res.text().catch(() => ''))
     throw new Error(`R2 PUT '${key}' failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 500)}` : ''}`)
   }
-  return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url }
+  return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url, alreadyPublished: false }
 }
 
 /**
@@ -215,7 +289,7 @@ export async function verifyPotWorkerBundleObject({
     return { ok: false, key, reason: `no object published at '${key}'` }
   }
   if (!res.ok) {
-    const text = await res.text().catch(() => '')
+    const text = redactS3ErrorBody(await res.text().catch(() => ''))
     return { ok: false, key, reason: `R2 GET '${key}' failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 500)}` : ''}` }
   }
   const recordedSha256 = res.headers.get(`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`)

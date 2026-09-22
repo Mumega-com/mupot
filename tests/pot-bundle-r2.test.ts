@@ -3,8 +3,9 @@
 // enablement, docs/workflows/tenant-provision.md "CI publish output contract").
 //
 // Covers: digest/metadata-key/object-key construction, the dirty-tree/RELEASE_SHA-mismatch
-// refusals (same discipline as scripts/deploy.mjs), and the R2 credential-derivation +
-// PUT/GET round trip with `fetch` mocked (fake fetch, per this repo's established DI
+// refusals (same discipline as scripts/deploy.mjs), the dedicated-R2-credential env-var
+// refusal (Athena round-1 ruling, 2026-09-22 — NOT derived from CLOUDFLARE_API_TOKEN), and
+// the PUT/GET round trip with `fetch` mocked (fake fetch, per this repo's established DI
 // pattern — see tests/secret-env-cf.test.ts's `fetchImpl` parameter, mirrored here) — never
 // against live R2.
 
@@ -13,11 +14,13 @@ import { readFileSync } from 'node:fs'
 import {
   POT_WORKER_BUNDLE_SHA256_METADATA_KEY,
   POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT,
+  R2_POT_BUNDLES_ACCESS_KEY_ID_ENV,
+  R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV,
   bundleObjectKey,
   sha256HexOfUtf8Text,
   assertPublishPreconditions,
   r2ObjectUrl,
-  deriveR2S3Credentials,
+  readR2PotBundlesCredentials,
   putPotWorkerBundleObject,
   verifyPotWorkerBundleObject,
 } from '../scripts/lib/pot-bundle-r2.mjs'
@@ -107,53 +110,70 @@ describe('r2ObjectUrl', () => {
   })
 })
 
-describe('deriveR2S3Credentials', () => {
-  it('derives accessKeyId from /user/tokens/verify result.id and secretAccessKey from sha256(token)', async () => {
-    const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
-      expect(String(url)).toBe('https://api.cloudflare.com/client/v4/user/tokens/verify')
-      expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer my-token')
-      return new Response(JSON.stringify({ success: true, result: { id: 'tok-id-123', status: 'active' } }), {
-        status: 200,
-      })
+// Athena round-1 ruling (2026-09-22): NO derivation from CLOUDFLARE_API_TOKEN and no
+// token-verification network call of any kind — a dedicated, bucket-scoped R2 credential
+// pair read straight from the environment, refused by NAME (never by value), synchronously,
+// before any network call.
+describe('readR2PotBundlesCredentials', () => {
+  it('reads both env vars when present', () => {
+    const creds = readR2PotBundlesCredentials({
+      [R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]: 'ak-123',
+      [R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]: 'sk-456',
     })
-    const creds = await deriveR2S3Credentials({ apiToken: 'my-token', fetchImpl: fetchImpl as unknown as typeof fetch })
-    expect(creds.accessKeyId).toBe('tok-id-123')
-    expect(creds.secretAccessKey).toBe(sha256HexOfUtf8Text('my-token'))
-    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(creds).toEqual({ accessKeyId: 'ak-123', secretAccessKey: 'sk-456' })
   })
 
-  it('never logs or returns the raw token itself', async () => {
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ success: true, result: { id: 'tok-id', status: 'active' } }), { status: 200 }),
+  it('throws naming ONLY the missing var when the access key id is absent', () => {
+    expect(() => readR2PotBundlesCredentials({ [R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]: 'sk-456' })).toThrow(
+      new RegExp(`missing required environment variable\\(s\\): ${R2_POT_BUNDLES_ACCESS_KEY_ID_ENV}(?!.*${R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV})`),
     )
-    const creds = await deriveR2S3Credentials({ apiToken: 'super-secret-value', fetchImpl: fetchImpl as unknown as typeof fetch })
-    expect(JSON.stringify(creds)).not.toContain('super-secret-value')
   })
 
-  it('throws with a descriptive error on an invalid/expired token', async () => {
-    const fetchImpl = vi.fn(async () =>
-      new Response(JSON.stringify({ success: false, errors: [{ code: 1000, message: 'Invalid API Token' }] }), {
-        status: 401,
+  it('throws naming ONLY the missing var when the secret access key is absent', () => {
+    expect(() => readR2PotBundlesCredentials({ [R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]: 'ak-123' })).toThrow(
+      new RegExp(`missing required environment variable\\(s\\): ${R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV} —`),
+    )
+  })
+
+  it('throws naming BOTH vars when neither is set', () => {
+    expect(() => readR2PotBundlesCredentials({})).toThrow(
+      new RegExp(`${R2_POT_BUNDLES_ACCESS_KEY_ID_ENV}, ${R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV}`),
+    )
+  })
+
+  it('treats a blank/whitespace-only value the same as absent', () => {
+    expect(() =>
+      readR2PotBundlesCredentials({
+        [R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]: '   ',
+        [R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]: 'sk-456',
       }),
-    )
-    await expect(
-      deriveR2S3Credentials({ apiToken: 'bad-token', fetchImpl: fetchImpl as unknown as typeof fetch }),
-    ).rejects.toThrow(/verification failed.*401.*code:1000.*Invalid API Token/s)
+    ).toThrow(new RegExp(R2_POT_BUNDLES_ACCESS_KEY_ID_ENV))
   })
 
-  it('throws on a non-JSON error body rather than crashing on .json()', async () => {
-    const fetchImpl = vi.fn(async () => new Response('<html>502</html>', { status: 502 }))
-    await expect(
-      deriveR2S3Credentials({ apiToken: 'x', fetchImpl: fetchImpl as unknown as typeof fetch }),
-    ).rejects.toThrow(/verification failed.*502/s)
+  it('never includes the credential VALUES in the thrown message, even when one is present', () => {
+    let thrown: unknown
+    try {
+      readR2PotBundlesCredentials({ [R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]: 'super-secret-access-key-value' })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).not.toContain('super-secret-access-key-value')
   })
 
-  it('refuses a blank apiToken before ever calling fetch', async () => {
-    const fetchImpl = vi.fn()
-    await expect(deriveR2S3Credentials({ apiToken: '  ', fetchImpl: fetchImpl as unknown as typeof fetch })).rejects.toThrow(
-      /apiToken is required/,
-    )
-    expect(fetchImpl).not.toHaveBeenCalled()
+  it('is synchronous — returns the credentials object directly, never a Promise (no network call is possible)', () => {
+    const result = readR2PotBundlesCredentials({
+      [R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]: 'ak',
+      [R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]: 'sk',
+    })
+    expect(result).not.toBeInstanceOf(Promise)
+    expect(result).toEqual({ accessKeyId: 'ak', secretAccessKey: 'sk' })
+  })
+
+  it('never reads CLOUDFLARE_API_TOKEN as a fallback', () => {
+    expect(() =>
+      readR2PotBundlesCredentials({ CLOUDFLARE_API_TOKEN: 'some-deploy-token-value' }),
+    ).toThrow(new RegExp(`${R2_POT_BUNDLES_ACCESS_KEY_ID_ENV}, ${R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV}`))
   })
 })
 
@@ -167,7 +187,7 @@ const fakeSigningClient = () => ({
 })
 
 describe('putPotWorkerBundleObject', () => {
-  it('PUTs to the exact object key with the sha256 recorded as x-amz-meta-sha256', async () => {
+  it('PUTs to the exact object key with the sha256 recorded as x-amz-meta-sha256, a conditional If-None-Match, and a SIGNED payload (never UNSIGNED-PAYLOAD)', async () => {
     const sha = 'f'.repeat(40)
     const signingClient = fakeSigningClient()
     const fetchImpl = vi.fn(async (req: Request) => {
@@ -176,6 +196,9 @@ describe('putPotWorkerBundleObject', () => {
       expect(req.headers.get(`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`)).toBe(
         sha256HexOfUtf8Text('console.log(1)'),
       )
+      expect(req.headers.get('If-None-Match')).toBe('*')
+      expect(req.headers.get('X-Amz-Content-Sha256')).toBe(sha256HexOfUtf8Text('console.log(1)'))
+      expect(req.headers.get('X-Amz-Content-Sha256')).not.toBe('UNSIGNED-PAYLOAD')
       return new Response('', { status: 200 })
     })
     const receipt = await putPotWorkerBundleObject({
@@ -194,6 +217,7 @@ describe('putPotWorkerBundleObject', () => {
       size: Buffer.byteLength('console.log(1)', 'utf8'),
       bucket: 'mupot-pot-bundles',
       url: `https://acct.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
+      alreadyPublished: false,
     })
     expect(signingClient.sign).toHaveBeenCalledOnce()
   })
@@ -214,6 +238,133 @@ describe('putPotWorkerBundleObject', () => {
         fetchImpl: fetchImpl as unknown as typeof fetch,
       }),
     ).rejects.toThrow(/R2 PUT.*failed.*403.*access denied/s)
+  })
+
+  it('scrubs <AWSAccessKeyId> from a PUT failure body before it reaches the thrown message', async () => {
+    const sha = '9'.repeat(40)
+    const signingClient = fakeSigningClient()
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('<Error><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId><Code>InvalidAccessKeyId</Code></Error>', {
+          status: 403,
+        }),
+    )
+    let thrown: unknown
+    try {
+      await putPotWorkerBundleObject({
+        accountId: 'acct',
+        bucket: 'mupot-pot-bundles',
+        releaseSha: sha,
+        bodyText: 'x',
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).not.toContain('SUPERSECRETKEYID')
+    expect((thrown as Error).message).toContain('REDACTED')
+  })
+
+  // Kasra-core round-2 finding (2026-09-22): a plain overwrite-by-key PUT could silently
+  // replace an already-published RELEASE_SHA's bundle with DIFFERENT bytes (a stale local
+  // tree, a non-reproducible build, two colonies racing the same commit). Conditional write
+  // + a same-digest-vs-different-digest branch on 412 closes this.
+  describe('conditional write (If-None-Match) on an already-published key', () => {
+    const sha = '4'.repeat(40)
+    const bodyText = 'export default { fetch() {} }'
+    const digest = sha256HexOfUtf8Text(bodyText)
+
+    it('treats a 412 with an IDENTICAL existing digest as a successful, idempotent re-publish', async () => {
+      const signingClient = fakeSigningClient()
+      let call = 0
+      const fetchImpl = vi.fn(async (req: Request) => {
+        call++
+        if (call === 1) {
+          expect(req.method).toBe('PUT')
+          return new Response('', { status: 412 })
+        }
+        // The internal re-verify GET.
+        expect(req.method).toBe('GET')
+        return new Response(bodyText, {
+          status: 200,
+          headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: digest },
+        })
+      })
+      const receipt = await putPotWorkerBundleObject({
+        accountId: 'acct',
+        bucket: 'mupot-pot-bundles',
+        releaseSha: sha,
+        bodyText,
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+      expect(receipt.alreadyPublished).toBe(true)
+      expect(receipt.sha256).toBe(digest)
+      expect(fetchImpl).toHaveBeenCalledTimes(2)
+    })
+
+    it('throws BundleShaConflictError (code: bundle_sha_conflict) on a 412 with a DIFFERENT existing digest — never silently overwrites', async () => {
+      const signingClient = fakeSigningClient()
+      const existingBody = 'a completely different bundle'
+      const existingDigest = sha256HexOfUtf8Text(existingBody)
+      let call = 0
+      const fetchImpl = vi.fn(async (req: Request) => {
+        call++
+        if (call === 1) return new Response('', { status: 412 })
+        return new Response(existingBody, {
+          status: 200,
+          headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: existingDigest },
+        })
+      })
+      let thrown: unknown
+      try {
+        await putPotWorkerBundleObject({
+          accountId: 'acct',
+          bucket: 'mupot-pot-bundles',
+          releaseSha: sha,
+          bodyText,
+          accessKeyId: 'ak',
+          secretAccessKey: 'sk',
+          signingClient,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+        })
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      expect((thrown as Error).name).toBe('BundleShaConflictError')
+      expect((thrown as { code?: string }).code).toBe('bundle_sha_conflict')
+      expect((thrown as { existingSha256?: string }).existingSha256).toBe(existingDigest)
+      expect((thrown as { attemptedSha256?: string }).attemptedSha256).toBe(digest)
+    })
+
+    it('throws BundleShaConflictError even when the existing object is unreadable (fails closed, never assumes match)', async () => {
+      const signingClient = fakeSigningClient()
+      let call = 0
+      const fetchImpl = vi.fn(async () => {
+        call++
+        if (call === 1) return new Response('', { status: 412 })
+        return new Response('server error', { status: 500 })
+      })
+      await expect(
+        putPotWorkerBundleObject({
+          accountId: 'acct',
+          bucket: 'mupot-pot-bundles',
+          releaseSha: sha,
+          bodyText,
+          accessKeyId: 'ak',
+          secretAccessKey: 'sk',
+          signingClient,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+        }),
+      ).rejects.toMatchObject({ code: 'bundle_sha_conflict' })
+    })
   })
 
   it('defaults to a real makeR2SigningClient (aws4fetch) when no signingClient is injected — the signed request still reaches fetchImpl with a real Authorization header', async () => {
@@ -336,10 +487,40 @@ describe('verifyPotWorkerBundleObject', () => {
     expect(result.ok).toBe(false)
     expect((result as { reason: string }).reason).toMatch(/R2 GET.*failed.*500.*server error/s)
   })
+
+  it('scrubs <AWSAccessKeyId> from a GET failure body before it reaches the returned reason', async () => {
+    const signingClient = fakeSigningClient()
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('<Error><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId><Code>AccessDenied</Code></Error>', {
+          status: 403,
+        }),
+    )
+    const result = await verifyPotWorkerBundleObject({
+      accountId: 'acct',
+      bucket: 'mupot-pot-bundles',
+      releaseSha: sha,
+      accessKeyId: 'ak',
+      secretAccessKey: 'sk',
+      signingClient,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    })
+    expect(result.ok).toBe(false)
+    expect((result as { reason: string }).reason).not.toContain('SUPERSECRETKEYID')
+    expect((result as { reason: string }).reason).toContain('REDACTED')
+  })
 })
 
 describe('POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT', () => {
   it('is the bucket name this task provisioned', () => {
     expect(POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT).toBe('mupot-pot-bundles')
+  })
+
+  it('matches the bucket_name wrangler.example.toml documents for POT_WORKER_BUNDLE_BUCKET (one constant, no drift)', () => {
+    const wranglerExample = readFileSync(new URL('../wrangler.example.toml', import.meta.url), 'utf8')
+    const bindingBlockMatch =
+      /binding = "POT_WORKER_BUNDLE_BUCKET"\s*\n\s*bucket_name = "([^"]+)"/.exec(wranglerExample)
+    expect(bindingBlockMatch, 'wrangler.example.toml must still declare the POT_WORKER_BUNDLE_BUCKET r2_buckets binding').not.toBeNull()
+    expect(POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT).toBe(bindingBlockMatch![1])
   })
 })

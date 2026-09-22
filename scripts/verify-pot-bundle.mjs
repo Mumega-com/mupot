@@ -8,8 +8,10 @@
 //
 //   node scripts/verify-pot-bundle.mjs <release-sha> [--bucket <name>]
 //
-// Requires CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID in the environment (same two
-// variables scripts/publish-pot-bundle.mjs and `wrangler` itself already read).
+// Requires CLOUDFLARE_ACCOUNT_ID plus the SAME dedicated, bucket-scoped R2 credential pair
+// scripts/publish-pot-bundle.mjs uses — R2_POT_BUNDLES_ACCESS_KEY_ID and
+// R2_POT_BUNDLES_SECRET_ACCESS_KEY. Deliberately NOT CLOUDFLARE_API_TOKEN — see
+// scripts/lib/pot-bundle-r2.mjs's header for why.
 //
 // Read-only — unlike publish-pot-bundle.mjs this does not touch the local working tree at
 // all (no dirty-tree/HEAD-match check): it verifies whatever RELEASE_SHA is asked for,
@@ -21,7 +23,7 @@
 // digest mismatch, transport error) — never a silent "looks fine" for a 200 that merely
 // proves the bytes were readable.
 
-import { deriveR2S3Credentials, verifyPotWorkerBundleObject, POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT } from './lib/pot-bundle-r2.mjs'
+import { readR2PotBundlesCredentials, verifyPotWorkerBundleObject, POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT } from './lib/pot-bundle-r2.mjs'
 
 function parseArgs(argv) {
   const opts = { releaseSha: null, bucket: null }
@@ -42,12 +44,7 @@ async function main() {
     process.exit(1)
   }
 
-  const apiToken = process.env.CLOUDFLARE_API_TOKEN
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID
-  if (!apiToken || !apiToken.trim()) {
-    console.error('✘ CLOUDFLARE_API_TOKEN is not set in the environment.')
-    process.exit(1)
-  }
   if (!accountId || !accountId.trim()) {
     console.error('✘ CLOUDFLARE_ACCOUNT_ID is not set in the environment.')
     process.exit(1)
@@ -56,7 +53,7 @@ async function main() {
 
   let creds
   try {
-    creds = await deriveR2S3Credentials({ apiToken })
+    creds = readR2PotBundlesCredentials()
   } catch (err) {
     console.log(JSON.stringify({ ok: false, reason: err instanceof Error ? err.message : String(err) }))
     process.exit(1)
