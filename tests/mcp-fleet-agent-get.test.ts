@@ -178,4 +178,31 @@ describe('MCP fleet_agent_get tool (mupot#1184)', () => {
     expect(result.presence_mode).toBe('')
     expect(result.presence_ttl_sec).toBe(300)
   })
+
+  // mupot#1494 round 3 (P3, adversarial round 2) — an operator-stopped poll row's
+  // presence_mode COLUMN can still literally read 'poll' (see isActivePollPresenceMode's doc
+  // comment, src/fleet/registry.ts), but this read-only view must report the ROUTING truth
+  // (getFleetAgentLiveness's own filtered value), not the raw column — a stopped row shows
+  // presence_mode: '' here, exactly as dispatch routing already treats it.
+  it('a STOPPED poll-mode row reports presence_mode \'\' — the routing truth, not the raw column', async () => {
+    harness.sqlite.exec(
+      `UPDATE fleet_agents
+          SET presence_mode = 'poll', presence_ttl_sec = 1200, status = 'stopped',
+              last_reported_at = '${sqliteStamp(NOW - 600_000)}'
+        WHERE tenant = '${TENANT}' AND agent_id = '${OTHER_AGENT_ID}'`,
+    )
+    const adminAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+    const res = await invokeTool(adminAuth, env, 'fleet_agent_get', { agent_id: OTHER_AGENT_ID }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { presence_mode: string; live: boolean; derived_presence: string }
+    // The raw column really does still say 'poll' — proving this isn't a coincidence.
+    expect(harness.sqlite.prepare(
+      `SELECT presence_mode FROM fleet_agents WHERE tenant = ? AND agent_id = ?`,
+    ).get(TENANT, OTHER_AGENT_ID)).toEqual({ presence_mode: 'poll' })
+    expect(result.presence_mode).toBe('')
+    expect(result.live).toBe(false)
+  })
 })

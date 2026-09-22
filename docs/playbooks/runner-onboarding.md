@@ -122,9 +122,22 @@ rule above (you can never even READ another agent's `dispatch_receipt_id` off `t
 `runtime_delivery_stale` even though you never successfully settled it before), that is an
 operator-repair situation, not something a runner can self-heal — ask an org admin to run
 `task_dispatch_lease_reset({ task_id, dispatch_receipt_id, reason })`, which resets the
-message back to the same pristine state a fresh, never-delivered dispatch starts in (refused,
-receipted, if the message was already consumed or dead-lettered — this is a repair, never an
-un-delete). Your next `attempt: 1` settle then proceeds normally.
+message back to the same pristine state a fresh, never-delivered dispatch starts in. This
+call is org-admin ONLY (an explicit `org`-scope `admin`+ capability grant — a squad admin is
+refused, and so is any agent-bound token, even one whose member holds real org:admin
+standing: this repair must always trace to a human operator). It refuses — receipted, never
+a silent no-op — if the message was already consumed or dead-lettered (this is a repair,
+never an un-delete), if `task_id` does not match the dispatch's own task, and if the lease is
+genuinely LIVE and unexpired (a real resident is mid-flight, not stuck) — that last refusal
+names the current holder and its expiry, and only proceeds if the operator confirms the
+holder is actually gone and passes `override: true`, in which case the prior lease state is
+preserved in the audit receipt, never silently discarded. Your next `attempt: 1` settle then
+proceeds normally.
+
+**Reassigning a task while its dispatch is still mid-flight is refused**
+(`task_update({ task_id, assignee_agent_id })` → `409 task_dispatch_in_flight`) rather than
+silently orphaning it — wait for the dispatch to settle (or fail) first, or have an operator
+resolve it via the repair above before reassigning.
 
 ## Worked example (poll every 5 minutes)
 
@@ -160,7 +173,7 @@ task_dispatch_runtime_receipt({
   `upsertPollFleetPresence`, `touchPollFleetPresence`, `clearPollFleetPresence`,
   `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`, `isActivePollPresenceMode`.
 - `src/tasks/runtime-receipts.ts` — `claimUnleasedForPairSettlement`,
-  `loadLatestDispatchReceiptsForTasks`, `adminResetDispatchLease`.
+  `loadLatestDispatchReceiptsForTasks`, `adminResetDispatchLease`, `hasInFlightDispatchReceipt`.
 - `src/agents/messages.ts` — `leaseAvailableClause`, `bearerFencePredicate`.
 - `src/bus/consumer.ts` — `resolveDispatchDeliveryMode` + `hasRegisteredDeliverySurface`
   (the routing rule and the force-eligibility check).
