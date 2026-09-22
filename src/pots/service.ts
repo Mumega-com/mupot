@@ -9,6 +9,7 @@
 // happened on THIS call. `ok` is true if and only if every step below ran and the tenant
 // answered `/health` through the real dispatch path.
 
+import type { R2Bucket } from '@cloudflare/workers-types'
 import type { Env } from '../types'
 import type {
   ProvisionStep, ProvisionStepReceipt,
@@ -255,15 +256,36 @@ async function loadAlreadyAppliedSet(cf: CloudflareApiConfig, databaseId: string
   return set
 }
 
+/** R2 custom-metadata key the CI publish step (docs/workflows/tenant-provision.md, "CI
+ *  publish output contract") must set on every `${RELEASE_SHA}/worker.js` object it
+ *  writes — the hex sha256 of the EXACT bytes being uploaded. `loadPotWorkerBundle`
+ *  recomputes the digest of what it reads back and refuses to deploy on any mismatch or
+ *  absence, rather than trusting an R2 GET that merely succeeded. */
+export const POT_WORKER_BUNDLE_SHA256_METADATA_KEY = 'sha256'
+
 export interface PotWorkerBundle {
   code: string
   /** 'r2': fetched from POT_WORKER_BUNDLE_BUCKET keyed by RELEASE_SHA — the production
-   *  target (docs/workflows/tenant-provision.md option B). 'explicit': the caller supplied
+   *  target (docs/workflows/tenant-provision.md option B), digest-verified against the
+   *  CI publish step's own recorded sha256 before use. 'explicit': the caller supplied
    *  `worker_js_code` directly — the interim path that needs no new CF infrastructure
    *  (option C), produced today via `wrangler deploy --dry-run --outdir` (see
-   *  scripts/build-pot-worker-bundle.mjs). */
+   *  scripts/build-pot-worker-bundle.mjs). Nothing published anywhere verifies it — it is
+   *  still digest-RECEIPTED (`sha256` below), never silently deployed unaccounted-for
+   *  ("an unpinned fallback is an unsigned binary on the control plane"). */
   source: 'r2' | 'explicit'
+  /** sha256Hex(code) — recorded on the `deploy_worker` receipt regardless of source, so
+   *  exactly which bytes got deployed is always auditable after the fact. For `source:
+   *  'r2'` this is, by construction, equal to the object's own recorded digest (the
+   *  mismatch case never reaches this type — see `loadPotWorkerBundle`). */
+  sha256: string
+  /** Only set for `source: 'r2'` — which published object this bundle came from. */
+  r2ObjectKey?: string
 }
+
+export type LoadPotWorkerBundleResult =
+  | { ok: true; bundle: PotWorkerBundle }
+  | { ok: false; reason: string }
 
 /**
  * The tenant script body is THIS worker's own built bundle (mupot#1285 requirement 3).
@@ -285,25 +307,67 @@ export interface PotWorkerBundle {
  *
  * Neither source configured is a hard, named failure (`deploy_worker` step fails with a
  * specific reason) — never a silent skip like the pre-#1285 `if (workerJsCode)` branch.
+ *
+ * DIGEST VERIFICATION (mupot#1507 round-2 requirement 4): an R2 GET that returns 200 only
+ * proves the bytes were *readable*, not that they are the bytes CI actually built —
+ * silent corruption, a partial multipart write, or a stale/overwritten key would all read
+ * back successfully. So a `source: 'r2'` bundle is trusted only when the object carries
+ * its own recorded digest (`POT_WORKER_BUNDLE_SHA256_METADATA_KEY` custom metadata,
+ * written by the CI publish step) AND that digest matches what this function itself
+ * computes from the bytes it just read. A TRANSPORT failure (the GET call throwing) still
+ * falls through to the explicit fallback, same as before — but an object that EXISTS and
+ * fails its own digest check is a hard, named `deploy_worker` failure, never a silent
+ * fallback to a possibly-stale explicit bundle: falling back would mask exactly the
+ * tampering/corruption this check exists to catch.
  */
 export async function loadPotWorkerBundle(
   env: Env,
   explicitCode?: string,
-): Promise<PotWorkerBundle | null> {
+): Promise<LoadPotWorkerBundleResult> {
   if (env.POT_WORKER_BUNDLE_BUCKET) {
+    const key = `${env.RELEASE_SHA || 'unknown'}/worker.js`
+    let obj: Awaited<ReturnType<R2Bucket['get']>> = null
     try {
-      const key = `${env.RELEASE_SHA || 'unknown'}/worker.js`
-      const obj = await env.POT_WORKER_BUNDLE_BUCKET.get(key)
-      if (obj) return { code: await obj.text(), source: 'r2' }
+      obj = await env.POT_WORKER_BUNDLE_BUCKET.get(key)
     } catch {
-      // Fall through to the explicit path — an R2 read failure is not a hard stop when a
-      // caller-supplied bundle is available.
+      obj = null // Transport failure — fall through to the explicit path below.
+    }
+    if (obj) {
+      const code = await obj.text()
+      const actualSha256 = await sha256Hex(code)
+      const expectedSha256 = obj.customMetadata?.[POT_WORKER_BUNDLE_SHA256_METADATA_KEY]
+      if (!expectedSha256) {
+        return {
+          ok: false,
+          reason:
+            `R2 object '${key}' carries no '${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}' custom ` +
+            'metadata — the CI publish step must record the digest it built (see ' +
+            'docs/workflows/tenant-provision.md, "CI publish output contract"); an unpinned ' +
+            'R2 artifact cannot be trusted, and this is not silently treated as "no bundle" ' +
+            'because one clearly exists — falling back to worker_js_code would mask that.',
+        }
+      }
+      if (expectedSha256 !== actualSha256) {
+        return {
+          ok: false,
+          reason:
+            `R2 object '${key}' digest mismatch: recorded ${expectedSha256}, computed ` +
+            `${actualSha256} from the bytes actually read back — refusing to deploy a ` +
+            'bundle that does not match its own published digest.',
+        }
+      }
+      return { ok: true, bundle: { code, source: 'r2', sha256: actualSha256, r2ObjectKey: key } }
     }
   }
   if (explicitCode && explicitCode.trim().length > 0) {
-    return { code: explicitCode, source: 'explicit' }
+    return { ok: true, bundle: { code: explicitCode, source: 'explicit', sha256: await sha256Hex(explicitCode) } }
   }
-  return null
+  return {
+    ok: false,
+    reason:
+      'no worker bundle available: POT_WORKER_BUNDLE_BUCKET has no object for the current ' +
+      'RELEASE_SHA and no worker_js_code was supplied — see docs/workflows/tenant-provision.md',
+  }
 }
 
 export async function uploadUserWorkerToDispatch(
@@ -385,9 +449,21 @@ export interface SeedIdentitiesResult {
   alreadySeeded: boolean
   adminMemberId: string
   adminRawToken: string | null
+  /** sha256(rawToken).slice(0, 16) — IDENTICAL derivation to
+   *  `CredentialClaimHandle.fingerprint` (src/auth/credential-claim.ts), and in fact
+   *  always recoverable as `member_tokens.token_hash.slice(0, 16)` since token_hash IS
+   *  the full un-truncated sha256Hex(raw). Safe to write into the (parent-owned)
+   *  `pot_provision_receipts` ledger — it authenticates nothing, so recording it there
+   *  gives the parent a permanently queryable bootstrap record WITHOUT granting the
+   *  parent any standing on the child pot's own credential plane (see
+   *  docs/workflows/tenant-provision.md, "the provisioner's authority ends at the
+   *  handover"). Populated on BOTH a fresh seed and an `alreadySeeded` retry (the retry
+   *  path reads the stored `token_hash` back rather than needing the raw value again). */
+  adminTokenFingerprint: string | null
   leadAgentId: string
   leadAgentMemberId: string
   leadAgentRawToken: string | null
+  leadAgentTokenFingerprint: string | null
   detail?: string
 }
 
@@ -426,14 +502,39 @@ export async function seedPotIdentities(
       [`${input.slug}-bot`],
     )
     const existingAgent = agentRows[0]?.results?.[0] as { id?: string } | undefined
+
+    // Fingerprints are recoverable from the STORED hash — no raw value needed, and none
+    // exists to recover (sha256Hex is one-way by design). Missing rows (e.g. a schema
+    // that predates the seed-seat token) fingerprint as null rather than throwing.
+    const adminTokenRows = await executeD1Query(
+      cf,
+      databaseId,
+      "SELECT token_hash FROM member_tokens WHERE member_id = ?1 AND label = 'admin' ORDER BY created_at DESC LIMIT 1",
+      [existingAdmin.id],
+    )
+    const adminTokenHash = (adminTokenRows[0]?.results?.[0] as { token_hash?: string } | undefined)?.token_hash ?? null
+
+    let leadAgentTokenHash: string | null = null
+    if (existingAgent?.id) {
+      const leadAgentTokenRows = await executeD1Query(
+        cf,
+        databaseId,
+        "SELECT token_hash FROM member_tokens WHERE agent_id = ?1 AND label = 'seed-seat' ORDER BY created_at DESC LIMIT 1",
+        [existingAgent.id],
+      )
+      leadAgentTokenHash = (leadAgentTokenRows[0]?.results?.[0] as { token_hash?: string } | undefined)?.token_hash ?? null
+    }
+
     return {
       ok: true,
       alreadySeeded: true,
       adminMemberId: existingAdmin.id,
       adminRawToken: null,
+      adminTokenFingerprint: adminTokenHash ? adminTokenHash.slice(0, 16) : null,
       leadAgentId: existingAgent?.id ?? '',
       leadAgentMemberId: '',
       leadAgentRawToken: null,
+      leadAgentTokenFingerprint: leadAgentTokenHash ? leadAgentTokenHash.slice(0, 16) : null,
       detail: `admin member already exists for ${input.adminEmail} — seeding skipped, no new tokens minted`,
     }
   }
@@ -502,9 +603,11 @@ export async function seedPotIdentities(
         alreadySeeded: false,
         adminMemberId,
         adminRawToken: null,
+        adminTokenFingerprint: null,
         leadAgentId,
         leadAgentMemberId,
         leadAgentRawToken: null,
+        leadAgentTokenFingerprint: null,
         detail: `seed statement ${i} (${steps[i].sql.slice(0, 40)}...) failed: ${errMsg(error)}`,
       }
     }
@@ -515,9 +618,11 @@ export async function seedPotIdentities(
     alreadySeeded: false,
     adminMemberId,
     adminRawToken,
+    adminTokenFingerprint: adminTokenHash.slice(0, 16),
     leadAgentId,
     leadAgentMemberId,
     leadAgentRawToken,
+    leadAgentTokenFingerprint: leadAgentTokenHash.slice(0, 16),
   }
 }
 
@@ -769,15 +874,14 @@ export async function provisionSovereignPot(
     `applied ${schemaResult.applied.length} file(s), skipped ${schemaResult.skipped.length} already-applied`,
   )
 
-  // 4. Deploy the tenant worker into the dispatch namespace.
-  const bundle = await loadPotWorkerBundle(env, workerJsCode ?? input.worker_js_code)
-  if (!bundle) {
-    const detail =
-      'no worker bundle available: POT_WORKER_BUNDLE_BUCKET has no object for the current ' +
-      'RELEASE_SHA and no worker_js_code was supplied — see docs/workflows/tenant-provision.md'
-    await recordStep('deploy_worker', false, detail)
-    return bail(`deploy_worker failed: ${detail}`)
+  // 4. Deploy the tenant worker into the dispatch namespace. Digest-verified (mupot#1507
+  // round 2 requirement 4) — see loadPotWorkerBundle's doc comment.
+  const bundleResult = await loadPotWorkerBundle(env, workerJsCode ?? input.worker_js_code)
+  if (!bundleResult.ok) {
+    await recordStep('deploy_worker', false, bundleResult.reason)
+    return bail(`deploy_worker failed: ${bundleResult.reason}`)
   }
+  const bundle = bundleResult.bundle
   try {
     await uploadUserWorkerToDispatch(cf, slug, bundle.code, {
       d1DatabaseId: d1.uuid,
@@ -791,7 +895,18 @@ export async function provisionSovereignPot(
     await recordStep('deploy_worker', false, errMsg(error))
     return bail(`deploy_worker failed: ${errMsg(error)}`)
   }
-  await recordStep('deploy_worker', true, `uploaded via ${bundle.source} bundle`)
+  // The receipt names the EXACT bytes deployed — source, digest, and (for R2) which
+  // published object — regardless of which source won, per requirement 4: "the
+  // worker_js_code fallback is digest-receipted too".
+  await recordStep(
+    'deploy_worker',
+    true,
+    JSON.stringify({
+      source: bundle.source,
+      sha256: bundle.sha256,
+      ...(bundle.r2ObjectKey ? { r2_object_key: bundle.r2ObjectKey } : {}),
+    }),
+  )
 
   // 5. Seed department/squad/admin member/lead agent, tokens hashed and persisted.
   let seed: SeedIdentitiesResult
@@ -810,12 +925,21 @@ export async function provisionSovereignPot(
     await recordStep('seed_identities', false, seed.detail ?? 'unknown seed failure')
     return bail(`seed_identities failed: ${seed.detail ?? 'unknown seed failure'}`)
   }
+  // Structured, not prose — this is what makes the bootstrap QUERYABLE from the parent
+  // (mupot#1507 round-2 requirement 1): admin_member_id and both fingerprints, never a
+  // raw token or a live claim. json_extract() can pull this back out of the TEXT column
+  // like every other JSON-shaped receipt detail in this schema.
   await recordStep(
     'seed_identities',
     true,
-    seed.alreadySeeded
-      ? (seed.detail ?? 'already seeded')
-      : `seeded admin ${seed.adminMemberId}, lead agent ${seed.leadAgentId}`,
+    JSON.stringify({
+      already_seeded: seed.alreadySeeded,
+      admin_member_id: seed.adminMemberId,
+      admin_token_fingerprint: seed.adminTokenFingerprint,
+      lead_agent_id: seed.leadAgentId,
+      lead_agent_member_id: seed.leadAgentMemberId || null,
+      lead_agent_token_fingerprint: seed.leadAgentTokenFingerprint,
+    }),
   )
 
   // 6. Verify reachability through the real dispatch path BEFORE claiming success.

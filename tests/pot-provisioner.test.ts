@@ -302,32 +302,66 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
     })
   })
 
-  describe('loadPotWorkerBundle (requirement 3: bundle source trade-off)', () => {
-    it('prefers the R2-published bundle for the current RELEASE_SHA when present', async () => {
-      const bucket = { get: vi.fn().mockResolvedValue({ text: async () => '// r2 bundle' }) }
+  describe('loadPotWorkerBundle (requirement 3: bundle source trade-off; requirement 4: digest verification)', () => {
+    async function sha256(text: string): Promise<string> {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+    }
+
+    it('prefers the R2-published bundle when its recorded digest matches the bytes read back', async () => {
+      const code = '// r2 bundle'
+      const digest = await sha256(code)
+      const bucket = { get: vi.fn().mockResolvedValue({ text: async () => code, customMetadata: { sha256: digest } }) }
       const env = { RELEASE_SHA: 'sha123', POT_WORKER_BUNDLE_BUCKET: bucket } as unknown as Env
-      const bundle = await loadPotWorkerBundle(env, '// explicit bundle')
-      expect(bundle).toEqual({ code: '// r2 bundle', source: 'r2' })
+      const result = await loadPotWorkerBundle(env, '// explicit bundle')
+      expect(result).toEqual({ ok: true, bundle: { code, source: 'r2', sha256: digest, r2ObjectKey: 'sha123/worker.js' } })
       expect(bucket.get).toHaveBeenCalledWith('sha123/worker.js')
     })
 
-    it('falls back to the explicit bundle when R2 has no object for this RELEASE_SHA', async () => {
+    it('FAILS CLOSED (never falls back) when the R2 object digest does not match its own recorded metadata', async () => {
+      const bucket = {
+        get: vi.fn().mockResolvedValue({ text: async () => '// tampered or corrupted bytes', customMetadata: { sha256: 'deadbeef'.repeat(8) } }),
+      }
+      const env = { RELEASE_SHA: 'sha123', POT_WORKER_BUNDLE_BUCKET: bucket } as unknown as Env
+      const result = await loadPotWorkerBundle(env, '// explicit bundle')
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure')
+      expect(result.reason).toContain('digest mismatch')
+      expect(result.reason).toContain('sha123/worker.js')
+    })
+
+    it('FAILS CLOSED when the R2 object carries no recorded digest at all — an unpinned artifact is never silently trusted', async () => {
+      const bucket = { get: vi.fn().mockResolvedValue({ text: async () => '// unsigned bundle', customMetadata: {} }) }
+      const env = { RELEASE_SHA: 'sha123', POT_WORKER_BUNDLE_BUCKET: bucket } as unknown as Env
+      const result = await loadPotWorkerBundle(env, '// explicit bundle')
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure')
+      expect(result.reason).toContain('no')
+      expect(result.reason).toContain('sha256')
+      expect(result.reason).toContain('custom')
+    })
+
+    it('falls back to the explicit bundle (digest-receipted) when R2 has no object for this RELEASE_SHA', async () => {
       const bucket = { get: vi.fn().mockResolvedValue(null) }
       const env = { RELEASE_SHA: 'sha123', POT_WORKER_BUNDLE_BUCKET: bucket } as unknown as Env
-      const bundle = await loadPotWorkerBundle(env, '// explicit bundle')
-      expect(bundle).toEqual({ code: '// explicit bundle', source: 'explicit' })
+      const code = '// explicit bundle'
+      const result = await loadPotWorkerBundle(env, code)
+      expect(result).toEqual({ ok: true, bundle: { code, source: 'explicit', sha256: await sha256(code) } })
     })
 
     it('falls back to the explicit bundle when no bucket binding is configured at all', async () => {
       const env = {} as unknown as Env
-      const bundle = await loadPotWorkerBundle(env, '// explicit bundle')
-      expect(bundle).toEqual({ code: '// explicit bundle', source: 'explicit' })
+      const code = '// explicit bundle'
+      const result = await loadPotWorkerBundle(env, code)
+      expect(result).toEqual({ ok: true, bundle: { code, source: 'explicit', sha256: await sha256(code) } })
     })
 
-    it('returns null (hard, named failure) when neither source has a bundle', async () => {
+    it('is a hard, named failure when neither source has a bundle', async () => {
       const env = {} as unknown as Env
-      const bundle = await loadPotWorkerBundle(env, undefined)
-      expect(bundle).toBeNull()
+      const result = await loadPotWorkerBundle(env, undefined)
+      expect(result.ok).toBe(false)
+      if (result.ok) throw new Error('expected failure')
+      expect(result.reason).toContain('no worker bundle available')
     })
   })
 
@@ -359,7 +393,9 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
       expect(inserted.some((sql) => sql.includes('member_tokens'))).toBe(true)
     })
 
-    it('is idempotent on admin email — a retry against an already-seeded pot mints no new tokens', async () => {
+    it('is idempotent on admin email — a retry against an already-seeded pot mints no new tokens, and returns the existing fingerprints', async () => {
+      const adminTokenHash = 'a'.repeat(64)
+      const leadAgentTokenHash = 'b'.repeat(64)
       global.fetch = vi.fn().mockImplementation(async (url: string, init: RequestInit) => {
         const body = JSON.parse(init.body as string)
         if (/SELECT id FROM members WHERE email/.test(body.sql)) {
@@ -367,6 +403,13 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
         }
         if (/SELECT id FROM agents WHERE slug/.test(body.sql)) {
           return { status: 200, json: async () => ({ success: true, result: [{ results: [{ id: 'existing-agent-id' }] }] }) }
+        }
+        // Fingerprint reads (requirement 1) — pure SELECTs on the stored hash, never the raw.
+        if (/SELECT token_hash FROM member_tokens WHERE member_id/.test(body.sql)) {
+          return { status: 200, json: async () => ({ success: true, result: [{ results: [{ token_hash: adminTokenHash }] }] }) }
+        }
+        if (/SELECT token_hash FROM member_tokens WHERE agent_id/.test(body.sql)) {
+          return { status: 200, json: async () => ({ success: true, result: [{ results: [{ token_hash: leadAgentTokenHash }] }] }) }
         }
         throw new Error('unexpected write during an already-seeded retry: ' + body.sql)
       })
@@ -381,6 +424,10 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
       expect(result.leadAgentId).toBe('existing-agent-id')
       expect(result.adminRawToken).toBeNull()
       expect(result.leadAgentRawToken).toBeNull()
+      // The fingerprint is recoverable from the STORED hash alone — no raw value ever
+      // touched again — and is exactly the hash's own first 16 hex chars.
+      expect(result.adminTokenFingerprint).toBe(adminTokenHash.slice(0, 16))
+      expect(result.leadAgentTokenFingerprint).toBe(leadAgentTokenHash.slice(0, 16))
     })
 
     it('fails closed and names the failing statement when an insert fails', async () => {
@@ -492,6 +539,27 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
       expect(rows.map((r) => r.step)).toEqual(['create_d1', 'create_kv', 'apply_schema', 'deploy_worker', 'seed_identities', 'verify_reachable'])
       expect(rows.every((r) => r.ok === 1)).toBe(true)
       expect(result.receipts).toHaveLength(6)
+
+      // requirement 1 (round 2): the seed_identities receipt is QUERYABLE from the
+      // parent — admin member id + fingerprint, never a raw token or a live claim.
+      const seedReceipt = rows.find((r) => r.step === 'seed_identities')
+      const seedDetail = JSON.parse(seedReceipt!.detail!)
+      expect(seedDetail.admin_member_id).toBe(result.admin_member_id)
+      expect(seedDetail.admin_token_fingerprint).toMatch(/^[0-9a-f]{16}$/)
+      expect(seedDetail.lead_agent_id).toBe(result.lead_agent_id)
+      expect(seedDetail.lead_agent_token_fingerprint).toMatch(/^[0-9a-f]{16}$/)
+      expect(seedDetail).not.toHaveProperty('admin_raw_token')
+      expect(JSON.stringify(seedDetail)).not.toContain('pot_adm_')
+      expect(JSON.stringify(seedDetail)).not.toContain('pot_agt_')
+      // The fingerprint matches the actual claim's own fingerprint (same derivation,
+      // sha256(raw).slice(0,16) — see src/auth/credential-claim.ts).
+      expect(seedDetail.admin_token_fingerprint).toBe(result.admin_credential_claim?.fingerprint)
+
+      // requirement 4 (round 2): the deploy_worker receipt names the exact bytes deployed.
+      const deployReceipt = rows.find((r) => r.step === 'deploy_worker')
+      const deployDetail = JSON.parse(deployReceipt!.detail!)
+      expect(deployDetail.source).toBe('explicit')
+      expect(deployDetail.sha256).toMatch(/^[0-9a-f]{64}$/)
     })
 
     it('adopt-orphans path: reuses the named D1/KV instead of creating duplicates (mupot#1285 comment 2026-09-22)', async () => {
@@ -625,52 +693,118 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285 completion)', () => {
       expect(reach?.detail).toContain('502')
     })
 
-    it('a retry after seeding already ran does not mint a second admin — idempotent seed_identities', async () => {
+    it('idempotency (mupot#1507 round 2, requirement 3): retry ADOPTS the same D1/KV (not a canned id), mints NO second admin/lead-agent/claim, returns the EXISTING admin reference', async () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
-      const seedState = { seeded: false, adminId: '', agentId: '', membersInsertCount: 0 }
-      const { fetchMock } = createFakeCf({
-        queryOverride: (sql, params) => {
-          if (/SELECT id FROM members WHERE email/.test(sql)) {
-            return seedState.seeded
-              ? { success: true, result: [{ results: [{ id: seedState.adminId }] }] }
-              : { success: true, result: [{ results: [] }] }
+
+      // A STATEFUL fake — D1/KV created on the FIRST call must be found BY NAME on the
+      // SECOND. A fake that just returns the same canned id on every create call (the
+      // simpler `createFakeCf` helper used elsewhere in this file) cannot distinguish
+      // "genuinely adopted by name" from "created twice, coincidentally same id" — this
+      // test exists specifically to close that gap.
+      const d1ByName = new Map<string, { uuid: string; name: string }>()
+      const kvByTitle = new Map<string, { id: string; title: string }>()
+      let d1CreateCalls = 0
+      let kvCreateCalls = 0
+      const seedState = {
+        seeded: false, adminId: '', agentId: '', membersInsertCount: 0,
+        adminTokenHash: '', leadAgentTokenHash: '',
+      }
+
+      const fetchMock = vi.fn(async (url: string, init: RequestInit = {}) => {
+        const method = init.method || 'GET'
+        if (method === 'GET' && url.includes('/d1/database?')) {
+          const name = new URL(url).searchParams.get('name') || ''
+          const found = d1ByName.get(name)
+          return { status: 200, json: async () => ({ success: true, result: found ? [found] : [] }) }
+        }
+        if (method === 'POST' && /\/d1\/database$/.test(url)) {
+          d1CreateCalls += 1
+          const body = JSON.parse(init.body as string)
+          const entry = { uuid: `d1-${body.name}`, name: body.name }
+          d1ByName.set(body.name, entry)
+          return { status: 200, json: async () => ({ success: true, result: entry }) }
+        }
+        if (method === 'GET' && url.includes('/storage/kv/namespaces?')) {
+          const page = Number(new URL(url).searchParams.get('page') || '1')
+          return { status: 200, json: async () => ({ success: true, result: page === 1 ? Array.from(kvByTitle.values()) : [] }) }
+        }
+        if (method === 'POST' && url.includes('/storage/kv/namespaces')) {
+          kvCreateCalls += 1
+          const body = JSON.parse(init.body as string)
+          const entry = { id: `kv-${body.title}`, title: body.title }
+          kvByTitle.set(body.title, entry)
+          return { status: 200, json: async () => ({ success: true, result: entry }) }
+        }
+        if (method === 'PUT' && url.includes('/workers/dispatch/namespaces')) {
+          return { status: 200, json: async () => ({ success: true, result: { id: 'deployed' } }) }
+        }
+        if (method === 'POST' && /\/d1\/database\/[^/]+\/query$/.test(url)) {
+          const body = JSON.parse(init.body as string)
+          if (/^SELECT file, sha256, splitter_version, status FROM pot_schema_applied/.test(body.sql)) {
+            return { status: 200, json: async () => ({ success: false, errors: [{ message: 'D1_ERROR: no such table: pot_schema_applied' }] }) }
           }
-          if (/SELECT id FROM agents WHERE slug/.test(sql)) {
-            return { success: true, result: [{ results: seedState.seeded ? [{ id: seedState.agentId }] : [] }] }
+          if (/SELECT id FROM members WHERE email/.test(body.sql)) {
+            return { status: 200, json: async () => ({ success: true, result: [{ results: seedState.seeded ? [{ id: seedState.adminId }] : [] }] }) }
           }
-          // seedPotIdentities's OWN inserts use positional `?1` placeholders (real
-          // parameterized queries); the schema chain's static seed data (e.g. the
-          // "INSERT INTO memberships ..." backfills, the default "river-*" agents) is
-          // baked-in literal SQL with no placeholders at all — `?1` is what tells them
-          // apart. A bare `/INSERT INTO members/` regex would also match
-          // "INSERT INTO memberships" (prefix collision) and every schema-seeded agent row.
-          if (/^INSERT INTO members\b.*VALUES \(\?1/.test(sql) && !seedState.seeded) {
+          if (/SELECT id FROM agents WHERE slug/.test(body.sql)) {
+            return { status: 200, json: async () => ({ success: true, result: [{ results: seedState.seeded ? [{ id: seedState.agentId }] : [] }] }) }
+          }
+          if (/SELECT token_hash FROM member_tokens WHERE member_id/.test(body.sql)) {
+            return { status: 200, json: async () => ({ success: true, result: [{ results: [{ token_hash: seedState.adminTokenHash }] }] }) }
+          }
+          if (/SELECT token_hash FROM member_tokens WHERE agent_id/.test(body.sql)) {
+            return { status: 200, json: async () => ({ success: true, result: [{ results: [{ token_hash: seedState.leadAgentTokenHash }] }] }) }
+          }
+          const params: unknown[] = body.params ?? []
+          if (/^INSERT INTO members\b.*VALUES \(\?1/.test(body.sql) && !seedState.seeded) {
             seedState.membersInsertCount += 1
             if (seedState.membersInsertCount === 1) seedState.adminId = String(params[0])
           }
-          if (/^INSERT INTO agents\b.*VALUES \(\?1/.test(sql) && !seedState.seeded) {
+          if (/^INSERT INTO agents\b.*VALUES \(\?1/.test(body.sql) && !seedState.seeded) {
             seedState.agentId = String(params[0])
           }
-          return undefined
-        },
+          // member_tokens: admin's insert has 7 columns (no agent_id), lead agent's has 8.
+          if (/^INSERT INTO member_tokens \(id, member_id, token_hash,/.test(body.sql) && !seedState.seeded) {
+            seedState.adminTokenHash = String(params[2])
+          }
+          if (/^INSERT INTO member_tokens \(id, member_id, agent_id, token_hash,/.test(body.sql) && !seedState.seeded) {
+            seedState.leadAgentTokenHash = String(params[3])
+          }
+          return { status: 200, json: async () => ({ success: true, result: [{ results: [], success: true }] }) }
+        }
+        return { status: 404, json: async () => ({ success: false, errors: [{ message: 'unhandled mock route: ' + url }] }) }
       })
+
       global.fetch = fetchMock as any
       const env = makeEnv({ harnessDb: harness.db, DISPATCHER: fakeDispatcher({ status: 200 }) as any })
+      const input = { slug: 'idem2', brand_name: 'Idem Co', admin_email: 'admin@idem2.test', minted_by_member_id: 'admin-mem-id' }
 
-      const first = await provisionSovereignPot(
-        env, { slug: 'retryme', brand_name: 'Retry Co', admin_email: 'admin@retryme.test' }, '// worker bundle',
-      )
+      const first = await provisionSovereignPot(env, input, '// worker bundle')
       expect(first.ok).toBe(true)
-      seedState.seeded = true
+      expect(first.admin_credential_claim).not.toBeNull()
+      const sessionsPutCallsAfterFirst = (env.SESSIONS as unknown as { put: { mock: { calls: unknown[] } } }).put.mock.calls.length
+      expect(sessionsPutCallsAfterFirst).toBeGreaterThan(0)
 
-      const second = await provisionSovereignPot(
-        env, { slug: 'retryme', brand_name: 'Retry Co', admin_email: 'admin@retryme.test' }, '// worker bundle',
-      )
+      seedState.seeded = true // simulates a genuinely already-seeded pot on retry
+
+      const second = await provisionSovereignPot(env, input, '// worker bundle')
+
       expect(second.ok).toBe(true)
+      // Adopts — one create call total across BOTH calls, not one per call.
+      expect(d1CreateCalls).toBe(1)
+      expect(kvCreateCalls).toBe(1)
+      expect(second.d1_database_id).toBe(first.d1_database_id)
+      expect(second.kv_namespace_id).toBe(first.kv_namespace_id)
+      // No second admin, no second lead agent — the EXISTING references come back.
       expect(second.admin_member_id).toBe(first.admin_member_id)
+      expect(second.lead_agent_id).toBe(first.lead_agent_id)
+      expect(seedState.membersInsertCount).toBe(2) // admin + lead-agent-home-member, ONCE
+      // No second claim minted — nothing new to redeem on an already-seeded retry.
+      expect(second.admin_credential_claim).toBeNull()
+      expect(second.lead_agent_credential_claim).toBeNull()
       expect(second.admin_token).toBeNull()
-      expect(second.admin_credential_claim).toBeNull() // nothing new to claim on an already-seeded retry
+      expect((env.SESSIONS as unknown as { put: { mock: { calls: unknown[] } } }).put.mock.calls.length).toBe(sessionsPutCallsAfterFirst)
     })
 
     it('the two-argument form production actually calls reports incomplete and names the orphans', async () => {
