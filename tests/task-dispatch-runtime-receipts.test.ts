@@ -1943,4 +1943,31 @@ describe('task_update refuses reassignment while a dispatch is in flight (mupot#
       fixture.harness.close()
     }
   })
+
+  // The guard lives ONLY inside the `assignee_agent_id !== undefined` branch — a STATUS
+  // change (completion, landing, blocking) that never touches assignee_agent_id at all must
+  // never be gated on dispatch flight-state. Regression coverage for the CI failure on
+  // tests/mcp-flight-tools.test.ts's "re-authenticates the same Product bearer through
+  // assignment, dispatch, read, task completion, and landing": that failure was NOT this
+  // guard misfiring on a status change (it never even reaches this code path for one) — it
+  // was a hand-rolled fixture missing the task_dispatch_receipts/task_dispatch_runtime_
+  // receipts TABLES the guard's query references, on the earlier ASSIGNMENT call, which
+  // threw `internal_error` (500) rather than the intended 409. Fixed by adding the (empty)
+  // tables to that fixture. This test independently proves the guard's own SCOPE is
+  // correct: a pure status transition sails through mid-flight; only a REAL
+  // assignee_agent_id change is gated.
+  it('a pure STATUS change (no assignee_agent_id in the call at all) is never blocked, even mid-flight — completion/landing must not be gated on dispatch state', async () => {
+    const fixture = runtimeFixture()
+    try {
+      const res = await invokeTool(fixture.gateAuth, fixture.env, 'task_update', {
+        task_id: TASK_ID, status: 'in_progress', note: 'operator lands/starts without touching assignment',
+      }, 'https://pot.test')
+      expect(res.ok).toBe(true)
+
+      const row = fixture.harness.sqlite.prepare('SELECT assignee_agent_id, status FROM tasks WHERE id = ?').get(TASK_ID) as { assignee_agent_id: string; status: string }
+      expect(row).toEqual({ assignee_agent_id: AGENT_ID, status: 'in_progress' }) // assignee untouched, status changed
+    } finally {
+      fixture.harness.close()
+    }
+  })
 })

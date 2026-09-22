@@ -1301,6 +1301,21 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           delivered_at TEXT, consumed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
           UNIQUE (tenant, flight_id, event_type)
         );
+        -- mupot#1494 round 3 (P2-5) — task_update's reassignment guard
+        -- (hasInFlightDispatchReceipt, src/tasks/runtime-receipts.ts) queries these two
+        -- tables unconditionally on every assignee_agent_id change; this fixture never
+        -- seeds a row in either (no test here ever dispatches task-m000), so both stay
+        -- empty and the guard's own query correctly finds nothing "in flight" — but the
+        -- TABLES themselves must exist or the query throws (a real column addition to
+        -- shared production tables silently 500ing every hand-rolled fixture that never
+        -- expected to need them is exactly the failure mode
+        -- scripts/check-test-schema-source.mjs exists to catch).
+        CREATE TABLE task_dispatch_receipts (
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, task_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE task_dispatch_runtime_receipts (
+          tenant TEXT NOT NULL, dispatch_receipt_id TEXT NOT NULL, stage TEXT NOT NULL
+        );
 
         INSERT INTO departments VALUES ('dept-home', 'home', 'Home');
         INSERT INTO departments VALUES ('dept-other', 'other', 'Other');
