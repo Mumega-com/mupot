@@ -37,9 +37,9 @@ export interface SovereignPotProvisionInput {
    *  leaves in self-serve checkout, tracked separately from #1285. */
   minted_by_member_id?: string
   /** The interactive caller's own tenant (`auth.tenant`) — recorded on every
-   *  `pot_provision_receipts` row this call writes (`actor_tenant`, migration 0164) and
+   *  `pot_provision_receipts` row this call writes (`actor_tenant`, migration 0169) and
    *  used to derive/verify `provisioner_tenant` on the `pots` registry row (migration
-   *  0167). Independent of `minted_by_member_id`: even a caller with no interactive member
+   *  0170). Independent of `minted_by_member_id`: even a caller with no interactive member
    *  identity still has a tenant. */
   caller_tenant?: string
   /** Set ONLY by `src/pots/checkout.ts`'s Stripe self-serve path — the completed Checkout
@@ -91,7 +91,7 @@ export interface OrphanedResources {
   kv_adopted: boolean
 }
 
-/** One step's outcome, exactly as written to `pot_provision_receipts` (migration 0164). */
+/** One step's outcome, exactly as written to `pot_provision_receipts` (migration 0169). */
 export interface ProvisionStepReceipt {
   step: ProvisionStep
   ok: boolean
@@ -110,7 +110,7 @@ export interface SovereignPotProvisionResult {
   orphaned_resources: OrphanedResources | null
   /** Why it stopped, in words an operator can act on. */
   incomplete_reason: string | null
-  /** Groups this call's `pot_provision_receipts` rows (migration 0164). */
+  /** Groups this call's `pot_provision_receipts` rows (migration 0169). */
   run_id: string
   /** Every step's receipt, in the order it was attempted — mirrors what was written to
    *  `pot_provision_receipts`, so a caller doesn't have to query the ledger separately

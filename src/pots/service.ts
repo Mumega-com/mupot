@@ -4,7 +4,7 @@
 // never wrote anywhere, and return `ok:true` — a success-shaped response for a tenant that
 // could not be reached, logged into, or queried (no schema). This file is the completion:
 // every step below is actually attempted, in order, fail-closed on the first failure, with
-// a receipt written for each one (`pot_provision_receipts`, migration 0164) and returned in
+// a receipt written for each one (`pot_provision_receipts`, migration 0169) and returned in
 // the response so a caller does not have to query the ledger separately to know what
 // happened on THIS call. `ok` is true if and only if every step below ran and the tenant
 // answered `/health` through the real dispatch path.
@@ -906,10 +906,10 @@ export async function verifyPotReachable(
  * both success and failure (mupot#1507-v2 P0-B, Athena's binding addition 1: "the receipt
  * table's CHECK and every writer are ONE review unit"). Before this, only three of six
  * steps' SUCCESS paths wrote JSON; every FAILURE path across all six wrote plain prose
- * instead — which the round-2 version of migration 0164's CHECK (`json_valid(detail)`
+ * instead — which the round-2 version of migration 0169's CHECK (`json_valid(detail)`
  * required for exactly those three steps) then REJECTED outright for the ones it covered,
  * and `writeProvisionReceipt`'s swallowed catch turned that rejection into a step that ran,
- * failed, and left NO receipt at all. Migration 0164 (this branch, rewritten in place) now
+ * failed, and left NO receipt at all. Migration 0169 (this branch, rewritten in place) now
  * requires `json_valid(detail)` for EVERY step, and `receiptOk`/`receiptError` are the only
  * two functions that build a `detail` value anywhere in this file — one call site's shape
  * is every call site's shape, by construction, not by convention.
@@ -953,7 +953,7 @@ export function receiptError(errorClass: string, message: string, extraFields: R
   return JSON.stringify({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...extraFields })
 }
 
-/** Appends one row to `pot_provision_receipts` (migration 0164) on the ORCHESTRATOR's own
+/** Appends one row to `pot_provision_receipts` (migration 0169) on the ORCHESTRATOR's own
  *  D1 (`env.DB` — the same database that carries `pots`, migration 0145), never the
  *  tenant's new pot D1. Returns whether the write actually landed.
  *
@@ -1227,8 +1227,8 @@ export async function provisionSovereignPot(
 
   // 0. Registry gate — BEFORE any Cloudflare call (mupot#1507 round-2 P0-4, Athena
   // condition i; ownership check corrected mupot#1507-v2 P0-C). `pots` (migration 0145)
-  // plus its `provisioner_member_id`/`provisioner_tenant` (migration 0167) and
-  // `checkout_session_id` (migration 0167, added mupot#1507-v2) columns is the
+  // plus its `provisioner_member_id`/`provisioner_tenant` (migration 0170) and
+  // `checkout_session_id` (migration 0170, added mupot#1507-v2) columns is the
   // account-wide ownership record: a slug already claimed by a DIFFERENT owner is refused
   // outright, never silently adopted. A brand-new slug is claimed HERE, before create_d1
   // — the INSERT's own UNIQUE(slug) constraint is the concurrency guard: if two calls race

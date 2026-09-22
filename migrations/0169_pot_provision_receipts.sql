@@ -1,4 +1,4 @@
--- 0164_pot_provision_receipts.sql — a receipt trail for provisionSovereignPot
+-- 0169_pot_provision_receipts.sql — a receipt trail for provisionSovereignPot
 -- (mupot#1285). One row per STEP attempted for one provisioning call, written
 -- into the ORCHESTRATOR's own D1 (the same D1 that carries `pots`, migration
 -- 0145) — not the tenant's own new D1, which gets the full schema chain

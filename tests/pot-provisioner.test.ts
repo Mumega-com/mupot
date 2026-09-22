@@ -731,7 +731,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
 
     for (const step of ALL_STEPS) {
       for (const ok of [true, false]) {
-        it(`step=${step} ok=${ok}: the built detail is accepted by the REAL 0164 CHECK constraint`, async () => {
+        it(`step=${step} ok=${ok}: the built detail is accepted by the REAL 0169 CHECK constraint`, async () => {
           const harness = createSqliteD1()
           applyAllMigrations(harness.sqlite)
           const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env

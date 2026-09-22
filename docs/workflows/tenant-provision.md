@@ -29,7 +29,7 @@ exactly where it stopped — every time, not just on the happy path.
 `ok` is `true` **only** when all six steps ran to completion, in order, and step 6 answered
 `200`. Any failure returns `status: 'incomplete'` with `completed` / `not_completed` /
 `orphaned_resources` naming exactly what happened, and a `pot_provision_receipts` row
-(migration `0164`, on the ORCHESTRATOR's own D1 — not the tenant's) per step, grouped by
+(migration `0169`, on the ORCHESTRATOR's own D1 — not the tenant's) per step, grouped by
 `run_id`. The in-call response's `receipts` array mirrors those rows, so a caller does not
 need to query the ledger separately.
 
@@ -208,7 +208,7 @@ Four load-bearing semantics changed as a result:
   registry write is still `ok: false` (see the code comment on that specific edge case;
   it is the one place `not_completed` can read `[]` under `status: 'incomplete'`).
 - **Adoption rule.** A slug is claimed in the `pots` registry (`provisioner_member_id` +
-  `provisioner_tenant`, migration 0167) BEFORE any Cloudflare call. Reuse-by-name is
+  `provisioner_tenant`, migration 0170) BEFORE any Cloudflare call. Reuse-by-name is
   allowed ONLY when the caller matches that claim; anyone else gets `pot_slug_taken`
   (409) with zero CF calls made, even if the D1/KV/worker CF resources for that slug
   already exist under a different provisioner.
@@ -246,7 +246,7 @@ match what was actually deployed (P1-1); an R2 read failure is a hard failure, n
 fallback (P1-2); the reserved-slug refusal and the no-claim-without-a-minter rule are both
 pinned by dedicated tests at the `provisionSovereignPot` entry (P1-3, "M5"/"M8").
 
-**P2 (all addressed):** receipts carry `actor_member_id`/`actor_tenant` (migration 0164);
+**P2 (all addressed):** receipts carry `actor_member_id`/`actor_tenant` (migration 0169);
 a database `CHECK` constraint refuses any receipt `detail` containing `@` and requires
 valid JSON for the three structured steps — enforced by SQLite itself, not just
 application code (verified empirically against a real engine); `verify_reachable`'s
@@ -292,7 +292,7 @@ params with a multi-statement body (D1's per-statement binding semantics for tha
 combination are undocumented, so this codebase never relies on them either).
 
 **P0-B — the receipt ledger's own CHECK constraint was rejecting the receipts it was
-supposed to record.** Migration 0164's round-2 CHECK required `json_valid(detail)` for only
+supposed to record.** Migration 0169's round-2 CHECK required `json_valid(detail)` for only
 three of the six steps and separately refused ANY `'@'` character in `detail` regardless of
 context. Every FAILURE path across all six steps wrote plain prose — which the three-step
 JSON rule then rejected outright for the steps it covered, and the blanket `'@'` rule
@@ -318,7 +318,7 @@ interactive member at checkout time), so ownership of a self-serve `pots` row ma
 `null` on both sides when `TENANT_SLUG` was unset). A second self-serve call for the same
 slug — a retry, a different customer, an attacker — could silently adopt whatever the first
 call claimed, redeploying over a live customer's pot and handing the caller back the
-victim's own admin identity references. **Fix:** migration 0167 (still branch-only, rewritten
+victim's own admin identity references. **Fix:** migration 0170 (still branch-only, rewritten
 in place) adds `pots.checkout_session_id`. `checkout.ts` passes the completed Stripe
 Checkout Session's own `id` through to `provisionSovereignPot` as `checkout_session_id`;
 the registry gate now requires an EXACT session-id match to adopt a row that carries one —
@@ -374,11 +374,14 @@ schema climbs.
   session never calls the live CF API, so the refusal text and the one-call-one-batch
   atomicity claim are verified against documentation and a faithful test double, not a real
   D1 database.
-- Renumber migrations `0164`/`0167` at actual merge/rebase time — `scripts/check-migration-
-  numbering.mjs` currently reports them "at or below" origin/main's head because main has
-  advanced (0165 landed) since this branch's base commit; this PR deliberately keeps both
-  numbers as-is per its own brief (a successor PR building on a frozen head, not yet
-  rebasing), the same way this exact branch's history already renumbered twice before for
-  the identical reason.
+- Nothing further to renumber for THIS PR: `0169`/`0170` were assigned after rebasing onto
+  `origin/main` (`585f26cf`, head migration `0165`), with `0166`/`0168` deliberately skipped
+  as reserved by sibling in-flight PRs (a bootstrap successor and a runners successor,
+  neither merged yet). `scripts/check-migration-numbering.mjs` passes clean at this head. If
+  either sibling merges first and claims a number this branch also touches before THIS
+  branch merges, the collision-and-renumber dance happens again — same as the two prior
+  renumbers in this branch's own history (`0163`→`0164`, `0165`→`0167`, and now this PR's
+  own `0164`→`0169`/`0167`→`0170`) — a migration number is provisional until merge, not
+  claimed at branch time.
 - Wire `pot_release`'s org:admin-only MCP tool into whatever admin dashboard surface lists
   provisioning attempts, so a human doesn't need raw MCP/SQL access to use it.
