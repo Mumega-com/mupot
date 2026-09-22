@@ -874,3 +874,60 @@ describe('authoritative inbox lease attempt reconciliation', () => {
     } finally { f.harness.close() }
   })
 })
+
+// mupot#1494 round 3 (P1-i) — `inbox`'s consuming UPDATE used to check ONLY `read_at IS
+// NULL`, never `lease_expires_at` — so a row currently held under a live lease (a real
+// `inbox_lease` hand-out, or the pair-settlement claim in src/tasks/runtime-receipts.ts) was
+// handed straight back out by `inbox`, double-processing the same dispatch. `inbox` and
+// `inbox_lease` must now agree on "currently available to hand out" via the SAME
+// `leaseAvailableClause`.
+describe('inbox honors a live lease exactly like inbox_lease (mupot#1494 round 3, P1-i)', () => {
+  it('a message currently held under a live inbox_lease is NOT handed out by the MCP inbox tool, addressed by its real uuid', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
+        INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+        VALUES ('tok-a', 'agent-member', 'tenant-a', '${'a'.repeat(64)}', 'agent-a', '', 'workspace', '${T0}');
+      `)
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+      }
+      // The real production shape: agent_messages.id is a uuid, not a friendly slug.
+      const uuid = 'a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6'
+      f.harness.sqlite.exec(`
+        INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('${uuid}', 'tenant-a', 'agent-a', 'sender', 'owner', 'request', 'work ${uuid}', '${T0}');
+      `)
+
+      // Real lease, real (current) clock — DEFAULT_LEASE_SECONDS is 5 minutes out, comfortably
+      // longer than this test takes to run, so no fake clock is needed for the live-lease half.
+      const leased = await leaseAgentInbox(f.env, { agent: 'agent-a' })
+      expect(leased).toMatchObject({ ok: true, messages: [{ id: uuid }] })
+
+      const res = await invokeTool(auth, f.env, 'inbox', {})
+      // `remaining` still counts it (it IS unread, just not currently hand-out-able) — only
+      // the returned `messages` page is affected by the lease clause.
+      expect(res).toMatchObject({ ok: true, result: { messages: [], remaining: 1 } })
+
+      // The row itself is untouched by inbox's attempt — still exactly the live lease
+      // inbox_lease stamped, not consumed (read_at still NULL).
+      const row = f.row(uuid)
+      expect(row.read_at).toBeNull()
+      expect(row.delivery_attempts).toBe(1)
+
+      // After the lease expires, `inbox` DOES pick it up (and consumes it) — the fix narrows
+      // the window, it does not wall the message off forever. Uses the service function
+      // directly with a clock advanced PAST the real lease's real expiry (the MCP tool always
+      // reads the real wall clock, so the lease above was stamped against real "now").
+      const pastExpiry = { now: () => new Date(Date.now() + (DEFAULT_LEASE_SECONDS + 5) * 1000).toISOString() }
+      const afterExpiry = await readAgentInbox(f.env, { agent: 'agent-a' }, pastExpiry)
+      expect(afterExpiry).toMatchObject({ ok: true, messages: [{ id: uuid }] })
+      expect(f.row(uuid).read_at).not.toBeNull()
+    } finally { f.harness.close() }
+  })
+})

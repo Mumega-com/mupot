@@ -18,6 +18,17 @@
 ALTER TABLE fleet_agents ADD COLUMN presence_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE fleet_agents ADD COLUMN presence_ttl_sec INTEGER;
 
+-- mupot#1494 round 3 (P2-a) — `squads` has two independent writers (reportFleetAgents, the
+-- daemon's bulk self-report; upsertPollFleetPresence, check_in(presence_mode:'poll')) that
+-- used to plainly overwrite each other's contribution on ON CONFLICT. This column tracks the
+-- POLL writer's own last contribution (its current home-squad slug, or NULL) SEPARATELY from
+-- the column both writers share, so each writer's ON CONFLICT can replace exactly its own
+-- portion and union in the other's, instead of either accumulating stale values forever or
+-- clobbering the other side's membership. Additive, nullable, no backfill: every existing row
+-- reads NULL (no poll contribution recorded), which both merge formulas already treat as
+-- "nothing to preserve/remove" — a resident-only row is unaffected.
+ALTER TABLE fleet_agents ADD COLUMN poll_home_squad_slug TEXT;
+
 -- Second half of #1494: task_dispatch's routing decision (src/bus/consumer.ts routeEvent,
 -- 'agent.wake' case) must "never silently" fall back to the in-Worker executor — record which
 -- route was actually taken, durably, on the SAME receipt row a caller/operator already reads

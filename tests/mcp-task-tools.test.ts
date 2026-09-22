@@ -1399,7 +1399,7 @@ describe('MCP task cutover tools', () => {
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1', delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).toMatchObject({ dispatched: true, delivery_forced_ignored: 'no_delivery_mode' })
+    expect(res.result).toMatchObject({ dispatched: true, delivery_forced_predicted: 'no_delivery_mode' })
     const payload = (events[0] as { payload: Record<string, unknown> }).payload
     expect(Object.prototype.hasOwnProperty.call(payload, 'delivery')).toBe(false)
   })

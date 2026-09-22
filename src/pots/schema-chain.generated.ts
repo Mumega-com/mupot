@@ -3002,10 +3002,11 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0163_fleet_agents_presence_mode.sql",
-    sha256: "986a870251c3aa699ed3c12177e0b107efe3182ddd5d8130b1208ce3292344ab",
+    sha256: "78bcf692b3dc532549eb8cd378db24411328d9120d35238f85ece3dd6fe7baeb",
     statements: [
       "-- 0163_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).\n--\n-- Additive only, no backfill: every existing row keeps presence_mode='' and\n-- presence_ttl_sec=NULL, so src/fleet/registry.ts's derivePresence keeps reading the ONE global\n-- presenceTtlSec(env) window for every row this migration doesn't touch — resident/signed-attach\n-- semantics are completely unchanged.\n--\n-- Why this is needed: a polling runner (cron, an external orchestrator, a laptop that wakes\n-- every N minutes — no resident heartbeat daemon) has no way to stay inside the global\n-- presence_ttl_sec window without polling far more often than its own cadence justifies, so\n-- task_dispatch's liveness check never saw it as live and it could never receive dispatched\n-- work (see the issue's \"Runner onboarding is not smooth\" report). check_in accepts\n-- presence_mode:'poll' + poll_interval_sec, computes a per-row TTL\n-- (max(180, 2*poll_interval_sec) — see pollPresenceTtlSec) and stores it here; last_reported_at\n-- is then refreshed on every subsequent authenticated call that agent makes\n-- (touchPollFleetPresence), so a faithfully-polling runner reads as continuously live on its\n-- own declared cadence.\nALTER TABLE fleet_agents ADD COLUMN presence_mode TEXT NOT NULL DEFAULT '';",
       "\nALTER TABLE fleet_agents ADD COLUMN presence_ttl_sec INTEGER;",
+      "\n\n-- mupot#1494 round 3 (P2-a) — `squads` has two independent writers (reportFleetAgents, the\n-- daemon's bulk self-report; upsertPollFleetPresence, check_in(presence_mode:'poll')) that\n-- used to plainly overwrite each other's contribution on ON CONFLICT. This column tracks the\n-- POLL writer's own last contribution (its current home-squad slug, or NULL) SEPARATELY from\n-- the column both writers share, so each writer's ON CONFLICT can replace exactly its own\n-- portion and union in the other's, instead of either accumulating stale values forever or\n-- clobbering the other side's membership. Additive, nullable, no backfill: every existing row\n-- reads NULL (no poll contribution recorded), which both merge formulas already treat as\n-- \"nothing to preserve/remove\" — a resident-only row is unaffected.\nALTER TABLE fleet_agents ADD COLUMN poll_home_squad_slug TEXT;",
       "\n\n-- Second half of #1494: task_dispatch's routing decision (src/bus/consumer.ts routeEvent,\n-- 'agent.wake' case) must \"never silently\" fall back to the in-Worker executor — record which\n-- route was actually taken, durably, on the SAME receipt row a caller/operator already reads\n-- for dispatch state. Additive, nullable, no backfill: a NULL here just means \"dispatched before\n-- this migration\" (or an event still mid-flight), not a distinct third route.\nALTER TABLE task_dispatch_receipts ADD COLUMN delivered_via TEXT\n  CHECK (delivered_via IS NULL OR delivered_via IN ('inbox', 'in_worker'));",
     ],
     objects: [],
@@ -3095,4 +3096,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "7e4c823484a7beb8e56aed25c0a895bcc0c3951c400e265997cd9ad7c95e7f1c"
+export const SCHEMA_CHAIN_DIGEST: string = "2768b6ba684c89808637a042869364bc61a44c889776f96749e234f7063db116"

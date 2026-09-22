@@ -3,7 +3,7 @@ import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
 import { dispatchInboxRequestId } from '../bus/fleet-bridge'
-import { MAX_LEASE_SECONDS } from '../agents/messages'
+import { MAX_LEASE_SECONDS, bearerFencePredicate } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
@@ -304,15 +304,43 @@ async function resolveMessageId(
  * blocks exactly that redelivery for its window (mirrors — not exceeds — the crash-recovery
  * property every resident lease already has: an abandoned settlement eventually becomes
  * re-leasable again, by design, the same as an abandoned resident lease does).
+ *
+ * mupot#1494 round 3 (P0, Athena's structural ruling) — the OWNERSHIP predicate (the claimed
+ * message must belong to a dispatch whose `agent_id` AND the task's `assignee_agent_id` both
+ * equal the CALLER's own agent id), the caller's own `active` status, and the SAME bearer
+ * fence `leaseAgentInbox` enforces are now all INSIDE this one UPDATE's WHERE — not a
+ * check-then-write. Round 2 called this function unconditionally once the token check passed,
+ * relying ENTIRELY on `loadDelivery`'s later JOIN + the ownership check just after it to
+ * refuse a mismatched caller — but by then the write had already landed on the VICTIM's row
+ * (delivery_attempts 0->1, a live 1h lease), stranding the victim's own inbox_lease for the
+ * window and permanently desynchronising its attempt counter. Embedding the predicate in the
+ * WHERE makes a non-owner's (or inactive, or fenced-out) claim change ZERO rows atomically —
+ * no side effect ever lands, regardless of what happens next in `recordTaskDispatchRuntimeReceipt`.
  */
-async function claimUnleasedForPairSettlement(env: Env, messageId: string): Promise<boolean> {
+async function claimUnleasedForPairSettlement(
+  env: Env,
+  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string },
+): Promise<boolean> {
   const leaseExpiresAt = new Date(Date.now() + MAX_LEASE_SECONDS * 1000).toISOString()
   const result = await env.DB.prepare(`
     UPDATE agent_messages
        SET delivery_attempts = 1, lease_expires_at = ?3
      WHERE tenant = ?1 AND id = ?2
        AND delivery_attempts = 0 AND lease_expires_at IS NULL AND read_at IS NULL AND dead_lettered_at IS NULL
-  `).bind(env.TENANT_SLUG, messageId, leaseExpiresAt).run()
+       AND ${bearerFencePredicate('?1', '?4')}
+       AND EXISTS (
+         SELECT 1
+           FROM task_dispatch_receipts dispatch
+           JOIN tasks task ON task.id = dispatch.task_id
+           JOIN agents caller ON caller.id = ?4 AND caller.status = 'active'
+          WHERE dispatch.tenant = ?1 AND dispatch.id = ?5 AND dispatch.task_id = ?6
+            AND dispatch.agent_id = ?4
+            AND task.assignee_agent_id = ?4
+       )
+  `).bind(
+    env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
+    input.dispatchReceiptId, input.taskId,
+  ).run()
   return result.meta?.changes === 1
 }
 
@@ -481,7 +509,12 @@ export async function recordTaskDispatchRuntimeReceipt(
   // a resident agent's inbox_lease() would have produced. See claimUnleasedForPairSettlement's
   // doc comment. Credential-gated: this runs only after the token check above succeeds.
   if (usedPairCorrelator && input.attempt === 1) {
-    await claimUnleasedForPairSettlement(env, messageId)
+    await claimUnleasedForPairSettlement(env, {
+      messageId,
+      dispatchReceiptId: input.dispatchReceiptId,
+      taskId: input.taskId,
+      callerAgentId: agentId,
+    })
   }
 
   const delivery = await loadDelivery(env, input, messageId)
@@ -809,4 +842,96 @@ export async function listTaskDispatchReceiptTimeline(
     })),
     task_status: task.status,
   }
+}
+
+// ── operator lease repair (mupot#1494 round 3 — Athena's RECORD INTEGRITY ruling) ──────────
+//
+// The P0 fix above (claimUnleasedForPairSettlement) makes the round-2 wedge attack impossible
+// going forward: a non-owner's claim now changes zero rows. This section is the RECOVERY path
+// for the shape of damage that attack (or any other cause of a stuck lease / desynchronised
+// delivery_attempts counter) leaves behind — a receipted, org-admin-only repair, never a
+// silent DB patch.
+
+export interface AdminResetDispatchLeaseResult {
+  /** True iff the row was reset to pristine. False means "not found" or "refused" (already
+   *  consumed or dead-lettered) — never a side effect either way. */
+  reset: boolean
+  message_id: string | null
+  audit_id: string
+}
+
+/**
+ * adminResetDispatchLease — reset a wedged agent_messages row's delivery bookkeeping
+ * (`delivery_attempts`, `lease_expires_at`, `lease_attempt_id`) back to PRISTINE
+ * (`0`/`NULL`/`NULL`) — the exact state a fresh, never-delivered dispatch starts in — so the
+ * assignee's next `attempt: 1` settle (via `inbox_lease` OR the `{task_id,
+ * dispatch_receipt_id}` pair correlator) proceeds exactly as if the message had just been
+ * delivered. Refuses (0 rows, `reset: false`) once the row is `read_at` (already consumed) or
+ * `dead_lettered_at` (already terminally failed) — this is a lease/attempt REPAIR, never an
+ * un-delete or a bypass of a genuine terminal state. Every call — found or not, reset or
+ * refused — writes one `mutation_audit_entries` row, so a reset is always an auditable fact.
+ * Callers MUST have already verified `hasWorkspaceAdmin(auth)` — this function does not
+ * re-check authority, only records who acted.
+ */
+export async function adminResetDispatchLease(
+  env: Env,
+  auth: AuthContext,
+  input: { taskId: string; dispatchReceiptId: string; reason: string },
+): Promise<AdminResetDispatchLeaseResult> {
+  const memberId = auth.memberId?.trim() ?? ''
+  const credentialId = auth.tokenId?.trim() ?? ''
+  const auditId = crypto.randomUUID()
+  const now = nowSqlUtc()
+  const evidence = canonicalJson({
+    task_id: input.taskId,
+    dispatch_receipt_id: input.dispatchReceiptId,
+    reason: text(input.reason, 500),
+  })
+
+  const message = await env.DB.prepare(
+    `SELECT id FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId)).first<{ id: string }>()
+
+  if (!message) {
+    await env.DB.prepare(`
+      INSERT INTO mutation_audit_entries (
+        id, tenant, principal_kind, principal_id, member_id, agent_id,
+        credential_id, origin, handler, operation, target_kind, target_id,
+        task_id, request_id, idempotency_key, evidence_json, recorded_at
+      ) VALUES (
+        ?1, ?2, 'member', ?3, ?3, NULL,
+        ?4, 'mcp', 'task_dispatch_lease_reset', 'reset_not_found', 'dispatch_receipt', ?5,
+        ?6, ?7, ?7, ?8, ?9
+      )
+    `).bind(
+      auditId, env.TENANT_SLUG, memberId, credentialId, input.dispatchReceiptId,
+      input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence, now,
+    ).run()
+    return { reset: false, message_id: null, audit_id: auditId }
+  }
+
+  const result = await env.DB.prepare(`
+    UPDATE agent_messages
+       SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL
+     WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
+  `).bind(env.TENANT_SLUG, message.id).run()
+  const reset = result.meta?.changes === 1
+
+  await env.DB.prepare(`
+    INSERT INTO mutation_audit_entries (
+      id, tenant, principal_kind, principal_id, member_id, agent_id,
+      credential_id, origin, handler, operation, target_kind, target_id,
+      task_id, request_id, idempotency_key, evidence_json, recorded_at
+    ) VALUES (
+      ?1, ?2, 'member', ?3, ?3, NULL,
+      ?4, 'mcp', 'task_dispatch_lease_reset', ?5, 'agent_message', ?6,
+      ?7, ?8, ?8, ?9, ?10
+    )
+  `).bind(
+    auditId, env.TENANT_SLUG, memberId, credentialId,
+    reset ? 'reset' : 'reset_refused_terminal', message.id,
+    input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence, now,
+  ).run()
+
+  return { reset, message_id: message.id, audit_id: auditId }
 }
