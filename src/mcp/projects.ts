@@ -175,6 +175,10 @@ const toolProjectCreate: ToolSpec = {
     // scope, and an org-scoped grant that expires on its own clock is still
     // strictly narrower than the standing workspace admin it replaces.
     const denied = requireWorkspaceAdmin(auth)
+    // createdViaElevationGrant: the elevation_grants.id that authorized this create,
+    // when this call ran under a bounded elevation rather than standing
+    // workspace admin — null otherwise (stamped alongside created_by_member_id).
+    let createdViaElevationGrant: string | undefined
     if (denied) {
       // action:workspace_project, NOT action:project_lifecycle.
       //
@@ -197,8 +201,9 @@ const toolProjectCreate: ToolSpec = {
           remedy: elevationRemedyMessage(elevated.reason),
         })
       }
+      createdViaElevationGrant = elevated.grant.id
     }
-    const result = await createProject(env, args)
+    const result = await createProject(env, args, { createdByMemberId: auth.memberId ?? undefined, createdViaElevationGrant })
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'created', result.value.id)
     return done({ project: result.value })
@@ -380,7 +385,7 @@ const toolProjectUpdate: ToolSpec = {
     if (str(input.status) === 'active') {
       const existing = await getProject(env, projectId)
       if (existing?.status === 'planned') {
-        const started = await startProject(env, projectId, defaultStartGateDeps())
+        const started = await startProject(env, projectId, defaultStartGateDeps(auth.memberId ?? null))
         if (!started.ok) {
           const code = started.error === 'project_not_found' ? 404 : 409
           return fail(code, started.error, { blocked_start: true })

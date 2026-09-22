@@ -99,6 +99,7 @@ import {
   revokeAllAgentSessionsForAgent,
 } from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
+import { isSlugBaseReserved, slugBaseFromSquadSlug } from '../org/team-bootstrap'
 import {
   type ToolSpec,
   fail,
@@ -140,6 +141,12 @@ const GRANTABLE_AGENT_CAPABILITIES = new Set<Capability>(['observer', 'member', 
 // Emit an attributed provision event so the activity feed/consumer knows a member
 // caused a structural change (kasra-review W2 — the mint was previously unattributed
 // on the bus). One event type carries the kind; payload names what was created.
+// See src/projects/start-gate.ts's emitOrgProvisioned for a deliberate, small
+// duplicate of this same "org.provisioned" event shape (mupot#1498, P2-4) — NOT
+// imported from here, because src/mcp/provision.ts <-> src/mcp/index.ts <->
+// src/mcp/projects.ts <-> src/projects/start-gate.ts would close a NEW import
+// cycle through a module that is not already part of the existing, carefully-
+// entered index/provision cycle.
 async function emitProvisioned(
   env: Env,
   memberId: string,
@@ -398,6 +405,12 @@ const toolCreateSquad: ToolSpec = {
     // project_lifecycle on its department may create a squad there for a bounded
     // window, without being handed standing department admin.
     const grants = auth.capabilities ?? []
+    // createdViaElevationGrant: the elevation_grants.id that authorized this create,
+    // when this call ran under a bounded elevation rather than standing
+    // department:admin — null otherwise. Stamped alongside created_by_member_id
+    // so a slug_taken refusal (or an adopt:true override) can report "created
+    // by member X under elevation receipt Y" rather than just naming the actor.
+    let createdViaElevationGrant: string | undefined
     if (!hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
@@ -411,20 +424,26 @@ const toolCreateSquad: ToolSpec = {
           remedy: elevationRemedyMessage(elevated.reason),
         })
       }
+      createdViaElevationGrant = elevated.grant.id
     }
 
-    const result = await createSquad(env, dept.id, {
-      slug: args.slug,
-      name: args.name,
-      charter: args.charter,
-      role: args.role,
-      okr: args.okr,
-      kpi_target: args.kpi_target,
-      effort: args.effort,
-      autonomy: args.autonomy,
-      budget_cap_cents: args.budget_cap_cents,
-      budget_window: args.budget_window,
-    })
+    const result = await createSquad(
+      env,
+      dept.id,
+      {
+        slug: args.slug,
+        name: args.name,
+        charter: args.charter,
+        role: args.role,
+        okr: args.okr,
+        kpi_target: args.kpi_target,
+        effort: args.effort,
+        autonomy: args.autonomy,
+        budget_cap_cents: args.budget_cap_cents,
+        budget_window: args.budget_window,
+      },
+      { createdByMemberId: auth.memberId ?? undefined, createdViaElevationGrant },
+    )
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {
       squad_id: result.value.id,
@@ -2364,11 +2383,13 @@ const toolUpdateSquad: ToolSpec = {
   name: 'update_squad',
   scope: 'squad',
   min: 'admin',
-  args: '{ squad: string (id|slug), budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
+  args:
+    '{ squad: string (id|slug), slug?: string (new slug, must end "-sqd" — mupot#1495), budget_cap_cents?: number|null, budget_window?: "day"|"week", reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       squad: STRING_SCHEMA,
+      slug: STRING_SCHEMA,
       budget_cap_cents: OPTIONAL_NUMBER_SCHEMA,
       budget_window: STRING_SCHEMA,
       reason: STRING_SCHEMA,
@@ -2393,7 +2414,7 @@ const toolUpdateSquad: ToolSpec = {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
     }
 
-    const PATCHABLE = ['budget_cap_cents', 'budget_window'] as const
+    const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window'] as const
     const patch: UnitConfigPatch = {}
     for (const key of PATCHABLE) {
       if (key in args) patch[key] = args[key]
@@ -2402,26 +2423,52 @@ const toolUpdateSquad: ToolSpec = {
       return fail(400, 'invalid_args', 'at least one field to update is required')
     }
 
+    // mupot#1498, P0(c) (kasra-review adversarial round-1 gate on PR #1510,
+    // Athena's round-2 confirmation): renaming a squad INTO a `<x>-sqd` slug
+    // that team_bootstrap has already claimed for `x` (a `<x>-prj` project
+    // exists, or a team_bootstrap_receipts row names slug_base `x`) is the
+    // EXACT squat this fix closes on the create side — a squad admin (this
+    // tool's ordinary floor) renaming their OWN squad to steal a future
+    // team_bootstrap call's ADMIN edge + mintable bot. The rename into a
+    // reserved name needs create_squad's OLD floor, department:admin, not
+    // squad:admin — checked here, on the UPDATE path itself (the squat IS a
+    // rename), before the write, for every caller regardless of how they
+    // otherwise qualify for the ordinary squad:admin floor above.
+    if ('slug' in patch) {
+      const newSlug = str(patch.slug)
+      const reservedSlugBase = newSlug ? slugBaseFromSquadSlug(newSlug) : null
+      if (reservedSlugBase && (await isSlugBaseReserved(env, env.TENANT_SLUG, reservedSlugBase))) {
+        if (!hasCapability(grants, 'department', squad.department_id, 'admin')) {
+          return fail(403, 'forbidden', {
+            need: 'admin',
+            scope: 'department',
+            reason: 'slug_reserved_by_team_bootstrap',
+          })
+        }
+      }
+    }
+
     // Before-image, read outside the UPDATE transaction — see the race caveat in
     // the doc comment above.
     const before = await env.DB.prepare(
-      'SELECT budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
     if (!before) return fail(404, 'squad_not_found', { squad: squadRef })
 
     const result = await updateUnitConfig(env, 'squad', squad.id, patch)
     if (!result.ok) {
       if (result.error === 'not_found') return fail(404, 'squad_not_found', { squad: squadRef })
+      if (result.error === 'slug_taken') return fail(409, 'slug_taken')
       return fail(400, 'invalid_args', { reason: result.error })
     }
 
     const after = await env.DB.prepare(
-      'SELECT budget_cap_cents, budget_window FROM squads WHERE id = ?1',
+      'SELECT slug, budget_cap_cents, budget_window FROM squads WHERE id = ?1',
     )
       .bind(squad.id)
-      .first<{ budget_cap_cents: number | null; budget_window: string }>()
+      .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
 
     const changed: Record<string, { from: unknown; to: unknown }> = {}
     for (const key of Object.keys(patch)) {

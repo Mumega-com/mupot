@@ -372,7 +372,7 @@ projectsApp.post('/', async (c) => {
     if (prepared.error === 'invalid_template') return c.json({ error: prepared.error }, 400)
     return c.json({ error: prepared.error }, mutationStatus(prepared.error))
   }
-  const result = await createProject(c.env, prepared.value)
+  const result = await createProject(c.env, prepared.value, { createdByMemberId: auth.memberId ?? undefined })
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({
     ok: true,
@@ -450,7 +450,7 @@ projectsApp.patch('/:id', async (c) => {
   if (safeBody.status === 'active') {
     const existing = await getProject(c.env, c.req.param('id'))
     if (existing?.status === 'planned') {
-      const started = await startProject(c.env, existing.id, defaultStartGateDeps())
+      const started = await startProject(c.env, existing.id, defaultStartGateDeps(c.get('auth').memberId ?? null))
       if (!started.ok) {
         const status = started.error === 'project_not_found' ? 404 : 409
         return c.json({ error: started.error, blocked_start: true }, status)

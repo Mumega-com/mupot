@@ -45,6 +45,21 @@ export interface CreateProjectInput {
   assigned_squad_id?: unknown
 }
 
+// CreateProjectOpts.createdByMemberId (migration 0166, mupot#1498 P0(a)) is
+// deliberately NOT a field on CreateProjectInput — every route handler in
+// this repo builds that input by casting an unvalidated JSON body
+// (`body = (await c.req.json()) as CreateProjectInput`), and a provenance
+// column must never be settable by the caller's own request. It is instead a
+// separate parameter only a caller holding a TypeScript reference to
+// createProject can pass — the SAME discipline org/service.ts's CreateOpts.kind
+// already uses, for the same reason (see that file's block comment).
+export interface CreateProjectOpts {
+  createdByMemberId?: string
+  /** elevation_grants.id, when this create ran under a bounded action:*
+   *  elevation rather than standing capability (migration 0166). */
+  createdViaElevationGrant?: string
+}
+
 export interface UpdateProjectInput {
   slug?: unknown
   name?: unknown
@@ -221,6 +236,7 @@ async function optionalAssignedSquad(
 export async function createProject(
   env: Env,
   input: CreateProjectInput,
+  opts: CreateProjectOpts = {},
 ): Promise<ProjectMutationResult<Project>> {
   if (!isNonEmptyString(input.name)) return { ok: false, error: 'invalid_name' }
   const slug = typeof input.slug === 'string' && input.slug.trim()
@@ -272,6 +288,8 @@ export async function createProject(
     live_url: liveUrl.value,
     assigned_squad_id: assignedSquad.value,
     deploy_status: liveUrl.value ? 'healthy' : 'idle',
+    created_by_member_id: opts.createdByMemberId ?? null,
+    created_via_elevation_grant: opts.createdViaElevationGrant ?? null,
     created_at: now,
     updated_at: now,
   }
@@ -282,14 +300,14 @@ export async function createProject(
        (id, slug, name, description, goal, status, parent_project_id, target_date,
         cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
         repo_url, worker_name, live_url, assigned_squad_id, deploy_status,
-        created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        created_by_member_id, created_via_elevation_grant, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
       project.parent_project_id, project.target_date,
       project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
       project.repo_url, project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
-      project.created_at, project.updated_at,
+      project.created_by_member_id, project.created_via_elevation_grant, project.created_at, project.updated_at,
     ).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {

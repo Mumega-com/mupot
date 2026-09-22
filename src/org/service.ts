@@ -48,6 +48,20 @@ export interface CreateOpts {
   // 'work' (default) | 'home'. Omit entirely on every call site except
   // src/members/bootstrap-self.ts — see the block comment above.
   kind?: OrgKind
+  // Provenance stamp for squads.created_by_member_id (migration 0166,
+  // mupot#1498 P0(b)) — the caller's own member id, when known. SAME
+  // discipline as `kind` above: never a field any *Input interface can
+  // carry, so no JSON body can spoof it; only a caller with a TypeScript
+  // reference to createSquad can pass it. Every production call site should
+  // pass its own auth.memberId here so team_bootstrap's provenance-based
+  // squad-adoption check (which replaced the old "empty squad" ground
+  // entirely — createSquad grants its creator no capability row, so every
+  // fresh squad satisfied that test) has something to compare against.
+  createdByMemberId?: string
+  // Same discipline, one level up: the elevation_grants.id that authorized
+  // this create, when it ran under a bounded action:* elevation rather than
+  // standing capability (migration 0166). Never a request-body field.
+  createdViaElevationGrant?: string
 }
 
 const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
@@ -246,6 +260,8 @@ export async function createSquad(
     autonomy,
     budget_cap_cents,
     budget_window,
+    created_by_member_id: opts.createdByMemberId ?? null,
+    created_via_elevation_grant: opts.createdViaElevationGrant ?? null,
     created_at: new Date().toISOString(),
   }
 
@@ -254,8 +270,8 @@ export async function createSquad(
       `INSERT INTO squads
         (id, department_id, slug, name, charter, kind,
          role, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-         created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         created_by_member_id, created_via_elevation_grant, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
         squad.id,
@@ -272,6 +288,8 @@ export async function createSquad(
         squad.autonomy,
         squad.budget_cap_cents,
         squad.budget_window,
+        squad.created_by_member_id,
+        squad.created_via_elevation_grant,
         squad.created_at,
       )
       .run()
@@ -1086,11 +1104,49 @@ export interface UnitConfigPatch {
   // role is patchable on squads (and on agents, though agents already have role
   // in the core shape — it is included here for uniform patch surface).
   role?: unknown
+  // slug — SQUAD ONLY (mupot#1495 "type-safe slugs": update_squad had NO slug
+  // field at all before this — renaming a squad needed a raw D1 UPDATE by
+  // hand). Rejected outright when kind='agent': agents already have their own
+  // governed slug-patch path (update_agent's UPDATABLE_TEXT_COLUMNS), which
+  // does not carry a suffix requirement — routing a second, differently-
+  // validated writer at the SAME column through this generic patch would let
+  // an agent's slug bypass update_agent's own checks. See isValidSquadSlugUpdate
+  // below for why a squad's NEW slug must carry the '-sqd' suffix.
+  slug?: unknown
 }
 
 export type UpdateUnitConfigResult =
   | { ok: true }
-  | { ok: false; error: 'not_found' | 'invalid_role' | 'invalid_okr' | 'invalid_kpi_target' | 'invalid_effort' | 'invalid_autonomy' | 'invalid_budget_cap_cents' | 'invalid_budget_window' }
+  | {
+      ok: false
+      error:
+        | 'not_found'
+        | 'invalid_role'
+        | 'invalid_okr'
+        | 'invalid_kpi_target'
+        | 'invalid_effort'
+        | 'invalid_autonomy'
+        | 'invalid_budget_cap_cents'
+        | 'invalid_budget_window'
+        | 'invalid_slug'
+        | 'slug_taken'
+    }
+
+/**
+ * mupot#1495 "type-safe slugs" (Hadi, 2026-09-22): "projects `*-prj`, squads
+ * `*-sqd`, departments `*-dep`, agents `*-bot`". This enforces the suffix on
+ * the ONE NEW path this PR adds (update_squad's slug field) — the broader
+ * sweep (project_create/update, create_squad, create_department,
+ * create_agent/update_agent, and a backfill migration for existing rows) is
+ * explicitly #1495's own, separate migration, so an EXISTING unsuffixed
+ * squad slug (e.g. a squad created before this ships) is untouched and stays
+ * valid until #1495 lands — this validator only gates a squad's NEW slug on
+ * a WRITE through this new field, never a read, and never an existing row.
+ */
+const SQUAD_SLUG_SUFFIX = '-sqd'
+export function isValidSquadSlugUpdate(v: unknown): v is string {
+  return isValidSlug(v) && (v as string).endsWith(SQUAD_SLUG_SUFFIX) && (v as string).length > SQUAD_SLUG_SUFFIX.length
+}
 
 /**
  * Patch any subset of the work-unit config fields on an agent or squad.
@@ -1189,6 +1245,17 @@ export async function updateUnitConfig(
     binds.push(patch.budget_window)
   }
 
+  // slug — squad-only (see UnitConfigPatch's field comment + isValidSquadSlugUpdate
+  // above). An agent kind reaching this branch is a caller bug (update_agent owns
+  // agent slug patching through a different, unsuffixed path) — refused rather
+  // than silently applied with a validation rule that path never asked for.
+  if ('slug' in patch) {
+    if (kind !== 'squad') return { ok: false, error: 'invalid_slug' }
+    if (!isValidSquadSlugUpdate(patch.slug)) return { ok: false, error: 'invalid_slug' }
+    setClauses.push('slug = ?')
+    binds.push(patch.slug)
+  }
+
   // Nothing to patch — treat as a no-op success (caller is responsible for sending
   // a non-empty patch; we do not 400 here because a partial update with unknown
   // keys simply elides those keys and the result is consistent).
@@ -1198,9 +1265,16 @@ export async function updateUnitConfig(
   const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = ?`
   binds.push(id)
 
-  const result = await env.DB.prepare(sql)
-    .bind(...binds)
-    .run()
+  let result
+  try {
+    result = await env.DB.prepare(sql).bind(...binds).run()
+  } catch (err) {
+    // squads.slug is UNIQUE(department_id, slug) — a rename colliding with a
+    // sibling squad's slug in the SAME department surfaces here, not as a
+    // generic 500 (parity with createSquad's own slug_taken mapping above).
+    if ('slug' in patch && isUniqueViolation(err)) return { ok: false, error: 'slug_taken' }
+    throw err
+  }
 
   if (!result.meta.changes) return { ok: false, error: 'not_found' }
   return { ok: true }

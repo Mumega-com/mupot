@@ -18,6 +18,8 @@ export const PROJECT_COLUMN_LIST = [
   'live_url',
   'assigned_squad_id',
   'deploy_status',
+  'created_by_member_id',
+  'created_via_elevation_grant',
   'created_at',
   'updated_at',
 ] as const
