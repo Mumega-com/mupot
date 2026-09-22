@@ -3001,6 +3001,24 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
+    file: "0163_pot_provision_receipts.sql",
+    sha256: "48e8e0ba29bed15ea6b95464f5cb431803f05296d3f7d51dc982f520cdc0c58b",
+    statements: [
+      "-- 0163_pot_provision_receipts.sql — a receipt trail for provisionSovereignPot\n-- (mupot#1285). One row per STEP attempted for one provisioning call, written\n-- into the ORCHESTRATOR's own D1 (the same D1 that carries `pots`, migration\n-- 0145) — not the tenant's own new D1, which gets the full schema chain\n-- applied to it separately.\n--\n-- WHY THIS EXISTS\n--\n-- Before #1285, `provisionSovereignPot`'s honesty lived entirely in its return\n-- value: `completed` / `not_completed` / `orphaned_resources` in the response\n-- body of one call. Nobody persisted that body. A partial run that created a\n-- billable D1 + KV and then failed left no queryable trace anywhere except an\n-- operator's terminal scrollback — exactly the \"orphan discovered on a bill\"\n-- failure #1285 documents (Psychonom's D1 `b0568c25...` / KV `061ebc1e...`,\n-- live 2026-09-22, orphaned this exact way).\n--\n-- SHAPE follows the append-only receipt idiom already used by\n-- task_dispatch_runtime_receipts (this file), member_home_provisioning_receipts\n-- (0161) and project_access_grant_receipts (0157/0160): TEXT id (UUID), no\n-- AUTOINCREMENT surrogate, append-only enforced by trigger not convention.\n--\n-- `step` is exactly the ProvisionStep union from src/pots/types.ts. `ok=0` with\n-- `detail` naming the failure (statement index, HTTP error, health-check\n-- response, ...) is a first-class row, not an absence of one — the same\n-- \"receipts, not grades\" discipline as every other ledger in this schema.\n\nCREATE TABLE IF NOT EXISTS pot_provision_receipts (\n  id           TEXT NOT NULL PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  slug         TEXT NOT NULL,\n  -- One provisionSovereignPot() call gets one run_id; its steps share it so\n  -- they can be grouped back into one attempt.\n  run_id       TEXT NOT NULL,\n  step         TEXT NOT NULL CHECK (step IN (\n    'create_d1', 'create_kv', 'apply_schema', 'deploy_worker',\n    'seed_identities', 'verify_reachable'\n  )),\n  ok           INTEGER NOT NULL CHECK (ok IN (0, 1)),\n  detail       TEXT,\n  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_pot_provision_receipts_slug\n  ON pot_provision_receipts(slug, created_at DESC);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_pot_provision_receipts_run\n  ON pot_provision_receipts(run_id, created_at ASC);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS pot_provision_receipts_no_update\n  BEFORE UPDATE ON pot_provision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'pot_provision_receipts is append-only');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS pot_provision_receipts_no_delete\n  BEFORE DELETE ON pot_provision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'pot_provision_receipts is append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "pot_provision_receipts" },
+      { type: "index", name: "idx_pot_provision_receipts_slug" },
+      { type: "index", name: "idx_pot_provision_receipts_run" },
+      { type: "trigger", name: "pot_provision_receipts_no_update" },
+      { type: "trigger", name: "pot_provision_receipts_no_delete" },
+    ],
+  },
+  {
     file: "0165_member_home_provisioning_receipts_web_channel.sql",
     sha256: "8ec5697b1af8da15ec46dbc3e5e3e0d2e26ba8d61dd96d7ce3e511c749433692",
     statements: [
@@ -3054,4 +3072,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "dac8771bb77404427123edb36280e08a1eccaa80f2f9600fc640b052b869db9d"
+export const SCHEMA_CHAIN_DIGEST: string = "feef303a70c29abeb6f84cb877b58cdfcf2a5e3de7a5f87e4bd7f1cc6106740e"

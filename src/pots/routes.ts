@@ -56,7 +56,7 @@ potsApp.post('/provision', async (c) => {
   }
 
   try {
-    const result = await provisionSovereignPot(c.env, body)
+    const result = await provisionSovereignPot(c.env, { ...body, minted_by_member_id: auth.memberId })
     // 201 Created is a claim that the thing now exists. It does not, unless every step ran
     // and it was verified reachable. 202 Accepted is the honest code for "we started, and
     // here is exactly how far we got".
