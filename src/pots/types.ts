@@ -39,7 +39,7 @@ export interface SovereignPotProvisionInput {
   /** The interactive caller's own tenant (`auth.tenant`) — recorded on every
    *  `pot_provision_receipts` row this call writes (`actor_tenant`, migration 0164) and
    *  used to derive/verify `provisioner_tenant` on the `pots` registry row (migration
-   *  0165). Independent of `minted_by_member_id`: even a caller with no interactive member
+   *  0167). Independent of `minted_by_member_id`: even a caller with no interactive member
    *  identity still has a tenant. */
   caller_tenant?: string
 }

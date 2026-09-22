@@ -208,7 +208,7 @@ Four load-bearing semantics changed as a result:
   registry write is still `ok: false` (see the code comment on that specific edge case;
   it is the one place `not_completed` can read `[]` under `status: 'incomplete'`).
 - **Adoption rule.** A slug is claimed in the `pots` registry (`provisioner_member_id` +
-  `provisioner_tenant`, migration 0165) BEFORE any Cloudflare call. Reuse-by-name is
+  `provisioner_tenant`, migration 0167) BEFORE any Cloudflare call. Reuse-by-name is
   allowed ONLY when the caller matches that claim; anyone else gets `pot_slug_taken`
   (409) with zero CF calls made, even if the D1/KV/worker CF resources for that slug
   already exist under a different provisioner.

@@ -1,4 +1,4 @@
--- 0165_pots_registry_provisioner.sql — records WHO claimed a slug, so a retry
+-- 0167_pots_registry_provisioner.sql — records WHO claimed a slug, so a retry
 -- can be told apart from a takeover (mupot#1507 round-2 adversarial gate,
 -- Athena condition i: "reuse-by-name is allowed ONLY when the caller is the
 -- pot's registered provisioner").
