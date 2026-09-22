@@ -953,25 +953,35 @@ export async function listFleetAgentRuntimeView(
     const slugs = (slugRows.results ?? []).map((r) => r.slug)
     if (slugs.length === 0) return []
     slugsJson = JSON.stringify(slugs)
-    // mupot#1494 round 3 (P2-b) — the home-squad exclusion belongs ONLY to a squad-SCOPED
-    // read. Round 2 (G-FP1b) applied it UNCONDITIONALLY, reasoning that an unrestricted
-    // (org-admin) read must not surface an agent whose only squad is someone's home — but
-    // that made a home-squad-only agent invisible in EVERY view, including the unrestricted
-    // one, which is strictly LESS visible than the round-1 bug it replaced (round 1's
-    // squads='[]' shape was at least visible unrestricted). A squad-scoped dashboard viewer
-    // should not see that agent as a member of a squad it does not actually share; an
-    // unrestricted org-admin view has no such reason to hide it.
+    // Squad-scoped membership test ONLY — no home-squad exclusion here. See the
+    // `homeExclusion` comment below for why: a caller scoped to squads it has REAL
+    // standing on (this EXISTS clause) may legitimately have standing on a home squad
+    // (its own member, or an admin/elevation grant), and that scoped view must show it.
     scopeClause =
-      ` AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))
-        AND NOT EXISTS (
+      ` AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))`
+  }
+  // mupot#1494 round 3 (P2-b), CORRECTED per #1472's pinned isolation invariant
+  // (2026-09-22): home squads and their agents/hosts must be hidden from EVERY
+  // unrestricted org/department view — that invariant WINS over round 3's original
+  // finding. Round 3 first draft moved this exclusion into the squad-SCOPED branch
+  // instead, which made the unrestricted view leak a home-only agent's host/presence to
+  // every org-scope viewer (regression caught by
+  // tests/dashboard-fleet-brain-agent-scope.test.ts's #1472 isolation test). Correct
+  // shape: the exclusion applies ONLY when UNSCOPED (`scopeClause` empty — no
+  // `squadIds`, i.e. an org/department/unrestricted read); a squad-scoped read is
+  // already restricted to squads the caller has real standing on by the EXISTS clause
+  // above, so if that includes a home squad the caller is entitled to see it (the
+  // home's own member, or an elevation-with-receipt) — no separate check needed there.
+  const homeExclusion = scopeClause === ''
+    ? ` AND NOT EXISTS (
           SELECT 1 FROM json_each(fleet_agents.squads) je
            WHERE je.value IN (SELECT slug FROM squads WHERE kind = 'home')
         )`
-  }
+    : ''
   const statement = env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host, presence_ttl_sec
        FROM fleet_agents
-      WHERE tenant = ?1${scopeClause}
+      WHERE tenant = ?1${homeExclusion}${scopeClause}
       ORDER BY agent_id ASC`,
   )
   const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)
