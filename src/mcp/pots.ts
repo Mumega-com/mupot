@@ -101,8 +101,16 @@ export const toolPotRelease: ToolSpec = {
     if (!isOrgAdmin(auth)) {
       return fail(403, 'forbidden', 'Only org administrators can release a pot slug.')
     }
+    // Same operator-principal + tenant fence as pot_provision (mupot#1516 round-2 P1-3:
+    // the tenant fence was MISSING here — a foreign-tenant org:admin could release a slug
+    // and have it receipted under `actor_tenant: 'someone-else'` on THIS deployment's own
+    // ledger, then have a DIFFERENT provisioner on THIS deployment reclaim it, with no
+    // record that the release itself came from outside this colony at all).
     if (auth.boundAgentId) {
       return fail(403, 'operator_principal_required', 'Releasing a pot slug requires an operator principal, not a bound-agent session.')
+    }
+    if (auth.tenant !== env.TENANT_SLUG) {
+      return fail(403, 'tenant_mismatch', 'Caller tenant does not match this deployment.')
     }
     const slug = typeof args?.slug === 'string' ? args.slug.trim() : ''
     if (!slug) {
@@ -111,7 +119,10 @@ export const toolPotRelease: ToolSpec = {
 
     const result = await releaseStalePot(env, slug, auth.memberId ?? null, auth.tenant)
     if (!result.ok) {
-      const status = result.error === 'not_found' ? 404 : 409
+      const status =
+        result.error === 'not_found' ? 404 :
+        result.error === 'receipt_write_failed' ? 500 :
+        409 // not_stale, cannot_release_active_pot, release_lost_race — all named conflicts
       return fail(status, result.error, `Cannot release '${slug}': ${result.error}.`)
     }
     return done({ slug: result.slug, released_from_status: result.released_from_status })

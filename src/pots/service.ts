@@ -1363,6 +1363,24 @@ export async function provisionSovereignPot(
     }
   }
 
+  // PREFLIGHT: resolve the worker bundle source BEFORE touching any Cloudflare resource
+  // (mupot#1516 round-2 ENABLEMENT GATE). Before this, a deployment with neither
+  // `POT_WORKER_BUNDLE_BUCKET` configured nor a `workerJsCode` argument would burn a REAL,
+  // billable D1 (step 1) and KV namespace (step 2) — and apply the ENTIRE schema chain
+  // (step 3) — before discovering at step 4 that there was never anything to deploy. This
+  // is the exact orphan class #1285 documents (Psychonom's D1/KV, created and then
+  // abandoned when a later step failed) recurring for a class of failure that is knowable
+  // BEFORE the first Cloudflare call: whether a bundle source exists at all does not depend
+  // on the slug, the D1, or the schema. Resolved ONCE, here, and reused unchanged at the
+  // real `deploy_worker` step below (never re-resolved — an R2 GET is not free, and
+  // resolving twice could theoretically observe two different answers).
+  const preflightBundle = await loadPotWorkerBundle(env, workerJsCode)
+  if (!preflightBundle.ok) {
+    await recordStep('deploy_worker', false, receiptError('no_bundle_source', preflightBundle.reason))
+    return bail(`deploy_worker failed (preflight, before any Cloudflare call): ${preflightBundle.reason}`)
+  }
+  const bundle = preflightBundle.bundle
+
   // 1. D1 — reuse-or-create, idempotent on slug.
   const dbName = `mupot-pot-${slug}`
   let d1: { uuid: string; name: string; adopted: boolean }
@@ -1430,13 +1448,8 @@ export async function provisionSovereignPot(
   }
 
   // 4. Deploy the tenant worker into the dispatch namespace. Digest-verified (mupot#1507
-  // round 2 requirement 4) — see loadPotWorkerBundle's doc comment.
-  const bundleResult = await loadPotWorkerBundle(env, workerJsCode)
-  if (!bundleResult.ok) {
-    await recordStep('deploy_worker', false, receiptError('no_bundle', bundleResult.reason))
-    return bail(`deploy_worker failed: ${bundleResult.reason}`)
-  }
-  const bundle = bundleResult.bundle
+  // round 2 requirement 4) — see loadPotWorkerBundle's doc comment. `bundle` was already
+  // resolved by the PREFLIGHT check above, before create_d1 — not re-resolved here.
   try {
     await uploadUserWorkerToDispatch(cf, slug, bundle.code, {
       d1DatabaseId: d1.uuid,
@@ -1531,10 +1544,43 @@ export async function provisionSovereignPot(
   // the one case where `bail()`'s `not_completed` reads `[]` under `status: 'incomplete'`
   // — `incomplete_reason` is the authoritative signal for this specific edge, not the
   // (otherwise reliable) empty-array-means-provisioned convention. The `pots` row itself
-  // is left at `status: 'provisioning'`, which is accurate: every step ran, but the
-  // registry does not yet agree, so a retry by the SAME provisioner still adopts correctly.
+  // is left at whatever status it was already at (normally `'provisioning'`), which is
+  // accurate: every step ran, but the registry does not yet agree, so a retry by the SAME
+  // provisioner still adopts correctly.
+  //
+  // GUARDED BY THIS RUN'S OWN CLAIM, NOT JUST THE SLUG (mupot#1516 round-2 P3). The six
+  // steps above can take real wall-clock time (up to ~970 sequential D1 REST calls for a
+  // fresh schema chain) — long enough for the row this run claimed at the registry gate to
+  // have been reassigned since: an org:admin's `pot_release` on a run that looked stale but
+  // wasn't, then a DIFFERENT provisioner's claim, racing THIS run's own finish line. An
+  // unconditional `WHERE slug = ?1` would mark that OTHER provisioner's now-claimed row
+  // `'active'` on THIS run's say-so — a false success for a pot this run no longer owns.
+  // The WHERE clause re-asserts the SAME ownership predicate the registry gate itself used
+  // (checkout-session match, or member+tenant match); `status IN ('provisioning', 'active')`
+  // — not JUST `'provisioning'` — because an idempotent RETRY of an already-provisioned run
+  // (e.g. a replayed Stripe webhook for a self-serve checkout) reaches this same UPDATE with
+  // the row already `'active'`, and that retry must still report `ok: true`, not a false
+  // "lost ownership" refusal for a status transition that has nothing left to do.
+  // `meta.changes` is checked the same way `releaseStalePot`'s own guard is, for the same
+  // reason — a 0-row UPDATE (ownership mismatch) is never treated as a success; a WHERE
+  // match on an already-`'active'` row still counts as 1 change (verified empirically
+  // against node:sqlite — `UPDATE ... SET x = x WHERE ...` counts the matched row).
   try {
-    await env.DB.prepare("UPDATE pots SET status = 'active' WHERE slug = ?1").bind(slug).run()
+    const activation = await env.DB.prepare(
+      `UPDATE pots SET status = 'active' WHERE slug = ?1 AND status IN ('provisioning', 'active') AND (
+         (checkout_session_id IS NOT NULL AND checkout_session_id = ?2)
+         OR (checkout_session_id IS NULL AND provisioner_member_id IS ?3 AND provisioner_tenant IS ?4)
+       )`,
+    )
+      .bind(slug, actorCheckoutSessionId, actorMemberId, actorTenant)
+      .run()
+    if ((activation.meta?.changes ?? 0) === 0) {
+      return bail(
+        'registry activation refused: this run no longer owns the slug (reclaimed, released, or altered ' +
+          'concurrently) — all six steps completed, but the pots row could not be marked active under this ' +
+          "run's own claim",
+      )
+    }
   } catch (error) {
     return bail(`registry activation failed: ${errMsg(error)} — all six steps completed, but the pots registry row could not be marked active`)
   }
@@ -1588,7 +1634,26 @@ export async function provisionSovereignPot(
 
 export type ReleaseStalePotResult =
   | { ok: true; slug: string; released_from_status: string }
-  | { ok: false; slug: string; error: 'not_found' | 'not_stale' | 'cannot_release_active_pot' }
+  | {
+      ok: false
+      slug: string
+      error:
+        | 'not_found'
+        | 'not_stale'
+        | 'cannot_release_active_pot'
+        /** The row's status changed between this call's own SELECT and its UPDATE (a
+         *  provisioner reclaimed it, or a concurrent release already landed) — the
+         *  `WHERE status = ?2` guard caught it, `meta.changes === 0`. Never reported as a
+         *  success (mupot#1516 round-2 P1-2): a stale read must not be allowed to certify a
+         *  write that never happened. */
+        | 'release_lost_race'
+        /** The state flip landed but its OWN receipt could not be written — reverted rather
+         *  than left as an unreceipted status change (mupot#1516 round-2 P1-1: the ledger is
+         *  the only durable record of WHO released a slug and WHY; a release with no
+         *  receipt is exactly the "ran, changed something, and left no trace" failure mode
+         *  `provisionSovereignPot`'s own `recordStep` already treats as fail-closed). */
+        | 'receipt_write_failed'
+    }
 
 /**
  * Releases a `pots` row stuck at `status: 'provisioning'` past `STALE_PROVISIONING_MS`, so
@@ -1630,10 +1695,32 @@ export async function releaseStalePot(
     return { ok: false, slug, error: 'not_stale' }
   }
 
-  await env.DB.prepare("UPDATE pots SET status = 'released' WHERE slug = ?1 AND status = ?2")
+  // The WHERE clause is the concurrency guard — same shape as the registry gate's own
+  // released-row reclaim. `meta.changes` MUST be read: a stale `row.status` read earlier in
+  // this function (the pot was reclaimed by its provisioner, or released by a concurrent
+  // call) means this UPDATE's WHERE clause matches nothing, and an unchecked `.run()` would
+  // let this function report `ok:true` for a write that never happened (mupot#1516 round-2
+  // P1-2).
+  const update = await env.DB.prepare("UPDATE pots SET status = 'released' WHERE slug = ?1 AND status = ?2")
     .bind(slug, row.status)
     .run()
-  await writeProvisionReceipt(
+  if ((update.meta?.changes ?? 0) === 0) {
+    return { ok: false, slug, error: 'release_lost_race' }
+  }
+
+  // FAIL CLOSED (mupot#1516 round-2 P1-1). The round-2 version of this function fired the
+  // UPDATE and then called `writeProvisionReceipt` WITHOUT checking its returned boolean —
+  // exactly the swallow `recordStep` (provisionSovereignPot's own receipt writer) was fixed
+  // to stop doing. A discarded `false` here meant: the state flip lands durably, `ok:true`
+  // goes back to the caller, and the append-only ledger carries ZERO rows explaining who
+  // released the slug or why. Since there is no atomic multi-statement transaction
+  // available here that can conditionally include-or-skip the receipt based on the UPDATE's
+  // OWN runtime result (D1's batch API commits every statement in a batch unconditionally;
+  // it cannot itself decide not to run statement 2 because statement 1 changed 0 rows), a
+  // receipt-write failure AFTER a real state change is handled by explicit compensation:
+  // revert the status flip rather than leave an unreceipted mutation on a table other code
+  // paths trust as ground truth.
+  const receiptWritten = await writeProvisionReceipt(
     env,
     crypto.randomUUID(),
     slug,
@@ -1643,5 +1730,16 @@ export async function releaseStalePot(
     actorMemberId,
     actorTenant,
   )
+  if (!receiptWritten) {
+    try {
+      await env.DB.prepare("UPDATE pots SET status = ?2 WHERE slug = ?1 AND status = 'released'")
+        .bind(slug, row.status)
+        .run()
+    } catch (error) {
+      console.error(`releaseStalePot: compensating revert failed for slug=${slug}: ${errMsg(error)}`)
+    }
+    return { ok: false, slug, error: 'receipt_write_failed' }
+  }
+
   return { ok: true, slug, released_from_status: row.status }
 }

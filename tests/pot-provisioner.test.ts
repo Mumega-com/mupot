@@ -663,7 +663,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     it('refuses to release a row that does not exist', async () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
-      const env = { DB: harness.db } as unknown as Env
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
       const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'ghost' })
       expect(outcome.ok).toBe(false)
       if (outcome.ok) throw new Error('expected failure')
@@ -674,7 +674,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
       insertPot(harness, { status: 'active', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
-      const env = { DB: harness.db } as unknown as Env
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
       const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'relslug' })
       expect(outcome.ok).toBe(false)
       if (outcome.ok) throw new Error('expected failure')
@@ -687,7 +687,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
       insertPot(harness, { status: 'provisioning', createdAt: new Date().toISOString() })
-      const env = { DB: harness.db } as unknown as Env
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
       const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'relslug' })
       expect(outcome.ok).toBe(false)
       if (outcome.ok) throw new Error('expected failure')
@@ -746,6 +746,231 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       await expect(provisionSovereignPot(env, {
         slug: 'relslug', brand_name: 'Loser Co', admin_email: 'loser@relslug.test', minted_by_member_id: 'loser', caller_tenant: 'mumega',
       })).rejects.toThrow(PotSlugTakenError)
+    })
+
+    it('P1-2: a LOST RACE (the row is reclaimed between this call\'s own SELECT and its UPDATE) refuses release_lost_race, writes NO receipt, and never touches the winner\'s row', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+
+      // Intercept the FIRST SELECT (the pre-check read) and, immediately after it resolves
+      // but BEFORE releaseStalePot's own UPDATE runs, simulate a concurrent winner
+      // reclaiming the row — exactly the race the meta.changes check exists to catch.
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      let selectSeen = false
+      const racyDb = {
+        ...harness.db,
+        prepare(sql: string) {
+          if (!selectSeen && sql.includes('SELECT status, created_at FROM pots')) {
+            selectSeen = true
+            const stmt = realPrepare(sql)
+            return {
+              bind: (...args: unknown[]) => {
+                const bound = stmt.bind(...args)
+                return {
+                  first: async (...fa: unknown[]) => {
+                    const result = await bound.first(...fa)
+                    // The race, exactly as named in the finding: the original provisioner's
+                    // OWN retry completes and flips the row to 'active' THIS INSTANT, after
+                    // our read (which saw 'provisioning') but before our own UPDATE.
+                    harness.sqlite.exec("UPDATE pots SET status = 'active' WHERE slug = 'relslug'")
+                    return result
+                  },
+                }
+              },
+            }
+          }
+          return realPrepare(sql)
+        },
+      } as unknown as Env['DB']
+      const racyEnv = { ...env, DB: racyDb } as unknown as Env
+
+      const outcome = await toolPotRelease.run(orgAdminAuth, racyEnv, { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('release_lost_race')
+
+      // The now-active row is untouched — never flipped to 'released' out from under the
+      // provisioning run that just legitimately completed it.
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('active')
+      const receiptCount = harness.sqlite.prepare("SELECT COUNT(*) as c FROM pot_provision_receipts WHERE slug = 'relslug'").get() as { c: number }
+      expect(receiptCount.c).toBe(0)
+    })
+
+    it('P1-1: a receipt-write failure during release is FAIL CLOSED — the state flip is reverted, never ok:true with zero receipts', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      const sabotagedDb = {
+        ...harness.db,
+        prepare(sql: string) {
+          if (sql.includes('INSERT INTO pot_provision_receipts')) {
+            return { bind: () => ({ run: async () => { throw new Error('receipts table is locked') } }) }
+          }
+          return realPrepare(sql)
+        },
+      } as unknown as Env['DB']
+      const sabotagedEnv = { ...env, DB: sabotagedDb } as unknown as Env
+
+      const outcome = await toolPotRelease.run(orgAdminAuth, sabotagedEnv, { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('receipt_write_failed')
+
+      // REVERTED — the status flip did not survive the failed receipt write. Round-2's own
+      // version discarded the write's boolean here, so this exact scenario left the row
+      // durably 'released' with ok:true and ZERO receipts.
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('provisioning')
+      const receiptCount = harness.sqlite.prepare("SELECT COUNT(*) as c FROM pot_provision_receipts WHERE slug = 'relslug'").get() as { c: number }
+      expect(receiptCount.c).toBe(0)
+    })
+
+    it('P1-3: pot_release refuses a caller whose tenant does not match this deployment (through invokeTool)', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+      const foreignAuth: AuthContext = {
+        memberId: 'foreign-admin', role: 'admin', tenant: 'foreign-tenant',
+        capabilities: [{ scope_type: 'org', scope_id: 'foreign-tenant', capability: 'admin' }],
+      }
+
+      const outcome = await invokeTool(foreignAuth, env, 'pot_release', { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('tenant_mismatch')
+
+      // Never released, never receipted under a foreign actor_tenant.
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('provisioning')
+      const receiptCount = harness.sqlite.prepare("SELECT COUNT(*) as c FROM pot_provision_receipts WHERE slug = 'relslug'").get() as { c: number }
+      expect(receiptCount.c).toBe(0)
+    })
+
+    it('P1-4: pot_release refuses a bound-agent session (through invokeTool)', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+      const agentAuth: AuthContext = {
+        memberId: 'agent-member', boundAgentId: 'agent-1', role: 'admin', tenant: 'mumega',
+        capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }],
+      }
+
+      const outcome = await invokeTool(agentAuth, env, 'pot_release', { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('operator_principal_required')
+
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('provisioning')
+    })
+  })
+
+  describe('P3: provisionSovereignPot\'s final registry activation is guarded by ownership, not just the slug (mupot#1516 round-2)', () => {
+    it('a slug reassigned to a DIFFERENT provisioner while this run\'s six steps were in flight is refused at activation, not marked active on this run\'s say-so', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+
+      // Intercept the FINAL activation UPDATE and, right before it runs, simulate the slug
+      // having been reassigned to a different provisioner in the meantime (e.g. released by
+      // an admin and reclaimed by someone else while this run's six steps were in flight).
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      const racyDb = {
+        ...harness.db,
+        prepare(sql: string) {
+          if (sql.includes("UPDATE pots SET status = 'active'")) {
+            harness.sqlite.exec(
+              "UPDATE pots SET provisioner_member_id = 'reassigned-owner' WHERE slug = 'ownershiprace'",
+            )
+          }
+          return realPrepare(sql)
+        },
+      } as unknown as Env['DB']
+
+      const env = {
+        PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+        SECRET_ENV_CF_ACCOUNT_ID: 'acc-123',
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc',
+        TENANT_SLUG: 'mumega',
+        DB: racyDb,
+        SESSIONS: fakeSessionsKv(),
+        DISPATCHER: fakeDispatcher({ tenant: 'ownershiprace', releaseSha: null as any }) as any,
+      } as unknown as Env
+
+      const result = await provisionSovereignPot(
+        env, { slug: 'ownershiprace', brand_name: 'Ownership Race Co', admin_email: 'admin@ownershiprace.test', minted_by_member_id: 'original-owner', caller_tenant: 'mumega' }, '// bundle',
+      )
+
+      expect(result.ok).toBe(false)
+      expect(result.incomplete_reason).toContain('registry activation refused')
+      const row = harness.sqlite.prepare("SELECT status, provisioner_member_id FROM pots WHERE slug = 'ownershiprace'").get() as any
+      // Reassigned owner, status never flipped to active by the original run.
+      expect(row.provisioner_member_id).toBe('reassigned-owner')
+      expect(row.status).toBe('provisioning')
+    })
+  })
+
+  describe('ENABLEMENT GATE: bundle source is resolved BEFORE any Cloudflare call (mupot#1516 round-2)', () => {
+    it('no POT_WORKER_BUNDLE_BUCKET and no workerJsCode refuses no_bundle_source with ZERO Cloudflare calls — the #1285 orphan class this closes', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const fetchSpy = vi.fn()
+      global.fetch = fetchSpy as any
+
+      const env = {
+        PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+        SECRET_ENV_CF_ACCOUNT_ID: 'acc-123',
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc',
+        TENANT_SLUG: 'mumega',
+        DB: harness.db,
+      } as unknown as Env
+
+      const result = await provisionSovereignPot(env, { slug: 'preflightfail', brand_name: 'Preflight Fail Co', admin_email: 'admin@preflightfail.test' })
+
+      expect(result.ok).toBe(false)
+      expect(result.not_completed).toEqual(['create_d1', 'create_kv', 'apply_schema', 'deploy_worker', 'seed_identities', 'verify_reachable'])
+      expect(result.completed).toEqual([])
+      // The defining proof: no D1, no KV, nothing — zero Cloudflare calls of any kind.
+      expect(fetchSpy).not.toHaveBeenCalled()
+
+      const receipt = harness.sqlite.prepare(
+        "SELECT step, ok, detail FROM pot_provision_receipts WHERE slug = 'preflightfail'",
+      ).get() as { step: string; ok: number; detail: string }
+      expect(receipt.step).toBe('deploy_worker')
+      expect(receipt.ok).toBe(0)
+      expect(JSON.parse(receipt.detail).error.class).toBe('no_bundle_source')
+
+      // The registry row was still claimed (the preflight runs AFTER the registry gate,
+      // never before it) — but never got past 'provisioning'.
+      const potRow = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'preflightfail'").get() as any
+      expect(potRow.status).toBe('provisioning')
+    })
+
+    it('a configured bundle source still lets the run proceed normally (positive control)', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+      const env = {
+        PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+        SECRET_ENV_CF_ACCOUNT_ID: 'acc-123',
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc',
+        TENANT_SLUG: 'mumega',
+        DB: harness.db,
+        DISPATCHER: fakeDispatcher({ tenant: 'preflightok', releaseSha: null as any }) as any,
+      } as unknown as Env
+
+      const result = await provisionSovereignPot(env, { slug: 'preflightok', brand_name: 'Preflight OK Co', admin_email: 'admin@preflightok.test' }, '// bundle')
+      expect(result.ok).toBe(true)
     })
   })
 
