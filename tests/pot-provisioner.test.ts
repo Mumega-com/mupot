@@ -1241,6 +1241,16 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         expect((parsed.error.message.match(/\[redacted-email\]/g) ?? []).length).toBe(1)
       })
 
+      it('mupot#1523 re-run P1: a NON-composable combining mark (CGJ U+034F, variation selector U+FE0F, Thai U+0E31) inside an email is still redacted after NFKC', () => {
+        for (const mark of ['\u034F', '\uFE0F', '\u0E31', '\u20E0']) {
+          const obfuscated = `victim@exa${mark}mple.com`
+          expect(obfuscated.normalize('NFKC')).toBe(obfuscated) // sanity: NFKC does NOT fold this one away
+          const detail = receiptError('sql_error', `near "${obfuscated}": syntax error`)
+          const parsed = JSON.parse(detail)
+          expect(parsed.error.message).toBe('near "[redacted-email]": syntax error')
+        }
+      })
+
       it('mupot#1523 item 3: two keys that redact to the SAME string are both preserved, suffixed, never silently dropped', () => {
         const detail = receiptOk({ 'victim1@example.com': 'a', 'victim2@example.com': 'b', 'victim3@example.com': 'c' })
         const parsed = JSON.parse(detail)
@@ -1408,6 +1418,17 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
             if (result.ok) throw new Error('expected failure')
             expect(result.error, JSON.stringify(bad)).toBe('invalid_email')
           }
+        })
+
+        it('mupot#1523 re-run P1: refuses format characters and non-composable combining marks inside admin_email, still accepts NFD accents', () => {
+          for (const mark of ['\u00AD', '\u200B', '\u034F', '\uFE0F', '\u0E31']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: `admin@exa${mark}mple.com` })
+            expect(result.ok).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error).toBe('invalid_email')
+          }
+          const nfd = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'admin@exa\u0308mple.com' })
+          expect(nfd.ok).toBe(true)
         })
 
         it('mupot#1523 item 6: refuses a Unicode CONTROL character (category Cc, e.g. NUL) inside admin_email even though it is not `\\s`', () => {

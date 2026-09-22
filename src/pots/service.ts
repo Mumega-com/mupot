@@ -1002,7 +1002,13 @@ const EMAIL_RE = /[\p{L}\p{N}_.+-]+@[\p{L}\p{N}_-]+\.[\p{L}\p{N}_.-]+/gu
 // version of this line. Listed explicitly alongside `\p{Cf}`/`\p{Cc}` because none of them
 // share a Unicode general category with the others; there is no single category that covers
 // "renders as blank" the way there almost is for "is a format character."
-const FORMAT_CHAR_RE = /[\p{Cf}\p{Cc}⠀ᅟᅠㅤﾠ឴឵]/gu
+// mupot#1523 scoped re-run P1: NFKC only recomposes marks that HAVE a precomposed form.
+// A combining mark with no composition against its neighbour (U+034F CGJ, variation
+// selectors U+FE00-FE0F/U+E0100, Hebrew points, Thai vowels, enclosing marks) survives
+// normalization as a separate non-\p{L}/\p{N} codepoint and breaks the greedy run exactly
+// like the soft hyphen. Strip the whole mark category (`\p{M}` — Mn/Mc/Me) AFTER NFKC, so
+// the class is closed rather than enumerated one codepoint at a time.
+const FORMAT_CHAR_RE = /[\p{Cf}\p{Cc}\p{M}⠀ᅟᅠㅤﾠ឴឵]/gu
 
 /** Redacts anything email-shaped and bounds the length of a string. Applied to EVERY
  *  `receiptError` message AND `errorClass` AND recursively to every string value AND object

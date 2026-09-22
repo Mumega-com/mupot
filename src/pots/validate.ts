@@ -73,7 +73,12 @@ const MAX_ADMIN_EMAIL_LENGTH = 254
 // U+0000 is Cc but not `\s`) never legitimately appear in a mailbox address; a caller-supplied
 // `admin_email` containing one is refused outright rather than silently accepted and passed
 // through to an inlined seed-batch SQL statement.
-const EMAIL_WHITESPACE_OR_CONTROL_RE = /[\s\p{Cc}]/u
+// mupot#1523 scoped re-run P1: format characters (Cf — soft hyphen, ZWSP, ZWJ, bidi
+// marks) and combining marks that do not recompose under NFKC (M — CGJ, variation
+// selectors, non-Latin points) are refused too. The same predicate the receipt redactor
+// strips on; the check runs on the NFKC form so a legitimate NFD `exämple.com` (which
+// recomposes) is still accepted while an invisible-character smuggle is not.
+const EMAIL_WHITESPACE_OR_CONTROL_RE = /[\s\p{Cc}\p{Cf}\p{M}]/u
 
 /** Basic `admin_email` SHAPE validation (mupot#1520 P1-A) — not a full RFC 5322 validator (no
  *  attempt at quoted local parts, IP-literal domains, or IDNA percent-encoding), just enough
@@ -88,7 +93,7 @@ const EMAIL_WHITESPACE_OR_CONTROL_RE = /[\s\p{Cc}]/u
  *  unicode domain like `admin@exämple.com` are both accepted. Length is bounded separately,
  *  above (`MAX_ADMIN_EMAIL_LENGTH`, RFC 5321 §4.5.3.1.3's 254). */
 function isPlausibleEmailShape(email: string): boolean {
-  if (EMAIL_WHITESPACE_OR_CONTROL_RE.test(email)) return false
+  if (EMAIL_WHITESPACE_OR_CONTROL_RE.test(email.normalize('NFKC'))) return false
   const at = email.indexOf('@')
   if (at <= 0 || at !== email.lastIndexOf('@')) return false // exactly one '@', non-empty local part
   const domain = email.slice(at + 1)
