@@ -184,15 +184,15 @@ repairing a stuck lease — every call, successful or refused, is receipted (see
 
 ## Receipt(s) written
 
-- `fleet_agents.presence_mode` / `presence_ttl_sec` — columns from `migrations/0168`.
-- `fleet_agents.poll_home_squad_slug` — new nullable column, same migration 0168 (#1514,
+- `fleet_agents.presence_mode` / `presence_ttl_sec` — columns from `migrations/0171`.
+- `fleet_agents.poll_home_squad_slug` — new nullable column, same migration 0171 (#1514,
   P2-a): tracks the poll writer's own last squad contribution separately from the
   daemon-report writer's, so the two merge (union) instead of clobbering each other.
 - `task_dispatch_receipts.delivered_via` (`'inbox'|'in_worker'`, same migration) —
   written by `recordDispatchDeliveryMode()`, "never silent" per the issue's own demand.
 - `task_dispatch_runtime_receipts` row (settle step, pre-existing table). **v4:** the
   `stage` CHECK now also admits `'reset_terminated'` (table-rebuild migration, same
-  `migrations/0168`, widen-don't-relabel — every existing row's `stage` is copied
+  `migrations/0171`, widen-don't-relabel — every existing row's `stage` is copied
   unchanged) — the row `adminResetDispatchLease({ terminate: true })` writes.
 - `mutation_audit_entries` row for every `task_dispatch_lease_reset` call (#1514) —
   `operation` is `'reset'`, `'reset_override'`, `'reset_refused_terminal'`,
@@ -204,7 +204,7 @@ repairing a stuck lease — every call, successful or refused, is receipted (see
   resolves a reported SLUG to its canonical `agents.id` before every write
   (`reportFleetAgents`, `/attach-signed`), so the daemon-report/signed-attach writers and
   the poll writer (`upsertPollFleetPresence`, already uuid-keyed) converge on ONE row per
-  real agent instead of two. `migrations/0168`'s v4 addendum backfills any pre-existing
+  real agent instead of two. `migrations/0171`'s v4 addendum backfills any pre-existing
   duplicate pair (rename the lone slug-keyed row onto its uuid when no uuid row exists yet;
   delete the redundant slug-keyed row when both already exist) — an unmapped or
   tenant-wide-ambiguous slug is left untouched, never guessed through.

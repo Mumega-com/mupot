@@ -1,4 +1,4 @@
--- 0168_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).
+-- 0171_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).
 --
 -- Additive only, no backfill: every existing row keeps presence_mode='' and
 -- presence_ttl_sec=NULL, so src/fleet/registry.ts's derivePresence keeps reading the ONE global
@@ -64,8 +64,9 @@ ALTER TABLE task_dispatch_receipts ADD COLUMN delivered_via TEXT
 -- touched, only the set of values a FUTURE row may carry is expanded.
 --
 -- task_dispatch_runtime_receipts is UNAPPLIED IN PRODUCTION as of this writing (created by
--- 0138, and this whole 0163->0168 migration range is branch/schema-only per this file's own
--- established convention — a human applies it); this rebuild is still written as fully
+-- 0138, and this file is branch/schema-only per this repo's own established convention — a
+-- human applies it; renumbered 0163 -> 0168 -> 0171 as sibling in-flight PRs claimed the
+-- numbers in between, see git history); this rebuild is still written as fully
 -- ROW- AND VALUE-PRESERVING (straight column copy, no CASE/relabel) so it is correct
 -- regardless of whether production data exists by the time it is actually applied — same
 -- posture 0165 took after discovering its own "unapplied" assumption was wrong once already.

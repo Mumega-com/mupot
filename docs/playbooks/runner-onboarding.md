@@ -207,7 +207,7 @@ task_dispatch_runtime_receipt({
 - **mupot#1506 is CLOSED (v4):** a poll row keyed by an agent's uuid and a daemon/signed-
   attach row for the same agent keyed by its slug used to be two independent rows that
   never reconciled — `resolveFleetWriteAgentId` now converges every writer onto the
-  canonical `agents.id`, and a `migrations/0168` addendum backfills any pre-existing
+  canonical `agents.id`, and a `migrations/0171` addendum backfills any pre-existing
   duplicate pair. The home-squad exclusion (`listFleetAgentRuntimeView`) also no longer
   trusts a `fleet_agents` row's own self-reported `squads` array — it derives from the
   agent's REAL `agents.squad_id` membership instead, closing a separate self-report-honesty
