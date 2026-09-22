@@ -1090,7 +1090,7 @@ export async function provisionSovereignPot(
 
   // 0. Registry gate — BEFORE any Cloudflare call (mupot#1507 round-2 P0-4, Athena
   // condition i). `pots` (migration 0145) plus its round-2 `provisioner_member_id`/
-  // `provisioner_tenant` columns (migration 0165) is the account-wide ownership record: a
+  // `provisioner_tenant` columns (migration 0167) is the account-wide ownership record: a
   // slug already claimed by a DIFFERENT (member, tenant) pair is refused outright, never
   // silently adopted. A brand-new slug is claimed HERE, before create_d1 — the INSERT's
   // own UNIQUE(slug) constraint is the concurrency guard: if two calls race for the same

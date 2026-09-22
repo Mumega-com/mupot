@@ -3019,10 +3019,10 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0165_pots_registry_provisioner.sql",
-    sha256: "ce9323c5df93dff6548e23a76fe3c7d567128a8c8f50d5e4fca460c4469349c6",
+    file: "0167_pots_registry_provisioner.sql",
+    sha256: "45de66fe72ef77a3ec4b574e9e77259b40400c6f0d7dec4c30758117379ff775",
     statements: [
-      "-- 0165_pots_registry_provisioner.sql — records WHO claimed a slug, so a retry\n-- can be told apart from a takeover (mupot#1507 round-2 adversarial gate,\n-- Athena condition i: \"reuse-by-name is allowed ONLY when the caller is the\n-- pot's registered provisioner\").\n--\n-- Before this, `provisionSovereignPot` adopted any existing D1/KV/worker\n-- whose NAME matched the requested slug, with no check on who created it.\n-- Two org-admins (or the same admin retrying, or a hostile one squatting a\n-- slug first) racing the same slug meant whoever called second silently\n-- inherited whatever the first left behind — including, on a race, a\n-- still-in-flight seed. `pots` (migration 0145) already exists as the\n-- account-wide slug registry `checkSlugAvailability` reads; this adds the\n-- missing half — who is allowed to call `provisionSovereignPot` again for a\n-- given slug and have it ADOPT rather than refuse `pot_slug_taken`.\n--\n-- Additive, nullable, no backfill: existing `pots` rows (only ever written by\n-- the 2026-09-04 namespace-audit seed per 0145's own header, and by this\n-- PR's own writes going forward) have no provisioner on record, which reads\n-- as \"nobody currently holds a reuse claim\" — the safe default (fail closed\n-- toward `pot_slug_taken` for a foreign caller, never open toward adoption).\n\nALTER TABLE pots ADD COLUMN provisioner_member_id TEXT;",
+      "-- 0167_pots_registry_provisioner.sql — records WHO claimed a slug, so a retry\n-- can be told apart from a takeover (mupot#1507 round-2 adversarial gate,\n-- Athena condition i: \"reuse-by-name is allowed ONLY when the caller is the\n-- pot's registered provisioner\").\n--\n-- Before this, `provisionSovereignPot` adopted any existing D1/KV/worker\n-- whose NAME matched the requested slug, with no check on who created it.\n-- Two org-admins (or the same admin retrying, or a hostile one squatting a\n-- slug first) racing the same slug meant whoever called second silently\n-- inherited whatever the first left behind — including, on a race, a\n-- still-in-flight seed. `pots` (migration 0145) already exists as the\n-- account-wide slug registry `checkSlugAvailability` reads; this adds the\n-- missing half — who is allowed to call `provisionSovereignPot` again for a\n-- given slug and have it ADOPT rather than refuse `pot_slug_taken`.\n--\n-- Additive, nullable, no backfill: existing `pots` rows (only ever written by\n-- the 2026-09-04 namespace-audit seed per 0145's own header, and by this\n-- PR's own writes going forward) have no provisioner on record, which reads\n-- as \"nobody currently holds a reuse claim\" — the safe default (fail closed\n-- toward `pot_slug_taken` for a foreign caller, never open toward adoption).\n\nALTER TABLE pots ADD COLUMN provisioner_member_id TEXT;",
       "\nALTER TABLE pots ADD COLUMN provisioner_tenant TEXT;",
       "\n\nCREATE INDEX IF NOT EXISTS idx_pots_provisioner\n  ON pots(provisioner_member_id);",
     ],
@@ -3035,4 +3035,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "1ec7fa431fd5eb0eef8a774af1cff84fec9ced6ded6230054b3900a0b106ec21"
+export const SCHEMA_CHAIN_DIGEST: string = "8b6ed3591d75ff9c830c255cedfcd233c5de8a709b9bf9b1dd710c2e52c32809"
