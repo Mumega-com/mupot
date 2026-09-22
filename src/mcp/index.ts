@@ -100,6 +100,9 @@ import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../tasks/assigne
 import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
+  loadLatestDispatchReceiptsForTasks,
+  adminResetDispatchLease,
+  hasInFlightDispatchReceipt,
   type TaskDispatchRuntimeStage,
 } from '../tasks/runtime-receipts'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
@@ -145,8 +148,16 @@ import {
   readFleetAgentRow,
   getFleetAgentLiveness,
   derivePresence,
-  presenceTtlSec,
+  resolveFleetPresenceTtlSec,
+  clampPollIntervalSec,
+  pollPresenceTtlSec,
+  upsertPollFleetPresence,
+  touchPollFleetPresence,
+  clearPollFleetPresence,
+  POLL_PRESENCE_MODE,
+  RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
+import { hasRegisteredDeliverySurface } from '../bus/consumer'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { toolAgentLifecycle } from './agent-lifecycle'
@@ -1053,7 +1064,33 @@ const toolTaskList: ToolSpec = {
     const agentStates: ReadonlyMap<string, AgentRuntimeState> =
       visibleTaskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
-    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(visibleTaskRows, agentStates) })
+    // mupot#1494/#1502 (P1-a) — a task_list-only runner has no other way to learn the
+    // dispatch_receipt_id it needs to settle with, and delivered_via must be READABLE, not
+    // just recorded, to be "never silent". Attached post-ranking: it never affects order.
+    const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
+    // mupot#1494 round 3 (P0, part b; comment corrected round 2 of adversarial review) —
+    // `assignee_agent_id` on task_list is an optional FILTER, not a restriction: a squad
+    // member listing another agent's tasks must never read that other agent's
+    // dispatch_receipt_id. NOT because the id is a secret/capability token — it is a bare
+    // correlator, and other legitimate projections (dashboards, receipts) may show it too;
+    // `claimUnleasedForPairSettlement`'s ownership predicate (src/tasks/runtime-receipts.ts)
+    // is what actually gates settlement, keyed on the caller's REAL identity, never on
+    // knowledge of this id alone. This filter is about need-to-know noise reduction (a
+    // non-assignee has no legitimate use for another agent's receipt id), not a security
+    // boundary the id's secrecy is load-bearing for. Attach ONLY to a row whose assignee is
+    // the CALLER — every other row gets neither field, exactly as if no dispatch had ever
+    // been recorded for it.
+    const rankedTasks = rankTasks(visibleTaskRows, agentStates).map((t) => {
+      const info = t.assignee_agent_id === auth.boundAgentId ? dispatchInfo.get(t.id) : undefined
+      return info ? { ...t, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : t
+    })
+
+    // mupot#1494 round 3 (P2-c) — touch AFTER every read/write above has succeeded, not
+    // merely after the tool-layer 400/403/404 refusals: this is the LAST thing on the success
+    // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
+    await touchPollFleetPresence(env, auth.boundAgentId)
+
+    return done({ squad_id: squadRes.squad.id, tasks: rankedTasks })
   },
 }
 
@@ -1099,8 +1136,13 @@ const toolTaskBoard: ToolSpec = {
       done: [],
     }
     const visibleTaskRows = await loadGateWakeNotices(env, rows.results ?? [])
+    // mupot#1494/#1502 (P1-a) — same reader as task_list; see its comment above.
+    const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
     for (const task of visibleTaskRows) {
-      if (columns[task.status]) columns[task.status].push(task)
+      // mupot#1494 round 3 (P0, part b) — assignee-only, same rule as task_list above.
+      const info = task.assignee_agent_id === auth.boundAgentId ? dispatchInfo.get(task.id) : undefined
+      const enriched = info ? { ...task, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : task
+      if (columns[task.status]) columns[task.status].push(enriched)
     }
     const counts = Object.fromEntries(
       ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
@@ -1439,6 +1481,17 @@ const toolTaskUpdate: ToolSpec = {
       if (args.assignee_agent_id !== undefined) {
         const check = await resolveTaskAssignee(env, args.assignee_agent_id, existing.squad_id)
         if (check.error) return fail(400, check.error)
+        // mupot#1494 round 3 (P2-5, adversarial round 2) — reassigning (or unassigning)
+        // AWAY from the agent a dispatch is currently mid-flight to orphans that dispatch:
+        // the old agent's eventual settle fails ownership, the new agent has nothing of its
+        // own to settle, and a fresh dispatch is itself refused while the stale one is
+        // unsettled. Refuse the reassignment outright rather than create that wedge. Only
+        // checked when the assignee is actually CHANGING (a same-value no-op "reassignment"
+        // is harmless) — see hasInFlightDispatchReceipt's own doc comment for the exact
+        // in-flight definition.
+        if (check.value !== existing.assignee_agent_id && await hasInFlightDispatchReceipt(env, existing.id)) {
+          return fail(409, 'task_dispatch_in_flight', 'this task has an undelivered/unsettled dispatch — wait for it to settle or fail, or have an operator repair the lease, before reassigning')
+        }
         next.assignee_agent_id = check.value
         // Naming one owner clears the other. The alternative — making the caller
         // null the previous field first — turns an ordinary handoff into a
@@ -2141,16 +2194,28 @@ const toolTaskDispatch: ToolSpec = {
   name: 'task_dispatch',
   scope: 'squad (of the task)',
   min: 'member',
-  args: '{ task_id: string }',
+  args: '{ task_id: string, delivery?: "inbox" }',
   inputSchema: {
     type: 'object',
-    properties: { task_id: STRING_SCHEMA },
+    properties: {
+      task_id: STRING_SCHEMA,
+      // mupot#1494 — force the inbox route regardless of the target's registered/derived
+      // liveness. Consulted by src/bus/consumer.ts's resolveDispatchDeliveryMode.
+      delivery: { type: 'string', enum: ['inbox'] },
+    },
     required: ['task_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    // validateArgs (the shared dispatcher gate) does not enforce inputSchema `enum` — a
+    // decision-branching field like `delivery` is rejected here rather than silently ignored,
+    // so a caller's typo can never be mistaken for "delivery not forced".
+    if (args.delivery !== undefined && args.delivery !== null && args.delivery !== 'inbox') {
+      return fail(400, 'invalid_args', 'delivery must be "inbox"')
+    }
+    const forceInboxDelivery = args.delivery === 'inbox'
     const task = await loadTask(env, taskId)
     if (!task) return fail(404, 'task_not_found')
 
@@ -2167,6 +2232,41 @@ const toolTaskDispatch: ToolSpec = {
     if (assignee.error || assignee.value !== task.assignee_agent_id) {
       return fail(409, 'task_not_dispatchable')
     }
+
+    // mupot#1494 v4 (P1-a, adversarial round 2) — hasInFlightDispatchReceipt's OWN doc
+    // comment already claimed this task's reassignment guard "see toolTaskDispatch's own
+    // task_not_dispatchable gate" — a gate that did not actually exist here. PROVED: a
+    // fresh dispatch succeeded even while an earlier one on the same task was still
+    // genuinely unsettled, which both contradicted that doc comment and let an operator
+    // bypass P2-5's reassignment refusal by dispatching again, settling the NEW receipt,
+    // then reassigning while the OLD one stayed unsettled — the exact orphan P2-5 exists to
+    // prevent. Refuse while any earlier dispatch on this task is still in flight; a
+    // `task_dispatch_lease_reset(terminate: true)` repair (or a real completed/failed
+    // settle) clears this the same way it clears the reassignment guard.
+    if (await hasInFlightDispatchReceipt(env, task.id)) {
+      return fail(409, 'task_not_dispatchable')
+    }
+
+    // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` must not strand a task in an inbox
+    // nothing is known to poll. Run the SAME eligibility check consumer.ts's
+    // resolveDispatchDeliveryMode will run asynchronously, synchronously, here, so an
+    // ineligible force is visibly reported back to the caller (a queue-decoupled async
+    // decision has no other way to tell a synchronous caller "your force was ignored").
+    // Never fails the dispatch — the task is still dispatched, just not forced to inbox.
+    //
+    // mupot#1494 round 3 (P3) — renamed from `delivery_forced_ignored`: this eligibility read
+    // happens synchronously HERE, at dispatch time, but the actual route is decided AGAIN,
+    // asynchronously, by resolveDispatchDeliveryMode in the queue consumer — so what this
+    // field reports is a PREDICTION of that later decision, not a guarantee of what the
+    // consumer will do (the fleet row can change in between). `delivered_via`, readable off
+    // task_list/task_board (mupot#1502), is the actual, after-the-fact fact; this field is
+    // only ever the best synchronous guess.
+    let deliveryForcedPredicted: 'no_delivery_mode' | undefined
+    if (forceInboxDelivery) {
+      const route = await getFleetAgentLiveness(env, task.assignee_agent_id)
+      if (!hasRegisteredDeliverySurface(route)) deliveryForcedPredicted = 'no_delivery_mode'
+    }
+    const effectiveForceDelivery = forceInboxDelivery && !deliveryForcedPredicted
 
     const memberId = auth.memberId as string
     const receiptId = crypto.randomUUID()
@@ -2185,13 +2285,18 @@ const toolTaskDispatch: ToolSpec = {
       dispatchedAt,
     ).run()
 
-    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string }> = {
+    const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; delivery?: 'inbox' }> = {
       type: 'agent.wake',
       tenant: env.TENANT_SLUG,
       squad_id: task.squad_id,
       agent_id: task.assignee_agent_id,
       actor: memberActor(memberId),
-      payload: { task_id: task.id, by: memberId, dispatch_receipt_id: receiptId },
+      payload: {
+        task_id: task.id,
+        by: memberId,
+        dispatch_receipt_id: receiptId,
+        ...(effectiveForceDelivery ? { delivery: 'inbox' as const } : {}),
+      },
       ts: dispatchedAt,
     }
     try {
@@ -2227,6 +2332,7 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_by: memberActor(memberId),
         dispatched_at: dispatchedAt,
       },
+      ...(deliveryForcedPredicted ? { delivery_forced_predicted: deliveryForcedPredicted } : {}),
     })
   },
 }
@@ -2243,6 +2349,7 @@ function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutc
     || error.code === 'runtime_artifact_required'
     || error.code === 'runtime_gate_required'
     || error.code === 'runtime_receipt_transition_conflict'
+    || error.code === 'dispatch_terminated'
   ) return fail(409, error.code)
   return fail(500, error.code)
 }
@@ -2251,12 +2358,16 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
   name: 'task_dispatch_runtime_receipt',
   scope: 'assigned task runtime receipt',
   min: 'member',
-  args: '{ task_id, dispatch_receipt_id, message_id, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
+  args: '{ task_id, dispatch_receipt_id, message_id?, stage, runtime_receipt_hash, attempt, artifact_refs?, artifact_sha256?, result?, reason? }',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       dispatch_receipt_id: STRING_SCHEMA,
+      // mupot#1494 — optional: a task_list-polling runner never observes a raw agent_messages
+      // id. When omitted, recordTaskDispatchRuntimeReceipt resolves it from
+      // {task_id, dispatch_receipt_id} via the same convention deliverDispatchToInbox used to
+      // write the message (src/tasks/runtime-receipts.ts resolveMessageId).
       message_id: STRING_SCHEMA,
       stage: { type: 'string', enum: ['runtime_consumed', 'completed', 'failed'] },
       runtime_receipt_hash: STRING_SCHEMA,
@@ -2269,7 +2380,6 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
     required: [
       'task_id',
       'dispatch_receipt_id',
-      'message_id',
       'stage',
       'runtime_receipt_hash',
       'attempt',
@@ -3716,6 +3826,12 @@ const toolInbox: ToolSpec = {
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
+    // mupot#1494 round 3 (P2-c) — touch AFTER the service call SUCCEEDS, not merely after the
+    // tool-layer 400/403 refusals above: readAgentInbox can itself refuse (db_error,
+    // consumer_fenced, or a service-layer 400) — that is a refusal too, and must leave
+    // last_reported_at untouched exactly like a tool-layer refusal does. Last thing on the
+    // success path only.
+    await touchPollFleetPresence(env, agent)
     // `complete` is surfaced deliberately: a caller must be able to know it was
     // handed everything WITHOUT comparing a length against a cap it has to know.
     return done({
@@ -3856,6 +3972,13 @@ const toolInboxLease: ToolSpec = {
       if (res.reason === 'consumer_fenced' || res.reason === 'attempt_conflict') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
+    // mupot#1494 round 3 (P2-c) — touch AFTER leaseAgentInbox SUCCEEDS, not merely after the
+    // tool-layer 400/403/500 refusals above. Round 2's own fix (P2-i) only enumerated the
+    // TOOL layer: `inbox_lease({attempt_id:'x'})` still returned 400 invalid_attempt from
+    // WITHIN leaseAgentInbox's attempt-id branch (a SERVICE-layer refusal) after the touch had
+    // already run — a trivially repeatable no-op call held the agent 'live' forever. Last
+    // thing on the success path only, regardless of which layer would have refused.
+    await touchPollFleetPresence(env, agent)
     if ('state' in res) return done({
       tenant: res.tenant,
       agent_id: res.agent_id,
@@ -4198,6 +4321,95 @@ const toolInboxFenceSet: ToolSpec = {
   },
 }
 
+// task_dispatch_lease_reset — mupot#1494 round 3 (Athena's RECORD INTEGRITY ruling). The
+// receipted operator repair for a wedged/desynchronised dispatch lease — see
+// adminResetDispatchLease's doc comment (src/tasks/runtime-receipts.ts) for the exact repair
+// semantics. org-admin only; every call (found or not, reset or refused) is receipted to
+// mutation_audit_entries.
+const toolTaskDispatchLeaseReset: ToolSpec = {
+  name: 'task_dispatch_lease_reset',
+  scope: 'org (workspace admin repairs a wedged/desynchronised dispatch lease)',
+  min: 'admin',
+  args: '{ task_id: string, dispatch_receipt_id: string, reason: string, override?: boolean, terminate?: boolean }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      dispatch_receipt_id: STRING_SCHEMA,
+      reason: STRING_SCHEMA,
+      override: { type: 'boolean' },
+      // mupot#1494 v4 (P1-a) — also mark the dispatch's runtime receipt TERMINAL
+      // ('reset_terminated'), so hasInFlightDispatchReceipt sees it as settled and
+      // reassignment/unassignment/re-dispatch stop refusing a genuinely dead runner's task
+      // forever. See adminResetDispatchLease's doc comment for the exact repair semantics.
+      terminate: { type: 'boolean' },
+    },
+    required: ['task_id', 'dispatch_receipt_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    // mupot#1494 round 3 (P1-B, adversarial round 2) — this repair is org-admin ONLY, and
+    // that must be provable from the CAPABILITY GRANT alone, never `hasWorkspaceAdmin`'s
+    // legacy-`role` fallback (which fires whenever `auth.capabilities` is absent — the exact
+    // gap a squad-scoped admin passed through, M9). Uses `hasCapability` directly against an
+    // explicit `'org'` scope grant. Also refuses any agent-bound token outright
+    // (`operator_principal_required`, same pattern as src/mcp/provision.ts) — an agent
+    // acting on its own member's org:admin standing is not a human operator invoking this
+    // repair directly, and this tool's receipt must always be attributable to a human call.
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (!hasCapability(auth.capabilities ?? [], 'org', null, 'admin')) {
+      return fail(403, 'forbidden', { need: 'org:admin' })
+    }
+    const taskId = str(args.task_id)
+    const dispatchReceiptId = str(args.dispatch_receipt_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    if (!dispatchReceiptId) return fail(400, 'invalid_args', 'dispatch_receipt_id required')
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+    if (reason.length < 1 || reason.length > 500) return fail(400, 'invalid_args', 'reason must be 1-500 characters')
+    if (args.override !== undefined && typeof args.override !== 'boolean') {
+      return fail(400, 'invalid_args', 'override must be a boolean')
+    }
+    if (args.terminate !== undefined && typeof args.terminate !== 'boolean') {
+      return fail(400, 'invalid_args', 'terminate must be a boolean')
+    }
+    if (!auth.memberId) return fail(403, 'forbidden', { need: 'member identity' })
+    const result = await adminResetDispatchLease(env, auth, {
+      taskId, dispatchReceiptId, reason, override: args.override === true, terminate: args.terminate === true,
+    })
+    if (result.code === 'reset_refused_lease_live') {
+      // mupot#1494 round 3 (P1-A) — typed refusal naming the current holder + expiry, so an
+      // operator can decide (find/confirm the holder is actually gone, then retry with
+      // `override: true`) rather than the tool silently stealing an in-flight lease.
+      return fail(409, 'lease_live', { message_id: result.message_id, audit_id: result.audit_id, ...result.lease_live })
+    }
+    if (result.code === 'reset_refused_task_mismatch') {
+      return fail(409, 'task_mismatch', { message_id: result.message_id, audit_id: result.audit_id })
+    }
+    if (result.code === 'reset_refused_credential_required') {
+      // mupot#1494 v4 (P1-a) — terminate:true needs a real bearer credential to anchor the
+      // terminal receipt to; a directory-OAuth org-admin session with none can still reset
+      // without terminate.
+      return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
+    }
+    if (result.code === 'reset_refused_already_terminal') {
+      // mupot#1494 v4 round 3 (P1-A) — an explicit, named refusal distinct from the generic
+      // lease_reset_refused: this dispatch was already operator-terminated
+      // (reset_terminated), never a plain completed/failed settle (those are repairable and
+      // never reach this code — see adminResetDispatchLease's narrowed terminal check).
+      // Without this branch the caller only sees the opaque lease_reset_refused 409 and has
+      // no way to distinguish "already terminated, this is final" from an ordinary refusal.
+      return fail(409, 'already_terminated', { message_id: result.message_id, audit_id: result.audit_id })
+    }
+    if (!result.reset) {
+      return fail(409, 'lease_reset_refused', { message_id: result.message_id, audit_id: result.audit_id })
+    }
+    return done({
+      reset: true, overrode: result.overrode, terminated: result.terminated,
+      message_id: result.message_id, audit_id: result.audit_id,
+    })
+  },
+}
+
 type PeerRow = Agent & {
   presence_source: string | null
   presence_label: string | null
@@ -4290,7 +4502,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string }',
+  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4304,6 +4516,10 @@ const toolCheckIn: ToolSpec = {
       provider: STRING_SCHEMA,
       effort: { type: 'string', enum: [...SEVEN_AXIS_EFFORTS] },
       flight_id: STRING_SCHEMA,
+      // mupot#1494 — a polling runner (no resident heartbeat daemon) declares its own delivery
+      // cadence so task_dispatch can route it an inbox envelope without a 180s heartbeat.
+      presence_mode: { type: 'string', enum: [POLL_PRESENCE_MODE, RESIDENT_PRESENCE_MODE] },
+      poll_interval_sec: { type: 'number' },
     },
     additionalProperties: false,
   },
@@ -4313,9 +4529,66 @@ const toolCheckIn: ToolSpec = {
         return fail(400, 'invalid_args', `${key} must be a string`)
       }
     }
+    if (args.poll_interval_sec !== undefined && args.poll_interval_sec !== null && typeof args.poll_interval_sec !== 'number') {
+      return fail(400, 'invalid_args', 'poll_interval_sec must be a number')
+    }
+    // validateArgs (the shared dispatcher gate) does not enforce inputSchema `enum` — every
+    // enum-shaped field in this codebase is hand-validated in its own tool's run() (see
+    // `harness`/`effort` above, normalized rather than rejected). presence_mode is a real branch
+    // point (it decides whether a fleet row gets created/updated), so an unrecognized value is
+    // REJECTED here rather than silently normalized.
+    if (
+      args.presence_mode !== undefined && args.presence_mode !== null
+      && args.presence_mode !== POLL_PRESENCE_MODE && args.presence_mode !== RESIDENT_PRESENCE_MODE
+    ) {
+      return fail(400, 'invalid_args', `presence_mode must be "${POLL_PRESENCE_MODE}" or "${RESIDENT_PRESENCE_MODE}"`)
+    }
 
     const id = await loadMemberIdentity(env, auth)
     if (!id) return fail(403, 'not_member_bound', 'check_in requires a member-token principal')
+
+    // mupot#1494 — establish/refresh poll-mode fleet presence BEFORE the debounce return below:
+    // this is a completely separate write path (fleet_agents, not the presence table the KV key
+    // debounces), and a caller polling every poll_interval_sec must have its TTL genuinely reset
+    // on every call, never silently skipped by the presence-table's unrelated 30s debounce.
+    let pollPresence:
+      | { presence_mode: 'poll'; poll_interval_sec: number; presence_ttl_sec: number }
+      | { presence_stopped_by_operator: true }
+      | { poll_registration_cleared: true }
+      | undefined
+    if (args.presence_mode === POLL_PRESENCE_MODE) {
+      if (!auth.boundAgentId) {
+        return fail(400, 'invalid_args', 'presence_mode: poll requires an agent-bound credential')
+      }
+      const pollIntervalSec = clampPollIntervalSec(args.poll_interval_sec)
+      const ttlSec = pollPresenceTtlSec(pollIntervalSec)
+      const result = await upsertPollFleetPresence(env, {
+        agentId: auth.boundAgentId,
+        display: id.displayName,
+        memberId: id.memberId,
+        ttlSec,
+      })
+      // mupot#1494 round 2 (P2-f) — an operator (or the agent's own prior self-detach) stopped
+      // this row; that verdict wins over a poll-mode check_in trying to resurrect it. No TTL/
+      // poll_interval echoed back — none of it took effect.
+      pollPresence = result.stoppedByOperator
+        ? { presence_stopped_by_operator: true }
+        : { presence_mode: 'poll', poll_interval_sec: pollIntervalSec, presence_ttl_sec: ttlSec }
+    } else if (args.presence_mode === RESIDENT_PRESENCE_MODE) {
+      // mupot#1494 round 2 (P2-g) — explicit de-registration: clear any prior poll-mode
+      // registration so this row falls back to ordinary resident rules (global TTL,
+      // runtime && live), exactly as if it had never poll-registered.
+      await clearPollFleetPresence(env, auth.boundAgentId)
+      // mupot#1494 round 3 (P3) — confirm the clear happened. Round 2 left `pollPresence`
+      // undefined on this branch, so the caller had no way to tell "resident mode confirmed,
+      // poll registration cleared" apart from "not present, this call never touched it".
+      pollPresence = { poll_registration_cleared: true }
+    } else {
+      // Not (re-)establishing this call — still slide the TTL window forward if this agent is
+      // ALREADY poll-registered from an earlier check_in (cheap: touchPollFleetPresence's WHERE
+      // clause makes this a no-op for every other agent, including every resident one).
+      await touchPollFleetPresence(env, auth.boundAgentId)
+    }
 
     const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
     const axis = normalizeSevenAxis({
@@ -4381,6 +4654,7 @@ const toolCheckIn: ToolSpec = {
             },
           }
         : {}),
+      ...(pollPresence ?? {}),
     }
 
     try {
@@ -4764,7 +5038,11 @@ const toolFleetAgentGet: ToolSpec = {
 
     const routeInfo = await getFleetAgentLiveness(env, targetAgent.id)
     const row = await readFleetAgentRow(env, targetAgent.id)
-    const ttlSec = presenceTtlSec(env)
+    // mupot#1494 round 2 (P1-b) — resolveFleetPresenceTtlSec is THE one per-row TTL
+    // resolution every fleet_agents presence reader now calls, so this read-only view can
+    // never disagree with the actual dispatch-routing decision (getFleetAgentLiveness), the
+    // dashboard fleet view, routine selectAgent, or the agent view.
+    const ttlSec = resolveFleetPresenceTtlSec(env, row)
     const status = String(row?.status ?? 'unknown')
     const lastReportedAt = String(row?.last_reported_at ?? '')
     const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
@@ -4776,6 +5054,14 @@ const toolFleetAgentGet: ToolSpec = {
       runtime: routeInfo.runtime,
       status: row?.status ?? null,
       last_reported_at: row?.last_reported_at ?? null,
+      // mupot#1494 round 3 (P3, adversarial round 2) — reads `routeInfo.presenceMode`
+      // (getFleetAgentLiveness's OWN isActivePollPresenceMode-filtered value), never the
+      // raw `row.presence_mode` column: an operator-stopped row's column can still
+      // literally read 'poll' (see isActivePollPresenceMode's doc comment,
+      // src/fleet/registry.ts) even though routing has already stopped treating it as
+      // poll-active — this read-only view must agree with the routing decision, not the
+      // raw storage.
+      presence_mode: routeInfo.presenceMode || '',
       presence_ttl_sec: ttlSec,
       derived_presence: derivedPresence,
       live: routeInfo.live,
@@ -5405,6 +5691,7 @@ export const TOOLS: ToolSpec[] = [
   toolInboxDeadLetters,
   toolInboxFenceStatus,
   toolInboxFenceSet,
+  toolTaskDispatchLeaseReset,
   toolPeers,
   toolCheckIn,
   toolEndAgentSession,
@@ -5667,6 +5954,14 @@ export async function invokeTool(
       ctx.waitUntil(touchPromise)
     }
   }
+
+  // Poll-mode fleet presence (mupot#1494): a poll-registered agent's fleet_agents.last_reported_at
+  // is also refreshed inline by the specific tools a polling runner actually lives on — inbox,
+  // inbox_lease and task_list (see each tool's own run()) — so this dispatcher-level chokepoint
+  // does not need its own copy of that write. Kept narrow (named tools only, not every tool call)
+  // deliberately: touchPollFleetPresence is cheap and self-guarding, but the SMALLEST correct
+  // surface is the one a polling runner's actual poll loop exercises, not every MCP call site in
+  // the codebase.
 
   return { ...outcome, tool: spec.name }
 }

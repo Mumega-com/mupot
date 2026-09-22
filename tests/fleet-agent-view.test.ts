@@ -58,6 +58,11 @@ function makeDb(opts: MockDbOpts = {}) {
       const found = members.find((m) => m.id === id && m.tenant === tenant)
       return found ? { 1: 1 } : null
     }
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's exact-id probe. No real agents
+    // table in this mock; every reported agent_id here is a bare slug ('kasra' etc.) that
+    // never matches a real agents.id, so "no match" is the correct answer — falls through
+    // to the slug lookup below, also unmatched, returning the identifier unchanged.
+    if (sql.includes('SELECT 1 FROM agents WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
 
@@ -107,6 +112,13 @@ function makeDb(opts: MockDbOpts = {}) {
     }
     // reportFleetAgents keyed-agent skip check: no registered keys in these tests.
     if (sql.includes('FROM agent_keys')) return []
+    // mupot#1494 v4 (P1-c) — loadKnownSquadSlugs' allow-list for validReport's squads
+    // filter. No real squads table in this mock; 'growth' is the only slug any fixture in
+    // this file reports via reportFleetAgents (the rest seed fleet_agents rows directly).
+    if (sql.includes('FROM squads')) return [{ slug: 'growth' }]
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's slug lookup, reached only when the
+    // id probe above already missed. No real agents table in this mock — always unmatched.
+    if (sql.includes('SELECT id FROM agents WHERE slug')) return []
     throw new Error('unhandled all: ' + sql)
   }
 

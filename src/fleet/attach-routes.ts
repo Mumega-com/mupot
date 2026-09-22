@@ -24,7 +24,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
-import { getAgentView } from './registry'
+import { getAgentView, resolveFleetWriteAgentId } from './registry'
 import { verifySignedAttach } from './signed-attach'
 import { verifySignedDetach } from './signed-detach'
 import { isValidRuntime, runtimeVocabulary, RUNTIME_SET } from './runtimes'
@@ -49,7 +49,17 @@ function cleanHost(v: unknown): string {
  *  caller-authenticated identity (token-derived for bearer; key-bound for signed). `host` is
  *  always written (INSERT and UPDATE) — unlike display/squads/provider_contract, which are
  *  intentionally preserved on UPDATE for the daemon-populated case, host reflects the
- *  CURRENT physical machine, so a fresh self-report should always overwrite a stale one. */
+ *  CURRENT physical machine, so a fresh self-report should always overwrite a stale one.
+ *
+ *  mupot#1494 v4 round 2 (P1-1, adversarial regression) — resolves `agentId` through
+ *  `resolveFleetWriteAgentId` INTERNALLY, once, here — never at an individual call site.
+ *  Round 1 of this fix applied the resolve call only at the `/attach-signed` call site;
+ *  `/attach` (bearer) upserted the RAW reported identifier, so the same real agent could
+ *  still end up keyed differently depending on which route wrote it last. Centralizing the
+ *  resolution inside the one function that actually performs the write means every current
+ *  AND future caller gets it for free — no call site can forget. Returns the RESOLVED id so
+ *  the caller's own follow-up read (the boot-ack `getAgentView` lookup) uses the same key
+ *  the row was actually written under. */
 async function upsertRunning(
   env: Env,
   agentId: string,
@@ -59,7 +69,8 @@ async function upsertRunning(
   memberId: string | null,
   host: string,
   model: string | null = null,
-): Promise<void> {
+): Promise<string> {
+  const writeAgentId = await resolveFleetWriteAgentId(env, agentId)
   await env.DB.prepare(
     `INSERT INTO fleet_agents
           (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract,
@@ -77,7 +88,7 @@ async function upsertRunning(
           last_reported_at = excluded.last_reported_at,
           updated_at       = excluded.updated_at`,
   )
-    .bind(agentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model)
+    .bind(writeAgentId, env.TENANT_SLUG, runtime, lifecycle, memberId, agentType, memberId, host, model)
     .run()
 
   // Runtime truth reaches the identity record too (harness-native-mupot lane A): the Fleet
@@ -90,24 +101,45 @@ async function upsertRunning(
           SET model = ?1
         WHERE id = ?2`,
     )
-      .bind(model, agentId)
+      .bind(model, writeAgentId)
       .run()
   }
+
+  return writeAgentId
 }
 
 /** Mark a fleet row stopped for the authenticated/key-bound identity. Signed
- *  verifiers require an active bound member before calling this helper. */
+ *  verifiers require an active bound member before calling this helper.
+ *
+ *  mupot#1494 round 3 (P1-iii) — also clears `presence_mode`/`presence_ttl_sec`: this IS the
+ *  operator path to de-register a poll-mode row (the agent's own explicit path is
+ *  `check_in({presence_mode:'resident'})` -> clearPollFleetPresence). Without this, an
+ *  operator detach froze `status`/liveness but left `presence_mode='poll'` on the row for the
+ *  agent's own NEXT poll check-in to write straight back (upsertPollFleetPresence's ON
+ *  CONFLICT sets `presence_mode = 'poll'` unconditionally) — display-truth drift even though
+ *  routing itself is independently guarded by isActivePollPresenceMode (registry.ts). */
+// mupot#1494 v4 round 2 (P1-1, adversarial regression) — resolves `agentId` through
+// `resolveFleetWriteAgentId` INTERNALLY, same discipline as `upsertRunning` above. This is
+// the exact bug the round found: `/attach-signed` wrote a row keyed by the resolved
+// `agents.id`, but `/detach-signed` called this function with the raw signed identity (a
+// SLUG, from `agent_keys.agent_id`) — the WHERE never matched the uuid-keyed row, `changes`
+// stayed 0, detach returned `404 not_found_or_not_owner`, and the row stayed `running`
+// forever (dispatch-live) even though the runtime genuinely detached. Resolving here closes
+// it for BOTH callers (`/detach` and `/detach-signed`) without either needing to remember.
 async function markStopped(env: Env, agentId: string, memberId: string | null): Promise<number> {
+  const writeAgentId = await resolveFleetWriteAgentId(env, agentId)
   const result = await env.DB.prepare(
     `UPDATE fleet_agents
         SET status           = 'stopped',
+            presence_mode    = '',
+            presence_ttl_sec = NULL,
             last_reported_at = datetime('now'),
             updated_at       = datetime('now')
       WHERE tenant    = ?1
         AND agent_id  = ?2
         AND ((?3 IS NULL AND member_id IS NULL) OR member_id = ?4)`,
   )
-    .bind(env.TENANT_SLUG, agentId, memberId, memberId)
+    .bind(env.TENANT_SLUG, writeAgentId, memberId, memberId)
     .run()
 
   return (result.meta as { changes?: number }).changes ?? 0
@@ -245,12 +277,17 @@ fleetAttachApp.post('/attach', async (c) => {
 
   // 7. Upsert (shared with the signed path). display + squads + provider_contract default
   //    on INSERT and are NOT overwritten on UPDATE (preserve any daemon-populated value).
-  await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId, host, model)
+  // mupot#1494 v4 round 2 (P1-1) — `agentId` here is already `id.boundAgentId` (a uuid, per
+  // BLOCK-1's equality check above), so `upsertRunning`'s internal resolve is normally a
+  // no-op for this path — but the RETURNED id is still used for the boot-ack lookup below,
+  // never the pre-resolve local, so this route can never drift from the same discipline
+  // every other fleet_agents writer now follows.
+  const writeAgentId = await upsertRunning(c.env, agentId, runtime, lifecycle, agentType, memberId, host, model)
 
   // 8. Boot-ack: return the full getAgentView row so the runtime confirms its identity,
   //    type, and capabilities as mupot sees them after the upsert.
   const views = await getAgentView(c.env)
-  const agent = views.find((v) => v.agent_id === agentId) ?? null
+  const agent = views.find((v) => v.agent_id === writeAgentId) ?? null
 
   return c.json({ ok: true, agent })
 })
@@ -292,11 +329,19 @@ fleetAttachApp.post('/attach-signed', async (c) => {
   // 3. Upsert — every AUTH-RELEVANT field is signature-covered: agent_id/type/runtime/
   //    lifecycle are in the signed bytes; member_id is key-bound (from agent_keys), never
   //    the body. `host` is the one unsigned, display-only exception (untrusted by design).
-  await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id, host)
+  //
+  //    mupot#1494 v4 (P1-b) — `agent_keys.agent_id` (and so `v.agent_id`, the signed
+  //    identity) is keyed by SLUG (see the identifier-space-bridge note in registry.ts),
+  //    while the poll writer (`upsertPollFleetPresence`) keys on `agents.id` (a uuid). Left
+  //    unresolved, the SAME real agent gets two fleet_agents rows depending on which surface
+  //    last wrote it. `upsertRunning` now resolves `v.agent_id` to the canonical `agents.id`
+  //    INTERNALLY (v4 round 2, P1-1 — resolution centralized in the write function itself,
+  //    never at an individual call site) and returns it for the boot-ack lookup below.
+  const writeAgentId = await upsertRunning(c.env, v.agent_id, v.runtime, v.lifecycle, v.type, v.member_id, host)
 
   // 4. Boot-ack.
   const views = await getAgentView(c.env)
-  const agent = views.find((view) => view.agent_id === v.agent_id) ?? null
+  const agent = views.find((view) => view.agent_id === writeAgentId) ?? null
   return c.json({ ok: true, agent })
 })
 

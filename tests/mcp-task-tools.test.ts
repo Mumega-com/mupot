@@ -1385,6 +1385,43 @@ describe('MCP task cutover tools', () => {
     expect(updates.filter((update) => update.sql.includes('INSERT INTO task_dispatch_receipts'))).toHaveLength(1)
   })
 
+  // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` is eligibility-gated: toolTaskDispatch runs
+  // the SAME hasRegisteredDeliverySurface check consumer.ts's resolveDispatchDeliveryMode will
+  // run asynchronously, SYNCHRONOUSLY, so an ineligible force is visibly reported back rather
+  // than silently dropped by a queue-decoupled decision the caller can never see. This fixture
+  // (makeEnv) has NO fleet_agents row for AGENT_ID at all — the state a brand-new/never-attached
+  // agent's assignee is actually in — so the force is correctly IGNORED here; the "force
+  // honored" case (a registered-but-stale agent) is covered against REAL fleet_agents schema in
+  // tests/task-dispatch-force-inbox-eligibility.test.ts.
+  it("task_dispatch({ delivery: 'inbox' }) is IGNORED when the target has no registered delivery surface, and says so", async () => {
+    const { env, events } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1', delivery: 'inbox' }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    expect(res.result).toMatchObject({ dispatched: true, delivery_forced_predicted: 'no_delivery_mode' })
+    const payload = (events[0] as { payload: Record<string, unknown> }).payload
+    expect(Object.prototype.hasOwnProperty.call(payload, 'delivery')).toBe(false)
+  })
+
+  it('task_dispatch WITHOUT delivery does not add a delivery key to the emitted payload at all (never a stray undefined/false)', async () => {
+    const { env, events } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1' }, 'https://pot.example')
+
+    const payload = (events[0] as { payload: Record<string, unknown> }).payload
+    expect(Object.prototype.hasOwnProperty.call(payload, 'delivery')).toBe(false)
+  })
+
+  it('task_dispatch rejects an unrecognized delivery value', async () => {
+    const { env } = makeEnv([task({ assignee_agent_id: AGENT_ID })])
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: 'task-1', delivery: 'carrier-pigeon' }, 'https://pot.example')
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('invalid_args')
+  })
+
   it('task_dispatch refuses an unassigned task without emitting a wake', async () => {
     const { env, events } = makeEnv([task()])
 

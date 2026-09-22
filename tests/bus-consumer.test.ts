@@ -121,7 +121,8 @@ describe('bus queue consumer', () => {
 
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
 
-    expect(run).toHaveBeenCalledTimes(2)
+    // claim (1) + recordDispatchDeliveryMode (mupot#1494, 1) + consume (1) = 3.
+    expect(run).toHaveBeenCalledTimes(3)
     expect(item.ack).toHaveBeenCalledOnce()
     expect(item.retry).not.toHaveBeenCalled()
   })
@@ -421,6 +422,9 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     executionReceiptId: string | null
     executionClaimExpiresAt: number | null
     taskStatus: string
+    // mupot#1494 — resolveDispatchDeliveryMode's decision, as recorded by
+    // recordDispatchDeliveryMode. null until the routing decision writes it.
+    deliveredVia: string | null
   }
   interface MsgRow {
     seq: number; id: string; tenant: string; to_agent: string; from_agent: string
@@ -431,7 +435,14 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
   // are keyed by whatever the real attach call declared — a slug, per the live mumega tenant DB,
   // 2026-07-14). This lets the tests prove delivery targets the RESOLVED identity, not the raw
   // event.agent_id (the identifier-space bridge fix in src/fleet/registry.ts).
-  interface FleetRow { agentId: string; runtime: string; status: string; last_reported_at: string }
+  interface FleetRow {
+    agentId: string
+    runtime: string
+    status: string
+    last_reported_at: string
+    /** '' | 'poll' — mupot#1494. Unset (undefined) behaves exactly as before this feature. */
+    presenceMode?: string
+  }
 
   function makeWorld(opts: {
     receipt?: Partial<ReceiptState>
@@ -444,7 +455,7 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
   } = {}) {
     const receipt: ReceiptState = {
       consumedAt: null, claimExpiresAt: null, executionReceiptId: null,
-      executionClaimExpiresAt: null, taskStatus: 'open',
+      executionClaimExpiresAt: null, taskStatus: 'open', deliveredVia: null,
       ...opts.receipt,
     }
     const fleet = opts.fleet ?? null
@@ -484,7 +495,10 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
       if (sql.includes('FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2')) {
         const [tenant, agentIdParam] = b as [string, string]
         if (!fleet || tenant !== fleetTenant || agentIdParam !== fleet.agentId) return null
-        return { agent_id: fleet.agentId, runtime: fleet.runtime, status: fleet.status, last_reported_at: fleet.last_reported_at }
+        return {
+          agent_id: fleet.agentId, runtime: fleet.runtime, status: fleet.status,
+          last_reported_at: fleet.last_reported_at, presence_mode: fleet.presenceMode ?? '',
+        }
       }
       if (sql.includes('SELECT slug FROM agents WHERE id')) {
         const [agentIdParam] = b as [string]
@@ -520,6 +534,11 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
         if (receipt.consumedAt !== null) return { meta: { changes: 0 } }
         receipt.consumedAt = '2026-07-14T00:00:01.000Z'
         receipt.claimExpiresAt = null
+        return { meta: { changes: 1 } }
+      }
+      if (sql.includes('SET delivered_via = ?')) {
+        const [mode] = b as [string]
+        receipt.deliveredVia = mode
         return { meta: { changes: 1 } }
       }
       if (sql.includes('INSERT INTO agent_messages')) {
@@ -597,6 +616,8 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(db._messages[0].to_agent).toBe('agent-1-ext')
     expect(db._messages[0].request_id).toBe('dispatch-inbox:receipt-1')
     expect(db._receipt.consumedAt).not.toBeNull()
+    // mupot#1494 — the route decision is recorded, never silently.
+    expect(db._receipt.deliveredVia).toBe('inbox')
     expect(item.ack).toHaveBeenCalledOnce()
     expect(item.retry).not.toHaveBeenCalled()
   })
@@ -611,6 +632,8 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(fetch).toHaveBeenCalledOnce()
     expect(db._messages).toHaveLength(0)
     expect(db._receipt.consumedAt).not.toBeNull()
+    // mupot#1494 — a genuine fallback (no delivery mode at all) is recorded as such, never silent.
+    expect(db._receipt.deliveredVia).toBe('in_worker')
     expect(item.ack).toHaveBeenCalledOnce()
   })
 
@@ -624,6 +647,72 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(fetch).toHaveBeenCalledOnce()
     expect(db._messages).toHaveLength(0)
     expect(db._receipt.consumedAt).not.toBeNull()
+    expect(db._receipt.deliveredVia).toBe('in_worker')
+  })
+
+  // ── mupot#1494 — poll-mode delivery + delivery:'inbox' + never-silent recording ────────────
+
+  it('poll-mode route: a presence_mode=poll agent gets an inbox envelope even though its heartbeat looks stale by the resident TTL', async () => {
+    const pollAgent: FleetRow = {
+      agentId: 'agent-1-ext', runtime: 'poll', status: 'running',
+      last_reported_at: '2020-01-01 00:00:00', // ancient — would fail the resident live check
+      presenceMode: 'poll',
+    }
+    const db = makeWorld({ fleet: pollAgent })
+    const { env, fetch } = envWith(db)
+    const item = message(dispatchEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    // A poll-mode agent's ONLY delivery surface is its inbox — it must never fall back to
+    // in-Worker just because the moment-to-moment heartbeat reading is stale (there is no
+    // in-Worker fallback that could reach it any better).
+    expect(fetch).not.toHaveBeenCalled()
+    expect(db._messages).toHaveLength(1)
+    expect(db._messages[0].to_agent).toBe('agent-1-ext')
+    expect(db._receipt.consumedAt).not.toBeNull()
+    expect(db._receipt.deliveredVia).toBe('inbox')
+  })
+
+  // Round 2 (P1-e) correction: force used to win UNCONDITIONALLY (round 1), which could
+  // strand a task in an inbox nobody is known to poll. It is now REFUSED against a target
+  // with no registered delivery surface at all — falls back to in_worker exactly like an
+  // unforced dispatch would, and is recorded as such (delivered_via:'in_worker'), never silent.
+  it("delivery:'inbox' is IGNORED (falls back to in_worker) against a target with NO fleet row at all — force must not strand a task", async () => {
+    const db = makeWorld({ fleet: null })
+    const { env, fetch } = envWith(db)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(db._messages).toHaveLength(0)
+    expect(db._receipt.deliveredVia).toBe('in_worker')
+  })
+
+  it("delivery:'inbox' IS honored against a STALE-but-registered resident (runtime declared, heartbeat stale) — this is what force is for", async () => {
+    const db = makeWorld({ fleet: STALE_RUNTIME })
+    const { env, fetch } = envWith(db)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).not.toHaveBeenCalled()
+    expect(db._messages).toHaveLength(1)
+    expect(db._messages[0].to_agent).toBe('agent-1-ext')
+    expect(db._receipt.deliveredVia).toBe('inbox')
+  })
+
+  it("delivery:'inbox' is additive, never subtractive: a live resident runtime still routes to inbox exactly as it would unforced", async () => {
+    const db = makeWorld({ fleet: LIVE_RUNTIME })
+    const { env, fetch } = envWith(db)
+    const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
+
+    expect(fetch).not.toHaveBeenCalled()
+    expect(db._messages).toHaveLength(1)
+    expect(db._receipt.deliveredVia).toBe('inbox')
   })
 
   it('BLOCK-1 regression: a failed external delivery retries and RE-REACHES delivery (v1 silently lost this)', async () => {
@@ -682,6 +771,7 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(fetch).not.toHaveBeenCalled() // MUST NOT fall through to in-Worker
     expect(db._messages).toHaveLength(1) // idempotent re-delivery attempt is a no-op
     expect(db._receipt.consumedAt).not.toBeNull() // the interrupted attempt is finished
+    expect(db._receipt.deliveredVia).toBe('inbox') // the sticky branch is always 'inbox'
     expect(item.ack).toHaveBeenCalledOnce()
   })
 

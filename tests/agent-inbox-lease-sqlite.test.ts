@@ -874,3 +874,142 @@ describe('authoritative inbox lease attempt reconciliation', () => {
     } finally { f.harness.close() }
   })
 })
+
+// mupot#1494 round 3 (P1-i) — `inbox`'s consuming UPDATE used to check ONLY `read_at IS
+// NULL`, never `lease_expires_at` — so a row currently held under a live lease (a real
+// `inbox_lease` hand-out, or the pair-settlement claim in src/tasks/runtime-receipts.ts) was
+// handed straight back out by `inbox`, double-processing the same dispatch. `inbox` and
+// `inbox_lease` must now agree on "currently available to hand out" via the SAME
+// `leaseAvailableClause`.
+describe('inbox honors a live lease exactly like inbox_lease (mupot#1494 round 3, P1-i)', () => {
+  it('a message currently held under a live inbox_lease is NOT handed out by the MCP inbox tool, addressed by its real uuid', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
+        INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+        VALUES ('tok-a', 'agent-member', 'tenant-a', '${'a'.repeat(64)}', 'agent-a', '', 'workspace', '${T0}');
+      `)
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+      }
+      // The real production shape: agent_messages.id is a uuid, not a friendly slug.
+      const uuid = 'a1b2c3d4-e5f6-47a8-b9c0-d1e2f3a4b5c6'
+      f.harness.sqlite.exec(`
+        INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        VALUES ('${uuid}', 'tenant-a', 'agent-a', 'sender', 'owner', 'request', 'work ${uuid}', '${T0}');
+      `)
+
+      // Real lease, real (current) clock — DEFAULT_LEASE_SECONDS is 5 minutes out, comfortably
+      // longer than this test takes to run, so no fake clock is needed for the live-lease half.
+      const leased = await leaseAgentInbox(f.env, { agent: 'agent-a' })
+      expect(leased).toMatchObject({ ok: true, messages: [{ id: uuid }] })
+
+      const res = await invokeTool(auth, f.env, 'inbox', {})
+      // `remaining` still counts it (it IS unread, just not currently hand-out-able) — only
+      // the returned `messages` page is affected by the lease clause.
+      expect(res).toMatchObject({ ok: true, result: { messages: [], remaining: 1 } })
+
+      // The row itself is untouched by inbox's attempt — still exactly the live lease
+      // inbox_lease stamped, not consumed (read_at still NULL).
+      const row = f.row(uuid)
+      expect(row.read_at).toBeNull()
+      expect(row.delivery_attempts).toBe(1)
+
+      // After the lease expires, `inbox` DOES pick it up (and consumes it) — the fix narrows
+      // the window, it does not wall the message off forever. Uses the service function
+      // directly with a clock advanced PAST the real lease's real expiry (the MCP tool always
+      // reads the real wall clock, so the lease above was stamped against real "now").
+      const pastExpiry = { now: () => new Date(Date.now() + (DEFAULT_LEASE_SECONDS + 5) * 1000).toISOString() }
+      const afterExpiry = await readAgentInbox(f.env, { agent: 'agent-a' }, pastExpiry)
+      expect(afterExpiry).toMatchObject({ ok: true, messages: [{ id: uuid }] })
+      expect(f.row(uuid).read_at).not.toBeNull()
+    } finally { f.harness.close() }
+  })
+})
+
+// mupot#1494 round 3 (P2-2 / P2-3, adversarial round 2) — the `allowAttemptHeld` carve-out
+// (P1-i) must NEVER reach `leaseAgentInbox`'s own `leasable` (P2-2 — a plain lease must not
+// steal a row a durable attempt already holds), and must NEVER apply to a DISPATCH message
+// even inside `inbox`'s own carve-out (P2-3 — a dispatch's settle contract requires
+// `read_at IS NULL`, so letting `inbox` consume it out from under the attempt holder breaks
+// that holder's later settle, the exact double-processing wedge P1-i exists to close).
+describe('the attempt-held carve-out never leaks into leaseAgentInbox, and never covers a dispatch message (mupot#1494 round 3, P2-2 / P2-3)', () => {
+  it('P2-2: a plain inbox_lease does not steal a row held under a live durable attempt lease', async () => {
+    const f = fixture()
+    try {
+      f.seed('m1')
+      const attemptId = 'a'.repeat(20)
+      const attemptResult = await leaseAgentInbox(f.env, { agent: 'agent-a', limit: 1, attemptId })
+      expect(attemptResult).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'm1' }] })
+
+      // A plain (non-attempt) lease must not be handed the same row while the durable
+      // attempt's own lease is still live.
+      const plainLease = await leaseAgentInbox(f.env, { agent: 'agent-a' })
+      expect(plainLease).toMatchObject({ ok: true, messages: [] })
+      expect(f.row('m1').delivery_attempts).toBe(1) // untouched by the plain attempt
+    } finally { f.harness.close() }
+  })
+
+  it('P2-3: inbox() refuses a DISPATCH message (from_agent=mupot-dispatch) held under a live durable attempt lease', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
+        INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+        VALUES ('tok-a', 'agent-member', 'tenant-a', '${'a'.repeat(64)}', 'agent-a', '', 'workspace', '${T0}');
+        INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, created_at)
+        VALUES ('dispatch-msg-1', 'tenant-a', 'agent-a', 'mupot-dispatch', 'owner', 'request',
+          '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"t1","dispatch_receipt_id":"d1","squad_id":"s1","runtime_address":"agent-a"}',
+          'dispatch-inbox:d1', '${T0}');
+      `)
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+      }
+      const attemptId = 'b'.repeat(20)
+      const attemptResult = await leaseAgentInbox(f.env, { agent: 'agent-a', limit: 1, attemptId })
+      expect(attemptResult).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'dispatch-msg-1' }] })
+
+      // A plain `inbox` call must NOT consume this dispatch message while the durable
+      // attempt holds it — doing so would set read_at, permanently failing the attempt
+      // holder's own later settle as stale.
+      const res = await invokeTool(auth, f.env, 'inbox', {})
+      expect(res).toMatchObject({ ok: true, result: { messages: [] } })
+      expect(f.row('dispatch-msg-1').read_at).toBeNull()
+    } finally { f.harness.close() }
+  })
+
+  it('a NON-dispatch message under the same durable attempt lease is still consumable by inbox() — the pre-existing legacy reconciliation property is unchanged', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('agent-member', 'agent@pot.test', 'Agent Member', 'active', 'tenant-a');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('tenant-a', 'agent-a', 'agent-member', '${T0}');
+        INSERT INTO member_tokens (id, member_id, tenant, token_hash, agent_id, label, channel, created_at)
+        VALUES ('tok-a', 'agent-member', 'tenant-a', '${'a'.repeat(64)}', 'agent-a', '', 'workspace', '${T0}');
+      `)
+      f.seed('m1')
+      const auth: AuthContext = {
+        userId: 'agent-member', memberId: 'agent-member', email: null, tenant: 'tenant-a', role: 'member',
+        channel: 'workspace', boundAgentId: 'agent-a', tokenId: 'tok-a', capabilities: [],
+      }
+      const attemptId = 'c'.repeat(20)
+      const attemptResult = await leaseAgentInbox(f.env, { agent: 'agent-a', limit: 1, attemptId })
+      expect(attemptResult).toMatchObject({ ok: true, state: 'leased', messages: [{ id: 'm1' }] })
+
+      const res = await invokeTool(auth, f.env, 'inbox', {})
+      expect(res).toMatchObject({ ok: true, result: { messages: [{ id: 'm1' }] } })
+      expect(f.row('m1').read_at).not.toBeNull()
+    } finally { f.harness.close() }
+  })
+})

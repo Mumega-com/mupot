@@ -16,7 +16,7 @@
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
-import { getFleetAgentLiveness } from '../fleet/registry'
+import { getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
@@ -57,7 +57,73 @@ async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<vo
   }
 }
 
-type TaskDispatchPayload = { task_id?: unknown; dispatch_receipt_id?: unknown }
+type TaskDispatchPayload = { task_id?: unknown; dispatch_receipt_id?: unknown; delivery?: unknown }
+
+/** True iff the dispatching caller (toolTaskDispatch, src/mcp/index.ts) explicitly forced the
+ *  inbox route via `task_dispatch({ delivery: 'inbox' })` (mupot#1494). */
+function forcedInboxDelivery(event: BusEvent): boolean {
+  return (event.payload as TaskDispatchPayload)?.delivery === 'inbox'
+}
+
+export type DispatchDeliveryMode = 'inbox' | 'in_worker'
+
+type DispatchRoute = Pick<FleetAgentRouteInfo, 'runtime' | 'live' | 'presenceMode'>
+
+/**
+ * hasRegisteredDeliverySurface — mupot#1494 round 2 (P1-e). "Does an inbox exist somewhere
+ * that SOMETHING is plausibly polling", independent of the moment-to-moment liveness reading:
+ * true for a poll-registered agent (any TTL state — its inbox is its ONLY surface, live or
+ * not), OR a resident/daemon agent that has EVER declared a runtime (`route.runtime !== ''`),
+ * even if its heartbeat currently reads stale. False only when NEITHER holds — no fleet row at
+ * all, or one that never declared a runtime and was never poll-registered: genuinely no known
+ * identity to strand a message on. This is DELIBERATELY LOOSER than "currently live" — it is
+ * the eligibility test for `delivery:'inbox'` forcing (see resolveDispatchDeliveryMode), not
+ * the natural (unforced) routing predicate.
+ */
+export function hasRegisteredDeliverySurface(route: DispatchRoute): boolean {
+  return route.presenceMode === 'poll' || route.runtime !== ''
+}
+
+/**
+ * resolveDispatchDeliveryMode — the ONE decision "does this dispatch go to the target's inbox,
+ * or does the in-Worker AgentDO execute it" (mupot#1494). Pure and independently testable (no
+ * DB, no fetch) so the routing rule itself — not just its DB/HTTP side effects — is directly
+ * mutation-tested.
+ *
+ * Routes to inbox NATURALLY (unforced) when EITHER:
+ *   - its fleet_agents row declares `presence_mode: 'poll'` (a polling runner's ONLY delivery
+ *     surface is its inbox — it is deliberately NOT gated on `route.live` here: a poll-mode
+ *     agent between polls, or one that just missed its own TTL window, still only has an inbox
+ *     to reach it through — there is no in-Worker fallback that could ever reach it either), OR
+ *   - it is a resident/daemon-reported runtime that is CURRENTLY live (`route.runtime` non-empty
+ *     AND `route.live` — exactly the pre-#1494 external-route condition, unchanged for every
+ *     resident agent).
+ *
+ * `forceInbox` (the caller's explicit `delivery: 'inbox'`) wins ADDITIONALLY — but ONLY when
+ * `hasRegisteredDeliverySurface(route)` is true (round 2 P1-e fix: force used to win
+ * UNCONDITIONALLY, which could strand a task in an inbox literally nobody is known to poll —
+ * no fleet row, no runtime ever declared. The false claim this replaced lived at the
+ * IN-WORKER-route comment near this function's caller: "a dead external runtime can never
+ * strand the task" was true for the NATURAL predicate alone, but `delivery:'inbox'` forcing
+ * broke it — force could hand a genuinely-unknown identity's only copy of the work to an inbox
+ * with zero known readers). Concretely: forcing now overrides a STALE-BUT-REGISTERED resident
+ * (runtime declared, heartbeat currently stale) into the inbox route — the caller believes it
+ * knows better than the heartbeat — but is a no-op (ignored, see the dispatch tool's own
+ * synchronous eligibility check and its `delivery_forced_predicted` note) against an identity
+ * with no registered surface at all.
+ *
+ * Falls back to the in-Worker route ONLY when neither the natural predicate nor an eligible
+ * force holds. That fallback is the ONLY thing this function can return besides 'inbox' —
+ * never a third, silent option, and it CAN genuinely be reached even with `forceInbox: true`.
+ */
+export function resolveDispatchDeliveryMode(
+  route: DispatchRoute,
+  forceInbox: boolean,
+): DispatchDeliveryMode {
+  const naturallyInbox = route.presenceMode === 'poll' || (route.runtime !== '' && route.live)
+  const forceHonored = forceInbox && hasRegisteredDeliverySurface(route)
+  return (naturallyInbox || forceHonored) ? 'inbox' : 'in_worker'
+}
 
 interface TaskDispatchReceiptState {
   consumed_at: string | null
@@ -158,6 +224,27 @@ async function consumeTaskDispatchReceipt(env: Env, event: BusEvent, leaseExpire
     ...(leaseExpiresAt === undefined ? [] : [leaseExpiresAt]),
   ).run()
   return result.meta?.changes === 1
+}
+
+/**
+ * recordDispatchDeliveryMode — persist resolveDispatchDeliveryMode's decision onto the durable
+ * receipt row, so "which route did this dispatch actually take" is a queryable fact rather than
+ * a claim that lived only in a log line (mupot#1494: "never silently" fall back). Best-effort by
+ * design (never throws into the caller) — a lost annotation write must not turn a successful
+ * dispatch into a retried/duplicated one; the route decision itself already happened and this is
+ * bookkeeping about it, not a gate on it.
+ */
+async function recordDispatchDeliveryMode(env: Env, event: BusEvent, mode: DispatchDeliveryMode): Promise<void> {
+  const identity = taskDispatchIdentity(event)
+  if (!identity || !event.agent_id) return
+  try {
+    await env.DB.prepare(
+      `UPDATE task_dispatch_receipts SET delivered_via = ?
+        WHERE tenant = ? AND id = ? AND task_id = ? AND agent_id = ?`,
+    ).bind(mode, event.tenant, identity.receiptId, identity.taskId, event.agent_id).run()
+  } catch {
+    // best-effort — see doc comment above
+  }
 }
 
 async function blockInterruptedTaskExecution(env: Env, event: BusEvent, now: number): Promise<boolean> {
@@ -287,6 +374,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           }
           throw error
         }
+        await recordDispatchDeliveryMode(env, event, 'inbox')
         if (!(await consumeTaskDispatchReceipt(env, event))) {
           throw new Error('external dispatch receipt consume failed')
         }
@@ -313,13 +401,23 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         throw new Error('task dispatch receipt lease busy')
       }
 
+      // mupot#1494 — the ONE routing predicate, shared with the (a) sticky branch's decision
+      // (which is always 'inbox' by definition — a prior attempt already committed to it).
+      // `resolveDispatchDeliveryMode` is pure and independently unit-tested; this call site only
+      // supplies the two inputs it needs and acts on (and durably records — never silently) what
+      // it returns.
+      const deliveryMode = resolveDispatchDeliveryMode(route, forcedInboxDelivery(event))
       try {
-        if (route.runtime && route.live) {
-          // EXTERNAL route: deliver to inbox only. Deliberately do NOT wake-execute in-Worker
-          // and do NOT set execution_receipt_id — a failed delivery genuinely re-reaches
-          // delivery on retry via the (a) branch above, not the execution-receipt recovery
-          // branch (BLOCK-1 fix: no recovery-branch bypass, because execution_receipt_id is
-          // never touched by this route at all).
+        if (deliveryMode === 'inbox') {
+          // INBOX route: deliver to the target's inbox only. Deliberately do NOT wake-execute
+          // in-Worker and do NOT set execution_receipt_id — a failed delivery genuinely
+          // re-reaches delivery on retry via the (a) branch above, not the execution-receipt
+          // recovery branch (BLOCK-1 fix: no recovery-branch bypass, because
+          // execution_receipt_id is never touched by this route at all). Covers BOTH a live
+          // resident runtime (route.runtime && route.live, the pre-#1494 condition) and a
+          // poll-mode agent (route.presenceMode === 'poll', mupot#1494) — see
+          // resolveDispatchDeliveryMode's doc comment for why a poll-mode agent is routed here
+          // regardless of the moment-to-moment `route.live` reading.
           await deliverDispatchToInbox(env, {
             agentId: deliveryTarget,
             squadId: event.squad_id ?? '',
@@ -329,10 +427,21 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             projectId: receipt.project_id,
           })
         } else {
-          // IN-WORKER route (fallback: no fleet row, empty runtime, or stale/dead presence) —
-          // today's behavior, unchanged. This is the only path that executes in-Worker, so a
-          // dead external runtime can never strand the task (BLOCK-2 fix: exactly one route is
-          // chosen and acted on per lease-holder).
+          // IN-WORKER route: reached whenever `resolveDispatchDeliveryMode` returns
+          // 'in_worker' — either a genuine fallback (no registered delivery mode at all — no
+          // fleet row, empty runtime, or a stale/dead resident presence with `delivery:'inbox'`
+          // NOT requested), or `delivery:'inbox'` WAS requested but
+          // `hasRegisteredDeliverySurface(route)` is false (round 2 P1-e correction: an
+          // EARLIER version of this comment claimed "a dead external runtime can never strand
+          // the task" as if that held unconditionally — it does NOT once forcing exists,
+          // because forcing an inbox delivery onto a truly unregistered identity would strand
+          // the task in an inbox nothing is known to poll. Force is therefore only honored
+          // when the target has SOME registered surface — see resolveDispatchDeliveryMode's
+          // doc comment — and toolTaskDispatch (src/mcp/index.ts) runs the SAME eligibility
+          // check synchronously so an ineligible force is visibly reported back to the caller
+          // as `delivery_forced_predicted: 'no_delivery_mode'`, never silently dropped here).
+          // This remains the only path that executes in-Worker: exactly one route is chosen
+          // and acted on per lease-holder (BLOCK-2 fix, unchanged).
           await wakeAgent(env, event.agent_id, event)
         }
       } catch (error) {
@@ -342,6 +451,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         throw error
       }
+      await recordDispatchDeliveryMode(env, event, deliveryMode)
       if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {
         throw new Error('task dispatch receipt consume failed')
       }

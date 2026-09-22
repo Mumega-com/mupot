@@ -15,7 +15,7 @@
 // from token usage via src/agents/cost.ts (see that module for the caveats).
 
 import type { Env, Agent } from '../types'
-import { derivePresence, presenceTtlSec } from '../fleet/registry'
+import { derivePresence, resolveFleetPresenceTtlSec } from '../fleet/registry'
 
 // ── Time window ───────────────────────────────────────────────────────────────
 
@@ -255,6 +255,10 @@ interface AgentRuntimeEvidence {
   key_member_id: string | null
   fleet_status: string | null
   last_reported_at: string | null
+  // mupot#1494 round 2 (P1-b) — per-row TTL override; resolved via resolveFleetPresenceTtlSec
+  // so this reader agrees with dispatch (getFleetAgentLiveness), the dashboard fleet view, and
+  // routine selectAgent about whether a poll-mode agent is live.
+  presence_ttl_sec: number | null
 }
 
 export function deriveAgentRuntimeState(
@@ -272,7 +276,8 @@ export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Prom
     `SELECT a.id AS agent_id,
             m.id AS key_member_id,
             f.status AS fleet_status,
-            f.last_reported_at
+            f.last_reported_at,
+            f.presence_ttl_sec
        FROM agents a
        LEFT JOIN agent_keys k
               ON k.tenant = ?1 AND k.agent_id = a.id
@@ -286,8 +291,9 @@ export async function loadAgentRuntimeStates(env: Env, nowMs = Date.now()): Prom
     .all<AgentRuntimeEvidence>()
 
   const states = new Map<string, AgentRuntimeState>()
-  const ttlSec = presenceTtlSec(env)
   for (const row of rows.results ?? []) {
+    // mupot#1494 round 2 (P1-b) — per row, not one batch-level window.
+    const ttlSec = resolveFleetPresenceTtlSec(env, row)
     states.set(row.agent_id, deriveAgentRuntimeState(row, ttlSec, nowMs))
   }
   return states

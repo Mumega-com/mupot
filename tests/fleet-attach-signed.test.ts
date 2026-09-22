@@ -13,6 +13,9 @@
 
 import { describe, it, expect } from 'vitest'
 import { fleetAttachApp } from '../src/fleet/attach-routes'
+import { getFleetAgentLiveness } from '../src/fleet/registry'
+import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
 
 const SIG_DOMAIN = 'fleet-attach:v1'
@@ -59,6 +62,12 @@ function makeDb(opts: {
     }
     if (sql.includes('FROM member_tokens t')) return tokens[b[0] as string] ?? null
     if (sql.includes('FROM members WHERE id')) return null
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's exact-id probe, now run before
+    // /attach-signed's upsertRunning. No real agents table in this mock; 'kasra' (the
+    // identifier every fixture in this file signs) never matches a real agents.id, so
+    // "no match" is correct — falls through to the slug lookup below, also unmatched,
+    // returning the identifier unchanged (preserving every existing `db._fleet.get('mumega:kasra')` assertion).
+    if (sql.includes('SELECT 1 FROM agents WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
   function all(sql: string, b: unknown[]) {
@@ -70,6 +79,9 @@ function makeDb(opts: {
       }))
     }
     if (sql.includes('capabilities')) return []
+    // mupot#1494 v4 (P1-b) — resolveFleetWriteAgentId's slug lookup, reached only when the
+    // id probe above already missed. No real agents table in this mock — always unmatched.
+    if (sql.includes('SELECT id FROM agents WHERE slug')) return []
     throw new Error('unhandled all: ' + sql)
   }
   function run(sql: string, b: unknown[]) {
@@ -463,5 +475,82 @@ describe('signed detach', () => {
     ;(attach as Record<string, unknown>).sig = await sign(kp.privateKey, { ...(attach as Record<string, string | number>), tenant: 'mumega' })
     expect((await post(env, '/attach-signed', attach)).status).toBe(401)
     expect(db._fleet.size).toBe(0)
+  })
+})
+
+// mupot#1494 v4 round 2 (P1-1, adversarial regression on the ORIGINAL P1-b fix) — REAL
+// schema (applyAllMigrations, real `agents`/`agent_keys`/`agent_attach_nonces` tables), so
+// `resolveFleetWriteAgentId` actually has a slug->uuid mapping to resolve THROUGH, rather
+// than the hand-rolled mock above (which this PR itself patched to answer "no match" for
+// both of that resolver's probes — meaning the mock could never exercise the branch where
+// resolution actually changes the identifier, only the safe-degrade fallback). Round 1
+// applied the resolve INSIDE `/attach-signed` only; `markStopped` (shared by `/detach` and
+// `/detach-signed`) still took the raw, unresolved identifier — so a real attach-signed round
+// trip (write under the resolved uuid, then detach under the raw signed slug) failed to
+// detach at all: `404 not_found_or_not_owner`, row stays `running`, agent stays
+// dispatch-live forever. Fixed by moving the resolve INSIDE `upsertRunning`/`markStopped`
+// themselves (src/fleet/attach-routes.ts) so every caller gets it for free.
+describe('mupot#1494 v4 round 2 (P1-1) — real-schema slug/uuid resolution on the signed attach/detach round trip', () => {
+  it('attach-signed (slug identity) writes under the resolved uuid; detach-signed (same slug identity) still finds and stops it — 200, liveness false', async () => {
+    const harness = createSqliteD1()
+    try {
+      applyAllMigrations(harness.sqlite)
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+
+      const AGENT_UUID = 'agent-p11-uuid-0000-0000-000000000000'
+      const AGENT_SLUG = 'p11-signed-runner'
+      const now = () => new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+
+      harness.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('dept-p11', 'dept-p11', 'Dept P11');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-p11', 'dept-p11', 'squad-p11', 'Squad P11');
+        INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_UUID}', 'squad-p11', '${AGENT_SLUG}', 'P11 Runner', 'active');
+        INSERT INTO members (id, display_name, status, tenant) VALUES ('mem-p11', 'P11 Member', 'active', 'mumega');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('mumega', '${AGENT_UUID}', 'mem-p11', '${now()}');
+      `)
+
+      // agent_keys is keyed by the SLUG (the identifier-space-bridge convention this whole
+      // fix exists for) — algo MUST be the literal 'Ed25519' (capital E): both
+      // loadActiveAgentKey's callers (verifySignedAttach/verifySignedDetach) hard-check
+      // `keyRow.algo !== 'Ed25519'` and refuse otherwise.
+      const { kp, pubX } = await genKey()
+      harness.sqlite.exec(
+        `INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+         VALUES ('mumega', '${AGENT_SLUG}', '${pubX}', 'Ed25519', 'mem-p11', ${Math.floor(Date.now() / 1000)})`,
+      )
+
+      // 1. Attach-signed, identity = the SLUG (as agent_keys.agent_id always is).
+      const attachBody = freshBody(AGENT_SLUG, 'mumega')
+      ;(attachBody as Record<string, unknown>).sig =
+        await sign(kp.privateKey, { ...(attachBody as Record<string, string | number>), tenant: 'mumega' })
+      const attachRes = await post(env, '/attach-signed', attachBody)
+      expect(attachRes.status).toBe(200)
+
+      // The row is written under the RESOLVED uuid, not the raw slug — exactly ONE row.
+      const rows = harness.sqlite.prepare(`SELECT agent_id, status FROM fleet_agents WHERE tenant = 'mumega'`).all() as
+        Array<{ agent_id: string; status: string }>
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ agent_id: AGENT_UUID, status: 'running' })
+
+      // 2. Detach-signed, SAME slug identity, a FRESH nonce (the shared ledger is keyed by
+      // nonce regardless of domain). Pre-fix: markStopped looked up `agent_id = <slug>`
+      // against a row keyed by the uuid — 0 rows changed, 404, row stays running forever.
+      const detachBody = freshDetachBody(AGENT_SLUG)
+      ;(detachBody as Record<string, unknown>).sig =
+        await signDetach(kp.privateKey, { ...(detachBody as Record<string, string | number>), tenant: 'mumega' })
+      const detachRes = await post(env, '/detach-signed', detachBody)
+      expect(detachRes.status).toBe(200)
+
+      const afterDetach = harness.sqlite.prepare(`SELECT agent_id, status FROM fleet_agents WHERE tenant = 'mumega'`).all() as
+        Array<{ agent_id: string; status: string }>
+      expect(afterDetach).toHaveLength(1) // still ONE row — detach never creates a second
+      expect(afterDetach[0]).toMatchObject({ agent_id: AGENT_UUID, status: 'stopped' })
+
+      // 3. Liveness reads false by whichever identifier a caller holds.
+      const liveByUuid = await getFleetAgentLiveness(env, AGENT_UUID)
+      expect(liveByUuid.live).toBe(false)
+    } finally {
+      harness.close()
+    }
   })
 })

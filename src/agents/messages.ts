@@ -761,6 +761,7 @@ async function readAgentInboxForReader(
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 AND ${leaseAvailableClause('?1', { allowAttemptHeld: true })}
                  ${seatSql}
                  AND EXISTS (SELECT 1 FROM agent_inbox_fences
                              WHERE tenant = ?2 AND agent_id = ?3
@@ -776,10 +777,17 @@ async function readAgentInboxForReader(
           ? [now(), tenant, input.agent, limit, targetSeat]
           : [now(), tenant, input.agent, limit]
         const rows = await env.DB.prepare(
+          // mupot#1494 round 3 (P1-i) — `inbox`'s consuming UPDATE used to check ONLY
+          // `read_at IS NULL`, so a row currently held under a live lease (a real
+          // `inbox_lease` hand-out, or `claimUnleasedForPairSettlement`'s lease-equivalent
+          // claim) was handed straight back out here — double processing the same
+          // dispatch. `leaseAvailableClause` is the SAME clause `leaseAgentInbox` enforces;
+          // ?1 is already bound to `now()` for the SET above, so it's reused here too.
           `UPDATE agent_messages SET read_at = ?1
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 AND ${leaseAvailableClause('?1', { allowAttemptHeld: true })}
                  ${seatSql}
                  AND COALESCE((SELECT mode FROM agent_inbox_fences
                                WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
@@ -923,6 +931,34 @@ export const DEFAULT_LEASE_SECONDS = 300
  *  pick the message up until it expires, and there is no unlease call. */
 export const MAX_LEASE_SECONDS = 3600
 const MIN_LEASE_SECONDS = 1
+
+/**
+ * LEASE_LIVE_PREDICATE — mupot#1494 v4 (P0 successor, Athena's ruling). THE single SQL
+ * fragment for "is this lease currently LIVE" — not NULL, not expired — evaluated via
+ * `julianday()` on BOTH sides, same discipline and same reason as `TOKEN_LIVE_PREDICATE`
+ * (src/auth/token-lifecycle.ts): `agent_messages.lease_expires_at` is written as
+ * `new Date().toISOString()` (this file, e.g. `leaseAgentInbox`,
+ * `claimUnleasedForPairSettlement` in src/tasks/runtime-receipts.ts) but round-2's own P1-A
+ * repair fix (src/tasks/runtime-receipts.ts, since replaced) compared it against
+ * `nowSqlUtc()` (`'YYYY-MM-DD HH:MM:SS'`, no `T`, no ms) with a plain JS `>` string compare.
+ * `'T'` (0x54) sorts above `' '` (0x20), so for any same-UTC-day value the ISO string always
+ * compares greater than the space-shaped `now` — every same-day EXPIRED lease read as LIVE.
+ * `julianday()` parses both shapes and compares the actual instants, so this predicate gives
+ * the same, correct answer regardless of which format `nowParam` happens to be bound in.
+ *
+ * Consumed by `leaseAvailableClause` below, and by `adminResetDispatchLease` +
+ * `validateEnvelope` in src/tasks/runtime-receipts.ts — ONE predicate, three call sites, so
+ * "is this lease live" can never again mean two different things depending on which file
+ * asks. `claimUnleasedForPairSettlement` does NOT need it: it gates on
+ * `lease_expires_at IS NULL` (an exact-NULL pristine-state check, not a magnitude compare),
+ * which no timestamp format can make ambiguous.
+ *
+ * Bind: `column` is a verbatim SQL column reference (e.g. `'lease_expires_at'` or a
+ * qualified `'m.lease_expires_at'`), NEVER user input. `nowParam` is the bound parameter
+ * placeholder for "now" (any format `julianday()` can parse — ISO or `nowSqlUtc()`'s shape).
+ */
+export const LEASE_LIVE_PREDICATE = (column: string, nowParam: string): string =>
+  `${column} IS NOT NULL AND julianday(${column}) > julianday(${nowParam})`
 /** Ids accepted by one inbox_ack call — the lease cap is MAX_INBOX_LIMIT, so a caller can
  *  always ack a full lease in one shot. */
 const MAX_ACK_IDS = MAX_INBOX_LIMIT
@@ -1136,10 +1172,65 @@ async function materializeAttempt(row: StoredLeaseAttempt): Promise<LeaseAttempt
 
 /** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
  *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
- *  because these statements bind different positions. */
-function bearerFencePredicate(tenantParam: string, agentParam: string): string {
+ *  because these statements bind different positions. Exported (mupot#1494 round 3, P1-ii) so
+ *  src/tasks/runtime-receipts.ts's pair-settlement claim enforces the SAME fence a bearer
+ *  inbox_lease would — a signed_only-fenced agent's dispatch must not be settleable through
+ *  the bearer-only pair-settlement path when leaseAgentInbox itself would have handed out
+ *  nothing. */
+export function bearerFencePredicate(tenantParam: string, agentParam: string): string {
   return `COALESCE((SELECT mode FROM agent_inbox_fences
                      WHERE tenant = ${tenantParam} AND agent_id = ${agentParam}), 'bearer_only') = 'bearer_only'`
+}
+
+/**
+ * leaseAvailableClause — mupot#1494 round 3 (P1-i). THE "is this row currently free to hand
+ * out" clause: NULL means never leased; a lease at or before `nowParam` has expired. Both
+ * timestamps are ISO-8601 UTC with a fixed shape, so lexicographic `<=` IS chronological.
+ * Shared by `leaseAgentInbox`'s `leasable` and `readAgentInboxForReader`'s CONSUMING UPDATE
+ * (the plain `inbox` tool) so a row currently held under a live PLAIN lease — whether from a
+ * real `inbox_lease` call or from `claimUnleasedForPairSettlement`'s lease-equivalent claim
+ * (src/tasks/runtime-receipts.ts) — cannot ALSO be handed out through `inbox`. Before this fix
+ * `inbox`'s consuming UPDATE checked only `read_at IS NULL`, so a successfully leased-or-
+ * pair-settled, still-unacked dispatch was handed straight back out by `inbox` — double
+ * processing (the same row executed twice).
+ *
+ * `allowAttemptHeld` (default false): pass `true` ONLY for `inbox`'s own consuming UPDATE. A
+ * row held under a DURABLE ATTEMPT lease (`lease_attempt_id IS NOT NULL`, stamped by
+ * `leaseAgentInboxWithAttempt`) has always remained consumable via the plain `inbox` tool
+ * during that hold — a deliberate, pre-existing, tested reconciliation property (see "never
+ * rolls back a same-time legacy inbox consume when attempt ACK is fenced",
+ * tests/inbox-lease-attempt-ack.test.ts), distinct from the PLAIN-lease double-processing hole
+ * this fix closes (a plain lease/claim always has `lease_attempt_id IS NULL` — see
+ * `leaseAgentInbox`'s main branch and `claimUnleasedForPairSettlement`, neither of which ever
+ * stamps it). `leaseAgentInbox`'s own `leasable` predicate must NEVER get this exception — a
+ * plain lease attempt must not double-lease a row any other lease (attempt or plain) already
+ * holds.
+ */
+function leaseAvailableClause(nowParam: string, opts: { allowAttemptHeld?: boolean } = {}): string {
+  // mupot#1494 v4 (P0 successor, Athena's ruling) — derived from LEASE_LIVE_PREDICATE
+  // rather than a standalone `lease_expires_at <= nowParam` string compare. Every writer
+  // of `lease_expires_at` in THIS file stamps ISO-8601 (`new Date().toISOString()`), so a
+  // plain lexicographic compare against an ISO `nowParam` was never actually wrong here —
+  // but `julianday()` on both sides costs nothing, makes this clause format-agnostic
+  // against whatever shape a future caller binds for `nowParam`, and — the concrete reason
+  // this changed now — guarantees this clause can NEVER diverge from the same liveness
+  // definition `adminResetDispatchLease` and `validateEnvelope`
+  // (src/tasks/runtime-receipts.ts) consume, which cannot assume an ISO `now` (see
+  // LEASE_LIVE_PREDICATE's own doc comment).
+  const base = `NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', nowParam)})`
+  // mupot#1494 round 3 (P2-3, adversarial round 2) — the `allowAttemptHeld` carve-out
+  // exists for the pre-existing, deliberately-tested "legacy inbox consume during an
+  // attempt lease" reconciliation property (tests/inbox-lease-attempt-ack.test.ts). That
+  // property was never meant to cover a DISPATCH message: a dispatch's settle contract
+  // (src/tasks/runtime-receipts.ts validateEnvelope) requires `read_at IS NULL` and its
+  // OWN live lease — `inbox` consuming a dispatch message out from under an attempt
+  // holder sets `read_at`, which permanently fails that holder's subsequent settle as
+  // stale, exactly the double-processing/wedge class P1-i exists to close. Excluding
+  // `from_agent = 'mupot-dispatch'` rows from the carve-out closes that gap without
+  // touching the legacy (non-dispatch) reconciliation behavior the carve-out exists for.
+  return opts.allowAttemptHeld
+    ? `(${base} OR (lease_attempt_id IS NOT NULL AND from_agent <> 'mupot-dispatch'))`
+    : base
 }
 
 async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promise<boolean> {
@@ -1560,11 +1651,12 @@ export async function leaseAgentInbox(
     }, nowIso, expiresIso)
   }
 
-  // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
-  // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
+  // "Not currently leased" — mupot#1494 round 3 (P1-i): now delegates to the SAME
+  // `leaseAvailableClause` the `inbox` tool's consuming UPDATE uses, so the two can never
+  // drift apart again.
   const leasable = (t: string, a: string, nowParam: string, seatParam: string) =>
     `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
-     AND (lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})
+     AND ${leaseAvailableClause(nowParam)}
      AND (CASE WHEN ${seatParam} IS NULL THEN target_seat IS NULL ELSE (target_seat = ${seatParam} OR target_seat IS NULL) END)`
 
   const bearerFencePredicate = (t: string, a: string) =>
