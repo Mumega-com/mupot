@@ -26,6 +26,20 @@
 // RELEASE_SHA is derived from git ONLY. Any extra/forwarded arg that tries to
 // smuggle its own `--var RELEASE_SHA:...` is refused outright — see
 // assertNoCallerReleaseSha in scripts/lib/release-sha.mjs (mupot#571).
+//
+// POST-DEPLOY BUNDLE PUBLISH (mupot#1285/#1516 enablement — docs/workflows/
+// tenant-provision.md "the actual 'PUT it to R2 after a successful deploy' step in
+// scripts/deploy.mjs is the follow-up"). After a successful, CLEAN deploy, this script
+// runs scripts/publish-pot-bundle.mjs so the R2 bucket `loadPotWorkerBundle` reads always
+// carries THIS deploy's own bundle under its own RELEASE_SHA. A deploy whose bundle fails
+// to publish must not report success silently — the publish step's exit code is this
+// script's own exit code. Skip with `--skip-bundle-publish` (e.g. a colony with no
+// POT_WORKER_BUNDLE_BUCKET wired up yet, or CI running scripts/deploy.mjs somewhere that
+// legitimately has no CLOUDFLARE_API_TOKEN scoped for R2). A deploy that is not a verified
+// clean release (dirty override, or off-main) never attempts the publish at all — its
+// RELEASE_SHA carries a `-dirty` suffix that `assertPublishPreconditions` (scripts/lib/
+// pot-bundle-r2.mjs) would refuse anyway, and that is a correct, PRINTED skip, not a
+// silent gap.
 
 import { spawnSync } from 'node:child_process'
 import { assertNoCallerReleaseSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
@@ -39,7 +53,11 @@ function capture(cmd, args) {
   return (r.stdout || '').trim()
 }
 
-const extra = process.argv.slice(2)
+const rawArgs = process.argv.slice(2)
+const skipBundlePublish = rawArgs.includes('--skip-bundle-publish')
+const extra = rawArgs.filter((a) => a !== '--skip-bundle-publish')
+const configFlagIndex = extra.indexOf('--config')
+const configPath = configFlagIndex >= 0 ? extra[configFlagIndex + 1] : null
 
 try {
   assertNoCallerReleaseSha(extra)
@@ -79,4 +97,38 @@ try {
 }
 
 const res = spawnSync('npx', ['wrangler', 'deploy', ...releaseArgs, ...extra], { stdio: 'inherit' })
-process.exit(res.status ?? 1)
+if (res.status !== 0) {
+  // The deploy itself failed — there is no successful build to publish a bundle for.
+  process.exit(res.status ?? 1)
+}
+
+if (skipBundlePublish) {
+  console.error('→ skipping bundle publish (--skip-bundle-publish).')
+  process.exit(0)
+}
+
+if (!clean) {
+  console.error(
+    '→ skipping bundle publish: this deploy is not a verified clean release ' +
+      `(RELEASE_SHA stamped as '${fullSha}-dirty') — publish-pot-bundle.mjs would refuse it ` +
+      'anyway (it only ever publishes an exact HEAD commit from a clean tree).',
+  )
+  process.exit(0)
+}
+
+const publishArgs = ['scripts/publish-pot-bundle.mjs', '--release-sha', fullSha]
+if (configPath) publishArgs.push('--config', configPath)
+console.error(`→ deploy succeeded — publishing the bundle: node ${publishArgs.join(' ')}`)
+const publish = spawnSync('node', publishArgs, { stdio: 'inherit' })
+if (publish.status !== 0) {
+  const retryCmd = `node scripts/publish-pot-bundle.mjs --release-sha ${fullSha}${configPath ? ` --config ${configPath}` : ''}`
+  console.error(
+    '✘ the deploy itself succeeded, but publishing its bundle to R2 FAILED (see output ' +
+      'above) — this deploy is NOT reporting success, because a tenant provisioned right ' +
+      `now would get this RELEASE_SHA's bundle from nowhere. Re-run \`${retryCmd}\` once ` +
+      'fixed, or pass --skip-bundle-publish if this deploy target deliberately has no ' +
+      'bundle bucket wired up.',
+  )
+  process.exit(publish.status ?? 1)
+}
+process.exit(0)

@@ -8,7 +8,13 @@
 // (explicit `worker_js_code`) AND the first half of option B (CI-published R2 artifact) —
 // both need the SAME built bundle text, this script just produces it.
 //
-//   node scripts/build-pot-worker-bundle.mjs [--outdir <dir>]
+//   node scripts/build-pot-worker-bundle.mjs [--outdir <dir>] [--config <wrangler.toml>]
+//
+// Any argument other than `--outdir` is forwarded verbatim to the underlying
+// `wrangler deploy --dry-run` call (added for scripts/publish-pot-bundle.mjs, which needs
+// to build the SAME `--config` a multi-tenant colony's `scripts/deploy.mjs` invocation
+// used — without this, a post-deploy publish step for e.g. `wrangler.acme.toml` would
+// silently build and publish the DEFAULT wrangler.toml's bundle instead).
 //
 // Prints the built worker.js path to stdout. Uses `wrangler deploy --dry-run --outdir` —
 // dry-run means wrangler builds the bundle and writes it to disk WITHOUT calling the
@@ -36,8 +42,11 @@ import { join } from 'node:path'
 const args = process.argv.slice(2)
 const outdirFlagIndex = args.indexOf('--outdir')
 const outdir = outdirFlagIndex >= 0 ? args[outdirFlagIndex + 1] : mkdtempSync(join(tmpdir(), 'mupot-pot-bundle-'))
+// Everything except the `--outdir <dir>` pair this script consumes itself is forwarded to
+// wrangler verbatim (e.g. `--config wrangler.acme.toml`).
+const forwardedArgs = outdirFlagIndex >= 0 ? [...args.slice(0, outdirFlagIndex), ...args.slice(outdirFlagIndex + 2)] : args
 
-const res = spawnSync('npx', ['wrangler', 'deploy', '--dry-run', '--outdir', outdir], { stdio: 'inherit' })
+const res = spawnSync('npx', ['wrangler', 'deploy', '--dry-run', '--outdir', outdir, ...forwardedArgs], { stdio: 'inherit' })
 if (res.status !== 0) {
   console.error('✘ wrangler dry-run build failed — see output above.')
   process.exit(res.status ?? 1)

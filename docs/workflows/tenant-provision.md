@@ -79,18 +79,72 @@ a path whose entire point is to be more honest than what it replaces.
 **B — CI publishes the built bundle to R2 at deploy time, keyed by `RELEASE_SHA`; this is
 the production target.** This was the design decision recorded on the issue 2026-09-04 (S2).
 `provisionSovereignPot` checks this FIRST via `loadPotWorkerBundle` — `env.POT_WORKER_BUNDLE_BUCKET`
-(new optional R2 binding, `src/types.ts`), object key `${RELEASE_SHA}/worker.js`. **Not
-implemented in this PR**: `scripts/deploy.mjs` does not yet write to this bucket, and no
-`wrangler.toml` R2 binding for it exists — this session cannot create Cloudflare resources
-(a bucket) or verify the write path live. `scripts/build-pot-worker-bundle.mjs` (new, this
-PR) produces the bundle text via `wrangler deploy --dry-run --outdir` — the actual "PUT it
-to R2 after a successful deploy" step in `scripts/deploy.mjs` is the follow-up.
+(optional R2 binding, `src/types.ts`), object key `${RELEASE_SHA}/worker.js`.
 
-**CI publish output contract (round 2 — required, not optional).** An R2 GET returning 200
-only proves the bytes were *readable*, not that they are the bytes CI actually built —
-silent corruption, a partial multipart write, or a stale key left over from a previous
-release would all read back successfully. `loadPotWorkerBundle` therefore treats an R2
-object as untrusted unless the CI publish step (once built) satisfies this exact contract:
+**Enablement (mupot#1285/#1516 follow-up — the R2-publish half of option B, now built):**
+the `mupot-pot-bundles` R2 bucket exists; a colony wires it up with the same binding block
+used everywhere else in this repo, in its own gitignored `wrangler.toml` (see
+`wrangler.example.toml` for the exact snippet — this is a config change, no code needed on
+that side):
+
+```toml
+[[r2_buckets]]
+binding = "POT_WORKER_BUNDLE_BUCKET"
+bucket_name = "mupot-pot-bundles"
+```
+
+With that binding present, `npm run deploy` (`scripts/deploy.mjs`) now publishes the
+just-deployed bundle to it automatically as a post-deploy step, calling
+`scripts/publish-pot-bundle.mjs` with the exact `RELEASE_SHA` (and `--config`, for a
+multi-tenant colony) the deploy itself just stamped:
+
+1. `scripts/build-pot-worker-bundle.mjs` builds the bundle text via `wrangler deploy
+   --dry-run --outdir` (unchanged from before this follow-up — now also forwards any extra
+   args like `--config` through to that dry-run build, so a non-default `wrangler.toml`
+   builds its OWN bundle rather than silently publishing the default one).
+2. `scripts/publish-pot-bundle.mjs` refuses to run at all from a dirty working tree, or
+   when the `RELEASE_SHA` it is given is not the exact commit `git rev-parse HEAD` reports
+   — the identical discipline `scripts/deploy.mjs` itself already applies before stamping a
+   build (see the next section for exactly why). It then signs and PUTs the built bundle to
+   `https://<account_id>.r2.cloudflarestorage.com/mupot-pot-bundles/${RELEASE_SHA}/worker.js`
+   via the R2 **S3-compatible API** — deliberately NOT the plain bearer-token Cloudflare v4
+   REST API's "Upload Object" endpoint, which (verified directly against the published
+   `cloudflare` npm package's own `ObjectUploadParams` type) has no way to set custom
+   metadata at upload time at all. Authenticates with the SAME `CLOUDFLARE_API_TOKEN` (and
+   `CLOUDFLARE_ACCOUNT_ID`) `wrangler` itself already reads from the environment for
+   `wrangler deploy` — no separate R2-specific Access Key ID / Secret Access Key pair to
+   provision: the S3 Access Key ID is derived from the token's own `id` (resolved via the
+   minimal-permission `GET /user/tokens/verify`) and the Secret Access Key is the SHA-256
+   hash of the token's raw value, per developers.cloudflare.com/r2/api/tokens/. Signing
+   uses `aws4fetch` (Cloudflare's own recommended lightweight SigV4 client for R2).
+3. A deploy whose bundle publish then FAILS is not reported as a successful deploy —
+   `scripts/deploy.mjs` exits non-zero and prints the retry command, so a tenant
+   provisioned moments later can never silently get "no bundle for this RELEASE_SHA" for a
+   release that in fact went out. Skip the step entirely with `--skip-bundle-publish`
+   (e.g. a colony that has not wired the bucket binding at all yet) or by deploying from a
+   non-clean tree (`MUPOT_ALLOW_DIRTY_DEPLOY=1`) — a `-dirty`-suffixed `RELEASE_SHA` is
+   never a valid publish target in the first place, so that case is a printed skip, not a
+   failure.
+4. `scripts/verify-pot-bundle.mjs <release-sha>` is the operator receipt: it independently
+   re-fetches a previously-published object and re-verifies its digest against the same
+   `x-amz-meta-sha256` metadata `loadPotWorkerBundle` itself checks, for any past release —
+   not coupled to the local working tree at all.
+
+**Still not done, and explicitly out of scope for this follow-up too:** this session never
+calls the live Cloudflare API (no bucket write, no token-verify call, no deploy) — the S3
+endpoint shapes and the token-to-S3-credential derivation above are sourced from
+developers.cloudflare.com and the published `cloudflare` npm package's own type
+definitions, not exercised against a real account. Kasra-core should smoke-test
+`scripts/publish-pot-bundle.mjs` and `scripts/verify-pot-bundle.mjs` for real once a scoped
+token is available, then run a real `pot_provision` end to end against the published
+bundle.
+
+**CI publish output contract (round 2 — required, not optional; this is the exact contract
+`scripts/publish-pot-bundle.mjs` now satisfies).** An R2 GET returning 200 only proves the
+bytes were *readable*, not that they are the bytes CI actually built — silent corruption, a
+partial multipart write, or a stale key left over from a previous release would all read
+back successfully. `loadPotWorkerBundle` therefore treats an R2 object as untrusted unless
+the publish step satisfies this exact contract:
 
 - **Object key:** `${RELEASE_SHA}/worker.js` (unchanged from the design above; `RELEASE_SHA`
   is the same value `scripts/deploy.mjs` already stamps for the colony worker, mupot#443).
@@ -98,8 +152,9 @@ object as untrusted unless the CI publish step (once built) satisfies this exact
   `src/pots/service.ts`) whose value is the lowercase hex sha256 digest of the EXACT bytes
   in the object body — i.e. `sha256 === sha256Hex(await fs.readFile(bundlePath, 'utf8'))`
   for whatever bundle text `scripts/build-pot-worker-bundle.mjs` produced, computed and set
-  in the SAME publish step that does the R2 `put()` (`{ customMetadata: { sha256 } }`), not
-  read back and hoped to match.
+  in the SAME publish step that does the R2 write (an `x-amz-meta-sha256` header on the
+  S3-compatible PUT — R2 maps that 1:1 onto `customMetadata.sha256` for a Workers-binding
+  reader, stripping the `x-amz-meta-` prefix), not read back and hoped to match.
 
 `loadPotWorkerBundle` recomputes the digest of what it reads and compares it to this custom
 metadata field. Missing metadata or a mismatch is a hard `deploy_worker` failure — never a
@@ -479,8 +534,14 @@ per-statement cap — the two bounds do not fight each other for an ordinary cal
 - Run `scripts/build-pot-worker-bundle.mjs` for real (needs a real `wrangler.toml`) and wire
   its output into a live `pot_provision` call end-to-end — with a real CF token, on a
   disposable test slug, watching the receipts land.
-- Design and land the R2-publish half of bundle option B (`scripts/deploy.mjs` writing to
-  `POT_WORKER_BUNDLE_BUCKET` after a successful deploy), and the actual bucket/binding.
+- Smoke-test `scripts/publish-pot-bundle.mjs` / `scripts/verify-pot-bundle.mjs` for real
+  (mupot#1285/#1516 enablement, now built — see "Bundle source trade-off" above): a live
+  `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`, the `POT_WORKER_BUNDLE_BUCKET` binding
+  added to the real `wrangler.toml`, one real `npm run deploy`, and confirmation that
+  `loadPotWorkerBundle` picks the published object up on the next `pot_provision` call.
+  This session never called the real R2 S3-compatible endpoint or `/user/tokens/verify` —
+  both are implemented against documentation and the published `cloudflare` npm package's
+  own types, not exercised live.
 - Migrate Psychonom's `psychonom-prj` / `psychonom-sqd` / `psychonom-mubot` rows (currently
   living inside the mumega tenant) into its own pot once one is actually stood up for it —
   named in the issue as part of this work's acceptance criteria, not attempted here (it is a

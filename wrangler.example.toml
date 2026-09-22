@@ -105,6 +105,19 @@ id = "<YOUR_OAUTH_KV_ID>"
 binding = "BLOBS"
 bucket_name = "mupot-blobs"
 
+# ── sovereign-pot worker bundles (mupot#1285/#1516 enablement) ──
+# Optional. `loadPotWorkerBundle` (src/pots/service.ts) checks this FIRST when
+# provisioning a new tenant pot, keyed `${RELEASE_SHA}/worker.js` — written by
+# `npm run deploy` (scripts/deploy.mjs's post-deploy step) via
+# scripts/publish-pot-bundle.mjs. See docs/workflows/tenant-provision.md
+# "Bundle source trade-off" for the full design and the CI publish output
+# contract a caller of the bucket directly (not through those two scripts)
+# must still satisfy. Absent entirely ⇒ provisionSovereignPot falls back to an
+# explicit `worker_js_code` argument, unchanged.
+[[r2_buckets]]
+binding = "POT_WORKER_BUNDLE_BUCKET"
+bucket_name = "mupot-pot-bundles"
+
 # ── Workers AI (embeddings + cheap inference) ──
 [ai]
 binding = "AI"
