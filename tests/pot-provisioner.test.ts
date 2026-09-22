@@ -608,6 +608,14 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     it('MCP tool inputSchema properties are built from the SAME allow-list (parity by construction)', () => {
       expect(Object.keys(toolPotProvision.inputSchema.properties as object).sort()).toEqual([...PROVISION_ALLOWED_FIELDS].sort())
     })
+
+    it('Athena condition iii: provisionSovereignPot ITSELF refuses forbidden keys via an `as any` bypass, independent of either surface validator', async () => {
+      const env = { SECRET_ENV_CF_API_TOKEN: 'x', TENANT_SLUG: 'mumega' } as unknown as Env
+      for (const forbidden of ['worker_js_code', 'cf_api_token', 'account_id']) {
+        const input = { slug: 'x', brand_name: 'X', admin_email: 'a@b.com', [forbidden]: 'smuggled' } as any
+        await expect(provisionSovereignPot(env, input), forbidden).rejects.toThrow(new RegExp(forbidden))
+      }
+    })
   })
 
   describe('POST /api/pots/provision through the real Hono app (round-2 P0-3)', () => {
