@@ -307,19 +307,6 @@ inviteApp.post('/:id', async (c) => {
     )
   }
 
-  // mupot#1504: "Web onboarding door never creates the member's home
-  // squad" — the member row + capability grant are now durably committed
-  // (acceptInvite's own atomic batch, above), so this is the ONE
-  // unambiguous first-contact event the web door can observe. Same
-  // channel-agnostic function IM's 'join' case calls (src/members/service.ts,
-  // src/im/index.ts) — idempotent (a member who later also joins via
-  // Telegram gets no second home, no second receipt) and best-effort: a
-  // provisioning failure never blocks or rolls back this accept, and writes
-  // no receipt row (member_home_provisioning_receipts is receipted on
-  // success only). Not awaited-for-effect on the response below — the
-  // redirect to /auth/login happens regardless of provisioning outcome.
-  await provisionHomeForMember(c.env, result.value.member_id, 'web')
-
   // mupot#1436 A2 (gated, not built here): stash a short-lived pointer to the
   // just-minted member so a follow-on login can link the two.
   //
@@ -378,6 +365,35 @@ inviteApp.post('/:id', async (c) => {
     sameSite: 'Lax',
     path: '/',
     maxAge: PENDING_INVITE_TTL_SECONDS,
+  })
+
+  // mupot#1504: "Web onboarding door never creates the member's home
+  // squad" — the member row + capability grant are durably committed
+  // (acceptInvite's own atomic batch, above), so this is the ONE
+  // unambiguous first-contact event the web door can observe. Same
+  // channel-agnostic function IM's 'join' case calls (src/members/service.ts,
+  // src/im/index.ts) — idempotent (a member who later also joins via
+  // Telegram gets no second home, no second receipt) and best-effort.
+  //
+  // ADVERSARIAL ROUND 1, P2-a: this call is DELIBERATELY positioned AFTER
+  // the pending-invite KV marker + cookie above, not before. The accept
+  // itself (acceptInvite) already spent the invite and minted the member —
+  // that cannot be undone from here — so the ONE thing this handler still
+  // owes the human is the marker + cookie that let /auth/login link their
+  // Google identity to the member they just became. If provisioning ran
+  // first and rejected unhandled, the marker/cookie would never be
+  // written and the human would be stuck: accepted, but with no way to
+  // ever link Google. Sequencing provisioning LAST means the worst case
+  // of a provisioning failure is exactly what it should be — a missing
+  // home, never a missing login path. The `.catch` below is defense in
+  // depth on top of provisionHomeForMember's own internal never-throws
+  // guarantee (see its doc comment in src/members/service.ts) — belt and
+  // braces, not a claim that the function still needs it.
+  await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
+    console.error('dashboard/invite: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+      member_id: result.value.member_id, channel: 'web',
+      error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+    })
   })
 
   return c.redirect('/auth/login')

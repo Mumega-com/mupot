@@ -1192,22 +1192,50 @@ export async function upsertCapabilityGrant(
 // against a homeless member must never be able to mint repeated 'failed'
 // rows into an append-only audit table).
 //
-// IDEMPOTENT: an existing home is a pure read (getMemberHomeSquad), no write
-// attempted, no receipt written — the second caller (whichever channel a
-// member touches second) is a guaranteed no-op, never a second home or a
-// second receipt row (see createHomeForMember's own doc comment for why two
-// homes per human is structurally impossible regardless of caller).
+// IDEMPOTENT (in home count, not in receipt count — see below): an existing
+// home is a pure read (getMemberHomeSquad), no write attempted, no receipt
+// written — a SEQUENTIAL second caller (whichever channel a member touches
+// second) is a guaranteed no-op, never a second home (see
+// createHomeForMember's own doc comment for why two homes per human is
+// structurally impossible regardless of caller). A CONCURRENT second caller
+// (both read getMemberHomeSquad before either has committed) still
+// converges on ONE home and ONE capability grant (createHomeForMember's own
+// unique-violation race-recovery adopts the winner's row for the loser
+// too) — but see "OVER-RECORDING UNDER A RACE IS ACCEPTED", next.
 //
-// RECEIPTED ONLY ON SUCCESS: migrations/0161 (member_home_provisioning_receipts,
-// widened by 0165 to admit `channel IN ('web','im')`) gets a row on
-// disposition 'created' or 'existing' — i.e. only when createHomeForMember
-// itself returned ok:true. A FAILED provisioning attempt writes nothing (no
-// receipt, no partial row) — same "audit success, not attempts" doctrine the
-// original IM-only version established, so a transient failure can never
-// accumulate unbounded rows in an append-only table, and the CALLER's own
-// success (accepting the invite / joining the project) is never blocked or
-// rolled back by a provisioning failure — see both call sites: neither
-// awaits this function's result as a gate on their own response.
+// RECEIPTED ON EVERY REAL DISPOSITION, INCLUDING 'existing' (Athena's
+// ruling on adversarial round 1's P2-b, 2026-09-22): migrations/0161
+// (member_home_provisioning_receipts, widened by 0165 to admit `channel IN
+// ('web','im','telegram')`) gets a row whenever createHomeForMember returns
+// `ok: true` — disposition `'created'` (this call actually inserted the
+// squad + capability rows) OR `'existing'` (this call found a home already
+// there via createHomeForMember's own department-keyed lookup or its
+// race-recovery path — NOT the ordinary already-homed short-circuit above,
+// which returns before ever calling createHomeForMember and so never
+// reaches this write at all). Only a FAILED provisioning attempt (`ok:
+// false`) writes nothing — a transient failure can never accumulate
+// unbounded rows in an append-only table.
+//
+// OVER-RECORDING UNDER A RACE IS ACCEPTED, NOT A BUG (Athena's ruling,
+// 2026-09-22): a genuine concurrent web+im race can make BOTH callers reach
+// createHomeForMember with a real disposition — the winner gets 'created',
+// the loser gets 'existing' via race-recovery — and BOTH write their own
+// receipt row. Two rows for one home, one capability grant. Deliberately
+// NOT gated on disposition and NOT serialized: the ledger records
+// PROVISIONING ATTEMPTS THAT REACHED A REAL OUTCOME, not a 1:1 mapping to
+// homes. It will never contain a row for a home that does not exist, and it
+// will never under-count — over-counting under a genuine race is the
+// accepted trade against adding either a disposition filter (which would
+// make the ledger blind to the loser's channel entirely) or a serialization
+// lock (which this Worker has no cheap primitive for).
+//
+// NEVER THROWS: every step below — including the dynamic import — is
+// wrapped so NO exception this function can encounter propagates to the
+// caller; the CALLER's own success (accepting the invite / joining the
+// project) is never blocked, delayed, or rolled back by a provisioning
+// failure. Each of the three call sites additionally wraps ITS OWN call in
+// `.catch(...)` as defense in depth (adversarial round 1, P2-a) — belt and
+// braces, not a claim that this function can still reject.
 export type HomeProvisioningChannel = 'web' | 'im'
 
 export async function provisionHomeForMember(
@@ -1215,43 +1243,79 @@ export async function provisionHomeForMember(
   memberId: string,
   channel: HomeProvisioningChannel,
 ): Promise<void> {
-  // Dynamic import: src/org/service.ts does not import this module, so a
-  // static import would be safe today, but the original (src/im/index.ts)
-  // used a dynamic import to keep src/members/service.ts free of a
-  // compile-time dependency on the org component from a module several
-  // other files (agent-access.ts, index.ts) already import type-only from —
-  // kept identical here rather than changing a working, reviewed pattern as
-  // a side effect of the move.
-  const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
-
-  // Both lookup steps are wrapped so a genuine (non-'member_not_found'-shaped)
-  // failure — e.g. createHomeForMember's own re-thrown non-unique-violation
-  // batch error — is LOGGED but never propagates into the caller: neither
-  // the web accept response nor the IM join reply is allowed to fail
-  // because home provisioning did. This is the "failure → caller still
-  // succeeds, zero receipts" contract mupot#1504 requires of both callers.
-  let home: Awaited<ReturnType<typeof getMemberHomeSquad>>
+  // Adversarial round 1, P2-a: the dynamic import itself used to sit OUTSIDE
+  // every try/catch below — a module-load rejection (however unlikely) would
+  // have propagated straight out of this function, past both inner guards,
+  // and into whichever caller forgot its own `.catch`. The whole function
+  // body is now one try/catch so NOTHING it does can ever reject; the inner
+  // try/catches stay too, purely so a home-lookup failure and a
+  // createHomeForMember failure get their OWN distinct log lines instead of
+  // one generic "something failed" message.
   try {
-    home = await getMemberHomeSquad(env, memberId)
+    // Dynamic import: src/org/service.ts does not import this module, so a
+    // static import would be safe today, but the original (src/im/index.ts)
+    // used a dynamic import to keep src/members/service.ts free of a
+    // compile-time dependency on the org component from a module several
+    // other files (agent-access.ts, index.ts) already import type-only from —
+    // kept identical here rather than changing a working, reviewed pattern as
+    // a side effect of the move.
+    const { getMemberHomeSquad, createHomeForMember } = await import('../org/service')
+
+    let home: Awaited<ReturnType<typeof getMemberHomeSquad>>
+    try {
+      home = await getMemberHomeSquad(env, memberId)
+    } catch (err) {
+      console.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', {
+        member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+      return
+    }
+    if (home) return // idempotent: already has one — no write, no receipt.
+
+    let created: Awaited<ReturnType<typeof createHomeForMember>>
+    try {
+      created = await createHomeForMember(env, memberId)
+    } catch (err) {
+      console.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', {
+        member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+      return
+    }
+    if (!created.ok) return // failed provisioning (e.g. member_not_found) — no receipt row, caller still succeeds.
+    // Athena's ruling on adversarial round 1's P2-b (2026-09-22): a
+    // concurrent web+im race can make BOTH callers reach a real disposition
+    // ('created' for the winner, 'existing' for the loser adopting its row
+    // via createHomeForMember's own race recovery) and each writes its OWN
+    // receipt — over-recording, not corruption (one home, one capability
+    // grant, either way). ACCEPTED AS-IS: no gating on disposition, no
+    // serialization. The ledger can contain more than one row per home
+    // under a genuine race; it will never contain a row for a home that
+    // does not exist. See the doc comment above this function.
+
+    try {
+      await env.DB.prepare(
+        `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, channel, created.disposition).run()
+    } catch (err) {
+      // Athena's ruling on adversarial round 1's P1 (2026-09-22): this used
+      // to be a bare `catch {}` — a failed receipt write was not just
+      // non-fatal, it was INVISIBLE. Home provisioning itself already
+      // succeeded by this point (the squad + capability rows are
+      // committed), so this stays non-blocking for the caller — but a
+      // logged-and-dropped attempt is honest, a swallowed one is not.
+      // console.warn (not .error): the home is safely provisioned either
+      // way; this is a degraded-but-recovered audit write, the same
+      // severity class as src/addons/mirror.ts's "Vector index write
+      // failed (relational engram preserved)".
+      console.warn('members/service: provisionHomeForMember receipt write failed (non-fatal, home already provisioned)', {
+        member_id: memberId, channel, squad_id: created.squad.id, disposition: created.disposition,
+        error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+      })
+    }
   } catch (err) {
-    console.error('members/service: provisionHomeForMember home lookup failed (non-fatal)', { memberId, channel, err })
-    return
+    console.error('members/service: provisionHomeForMember failed unexpectedly (non-fatal)', {
+      member_id: memberId, channel, error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+    })
   }
-  if (home) return // idempotent: already has one — no write, no receipt.
-
-  let created: Awaited<ReturnType<typeof createHomeForMember>>
-  try {
-    created = await createHomeForMember(env, memberId)
-  } catch (err) {
-    console.error('members/service: provisionHomeForMember createHomeForMember failed (non-fatal)', { memberId, channel, err })
-    return
-  }
-  if (!created.ok) return // failed provisioning (e.g. member_not_found) — no receipt row, caller still succeeds.
-
-  try {
-    await env.DB.prepare(
-      `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, created.squad.id, channel, created.disposition).run()
-  } catch { /* best-effort audit write; never blocks the caller's own reply */ }
 }

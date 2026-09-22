@@ -436,7 +436,18 @@ membersApp.post('/invites/:id/accept', async (c) => {
   // dashboard's own /invite/:id door (this route mints over the web/API
   // plane, not IM), same receipt table, same idempotent/best-effort
   // contract — never blocks or is reflected in this response either way.
-  await provisionHomeForMember(c.env, result.value.member_id, 'web')
+  //
+  // Adversarial round 1, P2-a: this call sits BEFORE the raw token response
+  // below — the token is returned EXACTLY ONCE, so an uncaught rejection
+  // here would burn it with no way to ever hand it back. `.catch` is
+  // defense in depth on top of provisionHomeForMember's own internal
+  // never-throws guarantee (src/members/service.ts).
+  await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
+    console.error('members/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+      member_id: result.value.member_id, channel: 'web',
+      error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+    })
+  })
 
   // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
   protectRawTokenResponse(c)

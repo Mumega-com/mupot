@@ -352,9 +352,21 @@ export async function handleImMessage(
     // memberIntakeEnvelope's own doc comment for why it moved out of the
     // per-message read path). mupot#1504: provisionHomeForMember
     // (src/members/service.ts) is the SAME channel-agnostic function the
-    // web invite-accept path now also calls — this is call site (b), the
+    // web invite-accept path now also calls — this is call site (c), the
     // 'im' channel, unchanged behaviour from before the move/rename.
-    if (result.ok) await provisionHomeForMember(env, result.value.member_id, 'im')
+    //
+    // Adversarial round 1, P2-a: `.catch` is defense in depth on top of
+    // provisionHomeForMember's own internal never-throws guarantee — an
+    // uncaught rejection here must never cost the human their "Joined
+    // project ..." reply for a join that already durably happened.
+    if (result.ok) {
+      await provisionHomeForMember(env, result.value.member_id, 'im').catch((err: unknown) => {
+        console.error('im/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
+          member_id: result.value.member_id, channel: 'im',
+          error_class: err instanceof Error ? err.constructor.name : typeof err, err,
+        })
+      })
+    }
     return result.ok ? joinedReply(result.value.project_id) : 'Could not join. Ask an admin for a new invitation.'
   }
 

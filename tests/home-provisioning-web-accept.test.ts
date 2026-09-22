@@ -277,4 +277,96 @@ describe('mupot#1504 — web accept provisions a home squad', () => {
       { member_id: body.member_id, squad_id: homeSquadId, channel: 'web', disposition: 'created' },
     ])
   })
+
+  // ── adversarial round 1, P1 — 0165's widened CHECK ──────────────────────────
+  it('P1: 0165 CHECK admits "web", "im", AND "telegram" (widened, not relabeled) — refuses anything else', () => {
+    harness = makeHarness()
+    const insert = (channel: string) => harness!.sqlite.prepare(
+      `INSERT INTO member_home_provisioning_receipts (id, tenant, member_id, squad_id, channel, disposition)
+       VALUES (?, ?, ?, ?, ?, 'created')`,
+    ).run(crypto.randomUUID(), TENANT, 'member-admin', 'squad-web', channel)
+
+    expect(() => insert('web')).not.toThrow()
+    expect(() => insert('im')).not.toThrow()
+    // 'telegram' must still be accepted — the currently-deployed merge-base
+    // src/im/index.ts writes this literal, and migration/deploy ordering is
+    // not atomic (see 0165's own header). A CHECK that dropped 'telegram'
+    // would silently lose every IM-join receipt until the code redeploys.
+    expect(() => insert('telegram')).not.toThrow()
+    expect(() => insert('discord')).toThrow(/CHECK constraint failed/)
+
+    const rows = harness.sqlite.prepare(
+      `SELECT channel FROM member_home_provisioning_receipts ORDER BY channel`,
+    ).all() as { channel: string }[]
+    expect(rows.map(r => r.channel)).toEqual(['im', 'telegram', 'web'])
+  })
+
+  // ── adversarial round 1, P2-b — Athena's ruling: over-recording is accepted ──
+  it('P2-b: a genuinely CONCURRENT web+im race converges on ONE home + ONE capability grant, but writes TWO receipts (accepted over-recording)', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-race', 'race@pot.test', 'Race Member', 'active', '${TENANT}');
+    `)
+
+    // Same technique tests/accept-invite-direct.test.ts uses for its own
+    // "5x concurrent Promise.all" race test against this same synchronous
+    // node:sqlite-backed D1 harness: both calls start in the same
+    // synchronous tick, so their internal awaits interleave deterministically
+    // — both see no home before either has committed.
+    const [webResult, imResult] = await Promise.allSettled([
+      provisionHomeForMember(env, 'member-race', 'web'),
+      provisionHomeForMember(env, 'member-race', 'im'),
+    ])
+    expect(webResult.status).toBe('fulfilled')
+    expect(imResult.status).toBe('fulfilled')
+
+    // ONE home, ONE capability grant, regardless of the race.
+    const home = await getMemberHomeSquad(env, 'member-race')
+    expect(home).not.toBeNull()
+    const capCount = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS n FROM capabilities WHERE member_id = 'member-race' AND scope_id = ?`,
+    ).get(home!.id) as { n: number }
+    expect(capCount.n).toBe(1)
+
+    // TWO receipts — one 'created' (the race winner), one 'existing' (the
+    // race loser, adopting the winner's row via createHomeForMember's own
+    // race recovery). Athena's ruling: this is ACCEPTED over-recording, not
+    // a defect — asserted explicitly here rather than silently tolerated.
+    const receipts = receiptRows(harness)
+    expect(receipts).toHaveLength(2)
+    expect(receipts.filter(r => r.disposition === 'created')).toHaveLength(1)
+    expect(receipts.filter(r => r.disposition === 'existing')).toHaveLength(1)
+    expect(receipts.map(r => r.channel).sort()).toEqual(['im', 'web'])
+    for (const r of receipts) {
+      expect(r.member_id).toBe('member-race')
+      expect(r.squad_id).toBe(home!.id)
+    }
+  })
+
+  it('P2-b: a disposition="existing" outcome reached FROM INSIDE provisionHomeForMember (not the already-homed short-circuit) DOES write a receipt', async () => {
+    // This is the same race as above, isolated to prove specifically that
+    // the 'existing'-disposition branch (as opposed to the ordinary
+    // already-homed early return, which never calls createHomeForMember at
+    // all and so never reaches a receipt write) is exercised and receipted.
+    // Before this test, no test in the repo drove provisionHomeForMember's
+    // OWN 'existing' path — every existing idempotency test only exercised
+    // the early short-circuit.
+    harness = makeHarness()
+    const env = envFor(harness)
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-existing-path', 'existing-path@pot.test', 'Existing Path', 'active', '${TENANT}');
+    `)
+
+    await Promise.all([
+      provisionHomeForMember(env, 'member-existing-path', 'web'),
+      provisionHomeForMember(env, 'member-existing-path', 'im'),
+    ])
+
+    const existingReceipt = receiptRows(harness).find(r => r.disposition === 'existing')
+    expect(existingReceipt).toBeDefined()
+    expect(existingReceipt!.member_id).toBe('member-existing-path')
+  })
 })
