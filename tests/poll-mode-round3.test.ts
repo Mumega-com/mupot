@@ -379,3 +379,66 @@ describe('mupot#1494 v4 (P1-c) — home exclusion derives from real membership, 
     expect(scoped.map((r) => r.agent_id)).toContain(HOME_AGENT_ID)
   })
 })
+
+// mupot#1494 v4 round 2 (P2-a, adversarial regression) — the squad-SCOPED view's own
+// INCLUSION test used to read the same self-reported fleet_agents.squads array the P1-c
+// exclusion fix already stopped trusting: an agent whose REAL home is NOT the scoped squad
+// could self-report that squad's slug and appear in the scoped view anyway, host included.
+describe('mupot#1494 v4 round 2 (P2-a) — squad-scoped INCLUSION also derives from real membership', () => {
+  const SQUAD_WORK_ID = 'squad-p2a-work'
+  const SQUAD_OTHER_ID = 'squad-p2a-other'
+  const WORK_AGENT_ID = 'agent-p2a-work'
+  const OTHER_AGENT_ID = 'agent-p2a-other'
+
+  beforeEach(() => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'p2a-dept', 'P2A Dept');
+      INSERT INTO squads (id, department_id, slug, name) VALUES
+        ('${SQUAD_WORK_ID}', '${DEPT_ID}', 'p2a-work', 'P2A Work'),
+        ('${SQUAD_OTHER_ID}', '${DEPT_ID}', 'p2a-other', 'P2A Other');
+      INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+        ('${WORK_AGENT_ID}', '${SQUAD_WORK_ID}', 'p2a-work-runner', 'Work Runner', 'active'),
+        ('${OTHER_AGENT_ID}', '${SQUAD_OTHER_ID}', 'p2a-other-runner', 'Other Runner', 'active');
+    `)
+    env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+  })
+  afterEach(() => harness.close())
+
+  it('EVASION closed: an agent whose REAL squad is NOT the scoped one cannot appear there by self-reporting its slug', async () => {
+    // OTHER_AGENT's real squad_id is SQUAD_OTHER_ID — it self-reports the WORK squad's
+    // slug instead, trying to appear (with its host) in a caller scoped to the work squad.
+    const reportRes = await reportFleetAgents(env, OTHER_AGENT_ID, [
+      { agent_id: OTHER_AGENT_ID, status: 'running', squads: ['p2a-work'], host: 'Other Runner SECRET HOST' },
+    ])
+    expect(reportRes.ok).toBe(true) // 'p2a-work' is a REAL slug, so validReport accepts it
+
+    const scoped = await listFleetAgentRuntimeView(env, Date.now(), [SQUAD_WORK_ID])
+    expect(scoped.map((r) => r.agent_id)).not.toContain(OTHER_AGENT_ID)
+  })
+
+  it('the honest case still works: an agent whose REAL squad IS the scoped one is included, host and all', async () => {
+    await reportFleetAgents(env, WORK_AGENT_ID, [
+      { agent_id: WORK_AGENT_ID, status: 'running', squads: ['p2a-work'], host: 'Work Runner VISIBLE HOST' },
+    ])
+    const scoped = await listFleetAgentRuntimeView(env, Date.now(), [SQUAD_WORK_ID])
+    const row = scoped.find((r) => r.agent_id === WORK_AGENT_ID)
+    expect(row).toBeDefined()
+    expect(row!.host).toBe('Work Runner VISIBLE HOST')
+
+    // Scoped to the OTHER squad, the work agent must not appear even though the two rows
+    // coexist in the same tenant.
+    const scopedOther = await listFleetAgentRuntimeView(env, Date.now(), [SQUAD_OTHER_ID])
+    expect(scopedOther.map((r) => r.agent_id)).not.toContain(WORK_AGENT_ID)
+  })
+
+  it('an unresolvable fleet_agents row (agent_id matches no real agent at all) is excluded from every scoped view', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, host, last_reported_at, updated_at)
+      VALUES ('ghost-p2a', '${TENANT}', '', 'claude-code', '["p2a-work"]', '', 'running', 'daemon', 'Ghost Host', datetime('now'), datetime('now'));
+    `)
+    const scoped = await listFleetAgentRuntimeView(env, Date.now(), [SQUAD_WORK_ID])
+    expect(scoped.map((r) => r.agent_id)).not.toContain('ghost-p2a')
+  })
+})

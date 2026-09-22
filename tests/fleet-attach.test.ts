@@ -65,6 +65,12 @@ function makeDb(opts: MockOpts = {}) {
       const [id, tenant] = binds as [string, string]
       return members.find((m) => m.id === id && m.tenant === tenant) ? { 1: 1 } : null
     }
+    // mupot#1494 v4 round 2 (P1-1) — resolveFleetWriteAgentId's exact-id probe, now called
+    // internally by upsertRunning/markStopped on every fleet_agents write. No real agents
+    // table in this mock; every agent_id here ('kasra' etc.) never matches a real
+    // agents.id, so "no match" is correct — falls through to the slug lookup below, also
+    // unmatched, returning the identifier unchanged (preserving every existing assertion).
+    if (sql.includes('SELECT 1 FROM agents WHERE id')) return null
     throw new Error('unhandled first: ' + sql)
   }
 
@@ -90,6 +96,10 @@ function makeDb(opts: MockOpts = {}) {
       const [memberId] = binds as [string]
       return caps.filter((c) => c.member_id === memberId)
     }
+    // mupot#1494 v4 round 2 (P1-1) — resolveFleetWriteAgentId's slug lookup, reached only
+    // when the id probe above already missed. No real agents table in this mock — always
+    // unmatched.
+    if (sql.includes('SELECT id FROM agents WHERE slug')) return []
     throw new Error('unhandled all: ' + sql)
   }
 

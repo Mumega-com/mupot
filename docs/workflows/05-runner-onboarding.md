@@ -175,6 +175,58 @@ any terminal receipt), and `hasInFlightDispatchReceipt` / `task_dispatch`'s own 
 dies → `task_dispatch_lease_reset({ ..., override: true, terminate: true })` → reassign →
 fresh `task_dispatch` → settle** — every step receipted, no step a silent DB patch.
 
+## v4 round 2: closing the regressions round 1's own fixes introduced
+
+A second adversarial round on v4 itself (pinned `eb363054`) found AMBER — a NEW P1
+regression in round 1's own P1-b fix, plus a class round 1 left open on its own new
+`terminate: true` feature. All fixed on the same branch, before this doc was last updated.
+
+- **P1-1 (regression):** round 1's `resolveFleetWriteAgentId` resolve call was applied only
+  at the `/attach-signed` call site — `/attach` (bearer), `/detach`, and `/detach-signed`
+  still used the raw, unresolved identifier. PROVED: `/attach-signed` wrote a row keyed by
+  the resolved `agents.id`; `/detach-signed` then looked it up by the raw signed slug, found
+  nothing, returned `404 not_found_or_not_owner`, and the row stayed `running` — a genuinely
+  detached runtime stayed dispatch-live forever. **Fix:** the resolve now lives INSIDE
+  `upsertRunning`/`markStopped` themselves (`src/fleet/attach-routes.ts`), not at an
+  individual call site, so every current and future writer/lookup gets it for free.
+  `tests/fleet-attach-signed.test.ts` gained a REAL-schema describe block (the mock this
+  file otherwise uses had been patched, in round 1, to answer "no match" for both of the
+  resolver's probes — meaning the resolution branch itself was never actually exercised).
+- **P1-2 (round 1's own `terminate: true` left a resurrection window):** a reset+terminate
+  cleared the message back toward pristine and wrote a `reset_terminated` receipt, but
+  `recordTaskDispatchRuntimeReceipt` never consulted the terminal-stage set, and the message
+  itself was never marked consumed — so a "dead" runner that was not actually dead could
+  still settle the SAME dispatch afterward, corrupting `tasks.execution_receipt_id` onto a
+  dispatch already declared closed. **Fix:** the settle path now refuses
+  (`dispatch_terminated`, 409, no write) the instant ANY terminal receipt already exists for
+  a dispatch — checked early, and embedded a second time inside
+  `claimUnleasedForPairSettlement`'s own claim UPDATE for the race-closing case; `terminate:
+  true`'s lease-clearing UPDATE now ALSO sets `read_at` in the SAME atomic statement (never
+  a separate step, never a window where the message reads pristine again); and
+  `adminResetDispatchLease` itself now refuses (`reset_refused_already_terminal`) outright,
+  even under `override: true`, when the dispatch already carries any terminal receipt — a
+  genuinely completed dispatch has nothing left to repair.
+- **P2-a:** the squad-SCOPED view's own INCLUSION test had the SAME self-report-trust bug
+  step 6's P1-c exclusion fix already closed — it read `fleet_agents.squads` instead of the
+  agent's real `agents.squad_id`. Fixed the same way, and the slug-translation query this
+  replaced is gone entirely (an id-membership test needs no round-trip through slugs).
+- **P2-b:** migration `0171`'s Case B (duplicate rows) used to delete the redundant
+  slug-keyed row outright — correct when the SLUG row is empty, but round 1 got the common
+  case backwards: the POLL writer (uuid-keyed) never sets `display`/`runtime`/`host`, so the
+  usual shape is an EMPTY uuid row and a RICH slug row, and round 1 kept the empty one.
+  Fixed: merge non-empty fields forward (never clobbering a real value already on the
+  survivor) before the delete, and receipt the merge to `mutation_audit_entries`
+  (`fleet_agents_dedup_merge`) so it is an auditable fact, not a silent patch.
+- **P2-c / P3:** the override guard's two-attempt WHERE clauses are now pinned by a
+  source-level assertion (this class of guard is provably immune to every SEQUENTIAL test
+  this suite can construct — "receipts are blind to real concurrency" is structural, not
+  fixable by a cleverer assertion); `reason` sanitization is pinned behaviorally (hostile
+  control/bidi/zero-width characters, checked against both the persisted audit evidence and
+  the terminal receipt row); and the reset tool's audit-write + terminal-receipt-write now
+  land in ONE `env.DB.batch` when both apply (the two-attempt lease UPDATE stays a separate
+  statement by necessity — see the code comment on `adminResetDispatchLease` for why
+  batching it too would trade away the provable `overrode` determination).
+
 ## Human gate
 
 None in the happy path — machine-to-machine end to end; the only human involvement there

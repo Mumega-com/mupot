@@ -157,7 +157,17 @@ dead-runner recovery is then: **reset(terminate) → reassign (or unassign) → 
 is idempotent (a second call on an already-terminal dispatch writes no duplicate row) and
 refuses (`409`, receipted, zero side effects) if your session has no live bearer credential
 to anchor the new receipt to — a directory-OAuth org-admin session can still reset without
-`terminate`, just not terminate in the same call.
+`terminate`, just not terminate in the same call. It also refuses outright
+(`reset_refused_already_terminal`) — even with `override: true` — if the dispatch already
+has a genuine `completed`/`failed` receipt: there is nothing left to repair.
+
+**Once a dispatch is terminated, it is terminated everywhere, permanently.** The underlying
+message is marked consumed in the SAME atomic write that clears its lease — it can never
+again be leased, pair-settled, or redelivered via `inbox`/`inbox_lease` — and
+`task_dispatch_runtime_receipt` refuses (`dispatch_terminated`, 409, no write) any further
+settle attempt on that dispatch, from any runner, through any correlator. A runner that was
+declared dead but was not actually dead simply gets refused when it resurfaces; it does not
+corrupt task state.
 
 ## Worked example (poll every 5 minutes)
 

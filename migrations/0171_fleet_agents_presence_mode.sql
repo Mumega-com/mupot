@@ -183,11 +183,77 @@ UPDATE fleet_agents
 
 -- Case B — a genuine duplicate: BOTH a slug-keyed row and its resolved uuid-keyed row already
 -- exist. The uuid-keyed row is the one every writer converges on going forward and the one
--- dispatch routing already reads by (src/mcp/index.ts, src/bus/consumer.ts) — delete the
--- redundant slug-keyed row. fleet_agents is a DISPLAY cache, never authority (see this
--- table's own 0035 header): any display field (display/runtime/squads/host/...) only the
--- deleted row carried is re-populated onto the surviving uuid row by that same agent's very
--- next daemon report or signed attach.
+-- dispatch routing already reads by (src/mcp/index.ts, src/bus/consumer.ts) — the redundant
+-- slug-keyed row is deleted, but NOT before its display fields are merged forward and the
+-- merge is receipted.
+--
+-- mupot#1494 v4 round 2 (P2-b, adversarial regression) — round 1 deleted the slug-keyed row
+-- outright, reasoning "fleet_agents is a DISPLAY cache, never authority... re-populated by
+-- the next report" — true for the common case (daemon reports display/runtime/host on a
+-- regular cadence), but WRONG for the shape actually seen in practice: the uuid-keyed row is
+-- typically the POLL writer's (`upsertPollFleetPresence` never sets display/runtime/host —
+-- only `agent_id`/`squads`/`presence_mode`/timestamps), so round 1 kept the EMPTY row and
+-- discarded the RICH one, and there is no guarantee a "next report" ever comes for an agent
+-- that has switched fully to poll mode. Fixed: merge forward, per column, ONLY where the
+-- surviving uuid row's own value is still empty/default (never clobber a real value the
+-- uuid row already carries), and RECEIPT the merge to `mutation_audit_entries` (operation
+-- `fleet_agents_dedup_merge`) before the delete, so the merge is an auditable fact, not a
+-- silent DB patch — same discipline as `adminResetDispatchLease`'s own audit trail.
+--
+-- Part 1 — MERGE forward (before the DELETE, while the slug row's values are still readable).
+UPDATE fleet_agents
+   SET display = CASE WHEN display = '' THEN COALESCE((
+         SELECT s.display FROM fleet_agents s
+          WHERE s.tenant = fleet_agents.tenant AND s.agent_id = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)
+       ), '') ELSE display END,
+       runtime = CASE WHEN runtime = '' THEN COALESCE((
+         SELECT s.runtime FROM fleet_agents s
+          WHERE s.tenant = fleet_agents.tenant AND s.agent_id = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)
+       ), '') ELSE runtime END,
+       squads = CASE WHEN squads = '[]' THEN COALESCE((
+         SELECT s.squads FROM fleet_agents s
+          WHERE s.tenant = fleet_agents.tenant AND s.agent_id = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)
+       ), '[]') ELSE squads END,
+       host = CASE WHEN host = '' THEN COALESCE((
+         SELECT s.host FROM fleet_agents s
+          WHERE s.tenant = fleet_agents.tenant AND s.agent_id = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)
+       ), '') ELSE host END
+ WHERE EXISTS (SELECT 1 FROM agents WHERE id = fleet_agents.agent_id)
+   AND (SELECT COUNT(*) FROM agents WHERE slug = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)) = 1
+   AND EXISTS (
+     SELECT 1 FROM fleet_agents s
+      WHERE s.tenant = fleet_agents.tenant
+        AND s.agent_id = (SELECT slug FROM agents WHERE id = fleet_agents.agent_id)
+   );
+
+-- Part 2 — RECEIPT the merge. Deterministic id/request_id (not randomblob) so a re-run of
+-- this migration on the same data is a clean PK-conflict failure, never a silent duplicate.
+INSERT INTO mutation_audit_entries (
+  id, tenant, principal_kind, principal_id, agent_id,
+  origin, handler, operation, target_kind, target_id, request_id, idempotency_key,
+  evidence_json, recorded_at
+)
+SELECT
+  'migration-0171-dedup:' || uuid_row.tenant || ':' || uuid_row.agent_id,
+  uuid_row.tenant, 'migration', 'migration:0171_fleet_agents_presence_mode', uuid_row.agent_id,
+  'migration', 'migrations/0171_fleet_agents_presence_mode', 'fleet_agents_dedup_merge',
+  'fleet_agents', uuid_row.agent_id,
+  'migration-0171-dedup:' || uuid_row.tenant || ':' || uuid_row.agent_id,
+  'migration-0171-dedup:' || uuid_row.tenant || ':' || uuid_row.agent_id,
+  json_object(
+    'merged_from_agent_id', slug_row.agent_id,
+    'merged_display', slug_row.display,
+    'merged_runtime', slug_row.runtime,
+    'merged_squads', slug_row.squads,
+    'merged_host', slug_row.host
+  ),
+  datetime('now')
+FROM fleet_agents uuid_row
+JOIN agents a ON a.id = uuid_row.agent_id
+JOIN fleet_agents slug_row ON slug_row.tenant = uuid_row.tenant AND slug_row.agent_id = a.slug
+WHERE (SELECT COUNT(*) FROM agents WHERE slug = a.slug) = 1;
+
+-- Part 3 — delete the now-redundant slug-keyed row (its useful fields already merged above).
 DELETE FROM fleet_agents
  WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = fleet_agents.agent_id)
    AND (SELECT COUNT(*) FROM agents WHERE slug = fleet_agents.agent_id) = 1

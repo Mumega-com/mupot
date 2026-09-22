@@ -189,6 +189,11 @@ export type TaskDispatchRuntimeReceiptErrorCode =
   | 'runtime_gate_required'
   | 'runtime_receipt_transition_conflict'
   | 'runtime_receipt_persistence_conflict'
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
+  // already declared TERMINAL (`reset(terminate: true)`, or a genuine `completed`/`failed`
+  // settle) can never be settled again through ANY path, regardless of the underlying
+  // message's own lease/read state.
+  | 'dispatch_terminated'
 
 export class TaskDispatchRuntimeReceiptError extends Error {
   readonly name = 'TaskDispatchRuntimeReceiptError'
@@ -416,6 +421,17 @@ async function claimUnleasedForPairSettlement(
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
        )
+       -- mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
+       -- already declared TERMINAL (reset(terminate:true)) must never be resurrected through
+       -- this claim, even if the message itself still reads pristine (delivery_attempts=0,
+       -- read_at NULL). Embedded in the WHERE, not a separate check-then-write: a race
+       -- between "operator terminates" and "runner claims" resolves atomically, same
+       -- discipline as the ownership EXISTS clause above.
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts term
+          WHERE term.tenant = ?1 AND term.dispatch_receipt_id = ?5
+            AND term.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+       )
   `).bind(
     env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
     input.dispatchReceiptId, input.taskId,
@@ -534,6 +550,25 @@ export async function recordTaskDispatchRuntimeReceipt(
     || !SHA256_RE.test(text(input.runtimeReceiptHash, 64))
   ) throw new TaskDispatchRuntimeReceiptError('runtime_receipt_invalid')
   text(input.taskId, 200); text(input.dispatchReceiptId, 200)
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
+  // already declared TERMINAL (`reset(terminate: true)` writes `stage: 'reset_terminated'`
+  // — never a value `STAGES` accepts as caller input, so it can NEVER be "this same call
+  // replayed") must refuse EVERY settle attempt, unconditionally. A genuine `completed`/
+  // `failed` terminal row still allows its OWN idempotent replay (the exact same
+  // stage+attempt, matched below) to return the cached receipt as before — this check
+  // excludes only that one row, so it never blocks the tested idempotency property, but
+  // refuses any OTHER stage/attempt once the dispatch has already resolved. Checked FIRST,
+  // before any lease/message work, so a terminated dispatch fails fast; the embedded
+  // `NOT EXISTS` inside `claimUnleasedForPairSettlement`'s own UPDATE (below) is the
+  // atomic, race-closing second layer — this early check is the cheap, common-case one.
+  const existingTerminal = await env.DB.prepare(`
+    SELECT 1 FROM task_dispatch_runtime_receipts
+     WHERE tenant = ?1 AND dispatch_receipt_id = ?2
+       AND stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+       AND NOT (stage = ?3 AND attempt = ?4)
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.stage, input.attempt).first<{ 1: number }>()
+  if (existingTerminal) throw new TaskDispatchRuntimeReceiptError('dispatch_terminated')
   // mupot#1494 round 2 (P1-a) — captured BEFORE resolution: true iff the caller used the
   // {task_id, dispatch_receipt_id} correlator (a task_list-only runner never has a raw
   // agent_messages id to pass — see resolveMessageId's doc comment).
@@ -953,6 +988,13 @@ export type AdminResetDispatchLeaseCode =
   // effects, rather than silently downgrading `terminate: true` to a no-op or crashing on
   // the FK at insert time.
   | 'reset_refused_credential_required'
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch that ALREADY carries
+  // a terminal runtime receipt (a genuine `completed`/`failed` settle, or an earlier
+  // `terminate: true`) has nothing left to repair. Refused unconditionally — even under
+  // `override: true` — before any read/write on the message: there is no "wedge" to fix on
+  // a dispatch that has already resolved, and resetting its lease bookkeeping regardless
+  // would let a resurrected/late runner settle a dispatch the record already closed.
+  | 'reset_refused_already_terminal'
 
 export interface AdminResetDispatchLeaseResult {
   /** True iff the row was reset to pristine. False means "not found", "refused" (already
@@ -1073,8 +1115,15 @@ export async function adminResetDispatchLease(
     ...extra,
   })
 
-  const writeAudit = async (operation: string, targetKind: string, targetId: string, evidenceJson: string): Promise<void> => {
-    await env.DB.prepare(`
+  // mupot#1494 v4 round 2 (P2-c/batching) — returns the PREPARED statement rather than
+  // running it, so the one call site that also needs to write a terminal receipt
+  // (terminate: true, on success) can batch both writes into ONE env.DB.batch — audit row
+  // + state change land together, atomically, never "audit succeeded, terminal receipt
+  // didn't" or the reverse. Every OTHER call site (all single-write refusal branches) just
+  // `.run()`s the returned statement immediately via `writeAudit` below — unchanged
+  // behavior, since a single statement was already atomic on its own.
+  const buildAuditStmt = (operation: string, targetKind: string, targetId: string, evidenceJson: string) =>
+    env.DB.prepare(`
       INSERT INTO mutation_audit_entries (
         id, tenant, principal_kind, principal_id, member_id, agent_id,
         credential_id, origin, handler, operation, target_kind, target_id,
@@ -1089,7 +1138,10 @@ export async function adminResetDispatchLease(
       agentId ? 'agent' : 'member', agentId ?? memberId, memberId, agentId,
       credentialId, operation, targetKind, targetId,
       input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidenceJson, now,
-    ).run()
+    )
+
+  const writeAudit = async (operation: string, targetKind: string, targetId: string, evidenceJson: string): Promise<void> => {
+    await buildAuditStmt(operation, targetKind, targetId, evidenceJson).run()
   }
 
   // P2-4: taskId must match the dispatch's OWN task before any read/write on the message.
@@ -1110,6 +1162,27 @@ export async function adminResetDispatchLease(
     return {
       reset: false, code: 'reset_refused_task_mismatch', message_id: null, audit_id: auditId,
       overrode: false, terminated: false,
+    }
+  }
+
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch that already carries
+  // ANY terminal runtime receipt (a genuine settle, or an earlier terminate:true) has
+  // nothing to repair; refuse unconditionally, even under override:true, before touching
+  // the message at all. PROVED gap this closes: `reset(override:true, terminate:true)` on a
+  // dispatch a runner had ALREADY genuinely completed used to succeed anyway — resetting a
+  // message that settle may never have touched (recordTaskDispatchRuntimeReceipt does not
+  // itself ack the underlying agent_messages row) — manufacturing a second, contradictory
+  // terminal marker on an already-closed dispatch.
+  const existingTerminal = await env.DB.prepare(`
+    SELECT 1 FROM task_dispatch_runtime_receipts
+     WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+     LIMIT 1
+  `).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ 1: number }>()
+  if (existingTerminal) {
+    await writeAudit('reset_refused_already_terminal', 'dispatch_receipt', input.dispatchReceiptId, evidence())
+    return {
+      reset: false, code: 'reset_refused_already_terminal', message_id: null, audit_id: auditId,
+      overrode: false, terminated: true,
     }
   }
 
@@ -1169,15 +1242,32 @@ export async function adminResetDispatchLease(
     }
   }
 
-  // mupot#1494 v4 (P2) — attempt 1: succeeds ONLY if the lease is NOT live, freshly
-  // re-evaluated at write time (not the earlier SELECT's snapshot). Its success is proof the
-  // row was not live — `overrode` can never be wrongly true out of this branch.
+  // mupot#1494 v4 round 2 (P1-2, adversarial regression) — when `terminate: true`, the SAME
+  // atomic UPDATE that clears the lease ALSO marks the message CONSUMED (`read_at = now`)
+  // instead of leaving it pristine. Round 1 reset to pristine unconditionally (the shape a
+  // fresh, never-delivered dispatch starts in — deliberately re-leasable) and relied on the
+  // SEPARATE `reset_terminated` receipt row alone to say "this is done". PROVED gap: between
+  // that reset and the receipt insert (and indefinitely after, since nothing about a
+  // pristine message refuses a fresh lease/pair-settle), the presumed-dead runner could
+  // still successfully claim and settle it — corrupting `tasks.execution_receipt_id` onto a
+  // dispatch already declared terminal, and creating a stage the terminal-stage set could
+  // never see as "in flight again" (a wedge invisible to the very guard meant to catch it).
+  // Setting `read_at` here, in the SAME statement, leaves ZERO window: `read_at IS NULL` is
+  // the very first thing `claimUnleasedForPairSettlement`'s WHERE and `validateEnvelope`
+  // both require, so a terminated message can never again be leased, pair-settled, or
+  // redelivered via `inbox`/`inbox_lease` (`leaseAvailableClause` doesn't even apply to a
+  // read message — the row is simply gone from every consuming surface).
+  //
+  // attempt 1: succeeds ONLY if the lease is NOT live, freshly re-evaluated at write time
+  // (not the earlier SELECT's snapshot). Its success is proof the row was not live —
+  // `overrode` can never be wrongly true out of this branch.
   const notLiveAttempt = await env.DB.prepare(`
     UPDATE agent_messages
-       SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL
+       SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL,
+           read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
      WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
        AND NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})
-  `).bind(env.TENANT_SLUG, message.id, now).run()
+  `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0).run()
 
   let reset = notLiveAttempt.meta?.changes === 1
   let overrode = false
@@ -1193,12 +1283,15 @@ export async function adminResetDispatchLease(
       // Attempt 2: succeeds ONLY if the lease IS live, freshly re-evaluated at write time.
       // Its success is proof the row WAS live — override_of never names a holder that held
       // nothing, because this branch cannot fire unless the guard just proved otherwise.
+      // Same `terminate` -> `read_at` closure as attempt 1 above — one atomic write, zero
+      // window where a stolen-and-terminated lease reads as pristine again.
       const liveOverrideAttempt = await env.DB.prepare(`
         UPDATE agent_messages
-           SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL
+           SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL,
+               read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
          WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
            AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}
-      `).bind(env.TENANT_SLUG, message.id, now).run()
+      `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0).run()
       reset = liveOverrideAttempt.meta?.changes === 1
       overrode = reset
       if (reset) {
@@ -1212,7 +1305,7 @@ export async function adminResetDispatchLease(
     }
   }
 
-  await writeAudit(
+  const finalAuditStmt = buildAuditStmt(
     reset ? (overrode ? 'reset_override' : 'reset') : 'reset_refused_terminal',
     'agent_message',
     message.id,
@@ -1239,7 +1332,7 @@ export async function adminResetDispatchLease(
       operation: 'reset_terminated', dispatch_receipt_id: input.dispatchReceiptId, audit_id: auditId,
     }))
     const attempt = Math.min(5, Math.max(1, message.delivery_attempts || 1))
-    await env.DB.prepare(`
+    const terminalReceiptStmt = env.DB.prepare(`
       INSERT INTO task_dispatch_runtime_receipts (
         id, tenant, dispatch_receipt_id, task_id, agent_id, message_id,
         member_id, credential_id, stage, attempt, runtime_address,
@@ -1256,19 +1349,19 @@ export async function adminResetDispatchLease(
       terminateReceiptId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, dispatch.agent_id, message.id,
       memberId, credentialId, attempt, message.to_agent, runtimeReceiptHash, requestDigest,
       sanitizeReceiptText(text(input.reason, 500)), auditId, now,
-    ).run()
+    )
+    // mupot#1494 v4 round 2 (P2-c/batching, adversarial finding) — the audit row and the
+    // terminal receipt land in ONE env.DB.batch, atomically: never "the audit says
+    // reset_terminated but no terminal receipt exists" or the reverse.
+    await env.DB.batch([finalAuditStmt, terminalReceiptStmt])
     terminated = true
-  } else if (terminate) {
-    // reset did not happen — check whether the dispatch is ALREADY terminal for some other
-    // reason (e.g. a runner genuinely completed/failed it), so the caller isn't told
-    // "not terminated" about a dispatch that plainly is.
-    const existingTerminal = await env.DB.prepare(`
-      SELECT 1 FROM task_dispatch_runtime_receipts
-       WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
-       LIMIT 1
-    `).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ 1: number }>()
-    terminated = existingTerminal !== null
+  } else {
+    await finalAuditStmt.run()
   }
+  // No `else if (terminate)` re-check needed: the early `reset_refused_already_terminal`
+  // guard above already proved no terminal receipt exists for this dispatch before this
+  // point runs, so a `reset` that fails here (terminal message state, or a lease race) is
+  // never "actually already terminated" — `terminated` correctly stays `false`.
 
   return {
     reset,

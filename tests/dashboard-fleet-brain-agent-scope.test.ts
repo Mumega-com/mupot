@@ -83,9 +83,15 @@ async function makeHarness(): Promise<SqliteD1Harness> {
       ('cap-org', 'member-org', 'org', NULL, 'admin');
 
     -- fleet_agents.squads is a self-reported JSON array of squad SLUGS.
+    -- mupot#1494 v4 round 2 (P2-a) — keyed on the REAL agent's id/slug ('agent-a'/
+    -- 'agent-b'), not an unrelated host string: squad-scoped INCLUSION now derives from
+    -- ACTUAL agents.squad_id membership (never from this row's own self-reported
+    -- \`squads\` column), so a fleet_agents row this can't resolve to a real agent has no
+    -- real squad membership to be included by — this is the shape every real writer
+    -- (reportFleetAgents, upsertPollFleetPresence, attach-signed) actually produces.
     INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, last_reported_at, updated_at) VALUES
-      ('host-a', 'pot-a', 'Host A', 'tmux', '["squad-a"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now')),
-      ('host-b', 'pot-a', 'Host B', 'tmux', '["squad-b"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now'));
+      ('agent-a', 'pot-a', 'Host A', 'tmux', '["squad-a"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now')),
+      ('agent-b', 'pot-a', 'Host B', 'tmux', '["squad-b"]', 'always_on', 'running', 'daemon', datetime('now'), datetime('now'));
 
     INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at) VALUES
       ('pot-a', 'member-squad-a', 'Squad A Member', 'claude-code', 'build', 'agent-a', datetime('now'), datetime('now')),
@@ -322,8 +328,8 @@ describe('FLIGHT-001 #797 — /fleet, /brain, /agents/:id squad scoping (real SQ
     const env = { DB: harness.db, TENANT_SLUG: 'pot-a' } as unknown as Env
     const scoped = await listFleetAgentRuntimeView(env, NOW, ['squad-a'])
     const unrestricted = await listFleetAgentRuntimeView(env, NOW, null)
-    expect(scoped.map((r) => r.agent_id)).toEqual(['host-a'])
-    expect(unrestricted.map((r) => r.agent_id).sort()).toEqual(['host-a', 'host-b'])
+    expect(scoped.map((r) => r.agent_id)).toEqual(['agent-a'])
+    expect(unrestricted.map((r) => r.agent_id).sort()).toEqual(['agent-a', 'agent-b'])
   })
 
   it('listPresence: scoped(["squad-a"]) excludes squad-b\'s presence row; unrestricted(null) includes it', async () => {

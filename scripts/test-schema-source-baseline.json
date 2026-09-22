@@ -80,7 +80,6 @@
     "tests/executor-inkwell-s4.test.ts",
     "tests/executor-mcpwp-s4.test.ts",
     "tests/fleet-agent-view.test.ts",
-    "tests/fleet-attach-signed.test.ts",
     "tests/fleet-attach.test.ts",
     "tests/fleet-bridge.test.ts",
     "tests/fleet-control-route.test.ts",

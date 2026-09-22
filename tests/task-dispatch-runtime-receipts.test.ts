@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
@@ -548,6 +551,12 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         attempt: 1,
         reason: 'Runtime failed before consumption.',
       })
+      // mupot#1494 v4 round 2 (P1-2) — this used to fall all the way through to the DB
+      // mutation and surface as `runtime_receipt_transition_conflict`. The new early
+      // terminal-receipt check (any stage IN completed/failed/reset_terminated already
+      // recorded for this dispatch, excluding only an exact idempotent replay of THIS
+      // call's own stage+attempt) now catches it first with the more specific
+      // `dispatch_terminated` — same refusal, clearer reason, zero wasted work.
       await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
@@ -555,7 +564,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         stage: 'runtime_consumed',
         runtimeReceiptHash: '4'.repeat(64),
         attempt: 1,
-      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
       expect(fixture.harness.sqlite.prepare(
@@ -582,6 +591,8 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         'UPDATE agent_messages SET read_at = NULL, lease_expires_at = ?, delivery_attempts = 2 WHERE id = ?',
       ).run('2099-01-01T00:00:00.000Z', MESSAGE_ID)
       const restartedEnv = { ...fixture.env }
+      // mupot#1494 v4 round 2 (P1-2) — same reclassification as the test above: the early
+      // terminal-receipt check now catches this before the DB mutation runs.
       await expect(recordTaskDispatchRuntimeReceipt(restartedEnv, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,
@@ -589,7 +600,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         stage: 'runtime_consumed',
         runtimeReceiptHash: '6'.repeat(64),
         attempt: 2,
-      })).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'blocked' })
     } finally {
@@ -2042,6 +2053,183 @@ describe('adminResetDispatchLease terminate:true — the wedge now has an exit (
   })
 })
 
+// mupot#1494 v4 round 2 (P1-2, adversarial regression on round 1's own terminate:true fix) —
+// a dead runner declared terminal must NEVER be able to settle again through any door, and
+// the underlying message must be provably CONSUMED (not merely "pristine, but there's a
+// receipt saying not to use it") the instant terminate:true lands.
+describe('adminResetDispatchLease terminate:true — the terminated dispatch cannot be resurrected (mupot#1494 v4 round 2, P1-2)', () => {
+  it('terminate:true marks the underlying message CONSUMED (read_at set), not merely pristine', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      const reset = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'dead runner, terminating', terminate: true,
+      })
+      expect(reset).toMatchObject({ reset: true, terminated: true })
+
+      const row = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string | null; read_at: string | null }
+      expect(row.delivery_attempts).toBe(0)
+      expect(row.lease_expires_at).toBeNull()
+      expect(row.read_at).not.toBeNull() // CONSUMED, not pristine — the P1-2 fix
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a plain reset (no terminate) still leaves the message pristine (read_at NULL) — unchanged behavior', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const expiredSameDay = new Date(Date.now() - 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(expiredSameDay, MESSAGE_ID)
+
+      const reset = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'plain repair, no terminate',
+      })
+      expect(reset).toMatchObject({ reset: true, terminated: false })
+
+      const row = fixture.harness.sqlite.prepare(
+        'SELECT read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { read_at: string | null }
+      expect(row.read_at).toBeNull()
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a "dead" runner that actually resumes AFTER terminate:true cannot settle via the pair correlator — refused dispatch_terminated, no state corruption', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'declared dead', terminate: true,
+      })
+
+      const before = fixture.harness.sqlite.prepare('SELECT status, execution_receipt_id FROM tasks WHERE id = ?').get(TASK_ID)
+
+      // The presumed-dead runner is not actually dead — it wakes up and tries to settle the
+      // SAME dispatch via the task_list-only pair correlator (messageId omitted), exactly
+      // the path a resurrection would use.
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
+
+      // Zero corruption: tasks.execution_receipt_id/status untouched, message stays consumed.
+      expect(fixture.harness.sqlite.prepare('SELECT status, execution_receipt_id FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual(before)
+      const message = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; read_at: string | null }
+      expect(message.delivery_attempts).toBe(0) // the pair-correlator claim never landed
+      expect(message.read_at).not.toBeNull() // still consumed from termination
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a "dead" runner that resumes with its OWN raw message_id (already leased before termination) is also refused', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      // Simulate: the runner HAD already leased normally (delivery_attempts=1, live lease)
+      // before the operator declared it dead.
+      const liveExpiry = new Date(Date.now() + 5 * 60_000).toISOString()
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = ? WHERE id = ?`,
+      ).run(liveExpiry, MESSAGE_ID)
+
+      const reset = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'declared dead mid-lease', override: true, terminate: true,
+      })
+      expect(reset).toMatchObject({ reset: true, overrode: true, terminated: true })
+
+      // The runner, unaware, tries to settle with its OWN raw message_id.
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'dispatch_terminated' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('the terminated message is invisible to inbox_lease — it can never be redelivered', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'declared dead', terminate: true,
+      })
+
+      const leaseResult = await leaseAgentInbox(fixture.env, { agent: RUNTIME_ADDRESS })
+      expect(leaseResult.ok).toBe(true)
+      if (leaseResult.ok) expect((leaseResult as { messages: unknown[] }).messages).toHaveLength(0)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('reset(override:true, terminate:true) on a dispatch a runner ALREADY genuinely completed is refused — reset_refused_already_terminal, zero side effects', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      // A REAL, honest terminal settle through the normal path: runtime_consumed then
+      // failed (same shape the pre-existing reassignment-guard test above uses — 'completed'
+      // additionally requires an independent-gate grant this fixture's simplest path doesn't
+      // exercise; 'failed' is equally terminal for this test's purpose).
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: '',
+        stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+      })
+      await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: '',
+        stage: 'failed', runtimeReceiptHash: 'e'.repeat(64), attempt: 1, reason: 'genuinely done, failed for real',
+      })
+      const before = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID)
+
+      const result = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: 'operator mistakenly thinks it is stuck',
+        override: true, terminate: true,
+      })
+      expect(result).toMatchObject({ reset: false, code: 'reset_refused_already_terminal', terminated: true })
+
+      // Zero side effects on the message — a genuinely completed dispatch is untouched.
+      expect(fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID)).toEqual(before)
+
+      // No duplicate/contradictory reset_terminated row was manufactured — exactly the two
+      // genuine receipts, no reset_terminated row at all (order-independent: both genuine
+      // calls happen back-to-back and can tie on created_at's second-resolution timestamp).
+      const stages = fixture.harness.sqlite.prepare(
+        `SELECT stage FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ?`,
+      ).all(DISPATCH_ID) as Array<{ stage: string }>
+      expect(stages.map((s) => s.stage).sort()).toEqual(['failed', 'runtime_consumed'])
+
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT operation FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { operation: string }
+      expect(audit.operation).toBe('reset_refused_already_terminal')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
 // mupot#1494 round 3 (P1-B, adversarial round 2) — org-admin gate on task_dispatch_lease_reset
 // must be provable from the CAPABILITY GRANT alone (never hasWorkspaceAdmin's legacy-role
 // fallback), and must refuse every agent-bound token outright.
@@ -2206,6 +2394,87 @@ describe('task_update refuses reassignment while a dispatch is in flight (mupot#
 
       const row = fixture.harness.sqlite.prepare('SELECT assignee_agent_id, status FROM tasks WHERE id = ?').get(TASK_ID) as { assignee_agent_id: string; status: string }
       expect(row).toEqual({ assignee_agent_id: AGENT_ID, status: 'in_progress' }) // assignee untouched, status changed
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 v4 round 2 (P2-c, adversarial regression — M-WHERE2 survived) — the override
+// guard's freshness re-check lives inside two UPDATE statements' own WHERE clauses
+// (src/tasks/runtime-receipts.ts, adminResetDispatchLease's two-attempt design). A mutation
+// that widens or removes either clause's guard doesn't necessarily change any BEHAVIORAL
+// test's outcome for the sequential (non-concurrent) scenarios this suite can construct —
+// "receipts are blind to real concurrency" is a documented, structural limitation of every
+// test in this file, not something a cleverer assertion fixes. A SOURCE-level pin closes the
+// gap the behavioral suite structurally cannot: it fails the instant either fragment is
+// edited away, independent of whether a sequential test happens to notice.
+describe('source-assert: adminResetDispatchLease\'s two-attempt WHERE guards (mupot#1494 v4 round 2, P2-c)', () => {
+  const SOURCE = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'tasks', 'runtime-receipts.ts'),
+    'utf8',
+  )
+
+  // Counting exact occurrences, not `.indexOf()`/`.toContain()`: `loadMessage`'s own SELECT
+  // (the initial liveness read AND the fresh re-read before attempt 2) carries the SAME
+  // un-negated `AND ${LEASE_LIVE_PREDICATE(...)}` substring attempt 2's WHERE does — a first-
+  // match-only assertion would silently pass by matching `loadMessage`'s copy even if attempt
+  // 2's OWN guard were deleted entirely (caught by hand: an early draft of this test did
+  // exactly that and stayed green under that mutation).
+  const NEGATED_GUARD = "AND NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})"
+  const UNNEGATED_GUARD = "AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}"
+
+  it('attempt 1 (not-live) pins LEASE_LIVE_PREDICATE fresh, negated, inside its own UPDATE WHERE — exactly once in the file', () => {
+    expect(SOURCE.split(NEGATED_GUARD).length - 1).toBe(1)
+  })
+
+  it('attempt 2 (override, must-be-live) pins the SAME predicate, UN-negated — exactly twice in the file (loadMessage\'s own read + attempt 2\'s WHERE)', () => {
+    // Deliberately a COUNT, not a containment check: if attempt 2's own copy is deleted,
+    // `loadMessage`'s identical substring still matches a plain `.toContain()`, so the count
+    // must drop from 2 to 1 for this assertion to catch the regression.
+    expect(SOURCE.split(UNNEGATED_GUARD).length - 1).toBe(2)
+  })
+
+  it('both attempts require read_at IS NULL AND dead_lettered_at IS NULL — a terminal message can never be reset via either branch', () => {
+    const occurrences = SOURCE.split('read_at IS NULL AND dead_lettered_at IS NULL').length - 1
+    expect(occurrences).toBeGreaterThanOrEqual(2) // notLiveAttempt + liveOverrideAttempt
+  })
+})
+
+// mupot#1494 v4 round 2 (P3, adversarial regression — M-SANITIZE survived) — a BEHAVIORAL
+// pin (stronger than a source-assert): seed a `reason` containing control/bidi/zero-width
+// characters this file's own `sanitizeReceiptText` strips, and prove the PERSISTED
+// evidence_json (both the mutation_audit_entries row AND, when terminate:true, the
+// task_dispatch_runtime_receipts.reason column) actually has them stripped — not merely
+// that the function is referenced somewhere in the source.
+describe('adminResetDispatchLease sanitizes `reason` before it is ever persisted (mupot#1494 v4 round 2, P3)', () => {
+  it('a control character + a zero-width character + a bidi override in `reason` are stripped from BOTH the audit evidence and the terminal receipt row', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      // \x07 (BEL, a C0 control char), ​ (zero-width space), ‮ (RTL override).
+      const hostileReason = 'operator says: stop\x07 now​‮reversed'
+      const result = await adminResetDispatchLease(fixture.env, adminAuthFor(GATE_MEMBER_ID, GATE_TOKEN_ID), {
+        taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, reason: hostileReason, terminate: true,
+      })
+      expect(result).toMatchObject({ reset: true, terminated: true })
+
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT evidence_json FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { evidence_json: string }
+      const auditReason = (JSON.parse(audit.evidence_json) as { reason: string }).reason
+      expect(auditReason).not.toContain('\x07')
+      expect(auditReason).not.toContain('​')
+      expect(auditReason).not.toContain('‮')
+      expect(auditReason).toContain('operator says: stop')
+      expect(auditReason).toContain('reversed')
+
+      const receipt = fixture.harness.sqlite.prepare(
+        `SELECT reason FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? AND stage = 'reset_terminated'`,
+      ).get(DISPATCH_ID) as { reason: string }
+      expect(receipt.reason).not.toContain('\x07')
+      expect(receipt.reason).not.toContain('​')
+      expect(receipt.reason).not.toContain('‮')
+      expect(receipt.reason).toBe(auditReason) // both writes sanitize identically
     } finally {
       fixture.harness.close()
     }

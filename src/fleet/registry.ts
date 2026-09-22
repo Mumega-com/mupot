@@ -1010,23 +1010,37 @@ export async function listFleetAgentRuntimeView(
   squadIds?: string[] | null,
 ): Promise<FleetAgentRuntimeView[]> {
   let scopeClause = ''
-  let slugsJson: string | null = null
+  let squadIdsJson: string | null = null
   if (squadIds !== undefined && squadIds !== null) {
     if (squadIds.length === 0) return []
-    const slugRows = await env.DB.prepare(
-      `SELECT slug FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))`,
-    )
-      .bind(JSON.stringify(squadIds))
-      .all<{ slug: string }>()
-    const slugs = (slugRows.results ?? []).map((r) => r.slug)
-    if (slugs.length === 0) return []
-    slugsJson = JSON.stringify(slugs)
-    // Squad-scoped membership test ONLY — no home-squad exclusion here. See the
-    // `homeExclusion` comment below for why: a caller scoped to squads it has REAL
-    // standing on (this EXISTS clause) may legitimately have standing on a home squad
-    // (its own member, or an admin/elevation grant), and that scoped view must show it.
-    scopeClause =
-      ` AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))`
+    squadIdsJson = JSON.stringify(squadIds)
+    // mupot#1494 v4 round 2 (P2-a, adversarial regression) — this used to be
+    // `EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN
+    // (SELECT slug FROM squads WHERE id IN (...caller's squadIds...)))` — the SAME
+    // self-report trust the P1-c exclusion fix above closed, just on the INCLUSION side:
+    // any agent could self-report `squads:['<a real work-squad slug the caller can see>']`
+    // and appear in that caller's scoped view, host included, regardless of its ACTUAL
+    // `agents.squad_id`. Fixed the same way: derive membership from the agent's REAL
+    // squad, resolved the SAME safe id-then-unambiguous-slug way `readFleetAgentRow`
+    // does, and test it directly against the caller's `squadIds` — no more round-trip
+    // through self-reported slugs, and no more slug-translation query at all (an id
+    // membership test doesn't need one). A caller scoped to squads it has REAL standing
+    // on (this EXISTS clause) may legitimately have standing on a home squad (its own
+    // member, or an admin/elevation grant) — no separate home check needed here, see the
+    // `homeExclusion` comment below for why that stays unscoped-only.
+    scopeClause = ` AND EXISTS (
+          SELECT 1
+            FROM agents real_agent
+           WHERE (
+             real_agent.id = fleet_agents.agent_id
+             OR (
+               real_agent.slug = fleet_agents.agent_id
+               AND NOT EXISTS (SELECT 1 FROM agents canonical WHERE canonical.id = fleet_agents.agent_id)
+               AND (SELECT COUNT(*) FROM agents dupe WHERE dupe.slug = fleet_agents.agent_id) = 1
+             )
+           )
+           AND real_agent.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+        )`
   }
   // mupot#1494 v4 (P1-c, adversarial round 2) — this used to read `fleet_agents.squads`,
   // the SELF-REPORTED array `validReport` accepts from the reporting agent itself. An
@@ -1064,7 +1078,7 @@ export async function listFleetAgentRuntimeView(
   // is no LIVE gap today. Making the exclusion itself unconditional would re-open the
   // EXACT regression `be955ff3` fixed (a home-squad member's OWN scoped view hiding its
   // own agent) unless the exclusion is ALSO taught to carve out "the caller's real home
-  // squad is inside its own accessible `slugs`" — a second, independent piece of logic
+  // squad is inside its own accessible `squadIds`" — a second, independent piece of logic
   // this round did not have room to design AND prove against the pinned #1472 test with
   // confidence. Left as a named follow-up rather than a speculative change to a
   // twice-regressed invariant.
@@ -1088,7 +1102,7 @@ export async function listFleetAgentRuntimeView(
       WHERE tenant = ?1${homeExclusion}${scopeClause}
       ORDER BY agent_id ASC`,
   )
-  const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)
+  const bound = squadIdsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, squadIdsJson)
   const rows = await bound.all<Record<string, unknown>>()
 
   // mupot#1494 round 2 (P1-b) — per-row TTL, resolved per row via resolveFleetPresenceTtlSec
