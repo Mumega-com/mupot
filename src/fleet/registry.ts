@@ -178,7 +178,7 @@ export function clampPollIntervalSec(v: unknown): number {
  * mupot#1494 round 3 (P2-a) — a NAIVE union of the two sides is not enough: poll's own
  * re-resolution on a LATER squad reassignment (P1-c, round 2) must REPLACE what poll itself
  * previously contributed, not accumulate every home squad it has ever had. So the row tracks
- * poll's own last contribution separately, in `poll_home_squad_slug` (migration 0163) —
+ * poll's own last contribution separately, in `poll_home_squad_slug` (migration 0168) —
  * each writer's ON CONFLICT then REPLACES only its own portion and UNIONs in the other
  * writer's current contribution, never accumulating stale values from either side.
  */

@@ -100,8 +100,8 @@ every call, successful or refused, is receipted (see below).
 
 ## Receipt(s) written
 
-- `fleet_agents.presence_mode` / `presence_ttl_sec` — columns from `migrations/0163`.
-- `fleet_agents.poll_home_squad_slug` — new nullable column, same migration 0163 (#1514,
+- `fleet_agents.presence_mode` / `presence_ttl_sec` — columns from `migrations/0168`.
+- `fleet_agents.poll_home_squad_slug` — new nullable column, same migration 0168 (#1514,
   P2-a): tracks the poll writer's own last squad contribution separately from the
   daemon-report writer's, so the two merge (union) instead of clobbering each other.
 - `task_dispatch_receipts.delivered_via` (`'inbox'|'in_worker'`, same migration) —
