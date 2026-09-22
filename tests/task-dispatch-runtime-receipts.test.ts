@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-import { listTaskDispatchReceiptTimeline, recordTaskDispatchRuntimeReceipt } from '../src/tasks/runtime-receipts'
+import {
+  listTaskDispatchReceiptTimeline,
+  recordTaskDispatchRuntimeReceipt,
+  adminResetDispatchLease,
+} from '../src/tasks/runtime-receipts'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
 import { leaseAgentInbox } from '../src/agents/messages'
 import type { AuthContext, Env } from '../src/types'
@@ -1229,6 +1233,349 @@ describe('resolveMessageId — from_agent scoping (mupot#1494 round 2, M4)', () 
       const stored = fixture.harness.sqlite.prepare('SELECT message_id FROM task_dispatch_runtime_receipts LIMIT 1').get() as { message_id: string }
       expect(stored.message_id).toBe(MESSAGE_ID)
       expect(stored.message_id).not.toBe('impostor-message-1')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 round 3 (P0, structural — Athena's ruling). Pair-settlement is NOT a
+// pre-authorization write: the ownership/active/fence predicate lives INSIDE the claim
+// UPDATE's WHERE, so a mismatched/ineligible caller's claim changes ZERO rows, every time.
+describe('claimUnleasedForPairSettlement — is not a pre-authorization write (mupot#1494 round 3, P0)', () => {
+  function unchangedMessageRow(sqlite: ReturnType<typeof createSqliteD1>['sqlite']) {
+    return sqlite.prepare(
+      'SELECT delivery_attempts, lease_expires_at, read_at FROM agent_messages WHERE id = ?',
+    ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string | null; read_at: string | null }
+  }
+
+  it('a non-assignee squad member settling the VICTIM\'s pair is refused and changes zero rows; the victim then leases normally', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const before = unchangedMessageRow(fixture.harness.sqlite)
+      expect(before).toEqual({ delivery_attempts: 0, lease_expires_at: null, read_at: null })
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.gateAuth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_receipt_forbidden' })
+
+      const after = unchangedMessageRow(fixture.harness.sqlite)
+      expect(after).toEqual(before) // byte-identical — zero side effects from the refused claim
+
+      // The VICTIM's own real inbox_lease still works exactly as if the attack never happened.
+      const leaseResult = await leaseAgentInbox(fixture.env, { agent: RUNTIME_ADDRESS })
+      expect(leaseResult.ok).toBe(true)
+      if (leaseResult.ok) {
+        expect((leaseResult as { messages: unknown[] }).messages).toHaveLength(1)
+      }
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a CROSS-SQUAD agent (no capability at all on the victim\'s squad) settling the victim\'s pair is refused and changes zero rows', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const otherSquadId = 'squad-cross-1'
+      const attackerAgentId = 'agent-cross-1'
+      const attackerMemberId = 'member-cross-1'
+      const attackerTokenId = 'token-cross-1'
+      fixture.harness.sqlite.exec(`
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('${otherSquadId}', 'department-runtime-1', 'cross-squad', 'Cross Squad');
+        INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${attackerAgentId}', '${otherSquadId}', 'cross-attacker', 'Cross Attacker', 'active');
+        INSERT INTO members (id, display_name, status, tenant) VALUES ('${attackerMemberId}', 'Cross Attacker Member', 'active', '${TENANT}');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', '${attackerAgentId}', '${attackerMemberId}', '${T0}');
+        INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant, expires_at)
+          VALUES ('${attackerTokenId}', '${attackerMemberId}', 'hash-cross-1', 'cross', 'workspace', '${T0}', NULL, '${attackerAgentId}', '${TENANT}', '2099-01-01T00:00:00.000Z');
+      `)
+      const attackerAuth: AuthContext = {
+        userId: attackerMemberId,
+        tenant: TENANT,
+        channel: 'workspace',
+        role: 'member',
+        memberId: attackerMemberId,
+        tokenId: attackerTokenId,
+        boundAgentId: attackerAgentId,
+        capabilities: [], // NO capability on the victim's squad at all
+      }
+      const before = unchangedMessageRow(fixture.harness.sqlite)
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, attackerAuth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_receipt_forbidden' })
+
+      expect(unchangedMessageRow(fixture.harness.sqlite)).toEqual(before)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('the ASSIGNEE\'s own token still refuses the claim (and changes zero rows) once the agent is deactivated', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE agents SET status = 'inactive' WHERE id = ?`).run(AGENT_ID)
+      const before = unchangedMessageRow(fixture.harness.sqlite)
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_receipt_forbidden' })
+
+      expect(unchangedMessageRow(fixture.harness.sqlite)).toEqual(before)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('a revoked token is refused before the claim ever runs, changing zero rows', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE member_tokens SET revoked_at = ? WHERE id = ?`).run(T0, TOKEN_ID)
+      const before = unchangedMessageRow(fixture.harness.sqlite)
+
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'agent_bound_workspace_credential_required' })
+
+      expect(unchangedMessageRow(fixture.harness.sqlite)).toEqual(before)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('mupot#1494 round 3 (P1-ii) — a signed_only-fenced agent cannot settle its OWN pair via the bearer path; row untouched', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      fixture.harness.sqlite.exec(`
+        INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason)
+        VALUES ('${TENANT}', '${AGENT_ID}', 'signed_only', 1, '${'f'.repeat(64)}', '${MEMBER_ID}', '${T0}', 'native gateway cutover');
+      `)
+      const before = unchangedMessageRow(fixture.harness.sqlite)
+
+      // The claim never fires (fence blocks it), so the row stays pristine
+      // (delivery_attempts=0, no lease) — validateEnvelope then refuses it as stale (it
+      // expects a resident's live lease, exactly like a never-`inbox_lease`d row always did
+      // pre-#1494), NOT "not found": `loadDelivery` still finds the real dispatch/task/message
+      // row, only the claim's WRITE was blocked.
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+
+      expect(unchangedMessageRow(fixture.harness.sqlite)).toEqual(before)
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 round 3 (P0, part b + Athena pin) — dispatch_receipt_id/delivered_via must be
+// assignee-scoped on task_list/task_board, and the pin itself must be provably load-bearing:
+// the round-2 gate found loadLatestDispatchReceiptsForTasks returning {} left ALL named tests
+// green. These tests are that missing coverage.
+describe('task_list / task_board — dispatch_receipt_id is assignee-scoped (mupot#1494 round 3, P0-b)', () => {
+  it('task_list attaches dispatch_receipt_id + delivered_via for the ASSIGNEE\'s own view', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE task_dispatch_receipts SET delivered_via = 'inbox' WHERE id = ?`).run(DISPATCH_ID)
+      const res = await invokeTool(fixture.auth, fixture.env, 'task_list', {}, 'https://pot.test')
+      expect(res.ok).toBe(true)
+      const tasks = (res.result as { tasks: Array<Record<string, unknown>> }).tasks
+      const row = tasks.find((t) => t.id === TASK_ID)
+      expect(row).toMatchObject({ dispatch_receipt_id: DISPATCH_ID, delivered_via: 'inbox' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('task_list does NOT attach dispatch_receipt_id for a non-assignee squad member viewing the SAME task', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE task_dispatch_receipts SET delivered_via = 'inbox' WHERE id = ?`).run(DISPATCH_ID)
+      const res = await invokeTool(fixture.gateAuth, fixture.env, 'task_list', {}, 'https://pot.test')
+      expect(res.ok).toBe(true)
+      const tasks = (res.result as { tasks: Array<Record<string, unknown>> }).tasks
+      const row = tasks.find((t) => t.id === TASK_ID)
+      expect(row).toBeDefined()
+      expect(row).not.toHaveProperty('dispatch_receipt_id')
+      expect(row).not.toHaveProperty('delivered_via')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('task_board attaches dispatch_receipt_id + delivered_via for the ASSIGNEE\'s own view', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE task_dispatch_receipts SET delivered_via = 'inbox' WHERE id = ?`).run(DISPATCH_ID)
+      const res = await invokeTool(fixture.auth, fixture.env, 'task_board', {}, 'https://pot.test')
+      expect(res.ok).toBe(true)
+      const columns = (res.result as { columns: Record<string, Array<Record<string, unknown>>> }).columns
+      const row = columns.open.find((t) => t.id === TASK_ID)
+      expect(row).toMatchObject({ dispatch_receipt_id: DISPATCH_ID, delivered_via: 'inbox' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('task_board does NOT attach dispatch_receipt_id for a non-assignee squad member viewing the SAME task', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE task_dispatch_receipts SET delivered_via = 'inbox' WHERE id = ?`).run(DISPATCH_ID)
+      const res = await invokeTool(fixture.gateAuth, fixture.env, 'task_board', {}, 'https://pot.test')
+      expect(res.ok).toBe(true)
+      const columns = (res.result as { columns: Record<string, Array<Record<string, unknown>>> }).columns
+      const row = columns.open.find((t) => t.id === TASK_ID)
+      expect(row).toBeDefined()
+      expect(row).not.toHaveProperty('dispatch_receipt_id')
+      expect(row).not.toHaveProperty('delivered_via')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+})
+
+// mupot#1494 round 3 — Athena's RECORD INTEGRITY ruling: a receipted operator repair for a
+// wedged dispatch lease, tested end-to-end against a DIRECTLY-simulated wedge (the shape the
+// now-impossible round-2 attack would have left behind).
+describe('adminResetDispatchLease — operator repair for a wedged lease (mupot#1494 round 3)', () => {
+  // Reuses the fixture's own GATE_MEMBER_ID (already a real `members` row — mutation_audit_
+  // entries.member_id is FK'd to it) as the acting org-admin; adminResetDispatchLease itself
+  // does not re-check authority (callers must already have verified hasWorkspaceAdmin per its
+  // doc comment) — the MCP tool-layer gate is covered separately.
+  function adminAuth(overrides: Partial<AuthContext> = {}): AuthContext {
+    return {
+      userId: GATE_MEMBER_ID,
+      tenant: TENANT,
+      channel: 'workspace',
+      role: 'owner',
+      memberId: GATE_MEMBER_ID,
+      tokenId: GATE_TOKEN_ID,
+      boundAgentId: undefined,
+      capabilities: [{ member_id: GATE_MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+      ...overrides,
+    }
+  }
+
+  it('resets a wedged row to pristine, receipts the reset, and the victim recovers with ONE subsequent attempt:1 call', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      // Simulate DIRECTLY in the DB the exact wedge the round-2 attack (now impossible) would
+      // have left: delivery_attempts desynchronised to 2 with a live stray lease, as if an
+      // attacker's claim had landed and the victim's own subsequent inbox_lease had bumped it
+      // again.
+      fixture.harness.sqlite.prepare(
+        `UPDATE agent_messages SET delivery_attempts = 2, lease_expires_at = ? WHERE id = ?`,
+      ).run('2099-01-01T00:00:00.000Z', MESSAGE_ID)
+
+      // Confirm the wedge: the victim's protocol-correct attempt:1 settle is refused stale.
+      await expect(recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: MESSAGE_ID,
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+
+      const result = await adminResetDispatchLease(fixture.env, adminAuth(), {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        reason: 'repairing a wedged lease found in the round-3 adversarial review',
+      })
+      expect(result.reset).toBe(true)
+      expect(result.message_id).toBe(MESSAGE_ID)
+
+      const row = fixture.harness.sqlite.prepare(
+        'SELECT delivery_attempts, lease_expires_at, lease_attempt_id, read_at FROM agent_messages WHERE id = ?',
+      ).get(MESSAGE_ID) as { delivery_attempts: number; lease_expires_at: string | null; lease_attempt_id: string | null; read_at: string | null }
+      expect(row).toEqual({ delivery_attempts: 0, lease_expires_at: null, lease_attempt_id: null, read_at: null })
+
+      // One receipt row, attributed to the admin, with a non-empty evidence blob.
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT principal_id, operation, handler, evidence_json FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { principal_id: string; operation: string; handler: string; evidence_json: string }
+      expect(audit).toMatchObject({ principal_id: GATE_MEMBER_ID, operation: 'reset', handler: 'task_dispatch_lease_reset' })
+      expect(JSON.parse(audit.evidence_json)).toMatchObject({ task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID })
+
+      // The victim recovers within ONE subsequent call — no special-casing on its end. The
+      // reset row is pristine, the SAME shape a never-delivered dispatch starts in, so the
+      // victim's ordinary {task_id, dispatch_receipt_id} pair-correlator settle (exactly what
+      // a task_list-only runner already uses) claims it and proceeds normally.
+      const recovered = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        messageId: '',
+        stage: 'runtime_consumed',
+        runtimeReceiptHash: RUNTIME_HASH,
+        attempt: 1,
+      })
+      expect(recovered).toMatchObject({ receipt: { stage: 'runtime_consumed' }, task_status: 'in_progress' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('refuses (0 rows, reset:false) and still receipts once the message was already consumed (read_at set) — a repair, not an un-delete', async () => {
+    const fixture = runtimeFixture() // pre-leased/read fixture default: NOT unleased
+    try {
+      fixture.harness.sqlite.prepare(`UPDATE agent_messages SET read_at = ? WHERE id = ?`).run(T0, MESSAGE_ID)
+
+      const result = await adminResetDispatchLease(fixture.env, adminAuth(), {
+        taskId: TASK_ID,
+        dispatchReceiptId: DISPATCH_ID,
+        reason: 'attempted repair on an already-consumed message',
+      })
+      expect(result.reset).toBe(false)
+      expect(result.message_id).toBe(MESSAGE_ID)
+
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT operation FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { operation: string }
+      expect(audit.operation).toBe('reset_refused_terminal')
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('reports not-found (and still receipts) for a dispatch_receipt_id with no delivered inbox message', async () => {
+    const fixture = runtimeFixture({ unleased: true })
+    try {
+      const result = await adminResetDispatchLease(fixture.env, adminAuth(), {
+        taskId: TASK_ID,
+        dispatchReceiptId: 'never-dispatched-receipt',
+        reason: 'operator typo',
+      })
+      expect(result.reset).toBe(false)
+      expect(result.message_id).toBeNull()
+
+      const audit = fixture.harness.sqlite.prepare(
+        `SELECT operation FROM mutation_audit_entries WHERE id = ?`,
+      ).get(result.audit_id) as { operation: string }
+      expect(audit.operation).toBe('reset_not_found')
     } finally {
       fixture.harness.close()
     }

@@ -77,7 +77,7 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).toMatchObject({ dispatched: true, delivery_forced_ignored: 'no_delivery_mode' })
+    expect(res.result).toMatchObject({ dispatched: true, delivery_forced_predicted: 'no_delivery_mode' })
     expect(events).toHaveLength(1)
     expect(Object.prototype.hasOwnProperty.call(events[0].payload as object, 'delivery')).toBe(false)
   })
@@ -92,7 +92,7 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).not.toHaveProperty('delivery_forced_ignored')
+    expect(res.result).not.toHaveProperty('delivery_forced_predicted')
     expect(events).toHaveLength(1)
     expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
   })
@@ -107,7 +107,7 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).not.toHaveProperty('delivery_forced_ignored')
+    expect(res.result).not.toHaveProperty('delivery_forced_predicted')
     expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
   })
 
@@ -121,13 +121,13 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).toMatchObject({ delivery_forced_ignored: 'no_delivery_mode' })
+    expect(res.result).toMatchObject({ delivery_forced_predicted: 'no_delivery_mode' })
   })
 
-  it('WITHOUT delivery, never adds delivery_forced_ignored regardless of fleet state', async () => {
+  it('WITHOUT delivery, never adds delivery_forced_predicted regardless of fleet state', async () => {
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
-    expect(res.result).not.toHaveProperty('delivery_forced_ignored')
+    expect(res.result).not.toHaveProperty('delivery_forced_predicted')
   })
 })

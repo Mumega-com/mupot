@@ -166,6 +166,53 @@ export function clampPollIntervalSec(v: unknown): number {
   return Math.min(POLL_INTERVAL_MAX_SEC, Math.max(POLL_INTERVAL_MIN_SEC, Math.round(n)))
 }
 
+/**
+ * fleet_agents.squads has TWO independent writers — `reportFleetAgents` (the daemon's bulk
+ * self-report, which sees a runtime's real multi-squad membership) and
+ * `upsertPollFleetPresence` (check_in(presence_mode:'poll'), which resolves only its own home-
+ * squad slug). Round 2 had each ON CONFLICT plainly OVERWRITE the column with its own writer's
+ * view — so whichever writer landed LAST silently erased the other's membership (a resident
+ * daemon reporting `["a","b"]` then a single poll check-in collapsed the row to `["home"]`,
+ * dropping the agent out of every OTHER squad's fleet view).
+ *
+ * mupot#1494 round 3 (P2-a) — a NAIVE union of the two sides is not enough: poll's own
+ * re-resolution on a LATER squad reassignment (P1-c, round 2) must REPLACE what poll itself
+ * previously contributed, not accumulate every home squad it has ever had. So the row tracks
+ * poll's own last contribution separately, in `poll_home_squad_slug` (migration 0163) —
+ * each writer's ON CONFLICT then REPLACES only its own portion and UNIONs in the other
+ * writer's current contribution, never accumulating stale values from either side.
+ */
+
+/** The POLL upsert's own SET expression: existing squads MINUS the row's OWN previous poll
+ *  contribution (if any), UNION the new poll squads (the new home slug). A daemon-reported
+ *  squad the poll writer never touched survives untouched; poll's own prior home squad does
+ *  NOT survive a reassignment. */
+function pollSquadsMergeSql(): string {
+  return `(SELECT json_group_array(value) FROM (
+             SELECT value FROM json_each(fleet_agents.squads)
+              WHERE fleet_agents.poll_home_squad_slug IS NULL
+                 OR value <> fleet_agents.poll_home_squad_slug
+             UNION
+             SELECT value FROM json_each(excluded.squads)
+             ORDER BY value ASC
+           ))`
+}
+
+/** The DAEMON report's own SET expression: `excluded.squads` (the report's full, authoritative
+ *  view) REPLACES the daemon's own prior contribution entirely (a daemon report can shrink its
+ *  own list — that's a real membership change, not a bug), UNION the row's separately-tracked
+ *  poll contribution, if any, so a daemon report can never silently erase a poll-mode
+ *  registration on the same row. */
+function daemonSquadsMergeSql(): string {
+  return `(SELECT json_group_array(value) FROM (
+             SELECT value FROM json_each(excluded.squads)
+             UNION
+             SELECT fleet_agents.poll_home_squad_slug AS value
+              WHERE fleet_agents.poll_home_squad_slug IS NOT NULL
+             ORDER BY value ASC
+           ))`
+}
+
 /** The per-row presence TTL for a poll-mode agent: 2x its own declared cadence (room for one
  *  missed/late poll before it reads as stale), floored at DEFAULT_PRESENCE_TTL_SEC so a very
  *  fast poller (near POLL_INTERVAL_MIN_SEC) doesn't get an unrealistically tight window. */
@@ -218,17 +265,25 @@ export async function upsertPollFleetPresence(
   // runtime here does not weaken poll-mode dispatch routing (see getFleetAgentLiveness's early
   // return, corrected in the same round to stop treating empty-runtime-plus-poll-mode as "no
   // row at all").
+  // mupot#1494 round 3 (P2-a) — this call's OWN contribution to `squads` (its current home
+  // slug, or NULL if it has none) is tracked separately so a LATER re-resolution can replace
+  // exactly what THIS writer contributed without touching the daemon's. See
+  // pollSquadsMergeSql's doc comment.
+  const pollHomeSquadSlug = squadRow?.slug ?? null
   const row = await env.DB.prepare(
     `INSERT INTO fleet_agents
         (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status,
          reported_by, agent_type, member_id, host, presence_mode, presence_ttl_sec,
-         last_reported_at, updated_at)
+         poll_home_squad_slug, last_reported_at, updated_at)
       VALUES (?1, ?2, ?3, '', ?6, 'on_demand', NULL, 'running',
               ?1, 'generic', ?4, '', 'poll', ?5,
-              datetime('now'), datetime('now'))
+              ?7, datetime('now'), datetime('now'))
       ON CONFLICT(tenant, agent_id) DO UPDATE SET
         display           = excluded.display,
-        squads            = excluded.squads,
+        -- mupot#1494 round 3 (P2-a) — replace ONLY this writer's own prior contribution
+        -- (poll_home_squad_slug), union in the daemon's. See pollSquadsMergeSql's doc comment.
+        squads            = ${pollSquadsMergeSql()},
+        poll_home_squad_slug = excluded.poll_home_squad_slug,
         -- mupot#1494 round 2 (P2-f) — operator detach wins. A row an operator (or the agent's
         -- own prior self-detach — /api/fleet/detach requires the SAME token.boundAgentId as
         -- the target agent_id, which for a poll row IS the agent's own uuid, so self-detach is
@@ -243,7 +298,7 @@ export async function upsertPollFleetPresence(
         updated_at        = CASE WHEN fleet_agents.status = 'stopped' THEN fleet_agents.updated_at ELSE datetime('now') END
       RETURNING status`,
   )
-    .bind(input.agentId, env.TENANT_SLUG, input.display, input.memberId, input.ttlSec, squadsJson)
+    .bind(input.agentId, env.TENANT_SLUG, input.display, input.memberId, input.ttlSec, squadsJson, pollHomeSquadSlug)
     .first<{ status: string }>()
 
   return { stoppedByOperator: row?.status === 'stopped' }
@@ -401,7 +456,11 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
       `INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status, reported_by, agent_type, member_id, host, last_reported_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now'))
        ON CONFLICT(tenant, agent_id) DO UPDATE SET
-            display=excluded.display, runtime=excluded.runtime, squads=excluded.squads,
+            display=excluded.display, runtime=excluded.runtime,
+            -- mupot#1494 round 3 (P2-a) — the daemon's own contribution is fully REPLACED by
+            -- this report (authoritative), union in whatever a poll check-in separately
+            -- tracked. See daemonSquadsMergeSql's doc comment.
+            squads=${daemonSquadsMergeSql()},
             lifecycle=excluded.lifecycle, provider_contract=excluded.provider_contract,
             status=excluded.status, reported_by=excluded.reported_by,
             agent_type=excluded.agent_type, member_id=excluded.member_id,
@@ -770,14 +829,32 @@ export async function getFleetAgentRuntimeStates(
  * same presence definition `listFleetAgentRuntimeView`/`getAgentView` already use for the
  * dashboard/#agent-bus feed), read through the agents.id → fleet_agents.agent_id bridge above.
  */
+/**
+ * isActivePollPresenceMode — mupot#1494 round 3 (P1-iii). THE gate for whether a row's poll
+ * registration is currently ACTIVE for dispatch-routing purposes: `presence_mode='poll'` AND
+ * the row has not been operator-stopped. Round 2's operator-detach fix (P2-f) correctly froze
+ * `status`/`last_reported_at` on a stopped row, but left `presence_mode` itself — the ONE
+ * field `resolveDispatchDeliveryMode` (src/bus/consumer.ts) actually routes on — unconditionally
+ * writable by the agent's own subsequent poll check-ins, so a detached poll row kept routing
+ * to inbox forever. Exported so `getFleetAgentLiveness` and any future presence_mode reader
+ * share the SAME rule rather than re-deriving it.
+ */
+export function isActivePollPresenceMode(presenceMode: string, status: string): boolean {
+  return presenceMode === 'poll' && status !== 'stopped'
+}
+
 export async function getFleetAgentLiveness(
   env: Env,
   agentId: string,
   nowMs = Date.now(),
 ): Promise<FleetAgentRouteInfo> {
   const row = await readFleetAgentRow(env, agentId)
-  const presenceMode = row?.presence_mode ? String(row.presence_mode) : ''
+  const rawPresenceMode = row?.presence_mode ? String(row.presence_mode) : ''
   const runtime = row?.runtime ? String(row.runtime) : ''
+  const status = String(row?.status ?? 'unknown')
+  // mupot#1494 round 3 (P1-iii) — an operator-stopped row must not route as poll, regardless
+  // of what the presence_mode column literally still holds (see isActivePollPresenceMode).
+  const presenceMode = isActivePollPresenceMode(rawPresenceMode, status) ? rawPresenceMode : ''
   // mupot#1494 round 2 (P2-h fallout) — an empty `runtime` used to mean "no row / nothing to
   // route to" UNCONDITIONALLY, which was true before poll-mode existed but stopped being true
   // the moment a poll-mode row could legitimately carry an empty runtime (its harness is not
@@ -789,7 +866,6 @@ export async function getFleetAgentLiveness(
   // Per-row TTL (poll-mode, mupot#1494) via resolveFleetPresenceTtlSec — THE ONE shared
   // resolution every fleet_agents presence reader now calls (round 2 P1-b).
   const ttlSec = resolveFleetPresenceTtlSec(env, row)
-  const status = String(row?.status ?? 'unknown')
   const lastReportedAt = String(row?.last_reported_at ?? '')
   const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
   return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
@@ -877,22 +953,25 @@ export async function listFleetAgentRuntimeView(
     const slugs = (slugRows.results ?? []).map((r) => r.slug)
     if (slugs.length === 0) return []
     slugsJson = JSON.stringify(slugs)
+    // mupot#1494 round 3 (P2-b) — the home-squad exclusion belongs ONLY to a squad-SCOPED
+    // read. Round 2 (G-FP1b) applied it UNCONDITIONALLY, reasoning that an unrestricted
+    // (org-admin) read must not surface an agent whose only squad is someone's home — but
+    // that made a home-squad-only agent invisible in EVERY view, including the unrestricted
+    // one, which is strictly LESS visible than the round-1 bug it replaced (round 1's
+    // squads='[]' shape was at least visible unrestricted). A squad-scoped dashboard viewer
+    // should not see that agent as a member of a squad it does not actually share; an
+    // unrestricted org-admin view has no such reason to hide it.
     scopeClause =
-      ' AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))'
+      ` AND EXISTS (SELECT 1 FROM json_each(fleet_agents.squads) je WHERE je.value IN (SELECT value FROM json_each(?2)))
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(fleet_agents.squads) je
+           WHERE je.value IN (SELECT slug FROM squads WHERE kind = 'home')
+        )`
   }
   const statement = env.DB.prepare(
     `SELECT agent_id, display, runtime, squads, lifecycle, status, last_reported_at, host, presence_ttl_sec
        FROM fleet_agents
-      WHERE tenant = ?1
-        -- G-FP1b point 2/3: applied UNCONDITIONALLY — an unrestricted
-        -- (org-admin) read must not surface a fleet-registered agent whose
-        -- ONLY squad membership is someone's home (fleet_agents.squads is a
-        -- denormalized JSON array of squad SLUGS, so this checks slugs
-        -- against the current home-squad slug set rather than joining ids).
-        AND NOT EXISTS (
-          SELECT 1 FROM json_each(fleet_agents.squads) je
-           WHERE je.value IN (SELECT slug FROM squads WHERE kind = 'home')
-        )${scopeClause}
+      WHERE tenant = ?1${scopeClause}
       ORDER BY agent_id ASC`,
   )
   const bound = slugsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, slugsJson)

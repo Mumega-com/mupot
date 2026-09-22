@@ -20,7 +20,7 @@
 |---|------|-----------|------------|
 | 1 | **Mint a token** for the runner's agent. | `mint_agent_token({ agent: "<agent-id-or-slug>", capability: "member" })` → `reveal_credential_claim({ claim_id })` to redeem the actual bearer once. | An **admin** on the agent's squad. Never self-mintable. |
 | 2 | **Declare poll mode.** Every time the runner wakes (or at minimum, once per session), call `check_in` with `presence_mode: 'poll'` and your real polling cadence. | `check_in({ presence_mode: "poll", poll_interval_sec: 300 })` | The runner itself, using the minted token. |
-| 3 | **Poll for work.** Either surface works; both now carry the `dispatch_receipt_id` you need for step 5. `inbox`/`inbox_lease` additionally give you a raw `message_id`; `task_list`/`task_board` do not — that's fine, see "Settling" below. | `inbox_lease({ limit: 5 })` (or `inbox({ peek: true })`), **or** `task_list({ assignee_agent_id: "<self>", status: "open" })` | The runner, on its own cadence. |
+| 3 | **Poll for work.** Either surface works; both now carry the `dispatch_receipt_id` you need for step 5 — **but only on a row assigned to you**: `task_list`/`task_board` attach `dispatch_receipt_id`/`delivered_via` ONLY when that row's `assignee_agent_id` is your own bound agent id, never on a task assigned to someone else you happen to be able to list (mupot#1494 round 3, P0). `inbox`/`inbox_lease` additionally give you a raw `message_id`; `task_list`/`task_board` do not — that's fine, see "Settling" below. | `inbox_lease({ limit: 5 })` (or `inbox({ peek: true })`), **or** `task_list({ assignee_agent_id: "<self>", status: "open" })` | The runner, on its own cadence. |
 | 4 | **Report progress** on the work it picked up. | `runner_record({ name, task, status: "running"|"landed"|"failed" })` and/or `task_update({ task_id, status, result })` | The runner. |
 | 5 | **Settle the runtime receipt** once the task is genuinely done or has failed. | `task_dispatch_runtime_receipt({ task_id, dispatch_receipt_id, stage: "completed"|"failed", runtime_receipt_hash, attempt: 1, ... })` — `message_id` is **optional**: if you polled via `task_list`/`task_board` and never saw a raw `agent_messages` id, omit it; the pair `{task_id, dispatch_receipt_id}` alone resolves and settles it. | The runner. |
 
@@ -86,7 +86,7 @@ A caller can also force the inbox route explicitly: `task_dispatch({ task_id, de
 or a runtime ever declared, even if currently stale). Forcing against a target with no
 fleet row at all is refused (it would strand the task in an inbox nobody is known to
 poll): the dispatch still happens, routed normally (in-Worker in that case), and the
-tool's own result carries `delivery_forced_ignored: 'no_delivery_mode'` so you know the
+tool's own result carries `delivery_forced_predicted: 'no_delivery_mode'` so you know the
 force did not take effect.
 
 ## Settling with only `{task_id, dispatch_receipt_id}`
@@ -108,6 +108,23 @@ an explicit `message_id` for the wrong receipt is refused the same way.
 
 If your task needs two stages (`runtime_consumed` then `completed`/`failed`), settle both
 with `message_id` omitted and `attempt: 1` — the first call's claim covers both.
+
+**This is not a pre-authorization write (mupot#1494 round 3, P0).** The pair-settlement
+claim's ownership check — the message must belong to a dispatch whose `agent_id` AND the
+task's `assignee_agent_id` both equal YOUR OWN bound agent id — lives inside the same atomic
+UPDATE that claims it, not a check performed before or after. Settling someone else's pair
+(even a real one, even with a live workspace token) changes zero rows and is refused; it
+never touches the other agent's message, lease, or attempt count. Combined with the step-3
+rule above (you can never even READ another agent's `dispatch_receipt_id` off `task_list`/
+`task_board`), there is no way to reach another agent's dispatch through this path at all.
+
+**If a lease looks permanently stuck** (an `attempt: 1` settle keeps returning
+`runtime_delivery_stale` even though you never successfully settled it before), that is an
+operator-repair situation, not something a runner can self-heal — ask an org admin to run
+`task_dispatch_lease_reset({ task_id, dispatch_receipt_id, reason })`, which resets the
+message back to the same pristine state a fresh, never-delivered dispatch starts in (refused,
+receipted, if the message was already consumed or dead-lettered — this is a repair, never an
+un-delete). Your next `attempt: 1` settle then proceeds normally.
 
 ## Worked example (poll every 5 minutes)
 
@@ -137,7 +154,10 @@ task_dispatch_runtime_receipt({
   `task_list`/`task_board` fields above).
 - `src/fleet/registry.ts` — `clampPollIntervalSec`, `pollPresenceTtlSec`,
   `upsertPollFleetPresence`, `touchPollFleetPresence`, `clearPollFleetPresence`,
-  `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`.
+  `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`, `isActivePollPresenceMode`.
+- `src/tasks/runtime-receipts.ts` — `claimUnleasedForPairSettlement`,
+  `loadLatestDispatchReceiptsForTasks`, `adminResetDispatchLease`.
+- `src/agents/messages.ts` — `leaseAvailableClause`, `bearerFencePredicate`.
 - `src/bus/consumer.ts` — `resolveDispatchDeliveryMode` + `hasRegisteredDeliverySurface`
   (the routing rule and the force-eligibility check).
 - `src/tasks/runtime-receipts.ts` — `resolveMessageId` (the alternative correlator),

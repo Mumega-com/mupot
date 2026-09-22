@@ -109,7 +109,7 @@ export function hasRegisteredDeliverySurface(route: DispatchRoute): boolean {
  * with zero known readers). Concretely: forcing now overrides a STALE-BUT-REGISTERED resident
  * (runtime declared, heartbeat currently stale) into the inbox route — the caller believes it
  * knows better than the heartbeat — but is a no-op (ignored, see the dispatch tool's own
- * synchronous eligibility check and its `delivery_forced_ignored` note) against an identity
+ * synchronous eligibility check and its `delivery_forced_predicted` note) against an identity
  * with no registered surface at all.
  *
  * Falls back to the in-Worker route ONLY when neither the natural predicate nor an eligible
@@ -439,7 +439,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // when the target has SOME registered surface — see resolveDispatchDeliveryMode's
           // doc comment — and toolTaskDispatch (src/mcp/index.ts) runs the SAME eligibility
           // check synchronously so an ineligible force is visibly reported back to the caller
-          // as `delivery_forced_ignored: 'no_delivery_mode'`, never silently dropped here).
+          // as `delivery_forced_predicted: 'no_delivery_mode'`, never silently dropped here).
           // This remains the only path that executes in-Worker: exactly one route is chosen
           // and acted on per lease-holder (BLOCK-2 fix, unchanged).
           await wakeAgent(env, event.agent_id, event)

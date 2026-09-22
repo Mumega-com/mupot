@@ -140,6 +140,10 @@ describe('MCP check_in(presence_mode) against REAL schema (mupot#1494 round 2)',
     const res = await invokeTool(auth(), env, 'check_in', { presence_mode: 'resident' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
+    // mupot#1494 round 3 (P3) — the clear itself must be CONFIRMED in the response, not just
+    // silently effected: round 2 left no field at all here, indistinguishable from "this call
+    // never touched presence_mode".
+    expect(res.result).toMatchObject({ poll_registration_cleared: true })
     const row = fleetRow(harness.sqlite)
     expect(row!.presence_mode).toBe('')
     expect(row!.presence_ttl_sec).toBeNull()

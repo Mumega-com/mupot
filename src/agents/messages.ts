@@ -761,6 +761,7 @@ async function readAgentInboxForReader(
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 AND ${leaseAvailableClause('?1')}
                  ${seatSql}
                  AND EXISTS (SELECT 1 FROM agent_inbox_fences
                              WHERE tenant = ?2 AND agent_id = ?3
@@ -776,10 +777,17 @@ async function readAgentInboxForReader(
           ? [now(), tenant, input.agent, limit, targetSeat]
           : [now(), tenant, input.agent, limit]
         const rows = await env.DB.prepare(
+          // mupot#1494 round 3 (P1-i) — `inbox`'s consuming UPDATE used to check ONLY
+          // `read_at IS NULL`, so a row currently held under a live lease (a real
+          // `inbox_lease` hand-out, or `claimUnleasedForPairSettlement`'s lease-equivalent
+          // claim) was handed straight back out here — double processing the same
+          // dispatch. `leaseAvailableClause` is the SAME clause `leaseAgentInbox` enforces;
+          // ?1 is already bound to `now()` for the SET above, so it's reused here too.
           `UPDATE agent_messages SET read_at = ?1
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
+                 AND ${leaseAvailableClause('?1')}
                  ${seatSql}
                  AND COALESCE((SELECT mode FROM agent_inbox_fences
                                WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
@@ -1136,10 +1144,30 @@ async function materializeAttempt(row: StoredLeaseAttempt): Promise<LeaseAttempt
 
 /** The bearer half of the 0058 consumer fence, written once so lease/ack/dead-letter cannot
  *  drift from the predicate readAgentInboxForReader enforces. `?N` numbering is caller-chosen
- *  because these statements bind different positions. */
-function bearerFencePredicate(tenantParam: string, agentParam: string): string {
+ *  because these statements bind different positions. Exported (mupot#1494 round 3, P1-ii) so
+ *  src/tasks/runtime-receipts.ts's pair-settlement claim enforces the SAME fence a bearer
+ *  inbox_lease would — a signed_only-fenced agent's dispatch must not be settleable through
+ *  the bearer-only pair-settlement path when leaseAgentInbox itself would have handed out
+ *  nothing. */
+export function bearerFencePredicate(tenantParam: string, agentParam: string): string {
   return `COALESCE((SELECT mode FROM agent_inbox_fences
                      WHERE tenant = ${tenantParam} AND agent_id = ${agentParam}), 'bearer_only') = 'bearer_only'`
+}
+
+/**
+ * leaseAvailableClause — mupot#1494 round 3 (P1-i). THE "is this row currently free to hand
+ * out" clause: NULL means never leased; a lease at or before `nowParam` has expired. Both
+ * timestamps are ISO-8601 UTC with a fixed shape, so lexicographic `<=` IS chronological.
+ * Shared by `leaseAgentInbox`'s `leasable` and `readAgentInboxForReader`'s CONSUMING UPDATE
+ * (the plain `inbox` tool) so a row currently held under a live lease — whether from a real
+ * `inbox_lease` call or from `claimUnleasedForPairSettlement`'s lease-equivalent claim
+ * (src/tasks/runtime-receipts.ts) — cannot ALSO be handed out through `inbox`. Before this fix
+ * `inbox`'s consuming UPDATE checked only `read_at IS NULL`, so a successfully leased-or-
+ * pair-settled, still-unacked dispatch was handed straight back out by `inbox` — double
+ * processing (the same row executed twice).
+ */
+function leaseAvailableClause(nowParam: string): string {
+  return `(lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})`
 }
 
 async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promise<boolean> {
@@ -1560,11 +1588,12 @@ export async function leaseAgentInbox(
     }, nowIso, expiresIso)
   }
 
-  // "Not currently leased" — NULL means never leased; a lease at or before now has expired.
-  // Both timestamps are ISO-8601 UTC with a fixed shape, so lexicographic <= IS chronological.
+  // "Not currently leased" — mupot#1494 round 3 (P1-i): now delegates to the SAME
+  // `leaseAvailableClause` the `inbox` tool's consuming UPDATE uses, so the two can never
+  // drift apart again.
   const leasable = (t: string, a: string, nowParam: string, seatParam: string) =>
     `tenant = ${t} AND to_agent = ${a} AND read_at IS NULL AND dead_lettered_at IS NULL
-     AND (lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})
+     AND ${leaseAvailableClause(nowParam)}
      AND (CASE WHEN ${seatParam} IS NULL THEN target_seat IS NULL ELSE (target_seat = ${seatParam} OR target_seat IS NULL) END)`
 
   const bearerFencePredicate = (t: string, a: string) =>

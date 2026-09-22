@@ -96,11 +96,21 @@ async function upsertRunning(
 }
 
 /** Mark a fleet row stopped for the authenticated/key-bound identity. Signed
- *  verifiers require an active bound member before calling this helper. */
+ *  verifiers require an active bound member before calling this helper.
+ *
+ *  mupot#1494 round 3 (P1-iii) — also clears `presence_mode`/`presence_ttl_sec`: this IS the
+ *  operator path to de-register a poll-mode row (the agent's own explicit path is
+ *  `check_in({presence_mode:'resident'})` -> clearPollFleetPresence). Without this, an
+ *  operator detach froze `status`/liveness but left `presence_mode='poll'` on the row for the
+ *  agent's own NEXT poll check-in to write straight back (upsertPollFleetPresence's ON
+ *  CONFLICT sets `presence_mode = 'poll'` unconditionally) — display-truth drift even though
+ *  routing itself is independently guarded by isActivePollPresenceMode (registry.ts). */
 async function markStopped(env: Env, agentId: string, memberId: string | null): Promise<number> {
   const result = await env.DB.prepare(
     `UPDATE fleet_agents
         SET status           = 'stopped',
+            presence_mode    = '',
+            presence_ttl_sec = NULL,
             last_reported_at = datetime('now'),
             updated_at       = datetime('now')
       WHERE tenant    = ?1
