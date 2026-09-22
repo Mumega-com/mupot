@@ -152,6 +152,10 @@ task_dispatch_runtime_receipt({
 
 - Issue mupot#1494 (this playbook closes it); #1502 (delivered_via readability, closed by the
   `task_list`/`task_board` fields above).
+- `docs/workflows/05-runner-onboarding.md` — the audit-schema catalog entry for this same
+  workflow (Trigger/Actor(s)/Tool-route sequence/Human gate/Receipts/What the person
+  sees/Tests/Known gaps against the actual PR diff). This playbook is the operational
+  how-to; that doc is the code-cited record of what shipped and what didn't.
 - `src/fleet/registry.ts` — `clampPollIntervalSec`, `pollPresenceTtlSec`,
   `upsertPollFleetPresence`, `touchPollFleetPresence`, `clearPollFleetPresence`,
   `resolveFleetPresenceTtlSec`, `getFleetAgentLiveness`, `isActivePollPresenceMode`.
