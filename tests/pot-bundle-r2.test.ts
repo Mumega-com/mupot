@@ -1144,6 +1144,9 @@ describe('real CLI process — pre-PUT classification (P1-2) through scripts/pub
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('DIFFERENT digest')
     expect(result.stderr).toContain(differentDigest)
-    expect(result.stdout).toBe('') // never prints a success receipt
+    // stdout DOES carry the (inherited) real wrangler build's own output — this only
+    // asserts no SUCCESS RECEIPT (buildPublishReceipt's `{"ok":true,...}` JSON line) was
+    // ever printed, never that stdout is empty.
+    expect(result.stdout).not.toContain('"ok":true')
   }, 60_000)
 })
