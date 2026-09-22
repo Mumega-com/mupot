@@ -450,7 +450,7 @@ projectsApp.patch('/:id', async (c) => {
   if (safeBody.status === 'active') {
     const existing = await getProject(c.env, c.req.param('id'))
     if (existing?.status === 'planned') {
-      const started = await startProject(c.env, existing.id, defaultStartGateDeps())
+      const started = await startProject(c.env, existing.id, defaultStartGateDeps(c.get('auth').memberId ?? null))
       if (!started.ok) {
         const status = started.error === 'project_not_found' ? 404 : 409
         return c.json({ error: started.error, blocked_start: true }, status)

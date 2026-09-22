@@ -302,4 +302,75 @@ describe('update_squad — slug field (mupot#1495)', () => {
     const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
     expect(row?.slug).toBe('sqa')
   })
+
+  // ── P0(c) (kasra-review adversarial round-1 gate on PR #1510, Athena's
+  // round-2 confirmation): renaming INTO a slug team_bootstrap has already
+  // claimed for `x` (a `<x>-prj` project exists) needs department:admin, the
+  // OLD create_squad floor — squad:admin (this tool's ordinary floor) is not
+  // enough, because the squat IS a rename. ─────────────────────────────────
+  describe('reserved-name rename requires department:admin (mupot#1498, P0c)', () => {
+    beforeEach(() => {
+      harness.sqlite.exec(`
+        INSERT INTO projects (id, slug, name, status) VALUES ('proj-reserved', 'reserved-prj', 'Reserved', 'active');
+      `)
+    })
+
+    function squadAdminOnlyAuth(): AuthContext {
+      return {
+        userId: 'u2', email: 'squadadmin@example.com', role: 'member', tenant: 'test',
+        memberId: 'member-squad-admin', boundAgentId: null,
+        capabilities: [{ member_id: 'member-squad-admin', scope_type: 'squad', scope_id: 'sq-a', capability: 'admin' }],
+      } as AuthContext
+    }
+
+    function deptAdminAuth(): AuthContext {
+      return {
+        userId: 'u3', email: 'deptadmin@example.com', role: 'member', tenant: 'test',
+        memberId: 'member-dept-admin', boundAgentId: null,
+        capabilities: [{ member_id: 'member-dept-admin', scope_type: 'department', scope_id: 'dept-1', capability: 'admin' }],
+      } as AuthContext
+    }
+
+    it('403s a squad-admin-only rename into a name reserved by an existing <x>-prj project', async () => {
+      const outcome = await invokeTool(
+        squadAdminOnlyAuth(),
+        env,
+        'update_squad',
+        { squad: 'sq-a', slug: 'reserved-sqd' },
+        CTX2,
+      )
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) return
+      expect(outcome.status).toBe(403)
+      expect(outcome.error).toBe('forbidden')
+      const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+      expect(row?.slug).toBe('sqa') // untouched
+    })
+
+    it('allows a department-admin rename into the SAME reserved name', async () => {
+      const outcome = await invokeTool(
+        deptAdminAuth(),
+        env,
+        'update_squad',
+        { squad: 'sq-a', slug: 'reserved-sqd' },
+        CTX2,
+      )
+      expect(outcome.ok).toBe(true)
+      const row = await env.DB.prepare('SELECT slug FROM squads WHERE id = ?').bind('sq-a').first<{ slug: string }>()
+      expect(row?.slug).toBe('reserved-sqd')
+    })
+
+    it('does NOT require department:admin for a rename into an UNRESERVED -sqd name', async () => {
+      // Control: squad-admin alone is still enough when the target name is
+      // not claimed by any project or team_bootstrap attempt.
+      const outcome = await invokeTool(
+        squadAdminOnlyAuth(),
+        env,
+        'update_squad',
+        { squad: 'sq-a', slug: 'unclaimed-sqd' },
+        CTX2,
+      )
+      expect(outcome.ok).toBe(true)
+    })
+  })
 })

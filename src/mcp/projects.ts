@@ -380,7 +380,7 @@ const toolProjectUpdate: ToolSpec = {
     if (str(input.status) === 'active') {
       const existing = await getProject(env, projectId)
       if (existing?.status === 'planned') {
-        const started = await startProject(env, projectId, defaultStartGateDeps())
+        const started = await startProject(env, projectId, defaultStartGateDeps(auth.memberId ?? null))
         if (!started.ok) {
           const code = started.error === 'project_not_found' ? 404 : 409
           return fail(code, started.error, { blocked_start: true })

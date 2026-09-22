@@ -10,7 +10,7 @@
 // blocked-start (no false active). A stale planned project with no provision
 // attempt escalates to org owners (ghost-start alarm).
 
-import type { Env, Project, ProjectAccessLevel, Task } from '../types'
+import type { BusEvent, Env, Project, ProjectAccessLevel, Task } from '../types'
 import {
   mintAgentBoundToken,
   resolveActiveAgentMember,
@@ -21,8 +21,44 @@ import { setAgentSquadAccess } from '../members/agent-access'
 import { createTask } from '../tasks/service'
 import { writeReceiptToD1 } from '../workflows/pipeline'
 import { createDepartment, createSquad } from '../org/service'
+import { createBus } from '../bus'
 import { lifecycleTaskId } from './circuit-breaker'
 import { getProject, updateProject, upsertProjectSquadAccess, type ProjectMutationResult } from './service'
+
+// A small, DELIBERATE duplicate of src/mcp/provision.ts's emitProvisioned — same
+// "org.provisioned" event shape, same best-effort/non-fatal discipline (mupot#1498,
+// P2-4: the auto-created department/squad below must emit the SAME event
+// create_department/create_squad already do, so a consumer watching org.provisioned
+// does not see a structural create appear from nowhere just because it happened
+// through project_update's start-gate instead of the provision tools). NOT imported
+// from provision.ts: doing so would close a NEW cycle (provision.ts -> mcp/index.ts
+// -> mcp/projects.ts -> this file) through a module that is not already part of the
+// existing, carefully-entered index/provision cycle.
+async function emitOrgProvisioned(
+  env: Env,
+  memberId: string,
+  kind: 'department' | 'squad',
+  id: string,
+  extra: { squad_id?: string } = {},
+): Promise<void> {
+  const event: BusEvent<{ kind: string; id: string; by: string }> = {
+    type: 'org.provisioned',
+    tenant: env.TENANT_SLUG,
+    squad_id: extra.squad_id,
+    actor: { kind: 'member', id: memberId },
+    payload: { kind, id, by: memberId },
+    ts: new Date().toISOString(),
+  }
+  try {
+    await createBus(env).emit(event)
+  } catch {
+    console.error('start-gate: org.provisioned emit failed (non-fatal)', {
+      tenant: env.TENANT_SLUG,
+      kind,
+      id,
+    })
+  }
+}
 
 export const START_GATE_STEP = 'project_start_gate'
 export const START_GATE_SCHEMA = 'mupot.project_start_gate/v1'
@@ -137,6 +173,15 @@ export interface StartGateDeps {
   resolveActiveAgentMember: ResolveActiveAgentMemberFn
   setAgentSquadAccess: SetAgentSquadAccessFn
   principal: string
+  /**
+   * The human member driving THIS call, when one exists (mupot#1498, P2-4) —
+   * threaded through so the no-writable-squad auto-create's org.provisioned
+   * events (emitOrgProvisioned, below) attribute to the real caller, the same
+   * way create_department/create_squad already do. null for a system-driven
+   * call (e.g. the ghost-start reaper) — those auto-creates, if ever added,
+   * emit nothing rather than attribute a structural change to no one.
+   */
+  actorMemberId: string | null
 }
 
 export interface GhostStartDeps {
@@ -148,7 +193,7 @@ export interface GhostStartDeps {
   principal: string
 }
 
-export function defaultStartGateDeps(): StartGateDeps {
+export function defaultStartGateDeps(actorMemberId: string | null = null): StartGateDeps {
   return {
     writeReceipt: writeReceiptToD1,
     updateProject: (env, id, input) => updateProject(env, id, { ...input, via_start_gate: true }),
@@ -159,6 +204,7 @@ export function defaultStartGateDeps(): StartGateDeps {
     resolveActiveAgentMember,
     setAgentSquadAccess: (env, input) => setAgentSquadAccess(env, input),
     principal: START_GATE_PRINCIPAL,
+    actorMemberId,
   }
 }
 
@@ -286,14 +332,20 @@ async function findProjectSquadDepartment(env: Env): Promise<{ id: string } | nu
     .first<{ id: string }>()
 }
 
-async function resolveProjectSquadDepartmentId(env: Env): Promise<string | null> {
+async function resolveProjectSquadDepartmentId(env: Env, actorMemberId: string | null): Promise<string | null> {
   const existing = await findProjectSquadDepartment(env)
   if (existing) return existing.id
   const created = await createDepartment(env, {
     slug: PROJECT_SQUAD_DEPARTMENT_SLUG,
     name: PROJECT_SQUAD_DEPARTMENT_NAME,
   })
-  if (created.ok) return created.value.id
+  if (created.ok) {
+    // P2-4: the same org.provisioned event create_department's own MCP tool
+    // emits — see emitOrgProvisioned's header for why this is a deliberate
+    // duplicate rather than an import.
+    if (actorMemberId) await emitOrgProvisioned(env, actorMemberId, 'department', created.value.id)
+    return created.value.id
+  }
   if (created.error === 'slug_taken') {
     // Race: a concurrent start-gate call for a DIFFERENT project won this
     // exact department between our read and this insert. Adopt it — same
@@ -314,8 +366,12 @@ async function resolveProjectSquadDepartmentId(env: Env): Promise<string | null>
  * fails closed with 'no_writable_squad', exactly as it did before this
  * function existed.
  */
-async function autoCreateWritableSquad(env: Env, project: Project): Promise<WritableSquadRow | null> {
-  const departmentId = await resolveProjectSquadDepartmentId(env)
+async function autoCreateWritableSquad(
+  env: Env,
+  project: Project,
+  actorMemberId: string | null,
+): Promise<WritableSquadRow | null> {
+  const departmentId = await resolveProjectSquadDepartmentId(env, actorMemberId)
   if (!departmentId) return null
 
   const squadSlug = `${project.slug}${AUTO_SQUAD_SLUG_SUFFIX}`
@@ -332,6 +388,8 @@ async function autoCreateWritableSquad(env: Env, project: Project): Promise<Writ
     const created = await createSquad(env, departmentId, { slug: squadSlug, name: `${project.name} Squad` })
     if (created.ok) {
       squadId = created.value.id
+      // P2-4: same org.provisioned event create_squad's own MCP tool emits.
+      if (actorMemberId) await emitOrgProvisioned(env, actorMemberId, 'squad', squadId, { squad_id: squadId })
     } else if (created.error === 'slug_taken') {
       const raced = await env.DB.prepare(
         `SELECT id FROM squads WHERE department_id = ?1 AND slug = ?2 LIMIT 1`,
@@ -619,7 +677,7 @@ export async function startProject(
       .bind(projectId)
       .first()
     if (!hasAnyEdge) {
-      squad = await autoCreateWritableSquad(env, project)
+      squad = await autoCreateWritableSquad(env, project, deps.actorMemberId)
     }
     if (!squad) return fail('no_writable_squad')
   }

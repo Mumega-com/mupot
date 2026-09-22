@@ -55,6 +55,8 @@ function errorStatus(error: TeamBootstrapError): 400 | 403 | 404 | 409 {
   if (error === 'department_not_found') return 404
   if (error === 'ambiguous_department') return 409
   if (error === 'squad_limit_reached' || error === 'agent_limit_reached') return 409
+  if (error === 'squad_slug_taken') return 409
+  if (error === 'project_archived') return 409
   if (error === 'cannot_invite_above_own_rank') return 403
   return 400
 }
@@ -152,7 +154,7 @@ export const toolTeamBootstrap: ToolSpec = {
   scope: 'org — composite project + squad + bot + invites bootstrap',
   min: 'admin',
   args:
-    '{ slug_base: string, name: string, department: string (id|slug), humans?: [{email, capability: "observer"|"member"}], bot?: { enabled?: boolean, name?, role?, model? }, seed_memory?: string }',
+    '{ slug_base: string, name: string, department: string (id|slug), humans?: [{email, capability: "observer"|"member"}], bot?: { enabled?: boolean, name?, role?, model? }, seed_memory?: string, adopt?: boolean (org:admin only — see squad_slug_taken) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -162,6 +164,7 @@ export const toolTeamBootstrap: ToolSpec = {
       humans: HUMANS_SCHEMA,
       bot: BOT_SCHEMA,
       seed_memory: STRING_SCHEMA,
+      adopt: OPTIONAL_BOOLEAN_SCHEMA,
     },
     required: ['slug_base', 'name', 'department'],
     additionalProperties: false,
@@ -212,6 +215,7 @@ export const toolTeamBootstrap: ToolSpec = {
       humans,
       bot,
       seed_memory: rawSeedMemory ?? undefined,
+      adopt: args.adopt === true,
     }
 
     const result = await teamBootstrap(env, auth, input)
@@ -244,7 +248,7 @@ export const toolTeamBootstrap: ToolSpec = {
     // — a replay call with the same seed_memory text must not accumulate a
     // duplicate engram on every retry.
     if (rawSeedMemory && result.disposition === 'created') {
-      const scope = `project:${result.project.id}`
+      const scope = `project:${result.project.project.id}`
       await createMemory(env).remember(scope, rawSeedMemory)
     }
 
@@ -255,8 +259,9 @@ export const toolTeamBootstrap: ToolSpec = {
     return done({
       disposition: result.disposition,
       receipt_id: result.receipt_id,
-      project: result.project,
-      squad: result.squad,
+      project: { ...result.project.project, created: result.project.created },
+      squad: { ...result.squad.squad, created: result.squad.created },
+      edge_kept: result.edge_kept,
       bot: result.bot
         ? { id: result.bot.agent.id, slug: result.bot.agent.slug, name: result.bot.agent.name, created: result.bot.created }
         : null,
@@ -267,6 +272,7 @@ export const toolTeamBootstrap: ToolSpec = {
         capability: invite.capability,
         created: invite.created,
       })),
+      duplicate_emails_in_request: result.duplicate_emails_in_request,
       credential_claim: credentialClaim,
       hermes_scaffold: scaffold,
     })

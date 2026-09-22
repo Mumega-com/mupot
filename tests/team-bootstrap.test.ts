@@ -113,8 +113,12 @@ describe('team_bootstrap — mupot#1498', () => {
 
     expect(result.disposition).toBe('created')
     expect((result.project as Record<string, unknown>).slug).toBe('psychonom-prj')
+    expect((result.project as Record<string, unknown>).created).toBe(true) // P0(b)
     expect((result.squad as Record<string, unknown>).slug).toBe('psychonom-sqd')
+    expect((result.squad as Record<string, unknown>).created).toBe(true) // P0(b)
     expect((result.squad as Record<string, unknown>).department_id).toBe(DEPT_ID)
+    expect(result.edge_kept).toBeNull() // P1-2: a fresh admin edge, nothing preserved
+    expect(result.duplicate_emails_in_request).toEqual([]) // P2-1
 
     const bot = result.bot as Record<string, unknown>
     expect(bot.slug).toBe('psychonom-bot')
@@ -195,7 +199,10 @@ describe('team_bootstrap — mupot#1498', () => {
     const secondResult = second.result as Record<string, unknown>
 
     expect((secondResult.project as Record<string, unknown>).id).toBe((firstResult.project as Record<string, unknown>).id)
+    expect((secondResult.project as Record<string, unknown>).created).toBe(false) // P0(b): adopted, not re-created
     expect((secondResult.squad as Record<string, unknown>).id).toBe((firstResult.squad as Record<string, unknown>).id)
+    expect((secondResult.squad as Record<string, unknown>).created).toBe(false)
+    expect(secondResult.edge_kept).toBeNull() // already admin from the first call — nothing preserved below it
 
     const invites = secondResult.invites as Array<Record<string, unknown>>
     const repeated = invites.find((i) => i.email === 'lead@example.com')!
@@ -221,15 +228,19 @@ describe('team_bootstrap — mupot#1498', () => {
     // No second credential claim minted on replay.
     expect(secondResult.credential_claim).toBeNull()
 
-    // Receipt is the SAME row (UNIQUE(tenant, slug_base)), invited_count accumulated.
-    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM team_bootstrap_receipts WHERE slug_base = ?')
+    // ONE RECEIPT ROW PER ATTEMPT (P1-3, kasra-review adversarial round-1
+    // gate on PR #1510) — two calls means two rows, each with its OWN
+    // invited_count (what THAT attempt itself inserted, never a running
+    // total), never a shared/overwritten row.
+    const receipts = await env.DB.prepare(
+      'SELECT attempt_no, disposition, invited_count FROM team_bootstrap_receipts WHERE slug_base = ? ORDER BY attempt_no',
+    )
       .bind('psychonom')
-      .first<{ n: number }>()
-    expect(receiptCount?.n).toBe(1)
-    const receipt = await env.DB.prepare('SELECT invited_count FROM team_bootstrap_receipts WHERE slug_base = ?')
-      .bind('psychonom')
-      .first<{ invited_count: number }>()
-    expect(receipt?.invited_count).toBe(2)
+      .all<{ attempt_no: number; disposition: string; invited_count: number }>()
+    const rows = receipts.results ?? []
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({ attempt_no: 1, disposition: 'created', invited_count: 1 })
+    expect(rows[1]).toMatchObject({ attempt_no: 2, disposition: 'created', invited_count: 1 })
   })
 
   it('rank ceiling: cannot invite a human above the caller\'s own rank on the (new) squad', async () => {
@@ -261,9 +272,16 @@ describe('team_bootstrap — mupot#1498', () => {
     if (result.ok) return
     expect(result.error).toBe('cannot_invite_above_own_rank')
 
-    // No partial writes: the ceiling check runs AFTER project/squad resolution
-    // (which DO commit independently — see the file header) but BEFORE the
-    // batch, so no edge/invite/receipt exists for this attempt.
+    // MUTATION TARGET (P1-4, kasra-review adversarial round-1 gate on PR
+    // #1510): the ceiling now runs on DEPARTMENT scope BEFORE project/squad
+    // are ever created — a mutation that moves it back to AFTER the creates
+    // (its old position) turns these two assertions red, because the
+    // project/squad would then exist despite the refusal.
+    const project = await env.DB.prepare('SELECT 1 FROM projects WHERE slug = ?').bind('ceiling-test-prj').first()
+    expect(project).toBeNull()
+    const squad = await env.DB.prepare('SELECT 1 FROM squads WHERE slug = ?').bind('ceiling-test-sqd').first()
+    expect(squad).toBeNull()
+
     const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
       .bind('ceiling-test')
       .first()
@@ -310,16 +328,40 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(outcome.error).toBe('forbidden')
   })
 
-  it('stage-1 (edge+bot) batch failure leaves no edge/bot/invite rows, but IS receipted as failed', async () => {
+  // Injects a synthetic failure on the FIRST statement matching `sqlSubstring`
+  // while `active.value` is true — same real-D1-plus-targeted-injection
+  // technique as envWithInjectedInviteFailure below, generalized for a
+  // single statement rather than a per-row match. The whole file calls
+  // applyAllMigrations(), so this is not a hand-rolled D1 mock.
+  function envWithInjectedFailure(base: Env, sqlSubstring: string, active: { value: boolean }): Env {
+    const realDb = base.DB
+    return {
+      ...base,
+      DB: {
+        ...realDb,
+        prepare(sql: string) {
+          const real = realDb.prepare(sql)
+          if (!active.value || !sql.includes(sqlSubstring)) return real
+          return {
+            bind(...values: unknown[]) {
+              void real.bind(...values)
+              return {
+                run: async () => {
+                  throw new Error(`injected failure for test: ${sqlSubstring}`)
+                },
+              }
+            },
+          }
+        },
+      },
+    } as unknown as Env
+  }
+
+  it('project_archived is refused BEFORE the squad is ever created', async () => {
     // Pre-seed an ARCHIVED project under the slug this call will resolve to.
-    // findProjectBySlug adopts it as "existing" (no createProject call), but
-    // the ADMIN-edge INSERT inside stage 1's batch then hits
-    // validate_project_squad_access_insert (migration 0055) and that whole
-    // transaction — edge + bot statements — rolls back together
-    // (tests/helpers/sqlite-d1.ts wraps every batch in BEGIN IMMEDIATE/
-    // COMMIT/ROLLBACK). Stage 2 (invites) is never reached. The failure is
-    // still receipted — migration 0166's 'failed' disposition exists exactly
-    // for this (Athena round-1 gate on PR #1510).
+    // P1-1 (kasra-review adversarial round-1 gate on PR #1510): this must be
+    // caught immediately after project resolution — before the squad (and
+    // its free-tier entitlement slot) is ever created.
     harness.sqlite.exec(`
       INSERT INTO projects (id, slug, name, status) VALUES ('proj-archived', 'batchfail-prj', 'Batch Fail', 'archived');
     `)
@@ -327,6 +369,37 @@ describe('team_bootstrap — mupot#1498', () => {
     const outcome = await invokeTool(
       orgAdminAuth(),
       env,
+      'team_bootstrap',
+      { slug_base: 'batchfail', name: 'Batch Fail', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('project_archived')
+    expect(outcome.status).toBe(409)
+
+    const squad = await env.DB.prepare('SELECT 1 FROM squads WHERE slug = ?').bind('batchfail-sqd').first()
+    expect(squad).toBeNull()
+    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('batchfail')
+      .first()
+    expect(receipt).toBeNull()
+  })
+
+  it('stage-1 (edge+bot) batch failure leaves no edge/bot/invite rows, but IS receipted as failed', async () => {
+    // Injects a failure on the ADMIN-edge INSERT itself (not an archived
+    // project — that is now caught earlier, see the test above) so stage 1's
+    // batch — edge + bot statements together — genuinely fails and rolls
+    // back (tests/helpers/sqlite-d1.ts wraps every batch in BEGIN IMMEDIATE/
+    // COMMIT/ROLLBACK). Stage 2 (invites) is never reached. The failure is
+    // still receipted — migration 0166's 'failed' disposition exists exactly
+    // for this (Athena round-1 gate on PR #1510).
+    const injection = { value: true }
+    const injectedEnv = envWithInjectedFailure(env, 'INSERT INTO project_squad_access', injection)
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      injectedEnv,
       'team_bootstrap',
       {
         slug_base: 'batchfail',
@@ -340,15 +413,19 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(outcome.ok).toBe(false)
     if (outcome.ok) return
     expect(outcome.error).toBe('provisioning_failed')
+    expect(outcome.status).toBe(400)
     expect((outcome.detail as Record<string, unknown>).stage).toBe('edge_or_bot')
 
-    // The squad WAS created before the write phase (its own independent
-    // commit — see the file header) — but nothing from stage 1 landed.
+    // The project + squad WERE created before the write phase (their own
+    // independent commits — see the file header) — but nothing from stage 1
+    // landed.
+    const project = await env.DB.prepare('SELECT id FROM projects WHERE slug = ?').bind('batchfail-prj').first<{ id: string }>()
     const squad = await env.DB.prepare('SELECT id FROM squads WHERE slug = ?').bind('batchfail-sqd').first<{ id: string }>()
+    expect(project).toBeTruthy()
     expect(squad).toBeTruthy()
 
     const edge = await env.DB.prepare('SELECT 1 FROM project_squad_access WHERE project_id = ?')
-      .bind('proj-archived')
+      .bind(project!.id)
       .first()
     expect(edge).toBeNull()
     const bot = await env.DB.prepare('SELECT 1 FROM agents WHERE slug = ?').bind('batchfail-bot').first()
@@ -373,10 +450,10 @@ describe('team_bootstrap — mupot#1498', () => {
       }>()
     expect(receipt?.disposition).toBe('failed')
     expect(receipt?.failed_step).toBe('edge_or_bot')
-    expect(['unique_violation', 'write_failed']).toContain(receipt?.failure_reason)
+    expect(receipt?.failure_reason).toBe('write_failed')
     expect(receipt?.failure_reason).not.toMatch(/@/) // no email/PII leaked into the reason
     expect(receipt?.invited_count).toBe(0)
-    expect(receipt?.project_id).toBe('proj-archived')
+    expect(receipt?.project_id).toBe(project!.id)
     expect(receipt?.squad_id).toBe(squad?.id)
     expect(receipt?.bot_agent_id).toBeNull()
   })
@@ -600,20 +677,337 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(edgeCount?.n).toBe(1)
     expect(edgeCount?.lvl).toBe('admin')
 
-    // The SAME receipt row transitions failed -> created; still one row.
-    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM team_bootstrap_receipts WHERE slug_base = ?')
-      .bind('partial')
-      .first<{ n: number }>()
-    expect(receiptCount?.n).toBe(1)
-    const finalReceipt = await env.DB.prepare(
-      'SELECT id, disposition, failed_step, failure_reason, invited_count FROM team_bootstrap_receipts WHERE slug_base = ?',
+    // ONE RECEIPT ROW PER ATTEMPT (P1-3): the failed attempt's row is NEVER
+    // rewritten — a second, NEW row records the successful retry, ordered by
+    // attempt_no. invited_count on the second row is what THAT attempt
+    // itself inserted (3: c, d, e) — never a running total (5).
+    const allReceipts = await env.DB.prepare(
+      'SELECT id, attempt_no, disposition, failed_step, failure_reason, invited_count FROM team_bootstrap_receipts WHERE slug_base = ? ORDER BY attempt_no',
     )
       .bind('partial')
-      .first<{ id: string; disposition: string; failed_step: string | null; failure_reason: string | null; invited_count: number }>()
-    expect(finalReceipt?.id).toBe(failedReceipt!.id) // same row, not a second one
-    expect(finalReceipt?.disposition).toBe('created')
-    expect(finalReceipt?.failed_step).toBeNull()
-    expect(finalReceipt?.failure_reason).toBeNull()
-    expect(finalReceipt?.invited_count).toBe(5)
+      .all<{
+        id: string
+        attempt_no: number
+        disposition: string
+        failed_step: string | null
+        failure_reason: string | null
+        invited_count: number
+      }>()
+    const receiptRows = allReceipts.results ?? []
+    expect(receiptRows).toHaveLength(2)
+    expect(receiptRows[0].id).toBe(failedReceipt!.id)
+    expect(receiptRows[0].attempt_no).toBe(1)
+    expect(receiptRows[0].disposition).toBe('failed')
+
+    expect(receiptRows[1].attempt_no).toBe(2)
+    expect(receiptRows[1].id).not.toBe(failedReceipt!.id) // a NEW row, not the same one rewritten
+    expect(receiptRows[1].disposition).toBe('created')
+    expect(receiptRows[1].failed_step).toBeNull()
+    expect(receiptRows[1].failure_reason).toBeNull()
+    expect(receiptRows[1].invited_count).toBe(3)
+  })
+
+  // ── P0: adoption without ownership (kasra-review adversarial round-1 gate
+  // on PR #1510, same class as #1507's P0-4) ─────────────────────────────────
+  it('squad squat: a squad admin cannot pre-name a target squad to steal a future bootstrap\'s ADMIN edge + mintable bot', async () => {
+    // The attacker renames (or creates) a squad to the EXACT slug a future
+    // team_bootstrap('hijack', ...) call will resolve to, and holds a real
+    // capability grant on it — squadIsAdoptable must refuse this squad, not
+    // silently adopt it just because the (department_id, slug) pair matches.
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-hijack', '${DEPT_ID}', 'hijack-sqd', 'Squatted Squad');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-attacker', 'attacker@pot.test', 'Attacker', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-attacker', 'member-attacker', 'squad', 'squad-hijack', 'admin');
+    `)
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'hijack', name: 'Hijack Target', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('squad_slug_taken')
+    expect(outcome.status).toBe(409)
+    const detail = outcome.detail as Record<string, unknown>
+    expect(detail.squad_id).toBe('squad-hijack')
+    expect(Array.isArray(detail.owners)).toBe(true)
+    expect((detail.owners as Array<Record<string, unknown>>).some((o) => o.member_id === 'member-attacker')).toBe(true)
+
+    // ZERO edges — the attacker's squad never got wired onto the project.
+    const edges = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = ?')
+      .bind('squad-hijack')
+      .first<{ n: number }>()
+    expect(edges?.n).toBe(0)
+    // No bot placed in the squatted squad either.
+    const agentCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ?')
+      .bind('squad-hijack')
+      .first<{ n: number }>()
+    expect(agentCount?.n).toBe(0)
+    // No receipt for this refused attempt.
+    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('hijack')
+      .first()
+    expect(receipt).toBeNull()
+  })
+
+  it('adopt:true + org:admin is an EXPLICIT, RECEIPTED override — disposition \'adopted\', actor recorded', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-claim', '${DEPT_ID}', 'claimed-sqd', 'Pre-existing Squad');
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-prior', 'prior@pot.test', 'Prior Owner', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-prior', 'member-prior', 'squad', 'squad-claim', 'admin');
+    `)
+
+    // Without adopt:true, this is the same refusal as the squat test above.
+    const refused = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'claimed', name: 'Claimed Team', department: DEPT_ID },
+      CTX,
+    )
+    expect(refused.ok).toBe(false)
+
+    // With adopt:true AND org:admin (orgAdminAuth already is), the override
+    // is honored — Athena, round-2 sharpening: "find-or-create is create +
+    // explicit adopt" — receipted as its own disposition, never silently
+    // folded into 'existing'.
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'claimed', name: 'Claimed Team', department: DEPT_ID, adopt: true },
+      CTX,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    const result = outcome.result as Record<string, unknown>
+    expect(result.disposition).toBe('adopted')
+    expect((result.squad as Record<string, unknown>).id).toBe('squad-claim')
+    expect((result.squad as Record<string, unknown>).created).toBe(false)
+
+    const receipt = await env.DB.prepare(
+      'SELECT disposition, actor_member_id, squad_id FROM team_bootstrap_receipts WHERE slug_base = ? AND squad_id = ?',
+    )
+      .bind('claimed', 'squad-claim')
+      .first<{ disposition: string; actor_member_id: string; squad_id: string }>()
+    expect(receipt?.disposition).toBe('adopted')
+    expect(receipt?.actor_member_id).toBe(ADMIN_MEMBER_ID)
+    expect(receipt?.squad_id).toBe('squad-claim')
+  })
+
+  // ── P1-2: the ADMIN edge is never silently raised ─────────────────────────
+  it('edge_kept: a deliberate non-admin edge is preserved, never raised to admin', async () => {
+    // Pre-seed the project, squad, AND a deliberate 'read' edge between them
+    // — team_bootstrap must adopt both but leave the edge exactly as it was.
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('proj-readonly', 'readonly-prj', 'Read Only', 'active');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-readonly', '${DEPT_ID}', 'readonly-sqd', 'Read Only Squad');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-readonly', 'squad-readonly', 'read');
+    `)
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'readonly', name: 'Read Only', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    const result = outcome.result as Record<string, unknown>
+    expect(result.edge_kept).toBe('read')
+
+    const edge = await env.DB.prepare('SELECT access_level FROM project_squad_access WHERE project_id = ? AND squad_id = ?')
+      .bind('proj-readonly', 'squad-readonly')
+      .first<{ access_level: string }>()
+    expect(edge?.access_level).toBe('read') // MUTATION TARGET: never raised to admin
+  })
+
+  // ── P1-1: archived project is a typed refusal (see the dedicated test
+  //    above too — this one asserts the trigger-error MAPPING as a backstop) ─
+  it('a project archived in the RACE WINDOW between the check and the edge insert maps to a typed archived_project reason', async () => {
+    // Deliberately construct the race the upfront status check cannot see:
+    // resolve project active, then archive it before stage 1's edge INSERT
+    // runs, by hooking the SAME injection wrapper to archive the project on
+    // the first statement touching project_squad_access.
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('proj-race', 'race-prj', 'Race', 'active');
+    `)
+    const base = env
+    let armed = true
+    const raceEnv: Env = {
+      ...base,
+      DB: {
+        ...base.DB,
+        prepare(sql: string) {
+          const real = base.DB.prepare(sql)
+          if (armed && sql.includes('INSERT INTO project_squad_access')) {
+            armed = false
+            harness.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'proj-race'`)
+          }
+          return real
+        },
+      },
+    } as unknown as Env
+
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      raceEnv,
+      'team_bootstrap',
+      { slug_base: 'race', name: 'Race', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('provisioning_failed')
+    expect((outcome.detail as Record<string, unknown>).stage).toBe('edge_or_bot')
+    expect((outcome.detail as Record<string, unknown>).reason).toBe('archived_project')
+
+    const receipt = await env.DB.prepare('SELECT failure_reason FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('race')
+      .first<{ failure_reason: string }>()
+    expect(receipt?.failure_reason).toBe('archived_project')
+  })
+
+  // ── P2-1: within-call email dedupe ─────────────────────────────────────────
+  it('dedupes the SAME email appearing twice in one call\'s humans[] — first occurrence wins, reported in duplicate_emails_in_request', async () => {
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      {
+        slug_base: 'dedupe',
+        name: 'Dedupe Team',
+        department: DEPT_ID,
+        humans: [
+          { email: 'Dup@Example.com', capability: 'member' },
+          { email: 'dup@example.com', capability: 'observer' }, // same address, different case + capability
+        ],
+        bot: { enabled: false },
+      },
+      CTX,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    const result = outcome.result as Record<string, unknown>
+    expect(result.duplicate_emails_in_request).toEqual(['dup@example.com'])
+    const invites = result.invites as Array<Record<string, unknown>>
+    expect(invites).toHaveLength(1)
+    expect(invites[0].capability).toBe('member') // first occurrence's capability wins
+
+    const rows = await env.DB.prepare('SELECT COUNT(*) AS n FROM invites WHERE lower(email) = ?')
+      .bind('dup@example.com')
+      .first<{ n: number }>()
+    expect(rows?.n).toBe(1)
+  })
+
+  // ── P2-2: a replay must report the STORED capability, never the requested one ──
+  it('replay with a DIFFERENT capability for a live invite reports the STORED capability, not the request', async () => {
+    const first = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      {
+        slug_base: 'restamp',
+        name: 'Restamp Team',
+        department: DEPT_ID,
+        humans: [{ email: 'x@example.com', capability: 'member' }],
+        bot: { enabled: false },
+      },
+      CTX,
+    )
+    expect(first.ok).toBe(true)
+
+    const second = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      {
+        slug_base: 'restamp',
+        name: 'Restamp Team',
+        department: DEPT_ID,
+        humans: [{ email: 'x@example.com', capability: 'observer' }], // different capability requested
+        bot: { enabled: false },
+      },
+      CTX,
+    )
+    expect(second.ok).toBe(true)
+    if (!second.ok) return
+    const result = second.result as Record<string, unknown>
+    const invites = result.invites as Array<Record<string, unknown>>
+    expect(invites[0].created).toBe(false)
+    expect(invites[0].capability).toBe('member') // STORED, not the requested 'observer'
+
+    const stored = await env.DB.prepare('SELECT capability FROM invites WHERE lower(email) = ?')
+      .bind('x@example.com')
+      .first<{ capability: string }>()
+    expect(stored?.capability).toBe('member') // untouched by the replay
+  })
+
+  // ── P2-3: actor_member_id guard at the boundary ───────────────────────────
+  it('refuses a caller with no memberId at all, before any write (actor_required)', async () => {
+    const noMemberAuth: AuthContext = {
+      userId: 'u-no-member',
+      email: null,
+      role: 'admin', // legacy-role org-admin passes the tool's hasWorkspaceAdmin floor
+      tenant: TENANT,
+      channel: 'workspace',
+      boundAgentId: null,
+    }
+    const outcome = await invokeTool(
+      noMemberAuth,
+      env,
+      'team_bootstrap',
+      { slug_base: 'noactor', name: 'No Actor', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('actor_required')
+    expect(outcome.status).toBe(400)
+    const project = await env.DB.prepare('SELECT 1 FROM projects WHERE slug = ?').bind('noactor-prj').first()
+    expect(project).toBeNull()
+  })
+
+  // ── P2-6 / P2-8: length caps ───────────────────────────────────────────────
+  it('rejects a slug_base too long for every derived slug to stay valid (44-char ceiling)', async () => {
+    const tooLong = 'a'.repeat(45)
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: tooLong, name: 'Too Long', department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('invalid_slug_base')
+
+    // exactly 44 chars is fine (44 + 4-char suffix = 48, isValidSlug's own ceiling).
+    const fits = 'b'.repeat(44)
+    const ok = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: fits, name: 'Fits', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(ok.ok).toBe(true)
+  })
+
+  it('rejects a name over the length cap', async () => {
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'longname', name: 'x'.repeat(201), department: DEPT_ID },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.error).toBe('invalid_name')
   })
 })
