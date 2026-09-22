@@ -392,7 +392,9 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       const leadCap = harness.sqlite.prepare(
         "SELECT capability FROM capabilities WHERE member_id = ? AND scope_type = 'squad'",
       ).get(result.leadAgentMemberId) as { capability: string } | undefined
-      expect(leadCap?.capability).toBe('member') // never 'lead' — the home-capability ceiling
+      // 'lead', matching agents.role — the home-capability ceiling (migration 0071) that
+      // used to cap this was dropped by migration 0087 on an explicit Hadi directive.
+      expect(leadCap?.capability).toBe('lead')
       const seedSeatToken = harness.sqlite.prepare(
         "SELECT * FROM member_tokens WHERE agent_id = ? AND label = 'seed-seat'",
       ).get(result.leadAgentId)
