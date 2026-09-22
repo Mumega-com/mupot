@@ -66,6 +66,7 @@ export const toolPotProvision: ToolSpec = {
         admin_name: str(args.admin_name) || undefined,
         plan_tier: (str(args.plan_tier) as any) || 'enterprise',
         custom_domain: str(args.custom_domain) || undefined,
+        minted_by_member_id: auth.memberId,
       }
       const result = await provisionSovereignPot(env, input)
       // `done()` reads as success to every caller. When provisioning did not finish, say so
