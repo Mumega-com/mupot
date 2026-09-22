@@ -1130,6 +1130,176 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(parsedOk.count).toBe(3) // non-string values pass through unchanged
     })
 
+    describe('mupot#1520 P1-A/P2-B: unicode-aware redaction, key redaction, Date serialization, and a whole-document bound', () => {
+      it('P1-A: a unicode email survives to the receipt with the OLD (\\w-only) regex and is redacted with the fix — in the message, a nested field, AND a key', () => {
+        const unicodeEmail = 'hédi.sérvat@exämple.com'
+        // Sanity check pinning the defect this fix closes: `\w` is ASCII-only, so the OLD
+        // regex never matches a unicode local-part/domain at all.
+        expect(unicodeEmail.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[redacted-email]')).toBe(unicodeEmail)
+
+        const detail = receiptError('sql_error', `contact ${unicodeEmail} for help`, {
+          nested: { hint: `owner is ${unicodeEmail}` },
+          [unicodeEmail]: 'value-under-an-email-shaped-key',
+        })
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+        expect(parsed.nested.hint).toBe('owner is [redacted-email]')
+        expect(parsed).not.toHaveProperty(unicodeEmail)
+        expect(Object.keys(parsed)).toContain('[redacted-email]')
+        expect(parsed['[redacted-email]']).toBe('value-under-an-email-shaped-key')
+      })
+
+      it('P1-A: a soft-hyphen-obfuscated domain (renders identically to a plain domain, invisible character mid-word) is still redacted', () => {
+        const SOFT_HYPHEN = '­'
+        const obfuscated = `hedi@exa${SOFT_HYPHEN}mple.com` // renders as "hedi@example.com"
+        const detail = receiptError('sql_error', `contact ${obfuscated} for help`)
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+        expect(parsed.error.message).not.toContain(SOFT_HYPHEN)
+      })
+
+      it('P1-A regression guard: `binding=@cf/meta/llama-3.3` and `model:@cf/meta/llama-3.3` both still survive the unicode-aware regex untouched', () => {
+        const detail = receiptError(
+          'sql_error',
+          'schema statement referenced binding=@cf/meta/llama-3.3 and model:@cf/meta/llama-3.3, neither is an email',
+        )
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toContain('binding=@cf/meta/llama-3.3')
+        expect(parsed.error.message).toContain('model:@cf/meta/llama-3.3')
+        expect(parsed.error.message).not.toContain('[redacted-email]')
+      })
+
+      it('P2-B: a Date value serializes to its ISO string instead of collapsing to {}', () => {
+        const at = new Date('2026-01-01T00:00:00.000Z')
+        const detail = receiptOk({ at })
+        const parsed = JSON.parse(detail)
+        expect(parsed.at).toBe('2026-01-01T00:00:00.000Z')
+      })
+
+      it('P2-B / mupot#1523 item 4: a 200-field SUCCESS detail (each field ~499 chars, individually under the per-leaf 500-char cap) is bounded as a WHOLE document, and the fallback preserves ok:true (a successful step is not misreported as failed)', () => {
+        const fields: Record<string, string> = {}
+        for (let i = 0; i < 200; i++) {
+          fields[`field_${i}`] = 'x'.repeat(499)
+        }
+        const naiveSerializedLength = JSON.stringify({ ok: true, ...fields }).length
+        expect(naiveSerializedLength).toBeGreaterThan(64 * 1024) // proves the scenario actually stresses the bound
+
+        const detail = receiptOk(fields)
+        expect(detail.length).toBeLessThanOrEqual(64 * 1024)
+        expect(() => JSON.parse(detail)).not.toThrow() // the CHECK constraint's json_valid(detail) must still pass
+        const parsed = JSON.parse(detail)
+        expect(parsed.ok).toBe(true) // NOT hardcoded false — this step actually succeeded
+        expect(parsed.truncated).toBe(true)
+        expect(parsed.error).toBeUndefined() // ok:true shape never carries an `error` object
+      })
+
+      it('mupot#1523 item 4: a 200-field FAILURE detail bounds the same way and keeps ok:false + a named error class', () => {
+        const extraFields: Record<string, string> = {}
+        for (let i = 0; i < 200; i++) {
+          extraFields[`field_${i}`] = 'x'.repeat(499)
+        }
+        const detail = receiptError('sql_error', 'boom', extraFields)
+        expect(detail.length).toBeLessThanOrEqual(64 * 1024)
+        const parsed = JSON.parse(detail)
+        expect(parsed.ok).toBe(false)
+        expect(parsed.truncated).toBe(true)
+        expect(parsed.error.class).toBe('detail_too_large')
+      })
+
+      it("mupot#1523 item 2: errorClass itself is redacted and bounded the same way as message — an email-shaped errorClass doesn't reach the ledger", () => {
+        const detail = receiptError('contact-admin@example.com', 'boom')
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.class).toBe('[redacted-email]')
+        expect(parsed.error.class).not.toContain('admin@example.com')
+      })
+
+      it('mupot#1523 item 1: an NFD-decomposed unicode email (combining marks, not precomposed letters) is still redacted', () => {
+        // 'é' as NFD is 'e' + COMBINING ACUTE ACCENT (U+0301); as NFC it is the single
+        // precomposed codepoint U+00E9. Confirm the fixture is actually decomposed before
+        // relying on it to exercise the NFKC-normalization fix.
+        const nfdEmail = 'hédi.sérvat@exämple.com' // é / é via combining marks
+        expect(nfdEmail.normalize('NFC')).toBe('hédi.sérvat@exämple.com')
+        expect(nfdEmail).not.toBe(nfdEmail.normalize('NFC')) // sanity: the fixture really is decomposed
+
+        const detail = receiptError('sql_error', `contact ${nfdEmail} for help`)
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+      })
+
+      it('mupot#1523 item 1: a braille-blank (U+2800) obfuscated domain is still redacted, and binding=/model: still survive', () => {
+        const BRAILLE_BLANK = '⠀'
+        const obfuscated = `hedi@exa${BRAILLE_BLANK}mple.com`
+        const detail = receiptError(
+          'sql_error',
+          `contact ${obfuscated} for help — binding=@cf/meta/llama-3.3 and model:@cf/meta/llama-3.3 are not emails`,
+        )
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toContain('contact [redacted-email] for help')
+        expect(parsed.error.message).toContain('binding=@cf/meta/llama-3.3')
+        expect(parsed.error.message).toContain('model:@cf/meta/llama-3.3')
+        // exactly one redaction happened — the binding/model mentions were not touched
+        expect((parsed.error.message.match(/\[redacted-email\]/g) ?? []).length).toBe(1)
+      })
+
+      it('mupot#1523 re-run P1: a NON-composable combining mark (CGJ U+034F, variation selector U+FE0F, Thai U+0E31) inside an email is still redacted after NFKC', () => {
+        for (const mark of ['\u034F', '\uFE0F', '\u0E31', '\u20E0']) {
+          const obfuscated = `victim@exa${mark}mple.com`
+          expect(obfuscated.normalize('NFKC')).toBe(obfuscated) // sanity: NFKC does NOT fold this one away
+          const detail = receiptError('sql_error', `near "${obfuscated}": syntax error`)
+          const parsed = JSON.parse(detail)
+          expect(parsed.error.message).toBe('near "[redacted-email]": syntax error')
+        }
+      })
+
+      it('mupot#1523 item 3: two keys that redact to the SAME string are both preserved, suffixed, never silently dropped', () => {
+        const detail = receiptOk({ 'victim1@example.com': 'a', 'victim2@example.com': 'b', 'victim3@example.com': 'c' })
+        const parsed = JSON.parse(detail)
+        expect(parsed['[redacted-email]']).toBe('a')
+        expect(parsed['[redacted-email]#2']).toBe('b')
+        expect(parsed['[redacted-email]#3']).toBe('c')
+        expect(Object.keys(parsed).filter((k) => k.startsWith('[redacted-email]'))).toHaveLength(3)
+      })
+
+      describe('mupot#1523 item 5: receiptOk/receiptError are TOTAL — never throw', () => {
+        it('an Invalid Date serializes as the string "invalid-date"', () => {
+          const detail = receiptOk({ at: new Date('this is not a valid date') })
+          const parsed = JSON.parse(detail)
+          expect(parsed.at).toBe('invalid-date')
+        })
+
+        it('a BigInt serializes as a string (JSON.stringify cannot serialize a raw BigInt)', () => {
+          const detail = receiptOk({ count: 9007199254740993n })
+          const parsed = JSON.parse(detail)
+          expect(parsed.count).toBe('9007199254740993')
+        })
+
+        it('a circular reference is replaced with "[circular]" instead of throwing/looping forever', () => {
+          const cyclic: Record<string, unknown> = { name: 'cyclic' }
+          cyclic.self = cyclic
+          expect(() => receiptOk({ nested: cyclic })).not.toThrow()
+          const parsed = JSON.parse(receiptOk({ nested: cyclic }))
+          expect(parsed.nested.name).toBe('cyclic')
+          expect(parsed.nested.self).toBe('[circular]')
+        })
+
+        it('a throwing getter is replaced with "[unreadable]" instead of propagating the throw', () => {
+          const landmine: Record<string, unknown> = {}
+          Object.defineProperty(landmine, 'boom', { enumerable: true, get() { throw new Error('nope') } })
+          expect(() => receiptOk({ landmine })).not.toThrow()
+          const parsed = JSON.parse(receiptOk({ landmine }))
+          expect(parsed.landmine.boom).toBe('[unreadable]')
+        })
+
+        it('a non-circular DAG (same object reachable via two different fields) is NOT misreported as circular', () => {
+          const shared = { note: 'shared@example.com' }
+          const detail = receiptOk({ a: shared, b: shared })
+          const parsed = JSON.parse(detail)
+          expect(parsed.a.note).toBe('[redacted-email]')
+          expect(parsed.b.note).toBe('[redacted-email]')
+        })
+      })
+    })
+
     it('FAIL CLOSED: a receipt write failure is treated as a FAILED STEP even when the underlying operation succeeded', async () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
@@ -1209,6 +1379,65 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         if (result.ok) throw new Error('expected failure')
         expect(result.error).toBe('field_too_long')
         expect(result.message).toContain('admin_email')
+      })
+
+      describe('mupot#1520 P1-A: admin_email shape validation', () => {
+        it("refuses 'notanemail' with a named invalid_email error", () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'notanemail' })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
+          expect(result.message).toContain('admin_email')
+        })
+
+        it('refuses an email with no domain dot, and one with two @ signs', () => {
+          for (const bad of ['admin@localhost', 'a@b@c.com', 'admin@.com', '@b.com', 'admin@']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+            expect(result.ok, bad).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error, bad).toBe('invalid_email')
+          }
+        })
+
+        it('accepts a plausible unicode email', () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'hédi.sérvat@exämple.com' })
+          expect(result.ok).toBe(true)
+        })
+
+        it("mupot#1523 item 6: refuses an internal empty domain segment ('a@b..c') — the round-1 check only looked at the FIRST/LAST segment", () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'a@b..c' })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
+        })
+
+        it("mupot#1523 item 6: refuses whitespace INSIDE admin_email (leading/trailing whitespace is already trimmed upstream by validateProvisionRequestBody's own str(), so these are all internal)", () => {
+          for (const bad of ['admin @example.com', 'admin@exa mple.com', 'admin@ex\tample.com', 'admin@example\t.com']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+            expect(result.ok, JSON.stringify(bad)).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error, JSON.stringify(bad)).toBe('invalid_email')
+          }
+        })
+
+        it('mupot#1523 re-run P1: refuses format characters and non-composable combining marks inside admin_email, still accepts NFD accents', () => {
+          for (const mark of ['\u00AD', '\u200B', '\u034F', '\uFE0F', '\u0E31']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: `admin@exa${mark}mple.com` })
+            expect(result.ok).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error).toBe('invalid_email')
+          }
+          const nfd = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'admin@exa\u0308mple.com' })
+          expect(nfd.ok).toBe(true)
+        })
+
+        it('mupot#1523 item 6: refuses a Unicode CONTROL character (category Cc, e.g. NUL) inside admin_email even though it is not `\\s`', () => {
+          const bad = 'admin@ex' + String.fromCharCode(0) + 'ample.com'
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
+        })
       })
 
       it('the HTTP route surfaces field_too_long as 400, not a 500 from downstream string interpolation', async () => {
@@ -1324,6 +1553,21 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(res.status).toBe(400)
     })
 
+    it("mupot#1520 P1-A: rejects admin_email='notanemail' with 400 invalid_email, never reaching provisionSovereignPot", async () => {
+      const { env } = await ownerEnv()
+      const fetchSpy = vi.fn()
+      global.fetch = fetchSpy
+      const res = await potsApp.request('/provision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'http://localhost', cookie: OWNER_COOKIE },
+        body: JSON.stringify({ slug: 'bademail', brand_name: 'Bad Email Co', admin_email: 'notanemail' }),
+      }, env)
+      expect(res.status).toBe(400)
+      const json = await res.json() as { error: string }
+      expect(json.error).toBe('invalid_email')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
     it('a slug already registered to someone else is refused 409, with zero Cloudflare calls', async () => {
       const { env, harness } = await ownerEnv()
       harness.sqlite.exec(
@@ -1356,6 +1600,15 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(outcome.ok).toBe(false)
       if (outcome.ok) throw new Error('expected failure')
       expect(outcome.error).toBe('tenant_mismatch')
+    })
+
+    it("mupot#1520 P1-A: rejects admin_email='notanemail' with 400 invalid_email through the MCP tool too — same validator, same shape", async () => {
+      const auth: AuthContext = { memberId: 'm1', role: 'admin', tenant: 'mumega', capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }] }
+      const outcome = await toolPotProvision.run(auth, { TENANT_SLUG: 'mumega', SECRET_ENV_CF_API_TOKEN: 'x' } as unknown as Env, { slug: 'x', brand_name: 'X', admin_email: 'notanemail' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.status).toBe(400)
+      expect(outcome.error).toBe('invalid_email')
     })
   })
 

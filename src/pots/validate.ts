@@ -49,7 +49,7 @@ export type ValidateProvisionRequestBodyResult =
   | { ok: true; value: ValidatedProvisionRequestBody }
   | {
       ok: false
-      error: 'invalid_body' | 'unexpected_fields' | 'missing_required_fields' | 'field_too_long'
+      error: 'invalid_body' | 'unexpected_fields' | 'missing_required_fields' | 'field_too_long' | 'invalid_email'
       message: string
     }
 
@@ -67,6 +67,40 @@ export type ValidateProvisionRequestBodyResult =
 const MAX_BRAND_NAME_LENGTH = 200
 const MAX_ADMIN_NAME_LENGTH = 200
 const MAX_ADMIN_EMAIL_LENGTH = 254
+
+// mupot#1523 round-2 P1 item 6: whitespace (space, tab, newline, ...) and Unicode control
+// characters (category Cc — the C0/C1 ranges, which `\s` does not fully cover: e.g. NUL
+// U+0000 is Cc but not `\s`) never legitimately appear in a mailbox address; a caller-supplied
+// `admin_email` containing one is refused outright rather than silently accepted and passed
+// through to an inlined seed-batch SQL statement.
+// mupot#1523 scoped re-run P1: format characters (Cf — soft hyphen, ZWSP, ZWJ, bidi
+// marks) and combining marks that do not recompose under NFKC (M — CGJ, variation
+// selectors, non-Latin points) are refused too. The same predicate the receipt redactor
+// strips on; the check runs on the NFKC form so a legitimate NFD `exämple.com` (which
+// recomposes) is still accepted while an invisible-character smuggle is not.
+const EMAIL_WHITESPACE_OR_CONTROL_RE = /[\s\p{Cc}\p{Cf}\p{M}]/u
+
+/** Basic `admin_email` SHAPE validation (mupot#1520 P1-A) — not a full RFC 5322 validator (no
+ *  attempt at quoted local parts, IP-literal domains, or IDNA percent-encoding), just enough
+ *  to close the round-2 gate's proof that `notanemail` sailed through unchallenged all the
+ *  way to an inlined seed-batch SQL statement and a `pot_provision_receipts` row. Requires:
+ *  no whitespace or control character anywhere (mupot#1523 round-2 P1 item 6); exactly one
+ *  '@'; a non-empty local part before it; and a domain after it split on '.' into two or more
+ *  segments, EVERY one of them non-empty (mupot#1523 round-2 P1 item 6 — the round-1 version
+ *  only checked the FIRST and LAST segment via `lastIndexOf('.')`, so `a@b..c` — an empty
+ *  segment in the MIDDLE — slipped through). So `notanemail`, `admin@localhost`,
+ *  `admin@.com`, `admin@b.`, and `a@b..c` are all refused, while `admin@example.com` and a
+ *  unicode domain like `admin@exämple.com` are both accepted. Length is bounded separately,
+ *  above (`MAX_ADMIN_EMAIL_LENGTH`, RFC 5321 §4.5.3.1.3's 254). */
+function isPlausibleEmailShape(email: string): boolean {
+  if (EMAIL_WHITESPACE_OR_CONTROL_RE.test(email.normalize('NFKC'))) return false
+  const at = email.indexOf('@')
+  if (at <= 0 || at !== email.lastIndexOf('@')) return false // exactly one '@', non-empty local part
+  const domain = email.slice(at + 1)
+  const domainSegments = domain.split('.')
+  if (domainSegments.length < 2 || domainSegments.some((segment) => segment.length === 0)) return false
+  return true
+}
 
 /** Validates a raw HTTP JSON body against the EXACT same field set the MCP tool's
  *  `additionalProperties: false` schema already enforces. Any key outside
@@ -112,6 +146,9 @@ export function validateProvisionRequestBody(body: unknown): ValidateProvisionRe
   }
   if (admin_email.length > MAX_ADMIN_EMAIL_LENGTH) {
     return { ok: false, error: 'field_too_long', message: `admin_email must be ${MAX_ADMIN_EMAIL_LENGTH} characters or fewer.` }
+  }
+  if (!isPlausibleEmailShape(admin_email)) {
+    return { ok: false, error: 'invalid_email', message: 'admin_email must look like a real email address (one "@", a non-empty local part, and a domain containing a ".").' }
   }
   if (admin_name !== undefined && admin_name.length > MAX_ADMIN_NAME_LENGTH) {
     return { ok: false, error: 'field_too_long', message: `admin_name must be ${MAX_ADMIN_NAME_LENGTH} characters or fewer.` }
