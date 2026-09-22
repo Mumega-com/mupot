@@ -1,8 +1,8 @@
--- 0163_team_bootstrap_receipts.sql — mupot#1498 (team_bootstrap: one call
+-- 0166_team_bootstrap_receipts.sql — mupot#1498 (team_bootstrap: one call
 -- creates project-prj + squad-sqd + project bot + token claim + Hermes
 -- profile scaffold). NOT applied by this build — branch/schema only, exactly
--- like 0143/0144/0147/0148/0157/0158/0159/0160/0161/0162 before it; a human
--- applies it.
+-- like 0143/0144/0147/0148/0157 through 0165 before it; a human applies it.
+-- (Renumbered from 0163 — 0163/0164/0165 are owned by PRs #1501/#1507/#1509.)
 --
 -- WHY THIS TABLE EXISTS
 --

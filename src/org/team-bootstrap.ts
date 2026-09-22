@@ -14,7 +14,7 @@
 // (type-safe suffixes, mupot#1495), an ADMIN project<->squad edge, an
 // optional `<slug_base>-bot` agent in that squad, plain-squad invites (0156
 // shape) for each named human, and one append-only team_bootstrap_receipts
-// row (migration 0163). The bot's credential claim and the optional
+// row (migration 0166). The bot's credential claim and the optional
 // project_remember seed are NOT written here — see the doc comment below on
 // why, and src/mcp/team-bootstrap.ts for where they happen.
 //
