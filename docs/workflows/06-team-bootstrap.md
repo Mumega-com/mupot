@@ -102,8 +102,15 @@ below for why it was provably unreachable, not merely undertested).
    — this happens *after* stage 3 commits, since neither a token mint nor
    `createMemory().remember()` (used for `seed_memory`, D1 + Vectorize) is a D1 write any
    stage could span.
-5. Two smaller tools this PR also touches, both load-bearing for `team_bootstrap` to be
-   useful:
+5. Three smaller tools this PR also touches (the third, `team_bootstrap_release`, is new —
+   P1-1, round 2 of the successor), all load-bearing for `team_bootstrap` to be useful:
+   - `team_bootstrap_release` (`src/mcp/team-bootstrap.ts`, core in `src/org/
+     team-bootstrap.ts`'s `releaseTeamBootstrapSlugBase`) — org-admin only, bound-agent
+     refused, same gating shape as `team_bootstrap` itself. `{ slug_base }` → 404
+     `project_not_found` if `<slug_base>-prj` doesn't exist, 409 `project_has_edges` if it has
+     ANY `project_squad_access` row, otherwise DELETEs the project and writes a
+     `'released'`-disposition attempt receipt naming it. See "Release path" below for how this
+     composes with `isSlugBaseReserved`.
    - `update_squad` (`src/mcp/provision.ts:2371`) gains a `slug` field — squad-only, must end
      `-sqd` (`isValidSquadSlugUpdate`), `slug_taken` mapped to `409`. **Renaming INTO a name
      team_bootstrap has already reserved for `x` (a `<x>-prj` project exists, or a
@@ -147,18 +154,40 @@ credential for that bot; for the project, the SAME edge and bot, onto a row whos
 
 `findAdoptGround` (`src/org/team-bootstrap.ts`) is the ONE adoptability check for BOTH limbs —
 called once for the resolved project, once for the resolved squad, each independently. Either
-ground is sufficient to adopt:
+ground is sufficient to adopt, and NEITHER holding means someone OTHER than this actor's own
+prior work put the resource here: refused (see the ground rule + refusal-receipt rule below,
+which are one mechanism, not two), UNLESS the caller passes `adopt: true` AND is `isOrgAdmin`
+(checked INSIDE `teamBootstrap` itself, never trusted from a caller whose own floor might one
+day be lowered):
 
 - **(i) a PRIOR team_bootstrap attempt already named this exact resource id for this exact
-  `slug_base`** — a genuine resumed retry, checked against the append-only receipt trail
-  (`team_bootstrap_receipts`), never against the resource's CURRENT state, which whoever
-  controls it can freely change to fake legitimacy.
+  `slug_base`, WITH `disposition IN ('created', 'adopted')`** — a genuine resumed retry,
+  checked against the append-only receipt trail (`team_bootstrap_receipts`), never against the
+  resource's CURRENT state, which whoever controls it can freely change to fake legitimacy.
+  The disposition filter is load-bearing, not decorative (round 2 of this successor, P0 — see
+  below): a `'failed'` receipt is never itself adoption ground, no matter what it names.
 - **(ii) `created_by_member_id` on the row equals the calling actor** — they made it
   themselves, through whatever tool, before this call.
 
-Neither holding means someone OTHER than this actor's own prior work put the resource here —
-refused, UNLESS the caller passes `adopt: true` AND is `isOrgAdmin` (checked INSIDE
-`teamBootstrap` itself, never trusted from a caller whose own floor might one day be lowered).
+**THE GROUND RULE AND THE REFUSAL-RECEIPT RULE ARE ONE MECHANISM (P0, kasra-review adversarial
+gate, round 2 of this successor, 2026-09-22 — "the refusal manufactures its own adoption
+ground").** The first cut of this rewrite's own resolve-both-before-create logic (below) wrote
+a REFUSED resource's id into the SAME `project_id`/`squad_id` columns ground (i) reads for a
+successful attempt — with no disposition filter on that read either. The result: call 1
+refuses a planted squad (no `adopt: true`) and writes a `'failed'`/`'name_resolution'` receipt
+naming it; call 2 — same args, still no `adopt: true`, even a DIFFERENT admin — found that
+exact receipt as `'prior_attempt'` ground and silently ADOPTED the planted squad, wiring an
+ADMIN edge and a mintable bot inside it. Every legacy row with NULL `created_by_member_id` was
+adoptable this way by simply calling twice. The fix has two independently-sufficient parts,
+both schema-enforced (CHECK constraints in migration 0166, not application discipline alone):
+the ground (i) disposition filter above, AND — the refusal-receipt rule — a `'name_resolution'`
+failure's `project_id`/`squad_id` are now ALWAYS `NULL`; the refused resource(s) go in the NEW
+`refused_project_id` / `refused_squad_id` columns instead, which nothing but this row's own
+audit trail ever reads. (The disposition filter alone still matters for a DIFFERENT case: a
+genuine stage-1/stage-2 write failure DOES carry real `project_id`/`squad_id` — the resources
+were legitimately created/adopted before the later write failed — and without the filter, a
+DIFFERENT actor, not the one who created them, could silently resume that failed attempt
+without `adopt: true`; a same-actor resume is unaffected, covered by ground (ii) regardless.)
 
 **"Empty" is NOT a ground, on either limb, deliberately.** PR #1510's round 2 gave the squad
 limb a THIRD ground — zero `agents` rows, zero `capabilities` rows scoped to it — reasoning
@@ -185,16 +214,25 @@ discovered the squad name was taken (finding 4) — an orphan project, ZERO rece
 permanent name reservation, no retry path. The successor finds both `<slug_base>-prj` and
 `<slug_base>-sqd` (read only) and clears both adoptability checks before creating anything. A
 refusal on EITHER limb writes a `'failed'` attempt receipt (`failed_step: 'name_resolution'`,
-`failure_reason: 'project_slug_taken'` or `'squad_slug_taken'`) instead of returning silently
-— `project_id`/`squad_id` on that row are the FOUND resource if one exists, else `NULL`
-(migration 0166 made both columns nullable for exactly this case).
+`failure_reason: 'project_slug_taken'` or `'squad_slug_taken'`) instead of returning silently —
+`project_id`/`squad_id` on that row are ALWAYS `NULL` (this is the refusal-receipt half of the
+P0 fix above, not merely "the limb that wasn't found"); the resource(s) that were found and
+refused are named in `refused_project_id`/`refused_squad_id` instead, which no adoptability
+check ever reads.
 
-**Release path, documented rather than built as a tool.** A `'failed'` receipt now reserves a
-`slug_base` for `update_squad`'s rename floor (`isSlugBaseReserved`) — but only WHILE the
-project it names still exists: `isSlugBaseReserved` joins each candidate receipt against a
-live `projects` row and ignores receipts whose project has been deleted (or that never named
-one). Deleting the orphaned project IS the release action; no dedicated `team_bootstrap_release`
-tool was built.
+**Release path (P1-1): a real, receipted tool, not merely a documented alternative.** A
+`'failed'` receipt reserves a `slug_base` for `update_squad`'s rename floor
+(`isSlugBaseReserved`) only WHILE the project it names still exists — `isSlugBaseReserved`
+joins each candidate receipt against a live `projects` row and ignores receipts whose project
+has been deleted (or that never named one, or is `NULL`). The `team_bootstrap_release` MCP
+tool (org:admin only, bound-agent refused, same floor as `team_bootstrap` itself) is the
+RECEIPTED way to trigger that: `{ slug_base }` → refuses `project_not_found` if the project
+doesn't exist, refuses `project_has_edges` (409) if it has ANY `project_squad_access` row (a
+real, in-use project is never releasable — only a genuine orphan is), otherwise deletes the
+project and writes a `'released'`-disposition attempt receipt naming it. Because the project
+is gone, `isSlugBaseReserved`'s own EXISTS join stops counting every receipt that ever named
+it — the release row included — automatically; no special-casing was needed for the new
+disposition.
 
 **Home fence (P2-4).** A resolved squad with `kind === 'home'` is refused unconditionally —
 `adopt: true` cannot override it, checked before the ordinary adoptability check even runs.
@@ -212,7 +250,7 @@ and the squad were newly made by this attempt; `'existing'` is reserved for the 
 case — both matched a PRIOR team_bootstrap attempt (a true resumed retry) and this call made
 no bot and sent no new invite either. See Receipt(s) written, below.
 
-**`created_via_receipt` (Athena ruling relayed 2026-09-22, mupot seq 5238).** A second,
+**`created_via_elevation_grant` (Athena ruling relayed 2026-09-22, mupot seq 5238).** A second,
 narrower provenance column alongside `created_by_member_id`: `elevation_grants.id` when the
 row was created under a bounded `action:*` elevation rather than standing capability — `NULL`
 in the common case (standing admin) or for a pre-migration row. Stamped at both call sites
@@ -221,7 +259,7 @@ that can create under an elevation (`project_create`'s `action:workspace_project
 provision.ts`, capturing `hasElevatedAction`'s returned `grant.id`); `team_bootstrap`'s own two
 creates and `start-gate`'s `autoCreateWritableSquad` have no elevation path today, so this
 column is simply always `NULL` on rows they create — nothing to stamp, not a gap. A
-`project_slug_taken`/`squad_slug_taken` refusal's `detail` now carries `created_via_receipt`
+`project_slug_taken`/`squad_slug_taken` refusal's `detail` now carries `created_via_elevation_grant`
 plus a `summary` string ("created by member X under elevation receipt Y", or just "created by
 member X" when no elevation was involved, or a plain "no recorded creator" marker for a
 pre-migration row) so an admin sees the FULL provenance picture — including the project's
@@ -255,9 +293,14 @@ lighter lead-proposal variant this PR does not build.
 ## Receipt(s) written
 
 `team_bootstrap_receipts` (migration `0166_team_bootstrap_receipts.sql`): `id, tenant,
-actor_member_id, slug_base, attempt_no, project_id, squad_id, bot_agent_id, disposition,
-failed_step, failure_reason, invited_count, created_at` —
-`UNIQUE(tenant, slug_base, attempt_no)`. Migration `0166` carries the repo's standard "NOT
+actor_member_id, slug_base, attempt_no, project_id, squad_id, refused_project_id,
+refused_squad_id, bot_agent_id, disposition, failed_step, failure_reason, invited_count,
+created_at` — `UNIQUE(tenant, slug_base, attempt_no)`. **`refused_project_id` /
+`refused_squad_id` (round 2 of the successor, P0)** are set ONLY on a `'name_resolution'`
+failure — the resource(s) found and refused that attempt — and schema-CHECK-enforced to be
+NULL everywhere else; `project_id`/`squad_id` are the mirror image, schema-CHECK-enforced NULL
+on every `'name_resolution'` failure and non-NULL everywhere else (including `'released'`,
+where `project_id` names what was deleted and `squad_id` stays NULL). Migration `0166` carries the repo's standard "NOT
 applied by this build — a human applies it" header (same as `0157`-`0165`); confirm
 migration state operationally before assuming this table exists on a given deployment.
 **`project_id` and `squad_id` are nullable as of the successor rewrite** — `NULL` only on a
@@ -289,26 +332,34 @@ adopted — ownership-checked — by the next attempt) is a property of team_boo
 find-or-create reads against the real resource tables, never of this receipt table, which
 merely records what each attempt observed and did.
 
-**`disposition` has FOUR values (redefined by the successor — round 2's `'adopted'` covered
+**`disposition` has FIVE values (redefined by the successor — round 2's `'adopted'` covered
 only the explicit-override branch; this fixes finding 7)**:
 - `'created'` — BOTH the project AND the squad were newly created by THIS attempt. Narrower
   than round 2, which said `'created'` whenever project OR squad OR bot OR any invite was new.
 - `'existing'` — the NARROWEST bucket: both resources matched a PRIOR team_bootstrap attempt
-  (a genuine resumed retry of this team's own prior work), and this call made no bot and sent
-  no new invite either — a true no-op replay.
+  WITH `disposition IN ('created', 'adopted')` (a genuine resumed retry of this team's own
+  prior work — NEVER a `'failed'` receipt, see the P0 fix above), and this call made no bot and
+  sent no new invite either — a true no-op replay.
 - **`'adopted'`** — every other combination: a provenance-owned pre-existing row, an
   `adopt: true` override, a mixed create-one/adopt-the-other attempt, a cross-department
   project reuse, or a start-gate auto-created squad found by slug. An AUDITED or provenance
   outcome, always distinguishable from a genuine no-op replay.
 - `'failed'` — the write phase did not finish this attempt, OR name resolution refused before
   any write. `project_id`/`squad_id` are real, already-committed rows for every disposition
-  EXCEPT a `'name_resolution'` failure, where either can be `NULL` (see above). `failed_step`
-  names where it stopped (`'edge_or_bot'` | `'invite_insert'` | `'name_resolution'`, the last
-  added by the successor); `failure_reason` is a short, STRUCTURAL classification
-  (`'unique_violation'` | `'write_failed'` | `'archived_project'` | `'project_slug_taken'` |
-  `'squad_slug_taken'`, the last two added by the successor) — deliberately NOT the raw driver
-  error text and NEVER an email address or other human PII, so this table stays safe to page
-  through operationally without becoming a second place secrets/PII could leak from.
+  EXCEPT a `'name_resolution'` failure, where BOTH are ALWAYS `NULL` (schema-enforced — see the
+  P0 fix above; refused resources go in `refused_project_id`/`refused_squad_id` instead).
+  `failed_step` names where it stopped (`'edge_or_bot'` | `'invite_insert'` |
+  `'name_resolution'`, the last added by the successor); `failure_reason` is a short,
+  STRUCTURAL classification (`'unique_violation'` | `'write_failed'` | `'archived_project'` |
+  `'project_slug_taken'` | `'squad_slug_taken'`, the last two added by the successor) —
+  deliberately NOT the raw driver error text and NEVER an email address or other human PII, so
+  this table stays safe to page through operationally without becoming a second place
+  secrets/PII could leak from. The `'archived_project'` case now ALSO writes this receipt
+  (round 2, P2) — the one refusal in the entire function that used to write none at all.
+- **`'released'`** (P1-1, new) — an org-admin's `team_bootstrap_release` call deleted the named
+  project after confirming it had zero edges. `squad_id` is NULL (a release touches only the
+  project reservation); `project_id` names the now-deleted project — deliberately, since this
+  row IS its audit trail.
 
 ## What the person sees
 
@@ -391,6 +442,28 @@ is refused `cannot_adopt_home_squad` even with `adopt: true` by org:admin, with 
 receipt written. Both the provenance equality conjunct and the home-fence check are
 mutation-proven load-bearing (each, independently weakened, turns the corresponding test RED).
 
+Round 2 of the successor (the P0 in the ground-rule/refusal-receipt section above) added: the
+squad-squat test now also makes a SECOND call with the same args and no `adopt: true`, proving
+the refused squad's own `'failed'` receipt did not become adoption ground — still refused, zero
+edges/bots, a SECOND independent receipt row (not a rewrite of the first); a legacy squad with
+NULL `created_by_member_id` refused across three repeated calls, then adopted only once
+`adopt: true` is passed; a cross-actor case — Admin 2, no `adopt: true`, cannot silently resume
+Admin 1's genuine stage-2 write failure (Admin 1 themselves still can, via provenance). The
+ground (i) disposition filter is mutation-proven load-bearing by the cross-actor case
+specifically (the two-call/legacy cases still pass even with the filter removed, because the
+refusal-receipt half of the fix — `project_id`/`squad_id` always NULL on a `'name_resolution'`
+failure — is independently sufficient for THOSE two; the filter's OWN, non-redundant
+contribution is the stage-1/stage-2 cross-actor case). A new `describe` block covers
+`team_bootstrap_release` + `isSlugBaseReserved`: reserved while the project exists, released
+(and the name genuinely reusable) after; refuses `project_has_edges` on an in-use project;
+refuses `project_not_found`, an agent-bound principal, and a non-admin; `isSlugBaseReserved`'s
+EXISTS join is mutation-proven load-bearing; a department-admin (real standing, not org-scoped)
+with `adopt: true` is refused 403 on both limbs (refused by the tool's own floor — see Known
+gaps for why the core function's OWN `isOrgAdmin` conjunct on the override cannot be pinned
+separately); `team_bootstrap`'s own two creates are asserted to stamp `created_by_member_id`
+with the acting admin; both `projects` and `squads` immutability triggers are mutation-proven
+load-bearing (deleting/disabling the trigger turns the corresponding UPDATE-throws test red).
+
 `tests/update-squad-tool.test.ts`'s slug-field `describe` blocks — rename, missing-suffix
 rejection, in-department collision, existing-unsuffixed-slug left alone, AND the
 reserved-name-rename requiring department:admin (squad-admin-only → 403; department-admin →
@@ -430,6 +503,26 @@ auto-created squad's `created_by_member_id` is stamped with the start-gate's act
   case; the reservation check errs conservative (refuses a few legitimate renames in the rare
   cross-department name-reuse case) rather than permissive (which is what let the P0 squat
   through in the first place).
+- **Cross-department residual: one project, two ADMIN squads.** `squads.slug` is
+  `UNIQUE(department_id, slug)` but a project is global — the SAME `<x>-prj` can legitimately
+  be adopted (via provenance or `adopt: true`) by TWO separate `team_bootstrap {slug_base:'x',
+  department: D1}` and `{..., department: D2}` calls, each resolving `x-sqd` in a DIFFERENT
+  department. Neither call is individually wrong (each department's squad genuinely doesn't
+  exist yet, or is genuinely owned by that call's actor), but the end state is one project
+  wired to two ADMIN squads (and potentially two bots) in two departments — receipted as
+  attempts 1 and 2 on the same `slug_base`, indistinguishable in the receipt trail from an
+  ordinary rename-retry. Not fixed here: closing it would mean either making `slug_base`
+  resolution department-independent (a bigger structural change to how the squad name is
+  derived) or refusing a second department's adoption of an already-admin-edged project
+  outright — both are scope decisions, not bugs in the fixes above.
+- **`team_bootstrap_release`'s edge check, not an exhaustive bot/human scan.** It refuses when
+  the project has ANY `project_squad_access` row — chosen as a superset gate rather than
+  separately checking for bots/agents/invites: every path that could place a bot or invite
+  under this project goes through an edge first (team_bootstrap's own stage 1 wires the edge
+  in the SAME batch as the bot), so "zero edges" already implies "nothing downstream of an
+  edge exists either." It does NOT release a squad — only the project reservation — since
+  `team_bootstrap` always re-resolves the squad independently by department+slug regardless of
+  what happens to the project.
 - **mupot#1495's own broader sweep is untouched**: `project_create`/`update`,
   `create_squad`, `create_department`, `create_agent`/`update_agent` suffix enforcement, and
   the existing-row backfill migration are explicitly a separate, later PR.

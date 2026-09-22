@@ -57,7 +57,7 @@ export interface CreateProjectOpts {
   createdByMemberId?: string
   /** elevation_grants.id, when this create ran under a bounded action:*
    *  elevation rather than standing capability (migration 0166). */
-  createdViaReceipt?: string
+  createdViaElevationGrant?: string
 }
 
 export interface UpdateProjectInput {
@@ -289,7 +289,7 @@ export async function createProject(
     assigned_squad_id: assignedSquad.value,
     deploy_status: liveUrl.value ? 'healthy' : 'idle',
     created_by_member_id: opts.createdByMemberId ?? null,
-    created_via_receipt: opts.createdViaReceipt ?? null,
+    created_via_elevation_grant: opts.createdViaElevationGrant ?? null,
     created_at: now,
     updated_at: now,
   }
@@ -300,14 +300,14 @@ export async function createProject(
        (id, slug, name, description, goal, status, parent_project_id, target_date,
         cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
         repo_url, worker_name, live_url, assigned_squad_id, deploy_status,
-        created_by_member_id, created_via_receipt, created_at, updated_at)
+        created_by_member_id, created_via_elevation_grant, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       project.id, project.slug, project.name, project.description, project.goal, project.status,
       project.parent_project_id, project.target_date,
       project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
       project.repo_url, project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
-      project.created_by_member_id, project.created_via_receipt, project.created_at, project.updated_at,
+      project.created_by_member_id, project.created_via_elevation_grant, project.created_at, project.updated_at,
     ).run()
     if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   } catch (error) {

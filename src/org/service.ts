@@ -61,7 +61,7 @@ export interface CreateOpts {
   // Same discipline, one level up: the elevation_grants.id that authorized
   // this create, when it ran under a bounded action:* elevation rather than
   // standing capability (migration 0166). Never a request-body field.
-  createdViaReceipt?: string
+  createdViaElevationGrant?: string
 }
 
 const ORG_KINDS: readonly OrgKind[] = ['work', 'home']
@@ -261,7 +261,7 @@ export async function createSquad(
     budget_cap_cents,
     budget_window,
     created_by_member_id: opts.createdByMemberId ?? null,
-    created_via_receipt: opts.createdViaReceipt ?? null,
+    created_via_elevation_grant: opts.createdViaElevationGrant ?? null,
     created_at: new Date().toISOString(),
   }
 
@@ -270,7 +270,7 @@ export async function createSquad(
       `INSERT INTO squads
         (id, department_id, slug, name, charter, kind,
          role, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window,
-         created_by_member_id, created_via_receipt, created_at)
+         created_by_member_id, created_via_elevation_grant, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
@@ -289,7 +289,7 @@ export async function createSquad(
         squad.budget_cap_cents,
         squad.budget_window,
         squad.created_by_member_id,
-        squad.created_via_receipt,
+        squad.created_via_elevation_grant,
         squad.created_at,
       )
       .run()

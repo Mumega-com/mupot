@@ -175,10 +175,10 @@ const toolProjectCreate: ToolSpec = {
     // scope, and an org-scoped grant that expires on its own clock is still
     // strictly narrower than the standing workspace admin it replaces.
     const denied = requireWorkspaceAdmin(auth)
-    // createdViaReceipt: the elevation_grants.id that authorized this create,
+    // createdViaElevationGrant: the elevation_grants.id that authorized this create,
     // when this call ran under a bounded elevation rather than standing
     // workspace admin — null otherwise (stamped alongside created_by_member_id).
-    let createdViaReceipt: string | undefined
+    let createdViaElevationGrant: string | undefined
     if (denied) {
       // action:workspace_project, NOT action:project_lifecycle.
       //
@@ -201,9 +201,9 @@ const toolProjectCreate: ToolSpec = {
           remedy: elevationRemedyMessage(elevated.reason),
         })
       }
-      createdViaReceipt = elevated.grant.id
+      createdViaElevationGrant = elevated.grant.id
     }
-    const result = await createProject(env, args, { createdByMemberId: auth.memberId ?? undefined, createdViaReceipt })
+    const result = await createProject(env, args, { createdByMemberId: auth.memberId ?? undefined, createdViaElevationGrant })
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'created', result.value.id)
     return done({ project: result.value })

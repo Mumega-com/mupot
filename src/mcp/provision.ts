@@ -405,12 +405,12 @@ const toolCreateSquad: ToolSpec = {
     // project_lifecycle on its department may create a squad there for a bounded
     // window, without being handed standing department admin.
     const grants = auth.capabilities ?? []
-    // createdViaReceipt: the elevation_grants.id that authorized this create,
+    // createdViaElevationGrant: the elevation_grants.id that authorized this create,
     // when this call ran under a bounded elevation rather than standing
     // department:admin — null otherwise. Stamped alongside created_by_member_id
     // so a slug_taken refusal (or an adopt:true override) can report "created
     // by member X under elevation receipt Y" rather than just naming the actor.
-    let createdViaReceipt: string | undefined
+    let createdViaElevationGrant: string | undefined
     if (!hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
@@ -424,7 +424,7 @@ const toolCreateSquad: ToolSpec = {
           remedy: elevationRemedyMessage(elevated.reason),
         })
       }
-      createdViaReceipt = elevated.grant.id
+      createdViaElevationGrant = elevated.grant.id
     }
 
     const result = await createSquad(
@@ -442,7 +442,7 @@ const toolCreateSquad: ToolSpec = {
         budget_cap_cents: args.budget_cap_cents,
         budget_window: args.budget_window,
       },
-      { createdByMemberId: auth.memberId ?? undefined, createdViaReceipt },
+      { createdByMemberId: auth.memberId ?? undefined, createdViaElevationGrant },
     )
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {

@@ -18,6 +18,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createElevationRequest, decideElevationRequest } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
+import { isSlugBaseReserved } from '../src/org/team-bootstrap'
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -349,10 +350,29 @@ describe('team_bootstrap — mupot#1498', () => {
 
     const squad = await env.DB.prepare('SELECT 1 FROM squads WHERE slug = ?').bind('batchfail-sqd').first()
     expect(squad).toBeNull()
-    const receipt = await env.DB.prepare('SELECT 1 FROM team_bootstrap_receipts WHERE slug_base = ?')
+    // P2 (kasra-review adversarial gate, 2026-09-22): this refusal used to
+    // write ZERO receipt — the only one in this function that didn't.
+    // Receipted now, same as every other name_resolution refusal, and
+    // project_id is NULL (P0 fix) — the refused project is named in
+    // refused_project_id only, never in a column an adoptability check reads.
+    const receipt = await env.DB.prepare(
+      'SELECT disposition, failed_step, failure_reason, project_id, squad_id, refused_project_id FROM team_bootstrap_receipts WHERE slug_base = ?',
+    )
       .bind('batchfail')
-      .first()
-    expect(receipt).toBeNull()
+      .first<{
+        disposition: string
+        failed_step: string
+        failure_reason: string
+        project_id: string | null
+        squad_id: string | null
+        refused_project_id: string | null
+      }>()
+    expect(receipt?.disposition).toBe('failed')
+    expect(receipt?.failed_step).toBe('name_resolution')
+    expect(receipt?.failure_reason).toBe('archived_project')
+    expect(receipt?.project_id).toBeNull()
+    expect(receipt?.squad_id).toBeNull()
+    expect(receipt?.refused_project_id).toBe('proj-archived')
   })
 
   it('stage-1 (edge+bot) batch failure leaves no edge/bot/invite rows, but IS receipted as failed', async () => {
@@ -680,6 +700,69 @@ describe('team_bootstrap — mupot#1498', () => {
     expect(receiptRows[1].invited_count).toBe(3)
   })
 
+  // ── P0, disposition-filter half (kasra-review adversarial gate, round 2 of
+  //    the successor, 2026-09-22): a 'failed' receipt from a genuine
+  //    stage-2 write failure (NOT a name_resolution refusal — that limb is
+  //    covered by the null-project_id/squad_id half of the same fix, see
+  //    the tests above) still carries REAL project_id/squad_id, because the
+  //    resources genuinely were created/adopted before the write failed.
+  //    Ground (i)'s disposition filter is what stops a DIFFERENT actor —
+  //    not the one who created them, so ground (ii) doesn't apply — from
+  //    silently resuming that failed attempt without adopt:true. ─────────
+  it('a DIFFERENT admin cannot silently resume another admin\'s stage-2 write failure without adopt:true', async () => {
+    harness.sqlite.exec(`INSERT INTO members (id, email, display_name, status, tenant)
+      VALUES ('member-admin-2', 'admin2@pot.test', 'Admin Two', 'active', '${TENANT}')`)
+    const admin2Auth = orgAdminAuth({
+      userId: 'member-admin-2',
+      memberId: 'member-admin-2',
+      email: 'admin2@pot.test',
+      capabilities: [{ member_id: 'member-admin-2', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+
+    const injection = { value: true }
+    const injectedEnv = envWithInjectedInviteFailure(env, 'x@example.com', injection)
+    const first = await invokeTool(
+      orgAdminAuth(), // Admin 1
+      injectedEnv,
+      'team_bootstrap',
+      { slug_base: 'crossresume', name: 'Cross Resume', department: DEPT_ID, humans: [{ email: 'x@example.com', capability: 'member' }] },
+      CTX,
+    )
+    expect(first.ok).toBe(false)
+    if (first.ok) return
+    expect((first.detail as Record<string, unknown>).stage).toBe('invite_insert')
+
+    const project = await env.DB.prepare('SELECT id, created_by_member_id FROM projects WHERE slug = ?')
+      .bind('crossresume-prj')
+      .first<{ id: string; created_by_member_id: string }>()
+    expect(project?.created_by_member_id).toBe(ADMIN_MEMBER_ID) // Admin 1's
+
+    // Admin 2 — a DIFFERENT actor, no adopt:true — must be refused, not
+    // silently hand a resumed, finished team_bootstrap onto Admin 1's
+    // project+squad.
+    injection.value = false
+    const second = await invokeTool(
+      admin2Auth,
+      injectedEnv,
+      'team_bootstrap',
+      { slug_base: 'crossresume', name: 'Cross Resume', department: DEPT_ID, humans: [{ email: 'x@example.com', capability: 'member' }] },
+      CTX,
+    )
+    expect(second.ok).toBe(false)
+    if (second.ok) return
+    expect(second.error).toBe('project_slug_taken')
+
+    // Admin 1 themselves CAN resume — provenance (ground ii) still works.
+    const resumedByOwner = await invokeTool(
+      orgAdminAuth(), // Admin 1 again
+      injectedEnv,
+      'team_bootstrap',
+      { slug_base: 'crossresume', name: 'Cross Resume', department: DEPT_ID, humans: [{ email: 'x@example.com', capability: 'member' }] },
+      CTX,
+    )
+    expect(resumedByOwner.ok).toBe(true)
+  })
+
   // ── P0: adoption without ownership (kasra-review adversarial round-1 gate
   // on PR #1510, same class as #1507's P0-4) ─────────────────────────────────
   it('squad squat: a squad admin cannot pre-name a target squad to steal a future bootstrap\'s ADMIN edge + mintable bot', async () => {
@@ -723,17 +806,107 @@ describe('team_bootstrap — mupot#1498', () => {
     // successor fix: round-2 silently returned with zero receipt, leaving no
     // retry-surface trail; see migration 0166's `name_resolution` step). The
     // project was never created either — both names are resolved and
-    // checked before any create — so project_id on this row is NULL.
+    // checked before any create — so project_id/squad_id on this row are
+    // BOTH NULL (P0 fix, round 2 of the successor: the refused squad goes in
+    // refused_squad_id ONLY, never in squad_id — see below for why).
     const receipt = await env.DB.prepare(
-      'SELECT disposition, failed_step, failure_reason, project_id, squad_id FROM team_bootstrap_receipts WHERE slug_base = ?',
+      'SELECT disposition, failed_step, failure_reason, project_id, squad_id, refused_squad_id FROM team_bootstrap_receipts WHERE slug_base = ?',
     )
       .bind('hijack')
-      .first<{ disposition: string; failed_step: string; failure_reason: string; project_id: string | null; squad_id: string | null }>()
+      .first<{
+        disposition: string
+        failed_step: string
+        failure_reason: string
+        project_id: string | null
+        squad_id: string | null
+        refused_squad_id: string | null
+      }>()
     expect(receipt?.disposition).toBe('failed')
     expect(receipt?.failed_step).toBe('name_resolution')
     expect(receipt?.failure_reason).toBe('squad_slug_taken')
     expect(receipt?.project_id).toBeNull()
-    expect(receipt?.squad_id).toBe('squad-hijack')
+    expect(receipt?.squad_id).toBeNull()
+    expect(receipt?.refused_squad_id).toBe('squad-hijack')
+
+    // P0 (kasra-review adversarial gate, round 2 of the successor,
+    // 2026-09-22): "the refusal manufactures its own adoption ground" — the
+    // 'failed' receipt above must NEVER itself become adoption ground on a
+    // second call. Before the fix, findAdoptGround's prior_attempt check
+    // selected ANY receipt naming squad_id = 'squad-hijack', with no
+    // disposition filter — so THIS retry, same args, still no adopt:true,
+    // silently ADOPTED the attacker's squad instead of refusing again.
+    const second = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'hijack', name: 'Hijack Target', department: DEPT_ID },
+      CTX,
+    )
+    expect(second.ok).toBe(false)
+    if (second.ok) return
+    expect(second.error).toBe('squad_slug_taken')
+
+    // Still zero edges, zero bot — the second call created nothing either.
+    const edgesAfterRetry = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = ?')
+      .bind('squad-hijack')
+      .first<{ n: number }>()
+    expect(edgesAfterRetry?.n).toBe(0)
+    const agentsAfterRetry = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ?')
+      .bind('squad-hijack')
+      .first<{ n: number }>()
+    expect(agentsAfterRetry?.n).toBe(0)
+
+    // A SECOND independent 'failed' receipt — the retry did not somehow
+    // reuse or rewrite the first one (append-only, one row per attempt).
+    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('hijack')
+      .first<{ n: number }>()
+    expect(receiptCount?.n).toBe(2)
+  })
+
+  // ── P0 (kasra-review adversarial gate, round 2 of the successor,
+  //    2026-09-22): a LEGACY row with NULL created_by_member_id (created
+  //    before migration 0166 ever ran) must be refused on EVERY call
+  //    without adopt:true — repeated calls must never accumulate enough
+  //    'failed' receipts to somehow become adoptable. ─────────────────────
+  it('a legacy squad with NULL created_by_member_id is refused on every call, not just the first, without adopt:true', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-legacy', '${DEPT_ID}', 'legacy-sqd', 'Legacy Squad');
+    `)
+    for (let i = 0; i < 3; i++) {
+      const outcome = await invokeTool(
+        orgAdminAuth(),
+        env,
+        'team_bootstrap',
+        { slug_base: 'legacy', name: 'Legacy Team', department: DEPT_ID },
+        CTX,
+      )
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) return
+      expect(outcome.error).toBe('squad_slug_taken')
+    }
+    const edges = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE squad_id = ?')
+      .bind('squad-legacy')
+      .first<{ n: number }>()
+    expect(edges?.n).toBe(0)
+    const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM team_bootstrap_receipts WHERE slug_base = ?')
+      .bind('legacy')
+      .first<{ n: number }>()
+    expect(receiptCount?.n).toBe(3)
+
+    // The SAME org-admin, WITH adopt:true, still succeeds — the override
+    // itself is untouched by this fix.
+    const overridden = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'legacy', name: 'Legacy Team', department: DEPT_ID, adopt: true },
+      CTX,
+    )
+    expect(overridden.ok).toBe(true)
+    if (!overridden.ok) return
+    const result = overridden.result as Record<string, unknown>
+    expect(result.disposition).toBe('adopted')
   })
 
   it('adopt:true + org:admin is an EXPLICIT, RECEIPTED override — disposition \'adopted\', actor recorded', async () => {
@@ -1153,12 +1326,12 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
     expect(planted.ok).toBe(true)
     if (!planted.ok) return
     const plantedProject = planted.result as {
-      project: { id: string; name: string; created_by_member_id: string | null; created_via_receipt: string | null }
+      project: { id: string; name: string; created_by_member_id: string | null; created_via_elevation_grant: string | null }
     }
     expect(plantedProject.project.created_by_member_id).toBe(LEAD_MEMBER_ID)
     // Athena ruling (mupot seq 5238): stamped with the elevation_grants.id
     // that authorized this create, not just the actor.
-    expect(plantedProject.project.created_via_receipt).toBe(grantId)
+    expect(plantedProject.project.created_via_elevation_grant).toBe(grantId)
 
     const outcome = await invokeTool(
       orgAdminAuth(),
@@ -1174,7 +1347,7 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
     const detail = outcome.detail as Record<string, unknown>
     expect(detail.project_id).toBe(plantedProject.project.id)
     expect(detail.created_by_member_id).toBe(LEAD_MEMBER_ID)
-    expect(detail.created_via_receipt).toBe(grantId)
+    expect(detail.created_via_elevation_grant).toBe(grantId)
     expect(detail.summary).toBe(`created by member ${LEAD_MEMBER_ID} under elevation receipt ${grantId}`)
 
     // The planter's own fields survive untouched — never adopted, never
@@ -1211,10 +1384,10 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
     expect(planted.ok).toBe(true)
     if (!planted.ok) return
     const plantedSquad = planted.result as {
-      squad: { id: string; created_by_member_id: string | null; created_via_receipt: string | null }
+      squad: { id: string; created_by_member_id: string | null; created_via_elevation_grant: string | null }
     }
     expect(plantedSquad.squad.created_by_member_id).toBe(LEAD_MEMBER_ID)
-    expect(plantedSquad.squad.created_via_receipt).toBe(grantId)
+    expect(plantedSquad.squad.created_via_elevation_grant).toBe(grantId)
 
     // Confirm it really is EMPTY — the exact ground round-2 wrongly trusted.
     const agentCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM agents WHERE squad_id = ?')
@@ -1241,7 +1414,7 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
     const detail = outcome.detail as Record<string, unknown>
     expect(detail.squad_id).toBe(plantedSquad.squad.id)
     expect(detail.created_by_member_id).toBe(LEAD_MEMBER_ID)
-    expect(detail.created_via_receipt).toBe(grantId)
+    expect(detail.created_via_elevation_grant).toBe(grantId)
     expect(detail.summary).toBe(`created by member ${LEAD_MEMBER_ID} under elevation receipt ${grantId}`)
 
     // P1-A: the project limb was never attempted either — no orphan project
@@ -1285,5 +1458,211 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
       .first<{ disposition: string; failed_step: string }>()
     expect(receipt?.disposition).toBe('failed')
     expect(receipt?.failed_step).toBe('name_resolution')
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROUND 2 OF THE SUCCESSOR — kasra-review adversarial gate on f04105b2,
+// 2026-09-22: team_bootstrap_release (P1-1), the remaining P1-2 pins, and P2
+// (archived-refusal receipt already covered above; immutability triggers
+// here).
+// ═══════════════════════════════════════════════════════════════════════════
+describe('team_bootstrap_release + isSlugBaseReserved (P1-1) — the receipted release path', () => {
+  let harness: SqliteD1Harness
+  let env: Env
+
+  beforeEach(() => {
+    harness = makeHarness()
+    env = makeEnv(harness)
+  })
+
+  it('isSlugBaseReserved: true while the project exists, false once it is released', async () => {
+    expect(await isSlugBaseReserved(env, TENANT, 'releaseme')).toBe(false)
+
+    const created = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'project_create',
+      { slug: 'releaseme-prj', name: 'Release Me' },
+      CTX,
+    )
+    expect(created.ok).toBe(true)
+    expect(await isSlugBaseReserved(env, TENANT, 'releaseme')).toBe(true)
+
+    const released = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap_release',
+      { slug_base: 'releaseme' },
+      CTX,
+    )
+    expect(released.ok).toBe(true)
+    expect(await isSlugBaseReserved(env, TENANT, 'releaseme')).toBe(false)
+
+    // The name is now genuinely free — team_bootstrap can create fresh under it.
+    const fresh = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'releaseme', name: 'Release Me Again', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(fresh.ok).toBe(true)
+  })
+
+  it('team_bootstrap_release refuses a project that has ANY edge — never releases something in use', async () => {
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'inuse', name: 'In Use', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(outcome.ok).toBe(true)
+
+    const released = await invokeTool(orgAdminAuth(), env, 'team_bootstrap_release', { slug_base: 'inuse' }, CTX)
+    expect(released.ok).toBe(false)
+    if (released.ok) return
+    expect(released.error).toBe('project_has_edges')
+    expect(released.status).toBe(409)
+
+    // Untouched.
+    expect(await isSlugBaseReserved(env, TENANT, 'inuse')).toBe(true)
+    const project = await env.DB.prepare("SELECT 1 FROM projects WHERE slug = 'inuse-prj'").first()
+    expect(project).toBeTruthy()
+  })
+
+  it('team_bootstrap_release refuses project_not_found, refuses an agent-bound principal, and requires org:admin', async () => {
+    const notFound = await invokeTool(orgAdminAuth(), env, 'team_bootstrap_release', { slug_base: 'nosuch' }, CTX)
+    expect(notFound.ok).toBe(false)
+    if (!notFound.ok) expect(notFound.error).toBe('project_not_found')
+
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('proj-r1', 'r1-prj', 'R1', 'active')`)
+    const boundAgent = await invokeTool(
+      orgAdminAuth({ boundAgentId: 'agent-x' }),
+      env,
+      'team_bootstrap_release',
+      { slug_base: 'r1' },
+      CTX,
+    )
+    expect(boundAgent.ok).toBe(false)
+    if (!boundAgent.ok) expect(boundAgent.error).toBe('operator_principal_required')
+
+    const nonAdmin = await invokeTool(
+      orgAdminAuth({ capabilities: [] }),
+      env,
+      'team_bootstrap_release',
+      { slug_base: 'r1' },
+      CTX,
+    )
+    expect(nonAdmin.ok).toBe(false)
+    if (!nonAdmin.ok) expect(nonAdmin.status).toBe(403)
+
+    // Still there — neither refusal touched it.
+    const project = await env.DB.prepare("SELECT 1 FROM projects WHERE id = 'proj-r1'").first()
+    expect(project).toBeTruthy()
+  })
+
+  it('MUTATION TARGET: isSlugBaseReserved without the EXISTS join treats every historical receipt as a permanent reservation', async () => {
+    const created = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'project_create',
+      { slug: 'pinme-prj', name: 'Pin Me' },
+      CTX,
+    )
+    expect(created.ok).toBe(true)
+    await invokeTool(orgAdminAuth(), env, 'team_bootstrap_release', { slug_base: 'pinme' }, CTX)
+    // The naive, unmutated code already asserts this is false above (see the
+    // first test in this block) — this test exists specifically so removing
+    // the `AND EXISTS (...)` join from isSlugBaseReserved's SQL (leaving
+    // just `WHERE tenant=? AND slug_base=?`) turns it red: with the join
+    // gone, the 'released' receipt itself (which still names the now-deleted
+    // project's id) would make this return true forever.
+    expect(await isSlugBaseReserved(env, TENANT, 'pinme')).toBe(false)
+  })
+
+  // ── P1-2: `&& isOrgAdmin` on BOTH override branches — a department-admin
+  //    (real admin standing, but NOT org-scoped) passing adopt:true must be
+  //    refused on both the project and squad limb. In practice this is
+  //    refused by team_bootstrap's own ToolSpec floor (hasWorkspaceAdmin)
+  //    before ever reaching the core function's isOrgAdmin check — see
+  //    docs/workflows/06-team-bootstrap.md's Known gaps for why that inner
+  //    check cannot be pinned separately through invokeTool (it is entailed
+  //    by the same floor, the same class as the deleted rank ceiling). This
+  //    test still matters: it proves the override never accidentally
+  //    bypasses the outer floor either. ─────────────────────────────────
+  it('a department-admin (not org-admin) with adopt:true is refused 403 on both the project and squad limb', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-deptadmin', 'deptadmin@pot.test', 'Dept Admin', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-deptadmin', 'member-deptadmin', 'department', '${DEPT_ID}', 'admin');
+      INSERT INTO projects (id, slug, name, status) VALUES ('proj-deptadopt', 'deptadopt-prj', 'Dept Adopt', 'active');
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-deptadopt', '${DEPT_ID}', 'deptadopt-sqd', 'Dept Adopt Squad');
+    `)
+    const deptAdminAuth: AuthContext = {
+      userId: 'member-deptadmin',
+      memberId: 'member-deptadmin',
+      email: 'deptadmin@pot.test',
+      role: 'member',
+      tenant: TENANT,
+      channel: 'workspace',
+      boundAgentId: null,
+      capabilities: [{ member_id: 'member-deptadmin', scope_type: 'department', scope_id: DEPT_ID, capability: 'admin' }],
+    }
+    const outcome = await invokeTool(
+      deptAdminAuth,
+      env,
+      'team_bootstrap',
+      { slug_base: 'deptadopt', name: 'Dept Adopt', department: DEPT_ID, adopt: true },
+      CTX,
+    )
+    expect(outcome.ok).toBe(false)
+    if (outcome.ok) return
+    expect(outcome.status).toBe(403)
+    // Refused at the tool's own floor — never adopted, either limb.
+    const project = await env.DB.prepare('SELECT created_by_member_id FROM projects WHERE id = ?')
+      .bind('proj-deptadopt')
+      .first<{ created_by_member_id: string | null }>()
+    expect(project?.created_by_member_id).toBeNull()
+    const edge = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE project_id = ?')
+      .bind('proj-deptadopt')
+      .first<{ n: number }>()
+    expect(edge?.n).toBe(0)
+  })
+
+  // ── P1-2: team_bootstrap's own two creates stamp created_by_member_id ────
+  it('team_bootstrap\'s own createProject/createSquad calls stamp created_by_member_id with the actor', async () => {
+    const outcome = await invokeTool(
+      orgAdminAuth(),
+      env,
+      'team_bootstrap',
+      { slug_base: 'ownstamp', name: 'Own Stamp', department: DEPT_ID, bot: { enabled: false } },
+      CTX,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    const result = outcome.result as { project: { created_by_member_id: string }; squad: { created_by_member_id: string } }
+    expect(result.project.created_by_member_id).toBe(ADMIN_MEMBER_ID)
+    expect(result.squad.created_by_member_id).toBe(ADMIN_MEMBER_ID)
+  })
+
+  // ── P2: provenance columns are immutable once set ─────────────────────────
+  it('projects.created_by_member_id and created_via_elevation_grant cannot be UPDATEd once set', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, status, created_by_member_id)
+      VALUES ('proj-immutable', 'immutable-prj', 'Immutable', 'active', '${ADMIN_MEMBER_ID}')`)
+    expect(() =>
+      harness.sqlite.exec(`UPDATE projects SET created_by_member_id = 'someone-else' WHERE id = 'proj-immutable'`),
+    ).toThrow(/immutable/)
+    // Other columns remain freely updatable.
+    expect(() => harness.sqlite.exec(`UPDATE projects SET name = 'Renamed' WHERE id = 'proj-immutable'`)).not.toThrow()
+  })
+
+  it('squads.created_by_member_id and created_via_elevation_grant cannot be UPDATEd once set', async () => {
+    harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name, created_by_member_id)
+      VALUES ('squad-immutable', '${DEPT_ID}', 'immutable-sqd', 'Immutable', '${ADMIN_MEMBER_ID}')`)
+    expect(() =>
+      harness.sqlite.exec(`UPDATE squads SET created_by_member_id = 'someone-else' WHERE id = 'squad-immutable'`),
+    ).toThrow(/immutable/)
+    expect(() => harness.sqlite.exec(`UPDATE squads SET name = 'Renamed' WHERE id = 'squad-immutable'`)).not.toThrow()
   })
 })

@@ -148,7 +148,7 @@ function projectFrom(row: DispatchRunRow): Project {
     // Not selected by this routine-run join (migration 0166) — this is a
     // synthetic partial view for routine dispatch, not a full projects row.
     created_by_member_id: null,
-    created_via_receipt: null,
+    created_via_elevation_grant: null,
     created_at: row.project_created_at,
     updated_at: row.project_updated_at,
   }

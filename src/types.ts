@@ -362,7 +362,7 @@ export interface Squad {
    * No FK — see migration 0166's comment. Stamped via createSquad's opts
    * parameter, never from a request body field.
    */
-  created_via_receipt: string | null
+  created_via_elevation_grant: string | null
   created_at: string
 }
 
@@ -547,7 +547,7 @@ export interface Project {
    * No FK — see migration 0166's comment. Stamped via createProject's opts
    * parameter, never from a request body field.
    */
-  created_via_receipt: string | null
+  created_via_elevation_grant: string | null
   created_at: string
   updated_at: string
 }

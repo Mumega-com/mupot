@@ -18,9 +18,11 @@ import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 import {
   teamBootstrap,
   isValidSlugBase,
+  releaseTeamBootstrapSlugBase,
   type TeamBootstrapInput,
   type TeamBootstrapHumanInput,
   type TeamBootstrapError,
+  type TeamBootstrapReleaseError,
 } from '../org/team-bootstrap'
 import { mintAgentBoundToken } from '../members/service'
 import { createCredentialClaim, type CredentialClaimHandle } from '../auth/credential-claim'
@@ -58,6 +60,12 @@ function errorStatus(error: TeamBootstrapError): 400 | 403 | 404 | 409 {
   if (error === 'squad_slug_taken' || error === 'project_slug_taken') return 409
   if (error === 'project_archived') return 409
   if (error === 'cannot_adopt_home_squad') return 403
+  return 400
+}
+
+function releaseErrorStatus(error: TeamBootstrapReleaseError): 400 | 404 | 409 {
+  if (error === 'project_not_found') return 404
+  if (error === 'project_has_edges') return 409
   return 400
 }
 
@@ -276,5 +284,37 @@ export const toolTeamBootstrap: ToolSpec = {
       credential_claim: credentialClaim,
       hermes_scaffold: scaffold,
     })
+  },
+}
+
+// team_bootstrap_release (P1-1, mupot#1498 successor round 2) — the
+// receipted way to clear a `slug_base` reservation on a genuine orphan
+// project. Thin ToolSpec wrapper, same gating pattern as team_bootstrap
+// itself: org-admin only, bound-agent refused, floor re-checked here rather
+// than trusted from AAGATE alone. See src/org/team-bootstrap.ts's
+// releaseTeamBootstrapSlugBase for the actual logic.
+export const toolTeamBootstrapRelease: ToolSpec = {
+  name: 'team_bootstrap_release',
+  scope: 'org — release a team_bootstrap slug_base reservation',
+  min: 'admin',
+  args: '{ slug_base: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      slug_base: STRING_SCHEMA,
+    },
+    required: ['slug_base'],
+    additionalProperties: false,
+  },
+  async run(auth: AuthContext, env: Env, args) {
+    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+
+    const slugBase = str(args.slug_base)
+    if (!slugBase || !isValidSlugBase(slugBase)) return fail(400, 'invalid_slug_base')
+
+    const result = await releaseTeamBootstrapSlugBase(env, auth, slugBase)
+    if (!result.ok) return fail(releaseErrorStatus(result.error), result.error, result.detail)
+    return done({ released_project_id: result.released_project_id, receipt_id: result.receipt_id })
   },
 }

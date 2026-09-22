@@ -56,14 +56,50 @@
 -- disposition still always carries both, unchanged from round-2: a create or
 -- adopt cannot proceed without knowing both rows).
 --
--- RELEASE PATH (P1-A, documented alternative to a dedicated release tool):
--- `isSlugBaseReserved` (src/org/team-bootstrap.ts, consumed by update_squad's
--- reserved-name rename floor) no longer treats a receipt as reserving a name
--- forever. A receipt reserves `slug_base` only WHILE the project it names
--- still exists (`EXISTS (SELECT 1 FROM projects WHERE id = receipt.project_id)`
--- — a receipt with NULL `project_id`, or one naming a project that has since
--- been deleted, does not reserve). Deleting the orphaned project is therefore
--- the release action; no new MCP tool was added for it.
+-- THE REFUSAL MANUFACTURED ITS OWN ADOPTION GROUND (P0, kasra-review
+-- adversarial gate on THIS rewrite, round 2 of the successor, 2026-09-22).
+-- The first cut of RESOLVE-BOTH-BEFORE-ANY-CREATE above wrote the REFUSED
+-- resource's id into the SAME `project_id`/`squad_id` columns a successful
+-- attempt uses — and ground (i) above ("a prior attempt already named this
+-- exact resource id") selected ANY row naming it, with no disposition
+-- filter. Measured end-to-end: call 1 refuses (planted squad, no
+-- adopt:true) and writes a `'failed'`/`'name_resolution'` receipt naming
+-- that exact squad_id; call 2 — same args, still no `adopt:true`, even a
+-- DIFFERENT admin — found that very receipt as `'prior_attempt'` ground and
+-- silently ADOPTED the planted squad: ADMIN edge + bot wired inside it,
+-- mintable by whoever already controlled it. Every legacy row with NULL
+-- `created_by_member_id` was adoptable this way by simply calling twice.
+-- FIX, two parts: (a) ground (i)'s query now requires
+-- `disposition IN ('created', 'adopted')` — a `'failed'` receipt, whatever
+-- its `failed_step`, is NEVER adoption ground (a genuine same-actor retry
+-- after a stage-1/stage-2 write failure is still covered by ground (ii),
+-- since that actor's own `created_by_member_id` stamp is already on the
+-- row). (b) `project_id`/`squad_id` on a `'name_resolution'` failure are now
+-- ALWAYS `NULL` — the refused resource(s) go in the NEW `refused_project_id`
+-- / `refused_squad_id` columns below instead, which nothing but this row's
+-- own audit trail ever reads. Both fixes are independently sufficient
+-- (either alone closes the hole) and both are schema-enforced by CHECK
+-- constraints below, not left to application discipline alone.
+--
+-- RELEASE PATH (P1-1: promoted from "documented alternative" to a real,
+-- receipted tool — Athena's own upgrade on PR #1516's sibling successor,
+-- 2026-09-22). `isSlugBaseReserved` (src/org/team-bootstrap.ts, consumed by
+-- update_squad's reserved-name rename floor) does not treat a receipt as
+-- reserving a name forever: a receipt reserves `slug_base` only WHILE the
+-- project it names still exists
+-- (`EXISTS (SELECT 1 FROM projects WHERE id = receipt.project_id)` — a
+-- receipt with NULL `project_id`, or one naming a project that has since
+-- been deleted, does not reserve). The `team_bootstrap_release` MCP tool
+-- (org:admin only, bound-agent refused, same as `team_bootstrap` itself) is
+-- the RECEIPTED way to make that happen: it refuses when the named project
+-- has ANY `project_squad_access` edge (a real, in-use project is never
+-- releasable — only a genuine orphan, one that was refused/never wired to
+-- anything, is), otherwise deletes the project row and writes a
+-- `'released'`-disposition attempt receipt naming it. Because the project
+-- is now gone, `isSlugBaseReserved`'s own EXISTS join stops counting EVERY
+-- receipt that ever named it — the release row included — so no
+-- special-casing was needed for the new disposition to compose with the
+-- existing reservation logic.
 --
 -- HOME FENCE (P2-4): team_bootstrap never adopts a `kind='home'` squad, even
 -- with `adopt: true` by an org-admin — checked in the core function on every
@@ -145,10 +181,16 @@
 --     resource it documents is retired, which is precisely when the audit
 --     trail is most needed. Orphan rows are the acceptable price (same
 --     reasoning as 0157's header).
---   * project_id / squad_id are nullable (changed in this rewrite — see
---     RESOLVE-BOTH-BEFORE-ANY-CREATE above): NULL on a `'name_resolution'`
---     failure for whichever limb was never found or created; always non-NULL
---     on every other disposition.
+--   * project_id / squad_id: ALWAYS `NULL` on a `'name_resolution'` failure
+--     (see the P0 fix above — this is now a hard invariant, CHECK-enforced,
+--     never merely "the limb that wasn't found"); always non-NULL on every
+--     other disposition, including `'released'` (project_id names what was
+--     released; squad_id is NULL — a release only touches the project
+--     reservation). `refused_project_id` / `refused_squad_id` are the
+--     mirror image: NULL everywhere EXCEPT a `'name_resolution'` failure,
+--     where they name whichever resource(s) were found-and-refused this
+--     attempt. Nothing but a human reading this table for audit purposes
+--     ever reads the `refused_*` columns — no adoptability check does.
 --   * bot_agent_id is NULL when this attempt declined to create a bot
 --     (`bot.enabled === false`) or never reached the bot step (a
 --     stage-1-or-earlier failure) — never fabricates an agent id that does
@@ -161,8 +203,13 @@
 --     that is not one of the two above — a provenance-owned pre-existing
 --     row, an org-admin's explicit `adopt: true` override, or a mixed
 --     create-one/adopt-the-other attempt — not just the explicit-override
---     branch round-2 limited it to), or `'failed'` (the write phase did not
---     finish this attempt, OR name resolution refused before any write).
+--     branch round-2 limited it to), `'failed'` (the write phase did not
+--     finish this attempt, OR name resolution refused before any write —
+--     see the P0 fix above for why a `'failed'` row can never itself become
+--     adoption ground), or `'released'` (an org-admin's `team_bootstrap_
+--     release` call deleted the named project after confirming it had no
+--     edges — its own attempt row on the same slug_base's attempt_no
+--     sequence, P1-1).
 --     `failed_step` names where it stopped (`'edge_or_bot'` |
 --     `'invite_insert'` | `'name_resolution'`, the last one added in this
 --     rewrite); `failure_reason` is a short, STRUCTURAL classification
@@ -178,7 +225,10 @@
 ALTER TABLE projects ADD COLUMN created_by_member_id TEXT;
 ALTER TABLE squads ADD COLUMN created_by_member_id TEXT;
 
--- created_via_receipt (Athena ruling relayed 2026-09-22, mupot seq 5238):
+-- created_via_elevation_grant (Athena ruling relayed 2026-09-22, mupot seq
+-- 5238; renamed from created_via_receipt in the SAME migration on Athena's
+-- round-2 gate of this rewrite — "receipt" was ambiguous against
+-- team_bootstrap_receipts itself, this column holds an elevation_grants.id):
 -- the elevation_grants.id that authorized this create, when the create ran
 -- under a bounded action:* elevation rather than standing capability — NULL
 -- when created under standing capability (the common case) or before this
@@ -190,10 +240,37 @@ ALTER TABLE squads ADD COLUMN created_by_member_id TEXT;
 -- audit-adjacent tables) — kept consistent rather than special-cased.
 -- Surfaced in team_bootstrap's project_slug_taken/squad_slug_taken refusal
 -- detail and the adopt:true override path so an admin adopting someone
--- else's row sees "created by member X under elevation receipt Y" when that
+-- else's row sees "created by member X under elevation grant Y" when that
 -- applies, not just the bare member id.
-ALTER TABLE projects ADD COLUMN created_via_receipt TEXT;
-ALTER TABLE squads ADD COLUMN created_via_receipt TEXT;
+ALTER TABLE projects ADD COLUMN created_via_elevation_grant TEXT;
+ALTER TABLE squads ADD COLUMN created_via_elevation_grant TEXT;
+
+-- IMMUTABILITY (Athena round-2 gate on this rewrite, P2, 2026-09-22):
+-- created_by_member_id and created_via_elevation_grant are AUTHZ INPUTS —
+-- team_bootstrap's findAdoptGround reads them to decide whether a caller may
+-- adopt a pre-existing row. A column that decides authorization must not be
+-- silently rewritable after the fact (an UPDATE that swaps in a different
+-- member id would let that member retroactively "become" the provenance
+-- owner of a row they never created). BEFORE UPDATE triggers, not a CHECK
+-- (a CHECK cannot compare NEW against OLD): abort if either column's value
+-- CHANGES on an UPDATE — `IS NOT` (not `!=`) so a NULL-to-NULL non-change
+-- never false-positives. Every other project/squad column remains freely
+-- updatable; only these two provenance columns are frozen once set.
+CREATE TRIGGER IF NOT EXISTS projects_provenance_immutable
+  BEFORE UPDATE ON projects
+  WHEN NEW.created_by_member_id IS NOT OLD.created_by_member_id
+    OR NEW.created_via_elevation_grant IS NOT OLD.created_via_elevation_grant
+BEGIN
+  SELECT RAISE(ABORT, 'projects.created_by_member_id / created_via_elevation_grant are immutable once set');
+END;
+
+CREATE TRIGGER IF NOT EXISTS squads_provenance_immutable
+  BEFORE UPDATE ON squads
+  WHEN NEW.created_by_member_id IS NOT OLD.created_by_member_id
+    OR NEW.created_via_elevation_grant IS NOT OLD.created_via_elevation_grant
+BEGIN
+  SELECT RAISE(ABORT, 'squads.created_by_member_id / created_via_elevation_grant are immutable once set');
+END;
 
 CREATE TABLE IF NOT EXISTS team_bootstrap_receipts (
   id                TEXT NOT NULL PRIMARY KEY,
@@ -201,16 +278,37 @@ CREATE TABLE IF NOT EXISTS team_bootstrap_receipts (
   actor_member_id   TEXT NOT NULL,          -- frozen copy of who made THIS attempt
   slug_base         TEXT NOT NULL,
   attempt_no        INTEGER NOT NULL,       -- 1, 2, 3... per (tenant, slug_base)
-  project_id        TEXT,                   -- NULL only on a name_resolution failure that never found/created it
-  squad_id          TEXT,                   -- NULL only on a name_resolution failure that never found/created it
+  -- project_id/squad_id: the REAL, committed resource this attempt used —
+  -- found, adopted, or created. NEVER the resource a 'name_resolution'
+  -- refusal merely LOOKED AT and refused (P0, kasra-review adversarial gate
+  -- on this migration's own rewrite, 2026-09-22: a refused resource named
+  -- here became a false 'prior_attempt' adoption ground on the very next
+  -- call — "the refusal manufactures its own adoption ground"). A refused
+  -- resource is recorded ONLY in refused_project_id/refused_squad_id below.
+  project_id        TEXT,
+  squad_id          TEXT,
+  -- refused_project_id/refused_squad_id: set ONLY on a 'name_resolution'
+  -- failure — the resource(s) that were found and refused THIS attempt.
+  -- Purely informational/audit; NEVER read by findAdoptGround or any other
+  -- adoptability check (that is the entire point of keeping them out of
+  -- project_id/squad_id) — enforced by the CHECK below, not just by
+  -- application code reading the right column.
+  refused_project_id TEXT,
+  refused_squad_id   TEXT,
   bot_agent_id      TEXT,                    -- NULL when no bot exists as of THIS attempt
-  disposition       TEXT NOT NULL CHECK (disposition IN ('created', 'existing', 'adopted', 'failed')),
+  disposition       TEXT NOT NULL CHECK (disposition IN ('created', 'existing', 'adopted', 'failed', 'released')),
   failed_step       TEXT CHECK (failed_step IS NULL OR failed_step IN ('edge_or_bot', 'invite_insert', 'name_resolution')),
   failure_reason    TEXT CHECK (failure_reason IS NULL OR failure_reason IN ('unique_violation', 'write_failed', 'archived_project', 'project_slug_taken', 'squad_slug_taken')),
   invited_count     INTEGER NOT NULL DEFAULT 0,  -- invites inserted BY THIS ATTEMPT ONLY
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (tenant, slug_base, attempt_no),
-  CHECK ((disposition = 'failed') = (failed_step IS NOT NULL))
+  CHECK ((disposition = 'failed') = (failed_step IS NOT NULL)),
+  -- A name_resolution failure NEVER carries a real project_id/squad_id —
+  -- schema-enforced, not just application discipline (the P0 above).
+  CHECK (failed_step IS NOT 'name_resolution' OR (project_id IS NULL AND squad_id IS NULL)),
+  -- refused_project_id/refused_squad_id are populated ONLY on a
+  -- name_resolution failure — nowhere else needs them.
+  CHECK (failed_step IS 'name_resolution' OR (refused_project_id IS NULL AND refused_squad_id IS NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_team_bootstrap_receipts_slug_base

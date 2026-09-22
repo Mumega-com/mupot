@@ -397,7 +397,16 @@ async function findAdoptGround(
   actorMemberId: string,
 ): Promise<AdoptGround | null> {
   const priorAttempt = await env.DB.prepare(
-    `SELECT 1 FROM team_bootstrap_receipts WHERE tenant = ?1 AND slug_base = ?2 AND ${column} = ?3 LIMIT 1`,
+    // disposition IN ('created','adopted') — kasra-review adversarial gate, P0,
+    // 2026-09-22: a 'failed' receipt (in particular a 'name_resolution'
+    // refusal) must NEVER itself become adoption ground on the next call —
+    // "the refusal manufactures its own adoption ground." See migration
+    // 0166's header for the full measured exploit and why a same-actor retry
+    // after a genuine stage-1/stage-2 write failure is still covered (ground
+    // (ii), provenance) without needing 'failed' rows counted here.
+    `SELECT 1 FROM team_bootstrap_receipts
+       WHERE tenant = ?1 AND slug_base = ?2 AND ${column} = ?3 AND disposition IN ('created', 'adopted')
+       LIMIT 1`,
   )
     .bind(tenant, slugBase, resourceId)
     .first()
@@ -414,11 +423,11 @@ async function findAdoptGround(
  * with no recorded creator at all. Never throws on a NULL creator — an admin
  * adopting an ownerless row still gets a legible detail.
  */
-function describeCreator(createdByMemberId: string | null, createdViaReceipt: string | null): string {
+function describeCreator(createdByMemberId: string | null, createdViaElevationGrant: string | null): string {
   if (createdByMemberId === null) return 'created before provenance tracking (no recorded creator)'
-  return createdViaReceipt === null
+  return createdViaElevationGrant === null
     ? `created by member ${createdByMemberId}`
-    : `created by member ${createdByMemberId} under elevation receipt ${createdViaReceipt}`
+    : `created by member ${createdByMemberId} under elevation receipt ${createdViaElevationGrant}`
 }
 
 /**
@@ -475,12 +484,18 @@ interface WriteReceiptInput {
   tenant: string
   actorMemberId: string
   slugBase: string
-  // Nullable ONLY for a 'name_resolution' failure that refused before ever
-  // finding/creating the resource on the OTHER limb (P1-A, migration 0166).
+  // ALWAYS null on a 'name_resolution' failure (P0 fix, migration 0166) —
+  // the refused resource goes in refused* below instead, never here. Always
+  // non-null for every other disposition.
   projectId: string | null
   squadId: string | null
+  // Set ONLY on a 'name_resolution' failure — the resource(s) that were
+  // found and refused. NEVER read by findAdoptGround or any adoptability
+  // check; purely an audit trail (P0 fix, migration 0166).
+  refusedProjectId?: string | null
+  refusedSquadId?: string | null
   botAgentId: string | null
-  disposition: TeamBootstrapDisposition | 'failed'
+  disposition: TeamBootstrapDisposition | 'failed' | 'released'
   invitedCount: number
   failedStep: TeamBootstrapFailedStep | null
   failureReason: TeamBootstrapFailureReason | null
@@ -508,9 +523,10 @@ async function writeReceipt(env: Env, input: WriteReceiptInput): Promise<string>
   const now = new Date().toISOString()
   await env.DB.prepare(
     `INSERT INTO team_bootstrap_receipts
-      (id, tenant, actor_member_id, slug_base, attempt_no, project_id, squad_id, bot_agent_id,
+      (id, tenant, actor_member_id, slug_base, attempt_no, project_id, squad_id,
+       refused_project_id, refused_squad_id, bot_agent_id,
        disposition, invited_count, failed_step, failure_reason, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`,
   )
     .bind(
       id,
@@ -520,6 +536,8 @@ async function writeReceipt(env: Env, input: WriteReceiptInput): Promise<string>
       attemptNo,
       input.projectId,
       input.squadId,
+      input.refusedProjectId ?? null,
+      input.refusedSquadId ?? null,
       input.botAgentId,
       input.disposition,
       input.invitedCount,
@@ -595,7 +613,24 @@ export async function teamBootstrap(
 
   // ── project status checked BEFORE the squad is ever created (P1-1) ───────
   if (existingProject && existingProject.status === 'archived') {
-    return { ok: false, error: 'project_archived', detail: { project_id: existingProject.id } }
+    // P2 (kasra-review adversarial gate, 2026-09-22): this refusal used to
+    // return with ZERO receipt — the only refusal in this function that
+    // didn't. Receipted now, same as every other name_resolution refusal.
+    const receiptId = await writeReceipt(env, {
+      tenant,
+      actorMemberId,
+      slugBase,
+      projectId: null,
+      squadId: null,
+      refusedProjectId: existingProject.id,
+      refusedSquadId: null,
+      botAgentId: null,
+      disposition: 'failed',
+      invitedCount: 0,
+      failedStep: 'name_resolution',
+      failureReason: 'archived_project',
+    })
+    return { ok: false, error: 'project_archived', detail: { project_id: existingProject.id, receipt_id: receiptId } }
   }
 
   let projectGround: AdoptGround | null = null
@@ -620,8 +655,12 @@ export async function teamBootstrap(
           tenant,
           actorMemberId,
           slugBase,
-          projectId: existingProject.id,
+          // P0 fix: NEVER the refused project's id — see migration 0166's
+          // header. The refused resource goes in refusedProjectId only.
+          projectId: null,
           squadId: null,
+          refusedProjectId: existingProject.id,
+          refusedSquadId: null,
           botAgentId: null,
           disposition: 'failed',
           invitedCount: 0,
@@ -634,9 +673,9 @@ export async function teamBootstrap(
           detail: {
             project_id: existingProject.id,
             created_by_member_id: existingProject.created_by_member_id,
-            created_via_receipt: existingProject.created_via_receipt,
+            created_via_elevation_grant: existingProject.created_via_elevation_grant,
             worker_name: existingProject.worker_name,
-            summary: describeCreator(existingProject.created_by_member_id, existingProject.created_via_receipt),
+            summary: describeCreator(existingProject.created_by_member_id, existingProject.created_via_elevation_grant),
             receipt_id: receiptId,
           },
         }
@@ -652,8 +691,10 @@ export async function teamBootstrap(
       tenant,
       actorMemberId,
       slugBase,
-      projectId: existingProject?.id ?? null,
-      squadId: existingSquad.id,
+      projectId: null,
+      squadId: null,
+      refusedProjectId: existingProject?.id ?? null,
+      refusedSquadId: existingSquad.id,
       botAgentId: null,
       disposition: 'failed',
       invitedCount: 0,
@@ -689,8 +730,10 @@ export async function teamBootstrap(
           tenant,
           actorMemberId,
           slugBase,
-          projectId: existingProject?.id ?? null,
-          squadId: existingSquad.id,
+          projectId: null,
+          squadId: null,
+          refusedProjectId: existingProject?.id ?? null,
+          refusedSquadId: existingSquad.id,
           botAgentId: null,
           disposition: 'failed',
           invitedCount: 0,
@@ -704,8 +747,8 @@ export async function teamBootstrap(
             squad_id: existingSquad.id,
             department_id: departmentId,
             created_by_member_id: existingSquad.created_by_member_id,
-            created_via_receipt: existingSquad.created_via_receipt,
-            summary: describeCreator(existingSquad.created_by_member_id, existingSquad.created_via_receipt),
+            created_via_elevation_grant: existingSquad.created_via_elevation_grant,
+            summary: describeCreator(existingSquad.created_by_member_id, existingSquad.created_via_elevation_grant),
             owners,
             receipt_id: receiptId,
           },
@@ -739,7 +782,21 @@ export async function teamBootstrap(
   // Archived check repeated for the narrow race-adopted branch above — the
   // upfront check already covers the common `existingProject` path.
   if (project.status === 'archived') {
-    return { ok: false, error: 'project_archived', detail: { project_id: project.id } }
+    const receiptId = await writeReceipt(env, {
+      tenant,
+      actorMemberId,
+      slugBase,
+      projectId: null,
+      squadId: null,
+      refusedProjectId: project.id,
+      refusedSquadId: null,
+      botAgentId: null,
+      disposition: 'failed',
+      invitedCount: 0,
+      failedStep: 'name_resolution',
+      failureReason: 'archived_project',
+    })
+    return { ok: false, error: 'project_archived', detail: { project_id: project.id, receipt_id: receiptId } }
   }
 
   // ── resolve-or-create SQUAD — its own commit, its own entitlement gate ────
@@ -941,4 +998,93 @@ export async function teamBootstrap(
     duplicate_emails_in_request: [...duplicateEmails],
     receipt_id: receiptId,
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// team_bootstrap_release (P1-1, promoted from a documented alternative to a
+// real receipted tool — Athena's own upgrade on PR #1516's sibling successor,
+// 2026-09-22). The ONLY way to release a `slug_base` reservation once
+// `isSlugBaseReserved` is holding it against a genuinely orphaned project —
+// see migration 0166's header for how this composes with that function
+// without any special-casing. Deliberately NARROW: releases the PROJECT
+// reservation only (a squad, if any exists under this slug_base, is
+// untouched — team_bootstrap itself always resolves the squad independently
+// by department+slug, so a released project does not orphan a squad the way
+// the reverse could). Refuses outright if the project has ANY
+// project_squad_access edge: a project actually wired to a squad is in use,
+// never a candidate for release regardless of how it got there.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type TeamBootstrapReleaseError =
+  | 'invalid_slug_base'
+  | 'actor_required'
+  | 'project_not_found'
+  | 'project_has_edges'
+  | 'release_failed'
+
+export type TeamBootstrapReleaseResult =
+  | { ok: true; released_project_id: string; receipt_id: string }
+  | { ok: false; error: TeamBootstrapReleaseError; detail?: unknown }
+
+/**
+ * Core function — NO authz inside for the org-admin gate itself (same
+ * doctrine as teamBootstrap's own file header: the caller, src/mcp/
+ * team-bootstrap.ts's ToolSpec, gates org-admin and refuses an agent-bound
+ * principal). Boundary guards run here regardless, before any read or write.
+ */
+export async function releaseTeamBootstrapSlugBase(
+  env: Env,
+  auth: AuthContext,
+  slugBase: unknown,
+): Promise<TeamBootstrapReleaseResult> {
+  if (!auth.memberId) return { ok: false, error: 'actor_required' }
+  if (!isValidSlugBase(slugBase)) return { ok: false, error: 'invalid_slug_base' }
+  const tenant = env.TENANT_SLUG
+
+  const project = await findProjectBySlug(env, `${slugBase}${PROJECT_SLUG_SUFFIX}`)
+  if (!project) return { ok: false, error: 'project_not_found' }
+
+  const edgeCount = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM project_squad_access WHERE project_id = ?1`,
+  )
+    .bind(project.id)
+    .first<{ n: number }>()
+  if ((edgeCount?.n ?? 0) > 0) {
+    return {
+      ok: false,
+      error: 'project_has_edges',
+      detail: { project_id: project.id, edge_count: edgeCount?.n ?? 0 },
+    }
+  }
+
+  try {
+    const result = await env.DB.prepare(`DELETE FROM projects WHERE id = ?1`).bind(project.id).run()
+    assertWritten(result, 'team_bootstrap_release.delete_project', 1)
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'release_failed',
+      detail: { reason: err instanceof Error ? err.message : String(err) },
+    }
+  }
+
+  // The 'released' row names the NOW-DELETED project's id — deliberately: it
+  // is the audit trail of what was released, and (per migration 0166's
+  // header) isSlugBaseReserved's own EXISTS join means this row, like every
+  // other receipt that named this project, stops reserving the name the
+  // instant the DELETE above commits. No special-casing needed.
+  const receiptId = await writeReceipt(env, {
+    tenant,
+    actorMemberId: auth.memberId,
+    slugBase,
+    projectId: project.id,
+    squadId: null,
+    botAgentId: null,
+    disposition: 'released',
+    invitedCount: 0,
+    failedStep: null,
+    failureReason: null,
+  })
+
+  return { ok: true, released_project_id: project.id, receipt_id: receiptId }
 }
