@@ -2,8 +2,8 @@
 
 import type { ToolOutcome, ToolSpec } from './index'
 import { isOrgAdmin } from '../auth/capability'
-import { provisionSovereignPot, listSovereignPots } from '../pots/service'
-import type { SovereignPotProvisionInput } from '../pots/types'
+import { provisionSovereignPot, listSovereignPots, PotSlugTakenError } from '../pots/service'
+import { PROVISION_ALLOWED_FIELDS, validateProvisionRequestBody } from '../pots/validate'
 
 function done(result: unknown): ToolOutcome {
   return { ok: true, result }
@@ -17,10 +17,6 @@ function fail(
   return { ok: false, status, error, detail }
 }
 
-function str(val: unknown): string | null {
-  return typeof val === 'string' && val.trim().length > 0 ? val.trim() : null
-}
-
 const STRING_SCHEMA = { type: 'string' }
 
 export const toolPotProvision: ToolSpec = {
@@ -30,14 +26,10 @@ export const toolPotProvision: ToolSpec = {
   args: '{ slug: string, brand_name: string, admin_email: string, admin_name?: string, plan_tier?: string, custom_domain?: string }',
   inputSchema: {
     type: 'object',
-    properties: {
-      slug: STRING_SCHEMA,
-      brand_name: STRING_SCHEMA,
-      admin_email: STRING_SCHEMA,
-      admin_name: STRING_SCHEMA,
-      plan_tier: STRING_SCHEMA,
-      custom_domain: STRING_SCHEMA,
-    },
+    // Built from src/pots/validate.ts's PROVISION_ALLOWED_FIELDS — the SAME list
+    // src/pots/routes.ts's HTTP body validator enforces, so the two surfaces cannot drift
+    // (mupot#1507 round-2 P0-3: they already had, silently, before this fix).
+    properties: Object.fromEntries(PROVISION_ALLOWED_FIELDS.map((field) => [field, STRING_SCHEMA])),
     required: ['slug', 'brand_name', 'admin_email'],
     additionalProperties: false,
   },
@@ -45,13 +37,18 @@ export const toolPotProvision: ToolSpec = {
     if (!isOrgAdmin(auth)) {
       return fail(403, 'forbidden', 'Only org administrators can provision sovereign pots.')
     }
+    // Same operator-principal fence as the HTTP route (src/pots/routes.ts) — a bound-agent
+    // session must never trigger sovereign-pot provisioning on its own weld token.
+    if (auth.boundAgentId) {
+      return fail(403, 'operator_principal_required', 'Provisioning a sovereign pot requires an operator principal, not a bound-agent session.')
+    }
+    if (auth.tenant !== env.TENANT_SLUG) {
+      return fail(403, 'tenant_mismatch', 'Caller tenant does not match this deployment.')
+    }
 
-    const slug = str(args.slug)
-    const brand_name = str(args.brand_name)
-    const admin_email = str(args.admin_email)
-
-    if (!slug || !brand_name || !admin_email) {
-      return fail(400, 'invalid_args', 'Missing required fields: slug, brand_name, admin_email.')
+    const validated = validateProvisionRequestBody(args)
+    if (!validated.ok) {
+      return fail(400, validated.error, validated.message)
     }
 
     if (!env.SECRET_ENV_CF_API_TOKEN) {
@@ -59,16 +56,16 @@ export const toolPotProvision: ToolSpec = {
     }
 
     try {
-      const input: SovereignPotProvisionInput = {
-        slug,
-        brand_name,
-        admin_email,
-        admin_name: str(args.admin_name) || undefined,
-        plan_tier: (str(args.plan_tier) as any) || 'enterprise',
-        custom_domain: str(args.custom_domain) || undefined,
+      const result = await provisionSovereignPot(env, {
+        ...validated.value,
+        // validateProvisionRequestBody keeps plan_tier as a plain trimmed string (it has no
+        // opinion on the SovereignPotTier union); provisionSovereignPot's own
+        // `input.plan_tier || 'enterprise'` fallback treats any non-recognized value the
+        // same as absent, so a narrowing cast here is safe.
+        plan_tier: validated.value.plan_tier as import('../pots/types').SovereignPotTier | undefined,
         minted_by_member_id: auth.memberId,
-      }
-      const result = await provisionSovereignPot(env, input)
+        caller_tenant: auth.tenant,
+      })
       // `done()` reads as success to every caller. When provisioning did not finish, say so
       // in the payload rather than letting the envelope speak for the outcome.
       return done({
@@ -78,6 +75,9 @@ export const toolPotProvision: ToolSpec = {
         ...(result.ok ? {} : { warning: result.incomplete_reason }),
       })
     } catch (err) {
+      if (err instanceof PotSlugTakenError) {
+        return fail(409, err.code, err.message)
+      }
       return fail(500, 'provisioning_failed', err instanceof Error ? err.message : String(err))
     }
   },

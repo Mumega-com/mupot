@@ -17,10 +17,17 @@ export interface SovereignPotProvisionInput {
   plan_tier?: SovereignPotTier
   /** Optional custom domain (CNAME) */
   custom_domain?: string
-  /** Cloudflare API token override (falls back to env.SECRET_ENV_CF_API_TOKEN) */
-  cf_api_token?: string
-  /** Cloudflare Account ID override (falls back to env.SECRET_ENV_CF_ACCOUNT_ID) */
-  account_id?: string
+  // NO `cf_api_token`, `account_id`, or `worker_js_code` field here, deliberately (mupot#1507
+  // round-2 P0-3). Cloudflare credentials come ONLY from env (SECRET_ENV_CF_API_TOKEN /
+  // SECRET_ENV_CF_ACCOUNT_ID); the worker bundle comes ONLY from the R2 artifact or the
+  // separate positional `workerJsCode` argument to `provisionSovereignPot` — a function
+  // parameter, not a property of this object, so it cannot be smuggled in by spreading an
+  // HTTP request body or MCP tool-call args into this type. Removed rather than gated: a
+  // type that cannot EXPRESS the unsafe field cannot be called unsafely by accident. See
+  // src/pots/validate.ts for the shared allow-list both the HTTP route and the MCP tool
+  // enforce on the wire, and `assertNoForbiddenProvisionInputKeys` in service.ts for the
+  // runtime defense-in-depth check (Athena round-2 condition iii) against a caller that
+  // bypasses the type via `as any`.
   /** The interactive caller's own member id (org-admin dashboard/MCP callers only).
    *  When present, freshly-minted credentials are wrapped as a one-time
    *  `CredentialClaimHandle` (src/auth/credential-claim.ts) redeemable ONLY by this
@@ -29,10 +36,12 @@ export interface SovereignPotProvisionInput {
    *  claim fields stay null; see docs/workflows/tenant-provision.md for the gap this
    *  leaves in self-serve checkout, tracked separately from #1285. */
   minted_by_member_id?: string
-  /** Explicit worker bundle for the tenant script (option C in
-   *  docs/workflows/tenant-provision.md) — used when no R2-published bundle is
-   *  configured for this build's RELEASE_SHA. See loadPotWorkerBundle in service.ts. */
-  worker_js_code?: string
+  /** The interactive caller's own tenant (`auth.tenant`) — recorded on every
+   *  `pot_provision_receipts` row this call writes (`actor_tenant`, migration 0164) and
+   *  used to derive/verify `provisioner_tenant` on the `pots` registry row (migration
+   *  0165). Independent of `minted_by_member_id`: even a caller with no interactive member
+   *  identity still has a tenant. */
+  caller_tenant?: string
 }
 
 /** The steps a pot needs before it exists. Named so a partial run can say which ones
