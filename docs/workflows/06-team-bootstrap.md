@@ -33,7 +33,7 @@ lighter lead-proposal variant in this PR (see Known gaps).
 2. AAGATE floor (`spec.min: 'admin'`, enforced centrally in `invokeTool`) + the tool's own
    `hasWorkspaceAdmin` re-check (`src/mcp/team-bootstrap.ts:175`) — never trust the floor
    alone for a sensitive act, same pattern every `provision.ts` tool follows.
-3. `teamBootstrap(env, auth, input)` (core, `src/org/team-bootstrap.ts:188`):
+3. `teamBootstrap(env, auth, input)` (core, `src/org/team-bootstrap.ts:293`):
    - Resolves the department by id or slug (`resolveDepartmentRef`) — 404
      `department_not_found` if missing.
    - Finds `<slug_base>-prj`, or creates it via the existing `createProject`
@@ -41,16 +41,25 @@ lighter lead-proposal variant in this PR (see Known gaps).
    - Finds `<slug_base>-sqd` under that department, or creates it via the existing
      `createSquad` (`src/org/service.ts`) — its own commit, its own entitlement gate
      (`maxSquads`).
-   - Enforces a **per-human rank ceiling** (`src/org/team-bootstrap.ts:259`):
+   - Enforces a **per-human rank ceiling** (`src/org/team-bootstrap.ts:364`):
      `capabilityRank(human.capability) > actorRankOnScopeFor(env, auth, 'squad', squad.id)` →
      `cannot_invite_above_own_rank`. This runs inside the core function, not just at the tool
      boundary — defense in depth against a future elevation path that might lower the tool's
      own floor.
-   - Builds **one `env.DB.batch()`** (`src/org/team-bootstrap.ts:309` onward): an ADMIN
-     `project_squad_access` upsert, the bot agent's two `prepareAgentCreate` statements (only
-     when no agent with slug `<slug_base>-bot` already exists in the squad), one `invites`
-     row per human with no existing live invite into this squad, and the
-     `team_bootstrap_receipts` row (insert or, on replay, an `invited_count` update).
+   - Runs a **three-stage write phase**, deliberately NOT one giant transaction (Athena
+     round-1 gate on PR #1510, 2026-09-22 — see "Receipt(s) written" below for why):
+     1. **Stage 1** (`src/org/team-bootstrap.ts:412`, one `env.DB.batch()`): the ADMIN
+        `project_squad_access` upsert + the bot agent's two `prepareAgentCreate` statements
+        (only when no agent with slug `<slug_base>-bot` already exists in the squad).
+        All-or-nothing.
+     2. **Stage 2** (`src/org/team-bootstrap.ts:450`): one `invites` row per human with no
+        existing live invite into this squad — inserted ONE AT A TIME, not batched. A
+        failure on invite N does not undo invites 1..N-1; the loop stops at the first
+        failure.
+     3. **Stage 3** (`src/org/team-bootstrap.ts:496`, and the shared
+        `writeReceiptOutcome` helper at `src/org/team-bootstrap.ts:246`): the
+        `team_bootstrap_receipts` write — insert on first call, or an update to the SAME
+        row on every later call — attempted whether stages 1-2 succeeded OR failed.
 4. Back in the tool (`src/mcp/team-bootstrap.ts:217` onward): if a bot was freshly created
    this call, mints its token via the existing `mintAgentBoundToken`
    (`src/members/service.ts`) and wraps it in a single-use claim via `createCredentialClaim`
@@ -80,24 +89,42 @@ which routes an agent's proposal through a human `task_verdict`). See Known gaps
 ## Receipt(s) written
 
 `team_bootstrap_receipts` (migration `0166_team_bootstrap_receipts.sql`): `id, tenant,
-actor_member_id, slug_base, project_id, squad_id, bot_agent_id, disposition, invited_count,
-created_at` — `UNIQUE(tenant, slug_base)` (idempotent: a second call for the same team updates
-this same row's `invited_count` rather than inserting a second row), append-only otherwise
-(`BEFORE UPDATE`/`BEFORE DELETE` triggers `RAISE(ABORT, ...)` on every other column).
-`actor_member_id` is a frozen copy of the caller at write time — the same "frozen copy at
-grant time" discipline `project_access_grant_receipts.decided_by` (workflow 3) already uses.
-Migration `0166` carries the repo's standard "NOT applied by this build — a human applies it"
-header (same as `0157`-`0165`); confirm migration state operationally before assuming this
-table exists on a given deployment.
+actor_member_id, slug_base, project_id, squad_id, bot_agent_id, disposition, failed_step,
+failure_reason, invited_count, created_at` — `UNIQUE(tenant, slug_base)`: exactly one row per
+team, forever. Migration `0166` carries the repo's standard "NOT applied by this build — a
+human applies it" header (same as `0157`-`0165`); confirm migration state operationally
+before assuming this table exists on a given deployment.
 
-Atomicity: the ADMIN edge, the bot agent's two statements, every invite insert, and the
-receipt write all land in **one** `env.DB.batch()` call (`src/org/team-bootstrap.ts:309`
-onward) — all or nothing. A trigger abort on any one statement (e.g. the project turns out to
-be archived) rolls the whole batch back; nothing composite is left half-built. The
-project/squad resolution steps that happen *before* the batch are NOT covered by that same
-transaction (each already owns its own commit + entitlement gate) — so a batch failure can
-still leave behind a real, reusable project/squad row, same "adopt, don't fork" doctrine
-`createHomeForMember` (workflow 8) already documents for its own department resolution.
+**`disposition` has three values, not two**: `'created'` (this call did something new),
+`'existing'` (a pure no-op replay), or **`'failed'`** — the write phase (stage 1 or stage 2,
+above) did not finish, but `project_id`/`squad_id` are already real, committed rows.
+`failed_step` names where it stopped (`'edge_or_bot'` | `'invite_insert'`); `failure_reason`
+is a short, STRUCTURAL classification (`'unique_violation'` | `'write_failed'`) —
+deliberately never the raw driver error text, and never an email address or other human
+PII, so this table stays safe to page through operationally.
+
+**An orphan project+squad(+bot)(+some invites) pair is a DESIGNED, resumable resting state,
+not corruption** (Athena round-1 gate on PR #1510, 2026-09-22, which is why the write phase
+above is three stages instead of one transaction). A retry for the same `slug_base` re-runs
+`teamBootstrap` from the top: project/squad/bot are found via the SAME find-or-create reads
+every call already does (see Tool/route sequence) — nothing is created twice — and stage 2's
+per-human dedup (a live-invite check per email) means only the invites that never landed are
+attempted again. `invited_count` accumulates correctly across a failed-then-retried sequence
+because stage 3 always adds `existingReceipt.invited_count` to what THIS call actually
+inserted, not to what it attempted.
+
+**What's actually immutable on this row, enforced by trigger, not convention**:
+`tenant`/`slug_base`/`project_id`/`squad_id`/`created_at` — the row's identity, and (once
+resolved) which concrete resources it is about. Everything else — `disposition`,
+`actor_member_id`, `bot_agent_id`, `invited_count`, `failed_step`, `failure_reason` —
+reflects the LATEST call's outcome by design, INCLUDING a `'failed'` row transitioning to
+`'created'` the moment a retry finishes the job (same row, `id` unchanged — never a second
+row for the same `slug_base`). This is a deliberate break from the append-only-COLUMN idiom
+`project_access_grant_receipts`/`member_home_provisioning_receipts` (workflows 3, 8) use —
+see migration `0166`'s header for the full reasoning. Every write to this table (success OR
+failure) is its own statement (`writeReceiptOutcome`, `src/org/team-bootstrap.ts:246`),
+never sharing a transaction with stage 1's batch or any stage-2 insert — that is precisely
+what lets it survive their failure.
 
 ## What the person sees
 
@@ -124,16 +151,28 @@ created}], credential_claim, hermes_scaffold }`.
 invites/receipt/claim/scaffold all present); idempotency on `slug_base` (no duplicate
 project/squad/bot/invite, `invited_count` accumulates on the same receipt row); the per-human
 rank ceiling (calls `teamBootstrap()` directly with a zero-standing actor); the agent-bound
-refusal; the AAGATE floor refusal; a batch-failure case that forces a trigger abort
-(pre-seeded archived project) and asserts the edge, bot, invite, and receipt are ALL absent
-afterward; `slug_base` suffix validation; invalid human capability; `bot.enabled: false`
-skipping bot creation and credential mint; `department_not_found` before any write.
-`tests/update-squad-tool.test.ts`'s `describe('update_squad — slug field (mupot#1495)')` —
-rename, missing-suffix rejection, in-department collision, existing-unsuffixed-slug left
-alone. `tests/project-start-gate.test.ts` — the new auto-create-squad case (and its
-retry-after-adding-an-agent), a second project reusing the same auto-provisioned department,
-and the pre-existing "a non-writable edge still refuses" case (unchanged, still green — proves
-the auto-create path is scoped to the true "zero edges" case, not "no writable edge").
+refusal; the AAGATE floor refusal; a stage-1 batch-failure case that forces a trigger abort
+(pre-seeded archived project) and asserts the edge, bot, and invite are ALL absent afterward
+BUT the failure is receipted (`disposition:'failed'`, `failed_step:'edge_or_bot'`, no PII in
+`failure_reason`); **a partial-failure retry** ("batch fails on invite 3 of 5") that wraps
+the real D1 harness's `prepare()` to inject a synthetic unique-violation on exactly one
+targeted invite insert (every other statement runs against the genuine SQLite engine —
+`applyAllMigrations()` still governs the whole file, so this is not a hand-rolled D1 mock),
+proving: invites 1-2 persist after the failure, the project/squad/bot/edge are real
+already-committed rows, the failure is receipted with `invited_count:2`, and a retry with the
+injection turned off adopts the existing project/squad/bot (asserted by id equality — a
+broken adopt path turns this test red), completes invites 3-5 with zero duplicates across all
+5 emails, mints no second bot/credential, keeps exactly one ADMIN edge, and updates the SAME
+receipt row (`id` unchanged) from `'failed'` to `'created'` with `failed_step`/
+`failure_reason` cleared; `slug_base` suffix validation; invalid human capability;
+`bot.enabled: false` skipping bot creation and credential mint; `department_not_found` before
+any write. `tests/update-squad-tool.test.ts`'s `describe('update_squad — slug field
+(mupot#1495)')` — rename, missing-suffix rejection, in-department collision,
+existing-unsuffixed-slug left alone. `tests/project-start-gate.test.ts` — the new
+auto-create-squad case (and its retry-after-adding-an-agent), a second project reusing the
+same auto-provisioned department, and the pre-existing "a non-writable edge still refuses"
+case (unchanged, still green — proves the auto-create path is scoped to the true "zero
+edges" case, not "no writable edge").
 
 ## Known gaps
 
