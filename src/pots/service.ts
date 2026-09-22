@@ -933,11 +933,21 @@ export async function verifyPotReachable(
  * is every call site's shape, by construction, not by convention.
  */
 export function receiptOk(fields: Record<string, unknown> = {}): string {
-  return JSON.stringify({ ok: true, ...redactFields(fields) })
+  return boundSerializedDetail({ ok: true, ...redactFields(fields) })
 }
 
 /** Maximum length of a `receiptError` message AFTER redaction — see `redactAndBound`. */
 const RECEIPT_MESSAGE_MAX_LENGTH = 500
+
+/** Maximum length, in characters, of the FULLY SERIALIZED `detail` document — mupot#1520
+ *  P2-B. `RECEIPT_MESSAGE_MAX_LENGTH` bounds one string LEAF; it says nothing about how many
+ *  leaves a call site passes. The round-2 gate proved the gap concretely: 200 fields at
+ *  ~500 chars each (each individually under the per-leaf cap) serialize to a ~101,701-char
+ *  document — comfortably over any per-row cap the receipts table or D1 itself enforces.
+ *  `boundSerializedDetail` is the backstop that caps the WHOLE document regardless of shape,
+ *  so `receiptOk`/`receiptError` remain the only two producers of `detail` and both are safe
+ *  by construction, not by a future call site remembering to keep field counts small. */
+const MAX_DETAIL_SERIALIZED_LENGTH = 64 * 1024
 
 /** A loose but adequate email-shape matcher for REDACTION purposes only (never used as a
  *  validity check) — this replaces the round-2 DB-level `instr(lower(detail), '@') = 0`
@@ -955,47 +965,105 @@ const RECEIPT_MESSAGE_MAX_LENGTH = 500
 // `binding=` as a fake "local part", `cf/meta/llama-3` as a fake "domain", and `.3` as a
 // fake "TLD" — redacting a Workers AI binding name that contains no email at all, the exact
 // false-positive this rule exists to avoid (see the doc comment above). This version
-// requires an RFC-ish local-part character class (`[\w.+-]+` — word characters, dots, plus
-// signs, hyphens; notably NOT '=', ':', or '/') immediately before the '@', so a prefix like
-// `binding=` or a path segment like `meta/llama-3` can never join the match. Verified
-// against both cited examples: `binding=@cf/meta/llama-3.3` has no substring matching
-// `[\w.+-]+@[\w-]+\.[\w.-]+` (no character run ending in '=' or '/' is a `\w`-only run, and
-// there is only one '@' in the whole token); `admin@example.com` matches cleanly.
-const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g
+// requires an RFC-ish local-part character class immediately before the '@' — notably NOT
+// '=', ':', or '/' — so a prefix like `binding=` or `model:` or a path segment like
+// `meta/llama-3` can never join the match. Verified against all three cited examples:
+// `binding=@cf/meta/llama-3.3` and `model:@cf/meta/llama-3.3` have no substring matching the
+// pattern below (no character run ending in '=', ':', or '/' can ever be the local part, and
+// there is only one '@' in either token); `admin@example.com` matches cleanly.
+//
+// mupot#1520 P1-A: the round-2 version of the local/domain character classes (`\w`) is
+// ASCII-only without the `/u` flag — `\w` is exactly `[A-Za-z0-9_]`, so `hédi.sérvat@
+// exämple.com` never matched at all and reached the append-only ledger verbatim. `\p{L}`
+// (any Unicode letter) and `\p{N}` (any Unicode number) replace the ASCII `\w` here, and the
+// `u` flag is required for `\p{...}` classes to be recognized rather than throwing/matching
+// literally. The excluded characters ('=', ':', '/', whitespace) are unaffected by this
+// change — they are still absent from every character class below.
+const EMAIL_RE = /[\p{L}\p{N}_.+-]+@[\p{L}\p{N}_-]+\.[\p{L}\p{N}_.-]+/gu
+
+// mupot#1520 P1-A: Unicode "format" characters (general category Cf) — the soft hyphen
+// (U+00AD), zero-width space (U+200B), zero-width joiner, bidi control marks, and similar —
+// render as INVISIBLE but sit inside what looks like one continuous run of letters. A domain
+// obfuscated as `exa­mple.com` (soft hyphen inside "example") renders identically to
+// `example.com` but silently breaks any greedy letter-run match in the middle, which is
+// exactly the "soft-hyphen domain" bypass proven against the round-2 regex (P1-A). Stripping
+// every Cf character before matching closes this class of bypass rather than the one
+// example — a receipt message has no legitimate need for invisible formatting characters, so
+// dropping them everywhere in the message (not just inside the part that turns out to be an
+// email) is a fine trade for a machine-readable audit ledger.
+const FORMAT_CHAR_RE = /\p{Cf}/gu
 
 /** Redacts anything email-shaped and bounds the length of a string. Applied to EVERY
- *  `receiptError` message AND recursively to every string value in `receiptOk`'s `fields`/
- *  `receiptError`'s `extraFields` (via `redactFields`, mupot#1516 round-2 P2-3) — there is
- *  no path to a `pot_provision_receipts` row that skips it, regardless of which of the two
- *  functions' parameters a string arrives through. */
+ *  `receiptError` message AND recursively to every string value AND object key in
+ *  `receiptOk`'s `fields`/`receiptError`'s `extraFields` (via `redactFields`, mupot#1516
+ *  round-2 P2-3; keys added mupot#1520 P2-B) — there is no path to a `pot_provision_receipts`
+ *  row that skips it, regardless of which of the two functions' parameters a string arrives
+ *  through, or whether it arrives as a value or a key. */
 function redactAndBound(message: string): string {
-  const redacted = message.replace(EMAIL_RE, '[redacted-email]')
+  const redacted = message.replace(FORMAT_CHAR_RE, '').replace(EMAIL_RE, '[redacted-email]')
   return redacted.length > RECEIPT_MESSAGE_MAX_LENGTH
     ? `${redacted.slice(0, RECEIPT_MESSAGE_MAX_LENGTH)}…(truncated)`
     : redacted
 }
 
-/** Recursively applies `redactAndBound` to every STRING leaf reachable from `value` —
- *  through plain objects and arrays — leaving numbers/booleans/null untouched (they cannot
- *  carry an email address or need length-bounding in this schema). mupot#1516 round-2
- *  P2-3: the round-2 version of `receiptOk`/`receiptError` redacted/bounded ONLY the
- *  `message` argument to `receiptError` — `fields`/`extraFields` on BOTH functions were
- *  spread into the JSON verbatim, unredacted and unbounded. Every field on today's actual
- *  call sites happens to be a safe id/count/enum, but the function signatures place no
- *  limit on what a future call site passes there — the redaction guarantee this schema's
- *  own CHECK-constraint history exists to hold must cover the WHOLE detail value, not just
- *  the one argument that happened to be the source of the round-1/round-2 defects. */
+/** Recursively applies `redactAndBound` to every STRING leaf AND every object KEY reachable
+ *  from `value` — through plain objects and arrays — leaving numbers/booleans/null untouched
+ *  (they cannot carry an email address or need length-bounding in this schema) and
+ *  serializing `Date` instances to their ISO string BEFORE the generic object branch can see
+ *  them. mupot#1516 round-2 P2-3: the round-2 version of `receiptOk`/`receiptError`
+ *  redacted/bounded ONLY the `message` argument to `receiptError` — `fields`/`extraFields` on
+ *  BOTH functions were spread into the JSON verbatim, unredacted and unbounded. Every field
+ *  on today's actual call sites happens to be a safe id/count/enum, but the function
+ *  signatures place no limit on what a future call site passes there — the redaction
+ *  guarantee this schema's own CHECK-constraint history exists to hold must cover the WHOLE
+ *  detail value, not just the one argument that happened to be the source of the round-1/
+ *  round-2 defects.
+ *
+ *  mupot#1520 P2-B: two more gaps proven at round-2 on THIS function. (1) Object KEYS were
+ *  never redacted — `receiptOk({'victim@real.com': 1})` emitted the real address verbatim as
+ *  a JSON key, only the (non-existent) string VALUE would have been touched. Every plain
+ *  object branch below now redacts the key the same way it redacts a string value, at every
+ *  depth. (2) A `Date` is `typeof 'object'` and `Object.entries(date)` is `[]` (Date has no
+ *  OWN enumerable properties — its value lives behind `.getTime()`/`.toISOString()`, not an
+ *  enumerable field) — so the pre-1520 generic object branch turned `receiptOk({at: new
+ *  Date()})` into `{"at":{}}`, silently discarding the timestamp. Checking `instanceof Date`
+ *  first and returning `.toISOString()` preserves it as a proper JSON string instead. */
 function redactDeep(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString()
   if (typeof value === 'string') return redactAndBound(value)
   if (Array.isArray(value)) return value.map(redactDeep)
   if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactDeep(v)]))
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [redactAndBound(k), redactDeep(v)]),
+    )
   }
   return value
 }
 
 function redactFields(fields: Record<string, unknown>): Record<string, unknown> {
   return redactDeep(fields) as Record<string, unknown>
+}
+
+/** Serializes `detail` and bounds the RESULT's total length — mupot#1520 P2-B. Per-leaf
+ *  redaction (`redactAndBound`, `RECEIPT_MESSAGE_MAX_LENGTH`) bounds one string at a time; it
+ *  cannot bound how many leaves a call site passes. Rather than truncate the serialized JSON
+ *  STRING directly (slicing a JSON document at an arbitrary byte offset overwhelmingly
+ *  produces invalid JSON, which the 0169 CHECK — `json_valid(detail)` — would then reject,
+ *  turning an oversized receipt into NO receipt at all, the exact `writeProvisionReceipt`
+ *  fail-closed trap `redactAndBound`'s own history exists to avoid), an oversized document is
+ *  replaced wholesale with a small, always-valid fallback that still names what happened and
+ *  by how much it overflowed. */
+function boundSerializedDetail(detail: Record<string, unknown>): string {
+  const json = JSON.stringify(detail)
+  if (json.length <= MAX_DETAIL_SERIALIZED_LENGTH) return json
+  return JSON.stringify({
+    ok: false,
+    error: {
+      class: 'detail_too_large',
+      message: `receipt detail exceeded ${MAX_DETAIL_SERIALIZED_LENGTH} chars after redaction ` +
+        `(${json.length} chars) and was dropped`,
+    },
+  })
 }
 
 /** Builds a failure `detail` — `{ok:false, error:{class, message}}`. `errorClass` is a
@@ -1006,7 +1074,7 @@ function redactFields(fields: Record<string, unknown>): Record<string, unknown> 
  *  `file`/`statement_index`/`kind`) alongside the error, same as `receiptOk`'s fields — and
  *  is redacted the same way. */
 export function receiptError(errorClass: string, message: string, extraFields: Record<string, unknown> = {}): string {
-  return JSON.stringify({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...redactFields(extraFields) })
+  return boundSerializedDetail({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...redactFields(extraFields) })
 }
 
 /** Appends one row to `pot_provision_receipts` (migration 0169) on the ORCHESTRATOR's own

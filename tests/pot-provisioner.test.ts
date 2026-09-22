@@ -1130,6 +1130,69 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(parsedOk.count).toBe(3) // non-string values pass through unchanged
     })
 
+    describe('mupot#1520 P1-A/P2-B: unicode-aware redaction, key redaction, Date serialization, and a whole-document bound', () => {
+      it('P1-A: a unicode email survives to the receipt with the OLD (\\w-only) regex and is redacted with the fix — in the message, a nested field, AND a key', () => {
+        const unicodeEmail = 'hédi.sérvat@exämple.com'
+        // Sanity check pinning the defect this fix closes: `\w` is ASCII-only, so the OLD
+        // regex never matches a unicode local-part/domain at all.
+        expect(unicodeEmail.replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[redacted-email]')).toBe(unicodeEmail)
+
+        const detail = receiptError('sql_error', `contact ${unicodeEmail} for help`, {
+          nested: { hint: `owner is ${unicodeEmail}` },
+          [unicodeEmail]: 'value-under-an-email-shaped-key',
+        })
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+        expect(parsed.nested.hint).toBe('owner is [redacted-email]')
+        expect(parsed).not.toHaveProperty(unicodeEmail)
+        expect(Object.keys(parsed)).toContain('[redacted-email]')
+        expect(parsed['[redacted-email]']).toBe('value-under-an-email-shaped-key')
+      })
+
+      it('P1-A: a soft-hyphen-obfuscated domain (renders identically to a plain domain, invisible character mid-word) is still redacted', () => {
+        const SOFT_HYPHEN = '­'
+        const obfuscated = `hedi@exa${SOFT_HYPHEN}mple.com` // renders as "hedi@example.com"
+        const detail = receiptError('sql_error', `contact ${obfuscated} for help`)
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toBe('contact [redacted-email] for help')
+        expect(parsed.error.message).not.toContain(SOFT_HYPHEN)
+      })
+
+      it('P1-A regression guard: `binding=@cf/meta/llama-3.3` and `model:@cf/meta/llama-3.3` both still survive the unicode-aware regex untouched', () => {
+        const detail = receiptError(
+          'sql_error',
+          'schema statement referenced binding=@cf/meta/llama-3.3 and model:@cf/meta/llama-3.3, neither is an email',
+        )
+        const parsed = JSON.parse(detail)
+        expect(parsed.error.message).toContain('binding=@cf/meta/llama-3.3')
+        expect(parsed.error.message).toContain('model:@cf/meta/llama-3.3')
+        expect(parsed.error.message).not.toContain('[redacted-email]')
+      })
+
+      it('P2-B: a Date value serializes to its ISO string instead of collapsing to {}', () => {
+        const at = new Date('2026-01-01T00:00:00.000Z')
+        const detail = receiptOk({ at })
+        const parsed = JSON.parse(detail)
+        expect(parsed.at).toBe('2026-01-01T00:00:00.000Z')
+      })
+
+      it('P2-B: a 200-field detail (each field ~499 chars, individually under the per-leaf 500-char cap) is bounded as a WHOLE document, not just per-leaf', () => {
+        const fields: Record<string, string> = {}
+        for (let i = 0; i < 200; i++) {
+          fields[`field_${i}`] = 'x'.repeat(499)
+        }
+        const naiveSerializedLength = JSON.stringify({ ok: true, ...fields }).length
+        expect(naiveSerializedLength).toBeGreaterThan(64 * 1024) // proves the scenario actually stresses the bound
+
+        const detail = receiptOk(fields)
+        expect(detail.length).toBeLessThanOrEqual(64 * 1024)
+        expect(() => JSON.parse(detail)).not.toThrow() // the CHECK constraint's json_valid(detail) must still pass
+        const parsed = JSON.parse(detail)
+        expect(parsed.ok).toBe(false)
+        expect(parsed.error.class).toBe('detail_too_large')
+      })
+    })
+
     it('FAIL CLOSED: a receipt write failure is treated as a FAILED STEP even when the underlying operation succeeded', async () => {
       const harness = createSqliteD1()
       applyAllMigrations(harness.sqlite)
@@ -1209,6 +1272,30 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
         if (result.ok) throw new Error('expected failure')
         expect(result.error).toBe('field_too_long')
         expect(result.message).toContain('admin_email')
+      })
+
+      describe('mupot#1520 P1-A: admin_email shape validation', () => {
+        it("refuses 'notanemail' with a named invalid_email error", () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'notanemail' })
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('expected failure')
+          expect(result.error).toBe('invalid_email')
+          expect(result.message).toContain('admin_email')
+        })
+
+        it('refuses an email with no domain dot, and one with two @ signs', () => {
+          for (const bad of ['admin@localhost', 'a@b@c.com', 'admin@.com', '@b.com', 'admin@']) {
+            const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: bad })
+            expect(result.ok, bad).toBe(false)
+            if (result.ok) throw new Error('expected failure')
+            expect(result.error, bad).toBe('invalid_email')
+          }
+        })
+
+        it('accepts a plausible unicode email', () => {
+          const result = validateProvisionRequestBody({ slug: 'gaf', brand_name: 'GAF', admin_email: 'hédi.sérvat@exämple.com' })
+          expect(result.ok).toBe(true)
+        })
       })
 
       it('the HTTP route surfaces field_too_long as 400, not a 500 from downstream string interpolation', async () => {
@@ -1324,6 +1411,21 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(res.status).toBe(400)
     })
 
+    it("mupot#1520 P1-A: rejects admin_email='notanemail' with 400 invalid_email, never reaching provisionSovereignPot", async () => {
+      const { env } = await ownerEnv()
+      const fetchSpy = vi.fn()
+      global.fetch = fetchSpy
+      const res = await potsApp.request('/provision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'http://localhost', cookie: OWNER_COOKIE },
+        body: JSON.stringify({ slug: 'bademail', brand_name: 'Bad Email Co', admin_email: 'notanemail' }),
+      }, env)
+      expect(res.status).toBe(400)
+      const json = await res.json() as { error: string }
+      expect(json.error).toBe('invalid_email')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
     it('a slug already registered to someone else is refused 409, with zero Cloudflare calls', async () => {
       const { env, harness } = await ownerEnv()
       harness.sqlite.exec(
@@ -1356,6 +1458,15 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       expect(outcome.ok).toBe(false)
       if (outcome.ok) throw new Error('expected failure')
       expect(outcome.error).toBe('tenant_mismatch')
+    })
+
+    it("mupot#1520 P1-A: rejects admin_email='notanemail' with 400 invalid_email through the MCP tool too — same validator, same shape", async () => {
+      const auth: AuthContext = { memberId: 'm1', role: 'admin', tenant: 'mumega', capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }] }
+      const outcome = await toolPotProvision.run(auth, { TENANT_SLUG: 'mumega', SECRET_ENV_CF_API_TOKEN: 'x' } as unknown as Env, { slug: 'x', brand_name: 'X', admin_email: 'notanemail' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.status).toBe(400)
+      expect(outcome.error).toBe('invalid_email')
     })
   })
 

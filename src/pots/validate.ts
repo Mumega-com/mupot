@@ -49,7 +49,7 @@ export type ValidateProvisionRequestBodyResult =
   | { ok: true; value: ValidatedProvisionRequestBody }
   | {
       ok: false
-      error: 'invalid_body' | 'unexpected_fields' | 'missing_required_fields' | 'field_too_long'
+      error: 'invalid_body' | 'unexpected_fields' | 'missing_required_fields' | 'field_too_long' | 'invalid_email'
       message: string
     }
 
@@ -67,6 +67,24 @@ export type ValidateProvisionRequestBodyResult =
 const MAX_BRAND_NAME_LENGTH = 200
 const MAX_ADMIN_NAME_LENGTH = 200
 const MAX_ADMIN_EMAIL_LENGTH = 254
+
+/** Basic `admin_email` SHAPE validation (mupot#1520 P1-A) — not a full RFC 5322 validator (no
+ *  attempt at quoted local parts, IP-literal domains, or IDNA percent-encoding), just enough
+ *  to close the round-2 gate's proof that `notanemail` sailed through unchallenged all the
+ *  way to an inlined seed-batch SQL statement and a `pot_provision_receipts` row. Requires
+ *  exactly one '@', a non-empty local part before it, and a domain after it that itself
+ *  contains at least one '.' with a non-empty segment on both sides — so `notanemail`,
+ *  `admin@localhost`, and `admin@.com` are all refused, while `admin@example.com` and a
+ *  unicode domain like `admin@exämple.com` are both accepted. Length is bounded separately,
+ *  above (`MAX_ADMIN_EMAIL_LENGTH`, RFC 5321 §4.5.3.1.3's 254). */
+function isPlausibleEmailShape(email: string): boolean {
+  const at = email.indexOf('@')
+  if (at <= 0 || at !== email.lastIndexOf('@')) return false // exactly one '@', non-empty local part
+  const domain = email.slice(at + 1)
+  const dot = domain.lastIndexOf('.')
+  if (dot <= 0 || dot === domain.length - 1) return false // domain has a '.' with non-empty segments either side
+  return true
+}
 
 /** Validates a raw HTTP JSON body against the EXACT same field set the MCP tool's
  *  `additionalProperties: false` schema already enforces. Any key outside
@@ -112,6 +130,9 @@ export function validateProvisionRequestBody(body: unknown): ValidateProvisionRe
   }
   if (admin_email.length > MAX_ADMIN_EMAIL_LENGTH) {
     return { ok: false, error: 'field_too_long', message: `admin_email must be ${MAX_ADMIN_EMAIL_LENGTH} characters or fewer.` }
+  }
+  if (!isPlausibleEmailShape(admin_email)) {
+    return { ok: false, error: 'invalid_email', message: 'admin_email must look like a real email address (one "@", a non-empty local part, and a domain containing a ".").' }
   }
   if (admin_name !== undefined && admin_name.length > MAX_ADMIN_NAME_LENGTH) {
     return { ok: false, error: 'field_too_long', message: `admin_name must be ${MAX_ADMIN_NAME_LENGTH} characters or fewer.` }
