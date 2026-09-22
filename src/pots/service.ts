@@ -611,15 +611,20 @@ async function readFullSeedIdentityState(
  * a real engine with the real trigger set; Kasra-core should confirm D1 REST honors the
  * same BEGIN/COMMIT semantics live before this ships broadly.
  *
- * A LEAD AGENT'S HOME MEMBER GETS `capability = 'member'`, NEVER anything higher — migration
- * 0071's `agent_member_bindings_home_capability_ceiling` / `agent_home_capability_ceiling_insert`
- * triggers hard-cap ANY member holding an agent binding at `observer`/`member`. An earlier
- * draft of this function granted the home member a `'lead'` capability matching the agent's
- * OWN `role` column — that is two different standing systems (the `agents.role` column is
- * the agent's own operational role; `capabilities` is human/member RBAC) and the schema
- * itself refuses to let them conflate: inserting the binding after a `'lead'` capability
- * grant, or the grant after the binding, both abort under the real chain. `'member'` is the
- * correct, schema-sanctioned floor for an agent's own identity-weld member.
+ * A LEAD AGENT'S HOME MEMBER GETS `capability = 'lead'`, matching the agent's OWN `role`
+ * column. An earlier draft of this function capped it at `'member'`, reasoning from
+ * migration 0071's `agent_member_bindings_home_capability_ceiling` /
+ * `agent_home_capability_ceiling_insert` triggers — which DID hard-cap any member holding
+ * an agent binding at `observer`/`member` when 0071 landed, but migration 0087
+ * (`0087_drop_home_capability_ceiling.sql`) DROPPED all five ceiling triggers on an
+ * explicit Hadi directive (2026-08-09), precisely because the ceiling made `routine_create`
+ * (which requires admin) impossible for any agent and left the whole authority map
+ * single-threaded. Verified empirically against this session's own real-schema test
+ * harness: the exact insert sequence an earlier draft assumed would abort (binding, then a
+ * `'lead'` capability grant on the bound member) succeeds cleanly on the current chain —
+ * `agent_home_capability_ceiling_insert` no longer exists to fire. Capping the seed-seat
+ * agent's own home member below its own operational role would have been an unforced,
+ * factually-wrong restriction sourced from superseded schema history.
  *
  * Idempotent on `adminEmail` (case-insensitively — `lower()` on both sides of the compare,
  * closing a duplicate-org:owner-capability injection an exact-match compare would have let
@@ -718,9 +723,9 @@ export async function seedPotIdentities(
     // MUST precede the seed-seat member_tokens insert below — member_tokens_agent_binding_insert
     // (migration 0071) aborts that insert otherwise. See the function doc comment.
     `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (${lit(input.slug)}, ${lit(leadAgentId)}, ${lit(leadAgentMemberId)}, ${lit(now)});`,
-    // 'member', never 'lead' — the home-capability ceiling triggers (migration 0071) cap
-    // ANY member holding an agent binding at observer/member. See the function doc comment.
-    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'member', ${lit(now)});`,
+    // 'lead', matching the agent's own role — the home-capability ceiling that used to cap
+    // this at observer/member was dropped in migration 0087. See the function doc comment.
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'lead', ${lit(now)});`,
     `INSERT INTO member_tokens (id, member_id, agent_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, ${lit(leadAgentId)}, ${lit(leadAgentTokenHash)}, 'seed-seat', 'workspace', ${lit(now)}, ${lit(input.slug)});`,
     'COMMIT;',
   ].join('\n')
