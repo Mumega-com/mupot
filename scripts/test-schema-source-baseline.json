@@ -12,7 +12,6 @@
     "tests/fixtures/marketing-monitor-intrinsic-poisoning.ts",
     "tests/fleet-agent-liveness.test.ts",
     "tests/flight-meta.test.ts",
-    "tests/inbox-fence-sqlite.test.ts",
     "tests/marketing-monitor-opportunities.test.ts",
     "tests/marketing-monitor-service.test.ts",
     "tests/mcp-addon-tools.test.ts",

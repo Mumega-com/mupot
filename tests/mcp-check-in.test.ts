@@ -188,11 +188,13 @@ describe('MCP check_in tool', () => {
         presence_ttl_sec: 600, // 2 * 300
       })
       expect(fleetUpserts).toHaveLength(1)
-      // upsertPollFleetPresence.bind(agentId, tenant, display, memberId, ttlSec, squadsJson)
-      // — squadsJson is '[]' here since this mock has no squads/agents tables (P1-c is
-      // exercised for real in tests/fleet-agent-liveness.test.ts and
-      // tests/mcp-check-in-poll-presence.test.ts).
-      expect(fleetUpserts[0]).toEqual([AGENT_ID, TENANT, 'Kasra Code', MEMBER_ID, 600, '[]'])
+      // upsertPollFleetPresence.bind(agentId, tenant, display, memberId, ttlSec, squadsJson,
+      // pollHomeSquadSlug) — squadsJson is '[]' and pollHomeSquadSlug is null here since this
+      // mock has no squads/agents tables (P1-c is exercised for real in
+      // tests/fleet-agent-liveness.test.ts and tests/mcp-check-in-poll-presence.test.ts;
+      // P2-a's poll_home_squad_slug tracking is exercised for real in
+      // tests/poll-mode-round3.test.ts).
+      expect(fleetUpserts[0]).toEqual([AGENT_ID, TENANT, 'Kasra Code', MEMBER_ID, 600, '[]', null])
     })
 
     it('clamps an out-of-bounds poll_interval_sec instead of storing it verbatim (bounded TTL derivation)', async () => {
