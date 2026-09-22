@@ -761,7 +761,7 @@ async function readAgentInboxForReader(
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
-                 AND ${leaseAvailableClause('?1')}
+                 AND ${leaseAvailableClause('?1', { allowAttemptHeld: true })}
                  ${seatSql}
                  AND EXISTS (SELECT 1 FROM agent_inbox_fences
                              WHERE tenant = ?2 AND agent_id = ?3
@@ -787,7 +787,7 @@ async function readAgentInboxForReader(
             WHERE seq IN (
               SELECT seq FROM agent_messages
                WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL
-                 AND ${leaseAvailableClause('?1')}
+                 AND ${leaseAvailableClause('?1', { allowAttemptHeld: true })}
                  ${seatSql}
                  AND COALESCE((SELECT mode FROM agent_inbox_fences
                                WHERE tenant = ?2 AND agent_id = ?3), 'bearer_only') = 'bearer_only'
@@ -1159,15 +1159,28 @@ export function bearerFencePredicate(tenantParam: string, agentParam: string): s
  * out" clause: NULL means never leased; a lease at or before `nowParam` has expired. Both
  * timestamps are ISO-8601 UTC with a fixed shape, so lexicographic `<=` IS chronological.
  * Shared by `leaseAgentInbox`'s `leasable` and `readAgentInboxForReader`'s CONSUMING UPDATE
- * (the plain `inbox` tool) so a row currently held under a live lease — whether from a real
- * `inbox_lease` call or from `claimUnleasedForPairSettlement`'s lease-equivalent claim
+ * (the plain `inbox` tool) so a row currently held under a live PLAIN lease — whether from a
+ * real `inbox_lease` call or from `claimUnleasedForPairSettlement`'s lease-equivalent claim
  * (src/tasks/runtime-receipts.ts) — cannot ALSO be handed out through `inbox`. Before this fix
  * `inbox`'s consuming UPDATE checked only `read_at IS NULL`, so a successfully leased-or-
  * pair-settled, still-unacked dispatch was handed straight back out by `inbox` — double
  * processing (the same row executed twice).
+ *
+ * `allowAttemptHeld` (default false): pass `true` ONLY for `inbox`'s own consuming UPDATE. A
+ * row held under a DURABLE ATTEMPT lease (`lease_attempt_id IS NOT NULL`, stamped by
+ * `leaseAgentInboxWithAttempt`) has always remained consumable via the plain `inbox` tool
+ * during that hold — a deliberate, pre-existing, tested reconciliation property (see "never
+ * rolls back a same-time legacy inbox consume when attempt ACK is fenced",
+ * tests/inbox-lease-attempt-ack.test.ts), distinct from the PLAIN-lease double-processing hole
+ * this fix closes (a plain lease/claim always has `lease_attempt_id IS NULL` — see
+ * `leaseAgentInbox`'s main branch and `claimUnleasedForPairSettlement`, neither of which ever
+ * stamps it). `leaseAgentInbox`'s own `leasable` predicate must NEVER get this exception — a
+ * plain lease attempt must not double-lease a row any other lease (attempt or plain) already
+ * holds.
  */
-function leaseAvailableClause(nowParam: string): string {
-  return `(lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})`
+function leaseAvailableClause(nowParam: string, opts: { allowAttemptHeld?: boolean } = {}): string {
+  const base = `(lease_expires_at IS NULL OR lease_expires_at <= ${nowParam})`
+  return opts.allowAttemptHeld ? `(${base} OR lease_attempt_id IS NOT NULL)` : base
 }
 
 async function bearerFenceBlocks(env: Env, tenant: string, agent: string): Promise<boolean> {

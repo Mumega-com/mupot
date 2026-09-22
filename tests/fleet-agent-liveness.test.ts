@@ -59,6 +59,7 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       updated_at TEXT NOT NULL DEFAULT '',
       presence_mode TEXT NOT NULL DEFAULT '',
       presence_ttl_sec INTEGER,
+      poll_home_squad_slug TEXT,
       PRIMARY KEY (tenant, agent_id)
     );
   `)

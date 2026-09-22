@@ -1,36 +1,27 @@
-import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import { readAgentInbox, readVerifiedSignedAgentInbox } from '../src/agents/messages'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
+
+// mupot#1494 round 3 — converted from a hand-written `agent_messages`/`agents`/`members`
+// schema to the real, committed migration chain (tests/helpers/migrations.ts
+// applyAllMigrations). The hand-written fixture was 8 columns short of the real table
+// (missing, among others, `delivery_attempts`/`lease_expires_at`/`dead_lettered_at`/
+// `lease_attempt_id`) — exactly the "hand-rolled fixture lies about the schema" failure
+// mode scripts/check-test-schema-source.mjs exists to catch: this fixture broke the moment
+// production code (leaseAvailableClause) started reading a real column it didn't have.
 
 function fixture() {
   const harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
-    CREATE TABLE members (id TEXT PRIMARY KEY);
-    CREATE TABLE agents (id TEXT PRIMARY KEY);
-    CREATE TABLE agent_messages (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      tenant TEXT NOT NULL,
-      to_agent TEXT NOT NULL,
-      from_agent TEXT NOT NULL,
-      from_member TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      body TEXT NOT NULL,
-      request_id TEXT,
-      in_reply_to TEXT,
-      created_at TEXT NOT NULL,
-      read_at TEXT,
-      project_id TEXT,
-      target_seat TEXT
-    );
-    INSERT INTO members(id) VALUES ('owner');
-    INSERT INTO agents(id) VALUES ('agent-a');
+    INSERT INTO departments (id, slug, name) VALUES ('dept-fence', 'fence', 'Fence Dept');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-fence', 'dept-fence', 'fence', 'Fence Squad');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('agent-a', 'squad-fence', 'agent-a', 'Agent A', 'active');
+    INSERT INTO members (id, display_name, status, tenant) VALUES ('owner', 'Owner', 'active', 'tenant-a');
   `)
-  harness.sqlite.exec(readFileSync(new URL('../migrations/0058_agent_inbox_fences.sql', import.meta.url), 'utf8'))
-  harness.sqlite.exec(readFileSync(new URL('../migrations/0137_agent_message_integrity.sql', import.meta.url), 'utf8'))
   const env = { TENANT_SLUG: 'tenant-a', DB: harness.db } as unknown as Env
   const seed = (id: string) => harness.sqlite.exec(`
     INSERT INTO agent_messages
