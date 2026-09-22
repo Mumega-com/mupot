@@ -1,9 +1,9 @@
 # Human onboarding door
 
-Source: mupot#1436, #1438, #1458 (invite → Google → member + squad). Code cited at
-`origin/main` `3c706069`. Route mounts: `src/index.ts:95` (`/auth` → `authApp`), `:108`
-(`/members` → `membersApp`), `:240` (`/invite` → `inviteApp`, mounted ahead of the dashboard
-catch-all so it bypasses `dashboardApp`'s auth/capability middleware).
+Source: mupot#1436, #1438, #1458, #1504 (invite → Google → member + squad + **home**). Code
+cited at `origin/main` `9b46799c`. Route mounts: `src/index.ts:95` (`/auth` → `authApp`),
+`:108` (`/members` → `membersApp`), `:240` (`/invite` → `inviteApp`, mounted ahead of the
+dashboard catch-all so it bypasses `dashboardApp`'s auth/capability middleware).
 
 ## Trigger
 
@@ -35,17 +35,29 @@ path.
    (`:311`) → INSERT `members` (`:324`) → INSERT `capabilities` (`:335`, scope_type
    squad/department/org — this row IS the squad-membership grant) → (web path skips
    `member_tokens`) → UPDATE `invites.member_id` (`:353`).
-5. On success: plants KV `pending_invite_link:<id>` plus an `HttpOnly` cookie
+5. **(mupot#1504)** Immediately after `acceptInvite` returns `ok:true`, the same handler
+   calls `provisionHomeForMember(c.env, result.value.member_id, 'web')`
+   (`src/dashboard/invite.ts:321`, function at `src/members/service.ts:1206`) — the
+   channel-agnostic home-on-first-contact writer (renamed from the IM-only
+   `provisionHomeOnFirstContact`). Idempotent (a read-only `getMemberHomeSquad` short
+   circuits if a home already exists) and best-effort: any failure is logged
+   (`console.error`) and swallowed, never blocking or rolling back the accept response
+   below. On success it calls `createHomeForMember` (`src/org/service.ts`, unchanged) and
+   writes a `member_home_provisioning_receipts` row with `channel='web'` — see workflow 8
+   for the home-squad isolation invariant this row's target squad is subject to.
+6. On success: plants KV `pending_invite_link:<id>` plus an `HttpOnly` cookie
    `mupot_pending_invite`, redirects to `/auth/login` (`src/dashboard/invite.ts:351-369`).
-6. `GET /auth/login` (`src/auth/index.ts:472-502`) binds the pending-invite cookie into the
+7. `GET /auth/login` (`src/auth/index.ts:472-502`) binds the pending-invite cookie into the
    OAuth `state` (`:482-490`), redirects to Google (`GOOGLE_AUTH`, `:419`).
-7. `GET /auth/callback` (`src/auth/index.ts:537-690`) exchanges the code, fetches the Google
+8. `GET /auth/callback` (`src/auth/index.ts:537-690`) exchanges the code, fetches the Google
    userinfo (`:592-611`), then does link-only invite consumption via
    `decidePendingInviteLink`/`linkAcceptedInviteIdentity` (`:638-677`, logic in
    `src/auth/pending-invite-link.ts:140-193`) → `linkLoginIdentity` writes
    `human_login_identities` (`src/auth/login-identity.ts:86-145`). Falls through to
    `upsertUserByEmail`/`mintSession` (`:683-688`) for the ordinary `users` row regardless.
-8. Later session loads resolve `auth.memberId` identity-first via `resolveHumanMemberId`
+   The callback does NOT touch home provisioning — that already happened at
+   step 5, before the human ever reaches Google.
+9. Later session loads resolve `auth.memberId` identity-first via `resolveHumanMemberId`
    (`src/members/resolve-human-member.ts:65-140`, called from `src/auth/index.ts:1429`),
    preferring a live `human_login_identities` row over email.
 
@@ -80,6 +92,12 @@ flow.
 - `human_login_identities` (`migrations/0143`): `id, tenant, provider, provider_subject,
   verified_email, member_id, linked_by_member_id, created_at, revoked_at`.
 - `member_tokens`: only for the JSON API path, never the web path.
+- **(mupot#1504)** `squads` + `capabilities` (`kind='home'` squad row + the member's own
+  `admin` grant on it, `src/org/service.ts`'s `createHomeForMember`, unchanged by this
+  work) and `member_home_provisioning_receipts` (`migrations/0161`, widened by `0163` to
+  admit `channel='web'` alongside `'im'`): `id, tenant, member_id, squad_id, channel,
+  disposition, created_at` — written ONLY on a successful provisioning attempt
+  (`disposition IN ('created','existing')`); a failure writes nothing.
 
 ## What the person sees
 
@@ -103,21 +121,31 @@ Ask an admin for an invite link."
 `tests/invite-landing-page.test.ts`, `tests/accept-invite-direct.test.ts`,
 `tests/admin-members-invite-link.test.ts`, `tests/dashboard-no-access-page.test.ts`,
 `tests/plain-squad-invite-create.test.ts`, `tests/plain-squad-invite-accept.test.ts`,
-`tests/invite-login-link.test.ts` (Google callback + link-only logic), and
-`tests/journey-new-member.test.ts` (full walk: admin creates squad → invites → invitee
+`tests/invite-login-link.test.ts` (Google callback + link-only logic),
+`tests/home-provisioning-web-accept.test.ts` (mupot#1504: web accept → home + one
+`channel='web'` receipt; a later Telegram bind-existing-member join for the same member is
+idempotent — no second home, no second receipt; an unknown-member provisioning failure
+never throws and writes zero receipts; direct `channel` value coverage for `'web'`/`'im'`),
+and `tests/journey-new-member.test.ts` (full walk: admin creates squad → invites → invitee
 accepts → Google sign-in links identity → MCP OAuth consent seats an agent → task flow —
-steps 1-12, no home-squad step).
+steps 1-12; predates #1504 and still does not itself assert a home squad, though the web
+accept step it drives now provisions one as a side effect).
 
 ## Known gaps
 
-- **Home squad is not wired into this flow.** The catalog's framing ("invite → Google →
-  member + squad + **home**") does not match shipped code: `createHomeForMember`
-  (`src/org/service.ts`) is invoked only from the Telegram/Hermes first-contact handler
-  (`src/im/index.ts:420`, `provisionHomeOnFirstContact`) — there is no call site anywhere in
-  the web invite/Google-login path, and `journey-new-member.test.ts`'s full web-onboarding
-  walk never creates or asserts a home squad. Issue #1472 built the *isolation* invariant for
-  homes (no standing org/department grant reaches `kind='home'`, see the
-  "home squads and admin-in by receipt" workflow doc) but did not add a caller from this door.
+- **(FIXED by mupot#1504)** Home squad is now wired into this flow — see step 5 above and
+  the new `provisionHomeForMember` receipt row. The catalog's original framing ("invite →
+  Google → member + squad + **home**") previously did not match shipped code:
+  `createHomeForMember` (`src/org/service.ts`) was invoked only from the Telegram/Hermes
+  first-contact handler. Issue #1472 built the *isolation* invariant for homes (no standing
+  org/department grant reaches `kind='home'`, see the "home squads and admin-in by receipt"
+  workflow doc); #1504 added the missing web-door caller. Residual: `member_home_
+  provisioning_receipts` has no FK to `members`/`squads` (deliberate, matching 0086/0115/0157
+  — a retirement must never cascade-erase the audit row) and the JSON API's own
+  `POST /invites/:id/accept` (`src/members/index.ts:403`, used by non-browser callers) is
+  NOT one of #1504's two call sites — a member minted through that path alone still gets no
+  home until they touch IM or the browser door, tracked as a follow-up rather than solved
+  here (see the PR body for mupot#1504).
 - #1436: config-flag `onboarding_doors` for tenant `mumega` was still zero rows as of
   2026-09-21 (tracked as **#1456**); the live end-to-end walk with a real second Google
   account (**#1442**) was still pending as of that comment.
