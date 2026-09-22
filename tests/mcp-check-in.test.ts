@@ -22,6 +22,8 @@ function auth(overrides: Partial<AuthContext> = {}): AuthContext {
 
 function makeEnv(opts: { debounced?: boolean; memberRow?: { display_name: string; email: string | null } | null } = {}) {
   const writes: unknown[][] = []
+  const fleetUpserts: unknown[][] = []
+  const fleetTouches: unknown[][] = []
   const kv: { get: string[]; put: Array<{ key: string; value: string; opts: { expirationTtl: number } }> } = {
     get: [],
     put: [],
@@ -52,6 +54,13 @@ function makeEnv(opts: { debounced?: boolean; memberRow?: { display_name: string
               },
               async run() {
                 if (sql.includes('INSERT INTO presence')) writes.push(args)
+                // upsertPollFleetPresence (mupot#1494 establish) vs touchPollFleetPresence
+                // (mupot#1494 refresh-only) — distinct SQL shapes, captured separately so
+                // tests can assert exactly which one fired.
+                if (sql.includes('INSERT INTO fleet_agents')) fleetUpserts.push(args)
+                else if (sql.includes('UPDATE fleet_agents') && sql.includes("presence_mode = 'poll'")) {
+                  fleetTouches.push(args)
+                }
                 return { meta: { changes: 1 } }
               },
               async all() {
@@ -64,7 +73,7 @@ function makeEnv(opts: { debounced?: boolean; memberRow?: { display_name: string
     },
   } as unknown as Env
 
-  return { env, writes, kv }
+  return { env, writes, kv, fleetUpserts, fleetTouches }
 }
 
 describe('MCP check_in tool', () => {
@@ -146,5 +155,104 @@ describe('MCP check_in tool', () => {
 
     expect(res.ok).toBe(false)
     expect(res.error).toBe('not_member_bound')
+  })
+
+  // mupot#1494 — poll-mode presence: a runner with no resident heartbeat daemon declares its
+  // delivery cadence so task_dispatch can route it inbox work without a 180s heartbeat.
+  describe('presence_mode: poll (mupot#1494)', () => {
+    it('establishes a poll-mode fleet row keyed by the caller\'s OWN agent id, and echoes the derived TTL', async () => {
+      const { env, fleetUpserts } = makeEnv()
+
+      const res = await invokeTool(
+        auth(),
+        env,
+        'check_in',
+        { presence_mode: 'poll', poll_interval_sec: 300 },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect(res.result).toMatchObject({
+        ok: true,
+        presence_mode: 'poll',
+        poll_interval_sec: 300,
+        presence_ttl_sec: 600, // 2 * 300
+      })
+      expect(fleetUpserts).toHaveLength(1)
+      // upsertPollFleetPresence.bind(agentId, tenant, display, memberId, ttlSec)
+      expect(fleetUpserts[0]).toEqual([AGENT_ID, TENANT, 'Kasra Code', MEMBER_ID, 600])
+    })
+
+    it('clamps an out-of-bounds poll_interval_sec instead of storing it verbatim (bounded TTL derivation)', async () => {
+      const { env } = makeEnv()
+
+      const tooSmall = await invokeTool(
+        auth(), env, 'check_in', { presence_mode: 'poll', poll_interval_sec: 1 }, 'https://pot.example',
+      )
+      expect(tooSmall.ok).toBe(true)
+      expect(tooSmall.result).toMatchObject({ poll_interval_sec: 60, presence_ttl_sec: 180 })
+
+      const tooLarge = await invokeTool(
+        auth(), env, 'check_in', { presence_mode: 'poll', poll_interval_sec: 999_999 }, 'https://pot.example',
+      )
+      expect(tooLarge.ok).toBe(true)
+      expect(tooLarge.result).toMatchObject({ poll_interval_sec: 3600, presence_ttl_sec: 7200 })
+    })
+
+    it('defaults poll_interval_sec to 300s when omitted', async () => {
+      const { env } = makeEnv()
+
+      const res = await invokeTool(auth(), env, 'check_in', { presence_mode: 'poll' }, 'https://pot.example')
+
+      expect(res.ok).toBe(true)
+      expect(res.result).toMatchObject({ poll_interval_sec: 300, presence_ttl_sec: 600 })
+    })
+
+    it('refuses presence_mode: poll for a caller with no agent-bound credential', async () => {
+      const { env } = makeEnv()
+
+      const res = await invokeTool(
+        auth({ boundAgentId: undefined }),
+        env,
+        'check_in',
+        { presence_mode: 'poll' },
+        'https://pot.example',
+      )
+
+      expect(res.ok).toBe(false)
+      expect(res.error).toBe('invalid_args')
+    })
+
+    it('rejects an unknown presence_mode value (validateArgs does not enforce enum; the tool must)', async () => {
+      const { env } = makeEnv()
+
+      const res = await invokeTool(auth(), env, 'check_in', { presence_mode: 'always-on' }, 'https://pot.example')
+
+      expect(res.ok).toBe(false)
+      expect(res.error).toBe('invalid_args')
+    })
+
+    it('presence_mode: resident does not establish a poll-mode fleet row (resident semantics unchanged)', async () => {
+      const { env, fleetUpserts } = makeEnv()
+
+      const res = await invokeTool(
+        auth(), env, 'check_in', { presence_mode: 'resident' }, 'https://pot.example',
+      )
+
+      expect(res.ok).toBe(true)
+      expect(res.result).not.toHaveProperty('presence_mode')
+      expect(fleetUpserts).toHaveLength(0)
+    })
+
+    it('a plain check_in (no presence_mode) still attempts the cheap poll-touch, never the establishing upsert', async () => {
+      const { env, fleetUpserts, fleetTouches } = makeEnv()
+
+      const res = await invokeTool(auth(), env, 'check_in', { source: 'codex' }, 'https://pot.example')
+
+      expect(res.ok).toBe(true)
+      expect(fleetUpserts).toHaveLength(0)
+      expect(fleetTouches).toHaveLength(1)
+      expect(fleetTouches[0]).toEqual([TENANT, AGENT_ID])
+    })
   })
 })

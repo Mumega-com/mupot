@@ -136,6 +136,96 @@ export function derivePresence(
   return ageSec <= ttlSec ? 'live' : 'stale'
 }
 
+// ── Poll-mode presence (mupot#1494) ─────────────────────────────────────────────────────────
+//
+// A resident runtime keeps `fleet_agents` fresh via a continuous heartbeat daemon (attach-signed
+// / /api/fleet/attach) and is judged live against the ONE global `presenceTtlSec(env)` window.
+// A polling runner (cron, an external orchestrator, a laptop that wakes every N minutes) has no
+// such daemon — it only ever touches mupot when it actually polls. Forcing it into the same
+// 180s-default window would mean it can never be "live" between polls, so `task_dispatch` would
+// never route it an inbox envelope and it can never receive dispatched work (#1494's bug).
+//
+// The fix is a PER-ROW TTL derived from the runner's own declared cadence, set once via
+// check_in(presence_mode:'poll', poll_interval_sec), and a last_reported_at that keeps sliding
+// forward on every subsequent authenticated call that agent makes (touchPollFleetPresence) —
+// so a runner that is faithfully polling on its own declared cadence reads as live continuously,
+// and one that stops (crashes, is retired) correctly decays to stale/dead like any other agent.
+export const POLL_INTERVAL_MIN_SEC = 60
+export const POLL_INTERVAL_MAX_SEC = 3600
+export const DEFAULT_POLL_INTERVAL_SEC = 300
+export const POLL_PRESENCE_MODE = 'poll'
+export const RESIDENT_PRESENCE_MODE = 'resident'
+
+/** Bound a caller-declared poll cadence to [POLL_INTERVAL_MIN_SEC, POLL_INTERVAL_MAX_SEC].
+ *  A missing/non-finite/non-numeric value falls back to DEFAULT_POLL_INTERVAL_SEC — never NaN,
+ *  never unbounded (an unbounded value could either starve dispatch routing at the low end, by
+ *  producing a near-zero TTL that a normal poll cadence can't stay inside, or hide a genuinely
+ *  dead runner for hours at the high end). */
+export function clampPollIntervalSec(v: unknown): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : DEFAULT_POLL_INTERVAL_SEC
+  return Math.min(POLL_INTERVAL_MAX_SEC, Math.max(POLL_INTERVAL_MIN_SEC, Math.round(n)))
+}
+
+/** The per-row presence TTL for a poll-mode agent: 2x its own declared cadence (room for one
+ *  missed/late poll before it reads as stale), floored at DEFAULT_PRESENCE_TTL_SEC so a very
+ *  fast poller (near POLL_INTERVAL_MIN_SEC) doesn't get an unrealistically tight window. */
+export function pollPresenceTtlSec(pollIntervalSec: number): number {
+  return Math.max(DEFAULT_PRESENCE_TTL_SEC, 2 * pollIntervalSec)
+}
+
+/**
+ * upsertPollFleetPresence — the check_in(presence_mode:'poll') write. Keyed by the CALLER'S OWN
+ * `agents.id` (auth.boundAgentId, a uuid) — never a slug — so this is an exact-id match on
+ * `readFleetAgentRow`'s first (unambiguous) lookup and never touches the slug-fallback ambiguity
+ * path a daemon-report or signed-attach row might occupy. Self-scoped by construction: a caller
+ * can only ever address ITS OWN row (there is no `agent_id` argument on check_in), the same
+ * "identity from authentication, never request text" invariant every other self-lane tool in
+ * this file already holds.
+ */
+export async function upsertPollFleetPresence(
+  env: Env,
+  input: { agentId: string; display: string; memberId: string | null; ttlSec: number },
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO fleet_agents
+        (agent_id, tenant, display, runtime, squads, lifecycle, provider_contract, status,
+         reported_by, agent_type, member_id, host, presence_mode, presence_ttl_sec,
+         last_reported_at, updated_at)
+      VALUES (?1, ?2, ?3, 'poll', '[]', 'on_demand', NULL, 'running',
+              ?1, 'generic', ?4, '', 'poll', ?5,
+              datetime('now'), datetime('now'))
+      ON CONFLICT(tenant, agent_id) DO UPDATE SET
+        display           = excluded.display,
+        status            = 'running',
+        member_id         = excluded.member_id,
+        presence_mode     = 'poll',
+        presence_ttl_sec  = excluded.presence_ttl_sec,
+        last_reported_at  = datetime('now'),
+        updated_at        = datetime('now')`,
+  )
+    .bind(input.agentId, env.TENANT_SLUG, input.display, input.memberId, input.ttlSec)
+    .run()
+}
+
+/**
+ * touchPollFleetPresence — the cheap per-call heartbeat for an already-poll-registered agent.
+ * A single indexed UPDATE gated on `presence_mode = 'poll'`, so it is a no-op (0 rows changed)
+ * for every OTHER caller: no fleet row at all, or a resident/signed-attach-owned row (resident
+ * semantics are untouched — this statement never matches one). Fail-soft by design: a presence
+ * touch must never break the real tool call it rides along with.
+ */
+export async function touchPollFleetPresence(env: Env, agentId: string | null | undefined): Promise<void> {
+  if (!agentId) return
+  try {
+    await env.DB.prepare(
+      `UPDATE fleet_agents SET last_reported_at = datetime('now'), updated_at = datetime('now')
+        WHERE tenant = ?1 AND agent_id = ?2 AND presence_mode = 'poll'`,
+    ).bind(env.TENANT_SLUG, agentId).run()
+  } catch {
+    // best-effort — never fail the caller's real request over a presence touch
+  }
+}
+
 export type ReportResult =
   | { ok: true; count: number; skipped?: number }
   | { ok: false; reason: string }
@@ -299,15 +389,28 @@ export async function reportFleetAgents(env: Env, reportedBy: string, agents: un
 //      same effect as scoping the slug match to the agent's own squad — agents.slug's actual
 //      invariant is UNIQUE(squad_id, slug), so "unique tenant-wide" is the necessary and
 //      sufficient condition for a bare slug to unambiguously identify one specific agent.
+export interface FleetAgentRowIdentity {
+  agent_id: string
+  runtime: string | null
+  status: string | null
+  last_reported_at: string | null
+  /** '' (legacy rows, migration default) | 'poll' | 'resident'. See "Poll-mode presence" above. */
+  presence_mode?: string | null
+  /** Per-row TTL override (seconds), set by check_in(presence_mode:'poll'). null means "use the
+   *  global presenceTtlSec(env) window" — the pre-#1494, resident-daemon behavior, unchanged. */
+  presence_ttl_sec?: number | null
+}
+
 export async function readFleetAgentRow(
   env: Env,
   agentId: string,
-): Promise<{ agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null } | null> {
-  type Row = { agent_id: string; runtime: string | null; status: string | null; last_reported_at: string | null }
+): Promise<FleetAgentRowIdentity | null> {
+  type Row = FleetAgentRowIdentity
 
   // 1. Exact id match — unambiguous (fleet_agents PK is (tenant, agent_id)), always wins.
   const byId = await env.DB.prepare(
-    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+    `SELECT agent_id, runtime, status, last_reported_at, presence_mode, presence_ttl_sec
+       FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, agentId)
     .first<Row>()
@@ -329,7 +432,8 @@ export async function readFleetAgentRow(
   if (Number(dupes?.n ?? 0) !== 1) return null // 0 means an ID collision; >1 means an ambiguous slug.
 
   return await env.DB.prepare(
-    `SELECT agent_id, runtime, status, last_reported_at FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
+    `SELECT agent_id, runtime, status, last_reported_at, presence_mode, presence_ttl_sec
+       FROM fleet_agents WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1`,
   )
     .bind(env.TENANT_SLUG, self.slug)
     .first<Row>()
@@ -367,6 +471,12 @@ export interface FleetAgentRouteInfo {
    * for any runtime — like kasra's live signed-attach today — that reports under its slug.
    */
   agentId: string
+  /** '' | 'poll' | 'resident' — the matched row's declared presence_mode (mupot#1494). A
+   *  'poll'-mode agent HAS a registered delivery mode (its inbox) regardless of the moment-to-
+   *  moment `live` reading — see resolveDispatchDeliveryMode in src/bus/consumer.ts, which is
+   *  what actually decides task_dispatch routing. '' means no row, or a legacy/daemon row that
+   *  never declared a mode — resident semantics for that case are unchanged from pre-#1494. */
+  presenceMode: string
 }
 
 export interface FleetAgentIdentity {
@@ -564,13 +674,19 @@ export async function getFleetAgentLiveness(
   nowMs = Date.now(),
 ): Promise<FleetAgentRouteInfo> {
   const row = await readFleetAgentRow(env, agentId)
+  const presenceMode = row?.presence_mode ? String(row.presence_mode) : ''
   const runtime = row?.runtime ? String(row.runtime) : ''
-  if (!runtime) return { runtime: '', live: false, agentId: '' }
-  const ttlSec = presenceTtlSec(env)
+  if (!runtime) return { runtime: '', live: false, agentId: '', presenceMode: '' }
+  // Per-row TTL (poll-mode, mupot#1494) wins when the row declares one; otherwise fall back to
+  // the ONE global window every resident/daemon row has always used — resident semantics
+  // unchanged. See pollPresenceTtlSec for how a poll-mode row's TTL is derived at check_in time.
+  const ttlSec = typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
+    ? row.presence_ttl_sec
+    : presenceTtlSec(env)
   const status = String(row?.status ?? 'unknown')
   const lastReportedAt = String(row?.last_reported_at ?? '')
   const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
-  return { runtime, live, agentId: String(row?.agent_id ?? '') }
+  return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
 }
 
 /**

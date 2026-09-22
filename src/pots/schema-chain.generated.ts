@@ -3001,6 +3001,16 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
+    file: "0163_fleet_agents_presence_mode.sql",
+    sha256: "986a870251c3aa699ed3c12177e0b107efe3182ddd5d8130b1208ce3292344ab",
+    statements: [
+      "-- 0163_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).\n--\n-- Additive only, no backfill: every existing row keeps presence_mode='' and\n-- presence_ttl_sec=NULL, so src/fleet/registry.ts's derivePresence keeps reading the ONE global\n-- presenceTtlSec(env) window for every row this migration doesn't touch — resident/signed-attach\n-- semantics are completely unchanged.\n--\n-- Why this is needed: a polling runner (cron, an external orchestrator, a laptop that wakes\n-- every N minutes — no resident heartbeat daemon) has no way to stay inside the global\n-- presence_ttl_sec window without polling far more often than its own cadence justifies, so\n-- task_dispatch's liveness check never saw it as live and it could never receive dispatched\n-- work (see the issue's \"Runner onboarding is not smooth\" report). check_in accepts\n-- presence_mode:'poll' + poll_interval_sec, computes a per-row TTL\n-- (max(180, 2*poll_interval_sec) — see pollPresenceTtlSec) and stores it here; last_reported_at\n-- is then refreshed on every subsequent authenticated call that agent makes\n-- (touchPollFleetPresence), so a faithfully-polling runner reads as continuously live on its\n-- own declared cadence.\nALTER TABLE fleet_agents ADD COLUMN presence_mode TEXT NOT NULL DEFAULT '';",
+      "\nALTER TABLE fleet_agents ADD COLUMN presence_ttl_sec INTEGER;",
+      "\n\n-- Second half of #1494: task_dispatch's routing decision (src/bus/consumer.ts routeEvent,\n-- 'agent.wake' case) must \"never silently\" fall back to the in-Worker executor — record which\n-- route was actually taken, durably, on the SAME receipt row a caller/operator already reads\n-- for dispatch state. Additive, nullable, no backfill: a NULL here just means \"dispatched before\n-- this migration\" (or an event still mid-flight), not a distinct third route.\nALTER TABLE task_dispatch_receipts ADD COLUMN delivered_via TEXT\n  CHECK (delivered_via IS NULL OR delivered_via IN ('inbox', 'in_worker'));",
+    ],
+    objects: [],
+  },
+  {
     file: "0165_member_home_provisioning_receipts_web_channel.sql",
     sha256: "8ec5697b1af8da15ec46dbc3e5e3e0d2e26ba8d61dd96d7ce3e511c749433692",
     statements: [
@@ -3026,4 +3036,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f5dfba7c28bcd90b07e5b76090ea992fff0264eeacaa577cdd7a4d07617661ab"
+export const SCHEMA_CHAIN_DIGEST: string = "4208f8898e2372ed2a516892b75469ce231d88ee6ad20f5eda276461f7040b58"

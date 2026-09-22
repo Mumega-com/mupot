@@ -147,4 +147,35 @@ describe('MCP fleet_agent_get tool (mupot#1184)', () => {
     expect(res.ok).toBe(false)
     expect(res.error).toBe('agent_not_found')
   })
+
+  // mupot#1494 — a poll-mode row's OWN presence_ttl_sec must govern this view exactly like it
+  // governs the actual dispatch-routing decision (getFleetAgentLiveness), never the global
+  // FLEET_PRESENCE_TTL_SEC='300' this suite otherwise runs under.
+  it('reports live via its own per-row TTL for a poll-mode agent, past the global 300s window', async () => {
+    harness.sqlite.exec(
+      `UPDATE fleet_agents
+          SET presence_mode = 'poll', presence_ttl_sec = 1200, last_reported_at = '${sqliteStamp(NOW - 600_000)}'
+        WHERE tenant = '${TENANT}' AND agent_id = '${OTHER_AGENT_ID}'`,
+    )
+    const adminAuth = auth({
+      capabilities: [{ member_id: MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+    })
+    const res = await invokeTool(adminAuth, env, 'fleet_agent_get', { agent_id: OTHER_AGENT_ID }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { presence_mode: string; presence_ttl_sec: number; derived_presence: string; live: boolean }
+    expect(result.presence_mode).toBe('poll')
+    expect(result.presence_ttl_sec).toBe(1200)
+    expect(result.derived_presence).toBe('live')
+    expect(result.live).toBe(true)
+  })
+
+  it('a resident agent (no presence_mode) still reports the global TTL, unchanged', async () => {
+    const res = await invokeTool(auth(), env, 'fleet_agent_get', {}, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    const result = res.result as { presence_mode: string; presence_ttl_sec: number }
+    expect(result.presence_mode).toBe('')
+    expect(result.presence_ttl_sec).toBe(300)
+  })
 })
