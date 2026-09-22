@@ -11,6 +11,8 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   POT_WORKER_BUNDLE_SHA256_METADATA_KEY,
   POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT,
@@ -25,7 +27,12 @@ import {
   verifyPotWorkerBundleObject,
   buildVerifyReceipt,
   buildPublishReceipt,
+  BundleShaConflictError,
+  BundlePublishUnconfirmedError,
 } from '../scripts/lib/pot-bundle-r2.mjs'
+
+const repoRoot = fileURLToPath(new URL('..', import.meta.url))
+const fakeR2FetchPreload = fileURLToPath(new URL('./fixtures/fake-r2-fetch-preload.mjs', import.meta.url))
 
 // The digest/metadata-key contract this whole module exists to satisfy is defined in
 // src/pots/service.ts's loadPotWorkerBundle — this pins the ONE literal that must never
@@ -188,11 +195,28 @@ const fakeSigningClient = () => ({
   sign: vi.fn(async (req: Request) => req),
 })
 
+/** Every `putPotWorkerBundleObject` call now does a pre-PUT read FIRST (mupot#1524
+ *  round-2 P2-1) — a fetchImpl mock that only handles a single PUT call must answer a
+ *  leading GET (with 404, "nothing published yet") before its PUT-specific assertions, or
+ *  the mock will see a GET where it expects a PUT and fail for the wrong reason. This
+ *  helper builds that "first call is the not-yet-published pre-check" wrapper once. */
+function withNotYetPublishedPreCheck(handlePut: (req: Request, call: number) => Promise<Response> | Response) {
+  let call = 0
+  return vi.fn(async (req: Request) => {
+    call++
+    if (call === 1) {
+      expect(req.method).toBe('GET')
+      return new Response('', { status: 404 })
+    }
+    return handlePut(req, call)
+  })
+}
+
 describe('putPotWorkerBundleObject', () => {
-  it('PUTs to the exact object key with the sha256 recorded as x-amz-meta-sha256, a conditional If-None-Match, and a SIGNED payload (never UNSIGNED-PAYLOAD)', async () => {
+  it('does a pre-PUT GET first; when nothing is published yet, PUTs to the exact object key with the sha256 recorded as x-amz-meta-sha256, a conditional If-None-Match, and a SIGNED payload (never UNSIGNED-PAYLOAD)', async () => {
     const sha = 'f'.repeat(40)
     const signingClient = fakeSigningClient()
-    const fetchImpl = vi.fn(async (req: Request) => {
+    const fetchImpl = withNotYetPublishedPreCheck((req) => {
       expect(req.method).toBe('PUT')
       expect(req.url).toBe(`https://acct.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`)
       expect(req.headers.get(`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`)).toBe(
@@ -221,13 +245,14 @@ describe('putPotWorkerBundleObject', () => {
       url: `https://<redacted-account>.r2.cloudflarestorage.com/mupot-pot-bundles/${sha}/worker.js`,
       alreadyPublished: false,
     })
-    expect(signingClient.sign).toHaveBeenCalledOnce()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(signingClient.sign).toHaveBeenCalledTimes(2)
   })
 
   it('throws (never swallows) a non-2xx PUT response', async () => {
     const sha = '1'.repeat(40)
     const signingClient = fakeSigningClient()
-    const fetchImpl = vi.fn(async () => new Response('access denied', { status: 403 }))
+    const fetchImpl = withNotYetPublishedPreCheck(() => new Response('access denied', { status: 403 }))
     await expect(
       putPotWorkerBundleObject({
         accountId: 'acct',
@@ -239,17 +264,27 @@ describe('putPotWorkerBundleObject', () => {
         signingClient,
         fetchImpl: fetchImpl as unknown as typeof fetch,
       }),
-    ).rejects.toThrow(/R2 PUT.*failed.*403.*access denied/s)
+    ).rejects.toThrow(/R2 PUT.*failed.*403/s)
   })
 
-  it('scrubs <AWSAccessKeyId> from a PUT failure body before it reaches the thrown message', async () => {
+  // mupot#1524 round-2 P1: the redaction fix this replaces (`redactS3ErrorBody`) scrubbed
+  // ONE tag (<AWSAccessKeyId>) and passed the rest of the body through verbatim — a real S3
+  // error body's other tags (<BucketName>, <Endpoint>, <HostId>, <RequestId>) can carry
+  // CLOUDFLARE_ACCOUNT_ID and the bucket name straight into the thrown message. The fix is
+  // an ALLOW-LIST (Athena's rule: a printed field must be NAMED to be printed) — only HTTP
+  // status + the S3 <Code> element ever reach the message. See the dedicated
+  // "PUT/GET failure allow-list" describe block below for the full sentinel-account/bucket
+  // coverage of both the PUT and GET failure paths.
+  it('never echoes the raw PUT failure body — only HTTP status + <Code> reach the thrown message', async () => {
     const sha = '9'.repeat(40)
     const signingClient = fakeSigningClient()
-    const fetchImpl = vi.fn(
-      async () =>
-        new Response('<Error><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId><Code>InvalidAccessKeyId</Code></Error>', {
-          status: 403,
-        }),
+    const fetchImpl = withNotYetPublishedPreCheck(
+      () =>
+        new Response(
+          '<Error><Code>InvalidAccessKeyId</Code><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId>' +
+            '<BucketName>super-secret-bucket</BucketName><Endpoint>super-secret-bucket.acct123.r2.cloudflarestorage.com</Endpoint></Error>',
+          { status: 403 },
+        ),
     )
     let thrown: unknown
     try {
@@ -267,30 +302,28 @@ describe('putPotWorkerBundleObject', () => {
       thrown = err
     }
     expect(thrown).toBeInstanceOf(Error)
-    expect((thrown as Error).message).not.toContain('SUPERSECRETKEYID')
-    expect((thrown as Error).message).toContain('REDACTED')
+    const message = (thrown as Error).message
+    expect(message).not.toContain('SUPERSECRETKEYID')
+    expect(message).not.toContain('super-secret-bucket')
+    expect(message).not.toContain('acct123')
+    expect(message).not.toContain('<BucketName>')
+    expect(message).not.toContain('<Endpoint>')
+    expect(message).toContain('InvalidAccessKeyId')
+    expect(message).toContain('403')
   })
 
-  // Kasra-core round-2 finding (2026-09-22): a plain overwrite-by-key PUT could silently
-  // replace an already-published RELEASE_SHA's bundle with DIFFERENT bytes (a stale local
-  // tree, a non-reproducible build, two colonies racing the same commit). Conditional write
-  // + a same-digest-vs-different-digest branch on 412 closes this.
-  describe('conditional write (If-None-Match) on an already-published key', () => {
+  // mupot#1524 round-2 P2-1: `If-None-Match: '*'` alone trusts the SERVER to enforce the
+  // conditional write. This describe block covers the PRE-PUT read layer, which does not
+  // depend on server enforcement at all.
+  describe('pre-PUT digest check (P2-1) — a server that ignores If-None-Match must still be refused', () => {
     const sha = '4'.repeat(40)
     const bodyText = 'export default { fetch() {} }'
     const digest = sha256HexOfUtf8Text(bodyText)
 
-    it('treats a 412 with an IDENTICAL existing digest as a successful, idempotent re-publish', async () => {
+    it('an IDENTICAL existing digest short-circuits to alreadyPublished with ZERO PUT calls (one fetch total)', async () => {
       const signingClient = fakeSigningClient()
-      let call = 0
       const fetchImpl = vi.fn(async (req: Request) => {
-        call++
-        if (call === 1) {
-          expect(req.method).toBe('PUT')
-          return new Response('', { status: 412 })
-        }
-        // The internal re-verify GET.
-        expect(req.method).toBe('GET')
+        expect(req.method).toBe('GET') // the pre-check — no PUT should ever be attempted.
         return new Response(bodyText, {
           status: 200,
           headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: digest },
@@ -308,17 +341,18 @@ describe('putPotWorkerBundleObject', () => {
       })
       expect(receipt.alreadyPublished).toBe(true)
       expect(receipt.sha256).toBe(digest)
-      expect(fetchImpl).toHaveBeenCalledTimes(2)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      expect(fetchImpl.mock.calls.every((call) => (call[0] as Request).method !== 'PUT')).toBe(true)
     })
 
-    it('throws BundleShaConflictError (code: bundle_sha_conflict) on a 412 with a DIFFERENT existing digest — never silently overwrites', async () => {
+    it('a DIFFERENT existing digest throws BundleShaConflictError with ZERO PUT calls, even on a server that would have silently accepted an overwrite (If-None-Match ignored)', async () => {
       const signingClient = fakeSigningClient()
       const existingBody = 'a completely different bundle'
       const existingDigest = sha256HexOfUtf8Text(existingBody)
-      let call = 0
       const fetchImpl = vi.fn(async (req: Request) => {
-        call++
-        if (call === 1) return new Response('', { status: 412 })
+        // A server that IGNORES If-None-Match would happily 200 a PUT here — the only
+        // reason this test can prove "0 PUTs" is that the pre-check throws before any PUT
+        // is ever attempted, never because the mock refuses a PUT itself.
         return new Response(existingBody, {
           status: 200,
           headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: existingDigest },
@@ -339,41 +373,146 @@ describe('putPotWorkerBundleObject', () => {
       } catch (err) {
         thrown = err
       }
-      expect(thrown).toBeInstanceOf(Error)
+      expect(thrown).toBeInstanceOf(BundleShaConflictError)
+      expect((thrown as { code?: string }).code).toBe('bundle_sha_conflict')
+      expect((thrown as { existingSha256?: string }).existingSha256).toBe(existingDigest)
+      expect((thrown as { attemptedSha256?: string }).attemptedSha256).toBe(digest)
+      expect(fetchImpl).toHaveBeenCalledTimes(1)
+      expect(fetchImpl.mock.calls.every((call) => (call[0] as Request).method !== 'PUT')).toBe(true)
+    })
+  })
+
+  // Kasra-core round-2 finding (2026-09-22): a plain overwrite-by-key PUT could silently
+  // replace an already-published RELEASE_SHA's bundle with DIFFERENT bytes (a stale local
+  // tree, a non-reproducible build, two colonies racing the same commit). Conditional write
+  // + a same-digest-vs-different-digest branch on 412 closes this — this is LAYER 2, only
+  // reachable when the pre-PUT check (above) saw nothing published yet (404) but another
+  // writer won the race between that read and this function's own PUT.
+  describe('conditional write (If-None-Match) 412 race path — reached only after a 404 pre-check', () => {
+    const raceSha = 'a'.repeat(40)
+    const bodyText = 'export default { fetch() {} }'
+    const digest = sha256HexOfUtf8Text(bodyText)
+
+    it('treats a 412 with an IDENTICAL existing digest as a successful, idempotent re-publish', async () => {
+      const signingClient = fakeSigningClient()
+      let call = 0
+      const fetchImpl = vi.fn(async (req: Request) => {
+        call++
+        if (call === 1) {
+          expect(req.method).toBe('GET') // pre-check
+          return new Response('', { status: 404 })
+        }
+        if (call === 2) {
+          expect(req.method).toBe('PUT')
+          return new Response('', { status: 412 })
+        }
+        // The internal re-verify GET after the 412.
+        expect(req.method).toBe('GET')
+        return new Response(bodyText, {
+          status: 200,
+          headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: digest },
+        })
+      })
+      const receipt = await putPotWorkerBundleObject({
+        accountId: 'acct',
+        bucket: 'mupot-pot-bundles',
+        releaseSha: raceSha,
+        bodyText,
+        accessKeyId: 'ak',
+        secretAccessKey: 'sk',
+        signingClient,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      })
+      expect(receipt.alreadyPublished).toBe(true)
+      expect(receipt.sha256).toBe(digest)
+      expect(fetchImpl).toHaveBeenCalledTimes(3)
+    })
+
+    it('throws BundleShaConflictError (code: bundle_sha_conflict) on a 412 with a DIFFERENT existing digest — never silently overwrites', async () => {
+      const signingClient = fakeSigningClient()
+      const existingBody = 'a completely different bundle'
+      const existingDigest = sha256HexOfUtf8Text(existingBody)
+      let call = 0
+      const fetchImpl = vi.fn(async (req: Request) => {
+        call++
+        if (call === 1) return new Response('', { status: 404 })
+        if (call === 2) return new Response('', { status: 412 })
+        return new Response(existingBody, {
+          status: 200,
+          headers: { [`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`]: existingDigest },
+        })
+      })
+      let thrown: unknown
+      try {
+        await putPotWorkerBundleObject({
+          accountId: 'acct',
+          bucket: 'mupot-pot-bundles',
+          releaseSha: raceSha,
+          bodyText,
+          accessKeyId: 'ak',
+          secretAccessKey: 'sk',
+          signingClient,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+        })
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).toBeInstanceOf(BundleShaConflictError)
       expect((thrown as Error).name).toBe('BundleShaConflictError')
       expect((thrown as { code?: string }).code).toBe('bundle_sha_conflict')
       expect((thrown as { existingSha256?: string }).existingSha256).toBe(existingDigest)
       expect((thrown as { attemptedSha256?: string }).attemptedSha256).toBe(digest)
     })
 
-    it('throws BundleShaConflictError even when the existing object is unreadable (fails closed, never assumes match)', async () => {
+    // mupot#1524 round-2 P2-4: a 412 whose confirming GET FAILS is not a confirmed digest
+    // conflict — it is an UNCONFIRMED outcome. The prior version of this test asserted
+    // `code: 'bundle_sha_conflict'` here, which claimed a fact (the existing bytes differ)
+    // that a 500 on the confirming GET never actually established.
+    it('throws BundlePublishUnconfirmedError (code: bundle_publish_unconfirmed), NOT BundleShaConflictError, when the confirming GET after a 412 itself fails', async () => {
       const signingClient = fakeSigningClient()
       let call = 0
       const fetchImpl = vi.fn(async () => {
         call++
-        if (call === 1) return new Response('', { status: 412 })
+        if (call === 1) return new Response('', { status: 404 })
+        if (call === 2) return new Response('', { status: 412 })
         return new Response('server error', { status: 500 })
       })
-      await expect(
-        putPotWorkerBundleObject({
+      let thrown: unknown
+      try {
+        await putPotWorkerBundleObject({
           accountId: 'acct',
           bucket: 'mupot-pot-bundles',
-          releaseSha: sha,
+          releaseSha: raceSha,
           bodyText,
           accessKeyId: 'ak',
           secretAccessKey: 'sk',
           signingClient,
           fetchImpl: fetchImpl as unknown as typeof fetch,
-        }),
-      ).rejects.toMatchObject({ code: 'bundle_sha_conflict' })
+        })
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).toBeInstanceOf(BundlePublishUnconfirmedError)
+      expect((thrown as { code?: string }).code).toBe('bundle_publish_unconfirmed')
+      expect((thrown as { code?: string }).code).not.toBe('bundle_sha_conflict')
+      // The GET's own status (500) must be discoverable from the thrown message — an
+      // operator debugging this needs to know WHY the confirmation failed.
+      expect((thrown as Error).message).toContain('500')
+      expect((thrown as { getStatus?: number }).getStatus).toBe(500)
     })
   })
 
   it('defaults to a real makeR2SigningClient (aws4fetch) when no signingClient is injected — the signed request still reaches fetchImpl with a real Authorization header', async () => {
     const sha = '2'.repeat(40)
-    const fetchImpl = vi.fn(async (req: Request) => {
+    const fetchImpl = withNotYetPublishedPreCheck((req) => {
       expect(req.headers.get('Authorization')).toMatch(/^AWS4-HMAC-SHA256 /)
       return new Response('', { status: 200 })
+    })
+    // The pre-check GET is ALSO real-signed — assert on it too via the first call.
+    let firstReq: Request | null = null
+    const wrapped = vi.fn(async (req: Request) => {
+      if (!firstReq) firstReq = req
+      return (fetchImpl as unknown as (req: Request) => Promise<Response>)(req)
     })
     await putPotWorkerBundleObject({
       accountId: 'acct',
@@ -382,9 +521,10 @@ describe('putPotWorkerBundleObject', () => {
       bodyText: 'x',
       accessKeyId: 'ak',
       secretAccessKey: 'sk',
-      fetchImpl: fetchImpl as unknown as typeof fetch,
+      fetchImpl: wrapped as unknown as typeof fetch,
     })
-    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(firstReq!.headers.get('Authorization')).toMatch(/^AWS4-HMAC-SHA256 /)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -414,6 +554,7 @@ describe('verifyPotWorkerBundleObject', () => {
     expect(result).toEqual({
       ok: true,
       key: `${sha}/worker.js`,
+      status: 200,
       sha256: goodDigest,
       size: Buffer.byteLength(bodyText, 'utf8'),
       bucket: 'mupot-pot-bundles',
@@ -471,10 +612,10 @@ describe('verifyPotWorkerBundleObject', () => {
       signingClient,
       fetchImpl: fetchImpl as unknown as typeof fetch,
     })
-    expect(result).toEqual({ ok: false, key: `${sha}/worker.js`, reason: `no object published at '${sha}/worker.js'` })
+    expect(result).toEqual({ ok: false, key: `${sha}/worker.js`, status: 404, reason: `no object published at '${sha}/worker.js'` })
   })
 
-  it('reports ok:false on a transport-level failure status', async () => {
+  it('reports ok:false on a transport-level failure status, with only HTTP status in the reason (no raw body)', async () => {
     const signingClient = fakeSigningClient()
     const fetchImpl = vi.fn(async () => new Response('server error', { status: 500 }))
     const result = await verifyPotWorkerBundleObject({
@@ -487,16 +628,24 @@ describe('verifyPotWorkerBundleObject', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     })
     expect(result.ok).toBe(false)
-    expect((result as { reason: string }).reason).toMatch(/R2 GET.*failed.*500.*server error/s)
+    expect((result as { status?: number }).status).toBe(500)
+    expect((result as { reason: string }).reason).toMatch(/R2 GET.*failed.*HTTP 500/s)
+    expect((result as { reason: string }).reason).not.toContain('server error')
   })
 
-  it('scrubs <AWSAccessKeyId> from a GET failure body before it reaches the returned reason', async () => {
+  // mupot#1524 round-2 P1 — see the equivalent PUT-side test above for the full rationale:
+  // an allow-list (HTTP status + S3 <Code> only), never a body passthrough with one tag
+  // scrubbed. <BucketName>/<Endpoint>/<HostId>/<RequestId> must never reach `reason`.
+  it('never echoes the raw GET failure body — only HTTP status + <Code> reach the returned reason', async () => {
     const signingClient = fakeSigningClient()
     const fetchImpl = vi.fn(
       async () =>
-        new Response('<Error><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId><Code>AccessDenied</Code></Error>', {
-          status: 403,
-        }),
+        new Response(
+          '<Error><Code>AccessDenied</Code><AWSAccessKeyId>SUPERSECRETKEYID</AWSAccessKeyId>' +
+            '<BucketName>super-secret-bucket</BucketName><Endpoint>super-secret-bucket.acct123.r2.cloudflarestorage.com</Endpoint>' +
+            '<HostId>host-id-value</HostId><RequestId>req-id-value</RequestId></Error>',
+          { status: 403 },
+        ),
     )
     const result = await verifyPotWorkerBundleObject({
       accountId: 'acct',
@@ -508,8 +657,16 @@ describe('verifyPotWorkerBundleObject', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     })
     expect(result.ok).toBe(false)
-    expect((result as { reason: string }).reason).not.toContain('SUPERSECRETKEYID')
-    expect((result as { reason: string }).reason).toContain('REDACTED')
+    const reason = (result as { reason: string }).reason
+    expect(reason).not.toContain('SUPERSECRETKEYID')
+    expect(reason).not.toContain('super-secret-bucket')
+    expect(reason).not.toContain('acct123')
+    expect(reason).not.toContain('host-id-value')
+    expect(reason).not.toContain('req-id-value')
+    expect(reason).not.toContain('<BucketName>')
+    expect(reason).not.toContain('<Endpoint>')
+    expect(reason).toContain('AccessDenied')
+    expect(reason).toContain('403')
   })
 })
 
@@ -610,9 +767,24 @@ describe('CodeQL js/clear-text-logging fix — no process.env value ever reaches
       expect(printed).not.toContain('url')
     })
 
-    it('failure: prints ONLY ok/reason — a reason string that happens to carry a sentinel still surfaces (this function trusts its caller\'s reason text; the library-level reason strings are separately tested to never carry an env value)', () => {
+    // mupot#1524 round-2 P1: this test previously cited "the library-level reason strings
+    // are separately tested to never carry an env value" — no such test existed anywhere
+    // in this file. `buildVerifyReceipt` DOES trust its caller's `reason` text verbatim
+    // (it has no way to know whether a caller-supplied string is safe); what makes that
+    // safe in practice is that EVERY `reason` `verifyPotWorkerBundleObject` itself can
+    // produce is free of environment-derived values BY CONSTRUCTION — see the real,
+    // executable coverage for that claim: the 'verifyPotWorkerBundleObject' describe
+    // block's "never echoes the raw GET failure body" test (allow-list: HTTP status + S3
+    // <Code> only) and the 404/missing-metadata/digest-mismatch tests there (key + digest
+    // values only, no env-derived value ever entering `reason`).
+    it('failure: prints ONLY ok/reason — trusts its caller\'s reason text verbatim (does not itself scrub it)', () => {
       const receipt = buildVerifyReceipt({ ok: false, key: 'abc/worker.js', reason: 'no object published' })
       expect(receipt).toEqual({ ok: false, reason: 'no object published' })
+    })
+
+    it('failure: a reason string a caller passes in with a sentinel DOES surface — proving this function itself does no filtering, so the guarantee lives entirely in what verifyPotWorkerBundleObject is allowed to put in reason', () => {
+      const receipt = buildVerifyReceipt({ ok: false, key: 'abc/worker.js', reason: `contains ${SENTINEL_ACCOUNT_ID}` })
+      expect(receipt.reason).toContain(SENTINEL_ACCOUNT_ID)
     })
   })
 
@@ -687,4 +859,93 @@ describe('CodeQL js/clear-text-logging fix — no process.env value ever reaches
     expect(printedReceipt).not.toContain(SENTINEL_ACCOUNT_ID)
     expect(printedReceipt).not.toContain(SENTINEL_BUCKET)
   })
+})
+
+// mupot#1524 round-2 P1: the false test citation this replaces asserted the allow-list
+// property only at the LIBRARY function boundary. These drive a real S3-shaped error body
+// carrying sentinel account id + bucket THROUGH THE ACTUAL CLI PROCESSES an operator or CI
+// would run — `node scripts/verify-pot-bundle.mjs` / `node scripts/publish-pot-bundle.mjs`
+// — via a `node --import` preload (tests/fixtures/fake-r2-fetch-preload.mjs) that replaces
+// `globalThis.fetch` before either script's module code runs. No real network call.
+describe('real CLI process — sentinel account id/bucket never leak through stdout/stderr', () => {
+  it('scripts/verify-pot-bundle.mjs: an AccessDenied error body never leaks CLOUDFLARE_ACCOUNT_ID or the bucket name', () => {
+    const sha = 'b'.repeat(40)
+    const sentinelAccountId = 'sentinel-cli-account-9f8e7d6c'
+    const sentinelBucket = 'sentinel-cli-bucket-3d2c1b0a'
+    const errorBody =
+      '<Error><Code>AccessDenied</Code>' +
+      `<BucketName>${sentinelBucket}</BucketName>` +
+      `<Endpoint>${sentinelBucket}.${sentinelAccountId}.r2.cloudflarestorage.com</Endpoint>` +
+      '<HostId>host-id-value</HostId><RequestId>req-id-value</RequestId></Error>'
+    const result = spawnSync(process.execPath, ['--import', fakeR2FetchPreload, 'scripts/verify-pot-bundle.mjs', sha], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CLOUDFLARE_ACCOUNT_ID: sentinelAccountId,
+        POT_WORKER_BUNDLE_R2_BUCKET: sentinelBucket,
+        R2_POT_BUNDLES_ACCESS_KEY_ID: 'ak-test',
+        R2_POT_BUNDLES_SECRET_ACCESS_KEY: 'sk-test',
+        FAKE_R2_STATUS: '403',
+        FAKE_R2_BODY: errorBody,
+      },
+    })
+    const combined = `${result.stdout}\n${result.stderr}`
+    expect(combined).not.toContain(sentinelAccountId)
+    expect(combined).not.toContain(sentinelBucket)
+    expect(combined).not.toContain('host-id-value')
+    expect(combined).not.toContain('req-id-value')
+    expect(combined).not.toContain('<BucketName>')
+    expect(combined).not.toContain('<Endpoint>')
+    expect(combined).toContain('AccessDenied')
+    expect(combined).toContain('403')
+    expect(result.status).toBe(1)
+    const printedLines = result.stdout.trim().split('\n')
+    const receipt = JSON.parse(printedLines[printedLines.length - 1])
+    expect(receipt).toEqual({ ok: false, reason: expect.stringContaining('AccessDenied') })
+  })
+
+  // NOTE ON SCOPE: this test requires a CLEAN working tree (scripts/publish-pot-bundle.mjs
+  // refuses to publish from a dirty tree — assertPublishPreconditions, same discipline as
+  // scripts/deploy.mjs) and a real `wrangler deploy --dry-run` build
+  // (scripts/build-pot-worker-bundle.mjs --config wrangler.example.toml), which this
+  // sandbox DOES support (verified 2026-09-22: no network call, no auth beyond parsing
+  // wrangler.example.toml). It runs correctly in CI (always a clean checkout) and locally
+  // once this PR's own changes are committed.
+  it('scripts/publish-pot-bundle.mjs: a PermanentRedirect error body never leaks CLOUDFLARE_ACCOUNT_ID or the bucket name', () => {
+    const sentinelAccountId = 'sentinel-cli-account-1a2b3c4d'
+    const sentinelBucket = 'sentinel-cli-bucket-5e6f7a8b'
+    const errorBody =
+      '<Error><Code>PermanentRedirect</Code>' +
+      `<BucketName>${sentinelBucket}</BucketName>` +
+      `<Endpoint>${sentinelBucket}.${sentinelAccountId}.r2.cloudflarestorage.com</Endpoint>` +
+      '<HostId>host-id-value-2</HostId><RequestId>req-id-value-2</RequestId></Error>'
+    const result = spawnSync(
+      process.execPath,
+      ['--import', fakeR2FetchPreload, 'scripts/publish-pot-bundle.mjs', '--config', 'wrangler.example.toml'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          CLOUDFLARE_ACCOUNT_ID: sentinelAccountId,
+          POT_WORKER_BUNDLE_R2_BUCKET: sentinelBucket,
+          R2_POT_BUNDLES_ACCESS_KEY_ID: 'ak-test',
+          R2_POT_BUNDLES_SECRET_ACCESS_KEY: 'sk-test',
+          FAKE_R2_STATUS: '403',
+          FAKE_R2_BODY: errorBody,
+        },
+      },
+    )
+    const combined = `${result.stdout}\n${result.stderr}`
+    expect(combined).not.toContain(sentinelAccountId)
+    expect(combined).not.toContain(sentinelBucket)
+    expect(combined).not.toContain('host-id-value-2')
+    expect(combined).not.toContain('req-id-value-2')
+    expect(combined).not.toContain('<BucketName>')
+    expect(combined).not.toContain('<Endpoint>')
+    expect(combined).toContain('PermanentRedirect')
+    expect(combined).toContain('403')
+    expect(result.status).not.toBe(0)
+  }, 60_000)
 })

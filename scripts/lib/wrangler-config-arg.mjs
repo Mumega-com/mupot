@@ -19,19 +19,29 @@
  * If `argv[i]` is one of the three recognized `--config`/`-c` spellings, returns
  * `{ value, consumed }` — `value` is the config path, `consumed` is how many argv entries
  * this flag occupies (1 for the `--config=<path>` single-token form, 2 for the two
- * space-separated forms). Returns `null` for anything else, INCLUDING a bare trailing
- * `--config`/`-c` with no following value — that is not a match, so the caller's own
- * "unrecognized/incomplete argument" handling applies instead of silently consuming it.
+ * space-separated forms). Returns `null` for anything else, INCLUDING:
+ *   - a bare trailing `--config`/`-c` with no following value, and
+ *   - a value that itself starts with `-` (`--config --dry-run=false`, `--config=--x`) —
+ *     mupot#1524 round-2 P2-2: a caller can never smuggle a second flag in as if it were a
+ *     config path this way. `build-pot-worker-bundle.mjs`'s ALLOWLIST is only as strong as
+ *     this shared matcher — before this fix, `--config --help` matched `--help` as the
+ *     config VALUE, forwarding `--config --help` to `wrangler deploy --dry-run`, which
+ *     printed wrangler's own help text and exited 0 (looked like a successful dry-run
+ *     build; built no bundle at all).
+ * In every `null` case, the caller's own "unrecognized/incomplete argument" handling
+ * applies instead of silently consuming (or misinterpreting) the token.
  */
 export function matchConfigFlag(argv, i) {
   const a = argv[i]
   if (a === '--config' || a === '-c') {
     const value = argv[i + 1]
-    if (typeof value !== 'string') return null
+    if (typeof value !== 'string' || value.startsWith('-')) return null
     return { value, consumed: 2 }
   }
   if (typeof a === 'string' && a.startsWith('--config=')) {
-    return { value: a.slice('--config='.length), consumed: 1 }
+    const value = a.slice('--config='.length)
+    if (value.startsWith('-')) return null
+    return { value, consumed: 1 }
   }
   return null
 }

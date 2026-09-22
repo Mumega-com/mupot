@@ -52,11 +52,18 @@ let configPath = null
 for (let i = 0; i < args.length; i++) {
   const a = args[i]
   if (a === '--outdir') {
-    if (typeof args[i + 1] !== 'string') {
-      console.error('✘ --outdir requires a value.')
+    const value = args[i + 1]
+    // mupot#1524 round-2 P2-2: a value that itself starts with `-` is refused as a
+    // likely-missing-value (e.g. `--outdir --x`) rather than accepted as a literal
+    // directory named `--x` — the same discipline `matchConfigFlag` now applies to
+    // `--config`/`-c` (scripts/lib/wrangler-config-arg.mjs), for the same reason: a flag
+    // silently absorbed as another flag's value can turn a documented no-network
+    // dry-run build into something else this script never validated.
+    if (typeof value !== 'string' || value.startsWith('-')) {
+      console.error('✘ --outdir requires a value (got none, or a value starting with "-", which is refused as a likely flag).')
       process.exit(1)
     }
-    outdir = args[i + 1]
+    outdir = value
     i++
     continue
   }

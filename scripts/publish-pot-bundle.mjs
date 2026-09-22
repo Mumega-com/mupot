@@ -47,6 +47,8 @@ import {
   readR2PotBundlesCredentials,
   putPotWorkerBundleObject,
   buildPublishReceipt,
+  BUNDLE_SHA_CONFLICT_EXIT_CODE,
+  BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE,
 } from './lib/pot-bundle-r2.mjs'
 import { matchConfigFlag } from './lib/wrangler-config-arg.mjs'
 
@@ -158,9 +160,23 @@ async function main() {
     if (err && err.code === 'bundle_sha_conflict') {
       console.error(
         `✘ ${err.message} Existing: ${err.existingSha256 ?? 'unreadable'}. Attempted: ${err.attemptedSha256}. ` +
-          'This is refused, not overwritten — a published RELEASE_SHA bundle is immutable.',
+          'This is refused, not overwritten — a published RELEASE_SHA bundle is immutable. ' +
+          'See docs/workflows/tenant-provision.md "Recovering from a digest mismatch" to ' +
+          'resolve (this will refuse again on every retry until the stale object is removed).',
       )
-      process.exit(1)
+      // Distinct exit code (mupot#1524 round-2 P2-3) so scripts/deploy.mjs — which only
+      // sees this exit code across the spawnSync boundary, not this error object — can
+      // name the real recovery procedure in its own post-deploy failure message instead
+      // of a generic "re-run publish" that would only refuse again.
+      process.exit(BUNDLE_SHA_CONFLICT_EXIT_CODE)
+    }
+    if (err && err.code === 'bundle_publish_unconfirmed') {
+      console.error(
+        `✘ ${err.message} This is NOT a confirmed digest conflict — do not assume the ` +
+          'immutability recovery procedure applies without first understanding why the ' +
+          'confirming GET failed.',
+      )
+      process.exit(BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE)
     }
     console.error(`✘ ${err instanceof Error ? err.message : String(err)}`)
     process.exit(1)

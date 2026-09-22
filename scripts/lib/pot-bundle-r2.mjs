@@ -167,11 +167,29 @@ export function makeR2SigningClient({ accessKeyId, secretAccessKey }) {
   return new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto' })
 }
 
-/** An S3-shaped XML error body can carry `<AWSAccessKeyId>...</AWSAccessKeyId>` — scrub the
- *  VALUE before any error body text is thrown, logged, or printed. Never a full redaction of
- *  the body (the rest of the XML is diagnostic and not secret), just this one field. */
-function redactS3ErrorBody(text) {
-  return text.replace(/(<AWSAccessKeyId>)[^<]*(<\/AWSAccessKeyId>)/gi, '$1REDACTED$2')
+/**
+ * A remote S3-compatible error body is untrusted, environment-adjacent text: a standard
+ * body carries `<BucketName>`, `<Endpoint>`, `<HostId>`, and `<RequestId>` elements, and
+ * R2's `<Endpoint>` in particular is exactly `<bucket>.<account-id>.r2.cloudflarestorage.com`
+ * — the account id and bucket name, straight from the request this module just signed.
+ *
+ * mupot#1524 round-2 P1 finding: the earlier `redactS3ErrorBody` scrubbed ONE tag
+ * (`<AWSAccessKeyId>`) and passed the remaining ~500 chars of the body through verbatim —
+ * CodeQL's js/clear-text-logging rule was green only because its dataflow analysis cannot
+ * trace env → signed request → REMOTE response → log; a real error body still laundered
+ * `CLOUDFLARE_ACCOUNT_ID` and the bucket name into a thrown message or printed reason.
+ *
+ * Athena's rule applies here: a printed field must be NAMED to be printed, never merely
+ * redacted after the fact. So this function is an ALLOW-LIST, not a scrubber — it returns
+ * only the HTTP status and the S3 `<Code>` element (e.g. `AccessDenied`,
+ * `InvalidAccessKeyId`), which are the two facts an operator actually needs to diagnose a
+ * failure without ever touching `<BucketName>`/`<Endpoint>`/`<HostId>`/`<RequestId>` or any
+ * other tag in the body — those are read by nothing here, so there is nothing to redact.
+ */
+function summarizeS3Error(status, bodyText) {
+  const match = typeof bodyText === 'string' ? bodyText.match(/<Code>([^<]*)<\/Code>/i) : null
+  const code = match ? match[1].trim() : null
+  return code ? `HTTP ${status} (${code})` : `HTTP ${status}`
 }
 
 /**
@@ -193,6 +211,38 @@ export class BundleShaConflictError extends Error {
 }
 
 /**
+ * Thrown by `putPotWorkerBundleObject` when a `412 Precondition Failed` (the object
+ * already exists) is followed by a confirming GET that itself fails — 404 (deleted
+ * between the PUT and the confirm-GET), a transport error, or an object present but
+ * missing/unreadable digest metadata. `bundle_sha_conflict` claims a KNOWN, DIFFERENT
+ * digest; none of these cases establish that. Reporting them as `bundle_sha_conflict`
+ * (mupot#1524 round-2 P2-4) tells the caller a fact ("the existing bytes differ") that
+ * was never actually confirmed. `code: 'bundle_publish_unconfirmed'` names what is
+ * actually true instead: this publish attempt's outcome (idempotent success, or a real
+ * conflict) could not be established either way.
+ */
+export class BundlePublishUnconfirmedError extends Error {
+  constructor(message, { key, getStatus, reason } = {}) {
+    super(message)
+    this.name = 'BundlePublishUnconfirmedError'
+    this.code = 'bundle_publish_unconfirmed'
+    this.key = key
+    this.getStatus = getStatus
+    this.reason = reason
+  }
+}
+
+/** Process exit codes `scripts/publish-pot-bundle.mjs` uses to let `scripts/deploy.mjs`
+ *  (which only sees the child's exit code, not the thrown error object, across the
+ *  `spawnSync` boundary) tell a genuine digest conflict apart from every other failure —
+ *  so its own post-deploy message can name the real recovery procedure
+ *  (docs/workflows/tenant-provision.md "Recovering from a digest mismatch") instead of a
+ *  generic "re-run publish" that would only refuse again (mupot#1524 round-2 P2-3). Named
+ *  exports (not inline literals) so the two scripts can never drift on the numbers. */
+export const BUNDLE_SHA_CONFLICT_EXIT_CODE = 2
+export const BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE = 3
+
+/**
  * PUTs the bundle text to `${releaseSha}/worker.js`, with the digest recorded as the
  * `POT_WORKER_BUNDLE_SHA256_METADATA_KEY` custom-metadata field via the S3-compatible
  * `x-amz-meta-sha256` header — the exact contract `loadPotWorkerBundle` verifies against.
@@ -205,19 +255,30 @@ export class BundleShaConflictError extends Error {
  * records as `x-amz-meta-sha256`, computed from the exact bytes in `bodyText` — the body is
  * therefore genuinely signature-covered, not merely accompanied by an unverified claim.
  *
- * CONDITIONAL WRITE (Kasra-core round-2 finding — a given RELEASE_SHA's bundle must be
- * IMMUTABLE once published, never silently overwritten by different bytes under a retry,
- * a re-run with a stale local tree, or two colonies racing the same commit). PUTs with
- * `If-None-Match: '*'` (R2's S3-compatible API conditional-write extension — write only if
- * the key does not already exist). A `412 Precondition Failed` means the key already
- * exists: this function then GETs the existing object and compares digests — an IDENTICAL
- * digest is treated as a successful, idempotent re-publish (`alreadyPublished: true` on the
- * result, no error); a DIFFERENT digest throws `BundleShaConflictError`
- * (`code: 'bundle_sha_conflict'`) rather than ever silently replacing what is already live
- * for that commit. UNVERIFIED LIVE (same discipline as the rest of this module): this
- * session cannot confirm R2's S3-compatible PutObject actually honors `If-None-Match: '*'`
- * with a `412` on conflict — see docs/workflows/tenant-provision.md's live-verify-before-
- * merge receipt for where this gets confirmed against a real bucket.
+ * CONDITIONAL WRITE, TWO LAYERS (Kasra-core round-2 finding, sharpened by mupot#1524
+ * round-2 P2-1 — a given RELEASE_SHA's bundle must be IMMUTABLE once published, never
+ * silently overwritten by different bytes under a retry, a re-run with a stale local tree,
+ * or two colonies racing the same commit):
+ *
+ *   1. PRE-PUT READ (first layer, P2-1): before ANY write attempt, this function GETs the
+ *      object back and compares digests. Identical bytes short-circuits to an idempotent
+ *      `alreadyPublished: true` result with ZERO PUT calls; different bytes throws
+ *      `BundleShaConflictError` with ZERO PUT calls. `If-None-Match: '*'` alone trusts the
+ *      SERVER to enforce the conditional write correctly — a server that silently ignores
+ *      the header would let a PUT of different bytes clobber an already-published bundle
+ *      with no visible error at all. Reading first removes that trust requirement for the
+ *      overwhelmingly common case (the object already exists and this call can see it).
+ *   2. `If-None-Match: '*'` (second layer): still sent on every PUT, for the race the
+ *      pre-check cannot see — two callers passing the pre-check concurrently, both
+ *      observing "does not exist yet". A `412 Precondition Failed` here means another
+ *      writer won that race between this function's own read and its write: the SAME
+ *      re-GET-and-compare logic runs again, with the SAME identical-vs-different branching
+ *      (see `BundlePublishUnconfirmedError` below for what happens when THAT confirming
+ *      GET itself cannot be trusted). UNVERIFIED LIVE (same discipline as the rest of this
+ *      module): this session cannot confirm R2's S3-compatible PutObject actually honors
+ *      `If-None-Match: '*'` with a `412` on conflict — see docs/workflows/
+ *      tenant-provision.md's live-verify-before-merge receipt for where this gets
+ *      confirmed against a real bucket.
  *
  * `signingClient` defaults to a real `makeR2SigningClient` instance; `fetchImpl` defaults
  * to the global `fetch` used to actually send the already-signed request. Both are
@@ -237,6 +298,33 @@ export async function putPotWorkerBundleObject({
   const url = r2ObjectUrl({ accountId, bucket, key })
   const sha256 = sha256HexOfUtf8Text(bodyText)
   const client = signingClient ?? makeR2SigningClient({ accessKeyId, secretAccessKey })
+
+  // LAYER 1 — pre-PUT read (mupot#1524 round-2 P2-1). Only a CONFIRMED read (`ok: true`,
+  // a genuine digest in hand) short-circuits here. Every other outcome (404 — nothing
+  // published yet — or an unreadable/inconclusive GET) falls through to the normal
+  // attempt-the-PUT path below, where `If-None-Match: '*'` is still the backstop.
+  const preCheck = await verifyPotWorkerBundleObject({
+    accountId,
+    bucket,
+    releaseSha,
+    accessKeyId,
+    secretAccessKey,
+    signingClient: client,
+    fetchImpl,
+  })
+  if (preCheck.ok) {
+    if (preCheck.sha256 === sha256) {
+      return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: true }
+    }
+    throw new BundleShaConflictError(
+      `refusing to publish '${key}': an object already exists there with a DIFFERENT digest ` +
+        `(existing ${preCheck.sha256}, attempted ${sha256}) — a published RELEASE_SHA bundle ` +
+        'is immutable; this commit must never resolve to two different bundles. Zero PUT ' +
+        'requests were made — the pre-publish read caught this before any write attempt.',
+      { key, existingSha256: preCheck.sha256, attemptedSha256: sha256 },
+    )
+  }
+
   const request = new Request(url, {
     method: 'PUT',
     headers: {
@@ -251,6 +339,7 @@ export async function putPotWorkerBundleObject({
   const res = await fetchImpl(signed)
 
   if (res.status === 412) {
+    // LAYER 2 — the server enforced the conditional write; a re-GET confirms what's there.
     const existing = await verifyPotWorkerBundleObject({
       accountId,
       bucket,
@@ -263,18 +352,30 @@ export async function putPotWorkerBundleObject({
     if (existing.ok && existing.sha256 === sha256) {
       return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: true }
     }
-    throw new BundleShaConflictError(
-      `refusing to publish '${key}': an object already exists there with a DIFFERENT digest ` +
-        `(existing ${existing.ok ? existing.sha256 : 'unreadable: ' + existing.reason}, attempted ${sha256}) — ` +
-        'a published RELEASE_SHA bundle is immutable; this commit must never resolve to two ' +
-        'different bundles.',
-      { key, existingSha256: existing.ok ? existing.sha256 : undefined, attemptedSha256: sha256 },
+    if (existing.ok) {
+      throw new BundleShaConflictError(
+        `refusing to publish '${key}': an object already exists there with a DIFFERENT digest ` +
+          `(existing ${existing.sha256}, attempted ${sha256}) — a published RELEASE_SHA bundle ` +
+          'is immutable; this commit must never resolve to two different bundles.',
+        { key, existingSha256: existing.sha256, attemptedSha256: sha256 },
+      )
+    }
+    // mupot#1524 round-2 P2-4: the confirming GET itself failed (404 / transport error /
+    // unreadable metadata) — this is NOT a confirmed digest conflict, it is an UNCONFIRMED
+    // publish outcome. Reporting it as `bundle_sha_conflict` would claim a fact (the
+    // existing bytes differ) that was never actually established.
+    throw new BundlePublishUnconfirmedError(
+      `cannot confirm the publish outcome for '${key}': the server reported the object ` +
+        `already exists (412), but the confirming GET (status ${existing.status ?? 'unknown'}) ` +
+        `failed to establish the existing digest (${existing.reason}) — this is neither a ` +
+        'confirmed idempotent re-publish nor a confirmed digest conflict.',
+      { key, getStatus: existing.status, reason: existing.reason },
     )
   }
 
   if (!res.ok) {
-    const text = redactS3ErrorBody(await res.text().catch(() => ''))
-    throw new Error(`R2 PUT '${key}' failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 500)}` : ''}`)
+    const summary = summarizeS3Error(res.status, await res.text().catch(() => ''))
+    throw new Error(`R2 PUT '${key}' failed: ${summary}`)
   }
   return { key, sha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }), alreadyPublished: false }
 }
@@ -303,11 +404,11 @@ export async function verifyPotWorkerBundleObject({
   const signed = await client.sign(request)
   const res = await fetchImpl(signed)
   if (res.status === 404) {
-    return { ok: false, key, reason: `no object published at '${key}'` }
+    return { ok: false, key, status: 404, reason: `no object published at '${key}'` }
   }
   if (!res.ok) {
-    const text = redactS3ErrorBody(await res.text().catch(() => ''))
-    return { ok: false, key, reason: `R2 GET '${key}' failed: HTTP ${res.status}${text ? ` — ${text.slice(0, 500)}` : ''}` }
+    const summary = summarizeS3Error(res.status, await res.text().catch(() => ''))
+    return { ok: false, key, status: res.status, reason: `R2 GET '${key}' failed: ${summary}` }
   }
   const recordedSha256 = res.headers.get(`x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}`)
   const bodyText = await res.text()
@@ -316,6 +417,7 @@ export async function verifyPotWorkerBundleObject({
     return {
       ok: false,
       key,
+      status: res.status,
       reason: `object exists but carries no 'x-amz-meta-${POT_WORKER_BUNDLE_SHA256_METADATA_KEY}' metadata`,
       actualSha256,
     }
@@ -324,12 +426,13 @@ export async function verifyPotWorkerBundleObject({
     return {
       ok: false,
       key,
+      status: res.status,
       reason: `digest mismatch: recorded ${recordedSha256}, computed ${actualSha256} from the bytes read back`,
       recordedSha256,
       actualSha256,
     }
   }
-  return { ok: true, key, sha256: actualSha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }) }
+  return { ok: true, key, status: res.status, sha256: actualSha256, size: Buffer.byteLength(bodyText, 'utf8'), bucket, url: redactedR2ObjectUrl({ bucket, key }) }
 }
 
 // ── Printed-receipt shaping (CodeQL js/clear-text-logging, 2026-09-22) ──

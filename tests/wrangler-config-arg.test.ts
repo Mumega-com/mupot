@@ -5,6 +5,13 @@
 // the long `--config <path>` form let a `-c`/`--config=` deploy silently build+publish the
 // DEFAULT wrangler.toml's bundle instead of the one actually deployed — this file pins all
 // three spellings for both matchConfigFlag and peekConfigArg.
+//
+// mupot#1524 round-2 P2-2 (successor PR): a value that itself starts with `-`
+// (`--config --dry-run=false`, `--config=--x`, `-c --help`) is now REFUSED rather than
+// accepted as a literal config path — a caller could otherwise smuggle a second flag in as
+// if it were `--config`'s value (proved live: `--config --help` used to forward
+// `--config --help` to `wrangler deploy --dry-run`, which printed wrangler's own help text
+// and exited 0 — looked like a successful dry-run build; built no bundle at all).
 
 import { describe, it, expect } from 'vitest'
 import { matchConfigFlag, peekConfigArg } from '../scripts/lib/wrangler-config-arg.mjs'
@@ -53,6 +60,30 @@ describe('matchConfigFlag', () => {
       consumed: 2,
     })
   })
+
+  // mupot#1524 round-2 P2-2 — a value starting with `-` is refused for every spelling.
+  it('returns null for --config --dry-run=false (a flag masquerading as the value)', () => {
+    expect(matchConfigFlag(['--config', '--dry-run=false'], 0)).toBeNull()
+  })
+
+  it('returns null for --config=--x (single-token form, dash-prefixed value)', () => {
+    expect(matchConfigFlag(['--config=--x'], 0)).toBeNull()
+  })
+
+  it('returns null for -c --help', () => {
+    expect(matchConfigFlag(['-c', '--help'], 0)).toBeNull()
+  })
+
+  it('returns null for -c -x (even a short-flag-shaped value)', () => {
+    expect(matchConfigFlag(['-c', '-x'], 0)).toBeNull()
+  })
+
+  it('still matches a legitimate path that merely CONTAINS a dash (not at the start)', () => {
+    expect(matchConfigFlag(['--config', 'wrangler-acme.toml'], 0)).toEqual({
+      value: 'wrangler-acme.toml',
+      consumed: 2,
+    })
+  })
 })
 
 describe('peekConfigArg', () => {
@@ -87,9 +118,24 @@ describe('peekConfigArg', () => {
     expect(argv).toEqual(snapshot)
   })
 
-  it('does not treat -c\'s value as itself a flag to re-scan (skips the consumed slot)', () => {
-    // If peekConfigArg failed to skip the consumed value, a value that happens to look like
-    // '--config' would be mis-parsed as a second flag occurrence.
-    expect(peekConfigArg(['-c', '--config', '--message', 'hi'])).toBe('--config')
+  it('does not treat a MATCHED flag\'s consumed value as itself a flag to re-scan', () => {
+    // '-c wrangler-acme.toml' is matched and its value consumed; peekConfigArg must not
+    // then also examine 'wrangler-acme.toml' as if it were its own argv position.
+    expect(peekConfigArg(['-c', 'wrangler-acme.toml', '--message', 'hi'])).toBe('wrangler-acme.toml')
+  })
+
+  // mupot#1524 round-2 P2-2 (successor PR): this replaces a prior test asserting that
+  // `-c --config` matched '--config' AS `-c`'s literal value — that was exactly the
+  // "flag masquerading as a value" hole P2-2 closes. Since `matchConfigFlag` now refuses a
+  // dash-prefixed value, the malformed `-c` is skipped (no match, nothing consumed), and
+  // peekConfigArg's normal per-index scan reaches the SUBSEQUENT `--config` token on its
+  // own next iteration and matches IT instead — never treating the rejected value as a
+  // literal path.
+  it('a malformed -c (dash-prefixed value) does not shadow a real --config flag later in argv', () => {
+    expect(peekConfigArg(['-c', '--config', 'real-path.toml', '--message', 'hi'])).toBe('real-path.toml')
+  })
+
+  it('never returns a dash-prefixed string as a config value, even at the end of argv', () => {
+    expect(peekConfigArg(['--message', 'hi', '--config', '--not-a-path'])).toBeNull()
   })
 })

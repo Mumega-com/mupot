@@ -60,6 +60,13 @@
 import { spawnSync } from 'node:child_process'
 import { assertNoCallerReleaseSha, isMainDescendant, releaseShaDeployArgs } from './lib/release-sha.mjs'
 import { peekConfigArg } from './lib/wrangler-config-arg.mjs'
+import { parseDeployArgs } from './lib/deploy-args.mjs'
+import {
+  BUNDLE_SHA_CONFLICT_EXIT_CODE,
+  BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE,
+  R2_POT_BUNDLES_ACCESS_KEY_ID_ENV,
+  R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV,
+} from './lib/pot-bundle-r2.mjs'
 import { generateBuildInfo } from './generate-build-info.mjs'
 
 // Automatically stamp src/build-info.ts prior to deploy
@@ -68,6 +75,22 @@ generateBuildInfo()
 function capture(cmd, args) {
   const r = spawnSync(cmd, args, { encoding: 'utf8' })
   return (r.stdout || '').trim()
+}
+
+/** `process.env` with the dedicated R2 credential pair explicitly stripped — the env
+ *  `wrangler deploy` (and, inside it, esbuild) run with. mupot#1524 round-2 Low: an
+ *  operator's shell sources both the deploy token AND the R2 credential pair before
+ *  running `npm run deploy` (docs/workflows/tenant-provision.md "Minting the R2
+ *  credential pair" step 5); `spawnSync(..., { stdio: 'inherit' })` with no explicit `env`
+ *  hands a child process the FULL environment by default, so wrangler/esbuild would see
+ *  `R2_POT_BUNDLES_ACCESS_KEY_ID`/`R2_POT_BUNDLES_SECRET_ACCESS_KEY` even though neither
+ *  ever reads them — an unnecessary widening of which processes can observe a scoped
+ *  credential pair. Neither script needs these vars; scoping them out costs nothing. */
+function envWithoutR2PotBundlesCreds() {
+  const env = { ...process.env }
+  delete env[R2_POT_BUNDLES_ACCESS_KEY_ID_ENV]
+  delete env[R2_POT_BUNDLES_SECRET_ACCESS_KEY_ENV]
+  return env
 }
 
 /** `$USER`, falling back to `git config user.name`, falling back to 'unknown' — never
@@ -86,12 +109,13 @@ function printBundlePublishSkipReceipt(reason) {
 }
 
 const rawArgs = process.argv.slice(2)
-const skipBundlePublish = rawArgs.includes('--skip-bundle-publish')
-const skipReasonFlagIndex = rawArgs.indexOf('--skip-reason')
-const skipReason = skipReasonFlagIndex >= 0 ? rawArgs[skipReasonFlagIndex + 1] : null
-// Strip both this script's own flags before forwarding the rest to wrangler — wrangler
-// knows neither of them.
-const extra = rawArgs.filter((a, i) => a !== '--skip-bundle-publish' && a !== '--skip-reason' && i !== skipReasonFlagIndex + 1)
+// scripts/lib/deploy-args.mjs owns the argv walk that separates this script's own two
+// flags (--skip-bundle-publish, --skip-reason <reason>) from everything else — extracted
+// so it can be unit-tested directly (tests/deploy-args.test.ts). mupot#1524 round-2 P0: an
+// earlier inline version derived a "skip this index" position from
+// `rawArgs.indexOf('--skip-reason')`, which is `-1` when the flag is absent — `-1 + 1 ===
+// 0` silently dropped rawArgs[0] on every deploy that didn't pass --skip-reason.
+const { skipBundlePublish, skipReason, extra } = parseDeployArgs(rawArgs)
 // Peek-only — NEVER strips --config/-c/--config=<path> from `extra`, which is forwarded to
 // `wrangler deploy` byte-for-byte below. Recognizes all three spellings (mupot round-2
 // finding, 2026-09-22): matching only the first ('--config') let a `-c`/`--config=` deploy
@@ -143,7 +167,10 @@ try {
   process.exit(1)
 }
 
-const res = spawnSync('npx', ['wrangler', 'deploy', ...releaseArgs, ...extra], { stdio: 'inherit' })
+const res = spawnSync('npx', ['wrangler', 'deploy', ...releaseArgs, ...extra], {
+  stdio: 'inherit',
+  env: envWithoutR2PotBundlesCreds(),
+})
 if (res.status !== 0) {
   // The deploy itself failed — there is no successful build to publish a bundle for.
   process.exit(res.status ?? 1)
@@ -160,6 +187,15 @@ if (skipBundlePublish) {
 }
 
 if (!clean) {
+  // mupot#1524 round-2 Low: the EXPLICIT --skip-bundle-publish path (above) already names
+  // its own consequence before the receipt line; this AUTOMATIC skip must say the same
+  // thing — a colony operator watching deploy output for THIS branch had no way to learn
+  // that pot_provision will refuse the RELEASE_SHA just deployed until it actually happens.
+  console.error(
+    `⚠ bundle publish skipped automatically (not a clean release) — pot_provision will ` +
+      `refuse this RELEASE_SHA (${fullSha}-dirty) with 'no_bundle_source' until a bundle is ` +
+      'published for it (unless an explicit worker_js_code fallback is supplied per-call).',
+  )
   printBundlePublishSkipReceipt(
     `not-a-clean-release (RELEASE_SHA stamped as '${fullSha}-dirty'; publish-pot-bundle.mjs ` +
       'only ever publishes an exact HEAD commit from a clean tree)',
@@ -170,9 +206,44 @@ if (!clean) {
 const publishArgs = ['scripts/publish-pot-bundle.mjs', '--release-sha', fullSha]
 if (configPath) publishArgs.push('--config', configPath)
 console.error(`→ deploy succeeded — publishing the bundle: node ${publishArgs.join(' ')}`)
-const publish = spawnSync('node', publishArgs, { stdio: 'inherit' })
+// The R2 credential pair the publish step needs is passed EXPLICITLY (`env: process.env`,
+// the full, un-stripped environment) — never left implicit — so this spawn's dependence on
+// those two vars is visible in the code, matching the explicit `env:
+// envWithoutR2PotBundlesCreds()` on the wrangler spawn above rather than one being explicit
+// and the other an unstated default.
+const publish = spawnSync('node', publishArgs, { stdio: 'inherit', env: process.env })
 const retryCmd = `node scripts/publish-pot-bundle.mjs --release-sha ${fullSha}${configPath ? ` --config ${configPath}` : ''}`
 if (publish.status !== 0) {
+  // mupot#1524 round-2 P2-3: a genuine digest conflict is NOT something re-running
+  // publish will ever fix — the object at that key is immutable by design, so "re-run
+  // publish" is actively misleading (it will refuse again, identically, forever) unless
+  // the stale object is removed first. scripts/publish-pot-bundle.mjs exits with the
+  // dedicated BUNDLE_SHA_CONFLICT_EXIT_CODE (see scripts/lib/pot-bundle-r2.mjs) for
+  // exactly this case, so this message can name the REAL recovery procedure instead.
+  if (publish.status === BUNDLE_SHA_CONFLICT_EXIT_CODE) {
+    console.error(
+      `✘ the deploy succeeded, but publishing its bundle to R2 was REFUSED: RELEASE_SHA ` +
+        `${fullSha} already has a DIFFERENT bundle published under it. This is NOT fixed ` +
+        `by re-running \`${retryCmd}\` — a published RELEASE_SHA bundle is immutable, so ` +
+        'publish will refuse again, identically, every time. Recovery: an operator deletes ' +
+        'the object at the receipted key (Cloudflare dashboard → R2 → the bucket → the key, ' +
+        'or `wrangler r2 object delete <bucket>/<key>`), logs a receipt line naming who/why/' +
+        `when, THEN re-runs \`${retryCmd}\`. See docs/workflows/tenant-provision.md ` +
+        '"Recovering from a digest mismatch" for the full procedure.',
+    )
+    process.exit(publish.status)
+  }
+  if (publish.status === BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE) {
+    console.error(
+      '✘ the deploy succeeded, but this publish attempt could not be CONFIRMED either way ' +
+        '(a conflict-check GET failed after a 412) — this is not proven to be a digest ' +
+        `conflict, so do not assume the recovery procedure above applies. Re-run \`${retryCmd}\` ` +
+        'once the underlying GET failure (see output above) is understood; if it keeps ' +
+        'recurring, treat it as a possible digest conflict and follow ' +
+        'docs/workflows/tenant-provision.md "Recovering from a digest mismatch".',
+    )
+    process.exit(publish.status)
+  }
   console.error(
     '✘ the deploy itself succeeded, but publishing its bundle to R2 FAILED (see output ' +
       'above) — this deploy is NOT reporting success, because a tenant provisioned right ' +
@@ -187,7 +258,9 @@ if (publish.status !== 0) {
 // proof the bundle is live and correct — re-verify with an independent re-GET + digest
 // check before this script ever prints its own "published" receipt.
 console.error(`→ re-verifying the published bundle: node scripts/verify-pot-bundle.mjs ${fullSha}`)
-const verify = spawnSync('node', ['scripts/verify-pot-bundle.mjs', fullSha], { stdio: 'inherit' })
+// Same explicit-env discipline as the publish spawn above — verify also needs the R2
+// credential pair.
+const verify = spawnSync('node', ['scripts/verify-pot-bundle.mjs', fullSha], { stdio: 'inherit', env: process.env })
 if (verify.status !== 0) {
   console.error(
     '✘ the deploy and the publish step both reported success, but the post-publish ' +

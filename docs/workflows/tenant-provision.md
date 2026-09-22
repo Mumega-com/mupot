@@ -172,8 +172,15 @@ multi-tenant colony) the deploy itself just stamped:
 6. **Live-verify-before-merge receipt** (Kasra-core, required before merging this PR):
    capture, as a PR comment, (a) UTC timestamp and operator name, (b) the git HEAD sha used
    for the live run, (c) `npm run deploy -- --config <toml>` exit code, (d) the
-   `scripts/publish-pot-bundle.mjs` stdout JSON receipt
-   (`{ok,bucket,key,sha256,size,already_published}`),
+   `scripts/publish-pot-bundle.mjs` stdout JSON receipt — the EXACT fields the script emits
+   today: `{ok,key,sha256,size,already_published,timestamp}`. Deliberately **no `bucket`
+   field** (mupot#1524 round-2 successor decision): CodeQL js/clear-text-logging flagged
+   `bucket` reaching a printed receipt because it CAN carry the env-derived
+   `POT_WORKER_BUNDLE_R2_BUCKET` value — re-adding even the wrangler.example.toml
+   *constant* would create a second place that name can drift from
+   `POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT` without a test catching it. The bucket is already
+   documented once, above, and pinned by test (`POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT`
+   describe block, `tests/pot-bundle-r2.test.ts`) — the receipt does not need to repeat it.
    (e) the `scripts/verify-pot-bundle.mjs <sha>` stdout JSON receipt confirming `ok:true`
    (also run automatically by `scripts/deploy.mjs` itself before it prints success),
    and (f) a `grep`-for-the-secret-value confirmation that neither
@@ -224,6 +231,101 @@ multi-tenant colony) the deploy itself just stamped:
 - **One bucket-name constant, pinned against `wrangler.example.toml`** —
   `POT_WORKER_BUNDLE_R2_BUCKET_DEFAULT` and the example config's `bucket_name` are asserted
   equal by a dedicated test, so the two can never silently drift apart.
+
+### Round 2 successor (mupot#1524 round-2 adversarial gate, 2026-09-22 — this PR)
+
+The round-2 gate above was re-run against its own fix commit and found a NEW P0 in that fix
+plus several P1/P2 gaps. #1524 closed superseded; this PR carries the same base
+(`1dc9a0b5`) plus these fixes, gated fresh:
+
+- **P0 — `scripts/deploy.mjs` was silently dropping `rawArgs[0]` on every deploy that did
+  not pass `--skip-reason`.** `skipReasonFlagIndex = rawArgs.indexOf('--skip-reason')` is
+  `-1` when the flag is absent, and the old filter's `i !== skipReasonFlagIndex + 1` became
+  `i !== 0` — so `npm run deploy -- --config=wrangler.acme.toml` forwarded NOTHING to
+  `wrangler deploy`, which fell back to the repo-default `wrangler.toml` and deployed
+  successfully, exit 0, no error. Fixed by extracting the argv walk to
+  `scripts/lib/deploy-args.mjs` (`parseDeployArgs`) with an explicit, single-pass index —
+  the "skip the next token" behavior only ever triggers from INSIDE the loop, never from a
+  search result that can come back `-1`. Unit-tested directly
+  (`tests/deploy-args.test.ts`) plus a real end-to-end spawn of `scripts/deploy.mjs` with a
+  fake `npx`/`wrangler` shim recording its argv, proving the WIRING and not just the
+  extracted function.
+- **P1 — the `<AWSAccessKeyId>`-only redaction did not close the leak class.** A standard
+  S3 error body also carries `<BucketName>`/`<Endpoint>`/`<HostId>`/`<RequestId>`, and R2's
+  `<Endpoint>` is exactly `<bucket>.<account-id>.r2.cloudflarestorage.com` — a real error
+  response could still launder `CLOUDFLARE_ACCOUNT_ID` and the bucket name through
+  `console.log`, and CodeQL's dataflow analysis cannot see across the
+  env → signed-request → REMOTE response → log boundary to catch it. Replaced with an
+  ALLOW-LIST (Athena's rule: a printed field must be NAMED to be printed): only HTTP status
+  plus the S3 `<Code>` element (e.g. `HTTP 403 (AccessDenied)`) ever reach a thrown message
+  or a returned `reason`. Covered by sentinel-account/bucket tests through BOTH the PUT and
+  GET failure paths, including two tests that spawn the REAL `scripts/verify-pot-bundle.mjs`
+  and `scripts/publish-pot-bundle.mjs` processes with a fake-fetch preload
+  (`tests/pot-bundle-r2.test.ts`, "real CLI process" describe block).
+- **P2-1 — immutability rested only on an UNVERIFIED `If-None-Match: '*'`.** A server that
+  silently ignores the header would let a PUT of different bytes clobber an
+  already-published bundle with no visible error. `putPotWorkerBundleObject` now reads the
+  object back and compares digests BEFORE ever attempting a PUT: an identical digest
+  short-circuits to `already_published: true` with **zero PUT calls**; a different digest
+  throws `BundleShaConflictError` with **zero PUT calls**. `If-None-Match: '*'` remains a
+  second layer for the race the pre-check cannot see (two publishers racing the same
+  not-yet-published key).
+- **P2-2 — a flag value that itself looks like a flag was silently accepted.**
+  `--config --dry-run=false`, `--config=--x`, and `--outdir --x` were all accepted as
+  literal values instead of refused — `matchConfigFlag`
+  (`scripts/lib/wrangler-config-arg.mjs`) and `scripts/build-pot-worker-bundle.mjs`'s own
+  `--outdir` handling now refuse any value starting with `-`, and
+  `scripts/lib/deploy-args.mjs`'s `--skip-reason` handling does the same.
+- **P2-3 — recovering from a digest mismatch had no documented procedure**, and
+  `scripts/deploy.mjs`'s post-deploy failure message suggested "re-run publish" even for a
+  genuine conflict — which only refuses again, identically, forever (a published bundle is
+  immutable by design). See "Recovering from a digest mismatch" below;
+  `scripts/publish-pot-bundle.mjs` now exits with a dedicated code
+  (`BUNDLE_SHA_CONFLICT_EXIT_CODE = 2`) so `scripts/deploy.mjs` — which only sees that exit
+  code across the `spawnSync` boundary — can name the real procedure instead.
+- **P2-4 — a 412 whose confirming GET itself failed was reported as a confirmed digest
+  conflict.** `bundle_sha_conflict` claims a KNOWN, DIFFERENT digest; a 404/transport
+  error/unreadable-metadata result on the confirming GET establishes no such thing. Now
+  throws `BundlePublishUnconfirmedError` (`code: 'bundle_publish_unconfirmed'`, exit code
+  `BUNDLE_PUBLISH_UNCONFIRMED_EXIT_CODE = 3`), naming the confirming GET's own status in the
+  message.
+- **Low — the auto-skip path (off-main/dirty release) now also names the
+  `no_bundle_source` consequence** up front, matching the explicit
+  `--skip-bundle-publish` path (previously only the explicit path did). `--skip-reason
+  --flag` and `-c`/`--config=`'s bare-flag-as-value shapes are refused (see P2-2).
+  **`scripts/deploy.mjs` now scopes the R2 credential pair explicitly**: its
+  `wrangler deploy` spawn runs with
+  `R2_POT_BUNDLES_ACCESS_KEY_ID`/`R2_POT_BUNDLES_SECRET_ACCESS_KEY` stripped from the
+  child's environment (`envWithoutR2PotBundlesCreds()`) — before this,
+  `spawnSync(..., { stdio: 'inherit' })` with no explicit `env` handed wrangler (and,
+  inside it, esbuild) the FULL operator shell environment by default, including a
+  credential pair neither ever reads. The `publish-pot-bundle.mjs`/`verify-pot-bundle.mjs`
+  spawns, which DO need the pair, now pass `env: process.env` explicitly too, so the
+  asymmetry is visible in the code rather than one spawn being explicit and the others an
+  unstated default. Covered by `tests/deploy-args.test.ts`'s env-scoping test.
+
+### Recovering from a digest mismatch (`bundle_sha_conflict`)
+
+A published RELEASE_SHA's bundle is immutable by design — re-running publish against the
+SAME key with DIFFERENT bytes will refuse identically, every time, forever. This is not a
+bug to retry past; it means either the wrong commit's bundle was built, or a previous
+publish left something behind that needs to go. Recovery:
+
+1. Confirm you actually mean to replace it: `node scripts/verify-pot-bundle.mjs
+   <release-sha>` and compare its `sha256` against what you expect to publish.
+2. **An operator** (this is a deliberate, receipted human action — not something either CLI
+   script does for you) deletes the object at the exact receipted key, via the Cloudflare
+   dashboard (R2 → the bucket → `<release-sha>/worker.js` → Delete) or
+   `wrangler r2 object delete <bucket>/<release-sha>/worker.js`.
+3. Log a receipt line naming who deleted it, when, and why (the same PR-comment discipline
+   as the live-verify-before-merge receipt above).
+4. Re-run `node scripts/publish-pot-bundle.mjs --release-sha <release-sha> [--config ...]`
+   (or re-run `npm run deploy` for the same commit). The pre-PUT digest check (P2-1 above)
+   will find nothing published and proceed normally.
+
+`scripts/deploy.mjs`'s own post-deploy failure message names this exact procedure when the
+publish step exits with `BUNDLE_SHA_CONFLICT_EXIT_CODE` — it never says "re-run publish"
+for this case, since that alone does not fix anything.
 
 UNVERIFIED LIVE, same discipline as the rest of this module: this session cannot confirm R2's
 S3-compatible PutObject actually honors `If-None-Match: '*'` with a `412` on conflict —
