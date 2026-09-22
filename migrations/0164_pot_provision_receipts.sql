@@ -29,13 +29,32 @@
 -- — that identity lives entirely on the CHILD pot, see "the provisioner's
 -- authority ends at the handover" in docs/workflows/tenant-provision.md). Both
 -- nullable: a Stripe-webhook self-serve call has no interactive member at all
--- (`checkout.ts` never sets `minted_by_member_id`). `detail` is a hard
--- CHECK boundary, not just a convention: no email address may ever appear in
--- it (a receipt is an operational ledger, not a place a customer's PII
--- accumulates), and it must stay valid JSON where the step schema expects
--- structure (`seed_identities`/`deploy_worker`/`verify_reachable`), so a
--- regression that starts interpolating a raw string back in is caught by the
--- database itself, not just code review.
+-- (`checkout.ts` never sets `minted_by_member_id`).
+--
+-- mupot#1507-v2 P0-B (rewritten in place — this migration is still unmerged/
+-- branch-only): the round-2 version of this CHECK required `json_valid(detail)`
+-- for only THREE of the six steps, and separately refused ANY '@' character via
+-- `instr(lower(detail), '@') = 0` regardless of context. Application code wrote
+-- plain prose on every FAILURE path across all six steps — which the three-step
+-- json_valid() rule then rejected outright for the steps it covered, and the
+-- blanket '@' rule rejected for EVERY step whenever a failure message happened
+-- to quote something with an '@' in it that was not an email at all (a Workers
+-- AI binding name like `@cf/meta/llama-3.3`, for instance). Either violation
+-- made the INSERT throw; the application's own write-failure handling then
+-- swallowed that throw, so the affected step's receipt simply never existed —
+-- an operator querying this table for a failed run saw nothing for the step
+-- that actually failed, not even a row saying so.
+--
+-- THE FIX SPLITS THE TWO CONCERNS the round-2 CHECK conflated: "is this valid
+-- JSON" is a STRUCTURAL property SQLite can verify exactly and cheaply for
+-- every row, so the DB keeps enforcing it, now uniformly across all six steps
+-- (`src/pots/service.ts`'s `receiptOk`/`receiptError` are the ONLY two
+-- functions in that file that build a `detail` value, so every row this schema
+-- will ever see is already JSON by construction). "Does this contain PII" is a
+-- content judgment call — matching what LOOKS like an email address, not
+-- refusing every '@' — which belongs in application code where it can be
+-- precise (see `redactAndBound` in `src/pots/service.ts`), not a DB substring
+-- rule that cannot tell a redacted email from an unrelated '@'.
 CREATE TABLE IF NOT EXISTS pot_provision_receipts (
   id              TEXT NOT NULL PRIMARY KEY,
   tenant          TEXT NOT NULL,
@@ -45,19 +64,15 @@ CREATE TABLE IF NOT EXISTS pot_provision_receipts (
   run_id          TEXT NOT NULL,
   step            TEXT NOT NULL CHECK (step IN (
     'create_d1', 'create_kv', 'apply_schema', 'deploy_worker',
-    'seed_identities', 'verify_reachable'
+    'seed_identities', 'verify_reachable',
+    -- Not a provisioning step — `releaseStalePot` (mupot#1507-v2 P1-A) records
+    -- an org:admin's explicit release of a stale `provisioning` row on this
+    -- SAME ledger, so one slug's full history (provisioned, abandoned,
+    -- released, reclaimed) lives in one place.
+    'release'
   )),
   ok              INTEGER NOT NULL CHECK (ok IN (0, 1)),
-  detail          TEXT CHECK (
-    detail IS NULL
-    OR (
-      instr(lower(detail), '@') = 0
-      AND (
-        step NOT IN ('seed_identities', 'deploy_worker', 'verify_reachable')
-        OR json_valid(detail)
-      )
-    )
-  ),
+  detail          TEXT CHECK (detail IS NULL OR json_valid(detail)),
   -- The CALLER's own identity — an org-admin's member id via the dashboard
   -- route or the MCP tool (both pass auth.memberId as minted_by_member_id).
   -- NULL for checkout.ts's self-serve path, which has no interactive member.

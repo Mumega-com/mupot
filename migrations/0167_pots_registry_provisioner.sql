@@ -24,3 +24,21 @@ ALTER TABLE pots ADD COLUMN provisioner_tenant TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pots_provisioner
   ON pots(provisioner_member_id);
+
+-- mupot#1507-v2 P0-C (this migration rewritten in place — still unmerged/
+-- branch-only): `checkout.ts`'s self-serve Stripe path never sets
+-- `provisioner_member_id` (there is no interactive member at checkout time),
+-- so a claim made through it degraded to matching `provisioner_tenant` alone
+-- — the SAME value (this deployment's own `TENANT_SLUG`, or NULL when unset)
+-- for every self-serve buyer. `null === null && tenant === tenant` then let
+-- ANY later self-serve call for the same slug adopt whatever the first one
+-- claimed — redeploying over a live customer's pot and handing the caller
+-- back the victim's own admin identity references. `checkout_session_id`
+-- scopes a self-serve claim to the EXACT Stripe Checkout Session that made
+-- it: `provisionSovereignPot`'s registry gate now requires an exact
+-- session-id match to adopt a row that carries one, which makes a webhook
+-- RETRY of the same session idempotent (same session id => same claim =>
+-- adopt) while refusing a genuinely different session on the same slug
+-- outright — see `src/pots/service.ts`'s registry-gate ownership check and
+-- `checkout.ts`'s `handlePotCreationCompleted`.
+ALTER TABLE pots ADD COLUMN checkout_session_id TEXT;

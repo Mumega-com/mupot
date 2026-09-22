@@ -66,9 +66,19 @@ export function sanitizeSlug(input: string): string {
     .replace(/^-|-$/g, '')
 }
 
+// Length bounds are 3-32 — DELIBERATELY the same window checkSlugAvailability's own
+// (now-removed) format regex used to enforce independently (mupot#1507-v2 P2, "align
+// validateSlug and checkSlugAvailability length rules"). The two functions used to
+// disagree (this one allowed 2-40, checkSlugAvailability's own regex only 3-32), which
+// meant a slug of length 33-40 passed THIS check, reached the registry gate, and only then
+// failed checkSlugAvailability's stricter rule — surfacing as `pot_slug_taken` (409, "this
+// is already claimed by someone else") when the real problem was `invalid_slug` (400, "this
+// was never a legal name to begin with"), a wrong-error-code class of its own.
+// checkSlugAvailability now calls THIS function for its format check instead of
+// re-implementing the rule a second time — one predicate, one place it can drift.
 export function validateSlug(slug: string): { ok: true } | { ok: false; error: string } {
-  if (!slug || slug.length < 2) return { ok: false, error: 'Slug must be at least 2 characters.' }
-  if (slug.length > 40) return { ok: false, error: 'Slug cannot exceed 40 characters.' }
+  if (!slug || slug.length < 3) return { ok: false, error: 'Slug must be at least 3 characters.' }
+  if (slug.length > 32) return { ok: false, error: 'Slug cannot exceed 32 characters.' }
   if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(slug)) {
     return { ok: false, error: 'Slug must start and end with alphanumeric characters and contain only letters, numbers, and dashes.' }
   }
@@ -582,34 +592,45 @@ async function readFullSeedIdentityState(
  * stored HASHED with the exact same `sha256Hex` (src/members/service.ts) the main pot's
  * token verification path uses.
  *
- * ATOMIC BATCH (mupot#1507 round-2 P0-1). The schema this seed runs against (migration
- * 0071) enforces a real invariant: `member_tokens_agent_binding_insert` aborts ANY
- * `member_tokens` insert carrying a non-null `agent_id` unless a matching row already
- * exists in `agent_member_bindings` — an agent cannot hold a credential without a
- * recorded human-readable identity weld to a member. The seed-seat token insert MUST
- * therefore be preceded by an `agent_member_bindings` insert for that exact
- * (tenant, agent_id, member_id) triple, in the SAME statement sequence — never added
- * around the trigger (a `catch` that swallows the abort and retries some other way would
- * be exactly the kind of workaround this trigger exists to make impossible).
+ * ATOMIC BATCH (mupot#1507 round-2 P0-1, corrected mupot#1507-v2 P0-A). The schema this
+ * seed runs against (migration 0071) enforces a real invariant:
+ * `member_tokens_agent_binding_insert` aborts ANY `member_tokens` insert carrying a
+ * non-null `agent_id` unless a matching row already exists in `agent_member_bindings` — an
+ * agent cannot hold a credential without a recorded human-readable identity weld to a
+ * member. The seed-seat token insert MUST therefore be preceded by an
+ * `agent_member_bindings` insert for that exact (tenant, agent_id, member_id) triple, in
+ * the SAME statement sequence — never added around the trigger (a `catch` that swallows
+ * the abort and retries some other way would be exactly the kind of workaround this
+ * trigger exists to make impossible).
  *
  * All nine writes below (department, squad, admin member, admin capability, admin token,
  * lead-agent member, lead agent, the binding, lead-agent capability, lead-agent token —
  * ten, counting both member rows) are sent as ONE D1 REST `/query` call: a single
- * `BEGIN; ...; COMMIT;` script with every value inlined via `escapeSqlLiteral` rather than
- * bound `?N` params. This is deliberate, not a shortcut: D1 REST's per-statement param
- * binding for a MULTI-statement string in one call is undocumented (would every
- * statement's own `?1, ?2, ...` need to be renumbered globally across the whole script, or
- * does each statement get its own local numbering? Cloudflare does not say), so inlining
- * avoids relying on unverified behavior for the one write path where getting it wrong
- * means a passing statement 3 that actually wrote statement 7's values. The `BEGIN`/
- * `COMMIT` wrapper gives real SQLite transaction semantics — D1 is built on SQLite, and a
- * script that errors before reaching `COMMIT` never persists any of it — closing the
- * exact "admin member + org:owner capability + orphan token, no lead agent" partial state
- * requirement 1 names. NOT verified against the LIVE Cloudflare D1 REST API in this
- * session (no live CF calls permitted) — this session's own real-SQLite test harness
- * (tests/pot-provisioner.test.ts) proves the SQL text itself is correct and atomic against
- * a real engine with the real trigger set; Kasra-core should confirm D1 REST honors the
- * same BEGIN/COMMIT semantics live before this ships broadly.
+ * semicolon-joined script with every value inlined via `escapeSqlLiteral` rather than
+ * bound `?N` params (D1 REST's per-statement param binding for a MULTI-statement string in
+ * one call is undocumented — would every statement's own `?1, ?2, ...` need to be
+ * renumbered globally across the whole script, or does each statement get its own local
+ * numbering? Cloudflare does not say — so inlining avoids relying on unverified behavior
+ * for the one write path where getting it wrong means a passing statement 3 that actually
+ * wrote statement 7's values).
+ *
+ * NO APP-LEVEL `BEGIN`/`COMMIT` WRAPPER (mupot#1507-v2 P0-A — this is a correction of the
+ * ROUND-2 version of this function, which DID wrap the batch in `BEGIN;`/`COMMIT;`). D1's
+ * REST `/query` endpoint REJECTS transaction-control statements outright —
+ * "cannot start a transaction within a transaction" — because the semicolon-joined
+ * statements in ONE `/query` call are ALREADY executed as a single atomic batch by
+ * Cloudflare; D1 is not a raw SQLite file this Worker can `BEGIN`/`COMMIT` against over the
+ * wire (developers.cloudflare.com/d1/best-practices/import-export-data/,
+ * developers.cloudflare.com/d1/worker-api/d1-database/, cloudflare/workers-sdk#2733). This
+ * repo's own `scripts/gen-schema-chain.mjs` already refuses to GENERATE a migration file
+ * containing transaction-control BEGIN for the identical reason (its own "TRANSACTION-
+ * CONTROL BEGIN IS CLASSIFIED AND REFUSED" doc comment) — the round-2 version of this
+ * function violated, at runtime, exactly the rule this codebase already enforces at
+ * generation time for migrations, and the test suite's own fake Cloudflare backend could
+ * not catch it because it answered `success:true` to raw SQL text without ever modeling
+ * D1's real refusal (see tests/helpers/d1-rest-double.ts, which now does). Atomicity here
+ * comes ENTIRELY from D1 REST's own documented one-call-one-batch semantics, not from
+ * anything this function sends.
  *
  * A LEAD AGENT'S HOME MEMBER GETS `capability = 'lead'`, matching the agent's OWN `role`
  * column. An earlier draft of this function capped it at `'member'`, reasoning from
@@ -710,7 +731,6 @@ export async function seedPotIdentities(
   const adminName = input.adminName || brandName
 
   const batchSql = [
-    'BEGIN;',
     `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES (${lit(departmentId)}, 'core', ${lit(brandName)}, 'work', 1, ${lit(now)});`,
     `INSERT INTO squads (id, department_id, slug, name, kind, created_at) VALUES (${lit(squadId)}, ${lit(departmentId)}, 'core', 'Core', 'work', ${lit(now)});`,
     `INSERT INTO members (id, email, display_name, status, tenant, created_at) VALUES (${lit(adminMemberId)}, ${lit(normalizedEmail)}, ${lit(adminName)}, 'active', ${lit(input.slug)}, ${lit(now)});`,
@@ -727,20 +747,15 @@ export async function seedPotIdentities(
     // this at observer/member was dropped in migration 0087. See the function doc comment.
     `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability, created_at) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, 'squad', ${lit(squadId)}, 'lead', ${lit(now)});`,
     `INSERT INTO member_tokens (id, member_id, agent_id, token_hash, label, channel, created_at, tenant) VALUES (${lit(crypto.randomUUID())}, ${lit(leadAgentMemberId)}, ${lit(leadAgentId)}, ${lit(leadAgentTokenHash)}, 'seed-seat', 'workspace', ${lit(now)}, ${lit(input.slug)});`,
-    'COMMIT;',
   ].join('\n')
 
   try {
     await executeD1Query(cf, databaseId, batchSql)
   } catch (error) {
-    // Best-effort rollback in case the REST connection's transaction survives the failed
-    // request (documented uncertainty — see the function doc comment). Swallowed: a
-    // failure here must not replace the real, load-bearing diagnostic below.
-    try {
-      await executeD1Query(cf, databaseId, 'ROLLBACK;')
-    } catch {
-      // Nothing to do — either it wasn't needed or the connection is already gone.
-    }
+    // No app-level ROLLBACK to issue here (mupot#1507-v2 P0-A) — nothing was BEGUN by this
+    // call in the first place. D1 REST's own one-call-one-batch atomicity means a failure
+    // anywhere in `batchSql` leaves the whole call unpersisted; there is nothing further
+    // for this Worker to undo over the wire.
     return {
       ok: false,
       alreadySeeded: false,
@@ -886,22 +901,83 @@ export async function verifyPotReachable(
   }
 }
 
-/** Best-effort append to `pot_provision_receipts` (migration 0164) on the ORCHESTRATOR's
- *  own D1 (`env.DB` — the same database that carries `pots`, migration 0145), never the
- *  tenant's new pot D1. A write failure here must not itself brick provisioning — the
- *  ledger is a durable AUDIT TRAIL, not a gate — but it never silently disappears from
- *  THIS call's own response either way, since `receipts` in `SovereignPotProvisionResult`
- *  is built from the same in-memory data independent of whether the row landed. */
-async function writeProvisionReceipt(
+/**
+ * The ONE JSON shape every `pot_provision_receipts.detail` value takes, on every step, on
+ * both success and failure (mupot#1507-v2 P0-B, Athena's binding addition 1: "the receipt
+ * table's CHECK and every writer are ONE review unit"). Before this, only three of six
+ * steps' SUCCESS paths wrote JSON; every FAILURE path across all six wrote plain prose
+ * instead — which the round-2 version of migration 0164's CHECK (`json_valid(detail)`
+ * required for exactly those three steps) then REJECTED outright for the ones it covered,
+ * and `writeProvisionReceipt`'s swallowed catch turned that rejection into a step that ran,
+ * failed, and left NO receipt at all. Migration 0164 (this branch, rewritten in place) now
+ * requires `json_valid(detail)` for EVERY step, and `receiptOk`/`receiptError` are the only
+ * two functions that build a `detail` value anywhere in this file — one call site's shape
+ * is every call site's shape, by construction, not by convention.
+ */
+export function receiptOk(fields: Record<string, unknown> = {}): string {
+  return JSON.stringify({ ok: true, ...fields })
+}
+
+/** Maximum length of a `receiptError` message AFTER redaction — see `redactAndBound`. */
+const RECEIPT_MESSAGE_MAX_LENGTH = 500
+
+/** A loose but adequate email-shape matcher for REDACTION purposes only (never used as a
+ *  validity check) — this replaces the round-2 DB-level `instr(lower(detail), '@') = 0`
+ *  CHECK, which refused ANY '@' character regardless of context. mupot#1507-v2 P0-B found
+ *  the exact failure that rule causes: a schema/deploy error can legitimately quote a
+ *  Workers AI binding name like `@cf/meta/llama-3.3` — no email in it at all — and the old
+ *  CHECK refused that receipt exactly as it would a real email, silently dropping it via
+ *  `writeProvisionReceipt`'s swallow. Redacting emails in application code (here) and
+ *  leaving the DB CHECK to enforce only `json_valid` (structure, which SQLite can actually
+ *  verify) separates "is this shaped right" (the database's job) from "does this contain
+ *  PII" (a judgment call belonging in code, where it can be precise about what it matches). */
+const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/g
+
+/** Redacts anything email-shaped and bounds the length of a receipt error message. Applied
+ *  to EVERY `receiptError` call — there is no path to a `pot_provision_receipts` row that
+ *  skips it. */
+function redactAndBound(message: string): string {
+  const redacted = message.replace(EMAIL_RE, '[redacted-email]')
+  return redacted.length > RECEIPT_MESSAGE_MAX_LENGTH
+    ? `${redacted.slice(0, RECEIPT_MESSAGE_MAX_LENGTH)}…(truncated)`
+    : redacted
+}
+
+/** Builds a failure `detail` — `{ok:false, error:{class, message}}`. `errorClass` is a
+ *  short, stable, machine-groupable string (`'sql_error'`, `'http_error'`,
+ *  `'transport_error'`, `'seed_failed'`, `'unreachable'`, `'receipt_write_failed'`, ...) —
+ *  never the raw message alone, so a receipt reader can group failures without parsing
+ *  prose. `extraFields` carries structured, queryable context (e.g. `apply_schema`'s
+ *  `file`/`statement_index`/`kind`) alongside the error, same as `receiptOk`'s fields. */
+export function receiptError(errorClass: string, message: string, extraFields: Record<string, unknown> = {}): string {
+  return JSON.stringify({ ok: false, error: { class: errorClass, message: redactAndBound(message) }, ...extraFields })
+}
+
+/** Appends one row to `pot_provision_receipts` (migration 0164) on the ORCHESTRATOR's own
+ *  D1 (`env.DB` — the same database that carries `pots`, migration 0145), never the
+ *  tenant's new pot D1. Returns whether the write actually landed.
+ *
+ *  FAIL CLOSED (mupot#1507-v2 P0-B — this REVERSES the round-2 version of this function,
+ *  which swallowed every write failure on the theory that "the ledger is a durable audit
+ *  trail, not a gate"). That reasoning only holds if the write can actually fail for
+ *  reasons unrelated to the DATA being written — round 2's own `detail` values violated
+ *  the receipt table's own CHECK constraint on every failure path (see `receiptOk`'s doc
+ *  comment), so "the ledger swallows its own write failures" was, in practice, "the ledger
+ *  silently has no row for any step that failed" — exactly the class of defect a receipt
+ *  ledger exists to prevent. `recordStep` (the caller, below) now treats a failed write as
+ *  a FAILED STEP regardless of whether the underlying provisioning operation itself
+ *  succeeded. Logged via `console.error` — the one channel available this deep in an
+ *  already-fail-closed path, and squarely inside a catch block (not a debugging log). */
+export async function writeProvisionReceipt(
   env: Env,
   runId: string,
   slug: string,
   step: ProvisionStep,
   ok: boolean,
-  detail: string | null,
+  detail: string,
   actorMemberId: string | null,
   actorTenant: string | null,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await env.DB.prepare(
       'INSERT INTO pot_provision_receipts (id, tenant, slug, run_id, step, ok, detail, actor_member_id, actor_tenant, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)',
@@ -911,8 +987,12 @@ async function writeProvisionReceipt(
         actorMemberId, actorTenant, new Date().toISOString(),
       )
       .run()
-  } catch {
-    // Swallowed deliberately — see doc comment above.
+    return true
+  } catch (error) {
+    console.error(
+      `pot_provision_receipts write failed for step=${step} slug=${slug} run_id=${runId}: ${errMsg(error)}`,
+    )
+    return false
   }
 }
 
@@ -920,6 +1000,24 @@ export interface SlugCheckResult {
   available: boolean
   slug: string
   reason?: string
+}
+
+/** A `pots` row left at `status: 'provisioning'` longer than this is presumed abandoned —
+ *  a Stripe checkout the customer never completed, or a run that crashed mid-flight
+ *  without a later retry (mupot#1507-v2 P1-A). 30 minutes: generous relative to how long a
+ *  real provisioning run or a Stripe Checkout session actually takes (minutes, not tens of
+ *  minutes), short enough that a genuinely abandoned slug doesn't sit unusable for days. */
+export const STALE_PROVISIONING_MS = 30 * 60 * 1000
+
+/** True when `row` is a `pots` row that has been stuck at `status: 'provisioning'` past
+ *  `STALE_PROVISIONING_MS`. An `'active'` row (or a fresh `'provisioning'` one) is never
+ *  stale — only a provisioning attempt that has had time to either finish or be retried and
+ *  still hasn't reads as abandoned. */
+function isStaleProvisioningRow(row: { status: string; created_at: string }, nowMs: number): boolean {
+  if (row.status !== 'provisioning') return false
+  const createdMs = Date.parse(row.created_at)
+  if (!Number.isFinite(createdMs)) return false
+  return nowMs - createdMs > STALE_PROVISIONING_MS
 }
 
 /**
@@ -933,31 +1031,39 @@ export interface SlugCheckResult {
  * FAIL CLOSED (mupot#1303). An unanswerable check is NOT an available slug — "I could not
  * determine whether this is taken" must never be answered as "this is not taken".
  *
- * Two sources are consulted because BOTH occupy the same `mupot-pots` dispatch namespace:
- * tenant pots (`pots`, migration 0145) and project sub-workers (`src/platform/dispatcher.ts`
- * dispatches `worker_name || slug` into it). A name taken by either is not available to a
- * new pot.
+ * FORMAT CHECK DELEGATES TO `validateSlug` (mupot#1507-v2 P2) — this function used to
+ * re-implement its own length/character regex, which had DRIFTED from `validateSlug`'s own
+ * rule (2-40 there, 3-32 here) — see `validateSlug`'s doc comment for the wrong-error-code
+ * consequence that caused. One predicate, called from both places `provisionSovereignPot`
+ * checks it (its own `validateSlug(slug)` call at entry, and this function via the registry
+ * gate for a brand-new slug).
+ *
+ * Two DB sources are consulted because BOTH occupy the same `mupot-pots` dispatch
+ * namespace: tenant pots (`pots`, migration 0145) and project sub-workers
+ * (`src/platform/dispatcher.ts` dispatches `worker_name || slug` into it). A name taken by
+ * either is not available to a new pot.
+ *
+ * A `pots` row stuck at `status: 'provisioning'` past `STALE_PROVISIONING_MS` reads as
+ * AVAILABLE here (mupot#1507-v2 P1-A) — a pre-flight UX signal only, telling a prospective
+ * customer "you can try this name," never an authorization decision on its own: the actual
+ * claim still runs through `provisionSovereignPot`'s registry gate, which refuses a
+ * DIFFERENT provisioner on a stale-but-still-`provisioning` row until an org:admin
+ * explicitly frees it via `pot_release` (see that function). An `'active'` row is NEVER
+ * reported available regardless of age.
  */
 export async function checkSlugAvailability(env: Env, rawSlug: string): Promise<SlugCheckResult> {
   const slug = (rawSlug || '').toLowerCase().trim()
 
-  if (!/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(slug)) {
-    return {
-      available: false,
-      slug,
-      reason: 'Slug must be 3-32 lowercase alphanumeric characters and cannot start or end with a hyphen.',
-    }
-  }
-
-  if (RESERVED_TENANT_SLUGS.has(slug)) {
-    return { available: false, slug, reason: 'This pot subdomain is reserved.' }
+  const format = validateSlug(slug)
+  if (!format.ok) {
+    return { available: false, slug, reason: format.error }
   }
 
   try {
-    const takenByPot = await env.DB.prepare('SELECT id FROM pots WHERE slug = ?1 LIMIT 1')
+    const takenByPot = await env.DB.prepare('SELECT status, created_at FROM pots WHERE slug = ?1 LIMIT 1')
       .bind(slug)
-      .first<{ id: string }>()
-    if (takenByPot) {
+      .first<{ status: string; created_at: string }>()
+    if (takenByPot && !isStaleProvisioningRow(takenByPot, Date.now())) {
       return { available: false, slug, reason: 'This pot subdomain is already taken.' }
     }
 
@@ -992,6 +1098,21 @@ export class PotSlugTakenError extends Error {
   constructor(readonly slug: string, reason?: string) {
     super(reason ? `Slug '${slug}' is not available: ${reason}` : `Slug '${slug}' is already provisioned by a different caller.`)
     this.name = 'PotSlugTakenError'
+  }
+}
+
+/** Thrown by `provisionSovereignPot` when `validateSlug` refuses the requested slug's
+ *  FORMAT (too short/long, illegal characters, reserved word) — distinct from
+ *  `PotSlugTakenError`, which means "this name is valid but already claimed by someone
+ *  else." Before mupot#1507-v2 P2, a format refusal threw a plain `Error`, which
+ *  `src/pots/routes.ts`/`src/mcp/pots.ts` had no specific catch for and fell through to a
+ *  generic 500 `provisioning_failed` — the wrong status for "the input was malformed,"
+ *  which callers can fix and retry immediately, unlike a genuine server error. */
+export class InvalidSlugError extends Error {
+  readonly code = 'invalid_slug' as const
+  constructor(readonly slug: string, reason: string) {
+    super(reason)
+    this.name = 'InvalidSlugError'
   }
 }
 
@@ -1058,7 +1179,7 @@ export async function provisionSovereignPot(
   const slug = sanitizeSlug(input.slug)
   const valid = validateSlug(slug)
   if (!valid.ok) {
-    throw new Error(valid.error)
+    throw new InvalidSlugError(slug, valid.error)
   }
 
   // Cloudflare credentials come ONLY from env — never the caller (mupot#1507 P0-3; the
@@ -1073,6 +1194,7 @@ export async function provisionSovereignPot(
   const cf: CloudflareApiConfig = { accountId, apiToken }
   const actorMemberId = input.minted_by_member_id ?? null
   const actorTenant = input.caller_tenant ?? env.TENANT_SLUG ?? null
+  const actorCheckoutSessionId = input.checkout_session_id ?? null
 
   const runId = crypto.randomUUID()
   const completed: ProvisionStep[] = []
@@ -1082,43 +1204,85 @@ export async function provisionSovereignPot(
     kv_namespace_id: null, kv_namespace_title: null, kv_adopted: false,
   }
 
-  const recordStep = async (step: ProvisionStep, ok: boolean, detail: string | null): Promise<void> => {
-    receipts.push({ step, ok, detail })
-    await writeProvisionReceipt(env, runId, slug, step, ok, detail, actorMemberId, actorTenant)
-    if (ok) completed.push(step)
+  /** Fail-closed (mupot#1507-v2 P0-B): returns whether this step is now considered
+   *  successfully completed, which is `ok && the receipt actually landed`. A step whose
+   *  underlying operation succeeded but whose receipt could not be WRITTEN is treated as a
+   *  FAILED step — see `writeProvisionReceipt`'s doc comment for why swallowing that used
+   *  to make failed steps disappear entirely instead of just this one edge. `detail` is
+   *  always a `receiptOk`/`receiptError` JSON string — every call site below builds it
+   *  through exactly one of those two functions. */
+  const recordStep = async (step: ProvisionStep, ok: boolean, detail: string): Promise<boolean> => {
+    const written = await writeProvisionReceipt(env, runId, slug, step, ok, detail, actorMemberId, actorTenant)
+    const effectiveOk = ok && written
+    receipts.push({
+      step,
+      ok: effectiveOk,
+      detail: written
+        ? detail
+        : receiptError('receipt_write_failed', "this step's receipt could not be written to pot_provision_receipts — treated as a failed step (fail-closed)"),
+    })
+    if (effectiveOk) completed.push(step)
+    return effectiveOk
   }
 
   // 0. Registry gate — BEFORE any Cloudflare call (mupot#1507 round-2 P0-4, Athena
-  // condition i). `pots` (migration 0145) plus its round-2 `provisioner_member_id`/
-  // `provisioner_tenant` columns (migration 0167) is the account-wide ownership record: a
-  // slug already claimed by a DIFFERENT (member, tenant) pair is refused outright, never
-  // silently adopted. A brand-new slug is claimed HERE, before create_d1 — the INSERT's
-  // own UNIQUE(slug) constraint is the concurrency guard: if two calls race for the same
-  // fresh slug, the loser's INSERT throws and it is refused exactly like a pre-existing
-  // claim would be, never adopts what the winner is mid-creating.
-  //
-  // KNOWN, DOCUMENTED GAP: `checkout.ts`'s self-serve path has no interactive member
-  // (`actorMemberId` is always null there), so "ownership" for that path degrades to
-  // matching on `actorTenant` alone (this deployment's own TENANT_SLUG) — two different
-  // anonymous customers racing the EXACT same slug within this narrow window are not
-  // distinguished by identity, only by `checkSlugAvailability`'s pre-existing gate at
-  // Stripe-session-creation time. Closing that fully needs a per-checkout-session claim
-  // token, tracked separately, not built in this round (docs/workflows/tenant-provision.md).
+  // condition i; ownership check corrected mupot#1507-v2 P0-C). `pots` (migration 0145)
+  // plus its `provisioner_member_id`/`provisioner_tenant` (migration 0167) and
+  // `checkout_session_id` (migration 0167, added mupot#1507-v2) columns is the
+  // account-wide ownership record: a slug already claimed by a DIFFERENT owner is refused
+  // outright, never silently adopted. A brand-new slug is claimed HERE, before create_d1
+  // — the INSERT's own UNIQUE(slug) constraint is the concurrency guard: if two calls race
+  // for the same fresh slug, the loser's INSERT throws and it is refused exactly like a
+  // pre-existing claim would be, never adopts what the winner is mid-creating.
   const existingPotRow = await env.DB.prepare(
-    'SELECT provisioner_member_id, provisioner_tenant FROM pots WHERE slug = ?1 LIMIT 1',
+    'SELECT status, provisioner_member_id, provisioner_tenant, checkout_session_id FROM pots WHERE slug = ?1 LIMIT 1',
   )
     .bind(slug)
-    .first<{ provisioner_member_id: string | null; provisioner_tenant: string | null }>()
+    .first<{
+      status: string
+      provisioner_member_id: string | null
+      provisioner_tenant: string | null
+      checkout_session_id: string | null
+    }>()
 
   if (existingPotRow) {
-    const isOwner =
-      existingPotRow.provisioner_member_id === actorMemberId &&
-      existingPotRow.provisioner_tenant === actorTenant
-    if (!isOwner) {
-      throw new PotSlugTakenError(slug)
+    if (existingPotRow.status === 'released') {
+      // An org:admin explicitly freed this slug via `releaseStalePot` — adoptable by ANY
+      // new caller, same as a brand-new slug, except this row is UPDATEd (the
+      // UNIQUE(slug) constraint already holds it) rather than INSERTed. The
+      // `WHERE status = 'released'` clause is the concurrency guard: if two callers race
+      // to claim the same just-released slug, the loser's UPDATE affects zero rows.
+      const claim = await env.DB.prepare(
+        "UPDATE pots SET status = 'provisioning', source = 'provision', created_at = ?2, " +
+          'provisioner_member_id = ?3, provisioner_tenant = ?4, checkout_session_id = ?5 ' +
+          "WHERE slug = ?1 AND status = 'released'",
+      )
+        .bind(slug, new Date().toISOString(), actorMemberId, actorTenant, actorCheckoutSessionId)
+        .run()
+      if ((claim.meta?.changes ?? 0) === 0) {
+        // Lost the race — someone else's claim landed first.
+        throw new PotSlugTakenError(slug)
+      }
+    } else {
+      // A checkout-session claim can only be adopted by the EXACT same session (mupot#1507-v2
+      // P0-C) — this is what makes a Stripe webhook replay idempotent (same session id =>
+      // same claim => adopt) while refusing a genuinely DIFFERENT session on the same slug.
+      // A member-claimed row can only be adopted by that exact (member, tenant) pair. A row
+      // with NEITHER claim set is unclaimed and is NEVER adoptable by anyone — including
+      // another caller who also carries no identity: two `null === null` callers matching
+      // each other is exactly how a second self-serve buyer used to redeploy over a live
+      // customer's pot when this deployment's own TENANT_SLUG was unset.
+      const isOwner = existingPotRow.checkout_session_id !== null
+        ? actorCheckoutSessionId !== null && actorCheckoutSessionId === existingPotRow.checkout_session_id
+        : existingPotRow.provisioner_member_id !== null
+          ? actorMemberId === existingPotRow.provisioner_member_id && actorTenant === existingPotRow.provisioner_tenant
+          : false
+      if (!isOwner) {
+        throw new PotSlugTakenError(slug)
+      }
+      // Owner retry — falls through to the normal reuse-by-name flow below (create_d1 etc.
+      // adopt the existing CF resources by name, exactly as before this gate existed).
     }
-    // Owner retry — falls through to the normal reuse-by-name flow below (create_d1 etc.
-    // adopt the existing CF resources by name, exactly as before this gate existed).
   } else {
     const availability = await checkSlugAvailability(env, slug)
     if (!availability.available) {
@@ -1126,10 +1290,13 @@ export async function provisionSovereignPot(
     }
     try {
       await env.DB.prepare(
-        'INSERT INTO pots (id, slug, worker_script, status, source, created_at, provisioner_member_id, provisioner_tenant) ' +
-          'VALUES (?1,?2,?3,?4,?5,?6,?7,?8)',
+        'INSERT INTO pots (id, slug, worker_script, status, source, created_at, provisioner_member_id, provisioner_tenant, checkout_session_id) ' +
+          'VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)',
       )
-        .bind(crypto.randomUUID(), slug, slug, 'provisioning', 'provision', new Date().toISOString(), actorMemberId, actorTenant)
+        .bind(
+          crypto.randomUUID(), slug, slug, 'provisioning', 'provision', new Date().toISOString(),
+          actorMemberId, actorTenant, actorCheckoutSessionId,
+        )
         .run()
     } catch {
       // Lost a race to a concurrent claim of the same slug — refuse exactly like a
@@ -1191,13 +1358,15 @@ export async function provisionSovereignPot(
   try {
     d1 = await getOrCreateD1Database(cf, dbName)
   } catch (error) {
-    await recordStep('create_d1', false, errMsg(error))
+    await recordStep('create_d1', false, receiptError('http_error', errMsg(error)))
     return bail(`create_d1 failed: ${errMsg(error)}`)
   }
   orphans.d1_database_id = d1.uuid
   orphans.d1_database_name = d1.name
   orphans.d1_adopted = d1.adopted
-  await recordStep('create_d1', true, d1.adopted ? `adopted existing database ${d1.uuid}` : `created ${d1.uuid}`)
+  if (!(await recordStep('create_d1', true, receiptOk({ adopted: d1.adopted, database_id: d1.uuid })))) {
+    return bail('create_d1 succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
+  }
 
   // 2. KV — reuse-or-create, idempotent on slug.
   const kvTitle = `mupot-pot-${slug}-kv`
@@ -1205,47 +1374,55 @@ export async function provisionSovereignPot(
   try {
     kv = await getOrCreateKVNamespace(cf, kvTitle)
   } catch (error) {
-    await recordStep('create_kv', false, errMsg(error))
+    await recordStep('create_kv', false, receiptError('http_error', errMsg(error)))
     return bail(`create_kv failed: ${errMsg(error)}`)
   }
   orphans.kv_namespace_id = kv.id
   orphans.kv_namespace_title = kv.title
   orphans.kv_adopted = kv.adopted
-  await recordStep('create_kv', true, kv.adopted ? `adopted existing namespace ${kv.id}` : `created ${kv.id}`)
+  if (!(await recordStep('create_kv', true, receiptOk({ adopted: kv.adopted, namespace_id: kv.id })))) {
+    return bail('create_kv succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
+  }
 
   // 3. Apply the schema chain (src/pots/schema-chain.ts) via the D1 REST API.
   let alreadyApplied: Set<string>
   try {
     alreadyApplied = await loadAlreadyAppliedSet(cf, d1.uuid)
   } catch (error) {
-    await recordStep('apply_schema', false, `could not read pot_schema_applied: ${errMsg(error)}`)
+    await recordStep('apply_schema', false, receiptError('read_error', `could not read pot_schema_applied: ${errMsg(error)}`))
     return bail(`apply_schema failed reading bookkeeping: ${errMsg(error)}`)
   }
   let schemaResult: ApplySchemaChainResult
   try {
     schemaResult = await applySchemaChain(makeD1Exec(cf, d1.uuid), { alreadyApplied })
   } catch (error) {
-    await recordStep('apply_schema', false, errMsg(error))
+    await recordStep('apply_schema', false, receiptError('transport_error', errMsg(error)))
     return bail(`apply_schema threw: ${errMsg(error)}`)
   }
   if (schemaResult.failed) {
     const detail =
       `file=${schemaResult.failed.file} statementIndex=${schemaResult.failed.statementIndex} ` +
       `kind=${schemaResult.failed.kind}: ${schemaResult.failed.error}`
-    await recordStep('apply_schema', false, detail)
+    await recordStep('apply_schema', false, receiptError('sql_error', schemaResult.failed.error, {
+      file: schemaResult.failed.file,
+      statement_index: schemaResult.failed.statementIndex,
+      kind: schemaResult.failed.kind,
+    }))
     return bail(`apply_schema failed: ${detail}`)
   }
-  await recordStep(
+  if (!(await recordStep(
     'apply_schema',
     true,
-    `applied ${schemaResult.applied.length} file(s), skipped ${schemaResult.skipped.length} already-applied`,
-  )
+    receiptOk({ applied: schemaResult.applied.length, skipped: schemaResult.skipped.length }),
+  ))) {
+    return bail('apply_schema succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
+  }
 
   // 4. Deploy the tenant worker into the dispatch namespace. Digest-verified (mupot#1507
   // round 2 requirement 4) — see loadPotWorkerBundle's doc comment.
   const bundleResult = await loadPotWorkerBundle(env, workerJsCode)
   if (!bundleResult.ok) {
-    await recordStep('deploy_worker', false, bundleResult.reason)
+    await recordStep('deploy_worker', false, receiptError('no_bundle', bundleResult.reason))
     return bail(`deploy_worker failed: ${bundleResult.reason}`)
   }
   const bundle = bundleResult.bundle
@@ -1259,21 +1436,23 @@ export async function provisionSovereignPot(
       releaseSha: env.RELEASE_SHA,
     })
   } catch (error) {
-    await recordStep('deploy_worker', false, errMsg(error))
+    await recordStep('deploy_worker', false, receiptError('http_error', errMsg(error)))
     return bail(`deploy_worker failed: ${errMsg(error)}`)
   }
   // The receipt names the EXACT bytes deployed — source, digest, and (for R2) which
   // published object — regardless of which source won, per requirement 4: "the
   // worker_js_code fallback is digest-receipted too".
-  await recordStep(
+  if (!(await recordStep(
     'deploy_worker',
     true,
-    JSON.stringify({
+    receiptOk({
       source: bundle.source,
       sha256: bundle.sha256,
       ...(bundle.r2ObjectKey ? { r2_object_key: bundle.r2ObjectKey } : {}),
     }),
-  )
+  ))) {
+    return bail('deploy_worker succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
+  }
 
   // 5. Seed department/squad/admin member/lead agent, tokens hashed and persisted.
   let seed: SeedIdentitiesResult
@@ -1285,21 +1464,22 @@ export async function provisionSovereignPot(
       adminName: input.admin_name,
     })
   } catch (error) {
-    await recordStep('seed_identities', false, errMsg(error))
+    await recordStep('seed_identities', false, receiptError('transport_error', errMsg(error)))
     return bail(`seed_identities threw: ${errMsg(error)}`)
   }
   if (!seed.ok) {
-    await recordStep('seed_identities', false, seed.detail ?? 'unknown seed failure')
-    return bail(`seed_identities failed: ${seed.detail ?? 'unknown seed failure'}`)
+    const seedFailureDetail = seed.detail ?? 'unknown seed failure'
+    await recordStep('seed_identities', false, receiptError('seed_failed', seedFailureDetail))
+    return bail(`seed_identities failed: ${seedFailureDetail}`)
   }
   // Structured, not prose — this is what makes the bootstrap QUERYABLE from the parent
   // (mupot#1507 round-2 requirement 1): admin_member_id and both fingerprints, never a
   // raw token or a live claim. json_extract() can pull this back out of the TEXT column
   // like every other JSON-shaped receipt detail in this schema.
-  await recordStep(
+  if (!(await recordStep(
     'seed_identities',
     true,
-    JSON.stringify({
+    receiptOk({
       already_seeded: seed.alreadySeeded,
       admin_member_id: seed.adminMemberId,
       admin_token_fingerprint: seed.adminTokenFingerprint,
@@ -1307,25 +1487,31 @@ export async function provisionSovereignPot(
       lead_agent_member_id: seed.leadAgentMemberId || null,
       lead_agent_token_fingerprint: seed.leadAgentTokenFingerprint,
     }),
-  )
+  ))) {
+    return bail('seed_identities succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
+  }
 
   // 6. Verify reachability through the real dispatch path BEFORE claiming success.
   // Structured JSON, never the raw /health body — mupot#1507 round-2 P2. `bodySha256`
   // lets an operator notice "the response changed" without the body itself ever landing
   // in a receipt.
   const reach = await verifyPotReachable(env, slug, rootDomain)
-  await recordStep(
+  const reachFields = {
+    status: reach.status,
+    tenant_match: reach.tenantMatch,
+    release_sha_match: reach.releaseShaMatch,
+    body_sha256: reach.bodySha256,
+  }
+  const verifyReceiptWritten = await recordStep(
     'verify_reachable',
     reach.ok,
-    JSON.stringify({
-      status: reach.status,
-      tenant_match: reach.tenantMatch,
-      release_sha_match: reach.releaseShaMatch,
-      body_sha256: reach.bodySha256,
-    }),
+    reach.ok ? receiptOk(reachFields) : receiptError('unreachable', reach.detail, reachFields),
   )
   if (!reach.ok) {
     return bail(`verify_reachable failed: ${reach.detail}`)
+  }
+  if (!verifyReceiptWritten) {
+    return bail('verify_reachable succeeded but its receipt failed to write — treated as a failed step (fail-closed)')
   }
 
   // Every step passed. Finalize the registry row (mupot#1507 round-2 P0-2/P0-4) — `ok` /
@@ -1387,4 +1573,64 @@ export async function provisionSovereignPot(
     lead_agent_credential_claim: leadAgentClaim,
     provisioned_at: new Date().toISOString(),
   }
+}
+
+export type ReleaseStalePotResult =
+  | { ok: true; slug: string; released_from_status: string }
+  | { ok: false; slug: string; error: 'not_found' | 'not_stale' | 'cannot_release_active_pot' }
+
+/**
+ * Releases a `pots` row stuck at `status: 'provisioning'` past `STALE_PROVISIONING_MS`, so
+ * a DIFFERENT provisioner can subsequently claim the slug (mupot#1507-v2 P1-A). The SAME
+ * provisioner never needs this — `provisionSovereignPot`'s registry gate already lets an
+ * owner retry their own claimed row regardless of age; this exists ONLY for the case where
+ * the original provisioner is gone (abandoned checkout, crashed run, no retry coming) and a
+ * DIFFERENT caller now wants the name.
+ *
+ * Deliberately NOT automatic and NOT reachable by the ordinary provisioning path — an
+ * org:admin action, explicit and receipted (`pot_provision_receipts`, step `'release'`),
+ * because silently reassigning a name out from under a still-possibly-active attempt is
+ * exactly the kind of footgun this whole file exists to close (see `#1285`'s own "adoption
+ * without ownership" history). Refuses outright, never releases:
+ *   - a row that does not exist (`not_found`)
+ *   - an `'active'` pot, regardless of age (`cannot_release_active_pot` — a live customer
+ *     pot is never a candidate for this, only an abandoned PROVISIONING attempt is)
+ *   - a `'provisioning'` row that is not yet stale (`not_stale` — still within the window a
+ *     legitimate retry could land in)
+ */
+export async function releaseStalePot(
+  env: Env,
+  rawSlug: string,
+  actorMemberId: string | null,
+  actorTenant: string | null,
+): Promise<ReleaseStalePotResult> {
+  const slug = (rawSlug || '').toLowerCase().trim()
+  const row = await env.DB.prepare('SELECT status, created_at FROM pots WHERE slug = ?1 LIMIT 1')
+    .bind(slug)
+    .first<{ status: string; created_at: string }>()
+
+  if (!row) {
+    return { ok: false, slug, error: 'not_found' }
+  }
+  if (row.status === 'active') {
+    return { ok: false, slug, error: 'cannot_release_active_pot' }
+  }
+  if (!isStaleProvisioningRow(row, Date.now())) {
+    return { ok: false, slug, error: 'not_stale' }
+  }
+
+  await env.DB.prepare("UPDATE pots SET status = 'released' WHERE slug = ?1 AND status = ?2")
+    .bind(slug, row.status)
+    .run()
+  await writeProvisionReceipt(
+    env,
+    crypto.randomUUID(),
+    slug,
+    'release',
+    true,
+    receiptOk({ released_from_status: row.status }),
+    actorMemberId,
+    actorTenant,
+  )
+  return { ok: true, slug, released_from_status: row.status }
 }

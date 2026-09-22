@@ -42,6 +42,21 @@ export interface SovereignPotProvisionInput {
    *  0167). Independent of `minted_by_member_id`: even a caller with no interactive member
    *  identity still has a tenant. */
   caller_tenant?: string
+  /** Set ONLY by `src/pots/checkout.ts`'s Stripe self-serve path — the completed Checkout
+   *  Session's own id (`session.id`), never caller-suppliable via the HTTP route or MCP
+   *  tool (both validate against `src/pots/validate.ts`'s `PROVISION_ALLOWED_FIELDS`, which
+   *  does not include it — same structural protection `minted_by_member_id`/
+   *  `caller_tenant` already get). This is the per-checkout-session claim mupot#1507-v2
+   *  P0-C introduces: self-serve callers have no interactive member (`minted_by_member_id`
+   *  is always null there), so before this field existed, "ownership" of a self-serve
+   *  `pots` row degraded to matching `actorTenant` alone — the SAME value for every
+   *  self-serve buyer on this deployment — meaning a SECOND checkout session for the same
+   *  slug (a retry, a different customer, an attacker) could adopt whatever the first
+   *  session claimed, purely because `null === null` and `tenant === tenant`. Scoping the
+   *  claim to the exact session id makes a Stripe webhook replay idempotent (same session
+   *  => same claim => adopt) while refusing a genuinely different session on the same slug
+   *  outright, before any Cloudflare call. See `provisionSovereignPot`'s registry gate. */
+  checkout_session_id?: string
 }
 
 /** The steps a pot needs before it exists. Named so a partial run can say which ones
@@ -53,6 +68,13 @@ export type ProvisionStep =
   | 'deploy_worker'
   | 'seed_identities'
   | 'verify_reachable'
+  /** Not one of the six provisioning steps above (never appears in `ALL_PROVISION_STEPS`,
+   *  never part of a `provisionSovereignPot` run's own `completed`/`not_completed`) — a
+   *  distinct, administrative action recorded on the SAME append-only ledger:
+   *  `releaseStalePot` (mupot#1507-v2 P1-A) freeing a stale `provisioning` row so a
+   *  different provisioner can claim the slug. Sharing the ledger keeps one queryable
+   *  history per slug instead of a second table for one action. */
+  | 'release'
 
 /** Resources that were created before provisioning stopped. Real, billable, and nobody's
  *  job to clean up unless the caller is TOLD about them. `adopted` distinguishes a

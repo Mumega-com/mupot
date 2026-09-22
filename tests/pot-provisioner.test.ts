@@ -16,15 +16,23 @@ import {
   provisionSovereignPot,
   checkSlugAvailability,
   PotSlugTakenError,
+  InvalidSlugError,
+  releaseStalePot,
+  receiptOk,
+  receiptError,
+  writeProvisionReceipt,
   DISPATCH_NAMESPACE,
 } from '../src/pots/service'
+import type { ProvisionStep } from '../src/pots/types'
 import { validateProvisionRequestBody, PROVISION_ALLOWED_FIELDS } from '../src/pots/validate'
-import { toolPotProvision, toolPotList } from '../src/mcp/pots'
+import { toolPotProvision, toolPotList, toolPotRelease } from '../src/mcp/pots'
 import { potsApp } from '../src/pots/routes'
 import { invokeTool } from '../src/mcp/index'
 import type { Env, AuthContext } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { execD1RestQuery, D1_TRANSACTION_CONTROL_ERROR, D1_MULTI_STATEMENT_PARAMS_ERROR } from './helpers/d1-rest-double'
+import { fakeSessionsKv, fakeDispatcher, createRealisticFakeCf } from './helpers/fake-cf-provisioner'
 
 const orgAdmin: AuthContext = {
   memberId: 'admin-mem-id',
@@ -33,171 +41,14 @@ const orgAdmin: AuthContext = {
   capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }],
 }
 
-/** Minimal in-memory KV double for the SESSIONS binding createCredentialClaim writes to. */
-function fakeSessionsKv() {
-  const store = new Map<string, string>()
-  return {
-    store,
-    put: vi.fn(async (key: string, value: string) => {
-      store.set(key, value)
-    }),
-    get: vi.fn(async (key: string) => store.get(key) ?? null),
-    delete: vi.fn(async (key: string) => {
-      store.delete(key)
-    }),
-  }
-}
-
-/** A DISPATCHER double that answers `/health` with a configurable body (default: a
- *  realistic `publicHealth`-shaped payload matching `tenant`/`releaseSha`, so the
- *  identity-check happy path is exercised for real rather than trivially). */
-function fakeDispatcher(opts: { status?: number; body?: string; tenant?: string; releaseSha?: string; throwNotFound?: boolean } = {}) {
-  return {
-    get: vi.fn((_name: string) => ({
-      fetch: vi.fn(async () => {
-        if (opts.throwNotFound) throw new Error('No user worker found for the given name.')
-        const body = opts.body ?? JSON.stringify({
-          ok: true, service: 'mupot', tenant: opts.tenant, commit: opts.releaseSha ?? null, clean: true,
-        })
-        return new Response(body, { status: opts.status ?? 200, headers: { 'content-type': 'application/json' } })
-      }),
-    })),
-  }
-}
-
 /** Routes a D1 REST `/query` call against a REAL SQLite database standing in for the
- *  child pot's D1 (mupot#1507 round-2 TEST HARNESS requirement: the old suite's fake
- *  answered success to every query, so the seed step's real triggers — most importantly
- *  migration 0071's `member_tokens_agent_binding_insert` — never actually ran).
- *
- *  Zero-param statements (the entire schema chain, and this PR's atomic seed batch, which
- *  inlines every value rather than binding params — see seedPotIdentities' doc comment)
- *  go through RAW `sqlite.exec()` / `sqlite.prepare().all()`, bypassing
- *  `tests/helpers/sqlite-d1.ts`'s `normalizeD1Bindings` entirely — that rewriter's
- *  `/\?(\d+)/g` regex matches a `?1`-shaped substring even INSIDE a `--` comment (real
- *  example: migrations/0040's own header comment), which would corrupt schema-chain SQL
- *  that was never parameterized in the first place. Only genuinely parameterized
- *  SELECTs (the identity-check queries in seedPotIdentities) go through the D1-emulation
- *  `harness.db` wrapper, which needs `?N`→anonymous-`?` rewriting to work at all. */
-async function execAgainstChildHarness(
-  harness: SqliteD1Harness,
-  sql: string,
-  params: unknown[],
-): Promise<{ success: boolean; result?: unknown; errors?: Array<{ message: string }> }> {
-  try {
-    const isSelect = /^\s*SELECT/i.test(sql)
-    if (params && params.length > 0) {
-      const stmt = harness.db.prepare(sql).bind(...params)
-      if (isSelect) {
-        const res = await stmt.all()
-        return { success: true, result: [{ results: res.results, success: true }] }
-      }
-      const res = await stmt.run()
-      return { success: true, result: [{ results: [], success: res.success }] }
-    }
-    if (isSelect) {
-      const rows = harness.sqlite.prepare(sql).all()
-      return { success: true, result: [{ results: rows, success: true }] }
-    }
-    harness.sqlite.exec(sql)
-    return { success: true, result: [{ results: [], success: true }] }
-  } catch (error) {
-    return { success: false, errors: [{ message: error instanceof Error ? error.message : String(error) }] }
-  }
-}
-
-/**
- * Fake Cloudflare REST backend backed by REAL SQLite child-pot databases. One
- * `SqliteD1Harness` per created/adopted D1 uuid, so the schema chain and seed batch run
- * against a real engine with the real migration 0071 trigger set — this is what actually
- * proves the P0-1 seed ordering fix (not a mock that answers success to everything).
- */
-function createRealisticFakeCf(opts: {
-  existingD1?: { uuid: string; name: string }
-  existingKv?: { id: string; title: string }
-  existingChildHarness?: SqliteD1Harness // pairs with existingD1, for adopt-orphan tests
-  failDeploy?: boolean
-  queryOverride?: (sql: string, params: unknown[], databaseId: string, queryCallIndex: number) => { success: boolean; result?: unknown; errors?: Array<{ message: string }> } | undefined
-} = {}) {
-  const calls: Array<{ url: string; method: string }> = []
-  const d1ByName = new Map<string, { uuid: string; name: string }>()
-  const kvByTitle = new Map<string, { id: string; title: string }>()
-  const childHarnesses = new Map<string, SqliteD1Harness>()
-  let d1CreateCalls = 0
-  let kvCreateCalls = 0
-  let queryCallIndex = 0
-
-  if (opts.existingD1) {
-    d1ByName.set(opts.existingD1.name, opts.existingD1)
-    childHarnesses.set(opts.existingD1.uuid, opts.existingChildHarness ?? createSqliteD1())
-  }
-  if (opts.existingKv) kvByTitle.set(opts.existingKv.title, opts.existingKv)
-
-  function harnessFor(uuid: string): SqliteD1Harness {
-    let h = childHarnesses.get(uuid)
-    if (!h) {
-      h = createSqliteD1()
-      childHarnesses.set(uuid, h)
-    }
-    return h
-  }
-
-  const fetchMock = vi.fn(async (url: string, init: RequestInit = {}) => {
-    const method = init.method || 'GET'
-    calls.push({ url, method })
-
-    if (method === 'GET' && url.includes('/d1/database?')) {
-      const name = new URL(url).searchParams.get('name') || ''
-      const found = d1ByName.get(name)
-      return { status: 200, json: async () => ({ success: true, result: found ? [found] : [] }) }
-    }
-    if (method === 'POST' && /\/d1\/database$/.test(url)) {
-      d1CreateCalls += 1
-      const body = JSON.parse(init.body as string)
-      const entry = { uuid: `d1-${body.name}`, name: body.name }
-      d1ByName.set(body.name, entry)
-      harnessFor(entry.uuid) // pre-create so the schema chain has somewhere to land
-      return { status: 200, json: async () => ({ success: true, result: entry }) }
-    }
-    if (method === 'GET' && url.includes('/storage/kv/namespaces?')) {
-      const page = Number(new URL(url).searchParams.get('page') || '1')
-      return { status: 200, json: async () => ({ success: true, result: page === 1 ? Array.from(kvByTitle.values()) : [] }) }
-    }
-    if (method === 'POST' && url.includes('/storage/kv/namespaces')) {
-      kvCreateCalls += 1
-      const body = JSON.parse(init.body as string)
-      const entry = { id: `kv-${body.title}`, title: body.title }
-      kvByTitle.set(body.title, entry)
-      return { status: 200, json: async () => ({ success: true, result: entry }) }
-    }
-    if (method === 'PUT' && url.includes('/workers/dispatch/namespaces')) {
-      if (opts.failDeploy) {
-        return { status: 400, json: async () => ({ success: false, errors: [{ message: 'mocked deploy failure' }] }) }
-      }
-      return { status: 200, json: async () => ({ success: true, result: { id: 'deployed' } }) }
-    }
-    const queryMatch = url.match(/\/d1\/database\/([^/]+)\/query$/)
-    if (method === 'POST' && queryMatch) {
-      const databaseId = queryMatch[1]
-      const body = init.body ? JSON.parse(init.body as string) : { sql: '', params: [] }
-      const idx = queryCallIndex
-      queryCallIndex += 1
-      const override = opts.queryOverride?.(body.sql, body.params ?? [], databaseId, idx)
-      if (override) {
-        return { status: 200, json: async () => override }
-      }
-      const result = await execAgainstChildHarness(harnessFor(databaseId), body.sql, body.params ?? [])
-      return { status: 200, json: async () => result }
-    }
-    return { status: 404, json: async () => ({ success: false, errors: [{ message: 'unhandled mock route: ' + url }] }) }
-  })
-
-  return {
-    fetchMock, calls, childHarnesses, harnessFor,
-    getD1CreateCalls: () => d1CreateCalls,
-    getKvCreateCalls: () => kvCreateCalls,
-  }
-}
+ *  child pot's D1 — thin local alias for `tests/helpers/d1-rest-double.ts`'s
+ *  `execD1RestQuery` (mupot#1507-v2 P0-A: that shared helper is what actually models D1's
+ *  real transaction-control refusal and implicit per-call atomicity; every fake-CF backend
+ *  in this repo should route `/query` through it rather than re-answering `success:true`
+ *  to raw SQL text, which is exactly how mupot#1507 round-1's seed-ordering defect and
+ *  round-2's app-level-BEGIN defect both shipped past a passing suite). */
+const execAgainstChildHarness = execD1RestQuery
 
 describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
   beforeEach(() => {
@@ -213,7 +64,7 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     it('validates allowed subdomain slugs', () => {
       expect(validateSlug('gaf')).toEqual({ ok: true })
       expect(validateSlug('viamar-corp')).toEqual({ ok: true })
-      expect(validateSlug('a')).toEqual({ ok: false, error: expect.stringContaining('at least 2') })
+      expect(validateSlug('a')).toEqual({ ok: false, error: expect.stringContaining('at least 3') })
       expect(validateSlug('mumega')).toEqual({ ok: false, error: expect.stringContaining('reserved') })
       expect(validateSlug('mupot')).toEqual({ ok: false, error: expect.stringContaining('reserved') })
     })
@@ -515,6 +366,102 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
     })
   })
 
+  describe('D1 REST double + seedPotIdentities atomicity WITHOUT app-level BEGIN/COMMIT (mupot#1507-v2 P0-A)', () => {
+    const cf = { accountId: 'acc-123', apiToken: 'cf-tok-abc' }
+
+    function seededChildHarness(): SqliteD1Harness {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      return harness
+    }
+
+    it('the double refuses BEGIN/COMMIT/ROLLBACK with D1\'s real error text — a real D1 engine is not a raw SQLite connection this Worker can wrap', async () => {
+      const harness = seededChildHarness()
+      for (const stmt of ['BEGIN;', 'BEGIN TRANSACTION;', 'begin immediate;', 'COMMIT;', 'ROLLBACK;']) {
+        const res = await execD1RestQuery(harness, stmt, [])
+        expect(res.success, stmt).toBe(false)
+        expect(res.errors?.[0]?.message, stmt).toBe(D1_TRANSACTION_CONTROL_ERROR)
+      }
+    })
+
+    it('the double refuses combining bound params with a multi-statement body', async () => {
+      const harness = seededChildHarness()
+      const res = await execD1RestQuery(harness, "SELECT 1; SELECT 2;", [1])
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_MULTI_STATEMENT_PARAMS_ERROR)
+    })
+
+    it('seedPotIdentities sends NO transaction-control statement — the batch it builds passes the double clean', async () => {
+      const harness = seededChildHarness()
+      const seenSql: string[] = []
+      global.fetch = vi.fn(async (url: string, init: RequestInit) => {
+        const body = JSON.parse(init.body as string)
+        seenSql.push(body.sql as string)
+        return { status: 200, json: async () => execD1RestQuery(harness, body.sql, body.params ?? []) }
+      }) as any
+
+      const result = await seedPotIdentities(cf, 'child-db', { slug: 'cleanbatch', brandName: 'Clean Batch Co', adminEmail: 'admin@cleanbatch.test' })
+
+      expect(result.ok).toBe(true)
+      const seedBatch = seenSql.find((sql) => /INSERT INTO departments/.test(sql))!
+      expect(seedBatch).toBeTruthy()
+      expect(seedBatch).not.toMatch(/^\s*BEGIN\b/im)
+      expect(seedBatch).not.toMatch(/;\s*COMMIT\s*;?\s*$/im)
+    })
+
+    it('MUTATION-PROVING: reintroducing an app-level BEGIN/COMMIT wrapper makes the REAL D1-shaped double refuse the whole batch — the exact defect P0-A closes', async () => {
+      // This is what the round-2 version of seedPotIdentities actually sent — reproduced
+      // here directly (not by editing src/pots/service.ts) to prove the double catches it,
+      // independent of whether the source regresses. The companion source-level mutation
+      // (re-adding 'BEGIN;'/'COMMIT;' to service.ts's `batchSql` array) was ALSO run by
+      // hand against this same suite as part of this PR's mutation ledger: with the double
+      // now used instead of the old always-succeeds fake, that mutation turns EVERY
+      // `seedPotIdentities` happy-path test in this file red (`result.ok` becomes `false`),
+      // where round-1/round-2's fake CF could not see it at all.
+      const harness = seededChildHarness()
+      const now = new Date().toISOString()
+      const wrappedBatch = [
+        'BEGIN;',
+        `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES ('d-x', 'core', 'X', 'work', 1, '${now}');`,
+        'COMMIT;',
+      ].join('\n')
+
+      const res = await execD1RestQuery(harness, wrappedBatch, [])
+
+      expect(res.success).toBe(false)
+      expect(res.errors?.[0]?.message).toBe(D1_TRANSACTION_CONTROL_ERROR)
+      // Nothing persisted — refused before it ever touched the engine.
+      expect(harness.sqlite.prepare("SELECT COUNT(*) as c FROM departments WHERE id = 'd-x'").get()).toEqual({ c: 0 })
+    })
+
+    it('a mid-batch failure through the double leaves ZERO identity rows — D1 REST\'s own one-call-one-batch atomicity, no app-level transaction needed', async () => {
+      const harness = seededChildHarness()
+      // Collide on departments.slug UNIQUE (global) so the seed batch's OWN department
+      // insert (statement 1 of the batch) fails.
+      harness.sqlite.exec(
+        `INSERT INTO departments (id, slug, name, kind, active, created_at) VALUES ('pre-existing-dept', 'core', 'Pretaken', 'work', 1, '${new Date().toISOString()}')`,
+      )
+      global.fetch = vi.fn(async (url: string, init: RequestInit) => {
+        const body = JSON.parse(init.body as string)
+        return { status: 200, json: async () => execD1RestQuery(harness, body.sql, body.params ?? []) }
+      }) as any
+
+      const result = await seedPotIdentities(cf, 'child-db', { slug: 'atomicfail', brandName: 'Atomic Fail Co', adminEmail: 'admin@atomicfail.test' })
+
+      expect(result.ok).toBe(false)
+      expect(harness.sqlite.prepare("SELECT COUNT(*) as c FROM members WHERE email = 'admin@atomicfail.test'").get()).toEqual({ c: 0 })
+      expect(harness.sqlite.prepare("SELECT COUNT(*) as c FROM agents WHERE slug = 'atomicfail-bot'").get()).toEqual({ c: 0 })
+    })
+
+    // HARNESS PIN (not a source mutation — see the double's own doc comment): if
+    // `tests/helpers/d1-rest-double.ts` were changed to ACCEPT transaction control instead
+    // of refusing it, this whole describe block's first test goes red immediately — that IS
+    // the intended signal. There is no separate automated check for "the double itself
+    // regressed to modeling D1 incorrectly" beyond that direct assertion; a reviewer
+    // changing the double's refusal behavior should treat that as changing what this test
+    // means, not as a test to work around.
+  })
+
   describe('verifyPotReachable (round-2 P1-1: tenant + release_sha identity check)', () => {
     it('is ok when tenant and release_sha both match', async () => {
       const env = { DISPATCHER: fakeDispatcher({ tenant: 'gaf', releaseSha: 'a'.repeat(40) }) as any, RELEASE_SHA: 'a'.repeat(40) } as unknown as Env
@@ -581,6 +528,290 @@ describe('Sovereign Pot Provisioner (Flight 2 + mupot#1285/#1507)', () => {
       const env = { DB: harness.db } as unknown as Env
       const res = await checkSlugAvailability(env, 'genuinely-unused-slug')
       expect(res.available).toBe(true)
+    })
+
+    it('M-CLAIM: refuses a slug already claimed by a `projects` worker BEFORE any pots row exists', async () => {
+      // Pins that checkSlugAvailability's cross-table check runs at the registry gate for
+      // a genuinely NEW slug (provisionSovereignPot's `!existingPotRow` branch) — without
+      // it, the INSERT into `pots` would succeed (pots.slug UNIQUE says nothing about
+      // `projects`), silently colliding with a project's own worker in the shared
+      // `mupot-pots` dispatch namespace.
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      harness.sqlite.exec(`
+        INSERT INTO departments (id, slug, name) VALUES ('d1', 'd1', 'D1');
+        INSERT INTO squads (id, department_id, slug, name) VALUES ('s1', 'd1', 's1', 'S1');
+        INSERT INTO projects (id, slug, name, description, goal, status, assigned_squad_id, worker_name)
+        VALUES ('p1', 'someproject', 'P', '', '', 'active', 's1', 'takenproj');
+      `)
+      const env = { DB: harness.db, SECRET_ENV_CF_API_TOKEN: 'x', TENANT_SLUG: 'mumega' } as unknown as Env
+      await expect(provisionSovereignPot(env, { slug: 'takenproj', brand_name: 'X', admin_email: 'a@b.com' }))
+        .rejects.toThrow(PotSlugTakenError)
+      expect(harness.sqlite.prepare("SELECT COUNT(*) as c FROM pots WHERE slug = 'takenproj'").get()).toEqual({ c: 0 })
+    })
+
+    describe('staleness (mupot#1507-v2 P1-A)', () => {
+      function insertPot(harness: SqliteD1Harness, overrides: Partial<{ status: string; created_at: string }> = {}) {
+        harness.sqlite.exec(
+          `INSERT INTO pots (id, slug, worker_script, status, source, created_at) VALUES ` +
+            `('p-stale', 'staleslug', 'staleslug', '${overrides.status ?? 'provisioning'}', 'checkout', ` +
+            `'${overrides.created_at ?? new Date().toISOString()}')`,
+        )
+      }
+
+      it('a FRESH provisioning row still reads as taken', async () => {
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        insertPot(harness)
+        const env = { DB: harness.db } as unknown as Env
+        expect((await checkSlugAvailability(env, 'staleslug')).available).toBe(false)
+      })
+
+      it('a STALE provisioning row (past STALE_PROVISIONING_MS) reads as available again', async () => {
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        insertPot(harness, { created_at: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+        const env = { DB: harness.db } as unknown as Env
+        expect((await checkSlugAvailability(env, 'staleslug')).available).toBe(true)
+      })
+
+      it('an ACTIVE row is taken regardless of age — staleness never applies to a live pot', async () => {
+        const harness = createSqliteD1()
+        applyAllMigrations(harness.sqlite)
+        insertPot(harness, { status: 'active', created_at: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+        const env = { DB: harness.db } as unknown as Env
+        expect((await checkSlugAvailability(env, 'staleslug')).available).toBe(false)
+      })
+    })
+  })
+
+  describe('validateSlug / checkSlugAvailability length alignment + 400 vs 409 (mupot#1507-v2 P2)', () => {
+    it('validateSlug and checkSlugAvailability agree on the 3-32 length window', () => {
+      expect(validateSlug('ab')).toEqual({ ok: false, error: expect.stringContaining('at least 3') })
+      expect(validateSlug('a'.repeat(33))).toEqual({ ok: false, error: expect.stringContaining('cannot exceed 32') })
+      expect(validateSlug('a'.repeat(32))).toEqual({ ok: true })
+    })
+
+    it('a malformed (too-long) slug is refused 400 invalid_slug, never 409 pot_slug_taken', async () => {
+      const env = { SECRET_ENV_CF_API_TOKEN: 'x', TENANT_SLUG: 'mumega' } as unknown as Env
+      await expect(provisionSovereignPot(env, { slug: 'a'.repeat(40), brand_name: 'X', admin_email: 'a@b.com' }))
+        .rejects.toThrow(InvalidSlugError)
+    })
+
+    it('POST /api/pots/provision surfaces a format refusal as 400, not 409 or 500', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const owner = JSON.stringify({ userId: 'u-owner', email: 'owner@local.test', role: 'owner', createdAt: '2026-09-01T00:00:00.000Z' })
+      const env = {
+        TENANT_SLUG: 'local',
+        DB: harness.db,
+        SESSIONS: { get: async (k: string) => (k === 'sess:owner-s' ? owner : null), put: async () => undefined, delete: async () => undefined },
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok',
+      } as unknown as Env
+      await env.DB.prepare(
+        `INSERT INTO members (id, tenant, email, display_name, status, created_at) VALUES ('mem-owner', 'local', 'owner@local.test', 'Owner', 'active', datetime('now'))`,
+      ).run()
+      const res = await potsApp.request('/provision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'http://localhost', cookie: 'mupot_session=owner-s' },
+        body: JSON.stringify({ slug: 'x'.repeat(40), brand_name: 'X', admin_email: 'a@b.com' }),
+      }, env)
+      expect(res.status).toBe(400)
+      const json = await res.json() as { error: string }
+      expect(json.error).toBe('invalid_slug')
+    })
+  })
+
+  describe('pot_release (mupot#1507-v2 P1-A)', () => {
+    const orgAdminAuth: AuthContext = {
+      memberId: 'admin-mem-id', role: 'admin', tenant: 'mumega',
+      capabilities: [{ scope_type: 'org', scope_id: 'mumega', capability: 'admin' }],
+    }
+
+    function insertPot(harness: SqliteD1Harness, opts: { status: string; createdAt: string }) {
+      harness.sqlite.exec(
+        `INSERT INTO pots (id, slug, worker_script, status, source, created_at) VALUES ` +
+          `('p-rel', 'relslug', 'relslug', '${opts.status}', 'checkout', '${opts.createdAt}')`,
+      )
+    }
+
+    it('refuses to release a row that does not exist', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const env = { DB: harness.db } as unknown as Env
+      const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'ghost' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('not_found')
+    })
+
+    it('NEVER releases an active pot, regardless of age', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'active', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db } as unknown as Env
+      const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('cannot_release_active_pot')
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('active')
+    })
+
+    it('refuses to release a provisioning row that is not yet stale', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date().toISOString() })
+      const env = { DB: harness.db } as unknown as Env
+      const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'relslug' })
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) throw new Error('expected failure')
+      expect(outcome.error).toBe('not_stale')
+    })
+
+    it('releases a stale provisioning row, receipted, and it becomes claimable by a NEW provisioner', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'provisioning', createdAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+
+      const outcome = await toolPotRelease.run(orgAdminAuth, env, { slug: 'relslug' })
+      expect(outcome.ok).toBe(true)
+
+      const row = harness.sqlite.prepare("SELECT status FROM pots WHERE slug = 'relslug'").get() as any
+      expect(row.status).toBe('released')
+      const receipt = harness.sqlite.prepare(
+        "SELECT step, ok, detail, actor_member_id FROM pot_provision_receipts WHERE slug = 'relslug'",
+      ).get() as any
+      expect(receipt.step).toBe('release')
+      expect(receipt.ok).toBe(1)
+      expect(JSON.parse(receipt.detail).ok).toBe(true)
+      expect(receipt.actor_member_id).toBe('admin-mem-id')
+
+      // Claimable by a genuinely different, brand-new provisioner now.
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+      const provisionEnv = {
+        ...env,
+        SECRET_ENV_CF_ACCOUNT_ID: 'acc-123',
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc',
+        PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+        DISPATCHER: fakeDispatcher({ tenant: 'relslug', releaseSha: null as any }) as any,
+        SESSIONS: fakeSessionsKv(),
+      } as unknown as Env
+      const result = await provisionSovereignPot(provisionEnv, {
+        slug: 'relslug', brand_name: 'New Owner Co', admin_email: 'newowner@relslug.test',
+        minted_by_member_id: 'new-admin-mem-id', caller_tenant: 'mumega',
+      }, '// bundle')
+      expect(result.ok).toBe(true)
+      const finalRow = harness.sqlite.prepare("SELECT status, provisioner_member_id FROM pots WHERE slug = 'relslug'").get() as any
+      expect(finalRow.status).toBe('active')
+      expect(finalRow.provisioner_member_id).toBe('new-admin-mem-id')
+    })
+
+    it('a race for the same just-released slug refuses the loser via the status=released WHERE guard', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      insertPot(harness, { status: 'released', createdAt: new Date().toISOString() })
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega', SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc' } as unknown as Env
+
+      // Simulate the winner already having claimed it.
+      harness.sqlite.exec("UPDATE pots SET status = 'provisioning', provisioner_member_id = 'winner' WHERE slug = 'relslug'")
+
+      await expect(provisionSovereignPot(env, {
+        slug: 'relslug', brand_name: 'Loser Co', admin_email: 'loser@relslug.test', minted_by_member_id: 'loser', caller_tenant: 'mumega',
+      })).rejects.toThrow(PotSlugTakenError)
+    })
+  })
+
+  describe('receipt detail is JSON on every step × outcome, and a failed write is a failed step (mupot#1507-v2 P0-B, Athena binding addition 1)', () => {
+    const ALL_STEPS: ProvisionStep[] = [
+      'create_d1', 'create_kv', 'apply_schema', 'deploy_worker', 'seed_identities', 'verify_reachable', 'release',
+    ]
+
+    for (const step of ALL_STEPS) {
+      for (const ok of [true, false]) {
+        it(`step=${step} ok=${ok}: the built detail is accepted by the REAL 0164 CHECK constraint`, async () => {
+          const harness = createSqliteD1()
+          applyAllMigrations(harness.sqlite)
+          const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+
+          // A message that is neither trivially empty JSON nor accidentally safe: it
+          // contains an '@' that is NOT an email (a Workers AI binding name) AND a real
+          // email address, exercising both halves of `redactAndBound` at once.
+          const detail = ok
+            ? receiptOk({ note: 'fine @cf/meta/llama-3.3 mention' })
+            : receiptError('test_error', 'boom @cf/meta/llama-3.3 failed, contact admin@example.com for help')
+
+          const written = await writeProvisionReceipt(env, 'run-1', 'detailtest', step, ok, detail, 'mem-1', 'mumega')
+          expect(written, `step=${step} ok=${ok}`).toBe(true)
+
+          const row = harness.sqlite.prepare(
+            'SELECT ok, detail FROM pot_provision_receipts WHERE slug = ? AND step = ?',
+          ).get('detailtest', step) as { ok: number; detail: string }
+          expect(row).toBeTruthy()
+          expect(row.ok).toBe(ok ? 1 : 0)
+          expect(() => JSON.parse(row.detail)).not.toThrow()
+          if (!ok) {
+            // The real email is gone from what actually landed in the ledger; the
+            // non-email '@' mention survives untouched.
+            expect(row.detail).not.toContain('admin@example.com')
+            expect(row.detail).toContain('@cf/meta/llama-3.3')
+            expect(row.detail).toContain('[redacted-email]')
+          }
+        })
+      }
+    }
+
+    it('MUTATION-EQUIVALENT: a non-JSON detail is REJECTED by the real CHECK (proves the constraint still guards structure)', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const env = { DB: harness.db, TENANT_SLUG: 'mumega' } as unknown as Env
+      const written = await writeProvisionReceipt(env, 'run-1', 'rawtest', 'apply_schema', false, 'plain prose, not JSON', null, null)
+      expect(written).toBe(false)
+      const row = harness.sqlite.prepare(
+        "SELECT COUNT(*) as c FROM pot_provision_receipts WHERE slug = 'rawtest'",
+      ).get() as { c: number }
+      expect(row.c).toBe(0)
+    })
+
+    it('FAIL CLOSED: a receipt write failure is treated as a FAILED STEP even when the underlying operation succeeded', async () => {
+      const harness = createSqliteD1()
+      applyAllMigrations(harness.sqlite)
+      const { fetchMock } = createRealisticFakeCf({})
+      global.fetch = fetchMock as any
+
+      // Sabotage ONLY the receipts INSERT — every other DB call on this same `harness.db`
+      // (the registry gate's SELECT/INSERT into `pots`) must keep working normally.
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      const sabotagedDb = {
+        ...harness.db,
+        prepare(sql: string) {
+          if (sql.includes('INSERT INTO pot_provision_receipts')) {
+            return { bind: () => ({ run: async () => { throw new Error('receipts table is locked') } }) }
+          }
+          return realPrepare(sql)
+        },
+      } as unknown as Env['DB']
+
+      const env = {
+        PUBLIC_ORIGIN: 'https://mupot.mumega.com',
+        SECRET_ENV_CF_ACCOUNT_ID: 'acc-123',
+        SECRET_ENV_CF_API_TOKEN: 'cf-tok-abc',
+        TENANT_SLUG: 'mumega',
+        DB: sabotagedDb,
+        DISPATCHER: fakeDispatcher({ tenant: 'receiptfail', releaseSha: null as any }) as any,
+      } as unknown as Env
+
+      const result = await provisionSovereignPot(env, { slug: 'receiptfail', brand_name: 'Receipt Fail Co', admin_email: 'admin@receiptfail.test' }, '// bundle')
+
+      // create_d1 itself SUCCEEDED (the CF call landed, a real database uuid came back) —
+      // only its receipt write failed. Round-2's swallowed write failure would have let
+      // this step (and the whole run) proceed toward `ok:true`. It must not: a step whose
+      // receipt cannot be written is itself a failed step.
+      expect(result.ok).toBe(false)
+      expect(result.status).toBe('incomplete')
+      expect(result.incomplete_reason).toContain('receipt failed to write')
     })
   })
 

@@ -2,7 +2,7 @@
 
 import type { ToolOutcome, ToolSpec } from './index'
 import { isOrgAdmin } from '../auth/capability'
-import { provisionSovereignPot, listSovereignPots, PotSlugTakenError } from '../pots/service'
+import { provisionSovereignPot, listSovereignPots, releaseStalePot, PotSlugTakenError, InvalidSlugError } from '../pots/service'
 import { PROVISION_ALLOWED_FIELDS, validateProvisionRequestBody } from '../pots/validate'
 
 function done(result: unknown): ToolOutcome {
@@ -78,8 +78,43 @@ export const toolPotProvision: ToolSpec = {
       if (err instanceof PotSlugTakenError) {
         return fail(409, err.code, err.message)
       }
+      if (err instanceof InvalidSlugError) {
+        return fail(400, err.code, err.message)
+      }
       return fail(500, 'provisioning_failed', err instanceof Error ? err.message : String(err))
     }
+  },
+}
+
+export const toolPotRelease: ToolSpec = {
+  name: 'pot_release',
+  scope: 'org:admin (release a STALE, abandoned `provisioning` pot slug so a different provisioner can claim it)',
+  min: 'admin',
+  args: '{ slug: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { slug: STRING_SCHEMA },
+    required: ['slug'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!isOrgAdmin(auth)) {
+      return fail(403, 'forbidden', 'Only org administrators can release a pot slug.')
+    }
+    if (auth.boundAgentId) {
+      return fail(403, 'operator_principal_required', 'Releasing a pot slug requires an operator principal, not a bound-agent session.')
+    }
+    const slug = typeof args?.slug === 'string' ? args.slug.trim() : ''
+    if (!slug) {
+      return fail(400, 'missing_required_fields', 'Required field: slug.')
+    }
+
+    const result = await releaseStalePot(env, slug, auth.memberId ?? null, auth.tenant)
+    if (!result.ok) {
+      const status = result.error === 'not_found' ? 404 : 409
+      return fail(status, result.error, `Cannot release '${slug}': ${result.error}.`)
+    }
+    return done({ slug: result.slug, released_from_status: result.released_from_status })
   },
 }
 
@@ -113,4 +148,4 @@ export const toolPotList: ToolSpec = {
   },
 }
 
-export const POT_TOOLS: ToolSpec[] = [toolPotProvision, toolPotList]
+export const POT_TOOLS: ToolSpec[] = [toolPotProvision, toolPotList, toolPotRelease]

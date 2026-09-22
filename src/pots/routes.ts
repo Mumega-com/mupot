@@ -6,7 +6,7 @@ import { requireAuth } from '../auth'
 import { csrf } from 'hono/csrf'
 import { isOrgAdmin } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { provisionSovereignPot, listSovereignPots, PotSlugTakenError } from './service'
+import { provisionSovereignPot, listSovereignPots, PotSlugTakenError, InvalidSlugError } from './service'
 import { validateProvisionRequestBody } from './validate'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
@@ -86,6 +86,9 @@ potsApp.post('/provision', async (c) => {
   } catch (err) {
     if (err instanceof PotSlugTakenError) {
       return c.json({ error: err.code, message: err.message }, 409)
+    }
+    if (err instanceof InvalidSlugError) {
+      return c.json({ error: err.code, message: err.message }, 400)
     }
     return c.json(
       {

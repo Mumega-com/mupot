@@ -262,6 +262,96 @@ first place. The suite now routes `/query` calls to a REAL SQLite database
 (`tests/helpers/sqlite-d1.ts`) with the full committed migration chain applied, so every
 insert in this document runs against the real constraint set.
 
+## Round 2-v2 (mupot#1507-v2): a real engine is not a raw SQLite connection
+
+A second adversarial pass on round 2's OWN fix found 3 new P0s — all in code round 2 itself
+introduced. This is a successor PR (superseding the frozen #1507 branch, same base commit),
+not a third round on that branch: Kasra-core froze #1507 at its own head, so these fixes
+land on a new branch built FROM that exact head.
+
+**P0-A — D1 REST is not a raw SQLite connection this Worker can `BEGIN`/`COMMIT` over the
+wire.** Round 2's `seedPotIdentities` wrapped its whole atomic seed batch in an app-level
+`BEGIN;` / `COMMIT;` script, reasoning "D1 is built on SQLite, so real transaction
+semantics apply." Cloudflare's D1 REST `/query` endpoint REJECTS transaction-control
+statements outright — `"cannot start a transaction within a transaction"` — because the
+semicolon-joined statements in ONE `/query` call are ALREADY executed as a single atomic
+batch by Cloudflare itself (developers.cloudflare.com/d1/best-practices/import-export-data/,
+developers.cloudflare.com/d1/worker-api/d1-database/, cloudflare/workers-sdk#2733). This
+codebase's own `scripts/gen-schema-chain.mjs` already refuses to GENERATE a migration file
+containing transaction-control BEGIN for the identical reason — round 2 violated, at
+runtime, exactly the rule this repo already enforces at generation time for migrations. The
+round-2 test suite could not see this: its fake Cloudflare backend answered `success: true`
+to raw SQL text, the same class of gap that let round-1's own defect ship. **Fix:** the
+`BEGIN;`/`COMMIT;` wrapper is gone — atomicity comes entirely from D1 REST's own documented
+one-call-one-batch semantics. **Test harness fix (again):** `tests/helpers/d1-rest-double.ts`
+is a new, reusable D1-REST double every fake-CF backend in this repo should route `/query`
+through — it refuses transaction control with D1's real error text, runs each `/query` body
+inside its OWN implicit transaction (mirroring D1's real behavior, so a mid-batch failure
+still leaves nothing committed without any app-level wrapper), and refuses combining bound
+params with a multi-statement body (D1's per-statement binding semantics for that
+combination are undocumented, so this codebase never relies on them either).
+
+**P0-B — the receipt ledger's own CHECK constraint was rejecting the receipts it was
+supposed to record.** Migration 0164's round-2 CHECK required `json_valid(detail)` for only
+three of the six steps and separately refused ANY `'@'` character in `detail` regardless of
+context. Every FAILURE path across all six steps wrote plain prose — which the three-step
+JSON rule then rejected outright for the steps it covered, and the blanket `'@'` rule
+rejected for EVERY step whenever a failure message happened to quote something with an `'@'`
+in it that was not an email (`@cf/meta/llama-3.3`, a Workers AI binding name, for instance).
+Either violation made the `INSERT` throw, and `writeProvisionReceipt`'s swallowed catch
+turned that into a step that ran, failed, and left NO receipt at all — the exact "orphan
+discovered with no explanation" failure mode this ledger exists to prevent. **Fix:** the
+CHECK now requires `json_valid(detail)` uniformly for every step (structure is a database
+concern SQLite can verify exactly); PII redaction moved to application code
+(`redactAndBound` in `src/pots/service.ts`, which matches EMAIL SHAPES, not every `'@'`);
+`receiptOk`/`receiptError` are the only two functions anywhere in that file that build a
+`detail` value, so every row this schema will ever see is JSON by construction, not
+convention. `writeProvisionReceipt` no longer swallows a write failure — it returns whether
+the write landed, and `recordStep` treats a failed write as a FAILED STEP even when the
+underlying provisioning operation itself succeeded (fail-closed, logged via `console.error`
+since there is no better channel this deep in an already-fail-closed path).
+
+**P0-C — a self-serve claim with no interactive member degraded to "everyone with the same
+tenant."** `checkout.ts`'s Stripe webhook path never set `minted_by_member_id` (there is no
+interactive member at checkout time), so ownership of a self-serve `pots` row matched on
+`actorTenant` alone — the SAME value for every self-serve buyer on this deployment (and
+`null` on both sides when `TENANT_SLUG` was unset). A second self-serve call for the same
+slug — a retry, a different customer, an attacker — could silently adopt whatever the first
+call claimed, redeploying over a live customer's pot and handing the caller back the
+victim's own admin identity references. **Fix:** migration 0167 (still branch-only, rewritten
+in place) adds `pots.checkout_session_id`. `checkout.ts` passes the completed Stripe
+Checkout Session's own `id` through to `provisionSovereignPot` as `checkout_session_id`;
+the registry gate now requires an EXACT session-id match to adopt a row that carries one —
+a webhook retry of the SAME session is idempotent (same id ⇒ same claim ⇒ adopt), a
+genuinely different session on the same slug is refused outright, before any Cloudflare
+call. A row with NEITHER a checkout-session claim NOR a member claim is never adoptable by
+anyone — including another caller who also carries no identity: two `null === null` callers
+matching each other was the exact mechanism of the original defect.
+
+**Release path for a burned slug (P1-A, new this round).** A `pots` row can get stuck at
+`status: 'provisioning'` forever — an abandoned Stripe checkout, a crashed run nobody
+retried. `checkSlugAvailability` now treats a `'provisioning'` row past
+`STALE_PROVISIONING_MS` (30 minutes) as available again for a NEW checkout attempt's
+pre-flight check — a UX signal only, never itself authorization. The SAME provisioner can
+always retry their own claimed row regardless of age (already true via the ownership check
+above). A DIFFERENT provisioner needs an explicit, receipted org:admin action —
+`releaseStalePot` / the `pot_release` MCP tool — which refuses outright to release anything
+that is `'active'` (regardless of age) or `'provisioning'` but not yet stale, and writes a
+`pot_provision_receipts` row under a new `step: 'release'` value on the SAME ledger. A
+released row is then adoptable by any new caller via an `UPDATE ... WHERE status =
+'released'`, guarded against a second concurrent claim the same way the original INSERT-race
+guard works.
+
+**The 'lead' seed-seat floor, spelled out (Athena's binding addition).** The seed-seat lead
+agent's own home member is seeded with `capability = 'lead'` (squad-scoped), matching the
+agent's own `role` column — this is the pot's first OPERATOR, not a bystander, so its
+capability sits on the SAME plane its role already claims. `'lead'` (rank 3) does **not**
+reach `mint_agent_token`, `grant_agent_capability`, or `routine_create` — all three require
+`min: 'admin'` (rank 4) in `src/auth/capability.ts`'s `RANK` ladder. The seed seat can act as
+a lead inside its own pot; it cannot mint tokens, grant capabilities, or create routines
+without a separate, later elevation to admin — the same ladder every other member in this
+schema climbs.
+
 ## What Kasra-core still needs to do (this session cannot)
 
 - Confirm the D1 list-by-name (`GET .../d1/database?name=`) and KV-list pagination against
@@ -278,3 +368,17 @@ insert in this document runs against the real constraint set.
   named in the issue as part of this work's acceptance criteria, not attempted here (it is a
   live-data migration on production identities, squarely inside "never touch live CF
   resources / tenant-specific hand-edits" for this build session).
+- Confirm LIVE that D1 REST's `/query` actually answers `"cannot start a transaction within
+  a transaction"` (or an equivalent refusal) for a `BEGIN`/`COMMIT`-bearing body, matching
+  the public docs this PR cites and `tests/helpers/d1-rest-double.ts`'s modeling of it — this
+  session never calls the live CF API, so the refusal text and the one-call-one-batch
+  atomicity claim are verified against documentation and a faithful test double, not a real
+  D1 database.
+- Renumber migrations `0164`/`0167` at actual merge/rebase time — `scripts/check-migration-
+  numbering.mjs` currently reports them "at or below" origin/main's head because main has
+  advanced (0165 landed) since this branch's base commit; this PR deliberately keeps both
+  numbers as-is per its own brief (a successor PR building on a frozen head, not yet
+  rebasing), the same way this exact branch's history already renumbered twice before for
+  the identical reason.
+- Wire `pot_release`'s org:admin-only MCP tool into whatever admin dashboard surface lists
+  provisioning attempts, so a human doesn't need raw MCP/SQL access to use it.

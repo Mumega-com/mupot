@@ -99,12 +99,24 @@ export async function handlePotCreationCompleted(
   const brand = metadata.brand || slug.toUpperCase()
   const tier = isPotTier(metadata.tier) ? (metadata.tier as PotTier) : 'starter'
   const ownerEmail = metadata.owner_email || session.customer_email
+  // The Stripe Checkout Session's OWN id — the per-checkout-session claim
+  // (mupot#1507-v2 P0-C). This self-serve path has no interactive member
+  // (`minted_by_member_id` is never set here), so without a claim scoped to the exact
+  // session, "ownership" of the `pots` row would degrade to matching this deployment's
+  // own `TENANT_SLUG` alone — the SAME value for every self-serve buyer, letting a second
+  // session for the same slug (a retry, a different customer, an attacker) silently adopt
+  // whatever the first session claimed. Scoping to `session.id` makes a webhook RETRY of
+  // the SAME session idempotent (same id => same claim => adopt) while a genuinely
+  // DIFFERENT session on the same slug is refused outright by
+  // `provisionSovereignPot`'s registry gate, before any Cloudflare call.
+  const checkoutSessionId = typeof session.id === 'string' ? session.id : undefined
 
   try {
     const result = await provisionSovereignPot(env, {
       slug,
       brand_name: brand,
       admin_email: ownerEmail,
+      checkout_session_id: checkoutSessionId,
     })
 
     // MONEY PATH. This runs after Stripe checkout completes. Emitting
