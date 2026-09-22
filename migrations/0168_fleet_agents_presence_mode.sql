@@ -1,4 +1,4 @@
--- 0163_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).
+-- 0168_fleet_agents_presence_mode.sql — poll-mode presence for external runners (mupot#1494).
 --
 -- Additive only, no backfill: every existing row keeps presence_mode='' and
 -- presence_ttl_sec=NULL, so src/fleet/registry.ts's derivePresence keeps reading the ONE global
