@@ -50,15 +50,24 @@ function makeEnv(opts: { debounced?: boolean; memberRow?: { display_name: string
             return {
               async first() {
                 if (sql.includes('FROM members WHERE id = ?1')) return memberRow
+                // upsertPollFleetPresence's squad lookup (P1-c) — no squads table in this
+                // hand-rolled mock; resolves to '[]', exercised for real against real SQLite
+                // in tests/fleet-agent-liveness.test.ts and tests/mcp-check-in-poll-presence.test.ts.
+                if (sql.includes('SELECT s.slug AS slug FROM agents a JOIN squads')) return null
+                // upsertPollFleetPresence's INSERT ... ON CONFLICT ... RETURNING status
+                // (round 2: uses .first(), not .run(), so it can read back whether an
+                // operator-stopped row won over this establish — see P2-f). This mock always
+                // simulates a fresh/running row; the stopped-wins case is exercised for real
+                // against real SQLite in tests/mcp-check-in-poll-presence.test.ts.
+                if (sql.includes('INSERT INTO fleet_agents')) {
+                  fleetUpserts.push(args)
+                  return { status: 'running' }
+                }
                 return null
               },
               async run() {
                 if (sql.includes('INSERT INTO presence')) writes.push(args)
-                // upsertPollFleetPresence (mupot#1494 establish) vs touchPollFleetPresence
-                // (mupot#1494 refresh-only) — distinct SQL shapes, captured separately so
-                // tests can assert exactly which one fired.
-                if (sql.includes('INSERT INTO fleet_agents')) fleetUpserts.push(args)
-                else if (sql.includes('UPDATE fleet_agents') && sql.includes("presence_mode = 'poll'")) {
+                if (sql.includes('UPDATE fleet_agents') && sql.includes("presence_mode = 'poll'")) {
                   fleetTouches.push(args)
                 }
                 return { meta: { changes: 1 } }
@@ -179,8 +188,11 @@ describe('MCP check_in tool', () => {
         presence_ttl_sec: 600, // 2 * 300
       })
       expect(fleetUpserts).toHaveLength(1)
-      // upsertPollFleetPresence.bind(agentId, tenant, display, memberId, ttlSec)
-      expect(fleetUpserts[0]).toEqual([AGENT_ID, TENANT, 'Kasra Code', MEMBER_ID, 600])
+      // upsertPollFleetPresence.bind(agentId, tenant, display, memberId, ttlSec, squadsJson)
+      // — squadsJson is '[]' here since this mock has no squads/agents tables (P1-c is
+      // exercised for real in tests/fleet-agent-liveness.test.ts and
+      // tests/mcp-check-in-poll-presence.test.ts).
+      expect(fleetUpserts[0]).toEqual([AGENT_ID, TENANT, 'Kasra Code', MEMBER_ID, 600, '[]'])
     })
 
     it('clamps an out-of-bounds poll_interval_sec instead of storing it verbatim (bounded TTL derivation)', async () => {

@@ -100,6 +100,7 @@ import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../tasks/assigne
 import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
+  loadLatestDispatchReceiptsForTasks,
   type TaskDispatchRuntimeStage,
 } from '../tasks/runtime-receipts'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
@@ -145,14 +146,16 @@ import {
   readFleetAgentRow,
   getFleetAgentLiveness,
   derivePresence,
-  presenceTtlSec,
+  resolveFleetPresenceTtlSec,
   clampPollIntervalSec,
   pollPresenceTtlSec,
   upsertPollFleetPresence,
   touchPollFleetPresence,
+  clearPollFleetPresence,
   POLL_PRESENCE_MODE,
   RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
+import { hasRegisteredDeliverySurface } from '../bus/consumer'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { toolAgentLifecycle } from './agent-lifecycle'
@@ -963,9 +966,6 @@ const toolTaskList: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // mupot#1494 — a polling runner lives on task_list; refresh its fleet presence window on
-    // every call, valid or not (the caller genuinely polled). No-op for every non-poll agent.
-    await touchPollFleetPresence(env, auth.boundAgentId)
     const squadRes = await resolveTaskSquad(env, auth, args)
     if (!squadRes.ok) return squadRes
     const status = args.status
@@ -995,6 +995,11 @@ const toolTaskList: ToolSpec = {
       baseClauses.push(`assignee_agent_id = ?${baseBinds.length + 1}`)
       baseBinds.push(assignee.trim())
     }
+
+    // mupot#1494 round 2 (P2-i) — AFTER every 400/403/404 refusal above, never before: a
+    // refused call must not refresh liveness (a caller probing for a live TTL window via a
+    // request it knows will be refused must learn nothing). No-op for every non-poll agent.
+    await touchPollFleetPresence(env, auth.boundAgentId)
 
     // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED
     // at the SQL layer, not just reordered in JS after an unbounded read —
@@ -1062,7 +1067,16 @@ const toolTaskList: ToolSpec = {
     const agentStates: ReadonlyMap<string, AgentRuntimeState> =
       visibleTaskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
-    return done({ squad_id: squadRes.squad.id, tasks: rankTasks(visibleTaskRows, agentStates) })
+    // mupot#1494/#1502 (P1-a) — a task_list-only runner has no other way to learn the
+    // dispatch_receipt_id it needs to settle with, and delivered_via must be READABLE, not
+    // just recorded, to be "never silent". Attached post-ranking: it never affects order.
+    const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
+    const rankedTasks = rankTasks(visibleTaskRows, agentStates).map((t) => {
+      const info = dispatchInfo.get(t.id)
+      return info ? { ...t, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : t
+    })
+
+    return done({ squad_id: squadRes.squad.id, tasks: rankedTasks })
   },
 }
 
@@ -1108,8 +1122,12 @@ const toolTaskBoard: ToolSpec = {
       done: [],
     }
     const visibleTaskRows = await loadGateWakeNotices(env, rows.results ?? [])
+    // mupot#1494/#1502 (P1-a) — same reader as task_list; see its comment above.
+    const dispatchInfo = await loadLatestDispatchReceiptsForTasks(env, visibleTaskRows.map((t) => t.id))
     for (const task of visibleTaskRows) {
-      if (columns[task.status]) columns[task.status].push(task)
+      const info = dispatchInfo.get(task.id)
+      const enriched = info ? { ...task, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : task
+      if (columns[task.status]) columns[task.status].push(enriched)
     }
     const counts = Object.fromEntries(
       ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
@@ -2189,6 +2207,19 @@ const toolTaskDispatch: ToolSpec = {
       return fail(409, 'task_not_dispatchable')
     }
 
+    // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` must not strand a task in an inbox
+    // nothing is known to poll. Run the SAME eligibility check consumer.ts's
+    // resolveDispatchDeliveryMode will run asynchronously, synchronously, here, so an
+    // ineligible force is visibly reported back to the caller (a queue-decoupled async
+    // decision has no other way to tell a synchronous caller "your force was ignored").
+    // Never fails the dispatch — the task is still dispatched, just not forced to inbox.
+    let deliveryForcedIgnored: 'no_delivery_mode' | undefined
+    if (forceInboxDelivery) {
+      const route = await getFleetAgentLiveness(env, task.assignee_agent_id)
+      if (!hasRegisteredDeliverySurface(route)) deliveryForcedIgnored = 'no_delivery_mode'
+    }
+    const effectiveForceDelivery = forceInboxDelivery && !deliveryForcedIgnored
+
     const memberId = auth.memberId as string
     const receiptId = crypto.randomUUID()
     const dispatchedAt = new Date().toISOString()
@@ -2216,7 +2247,7 @@ const toolTaskDispatch: ToolSpec = {
         task_id: task.id,
         by: memberId,
         dispatch_receipt_id: receiptId,
-        ...(forceInboxDelivery ? { delivery: 'inbox' as const } : {}),
+        ...(effectiveForceDelivery ? { delivery: 'inbox' as const } : {}),
       },
       ts: dispatchedAt,
     }
@@ -2253,6 +2284,7 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_by: memberActor(memberId),
         dispatched_at: dispatchedAt,
       },
+      ...(deliveryForcedIgnored ? { delivery_forced_ignored: deliveryForcedIgnored } : {}),
     })
   },
 }
@@ -3706,9 +3738,6 @@ const toolInbox: ToolSpec = {
         enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
       })
     }
-    // mupot#1494 — a polling runner lives on inbox; refresh its fleet presence window on every
-    // poll. No-op for every non-poll agent (touchPollFleetPresence's WHERE clause).
-    await touchPollFleetPresence(env, agent)
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3735,6 +3764,10 @@ const toolInbox: ToolSpec = {
       boundSeat,
     )
     if (!seatArg.ok) return fail(seatArg.status, seatArg.error, seatArg.detail)
+
+    // mupot#1494 round 2 (P2-i) — AFTER every 400/403 refusal above, never before: a refused
+    // call must not refresh liveness. No-op for every non-poll agent.
+    await touchPollFleetPresence(env, agent)
 
     const res = await readAgentInbox(env, {
       agent,
@@ -3843,9 +3876,6 @@ const toolInboxLease: ToolSpec = {
         enroll_url: enrollUrl(canonicalOrigin(env, ctx.origin), ctx.seat),
       })
     }
-    // mupot#1494 — a polling runner lives on inbox_lease; refresh its fleet presence window on
-    // every poll. No-op for every non-poll agent (touchPollFleetPresence's WHERE clause).
-    await touchPollFleetPresence(env, agent)
     let limit: number | undefined
     if (args.limit !== undefined) {
       if (typeof args.limit !== 'number' || !Number.isFinite(args.limit))
@@ -3878,6 +3908,10 @@ const toolInboxLease: ToolSpec = {
       boundSeat,
     )
     if (!seatArg.ok) return fail(seatArg.status, seatArg.error, seatArg.detail)
+
+    // mupot#1494 round 2 (P2-i) — AFTER every 400/403/500 refusal above, never before.
+    // No-op for every non-poll agent.
+    await touchPollFleetPresence(env, agent)
 
     const res = await leaseAgentInbox(env, {
       agent,
@@ -4374,20 +4408,33 @@ const toolCheckIn: ToolSpec = {
     // this is a completely separate write path (fleet_agents, not the presence table the KV key
     // debounces), and a caller polling every poll_interval_sec must have its TTL genuinely reset
     // on every call, never silently skipped by the presence-table's unrelated 30s debounce.
-    let pollPresence: { presence_mode: 'poll'; poll_interval_sec: number; presence_ttl_sec: number } | undefined
+    let pollPresence:
+      | { presence_mode: 'poll'; poll_interval_sec: number; presence_ttl_sec: number }
+      | { presence_stopped_by_operator: true }
+      | undefined
     if (args.presence_mode === POLL_PRESENCE_MODE) {
       if (!auth.boundAgentId) {
         return fail(400, 'invalid_args', 'presence_mode: poll requires an agent-bound credential')
       }
       const pollIntervalSec = clampPollIntervalSec(args.poll_interval_sec)
       const ttlSec = pollPresenceTtlSec(pollIntervalSec)
-      await upsertPollFleetPresence(env, {
+      const result = await upsertPollFleetPresence(env, {
         agentId: auth.boundAgentId,
         display: id.displayName,
         memberId: id.memberId,
         ttlSec,
       })
-      pollPresence = { presence_mode: 'poll', poll_interval_sec: pollIntervalSec, presence_ttl_sec: ttlSec }
+      // mupot#1494 round 2 (P2-f) — an operator (or the agent's own prior self-detach) stopped
+      // this row; that verdict wins over a poll-mode check_in trying to resurrect it. No TTL/
+      // poll_interval echoed back — none of it took effect.
+      pollPresence = result.stoppedByOperator
+        ? { presence_stopped_by_operator: true }
+        : { presence_mode: 'poll', poll_interval_sec: pollIntervalSec, presence_ttl_sec: ttlSec }
+    } else if (args.presence_mode === RESIDENT_PRESENCE_MODE) {
+      // mupot#1494 round 2 (P2-g) — explicit de-registration: clear any prior poll-mode
+      // registration so this row falls back to ordinary resident rules (global TTL,
+      // runtime && live), exactly as if it had never poll-registered.
+      await clearPollFleetPresence(env, auth.boundAgentId)
     } else {
       // Not (re-)establishing this call — still slide the TTL window forward if this agent is
       // ALREADY poll-registered from an earlier check_in (cheap: touchPollFleetPresence's WHERE
@@ -4843,13 +4890,11 @@ const toolFleetAgentGet: ToolSpec = {
 
     const routeInfo = await getFleetAgentLiveness(env, targetAgent.id)
     const row = await readFleetAgentRow(env, targetAgent.id)
-    // Per-row TTL (poll-mode, mupot#1494) wins when the row declares one — mirrors
-    // getFleetAgentLiveness exactly, so this read-only view never disagrees with the actual
-    // dispatch-routing decision. Resident/legacy rows (presence_ttl_sec unset) keep reading the
-    // one global window, unchanged.
-    const ttlSec = typeof row?.presence_ttl_sec === 'number' && row.presence_ttl_sec > 0
-      ? row.presence_ttl_sec
-      : presenceTtlSec(env)
+    // mupot#1494 round 2 (P1-b) — resolveFleetPresenceTtlSec is THE one per-row TTL
+    // resolution every fleet_agents presence reader now calls, so this read-only view can
+    // never disagree with the actual dispatch-routing decision (getFleetAgentLiveness), the
+    // dashboard fleet view, routine selectAgent, or the agent view.
+    const ttlSec = resolveFleetPresenceTtlSec(env, row)
     const status = String(row?.status ?? 'unknown')
     const lastReportedAt = String(row?.last_reported_at ?? '')
     const derivedPresence = derivePresence(status, lastReportedAt, ttlSec, Date.now())
