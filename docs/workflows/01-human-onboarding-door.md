@@ -94,7 +94,7 @@ flow.
 - `member_tokens`: only for the JSON API path, never the web path.
 - **(mupot#1504)** `squads` + `capabilities` (`kind='home'` squad row + the member's own
   `admin` grant on it, `src/org/service.ts`'s `createHomeForMember`, unchanged by this
-  work) and `member_home_provisioning_receipts` (`migrations/0161`, widened by `0163` to
+  work) and `member_home_provisioning_receipts` (`migrations/0161`, widened by `0165` to
   admit `channel='web'` alongside `'im'`): `id, tenant, member_id, squad_id, channel,
   disposition, created_at` — written ONLY on a successful provisioning attempt
   (`disposition IN ('created','existing')`); a failure writes nothing.

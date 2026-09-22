@@ -1173,11 +1173,18 @@ export async function upsertCapabilityGrant(
 // door too. "Web onboarding door never creates the member's home squad — a
 // web-only member has no private space" is exactly the bug this closes.
 //
-// CALLERS (exactly two, both after the member row + its capability grant are
+// CALLERS (exactly three, all after the member row + its capability grant are
 // already durably committed):
 //   (a) src/dashboard/invite.ts's POST /invite/:id handler, right after
-//       acceptInvite(...) succeeds — the web onboarding door.
-//   (b) src/im/index.ts's handleImMessage 'join' case, right after a
+//       acceptInvite(...) succeeds — the browser web onboarding door.
+//   (b) src/members/index.ts's POST /invites/:id/accept (the JSON API accept
+//       route — CLI/non-browser callers), right after the same
+//       acceptInvite(...) succeeds. Added in the same gate round as (c)'s
+//       fact correction: a member minted here alone previously got no home
+//       until they happened to also touch one of the other two channels.
+//       Same 'web' channel value as (a) — this route mints over the
+//       web/API plane, not IM.
+//   (c) src/im/index.ts's handleImMessage 'join' case, right after a
 //       Telegram project-invite redemption succeeds — unchanged behaviour,
 //       same call shape as before the move, just renamed and re-imported.
 // Never call this from a read-only/status path (memberIntakeEnvelope's own
@@ -1192,7 +1199,7 @@ export async function upsertCapabilityGrant(
 // homes per human is structurally impossible regardless of caller).
 //
 // RECEIPTED ONLY ON SUCCESS: migrations/0161 (member_home_provisioning_receipts,
-// widened by 0163 to admit `channel IN ('web','im')`) gets a row on
+// widened by 0165 to admit `channel IN ('web','im')`) gets a row on
 // disposition 'created' or 'existing' — i.e. only when createHomeForMember
 // itself returned ok:true. A FAILED provisioning attempt writes nothing (no
 // receipt, no partial row) — same "audit success, not attempts" doctrine the

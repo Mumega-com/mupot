@@ -5,15 +5,20 @@
 // provisionHomeOnFirstContact (src/im/index.ts, IM-only) is renamed/moved to
 // a channel-agnostic provisionHomeForMember (src/members/service.ts) and
 // gains a `channel: 'web' | 'im'` argument, wired into member_home_
-// provisioning_receipts.channel (migrations/0161, widened by 0163 to admit
-// 'web' alongside 'im'). It is now called from BOTH:
-//   (a) src/dashboard/invite.ts's POST /invite/:id handler (the web door),
-//       right after acceptInvite() mints the member + capability grant.
-//   (b) src/im/index.ts's handleImMessage 'join' case (unchanged behaviour).
+// provisioning_receipts.channel (migrations/0161 — LIVE in production since
+// 2026-09-21 23:00Z, widened by 0165 to admit 'web' alongside 'im' via a
+// row-preserving table rebuild). It is now called from THREE callers:
+//   (a) src/dashboard/invite.ts's POST /invite/:id handler (the browser web
+//       door), right after acceptInvite() mints the member + capability grant.
+//   (b) src/members/index.ts's POST /invites/:id/accept (the JSON API accept
+//       route, for CLI/non-browser callers), right after the same
+//       acceptInvite() success — channel 'web' (web/API plane, not IM).
+//   (c) src/im/index.ts's handleImMessage 'join' case (unchanged behaviour).
 //
 // This file proves, against the REAL migration chain and the REAL
-// inviteApp/imApp Hono apps:
-//   1. web accept -> a home squad exists + exactly ONE receipt (channel='web').
+// inviteApp/membersApp/imApp Hono apps:
+//   1. web accept (browser door) -> a home squad exists + exactly ONE
+//      receipt (channel='web').
 //   2. a later Telegram bind-existing-member join for the SAME member is a
 //      pure no-op for provisioning: no second home, no second receipt.
 //   3. a provisioning FAILURE (unknown member id) never throws and writes
@@ -21,6 +26,9 @@
 //   4. the receipt's `channel` column actually distinguishes 'web' from 'im'
 //      (not just "some receipt exists") — proven by direct calls to
 //      provisionHomeForMember with each channel value.
+//   5. the JSON API accept route (POST /invites/:id/accept) ALSO provisions
+//      a home, channel='web' — a member minted through that door alone
+//      (no browser, no Telegram) is not left without a private space.
 //
 // MUTATION CHECK (performed manually during development, not a standing
 // test — see the PR body): commenting out the `await
@@ -33,7 +41,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { inviteApp } from '../src/dashboard/invite'
 import { imApp } from '../src/im'
-import { acceptInvite } from '../src/members'
+import { acceptInvite, membersApp } from '../src/members'
 import { provisionHomeForMember } from '../src/members/service'
 import { createProjectInvite } from '../src/members/project-invites'
 import { getMemberHomeSquad } from '../src/org/service'
@@ -247,6 +255,26 @@ describe('mupot#1504 — web accept provisions a home squad', () => {
 
     expect(receiptRows(harness)).toEqual([
       { member_id: 'member-cross', squad_id: homeAfterFirst!.id, channel: 'web', disposition: 'created' },
+    ])
+  })
+
+  it('the JSON API accept route (POST /invites/:id/accept) ALSO provisions a home, channel="web"', async () => {
+    harness = makeHarness()
+    const env = envFor(harness)
+
+    const response = await membersApp.fetch(new Request(`${ORIGIN}/invites/inv-squad/accept`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ display_name: 'API User' }),
+    }), env)
+    expect(response.status).toBe(201)
+    const body = await response.json() as { member_id: string }
+
+    const homeSquadId = homeSquadIdFor(harness, body.member_id)
+    expect(homeSquadId).not.toBeNull()
+
+    expect(receiptRows(harness)).toEqual([
+      { member_id: body.member_id, squad_id: homeSquadId, channel: 'web', disposition: 'created' },
     ])
   })
 })
