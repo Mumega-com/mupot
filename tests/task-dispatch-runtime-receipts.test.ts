@@ -1806,27 +1806,29 @@ describe('adminResetDispatchLease — operator repair for a wedged lease (mupot#
 // must be provable from the CAPABILITY GRANT alone (never hasWorkspaceAdmin's legacy-role
 // fallback), and must refuse every agent-bound token outright.
 describe('task_dispatch_lease_reset — org-admin gate (mupot#1494 round 3, P1-B)', () => {
-  it('M9: a SQUAD admin (not org-scoped) is refused — 403 need org:admin', async () => {
+  it('M9: hasWorkspaceAdmin\'s legacy-role fallback (capabilities undefined, role reads \'admin\') is refused — 403 need org:admin', async () => {
     const fixture = runtimeFixture({ unleased: true })
     try {
-      const squadAdminAuth: AuthContext = {
+      // The EXACT M9 shape: `capabilities` UNDEFINED (never resolved/loaded, or a
+      // legacy-session context) with a `role` column that reads 'admin' — the precise
+      // condition under which `hasWorkspaceAdmin` (`if (auth.capabilities === undefined)
+      // return auth.role === 'owner' || auth.role === 'admin'`) grants org-admin from the
+      // LEGACY role alone, with no real org-scope capability grant behind it at all. A
+      // capabilities array with only a SQUAD-scoped grant is already correctly refused by
+      // `hasWorkspaceAdmin` itself (`hasCapability` gates on scope_type) — it's the
+      // `undefined` fallback specifically that this tool must never consult.
+      const legacyRoleAuth: AuthContext = {
         userId: GATE_MEMBER_ID,
         tenant: TENANT,
         channel: 'workspace',
-        role: 'member',
+        role: 'admin',
         memberId: GATE_MEMBER_ID,
         tokenId: GATE_TOKEN_ID,
         boundAgentId: undefined,
-        // A REAL squad-scoped admin grant — not org-scoped. M9 (round-1 adversarial
-        // finding): hasWorkspaceAdmin's `auth.capabilities === undefined` fallback to
-        // `auth.role` let a caller like this through if `role` happened to read 'admin';
-        // this fixture deliberately leaves `role: 'member'` (never a legacy-role escape)
-        // and supplies a real, non-empty capabilities array so ONLY the capability grant
-        // itself is under test.
-        capabilities: [{ member_id: GATE_MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'admin' }],
+        capabilities: undefined,
       }
-      const res = await invokeTool(squadAdminAuth, fixture.env, 'task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'squad admin attempt',
+      const res = await invokeTool(legacyRoleAuth, fixture.env, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'legacy-role fallback attempt',
       }, 'https://pot.test')
       expect(res).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
 
