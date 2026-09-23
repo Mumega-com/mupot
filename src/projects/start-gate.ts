@@ -23,6 +23,7 @@ import { writeReceiptToD1 } from '../workflows/pipeline'
 import { createDepartment, createSquad } from '../org/service'
 import { createBus } from '../bus'
 import { lifecycleTaskId } from './circuit-breaker'
+import { DEFAULT_CYCLE_DAYS, nextCycleBoundary } from './cycle-creation'
 import { getProject, updateProject, upsertProjectSquadAccess, type ProjectMutationResult } from './service'
 
 // A small, DELIBERATE duplicate of src/mcp/provision.ts's emitProvisioned — same
@@ -66,6 +67,21 @@ export const BLOCKED_START_STEP = 'blocked_start'
 export const BLOCKED_START_SCHEMA = 'mupot.blocked_start/v1'
 export const GHOST_START_ALARM_STEP = 'ghost_start_alarm'
 export const GHOST_START_ALARM_SCHEMA = 'mupot.ghost_start_alarm/v1'
+/**
+ * PR #1532 round 2: a SEPARATE, PER-ACTIVATION audit receipt (never
+ * INSERT-OR-IGNORE'd away by a fixed instance id the way START_GATE_STEP's
+ * `project-start:<id>` is) — see startActivationInstanceId. Its task_id is
+ * always the REAL seed task id (reused or freshly created), so migration
+ * 0059's workflow_receipts_project_hydrate_insert trigger populates
+ * project_id from it — which is what makes this receipt count as genuine
+ * activity to the stall detector's loadProjectIdleSignals (newest_evidence_at
+ * reads MAX(created_at) FROM workflow_receipts WHERE project_id = ?1). This
+ * is the FIX for "a revived project's stalled flag gets recomputed back to 1
+ * on the very next tick": the detector's own idleness predicate now has real,
+ * fresh evidence to work from — start-gate does not hand-write `stalled`.
+ */
+export const START_GATE_ACTIVATION_STEP = 'project_start_activation'
+export const START_GATE_ACTIVATION_SCHEMA = 'mupot.project_start_activation/v1'
 export const START_GATE_PRINCIPAL = 'system:project-loop'
 /** Default age (days) before a planned project with no provision attempt alarms. */
 export const DEFAULT_GHOST_START_DAYS = 7
@@ -118,7 +134,7 @@ export type WriteReceiptFn = (
 export type UpdateProjectFn = (
   env: Env,
   id: string,
-  input: { status: 'active'; via_start_gate?: boolean },
+  input: { status: 'active'; via_start_gate?: boolean; reset_cycle_boundary_at?: string },
 ) => Promise<ProjectMutationResult<Project>>
 
 export type CreateTaskFn = (
@@ -182,6 +198,13 @@ export interface StartGateDeps {
    * emit nothing rather than attribute a structural change to no one.
    */
   actorMemberId: string | null
+  /**
+   * Clock for the post-activation cycle-boundary reset below. Optional so the
+   * three existing call sites (mcp/projects.ts, dashboard/index.ts,
+   * projects/index.ts) need no change — defaults to the real clock inside
+   * startProject itself. Tests override it for a deterministic boundary.
+   */
+  nowIso?: () => string
 }
 
 export interface GhostStartDeps {
@@ -221,6 +244,12 @@ export function defaultGhostStartDeps(): GhostStartDeps {
 
 export function startInstanceId(projectId: string): string {
   return `project-start:${projectId}`
+}
+
+/** Unique per activation (activationKey is nowIso) — unlike startInstanceId,
+ *  never collapses a revival's audit trail into a single INSERT-OR-IGNORE'd row. */
+export function startActivationInstanceId(projectId: string, activationKey: string): string {
+  return `project-start-activation:${projectId}:${activationKey}`
 }
 
 export function ghostInstanceId(projectId: string): string {
@@ -558,6 +587,44 @@ export async function recordStartGateSuccess(
   })
 }
 
+/**
+ * PR #1532 round 2: the per-activation audit + activity receipt. See
+ * START_GATE_ACTIVATION_STEP's doc comment for why taskId MUST be the real
+ * seed task id (never lifecycleTaskId's synthetic string) — that's what lets
+ * migration 0059's hydrate trigger populate project_id, which is what the
+ * stall detector's evidence query reads.
+ */
+export async function recordStartGateActivation(
+  env: Env,
+  detail: {
+    projectId: string
+    taskId: string
+    principal: string
+    actorMemberId: string | null
+    oldCycleBoundaryAt: string | null
+    newCycleBoundaryAt: string | null
+    oldStalled: number
+    nowIso: string
+  },
+  writeReceipt: WriteReceiptFn,
+): Promise<void> {
+  await writeReceipt(env, {
+    instanceId: startActivationInstanceId(detail.projectId, detail.nowIso),
+    taskId: detail.taskId,
+    stepName: START_GATE_ACTIVATION_STEP,
+    status: 'ok',
+    detail: JSON.stringify({
+      schema: START_GATE_ACTIVATION_SCHEMA,
+      project_id: detail.projectId,
+      principal: detail.principal,
+      actor_member_id: detail.actorMemberId,
+      old_cycle_boundary_at: detail.oldCycleBoundaryAt,
+      new_cycle_boundary_at: detail.newCycleBoundaryAt,
+      old_stalled: detail.oldStalled,
+    }),
+  })
+}
+
 /** True when a start or blocked-start receipt exists (a provision was attempted). */
 export async function hasStartProvisionAttempt(env: Env, projectId: string): Promise<boolean> {
   const row = await env.DB.prepare(
@@ -716,9 +783,29 @@ export async function startProject(
   let taskId: string
   try {
     const existingCount = await countProjectTasks(env, projectId)
+    // mupot: reviving an archived project (archived -> planned -> active)
+    // re-runs this same startProject path. `existingCount > 0` means the
+    // project already carries tasks, but that is NOT proof a start-gate seed
+    // exists among them — every project that predates the start gate (or
+    // whose seed lived on a squad edge that was since removed/changed) has
+    // tasks with none of them carrying START_GATE_SEED_MARKER on the picked
+    // squad. The idempotence guard below (pickExistingSeedTaskId) exists so a
+    // RETRY after a partial failure reuses the seed it already made rather
+    // than minting a second one — it was never meant to be the ONLY path to
+    // a seed. Fall through to the exact same create-a-seed logic the
+    // existingCount === 0 branch runs when no seed is found, instead of
+    // failing closed with task_seed_failed. A seed that exists on a
+    // DIFFERENT squad than the one just picked (e.g. project_squad_access
+    // was repointed between an old activation and this one) is deliberately
+    // NOT reused here — isStartGateSeedTask's squadId check means
+    // pickExistingSeedTaskId will not find it, and a fresh seed is created on
+    // the picked squad instead, so the seed always lives where the assignee
+    // agent actually is.
+    let existingId: string | null = null
     if (existingCount > 0) {
-      const existingId = await pickExistingSeedTaskId(env, projectId, squad.squad_id)
-      if (!existingId) return fail('task_seed_failed')
+      existingId = await pickExistingSeedTaskId(env, projectId, squad.squad_id)
+    }
+    if (existingId) {
       taskId = existingId
     } else {
       const seed = seedTaskFromGoal(project)
@@ -737,10 +824,34 @@ export async function startProject(
     return fail('task_seed_failed')
   }
 
-  const activated = await deps.updateProject(env, projectId, {
-    status: 'active',
-    via_start_gate: true,
-  })
+  // mupot PR #1532 round 2: a REVIVED project (archived -> planned -> active,
+  // this same path) can carry an old, already-elapsed cycle_boundary_at from
+  // before it was archived, with a KILL receipt already on file for that
+  // exact boundary. Reset it to a fresh now+interval boundary — computed
+  // BEFORE the activation write so it can be folded into the SAME atomic
+  // UPDATE as the status flip (via_start_gate's reset_cycle_boundary_at,
+  // service.ts), never a second, separate write: a partial failure between
+  // two writes is exactly the class this closes. `stalled` is deliberately
+  // NOT hand-reset here — see START_GATE_ACTIVATION_STEP's doc comment and
+  // recordStartGateActivation below: the stall detector's OWN idleness
+  // predicate must independently arrive at stalled=0 from real evidence, or
+  // the very next tick recomputes it right back to 1 (a hand reset the
+  // detector immediately overwrites is not a reset).
+  const nowIso = (deps.nowIso ?? (() => new Date().toISOString()))()
+  const freshBoundary = nextCycleBoundary(nowIso, null, DEFAULT_CYCLE_DAYS)
+  const oldCycleBoundaryAt = project.cycle_boundary_at
+  const oldStalled = project.stalled
+
+  let activated: ProjectMutationResult<Project>
+  try {
+    activated = await deps.updateProject(env, projectId, {
+      status: 'active',
+      via_start_gate: true,
+      ...(freshBoundary !== null ? { reset_cycle_boundary_at: freshBoundary } : {}),
+    })
+  } catch {
+    return fail('activate_failed')
+  }
   if (!activated.ok || activated.value.status !== 'active') {
     return fail('activate_failed')
   }
@@ -754,6 +865,26 @@ export async function startProject(
       agentId: agent.id,
       resource: resource.kind,
       principal: deps.principal,
+    },
+    deps.writeReceipt,
+  )
+
+  // taskId here is ALWAYS a real task row (reused existing seed or the one
+  // just created) — never the synthetic lifecycleTaskId — so migration
+  // 0059's hydrate trigger stamps this receipt's project_id, making it real
+  // evidence to the stall detector (see the doc comment on
+  // START_GATE_ACTIVATION_STEP).
+  await recordStartGateActivation(
+    env,
+    {
+      projectId,
+      taskId,
+      principal: deps.principal,
+      actorMemberId: deps.actorMemberId,
+      oldCycleBoundaryAt,
+      newCycleBoundaryAt: freshBoundary,
+      oldStalled,
+      nowIso,
     },
     deps.writeReceipt,
   )
