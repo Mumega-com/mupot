@@ -67,9 +67,14 @@ export interface CircuitBreakerDeps {
   principal: string
 }
 
+/** Prefix for cycleInstanceId — exported so other surfaces (e.g. the needs_you
+ *  recommit-due source, src/attention/service.ts) can build the SAME instance_id
+ *  shape in a SQL EXISTS clause without hand-copying the string literal. */
+export const CYCLE_INSTANCE_PREFIX = 'project-cycle:'
+
 /** Stable workflow instance id for one project + boundary (UNIQUE with step_name). */
 export function cycleInstanceId(projectId: string, boundaryAt: string): string {
-  return `project-cycle:${projectId}:${boundaryAt}`
+  return `${CYCLE_INSTANCE_PREFIX}${projectId}:${boundaryAt}`
 }
 
 /** Synthetic task id for project-scoped lifecycle receipts (no FK on workflow_receipts). */

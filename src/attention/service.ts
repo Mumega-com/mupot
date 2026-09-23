@@ -2,6 +2,7 @@ import type { Env, OrgKind } from '../types'
 import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
+import { BREAKER_EXEMPT_STATUSES, CYCLE_INSTANCE_PREFIX, RECOMMIT_OR_KILL_STEP } from '../projects/circuit-breaker'
 import type { RoutinePrincipal } from '../routines/access'
 import { routineTablesReady } from '../routines/schema-ready'
 
@@ -9,6 +10,12 @@ const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
 const SOURCE_SCAN_CAP = 100
 const CURSOR_TTL_SECONDS = 600
+/** Warning window for the recommit-due source — matches the "72h heads-up"
+ *  requirement (mupot#lifecycle-warning). A row also appears once already
+ *  overdue (boundary in the past), which this same "<= threshold" test covers. */
+const RECOMMIT_DUE_WINDOW_MS = 72 * 60 * 60 * 1000
+/** Inside this window (or already overdue) a recommit-due row is 'urgent' rather than 'high'. */
+const RECOMMIT_URGENT_WINDOW_MS = 24 * 60 * 60 * 1000
 
 export type NeedsYouKind =
   | 'approval'
@@ -19,6 +26,7 @@ export type NeedsYouKind =
   | 'routine_budget'
   | 'blocked_task'
   | 'publishable_output'
+  | 'project_recommit_due'
 
 export type NeedsYouAction =
   | 'view'
@@ -29,10 +37,11 @@ export type NeedsYouAction =
   | 'change_budget'
   | 'cancel'
   | 'publish'
+  | 'recommit'
 
 export interface NeedsYouItem {
   kind: NeedsYouKind
-  source_type: 'task' | 'routine_run'
+  source_type: 'task' | 'routine_run' | 'project'
   source_id: string
   project_id: string
   project_name: string
@@ -63,6 +72,9 @@ export interface NeedsYouPage {
 interface SourceRow {
   kind: NeedsYouKind
   source_type: NeedsYouItem['source_type']
+  // project source rows carry NULL for every squad/gate field below — a
+  // 'project' row is visibility-scoped by projectVisibilityClause directly
+  // (see recommitDue query), never by squad membership.
   source_id: string
   project_id: string
   project_name: string
@@ -165,6 +177,22 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal): NeedsYouAction
     return ['view']
   }
 
+  if (row.source_type === 'project') {
+    // Recommit is gated the SAME way the write route gates it — POST
+    // /projects/:id/recommit and the project_recommit MCP tool both require
+    // access.workspaceAdmin (src/projects/index.ts, src/mcp/projects.ts).
+    // Self-recommit (an assignee recommitting their own project) is refused
+    // SERVER-SIDE by proposeProjectRecommit's isSelfRecommit check — that
+    // refusal is legible at write time (its own 'self_recommit' error), not
+    // silently pre-filtered here: doing so would need this visibility-only
+    // source to also resolve the project's task assignees, duplicating a
+    // second copy of that lookup for a case the write path already refuses
+    // cleanly.
+    return principal.actor_type === 'member' && principal.workspace_admin
+      ? ['view', 'recommit']
+      : ['view']
+  }
+
   const actions: NeedsYouAction[] = ['view']
   const human = principal.actor_type === 'member'
   if (row.kind === 'routine_answer' && human && principalCanAnswerRoutine(row, principal)) {
@@ -198,7 +226,9 @@ function itemFrom(row: SourceRow, principal: RoutinePrincipal): NeedsYouItem {
     deadline_at: row.deadline_at,
     safe_url: row.source_type === 'task'
       ? `/projects/${safePath(row.project_id)}#work`
-      : `/projects/${safePath(row.project_id)}/routines?run_id=${safePath(row.source_id)}`,
+      : row.source_type === 'project'
+        ? `/projects/${safePath(row.project_id)}`
+        : `/projects/${safePath(row.project_id)}/routines?run_id=${safePath(row.source_id)}`,
     allowed_actions: actionsFor(row, principal),
   }
 }
@@ -264,6 +294,7 @@ async function sourceRows(
   principal: RoutinePrincipal,
   options: NeedsYouOptions,
   cursor: NeedsYouCursor | null,
+  nowIso: string,
 ): Promise<SourceResult[]> {
   const visibility = projectVisibilityClause(principal.project_read)
   const projectClause = options.project_id ? ' AND p.id = ?' : ''
@@ -369,7 +400,58 @@ async function sourceRows(
       AND ${visibility.sql}
   `, [CONTENT_GATE_OWNER, ...projectScope], cursor)
 
-  return Promise.all([approvals, routineWaits, blockedTasks, publishableOutputs])
+  // Recommit-due warning (mupot lifecycle-warning): the circuit breaker
+  // (src/projects/circuit-breaker.ts) archives any non-exempt project at
+  // cycle_boundary_at unless a receipted recommit exists for that EXACT
+  // boundary — silently, with no prior notice. This source surfaces that
+  // fate 72h ahead (or once already overdue) so someone with recommit
+  // authority sees it before the breaker fires.
+  //
+  // Status eligibility reuses BREAKER_EXEMPT_STATUSES from circuit-breaker.ts
+  // directly (NOT IN over the same array shouldEvaluateBreaker checks) —
+  // one list, two readers, cannot diverge. See tests/attention-recommit-
+  // due.test.ts's "predicate parity" case.
+  //
+  // "No receipted recommit for that boundary" reuses hasReceiptedRecommit's
+  // OWN storage shape: a workflow_receipts row at instance_id =
+  // `${CYCLE_INSTANCE_PREFIX}${project_id}:${cycle_boundary_at}` (the exact
+  // format cycleInstanceId() builds — CYCLE_INSTANCE_PREFIX is imported, not
+  // re-typed) with step_name = RECOMMIT_OR_KILL_STEP and a JSON detail whose
+  // decision is 'recommit'. This is expressed as SQL (json_extract) rather
+  // than an N+1 hasReceiptedRecommit call per candidate row, but it reads the
+  // SAME columns hasReceiptedRecommit reads, under the SAME key — a
+  // recommitted-project test that seeds its receipt via the REAL
+  // proposeProjectRecommit() (not a hand-inserted row) is what proves the two
+  // never drift (see the "recommitted project is absent" test).
+  const exemptPlaceholders = BREAKER_EXEMPT_STATUSES.map(() => '?').join(', ')
+  const dueBy = new Date(Date.parse(nowIso) + RECOMMIT_DUE_WINDOW_MS).toISOString()
+  const urgentBy = new Date(Date.parse(nowIso) + RECOMMIT_URGENT_WINDOW_MS).toISOString()
+  const recommitDue = querySource(env, 'recommit_due', `
+    SELECT
+      'project_recommit_due' AS kind, 'project' AS source_type, p.id AS source_id,
+      p.id AS project_id, p.name AS project_name, p.name AS title,
+      'Cycle boundary at ' || p.cycle_boundary_at || ' — archived automatically without a recommit' AS reason,
+      CASE WHEN p.cycle_boundary_at <= ? THEN 0 ELSE 1 END AS urgency_rank,
+      'workspace_admin' AS responsible, NULL AS requested_by,
+      p.created_at, p.cycle_boundary_at AS deadline_at,
+      NULL AS squad_id, NULL AS squad_department_id, NULL AS squad_kind, NULL AS project_access_level,
+      NULL AS assignee_agent_id, NULL AS gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
+      COALESCE(p.cycle_boundary_at, '${DEADLINE_SENTINEL}') AS sort_deadline,
+      p.created_at AS sort_timestamp
+    FROM projects p
+    WHERE p.status NOT IN (${exemptPlaceholders})
+      AND p.cycle_boundary_at IS NOT NULL
+      AND p.cycle_boundary_at <= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM workflow_receipts wr
+         WHERE wr.instance_id = '${CYCLE_INSTANCE_PREFIX}' || p.id || ':' || p.cycle_boundary_at
+           AND wr.step_name = ?
+           AND json_extract(wr.detail, '$.decision') = 'recommit'
+      )${projectClause}
+      AND ${visibility.sql}
+  `, [urgentBy, ...BREAKER_EXEMPT_STATUSES, dueBy, RECOMMIT_OR_KILL_STEP, ...projectScope], cursor)
+
+  return Promise.all([approvals, routineWaits, blockedTasks, publishableOutputs, recommitDue])
 }
 
 function validateCursor(cursor: unknown): cursor is NeedsYouCursor {
@@ -382,7 +464,7 @@ function validateCursor(cursor: unknown): cursor is NeedsYouCursor {
     && Number.isSafeInteger(value.urgency_rank)
     && typeof value.deadline === 'string'
     && typeof value.timestamp === 'string'
-    && (value.type === 'task' || value.type === 'routine_run')
+    && (value.type === 'task' || value.type === 'routine_run' || value.type === 'project')
     && typeof value.id === 'string'
 }
 
@@ -441,6 +523,10 @@ export async function listNeedsYou(
   env: Env,
   principal: RoutinePrincipal,
   options: NeedsYouOptions = {},
+  // Test-only seam (never a client-supplied option — NeedsYouOptions has no
+  // `now` field, so no caller can spoof "now" through the public request
+  // shape). Mirrors the nowIso param every project-loop function takes.
+  nowIso: string = new Date().toISOString(),
 ): Promise<NeedsYouPage> {
   if (principal.tenant !== env.TENANT_SLUG) {
     return { items: [], next_cursor: null, truncated: false, truncated_sources: [] }
@@ -448,7 +534,7 @@ export async function listNeedsYou(
   const limit = options.limit ?? DEFAULT_LIMIT
   if (!validLimit(limit)) throw new Error('invalid_needs_you_pagination')
   const cursor = await resolveCursor(env, principal, options)
-  const sources = await sourceRows(env, principal, options, cursor)
+  const sources = await sourceRows(env, principal, options, cursor, nowIso)
   const rows = sources.flatMap(source => source.rows).sort((left, right) => (
     left.urgency_rank - right.urgency_rank
     || left.sort_deadline.localeCompare(right.sort_deadline)
