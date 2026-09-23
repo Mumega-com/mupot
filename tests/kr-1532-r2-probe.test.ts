@@ -7,7 +7,8 @@
 // project planned (blocked-start). Stale planned with no provision attempt escalates
 // to org owners (ghost-start alarm).
 
-import { readFileSync, readdirSync } from 'node:fs'
+import { appendFileSync, readFileSync, readdirSync } from 'node:fs'
+const plog = (...a: unknown[]) => appendFileSync('/tmp/claude-1002/-mnt-HC-Volume-104325311-mumega-com-agents-kasra/c2bf7ad5-9a95-4e83-92ed-eb64ac0586f0/scratchpad/kr1532r2-out.txt', a.map(String).join(' ') + '\n')
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Env, ProjectStatus, Task } from '../src/types'
@@ -223,7 +224,8 @@ async function realKillThenRevive(h: SqliteD1Harness, env: Env, id: string, T0: 
   grantSquadAccess(h, id, 'admin')
   insertAgent(h, `agent-${id}`)
   clock(T0)
-  const s = await startProject(env, id, makeDeps({ createTask: persistingCreateTask(), nowIso: () => T0 }))
+  const s = await startProject(env, id, makeDeps({ createTask: persistingCreateTask(), nowIso: () => T0, updateProject: async (e, i, inp) => { try { const r = await updateProject(e, i, inp); if (!r.ok) plog('UP', JSON.stringify(r)); return r } catch (x) { plog('UPX', (x as Error).message); throw x } } }))
+  if (!s.ok) plog('FIRST START FAIL', JSON.stringify(s))
   expect(s.ok).toBe(true)
   // tick at T0+1m schedules boundary if needed
   await tick(env, at(T0, 60000))
@@ -240,28 +242,28 @@ describe('KR r2 probe A: real kill -> revive -> real ticks', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    const pre = await realKillThenRevive(h, env, 'pA', T0)
-    console.log('PRE-REVIVE', JSON.stringify(pre))
+    const pre = await realKillThenRevive(h, env, 'pa', T0)
+    plog('PRE-REVIVE', JSON.stringify(pre))
     const R = '2026-08-01T00:00:00.000Z'
     clock(R)
-    expect((await updateProject(env, 'pA', { status: 'planned' })).ok).toBe(true)
-    const tp = await tick(env, at(R, 60000)); expect(tp.killed).toBe(0); expect(row(h,'pA').status).toBe('planned')
+    expect((await updateProject(env, 'pa', { status: 'planned' })).ok).toBe(true)
+    const tp = await tick(env, at(R, 60000)); expect(tp.killed).toBe(0); expect(row(h,'pa').status).toBe('planned')
     clock(at(R, 120000))
-    const rv = await startProject(env, 'pA', makeDeps({ createTask: persistingCreateTask(), nowIso: () => at(R, 120000) }))
-    console.log('REVIVE', JSON.stringify(rv.ok ? { ok: true } : rv), JSON.stringify(row(h,'pA')))
+    const rv = await startProject(env, 'pa', makeDeps({ createTask: persistingCreateTask(), nowIso: () => at(R, 120000) }))
+    plog('REVIVE', JSON.stringify(rv.ok ? { ok: true } : rv), JSON.stringify(row(h,'pa')))
     expect(rv.ok).toBe(true)
     const log: string[] = []
     for (const [label, ms] of [['R+5m', 5*60000], ['R+1d', D], ['R+7d', 7*D], ['R+13d', 13*D]] as const) {
-      const r = await tick(env, at(R, ms)); log.push(`${label} killed=${r.killed} cleared=${r.stall_cleared} flagged=${r.stall_flagged} ${JSON.stringify(row(h,'pA'))}`)
-      expect(r.killed).toBe(0); expect(row(h,'pA').status).toBe('active')
+      const r = await tick(env, at(R, ms)); log.push(`${label} killed=${r.killed} cleared=${r.stall_cleared} flagged=${r.stall_flagged} ${JSON.stringify(row(h,'pa'))}`)
+      expect(r.killed).toBe(0); expect(row(h,'pa').status).toBe('active')
     }
-    expect(row(h,'pA').stalled).toBe(0) // cleared by detector
+    expect(row(h,'pa').stalled).toBe(0) // cleared by detector
     // past stall threshold AND new boundary from revival, no recommit
     const r2 = await tick(env, at(R, 14*D + 3*3600000))
-    log.push(`R+14d3h killed=${r2.killed} ${JSON.stringify(row(h,'pA'))}`)
-    console.log(log.join('\n'))
+    log.push(`R+14d3h killed=${r2.killed} ${JSON.stringify(row(h,'pa'))}`)
+    plog(log.join('\n'))
     expect(r2.killed).toBe(1)
-    expect(row(h,'pA').status).toBe('archived')
+    expect(row(h,'pa').status).toBe('archived')
     h.close()
   })
 
@@ -269,20 +271,20 @@ describe('KR r2 probe A: real kill -> revive -> real ticks', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    await realKillThenRevive(h, env, 'pB', T0)
+    await realKillThenRevive(h, env, 'pb', T0)
     const R = '2026-08-01T00:00:00.000Z'
-    clock(R); expect((await updateProject(env, 'pB', { status: 'planned' })).ok).toBe(true)
-    const rv = await startProject(env, 'pB', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R }))
+    clock(R); expect((await updateProject(env, 'pb', { status: 'planned' })).ok).toBe(true)
+    const rv = await startProject(env, 'pb', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R }))
     expect(rv.ok).toBe(true)
     await tick(env, at(R, 60000))
     clock(at(R, 7*D))
-    const rc = await proposeProjectRecommit(env, 'pB', 'external-reviewer', 'keep going', writeReceiptToD1)
+    const rc = await proposeProjectRecommit(env, 'pb', 'external-reviewer', 'keep going', writeReceiptToD1)
     expect(rc).toMatchObject({ ok: true })
-    const b = row(h,'pB').cycle_boundary_at
+    const b = row(h,'pb').cycle_boundary_at
     const r = await tick(env, at(R, 14*D + 60000))
-    console.log('RECOMMIT tick', JSON.stringify(r), JSON.stringify(row(h,'pB')), 'oldBoundary', b)
+    plog('RECOMMIT tick', JSON.stringify(r), JSON.stringify(row(h,'pb')), 'oldBoundary', b)
     expect(r.killed).toBe(0)
-    expect(row(h,'pB').status).toBe('active')
+    expect(row(h,'pb').status).toBe('active')
     h.close()
   })
 })
@@ -292,25 +294,25 @@ describe('KR r2 probe B: launder via repeated revival', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    insertPlannedProject(h, { id: 'pL', goal: 'idle forever', created_at: T0 })
-    grantSquadAccess(h, 'pL', 'admin'); insertAgent(h, 'agent-pL')
+    insertPlannedProject(h, { id: 'pl', goal: 'idle forever', created_at: T0 })
+    grantSquadAccess(h, 'pl', 'admin'); insertAgent(h, 'agent-pl')
     clock(T0)
-    expect((await startProject(env, 'pL', makeDeps({ createTask: persistingCreateTask(), nowIso: () => T0 }))).ok).toBe(true)
+    expect((await startProject(env, 'pl', makeDeps({ createTask: persistingCreateTask(), nowIso: () => T0 }))).ok).toBe(true)
     let t = T0; let kills = 0
     for (let i = 0; i < 6; i++) {
       const r1 = await tick(env, at(t, 60000)); kills += r1.killed
       const r2 = await tick(env, at(t, 13*D)); kills += r2.killed
       const cyc = at(t, 13*D + 3600000); clock(cyc)
-      expect((await updateProject(env, 'pL', { status: 'archived' })).ok).toBe(true)
-      expect((await updateProject(env, 'pL', { status: 'planned' })).ok).toBe(true)
-      const s = await startProject(env, 'pL', makeDeps({ createTask: persistingCreateTask(), nowIso: () => cyc, actorMemberId: 'owner-1' }))
+      expect((await updateProject(env, 'pl', { status: 'archived' })).ok).toBe(true)
+      expect((await updateProject(env, 'pl', { status: 'planned' })).ok).toBe(true)
+      const s = await startProject(env, 'pl', makeDeps({ createTask: persistingCreateTask(), nowIso: () => cyc, actorMemberId: 'owner-1' }))
       expect(s.ok).toBe(true)
       t = cyc
     }
     const recs = h.sqlite.prepare(`SELECT detail FROM workflow_receipts WHERE step_name='project_start_activation' ORDER BY created_at`).all() as Array<{detail:string}>
     const recommits = h.sqlite.prepare(`SELECT count(*) n FROM workflow_receipts WHERE step_name='recommit_or_kill'`).get() as {n:number}
-    const seeds = h.sqlite.prepare(`SELECT count(*) n FROM tasks WHERE project_id='pL'`).get() as {n:number}
-    console.log('LAUNDER days alive', (Date.parse(t)-Date.parse(T0))/D, 'kills', kills, 'activation receipts', recs.length, 'recommit_or_kill rows', recommits.n, 'tasks', seeds.n, '\nlast detail', recs[recs.length-1].detail)
+    const seeds = h.sqlite.prepare(`SELECT count(*) n FROM tasks WHERE project_id='pl'`).get() as {n:number}
+    plog('LAUNDER days alive', (Date.parse(t)-Date.parse(T0))/D, 'kills', kills, 'activation receipts', recs.length, 'recommit_or_kill rows', recommits.n, 'tasks', seeds.n, '\nlast detail', recs[recs.length-1].detail)
     expect(kills).toBe(0)
     h.close()
   })
@@ -321,18 +323,18 @@ describe('KR r2 probe D2: activation receipt write fails after the UPDATE', () =
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    await realKillThenRevive(h, env, 'pD', T0)
+    await realKillThenRevive(h, env, 'pd', T0)
     const R = '2026-08-01T00:00:00.000Z'
-    clock(R); expect((await updateProject(env, 'pD', { status: 'planned' })).ok).toBe(true)
+    clock(R); expect((await updateProject(env, 'pd', { status: 'planned' })).ok).toBe(true)
     const wr = vi.fn(async (e: Env, r: { instanceId: string; taskId: string; stepName: string; status: string; detail?: string }) => {
       if (r.stepName === START_GATE_ACTIVATION_STEP) throw new Error('D1 transient')
       return writeReceiptToD1(e, r)
     })
     let res: unknown
-    try { res = await startProject(env, 'pD', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R, writeReceipt: wr })) } catch (e) { res = `THREW ${(e as Error).message}` }
-    console.log('D2 start result', typeof res === 'string' ? res : JSON.stringify(res), JSON.stringify(row(h,'pD')))
+    try { res = await startProject(env, 'pd', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R, writeReceipt: wr })) } catch (e) { res = `THREW ${(e as Error).message}` }
+    plog('D2 start result', typeof res === 'string' ? res : JSON.stringify(res), JSON.stringify(row(h,'pd')))
     const r = await tick(env, at(R, 60000))
-    console.log('D2 tick', JSON.stringify({ killed: r.killed, flagged: r.stall_flagged }), JSON.stringify(row(h,'pD')))
+    plog('D2 tick', JSON.stringify({ killed: r.killed, flagged: r.stall_flagged }), JSON.stringify(row(h,'pd')))
     h.close()
   })
 })
@@ -342,19 +344,20 @@ describe('KR r2 probe S: stall-scan starvation (>25 active)', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    await realKillThenRevive(h, env, 'pS', T0)
+    await realKillThenRevive(h, env, 'ps', T0)
     const R = '2026-08-01T00:00:00.000Z'
     // 25 other active, healthy projects with older updated_at and future boundaries
     for (let i = 0; i < 25; i++) {
       h.sqlite.exec(`INSERT INTO projects (id, slug, name, description, goal, status, cycle_boundary_at, stalled, created_at, updated_at)
         VALUES ('bg${i}','bg${i}','bg','','g','active','2026-12-01T00:00:00.000Z',0,'2026-07-30T00:00:00.000Z','2026-07-30T00:00:00.000Z')`)
+      h.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at) VALUES ('bg${i}','squad-a','write','2026-07-30T00:00:00.000Z')`)
       h.sqlite.exec(`INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, created_at, updated_at) VALUES ('bgt${i}','squad-a','bg${i}','t','b','d','open','2026-07-30T00:00:00.000Z','2026-07-30T00:00:00.000Z')`)
       h.sqlite.exec(`INSERT INTO workflow_receipts (id, instance_id, task_id, step_name, status, created_at) VALUES ('bgr${i}','bgi${i}','bgt${i}','x','ok','2026-07-31T00:00:00.000Z')`)
     }
-    clock(R); expect((await updateProject(env, 'pS', { status: 'planned' })).ok).toBe(true)
-    expect((await startProject(env, 'pS', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R }))).ok).toBe(true)
+    clock(R); expect((await updateProject(env, 'ps', { status: 'planned' })).ok).toBe(true)
+    expect((await startProject(env, 'ps', makeDeps({ createTask: persistingCreateTask(), nowIso: () => R }))).ok).toBe(true)
     const r = await tick(env, at(R, 60000))
-    console.log('STARVE tick', JSON.stringify({ killed: r.killed, cleared: r.stall_cleared }), JSON.stringify(row(h,'pS')))
+    plog('STARVE tick', JSON.stringify({ killed: r.killed, cleared: r.stall_cleared }), JSON.stringify(row(h,'ps')))
     h.close()
   })
 })
@@ -364,12 +367,12 @@ describe('KR r2 probe C: revived-to-planned, never started', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const h = makeHarness(); const env = envFor(h)
     const T0 = '2026-06-01T00:00:00.000Z'
-    await realKillThenRevive(h, env, 'pC', T0)
+    await realKillThenRevive(h, env, 'pc', T0)
     const R = '2026-08-01T00:00:00.000Z'
-    clock(R); expect((await updateProject(env, 'pC', { status: 'planned' })).ok).toBe(true)
+    clock(R); expect((await updateProject(env, 'pc', { status: 'planned' })).ok).toBe(true)
     let ghosts = 0, kills = 0
     for (const d of [1, 8, 30, 90]) { const r = await tick(env, at(R, d*D)); ghosts += r.ghost_alarmed; kills += r.killed }
-    console.log('PARKED planned: ghosts', ghosts, 'kills', kills, JSON.stringify(row(h,'pC')))
+    plog('PARKED planned: ghosts', ghosts, 'kills', kills, JSON.stringify(row(h,'pc')))
     h.close()
   })
 })
