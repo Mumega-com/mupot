@@ -133,4 +133,21 @@ describe('MCP project_wiki', () => {
     expect(outcome.ok).toBe(false)
     expect((outcome as { status: number }).status).toBe(503)
   })
+
+  it.each([
+    [404, 'not_found'],
+    [400, 'invalid_project'],
+  ])('P2-B: a well-formed-but-rejected upstream call (JSON %i) maps to 502 wiki_request_rejected, never the upstream body', async (status, code) => {
+    harness = makeHarness()
+    const base = await envFor(harness, new FakeInternalWiki({ [TENANT]: SECRET }))
+    // `as unknown as Fetcher`: the double implements only `fetch`, the one member wiki-client.ts calls.
+    const rejecting = { fetch: async () => Response.json({ error: code, detail: 'UPSTREAM-BODY-SENTINEL' }, { status }) } as unknown as Fetcher
+    const env = { ...base, INKWELL_SVC: rejecting } as Env
+
+    const outcome = await invokeTool(auth(), env, 'project_wiki', { project_id: 'proj-a-id' }, 'https://pot.example')
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { status: number }).status).toBe(502)
+    expect(JSON.stringify(outcome)).toContain('wiki_request_rejected')
+    expect(JSON.stringify(outcome)).not.toContain('UPSTREAM-BODY-SENTINEL')
+  })
 })

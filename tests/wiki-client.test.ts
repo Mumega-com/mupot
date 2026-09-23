@@ -191,6 +191,20 @@ describe('getProjectWikiGraph', () => {
     expect(fake.requests).toEqual([])
   })
 
+  it("an uppercase-containing project id is lowercased before it is sent — Inkwell's project regex is lowercase-only", async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    // Seeded lowercase, as the real store always is (project ids are
+    // crypto.randomUUID(), already lowercase). The fake does an EXACT,
+    // case-sensitive match on `project` — so this only finds the seeded
+    // topic if the client actually lowercased 'STEMMINDS' before sending;
+    // an un-lowercased send would silently return zero nodes instead.
+    fake.seed({ tenantSlug: TENANT, project: 'stemminds', slug: 'overview', title: 'Overview' })
+    const env = await makeEnv(makeHarness())
+    const graph = await getProjectWikiGraph(env, 'STEMMINDS', fake.fetch.bind(fake))
+    expect(graph.nodes.map((n) => n.slug)).toEqual(['overview'])
+    expect(graph.project).toBe('stemminds')
+  })
+
   it('P2: the fake itself refuses a request missing tenant_slug entirely with 400, not 401', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     const res = await fake.fetch(
@@ -216,6 +230,16 @@ describe('upsertProjectWikiTopic', () => {
     expect(result.created).toBe(true)
     const putRequest = fake.requests.find((r) => r.method === 'PUT')
     expect(putRequest).toBeDefined()
+    const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
+    expect(graph.nodes.map((n) => n.slug)).toEqual(['project-card'])
+  })
+
+  it("an uppercase-containing project id is lowercased in the PUT body's `project` — Inkwell's regex is lowercase-only", async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await makeEnv(makeHarness())
+    await upsertProjectWikiTopic(env, 'STEMMINDS', { slug: 'project-card', title: 'Stemminds' }, fake.fetch.bind(fake))
+    // The fake matches `project` exactly and case-sensitively — the topic is
+    // only found under the lowercase key if the client lowercased it.
     const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
     expect(graph.nodes.map((n) => n.slug)).toEqual(['project-card'])
   })

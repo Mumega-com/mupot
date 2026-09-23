@@ -286,11 +286,16 @@ export async function getProjectWikiGraph(
   projectKey: string,
   fetchImpl?: typeof fetch,
 ): Promise<WikiGraph> {
-  if (!isWikiSlug(projectKey)) throw new WikiClientError('wiki_unavailable')
+  // Inkwell's project param regex is lowercase-only (TENANT_SLUG_RE-shaped) —
+  // an uppercase-containing id 400s upstream. Lowercase FIRST, then
+  // validate, so a project id that only differs from a valid slug by case
+  // is accepted rather than rejected.
+  const project = projectKey.toLowerCase()
+  if (!isWikiSlug(project)) throw new WikiClientError('wiki_unavailable')
   const cfg = await resolveWikiConfig(env)
   if (!cfg) throw new WikiClientError('wiki_unavailable')
 
-  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project: projectKey })
+  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project })
   const res = await wikiRequest(cfg, `/api/internal/wiki/graph?${qs.toString()}`, { method: 'GET' }, fetchImpl)
   if (!res.ok) return throwForErrorResponse(res)
 
@@ -300,7 +305,7 @@ export async function getProjectWikiGraph(
   }
   return {
     tenant_slug: cfg.tenantSlug,
-    project: projectKey,
+    project,
     nodes: json.nodes as WikiTopic[],
     edges: json.edges as WikiEdge[],
   }
@@ -331,7 +336,9 @@ export async function upsertProjectWikiTopic(
   topic: WikiTopicUpsertInput,
   fetchImpl?: typeof fetch,
 ): Promise<WikiTopicUpsertResult> {
-  if (!isWikiSlug(projectKey) || !isWikiSlug(topic.slug)) throw new WikiClientError('wiki_unavailable')
+  // Same lowercase-first discipline as getProjectWikiGraph — see its comment.
+  const project = projectKey.toLowerCase()
+  if (!isWikiSlug(project) || !isWikiSlug(topic.slug)) throw new WikiClientError('wiki_unavailable')
   if (typeof topic.title !== 'string' || !topic.title.trim()) throw new WikiClientError('wiki_unavailable')
 
   const cfg = await resolveWikiConfig(env)
@@ -339,7 +346,7 @@ export async function upsertProjectWikiTopic(
 
   const body = {
     tenant_slug: cfg.tenantSlug,
-    project: projectKey,
+    project,
     title: topic.title,
     description: topic.description ?? '',
     topic_type: topic.topic_type ?? 'general',

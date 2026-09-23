@@ -30,7 +30,7 @@ import { loadProjectSituation } from '../projects/situation'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
-import { getProjectWikiGraph, WikiClientError } from '../projects/wiki-client'
+import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
@@ -312,6 +312,10 @@ const toolProjectWiki: ToolSpec = {
       const wiki = await getProjectWikiGraph(env, project.id)
       return done({ project_id: project.id, wiki })
     } catch (e) {
+      // A well-formed call the upstream rejected as invalid (P2-B) is
+      // distinct from the service being unreachable/misconfigured — 502,
+      // never the raw upstream body.
+      if (e instanceof WikiRequestError) return fail(502, 'wiki_request_rejected')
       if (e instanceof WikiClientError) return fail(503, e.reason)
       throw e
     }

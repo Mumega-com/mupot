@@ -207,7 +207,6 @@ import {
 import {
   createOrRefreshProjectCard,
   loadProjectWikiView,
-  projectSquadSummariesForWriter,
   projectWikiBody,
 } from './project-wiki'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
@@ -781,18 +780,20 @@ dashboardApp.get('/projects/:id/wiki', async (c) => {
   const project = await getReadableProject(c.env, auth, projectId)
   if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   const canManage = await canManageProject(c.env, auth, project.id)
-  const view = await loadProjectWikiView(c.env, project, canManage)
-  const status = view.graph === null ? 503 : 200
+  const view = await loadProjectWikiView(c.env, project, auth, canManage)
+  const status = view.status === 'unavailable' ? 503 : view.status === 'rejected' ? 502 : 200
   return c.html(shell(c.env, `${project.name} · Wiki`, projectWikiBody(view, c.req.query('status'))), status)
 })
 
 // POST /projects/:id/wiki/card — "Create/refresh project card": upserts ONE
-// wiki topic (slug `project-card`) built entirely from the project's own
-// columns (name/description/goal/live_url/repo_url/status/squads) — no
-// free-text from the request body. Gated on the SAME per-project `manage`
-// write check boards/settings use (canManageProject); CSRF is the
-// dashboardApp-wide csrf() middleware (registered above), same as every
-// other same-origin dashboard POST — no separate token field needed.
+// wiki topic (slug `project-card-<id>`) built entirely from the project's
+// own columns (name/description/goal/live_url/repo_url/status) — no
+// free-text from the request body, and (P2-A) no squad data, which is a
+// per-viewer LIVE render on the GET route, never part of the stored
+// artifact. Gated on the SAME per-project `manage` write check
+// boards/settings use (canManageProject); CSRF is the dashboardApp-wide
+// csrf() middleware (registered above), same as every other same-origin
+// dashboard POST — no separate token field needed.
 dashboardApp.post('/projects/:id/wiki/card', async (c) => {
   const auth = c.get('auth')
   const projectId = c.req.param('id')
@@ -802,13 +803,14 @@ dashboardApp.post('/projects/:id/wiki/card', async (c) => {
   const project = await getReadableProject(c.env, auth, projectId)
   if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
 
-  const squads = await projectSquadSummariesForWriter(c.env, auth, project.id)
-  const outcome = await createOrRefreshProjectCard(c.env, project, squads)
+  const outcome = await createOrRefreshProjectCard(c.env, project)
   const status = outcome.ok
     ? 'card_saved'
     : outcome.status === 'wiki_conflict'
       ? `wiki_conflict_${outcome.code}`
-      : 'wiki_unavailable'
+      : outcome.status === 'wiki_request_rejected'
+        ? 'wiki_request_rejected'
+        : 'wiki_unavailable'
   return c.redirect(`/projects/${encodeURIComponent(projectId)}/wiki?status=${encodeURIComponent(status)}`, 303)
 })
 

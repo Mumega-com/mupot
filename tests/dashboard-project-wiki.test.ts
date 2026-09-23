@@ -45,6 +45,18 @@ const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 // rather than hardcoding 'project-card'.
 const PROJECT_ID = 'visible-child'
 
+/**
+ * Squad fixture (P2-A / round-1 M2+M3 pin): the WRITER holds a real
+ * capability grant on BOTH squad-a (work) and squad-home-writer (home) —
+ * so squad-home-writer passes the read-access filter and ONLY the
+ * kind='home' filter excludes it (pins M2: dropping the home filter alone
+ * must leak it). squad-c (work) has a project_squad_access row but the
+ * writer holds NO grant on it at all — so ONLY the read-access filter
+ * excludes it (pins M3: an unfiltered query would leak it). An org admin
+ * viewer, being unrestricted, sees squad-a AND squad-c (still never the
+ * home squad) — proving the live squad list genuinely depends on the
+ * CURRENT VIEWER, not a value baked into the stored card.
+ */
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
   for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
@@ -55,12 +67,14 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO squads (id, department_id, slug, name, kind) VALUES
       ('squad-a', 'dept-a', 'squad-a', 'Squad Alpha', 'work'),
       ('squad-b', 'dept-b', 'squad-b', 'Squad Beta', 'work'),
+      ('squad-c', 'dept-b', 'squad-c', 'Squad Charlie', 'work'),
       ('squad-home-writer', 'dept-a', 'squad-home-writer', 'Writer Home', 'home');
     INSERT INTO projects (id, slug, name, description, goal, status, live_url, repo_url) VALUES
       ('${PROJECT_ID}', 'wikitest', 'Wiki Test Project', 'A project for wiki tests', 'Ship the wiki home',
        'active', 'https://wikitest.example.com', 'https://github.com/example/wikitest');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
       ('${PROJECT_ID}', 'squad-a', 'write'),
+      ('${PROJECT_ID}', 'squad-c', 'write'),
       ('${PROJECT_ID}', 'squad-home-writer', 'write');
   `)
   return harness
@@ -90,11 +104,22 @@ function as(auth: AuthContext | null): void {
   authState.current = auth
 }
 
-/** Member of squad-a, which holds `write` on visible-child -> canManageProject passes. */
+/** Member of squad-a AND squad-home-writer (see fixture doc comment above). */
 function writerMember(): AuthContext {
   return actor({
     memberId: 'member-writer',
-    capabilities: [{ member_id: 'member-writer', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
+    capabilities: [
+      { member_id: 'member-writer', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' },
+      { member_id: 'member-writer', scope_type: 'squad', scope_id: 'squad-home-writer', capability: 'member' },
+    ],
+  })
+}
+
+/** Org-scope admin — unrestricted project read, so sees EVERY work squad on the project (still never a home squad). */
+function adminViewer(): AuthContext {
+  return actor({
+    memberId: 'member-admin',
+    capabilities: [{ member_id: 'member-admin', scope_type: 'org', scope_id: null, capability: 'admin' }],
   })
 }
 
@@ -117,13 +142,20 @@ function postCardRequest(projectId: string, origin: string | null = 'https://pot
   return new Request(`https://pot.test/projects/${projectId}/wiki/card`, { method: 'POST', headers })
 }
 
-async function fetchGraph(fake: FakeInternalWiki, project: string): Promise<{ nodes: { slug: string }[] }> {
+async function fetchGraph(fake: FakeInternalWiki, project: string): Promise<{ nodes: { slug: string; description: string; tags: string[] }[] }> {
   const res = await fake.fetch(
     new Request(`https://inkwell-api.test/api/internal/wiki/graph?tenant_slug=${TENANT}&project=${project}`, {
       headers: { authorization: `Bearer ${SECRET}` },
     }),
   )
   return res.json()
+}
+
+/** A fetcher that mimics a well-formed-but-rejected 4xx from the real route (P2-B). */
+function rejectingFetcher(status: number, code: string): Fetcher {
+  // `as unknown as Fetcher`: the test double implements only `fetch`, the one
+  // member wiki-client.ts calls — same shape FakeInternalWiki.asFetcher() uses.
+  return { fetch: async () => Response.json({ error: code, detail: 'UPSTREAM-BODY-SENTINEL' }, { status }) } as unknown as Fetcher
 }
 
 afterEach(() => {
@@ -244,6 +276,65 @@ describe('GET /projects/:id/wiki — read gate', () => {
     expect(res.status).toBe(503)
     expect(await res.text()).toContain('Wiki unavailable')
   })
+
+  it.each([
+    [404, 'not_found'],
+    [400, 'invalid_project'],
+  ])('P2-B: a well-formed-but-rejected upstream read (JSON %i) renders an honest 502, not a 500 crash', async (status, code) => {
+    const harness = makeHarness()
+    const env = { ...(await envFor(harness, new FakeInternalWiki({ [TENANT]: SECRET }))), INKWELL_SVC: rejectingFetcher(status, code) } as Env
+    as(writerMember())
+
+    const res = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child/wiki'), env)
+    expect(res.status).toBe(502)
+    const body = await res.text()
+    expect(body).toContain('Wiki request rejected')
+    expect(body).not.toContain('UPSTREAM-BODY-SENTINEL')
+    expect(body).not.toContain(code)
+  })
+
+  it('P2-A: an org admin and a plain squad member viewing the SAME card see DIFFERENT live squad lists', async () => {
+    const harness = makeHarness()
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await envFor(harness, fake)
+    as(writerMember())
+    const created = await dashboardApp.fetch(postCardRequest('visible-child'), env)
+    expect(created.status).toBe(303)
+
+    as(writerMember())
+    const writerView = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child/wiki'), env)
+    const writerBody = await writerView.text()
+    expect(writerBody).toContain('Squad Alpha') // read-access grant -> visible
+    expect(writerBody).not.toContain('Writer Home') // M2 pin: home squad excluded even though writer has a grant on it
+    expect(writerBody).not.toContain('Squad Charlie') // M3 pin: no grant on squad-c -> excluded
+
+    as(adminViewer())
+    const adminView = await dashboardApp.fetch(new Request('https://pot.test/projects/visible-child/wiki'), env)
+    const adminBody = await adminView.text()
+    expect(adminBody).toContain('Squad Alpha')
+    expect(adminBody).toContain('Squad Charlie') // unrestricted -> sees the squad the writer could not
+    expect(adminBody).not.toContain('Writer Home') // still never a home squad, regardless of viewer
+
+    // The two viewers of the exact same stored card saw different squad lists.
+    expect(writerBody).not.toEqual(adminBody)
+  })
+
+  it('P2-A: the STORED topic body never contains any squad name at all', async () => {
+    const harness = makeHarness()
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await envFor(harness, fake)
+    as(writerMember())
+    const created = await dashboardApp.fetch(postCardRequest('visible-child'), env)
+    expect(created.status).toBe(303)
+
+    const graphJson = await fetchGraph(fake, PROJECT_ID)
+    const card = graphJson.nodes.find((n) => n.slug === projectCardTopicSlug(PROJECT_ID))
+    expect(card).toBeDefined()
+    expect(card!.description).not.toContain('Squad')
+    expect(card!.description).not.toContain('Alpha')
+    expect(card!.description).not.toContain('Charlie')
+    expect(card!.tags.join(',')).not.toContain('Squad')
+  })
 })
 
 describe('POST /projects/:id/wiki/card — write gate + CSRF', () => {
@@ -280,7 +371,7 @@ describe('POST /projects/:id/wiki/card — write gate + CSRF', () => {
     expect(fake.requests).toEqual([])
   })
 
-  it("a manager creates the project card from the project's OWN fields, idempotently, excluding home squads", async () => {
+  it("a manager creates the project card from the project's OWN fields, idempotently", async () => {
     const harness = makeHarness()
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     const env = await envFor(harness, fake)
@@ -295,8 +386,6 @@ describe('POST /projects/:id/wiki/card — write gate + CSRF', () => {
     expect(body).toContain('Wiki Test Project')
     expect(body).toContain('Ship the wiki home') // goal, folded into the single-line description
     expect(body).toContain('https://wikitest.example.com') // live_url
-    expect(body).toContain('Squad Alpha') // a work squad IS included
-    expect(body).not.toContain('Writer Home') // P1-2: a home squad is NEVER included, even though it has write access
 
     // Second POST refreshes the SAME topic (idempotent upsert) rather than duplicating it.
     const second = await dashboardApp.fetch(postCardRequest('visible-child'), env)
@@ -326,6 +415,49 @@ describe('POST /projects/:id/wiki/card — write gate + CSRF', () => {
     const absolute = location.startsWith('http') ? location : `https://pot.test${location}`
     const view = await dashboardApp.fetch(new Request(absolute), env)
     expect(await view.text()).toContain('conflicted')
+  })
+
+  it.each([
+    [404, 'not_found'],
+    [400, 'title too short'],
+  ])('P2-B: a well-formed-but-rejected upstream write (JSON %i) redirects with a typed status, not a 500', async (status, code) => {
+    const harness = makeHarness()
+    const env = { ...(await envFor(harness, new FakeInternalWiki({ [TENANT]: SECRET }))), INKWELL_SVC: rejectingFetcher(status, code) } as Env
+    as(writerMember())
+
+    const res = await dashboardApp.fetch(postCardRequest('visible-child'), env)
+    expect(res.status).toBe(303)
+    const location = res.headers.get('location')!
+    expect(location).toBe('/projects/visible-child/wiki?status=wiki_request_rejected')
+
+    const absolute = location.startsWith('http') ? location : `https://pot.test${location}`
+    const view = await dashboardApp.fetch(new Request(absolute), env)
+    const body = await view.text()
+    expect(body).toContain('rejected this request')
+    expect(body).not.toContain('UPSTREAM-BODY-SENTINEL')
+    expect(body).not.toContain(code)
+  })
+
+  it('contract: an uppercase-containing project id is lowercased in the card slug AND the Inkwell `project` param', async () => {
+    const harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('Upper-Child', 'upperchild', 'Upper Project', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('Upper-Child', 'squad-a', 'write');
+    `)
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await envFor(harness, fake)
+    as(writerMember())
+
+    expect(projectCardTopicSlug('Upper-Child')).toBe('project-card-upper-child')
+    const res = await dashboardApp.fetch(postCardRequest('Upper-Child'), env)
+    expect(res.status).toBe(303)
+    expect(res.headers.get('location')).toContain('status=card_saved')
+
+    const put = fake.requests.find((r) => r.method === 'PUT')
+    expect(put).toBeDefined()
+    expect(put!.path).toBe('/api/internal/wiki/topics/project-card-upper-child')
+    const graph = await fetchGraph(fake, 'upper-child')
+    expect(graph.nodes.map((n) => n.slug)).toEqual(['project-card-upper-child'])
   })
 
   it('P1-1: two DIFFERENT projects in the same tenant each get their OWN card, no slug collision', async () => {

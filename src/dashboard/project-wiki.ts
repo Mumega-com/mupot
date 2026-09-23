@@ -17,6 +17,19 @@
 // `project.slug` — see wiki-client.ts's file header for why (slug is
 // mutable/reclaimable, id is not).
 //
+// A STORED ARTIFACT MUST NOT ENCODE THE WRITER'S VIEW (P2-A, adversarial
+// gate round 2 follow-up): the project-card topic is written ONCE and read
+// LATER by an unbounded set of viewers, each with their OWN squad-read
+// scope — baking "squads visible to whoever clicked Create" into the stored
+// body would show an org admin's card (every squad) to a read-only observer
+// who could never see half of them on the project page itself, and vice
+// versa depending on who happened to write it last. So the card carries
+// ONLY the project's own columns (name/description/goal/status/live_url/
+// repo_url) — no squad data at all — and the squad list rendered on the
+// wiki PAGE is computed LIVE, per CURRENT VIEWER, at render time
+// (liveReadableSquadNames), the same way the project detail page computes
+// its own squad list live rather than baking one into a cache.
+//
 // XSS discipline: every topic title/description is interpolated through
 // hono/html's auto-escaping `html` tagged template, NEVER `raw()`. The two
 // places that DO use `raw()` (a topic slug used inside an `id="..."` /
@@ -34,6 +47,7 @@ import {
   upsertProjectWikiTopic,
   WikiClientError,
   WikiConflictError,
+  WikiRequestError,
   type WikiGraph,
   type WikiTopicUpsertInput,
   type WikiTopicUpsertResult,
@@ -51,119 +65,43 @@ import {
  * 63-char cap (see tests/dashboard-project-wiki.test.ts's length assertion).
  */
 export function projectCardTopicSlug(projectId: string): string {
-  return `project-card-${projectId}`
+  // Inkwell's slug regex is lowercase-only — lowercase the id so a project
+  // whose id happens to contain uppercase still gets a valid, findable slug
+  // instead of a silent wiki-client rejection (mirrors the same
+  // lowercase-first discipline wiki-client.ts applies to the `project` param).
+  return `project-card-${projectId.toLowerCase()}`
 }
 
-export interface ProjectWikiSquadSummary {
-  name: string
-  access_level: string
-}
+/** null exactly when the upstream wiki service could not be reached/rejected the call (fail-closed). */
+export type ProjectWikiStatus = 'ok' | 'unavailable' | 'rejected'
 
 export interface ProjectWikiView {
   project: Project
   canManage: boolean
-  /** null exactly when the upstream wiki service could not be reached (fail-closed). */
+  /** Computed LIVE for the CURRENT viewer at render time — see file header. Never stored. */
+  liveSquadNames: string[]
+  status: ProjectWikiStatus
+  /** Present only when status === 'ok'. */
   graph: WikiGraph | null
 }
 
 /**
- * Load the wiki view for an ALREADY-READ-CHECKED project (callers must run
- * getReadableProject / the equivalent read gate first — this function does
- * not re-check readability, only fetches the graph). Never throws: a
- * WikiClientError from the upstream collapses to `graph: null`, which the
- * route renders as an honest "wiki unavailable" state rather than a 500.
+ * liveReadableSquadNames — the squad names a project's wiki page shows,
+ * computed LIVE for `auth` at render time (never stored — see file header's
+ * P2-A note). Routes through loadReadableSquads(env, projectId,
+ * projectAccess(env, auth)) — the EXACT SAME read-access filter the project
+ * detail page itself uses for its own squad list — rather than an
+ * unfiltered `project_squad_access JOIN squads` query, then drops any row
+ * whose squad is `kind = 'home'` (home squads are members' personal
+ * squads; resolveGrantedSquadIds' own org-grant path already excludes them
+ * from broad "which squads can I see" answers for the same reason — see its
+ * doc comment in src/projects/readable-squads.ts).
  */
-export async function loadProjectWikiView(
-  env: Env,
-  project: Project,
-  canManage: boolean,
-): Promise<ProjectWikiView> {
-  try {
-    const graph = await getProjectWikiGraph(env, project.id)
-    return { project, canManage, graph }
-  } catch (e) {
-    if (e instanceof WikiClientError) return { project, canManage, graph: null }
-    throw e
-  }
-}
-
-const MAX_DESCRIPTION = 500
-
-/**
- * Build the `project-card-<id>` topic from the project's OWN fields only —
- * no free-text from any request body. This is the one write this surface
- * performs; it is a deterministic projection of columns the caller already
- * has read (or manage) access to, never attacker-suppliable content.
- *
- * SCHEMA NOTE confirmed against PR #1278 round 2: the internal-wiki PUT
- * route's own `cleanText` COLLAPSES ALL WHITESPACE (including newlines) to
- * single spaces before truncating at 500 chars — a multi-line `\n`-joined
- * description would be silently flattened server-side into one run-on line
- * regardless of what this function sends. So this builds a genuinely
- * SINGLE-LINE description itself (structured meta first, joined with " · ",
- * then the project's own free-text description), and puts the project's
- * status/squads into TAGS as well (structured, not prose) rather than
- * relying on newlines for structure. The description budget is reserved for
- * the short structured meta FIRST — the free-text project.description is
- * what gets trimmed if the combined length would exceed 500, never the
- * other way around (status/goal/links must never be the part silently cut).
- *
- * There is no structured `content_blocks` write path on this surface
- * (wiki_topics.content_blocks is always stored as `[]` by the create path
- * and left untouched by update) — if a future revision of the store adds
- * one, this is the one function that needs to change.
- */
-export function buildProjectCardTopic(
-  project: Project,
-  squads: ProjectWikiSquadSummary[],
-): WikiTopicUpsertInput {
-  const metaParts: string[] = [`Status: ${project.status}`]
-  if (project.goal) metaParts.push(`Goal: ${project.goal}`)
-  if (project.live_url) metaParts.push(`Live: ${project.live_url}`)
-  if (project.repo_url) metaParts.push(`Repo: ${project.repo_url}`)
-  if (squads.length > 0) metaParts.push(`Squads: ${squads.map((s) => s.name).join(', ')}`)
-  const meta = metaParts.join(' · ')
-
-  const separator = project.description ? ' — ' : ''
-  const budget = Math.max(0, MAX_DESCRIPTION - meta.length - separator.length)
-  const desc =
-    project.description.length > budget
-      ? `${project.description.slice(0, Math.max(0, budget - 1)).trimEnd()}…`
-      : project.description
-  const description = `${desc}${desc ? separator : ''}${meta}`.slice(0, MAX_DESCRIPTION)
-
-  const tags = ['project-card', project.status, ...squads.map((s) => s.name)].slice(0, 12)
-
-  return {
-    slug: projectCardTopicSlug(project.id),
-    title: project.name,
-    description,
-    topic_type: 'project-card',
-    tags,
-  }
-}
-
-/**
- * projectSquadSummariesForWriter — the squads a project's card mentions.
- *
- * P1-2 fix: this is a STORED artifact later readable by anyone with the
- * project's own wiki-read access, not a live, viewer-scoped render — so it
- * must not leak squad-access information the CURRENT WRITER themselves
- * cannot see, and must NEVER include a home squad regardless of the
- * writer's own authority (home squads are members' personal squads;
- * resolveGrantedSquadIds' own org-grant path already excludes them from
- * broad "which squads can I see" answers for the same reason — see its doc
- * comment in src/projects/readable-squads.ts). Routes through
- * loadReadableSquads(env, projectId, projectAccess(env, auth)) — the EXACT
- * SAME read-access filter the project detail page itself uses for its own
- * squad list — rather than an unfiltered `project_squad_access JOIN squads`
- * query, then drops any row whose squad is `kind = 'home'`.
- */
-export async function projectSquadSummariesForWriter(
+export async function liveReadableSquadNames(
   env: Env,
   auth: AuthContext,
   projectId: string,
-): Promise<ProjectWikiSquadSummary[]> {
+): Promise<string[]> {
   const access = await projectAccess(env, auth)
   const { rows } = await loadReadableSquads(env, projectId, access)
   if (rows.length === 0) return []
@@ -176,35 +114,115 @@ export async function projectSquadSummariesForWriter(
     .all<{ id: string; kind: string }>()
   const kindBySquadId = new Map((results ?? []).map((row) => [row.id, row.kind]))
 
-  return rows
-    .filter((row) => kindBySquadId.get(row.squad_id) !== 'home')
-    .map((row) => ({ name: row.squad_name, access_level: row.access_level }))
+  return rows.filter((row) => kindBySquadId.get(row.squad_id) !== 'home').map((row) => row.squad_name)
+}
+
+/**
+ * Load the wiki view for an ALREADY-READ-CHECKED project (callers must run
+ * getReadableProject / the equivalent read gate first — this function does
+ * not re-check readability, only fetches the graph + the viewer's live
+ * squad list). Never throws: a WikiClientError from the upstream collapses
+ * to status 'unavailable'; a WikiRequestError (a well-formed call the
+ * upstream rejected) collapses to status 'rejected' — both render an honest
+ * empty state rather than crashing to a 500, and NEITHER ever carries the
+ * raw upstream error body into the view.
+ */
+export async function loadProjectWikiView(
+  env: Env,
+  project: Project,
+  auth: AuthContext,
+  canManage: boolean,
+): Promise<ProjectWikiView> {
+  const liveSquadNames = await liveReadableSquadNames(env, auth, project.id)
+  try {
+    const graph = await getProjectWikiGraph(env, project.id)
+    return { project, canManage, liveSquadNames, status: 'ok', graph }
+  } catch (e) {
+    if (e instanceof WikiRequestError) return { project, canManage, liveSquadNames, status: 'rejected', graph: null }
+    if (e instanceof WikiClientError) return { project, canManage, liveSquadNames, status: 'unavailable', graph: null }
+    throw e
+  }
+}
+
+const MAX_DESCRIPTION = 500
+
+/**
+ * Build the `project-card-<id>` topic from the project's OWN fields only —
+ * no free-text from any request body, and (P2-A) no squad data, which is a
+ * per-VIEWER live render, never part of the stored artifact. This is the
+ * one write this surface performs; it is a deterministic projection of
+ * columns the caller already has read (or manage) access to, never
+ * attacker-suppliable content.
+ *
+ * SCHEMA NOTE confirmed against PR #1278 round 2: the internal-wiki PUT
+ * route's own `cleanText` COLLAPSES ALL WHITESPACE (including newlines) to
+ * single spaces before truncating at 500 chars — a multi-line `\n`-joined
+ * description would be silently flattened server-side into one run-on line
+ * regardless of what this function sends. So this builds a genuinely
+ * SINGLE-LINE description itself (structured meta first, joined with " · ",
+ * then the project's own free-text description). The description budget is
+ * reserved for the short structured meta FIRST — the free-text
+ * project.description is what gets trimmed if the combined length would
+ * exceed 500, never the other way around (status/goal/links must never be
+ * the part silently cut).
+ *
+ * There is no structured `content_blocks` write path on this surface
+ * (wiki_topics.content_blocks is always stored as `[]` by the create path
+ * and left untouched by update) — if a future revision of the store adds
+ * one, this is the one function that needs to change.
+ */
+export function buildProjectCardTopic(project: Project): WikiTopicUpsertInput {
+  const metaParts: string[] = [`Status: ${project.status}`]
+  if (project.goal) metaParts.push(`Goal: ${project.goal}`)
+  if (project.live_url) metaParts.push(`Live: ${project.live_url}`)
+  if (project.repo_url) metaParts.push(`Repo: ${project.repo_url}`)
+  const meta = metaParts.join(' · ')
+
+  const separator = project.description ? ' — ' : ''
+  const budget = Math.max(0, MAX_DESCRIPTION - meta.length - separator.length)
+  const desc =
+    project.description.length > budget
+      ? `${project.description.slice(0, Math.max(0, budget - 1)).trimEnd()}…`
+      : project.description
+  const description = `${desc}${desc ? separator : ''}${meta}`.slice(0, MAX_DESCRIPTION)
+
+  return {
+    slug: projectCardTopicSlug(project.id),
+    title: project.name,
+    description,
+    topic_type: 'project-card',
+    tags: ['project-card', project.status],
+  }
 }
 
 /**
  * The route's write action: build the deterministic project-card topic and
- * PUT it. Returns a discriminated outcome instead of throwing for the two
- * EXPECTED failure shapes (upstream unavailable, or a typed conflict) so the
- * caller (dashboardApp's POST route) can render an honest, specific status
- * instead of a 500 — an unexpected exception still propagates.
+ * PUT it. Returns a discriminated outcome instead of throwing for the
+ * EXPECTED failure shapes (upstream unavailable, a typed conflict, or a
+ * typed request rejection) so the caller (dashboardApp's POST route) can
+ * render an honest, specific status instead of a 500 — an unexpected
+ * exception still propagates.
  */
 export type CreateProjectCardOutcome =
   | { ok: true; result: WikiTopicUpsertResult }
   | { ok: false; status: 'wiki_unavailable' }
   | { ok: false; status: 'wiki_conflict'; code: string; existingProject?: string }
+  | { ok: false; status: 'wiki_request_rejected'; code: string }
 
 export async function createOrRefreshProjectCard(
   env: Env,
   project: Project,
-  squads: ProjectWikiSquadSummary[],
 ): Promise<CreateProjectCardOutcome> {
-  const topic = buildProjectCardTopic(project, squads)
+  const topic = buildProjectCardTopic(project)
   try {
     const result = await upsertProjectWikiTopic(env, project.id, topic)
     return { ok: true, result }
   } catch (e) {
     if (e instanceof WikiConflictError) {
       return { ok: false, status: 'wiki_conflict', code: e.code, existingProject: e.existingProject }
+    }
+    if (e instanceof WikiRequestError) {
+      return { ok: false, status: 'wiki_request_rejected', code: e.code }
     }
     if (e instanceof WikiClientError) return { ok: false, status: 'wiki_unavailable' }
     throw e
@@ -235,6 +253,10 @@ function escapeAttr(value: string): string {
 const WIKI_RESULT_MESSAGES: Readonly<Record<string, string>> = {
   card_saved: 'Project card saved.',
   wiki_unavailable: 'The wiki service is unavailable right now — nothing was saved.',
+  // P2-B: a FIXED message — the upstream's `error` string is deliberately
+  // NOT carried in the redirect (it is upstream-controlled text, and the
+  // status query param is reflectable by anyone who crafts the URL).
+  wiki_request_rejected: 'The wiki service rejected this request — nothing was saved.',
 }
 
 function wikiResultMessage(statusResult: string | undefined): string | null {
@@ -286,8 +308,19 @@ function topicCard(topic: WikiGraph['nodes'][number], edges: WikiGraph['edges'])
     </div>`
 }
 
+/**
+ * Live squad summary line (P2-A) — computed fresh for THIS request's viewer,
+ * never read from the stored card. Rendered separately from the topic list
+ * on every state (unavailable/rejected/empty/filled) since it depends only
+ * on mupot's own project_squad_access + the viewer's grants, not on Inkwell.
+ */
+function liveSquadsLine(names: string[]): Html {
+  if (names.length === 0) return html``
+  return html`<div class="ui-note" style="margin-bottom:10px;">Squads you can see on this project: ${names.join(', ')}</div>`
+}
+
 export function projectWikiBody(view: ProjectWikiView, statusResult?: string): Html {
-  const { project, canManage, graph } = view
+  const { project, canManage, liveSquadNames, status, graph } = view
   const resultMessage = wikiResultMessage(statusResult)
 
   const header = pageHeader({
@@ -299,12 +332,14 @@ export function projectWikiBody(view: ProjectWikiView, statusResult?: string): H
   const banner = resultMessage
     ? html`<div class="ui-note" style="margin-bottom:10px;">${resultMessage}</div>`
     : ''
+  const squadsLine = liveSquadsLine(liveSquadNames)
 
-  if (graph === null) {
+  if (status === 'unavailable') {
     return html`
       ${header}
       ${projectTabs(project.id)}
       ${banner}
+      ${squadsLine}
       ${sectionPanel({
         title: 'Wiki',
         body: emptyState({
@@ -315,11 +350,28 @@ export function projectWikiBody(view: ProjectWikiView, statusResult?: string): H
     `
   }
 
-  if (graph.nodes.length === 0) {
+  if (status === 'rejected') {
     return html`
       ${header}
       ${projectTabs(project.id)}
       ${banner}
+      ${squadsLine}
+      ${sectionPanel({
+        title: 'Wiki',
+        body: emptyState({
+          title: 'Wiki request rejected',
+          detail: 'The Inkwell wiki service rejected this request. Try again, or contact an admin if this persists.',
+        }),
+      })}
+    `
+  }
+
+  if (graph === null || graph.nodes.length === 0) {
+    return html`
+      ${header}
+      ${projectTabs(project.id)}
+      ${banner}
+      ${squadsLine}
       ${sectionPanel({
         title: 'Wiki',
         right: canManage ? createCardButton(project.id) : undefined,
@@ -337,6 +389,7 @@ export function projectWikiBody(view: ProjectWikiView, statusResult?: string): H
     ${header}
     ${projectTabs(project.id)}
     ${banner}
+    ${squadsLine}
     ${sectionPanel({
       title: `Wiki (${graph.nodes.length})`,
       right: canManage ? createCardButton(project.id) : undefined,
