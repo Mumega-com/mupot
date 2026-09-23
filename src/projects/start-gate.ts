@@ -23,6 +23,8 @@ import { writeReceiptToD1 } from '../workflows/pipeline'
 import { createDepartment, createSquad } from '../org/service'
 import { createBus } from '../bus'
 import { lifecycleTaskId } from './circuit-breaker'
+import { DEFAULT_CYCLE_DAYS, nextCycleBoundary } from './cycle-creation'
+import { setProjectStalledFlag } from './stall-detector'
 import { getProject, updateProject, upsertProjectSquadAccess, type ProjectMutationResult } from './service'
 
 // A small, DELIBERATE duplicate of src/mcp/provision.ts's emitProvisioned — same
@@ -182,6 +184,13 @@ export interface StartGateDeps {
    * emit nothing rather than attribute a structural change to no one.
    */
   actorMemberId: string | null
+  /**
+   * Clock for the post-activation cycle-boundary reset below. Optional so the
+   * three existing call sites (mcp/projects.ts, dashboard/index.ts,
+   * projects/index.ts) need no change — defaults to the real clock inside
+   * startProject itself. Tests override it for a deterministic boundary.
+   */
+  nowIso?: () => string
 }
 
 export interface GhostStartDeps {
@@ -716,9 +725,29 @@ export async function startProject(
   let taskId: string
   try {
     const existingCount = await countProjectTasks(env, projectId)
+    // mupot: reviving an archived project (archived -> planned -> active)
+    // re-runs this same startProject path. `existingCount > 0` means the
+    // project already carries tasks, but that is NOT proof a start-gate seed
+    // exists among them — every project that predates the start gate (or
+    // whose seed lived on a squad edge that was since removed/changed) has
+    // tasks with none of them carrying START_GATE_SEED_MARKER on the picked
+    // squad. The idempotence guard below (pickExistingSeedTaskId) exists so a
+    // RETRY after a partial failure reuses the seed it already made rather
+    // than minting a second one — it was never meant to be the ONLY path to
+    // a seed. Fall through to the exact same create-a-seed logic the
+    // existingCount === 0 branch runs when no seed is found, instead of
+    // failing closed with task_seed_failed. A seed that exists on a
+    // DIFFERENT squad than the one just picked (e.g. project_squad_access
+    // was repointed between an old activation and this one) is deliberately
+    // NOT reused here — isStartGateSeedTask's squadId check means
+    // pickExistingSeedTaskId will not find it, and a fresh seed is created on
+    // the picked squad instead, so the seed always lives where the assignee
+    // agent actually is.
+    let existingId: string | null = null
     if (existingCount > 0) {
-      const existingId = await pickExistingSeedTaskId(env, projectId, squad.squad_id)
-      if (!existingId) return fail('task_seed_failed')
+      existingId = await pickExistingSeedTaskId(env, projectId, squad.squad_id)
+    }
+    if (existingId) {
       taskId = existingId
     } else {
       const seed = seedTaskFromGoal(project)
@@ -745,6 +774,31 @@ export async function startProject(
     return fail('activate_failed')
   }
 
+  // mupot: a REVIVED project (archived -> planned -> active, this same path)
+  // can carry an old, already-elapsed cycle_boundary_at with stalled=1 from
+  // before it was archived. shouldEvaluateBreaker (circuit-breaker.ts)
+  // early-evaluates ANY stalled=1 project that has a non-null boundary — so
+  // without a reset, a revived project is immediately re-killable on the next
+  // loop tick, and project_recommit against that stale boundary already
+  // returns already_decided (a KILL receipt is on file for it), so nobody can
+  // save it either. Reset both, exactly as a brand-new active project would
+  // start: reuse nextCycleBoundary's pure now+interval branch (existing
+  // boundary passed as null so this is always a FRESH now+interval boundary,
+  // never an advance off the stale one — an ancient boundary plus one
+  // interval can still land in the past) and the shared setProjectStalledFlag
+  // writer stall-detector.ts already uses for the same column, rather than
+  // hand-rolling either write.
+  const nowIso = (deps.nowIso ?? (() => new Date().toISOString()))()
+  const freshBoundary = nextCycleBoundary(nowIso, null, DEFAULT_CYCLE_DAYS)
+  if (freshBoundary !== null) {
+    await env.DB.prepare(
+      `UPDATE projects SET cycle_boundary_at = ?1, updated_at = ?2 WHERE id = ?3`,
+    )
+      .bind(freshBoundary, nowIso, projectId)
+      .run()
+  }
+  await setProjectStalledFlag(env, projectId, 0, nowIso)
+
   await recordStartGateSuccess(
     env,
     {
@@ -758,9 +812,14 @@ export async function startProject(
     deps.writeReceipt,
   )
 
+  // Re-read: activated.value predates the cycle_boundary_at/stalled reset
+  // above, so the returned project must reflect the post-reset row, not the
+  // stale snapshot from the activation write.
+  const finalProject = (await getProject(env, projectId)) ?? activated.value
+
   return {
     ok: true,
-    project: activated.value,
+    project: finalProject,
     task_id: taskId,
     squad_id: squad.squad_id,
     agent_id: agent.id,
