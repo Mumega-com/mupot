@@ -8,6 +8,7 @@
 
 import type { Env, Project } from '../types'
 import {
+  BREAKER_EXEMPT_STATUSES,
   CIRCUIT_BREAKER_PRINCIPAL,
   defaultCircuitBreakerDeps,
   evaluateProjectCircuitBreaker,
@@ -103,11 +104,20 @@ export interface ProjectLoopDeps {
 const PROJECT_SELECT = `id, slug, name, description, goal, status, parent_project_id, target_date,
             cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by, created_at, updated_at`
 
+// mupot PR #1532 round 2: this SQL fragment and shouldEvaluateBreaker's
+// exemption check MUST read the same status set — two independently
+// hardcoded lists is exactly how 'planned' fell through both (each looked
+// right in isolation; neither one was the whole picture). All status values
+// here are from BREAKER_EXEMPT_STATUSES, a fixed internal enum never
+// user-supplied, so string-interpolating them is safe.
+const BREAKER_EXEMPT_SQL_LIST = BREAKER_EXEMPT_STATUSES.map((status) => `'${status}'`).join(', ')
+
 /**
  * Projects due for breaker evaluation: boundary elapsed (UTC instant compare),
- * OR stalled with a scheduled boundary (slice 4 early raise). Terminal / review
- * statuses exempt. String lexicographic compare is NOT used — offset ISO forms
- * like +03:00 would sort wrong against Zulu.
+ * OR stalled with a scheduled boundary (slice 4 early raise). Exempt statuses
+ * (BREAKER_EXEMPT_STATUSES, shared with shouldEvaluateBreaker) never selected
+ * regardless of boundary/stalled. String lexicographic compare is NOT used —
+ * offset ISO forms like +03:00 would sort wrong against Zulu.
  */
 export async function listProjectsDueAtBoundary(
   env: Env,
@@ -121,7 +131,7 @@ export async function listProjectsDueAtBoundary(
     `SELECT ${PROJECT_SELECT}
        FROM projects
       WHERE cycle_boundary_at IS NOT NULL
-        AND status NOT IN ('completed', 'archived', 'review')
+        AND status NOT IN (${BREAKER_EXEMPT_SQL_LIST})
       ORDER BY cycle_boundary_at ASC, id ASC
       LIMIT ?1`,
   )

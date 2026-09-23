@@ -10,16 +10,16 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import type { Env, Task } from '../src/types'
-import { runProjectLoopTick } from '../src/projects/loop'
-import { getProject } from '../src/projects/service'
+import type { Env, ProjectStatus, Task } from '../src/types'
+import { listProjectsDueAtBoundary, runProjectLoopTick } from '../src/projects/loop'
+import { getProject, updateProject } from '../src/projects/service'
 import { DEFAULT_CYCLE_DAYS, nextCycleBoundary } from '../src/projects/cycle-creation'
 import {
+  BREAKER_EXEMPT_STATUSES,
   cycleInstanceId,
-  defaultCircuitBreakerDeps,
-  evaluateProjectCircuitBreaker,
   proposeProjectRecommit,
   recordRecommitOrKill,
+  shouldEvaluateBreaker,
 } from '../src/projects/circuit-breaker'
 import { writeReceiptToD1 } from '../src/workflows/pipeline'
 import {
@@ -28,6 +28,7 @@ import {
   DEFAULT_GHOST_START_DAYS,
   GHOST_START_ALARM_SCHEMA,
   GHOST_START_ALARM_STEP,
+  START_GATE_ACTIVATION_STEP,
   START_GATE_SCHEMA,
   START_GATE_SEED_MARKER,
   START_GATE_STEP,
@@ -39,6 +40,7 @@ import {
   ghostInstanceId,
   hasStartProvisionAttempt,
   seedTaskFromGoal,
+  startActivationInstanceId,
   startInstanceId,
   startProject,
   type StartGateDeps,
@@ -724,21 +726,29 @@ describe('startProject revives an archived project with pre-existing, non-seed t
   })
 })
 
-// mupot: a revived project (archived -> planned -> active) can carry its OLD,
-// already-elapsed cycle_boundary_at with stalled=1 from before it was
-// archived — and a KILL receipt already on file for that exact boundary
-// (recorded by the breaker before the project was archived the first time).
-// Without a reset, shouldEvaluateBreaker (circuit-breaker.ts) early-evaluates
-// ANY stalled=1 project with a non-null boundary, so the revived project is
-// immediately re-killable on the next loop tick — and project_recommit
-// against that stale boundary already returns already_decided (kill is on
-// file), so nobody can save it either. Live prod repro: mumega-com (boundary
-// 2026-08-28) and viamar (boundary 2026-09-09), both stalled=1.
-describe('startProject resets a revived project onto a fresh cycle boundary', () => {
+// PR #1532 ROUND 2. Round 1's fix (hand-reset cycle_boundary_at + stalled at
+// activation) was adversarially gated BLOCKED and prod-confirmed broken: at
+// 00:47:2xZ the real loop re-archived EVERY revived project. THE CLASS: "a
+// reset the next tick recomputes is not a reset." runProjectLoopTick runs the
+// stall detector BEFORE the breaker; the detector independently recomputes
+// `stalled` from real evidence (task_verdicts / flight events / workflow
+// receipts carrying project_id) every tick — a hand-written stalled=0 that
+// isn't backed by real evidence gets flipped right back to 1 on the very next
+// tick (idleDurationDays computed from the project's OLD, pre-archive
+// activity), and shouldEvaluateBreaker's early-raise fires on `stalled===1`
+// regardless of whether the boundary itself is in the future. Round 2: (a)
+// the cycle_boundary_at reset is folded into the SAME atomic UPDATE as the
+// status flip (service.ts's reset_cycle_boundary_at, gated on via_start_gate)
+// — no more separate write, and (b) `stalled` is NEVER hand-written by
+// start-gate; instead, recordStartGateActivation's receipt uses the REAL seed
+// task id (not the synthetic lifecycleTaskId), so migration 0059's hydrate
+// trigger stamps project_id on it — real, fresh evidence the detector's OWN
+// predicate picks up on the next tick, converging to stalled=0 on its own.
+describe('startProject resets a revived project onto a fresh cycle boundary (PR #1532 round 2)', () => {
   const REVIVE_NOW = '2026-09-15T00:00:00.000Z'
   const STALE_BOUNDARY = '2026-08-28T00:00:00.000Z' // in the past relative to REVIVE_NOW, with a KILL receipt on file
 
-  it('clears the stale elapsed boundary + stalled=1; the breaker does not re-kill and recommit succeeds on the new boundary', async () => {
+  it('atomically resets cycle_boundary_at to a fresh now+interval value on activation (stalled is left for the detector, not hand-written)', async () => {
     const harness = makeHarness()
     const env = envFor(harness)
     try {
@@ -765,7 +775,7 @@ describe('startProject resets a revived project onto a fresh cycle boundary', ()
         writeReceiptToD1,
       )
 
-      const deps = makeDeps({ nowIso: () => REVIVE_NOW })
+      const deps = makeDeps({ createTask: persistingCreateTask(), nowIso: () => REVIVE_NOW })
       const result = await startProject(env, 'proj-revive-boundary', deps)
       expect(result.ok).toBe(true)
       if (!result.ok) return
@@ -774,23 +784,20 @@ describe('startProject resets a revived project onto a fresh cycle boundary', ()
         `SELECT cycle_boundary_at, stalled, status FROM projects WHERE id = ?`,
       ).get('proj-revive-boundary') as { cycle_boundary_at: string | null; stalled: number; status: string }
       expect(row.status).toBe('active')
-      expect(row.stalled).toBe(0)
       expect(row.cycle_boundary_at).not.toBeNull()
       expect(Date.parse(row.cycle_boundary_at!)).toBeGreaterThan(Date.parse(REVIVE_NOW))
       // Exact value: the pure now+interval calc, matching what production uses.
       expect(row.cycle_boundary_at).toBe(nextCycleBoundary(REVIVE_NOW, null, DEFAULT_CYCLE_DAYS))
       expect(result.project.cycle_boundary_at).toBe(row.cycle_boundary_at)
-      expect(result.project.stalled).toBe(0)
 
-      // The breaker, ticking right now, must NOT re-kill: boundary is in the
-      // future and stalled is cleared.
-      const outcome = await evaluateProjectCircuitBreaker(
-        env,
-        { id: 'proj-revive-boundary', status: 'active', cycle_boundary_at: row.cycle_boundary_at, stalled: 0 },
-        REVIVE_NOW,
-        defaultCircuitBreakerDeps(),
-      )
-      expect(outcome).toBe('skipped')
+      // The per-activation receipt carries the REAL task id (hydrate trigger
+      // populates project_id from it) — the mechanism the next section proves
+      // end-to-end through the real loop.
+      const activationReceipt = await env.DB.prepare(
+        `SELECT project_id, task_id FROM workflow_receipts WHERE instance_id = ?`,
+      ).bind(startActivationInstanceId('proj-revive-boundary', REVIVE_NOW)).first<{ project_id: string | null; task_id: string }>()
+      expect(activationReceipt?.project_id).toBe('proj-revive-boundary')
+      expect(activationReceipt?.task_id).toBe(result.task_id)
 
       // The OLD kill receipt (on the stale boundary) still exists and is
       // untouched — recommit only ever reads the CURRENT boundary's receipt.
@@ -798,17 +805,298 @@ describe('startProject resets a revived project onto a fresh cycle boundary', ()
         `SELECT 1 FROM workflow_receipts WHERE instance_id = ? AND step_name = 'recommit_or_kill'`,
       ).bind(cycleInstanceId('proj-revive-boundary', STALE_BOUNDARY)).first()
       expect(oldKillStillOnFile).toBeTruthy()
+    } finally {
+      harness.close()
+    }
+  })
 
-      // project_recommit on the NEW boundary succeeds — it is no longer
-      // shadowed by the old already_decided kill.
+  // ITEM 1 (coordinator, round 2): drive the REAL runProjectLoopTick with
+  // REAL deps against a revived project reached through real calls — no
+  // hand-called evaluateProjectCircuitBreaker with a fabricated stalled:0.
+  // This is the test that is RED on 5808f7b8 (round 1): round 1's hand-reset
+  // stalled=0 survives only until this test's first tick, where the stall
+  // detector recomputes it back to 1 from the project's genuinely stale
+  // pre-archive evidence, and the early-raise kills it again.
+  it('REAL LOOP: a revived idle project survives >=2 real ticks and can be recommitted on its new boundary', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const T0 = '2026-06-01T00:00:00.000Z' // first, ordinary activation, long ago
+      const OLD_BOUNDARY = '2026-08-28T00:00:00.000Z' // that cycle's boundary — long elapsed
+      const REVIVE_NOW = '2026-09-15T00:00:00.000Z' // an operator revives it
+      const TICK1 = '2026-09-15T00:05:00.000Z'
+      const TICK2 = '2026-09-20T00:00:00.000Z' // still well under the 14-day default stall threshold from REVIVE_NOW
+
+      insertPlannedProject(harness, { id: 'proj-real-loop', goal: 'Long-idle project, revived', created_at: T0 })
+      grantSquadAccess(harness, 'proj-real-loop', 'admin')
+      insertAgent(harness, 'agent-real-loop')
+
+      const firstActivation = await startProject(env, 'proj-real-loop', makeDeps({
+        createTask: persistingCreateTask(),
+        nowIso: () => T0,
+      }))
+      expect(firstActivation.ok).toBe(true)
+
+      // Simulate what the REAL breaker leaves behind after a long silence:
+      // stale boundary, stalled=1, a receipted KILL on that exact boundary,
+      // then archived.
+      harness.sqlite.exec(`
+        UPDATE projects SET cycle_boundary_at = '${OLD_BOUNDARY}', stalled = 1, status = 'archived'
+         WHERE id = 'proj-real-loop'
+      `)
+      await recordRecommitOrKill(
+        env,
+        {
+          projectId: 'proj-real-loop',
+          boundaryAt: OLD_BOUNDARY,
+          decision: 'kill',
+          principal: 'system:project-loop',
+          reason: 'cycle_boundary_no_recommit',
+        },
+        writeReceiptToD1,
+      )
+
+      // Revival: archived -> planned (bare updateProject, exactly how an
+      // operator/UI does it) -> planned -> active (startProject, this PR).
+      const toPlanned = await updateProject(env, 'proj-real-loop', { status: 'planned' })
+      expect(toPlanned.ok).toBe(true)
+
+      const revived = await startProject(env, 'proj-real-loop', makeDeps({
+        createTask: persistingCreateTask(),
+        nowIso: () => REVIVE_NOW,
+      }))
+      expect(revived.ok).toBe(true)
+      if (!revived.ok) return
+
+      // TICK 1 and TICK 2 through the REAL runProjectLoopTick with REAL deps
+      // (stall detector -> breaker -> cycle creation, in that order).
+      const tick1 = await runProjectLoopTick(env, { nowIso: () => TICK1 })
+      expect(tick1.ok).toBe(true)
+      expect(tick1.killed).toBe(0)
+      expect((await getProject(env, 'proj-real-loop'))?.status).toBe('active')
+
+      const tick2 = await runProjectLoopTick(env, { nowIso: () => TICK2 })
+      expect(tick2.ok).toBe(true)
+      expect(tick2.killed).toBe(0)
+      expect((await getProject(env, 'proj-real-loop'))?.status).toBe('active')
+
+      // A recommit on the project's CURRENT boundary succeeds — not shadowed
+      // by the old already_decided kill on the OLD boundary.
       const recommit = await proposeProjectRecommit(
         env,
-        'proj-revive-boundary',
+        'proj-real-loop',
         'external-reviewer',
         'still worth doing',
         writeReceiptToD1,
       )
       expect(recommit).toMatchObject({ ok: true })
+    } finally {
+      harness.close()
+    }
+  })
+
+  // ITEM 3 (coordinator, round 2): 'planned' is not breaker-evaluable at all
+  // — a project mid-revival (archived -> planned, before the planned ->
+  // active startProject call lands) must survive ticks untouched, carrying
+  // whatever stale state it inherited, until it is actually started.
+  it("a project in 'planned' with a stale, already-killed boundary survives ticks untouched and can then be started", async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const TICK = '2026-09-15T00:00:00.000Z'
+
+      insertPlannedProject(harness, { id: 'proj-mid-revival', goal: 'Mid-revival, not yet activated' })
+      grantSquadAccess(harness, 'proj-mid-revival', 'admin')
+      insertAgent(harness, 'agent-mid-revival')
+
+      harness.sqlite.exec(`
+        UPDATE projects SET cycle_boundary_at = '${STALE_BOUNDARY}', stalled = 1
+         WHERE id = 'proj-mid-revival'
+      `)
+      await recordRecommitOrKill(
+        env,
+        {
+          projectId: 'proj-mid-revival',
+          boundaryAt: STALE_BOUNDARY,
+          decision: 'kill',
+          principal: 'system:project-loop',
+          reason: 'cycle_boundary_no_recommit',
+        },
+        writeReceiptToD1,
+      )
+
+      // The predicate directly: 'planned' is exempt regardless of stalled/boundary.
+      expect(shouldEvaluateBreaker('planned', STALE_BOUNDARY, TICK, 1)).toBe(false)
+
+      const tick = await runProjectLoopTick(env, { nowIso: () => TICK })
+      expect(tick.ok).toBe(true)
+      expect(tick.killed).toBe(0)
+      const midway = await getProject(env, 'proj-mid-revival')
+      expect(midway?.status).toBe('planned')
+      expect(midway?.cycle_boundary_at).toBe(STALE_BOUNDARY) // untouched — exempt, not "fixed"
+
+      const started = await startProject(env, 'proj-mid-revival', makeDeps({
+        createTask: persistingCreateTask(),
+        nowIso: () => TICK,
+      }))
+      expect(started.ok).toBe(true)
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+// ITEM 4 (coordinator, round 2): startInstanceId is FIXED per project, and
+// recordStartGateSuccess's INSERT OR IGNORE means a second activation writes
+// NOTHING to that row — so it cannot be the evidence source for repeated
+// revivals. recordStartGateActivation uses a per-activation instance id
+// (startActivationInstanceId, keyed on nowIso) precisely so a boundary move
+// is never silent, on the first activation OR the fifth.
+describe('startProject records a per-activation audit receipt (item 4)', () => {
+  it('each activation writes its OWN receipt with principal, actor, and old/new boundary — never silently swallowed', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const FIRST = '2026-09-01T00:00:00.000Z'
+      const SECOND = '2026-09-20T00:00:00.000Z'
+
+      insertPlannedProject(harness, { id: 'proj-activation-audit', goal: 'Audit trail' })
+      grantSquadAccess(harness, 'proj-activation-audit', 'admin')
+      insertAgent(harness, 'agent-activation-audit')
+
+      const first = await startProject(env, 'proj-activation-audit', makeDeps({
+        createTask: persistingCreateTask(),
+        nowIso: () => FIRST,
+        actorMemberId: 'member-first',
+      }))
+      expect(first.ok).toBe(true)
+
+      // Second activation (e.g. archived -> planned -> active again).
+      harness.sqlite.exec(`UPDATE projects SET status = 'planned' WHERE id = 'proj-activation-audit'`)
+
+      const second = await startProject(env, 'proj-activation-audit', makeDeps({
+        createTask: persistingCreateTask(),
+        nowIso: () => SECOND,
+        actorMemberId: 'member-second',
+      }))
+      expect(second.ok).toBe(true)
+
+      const rows = harness.sqlite.prepare(
+        `SELECT instance_id, task_id, project_id, detail FROM workflow_receipts
+          WHERE step_name = ? ORDER BY created_at ASC`,
+      ).all(START_GATE_ACTIVATION_STEP) as Array<{
+        instance_id: string
+        task_id: string
+        project_id: string | null
+        detail: string
+      }>
+
+      expect(rows).toHaveLength(2)
+      expect(rows[0].instance_id).not.toBe(rows[1].instance_id)
+      // project_id populated on BOTH (real task_id -> hydrate trigger) —
+      // never left NULL the way the synthetic lifecycleTaskId leaves it.
+      expect(rows[0].project_id).toBe('proj-activation-audit')
+      expect(rows[1].project_id).toBe('proj-activation-audit')
+
+      const d0 = JSON.parse(rows[0].detail)
+      const d1 = JSON.parse(rows[1].detail)
+      expect(d0.actor_member_id).toBe('member-first')
+      expect(d1.actor_member_id).toBe('member-second')
+      expect(d0.old_cycle_boundary_at).toBeNull() // fresh project, no prior boundary
+      expect(d1.old_cycle_boundary_at).toBe(d0.new_cycle_boundary_at) // second activation's "old" is the first's fresh one
+      expect(d1.new_cycle_boundary_at).not.toBe(d0.new_cycle_boundary_at)
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+// ITEM 5 (coordinator, round 2): the cycle_boundary_at reset must be folded
+// into the SAME write as the activation status flip so a partial failure
+// cannot leave the project active with a stale boundary — and the caller
+// must get a typed error, never an unhandled exception.
+describe('startProject activation write failure (item 5 — atomicity)', () => {
+  it('a throwing updateProject leaves the project planned with its ORIGINAL boundary untouched, and returns a typed error', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const STALE_BOUNDARY = '2026-08-28T00:00:00.000Z'
+      insertPlannedProject(harness, { id: 'proj-activation-throws', goal: 'Boom' })
+      grantSquadAccess(harness, 'proj-activation-throws', 'admin')
+      insertAgent(harness, 'agent-activation-throws')
+      harness.sqlite.exec(`
+        UPDATE projects SET cycle_boundary_at = '${STALE_BOUNDARY}', stalled = 1
+         WHERE id = 'proj-activation-throws'
+      `)
+
+      const deps = makeDeps({
+        createTask: persistingCreateTask(),
+        updateProject: vi.fn(async () => {
+          throw new Error('boom')
+        }),
+      })
+
+      const result = await startProject(env, 'proj-activation-throws', deps)
+      expect(result).toMatchObject({ ok: false, error: 'activate_failed' })
+
+      const row = await getProject(env, 'proj-activation-throws')
+      expect(row?.status).toBe('planned') // not left active
+      expect(row?.cycle_boundary_at).toBe(STALE_BOUNDARY) // not left half-reset either — untouched
+
+      // The seed task created during this call was rolled back too — same
+      // compensateStartProvision path every other activate_failed uses.
+      const tasks = harness.sqlite.prepare(`SELECT id FROM tasks WHERE project_id = ?`).all('proj-activation-throws') as Array<{ id: string }>
+      expect(tasks).toHaveLength(0)
+
+      const receipt = harness.sqlite.prepare(
+        `SELECT status, detail FROM workflow_receipts WHERE instance_id = ? AND step_name = ?`,
+      ).get(startInstanceId('proj-activation-throws'), BLOCKED_START_STEP) as { status: string; detail: string }
+      expect(receipt.status).toBe('error')
+      expect(JSON.parse(receipt.detail)).toMatchObject({ reason: 'activate_failed' })
+    } finally {
+      harness.close()
+    }
+  })
+})
+
+// ITEM 3 parity (coordinator, round 2): listProjectsDueAtBoundary's SQL and
+// shouldEvaluateBreaker's exemption check must read the SAME
+// BREAKER_EXEMPT_STATUSES — this test fails if either one ever goes back to
+// an independently hand-written status list that drifts from the other
+// ('planned' falling out of sync between the two is exactly how this PR's
+// live incident happened).
+describe('listProjectsDueAtBoundary and shouldEvaluateBreaker never diverge (item 3 parity)', () => {
+  it('agree on every project status for a past-due, stalled=1 project', async () => {
+    const harness = makeHarness()
+    const env = envFor(harness)
+    try {
+      const TICK = '2026-09-15T00:00:00.000Z'
+      const PAST_BOUNDARY = '2026-08-01T00:00:00.000Z'
+      const ALL_STATUSES: ProjectStatus[] = ['planned', 'active', 'paused', 'review', 'completed', 'archived']
+
+      for (const status of ALL_STATUSES) {
+        const id = `proj-parity-${status}`
+        insertPlannedProject(harness, { id })
+        harness.sqlite.exec(`
+          UPDATE projects SET status = '${status}', cycle_boundary_at = '${PAST_BOUNDARY}', stalled = 1
+           WHERE id = '${id}'
+        `)
+      }
+
+      const due = await listProjectsDueAtBoundary(env, TICK)
+      const dueIds = new Set(due.map((p) => p.id))
+
+      for (const status of ALL_STATUSES) {
+        const id = `proj-parity-${status}`
+        const predicate = shouldEvaluateBreaker(status, PAST_BOUNDARY, TICK, 1)
+        expect(dueIds.has(id)).toBe(predicate)
+      }
+
+      // Anchor to the SHARED source, not just today's status set: every
+      // BREAKER_EXEMPT_STATUSES entry must be absent from the list.
+      for (const exempt of BREAKER_EXEMPT_STATUSES) {
+        expect(dueIds.has(`proj-parity-${exempt}`)).toBe(false)
+      }
     } finally {
       harness.close()
     }

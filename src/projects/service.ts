@@ -84,6 +84,13 @@ export interface UpdateProjectInput {
    * Bare updateProject callers cannot activate without authorize+provision.
    */
   via_start_gate?: boolean
+  /**
+   * Internal: start-gate only (requires via_start_gate: true). Resets
+   * cycle_boundary_at atomically with the SAME UPDATE that flips the status —
+   * see the doc comment at its check inside updateProject for why (PR #1532
+   * round 2).
+   */
+  reset_cycle_boundary_at?: string
   /** Principal recorded on lessons-capture when completed→archived. */
   lifecycle_principal?: string
 }
@@ -404,6 +411,22 @@ export async function updateProject(
     return { ok: false, error: 'start_gate_required' }
   }
 
+  // mupot PR #1532 round 2: a revived project (archived -> planned -> active)
+  // carries its OLD, already-elapsed cycle_boundary_at from before it was
+  // archived. start-gate.ts resets it to a fresh boundary as PART OF this
+  // same activation write — folded into the SAME UPDATE statement below,
+  // never a second, separate write — so a partial failure (this statement
+  // either fully applies or fully doesn't; CAS on id+updated_at+status below)
+  // can never leave the project active with the stale boundary. Gated behind
+  // via_start_gate for the same reason the status flip itself is: only
+  // start-gate.ts's authorize+provision path may move this column.
+  if (input.reset_cycle_boundary_at !== undefined && !viaStartGate) {
+    return { ok: false, error: 'start_gate_required' }
+  }
+  const nextCycleBoundaryAt = input.reset_cycle_boundary_at !== undefined
+    ? input.reset_cycle_boundary_at
+    : existing.cycle_boundary_at
+
   const nextSlug = input.slug === undefined ? existing.slug : input.slug
   if (!isValidSlug(nextSlug)) return { ok: false, error: 'invalid_slug' }
   const nextName = input.name === undefined ? existing.name : input.name
@@ -456,6 +479,7 @@ export async function updateProject(
     worker_name: nextWorkerName.value,
     live_url: nextLiveUrl.value,
     assigned_squad_id: nextAssignedSquad.value,
+    cycle_boundary_at: nextCycleBoundaryAt,
     updated_at: nextUpdatedAt(existing.updated_at),
   }
   try {
@@ -465,12 +489,14 @@ export async function updateProject(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
        target_date = ?, completion_proposed_by = ?,
        repo_url = ?, worker_name = ?, live_url = ?, assigned_squad_id = ?,
+       cycle_boundary_at = ?,
        updated_at = ?
        WHERE id = ? AND updated_at = ? AND status = ?`,
     ).bind(
       updated.slug, updated.name, updated.description, updated.goal, updated.status,
       updated.parent_project_id, updated.target_date, updated.completion_proposed_by,
       updated.repo_url, updated.worker_name, updated.live_url, updated.assigned_squad_id,
+      updated.cycle_boundary_at,
       updated.updated_at,
       updated.id, existing.updated_at, existing.status,
     ).run()

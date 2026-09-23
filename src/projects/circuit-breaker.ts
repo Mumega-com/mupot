@@ -86,10 +86,34 @@ export function isAtCycleBoundary(cycleBoundaryAt: string | null, nowIso: string
 }
 
 /**
- * Breaker evaluates at/after the boundary for non-terminal projects, OR early
- * when the stall detector has raised projects.stalled=1 (slice 4). Early raise
- * still requires a scheduled cycle_boundary_at — the flag alone never kills.
- * completed is exempt (structural finish path). archived is already terminal.
+ * Statuses the breaker never evaluates, regardless of boundary/stalled. THE
+ * ONE canonical exemption list — listProjectsDueAtBoundary's SQL (loop.ts)
+ * filters on this SAME array (not a second, independently-hardcoded list),
+ * so the query and the predicate cannot diverge the way they could when each
+ * enumerated the set by hand. Plain array (not a Set) so a consumer building
+ * a SQL `IN (...)` fragment or doing `.includes()` can use it directly —
+ * shared verbatim with sibling PR #1533 (needs_you recommit source), name
+ * kept exactly `BREAKER_EXEMPT_STATUSES` so whichever PR lands second is a
+ * trivial merge. 'planned' is exempt (PR #1532 round 2): a project
+ * mid-revival (archived -> planned, before start-gate's planned -> active
+ * call lands) still carries its OLD, already-elapsed boundary and stalled=1
+ * from before it was archived — without this exemption the breaker could
+ * early-raise-kill it before it ever gets the chance to activate.
+ * completed/review are exempt (non-terminal-but-not-live phases). archived is
+ * already terminal.
+ */
+export const BREAKER_EXEMPT_STATUSES: readonly ProjectStatus[] = [
+  'completed',
+  'archived',
+  'review',
+  'planned',
+]
+
+/**
+ * Breaker evaluates at/after the boundary for non-terminal, non-exempt
+ * projects, OR early when the stall detector has raised projects.stalled=1
+ * (slice 4). Early raise still requires a scheduled cycle_boundary_at — the
+ * flag alone never kills.
  */
 export function shouldEvaluateBreaker(
   status: ProjectStatus,
@@ -97,7 +121,7 @@ export function shouldEvaluateBreaker(
   nowIso: string,
   stalled: number,
 ): boolean {
-  if (status === 'completed' || status === 'archived' || status === 'review') return false
+  if (BREAKER_EXEMPT_STATUSES.includes(status)) return false
   if (stalled === 1 && cycleBoundaryAt !== null && cycleBoundaryAt.trim() !== '') return true
   return isAtCycleBoundary(cycleBoundaryAt, nowIso)
 }
