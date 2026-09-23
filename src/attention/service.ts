@@ -3,6 +3,14 @@ import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capabi
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
 import { BREAKER_EXEMPT_STATUSES, CYCLE_INSTANCE_PREFIX, RECOMMIT_OR_KILL_STEP } from '../projects/circuit-breaker'
+import {
+  DEFAULT_STALL_THRESHOLD_DAYS,
+  idleDurationDays,
+  isPastStallThreshold,
+  lastActivityFromSignals,
+  loadProjectIdleSignals,
+  resolveStallThresholdDays,
+} from '../projects/stall-detector'
 import type { RoutinePrincipal } from '../routines/access'
 import { routineTablesReady } from '../routines/schema-ready'
 
@@ -10,12 +18,33 @@ const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
 const SOURCE_SCAN_CAP = 100
 const CURSOR_TTL_SECONDS = 600
-/** Warning window for the recommit-due source — matches the "72h heads-up"
- *  requirement (mupot#lifecycle-warning). A row also appears once already
- *  overdue (boundary in the past), which this same "<= threshold" test covers. */
+/** Warning window for the recommit-due source's BOUNDARY trigger — matches
+ *  the "72h heads-up" requirement (mupot#lifecycle-warning). A row also
+ *  appears once already overdue (boundary in the past), which this same
+ *  "<= threshold" test covers. This is one of TWO independent triggers — see
+ *  the IDLE trigger below, which fires regardless of boundary distance
+ *  because shouldEvaluateBreaker's stalled=1 early-raise does too. */
 const RECOMMIT_DUE_WINDOW_MS = 72 * 60 * 60 * 1000
 /** Inside this window (or already overdue) a recommit-due row is 'urgent' rather than 'high'. */
 const RECOMMIT_URGENT_WINDOW_MS = 24 * 60 * 60 * 1000
+/**
+ * IDLE trigger lead time (round 2, mupot PR #1533 — adversarial P0-1).
+ * shouldEvaluateBreaker (circuit-breaker.ts) early-raises the breaker the
+ * MOMENT projects.stalled flips to 1, in the SAME cron tick as the stall
+ * detector sets it (runProjectLoopTick runs stall-detect then breaker,
+ * back to back) — there is no gap between "just became stalled" and
+ * "circuit breaker evaluates it" to warn inside. A boundary-only warning
+ * (RECOMMIT_DUE_WINDOW_MS above) misses this entirely whenever the real
+ * cycle_boundary_at is far in the future (the probe that found this: an
+ * idle active project with boundary +30d went from 0 needs_you items to
+ * stall_flagged:1 + killed:1 + archived in ONE tick).
+ *
+ * The fix warns BEFORE the flag flips: once a project's live idle duration
+ * (computed with the stall detector's OWN functions below, never a second
+ * copy) is within this many days of its stall threshold, it is due — even
+ * though projects.stalled is still 0 and cycle_boundary_at may be weeks out.
+ */
+const STALL_WARNING_LEAD_DAYS = 2
 
 export type NeedsYouKind =
   | 'approval'
@@ -400,58 +429,179 @@ async function sourceRows(
       AND ${visibility.sql}
   `, [CONTENT_GATE_OWNER, ...projectScope], cursor)
 
-  // Recommit-due warning (mupot lifecycle-warning): the circuit breaker
-  // (src/projects/circuit-breaker.ts) archives any non-exempt project at
-  // cycle_boundary_at unless a receipted recommit exists for that EXACT
-  // boundary — silently, with no prior notice. This source surfaces that
-  // fate 72h ahead (or once already overdue) so someone with recommit
-  // authority sees it before the breaker fires.
-  //
-  // Status eligibility reuses BREAKER_EXEMPT_STATUSES from circuit-breaker.ts
-  // directly (NOT IN over the same array shouldEvaluateBreaker checks) —
-  // one list, two readers, cannot diverge. See tests/attention-recommit-
-  // due.test.ts's "predicate parity" case.
-  //
-  // "No receipted recommit for that boundary" reuses hasReceiptedRecommit's
-  // OWN storage shape: a workflow_receipts row at instance_id =
-  // `${CYCLE_INSTANCE_PREFIX}${project_id}:${cycle_boundary_at}` (the exact
-  // format cycleInstanceId() builds — CYCLE_INSTANCE_PREFIX is imported, not
-  // re-typed) with step_name = RECOMMIT_OR_KILL_STEP and a JSON detail whose
-  // decision is 'recommit'. This is expressed as SQL (json_extract) rather
-  // than an N+1 hasReceiptedRecommit call per candidate row, but it reads the
-  // SAME columns hasReceiptedRecommit reads, under the SAME key — a
-  // recommitted-project test that seeds its receipt via the REAL
-  // proposeProjectRecommit() (not a hand-inserted row) is what proves the two
-  // never drift (see the "recommitted project is absent" test).
-  const exemptPlaceholders = BREAKER_EXEMPT_STATUSES.map(() => '?').join(', ')
-  const dueBy = new Date(Date.parse(nowIso) + RECOMMIT_DUE_WINDOW_MS).toISOString()
-  const urgentBy = new Date(Date.parse(nowIso) + RECOMMIT_URGENT_WINDOW_MS).toISOString()
-  const recommitDue = querySource(env, 'recommit_due', `
-    SELECT
-      'project_recommit_due' AS kind, 'project' AS source_type, p.id AS source_id,
-      p.id AS project_id, p.name AS project_name, p.name AS title,
-      'Cycle boundary at ' || p.cycle_boundary_at || ' — archived automatically without a recommit' AS reason,
-      CASE WHEN p.cycle_boundary_at <= ? THEN 0 ELSE 1 END AS urgency_rank,
-      'workspace_admin' AS responsible, NULL AS requested_by,
-      p.created_at, p.cycle_boundary_at AS deadline_at,
-      NULL AS squad_id, NULL AS squad_department_id, NULL AS squad_kind, NULL AS project_access_level,
-      NULL AS assignee_agent_id, NULL AS gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
-      COALESCE(p.cycle_boundary_at, '${DEADLINE_SENTINEL}') AS sort_deadline,
-      p.created_at AS sort_timestamp
-    FROM projects p
-    WHERE p.status NOT IN (${exemptPlaceholders})
-      AND p.cycle_boundary_at IS NOT NULL
-      AND p.cycle_boundary_at <= ?
-      AND NOT EXISTS (
-        SELECT 1 FROM workflow_receipts wr
-         WHERE wr.instance_id = '${CYCLE_INSTANCE_PREFIX}' || p.id || ':' || p.cycle_boundary_at
-           AND wr.step_name = ?
-           AND json_extract(wr.detail, '$.decision') = 'recommit'
-      )${projectClause}
-      AND ${visibility.sql}
-  `, [urgentBy, ...BREAKER_EXEMPT_STATUSES, dueBy, RECOMMIT_OR_KILL_STEP, ...projectScope], cursor)
+  const recommitDue = recommitDueSource(env, projectClause, projectScope, visibility, cursor, nowIso)
 
   return Promise.all([approvals, routineWaits, blockedTasks, publishableOutputs, recommitDue])
+}
+
+interface RecommitCandidateRow {
+  project_id: string
+  project_name: string
+  cycle_boundary_at: string
+  created_at: string
+  stall_threshold_days: number | null
+}
+
+/**
+ * Recommit-due warning (mupot lifecycle-warning): the circuit breaker
+ * (src/projects/circuit-breaker.ts) archives any non-exempt project at
+ * cycle_boundary_at unless a receipted recommit exists for that EXACT
+ * boundary — silently, with no prior notice. This source surfaces that fate
+ * ahead of time so someone with recommit authority sees it before the
+ * breaker fires. It has TWO independent triggers, because the breaker itself
+ * does (shouldEvaluateBreaker, circuit-breaker.ts):
+ *
+ *   1. BOUNDARY: cycle_boundary_at is within RECOMMIT_DUE_WINDOW_MS (72h) or
+ *      already past.
+ *   2. IDLE (round 2, mupot PR #1533 — adversarial P0-1): shouldEvaluateBreaker
+ *      early-raises the breaker the INSTANT projects.stalled flips to 1,
+ *      regardless of how far cycle_boundary_at is — and stall-detect + the
+ *      breaker run in the SAME cron tick (src/projects/loop.ts), so there is
+ *      no persisted "just stalled, not yet killed" window to warn inside. A
+ *      boundary-only check misses this: an idle active project with a
+ *      30-day-out boundary went from zero needs_you items to
+ *      stall_flagged:1 + killed:1 + archived in ONE real tick. The fix
+ *      computes LIVE idleness with the stall detector's OWN functions
+ *      (resolveStallThresholdDays / loadProjectIdleSignals /
+ *      lastActivityFromSignals / idleDurationDays / isPastStallThreshold,
+ *      all imported from src/projects/stall-detector.ts — never a second
+ *      copy) and fires once idle is within STALL_WARNING_LEAD_DAYS of the
+ *      threshold, days before the CACHED stalled column would even flip.
+ *
+ * Status eligibility reuses BREAKER_EXEMPT_STATUSES from circuit-breaker.ts
+ * directly (NOT IN over the same array shouldEvaluateBreaker AND
+ * listProjectsDueAtBoundary check) — one list, three readers, cannot
+ * diverge. See tests/attention-recommit-due.test.ts's "predicate parity"
+ * case (round 2 widened it to all three call sites).
+ *
+ * "No receipted recommit for THIS boundary" reuses hasReceiptedRecommit's
+ * OWN storage shape: a workflow_receipts row at instance_id =
+ * `${CYCLE_INSTANCE_PREFIX}${project_id}:${cycle_boundary_at}` (the exact
+ * format cycleInstanceId() builds — CYCLE_INSTANCE_PREFIX is imported, not
+ * re-typed) with step_name = RECOMMIT_OR_KILL_STEP and a JSON detail whose
+ * decision is 'recommit' — pinned exactly on the string 'recommit', not
+ * "any receipt exists": a KILL receipt for this boundary (e.g. one whose
+ * follow-on archive UPDATE failed, leaving the project still active) must
+ * NOT silence the warning. This is expressed as SQL (json_extract) rather
+ * than an N+1 hasReceiptedRecommit call per candidate row, but it reads the
+ * SAME columns hasReceiptedRecommit reads, under the SAME key — a
+ * recommitted-project test that seeds its receipt via the REAL
+ * proposeProjectRecommit() (not a hand-inserted row) is what proves the two
+ * never drift (see the "recommitted project is absent" test).
+ *
+ * IMPORTANT — this is NOT a pure single-SQL source like the others above:
+ * the idle trigger needs a live per-project computation (loadProjectIdleSignals
+ * issues real D1 reads) that cannot be expressed as one SELECT, so this
+ * fetches a bounded CANDIDATE window by SQL (status + boundary-not-null +
+ * no-receipt + visibility, capped at SOURCE_SCAN_CAP+1, ordered by
+ * cycle_boundary_at as a proximity proxy — see the residual-limit note
+ * below), then decides inclusion/urgency/reason in JS. Candidates are
+ * fetched newest-boundary-first as a best-effort ordering so a genuinely
+ * boundary-urgent row is unlikely to be the one that falls outside the cap;
+ * this is a DOCUMENTED residual limit (same shape as approvals.ts's
+ * APPROVALS_FETCH_CEILING gap), not a full fix — an idle-triggered warning
+ * on a project whose boundary sorts outside the fetched window could still
+ * be missed on a tenant with more than SOURCE_SCAN_CAP due-or-idle projects
+ * at once.
+ */
+async function recommitDueSource(
+  env: Env,
+  projectClause: string,
+  projectScope: unknown[],
+  visibility: { sql: string; binds: string[] },
+  cursor: NeedsYouCursor | null,
+  nowIso: string,
+): Promise<SourceResult> {
+  const exemptPlaceholders = BREAKER_EXEMPT_STATUSES.map(() => '?').join(', ')
+  const candidateResult = await env.DB.prepare(`
+    SELECT p.id AS project_id, p.name AS project_name, p.cycle_boundary_at,
+           p.created_at, p.stall_threshold_days
+      FROM projects p
+     WHERE p.status NOT IN (${exemptPlaceholders})
+       AND p.cycle_boundary_at IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM workflow_receipts wr
+          WHERE wr.instance_id = '${CYCLE_INSTANCE_PREFIX}' || p.id || ':' || p.cycle_boundary_at
+            AND wr.step_name = ?
+            AND json_extract(wr.detail, '$.decision') = 'recommit'
+       )${projectClause}
+       AND ${visibility.sql}
+     ORDER BY p.cycle_boundary_at ASC, p.id ASC
+     LIMIT ?
+  `).bind(...BREAKER_EXEMPT_STATUSES, RECOMMIT_OR_KILL_STEP, ...projectScope, SOURCE_SCAN_CAP + 1)
+    .all<RecommitCandidateRow>()
+
+  const candidateRows = candidateResult.results ?? []
+  const truncated = candidateRows.length > SOURCE_SCAN_CAP
+  const candidates = candidateRows.slice(0, SOURCE_SCAN_CAP)
+
+  const nowMs = Date.parse(nowIso)
+  const dueByMs = nowMs + RECOMMIT_DUE_WINDOW_MS
+  const urgentByMs = nowMs + RECOMMIT_URGENT_WINDOW_MS
+
+  const annotated = await Promise.all(candidates.map(async (candidate): Promise<SourceRow | null> => {
+    const boundaryMs = Date.parse(candidate.cycle_boundary_at)
+    const boundaryDue = Number.isFinite(boundaryMs) && boundaryMs <= dueByMs
+    const boundaryUrgent = Number.isFinite(boundaryMs) && boundaryMs <= urgentByMs
+
+    // Live idleness — the stall detector's OWN functions, never re-derived.
+    const thresholdDays = resolveStallThresholdDays(candidate.stall_threshold_days, DEFAULT_STALL_THRESHOLD_DAYS)
+    const signals = await loadProjectIdleSignals(env, candidate.project_id)
+    const lastActivity = lastActivityFromSignals(signals)
+    const idleDays = idleDurationDays(lastActivity, candidate.created_at, nowIso)
+    const idleUrgent = isPastStallThreshold(idleDays, thresholdDays)
+    const idleApproaching = idleUrgent || idleDays >= thresholdDays - STALL_WARNING_LEAD_DAYS
+
+    if (!boundaryDue && !idleApproaching) return null
+
+    const reasonParts: string[] = []
+    if (boundaryDue) reasonParts.push(`cycle boundary at ${candidate.cycle_boundary_at}`)
+    if (idleApproaching) {
+      reasonParts.push(idleUrgent
+        ? `idle ${idleDays.toFixed(1)}d has passed the ${thresholdDays}d stall threshold — the same cron tick that flags it stalled can archive it`
+        : `idle ${idleDays.toFixed(1)}d is within ${STALL_WARNING_LEAD_DAYS}d of the ${thresholdDays}d stall threshold — once stalled, the breaker can archive on that same tick`)
+    }
+    const reason = `${reasonParts.join('; ')} — recommitting protects only through this boundary (${candidate.cycle_boundary_at}); archived automatically without one`
+
+    return {
+      kind: 'project_recommit_due',
+      source_type: 'project',
+      source_id: candidate.project_id,
+      project_id: candidate.project_id,
+      project_name: candidate.project_name,
+      title: candidate.project_name,
+      reason,
+      urgency_rank: (boundaryUrgent || idleUrgent) ? 0 : 1,
+      responsible: 'workspace_admin',
+      requested_by: null,
+      created_at: candidate.created_at,
+      deadline_at: candidate.cycle_boundary_at,
+      squad_id: null, squad_department_id: null, squad_kind: null, project_access_level: null,
+      assignee_agent_id: null, gate_owner: null, has_gate_grant: 0, has_surface_grant: 0,
+      sort_deadline: candidate.cycle_boundary_at,
+      sort_timestamp: candidate.created_at,
+    }
+  }))
+
+  const included = annotated.filter((row): row is SourceRow => row !== null)
+  const rows = cursor === null ? included : included.filter(row => passesCursor(row, cursor))
+  return { name: 'recommit_due', rows, truncated }
+}
+
+/**
+ * JS mirror of cursorPredicate's SQL tuple ordering, for the ONE source
+ * (recommit-due) whose final urgency_rank cannot be known until a live
+ * per-row idleness computation runs — it cannot be expressed as a single
+ * ORDER-BY-able SQL SELECT the way orderedSourceQuery/cursorPredicate is.
+ * Both implementations walk the SAME five-column tuple (urgency_rank ASC,
+ * sort_deadline ASC, sort_timestamp DESC, source_type ASC, source_id ASC).
+ */
+function passesCursor(row: SourceRow, cursor: NeedsYouCursor): boolean {
+  if (row.urgency_rank !== cursor.urgency_rank) return row.urgency_rank > cursor.urgency_rank
+  if (row.sort_deadline !== cursor.deadline) return row.sort_deadline > cursor.deadline
+  if (row.sort_timestamp !== cursor.timestamp) return row.sort_timestamp < cursor.timestamp
+  if (row.source_type !== cursor.type) return row.source_type > cursor.type
+  return row.source_id > cursor.id
 }
 
 function validateCursor(cursor: unknown): cursor is NeedsYouCursor {

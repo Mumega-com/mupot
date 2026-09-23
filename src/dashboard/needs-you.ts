@@ -1,5 +1,6 @@
 import { html, raw } from 'hono/html'
 import type { AuthContext, Env } from '../types'
+import { ROUTES } from '../types'
 import { listNeedsYou, type NeedsYouItem } from '../attention/service'
 import { routinePrincipal } from '../routines/access'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
@@ -11,6 +12,17 @@ import type { Html } from './ui'
 // Same-origin fetch + hono/csrf's Origin check (dashboardApp.use('*', csrf()))
 // covers CSRF; no token field is needed (see src/dashboard/index.ts's own
 // "same-origin POST forms" comment on that middleware).
+//
+// ROUND 2 P0-2 (adversarial): projectsApp is mounted at ROUTES.projects
+// ('/api/projects', src/types.ts) by src/index.ts's `app.route(ROUTES.projects,
+// projectsApp)` — projectsApp's OWN route table has no idea it lives under
+// that prefix. The button's fetch target MUST be built from ROUTES.projects,
+// not a guessed '/projects/...' path (which 404s in prod and shows a
+// misleading "network error" on the button) — see
+// tests/dashboard-recommit-route.test.ts's "composed root mount" case, which
+// dispatches through app.route(ROUTES.projects, projectsApp) — the EXACT
+// mount call src/index.ts makes — rather than projectsApp.fetch() directly,
+// which would pass even with the wrong prefix baked in here.
 const RECOMMIT_BUTTON_CLASS = 'needs-you-recommit-btn'
 
 export interface NeedsYouDashboardView {
@@ -86,7 +98,7 @@ function recommitScript(): Html {
         btn.addEventListener('click', function () {
           btn.disabled = true;
           if (status) status.textContent = '…';
-          fetch('/projects/' + encodeURIComponent(projectId) + '/recommit', {
+          fetch('${ROUTES.projects}/' + encodeURIComponent(projectId) + '/recommit', {
             method: 'POST', credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ reason: 'dashboard_recommit' }),

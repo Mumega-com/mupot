@@ -8,7 +8,9 @@
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { ROUTES } from '../src/types'
 import type { AuthContext, Env } from '../src/types'
 import { listNeedsYou } from '../src/attention/service'
 import type { RoutinePrincipal } from '../src/routines/access'
@@ -25,6 +27,7 @@ vi.mock('../src/auth', () => ({
 }))
 
 const { projectsApp } = await import('../src/projects')
+const { dashboardApp } = await import('../src/dashboard')
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const TENANT = 'pot-a'
@@ -173,5 +176,71 @@ describe('POST /projects/:id/recommit (the dashboard Recommit button target)', (
     const response = await post(harness, '/proj-member/recommit', { reason: 'x' })
     expect(response.status).toBe(403)
     expect(receiptCount(harness, 'proj-member')).toBe(0)
+  })
+})
+
+// Round 2 adversarial P0-2: recommitScript() previously fetched
+// '/projects/' + id + '/recommit', but projectsApp is mounted at
+// ROUTES.projects = '/api/projects' (src/types.ts) by src/index.ts's
+// `app.route(ROUTES.projects, projectsApp)` — a 404 in production, showing
+// the button's own "network error" message. Testing the button's target via
+// projectsApp.fetch() directly (as every test above does) CANNOT catch this
+// class of bug: projectsApp's own route table has no idea what prefix it is
+// mounted under, so `projectsApp.fetch('/x/recommit')` "passes" no matter
+// what prefix the rendered script guesses. These two tests instead (a) read
+// the ACTUAL rendered script's fetch prefix out of the real /needs-you page
+// and (b) dispatch that exact prefix through a root app built with the
+// SAME mount call src/index.ts makes (`app.route(ROUTES.projects, projectsApp)`),
+// not a guessed path — proving the two agree. (Importing the real src/index.ts
+// `app` directly is not possible under vitest — it transitively imports
+// `cloudflare:*` Workers runtime built-ins that the Node ESM loader refuses;
+// confirmed by attempting it. This is the closest faithful reproduction of
+// that one mount line without pulling in the other 60+ subsystems index.ts
+// wires up.)
+describe('the Recommit button URL, dispatched through the REAL ROUTES.projects mount (round 2 P0-2)', () => {
+  let harness: SqliteD1Harness | undefined
+
+  afterEach(() => {
+    authState.current = null
+    harness?.close()
+    harness = undefined
+  })
+
+  it('the rendered script\'s fetch prefix is exactly ROUTES.projects, and that prefix resolves through app.route(ROUTES.projects, projectsApp)', async () => {
+    harness = makeHarness()
+    insertProject(harness, { id: 'proj-url-check', cycleBoundaryAt: '2026-09-24T00:00:00.000Z' })
+    as(actor({ memberId: 'member:distinct-admin' }))
+
+    const page = await dashboardApp.fetch(new Request('https://pot.test/needs-you'), envFor(harness))
+    expect(page.status).toBe(200)
+    const html = await page.text()
+    expect(html).toContain('recommit')
+
+    // Extract the literal string the script concatenates the project id onto.
+    const match = /fetch\('([^']*)'\s*\+\s*encodeURIComponent\(projectId\)\s*\+\s*'\/recommit'/.exec(html)
+    expect(match, 'expected the rendered script to contain a recommit fetch call').not.toBeNull()
+    const fetchPrefix = match![1] // literal string the script concatenates: '${ROUTES.projects}/'
+    expect(fetchPrefix).toBe(`${ROUTES.projects}/`)
+    expect(fetchPrefix).not.toBe('/projects/') // the round-2 bug — no /api prefix
+
+    // Now prove that EXACT prefix actually dispatches into projectsApp when
+    // mounted the way src/index.ts mounts it — not projectsApp.fetch(), a
+    // composed root using the real ROUTES.projects constant.
+    const rootApp = new Hono<{ Bindings: Env }>()
+    rootApp.route(ROUTES.projects, projectsApp)
+    const response = await rootApp.fetch(
+      request(`${fetchPrefix}proj-url-check/recommit`, 'POST', { reason: 'dashboard_recommit' }),
+      envFor(harness),
+    )
+    expect(response.status).toBe(200)
+    expect(receiptCount(harness, 'proj-url-check')).toBe(1)
+
+    // And the OLD buggy guess ('/projects/...', no /api prefix) 404s through
+    // that same real mount — this is exactly what shipped to prod in round 1.
+    const brokenResponse = await rootApp.fetch(
+      request('/projects/proj-url-check/recommit', 'POST', { reason: 'dashboard_recommit' }),
+      envFor(harness),
+    )
+    expect(brokenResponse.status).toBe(404)
   })
 })
