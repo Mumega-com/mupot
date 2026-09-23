@@ -1,6 +1,7 @@
 // tests/helpers/fake-internal-wiki.ts — an in-memory double for
-// workers/inkwell-api/src/routes/internal-wiki.ts (mumega.com PR #1278),
-// used to test src/projects/wiki-client.ts without a real Inkwell worker.
+// workers/inkwell-api/src/routes/internal-wiki.ts (mumega.com PR #1278,
+// confirmed against round 2, head 81839e85), used to test
+// src/projects/wiki-client.ts without a real Inkwell worker.
 //
 // DOUBLE DISCIPLINE (a double that accepts everything is a finding, not a
 // test): this fake REFUSES exactly what the real route refuses —
@@ -11,17 +12,27 @@
 //   - missing project -> 400 { error: 'project required' }
 //   - reads are STRICTLY scoped to (tenant, project) — a topic under a
 //     different project never appears in that project's graph/get (404)
-//   - round-2 contract (kasra, 2026-09-23): reads ALSO require
-//     required_keys=[] AND published=1 — a gated or unpublished topic is
-//     404 on GET /topics/:slug and ABSENT from GET /graph (both nodes and
-//     any edge touching it)
+//   - round-2 contract: reads ALSO require required_keys=[] AND published=1
+//     (via the SAME isTopicVisible(row, emptyKeySet) predicate the real
+//     route reuses) — a gated or unpublished topic is 404 on GET
+//     /topics/:slug and ABSENT from GET /graph (both nodes and any edge
+//     touching it)
 //   - PUT to a slug already owned by a different project -> 409
-//     topic_owned_by_other_project
+//     topic_owned_by_other_project (+ existing_project)
 //   - PUT to a slug that is pre-existing AND keychain-gated -> 409
 //     topic_is_keychain_gated (this fake never lets a PUT itself create a
 //     gated topic — required_keys is always forced to [] on write, exactly
 //     like the real route; a gated row can only get into the store via
-//     `seedGatedTopic`, standing in for the admin-only wiki.ts path)
+//     `seed()`, standing in for the admin-only wiki.ts path)
+//   - PUT with an edge naming a to_slug in a different project or that does
+//     not exist -> 400 cross_project_edge_refused
+//   - round-2 P1-2: PUT with an edge naming an UNPUBLISHED to_slug -> 400
+//     edge_target_unpublished — validated, like every edge, BEFORE any write
+//     (all-or-nothing; the topic itself is left untouched on refusal)
+//   - round-2 P2-5's `topic_write_conflict` (409, a TOCTOU race) is a
+//     concurrency outcome this single-threaded fake cannot naturally
+//     reproduce — wiki-client.test.ts exercises that mapping with a raw
+//     fetchImpl instead of through this double
 
 export interface FakeWikiTopicSeed {
   tenantSlug: string
@@ -192,6 +203,38 @@ export class FakeInternalWiki {
       if (existing && existing.required_keys.length > 0) {
         return Response.json({ error: 'topic_is_keychain_gated' }, { status: 409 })
       }
+      // Round-2 P2-5 parity: the TOCTOU race window (a concurrent write
+      // reassigning this slug between our pre-check and the actual write)
+      // is not reachable in this single-threaded fake — a caller wanting to
+      // exercise `topic_write_conflict` mapping does so with a raw
+      // fetchImpl, not through this double (see wiki-client.test.ts).
+
+      // ── Validate ALL edges BEFORE any write — all-or-nothing (round-2
+      //    invariant #6), same order the real route checks: existence +
+      //    same-project first, THEN published. ─────────────────────────────
+      type PendingEdge = { toSlug: string; relationType: string; weight: number }
+      const pendingEdges: PendingEdge[] = []
+      const edgesInput = Array.isArray(body.edges) ? body.edges : []
+      for (const raw of edgesInput) {
+        if (!raw || typeof raw !== 'object') return Response.json({ error: 'invalid_edge' }, { status: 400 })
+        const e = raw as Record<string, unknown>
+        const toSlug = typeof e.to_slug === 'string' ? e.to_slug : null
+        if (!toSlug) return Response.json({ error: 'invalid_edge_to_slug' }, { status: 400 })
+        const target = this.findByTenantSlug(tenantSlug, toSlug)
+        if (!target || target.project !== project) {
+          return Response.json({ error: 'cross_project_edge_refused', to_slug: toSlug }, { status: 400 })
+        }
+        // Round-2 P1-2: an edge to an unpublished (draft) target is refused
+        // — an edge is itself a read-side signal the target exists.
+        if (!target.published) {
+          return Response.json({ error: 'edge_target_unpublished', to_slug: toSlug }, { status: 400 })
+        }
+        pendingEdges.push({
+          toSlug,
+          relationType: typeof e.relation_type === 'string' ? e.relation_type : 'related',
+          weight: typeof e.weight === 'number' ? e.weight : 1,
+        })
+      }
 
       const now = Math.floor(Date.now() / 1000)
       const created = !existing
@@ -205,7 +248,7 @@ export class FakeInternalWiki {
         topic_type: typeof body.topic_type === 'string' ? body.topic_type : 'general',
         required_keys: [], // ALWAYS forced to [] on write, exactly like the real route
         tags: Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === 'string') : [],
-        published: true,
+        published: true, // this write path always produces a published=1 topic (no `published` body field exists)
         created_at: existing?.created_at ?? now,
         updated_at: now,
       }
@@ -216,29 +259,18 @@ export class FakeInternalWiki {
         this.topics.push(row)
       }
 
-      let edgesUpserted = 0
-      const edgesInput = Array.isArray(body.edges) ? body.edges : []
-      for (const raw of edgesInput) {
-        if (!raw || typeof raw !== 'object') return Response.json({ error: 'invalid_edge' }, { status: 400 })
-        const e = raw as Record<string, unknown>
-        const toSlug = typeof e.to_slug === 'string' ? e.to_slug : null
-        if (!toSlug) return Response.json({ error: 'invalid_edge_to_slug' }, { status: 400 })
-        const target = this.findByTenantSlug(tenantSlug, toSlug)
-        if (!target || target.project !== project) {
-          return Response.json({ error: 'cross_project_edge_refused', to_slug: toSlug }, { status: 400 })
-        }
+      for (const edge of pendingEdges) {
         this.edges.push({
           tenant_id: tenantSlug,
           from_slug: slug,
-          to_slug: toSlug,
-          relation_type: typeof e.relation_type === 'string' ? e.relation_type : 'related',
-          weight: typeof e.weight === 'number' ? e.weight : 1,
+          to_slug: edge.toSlug,
+          relation_type: edge.relationType,
+          weight: edge.weight,
         })
-        edgesUpserted += 1
       }
 
       return Response.json(
-        { ok: true, tenant_slug: tenantSlug, project, slug, id: row.id, created, edges_upserted: edgesUpserted },
+        { ok: true, tenant_slug: tenantSlug, project, slug, id: row.id, created, edges_upserted: pendingEdges.length },
         { status: created ? 201 : 200 },
       )
     }

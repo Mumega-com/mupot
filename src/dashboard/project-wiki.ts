@@ -163,6 +163,8 @@ const WIKI_RESULT_MESSAGES: Readonly<Record<string, string>> = {
     'The "project-card" wiki slug is already owned by a different project — nothing was saved.',
   wiki_conflict_topic_is_keychain_gated:
     'This project already has a restricted (keychain-gated) wiki page at this slug — nothing was saved.',
+  wiki_conflict_topic_write_conflict:
+    'Another write raced this one — nothing was saved. Try again.',
 }
 
 function createCardButton(projectId: string): Html {

@@ -103,16 +103,25 @@ export class WikiClientError extends Error {
   }
 }
 
-// Closed allowlist of internal-wiki.ts's own documented 409 conflict codes
-// (routes/internal-wiki.ts: 'topic_owned_by_other_project' when the slug
-// belongs to a different project in this tenant; 'topic_is_keychain_gated'
-// when a pre-existing keychain-gated topic refuses to be overwritten
-// silently). A 409 with any OTHER body shape (unexpected future code) is
-// treated as WikiClientError('wiki_unavailable'), never surfaced verbatim —
-// this keeps the "never leak the raw upstream body" discipline while still
-// giving the caller a typed, actionable conflict for the two documented
-// cases.
-const KNOWN_CONFLICT_CODES = ['topic_owned_by_other_project', 'topic_is_keychain_gated'] as const
+// Closed allowlist of internal-wiki.ts's own documented 409 conflict codes,
+// confirmed against mumega.com PR #1278 round 2 (head 81839e85,
+// routes/internal-wiki.ts PUT /topics/:slug):
+//   - 'topic_owned_by_other_project' — the slug belongs to a different
+//     project in this tenant (wiki_topics.UNIQUE is (tenant_id, slug), not
+//     (tenant_id, project, slug)). Carries `existing_project`.
+//   - 'topic_is_keychain_gated' — a pre-existing keychain-gated topic
+//     refuses to be silently overwritten/de-gated.
+//   - 'topic_write_conflict' (round-2 P2-5, NEW) — a TOCTOU race: either the
+//     UPDATE's own WHERE (tenant_id, slug, project, required_keys='[]')
+//     matched zero rows because a concurrent admin write changed the row
+//     between our read-check and this write, OR a concurrent PUT won a
+//     UNIQUE-constraint race on create. No `existing_project` — the route
+//     does not re-read the row to report one.
+// A 409 with any OTHER body shape (unexpected future code) is treated as
+// WikiClientError('wiki_unavailable'), never surfaced verbatim — this keeps
+// the "never leak the raw upstream body" discipline while still giving the
+// caller a typed, actionable conflict for the three documented cases.
+const KNOWN_CONFLICT_CODES = ['topic_owned_by_other_project', 'topic_is_keychain_gated', 'topic_write_conflict'] as const
 type WikiConflictCode = (typeof KNOWN_CONFLICT_CODES)[number]
 
 function isKnownConflictCode(v: unknown): v is WikiConflictCode {
@@ -122,10 +131,11 @@ function isKnownConflictCode(v: unknown): v is WikiConflictCode {
 /**
  * A typed 409 from PUT /topics/:slug — surfaced separately from
  * WikiClientError so a caller (e.g. the "Create/refresh project card" route)
- * can render an actionable message ("this slug belongs to another project")
- * instead of a generic "wiki unavailable" failure. `existingProject` is only
- * ever set for 'topic_owned_by_other_project' and is a plain project slug —
- * not free text, not the raw upstream body.
+ * can render an actionable message ("this slug belongs to another project",
+ * "try again — a concurrent write raced this one") instead of a generic
+ * "wiki unavailable" failure. `existingProject` is only ever set for
+ * 'topic_owned_by_other_project' and is a plain project slug — not free
+ * text, not the raw upstream body.
  */
 export class WikiConflictError extends Error {
   constructor(
@@ -244,21 +254,23 @@ export async function getProjectWikiGraph(
  * unreachable/non-2xx (including the upstream's own 409/400 validation
  * refusals — a caller that needs to distinguish those should be a rarer,
  * more specific need than this module's contract) upstream, or a malformed
- * response body. A 409 (slug owned by another project, or a pre-existing
- * keychain-gated topic) throws the more specific WikiConflictError instead —
- * see its doc comment — so a caller can render an actionable message rather
- * than a generic failure.
+ * response body. A 409 (slug owned by another project, a pre-existing
+ * keychain-gated topic, or a write-conflict race) throws the more specific
+ * WikiConflictError instead — see its doc comment — so a caller can render
+ * an actionable message rather than a generic failure. An edge naming an
+ * unpublished target is refused with a 400 (`edge_target_unpublished`) —
+ * collapsed to the generic WikiClientError like every other 400 validation
+ * refusal on this route, not given its own type (matches the client's
+ * blanket policy of not distinguishing per-field 400s).
  *
- * Sends `published: true` explicitly in the body (contract note, kasra
- * 2026-09-23: mumega.com PR #1278 round 2 is adding read-side filtering to
- * required_keys=[] AND published=1 — a card this route writes must set
- * published for it to ever be readable back). ASSUMPTION: round 2 had not
- * landed on the PR at the time this was written, so the exact field name is
- * inferred from the wiki_topics.published column rather than confirmed
- * against a merged schema — reconcile against #1278's final body schema
- * before merge. Harmless either way: today's route ignores unknown body
- * fields (insertWikiTopicRow hardcodes published=1 on create regardless),
- * so sending it now is forward-compatible, not a behavior change.
+ * NO `published` FIELD EXISTS on this route's body (confirmed against
+ * mumega.com PR #1278 round 2, head 81839e85,
+ * workers/inkwell-api/src/lib/wiki-store.ts's prepareInsertWikiTopic /
+ * prepareUpdateWikiTopic): a topic created through this path is always
+ * published=1 (hardcoded on INSERT) and UPDATE never touches the column.
+ * An earlier revision of this function sent a speculative `published: true`
+ * ahead of round 2 landing — removed now that the real schema is confirmed
+ * to have no such field.
  */
 export async function upsertProjectWikiTopic(
   env: Env,
@@ -280,7 +292,6 @@ export async function upsertProjectWikiTopic(
     topic_type: topic.topic_type ?? 'general',
     tags: topic.tags ?? [],
     edges: topic.edges ?? [],
-    published: true,
   }
   const res = await wikiRequest(
     cfg,
