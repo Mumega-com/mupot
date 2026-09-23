@@ -185,6 +185,7 @@ import { formatBurn, formatUsd } from '../agents/cost'
 import {
   canManageProject,
   canManageProjects,
+  getReadableProject,
   loadProjectDetail,
   projectManageAccessContext,
   loadProjectFlights,
@@ -203,6 +204,11 @@ import {
   projectsPageBody,
   submittedProjectFormValues,
 } from './projects'
+import {
+  createOrRefreshProjectCard,
+  loadProjectWikiView,
+  projectWikiBody,
+} from './project-wiki'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
 import {
   consumeRoutineRunNonce,
@@ -760,6 +766,52 @@ dashboardApp.get('/projects/:id', async (c) => {
   const view = await loadProjectDetail(c.env, c.get('auth'), c.req.param('id'))
   if (!view) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
   return c.html(shell(c.env, view.project.name, projectDetailBody(view, c.req.query('status'))))
+})
+
+// GET /projects/:id/wiki — mupot v0.50 goal item 4: per-project rendered wiki
+// home over the existing inkwell-api wiki store (mumega.com PR #1278). The
+// mupot project-read check (getReadableProject — the SAME predicate GET
+// /projects/:id uses) runs FIRST; only a caller who passes it ever triggers
+// the upstream Inkwell call. mupot stays the permission authority; Inkwell
+// stays the store — no new permission vocabulary is introduced here.
+dashboardApp.get('/projects/:id/wiki', async (c) => {
+  const auth = c.get('auth')
+  const projectId = c.req.param('id')
+  const project = await getReadableProject(c.env, auth, projectId)
+  if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+  const canManage = await canManageProject(c.env, auth, project.id)
+  const view = await loadProjectWikiView(c.env, project, auth, canManage)
+  const status = view.status === 'unavailable' ? 503 : view.status === 'rejected' ? 502 : 200
+  return c.html(shell(c.env, `${project.name} · Wiki`, projectWikiBody(view, c.req.query('status'))), status)
+})
+
+// POST /projects/:id/wiki/card — "Create/refresh project card": upserts ONE
+// wiki topic (slug `project-card-<id>`) built entirely from the project's
+// own columns (name/description/goal/live_url/repo_url/status) — no
+// free-text from the request body, and (P2-A) no squad data, which is a
+// per-viewer LIVE render on the GET route, never part of the stored
+// artifact. Gated on the SAME per-project `manage` write check
+// boards/settings use (canManageProject); CSRF is the dashboardApp-wide
+// csrf() middleware (registered above), same as every other same-origin
+// dashboard POST — no separate token field needed.
+dashboardApp.post('/projects/:id/wiki/card', async (c) => {
+  const auth = c.get('auth')
+  const projectId = c.req.param('id')
+  if (!await canManageProject(c.env, auth, projectId)) {
+    return c.html(shell(c.env, 'Projects', projectNotFoundBody()), 403)
+  }
+  const project = await getReadableProject(c.env, auth, projectId)
+  if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+
+  const outcome = await createOrRefreshProjectCard(c.env, project)
+  const status = outcome.ok
+    ? 'card_saved'
+    : outcome.status === 'wiki_conflict'
+      ? `wiki_conflict_${outcome.code}`
+      : outcome.status === 'wiki_request_rejected'
+        ? 'wiki_request_rejected'
+        : 'wiki_unavailable'
+  return c.redirect(`/projects/${encodeURIComponent(projectId)}/wiki?status=${encodeURIComponent(status)}`, 303)
 })
 
 // POST /projects/:id/boards — link an external board. Gated on per-project

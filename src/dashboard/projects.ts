@@ -74,7 +74,7 @@ export function projectLifecycleTransition(command: string) {
 
 type ParentContext = Pick<Project, 'id' | 'slug' | 'name' | 'status' | 'parent_project_id'>
 
-interface ProjectAccess extends ProjectReadAccess {
+export interface ProjectAccess extends ProjectReadAccess {
   readableSquadIds: string[] | null
   taskableSquadIds: string[] | null
 }
@@ -238,7 +238,7 @@ async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> 
   return resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
 }
 
-async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
+export async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
   const memberId = await memberIdFor(env, auth)
   const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
   const visibility = projectReadAccessFromGrants(auth, grants)
@@ -630,7 +630,7 @@ async function loadReadableTasks(
     .map(({ id, title, status, squad_name }) => ({ id, title, status, squad_name }))
 }
 
-async function loadReadableSquads(
+export async function loadReadableSquads(
   env: Env,
   projectId: string,
   access: ProjectAccess,
@@ -735,13 +735,33 @@ async function loadProjectAggregates(
   }
 }
 
+/**
+ * readableProjectWithAccess — the ONE place "is this project visible to
+ * `auth`" is decided (getProject + projectAccess + isReadableProject).
+ * loadProjectDetail and getReadableProject both call THIS, not their own
+ * copy of the combo, so the read gate cannot drift between the full project
+ * page and a lighter-weight surface built later (src/dashboard/project-wiki.ts
+ * — mupot v0.50 goal item 4 — was the first such surface, flagged in gate
+ * review for having its own copy before this refactor).
+ */
+async function readableProjectWithAccess(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<{ project: Project; access: ProjectAccess } | null> {
+  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
+  if (!project || !await isReadableProject(env, project.id, access)) return null
+  return { project, access }
+}
+
 export async function loadProjectDetail(
   env: Env,
   auth: AuthContext,
   projectId: string,
 ): Promise<ProjectDetailView | null> {
-  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
-  if (!project || !await isReadableProject(env, project.id, access)) return null
+  const readable = await readableProjectWithAccess(env, auth, projectId)
+  if (!readable) return null
+  const { project, access } = readable
 
   const squads = await loadReadableSquads(env, project.id, access)
   const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards, worker] = await Promise.all([
@@ -778,6 +798,25 @@ export async function loadProjectDetail(
     recentPrs: worker.recentPrs,
     deployments,
   }
+}
+
+/**
+ * getReadableProject — the project-page READ predicate, exported standalone
+ * so a lighter-weight project surface (src/dashboard/project-wiki.ts — mupot
+ * v0.50 goal item 4) can run the EXACT SAME read check loadProjectDetail
+ * runs, without paying for loadProjectDetail's full aggregate/task/
+ * member/activity/evidence load. Both route through readableProjectWithAccess
+ * above — one predicate, two call sites. Returns the project row, or null
+ * when it does not exist OR is not currently visible to `auth` — never
+ * distinguishes the two (same as loadProjectDetail returning null for both).
+ */
+export async function getReadableProject(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<Project | null> {
+  const readable = await readableProjectWithAccess(env, auth, projectId)
+  return readable?.project ?? null
 }
 
 export function projectFormValues(project?: Project): ProjectFormValues {
@@ -1576,10 +1615,13 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
   </section>`
 }
 
-function projectTabs(projectId: string) {
+// Exported so src/dashboard/project-wiki.ts (mupot v0.50 goal item 4) can
+// render the SAME tab strip on its page — one nav definition, not a copy.
+export function projectTabs(projectId: string) {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
     <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/routines">Routines</a>
+    <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/wiki">Wiki</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
     <a class="btn secondary sm" data-project-tab href="#board">Board</a>
     <a class="btn secondary sm" data-project-tab href="#squads">Team / Squads</a>

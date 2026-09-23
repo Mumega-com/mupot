@@ -30,6 +30,7 @@ import { loadProjectSituation } from '../projects/situation'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
+import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
@@ -281,6 +282,43 @@ const toolProjectList: ToolSpec = {
       projects: [...parentContexts, ...projects],
       next_cursor: nextCursor(offset, limit, resultRows.length),
     })
+  },
+}
+
+// project_wiki (mupot v0.50 goal item 4) — read a project's rendered wiki
+// graph (mumega.com PR #1278's internal wiki service path) so a seat can read
+// the wiki via MCP, not just the dashboard. Gated IDENTICALLY to project_get:
+// readAccess + readableProject — a caller without project read never reaches
+// the upstream Inkwell call at all (mirrors src/dashboard/project-wiki.ts's
+// "mupot is the permission authority" discipline on the dashboard surface).
+const toolProjectWiki: ToolSpec = {
+  name: 'project_wiki',
+  scope: 'visible workspace project',
+  min: 'observer',
+  args: '{ project_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_project_id')
+    const access = readAccess(auth)
+    const project = await readableProject(env, projectId, access)
+    if (!project) return fail(404, 'project_not_found')
+    try {
+      const wiki = await getProjectWikiGraph(env, project.id)
+      return done({ project_id: project.id, wiki })
+    } catch (e) {
+      // A well-formed call the upstream rejected as invalid (P2-B) is
+      // distinct from the service being unreachable/misconfigured — 502,
+      // never the raw upstream body.
+      if (e instanceof WikiRequestError) return fail(502, 'wiki_request_rejected')
+      if (e instanceof WikiClientError) return fail(503, e.reason)
+      throw e
+    }
   },
 }
 
@@ -608,6 +646,7 @@ export const PROJECT_TOOLS: ToolSpec[] = [
   toolProjectList,
   toolProjectGet,
   toolProjectContext,
+  toolProjectWiki,
   toolProjectUpdate,
   toolProjectRecommit,
   toolProjectDeploy,

@@ -235,7 +235,9 @@ export function mergeByChangeType<TBase extends Record<string, unknown>>(
 // ── Shared redirect-refusing fetch wrapper ──────────────────────────────────
 
 export interface CmsFetchInit {
-  method: 'GET' | 'POST'
+  // 'PUT' added for src/projects/wiki-client.ts's upsert call (internal-wiki.ts's
+  // PUT /topics/:slug) — additive, every existing GET/POST caller is unaffected.
+  method: 'GET' | 'POST' | 'PUT'
   headers?: Record<string, string>
   body?: string
 }
