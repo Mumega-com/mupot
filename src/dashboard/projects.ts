@@ -780,6 +780,26 @@ export async function loadProjectDetail(
   }
 }
 
+/**
+ * getReadableProject — the project-page READ predicate (getProject +
+ * projectAccess + isReadableProject), exported standalone so a lighter-weight
+ * project surface (src/dashboard/project-wiki.ts — mupot v0.50 goal item 4)
+ * can run the EXACT SAME read check loadProjectDetail runs, without paying
+ * for loadProjectDetail's full aggregate/task/member/activity/evidence load.
+ * Returns the project row, or null when it does not exist OR is not
+ * currently visible to `auth` — never distinguishes the two (same as
+ * loadProjectDetail returning null for both).
+ */
+export async function getReadableProject(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<Project | null> {
+  const [project, access] = await Promise.all([getProject(env, projectId), projectAccess(env, auth)])
+  if (!project || !await isReadableProject(env, project.id, access)) return null
+  return project
+}
+
 export function projectFormValues(project?: Project): ProjectFormValues {
   return {
     slug: project?.slug ?? '',
@@ -1576,10 +1596,13 @@ export function projectSettingsBody(view: ProjectSettingsView): Html {
   </section>`
 }
 
-function projectTabs(projectId: string) {
+// Exported so src/dashboard/project-wiki.ts (mupot v0.50 goal item 4) can
+// render the SAME tab strip on its page — one nav definition, not a copy.
+export function projectTabs(projectId: string) {
   return html`<nav aria-label="Project sections" style="display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;">
     <a class="btn secondary sm" data-project-tab href="#overview" aria-current="page">Overview</a>
     <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/routines">Routines</a>
+    <a class="btn secondary sm" href="/projects/${encodeURIComponent(projectId)}/wiki">Wiki</a>
     <a class="btn secondary sm" data-project-tab href="#work">Work</a>
     <a class="btn secondary sm" data-project-tab href="#board">Board</a>
     <a class="btn secondary sm" data-project-tab href="#squads">Team / Squads</a>
