@@ -309,7 +309,7 @@ const toolProjectWiki: ToolSpec = {
     const project = await readableProject(env, projectId, access)
     if (!project) return fail(404, 'project_not_found')
     try {
-      const wiki = await getProjectWikiGraph(env, project.slug)
+      const wiki = await getProjectWikiGraph(env, project.id)
       return done({ project_id: project.id, wiki })
     } catch (e) {
       if (e instanceof WikiClientError) return fail(503, e.reason)

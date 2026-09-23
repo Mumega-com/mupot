@@ -14,7 +14,12 @@
 // executors/shared/cms-adapter.ts) rather than re-implementing it. The Bearer
 // token is resolved via THE SAME per-pot 'inkwell' connector the department
 // executor already resolves (src/connectors/service.ts resolveConnector) — no
-// new secret, no new binding, no new env var.
+// new secret, no new binding, no new env var. Resolved POT-WIDE explicitly
+// (resolveConnector(env, 'pot', 'inkwell') — the same literal-'pot' idiom
+// src/dashboard/studio.ts / studio-data-api.ts already use for their own
+// pot-wide connectors) rather than passing a project identifier into the
+// scope-id argument position, which would only accidentally avoid colliding
+// with an agent/squad-scoped connector rather than being explicitly pot-wide.
 //
 // mupot is the PERMISSION AUTHORITY here; Inkwell stays the STORE. Every
 // caller of this module MUST run its own project-read (or project-manage, for
@@ -22,22 +27,42 @@
 // asking", only "which project" (see routes/internal-wiki.ts's header comment
 // for why the upstream route itself does no keychain check on this path).
 //
-// Fail-closed, secret-safe: every failure (missing config, network error,
-// non-2xx, malformed body) collapses to ONE typed WikiClientError
-// ('wiki_unavailable') — the Bearer token and the raw upstream response body
-// are NEVER included in a thrown message, only a short, safe reason string
-// (e.g. an HTTP status number).
+// PROJECT KEY: every caller passes `projectKey` = the mupot PROJECT'S OWN
+// IMMUTABLE id (`project.id`), never `project.slug`. A project's slug is
+// mutable (project_update) and reclaimable (a completed/archived project's
+// slug can be freed and later re-taken by an unrelated new project via
+// team-bootstrap release) — keying Inkwell's `project` field on slug would
+// let a renamed project silently lose its wiki, or a brand-new project
+// inherit a stranger's wiki content the moment it took a freed slug. `id` has
+// neither failure mode. `project.id` is a `crypto.randomUUID()` (see
+// src/projects/service.ts createProject), which is always lowercase hex +
+// hyphens and therefore already satisfies the slug shape Inkwell requires.
+//
+// Fail-closed, secret-safe: every unrecoverable failure (missing config,
+// network error, malformed body, 5xx, 401/403 auth failure) collapses to ONE
+// typed WikiClientError('wiki_unavailable'). A 409 (any conflict code the
+// upstream reports — the exact code vocabulary has already been renamed once
+// between #1278's rounds, so this client does not hardcode a closed
+// allowlist) is a typed WikiConflictError. Any OTHER 4xx (400/404/422/...) is
+// a typed WikiRequestError — a well-formed call the upstream rejected as
+// invalid, distinct from "the service itself is unreachable/misconfigured".
+// The Bearer token and the raw upstream response body are NEVER included in
+// a thrown message — only a short, safe reason string (a status number, or
+// an `error` code the upstream itself already intends to be a stable,
+// public-facing enum value).
 
 import { assertPublicHttpsUrl } from '../lib/ssrf'
 import { resolveConnector } from '../connectors/service'
 import { cmsFetch, resolveCmsFetch } from '../departments/executors/shared/cms-adapter'
 import type { Env } from '../types'
 
-// Same alphabet/cap as internal-wiki.ts's TOPIC_SLUG_RE / PROJECT_SLUG_RE —
-// validated here too so a malformed slug fails fast, locally, before ever
-// reaching the network (and never becomes part of a path-traversal-shaped
-// upstream URL).
-const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,79}$/
+// Cap and alphabet confirmed against mumega.com PR #1278 round 2 (head
+// 81839e85), lib/internal-auth.ts's TENANT_SLUG_RE — the SAME pattern
+// routes/internal-wiki.ts reuses for its PROJECT_SLUG_RE. 63 chars, not the
+// 80 an earlier reading of TOPIC_SLUG_RE alone suggested; validating to the
+// STRICTER of the two upstream caps client-side never produces a false
+// rejection the server would have accepted, only extra safety margin.
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
 
 export function isWikiSlug(value: string): boolean {
   return typeof value === 'string' && SLUG_RE.test(value)
@@ -103,47 +128,49 @@ export class WikiClientError extends Error {
   }
 }
 
-// Closed allowlist of internal-wiki.ts's own documented 409 conflict codes,
-// confirmed against mumega.com PR #1278 round 2 (head 81839e85,
-// routes/internal-wiki.ts PUT /topics/:slug):
-//   - 'topic_owned_by_other_project' — the slug belongs to a different
-//     project in this tenant (wiki_topics.UNIQUE is (tenant_id, slug), not
-//     (tenant_id, project, slug)). Carries `existing_project`.
-//   - 'topic_is_keychain_gated' — a pre-existing keychain-gated topic
-//     refuses to be silently overwritten/de-gated.
-//   - 'topic_write_conflict' (round-2 P2-5, NEW) — a TOCTOU race: either the
-//     UPDATE's own WHERE (tenant_id, slug, project, required_keys='[]')
-//     matched zero rows because a concurrent admin write changed the row
-//     between our read-check and this write, OR a concurrent PUT won a
-//     UNIQUE-constraint race on create. No `existing_project` — the route
-//     does not re-read the row to report one.
-// A 409 with any OTHER body shape (unexpected future code) is treated as
-// WikiClientError('wiki_unavailable'), never surfaced verbatim — this keeps
-// the "never leak the raw upstream body" discipline while still giving the
-// caller a typed, actionable conflict for the three documented cases.
-const KNOWN_CONFLICT_CODES = ['topic_owned_by_other_project', 'topic_is_keychain_gated', 'topic_write_conflict'] as const
-type WikiConflictCode = (typeof KNOWN_CONFLICT_CODES)[number]
-
-function isKnownConflictCode(v: unknown): v is WikiConflictCode {
-  return typeof v === 'string' && (KNOWN_CONFLICT_CODES as readonly string[]).includes(v)
-}
-
 /**
  * A typed 409 from PUT /topics/:slug — surfaced separately from
  * WikiClientError so a caller (e.g. the "Create/refresh project card" route)
- * can render an actionable message ("this slug belongs to another project",
- * "try again — a concurrent write raced this one") instead of a generic
- * "wiki unavailable" failure. `existingProject` is only ever set for
- * 'topic_owned_by_other_project' and is a plain project slug — not free
- * text, not the raw upstream body.
+ * can render an actionable message instead of a generic "wiki unavailable"
+ * failure. `code` is whatever `error` string the upstream returned —
+ * deliberately NOT restricted to a closed allowlist: internal-wiki.ts's own
+ * conflict codes have already been renamed once between #1278's rounds
+ * (topic_owned_by_other_project / topic_is_keychain_gated /
+ * topic_write_conflict, and a successor PR generalises these further), so a
+ * client that hardcodes today's exact strings breaks on the next rename. Any
+ * 409 IS a conflict regardless of its code; only the code's fallback value
+ * ('unknown_conflict', when the body is missing/malformed) is this client's
+ * own invention. `existingProject` is populated only when the upstream body
+ * carries a string `existing_project` field — a plain project id, never free
+ * text, never the raw body.
  */
 export class WikiConflictError extends Error {
   constructor(
-    public readonly code: WikiConflictCode,
+    public readonly code: string,
     public readonly existingProject?: string,
   ) {
     super(code)
     this.name = 'WikiConflictError'
+  }
+}
+
+/**
+ * A non-409 4xx from the upstream route — a well-formed HTTP call the route
+ * rejected as invalid (bad project shape, title out of range, too many
+ * edges, an edge naming an unpublished/nonexistent target, …). Distinct from
+ * WikiClientError('wiki_unavailable'): this is not "the service is broken",
+ * it is "this specific call was rejected", which a caller may want to
+ * surface differently (e.g. log-and-fail-closed vs. retry). `code` is
+ * whatever `error` string the upstream returned, same non-allowlisted
+ * discipline as WikiConflictError.
+ */
+export class WikiRequestError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+  ) {
+    super(`${status} ${code}`)
+    this.name = 'WikiRequestError'
   }
 }
 
@@ -155,17 +182,19 @@ interface WikiClientConfig {
 }
 
 /**
- * Resolve the SAME per-pot 'inkwell' connector the department executor
- * already resolves (src/dashboard/index.ts POST
- * /admin/departments/:dept/execute/:gateId calls
- * resolveConnector(env, dept, 'inkwell')). A project slug is, like a dept
- * key, neither an agent id nor a squad id, so this call hits the identical
- * pot-wide fallback branch resolveConnector already falls back to for the
- * dept-executor call — no new connector scope, no new secret.
+ * Resolve the pot-wide 'inkwell' connector — EXPLICITLY pot-wide
+ * (resolveConnector(env, 'pot', 'inkwell')), the same literal-'pot' idiom
+ * src/dashboard/studio.ts and studio-data-api.ts already use for their own
+ * pot-wide connectors (as opposed to src/dashboard/index.ts's dept-executor
+ * call, which passes a department key into the scope-id argument position —
+ * that only works because a department key happens never to collide with a
+ * real agent/squad id, not because it explicitly means "pot-wide"). This
+ * client never needs an agent- or squad-scoped override: the wiki surface is
+ * pot-level, not per-caller.
  */
-async function resolveWikiConfig(env: Env, projectSlug: string): Promise<WikiClientConfig | null> {
+async function resolveWikiConfig(env: Env): Promise<WikiClientConfig | null> {
   if (!env.INKWELL_API_URL) return null
-  const token = await resolveConnector(env, projectSlug, 'inkwell')
+  const token = await resolveConnector(env, 'pot', 'inkwell')
   if (!token) return null
   return { apiUrl: env.INKWELL_API_URL, token, tenantSlug: env.TENANT_SLUG, fetcher: env.INKWELL_SVC }
 }
@@ -217,24 +246,53 @@ async function wikiRequest(
 }
 
 /**
+ * Classify a non-ok response into the right typed error and throw it.
+ * 401/403/503 (and anything else NOT a well-formed 4xx rejection) collapse to
+ * WikiClientError('wiki_unavailable') — an access/availability problem, not a
+ * property of this specific call. 409 is ALWAYS WikiConflictError. Every
+ * other 4xx is WikiRequestError. This is the ONE place status codes are
+ * interpreted, so a future upstream rename only has to be reconciled here if
+ * it changes STATUS codes (never for a new `error` string — those pass
+ * through as-is).
+ */
+async function throwForErrorResponse(res: Response): Promise<never> {
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => null)) as { error?: unknown; existing_project?: unknown } | null
+    const code = typeof body?.error === 'string' && body.error ? body.error : 'unknown_conflict'
+    const existingProject = typeof body?.existing_project === 'string' ? body.existing_project : undefined
+    throw new WikiConflictError(code, existingProject)
+  }
+  if (res.status >= 400 && res.status < 500 && res.status !== 401 && res.status !== 403) {
+    const body = (await res.json().catch(() => null)) as { error?: unknown } | null
+    const code = typeof body?.error === 'string' && body.error ? body.error : 'unknown_request_error'
+    throw new WikiRequestError(res.status, code)
+  }
+  throw new WikiClientError('wiki_unavailable', `status ${res.status}`)
+}
+
+/**
  * Read the full node+edge graph for one project. Throws WikiClientError
- * (fail-closed) on missing config, an unreachable/non-2xx upstream, or a
- * malformed response body. A project with zero topics returns an EMPTY graph
- * (nodes: [], edges: []) — that is a valid 200 from the upstream route, not
- * an error; callers render the "No wiki pages yet" empty state for it.
+ * (fail-closed) on missing config or an unreachable/malformed upstream;
+ * WikiRequestError on a well-formed-but-rejected call (e.g. an invalid
+ * project shape this client's own local validation somehow missed). A
+ * project with zero VISIBLE topics returns an EMPTY graph (nodes: [],
+ * edges: []) — that is a valid 200 from the upstream route, not an error;
+ * callers render the "No wiki pages yet" empty state for it.
+ *
+ * `projectKey` MUST be the project's `id` (not its `slug` — see file header).
  */
 export async function getProjectWikiGraph(
   env: Env,
-  projectSlug: string,
+  projectKey: string,
   fetchImpl?: typeof fetch,
 ): Promise<WikiGraph> {
-  if (!isWikiSlug(projectSlug)) throw new WikiClientError('wiki_unavailable')
-  const cfg = await resolveWikiConfig(env, projectSlug)
+  if (!isWikiSlug(projectKey)) throw new WikiClientError('wiki_unavailable')
+  const cfg = await resolveWikiConfig(env)
   if (!cfg) throw new WikiClientError('wiki_unavailable')
 
-  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project: projectSlug })
+  const qs = new URLSearchParams({ tenant_slug: cfg.tenantSlug, project: projectKey })
   const res = await wikiRequest(cfg, `/api/internal/wiki/graph?${qs.toString()}`, { method: 'GET' }, fetchImpl)
-  if (!res.ok) throw new WikiClientError('wiki_unavailable', `status ${res.status}`)
+  if (!res.ok) return throwForErrorResponse(res)
 
   const json = (await res.json().catch(() => null)) as Partial<WikiGraph> | null
   if (!json || !Array.isArray(json.nodes) || !Array.isArray(json.edges)) {
@@ -242,7 +300,7 @@ export async function getProjectWikiGraph(
   }
   return {
     tenant_slug: cfg.tenantSlug,
-    project: projectSlug,
+    project: projectKey,
     nodes: json.nodes as WikiTopic[],
     edges: json.edges as WikiEdge[],
   }
@@ -250,43 +308,38 @@ export async function getProjectWikiGraph(
 
 /**
  * Upsert one topic (+ optional same-project edges) under a project's wiki.
- * Throws WikiClientError (fail-closed) on missing config, an
- * unreachable/non-2xx (including the upstream's own 409/400 validation
- * refusals — a caller that needs to distinguish those should be a rarer,
- * more specific need than this module's contract) upstream, or a malformed
- * response body. A 409 (slug owned by another project, a pre-existing
- * keychain-gated topic, or a write-conflict race) throws the more specific
- * WikiConflictError instead — see its doc comment — so a caller can render
- * an actionable message rather than a generic failure. An edge naming an
- * unpublished target is refused with a 400 (`edge_target_unpublished`) —
- * collapsed to the generic WikiClientError like every other 400 validation
- * refusal on this route, not given its own type (matches the client's
- * blanket policy of not distinguishing per-field 400s).
+ * Throws WikiClientError on missing config or an unreachable/malformed
+ * upstream; WikiConflictError on ANY 409 (slug owned by another project, a
+ * pre-existing keychain-gated topic, a write-conflict race, or any future
+ * conflict code — see WikiConflictError's doc comment); WikiRequestError on
+ * any other 4xx (title out of range, too many edges, an edge naming an
+ * unpublished/nonexistent/cross-project target, …).
  *
- * NO `published` FIELD EXISTS on this route's body (confirmed against
- * mumega.com PR #1278 round 2, head 81839e85,
- * workers/inkwell-api/src/lib/wiki-store.ts's prepareInsertWikiTopic /
- * prepareUpdateWikiTopic): a topic created through this path is always
- * published=1 (hardcoded on INSERT) and UPDATE never touches the column.
- * An earlier revision of this function sent a speculative `published: true`
- * ahead of round 2 landing — removed now that the real schema is confirmed
- * to have no such field.
+ * The body sends ONLY {tenant_slug, project, title, description, topic_type,
+ * tags, edges} — NO `published`, `required_keys`, `content_blocks`, or a
+ * body-level `slug` field, all of which the real route either ignores or
+ * does not accept at all (confirmed against #1278 round 2; the topic slug is
+ * the PATH param, never a body field). An earlier revision of this function
+ * sent a speculative `published: true` ahead of round 2 landing — removed
+ * now that the real schema is confirmed to have no such field at all.
+ *
+ * `projectKey` MUST be the project's `id` (not its `slug` — see file header).
  */
 export async function upsertProjectWikiTopic(
   env: Env,
-  projectSlug: string,
+  projectKey: string,
   topic: WikiTopicUpsertInput,
   fetchImpl?: typeof fetch,
 ): Promise<WikiTopicUpsertResult> {
-  if (!isWikiSlug(projectSlug) || !isWikiSlug(topic.slug)) throw new WikiClientError('wiki_unavailable')
+  if (!isWikiSlug(projectKey) || !isWikiSlug(topic.slug)) throw new WikiClientError('wiki_unavailable')
   if (typeof topic.title !== 'string' || !topic.title.trim()) throw new WikiClientError('wiki_unavailable')
 
-  const cfg = await resolveWikiConfig(env, projectSlug)
+  const cfg = await resolveWikiConfig(env)
   if (!cfg) throw new WikiClientError('wiki_unavailable')
 
   const body = {
     tenant_slug: cfg.tenantSlug,
-    project: projectSlug,
+    project: projectKey,
     title: topic.title,
     description: topic.description ?? '',
     topic_type: topic.topic_type ?? 'general',
@@ -299,21 +352,7 @@ export async function upsertProjectWikiTopic(
     { method: 'PUT', body: JSON.stringify(body) },
     fetchImpl,
   )
-
-  if (res.status === 409) {
-    const conflictJson = (await res.json().catch(() => null)) as { error?: unknown; existing_project?: unknown } | null
-    const code = conflictJson?.error
-    if (isKnownConflictCode(code)) {
-      throw new WikiConflictError(
-        code,
-        typeof conflictJson?.existing_project === 'string' ? conflictJson.existing_project : undefined,
-      )
-    }
-    // An unrecognized 409 shape — fail closed to the generic error rather
-    // than guessing at a conflict code we don't understand.
-    throw new WikiClientError('wiki_unavailable', 'status 409')
-  }
-  if (!res.ok) throw new WikiClientError('wiki_unavailable', `status ${res.status}`)
+  if (!res.ok) return throwForErrorResponse(res)
 
   const json = (await res.json().catch(() => null)) as Partial<WikiTopicUpsertResult> | null
   if (!json || typeof json.id !== 'string' || typeof json.created !== 'boolean') {

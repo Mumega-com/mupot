@@ -1,9 +1,11 @@
 // tests/wiki-client.test.ts — src/projects/wiki-client.ts against a FAKE
 // double of mumega.com PR #1278's internal wiki service path
 // (tests/helpers/fake-internal-wiki.ts, confirmed against round 2, head
-// 81839e85). The fake enforces the same refusals the real route does — this
-// suite asserts wiki-client.ts maps each of those refusals to the right
-// typed outcome, never leaking the bearer or the raw upstream body.
+// 81839e85, plus an announced successor contract — see
+// SERVICE_WRITE_KEY/fake-internal-wiki.ts). The fake enforces the same
+// refusals the real route does — this suite asserts wiki-client.ts maps
+// each of those refusals to the right typed outcome, never leaking the
+// bearer or the raw upstream body.
 //
 // Schema: real D1 (node:sqlite via createSqliteD1) + applyAllMigrations() —
 // this file imports production code (src/projects/wiki-client.ts), so per
@@ -20,8 +22,9 @@ import {
   upsertProjectWikiTopic,
   WikiClientError,
   WikiConflictError,
+  WikiRequestError,
 } from '../src/projects/wiki-client'
-import { FakeInternalWiki } from './helpers/fake-internal-wiki'
+import { FakeInternalWiki, SERVICE_WRITE_KEY } from './helpers/fake-internal-wiki'
 
 const MASTER_KEY = '22'.repeat(32)
 const TENANT = 'mumega'
@@ -38,8 +41,10 @@ function makeHarness(): SqliteD1Harness {
  * A pot-wide 'inkwell' connector row, seeded via a real INSERT against the
  * full migration chain's `connectors` table — matches resolveConnector's
  * exact query shape (tenant=?1, type=?2, scope_id=?3, scope_type IN
- * ('agent','squad','pot')); a project slug is neither an agent id nor a
- * squad id, so every lookup here falls into the pot-wide row.
+ * ('agent','squad','pot')). wiki-client.ts resolves this EXPLICITLY pot-wide
+ * (resolveConnector(env, 'pot', 'inkwell') — see P3 in the file header), so
+ * this row's scope_type='pot'/scope_id=NULL is matched unconditionally
+ * regardless of what literal string the caller passes as scope_id.
  */
 async function makeEnv(harness: SqliteD1Harness, overrides: Partial<Env> = {}): Promise<Env> {
   const encrypted = await encryptConnectorSecret(MASTER_KEY, CONNECTOR_ID, 'inkwell', SECRET)
@@ -125,6 +130,27 @@ describe('getProjectWikiGraph', () => {
     expect(graph.edges).toEqual([]) // and the edge naming it is dropped too
   })
 
+  it('P0: a service-written topic carries the reserved required_keys marker and stays visible via the service GET', async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await makeEnv(makeHarness())
+    await upsertProjectWikiTopic(env, 'stemminds', { slug: 'card', title: 'Card' }, fake.fetch.bind(fake))
+    const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
+    expect(graph.nodes).toHaveLength(1)
+    // The reserved marker is what hides this topic from Inkwell's PUBLIC
+    // reads (a real end-user's keychain never holds it) while the internal
+    // service channel — this client — still sees it.
+    expect(graph.nodes[0].required_keys).toEqual([SERVICE_WRITE_KEY])
+  })
+
+  it('P0: this client only ever calls /api/internal/wiki/* — never a public wiki.ts route', async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await makeEnv(makeHarness())
+    await upsertProjectWikiTopic(env, 'stemminds', { slug: 'card', title: 'Card' }, fake.fetch.bind(fake))
+    await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
+    expect(fake.requests.length).toBeGreaterThan(0)
+    expect(fake.requests.every((r) => r.path.startsWith('/api/internal/wiki/'))).toBe(true)
+  })
+
   it('wrong bearer -> WikiClientError, never leaks the secret or the upstream body', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: 'a-completely-different-secret' })
     const env = await makeEnv(makeHarness())
@@ -146,6 +172,12 @@ describe('getProjectWikiGraph', () => {
     await expect(getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))).rejects.toBeInstanceOf(WikiClientError)
   })
 
+  it('a raw 403 (auth-adjacent) also collapses to WikiClientError, not WikiRequestError', async () => {
+    const raw403 = (async () => new Response(JSON.stringify({ error: 'forbidden' }), { status: 403 })) as unknown as typeof fetch
+    const env = await makeEnv(makeHarness())
+    await expect(getProjectWikiGraph(env, 'stemminds', raw403)).rejects.toBeInstanceOf(WikiClientError)
+  })
+
   it('no INKWELL_API_URL configured on this pot -> WikiClientError (fail-closed, not a crash)', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     const env = await makeEnv(makeHarness(), { INKWELL_API_URL: undefined })
@@ -157,6 +189,17 @@ describe('getProjectWikiGraph', () => {
     const env = await makeEnv(makeHarness())
     await expect(getProjectWikiGraph(env, 'NOT A SLUG!', fake.fetch.bind(fake))).rejects.toBeInstanceOf(WikiClientError)
     expect(fake.requests).toEqual([])
+  })
+
+  it('P2: the fake itself refuses a request missing tenant_slug entirely with 400, not 401', async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const res = await fake.fetch(
+      new Request('https://inkwell-api.test/api/internal/wiki/graph?project=stemminds', {
+        headers: { authorization: `Bearer ${SECRET}` },
+      }),
+    )
+    expect(res.status).toBe(400)
+    expect((await res.json()) as { error: string }).toMatchObject({ error: 'tenant_slug required' })
   })
 })
 
@@ -177,6 +220,16 @@ describe('upsertProjectWikiTopic', () => {
     expect(graph.nodes.map((n) => n.slug)).toEqual(['project-card'])
   })
 
+  it('idempotent update of a service-written topic succeeds — the service marker never trips topic_is_keychain_gated', async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await makeEnv(makeHarness())
+    const first = await upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'V1' }, fake.fetch.bind(fake))
+    expect(first.created).toBe(true)
+    const second = await upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'V2' }, fake.fetch.bind(fake))
+    expect(second.created).toBe(false)
+    expect(second.id).toBe(first.id)
+  })
+
   it('a slug owned by a DIFFERENT project -> WikiConflictError(topic_owned_by_other_project)', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     fake.seed({ tenantSlug: TENANT, project: 'other-project', slug: 'project-card', title: 'Other Card' })
@@ -192,7 +245,7 @@ describe('upsertProjectWikiTopic', () => {
     expect((caught as WikiConflictError).existingProject).toBe('other-project')
   })
 
-  it('a pre-existing keychain-gated topic -> WikiConflictError(topic_is_keychain_gated), never silently stripped', async () => {
+  it('a pre-existing REAL keychain-gated topic -> WikiConflictError(topic_is_keychain_gated), never silently stripped', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     fake.seed({ tenantSlug: TENANT, project: 'stemminds', slug: 'project-card', title: 'Gated', requiredKeys: ['x'] })
     const env = await makeEnv(makeHarness())
@@ -201,22 +254,37 @@ describe('upsertProjectWikiTopic', () => {
     ).rejects.toMatchObject({ code: 'topic_is_keychain_gated' })
   })
 
-  it('round-2 P1-2: an edge to an UNPUBLISHED target is refused (400), and the topic write does not go through', async () => {
+  it('an edge to an UNPUBLISHED target is refused (400) -> WikiRequestError, and the topic write does not go through', async () => {
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
     fake.seed({ tenantSlug: TENANT, project: 'stemminds', slug: 'draft-target', title: 'Draft', published: false })
     const env = await makeEnv(makeHarness())
-    await expect(
-      upsertProjectWikiTopic(
+    let caught: unknown
+    try {
+      await upsertProjectWikiTopic(
         env,
         'stemminds',
         { slug: 'new-topic', title: 'New Topic', edges: [{ to_slug: 'draft-target' }] },
         fake.fetch.bind(fake),
-      ),
-    ).rejects.toBeInstanceOf(WikiClientError)
+      )
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(WikiRequestError)
+    expect((caught as WikiRequestError).status).toBe(400)
+    expect((caught as WikiRequestError).code).toBe('edge_target_unpublished')
 
     // The all-or-nothing write never created new-topic at all.
     const graph = await getProjectWikiGraph(env, 'stemminds', fake.fetch.bind(fake))
     expect(graph.nodes.map((n) => n.slug)).toEqual([])
+  })
+
+  it('more than 50 edges in one write -> WikiRequestError(too_many_edges)', async () => {
+    const fake = new FakeInternalWiki({ [TENANT]: SECRET })
+    const env = await makeEnv(makeHarness())
+    const edges = Array.from({ length: 51 }, (_, i) => ({ to_slug: `target-${i}` }))
+    await expect(
+      upsertProjectWikiTopic(env, 'stemminds', { slug: 'many-edges', title: 'Many Edges', edges }, fake.fetch.bind(fake)),
+    ).rejects.toBeInstanceOf(WikiRequestError)
   })
 
   it('round-2 P2-5: a raw 409 topic_write_conflict (TOCTOU race) maps to WikiConflictError with no existingProject', async () => {
@@ -236,12 +304,44 @@ describe('upsertProjectWikiTopic', () => {
     expect((caught as WikiConflictError).existingProject).toBeUndefined()
   })
 
-  it('an unrecognized 409 body shape fails closed to WikiClientError, never guesses a conflict code', async () => {
+  it('ANY 409 is a typed conflict, even an unrecognized future code (error names have already been renamed once upstream)', async () => {
     const raw409 = (async () => new Response(JSON.stringify({ error: 'some_future_code_we_do_not_know' }), { status: 409 })) as unknown as typeof fetch
     const env = await makeEnv(makeHarness())
-    await expect(
-      upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'Stemminds' }, raw409),
-    ).rejects.toBeInstanceOf(WikiClientError)
+    let caught: unknown
+    try {
+      await upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'Stemminds' }, raw409)
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(WikiConflictError)
+    expect((caught as WikiConflictError).code).toBe('some_future_code_we_do_not_know')
+  })
+
+  it('a 409 with a malformed/missing body still becomes a typed conflict, not WikiClientError', async () => {
+    const raw409 = (async () => new Response('not json', { status: 409 })) as unknown as typeof fetch
+    const env = await makeEnv(makeHarness())
+    let caught: unknown
+    try {
+      await upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'Stemminds' }, raw409)
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(WikiConflictError)
+    expect((caught as WikiConflictError).code).toBe('unknown_conflict')
+  })
+
+  it('ANY other 4xx is a typed WikiRequestError carrying whatever code the upstream returned', async () => {
+    const raw400 = (async () => new Response(JSON.stringify({ error: 'some_new_validation_code' }), { status: 400 })) as unknown as typeof fetch
+    const env = await makeEnv(makeHarness())
+    let caught: unknown
+    try {
+      await upsertProjectWikiTopic(env, 'stemminds', { slug: 'project-card', title: 'Stemminds' }, raw400)
+    } catch (e) {
+      caught = e
+    }
+    expect(caught).toBeInstanceOf(WikiRequestError)
+    expect((caught as WikiRequestError).status).toBe(400)
+    expect((caught as WikiRequestError).code).toBe('some_new_validation_code')
   })
 
   it('wrong bearer on write -> WikiClientError, and nothing is written', async () => {

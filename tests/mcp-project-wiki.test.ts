@@ -31,9 +31,9 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO squads (id, department_id, slug, name) VALUES
       ('${SQUAD_ID}', 'dept-a', 'squad-a', 'Squad A'),
       ('${OTHER_SQUAD_ID}', 'dept-a', 'squad-b', 'Squad B');
-    INSERT INTO projects (id, slug, name, status) VALUES ('project-a', 'project-a', 'Project A', 'active');
+    INSERT INTO projects (id, slug, name, status) VALUES ('proj-a-id', 'project-a-slug', 'Project A', 'active');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
-      ('project-a', '${SQUAD_ID}', 'write');
+      ('proj-a-id', '${SQUAD_ID}', 'write');
   `)
   return harness
 }
@@ -77,27 +77,27 @@ describe('MCP project_wiki', () => {
   it('a reader with project access gets the wiki graph', async () => {
     harness = makeHarness()
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
-    fake.seed({ tenantSlug: TENANT, project: 'project-a', slug: 'overview', title: 'Overview' })
+    fake.seed({ tenantSlug: TENANT, project: 'proj-a-id', slug: 'overview', title: 'Overview' })
     const env = await envFor(harness, fake)
 
-    const outcome = await invokeTool(auth(), env, 'project_wiki', { project_id: 'project-a' }, 'https://pot.example')
+    const outcome = await invokeTool(auth(), env, 'project_wiki', { project_id: 'proj-a-id' }, 'https://pot.example')
     expect(outcome.ok).toBe(true)
     const result = outcome.result as { project_id: string; wiki: { nodes: { slug: string }[] } }
-    expect(result.project_id).toBe('project-a')
+    expect(result.project_id).toBe('proj-a-id')
     expect(result.wiki.nodes.map((n) => n.slug)).toEqual(['overview'])
   })
 
   it('denies a caller with NO read access to the project — and the upstream wiki service is NEVER called', async () => {
     harness = makeHarness()
     const fake = new FakeInternalWiki({ [TENANT]: SECRET })
-    fake.seed({ tenantSlug: TENANT, project: 'project-a', slug: 'overview', title: 'Overview' })
+    fake.seed({ tenantSlug: TENANT, project: 'proj-a-id', slug: 'overview', title: 'Overview' })
     const env = await envFor(harness, fake)
 
     // Member of squad-b only — squad-b has no project_squad_access row on project-a.
     const outsider = auth({
       capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: OTHER_SQUAD_ID, capability: 'observer' }],
     })
-    const outcome = await invokeTool(outsider, env, 'project_wiki', { project_id: 'project-a' }, 'https://pot.example')
+    const outcome = await invokeTool(outsider, env, 'project_wiki', { project_id: 'proj-a-id' }, 'https://pot.example')
     expect(outcome.ok).toBe(false)
     expect((outcome as { status: number }).status).toBe(404)
     expect(fake.requests).toEqual([]) // deny-without-upstream-call invariant
@@ -109,7 +109,7 @@ describe('MCP project_wiki', () => {
     const env = await envFor(harness, fake)
 
     const grantless = auth({ capabilities: [] })
-    const outcome = await invokeTool(grantless, env, 'project_wiki', { project_id: 'project-a' }, 'https://pot.example')
+    const outcome = await invokeTool(grantless, env, 'project_wiki', { project_id: 'proj-a-id' }, 'https://pot.example')
     expect(outcome.ok).toBe(false)
     expect((outcome as { status: number }).status).toBe(403)
     expect(fake.requests).toEqual([])
@@ -129,7 +129,7 @@ describe('MCP project_wiki', () => {
     harness = makeHarness()
     const env = await envFor(harness, new FakeInternalWiki({ [TENANT]: 'wrong-secret' }))
 
-    const outcome = await invokeTool(auth(), env, 'project_wiki', { project_id: 'project-a' }, 'https://pot.example')
+    const outcome = await invokeTool(auth(), env, 'project_wiki', { project_id: 'proj-a-id' }, 'https://pot.example')
     expect(outcome.ok).toBe(false)
     expect((outcome as { status: number }).status).toBe(503)
   })

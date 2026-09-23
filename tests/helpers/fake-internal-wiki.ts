@@ -1,38 +1,73 @@
 // tests/helpers/fake-internal-wiki.ts — an in-memory double for
 // workers/inkwell-api/src/routes/internal-wiki.ts (mumega.com PR #1278,
-// confirmed against round 2, head 81839e85), used to test
+// confirmed against round 2, head 81839e85, plus an announced-but-unmerged
+// successor contract — see SERVICE_WRITE_KEY below), used to test
 // src/projects/wiki-client.ts without a real Inkwell worker.
 //
 // DOUBLE DISCIPLINE (a double that accepts everything is a finding, not a
 // test): this fake REFUSES exactly what the real route refuses —
-//   - wrong/absent Bearer -> 401 { error: 'unauthorized' }
-//   - missing tenant_slug (no secret configured for it) -> 401 (mirrors
-//     authorizeTenant's fail-closed: an unrecognized tenant is indistinguishable
-//     from a wrong bearer, by design — never leak which tenants exist)
+//   - absent Bearer -> 401 { error: 'unauthorized' }
+//   - missing tenant_slug entirely -> 400 { error: 'tenant_slug required' }
+//     (distinct from a WRONG bearer/tenant, which is 401 — mirrors
+//     authorizeTenant's own two-step: presence is validated before the
+//     secret comparison ever runs)
+//   - a tenant_slug asserted but not owned by this bearer, or no configured
+//     secret for it at all -> 401 { error: 'unauthorized' } (never reveals
+//     whether the tenant exists)
 //   - missing project -> 400 { error: 'project required' }
+//   - title outside [2, 120] chars (after trim) -> 400 title_required /
+//     title_too_short
+//   - more than 50 edges in one write -> 400 { error: 'too_many_edges' }
 //   - reads are STRICTLY scoped to (tenant, project) — a topic under a
 //     different project never appears in that project's graph/get (404)
-//   - round-2 contract: reads ALSO require required_keys=[] AND published=1
-//     (via the SAME isTopicVisible(row, emptyKeySet) predicate the real
-//     route reuses) — a gated or unpublished topic is 404 on GET
-//     /topics/:slug and ABSENT from GET /graph (both nodes and any edge
-//     touching it)
+//   - round-2 contract: reads ALSO require published=1 AND (required_keys=[]
+//     OR required_keys is EXACTLY the service marker — see
+//     SERVICE_WRITE_KEY) — a topic gated by any OTHER key, or unpublished,
+//     is 404 on GET /topics/:slug and ABSENT from GET /graph (both nodes and
+//     any edge touching it)
 //   - PUT to a slug already owned by a different project -> 409
 //     topic_owned_by_other_project (+ existing_project)
-//   - PUT to a slug that is pre-existing AND keychain-gated -> 409
-//     topic_is_keychain_gated (this fake never lets a PUT itself create a
-//     gated topic — required_keys is always forced to [] on write, exactly
-//     like the real route; a gated row can only get into the store via
-//     `seed()`, standing in for the admin-only wiki.ts path)
+//   - PUT to a slug that is pre-existing AND gated by a REAL (non-service)
+//     key -> 409 topic_is_keychain_gated (this fake never lets a PUT create
+//     or preserve a real gate — required_keys is always forced to the
+//     service marker on write, exactly mirroring the real route's "this path
+//     cannot create keychain-gated content"; a REAL gated row can only enter
+//     the store via `seed()`, standing in for the admin-only wiki.ts path)
+//   - UPDATE does NOT reset `published` — only CREATE forces published=1;
+//     an existing row's published flag survives an update untouched (round-2
+//     parity: the real route's UPDATE statement never SETs published)
 //   - PUT with an edge naming a to_slug in a different project or that does
 //     not exist -> 400 cross_project_edge_refused
-//   - round-2 P1-2: PUT with an edge naming an UNPUBLISHED to_slug -> 400
+//   - PUT with an edge naming an UNPUBLISHED to_slug -> 400
 //     edge_target_unpublished — validated, like every edge, BEFORE any write
 //     (all-or-nothing; the topic itself is left untouched on refusal)
-//   - round-2 P2-5's `topic_write_conflict` (409, a TOCTOU race) is a
-//     concurrency outcome this single-threaded fake cannot naturally
-//     reproduce — wiki-client.test.ts exercises that mapping with a raw
-//     fetchImpl instead of through this double
+//   - `topic_write_conflict` (409, a TOCTOU race) is a concurrency outcome
+//     this single-threaded fake cannot naturally reproduce —
+//     wiki-client.test.ts exercises that mapping with a raw fetchImpl
+//     instead of through this double
+//
+// ONLY /api/internal/wiki/* paths are handled — anything else (e.g. a public
+// routes/wiki.ts path) 404s uniformly, same as a route this fake does not
+// implement. wiki-client.ts never constructs any other path (see
+// tests/wiki-client.test.ts's "only calls /api/internal/wiki/*" test).
+
+/**
+ * P0 (adversarial gate, 2026-09-23): an ANNOUNCED-but-not-yet-merged
+ * successor to #1278 will force `required_keys = ['mupot:project']` (this
+ * exact reserved marker) on every service-path write, specifically so
+ * Inkwell's PUBLIC routes (routes/wiki.ts, keyed on a real end-user's
+ * keychain) hide service-written topics — a random site visitor holds no
+ * 'mupot:project' key, so isTopicVisible() returns false for them. The
+ * INTERNAL service GET path is expected to keep showing these topics
+ * (mupot is the one and only reader of this channel, and it should see what
+ * it itself wrote) by treating this ONE reserved key as service-visible,
+ * the same way an always-empty required_keys is visible today. This fake
+ * models that: writes always leave `required_keys = [SERVICE_WRITE_KEY]`,
+ * reads treat that exact array as visible, and the 409 "already gated"
+ * conflict check only fires for a REAL (non-service) key so a service topic
+ * can still be updated idempotently by a later service PUT.
+ */
+export const SERVICE_WRITE_KEY = 'mupot:project'
 
 export interface FakeWikiTopicSeed {
   tenantSlug: string
@@ -69,6 +104,10 @@ interface StoredEdge {
   weight: number
 }
 
+function isServiceOnlyGate(requiredKeys: string[]): boolean {
+  return requiredKeys.length === 0 || (requiredKeys.length === 1 && requiredKeys[0] === SERVICE_WRITE_KEY)
+}
+
 let idCounter = 0
 
 export class FakeInternalWiki {
@@ -82,7 +121,7 @@ export class FakeInternalWiki {
     this.secretsByTenant = new Map(Object.entries(secretsByTenant))
   }
 
-  /** Stand-in for the admin-only wiki.ts create path — the ONLY way a gated topic enters the store. */
+  /** Stand-in for the admin-only wiki.ts create path — the ONLY way a REAL (non-service) gated topic enters the store. */
   seed(seed: FakeWikiTopicSeed): void {
     this.topics.push({
       id: `seed-${idCounter++}`,
@@ -104,10 +143,10 @@ export class FakeInternalWiki {
     return this.topics.find((t) => t.tenant_id === tenantId && t.slug === slug)
   }
 
-  /** Round-2 read visibility: keyless AND published only. */
+  /** Service-path read visibility: published, AND (keyless OR service-marker-only). */
   private readableByTenantSlug(tenantId: string, slug: string): StoredTopic | undefined {
     const row = this.findByTenantSlug(tenantId, slug)
-    if (!row || row.required_keys.length > 0 || !row.published) return undefined
+    if (!row || !row.published || !isServiceOnlyGate(row.required_keys)) return undefined
     return row
   }
 
@@ -128,19 +167,28 @@ export class FakeInternalWiki {
     }
   }
 
-  private authorize(req: Request): { ok: true; tenantSlug: string } | { ok: false; res: Response } {
+  /**
+   * authorizeTenant() parity: presence of tenant_slug is checked BEFORE the
+   * bearer is compared against anything — a caller that sends no tenant_slug
+   * at all gets 400, never 401, even with a perfectly valid bearer for some
+   * OTHER tenant.
+   */
+  private authorize(
+    req: Request,
+    tenantSlugRaw: string | null,
+  ): { ok: true; tenantSlug: string } | { ok: false; res: Response } {
+    if (!tenantSlugRaw || !tenantSlugRaw.trim()) {
+      return { ok: false, res: Response.json({ error: 'tenant_slug required' }, { status: 400 }) }
+    }
+    const tenantSlug = tenantSlugRaw.trim()
+
     const auth = req.headers.get('authorization')
     const bearer = auth?.startsWith('Bearer ') ? auth.slice(7).trim() : null
-    if (!bearer) {
+    const expected = this.secretsByTenant.get(tenantSlug)
+    if (!bearer || !expected || bearer !== expected) {
       return { ok: false, res: Response.json({ error: 'unauthorized' }, { status: 401 }) }
     }
-    // Find a tenant whose configured secret matches this bearer. A caller
-    // asserting a tenant_slug the bearer does NOT own must 401, same as a
-    // wrong bearer entirely (never confirm/deny tenant existence).
-    for (const [tenant, secret] of this.secretsByTenant) {
-      if (secret === bearer) return { ok: true, tenantSlug: tenant }
-    }
-    return { ok: false, res: Response.json({ error: 'unauthorized' }, { status: 401 }) }
+    return { ok: true, tenantSlug }
   }
 
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -148,24 +196,28 @@ export class FakeInternalWiki {
     const url = new URL(req.url)
     this.requests.push({ method: req.method, path: url.pathname })
 
-    const auth = this.authorize(req)
+    if (!url.pathname.startsWith('/api/internal/wiki/')) {
+      return Response.json({ error: 'not_found' }, { status: 404 })
+    }
+
+    let putBody: Record<string, unknown> | null = null
+    if (req.method === 'PUT') {
+      putBody = (await req.json().catch(() => null)) as Record<string, unknown> | null
+      if (!putBody) return Response.json({ error: 'invalid_json' }, { status: 400 })
+    }
+    const tenantSlugRaw =
+      (typeof putBody?.tenant_slug === 'string' ? putBody.tenant_slug : null) ?? url.searchParams.get('tenant_slug')
+
+    const auth = this.authorize(req, tenantSlugRaw)
     if (!auth.ok) return auth.res
     const tenantSlug = auth.tenantSlug
-
-    // Cross-tenant assertion check: if the caller ALSO named a tenant_slug
-    // (query or body) that differs from the one the bearer actually owns,
-    // refuse — mirrors authorizeTenant's BLOCK-1 parity check.
-    const assertedTenant =
-      url.searchParams.get('tenant_slug') ??
-      (req.method === 'PUT' ? ((await req.clone().json().catch(() => null)) as Record<string, unknown> | null)?.tenant_slug : null)
-    if (typeof assertedTenant === 'string' && assertedTenant && assertedTenant !== tenantSlug) {
-      return Response.json({ error: 'unauthorized' }, { status: 401 })
-    }
 
     if (req.method === 'GET' && url.pathname === '/api/internal/wiki/graph') {
       const project = url.searchParams.get('project')
       if (!project) return Response.json({ error: 'project required' }, { status: 400 })
-      const nodes = this.topics.filter((t) => t.tenant_id === tenantSlug && t.project === project && t.required_keys.length === 0 && t.published)
+      const nodes = this.topics.filter(
+        (t) => t.tenant_id === tenantSlug && t.project === project && t.published && isServiceOnlyGate(t.required_keys),
+      )
       const visibleSlugs = new Set(nodes.map((n) => n.slug))
       const edges = this.edges.filter(
         (e) => e.tenant_id === tenantSlug && visibleSlugs.has(e.from_slug) && visibleSlugs.has(e.to_slug),
@@ -190,17 +242,24 @@ export class FakeInternalWiki {
 
     if (req.method === 'PUT' && topicMatch) {
       const slug = decodeURIComponent(topicMatch[1])
-      const body = (await req.json().catch(() => null)) as Record<string, unknown> | null
-      if (!body) return Response.json({ error: 'invalid_json' }, { status: 400 })
+      const body = putBody as Record<string, unknown>
       const project = typeof body.project === 'string' ? body.project : null
       if (!project) return Response.json({ error: 'project required' }, { status: 400 })
-      if (typeof body.title !== 'string' || !body.title.trim()) return Response.json({ error: 'title required' }, { status: 400 })
+
+      const titleRaw = typeof body.title === 'string' ? body.title.trim() : ''
+      if (!titleRaw) return Response.json({ error: 'title required' }, { status: 400 })
+      if (titleRaw.length < 2) return Response.json({ error: 'title too short' }, { status: 400 })
+      const title = titleRaw.slice(0, 120)
 
       const existing = this.findByTenantSlug(tenantSlug, slug)
       if (existing && existing.project !== project) {
         return Response.json({ error: 'topic_owned_by_other_project', existing_project: existing.project }, { status: 409 })
       }
-      if (existing && existing.required_keys.length > 0) {
+      // Only a REAL (non-service) gate refuses the write — a topic this
+      // service path itself previously wrote (required_keys ===
+      // [SERVICE_WRITE_KEY]) can be updated by a later service PUT, exactly
+      // like an ungated topic could (P0 idempotency requirement).
+      if (existing && !isServiceOnlyGate(existing.required_keys)) {
         return Response.json({ error: 'topic_is_keychain_gated' }, { status: 409 })
       }
       // Round-2 P2-5 parity: the TOCTOU race window (a concurrent write
@@ -209,12 +268,16 @@ export class FakeInternalWiki {
       // exercise `topic_write_conflict` mapping does so with a raw
       // fetchImpl, not through this double (see wiki-client.test.ts).
 
-      // ── Validate ALL edges BEFORE any write — all-or-nothing (round-2
-      //    invariant #6), same order the real route checks: existence +
-      //    same-project first, THEN published. ─────────────────────────────
+      const edgesInput = Array.isArray(body.edges) ? body.edges : []
+      if (edgesInput.length > 50) {
+        return Response.json({ error: 'too_many_edges', max: 50 }, { status: 400 })
+      }
+
+      // ── Validate ALL edges BEFORE any write — all-or-nothing, same order
+      //    the real route checks: existence + same-project first, THEN
+      //    published. ──────────────────────────────────────────────────────
       type PendingEdge = { toSlug: string; relationType: string; weight: number }
       const pendingEdges: PendingEdge[] = []
-      const edgesInput = Array.isArray(body.edges) ? body.edges : []
       for (const raw of edgesInput) {
         if (!raw || typeof raw !== 'object') return Response.json({ error: 'invalid_edge' }, { status: 400 })
         const e = raw as Record<string, unknown>
@@ -224,8 +287,8 @@ export class FakeInternalWiki {
         if (!target || target.project !== project) {
           return Response.json({ error: 'cross_project_edge_refused', to_slug: toSlug }, { status: 400 })
         }
-        // Round-2 P1-2: an edge to an unpublished (draft) target is refused
-        // — an edge is itself a read-side signal the target exists.
+        // An edge to an unpublished (draft) target is refused — an edge is
+        // itself a read-side signal the target exists.
         if (!target.published) {
           return Response.json({ error: 'edge_target_unpublished', to_slug: toSlug }, { status: 400 })
         }
@@ -243,12 +306,14 @@ export class FakeInternalWiki {
         tenant_id: tenantSlug,
         project,
         slug,
-        title: body.title,
-        description: typeof body.description === 'string' ? body.description : '',
+        title,
+        description: typeof body.description === 'string' ? body.description.replace(/\s+/g, ' ').trim().slice(0, 500) : '',
         topic_type: typeof body.topic_type === 'string' ? body.topic_type : 'general',
-        required_keys: [], // ALWAYS forced to [] on write, exactly like the real route
+        required_keys: [SERVICE_WRITE_KEY], // ALWAYS forced to the service marker on write
         tags: Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === 'string') : [],
-        published: true, // this write path always produces a published=1 topic (no `published` body field exists)
+        // CREATE forces published=1; UPDATE never touches it (round-2 parity —
+        // "update does NOT force published").
+        published: existing ? existing.published : true,
         created_at: existing?.created_at ?? now,
         updated_at: now,
       }

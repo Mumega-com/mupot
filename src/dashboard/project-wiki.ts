@@ -4,22 +4,31 @@
 //
 // SCOPE DISCIPLINE (mirrors account.ts's module header): mupot is the
 // PERMISSION AUTHORITY, Inkwell stays the STORE. Every load here runs
-// mupot's OWN project-read check FIRST (getReadableProject — the exact same
-// predicate src/dashboard/index.ts's GET /projects/:id uses via
-// loadProjectDetail) and ONLY THEN calls out to Inkwell's internal wiki
-// service path (src/projects/wiki-client.ts, mumega.com PR #1278). A caller
-// who fails the mupot read check never triggers an upstream call at all —
-// there is nothing to "leak via timing" or "leak via error shape" because no
-// request is made.
+// mupot's OWN project-read check FIRST (getReadableProject — routes through
+// dashboard/projects.ts's readableProjectWithAccess, the SAME predicate
+// loadProjectDetail's GET /projects/:id uses — one chokepoint, not a copy)
+// and ONLY THEN calls out to Inkwell's internal wiki service path
+// (src/projects/wiki-client.ts, mumega.com PR #1278). A caller who fails the
+// mupot read check never triggers an upstream call at all — there is
+// nothing to "leak via timing" or "leak via error shape" because no request
+// is made.
+//
+// PROJECT KEY: every call into wiki-client.ts passes `project.id`, never
+// `project.slug` — see wiki-client.ts's file header for why (slug is
+// mutable/reclaimable, id is not).
 //
 // XSS discipline: every topic title/description is interpolated through
-// hono/html's auto-escaping `html` tagged template, NEVER `raw()`. A topic
-// body containing `<script>` renders as inert escaped text.
+// hono/html's auto-escaping `html` tagged template, NEVER `raw()`. The two
+// places that DO use `raw()` (a topic slug used inside an `id="..."` /
+// `href="#..."` attribute) go through escapeAttr() first — hardened to
+// escape `&"'<>` (not just `&"`), and covered by its own attribute-injection
+// test/mutation, since a slug rendered here is upstream-sourced data this
+// module does not re-validate against Inkwell's own slug shape.
 import { html, raw } from 'hono/html'
-import type { Env, Project } from '../types'
+import type { AuthContext, Env, Project } from '../types'
 import type { Html } from './ui'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
-import { projectTabs } from './projects'
+import { loadReadableSquads, projectAccess, projectTabs } from './projects'
 import {
   getProjectWikiGraph,
   upsertProjectWikiTopic,
@@ -30,7 +39,20 @@ import {
   type WikiTopicUpsertResult,
 } from '../projects/wiki-client'
 
-export const PROJECT_CARD_TOPIC_SLUG = 'project-card'
+/**
+ * P1-1: Inkwell's wiki_topics.slug is UNIQUE PER TENANT, not per (tenant,
+ * project) — a fixed 'project-card' slug would collide the instant a SECOND
+ * project in this tenant tried to create its own card (the first write would
+ * permanently own the slug; every other project's write would 409
+ * topic_owned_by_other_project forever). Keying the slug on the project's
+ * own id makes it unique by construction. `project.id` is a
+ * `crypto.randomUUID()` (lowercase hex + hyphens), so
+ * `project-card-<36 chars>` is 49 chars — safely under wiki-client.ts's
+ * 63-char cap (see tests/dashboard-project-wiki.test.ts's length assertion).
+ */
+export function projectCardTopicSlug(projectId: string): string {
+  return `project-card-${projectId}`
+}
 
 export interface ProjectWikiSquadSummary {
   name: string
@@ -57,7 +79,7 @@ export async function loadProjectWikiView(
   canManage: boolean,
 ): Promise<ProjectWikiView> {
   try {
-    const graph = await getProjectWikiGraph(env, project.slug)
+    const graph = await getProjectWikiGraph(env, project.id)
     return { project, canManage, graph }
   } catch (e) {
     if (e instanceof WikiClientError) return { project, canManage, graph: null }
@@ -65,61 +87,98 @@ export async function loadProjectWikiView(
   }
 }
 
+const MAX_DESCRIPTION = 500
+
 /**
- * Build the `project-card` topic from the project's OWN fields only — no
- * free-text from any request body. This is the one write this surface
+ * Build the `project-card-<id>` topic from the project's OWN fields only —
+ * no free-text from any request body. This is the one write this surface
  * performs; it is a deterministic projection of columns the caller already
  * has read (or manage) access to, never attacker-suppliable content.
  *
- * SCHEMA NOTE / assumption made against PR #1278: the internal-wiki PUT route
- * accepts title/description/topic_type/tags/edges — there is no structured
- * `content_blocks` write path on this surface (wiki_topics.content_blocks is
- * always stored as `[]` by insertWikiTopicRow and left untouched by
- * updateWikiTopicRow). So goal/live_url/repo_url/status/squads are folded
- * into the plain-text `description` field (server-side truncated to 500
- * chars by internal-wiki.ts's cleanText) rather than given individual
- * structured slots. If a future revision of the store adds a structured
- * card shape, this is the one function that needs to change.
+ * SCHEMA NOTE confirmed against PR #1278 round 2: the internal-wiki PUT
+ * route's own `cleanText` COLLAPSES ALL WHITESPACE (including newlines) to
+ * single spaces before truncating at 500 chars — a multi-line `\n`-joined
+ * description would be silently flattened server-side into one run-on line
+ * regardless of what this function sends. So this builds a genuinely
+ * SINGLE-LINE description itself (structured meta first, joined with " · ",
+ * then the project's own free-text description), and puts the project's
+ * status/squads into TAGS as well (structured, not prose) rather than
+ * relying on newlines for structure. The description budget is reserved for
+ * the short structured meta FIRST — the free-text project.description is
+ * what gets trimmed if the combined length would exceed 500, never the
+ * other way around (status/goal/links must never be the part silently cut).
+ *
+ * There is no structured `content_blocks` write path on this surface
+ * (wiki_topics.content_blocks is always stored as `[]` by the create path
+ * and left untouched by update) — if a future revision of the store adds
+ * one, this is the one function that needs to change.
  */
 export function buildProjectCardTopic(
   project: Project,
   squads: ProjectWikiSquadSummary[],
 ): WikiTopicUpsertInput {
-  const lines: string[] = []
-  if (project.goal) lines.push(`Goal: ${project.goal}`)
-  lines.push(`Status: ${project.status}`)
-  if (project.live_url) lines.push(`Live: ${project.live_url}`)
-  if (project.repo_url) lines.push(`Repo: ${project.repo_url}`)
-  if (squads.length > 0) {
-    lines.push(`Squads: ${squads.map((s) => `${s.name} (${s.access_level})`).join(', ')}`)
-  }
-  const description = [project.description, '', ...lines].filter((l) => l !== undefined).join('\n').trim()
+  const metaParts: string[] = [`Status: ${project.status}`]
+  if (project.goal) metaParts.push(`Goal: ${project.goal}`)
+  if (project.live_url) metaParts.push(`Live: ${project.live_url}`)
+  if (project.repo_url) metaParts.push(`Repo: ${project.repo_url}`)
+  if (squads.length > 0) metaParts.push(`Squads: ${squads.map((s) => s.name).join(', ')}`)
+  const meta = metaParts.join(' · ')
+
+  const separator = project.description ? ' — ' : ''
+  const budget = Math.max(0, MAX_DESCRIPTION - meta.length - separator.length)
+  const desc =
+    project.description.length > budget
+      ? `${project.description.slice(0, Math.max(0, budget - 1)).trimEnd()}…`
+      : project.description
+  const description = `${desc}${desc ? separator : ''}${meta}`.slice(0, MAX_DESCRIPTION)
+
+  const tags = ['project-card', project.status, ...squads.map((s) => s.name)].slice(0, 12)
 
   return {
-    slug: PROJECT_CARD_TOPIC_SLUG,
+    slug: projectCardTopicSlug(project.id),
     title: project.name,
     description,
     topic_type: 'project-card',
-    tags: ['project-card', project.status],
+    tags,
   }
 }
 
 /**
- * projectSquadSummaries — squad name + access_level for a project's
- * project_squad_access rows (mirrors project_squad_list's join, unfiltered by
- * viewer read-scope: this is the PROJECT's own authoritative metadata used to
- * compose its OWN card, gated at the route by canManageProject, not by
- * per-squad read visibility).
+ * projectSquadSummariesForWriter — the squads a project's card mentions.
+ *
+ * P1-2 fix: this is a STORED artifact later readable by anyone with the
+ * project's own wiki-read access, not a live, viewer-scoped render — so it
+ * must not leak squad-access information the CURRENT WRITER themselves
+ * cannot see, and must NEVER include a home squad regardless of the
+ * writer's own authority (home squads are members' personal squads;
+ * resolveGrantedSquadIds' own org-grant path already excludes them from
+ * broad "which squads can I see" answers for the same reason — see its doc
+ * comment in src/projects/readable-squads.ts). Routes through
+ * loadReadableSquads(env, projectId, projectAccess(env, auth)) — the EXACT
+ * SAME read-access filter the project detail page itself uses for its own
+ * squad list — rather than an unfiltered `project_squad_access JOIN squads`
+ * query, then drops any row whose squad is `kind = 'home'`.
  */
-export async function projectSquadSummaries(env: Env, projectId: string): Promise<ProjectWikiSquadSummary[]> {
+export async function projectSquadSummariesForWriter(
+  env: Env,
+  auth: AuthContext,
+  projectId: string,
+): Promise<ProjectWikiSquadSummary[]> {
+  const access = await projectAccess(env, auth)
+  const { rows } = await loadReadableSquads(env, projectId, access)
+  if (rows.length === 0) return []
+
+  const squadIds = [...new Set(rows.map((r) => r.squad_id))]
   const { results } = await env.DB.prepare(
-    `SELECT s.name AS name, psa.access_level AS access_level
-       FROM project_squad_access psa
-       JOIN squads s ON s.id = psa.squad_id
-      WHERE psa.project_id = ?
-      ORDER BY s.name`,
-  ).bind(projectId).all<ProjectWikiSquadSummary>()
-  return results ?? []
+    `SELECT id, kind FROM squads WHERE id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+  )
+    .bind(JSON.stringify(squadIds))
+    .all<{ id: string; kind: string }>()
+  const kindBySquadId = new Map((results ?? []).map((row) => [row.id, row.kind]))
+
+  return rows
+    .filter((row) => kindBySquadId.get(row.squad_id) !== 'home')
+    .map((row) => ({ name: row.squad_name, access_level: row.access_level }))
 }
 
 /**
@@ -132,7 +191,7 @@ export async function projectSquadSummaries(env: Env, projectId: string): Promis
 export type CreateProjectCardOutcome =
   | { ok: true; result: WikiTopicUpsertResult }
   | { ok: false; status: 'wiki_unavailable' }
-  | { ok: false; status: 'wiki_conflict'; code: WikiConflictError['code']; existingProject?: string }
+  | { ok: false; status: 'wiki_conflict'; code: string; existingProject?: string }
 
 export async function createOrRefreshProjectCard(
   env: Env,
@@ -141,7 +200,7 @@ export async function createOrRefreshProjectCard(
 ): Promise<CreateProjectCardOutcome> {
   const topic = buildProjectCardTopic(project, squads)
   try {
-    const result = await upsertProjectWikiTopic(env, project.slug, topic)
+    const result = await upsertProjectWikiTopic(env, project.id, topic)
     return { ok: true, result }
   } catch (e) {
     if (e instanceof WikiConflictError) {
@@ -152,19 +211,45 @@ export async function createOrRefreshProjectCard(
   }
 }
 
+/**
+ * escapeAttr — hardened beyond the minimum a double-quoted attribute
+ * strictly needs (only `&`/`"` would suffice to prevent attribute
+ * breakout): also escapes `'`, `<`, `>` for defense in depth, because the
+ * value passed here (a topic/edge slug) is UPSTREAM-SOURCED data this
+ * module does not re-validate against Inkwell's own slug shape before
+ * rendering — a compromised or buggy upstream response is the realistic
+ * threat model, not a well-formed slug (which could never contain any of
+ * these characters in the first place). See the attribute-injection test in
+ * tests/dashboard-project-wiki.test.ts, and its paired mutation (reducing
+ * this function to `return value` must turn that test red).
+ */
 function escapeAttr(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
 }
 
 const WIKI_RESULT_MESSAGES: Readonly<Record<string, string>> = {
   card_saved: 'Project card saved.',
   wiki_unavailable: 'The wiki service is unavailable right now — nothing was saved.',
-  wiki_conflict_topic_owned_by_other_project:
-    'The "project-card" wiki slug is already owned by a different project — nothing was saved.',
-  wiki_conflict_topic_is_keychain_gated:
-    'This project already has a restricted (keychain-gated) wiki page at this slug — nothing was saved.',
-  wiki_conflict_topic_write_conflict:
-    'Another write raced this one — nothing was saved. Try again.',
+}
+
+function wikiResultMessage(statusResult: string | undefined): string | null {
+  if (!statusResult) return null
+  if (Object.hasOwn(WIKI_RESULT_MESSAGES, statusResult)) return WIKI_RESULT_MESSAGES[statusResult]
+  // Conflict codes are open-ended (see WikiConflictError's doc comment) — a
+  // status of the shape `wiki_conflict_<code>` always gets a message, even
+  // for a code this file has never seen before, rather than silently
+  // showing nothing.
+  const conflictPrefix = 'wiki_conflict_'
+  if (statusResult.startsWith(conflictPrefix)) {
+    const code = statusResult.slice(conflictPrefix.length)
+    return `Another write conflicted with this one (${code}) — nothing was saved. Try again.`
+  }
+  return null
 }
 
 function createCardButton(projectId: string): Html {
@@ -203,9 +288,7 @@ function topicCard(topic: WikiGraph['nodes'][number], edges: WikiGraph['edges'])
 
 export function projectWikiBody(view: ProjectWikiView, statusResult?: string): Html {
   const { project, canManage, graph } = view
-  const resultMessage = statusResult && Object.hasOwn(WIKI_RESULT_MESSAGES, statusResult)
-    ? WIKI_RESULT_MESSAGES[statusResult]
-    : null
+  const resultMessage = wikiResultMessage(statusResult)
 
   const header = pageHeader({
     crumbs: `Projects / ${project.name}`,

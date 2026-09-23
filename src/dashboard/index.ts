@@ -207,7 +207,7 @@ import {
 import {
   createOrRefreshProjectCard,
   loadProjectWikiView,
-  projectSquadSummaries,
+  projectSquadSummariesForWriter,
   projectWikiBody,
 } from './project-wiki'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
@@ -802,7 +802,7 @@ dashboardApp.post('/projects/:id/wiki/card', async (c) => {
   const project = await getReadableProject(c.env, auth, projectId)
   if (!project) return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
 
-  const squads = await projectSquadSummaries(c.env, project.id)
+  const squads = await projectSquadSummariesForWriter(c.env, auth, project.id)
   const outcome = await createOrRefreshProjectCard(c.env, project, squads)
   const status = outcome.ok
     ? 'card_saved'
