@@ -1,6 +1,43 @@
 # Changelog
 
-## Release status — 2026-09-06
+## Release status — 2026-09-25
+
+- **Current source version:** `0.30.0` on `main` (`package.json`, `src/version.ts`). Read
+  the commit with `git rev-parse origin/main`; this document does not pin it.
+- **Last recorded production deployment:** `c14ebc8c` (#1534), built 2026-09-23T05:47Z,
+  `clean:true`. Live `/health` is authoritative.
+- **Latest tagged stable release:** `v0.25.0`, unchanged.
+- **"v0.50" is a goal label for the wave below, not a version.** The source still reports
+  `0.30.0`; no `0.50.0` exists in `package.json`, a tag, or a milestone.
+- **CI:** GitHub Actions are disabled on Mumega-com private repos (org billing). Local test
+  runs are the CI of record; every merge below was verified locally and deployed by hand.
+
+## Preview on main — 2026-09-23 v0.50 wave: projects operate (deployed, not tagged)
+
+Three PRs that let a project be revived, warned before it is archived, and given a home
+page, with no hand status edits. Procedures: [docs/workflows/11-flight-completion.md](docs/workflows/11-flight-completion.md),
+[docs/workflows/12-project-lifecycle.md](docs/workflows/12-project-lifecycle.md).
+
+- **#1532** (`ab83ab5d`) — the start gate revives `archived → planned → active` on a project
+  that already has non-seed tasks, instead of failing `task_seed_failed`. The stale
+  cycle boundary is reset inside the activation UPDATE, not a second write; each activation
+  writes its own `project_start_activation` receipt; `planned` joins
+  `BREAKER_EXEMPT_STATUSES` so a mid-revival project is not killed on its old boundary.
+  Residuals: #1535.
+- **#1533** (`6c06a3c3`) — needs_you `project_recommit_due`: warns when the cycle boundary
+  is within 72 h or idleness is within 2 days of the stall threshold, before the circuit
+  breaker archives. One-tap Recommit on the dashboard posts to
+  `POST /api/projects/:id/recommit`. Residuals: #1536.
+- **#1534** (`c14ebc8c`) — per-project wiki home: `/projects/:id/wiki`, a "Create project
+  card" button, and MCP `project_wiki`. The card is topic `project-card-<lowercased
+  project.id>`; squads are computed live per viewer, not stored in the card. Needs
+  mumega-com#1282 (inkwell-api internal wiki path). Residuals: #1537.
+
+Also in the wave: first fully automatic flight `d87fa7c4` landed with no manual status
+edits. Open: #1531 (wave findings); Mubot is `member` on squad-core, so its delegated
+`flight_dispatch` returns `flight_delegation_forbidden` until an operator grants `lead`.
+
+## Release status — 2026-09-06 (superseded by the entry above)
 
 - **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
   commit.** Any SHA written here is false the moment the commit writing it is merged, so

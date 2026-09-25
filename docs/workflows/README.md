@@ -5,7 +5,7 @@ Every mupot workflow, documented against the actual code on `origin/main` (commi
 "all these workflows should be clearly available in the mupot workflows and be clear for
 everyone to see how mupot behaves on each one of those."
 
-This is the first set of ten named in the issue. It does not cover every workflow in the
+Workflows 1–10 are the set named in the issue; 11–12 were added 2026-09-25 for the v0.50 wave. It does not cover every workflow in the
 codebase — see Known gaps below for what's out of scope.
 
 ## Schema
@@ -29,7 +29,7 @@ A workflow that is not yet built is still documented with this schema — the do
 plainly in its Trigger/Tool-sequence sections rather than being omitted, so the catalog's
 own coverage is honest about what exists vs. what is only proposed.
 
-## The ten workflows
+## The workflows
 
 | # | Workflow | Status | Doc |
 |---|---|---|---|
@@ -37,12 +37,14 @@ own coverage is honest about what exists vs. what is only proposed.
 | 2 | First-person intake on Telegram (Mubot's five questions → home memory) | Built, code lives in `mupot-plugin` | [02-first-person-telegram-intake.md](./02-first-person-telegram-intake.md) |
 | 3 | Project access chain (proposal → human verdict → grant + receipt) | Built | [03-project-access-chain.md](./03-project-access-chain.md) |
 | 4 | Agent-proposed member invite | Not implemented (#1497) | [04-agent-proposed-member-invite.md](./04-agent-proposed-member-invite.md) |
-| 5 | Runner onboarding (mint → check_in poll-mode → receive → report → settle) | Broken for poll-mode runners; fix open (#1494, branch `kasra/poll-mode-runner-dispatch-v4`, supersedes #1514 which supersedes #1501) | [05-runner-onboarding.md](./05-runner-onboarding.md) |
-| 6 | Team bootstrap | Built, not yet merged (#1498, PR #1515 — supersedes #1510, round-2 P0) | [06-team-bootstrap.md](./06-team-bootstrap.md) |
+| 5 | Runner onboarding (mint → check_in poll-mode → receive → report → settle) | Built — poll-mode fix merged in #1522 (`1c07e61b`, fixes #1494); doc body predates it | [05-runner-onboarding.md](./05-runner-onboarding.md) |
+| 6 | Team bootstrap | Built — merged in #1515 (`476b5e54`, #1498) | [06-team-bootstrap.md](./06-team-bootstrap.md) |
 | 7 | Human decision channel (Telegram approve with harness-attested origin) | Built | [07-human-decision-channel.md](./07-human-decision-channel.md) |
 | 8 | Home squads and admin-in by receipt | Built (dashboard-operator path missing, #1474) | [08-home-squads-admin-in-by-receipt.md](./08-home-squads-admin-in-by-receipt.md) |
 | 9 | Verdict reversal (order-by-design) | Built | [09-verdict-reversal.md](./09-verdict-reversal.md) |
 | 10 | Deploy + migration (manual, snapshot, evidence) | Built (manual operator runbook) | [10-deploy-and-migration.md](./10-deploy-and-migration.md) |
+| 11 | Flight completion (task → dispatch → runtime receipts → verdict → done → land) | Built — first automatic flight `d87fa7c4`, 2026-09-23 | [11-flight-completion.md](./11-flight-completion.md) |
+| 12 | Project lifecycle (start, revive, recommit, circuit breaker) | Built — #1532, #1533 | [12-project-lifecycle.md](./12-project-lifecycle.md) |
 
 ## Cross-cutting notes
 
