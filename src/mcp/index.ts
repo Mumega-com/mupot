@@ -4143,7 +4143,15 @@ const toolInboxAck: ToolSpec = {
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    return done({ acked: res.acked, already_read: res.already_read, refused: res.refused })
+    return done({
+      acked: res.acked,
+      already_read: res.already_read,
+      refused: res.refused,
+      // mupot#1539 — `dispatch_envelope_unsettled`: this is your own task-dispatch envelope and
+      // acking it before `task_dispatch_runtime_receipt(stage:'runtime_consumed')` would make
+      // the task unsettleable. Settle first, then ack.
+      refusal_reasons: res.refusal_reasons,
+    })
   },
 }
 

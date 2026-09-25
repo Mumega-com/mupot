@@ -1027,6 +1027,9 @@ export interface AckResult {
    *  "exists, addressed to someone else": splitting them turns ack into a tenant-wide
    *  message-id oracle, the same class the send path collapses to send_target_not_visible. */
   refused: string[]
+  /** mupot#1539 — reasons for refused ids that ARE the caller's own rows (safe to name).
+   *  Ids refused as "not yours" never appear here (message-id oracle, see `refused`). */
+  refusal_reasons: Record<string, AckRefusalReason>
 }
 
 export type LeaseFailure = {
@@ -1740,6 +1743,53 @@ export async function leaseAgentInbox(
   }
 }
 
+/** mupot#1539 — typed reason attached to an `inbox_ack` id that was refused for a reason the
+ *  caller is allowed to learn (the row IS theirs, so naming it leaks nothing). */
+export type AckRefusalReason = 'dispatch_envelope_unsettled'
+
+/** The sender + request_id prefix `deliverDispatchToInbox` (src/bus/fleet-bridge.ts) writes a
+ *  dispatch envelope under. Duplicated as literals here (not imported) because fleet-bridge
+ *  imports this module; tests/dispatch-envelope-ack-wedge.test.ts pins both against
+ *  DISPATCH_BRIDGE_SENDER / DISPATCH_INBOX_PREFIX so they cannot drift. */
+export const DISPATCH_ENVELOPE_SENDER = 'mupot-dispatch'
+export const DISPATCH_ENVELOPE_REQUEST_PREFIX = 'dispatch-inbox:'
+
+/**
+ * DISPATCH_ENVELOPE_UNSETTLED_PREDICATE — mupot#1539. True for an agent_messages row (alias
+ * `m`) that is a LIVE dispatch envelope whose dispatch has not yet been taken into custody:
+ * no runtime receipt of ANY stage exists for it, it is not dead-lettered, and its task is still
+ * assigned to the dispatch's agent in a status where a settle can still happen.
+ *
+ * Marking such a row read is destructive: `runtime_consumed` requires an unread envelope under
+ * a live lease (validateEnvelope), a lease reset refuses read rows, and task_dispatch refuses a
+ * new dispatch while this one is in flight — the task wedges with no repair path.
+ *
+ * Deliberately "no receipt of any stage", NOT "no terminal receipt". Once `runtime_consumed`
+ * exists, validateEnvelope accepts `completed`/`failed` on a read envelope (the consumed
+ * receipt is the custody proof), so acking is harmless — and it is the RIGHT hygiene: an
+ * unread envelope is re-leased by inbox_lease once its lease lapses, which bumps
+ * delivery_attempts past the consumed attempt and would itself refuse the settle. Refusing the
+ * ack until a terminal receipt would move the wedge from "acked" to "redelivered".
+ */
+export const DISPATCH_ENVELOPE_UNSETTLED_PREDICATE = (m: string): string => `(
+  ${m}.from_agent = '${DISPATCH_ENVELOPE_SENDER}'
+  AND ${m}.request_id LIKE '${DISPATCH_ENVELOPE_REQUEST_PREFIX}%'
+  AND ${m}.dead_lettered_at IS NULL
+  AND EXISTS (
+    SELECT 1 FROM task_dispatch_receipts d
+      JOIN tasks t ON t.id = d.task_id
+     WHERE d.tenant = ${m}.tenant
+       AND d.id = substr(${m}.request_id, ${DISPATCH_ENVELOPE_REQUEST_PREFIX.length + 1})
+       AND t.assignee_agent_id = d.agent_id
+       AND t.status IN ('open', 'in_progress', 'blocked', 'rejected')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM task_dispatch_runtime_receipts r
+     WHERE r.tenant = ${m}.tenant
+       AND r.dispatch_receipt_id = substr(${m}.request_id, ${DISPATCH_ENVELOPE_REQUEST_PREFIX.length + 1})
+  )
+)`
+
 /**
  * Acknowledge messages the caller ACTUALLY handled: set read_at and drop the lease.
  *
@@ -1775,12 +1825,17 @@ export async function ackAgentMessages(
     // One statement, RETURNING the ids it actually moved. Rows addressed to another agent
     // never match `to_agent = ?2`, so a non-recipient's ack writes nothing at all — the
     // refusal is a property of the SQL, not of a check that could be skipped above it.
+    //
+    // mupot#1539 — a dispatch envelope not yet taken into custody is refused IN the statement
+    // (not by a pre-check that could race a concurrent settle); see
+    // DISPATCH_ENVELOPE_UNSETTLED_PREDICATE. The rest of the batch still acks.
     const acked = await env.DB.prepare(
-      `UPDATE agent_messages
+      `UPDATE agent_messages AS m
           SET read_at = ?3, lease_expires_at = NULL, lease_attempt_id = NULL
-        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
-          AND id IN (${placeholders})
+        WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.read_at IS NULL
+          AND m.id IN (${placeholders})
           AND ${bearerFencePredicate('?1', '?2')}
+          AND NOT ${DISPATCH_ENVELOPE_UNSETTLED_PREDICATE('m')}
         RETURNING id`,
     ).bind(tenant, input.agent, now(), ...ids).all<{ id: string }>()
     const ackedIds = new Set((acked.results ?? []).map((r) => r.id))
@@ -1795,6 +1850,7 @@ export async function ackAgentMessages(
     // naming it is what makes the retry idempotent rather than ambiguous) or not theirs.
     const rest = ids.filter((id) => !ackedIds.has(id))
     const alreadyRead = new Set<string>()
+    const refusalReasons: Record<string, AckRefusalReason> = {}
     if (rest.length > 0) {
       const restPlaceholders = rest.map((_, i) => `?${i + 3}`).join(', ')
       const owned = await env.DB.prepare(
@@ -1803,6 +1859,16 @@ export async function ackAgentMessages(
             AND id IN (${restPlaceholders})`,
       ).bind(tenant, input.agent, ...rest).all<{ id: string }>()
       for (const r of owned.results ?? []) alreadyRead.add(r.id)
+      // Classification only (no write): which of the caller's OWN unread rows were held back
+      // by the unsettled-dispatch guard. Scoped by to_agent = caller, so it names nothing the
+      // caller could not already read in its own inbox.
+      const unsettled = await env.DB.prepare(
+        `SELECT m.id AS id FROM agent_messages m
+          WHERE m.tenant = ?1 AND m.to_agent = ?2 AND m.read_at IS NULL
+            AND m.id IN (${restPlaceholders})
+            AND ${DISPATCH_ENVELOPE_UNSETTLED_PREDICATE('m')}`,
+      ).bind(tenant, input.agent, ...rest).all<{ id: string }>()
+      for (const r of unsettled.results ?? []) refusalReasons[r.id] = 'dispatch_envelope_unsettled'
     }
 
     return {
@@ -1810,6 +1876,7 @@ export async function ackAgentMessages(
       acked: ids.filter((id) => ackedIds.has(id)),
       already_read: rest.filter((id) => alreadyRead.has(id)),
       refused: rest.filter((id) => !alreadyRead.has(id)),
+      refusal_reasons: refusalReasons,
     }
   } catch (err) {
     return { ok: false, reason: 'db_error', detail: err instanceof Error ? err.message : String(err) }

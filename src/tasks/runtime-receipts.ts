@@ -230,6 +230,11 @@ interface DeliveryRow {
    *  exact format-split defect that JS comparison reintroduces. 1 iff live, 0 otherwise
    *  (SQLite has no boolean type; D1 returns the INTEGER as-is). */
   message_lease_live: number
+  /** mupot#1539 — 1 iff a `runtime_consumed` receipt already exists for THIS exact
+   *  (dispatch_receipt_id, attempt, agent, message) tuple, computed in SQL in `loadDelivery`.
+   *  This is the proof of custody `validateEnvelope` accepts for `completed`/`failed` in
+   *  place of "unread + live lease" — see the comment there. 0 otherwise. */
+  consumed_by_caller: number
 }
 
 interface ReceiptRow extends Omit<TaskDispatchRuntimeReceipt, 'artifact_refs'> {
@@ -455,6 +460,7 @@ async function loadDelivery(
   input: RecordTaskDispatchRuntimeReceiptInput,
   messageId: string,
   now: string,
+  callerAgentId: string,
 ): Promise<DeliveryRow> {
   const row = await env.DB.prepare(`
     SELECT
@@ -479,7 +485,21 @@ async function loadDelivery(
       message.lease_expires_at AS message_lease_expires_at,
       message.dead_lettered_at AS message_dead_lettered_at,
       CASE WHEN ${LEASE_LIVE_PREDICATE('message.lease_expires_at', '?5')} THEN 1 ELSE 0 END
-        AS message_lease_live
+        AS message_lease_live,
+      -- mupot#1539 — custody proof for completed/failed after the envelope was acked or its
+      -- lease lapsed. Every column is pinned: same dispatch, same attempt, same agent (the
+      -- CALLER, not merely "some agent"), same message. A consumed receipt written by a
+      -- different agent, for a different attempt, or against a different envelope proves
+      -- nothing about this caller's custody and must not count.
+      CASE WHEN EXISTS (
+        SELECT 1 FROM task_dispatch_runtime_receipts consumed
+         WHERE consumed.tenant = dispatch.tenant
+           AND consumed.dispatch_receipt_id = dispatch.id
+           AND consumed.stage = 'runtime_consumed'
+           AND consumed.attempt = ?6
+           AND consumed.agent_id = ?7
+           AND consumed.message_id = message.id
+      ) THEN 1 ELSE 0 END AS consumed_by_caller
     FROM task_dispatch_receipts dispatch
     JOIN tasks task ON task.id = dispatch.task_id
     JOIN agents agent ON agent.id = dispatch.agent_id
@@ -488,7 +508,8 @@ async function loadDelivery(
       AND dispatch.agent_id = task.assignee_agent_id
       AND dispatch.squad_id = task.squad_id
     LIMIT 1
-  `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, now)
+  `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, now,
+    input.attempt, callerAgentId)
     .first<DeliveryRow>()
   if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   return row
@@ -499,6 +520,36 @@ function validateEnvelope(
   input: RecordTaskDispatchRuntimeReceiptInput,
   allowAcknowledgedReplay: boolean,
 ): string {
+  // mupot#1539 — "a delivery fact is not a settle". `read_at` (set by inbox_ack, a plain
+  // `inbox` consume, or a lease-attempt ack) and lease expiry are facts about the INBOX
+  // envelope, not about the work. Before this fix, `completed`/`failed` demanded the same
+  // "unread + live lease" shape `runtime_consumed` does, so an assignee that acked its
+  // dispatch envelope after `runtime_consumed` — or simply took longer than the lease
+  // (MAX_LEASE_SECONDS = 1h) to finish — could never settle, and nothing could repair it
+  // (lease reset refuses read rows; task_dispatch refuses an in-flight dispatch). PROVED in
+  // prod on 5e194701 / 73d0c2a3.
+  //
+  // DECISION (for the gate): for `completed`/`failed` ONLY, a `runtime_consumed` receipt for
+  // this exact (dispatch, attempt, caller agent, message) REPLACES both the unread check and
+  // the lease-liveness check. Lease liveness cannot be required here: a read row has no live
+  // lease (inbox_ack and the lease-attempt ack NULL lease_expires_at; a plain `inbox` consume
+  // only takes rows whose lease is not live; nothing re-leases a read row), and an unread row
+  // whose lease lapsed after
+  // `runtime_consumed` is the same defect by another route (long work), so requiring either
+  // would keep the wedge. What proves custody instead:
+  //   - the consumed receipt itself, which could only have been written while the caller
+  //     held a live lease on an unread envelope (the non-custody branch below, unchanged);
+  //   - `delivery_attempts === attempt` (still enforced below): the envelope was not handed
+  //     out again after that consume, so no other attempt can be in flight on it;
+  //   - dead-lettered still refused; sender, request_id, project and body shape still pinned;
+  //   - the caller's live bound token, dispatch.agent_id = task.assignee = caller, and squad
+  //     membership (all checked in recordTaskDispatchRuntimeReceipt before this runs);
+  //   - for `completed`, the state mutation itself still requires status = 'in_progress',
+  //     execution_receipt_id = this dispatch and a runtime_consumed row at this attempt.
+  // `runtime_consumed` itself is NOT relaxed: taking custody still requires an unread
+  // envelope under a live lease, exactly as before.
+  const custodyProven = (input.stage === 'completed' || input.stage === 'failed')
+    && row.consumed_by_caller === 1
   if (
     row.dispatch_consumed_at === null
     || row.agent_status !== 'active'
@@ -516,7 +567,7 @@ function validateEnvelope(
     // through. `message_lease_live` is computed once, in SQL, via LEASE_LIVE_PREDICATE
     // (julianday both sides) in `loadDelivery` above — this function only reads the
     // already-correct answer.
-    || (!allowAcknowledgedReplay && (
+    || (!allowAcknowledgedReplay && !custodyProven && (
       row.message_read_at !== null
       || row.message_lease_live !== 1
     ))
@@ -660,7 +711,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     })
   }
 
-  const delivery = await loadDelivery(env, input, messageId, now)
+  const delivery = await loadDelivery(env, input, messageId, now, agentId)
   if (delivery.dispatch_agent_id !== agentId || delivery.task_assignee_agent_id !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
