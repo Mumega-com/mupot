@@ -469,9 +469,31 @@ describe('A. round 2 — the watchdog window and escalation (gate P0)', () => {
 
     const stale = await dispatchedId(env, ['task-1'])
     const second = await sweepStalledFlights(env, { nowMs: now + 3 * HOUR })
-    expect(second).toMatchObject({ escalated: 0, reaped: 1, escalated_flight_ids: [] })
+    expect(second).toMatchObject({ escalated: 0, reaped: 1, escalated_flight_ids: [], scanned: 1 })
     expect(flightRow(harness, stale).status).toBe('failed')
     expect(count(harness, `SELECT COUNT(*) AS n FROM flights WHERE status = 'waiting'`)).toBe(100)
+  })
+})
+
+describe('A. round 2 — concurrency and index (gate P0 (3), P1-1)', () => {
+  it('two overlapping sweeps escalate each due wait exactly once between them', async () => {
+    const now = Date.now()
+    const stmt = harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, status, created_at, started_at, waiting_since, meta)
+      VALUES (?, '${TENANT}', '${EXEC_AGENT}', '${EXEC_AGENT}', 'parked', 'waiting', 1, 1, ?, '{}')`)
+    for (let i = 0; i < 20; i += 1) stmt.run(`c-${i}`, now - 25 * HOUR)
+    const [a, b] = await Promise.all([
+      sweepStalledFlights(env, { nowMs: now }),
+      sweepStalledFlights(env, { nowMs: now }),
+    ])
+    expect(a.escalated + b.escalated).toBe(20)
+  })
+
+  it('the trigger lookup of in-air flights uses idx_flights_status, not a scan of every flight', () => {
+    const plan = harness.sqlite
+      .prepare(`EXPLAIN QUERY PLAN SELECT id FROM flights f WHERE f.status = 'running'`)
+      .all() as Array<{ detail: string }>
+    expect(plan.map((row) => row.detail).join(' | ')).toMatch(/USING (COVERING )?INDEX idx_flights_status/)
   })
 })
 
