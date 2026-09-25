@@ -64,6 +64,13 @@ inferred.
 The operation requires an active agent-bound workspace token for the persisted
 assignee. It rechecks the current token, member capability, assignment, project,
 message, sender, route, lease, and attempt before every new row and replay.
+
+`runtime_consumed` requires the envelope to be unread and under a live lease.
+`completed` and `failed` do not, once this agent has recorded `runtime_consumed`
+for the same dispatch, attempt and message (mupot#1539). Acking the envelope or
+letting its lease lapse after consumption is a delivery fact, not a settle, so it
+no longer blocks completion. The delivery attempt must still match: if the
+envelope was handed out again after the consume, the old attempt cannot settle.
 Mutation audit rows record the framework-derived invocation surface (`mcp` or
 `rest`); request headers cannot choose that value.
 
@@ -80,8 +87,14 @@ restarts after consumption, replay the same `runtime_consumed` call before doing
 anything else. Completion replay behaves the same. A changed delivery attempt is
 a new key and cannot consume the prior attempt's receipt.
 
-Do not call `inbox_ack` until governed handling is complete. Do not send an ACK to
-`mupot-dispatch`; it is a system attribution literal, not an agent identity.
+Record `runtime_consumed` before calling `inbox_ack` on a dispatch envelope.
+`inbox_ack` refuses a `mupot-dispatch` envelope whose dispatch has no runtime
+receipt yet: the id comes back in `refused` with
+`refusal_reasons[id] = "dispatch_envelope_unsettled"`, and the other ids in the
+batch are still acked. Once `runtime_consumed` is recorded, ack the envelope. An
+unread envelope is re-leased when its lease lapses, which moves the delivery
+attempt past the one you consumed. Do not send an ACK to `mupot-dispatch`; it is
+a system attribution literal, not an agent identity.
 
 Runtime write responses and ordinary task readers receive allowlisted DTOs only:
 stage, attempt, public route,

@@ -1770,6 +1770,23 @@ export const DISPATCH_ENVELOPE_REQUEST_PREFIX = 'dispatch-inbox:'
  * unread envelope is re-leased by inbox_lease once its lease lapses, which bumps
  * delivery_attempts past the consumed attempt and would itself refuse the settle. Refusing the
  * ack until a terminal receipt would move the wedge from "acked" to "redelivered".
+ *
+ * Applied to `inbox_ack` ONLY (MCP tool and REST /actions/inbox_ack share ackAgentMessages).
+ * The other paths that set read_at, decided per path (mupot#1539):
+ *  - plain `inbox` consume (MCP `inbox`, REST GET /api/inbox — readAgentInboxForReader): NOT
+ *    guarded here. Leaving the envelope out of the consume set would hide the dispatch from a
+ *    consume-mode reader entirely, and returning it without marking it read breaks the
+ *    delivered-once contract and makes `remaining`/`complete` drain loops spin. After custody
+ *    this path is harmless (validateEnvelope accepts completed/failed on a read envelope), and
+ *    it never takes a row under a live lease (leaseAvailableClause). Pre-custody consume is a
+ *    residual wedge tracked separately.
+ *  - `inbox_lease_ack` (ackAgentInboxLeaseAttempt): NOT guarded. Its attempt state machine
+ *    (leased -> acked | expired) has no "refused" terminal; adding one is a harness-contract
+ *    change. The normal attempt flow (lease, record runtime_consumed during the turn, ack after
+ *    the turn) is covered by the validateEnvelope fix.
+ *  - adminResetDispatchLease(terminate): writes read_at in the SAME batch as a
+ *    `reset_terminated` receipt, so the dispatch is settled by construction.
+ * No path gains the ability to set read_at; this only narrows the inbox_ack UPDATE.
  */
 export const DISPATCH_ENVELOPE_UNSETTLED_PREDICATE = (m: string): string => `(
   ${m}.from_agent = '${DISPATCH_ENVELOPE_SENDER}'
