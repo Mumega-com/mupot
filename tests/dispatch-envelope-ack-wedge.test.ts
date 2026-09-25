@@ -352,6 +352,25 @@ describe('mupot#1539 — custody is per attempt', () => {
   })
 })
 
+describe('mupot#1539 — only a runtime_consumed receipt is custody', () => {
+  it('a failed receipt (no consume) does not let completed through on an acked envelope', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      const failed = await f.call('task_dispatch_runtime_receipt', settle('failed'))
+      expect(failed).toMatchObject({ ok: true, result: { task_status: 'blocked' } })
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID] } })
+      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
+      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      f.harness.close()
+    }
+  })
+})
+
 describe('mupot#1539 — inbox_ack refuses a dispatch envelope not yet taken into custody', () => {
   it('refuses the unsettled envelope with a typed reason and still acks the rest of the batch', async () => {
     const f = fixture()
@@ -407,6 +426,19 @@ describe('mupot#1539 — inbox_ack refuses a dispatch envelope not yet taken int
     try {
       // Direct SQL: the task was closed out-of-band (operator), so this dispatch can never settle.
       f.harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(TASK_ID)
+      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refusal_reasons: {} } })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('an envelope whose task was reassigned away from the dispatch agent is ackable', async () => {
+    const f = fixture()
+    try {
+      // Direct SQL: task_update refuses reassignment while a dispatch is in flight, but an old row
+      // in this state can exist (pre-guard data); no one can settle that dispatch any more.
+      f.harness.sqlite.prepare('UPDATE tasks SET assignee_agent_id = ? WHERE id = ?').run(GATE_AGENT_ID, TASK_ID)
       const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
       expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refusal_reasons: {} } })
     } finally {
