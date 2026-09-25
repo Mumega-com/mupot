@@ -34,12 +34,22 @@ import {
   listIncompleteFlightTaskIds,
   routineControlLandLacksWitness,
   FlightProjectError,
+  FlightIdempotencyConflictError,
   type FlightStatus,
   type TriggerSource,
 } from './service'
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
+import {
+  findFlightByClientRequestId,
+  listLandedFlightsForTasks,
+  parseClientRequestId,
+  parseRedispatchReason,
+  sameDispatchRequest,
+  summarizeLandedConflict,
+  writeRedispatchReceipt,
+} from './rebooking'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
 
@@ -67,6 +77,8 @@ export interface DispatchBody {
     trigger_source?: TriggerSource
     budget_micro_usd?: number
     meta?: FlightMetaV1
+    /** mupot#1540 C idempotency key — see src/flight/rebooking.ts. */
+    client_request_id?: string
   }
   signals: FlightSignals
   opts: PreflightOptions
@@ -180,6 +192,8 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   if (projectId === null) return { ok: false, error: 'invalid_project_id' }
   const meta = b.meta == null ? undefined : parseFlightMetaV1(b.meta)
   if (b.meta != null && !meta) return { ok: false, error: 'invalid_flight_meta' }
+  const clientRequestId = parseClientRequestId(b.client_request_id)
+  if (!clientRequestId.ok) return { ok: false, error: 'invalid_client_request_id' }
 
   const normalized = normalizeSignalsInput(b.signals as Record<string, unknown>)
   if (!normalized.ok) return normalized
@@ -202,6 +216,7 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
         trigger_source: trigger,
         budget_micro_usd: budget,
         meta: meta ?? undefined,
+        ...(clientRequestId.value ? { client_request_id: clientRequestId.value } : {}),
       },
       signals,
       opts,
@@ -258,10 +273,58 @@ flightsApp.post('/', async (c) => {
       )
     }
   }
+  // mupot#1540 C — the same two duplicate-booking guards as the MCP flight_dispatch
+  // tool (one predicate, two surfaces; src/flight/rebooking.ts). They only apply to a
+  // governed (meta-bearing) dispatch: an unscoped flight declares no task_ids to compare.
+  const redispatchReason = parseRedispatchReason((raw as Record<string, unknown>).redispatch_landed_reason)
+  if (!redispatchReason.ok) return c.json({ error: 'invalid_redispatch_landed_reason' }, 400)
+  const dispatcher = flight.dispatched_by ?? flight.agent
+  const replayOriginal = async (): Promise<Response | null> => {
+    if (!flight.client_request_id || !flight.meta) return null
+    const original = await findFlightByClientRequestId(c.env, dispatcher, flight.client_request_id)
+    if (!original) return null
+    if (!sameDispatchRequest(original, {
+      agent: flight.agent,
+      goal: flight.goal,
+      project_id: flight.project_id ?? null,
+      budget_micro_usd: flight.budget_micro_usd ?? null,
+      meta: flight.meta,
+    })) {
+      return c.json({ error: 'client_request_id_conflict', flight_id: original.id }, 409)
+    }
+    return c.json({ id: original.id, status: original.status, idempotent_replay: true }, 200)
+  }
+  if (flight.client_request_id && !flight.meta) {
+    return c.json({ error: 'client_request_id_requires_meta' }, 400)
+  }
+  const replay = await replayOriginal()
+  if (replay) return replay
+  let presetFlightId: string | undefined
+  if (flight.meta) {
+    const landedConflicts = await listLandedFlightsForTasks(c.env, flight.meta.task_ids)
+    if (landedConflicts.length > 0) {
+      const conflict = summarizeLandedConflict(landedConflicts)
+      if (!redispatchReason.value) return c.json({ error: 'flight_task_already_landed', ...conflict }, 409)
+      presetFlightId = crypto.randomUUID()
+      await writeRedispatchReceipt(c.env, {
+        flightId: presetFlightId,
+        actor: { kind: 'member', id: auth.id.memberId },
+        reason: redispatchReason.value,
+        landedFlightIds: conflict.landed_flight_ids,
+        taskIds: conflict.task_ids,
+      })
+    }
+  }
+
   let result
   try {
-    result = await dispatchFlight(c.env, flight, signals, opts)
+    result = await dispatchFlight(c.env, flight, signals, opts, presetFlightId ? { id: presetFlightId } : {})
   } catch (error) {
+    if (error instanceof FlightIdempotencyConflictError) {
+      const raced = await replayOriginal()
+      if (raced) return raced
+      return c.json({ error: 'client_request_id_conflict' }, 409)
+    }
     if (!(error instanceof FlightProjectError)) throw error
     const status = error.code === 'project_not_found' || error.code === 'flight_task_not_found'
       ? 404

@@ -2,6 +2,17 @@ import type { Env, Squad } from '../types'
 
 export const FLIGHT_META_V1_SCHEMA = 'mupot.flight.meta/v1' as const
 
+// mupot#1540 B: the booker-settable running stall timeout. The watchdog already READ
+// meta.timeout_ms (src/flight/watchdog.ts) but KEYS below refused it, so the knob was
+// dead: no v1 flight could ever carry it. These bounds are the single source of truth —
+// watchdog.ts re-exports them as MIN/MAX_CONFIGURED_TIMEOUT_MS.
+//
+// Out-of-range is REFUSED at the boundary (parse → null → invalid_flight_meta), not
+// clamped: a booker asking for 48h must learn it gets at most 24h, not be silently
+// handed 24h. The watchdog keeps its own clamp as defence for rows written before this.
+export const FLIGHT_META_TIMEOUT_MS_MIN = 5 * 60 * 1000 // 5 minutes
+export const FLIGHT_META_TIMEOUT_MS_MAX = 24 * 60 * 60 * 1000 // 24 hours
+
 export type FlightConfidentiality = 'private' | 'internal' | 'public-projection'
 export type FlightPublicationTarget = 'none' | 'inkwell-draft' | 'mumega.com'
 
@@ -19,6 +30,8 @@ export interface FlightMetaV1 {
   parent_flight_id: string | null
   routine_run_id?: string
   routine_revision?: number
+  /** Running stall timeout in ms, integer in [FLIGHT_META_TIMEOUT_MS_MIN, FLIGHT_META_TIMEOUT_MS_MAX]. */
+  timeout_ms?: number
 }
 
 const KEYS = new Set<keyof FlightMetaV1>([
@@ -35,7 +48,15 @@ const KEYS = new Set<keyof FlightMetaV1>([
   'parent_flight_id',
   'routine_run_id',
   'routine_revision',
+  'timeout_ms',
 ])
+
+export function isFlightMetaTimeoutMs(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= FLIGHT_META_TIMEOUT_MS_MIN
+    && value <= FLIGHT_META_TIMEOUT_MS_MAX
+}
 
 function boundedString(value: unknown, max: number): value is string {
   return typeof value === 'string'
@@ -68,6 +89,7 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
   if (meta.parent_flight_id !== null && !boundedString(meta.parent_flight_id, 200)) return null
   if (meta.routine_run_id !== undefined && !boundedString(meta.routine_run_id, 200)) return null
   if (meta.routine_revision !== undefined && (!Number.isInteger(meta.routine_revision) || Number(meta.routine_revision) < 1)) return null
+  if (meta.timeout_ms !== undefined && !isFlightMetaTimeoutMs(meta.timeout_ms)) return null
 
   return {
     schema: FLIGHT_META_V1_SCHEMA,
@@ -83,6 +105,7 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
     parent_flight_id: meta.parent_flight_id,
     ...(meta.routine_run_id === undefined ? {} : { routine_run_id: meta.routine_run_id }),
     ...(meta.routine_revision === undefined ? {} : { routine_revision: Number(meta.routine_revision) }),
+    ...(meta.timeout_ms === undefined ? {} : { timeout_ms: meta.timeout_ms as number }),
   }
 }
 

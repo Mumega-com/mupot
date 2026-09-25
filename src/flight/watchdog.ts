@@ -5,8 +5,13 @@
 // Invariant Guarantees:
 // 1. Precise Classification:
 //    - 'running' / 'preflight' > timeout (default 60m, or meta.timeout_ms [5m..24h]) -> 'reap'
+//      measured from resumed_at (last waiting -> running) when set, else started_at
 //    - 'sleeping' with missed wake deadline (now > next_run_at + 30m) -> 'reap'
-//    - 'waiting' (human review gate) > 24h -> 'escalate' (HARD INVARIANT: NEVER REAP)
+//    - 'waiting' (human review gate) > 24h since waiting_since -> 'escalate'
+//      (HARD INVARIANT: NEVER REAP)
+//    running <-> waiting is driven by the tasks.status triggers in
+//    migrations/0172_flight_waiting_and_dispatch_idempotency.sql (mupot#1540): a flight
+//    whose every task is parked at a gate (review/approved, or already done) waits.
 //    - 'landed' / 'failed' / 'held' -> 'healthy' (terminal states cannot be reaped)
 // 2. Authoritative Principal Enforcement:
 //    - Only dispatched_by_agent_id, flight.agent, squad:lead on flight squad, org:admin,
@@ -22,6 +27,7 @@
 import type { Env } from '../types'
 import type { FlightRow, FlightStatus } from './service'
 import { getFlight } from './service'
+import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN } from './meta'
 
 export interface FlightActor {
   kind: 'member' | 'agent' | 'system'
@@ -31,8 +37,10 @@ export interface FlightActor {
 export const DEFAULT_RUNNING_STALL_TIMEOUT_MS = 60 * 60 * 1000 // 60 minutes
 export const DEFAULT_SLEEPING_STALL_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes past next_run_at
 export const DEFAULT_WAITING_GATE_ESCALATION_TIMEOUT_MS = 24 * 60 * 60 * 1000 // 24 hours
-export const MIN_CONFIGURED_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
-export const MAX_CONFIGURED_TIMEOUT_MS = 24 * 60 * 60 * 1000 // 24 hours
+// Same bounds meta.ts validates meta.timeout_ms against at dispatch (mupot#1540 B) —
+// one source, so the accepted range and the honoured range cannot drift.
+export const MIN_CONFIGURED_TIMEOUT_MS = FLIGHT_META_TIMEOUT_MS_MIN
+export const MAX_CONFIGURED_TIMEOUT_MS = FLIGHT_META_TIMEOUT_MS_MAX
 
 export type FlightWatchdogAction = 'healthy' | 'reap' | 'escalate'
 
@@ -76,7 +84,9 @@ export function evaluateFlightLiveness(
 
   // 1. Human Gate State: NEVER auto-reap. Slow human is not a dead flight.
   if (status === 'waiting') {
-    const baseline = flight.started_at ?? flight.created_at
+    // The gate clock starts when the flight ENTERED waiting, not at launch: a flight that
+    // ran 23h and then parked at review has not been waiting on a human for 23h.
+    const baseline = flight.waiting_since ?? flight.started_at ?? flight.created_at
     const ageMs = Math.max(0, nowMs - baseline)
     if (ageMs > DEFAULT_WAITING_GATE_ESCALATION_TIMEOUT_MS) {
       return {
@@ -140,7 +150,10 @@ export function evaluateFlightLiveness(
     // Malformed meta falls back to default
   }
 
-  const baseline = flight.started_at ?? flight.created_at
+  // resumed_at: set when a waiting flight is sent back to running (reject / reopen).
+  // The stall clock restarts there — otherwise a flight that waited 5h at a gate would
+  // be reaped the instant its task was sent back for rework.
+  const baseline = flight.resumed_at ?? flight.started_at ?? flight.created_at
   const ageMs = Math.max(0, nowMs - baseline)
 
   if (ageMs > timeoutMs) {
@@ -473,6 +486,8 @@ export interface FlightWatchdogSweepResult {
   reaped: number
   /** Flagged 'escalate' — counted and reported, NEVER reaped. */
   escalated: number
+  /** Which flights escalated, so the count is attributable rather than just a number. */
+  escalated_flight_ids: string[]
   /** Reap attempted and refused/errored. Does not abort the sweep. */
   failed: number
   /** The scan hit its LIMIT: this pass is PARTIAL, not a clean sweep. */
@@ -516,10 +531,12 @@ export async function sweepStalledFlights(
   let reaped = 0
   let escalated = 0
   let failed = 0
+  const escalatedFlightIds: string[] = []
 
   for (const { flight, evaluation } of scan.items) {
     if (evaluation.action === 'escalate') {
       escalated += 1
+      escalatedFlightIds.push(flight.id)
       continue
     }
 
@@ -549,6 +566,13 @@ export async function sweepStalledFlights(
     }
   }
 
+  if (escalatedFlightIds.length > 0) {
+    console.warn(
+      `[flight-watchdog] ESCALATE — ${escalatedFlightIds.length} flight(s) waiting at a gate > 24h ` +
+        `(never reaped): ${escalatedFlightIds.join(', ')}`,
+    )
+  }
+
   if (scan.capped) {
     console.warn(
       `[flight-watchdog] PARTIAL SWEEP — candidate scan hit its limit of ${scan.limit}; ` +
@@ -560,6 +584,7 @@ export async function sweepStalledFlights(
     candidates: scan.items.length,
     reaped,
     escalated,
+    escalated_flight_ids: escalatedFlightIds,
     failed,
     capped: scan.capped,
     scanned: scan.scanned,

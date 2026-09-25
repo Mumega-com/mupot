@@ -47,6 +47,13 @@ export interface FlightRow {
   started_at: number | null
   ended_at: number | null
   meta: string
+  // mupot#1540 (0172). Optional because hand-built rows (and pre-0172 reads) omit them.
+  /** Unix ms the flight entered 'waiting' (every task parked at a gate); NULL otherwise. */
+  waiting_since?: number | null
+  /** Unix ms of the last waiting → running (reject/reopen); restarts the stall clock. */
+  resumed_at?: number | null
+  /** Dispatcher-supplied idempotency key; unique per (tenant, dispatched_by_agent_id). */
+  client_request_id?: string | null
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null
@@ -65,6 +72,12 @@ export interface NewFlight {
   trigger_source?: TriggerSource
   budget_micro_usd?: number
   meta?: FlightMetaV1
+  /**
+   * Dispatcher-supplied idempotency key (mupot#1540 C). Unique per
+   * (tenant, dispatched_by_agent_id) — see 0172's partial unique index. A second
+   * INSERT with the same key throws FlightIdempotencyConflictError.
+   */
+  client_request_id?: string
 }
 
 export interface CreateFlightOptions {
@@ -78,6 +91,14 @@ export class FlightCreateFenceError extends Error {
   constructor() {
     super('routine_dispatch_fenced')
     this.name = 'FlightCreateFenceError'
+  }
+}
+
+/** A concurrent dispatch already claimed this (dispatcher, client_request_id). */
+export class FlightIdempotencyConflictError extends Error {
+  constructor() {
+    super('flight_client_request_id_taken')
+    this.name = 'FlightIdempotencyConflictError'
   }
 }
 
@@ -145,6 +166,9 @@ export async function validateFlightProjectAttribution(env: Env, flight: NewFlig
 
 function mapFlightProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('UNIQUE constraint failed') && message.includes('flights.client_request_id')) {
+    throw new FlightIdempotencyConflictError()
+  }
   if (message.includes('flight meta invalid')) throw new FlightProjectError('invalid_flight_meta')
   if (message.includes('flight project not found')) throw new FlightProjectError('project_not_found')
   if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
@@ -180,14 +204,15 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       f.trigger_source ?? 'manual',
       f.budget_micro_usd ?? null,
       JSON.stringify(f.meta ?? {}),
+      f.client_request_id ?? null,
     ]
     if (fence) {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
-             WHERE rr.id = ?10 AND rr.tenant = ?11 AND rr.project_id = ?3
+             WHERE rr.id = ?11 AND rr.tenant = ?12 AND rr.project_id = ?3
                AND rr.status IN ('leased','observing')
                AND NOT EXISTS (
                  SELECT 1 FROM routine_run_events requested
@@ -198,8 +223,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       ).bind(...values, fence.runId, fence.tenant).run()
     } else {
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9)`,
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10)`,
       ).bind(...values).run()
     }
   } catch (error) {
