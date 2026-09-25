@@ -204,15 +204,16 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       f.trigger_source ?? 'manual',
       f.budget_micro_usd ?? null,
       JSON.stringify(f.meta ?? {}),
-      f.client_request_id ?? null,
     ]
     if (fence) {
+      // Routine dispatch is idempotent by its own deterministic id (options.id) and never
+      // carries a client_request_id — the column is deliberately not written here.
       result = await env.DB.prepare(
-        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
           WHERE EXISTS (
             SELECT 1 FROM routine_runs rr
-             WHERE rr.id = ?11 AND rr.tenant = ?12 AND rr.project_id = ?3
+             WHERE rr.id = ?10 AND rr.tenant = ?11 AND rr.project_id = ?3
                AND rr.status IN ('leased','observing')
                AND NOT EXISTS (
                  SELECT 1 FROM routine_run_events requested
@@ -221,10 +222,19 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
                )
           )`,
       ).bind(...values, fence.runId, fence.tenant).run()
-    } else {
+    } else if (f.client_request_id !== undefined) {
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10)`,
+      ).bind(...values, f.client_request_id).run()
+    } else {
+      // No key → the pre-0172 statement, byte for byte. Deploy-order safety: until an
+      // operator applies 0172, flights has no client_request_id column, and naming it on
+      // every insert would fail EVERY dispatch. Only a caller that opts into the key
+      // depends on the migration.
+      result = await env.DB.prepare(
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9)`,
       ).bind(...values).run()
     }
   } catch (error) {

@@ -1269,9 +1269,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
           cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
-          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}',
-          -- mupot#1540 (0172): createFlight now writes client_request_id.
-          waiting_since INTEGER, resumed_at INTEGER, client_request_id TEXT
+          ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
         );
         -- flight_dispatch delivers a flight.dispatch/v1 envelope (#860), so this
         -- lifecycle test now needs the table the send writes to. Mirrors 0032.
