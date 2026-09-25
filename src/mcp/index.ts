@@ -4143,15 +4143,7 @@ const toolInboxAck: ToolSpec = {
       if (res.reason === 'consumer_fenced') return fail(409, res.reason)
       return fail(400, res.reason, res.detail)
     }
-    return done({
-      acked: res.acked,
-      already_read: res.already_read,
-      refused: res.refused,
-      // mupot#1539 — `dispatch_envelope_unsettled`: this is your own task-dispatch envelope and
-      // acking it before `task_dispatch_runtime_receipt(stage:'runtime_consumed')` would make
-      // the task unsettleable. Settle first, then ack.
-      refusal_reasons: res.refusal_reasons,
-    })
+    return done({ acked: res.acked, already_read: res.already_read, refused: res.refused })
   },
 }
 
@@ -4398,6 +4390,12 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       // terminal receipt to; a directory-OAuth org-admin session with none can still reset
       // without terminate.
       return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
+    }
+    if (result.code === 'reset_refused_consumed') {
+      // mupot#1539 round 2 (P1-A) — the assignee already took custody (runtime_consumed); a
+      // plain reset would rewind the attempt counter under it. Settle completed/failed, or
+      // reset with terminate:true.
+      return fail(409, 'dispatch_consumed', { audit_id: result.audit_id })
     }
     if (result.code === 'reset_refused_already_terminal') {
       // mupot#1494 v4 round 3 (P1-A) — an explicit, named refusal distinct from the generic

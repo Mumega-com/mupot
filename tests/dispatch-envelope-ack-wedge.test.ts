@@ -16,11 +16,7 @@ import { describe, expect, it } from 'vitest'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
-import {
-  DISPATCH_ENVELOPE_REQUEST_PREFIX,
-  DISPATCH_ENVELOPE_SENDER,
-} from '../src/agents/messages'
-import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX } from '../src/bus/fleet-bridge'
+import { inboxApp } from '../src/agents/inbox-routes'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'tenant-1539'
@@ -57,7 +53,8 @@ function fixture() {
       ('${GATE_MEMBER_ID}', 'Gate Member', 'active', '${TENANT}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
       ('cap-1539', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member'),
-      ('cap-1539-gate', '${GATE_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
+      ('cap-1539-gate', '${GATE_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member'),
+      ('cap-1539-operator', '${GATE_MEMBER_ID}', 'org', NULL, 'admin');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES
       ('${TENANT}', '${AGENT_ID}', '${MEMBER_ID}', '${T0}'),
       ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '${T0}');
@@ -107,8 +104,52 @@ function fixture() {
     boundAgentId: AGENT_ID,
     capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' }],
   }
-  const env = { TENANT_SLUG: TENANT, DB: harness.db } as Env
+  // Race seam (mupot#1539 round 2, P0-1): `beforeBatch` runs ONCE, immediately before the next
+  // env.DB.batch() — i.e. after validateEnvelope and every async authority/gate read, right at
+  // the write boundary. It stands in for a concurrent writer landing in that window.
+  const hooks: { beforeBatch: (() => void) | null } = { beforeBatch: null }
+  const db = new Proxy(harness.db, {
+    get(target, prop, receiver) {
+      if (prop === 'batch') {
+        return async (stmts: Parameters<typeof target.batch>[0]) => {
+          const hook = hooks.beforeBatch
+          hooks.beforeBatch = null
+          hook?.()
+          return target.batch(stmts)
+        }
+      }
+      const value: unknown = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+  const env = { TENANT_SLUG: TENANT, DB: db } as Env
+  const gateAuth: AuthContext = {
+    userId: GATE_MEMBER_ID,
+    tenant: TENANT,
+    channel: 'workspace',
+    role: 'member',
+    memberId: GATE_MEMBER_ID,
+    tokenId: GATE_TOKEN_ID,
+    boundAgentId: GATE_AGENT_ID,
+    capabilities: [{ member_id: GATE_MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' }],
+  }
+  // Org-admin OPERATOR (not agent-bound) for task_dispatch_lease_reset.
+  const operatorAuth: AuthContext = {
+    userId: GATE_MEMBER_ID,
+    tenant: TENANT,
+    channel: 'workspace',
+    role: 'owner',
+    memberId: GATE_MEMBER_ID,
+    tokenId: GATE_TOKEN_ID,
+    boundAgentId: undefined,
+    capabilities: [{ member_id: GATE_MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }],
+  }
   const call = (tool: string, args: Record<string, unknown>) => invokeTool(auth, env, tool, args, ORIGIN)
+  const callAs = (who: AuthContext, tool: string, args: Record<string, unknown>) => invokeTool(who, env, tool, args, ORIGIN)
+  const restInboxConsume = async () => {
+    const res = await inboxApp.request(`${ORIGIN}/`, { headers: { authorization: 'Bearer test-token' } }, env)
+    return { status: res.status, body: await res.json() as Record<string, unknown> }
+  }
   const rest = async (tool: string, args: Record<string, unknown>) => {
     const res = await mcpActionsApp.request(`${ORIGIN}/actions/${tool}`, {
       method: 'POST',
@@ -125,7 +166,16 @@ function fixture() {
   const taskStatus = () => (harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID) as {
     status: string
   }).status
-  return { harness, env, auth, call, rest, envelope, taskStatus }
+  const receipts = (stage: string) => (harness.sqlite.prepare(
+    'SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? AND stage = ?',
+  ).get(DISPATCH_ID, stage) as { n: number }).n
+  const lapseLease = () => harness.sqlite.prepare(
+    "UPDATE agent_messages SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?",
+  ).run(MESSAGE_ID)
+  return {
+    harness, env, auth, gateAuth, operatorAuth, hooks, call, callAs, rest, restInboxConsume,
+    envelope, taskStatus, receipts, lapseLease,
+  }
 }
 
 type Fixture = ReturnType<typeof fixture>
@@ -142,6 +192,12 @@ const settle = (stage: 'runtime_consumed' | 'completed' | 'failed', attempt = 1,
   ...extra,
 })
 
+/** Pair correlator (no message_id) — the task_list-only runner shape. */
+const pairSettle = (stage: 'runtime_consumed' | 'completed' | 'failed', attempt = 1) => {
+  const { message_id: _drop, ...rest } = settle(stage, attempt)
+  return rest
+}
+
 /** Real custody: inbox_lease hands the envelope out (delivery_attempts 0 -> 1, live lease),
  *  then runtime_consumed is recorded under that lease. */
 async function leaseAndConsume(f: Fixture) {
@@ -152,21 +208,48 @@ async function leaseAndConsume(f: Fixture) {
   expect(consumed).toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
 }
 
-describe('mupot#1539 — completed/failed after the envelope was acked or its lease lapsed', () => {
+/** A consumed receipt the CALLER did not write. No public path produces one (the settle path
+ *  pins agent = dispatch.agent_id = task.assignee = caller, and receipts are append-only, so an
+ *  UPDATE is refused by trigger); it is forged with direct INSERTs after a REAL lease. */
+function forgeConsumed(f: Fixture, over: { agentId: string; memberId: string; tokenId: string; messageId: string }) {
+  f.harness.sqlite.exec(`
+    INSERT INTO mutation_audit_entries (
+      id, tenant, principal_kind, principal_id, member_id, agent_id, credential_id, origin,
+      handler, operation, target_kind, target_id, task_id, request_id, idempotency_key,
+      evidence_json, recorded_at
+    ) VALUES (
+      'audit-forged', '${TENANT}', 'agent', '${over.agentId}', '${over.memberId}', '${over.agentId}',
+      '${over.tokenId}', 'mcp', 'task_dispatch_runtime_receipt', 'runtime_consumed', 'task',
+      '${TASK_ID}', '${TASK_ID}', 'forged', 'forged', '{}', '${T0}'
+    );
+    INSERT INTO task_dispatch_runtime_receipts (
+      id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id,
+      stage, attempt, runtime_address, runtime_receipt_hash, request_digest, artifact_refs_json,
+      artifact_sha256, result, reason, audit_entry_id, created_at
+    ) VALUES (
+      'receipt-forged', '${TENANT}', '${DISPATCH_ID}', '${TASK_ID}', '${over.agentId}',
+      '${over.messageId}', '${over.memberId}', '${over.tokenId}', 'runtime_consumed', 1,
+      '${AGENT_ID}', '${'a'.repeat(64)}', '${'e'.repeat(64)}', '[]', NULL, NULL, NULL,
+      'audit-forged', '${T0}'
+    );
+    UPDATE tasks SET status = 'in_progress', execution_receipt_id = '${DISPATCH_ID}' WHERE id = '${TASK_ID}';
+  `)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe('#1539 — completed/failed after the envelope was acked or its lease lapsed', () => {
   it('PROD SEQUENCE: dispatch -> runtime_consumed -> inbox_ack -> completed settles the task', async () => {
     const f = fixture()
     try {
       await leaseAndConsume(f)
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refused: [] } })
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] }))
+        .toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refused: [] } })
       expect(f.envelope().read_at).not.toBeNull()
-
       const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
       expect(completed).toMatchObject({ ok: true, result: { receipt: { stage: 'completed' }, task_status: 'review' } })
-      expect(f.taskStatus()).toBe('review')
-      // Exact replay of the same completed call stays idempotent on a read envelope.
-      const replay = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(replay).toMatchObject({ ok: true, result: { task_status: 'review' } })
+      // Exact replay stays idempotent on a read envelope.
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
     } finally {
       f.harness.close()
     }
@@ -178,7 +261,6 @@ describe('mupot#1539 — completed/failed after the envelope was acked or its le
       await leaseAndConsume(f)
       const ack = await f.rest('inbox_ack', { ids: [MESSAGE_ID] })
       expect(ack.status).toBe(200)
-      expect(ack.body).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID] } })
       const completed = await f.rest('task_dispatch_runtime_receipt', settle('completed'))
       expect(completed.status).toBe(200)
       expect(completed.body).toMatchObject({ ok: true, result: { task_status: 'review' } })
@@ -192,8 +274,8 @@ describe('mupot#1539 — completed/failed after the envelope was acked or its le
     try {
       await leaseAndConsume(f)
       await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      const failed = await f.call('task_dispatch_runtime_receipt', settle('failed'))
-      expect(failed).toMatchObject({ ok: true, result: { receipt: { stage: 'failed' }, task_status: 'blocked' } })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('failed')))
+        .toMatchObject({ ok: true, result: { receipt: { stage: 'failed' }, task_status: 'blocked' } })
     } finally {
       f.harness.close()
     }
@@ -203,277 +285,413 @@ describe('mupot#1539 — completed/failed after the envelope was acked or its le
     const f = fixture()
     try {
       await leaseAndConsume(f)
-      // Direct SQL: stands in for >1h of wall-clock work; no public path moves the clock.
-      f.harness.sqlite.prepare("UPDATE agent_messages SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
-        .run(MESSAGE_ID)
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: true, result: { task_status: 'review' } })
+      f.lapseLease() // direct SQL: stands in for >1h of wall-clock work
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
     } finally {
       f.harness.close()
     }
   })
+})
 
-  it('read envelope with NO consumed receipt: runtime_consumed AND completed stay refused', async () => {
+describe('#1539 — what does NOT prove custody', () => {
+  it('a read envelope with no consumed receipt cannot go straight to completed', async () => {
     const f = fixture()
     try {
-      // Real path that marks a pristine envelope read without custody: a plain `inbox` consume.
-      const read = await f.call('inbox', {})
-      expect(read.ok).toBe(true)
-      expect(f.envelope().read_at).not.toBeNull()
-      const consumed = await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))
-      expect(consumed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect((await f.call('inbox', {})).ok).toBe(true)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
       expect(f.taskStatus()).toBe('open')
     } finally {
       f.harness.close()
     }
   })
 
-  // A consumed receipt the CALLER did not write. No public path produces one (the settle path
-  // pins agent = dispatch.agent_id = task.assignee = caller, and receipts are append-only), so
-  // it is forged with direct SQL: the runner really leases the envelope, the forged receipt is
-  // inserted, the task is moved to the state a real consume would leave, and the runner acks.
-  // Without the pins in consumed_by_caller, the runner could then settle `completed` on the
-  // strength of a receipt that proves nothing about its own custody.
-  async function forgeConsumed(f: Fixture, over: { agentId: string; memberId: string; tokenId: string; messageId: string }) {
-    const lease = await f.call('inbox_lease', {})
-    expect(lease.ok).toBe(true)
-    f.harness.sqlite.exec(`
-      INSERT INTO mutation_audit_entries (
-        id, tenant, principal_kind, principal_id, member_id, agent_id, credential_id, origin,
-        handler, operation, target_kind, target_id, task_id, request_id, idempotency_key,
-        evidence_json, recorded_at
-      ) VALUES (
-        'audit-forged', '${TENANT}', 'agent', '${over.agentId}', '${over.memberId}', '${over.agentId}',
-        '${over.tokenId}', 'mcp', 'task_dispatch_runtime_receipt', 'runtime_consumed', 'task',
-        '${TASK_ID}', '${TASK_ID}', 'forged', 'forged', '{}', '${T0}'
-      );
-      INSERT INTO task_dispatch_runtime_receipts (
-        id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id,
-        stage, attempt, runtime_address, runtime_receipt_hash, request_digest, artifact_refs_json,
-        artifact_sha256, result, reason, audit_entry_id, created_at
-      ) VALUES (
-        'receipt-forged', '${TENANT}', '${DISPATCH_ID}', '${TASK_ID}', '${over.agentId}',
-        '${over.messageId}', '${over.memberId}', '${over.tokenId}', 'runtime_consumed', 1,
-        '${AGENT_ID}', '${'a'.repeat(64)}', '${'e'.repeat(64)}', '[]', NULL, NULL, NULL,
-        'audit-forged', '${T0}'
-      );
-      UPDATE tasks SET status = 'in_progress', execution_receipt_id = '${DISPATCH_ID}' WHERE id = '${TASK_ID}';
-    `)
-    const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-    expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID] } })
+  it('consumed receipt written by a DIFFERENT agent', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      forgeConsumed(f, { agentId: GATE_AGENT_ID, memberId: GATE_MEMBER_ID, tokenId: GATE_TOKEN_ID, messageId: MESSAGE_ID })
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.taskStatus()).toBe('in_progress')
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('consumed receipt anchored to a DIFFERENT message', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      forgeConsumed(f, { agentId: AGENT_ID, memberId: MEMBER_ID, tokenId: TOKEN_ID, messageId: OTHER_MESSAGE_ID })
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.taskStatus()).toBe('in_progress')
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('a dead-lettered envelope, even with a consumed receipt', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      f.harness.sqlite.prepare( // direct SQL: dead-lettering needs 5 real hand-outs
+        "UPDATE agent_messages SET dead_lettered_at = ?, dead_letter_reason = 'max_delivery_attempts_exceeded:5' WHERE id = ?",
+      ).run(T0, MESSAGE_ID)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('attempt mismatch: envelope re-handed out after the consume', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      f.lapseLease()
+      expect((await f.call('inbox_lease', {})).ok).toBe(true) // REAL re-lease -> attempt 2
+      expect(f.envelope().delivery_attempts).toBe(2)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.taskStatus()).toBe('in_progress')
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('completed@2 when only attempt 1 was consumed (no receipt row lands)', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      f.lapseLease()
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed', 2)))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.receipts('completed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('a failed receipt is not custody for completed', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('failed')))
+        .toMatchObject({ ok: true, result: { task_status: 'blocked' } })
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.receipts('completed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe('#1539 round 2 P0-1 — envelope invariants are re-asserted at write time (race)', () => {
+  const relet = (f: Fixture) => () => {
+    // A concurrent inbox_lease re-hand-out landing between validateEnvelope and the batch.
+    f.harness.sqlite.prepare(
+      "UPDATE agent_messages SET delivery_attempts = delivery_attempts + 1, lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?",
+    ).run(MESSAGE_ID)
   }
 
-  it('consumed receipt written by a DIFFERENT agent does not prove the caller\'s custody', async () => {
-    const f = fixture()
-    try {
-      await forgeConsumed(f, {
-        agentId: GATE_AGENT_ID, memberId: GATE_MEMBER_ID, tokenId: GATE_TOKEN_ID, messageId: MESSAGE_ID,
-      })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      expect(f.taskStatus()).toBe('in_progress')
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('consumed receipt anchored to a DIFFERENT message does not count', async () => {
-    const f = fixture()
-    try {
-      await forgeConsumed(f, {
-        agentId: AGENT_ID, memberId: MEMBER_ID, tokenId: TOKEN_ID, messageId: OTHER_MESSAGE_ID,
-      })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      expect(f.taskStatus()).toBe('in_progress')
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('dead-lettered envelope stays refused even with a consumed receipt', async () => {
-    const f = fixture()
-    try {
-      await leaseAndConsume(f)
-      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      // Direct SQL: dead-lettering needs 5 real hand-outs; the state is what matters here.
-      f.harness.sqlite.prepare(
-        "UPDATE agent_messages SET dead_lettered_at = ?, dead_letter_reason = 'max_delivery_attempts_exceeded:5' WHERE id = ?",
-      ).run(T0, MESSAGE_ID)
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('attempt mismatch (envelope re-handed out after the consume) stays refused', async () => {
-    const f = fixture()
-    try {
-      await leaseAndConsume(f)
-      // Direct SQL: lapse the lease, then a REAL inbox_lease re-hands the envelope out
-      // (delivery_attempts 1 -> 2) — the redelivery the lease exists to allow.
-      f.harness.sqlite.prepare("UPDATE agent_messages SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
-        .run(MESSAGE_ID)
-      const relet = await f.call('inbox_lease', {})
-      expect(relet.ok).toBe(true)
-      expect(f.envelope().delivery_attempts).toBe(2)
-      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      expect(f.taskStatus()).toBe('in_progress')
-    } finally {
-      f.harness.close()
-    }
-  })
-})
-
-describe('mupot#1539 — custody is per attempt', () => {
-  it('completed at attempt 2 is refused when only attempt 1 was consumed (no receipt row lands)', async () => {
-    const f = fixture()
-    try {
-      await leaseAndConsume(f)
-      // Direct SQL: lapse the lease; a REAL inbox_lease then re-hands the envelope out (attempt 2).
-      f.harness.sqlite.prepare("UPDATE agent_messages SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
-        .run(MESSAGE_ID)
-      expect((await f.call('inbox_lease', {})).ok).toBe(true)
-      expect(f.envelope().delivery_attempts).toBe(2)
-      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed', 2))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      expect(f.harness.sqlite.prepare(
-        "SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
-      ).get()).toEqual({ n: 0 })
-    } finally {
-      f.harness.close()
-    }
-  })
-})
-
-describe('mupot#1539 — only a runtime_consumed receipt is custody', () => {
-  it('a failed receipt (no consume) does not let completed through on an acked envelope', async () => {
+  it('runtime_consumed: a re-lease at the batch boundary refuses and writes nothing', async () => {
     const f = fixture()
     try {
       expect((await f.call('inbox_lease', {})).ok).toBe(true)
-      const failed = await f.call('task_dispatch_runtime_receipt', settle('failed'))
-      expect(failed).toMatchObject({ ok: true, result: { task_status: 'blocked' } })
-      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID] } })
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
-      expect(f.harness.sqlite.prepare(
-        "SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
-      ).get()).toEqual({ n: 0 })
+      f.hooks.beforeBatch = relet(f)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(f.taskStatus()).toBe('open')
+      expect(f.receipts('runtime_consumed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('completed (live-lease path): the Athena race refuses instead of moving the task to review', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      f.hooks.beforeBatch = relet(f)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(f.taskStatus()).toBe('in_progress')
+      expect(f.receipts('completed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('completed (custody path, acked): a dead-letter at the batch boundary refuses', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      f.hooks.beforeBatch = () => {
+        f.harness.sqlite.prepare("UPDATE agent_messages SET dead_lettered_at = ? WHERE id = ?").run(T0, MESSAGE_ID)
+      }
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(f.taskStatus()).toBe('in_progress')
+      expect(f.receipts('completed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('failed (P2-b): a re-lease at the batch boundary refuses', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      f.hooks.beforeBatch = relet(f)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('failed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(f.taskStatus()).toBe('in_progress')
+      expect(f.receipts('failed')).toBe(0)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('failed (P2-b): no consumed receipt and no live lease -> refused', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      f.lapseLease()
+      expect(await f.call('task_dispatch_runtime_receipt', settle('failed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.receipts('failed')).toBe(0)
     } finally {
       f.harness.close()
     }
   })
 })
 
-describe('mupot#1539 — inbox_ack refuses a dispatch envelope not yet taken into custody', () => {
-  it('refuses the unsettled envelope with a typed reason and still acks the rest of the batch', async () => {
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe('#1539 round 2 P0-3 — an envelope read BEFORE custody is recoverable by the assignee', () => {
+  it('plain MCP `inbox` consume -> runtime_consumed (pair correlator) -> completed', async () => {
     const f = fixture()
     try {
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID, OTHER_MESSAGE_ID] })
-      expect(ack).toMatchObject({
-        ok: true,
-        result: {
-          acked: [OTHER_MESSAGE_ID],
-          already_read: [],
-          refused: [MESSAGE_ID],
-          refusal_reasons: { [MESSAGE_ID]: 'dispatch_envelope_unsettled' },
-        },
-      })
-      expect(f.envelope().read_at).toBeNull()
-      // Custody is still takeable after the refused ack — the whole point of refusing it.
+      const read = await f.call('inbox', {})
+      expect(read.ok).toBe(true)
+      expect(f.envelope()).toMatchObject({ delivery_attempts: 0 })
+      expect(f.envelope().read_at).not.toBeNull()
+      expect(await f.call('task_dispatch_runtime_receipt', pairSettle('runtime_consumed')))
+        .toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
+      expect(f.envelope().delivery_attempts).toBe(1)
+      expect(await f.call('task_dispatch_runtime_receipt', pairSettle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('REST GET /api/inbox consume -> runtime_consumed (message_id) -> completed', async () => {
+    const f = fixture()
+    try {
+      const read = await f.restInboxConsume()
+      expect(read.status).toBe(200)
+      expect(read.body).toMatchObject({ ok: true, consumed: true })
+      expect(f.envelope().read_at).not.toBeNull()
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('inbox_lease(attempt_id) -> inbox_lease_ack before custody -> runtime_consumed -> completed', async () => {
+    const f = fixture()
+    try {
+      const A = 'attempt-1539-aaaaaaaa'
+      expect(await f.call('inbox_lease', { attempt_id: A, limit: 1 }))
+        .toMatchObject({ ok: true, result: { state: 'leased' } })
+      expect(await f.call('inbox_lease_ack', { attempt_id: A }))
+        .toMatchObject({ ok: true, result: { state: 'acked' } })
+      expect(f.envelope()).toMatchObject({ delivery_attempts: 1, lease_expires_at: null })
+      expect(f.envelope().read_at).not.toBeNull()
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
+      expect(f.envelope().delivery_attempts).toBe(1) // never advanced, never rewound
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('inbox_ack before custody -> runtime_consumed -> completed (acking is never destructive)', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID, OTHER_MESSAGE_ID] }))
+        .toMatchObject({ ok: true, result: { acked: [MESSAGE_ID, OTHER_MESSAGE_ID], refused: [] } })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: true, result: { task_status: 'review' } })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('recovery claim is the assignee\'s only: another agent writes nothing to the envelope', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox', {})).ok).toBe(true)
+      const before = f.envelope()
+      const res = await f.callAs(f.gateAuth, 'task_dispatch_runtime_receipt', settle('runtime_consumed'))
+      expect(res.ok).toBe(false)
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('recovery never rewinds or advances the attempt: attempt 2 on a row handed out once is refused', async () => {
+    const f = fixture()
+    try {
+      const A = 'attempt-1539-bbbbbbbb'
+      await f.call('inbox_lease', { attempt_id: A, limit: 1 })
+      await f.call('inbox_lease_ack', { attempt_id: A })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed', 2)))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.envelope()).toMatchObject({ delivery_attempts: 1, lease_expires_at: null })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('recovery is refused once any runtime receipt exists (failed, then read)', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect((await f.call('task_dispatch_runtime_receipt', settle('failed'))).ok).toBe(true)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      const before = f.envelope()
+      expect((await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))).ok).toBe(false)
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('recovery is refused while the task is in a status runtime_consumed cannot accept', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox', {})).ok).toBe(true)
+      f.harness.sqlite.prepare("UPDATE tasks SET status = 'review' WHERE id = ?").run(TASK_ID) // out-of-band move
+      const before = f.envelope()
+      expect((await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))).ok).toBe(false)
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('the adversarial in_progress sequence no longer strands the envelope: inbox_ack succeeds', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect(await f.call('task_update', { task_id: TASK_ID, status: 'in_progress' })).toMatchObject({ ok: true })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] }))
+        .toMatchObject({ ok: true, result: { acked: [MESSAGE_ID] } })
+    } finally {
+      f.harness.close()
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe('#1539 round 2 P1-A — lease reset never rewinds the attempt under custody', () => {
+  it('reset (no terminate) is refused once runtime_consumed exists; the stale completed@1 cannot land', async () => {
+    const f = fixture()
+    try {
       await leaseAndConsume(f)
+      f.lapseLease()
+      const reset = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner looks dead',
+      })
+      expect(reset).toMatchObject({ ok: false, status: 409, error: 'dispatch_consumed' })
+      expect(f.envelope().delivery_attempts).toBe(1)
+      // The adversarial's continuation: a re-lease now moves to attempt 2, never back to 1.
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect(f.envelope().delivery_attempts).toBe(2)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.receipts('completed')).toBe(0)
     } finally {
       f.harness.close()
     }
   })
 
-  it('REST /actions/inbox_ack applies the same guard', async () => {
+  it('the atomic half: custody landing between the pre-check and the reset UPDATE still refuses', async () => {
     const f = fixture()
     try {
-      const ack = await f.rest('inbox_ack', { ids: [MESSAGE_ID, OTHER_MESSAGE_ID] })
-      expect(ack.status).toBe(200)
-      expect(ack.body).toMatchObject({
-        ok: true,
-        result: { acked: [OTHER_MESSAGE_ID], refusal_reasons: { [MESSAGE_ID]: 'dispatch_envelope_unsettled' } },
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      f.lapseLease()
+      // Forge the consumed receipt at the reset's batch boundary (after its pre-check read).
+      f.hooks.beforeBatch = () => forgeConsumed(f, {
+        agentId: AGENT_ID, memberId: MEMBER_ID, tokenId: TOKEN_ID, messageId: MESSAGE_ID,
       })
-      expect(f.envelope().read_at).toBeNull()
+      const reset = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'race',
+      })
+      expect(reset.ok).toBe(false)
+      expect(f.envelope().delivery_attempts).toBe(1)
     } finally {
       f.harness.close()
     }
   })
 
-  it('after completed, inbox_ack succeeds', async () => {
+  it('terminate stays available as the operator\'s way out under custody', async () => {
     const f = fixture()
     try {
       await leaseAndConsume(f)
-      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed'))
-      expect(completed).toMatchObject({ ok: true, result: { task_status: 'review' } })
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refused: [], refusal_reasons: {} } })
+      f.lapseLease()
+      const reset = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner is gone', terminate: true,
+      })
+      expect(reset).toMatchObject({ ok: true, result: { reset: true, terminated: true } })
     } finally {
       f.harness.close()
     }
   })
+})
 
-  it('an envelope whose task is no longer settleable (done) is ackable — the guard never strands mail', async () => {
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe('#1539 round 2 P2-a — failed cannot settle after the dispatch completed', () => {
+  it('completed -> ack -> gate reject -> stale failed@1 is refused; task stays rejected, result intact', async () => {
     const f = fixture()
     try {
-      // Direct SQL: the task was closed out-of-band (operator), so this dispatch can never settle.
-      f.harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(TASK_ID)
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refusal_reasons: {} } })
+      await leaseAndConsume(f)
+      expect((await f.call('task_dispatch_runtime_receipt', settle('completed'))).ok).toBe(true)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      expect(await f.callAs(f.gateAuth, 'task_verdict', { task_id: TASK_ID, verdict: 'rejected', note: 'redo' }))
+        .toMatchObject({ ok: true, result: { task: { status: 'rejected' } } })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('failed')))
+        .toMatchObject({ ok: false, error: 'runtime_receipt_transition_conflict' })
+      expect(f.harness.sqlite.prepare('SELECT status, result FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'rejected', result: 'Work done.' })
+      expect(f.receipts('failed')).toBe(0)
     } finally {
       f.harness.close()
     }
-  })
-
-  it('an envelope whose task was reassigned away from the dispatch agent is ackable', async () => {
-    const f = fixture()
-    try {
-      // Direct SQL: task_update refuses reassignment while a dispatch is in flight, but an old row
-      // in this state can exist (pre-guard data); no one can settle that dispatch any more.
-      f.harness.sqlite.prepare('UPDATE tasks SET assignee_agent_id = ? WHERE id = ?').run(GATE_AGENT_ID, TASK_ID)
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refusal_reasons: {} } })
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('a dead-lettered envelope is ackable — settle is already impossible for it', async () => {
-    const f = fixture()
-    try {
-      // Direct SQL: see the dead-letter test above.
-      f.harness.sqlite.prepare(
-        "UPDATE agent_messages SET dead_lettered_at = ?, dead_letter_reason = 'max_delivery_attempts_exceeded:5' WHERE id = ?",
-      ).run(T0, MESSAGE_ID)
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [MESSAGE_ID], refusal_reasons: {} } })
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('refusal reasons are never given for ids that are not the caller\'s (no message-id oracle)', async () => {
-    const f = fixture()
-    try {
-      // Direct SQL: readdress the envelope to another agent.
-      f.harness.sqlite.prepare('UPDATE agent_messages SET to_agent = ? WHERE id = ?').run(GATE_AGENT_ID, MESSAGE_ID)
-      const ack = await f.call('inbox_ack', { ids: [MESSAGE_ID] })
-      expect(ack).toMatchObject({ ok: true, result: { acked: [], refused: [MESSAGE_ID], refusal_reasons: {} } })
-    } finally {
-      f.harness.close()
-    }
-  })
-
-  it('the guard\'s literals match what deliverDispatchToInbox writes', () => {
-    expect(DISPATCH_ENVELOPE_SENDER).toBe(DISPATCH_BRIDGE_SENDER)
-    expect(DISPATCH_ENVELOPE_REQUEST_PREFIX).toBe(DISPATCH_INBOX_PREFIX)
   })
 })
