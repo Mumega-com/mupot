@@ -42,13 +42,12 @@ import type { FlightSignals, PreflightOptions } from './preflight'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
 import {
+  findFinishedWorkConflict,
   findFlightByClientRequestId,
-  listLandedFlightsForTasks,
   parseClientRequestId,
   parseRedispatchReason,
   sameDispatchRequest,
-  summarizeLandedConflict,
-  writeRedispatchReceipt,
+  type RedispatchReceiptInput,
 } from './rebooking'
 
 // ── input parsing (pure, exported for tests) ──────────────────────────────────
@@ -279,6 +278,13 @@ flightsApp.post('/', async (c) => {
   const redispatchReason = parseRedispatchReason((raw as Record<string, unknown>).redispatch_landed_reason)
   if (!redispatchReason.ok) return c.json({ error: 'invalid_redispatch_landed_reason' }, 400)
   const dispatcher = flight.dispatched_by ?? flight.agent
+  // P3 (round 2): the key's scope must be the AUTHENTICATED principal, not a body field.
+  // dispatched_by is caller-supplied on this route, so the stored key is namespaced by the
+  // org-admin member who presented the bearer — another member cannot collide with, or
+  // read back, this member's flights by spoofing dispatched_by.
+  if (flight.client_request_id) {
+    flight.client_request_id = `member:${auth.id.memberId}:${flight.client_request_id}`
+  }
   const replayOriginal = async (): Promise<Response | null> => {
     if (!flight.client_request_id || !flight.meta) return null
     const original = await findFlightByClientRequestId(c.env, dispatcher, flight.client_request_id)
@@ -299,26 +305,23 @@ flightsApp.post('/', async (c) => {
   }
   const replay = await replayOriginal()
   if (replay) return replay
-  let presetFlightId: string | undefined
+  let redispatchReceipt: RedispatchReceiptInput | undefined
   if (flight.meta) {
-    const landedConflicts = await listLandedFlightsForTasks(c.env, flight.meta.task_ids)
-    if (landedConflicts.length > 0) {
-      const conflict = summarizeLandedConflict(landedConflicts)
-      if (!redispatchReason.value) return c.json({ error: 'flight_task_already_landed', ...conflict }, 409)
-      presetFlightId = crypto.randomUUID()
-      await writeRedispatchReceipt(c.env, {
-        flightId: presetFlightId,
+    const finishedConflict = await findFinishedWorkConflict(c.env, flight.meta.task_ids)
+    if (finishedConflict) {
+      if (!redispatchReason.value) return c.json(finishedConflict, 409)
+      redispatchReceipt = {
         actor: { kind: 'member', id: auth.id.memberId },
         reason: redispatchReason.value,
-        landedFlightIds: conflict.landed_flight_ids,
-        taskIds: conflict.task_ids,
-      })
+        landedFlightIds: finishedConflict.landed_flight_ids,
+        taskIds: finishedConflict.task_ids,
+      }
     }
   }
 
   let result
   try {
-    result = await dispatchFlight(c.env, flight, signals, opts, presetFlightId ? { id: presetFlightId } : {})
+    result = await dispatchFlight(c.env, flight, signals, opts, redispatchReceipt ? { redispatchReceipt } : {})
   } catch (error) {
     if (error instanceof FlightIdempotencyConflictError) {
       const raced = await replayOriginal()

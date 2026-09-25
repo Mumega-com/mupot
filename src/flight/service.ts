@@ -10,6 +10,7 @@ import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
+import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -54,6 +55,8 @@ export interface FlightRow {
   resumed_at?: number | null
   /** Dispatcher-supplied idempotency key; unique per (tenant, dispatched_by_agent_id). */
   client_request_id?: string | null
+  /** Unix ms the watchdog escalated the current wait (once per wait); NULL otherwise. */
+  escalated_at?: number | null
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null
@@ -85,6 +88,11 @@ export interface CreateFlightOptions {
   id?: string
   /** Internal atomic fence used by Routine dispatch before creating control work. */
   routineRunFence?: { runId: string; tenant: string }
+  /**
+   * mupot#1540: a receipted override of the finished-work refusal. Written in the SAME
+   * batch as the flight INSERT (see src/flight/rebooking.ts).
+   */
+  redispatchReceipt?: RedispatchReceiptInput
 }
 
 export class FlightCreateFenceError extends Error {
@@ -222,11 +230,17 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
                )
           )`,
       ).bind(...values, fence.runId, fence.tenant).run()
-    } else if (f.client_request_id !== undefined) {
-      result = await env.DB.prepare(
+    } else if (f.client_request_id !== undefined || options.redispatchReceipt) {
+      const insert = env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10)`,
-      ).bind(...values, f.client_request_id).run()
+      ).bind(...values, f.client_request_id ?? null)
+      if (options.redispatchReceipt) {
+        const [inserted] = await env.DB.batch([insert, redispatchReceiptStatement(env, id, options.redispatchReceipt)])
+        result = inserted
+      } else {
+        result = await insert.run()
+      }
     } else {
       // No key → the pre-0172 statement, byte for byte. Deploy-order safety: until an
       // operator applies 0172, flights has no client_request_id column, and naming it on

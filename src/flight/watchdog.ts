@@ -204,30 +204,57 @@ export async function scanStalledFlights(
   const nowMs = opts.nowMs ?? Date.now()
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500)
 
-  const rows = await env.DB.prepare(
+  // TWO windows, each with its own LIMIT (mupot#1540 round 2, gate P0). The single
+  // window used to include every 'waiting' flight — rows the sweep can NEVER reap — ordered
+  // oldest-first, so 100 parked flights permanently filled it and a genuinely stalled
+  // running flight behind them was never evaluated. Now:
+  //   1. reapable statuses only (preflight / running / sleeping);
+  //   2. waiting flights only when their escalation is DUE and has not already fired
+  //      (escalated_at IS NULL) — an escalated-once wait never re-enters the window.
+  const reapable = await env.DB.prepare(
     `SELECT f.*, a.name AS agent_name, s.name AS squad_name
        FROM flights f
        LEFT JOIN agents a ON a.id = f.agent
        LEFT JOIN squads s ON s.id = a.squad_id
       WHERE f.tenant = ?1
-        AND f.status IN ('preflight', 'running', 'sleeping', 'waiting')
+        AND f.status IN ('preflight', 'running', 'sleeping')
       ORDER BY f.created_at ASC
       LIMIT ?2`,
   )
     .bind(env.TENANT_SLUG, limit)
     .all<FlightRow>()
+  const escalationDue = await env.DB.prepare(
+    `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+       FROM flights f
+       LEFT JOIN agents a ON a.id = f.agent
+       LEFT JOIN squads s ON s.id = a.squad_id
+      WHERE f.tenant = ?1
+        AND f.status = 'waiting'
+        AND f.escalated_at IS NULL
+        AND COALESCE(f.waiting_since, f.started_at, f.created_at) < ?3
+      ORDER BY f.created_at ASC
+      LIMIT ?2`,
+  )
+    .bind(env.TENANT_SLUG, limit, nowMs - DEFAULT_WAITING_GATE_ESCALATION_TIMEOUT_MS)
+    .all<FlightRow>()
 
-  const candidates = rows.results ?? []
+  const reapableRows = reapable.results ?? []
+  const escalationRows = escalationDue.results ?? []
   const items: Array<{ flight: FlightRow; evaluation: FlightWatchdogEvaluation }> = []
 
-  for (const flight of candidates) {
+  for (const flight of [...reapableRows, ...escalationRows]) {
     const evaluation = evaluateFlightLiveness(flight, nowMs)
     if (evaluation.action === 'reap' || evaluation.action === 'escalate') {
       items.push({ flight, evaluation })
     }
   }
 
-  return { items, scanned: candidates.length, limit, capped: candidates.length >= limit }
+  return {
+    items,
+    scanned: reapableRows.length + escalationRows.length,
+    limit,
+    capped: reapableRows.length >= limit || escalationRows.length >= limit,
+  }
 }
 
 export async function listStalledFlights(
@@ -484,7 +511,7 @@ export interface FlightWatchdogSweepResult {
   /** Flights the liveness predicate flagged (reap + escalate). */
   candidates: number
   reaped: number
-  /** Flagged 'escalate' — counted and reported, NEVER reaped. */
+  /** Escalations FIRED this pass (each waiting flight escalates once per wait) — NEVER reaped. */
   escalated: number
   /** Which flights escalated, so the count is attributable rather than just a number. */
   escalated_flight_ids: string[]
@@ -535,8 +562,26 @@ export async function sweepStalledFlights(
 
   for (const { flight, evaluation } of scan.items) {
     if (evaluation.action === 'escalate') {
-      escalated += 1
-      escalatedFlightIds.push(flight.id)
+      // ONCE per wait (gate P0 (3)): claim the escalation with a conditional write, so a
+      // concurrent or later sweep cannot fire it again. The leave-waiting trigger clears
+      // escalated_at, so a flight that resumes and later parks again escalates afresh.
+      try {
+        const claimed = await env.DB.prepare(
+          `UPDATE flights SET escalated_at = ?3
+            WHERE id = ?1 AND tenant = ?2 AND status = 'waiting' AND escalated_at IS NULL
+            RETURNING id`,
+        ).bind(flight.id, env.TENANT_SLUG, nowMs).all<{ id: string }>()
+        if ((claimed.results ?? []).length === 1) {
+          escalated += 1
+          escalatedFlightIds.push(flight.id)
+        }
+      } catch (error) {
+        console.error(
+          `[flight-watchdog] escalation claim threw for flight ${flight.id}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        )
+        failed += 1
+      }
       continue
     }
 

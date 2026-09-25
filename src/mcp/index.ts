@@ -202,13 +202,12 @@ import {
   type FlightRow,
 } from '../flight/service'
 import {
+  findFinishedWorkConflict,
   findFlightByClientRequestId,
-  listLandedFlightsForTasks,
   parseClientRequestId,
   parseRedispatchReason,
   sameDispatchRequest,
-  summarizeLandedConflict,
-  writeRedispatchReceipt,
+  type RedispatchReceiptInput,
 } from '../flight/rebooking'
 import { parseDispatchBody } from '../flight/routes'
 import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
@@ -2640,8 +2639,9 @@ const toolFlightDispatch: ToolSpec = {
     + 'client_request_id?: string (idempotency key, <=200 chars, unique per dispatching agent — a retry with the '
     + 'same key returns the ORIGINAL flight with idempotent_replay:true; the same key with a different request is '
     + '409 client_request_id_conflict), '
-    + 'redispatch_landed_reason?: string (<=500 chars — explicit, receipted override of 409 flight_task_already_landed, '
-    + 'which refuses a dispatch naming a task_id that already belongs to a LANDED flight; requires lead on every flight squad) }',
+    + 'redispatch_landed_reason?: string (<=500 chars — explicit, receipted override of 409 flight_task_already_landed '
+    + '(a task_id already belongs to a LANDED flight) and 409 flight_task_already_done (a task_id is already done or '
+    + 'approved, whatever became of its earlier flight); requires lead on every flight squad) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2850,30 +2850,28 @@ const toolFlightDispatch: ToolSpec = {
     const replay = await replayOriginal()
     if (replay) return replay
 
-    let presetFlightId: string | undefined
-    const landedConflicts = await listLandedFlightsForTasks(env, meta.task_ids)
-    if (landedConflicts.length > 0) {
-      const conflict = summarizeLandedConflict(landedConflicts)
+    let redispatchReceipt: RedispatchReceiptInput | undefined
+    const finishedConflict = await findFinishedWorkConflict(env, meta.task_ids)
+    if (finishedConflict) {
+      const { error: conflictError, ...conflict } = finishedConflict
       if (!redispatchReason.value) {
-        return fail(409, 'flight_task_already_landed', conflict)
+        return fail(409, conflictError, conflict)
       }
-      // The override re-spends on work already landed, so it takes lead on every flight
-      // squad — the same bar as a budgeted dispatch — not the member floor of a booking.
+      // The override re-spends on finished work, so it takes lead on every flight squad —
+      // the same bar as a budgeted dispatch — not the member floor of a booking.
       for (const referencedSquad of referencedSquads) {
         const bypassAppliesHere = workspaceAdmin && referencedSquad.kind !== 'home'
         if (!bypassAppliesHere && !hasCapability(grants, 'squad', brandSquadScope(referencedSquad), 'lead')) {
           return fail(403, 'flight_redispatch_forbidden', { need: 'lead', scope: 'squad', squad_id: referencedSquad.id })
         }
       }
-      // Receipt FIRST, under the flight id the dispatch will then use. See rebooking.ts.
-      presetFlightId = crypto.randomUUID()
-      await writeRedispatchReceipt(env, {
-        flightId: presetFlightId,
+      // Written by createFlight in the SAME batch as the flight row. See rebooking.ts.
+      redispatchReceipt = {
         actor: { kind: 'agent', id: auth.boundAgentId },
         reason: redispatchReason.value,
         landedFlightIds: conflict.landed_flight_ids,
         taskIds: conflict.task_ids,
-      })
+      }
     }
 
     const signals = parseJsonArg(args.signals_json)
@@ -2903,7 +2901,7 @@ const toolFlightDispatch: ToolSpec = {
         parsed.value.flight,
         parsed.value.signals,
         parsed.value.opts,
-        presetFlightId ? { id: presetFlightId } : {},
+        redispatchReceipt ? { redispatchReceipt } : {},
       )
     } catch (error) {
       if (error instanceof FlightIdempotencyConflictError) {

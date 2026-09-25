@@ -11,15 +11,20 @@
 // Two independent guards, both used by the MCP flight_dispatch tool and the org-admin
 // POST /api/flights route (one predicate, two surfaces):
 //
-//   1. LANDED-TASK REFUSAL. A dispatch naming any task_id that already belongs to a
-//      LANDED flight in this tenant is refused `flight_task_already_landed`, listing the
-//      landed flight ids. Landing requires every task 'done' (landGovernedFlight) and
-//      'done' is terminal in the task transition matrix (src/tasks/service.ts), so a task
-//      in a landed flight never legitimately needs a second flight — except by an
-//      explicit, RECEIPTED override (redispatch_landed_reason), which writes a
-//      flight_redispatch_receipts row BEFORE the flight is created. Receipt-first means
-//      the failure mode is "an authorisation with no flight" (visible, harmless), never
-//      "a duplicate flight with no authorisation".
+//   1. FINISHED-WORK REFUSAL. Two typed refusals, checked in this order:
+//        - `flight_task_already_landed`: a task_id already belongs to a LANDED flight in
+//          this tenant (lists the landed flight ids);
+//        - `flight_task_already_done` (round 2, gate P1-2): a task_id is already 'done'
+//          or 'approved', WHATEVER happened to its earlier flight. The #1540 victims'
+//          earlier flights were REAPED ('failed'), not landed, so the landed check alone
+//          still let the approved work be re-booked — and a fresh flight over already-
+//          done tasks can land at once, which is exactly the fake throughput of 121ff12e.
+//      'done' is terminal in the task transition matrix (src/tasks/service.ts), so
+//      finished work never legitimately needs another flight — except by an explicit,
+//      RECEIPTED override (redispatch_landed_reason). The flight_redispatch_receipts row
+//      is written in the SAME D1 batch as the flight INSERT (createFlight's
+//      redispatchReceipt option): no receipt without its flight, no flight without its
+//      receipt.
 //
 //   2. IDEMPOTENCY KEY. client_request_id, unique per (tenant, dispatching agent). A retry
 //      carrying the same key returns the ORIGINAL flight (no second row, no second
@@ -78,6 +83,34 @@ export async function listLandedFlightsForTasks(env: Env, taskIds: readonly stri
   return rows.results ?? []
 }
 
+/** Every task in `taskIds` that is already finished ('done') or approved-awaiting-done. */
+export async function listFinishedTaskIds(env: Env, taskIds: readonly string[]): Promise<string[]> {
+  if (taskIds.length === 0) return []
+  const rows = await env.DB.prepare(
+    `SELECT id FROM tasks
+      WHERE id IN (SELECT value FROM json_each(?1))
+        AND status IN ('done', 'approved')
+      ORDER BY id`,
+  ).bind(JSON.stringify(taskIds)).all<{ id: string }>()
+  return (rows.results ?? []).map((row) => row.id)
+}
+
+export type FinishedWorkConflict =
+  | { error: 'flight_task_already_landed'; landed_flight_ids: string[]; task_ids: string[] }
+  | { error: 'flight_task_already_done'; landed_flight_ids: string[]; task_ids: string[] }
+
+/** The single predicate both dispatch surfaces call. null = no finished work named. */
+export async function findFinishedWorkConflict(
+  env: Env,
+  taskIds: readonly string[],
+): Promise<FinishedWorkConflict | null> {
+  const landed = await listLandedFlightsForTasks(env, taskIds)
+  if (landed.length > 0) return { error: 'flight_task_already_landed', ...summarizeLandedConflict(landed) }
+  const finished = await listFinishedTaskIds(env, taskIds)
+  if (finished.length > 0) return { error: 'flight_task_already_done', landed_flight_ids: [], task_ids: finished }
+  return null
+}
+
 export function summarizeLandedConflict(rows: readonly LandedTaskFlight[]): {
   landed_flight_ids: string[]
   task_ids: string[]
@@ -88,32 +121,34 @@ export function summarizeLandedConflict(rows: readonly LandedTaskFlight[]): {
   }
 }
 
-export async function writeRedispatchReceipt(
-  env: Env,
-  input: {
-    flightId: string
-    actor: { kind: 'member' | 'agent'; id: string }
-    reason: string
-    landedFlightIds: readonly string[]
-    taskIds: readonly string[]
-    nowMs?: number
-  },
-): Promise<void> {
-  await env.DB.prepare(
+export interface RedispatchReceiptInput {
+  actor: { kind: 'member' | 'agent'; id: string }
+  reason: string
+  landedFlightIds: readonly string[]
+  taskIds: readonly string[]
+}
+
+/**
+ * The receipt INSERT, bound to `flightId`. createFlight runs it in the SAME batch as the
+ * flight INSERT and guards it on that row existing, so the two commit or roll back together.
+ */
+export function redispatchReceiptStatement(env: Env, flightId: string, input: RedispatchReceiptInput, nowMs = Date.now()) {
+  return env.DB.prepare(
     `INSERT INTO flight_redispatch_receipts
        (id, tenant, flight_id, actor_kind, actor_id, reason, landed_flight_ids, task_ids, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+      WHERE EXISTS (SELECT 1 FROM flights WHERE id = ?3 AND tenant = ?2)`,
   ).bind(
     crypto.randomUUID(),
     env.TENANT_SLUG,
-    input.flightId,
+    flightId,
     input.actor.kind,
     input.actor.id,
     input.reason,
     JSON.stringify(input.landedFlightIds),
     JSON.stringify(input.taskIds),
-    input.nowMs ?? Date.now(),
-  ).run()
+    nowMs,
+  )
 }
 
 export async function findFlightByClientRequestId(

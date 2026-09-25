@@ -31,8 +31,26 @@
 --                         reject, a reopen, a missing task). resumed_at restarts the
 --                         running stall clock, so a flight that waited 5h at a gate is
 --                         not reaped the instant it is sent back for rework.
---    A waiting flight whose tasks all reach 'done' STAYS waiting: it is waiting to be
---    landed, and the watchdog escalates it at 24h instead of reaping it.
+--      waiting → landed   (round 2, gate P0) when EVERY task is 'done' and every gated
+--                         task's latest verdict is 'approved' — the SAME task predicate
+--                         landGovernedFlight enforces, plus its routine-proposal witness.
+--                         A SYSTEM LAND: score NULL (a system land is not a coherence
+--                         measurement and must never read as throughput), cost as
+--                         recorded, gate_reason 'auto_landed_all_tasks_done', receipted in
+--                         flight_status_transitions with that cause. Without this, 'done'
+--                         being terminal meant an approved-and-closed flight that nobody
+--                         landed stayed 'waiting' FOREVER: unreapable, re-escalated every
+--                         sweep, holding scan slots and routine skip-overlap pins.
+--                         It only ever fires from 'waiting', i.e. after the flight crossed
+--                         a gate; an ungated all-'done' running flight is still the
+--                         executor's to land (or the 60m reaper's). It deliberately writes
+--                         NO flight_event_outbox row: that table's actor_kind admits only
+--                         member|agent, and attributing a system land to the executor would
+--                         be a forged actor. The transition receipt is the audit record.
+--
+--    Performance (round 2, gate P1-1): tasks carries no tenant column, so the triggers
+--    cannot scope by tenant; they scope by flight status instead, through
+--    idx_flights_status below — an in-air-status lookup instead of a scan of every flight.
 --
 --    The trigger must NEVER abort a task write. Every json_* read goes through the
 --    CASE WHEN json_valid(...) guard (json_each on malformed JSON raises), and it only
@@ -61,6 +79,11 @@
 ALTER TABLE flights ADD COLUMN waiting_since INTEGER;      -- Unix ms; set on → waiting
 ALTER TABLE flights ADD COLUMN resumed_at INTEGER;         -- Unix ms; set on waiting → running
 ALTER TABLE flights ADD COLUMN client_request_id TEXT;     -- dispatcher-supplied idempotency key
+ALTER TABLE flights ADD COLUMN escalated_at INTEGER;       -- Unix ms the watchdog escalated this wait; once per wait
+
+-- The triggers select flights by status only (tasks has no tenant); without this every task
+-- status change scanned the whole flights table (gate P1-1: SCAN f, ~185x at 24k flights).
+CREATE INDEX IF NOT EXISTS idx_flights_status ON flights (status);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_flights_client_request_id
   ON flights (tenant, dispatched_by_agent_id, client_request_id)
@@ -72,8 +95,8 @@ CREATE TABLE IF NOT EXISTS flight_status_transitions (
   tenant                 TEXT NOT NULL,
   flight_id              TEXT NOT NULL,
   from_status            TEXT NOT NULL CHECK (from_status IN ('running', 'waiting')),
-  to_status              TEXT NOT NULL CHECK (to_status IN ('running', 'waiting')),
-  cause                  TEXT NOT NULL CHECK (cause IN ('task_status', 'migration_backfill')),
+  to_status              TEXT NOT NULL CHECK (to_status IN ('running', 'waiting', 'landed')),
+  cause                  TEXT NOT NULL CHECK (cause IN ('task_status', 'migration_backfill', 'auto_landed_all_tasks_done')),
   cause_task_id          TEXT,
   cause_task_from_status TEXT,
   cause_task_to_status   TEXT,
@@ -100,12 +123,12 @@ END;
 CREATE TABLE IF NOT EXISTS flight_redispatch_receipts (
   id                TEXT PRIMARY KEY,
   tenant            TEXT NOT NULL,
-  flight_id         TEXT NOT NULL,           -- the NEW flight the override authorised
+  flight_id         TEXT NOT NULL,           -- the NEW flight the override authorised (same batch as its INSERT)
   actor_kind        TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent')),
   actor_id          TEXT NOT NULL,
   reason            TEXT NOT NULL CHECK (length(trim(reason)) > 0),
-  landed_flight_ids TEXT NOT NULL,           -- JSON array: the landed flights overridden
-  task_ids          TEXT NOT NULL,           -- JSON array: the task ids already landed
+  landed_flight_ids TEXT NOT NULL,           -- JSON array: landed flights overridden (may be [])
+  task_ids          TEXT NOT NULL,           -- JSON array: task ids already landed / done / approved
   created_at        INTEGER NOT NULL,
   UNIQUE (tenant, flight_id)
 );
@@ -189,6 +212,7 @@ BEGIN
     FROM flights f
    WHERE f.status = 'waiting'
      AND json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') = 'array'
      AND EXISTS (
        SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
         WHERE ref.value = NEW.id
@@ -197,12 +221,126 @@ BEGIN
   UPDATE flights
      SET status = 'running',
          waiting_since = NULL,
+         escalated_at = NULL,
          resumed_at = unixepoch('now') * 1000
    WHERE status = 'waiting'
      AND json_extract(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND json_type(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END, '$.task_ids') = 'array'
      AND EXISTS (
        SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
         WHERE ref.value = NEW.id
+     );
+END;
+
+-- ── A (round 2, gate P0): the exit from 'waiting' when the gated work is finished ─────
+-- Same task predicate as landGovernedFlight (src/flight/service.ts) — task exists, matches
+-- the flight's project, is 'done', and if gated its LATEST verdict is 'approved' — plus the
+-- same routine-proposal witness for a routine CONTROL flight. Nothing here can land a
+-- flight whose work the gate did not approve.
+CREATE TRIGGER IF NOT EXISTS flights_auto_land_on_task_done
+AFTER UPDATE OF status ON tasks
+WHEN OLD.status IS NOT NEW.status
+ AND NEW.status = 'done'
+BEGIN
+  INSERT INTO flight_status_transitions
+    (id, tenant, flight_id, from_status, to_status, cause,
+     cause_task_id, cause_task_from_status, cause_task_to_status, created_at)
+  SELECT lower(hex(randomblob(16))), f.tenant, f.id, 'waiting', 'landed', 'auto_landed_all_tasks_done',
+         NEW.id, OLD.status, NEW.status, unixepoch('now') * 1000
+    FROM flights f
+   WHERE f.status = 'waiting'
+     AND json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') = 'array'
+     AND EXISTS (
+       SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
+        WHERE ref.value = NEW.id
+     )
+     AND NOT EXISTS (
+       SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
+         LEFT JOIN tasks t ON t.id = ref.value
+        WHERE t.id IS NULL
+           OR (f.project_id IS NOT NULL AND t.project_id IS NOT f.project_id)
+           OR t.status <> 'done'
+           OR (
+             t.gate_owner IS NOT NULL
+             AND COALESCE((
+               SELECT v.verdict FROM task_verdicts v
+                WHERE v.task_id = t.id
+                ORDER BY v.decided_at DESC, v.id DESC
+                LIMIT 1
+             ), '') <> 'approved'
+           )
+     )
+     AND (
+       json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id') IS NULL
+       OR NOT EXISTS (
+         SELECT 1 FROM routine_runs rr
+          WHERE rr.flight_id = f.id
+            AND rr.tenant = f.tenant
+            AND rr.id = json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id')
+       )
+       OR EXISTS (
+         SELECT 1
+           FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.receipt_refs') AS receipt_ref
+           JOIN routine_runs rr
+             ON rr.tenant = f.tenant
+            AND rr.flight_id = f.id
+            AND rr.id = json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id')
+          WHERE rr.proposal_json IS NOT NULL
+            AND json_valid(rr.proposal_json)
+            AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
+            AND receipt_ref.value = 'routine.proposal:' || rr.id
+       )
+     );
+
+  UPDATE flights
+     SET status = 'landed',
+         score = NULL,
+         gate_reason = 'auto_landed_all_tasks_done',
+         ended_at = unixepoch('now') * 1000
+   WHERE status = 'waiting'
+     AND json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND json_type(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') = 'array'
+     AND EXISTS (
+       SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
+        WHERE ref.value = NEW.id
+     )
+     AND NOT EXISTS (
+       SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
+         LEFT JOIN tasks t ON t.id = ref.value
+        WHERE t.id IS NULL
+           OR (flights.project_id IS NOT NULL AND t.project_id IS NOT flights.project_id)
+           OR t.status <> 'done'
+           OR (
+             t.gate_owner IS NOT NULL
+             AND COALESCE((
+               SELECT v.verdict FROM task_verdicts v
+                WHERE v.task_id = t.id
+                ORDER BY v.decided_at DESC, v.id DESC
+                LIMIT 1
+             ), '') <> 'approved'
+           )
+     )
+     AND (
+       json_type(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id') IS NULL
+       OR NOT EXISTS (
+         SELECT 1 FROM routine_runs rr
+          WHERE rr.flight_id = flights.id
+            AND rr.tenant = flights.tenant
+            AND rr.id = json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id')
+       )
+       OR EXISTS (
+         SELECT 1
+           FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.receipt_refs') AS receipt_ref
+           JOIN routine_runs rr
+             ON rr.tenant = flights.tenant
+            AND rr.flight_id = flights.id
+            AND rr.id = json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id')
+          WHERE rr.proposal_json IS NOT NULL
+            AND json_valid(rr.proposal_json)
+            AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
+            AND receipt_ref.value = 'routine.proposal:' || rr.id
+       )
      );
 END;
 

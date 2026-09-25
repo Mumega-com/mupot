@@ -13,6 +13,7 @@ import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'pot-1540-rest'
 const TOKEN = 'mupot_rest_1540_admin_token'
+const TOKEN_2 = 'mupot_rest_1540_second_admin_token'
 
 const signals = {
   contextComplete: true, toolsReachable: true, budgetRemainingMicroUsd: 100, budgetEstimateMicroUsd: 0,
@@ -37,10 +38,10 @@ function body(taskIds: string[], extra: Record<string, unknown> = {}): Record<st
 let harness: SqliteD1Harness
 let env: Env
 
-async function post(payload: Record<string, unknown>) {
+async function post(payload: Record<string, unknown>, token = TOKEN) {
   const response = await flightsApp.request('https://pot.test/', {
     method: 'POST',
-    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify(payload),
   }, env)
   return { status: response.status, json: await response.json() as Record<string, unknown> }
@@ -61,6 +62,9 @@ beforeEach(async () => {
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin', 'member-admin', 'org', NULL, 'admin');
     INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-1', 'squad-a', 'T1', 'done', 'done');
     INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-2', 'squad-a', 'T2', 'done', 'in_progress');
+    INSERT INTO tasks (id, squad_id, title, done_when, status) VALUES ('task-3', 'squad-a', 'T3', 'done', 'done');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-admin-2', 'b@test', 'Admin 2', 'active', '${TENANT}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin-2', 'member-admin-2', 'org', NULL, 'admin');
     INSERT INTO flights (id, tenant, agent, goal, status, meta)
     VALUES ('flight-landed', '${TENANT}', 'agent-a', 'g', 'landed',
             '{"schema":"mupot.flight.meta/v1","task_ids":["task-1"],"squad_ids":["squad-a"]}');
@@ -68,6 +72,9 @@ beforeEach(async () => {
   harness.sqlite
     .prepare(`INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant) VALUES ('tok', 'member-admin', ?, NULL, NULL, ?)`)
     .run(await hashMemberToken(TOKEN), TENANT)
+  harness.sqlite
+    .prepare(`INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant) VALUES ('tok-2', 'member-admin-2', ?, NULL, NULL, ?)`)
+    .run(await hashMemberToken(TOKEN_2), TENANT)
   env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
 })
 
@@ -98,5 +105,22 @@ describe('POST /api/flights duplicate-booking guards (mupot#1540 C)', () => {
     expect(count(`SELECT COUNT(*) AS n FROM flights WHERE id <> 'flight-landed'`)).toBe(1)
     const conflict = await post(body(['task-2'], { client_request_id: 'brain-7', goal: 'different' }))
     expect(conflict).toMatchObject({ status: 409, json: { error: 'client_request_id_conflict', flight_id: first.json.id } })
+  })
+
+  it('refuses a task that is already done even when no flight ever landed it (the reaped-victim shape)', async () => {
+    const res = await post(body(['task-3']))
+    expect(res).toMatchObject({ status: 409, json: { error: 'flight_task_already_done', task_ids: ['task-3'], landed_flight_ids: [] } })
+  })
+
+  it('P3: the key is scoped to the AUTHENTICATED member, not the body dispatched_by', async () => {
+    const mine = await post(body(['task-2'], { client_request_id: 'shared', dispatched_by: 'agent-a' }))
+    expect(mine.status, JSON.stringify(mine.json)).toBe(201)
+    const theirs = await post(body(['task-2'], { client_request_id: 'shared', dispatched_by: 'agent-a' }), TOKEN_2)
+    // A different admin reusing the key + spoofing the same dispatched_by must neither
+    // read back nor collide with the first member's flight.
+    expect(theirs.json.idempotent_replay).toBeUndefined()
+    expect(theirs.json.id).not.toBe(mine.json.id)
+    expect(harness.sqlite.prepare(`SELECT client_request_id AS k FROM flights WHERE id = ?`).get(mine.json.id as string))
+      .toEqual({ k: 'member:member-admin:shared' })
   })
 })

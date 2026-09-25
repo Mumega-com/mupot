@@ -23,6 +23,7 @@ import { createFlight, applyPreflight, listFlights } from './service'
 import type { NewFlight } from './service'
 import { checkFlightClearance } from './clearance'
 import type { ClearanceResult } from './clearance'
+import type { RedispatchReceiptInput } from './rebooking'
 
 export interface DispatchExtra {
   // The override mechanism: an intentional co-work flight that already knows about and
@@ -32,6 +33,8 @@ export interface DispatchExtra {
   allowCollisionWith?: string[]
   /** Internal deterministic identity for crash-safe control-plane replay. */
   id?: string
+  /** mupot#1540: receipted override, written in the same batch as the flight INSERT. */
+  redispatchReceipt?: RedispatchReceiptInput
 }
 
 export interface DispatchResult {
@@ -77,7 +80,10 @@ export async function dispatchFlight(
         reasons: [...preflight.reasons, 'flight_clearance_hold', ...clearanceReasonTags(clearance as ClearanceResult)],
       }
 
-  const id = await createFlight(env, flight, { id: extra.id })
+  const id = await createFlight(env, flight, {
+    id: extra.id,
+    ...(extra.redispatchReceipt ? { redispatchReceipt: extra.redispatchReceipt } : {}),
+  })
   const status = await applyPreflight(env, id, combined)
   return {
     id,

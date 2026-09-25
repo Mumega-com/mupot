@@ -20,6 +20,8 @@ import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
 import { sweepStalledFlights } from '../src/flight/watchdog'
 import { canonicalFlightMetaSql } from '../src/flight/meta-sql'
+import { createFlight, FlightIdempotencyConflictError } from '../src/flight/service'
+import { runRoutineScheduler } from '../src/routines/scheduler'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
@@ -196,14 +198,13 @@ async function land(env: Env, flightId: string) {
   return invokeTool(execAuth(), env, 'flight_land', { flight_id: flightId, cost_micro_usd: 0, score: 0.9 }, ORIGIN)
 }
 
-/** Land a flight through the real path: review → approve → done → flight_land. */
+/** Land a flight through the real gated path: review → approve → done (→ system land). */
 async function flyToLanded(env: Env, taskIds: string[], extra: Record<string, unknown> = {}): Promise<string> {
   const id = await dispatchedId(env, taskIds, extra)
   for (const t of taskIds) await toReview(env, t)
   for (const t of taskIds) await verdict(env, t, 'approved')
   for (const t of taskIds) await close(env, t)
-  const landed = await land(env, id)
-  expect(landed.ok, JSON.stringify(landed)).toBe(true)
+  expect(flightRow(harness, id).status).toBe('landed')
   return id
 }
 
@@ -275,20 +276,91 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(flightRow(harness, id).status).toBe('waiting')
   })
 
-  it('approve + done keeps it waiting, and flight_land lands it FROM waiting', async () => {
+  it('flight_land accepts a waiting flight (it refuses on the tasks, not on the status)', async () => {
+    const id = await dispatchedId(env, ['task-1'])
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'approved')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    const early = await land(env, id)
+    expect(early).toMatchObject({ ok: false, status: 409, error: 'flight_tasks_incomplete' })
+  })
+
+  it('P0: approve + done SYSTEM-LANDS the waiting flight: score NULL, receipted, cost as recorded', async () => {
     const id = await dispatchedId(env, ['task-1', 'task-2'])
     await toReview(env, 'task-1')
     await toReview(env, 'task-2')
     await verdict(env, 'task-1', 'approved')
-    expect(flightRow(harness, id).status).toBe('waiting')
     await close(env, 'task-1')
+    expect(flightRow(harness, id).status).toBe('waiting') // task-2 still at the gate
     await verdict(env, 'task-2', 'approved')
     await close(env, 'task-2')
-    expect(flightRow(harness, id).status).toBe('waiting') // waiting to be landed
 
-    const landed = await land(env, id)
-    expect(landed.ok, JSON.stringify(landed)).toBe(true)
+    const landed = flightRow(harness, id)
+    expect(landed).toMatchObject({ status: 'landed', score: null, gate_reason: 'auto_landed_all_tasks_done', cost_micro_usd: 0 })
+    expect(landed.ended_at).toEqual(expect.any(Number))
+    expect(transitions(harness, id).at(-1)).toMatchObject({
+      from_status: 'waiting', to_status: 'landed', cause: 'auto_landed_all_tasks_done',
+      cause_task_id: 'task-2', cause_task_from_status: 'approved', cause_task_to_status: 'done',
+    })
+    // No forged flight.landed actor: a system land writes no outbox row.
+    expect(count(harness, 'SELECT COUNT(*) AS n FROM flight_event_outbox WHERE flight_id = ?', id)).toBe(0)
+    // The executor's own land now finds nothing in the air.
+    expect(await land(env, id)).toMatchObject({ ok: false, status: 409, error: 'flight_not_in_air' })
+  })
+
+  it('P0: no system land unless the gate APPROVED — a done task whose latest verdict is not approved blocks it', async () => {
+    const id = await dispatchedId(env, ['task-1', 'task-2'])
+    await toReview(env, 'task-1')
+    await toReview(env, 'task-2')
+    await verdict(env, 'task-2', 'approved')
+    // Forge the shape the predicate must refuse: task-1 'done' with no approved verdict.
+    harness.sqlite.prepare(`UPDATE tasks SET status = 'done' WHERE id = 'task-1'`).run()
+    expect(flightRow(harness, id).status).toBe('waiting')
+    await close(env, 'task-2') // last task done — but task-1 was never approved
+    expect(flightRow(harness, id).status).toBe('waiting')
+    expect(transitions(harness, id).some((row) => row.to_status === 'landed')).toBe(false)
+  })
+
+  it('P0 (4): a routine skip-overlap pin on a gated flight releases once its work is approved and closed', async () => {
+    const id = await dispatchedId(env, ['task-1'])
+    const due = new Date().toISOString()
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-r', 'project-r', 'R', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-r', '${SQUAD_ID}', 'write');
+    `)
+    harness.sqlite.prepare(`
+      INSERT INTO routines (
+        id, tenant, project_id, name, objective, status, trigger_kind, run_once_at,
+        cron_expression, timezone, next_run_at, overlap_policy, execution_mode,
+        responsible_squad_id, budget_micro_usd, max_attempts, retry_backoff_seconds,
+        max_occurrences, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+      ) VALUES ('routine-r', ?, 'project-r', 'routine-r', 'Advance', 'enabled', 'cron', NULL,
+        '* * * * *', 'UTC', ?, 'skip', 'propose', ?, 100000, 3, 300,
+        NULL, 1, 'owner-1', ?, 'owner-1', ?, ?)
+    `).run(TENANT, due, SQUAD_ID, due, due, due)
+    harness.sqlite.prepare(`
+      INSERT INTO routine_runs (
+        id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, scheduled_for, status, waiting_reason, lease_owner, lease_expires_at,
+        attempt, retry_at, flight_id, created_at, updated_at
+      ) VALUES ('run-r', ?, 'project-r', 'routine-r', 1, ?, 'manual:run-r', 'cron', ?, 'running',
+        NULL, NULL, NULL, 1, NULL, ?, ?, ?)
+    `).run(TENANT, JSON.stringify({
+      execution_mode: 'propose', overlap_policy: 'skip', responsible_squad_id: SQUAD_ID,
+      preferred_agent_id: null, budget_micro_usd: 100000, max_attempts: 3, retry_backoff_seconds: 300,
+    }), due, id, due, due)
+
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'approved')
+    await close(env, 'task-1')
     expect(flightRow(harness, id).status).toBe('landed')
+
+    const summary = await runRoutineScheduler(env, new Date(), 'worker-1540')
+    expect(summary.occurrences_created).toBe(1)
+    const next = harness.sqlite
+      .prepare(`SELECT status, result_summary FROM routine_runs WHERE routine_id = 'routine-r' AND id <> 'run-r'`)
+      .get() as { status: string; result_summary: string | null }
+    expect(next.status).toBe('queued')
   })
 
   it('a reject sends it back to running and RESTARTS the stall clock; resubmission parks it again', async () => {
@@ -297,11 +369,13 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(flightRow(harness, id).status).toBe('waiting')
     // Simulate a 5h gate wait: launch was long ago.
     harness.sqlite.prepare('UPDATE flights SET started_at = started_at - ? WHERE id = ?').run(5 * HOUR, id)
+    harness.sqlite.prepare('UPDATE flights SET escalated_at = 1 WHERE id = ?').run(id)
 
     await verdict(env, 'task-1', 'rejected')
     const resumed = flightRow(harness, id)
     expect(resumed.status).toBe('running')
     expect(resumed.waiting_since).toBeNull()
+    expect(resumed.escalated_at).toBeNull() // a later wait escalates afresh
     expect(resumed.resumed_at).toEqual(expect.any(Number))
     expect(transitions(harness, id).map((row) => [row.from_status, row.to_status, row.cause_task_to_status])).toEqual([
       ['running', 'waiting', 'review'],
@@ -329,6 +403,28 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(transitions(harness, id)).toHaveLength(0)
   })
 
+  it('P2-1: a task leaving the parked set does NOT touch a flight that is already running', async () => {
+    const id = await dispatchedId(env, ['task-1', 'task-2'])
+    await toReview(env, 'task-1') // flight still running (task-2 in progress)
+    const blocked = await invokeTool(execAuth(), env, 'task_update', { task_id: 'task-2', status: 'blocked' }, ORIGIN)
+    expect(blocked.ok, JSON.stringify(blocked)).toBe(true)
+    const row = flightRow(harness, id)
+    expect(row.status).toBe('running')
+    expect(row.resumed_at).toBeNull()
+    expect(transitions(harness, id)).toHaveLength(0)
+  })
+
+  it('P3: the leave trigger ignores a waiting flight whose task_ids is not an array (parity guard)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, meta)
+      VALUES ('f-scalar', '${TENANT}', '${EXEC_AGENT}', 'g', 'waiting', '{"schema":"mupot.flight.meta/v1","task_ids":"task-1"}');
+    `)
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'rejected')
+    expect(flightRow(harness, 'f-scalar').status).toBe('waiting')
+    expect(transitions(harness, 'f-scalar')).toHaveLength(0)
+  })
+
   it('never aborts a task write because some other flight has malformed meta', async () => {
     harness.sqlite.exec(`
       INSERT INTO flights (id, tenant, agent, goal, status, meta)
@@ -340,6 +436,42 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     await verdict(env, 'task-1', 'rejected')
     expect(flightRow(harness, 'f-broken').status).toBe('running')
     expect(flightRow(harness, 'f-waiting-broken').status).toBe('waiting')
+  })
+})
+
+describe('A. round 2 — the watchdog window and escalation (gate P0)', () => {
+  function seedWaiting(n: number, waitingSince: number): void {
+    const stmt = harness.sqlite.prepare(`
+      INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, status, created_at, started_at, waiting_since, meta)
+      VALUES (?, '${TENANT}', '${EXEC_AGENT}', '${EXEC_AGENT}', 'parked', 'waiting', ?, ?, ?, ?)`)
+    for (let i = 0; i < n; i += 1) {
+      stmt.run(`w-${String(i).padStart(3, '0')}`, 1000 + i, 1000 + i, waitingSince, JSON.stringify(meta(['task-4'])))
+    }
+  }
+
+  it('100 parked flights no longer fill the window: a stale running flight behind them is reaped', async () => {
+    const now = Date.now()
+    seedWaiting(100, now) // oldest rows in the table, not yet due for escalation
+    const stale = await dispatchedId(env, ['task-1'])
+    const sweep = await sweepStalledFlights(env, { nowMs: now + 3 * HOUR })
+    expect(sweep.reaped).toBe(1)
+    expect(flightRow(harness, stale).status).toBe('failed')
+    expect(sweep.escalated).toBe(0)
+    expect(sweep.scanned).toBe(1) // the not-yet-due waits are not even read
+  })
+
+  it('escalates each wait ONCE: the next sweep neither re-escalates nor re-reads it', async () => {
+    const now = Date.now()
+    seedWaiting(100, now - 25 * HOUR)
+    const first = await sweepStalledFlights(env, { nowMs: now })
+    expect(first).toMatchObject({ escalated: 100, reaped: 0 })
+    expect(count(harness, `SELECT COUNT(*) AS n FROM flights WHERE status = 'waiting' AND escalated_at = ?`, now)).toBe(100)
+
+    const stale = await dispatchedId(env, ['task-1'])
+    const second = await sweepStalledFlights(env, { nowMs: now + 3 * HOUR })
+    expect(second).toMatchObject({ escalated: 0, reaped: 1, escalated_flight_ids: [] })
+    expect(flightRow(harness, stale).status).toBe('failed')
+    expect(count(harness, `SELECT COUNT(*) AS n FROM flights WHERE status = 'waiting'`)).toBe(100)
   })
 })
 
@@ -416,6 +548,60 @@ describe('C. duplicate booking (mupot#1540)', () => {
     const id = await dispatchedId(env, ['task-1'])
     harness.sqlite.prepare(`UPDATE flights SET status = 'failed' WHERE id = ?`).run(id)
     await dispatchedId(env, ['task-1'])
+  })
+
+  it('P1-2: the #1540 VICTIM shape — reaped flight, task later approved+done — is refused', async () => {
+    const reaped = await dispatchedId(env, ['task-1'])
+    const startedAt = flightRow(harness, reaped).started_at as number
+    // The real watchdog reaps it while the executor is still working (pre-fix prod shape).
+    expect(await sweepStalledFlights(env, { nowMs: startedAt + 62 * MIN })).toMatchObject({ reaped: 1 })
+    expect(flightRow(harness, reaped).status).toBe('failed')
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'approved')
+
+    const whileApproved = await dispatch(env, ['task-1'])
+    expect(whileApproved).toMatchObject({ ok: false, status: 409, error: 'flight_task_already_done', detail: { task_ids: ['task-1'] } })
+
+    await close(env, 'task-1')
+    const whileDone = await dispatch(env, ['task-1', 'task-2'])
+    expect(whileDone).toMatchObject({
+      ok: false, status: 409, error: 'flight_task_already_done', detail: { landed_flight_ids: [], task_ids: ['task-1'] },
+    })
+    expect(count(harness, 'SELECT COUNT(*) AS n FROM flights')).toBe(1)
+
+    const override = await dispatch(env, ['task-1'], { redispatch_landed_reason: 'redo reaped work' }, leadAuth())
+    expect(override.ok, JSON.stringify(override)).toBe(true)
+    const receipt = harness.sqlite.prepare('SELECT * FROM flight_redispatch_receipts').get() as Record<string, unknown>
+    expect(JSON.parse(receipt.task_ids as string)).toEqual(['task-1'])
+    expect(JSON.parse(receipt.landed_flight_ids as string)).toEqual([])
+  })
+
+  it('P2-2: a landed flight in ANOTHER tenant does not refuse this tenant\'s dispatch', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, meta)
+      VALUES ('f-other-tenant', 'some-other-tenant', '${EXEC_AGENT}', 'g', 'landed',
+              '${JSON.stringify(meta(['task-2']))}');
+    `)
+    await dispatchedId(env, ['task-2'])
+  })
+
+  it('P3: the override receipt commits with its flight or not at all (same batch)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, meta, client_request_id)
+      VALUES ('f-holds-key', '${TENANT}', '${EXEC_AGENT}', '${EXEC_AGENT}', 'g', '{}', 'k-batch');
+    `)
+    await expect(createFlight(env, {
+      agent: EXEC_AGENT, goal: 'g', meta: meta(['task-1']) as never, client_request_id: 'k-batch',
+    }, {
+      redispatchReceipt: { actor: { kind: 'agent', id: EXEC_AGENT }, reason: 'r', landedFlightIds: [], taskIds: ['task-1'] },
+    })).rejects.toBeInstanceOf(FlightIdempotencyConflictError)
+    expect(count(harness, 'SELECT COUNT(*) AS n FROM flight_redispatch_receipts')).toBe(0)
+
+    // …and when the flight commits, the receipt is bound to it.
+    await flyToLanded(env, ['task-1'])
+    const res = await dispatch(env, ['task-1'], { redispatch_landed_reason: 'again' }, leadAuth())
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    expect(count(harness, `SELECT COUNT(*) AS n FROM flight_redispatch_receipts r JOIN flights f ON f.id = r.flight_id`)).toBe(1)
   })
 
   it('the override needs lead, and is refused for a member without writing a receipt', async () => {
