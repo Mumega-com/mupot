@@ -603,6 +603,20 @@ describe('#1539 round 2 P0-3 — an envelope read BEFORE custody is recoverable 
     }
   })
 
+  it('recovery is for READ rows only: an unread envelope whose lease lapsed must be re-leased', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      f.lapseLease() // abandoned hand-out, never consumed, never read
+      const before = f.envelope()
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
   it('the adversarial in_progress sequence no longer strands the envelope: inbox_ack succeeds', async () => {
     const f = fixture()
     try {
