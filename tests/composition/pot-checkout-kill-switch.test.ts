@@ -103,8 +103,19 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+// Parse the request target and match the exact Stripe API host (a substring test would
+// also match e.g. https://evil.example/?api.stripe.com, and would miss Request objects).
+function requestHost(input: unknown): string | null {
+  try {
+    const url = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input)
+    return new URL(url).hostname
+  } catch {
+    return null
+  }
+}
+
 function stripeCalls(): unknown[][] {
-  return fetchSpy.mock.calls.filter((call) => String(call[0]).includes('api.stripe.com'))
+  return fetchSpy.mock.calls.filter((call) => requestHost(call[0]) === 'api.stripe.com')
 }
 
 describe('anonymous pot checkout is OFF by default (mupot#1518)', () => {
