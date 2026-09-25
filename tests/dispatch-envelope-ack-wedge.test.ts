@@ -617,6 +617,23 @@ describe('#1539 round 2 P0-3 — an envelope read BEFORE custody is recoverable 
     }
   })
 
+  it('recovery never re-stamps a live claim (a second seat cannot extend the first seat\'s window)', async () => {
+    const f = fixture()
+    try {
+      expect((await f.call('inbox', {})).ok).toBe(true)
+      // Direct SQL: the state an earlier recovery claim leaves (read, attempt 1, live lease),
+      // pinned to a known expiry so a re-stamp is observable.
+      f.harness.sqlite.prepare(
+        "UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = '2099-06-01T00:00:00.000Z' WHERE id = ?",
+      ).run(MESSAGE_ID)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: true, result: { task_status: 'in_progress' } })
+      expect(f.envelope()).toMatchObject({ delivery_attempts: 1, lease_expires_at: '2099-06-01T00:00:00.000Z' })
+    } finally {
+      f.harness.close()
+    }
+  })
+
   it('the adversarial in_progress sequence no longer strands the envelope: inbox_ack succeeds', async () => {
     const f = fixture()
     try {
