@@ -27,29 +27,31 @@ function kv() {
   }
 }
 
-/** D1 stand-in that records every statement. Slug lookups return "no row" (slug free). */
-function recordingDb() {
-  const statements: string[] = []
-  const db = {
-    prepare(sql: string) {
-      statements.push(sql)
-      const stmt = {
-        bind: () => stmt,
-        first: async () => null,
-        all: async () => ({ results: [], success: true, meta: {} }),
-        run: async () => ({ success: true, meta: {} }),
-        raw: async () => [],
-      }
-      return stmt
+/**
+ * TRIPWIRE, not a D1. It answers no SQL: ANY property access is recorded and then throws.
+ * Workerd composition tests cannot use tests/helpers/sqlite-d1 (node:sqlite), and a
+ * hand-written D1 that answers queries is exactly what scripts/check-test-schema-source.mjs
+ * forbids. What these root-app tests need to prove about the DB is only "was it touched",
+ * which a tripwire proves without inventing a schema. The flag="true" Stripe paths, which
+ * need a slug lookup that SUCCEEDS, run against real SQLite + applyAllMigrations() in
+ * tests/pot-checkout-provisioning.test.ts.
+ */
+function tripwireDb() {
+  const touched: string[] = []
+  const db = new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        touched.push(String(prop))
+        throw new Error(`tripwire: DB.${String(prop)} touched`)
+      },
     },
-    batch: async () => [],
-    exec: async () => ({ count: 0, duration: 0 }),
-  }
-  return { db, statements }
+  )
+  return { db, touched }
 }
 
 function makeEnv(flag: string | undefined) {
-  const { db, statements } = recordingDb()
+  const { db, touched } = tripwireDb()
   const env: Record<string, unknown> = {
     TENANT_SLUG: 'mumega',
     BRAND: 'mupot',
@@ -64,7 +66,7 @@ function makeEnv(flag: string | undefined) {
     STRIPE_SECRET_KEY: 'sk_test_placeholder_not_a_real_key',
   }
   if (flag !== undefined) env.POT_SELF_SERVE_CHECKOUT_ENABLED = flag
-  return { env: env as never, statements }
+  return { env: env as never, touched }
 }
 
 // Every route that reaches publicPotsApp's POST /checkout (src/index.ts mounts it at
@@ -75,8 +77,6 @@ const CHECKOUT_PATHS = [
   '/t/mumega/api/pots/checkout',
   '/t/mumega/api/pots/public/checkout',
 ]
-
-const STRIPE_UPSTREAM_TEXT = 'No such price: price_leaky_upstream_detail req_ABC123 acct_1LEAK'
 
 function checkoutRequest(path: string, body: string = JSON.stringify({ slug: 'novacorp', owner_email: 'ceo@novacorp.test', tier: 'pro' })) {
   return new Request(`https://mupot.mumega.com${path}`, {
@@ -109,13 +109,13 @@ function stripeCalls(): unknown[][] {
 
 describe('anonymous pot checkout is OFF by default (mupot#1518)', () => {
   it.each(CHECKOUT_PATHS)('flag UNSET: POST %s -> 503 checkout_unavailable, no Stripe fetch, no DB read', async (path) => {
-    const { env, statements } = makeEnv(undefined)
+    const { env, touched } = makeEnv(undefined)
     const res = await worker.fetch(checkoutRequest(path), env, ctx)
 
     expect(res.status).toBe(503)
     expect(await res.json()).toEqual({ ok: false, error: 'checkout_unavailable' })
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(statements).toEqual([])
+    expect(touched).toEqual([])
   })
 
   it.each(CHECKOUT_PATHS)('flag UNSET: refuses %s BEFORE parsing the body (invalid JSON still 503)', async (path) => {
@@ -128,68 +128,38 @@ describe('anonymous pot checkout is OFF by default (mupot#1518)', () => {
   it.each(['TRUE', 'True', '1', 'yes', 'on', '', ' true', 'true ', 'false'])(
     'flag %j is DISABLED (only the exact string "true" enables)',
     async (value) => {
-      const { env, statements } = makeEnv(value)
+      const { env, touched } = makeEnv(value)
       for (const path of CHECKOUT_PATHS) {
         const res = await worker.fetch(checkoutRequest(path), env, ctx)
         expect(res.status, path).toBe(503)
         expect(await res.json()).toEqual({ ok: false, error: 'checkout_unavailable' })
       }
       expect(fetchSpy).not.toHaveBeenCalled()
-      expect(statements).toEqual([])
+      expect(touched).toEqual([])
     },
   )
 })
 
-describe('flag "true" reaches the existing checkout behavior (stubbed Stripe)', () => {
-  it.each(CHECKOUT_PATHS)('POST %s -> 200 with the Stripe session url', async (path) => {
-    const { env, statements } = makeEnv('true')
-    const res = await worker.fetch(checkoutRequest(path), env, ctx)
+describe('flag "true" reaches the existing checkout handler through the root app', () => {
+  it.each(CHECKOUT_PATHS)('POST %s with invalid JSON -> the handler own 400 invalid_json (past the guard)', async (path) => {
+    const { env, touched } = makeEnv('true')
+    const res = await worker.fetch(checkoutRequest(path, '{not json'), env, ctx)
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ ok: false, error: 'invalid_json' })
+    expect(touched).toEqual([])
+  })
 
-    expect(res.status).toBe(200)
+  it.each(CHECKOUT_PATHS)('POST %s with a valid body -> reaches the slug lookup (DB touched); fail-closed lookup -> 400, no Stripe', async (path) => {
+    const { env, touched } = makeEnv('true')
+    const res = await worker.fetch(checkoutRequest(path), env, ctx)
+    // The tripwire DB throws, checkSlugAvailability fails CLOSED (#1303) -> existing 400.
+    expect(res.status).toBe(400)
     expect(await res.json()).toEqual({
-      ok: true,
-      url: 'https://checkout.stripe.com/c/pay/cs_test_stub',
-      session_id: 'cs_test_stub',
+      ok: false,
+      error: 'Availability could not be verified right now. Please try again.',
     })
-    expect(stripeCalls()).toHaveLength(1)
-    expect(statements.some((sql) => sql.includes('FROM pots'))).toBe(true)
-  })
-})
-
-describe('Stripe failure is NOT echoed to the anonymous caller (mupot#1518)', () => {
-  it.each(CHECKOUT_PATHS)('Stripe HTTP 400 on %s -> generic checkout_failed, upstream text absent from body and logs', async (path) => {
-    fetchSpy.mockImplementation(async () =>
-      new Response(JSON.stringify({ error: { message: STRIPE_UPSTREAM_TEXT } }), { status: 400 }),
-    )
-    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const { env } = makeEnv('true')
-
-    const res = await worker.fetch(checkoutRequest(path), env, ctx)
-    const text = await res.text()
-
-    expect(res.status).toBe(502)
-    expect(JSON.parse(text)).toEqual({ ok: false, error: 'checkout_failed' })
-    expect(text).not.toContain('price_leaky_upstream_detail')
-    expect(text).not.toContain('Stripe')
-    expect(stripeCalls()).toHaveLength(1)
-    const logged = JSON.stringify(errors.mock.calls)
-    expect(logged).toContain('stripe_session_create_failed')
-    expect(logged).not.toContain('price_leaky_upstream_detail')
-    expect(logged).not.toContain('sk_test_placeholder_not_a_real_key')
-  })
-
-  it('a thrown fetch -> generic checkout_failed, no exception text echoed', async () => {
-    fetchSpy.mockImplementation(async () => {
-      throw new Error(`socket reset ${STRIPE_UPSTREAM_TEXT}`)
-    })
-    vi.spyOn(console, 'error').mockImplementation(() => {})
-    const { env } = makeEnv('true')
-
-    const res = await worker.fetch(checkoutRequest('/api/pots/checkout'), env, ctx)
-    const text = await res.text()
-    expect(res.status).toBe(502)
-    expect(JSON.parse(text)).toEqual({ ok: false, error: 'checkout_failed' })
-    expect(text).not.toContain('price_leaky_upstream_detail')
+    expect(touched).toContain('prepare')
+    expect(stripeCalls()).toHaveLength(0)
   })
 })
 
