@@ -61,6 +61,7 @@ import { ccSpendApp } from './economy/cc-spend'
 import { resellerApp } from './reseller/routes'
 import { potsApp, publicPotsApp } from './pots/routes'
 import { pricingPageHtml } from './dashboard/pricing'
+import { isPotSelfServeCheckoutEnabled } from './pots/checkout-flag'
 import { inboxApp } from './agents/inbox-routes'
 import { coordinationApp } from './coordination/routes'
 import { addonsApp } from './addons/routes'
@@ -130,7 +131,10 @@ app.route('/api/webhooks', supabaseWebhookApp)
 app.route('/api/billing', billingRoutesApp)
 app.route('/webhooks/stripe', billingRoutesApp)
 // Public Pricing & Self-Serve Sovereign Pot Provisioning:
-app.get('/pricing', (c) => c.html(pricingPageHtml(new URL(c.req.url).origin)))
+// mupot#1518: plan buttons render disabled (no POST wired) unless the checkout flag is on.
+app.get('/pricing', (c) =>
+  c.html(pricingPageHtml(new URL(c.req.url).origin, { checkoutEnabled: isPotSelfServeCheckoutEnabled(c.env) })),
+)
 app.route('/api/pots/public', publicPotsApp)
 app.route('/api/pots', publicPotsApp)
 // Outbound Alert Webhooks:
