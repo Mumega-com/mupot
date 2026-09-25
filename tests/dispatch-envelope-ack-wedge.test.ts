@@ -330,6 +330,28 @@ describe('mupot#1539 — completed/failed after the envelope was acked or its le
   })
 })
 
+describe('mupot#1539 — custody is per attempt', () => {
+  it('completed at attempt 2 is refused when only attempt 1 was consumed (no receipt row lands)', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      // Direct SQL: lapse the lease; a REAL inbox_lease then re-hands the envelope out (attempt 2).
+      f.harness.sqlite.prepare("UPDATE agent_messages SET lease_expires_at = '2020-01-01T00:00:00.000Z' WHERE id = ?")
+        .run(MESSAGE_ID)
+      expect((await f.call('inbox_lease', {})).ok).toBe(true)
+      expect(f.envelope().delivery_attempts).toBe(2)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      const completed = await f.call('task_dispatch_runtime_receipt', settle('completed', 2))
+      expect(completed).toMatchObject({ ok: false, error: 'runtime_delivery_stale' })
+      expect(f.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
+      ).get()).toEqual({ n: 0 })
+    } finally {
+      f.harness.close()
+    }
+  })
+})
+
 describe('mupot#1539 — inbox_ack refuses a dispatch envelope not yet taken into custody', () => {
   it('refuses the unsettled envelope with a typed reason and still acks the rest of the batch', async () => {
     const f = fixture()
