@@ -168,9 +168,8 @@ publicPotsApp.post('/checkout', async (c) => {
   if (!result.ok) {
     // result.error is one of this module's own codes (slug validation reasons,
     // checkout_unavailable, checkout_failed) — never upstream Stripe text (mupot#1518).
-    if (result.error === checkout.CHECKOUT_UNAVAILABLE) {
-      return c.json({ ok: false, error: result.error }, 503)
-    }
+    // checkout_unavailable from the inner guard is unreachable here (the flag guard above
+    // returns first); it stays a refusal (400, no Stripe) if that guard is ever removed.
     if (result.error === checkout.CHECKOUT_FAILED) {
       return c.json({ ok: false, error: result.error }, 502)
     }
