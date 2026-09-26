@@ -143,7 +143,13 @@ describe('A3 — plain squad invite accept', () => {
     expect(await tg.text()).toMatch(/redeemed in Telegram/i)
   })
 
-  it('P1-A: acceptInvite rollback clears member_id with accepted_at', async () => {
+  // #1457: this used to assert 'member_already_exists' (a dead end) for the
+  // exact same-email collision this fixture sets up. That was the defect —
+  // see tests/accept-invite-existing-member.test.ts for the full #1457
+  // coverage; this one stays here specifically to prove the fix reaches a
+  // SQUAD-scoped invite (not just org/department) since this file already
+  // owns the squad-grant fixtures.
+  it('#1457: an existing active member on the invited email is GRANTED ONTO the squad, not refused', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     harness.sqlite.exec(`
@@ -151,12 +157,28 @@ describe('A3 — plain squad invite accept', () => {
       VALUES ('member-dup', 'squaduser@example.com', 'Already Here', 'active', '${TENANT}');
     `)
     const result = await acceptInvite(env, 'inv-squad', 'Squad User', { mintToken: false })
-    expect(result).toEqual({ ok: false, error: 'member_already_exists' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.value.member_id).toBe('member-dup')
+    expect(result.value.linked_existing).toBe(true)
+    expect(result.value.token).toBeNull()
+
     const row = harness.sqlite
       .prepare(`SELECT accepted_at, member_id FROM invites WHERE id = 'inv-squad'`)
       .get() as { accepted_at: string | null; member_id: string | null }
-    expect(row.accepted_at).toBeNull()
-    expect(row.member_id).toBeNull()
+    expect(row.accepted_at).not.toBeNull()
+    expect(row.member_id).toBe('member-dup')
+
+    // No second member row was minted for the collided email.
+    const memberCount = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM members WHERE email = 'squaduser@example.com'`)
+      .get() as { n: number }
+    expect(memberCount.n).toBe(1)
+
+    const cap = harness.sqlite
+      .prepare(`SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = 'member-dup'`)
+      .get()
+    expect(cap).toEqual({ scope_type: 'squad', scope_id: 'squad-web', capability: 'member' })
   })
 })
 

@@ -209,6 +209,19 @@ export function inviteAlreadyAcceptedBody(brand: string) {
     <p><a href="/auth/login">Go to sign in →</a></p>`)
 }
 
+// #1457: rendered when acceptInvite() grants onto a PRE-EXISTING member
+// (linked_existing) instead of minting a fresh one — e.g. the person already
+// signed in with Google before opening this invite link. No token exists to
+// hand back on this branch (acceptInvite never mints one here), so the ONLY
+// way forward is signing in — same pending-invite marker/cookie as the
+// fresh-member path lets /auth/login → /auth/callback link the identity.
+export function inviteLinkedExistingBody(brand: string) {
+  return pageShell(brand, 'Sign in to continue', `
+    <h1>Your invite is attached to your existing account</h1>
+    <p class="muted">Sign in to continue.</p>
+    <p><a href="/auth/login">Sign in →</a></p>`)
+}
+
 export function inviteTelegramOnlyBody(brand: string, ctx: InviteLandingContext) {
   return pageShell(brand, 'Telegram invite', `
     <h1>This invite is redeemed in Telegram</h1>
@@ -300,7 +313,13 @@ inviteApp.post('/:id', async (c) => {
         400,
       )
     }
-    // member_already_exists
+    // member_already_exists (the last-resort UNIQUE-violation race — see
+    // acceptInvite's own doc comment) OR #1457's two existing-member
+    // refusals (member_belongs_to_other_tenant, member_not_active) — none of
+    // these are reachable through the ordinary happy path any more (a
+    // same-tenant active member is granted onto, not refused, per #1457),
+    // so one generic copy covers what's left without over-explaining an
+    // edge case to an anonymous visitor.
     return c.html(
       invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),
       409,
@@ -395,6 +414,16 @@ inviteApp.post('/:id', async (c) => {
       error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })
   })
+
+  // #1457: the accept just landed on a PRE-EXISTING member rather than
+  // minting a fresh one — the marker/cookie above are already written
+  // (unchanged) so /auth/login → /auth/callback can still link this
+  // person's Google identity, but there is no "welcome, you're new here"
+  // moment to redirect straight past. Tell them plainly and hand them the
+  // sign-in button instead of a silent 302.
+  if (result.value.linked_existing) {
+    return c.html(inviteLinkedExistingBody(c.env.BRAND))
+  }
 
   return c.redirect('/auth/login')
 })

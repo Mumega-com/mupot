@@ -27,6 +27,7 @@
 
 import { Hono } from 'hono'
 import type { Context, MiddlewareHandler } from 'hono'
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type {
   Env,
   AuthContext,
@@ -199,8 +200,18 @@ export interface AcceptInviteSuccess {
   // null when the caller opted out of minting (mupot#1436 round 2 WARN-C —
   // the web invite-landing page authenticates by sending the human to log
   // in, never by handing back a bearer, so it has no use for a token and
-  // must not mint/persist one just to discard it).
+  // must not mint/persist one just to discard it) OR — #1457 — when this
+  // accept granted onto a PRE-EXISTING member (linked_existing below): the
+  // invite link is the redemption secret, so handing a raw workspace token
+  // bound to a member who may already hold other grants to whoever holds
+  // that link is a privilege-widening class, independent of what the caller
+  // asked for.
   token: { id: string; label: 'workspace'; channel: ConnectionChannel; raw: string } | null
+  // #1457: true when this accept resolved to an ALREADY-EXISTING active
+  // member (matched by email — see acceptInvite's own doc comment) instead
+  // of minting a fresh one. Callers must render "sign in to continue"
+  // rather than treating this like a brand-new account.
+  linked_existing: boolean
 }
 
 export type AcceptInviteError =
@@ -212,6 +223,12 @@ export type AcceptInviteError =
   // (JSON API, web invite-landing form) inherits the same limit rather than
   // each re-implementing (and potentially forgetting) its own.
   | 'invalid_display_name'
+  // #1457: the invited email already resolves to an existing member, but that
+  // member is not eligible to be granted onto — refused rather than silently
+  // creating a second row (which members.email's UNIQUE constraint would
+  // refuse anyway) or silently reactivating/re-homing someone else's account.
+  | 'member_belongs_to_other_tenant'
+  | 'member_not_active'
 
 export type AcceptInviteResult =
   | { ok: true; value: AcceptInviteSuccess }
@@ -241,12 +258,23 @@ export function isTelegramDoorInvite(invite: {
   )
 }
 
+// #1457: last-resort rollback shared by every branch below (fresh-mint UNIQUE
+// race, and the two existing-member refusals) — one copy of "undo the claim
+// so the person can retry", not three.
+async function rollbackInviteClaim(env: Env, inviteId: string): Promise<void> {
+  await env.DB.prepare('UPDATE invites SET accepted_at = NULL, member_id = NULL WHERE id = ?')
+    .bind(inviteId)
+    .run()
+}
+
 export async function acceptInvite(
   env: Env,
   inviteId: string,
   displayName: string,
   // mupot#1436 round 2 WARN-C. Defaults to true so the existing JSON API
-  // caller is unchanged; the web invite-landing page passes false.
+  // caller is unchanged; the web invite-landing page passes false. #1457:
+  // ignored entirely when the accept resolves onto a pre-existing member —
+  // see the token comment further down.
   options?: { mintToken?: boolean },
 ): Promise<AcceptInviteResult> {
   const mintToken = options?.mintToken ?? true
@@ -276,16 +304,22 @@ export async function acceptInvite(
     return { ok: false, error: 'invalid_display_name' }
   }
 
-  // Mint the member. The email comes from the INVITE (server-trusted), never a
-  // caller-supplied value — callers only ever supply the display name.
-  const member: Member = {
-    id: crypto.randomUUID(),
-    email: invite.email,
-    display_name: trimmedDisplayName,
-    telegram_chat_id: null,
-    status: 'active',
-    created_at: new Date().toISOString(),
-  }
+  // #1457 (live shape of #1162): a person who signs in with Google BEFORE
+  // opening their invite already has a members row (findOrCreateHumanMember,
+  // src/members/human-identity.ts, email from the IdP, linked via
+  // src/auth/login-identity.ts). members.email is GLOBALLY UNIQUE (0002, not
+  // tenant-scoped) — the old code always attempted an INSERT here and only
+  // discovered that collision via the UNIQUE-violation catch far below,
+  // which is a dead end (member_already_exists, 409) for a real, legitimate
+  // accept. Resolve BEFORE deciding INSERT-vs-GRANT (check-then-write, one
+  // path) so order of operations — invite-first or login-first — does not
+  // change the outcome. Same normalization idx_members_email_lower (0146) is
+  // a functional index on.
+  const existingMember = await env.DB.prepare(
+    `SELECT id, status, tenant FROM members WHERE lower(email) = lower(?1) LIMIT 1`,
+  )
+    .bind(invite.email)
+    .first<{ id: string; status: Member['status']; tenant: string | null }>()
 
   // A3-2: squad-first. The grant is the same capabilities INSERT this
   // function already owns for org/department — not a memberships-table
@@ -297,17 +331,23 @@ export async function acceptInvite(
       : 'org'
   const scopeId: string | null = invite.squad_id ?? invite.department_id
 
-  // Mint the workspace token now (unless the caller opted out, WARN-C) so we
-  // can hand it back exactly once.
-  const rawToken = mintToken ? mintRawToken() : null
+  // #1457: NEVER mint a workspace token when granting onto a PRE-EXISTING
+  // member, regardless of what the caller asked for — the invite link is the
+  // redemption secret, and handing a raw bearer bound to a member who may
+  // already hold OTHER grants to whoever holds that link is a
+  // privilege-widening class, not a convenience. `options.mintToken` still
+  // governs the fresh-member path exactly as before (WARN-C).
+  const willMintToken = mintToken && existingMember === null
+  const rawToken = willMintToken ? mintRawToken() : null
   const tokenHash = rawToken !== null ? await sha256Hex(rawToken) : null
-  const tokenId = mintToken ? crypto.randomUUID() : null
+  const tokenId = willMintToken ? crypto.randomUUID() : null
   const grantId = crypto.randomUUID()
   const acceptedAt = new Date().toISOString()
 
-  // Atomic redemption: flip accepted_at ONLY if still unaccepted (single-use),
-  // then create member + capability + token in the same batch. If the conditional
-  // UPDATE changed zero rows, a concurrent accept won the race → 409.
+  // Atomic redemption: flip accepted_at ONLY if still unaccepted (single-use).
+  // If the conditional UPDATE changed zero rows, a concurrent accept won the
+  // race → 409. Unconditional on new-vs-existing-member: both branches below
+  // spend the SAME invite through the SAME serialization point.
   const claim = await env.DB.prepare(
     'UPDATE invites SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL',
   )
@@ -317,6 +357,96 @@ export async function acceptInvite(
   // D1 exposes the affected-row count under meta.changes.
   if (!claim.meta || claim.meta.changes === 0) {
     return { ok: false, error: 'invite_already_accepted' }
+  }
+
+  if (existingMember) {
+    // #1457: same-tenant, active-only. A NULL tenant is a pre-tenant-column
+    // legacy row (the `tenant` column was added to `members` by a later
+    // ALTER TABLE than 0002) — this pot's D1 IS one tenant's own database
+    // (see this file's header), so an unstamped row belongs here by
+    // construction; only an EXPLICIT foreign stamp is refused. Same
+    // null-safe convention src/auth/index.ts's own status check uses.
+    const belongsToOtherTenant = existingMember.tenant !== null && existingMember.tenant !== env.TENANT_SLUG
+    if (belongsToOtherTenant) {
+      await rollbackInviteClaim(env, inviteId)
+      return { ok: false, error: 'member_belongs_to_other_tenant' }
+    }
+    if (existingMember.status !== 'active') {
+      await rollbackInviteClaim(env, inviteId)
+      return { ok: false, error: 'member_not_active' }
+    }
+
+    try {
+      // Grant onto the existing member. `capabilities` is
+      // UNIQUE(member_id, scope_type, scope_id) — at most one row can exist
+      // on this exact scope regardless of capability value, so check first:
+      // an identical grant is satisfied (no duplicate insert attempt, which
+      // would violate that constraint), and a DIFFERENT one already on this
+      // scope is left untouched rather than silently widened/narrowed by a
+      // re-invite — this path only ever ADDS a missing grant.
+      const existingGrant = scopeId === null
+        ? await env.DB.prepare(
+            `SELECT capability FROM capabilities
+              WHERE member_id = ?1 AND scope_type = ?2 AND scope_id IS NULL LIMIT 1`,
+          ).bind(existingMember.id, scopeType).first<{ capability: Capability }>()
+        : await env.DB.prepare(
+            `SELECT capability FROM capabilities
+              WHERE member_id = ?1 AND scope_type = ?2 AND scope_id = ?3 LIMIT 1`,
+          ).bind(existingMember.id, scopeType, scopeId).first<{ capability: Capability }>()
+
+      const writes: D1PreparedStatement[] = []
+      if (!existingGrant) {
+        writes.push(
+          env.DB.prepare(
+            'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
+          ).bind(grantId, existingMember.id, scopeType, scopeId, invite.capability),
+        )
+      }
+      // A2: D1 is the callback's authority for which member this accept
+      // linked. Same write-once stamp as the fresh-member path below.
+      writes.push(
+        env.DB.prepare('UPDATE invites SET member_id = ? WHERE id = ? AND accepted_at IS NOT NULL').bind(
+          existingMember.id,
+          inviteId,
+        ),
+      )
+      const acceptWrites = await env.DB.batch(writes)
+      assertBatchWritten(acceptWrites, 'invite_accept_link_existing', 1)
+
+      return {
+        ok: true,
+        value: {
+          member_id: existingMember.id,
+          email: invite.email,
+          capability: {
+            scope_type: scopeType,
+            scope_id: scopeId,
+            // Report the grant that actually governs this scope now — the
+            // invite's OWN capability when we just inserted it, or whatever
+            // was already there when we deliberately left it alone.
+            capability: existingGrant?.capability ?? invite.capability,
+          },
+          // #1457: never minted on this branch — see the comment above.
+          token: null,
+          linked_existing: true,
+        },
+      }
+    } catch (err) {
+      await rollbackInviteClaim(env, inviteId)
+      if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
+      throw err
+    }
+  }
+
+  // Mint a fresh member. The email comes from the INVITE (server-trusted),
+  // never a caller-supplied value — callers only ever supply the display name.
+  const member: Member = {
+    id: crypto.randomUUID(),
+    email: invite.email,
+    display_name: trimmedDisplayName,
+    telegram_chat_id: null,
+    status: 'active',
+    created_at: new Date().toISOString(),
   }
 
   try {
@@ -340,7 +470,7 @@ export async function acceptInvite(
     // asked to mint one — the array's length IS the write count assertBatchWritten
     // below checks, so an HTML-path accept genuinely never inserts into
     // member_tokens, not merely "never returns" its row.
-    if (mintToken && tokenId !== null && tokenHash !== null) {
+    if (willMintToken && tokenId !== null && tokenHash !== null) {
       writes.push(
         env.DB.prepare(
           'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
@@ -365,10 +495,9 @@ export async function acceptInvite(
     assertBatchWritten(acceptWrites, 'invite_accept_mint', 1)
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
-    // on members.email UNIQUE). The conditional claim above already serialized us.
-    await env.DB.prepare('UPDATE invites SET accepted_at = NULL, member_id = NULL WHERE id = ?')
-      .bind(inviteId)
-      .run()
+    // on members.email UNIQUE — a genuine concurrent-signup race the SELECT
+    // above lost; the conditional claim above already serialized us).
+    await rollbackInviteClaim(env, inviteId)
     if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
     throw err
   }
@@ -383,7 +512,7 @@ export async function acceptInvite(
       email: invite.email,
       capability: { scope_type: scopeType, scope_id: scopeId, capability: invite.capability },
       token:
-        mintToken && tokenId !== null && rawToken !== null
+        willMintToken && tokenId !== null && rawToken !== null
           ? {
               id: tokenId,
               label: 'workspace',
@@ -391,6 +520,7 @@ export async function acceptInvite(
               raw: rawToken,
             }
           : null,
+      linked_existing: false,
     },
   }
 }
@@ -451,6 +581,24 @@ membersApp.post('/invites/:id/accept', async (c) => {
 
   // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
   protectRawTokenResponse(c)
+
+  // #1457: an accept that granted onto a PRE-EXISTING member never carries a
+  // token (acceptInvite enforces that regardless of caller intent) — 200,
+  // not 201 ("created"), and next:'sign_in' tells a non-browser caller what
+  // to do next since there is no bearer to hand back.
+  if (result.value.linked_existing) {
+    return c.json(
+      {
+        member_id: result.value.member_id,
+        capability: result.value.capability,
+        token: null,
+        linked_existing: true,
+        next: 'sign_in',
+      },
+      200,
+    )
+  }
+
   return c.json(
     {
       member_id: result.value.member_id,

@@ -44,6 +44,19 @@ function makeEnv(options: {
           if (sql.includes('SELECT id, display_name FROM members')) {
             return { id: 'member-1', display_name: 'Operator' } as T
           }
+          // #1457: acceptInvite's own existing-member resolution
+          // (src/members/index.ts) — a narrower substring than the
+          // generic 'FROM members' + 'lower(email)' catch-all below, which
+          // would otherwise wrongly match this query too and hand back
+          // that fixture's `{ email: null }` shape (no `status`/`tenant`),
+          // making this test's brand-new invite email look like a
+          // member belonging to a foreign/undefined tenant. This test's
+          // invite email ('operator@example.test') is brand new — no
+          // existing member — so the fresh-mint path this test exercises
+          // stays reachable.
+          if (sql.includes('SELECT id, status, tenant FROM members') && sql.includes('lower(email)')) {
+            return null
+          }
           // mupot#1411 P0-A round 4 (kasra-review, 2026-09-15):
           // targetMaxRankAcrossScopes now also folds in the target's
           // role-plane rank via targetLegacyRoleRank, bridged by email
