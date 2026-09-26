@@ -175,6 +175,19 @@ against a dispatch-scoped `failed` row, and a `completed` task's `status` moving
 repairable reset; only an explicit `terminate: true` call's own `reset_terminated` marker is
 final.
 
+**mupot#1539 (round 2):** a reset WITHOUT `terminate` is refused (`409 dispatch_consumed`)
+once the dispatch has a `runtime_consumed` receipt, whatever happened after it. A reset
+rewinds `delivery_attempts` to 0, so attempt numbers get reused under that custody receipt
+(a stale holder's `completed@1` could land on a re-leased attempt 1). Nothing is left for it
+to repair: the assignee settles `completed`/`failed` without any lease, and every
+`runtime_consumed` at a reused attempt number is a replay. To give up on a consumed dispatch,
+use `terminate: true`.
+
+**Envelope already read?** If the dispatch envelope was marked read before
+`runtime_consumed` (a plain `inbox` consume, GET /api/inbox, `inbox_lease_ack`,
+`inbox_ack`), call `runtime_consumed` for the attempt it was last handed out at (1 if it was
+never leased). The server gives the assignee a fresh lease; no operator is needed.
+
 **Once a dispatch is `reset_terminated`, that dispatch is terminated everywhere,
 permanently — this is true ONLY for `reset_terminated`, not for a plain `completed`/`failed`
 settle.** The underlying message is marked consumed in the SAME atomic write that clears its

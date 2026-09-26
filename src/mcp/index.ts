@@ -4391,6 +4391,12 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       // without terminate.
       return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
     }
+    if (result.code === 'reset_refused_consumed') {
+      // mupot#1539 round 2 (P1-A) — the assignee already took custody (runtime_consumed); a
+      // plain reset would rewind the attempt counter under it. Settle completed/failed, or
+      // reset with terminate:true.
+      return fail(409, 'dispatch_consumed', { audit_id: result.audit_id })
+    }
     if (result.code === 'reset_refused_already_terminal') {
       // mupot#1494 v4 round 3 (P1-A) — an explicit, named refusal distinct from the generic
       // lease_reset_refused: this dispatch was already operator-terminated
