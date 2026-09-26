@@ -350,7 +350,21 @@ export function enrollPageBody(view: EnrollView, error?: string) {
   </p>
 </div>`
 
-  const agentCards = view.agents.map((a) => {
+  // ── the picker: department -> squad -> agent ────────────────────────────────
+  //
+  // This was a flat list. With one squad that reads fine; the live pot renders
+  // "dgd-dme-cursor, stem-claude, and many others" in a single undifferentiated
+  // column, and it degrades with every agent added. The grouping data was ALREADY
+  // present on ConsentableAgent (squad_name) and needed one further join for the
+  // department — no new authority, no new query per agent.
+  //
+  // autonomy and budget are shown because they are the two facts that decide
+  // whether this is the right agent to weld a harness to, and ConsentableAgent
+  // has carried both all along without the page ever displaying them.
+  const money = (cents: number | null, window: string): string =>
+    cents === null ? 'no budget cap' : `$${(cents / 100).toFixed(2)}/${esc(window)}`
+
+  const renderAgent = (a: (typeof view.agents)[number]): string => {
     const checked = view.preselectedAgent === a.id ? ' checked' : ''
     const keys = a.liveKeys.length === 0
       ? `<p style="margin:8px 0 0;font-size:13px;color:var(--muted)">No live key for this agent yet.</p>`
@@ -366,9 +380,37 @@ export function enrollPageBody(view: EnrollView, error?: string) {
         style="margin-right:8px"/>
       <strong>${esc(a.name)}</strong>
       <code class="inline">${esc(a.slug)}</code>
-      <span style="color:var(--muted);font-size:13px"> · ${esc(a.squad_name)}</span>
+      <span style="color:var(--muted);font-size:13px">
+        · ${esc(a.autonomy)} · ${money(a.budget_cap_cents, a.budget_window)}</span>
       ${keys}
     </label>`
+  }
+
+  // Preserve the query's ORDER BY (department, squad, agent) rather than
+  // re-sorting here — one ordering, decided in SQL, so the page cannot disagree
+  // with the list it was handed.
+  const byDepartment = new Map<string, Map<string, (typeof view.agents)>>()
+  for (const a of view.agents) {
+    const dept = byDepartment.get(a.department_name) ?? new Map()
+    const squad = dept.get(a.squad_name) ?? []
+    squad.push(a)
+    dept.set(a.squad_name, squad)
+    byDepartment.set(a.department_name, dept)
+  }
+
+  const agentCards = [...byDepartment.entries()].map(([deptName, squads]) => {
+    const squadBlocks = [...squads.entries()].map(([squadName, agents]) => `
+      <div style="margin:0 0 14px 0">
+        <div style="font-size:13px;color:var(--muted);margin:0 0 6px 2px">
+          ${esc(squadName)} · ${agents.length} agent${agents.length === 1 ? '' : 's'}
+        </div>
+        ${agents.map(renderAgent).join('')}
+      </div>`).join('')
+    return `
+    <section style="margin:0 0 22px 0">
+      <h3 style="margin:0 0 10px 0;font-size:15px">${esc(deptName)}</h3>
+      ${squadBlocks}
+    </section>`
   }).join('')
 
   return html`
