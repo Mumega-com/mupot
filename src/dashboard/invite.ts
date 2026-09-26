@@ -296,11 +296,15 @@ inviteApp.post('/:id', async (c) => {
     return c.html(invitePageBody(c.env.BRAND, view.ctx, 'Enter your name to continue.'), 400)
   }
 
-  // LOAD-BEARING: the public JSON accept mints a token but writes no KV
-  // marker; the web path writes the marker but mints no token; flipping
-  // this to true lets a JSON-accepted invite be linked to a victim's
-  // Google identity (adversarial gate #1458).
-  const result = await acceptInvite(c.env, inviteId, displayName, { mintToken: false })
+  // mupot#1551 (Athena's ruling, 2026-09-26): acceptInvite() itself can no
+  // longer mint a token at all — that used to be a per-caller `mintToken`
+  // option (see adversarial gate #1458's original LOAD-BEARING note on this
+  // exact call, since the JSON accept route minted one while this door only
+  // wrote its KV marker: flipping either half of that asymmetry the wrong
+  // way could link a JSON-minted, unverified-email member to a victim's
+  // Google identity). Both callers now get `token: null` unconditionally, so
+  // that asymmetry no longer exists to get wrong.
+  const result = await acceptInvite(c.env, inviteId, displayName)
   if (!result.ok) {
     if (result.error === 'invite_not_found') return c.html(inviteNotFoundBody(c.env.BRAND), 404)
     if (result.error === 'invite_already_accepted') return c.html(inviteAlreadyAcceptedBody(c.env.BRAND), 409)

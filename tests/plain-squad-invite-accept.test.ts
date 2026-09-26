@@ -81,7 +81,7 @@ describe('A3 — plain squad invite accept', () => {
     harness = makeHarness()
     const env = envFor(harness)
 
-    const result = await acceptInvite(env, 'inv-squad', 'Squad User', { mintToken: false })
+    const result = await acceptInvite(env, 'inv-squad', 'Squad User')
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('unreachable')
     expect(result.value.capability).toEqual({
@@ -150,7 +150,7 @@ describe('A3 — plain squad invite accept', () => {
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-dup', 'squaduser@example.com', 'Already Here', 'active', '${TENANT}');
     `)
-    const result = await acceptInvite(env, 'inv-squad', 'Squad User', { mintToken: false })
+    const result = await acceptInvite(env, 'inv-squad', 'Squad User')
     expect(result).toEqual({ ok: false, error: 'member_already_exists' })
     const row = harness.sqlite
       .prepare(`SELECT accepted_at, member_id FROM invites WHERE id = 'inv-squad'`)
