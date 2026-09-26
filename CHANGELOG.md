@@ -61,8 +61,9 @@ PR's own commit message, which in a few cases named a *different*, superseded PR
 - **#1374** — reap the run with the flight, so overlap cannot pin a dead cron.
 - **#1522** — poll-mode runner dispatch v4: lease-format split (P0), `reset(terminate)`
   exit, `fleet_agents` dedup (supersedes #1514).
-- **#1542** — settle completed/failed only after the dispatch envelope was acked or its
-  lease lapsed (#1539).
+- **#1542** — dispatch-envelope custody: settle requires the caller's own
+  `runtime_consumed` receipt, so `inbox_ack` on the envelope no longer bricks the task;
+  reset-without-terminate refused once consumed (#1539).
 - **#1545** — flights wait at the gate, `timeout_ms` is live, no duplicate booking
   (#1540; migration 0172).
 
