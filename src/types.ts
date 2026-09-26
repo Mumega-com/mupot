@@ -288,6 +288,11 @@ export interface Env {
   DISPATCHER?: import('./platform/dispatcher').DispatchNamespace
   STRIPE_SECRET_KEY?: string
   STRIPE_WEBHOOK_SECRET?: string
+  // mupot#1518 hotfix: anonymous self-serve pot checkout (POST /api/pots/checkout and every
+  // route that reaches it) is OFF unless this is exactly the string "true". Any other value,
+  // or unset, returns 503 checkout_unavailable before any DB read or Stripe call, and
+  // /pricing renders its plan buttons disabled. Read via isPotSelfServeCheckoutEnabled().
+  POT_SELF_SERVE_CHECKOUT_ENABLED?: string
   SUPABASE_WEBHOOK_SECRET?: string
   // TypeSafe Jev (System One) — used only by the agent_lifecycle intent path.
   // Absent ⇒ that path returns classifier_unavailable (no guess, no execute).

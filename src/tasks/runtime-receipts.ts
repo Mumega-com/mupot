@@ -2,7 +2,7 @@ import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
-import { dispatchInboxRequestId } from '../bus/fleet-bridge'
+import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -230,6 +230,10 @@ interface DeliveryRow {
    *  exact format-split defect that JS comparison reintroduces. 1 iff live, 0 otherwise
    *  (SQLite has no boolean type; D1 returns the INTEGER as-is). */
   message_lease_live: number
+  /** mupot#1539 — 1 iff ENVELOPE_HOLDS_SQL (below) is true for this settle, evaluated in the
+   *  same read. The SAME fragment is re-asserted inside the state mutation, so this column is
+   *  the early, typed refusal and the mutation is the atomic one. 0 otherwise. */
+  envelope_holds: number
 }
 
 interface ReceiptRow extends Omit<TaskDispatchRuntimeReceipt, 'artifact_refs'> {
@@ -357,8 +361,8 @@ async function resolveMessageId(
 ): Promise<string> {
   if (providedMessageId) return providedMessageId
   const row = await env.DB.prepare(
-    `SELECT id FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1`,
-  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(dispatchReceiptId)).first<{ id: string }>()
+    `SELECT id FROM agent_messages WHERE tenant = ?1 AND from_agent = ?3 AND request_id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, dispatchInboxRequestId(dispatchReceiptId), DISPATCH_BRIDGE_SENDER).first<{ id: string }>()
   if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   return row.id
 }
@@ -450,11 +454,108 @@ async function claimUnleasedForPairSettlement(
   return result.meta?.changes === 1
 }
 
+/**
+ * envelopeHoldsSql — mupot#1539, the ONE definition of "this dispatch envelope still supports
+ * this settle". Used twice: as `envelope_holds` in `loadDelivery` (early, typed refusal) and
+ * inside every state mutation's WHERE in `recordTaskDispatchRuntimeReceipt` (atomic refusal).
+ * A concurrent re-lease, dead-letter or lease expiry between the two makes the mutation change
+ * zero rows, which fails the batch (see the audit INSERT's principal_kind CASE) and rolls back.
+ *
+ * Holds iff the envelope is this dispatch's (sender + request_id), not dead-lettered, still at
+ * delivery attempt `attempt`, and EITHER under a live lease OR — for `completed`/`failed` only —
+ * the caller already recorded `runtime_consumed` for this exact (dispatch, attempt, agent,
+ * message). `read_at` is deliberately absent: it is a delivery fact (inbox_ack, `inbox`
+ * consume, inbox_lease_ack), never a settle. A read envelope carries a live lease only if
+ * `claimReadEnvelopeForRecovery` gave it one.
+ *
+ * Arguments are SQL placeholders (e.g. '?6'), not values. The sender and prefix are the
+ * producer's own constants (src/bus/fleet-bridge.ts), inlined as literals they control.
+ */
+function envelopeHoldsSql(
+  stage: TaskDispatchRuntimeStage,
+  p: { tenant: string; messageId: string; dispatchId: string; attempt: string; agentId: string; now: string },
+): string {
+  const custody = stage === 'completed' || stage === 'failed'
+  return `EXISTS (
+    SELECT 1 FROM agent_messages envelope
+     WHERE envelope.tenant = ${p.tenant} AND envelope.id = ${p.messageId}
+       AND envelope.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+       AND envelope.request_id = '${DISPATCH_INBOX_PREFIX}' || ${p.dispatchId}
+       AND envelope.dead_lettered_at IS NULL
+       AND envelope.delivery_attempts = ${p.attempt}
+       AND (
+         ${LEASE_LIVE_PREDICATE('envelope.lease_expires_at', p.now)}
+         ${custody ? `OR EXISTS (
+           SELECT 1 FROM task_dispatch_runtime_receipts consumed
+            WHERE consumed.tenant = ${p.tenant}
+              AND consumed.dispatch_receipt_id = ${p.dispatchId}
+              AND consumed.stage = 'runtime_consumed'
+              AND consumed.attempt = ${p.attempt}
+              AND consumed.agent_id = ${p.agentId}
+              AND consumed.message_id = envelope.id
+         )` : ''}
+       )
+  )`
+}
+
+/**
+ * claimReadEnvelopeForRecovery — mupot#1539 round 2 (P0-3). A dispatch envelope marked read
+ * BEFORE custody (plain `inbox` consume, REST GET /api/inbox, `inbox_lease_ack`, `inbox_ack`)
+ * used to make `runtime_consumed` impossible forever. This gives the assignee the same
+ * lease-equivalent `claimUnleasedForPairSettlement` gives a pristine row, so `runtime_consumed`
+ * can be recorded; `read_at` is never touched (no route gains the ability to clear or set it).
+ *
+ * Every condition is inside the one UPDATE (no check-then-write):
+ *  - the row is this dispatch's envelope, READ, not dead-lettered, and has no live lease
+ *    (so two claims, or a claim and a live holder, cannot both win);
+ *  - NO runtime receipt of any stage exists for the dispatch: once custody or a terminal
+ *    disposition exists, there is nothing to recover and attempt numbers must not move;
+ *  - the attempt stays the one the envelope was last handed out at (`delivery_attempts =
+ *    attempt`), or 0 -> 1 for a row consumed without ever being leased — never rewound;
+ *  - caller is active, is the dispatch's agent AND the task's assignee, the task is in a
+ *    status the `runtime_consumed` transition accepts, and the bearer fence allows it.
+ */
+async function claimReadEnvelopeForRecovery(
+  env: Env,
+  input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; attempt: number; now: string },
+): Promise<void> {
+  const leaseExpiresAt = new Date(Date.now() + MAX_LEASE_SECONDS * 1000).toISOString()
+  await env.DB.prepare(`
+    UPDATE agent_messages
+       SET delivery_attempts = ?7, lease_expires_at = ?3
+     WHERE tenant = ?1 AND id = ?2
+       AND from_agent = '${DISPATCH_BRIDGE_SENDER}'
+       AND request_id = '${DISPATCH_INBOX_PREFIX}' || ?5
+       AND read_at IS NOT NULL AND dead_lettered_at IS NULL
+       AND NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?8')})
+       AND (delivery_attempts = ?7 OR (delivery_attempts = 0 AND ?7 = 1))
+       AND ${bearerFencePredicate('?1', '?4')}
+       AND EXISTS (
+         SELECT 1
+           FROM task_dispatch_receipts dispatch
+           JOIN tasks task ON task.id = dispatch.task_id
+           JOIN agents caller ON caller.id = ?4 AND caller.status = 'active'
+          WHERE dispatch.tenant = ?1 AND dispatch.id = ?5 AND dispatch.task_id = ?6
+            AND dispatch.agent_id = ?4
+            AND task.assignee_agent_id = ?4
+            AND task.status IN ('open', 'blocked', 'rejected')
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts any_receipt
+          WHERE any_receipt.tenant = ?1 AND any_receipt.dispatch_receipt_id = ?5
+       )
+  `).bind(
+    env.TENANT_SLUG, input.messageId, leaseExpiresAt, input.callerAgentId,
+    input.dispatchReceiptId, input.taskId, input.attempt, input.now,
+  ).run()
+}
+
 async function loadDelivery(
   env: Env,
   input: RecordTaskDispatchRuntimeReceiptInput,
   messageId: string,
   now: string,
+  callerAgentId: string,
 ): Promise<DeliveryRow> {
   const row = await env.DB.prepare(`
     SELECT
@@ -479,7 +580,11 @@ async function loadDelivery(
       message.lease_expires_at AS message_lease_expires_at,
       message.dead_lettered_at AS message_dead_lettered_at,
       CASE WHEN ${LEASE_LIVE_PREDICATE('message.lease_expires_at', '?5')} THEN 1 ELSE 0 END
-        AS message_lease_live
+        AS message_lease_live,
+      CASE WHEN ${envelopeHoldsSql(input.stage, {
+        tenant: 'dispatch.tenant', messageId: 'message.id', dispatchId: 'dispatch.id',
+        attempt: '?6', agentId: '?7', now: '?5',
+      })} THEN 1 ELSE 0 END AS envelope_holds
     FROM task_dispatch_receipts dispatch
     JOIN tasks task ON task.id = dispatch.task_id
     JOIN agents agent ON agent.id = dispatch.agent_id
@@ -488,7 +593,8 @@ async function loadDelivery(
       AND dispatch.agent_id = task.assignee_agent_id
       AND dispatch.squad_id = task.squad_id
     LIMIT 1
-  `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, now)
+  `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, now,
+    input.attempt, callerAgentId)
     .first<DeliveryRow>()
   if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   return row
@@ -499,27 +605,28 @@ function validateEnvelope(
   input: RecordTaskDispatchRuntimeReceiptInput,
   allowAcknowledgedReplay: boolean,
 ): string {
+  // mupot#1539 — "a delivery fact is not a settle". `read_at` (inbox_ack, `inbox` consume,
+  // inbox_lease_ack) and lease expiry are facts about the INBOX envelope, not the work. The
+  // lease/custody rule now lives in ONE place, envelopeHoldsSql, read here as
+  // `envelope_holds` and re-asserted inside the state mutation (so a concurrent re-lease
+  // between this check and the write refuses atomically). For `completed`/`failed`, a
+  // `runtime_consumed` receipt for this exact (dispatch, attempt, caller, message) replaces
+  // the live lease: a read row never has one, and long work outlives MAX_LEASE_SECONDS.
+  // `runtime_consumed` still needs a live lease — from inbox_lease, the pristine pair claim,
+  // or claimReadEnvelopeForRecovery for a row read before custody.
   if (
     row.dispatch_consumed_at === null
     || row.agent_status !== 'active'
-    || row.message_from_agent !== 'mupot-dispatch'
-    || row.message_request_id !== `dispatch-inbox:${input.dispatchReceiptId}`
+    || row.message_from_agent !== DISPATCH_BRIDGE_SENDER
+    || row.message_request_id !== dispatchInboxRequestId(input.dispatchReceiptId)
     || row.message_project_id !== row.task_project_id
     || row.dispatch_project_id !== row.task_project_id
     || row.message_dead_lettered_at !== null
     || row.message_delivery_attempts !== input.attempt
-    // mupot#1494 v4 (P2, pre-existing at base 585f26cf:261-262) — this used to be a plain JS
-    // `row.message_lease_expires_at <= now` string compare, the SAME fail-OPEN half of the
-    // P0 defect class the reset tool's fail-CLOSED half was fixed for: `nowSqlUtc()`'s
-    // space-separated `now` sorts BELOW an ISO `lease_expires_at` for any same-UTC-day
-    // value, so an actually-expired lease read as still live and a stale settle went
-    // through. `message_lease_live` is computed once, in SQL, via LEASE_LIVE_PREDICATE
-    // (julianday both sides) in `loadDelivery` above — this function only reads the
-    // already-correct answer.
-    || (!allowAcknowledgedReplay && (
-      row.message_read_at !== null
-      || row.message_lease_live !== 1
-    ))
+    // mupot#1494 v4 (P2) — lease liveness is never compared in JS (nowSqlUtc()'s
+    // space-separated `now` sorts below an ISO lease string); envelopeHoldsSql evaluates it
+    // with LEASE_LIVE_PREDICATE (julianday both sides) and this reads the answer.
+    || (!allowAcknowledgedReplay && row.envelope_holds !== 1)
   ) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_stale')
 
   let parsed: unknown
@@ -660,7 +767,20 @@ export async function recordTaskDispatchRuntimeReceipt(
     })
   }
 
-  const delivery = await loadDelivery(env, input, messageId, now)
+  // mupot#1539 round 2 (P0-3) — recover a dispatch envelope that was marked read before
+  // custody. No-op unless every condition in claimReadEnvelopeForRecovery holds.
+  if (input.stage === 'runtime_consumed') {
+    await claimReadEnvelopeForRecovery(env, {
+      messageId,
+      dispatchReceiptId: input.dispatchReceiptId,
+      taskId: input.taskId,
+      callerAgentId: agentId,
+      attempt: input.attempt,
+      now,
+    })
+  }
+
+  const delivery = await loadDelivery(env, input, messageId, now, agentId)
   if (delivery.dispatch_agent_id !== agentId || delivery.task_assignee_agent_id !== agentId) {
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_forbidden')
   }
@@ -725,8 +845,12 @@ export async function recordTaskDispatchRuntimeReceipt(
                   AND failed.dispatch_receipt_id = ?1
                   AND failed.stage = 'failed'
              )
+             -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time.
+             AND ${envelopeHoldsSql('runtime_consumed', {
+               tenant: '?5', messageId: '?6', dispatchId: '?1', attempt: '?7', agentId: '?4', now: '?2',
+             })}
           RETURNING status
-        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG)
+        `).bind(input.dispatchReceiptId, now, input.taskId, agentId, env.TENANT_SLUG, messageId, input.attempt)
       : input.stage === 'completed'
         ? env.DB.prepare(`
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
@@ -790,16 +914,38 @@ export async function recordTaskDispatchRuntimeReceipt(
                     AND consumed.stage = 'runtime_consumed'
                     AND consumed.attempt = ?7
                )
+               -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time: a
+               -- re-lease (delivery_attempts moved), dead-letter, or lost custody between
+               -- validateEnvelope and this batch changes zero rows and fails the batch.
+               AND ${envelopeHoldsSql('completed', {
+                 tenant: '?6', messageId: '?9', dispatchId: '?5', attempt: '?7', agentId: '?4', now: '?8',
+               })}
             RETURNING status
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
-            env.TENANT_SLUG, input.attempt, nowSqlUtc())
+            env.TENANT_SLUG, input.attempt, nowSqlUtc(), messageId)
         : env.DB.prepare(`
             UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status IN ('open', 'in_progress', 'blocked', 'rejected')
                AND (execution_receipt_id IS NULL OR execution_receipt_id = ?5)
+               -- mupot#1539 round 2 (P0-1 / P2-b) — same envelope fence as consume/complete:
+               -- live lease or this caller's consumed receipt at this attempt, re-asserted at
+               -- write time.
+               AND ${envelopeHoldsSql('failed', {
+                 tenant: '?6', messageId: '?7', dispatchId: '?5', attempt: '?8', agentId: '?4', now: '?2',
+               })}
+               -- mupot#1539 round 2 (P2-a) — a dispatch that already settled 'completed' cannot
+               -- later settle 'failed' (a stale failed@N would overwrite tasks.result and move a
+               -- gate-rejected task to blocked). Rework after a rejection is a new dispatch.
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_dispatch_runtime_receipts done_receipt
+                  WHERE done_receipt.tenant = ?6
+                    AND done_receipt.dispatch_receipt_id = ?5
+                    AND done_receipt.stage = 'completed'
+               )
             RETURNING status
-          `).bind(reason, now, input.taskId, agentId, input.dispatchReceiptId)
+          `).bind(reason, now, input.taskId, agentId, input.dispatchReceiptId,
+            env.TENANT_SLUG, messageId, input.attempt)
     await env.DB.batch([
       mutation,
       env.DB.prepare(`
@@ -1008,6 +1154,11 @@ export type AdminResetDispatchLeaseCode =
   // effects, rather than silently downgrading `terminate: true` to a no-op or crashing on
   // the FK at insert time.
   | 'reset_refused_credential_required'
+  // mupot#1539 round 2 (P1-A) — a non-terminating reset rewinds delivery_attempts to 0, which
+  // would let attempt numbers be reused under an existing runtime_consumed receipt (the
+  // custody pin on (dispatch, attempt) is defeated: a stale holder's completed@1 could land on
+  // a re-leased attempt 1). Refused once custody exists; settle, or use terminate.
+  | 'reset_refused_consumed'
   // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch that ALREADY carries
   // a terminal runtime receipt (a genuine `completed`/`failed` settle, or an earlier
   // `terminate: true`) has nothing left to repair. Refused unconditionally — even under
@@ -1221,6 +1372,26 @@ export async function adminResetDispatchLease(
   // task_dispatch_runtime_receipts row to (NOT NULL, FK'd to member_tokens). Refused
   // up front, before any read/write on the message, so this is zero-side-effect like every
   // other refusal here.
+  // mupot#1539 round 2 (P1-A) — refuse (don't preserve-and-proceed): once runtime_consumed
+  // exists, the assignee can settle completed/failed WITHOUT any lease (envelopeHoldsSql's
+  // custody branch), so a plain reset has nothing left to repair — its only effect would be
+  // rewinding the attempt counter under that custody. `terminate: true` stays available as
+  // the operator's way out. The same condition is re-asserted inside the reset UPDATE.
+  if (!terminate) {
+    const consumed = await env.DB.prepare(`
+      SELECT 1 FROM task_dispatch_runtime_receipts
+       WHERE tenant = ?1 AND dispatch_receipt_id = ?2 AND stage = 'runtime_consumed'
+       LIMIT 1
+    `).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ 1: number }>()
+    if (consumed) {
+      await writeAudit('reset_refused_consumed', 'dispatch_receipt', input.dispatchReceiptId, evidence())
+      return {
+        reset: false, code: 'reset_refused_consumed', message_id: null, audit_id: auditId,
+        overrode: false, terminated: false,
+      }
+    }
+  }
+
   if (terminate && credentialId === '') {
     await writeAudit('reset_refused_credential_required', 'dispatch_receipt', input.dispatchReceiptId, evidence())
     return {
@@ -1244,8 +1415,8 @@ export async function adminResetDispatchLease(
            CASE WHEN read_at IS NULL AND dead_lettered_at IS NULL
                      AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}
                 THEN 1 ELSE 0 END AS lease_live
-      FROM agent_messages WHERE tenant = ?1 AND from_agent = 'mupot-dispatch' AND request_id = ?2 LIMIT 1
-  `).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId), now).first<MessageRow>()
+      FROM agent_messages WHERE tenant = ?1 AND from_agent = ?4 AND request_id = ?2 LIMIT 1
+  `).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId), now, DISPATCH_BRIDGE_SENDER).first<MessageRow>()
 
   const message = await loadMessage()
   if (!message) {
@@ -1317,7 +1488,13 @@ export async function adminResetDispatchLease(
            read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
      WHERE tenant = ?1 AND id = ?2 AND read_at IS NULL AND dead_lettered_at IS NULL
        AND ${useOverride ? liveGuard : notLiveGuard}
-  `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0)
+       -- mupot#1539 round 2 (P1-A) — atomic half of the reset_refused_consumed check above.
+       AND (?4 = 1 OR NOT EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts consumed
+          WHERE consumed.tenant = ?1 AND consumed.dispatch_receipt_id = ?5
+            AND consumed.stage = 'runtime_consumed'
+       ))
+  `).bind(env.TENANT_SLUG, message.id, now, terminate ? 1 : 0, input.dispatchReceiptId)
 
   // The audit row's own content (which `operation`, whether `override_of` appears) is
   // decided via `CASE WHEN changes() = 1 ...`, referencing the lease UPDATE that

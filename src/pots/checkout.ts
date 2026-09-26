@@ -5,6 +5,7 @@ import { isPotTier, type PotTier } from '../billing/plans'
 import { TIER_PRICING } from '../billing/stripe'
 import { provisionSovereignPot, checkSlugAvailability, type SlugCheckResult } from './service'
 import { createBus } from '../bus'
+import { CHECKOUT_UNAVAILABLE, isPotSelfServeCheckoutEnabled } from './checkout-flag'
 
 // checkSlugAvailability / SlugCheckResult moved to src/pots/service.ts in mupot#1507
 // round-2 (P0-4) — provisionSovereignPot needed to call it directly without a circular
@@ -12,6 +13,7 @@ import { createBus } from '../bus'
 // here so nothing importing them FROM checkout.ts (this file's own established public
 // surface) breaks.
 export { checkSlugAvailability, type SlugCheckResult }
+export { CHECKOUT_UNAVAILABLE, isPotSelfServeCheckoutEnabled }
 
 export interface CreatePotCheckoutParams {
   slug: string
@@ -21,14 +23,22 @@ export interface CreatePotCheckoutParams {
   origin: string
 }
 
+/** Generic error for any upstream (Stripe/network) failure. Upstream text is never echoed (mupot#1518). */
+export const CHECKOUT_FAILED = 'checkout_failed'
+
 /**
  * Creates a Stripe Checkout Session for instant new pot provisioning upon payment.
+ * Refuses (checkout_unavailable) before any DB read or Stripe call while the flag is off.
  */
 export async function createPotCheckoutSession(
   env: Env,
   params: CreatePotCheckoutParams,
   fetchFn: typeof fetch = fetch,
 ): Promise<{ ok: true; url: string; sessionId: string } | { ok: false; error: string }> {
+  if (!isPotSelfServeCheckoutEnabled(env)) {
+    return { ok: false, error: CHECKOUT_UNAVAILABLE }
+  }
+
   const slugCheck = await checkSlugAvailability(env, params.slug)
   if (!slugCheck.available) {
     return { ok: false, error: slugCheck.reason || 'slug_unavailable' }
@@ -39,7 +49,7 @@ export async function createPotCheckoutSession(
 
   const secretKey = env.STRIPE_SECRET_KEY
   if (!secretKey) {
-    return { ok: false, error: 'STRIPE_SECRET_KEY not configured' }
+    return { ok: false, error: CHECKOUT_UNAVAILABLE }
   }
 
   const searchParams = new URLSearchParams()
@@ -72,14 +82,19 @@ export async function createPotCheckoutSession(
     })
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => '')
-      return { ok: false, error: `Stripe error: HTTP ${res.status} ${errText}` }
+      // mupot#1518: the Stripe response body is NOT returned to the (anonymous) caller and
+      // NOT logged — it can carry request ids, account hints and echoed params. Status only.
+      console.error('[pots:checkout] stripe_session_create_failed', { status: res.status })
+      return { ok: false, error: CHECKOUT_FAILED }
     }
 
     const session = (await res.json()) as { id: string; url: string }
     return { ok: true, url: session.url, sessionId: session.id }
   } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    console.error('[pots:checkout] stripe_session_create_threw', {
+      name: error instanceof Error ? error.name : typeof error,
+    })
+    return { ok: false, error: CHECKOUT_FAILED }
   }
 }
 

@@ -136,6 +136,15 @@ publicPotsApp.get('/slug-available', async (c) => {
 })
 
 publicPotsApp.post('/checkout', async (c) => {
+  // mupot#1518 hotfix: FIRST statement. publicPotsApp is mounted at /api/pots/public AND
+  // /api/pots (src/index.ts), and /t/<home-slug>/... is rewritten onto both, so every route
+  // that reaches the anonymous checkout lands here. Off unless the flag is exactly "true";
+  // refuse before parsing the body, reading D1, or calling Stripe.
+  const checkout = await import('./checkout')
+  if (!checkout.isPotSelfServeCheckoutEnabled(c.env)) {
+    return c.json({ ok: false, error: checkout.CHECKOUT_UNAVAILABLE }, 503)
+  }
+
   let body: { slug?: string; brand?: string; tier?: any; owner_email?: string }
   try {
     body = await c.req.json()
@@ -147,9 +156,8 @@ publicPotsApp.post('/checkout', async (c) => {
     return c.json({ ok: false, error: 'slug_and_owner_email_required' }, 400)
   }
 
-  const { createPotCheckoutSession } = await import('./checkout')
   const origin = new URL(c.req.url).origin
-  const result = await createPotCheckoutSession(c.env, {
+  const result = await checkout.createPotCheckoutSession(c.env, {
     slug: body.slug,
     brand: body.brand || body.slug.toUpperCase(),
     tier: body.tier || 'starter',
@@ -158,6 +166,13 @@ publicPotsApp.post('/checkout', async (c) => {
   })
 
   if (!result.ok) {
+    // result.error is one of this module's own codes (slug validation reasons,
+    // checkout_unavailable, checkout_failed) — never upstream Stripe text (mupot#1518).
+    // checkout_unavailable from the inner guard is unreachable here (the flag guard above
+    // returns first); it stays a refusal (400, no Stripe) if that guard is ever removed.
+    if (result.error === checkout.CHECKOUT_FAILED) {
+      return c.json({ ok: false, error: result.error }, 502)
+    }
     return c.json({ ok: false, error: result.error }, 400)
   }
 
