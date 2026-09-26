@@ -88,14 +88,22 @@ interface ObserverRow {
  * return the cooldown + escalate signals.
  *
  * Durably updates loop_observer counters via a single UPSERT per call.
- * Escalation is deduped: escalate=true is returned at most once per
- * ESCALATION_COOLDOWN_MS, so the operator receives ONE signal per stuck state,
- * not one per tick.
+ *
+ * Escalation is RATE-limited, not deduped to one: escalate=true is returned at
+ * most once per ESCALATION_COOLDOWN_MS (1h) rather than once per tick (15m).
+ * It is NOT once per stuck state — nothing resets consecutive_fails except a
+ * 'spawned' tick, so an agent that stays stuck re-escalates every hour for as
+ * long as it stays stuck. A window bounds the RATE; only a counter reset would
+ * bound the TOTAL.
  *
  * AgentDO consumes:
  *   cooldown  → extend the next alarm (back off; don't busy-loop)
- *   escalate  → emit a single operator notification via existing approval/notification
- *               seam. TODO: wire the actual emit in AgentDO (see agent-do.ts).
+ *   escalate  → AgentDO emits an operator-facing task via createTask, tagged
+ *               gate_owner 'gate:escalation' (see agent-do.ts). That tag drives
+ *               no wake today: the gate-owner wake fires only on a transition
+ *               INTO status 'review', and this task is created 'open'. What does
+ *               carry it to a human is the GitHub issue mirror and the squad
+ *               task list.
  *
  * The `now` parameter is injectable for determinism in tests.
  */
