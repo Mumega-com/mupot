@@ -186,8 +186,10 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 #                                           # sender uses (src/routes/auth.ts) — one Resend key/from
 #                                           # pair can serve both workers.
 # RESEND_FROM_EMAIL is NON-secret (a from-address) — set it in [vars] above, not here.
-# Rollout: 1) wrangler secret put RESEND_API_KEY, 2) set RESEND_FROM_EMAIL + EMAIL_LOGIN_ENABLED="true"
-# in [vars], 3) deploy. Missing RESEND_API_KEY/RESEND_FROM_EMAIL with EMAIL_LOGIN_ENABLED="true":
+# Rollout: 1) APPLY migrations/0174_email_login_attempts.sql FIRST (email_login_attempts +
+# email_login_rate_limits — every route below reads/writes these unconditionally once the flag is
+# on), 2) wrangler secret put RESEND_API_KEY, 3) set RESEND_FROM_EMAIL + EMAIL_LOGIN_ENABLED="true"
+# in [vars], 4) deploy. Missing RESEND_API_KEY/RESEND_FROM_EMAIL with EMAIL_LOGIN_ENABLED="true":
 # /auth/email/start still 200s (no account-existence oracle) and logs one structured error; nothing
 # sends. See docs/operations/email-login.md for the full runbook.
 

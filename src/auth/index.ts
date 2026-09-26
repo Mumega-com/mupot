@@ -61,6 +61,9 @@ import {
   parsePendingInviteIdFromState,
 } from './pending-invite-link'
 import {
+  emailConfirmBody,
+  emailConfirmMissingBody,
+  emailIdentityConflictBody,
   emailSentBody,
   emailVerifyFailureBody,
   isEmailLoginEnabled,
@@ -841,6 +844,20 @@ function acceptsHtml(c: Context<AppEnv>): boolean {
   return accept.includes('text/html')
 }
 
+/**
+ * cf-connecting-ip ONLY (adversarial gate: "don't trust x-forwarded-for over
+ * cf-connecting-ip"). Cloudflare's edge sets this header itself on every
+ * request that reaches the Worker — the client cannot forge it. X-Forwarded-For
+ * is attacker-controllable (a client can send any value it likes) and must
+ * never feed a rate-limit boundary; there is no fallback to it here. Absent
+ * (local dev / a test harness with no CF edge in front of it) falls back to
+ * the literal string 'unknown', which is itself rate-limited as its own
+ * shared bucket — never skipped (see email-login.ts's underRateLimit doc).
+ */
+function resolveClientIp(c: Context<AppEnv>): string {
+  return c.req.header('cf-connecting-ip') ?? 'unknown'
+}
+
 /** Accepts either a same-origin HTML form POST (the real, no-JS UI) or a JSON
  *  body (tests, or a future API caller) — never guesses at an unknown
  *  content-type; an unparseable body just yields empty fields, which every
@@ -879,6 +896,7 @@ async function finishEmailLoginSuccess(
   pendingInviteId: string | null,
 ): Promise<Response> {
   const env = c.env
+  const tenant = env.TENANT_SLUG
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
 
@@ -903,7 +921,7 @@ async function finishEmailLoginSuccess(
     }
     if (inviteDecision.action === 'link') {
       const linked = await linkAcceptedInviteIdentity(env, {
-        tenant: env.TENANT_SLUG,
+        tenant,
         provider: 'email',
         providerSubject: emailNormalized,
         verifiedEmail: emailNormalized,
@@ -920,22 +938,68 @@ async function finishEmailLoginSuccess(
         )
       }
     }
+    // Invite path carries its OWN D1-authoritative link (the invite row +
+    // email match, above) — never re-derived through decideIdentitylessAttach,
+    // same as the Google callback's own invite branch. Proceed straight to
+    // mint below; the gate that follows is for the NO-invite path only.
+  } else {
+    // mupot#1564 adversarial gate P0-2 (kasra-review + Athena, PR #1574
+    // round 1): the ordinary (no-invite) login used to fall straight through
+    // to upsertUserByEmail — a SECOND, email-keyed lookup into `users` that
+    // grants `users.role` (up to and including 'owner') regardless of
+    // whether THIS request's own members-identity attach would even be
+    // allowed. Repro: a `members` row with a LIVE Google identity already
+    // bound, and a `users` row with the same email carrying role='owner' —
+    // email login inherited the owner session with no email identity ever
+    // linked to that member. A `users` row and a `members` row sharing an
+    // email are NOT the same authority: the members row can already be
+    // under someone else's exclusive control (a live identity, an unbound
+    // bearer, a Telegram bind — mupot#1551, decideIdentitylessAttach). Gate
+    // on the SAME predicate the identity bridge itself applies, BEFORE
+    // upsertUserByEmail ever runs:
+    //   - a live ('email', subject) identity already exists → returning
+    //     user, always safe (idempotent re-login, no attach decision needed).
+    //   - no live identity yet, but decideIdentitylessAttach says 'eligible'
+    //     or 'not_found' → safe to proceed; registerWebSession (inside
+    //     mintSession below) performs the real, atomically-guarded attach.
+    //   - 'denied_competing_control' or 'ambiguous' → REFUSE THE WHOLE
+    //     LOGIN. No `users` row is touched, no session is minted. The
+    //     caller already proved mailbox control to reach this function, so
+    //     this refusal carries no account-existence oracle beyond "this
+    //     email is already linked elsewhere" — it never names the other
+    //     provider/method.
+    const existingEmailIdentity = await resolveLoginIdentity(env, tenant, 'email', emailNormalized)
+    if (!existingEmailIdentity) {
+      const decision = await decideIdentitylessAttach(env, {
+        tenant,
+        normalizedEmail: emailNormalized,
+        provider: 'email',
+        subject: emailNormalized,
+      })
+      if (decision.kind === 'denied_competing_control' || decision.kind === 'ambiguous') {
+        return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
+      }
+    }
   }
 
   const derivedId = await deriveUserId('email', emailNormalized)
-  // allowBootstrapOwner=true: email login is a legitimate first-owner path,
-  // exactly like the pot's own Google login (both are the pot's OWN
-  // first-party sign-in doors — never the SSO handoff, which stays false).
-  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, true)
+  // allowBootstrapOwner=FALSE, always, for email (adversarial gate P0-2,
+  // "also pass allowBootstrapOwner=false for email — Google keeps it"):
+  // unlike Google's own /callback (the legitimate first-owner ceremony),
+  // email login must never auto-mint the pot's first-ever owner on a virgin
+  // pot — proving mailbox control is weaker evidence than an IdP-verified
+  // identity, and "first owner" is exactly the highest-value grant a
+  // "prove you can read an inbox" door should not be trusted to hand out.
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, false)
   await mintSession(c, userId, emailNormalized, role, {
     loginIdentity: { provider: 'email', subject: emailNormalized },
   })
   return c.redirect('/')
 }
 
-function emailVerifyFailureStatus(kind: 'invalid' | 'expired' | 'too_many_attempts'): 401 | 410 | 429 {
+function emailVerifyFailureStatus(kind: 'invalid' | 'expired' | 'too_many_attempts' | 'rate_limited'): 401 | 410 | 429 {
   if (kind === 'expired') return 410
-  if (kind === 'too_many_attempts') return 429
+  if (kind === 'too_many_attempts' || kind === 'rate_limited') return 429
   return 401
 }
 
@@ -958,14 +1022,12 @@ authApp.post('/email/start', async (c) => {
   const form = await readEmailFormBody(c)
   const email = form.email ?? ''
   const pendingInviteId = getCookie(c, PENDING_INVITE_COOKIE) ?? null
-  const ip = c.req.header('cf-connecting-ip')
-    ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    ?? 'unknown'
 
   await startEmailLogin({
     env,
+    tenant: env.TENANT_SLUG,
     email,
-    ip,
+    ip: resolveClientIp(c),
     pendingInviteId,
     origin: new URL(c.req.url).origin,
     waitUntil: (p) => c.executionCtx.waitUntil(p),
@@ -978,24 +1040,45 @@ authApp.post('/email/start', async (c) => {
 })
 
 // GET /auth/email/verify?t=&a= → the emailed link.
+//
+// mupot#1564 adversarial gate P1-2: this used to CONSUME the token on a bare
+// GET — a plain navigation, which both a login-CSRF (`<img
+// src="…/verify?t=…&a=…">` embedded on a page the victim's browser loads,
+// signing the VICTIM into the ATTACKER's session) and a mail-scanner
+// prefetch (M365 Safe Links etc., which issues real GETs against links in
+// scanned mail) can trigger with zero human intent — burning the real user's
+// link before they ever click it. GET now touches NO database state at all;
+// it renders a static confirm page (src/auth/email-login.ts's
+// emailConfirmBody) whose own POST — csrf()-protected, same as every other
+// cookie-relevant mount here — is the only thing that ever consumes.
 authApp.get('/email/verify', async (c) => {
   const env = c.env
   if (!isEmailLoginEnabled(env)) return c.json({ error: 'not_found' }, 404)
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
   const token = c.req.query('t') ?? ''
   const attemptId = c.req.query('a') ?? ''
-  const result = await verifyEmailLoginByToken(env, attemptId, token)
-  return respondEmailVerifyResult(c, result)
+  if (!token || !attemptId) {
+    return c.html(emailConfirmMissingBody(env.BRAND || env.TENANT_SLUG), 400)
+  }
+  return c.html(emailConfirmBody(env.BRAND || env.TENANT_SLUG, token, attemptId))
 })
 
-// POST /auth/email/verify {email, code} → the typed-in code (cross-device:
-// the code was sent alongside the link, so it can be typed into the SAME
-// browser/tab the flow started in even when the link itself was opened on a
-// different device).
+// POST /auth/email/verify → either the confirm page's {t, a} (the emailed
+// link, consumed here for real — see the GET route's own comment) or the
+// typed-in {email, code} form (cross-device: the code was sent alongside the
+// link, so it can be typed into the SAME browser/tab the flow started in
+// even when the link itself was opened on a different device). One route,
+// dispatched on which fields are present, so there is exactly one place that
+// mints an email-login session from a verified secret.
 authApp.post('/email/verify', async (c) => {
   const env = c.env
   if (!isEmailLoginEnabled(env)) return c.json({ error: 'not_found' }, 404)
   const form = await readEmailFormBody(c)
-  const result = await verifyEmailLoginByCode(env, form.email ?? '', form.code ?? '')
+  const ip = resolveClientIp(c)
+  const result = (form.t && form.a)
+    ? await verifyEmailLoginByToken(env, env.TENANT_SLUG, form.a, form.t, ip)
+    : await verifyEmailLoginByCode(env, env.TENANT_SLUG, form.email ?? '', form.code ?? '', ip)
   return respondEmailVerifyResult(c, result)
 })
 
