@@ -431,6 +431,71 @@ describe('linkLoginIdentity — requireExclusiveControl atomic guard (mupot#1551
     expect(identityCountForEmail(harness)).toBe(0)
   })
 
+  it('the member being archived AFTER the decision but BEFORE the write makes the link fail atomically — not "already linked"', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-archived-race', 'archivedrace@example.com')
+    const env = { DB: harness.db } as unknown as Env
+
+    const decision = await decideIdentitylessAttach(env, {
+      tenant: TENANT,
+      normalizedEmail: 'archivedrace@example.com',
+    })
+    expect(decision).toEqual({ kind: 'eligible', memberId: 'mem-archived-race', status: 'active' })
+
+    // Race: the row is archived (mupot#1561, migration 0173's archive_row —
+    // status flips to 'suspended' AND archived_at is stamped) strictly
+    // between the eligibility read above and the guarded write below.
+    harness.sqlite
+      .prepare(
+        `UPDATE members SET status = 'suspended', archived_at = datetime('now'), archived_reason = 'test'
+          WHERE id = 'mem-archived-race'`,
+      )
+      .run()
+
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-archived-race',
+      verifiedEmail: 'archivedrace@example.com',
+      memberId: 'mem-archived-race',
+      requireExclusiveControl: true,
+    })
+    expect(linked).toEqual({ ok: false, error: 'competing_control' })
+    expect(identityCountForEmail(harness)).toBe(0)
+  })
+
+  it('a SUSPENDED-only (not archived) member being flipped AFTER the decision also fails the write', async () => {
+    // Isolates the `status = 'active'` half of the new leaf from the
+    // `archived_at IS NULL` half — a member suspended for an unrelated
+    // reason (never archived) must be caught the same way.
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-suspended-race', 'suspendedrace@example.com')
+    const env = { DB: harness.db } as unknown as Env
+
+    const decision = await decideIdentitylessAttach(env, {
+      tenant: TENANT,
+      normalizedEmail: 'suspendedrace@example.com',
+    })
+    expect(decision.kind).toBe('eligible')
+
+    harness.sqlite
+      .prepare(`UPDATE members SET status = 'suspended' WHERE id = 'mem-suspended-race'`)
+      .run()
+
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-suspended-race',
+      verifiedEmail: 'suspendedrace@example.com',
+      memberId: 'mem-suspended-race',
+      requireExclusiveControl: true,
+    })
+    expect(linked).toEqual({ ok: false, error: 'competing_control' })
+    expect(identityCountForEmail(harness)).toBe(0)
+  })
+
   it('a competing identity landing in the race window also fails the write (atomic recheck, not just the read)', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
@@ -897,6 +962,58 @@ describe('P1-a: a login-time denial must also close loadAuthFromCookie\'s own fa
     expect(meRes.status).toBe(200)
     const body = (await meRes.json()) as { memberId?: string }
     expect(body.memberId).not.toBe('mem-sq')
+    expect(body.memberId).toBeUndefined()
+  })
+
+  it('an ALREADY-LINKED member archived between logins: the retry-attach branch must not hand back memberId via the unchecked registerWebSession return', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-archived-retry', 'real@example.com')
+    const env = envFor(harness, memoryKv())
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-archived-retry',
+      verifiedEmail: 'real@example.com',
+      memberId: 'mem-archived-retry',
+    })
+    expect(linked.ok).toBe(true)
+
+    // Archived (mupot#1561, migration 0173) AFTER the identity was linked —
+    // e.g. an admin archived this person's account after they last logged
+    // in, but their browser still holds a live cookie session.
+    harness.sqlite
+      .prepare(
+        `UPDATE members SET status = 'suspended', archived_at = datetime('now'), archived_reason = 'test'
+          WHERE id = 'mem-archived-retry'`,
+      )
+      .run()
+
+    // Hand-craft an UNREGISTERED session (no webSessionRegistered flag) that
+    // carries the real, already-linked join key — record.email deliberately
+    // differs from members.email to prove resolution goes through
+    // resolveLoginIdentity's join key (existingIdentity branch, which never
+    // re-checks liveness on its own), not an email match.
+    await env.SESSIONS.put(
+      'sess:archived-retry-sid',
+      JSON.stringify({
+        userId: 'archived-retry-user',
+        email: 'different@example.com',
+        role: 'member',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        loginIdentity: { provider: 'google', subject: 'sub-archived-retry' },
+      }),
+    )
+
+    // Request 1: the very first check against this crafted session.
+    const meRes = await authApp.request(
+      `${ORIGIN}/me`,
+      { headers: { cookie: 'mupot_session=archived-retry-sid' } },
+      env,
+    )
+    const body = (await meRes.json()) as { memberId?: string; webSessionMemberId?: string }
+    expect(body.memberId).not.toBe('mem-archived-retry')
+    expect(body.webSessionMemberId).not.toBe('mem-archived-retry')
     expect(body.memberId).toBeUndefined()
   })
 

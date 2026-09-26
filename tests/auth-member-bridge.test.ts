@@ -59,6 +59,12 @@ function makeEnv(seed: {
   const identities = seed.identities ?? []
   const bearers = seed.bearers ?? []
   const sessions = new Map<string, string>()
+  // mupot#1551 (Athena BLOCK, both gates): loadAuthFromCookie's retry-attach
+  // branch now re-derives memberId through loadWebSession (never trusting
+  // registerWebSession's own return raw), so this mock must model
+  // web_sessions state for real instead of no-op'ing every write — keyed by
+  // id_hash exactly like the real table.
+  const webSessions = new Map<string, { member_id: string }>()
 
   const env = {
     TENANT_SLUG: seed.tenant ?? 'local',
@@ -131,6 +137,33 @@ function makeEnv(seed: {
               )
               return (m ? ({ id: m.id, status: m.status } as unknown as T) : null)
             }
+            // loadWebSession's own join (web_sessions LEFT JOIN members) —
+            // the retry-attach branch's re-derivation step. idHash is the
+            // FIRST bound param; look it up in the write-side Map above.
+            if (sql.includes('FROM web_sessions ws')) {
+              const [idHash] = args as [string]
+              const row = webSessions.get(idHash)
+              if (!row) return null as T | null
+              // Live status, not a cached snapshot from insert time — a
+              // member archived/suspended AFTER the session was created must
+              // be caught on this read, matching the real LEFT JOIN.
+              const member = members.find((r) => r.id === row.member_id)
+              const future = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+              return {
+                id_hash: idHash,
+                tenant: seed.tenant ?? 'local',
+                member_id: row.member_id,
+                login_identity_id: 'ident-fixture',
+                created_at: '2026-01-01T00:00:00.000Z',
+                last_seen_at: '2026-01-01T00:00:00.000Z',
+                idle_expires_at: future,
+                absolute_expires_at: future,
+                recent_reauth_at: null,
+                revoked_at: null,
+                revoke_reason: null,
+                member_status: member?.status ?? null,
+              } as unknown as T
+            }
             return null as T | null
           },
           all: async <T>() => {
@@ -152,14 +185,23 @@ function makeEnv(seed: {
             }
             return { results: [] as T[] }
           },
-          // The only writes this file's fixtures ever legitimately reach are
-          // registerWebSession's own (a possible verified_email refresh
-          // UPDATE, and createWebSession's INSERT into web_sessions) — this
-          // mock does not model web_sessions state at all (nothing here reads
-          // it back; registerWebSession now hands its resolved memberId back
-          // directly, mupot#1551 round 2), so any write is a structural no-op
-          // that must not throw.
-          run: async () => ({ success: true, meta: { changes: 1 } }),
+          // mupot#1551 (Athena BLOCK, both gates): createWebSession's own
+          // INSERT INTO web_sessions must actually land in the Map above now
+          // — the retry-attach branch re-reads it via loadWebSession
+          // immediately afterward instead of trusting registerWebSession's
+          // raw return. Bind order (src/auth/web-sessions.ts createWebSession):
+          // idHash, tenant, memberId, loginIdentityId, nowIso, idleExpiresAt,
+          // absoluteExpiresAt. Every OTHER write this file's fixtures reach
+          // (e.g. a possible verified_email refresh UPDATE) stays a
+          // structural no-op — must not throw, changes nothing this mock
+          // reads back.
+          run: async () => {
+            if (sql.includes('INSERT INTO web_sessions')) {
+              const [idHash, , memberId] = args as [string, string, string]
+              webSessions.set(idHash, { member_id: memberId })
+            }
+            return { success: true, meta: { changes: 1 } }
+          },
         })
         return {
           bind: (...args: unknown[]) => run(args),

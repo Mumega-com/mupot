@@ -166,6 +166,22 @@ export async function linkLoginIdentity(
         AND NOT EXISTS (
           SELECT 1 FROM members m
            WHERE m.id = ?6 AND m.tenant = ?2 AND m.telegram_chat_id IS NOT NULL
+        )
+        AND EXISTS (
+          -- mupot#1551 (Athena BLOCK, both gates): row liveness was checked
+          -- in JS before this write, never inside it — a member archived or
+          -- suspended strictly between the caller's decideIdentitylessAttach
+          -- read and this INSERT must not get linked. Migration 0173's
+          -- archive_row also flips status to 'suspended' (belt), but this
+          -- checks archived_at directly too (suspenders) rather than trusting
+          -- that coupling to hold forever. EXISTS, not a scalar compare on a
+          -- LEFT JOIN column — status is NOT NULL by schema so the equality
+          -- check cannot silently flip on NULL, and archived_at's own NULL
+          -- is the correct "not archived" value, checked with IS NULL, never
+          -- a negated equality.
+          SELECT 1 FROM members m2
+           WHERE m2.id = ?6 AND m2.tenant = ?2
+             AND m2.status = 'active' AND m2.archived_at IS NULL
         )`,
     )
       .bind(

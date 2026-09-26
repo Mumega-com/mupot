@@ -1473,19 +1473,30 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
           record.loginIdentity,
         )
         if (retry.registered && retry.memberId) {
-          // Newly linked on THIS request — persist the flag so future
-          // requests take the fast `webSessionMemberId` path above instead
-          // of retrying the write every time. registerWebSession hands back
-          // the memberId directly (mupot#1551 round 2) — no second D1 round
-          // trip through loadWebSession needed just to re-derive what this
-          // same call already resolved.
+          // Newly linked on THIS request. mupot#1551 (Athena BLOCK, both
+          // gates): registerWebSession's own memberId is NOT re-verified for
+          // liveness on the way out — trusting it directly bypassed
+          // loadWebSession's status='active' check (the SAME check the
+          // record.webSessionRegistered branch above this one already goes
+          // through), so a member archived/suspended between the INSERT
+          // above and this line would still be handed authority. Re-derive
+          // through loadWebSession instead of trusting retry.memberId raw —
+          // reuses that one existing predicate rather than adding a fourth
+          // copy of "status='active' AND archived_at IS NULL" in this file.
           await c.env.SESSIONS.put(
             sessionKey(sessionId),
             JSON.stringify({ ...record, webSessionRegistered: true }),
             { expirationTtl: SESSION_TTL_SECONDS },
           )
-          memberId = retry.memberId
-          auth.webSessionMemberId = retry.memberId
+          const webSession = await loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
+          if (webSession.ok) {
+            auth.webSessionIdHash = webSession.session.id_hash
+            auth.webSessionMemberId = webSession.session.member_id
+            memberId = webSession.session.member_id
+          }
+          // Still not live (e.g. archived/suspended in the instant between
+          // the INSERT and this read): memberId stays null, exactly like the
+          // denied-at-write-time branch below.
         }
         // Still denied/unresolved: memberId stays null. NEVER fall through to
         // the old lenient email-only resolveHumanMemberId call below — that
@@ -1502,8 +1513,15 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
         // ALREADY has a live identity from a real prior login is not a fresh
         // claim this read would be creating, it is already legitimately
         // claimed — refusing to even READ it would be a false positive, not
-        // a fix (mupot#1551 round 3, kasra-review finding: an operator's own
-        // bearer-token-holding, already-identified member row 403ing here).
+        // a fix. This flag ONLY skips the identity check, though — it does
+        // NOT exempt a live unbound bearer or a Telegram bind, both still
+        // enforced below. An operator holding their own workspace bearer
+        // whose CURRENT session carries no `loginIdentity` is still denied
+        // here by the bearer check and must complete a real login (which
+        // stores `loginIdentity` and takes the retry-attach branch above,
+        // never reaching this fallback at all) — that is what actually
+        // resolves the operator/legit-member shape in
+        // tests/agent-connection-issued-key.test.ts, not this flag.
         const decision = await decideIdentitylessAttach(c.env, {
           tenant: c.env.TENANT_SLUG,
           normalizedEmail: (auth.email ?? '').trim().toLowerCase(),
