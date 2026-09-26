@@ -19,7 +19,9 @@ function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): Sqli
       // group as 0073/0074, or this rolling-deploy simulation breaks with
       // "no such table: routine_run_actions" instead of exercising the
       // degrade-to-empty path this test is actually about.
-      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_'))
+      // 0172 (mupot#1540) likewise references routine_runs (its tasks.status triggers and
+      // backfill leave routine control flights to their routine), so it joins this group.
+      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_') || file.startsWith('0172_'))
     ) {
       continue
     }
