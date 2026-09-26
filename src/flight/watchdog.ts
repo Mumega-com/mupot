@@ -27,7 +27,8 @@
 import type { Env } from '../types'
 import type { FlightRow, FlightStatus } from './service'
 import { getFlight } from './service'
-import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN } from './meta'
+import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
+import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
 
 export interface FlightActor {
   kind: 'member' | 'agent' | 'system'
@@ -37,6 +38,19 @@ export interface FlightActor {
 export const DEFAULT_RUNNING_STALL_TIMEOUT_MS = 60 * 60 * 1000 // 60 minutes
 export const DEFAULT_SLEEPING_STALL_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes past next_run_at
 export const DEFAULT_WAITING_GATE_ESCALATION_TIMEOUT_MS = 24 * 60 * 60 * 1000 // 24 hours
+/**
+ * How long a parked flight whose work is FINISHED (every task done) may wait for its
+ * executor to land it before the watchdog system-lands it (mupot#1540 r2 P1-A).
+ *
+ * 6h, because: the executor normally lands minutes after closing its last task, so the
+ * grace only has to outlast an executor that is itself stalled — a quota block, a
+ * deferred and redelivered harness turn. The 2026-09-25 incident this issue came from
+ * had an agent quota-blocked for ~5h; 6h clears that with margin. It must stay well
+ * under the 24h gate escalation, so a zombie is closed long before it is escalated
+ * as a slow human, and short enough that a finished flight does not pin a routine or
+ * a board for most of a day.
+ */
+export const FLIGHT_SYSTEM_LAND_GRACE_MS = 6 * 60 * 60 * 1000 // 6 hours
 // Same bounds meta.ts validates meta.timeout_ms against at dispatch (mupot#1540 B) —
 // one source, so the accepted range and the honoured range cannot drift.
 export const MIN_CONFIGURED_TIMEOUT_MS = FLIGHT_META_TIMEOUT_MS_MIN
@@ -504,6 +518,130 @@ export async function reapStalledFlight(
   }
 }
 
+/**
+ * Finished parked flights past the grace window (mupot#1540 r2 P1-A): waiting, not yet
+ * escalated, every task done. Its own window and LIMIT, like the other two — and a row
+ * leaves it on the first pass either way (landed, or escalated because it cannot be).
+ */
+async function listFinishedParkedFlights(env: Env, nowMs: number, limit: number): Promise<FlightRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT f.* FROM flights f
+      WHERE f.tenant = ?1
+        AND f.status = 'waiting'
+        AND f.escalated_at IS NULL
+        AND COALESCE(f.waiting_since, f.started_at, f.created_at) < ?3
+        AND json_valid(f.meta)
+        AND json_type(f.meta, '$.task_ids') = 'array'
+        AND NOT EXISTS (
+          SELECT 1 FROM json_each(f.meta, '$.task_ids') ref
+            LEFT JOIN tasks t ON t.id = ref.value
+           WHERE t.id IS NULL OR t.status <> 'done'
+        )
+      ORDER BY COALESCE(f.waiting_since, f.started_at, f.created_at) ASC, f.id ASC
+      LIMIT ?2`,
+  ).bind(env.TENANT_SLUG, limit, nowMs - FLIGHT_SYSTEM_LAND_GRACE_MS).all<FlightRow>()
+  return rows.results ?? []
+}
+
+/** The rows evaluateStructuralSignal judges, for exactly this flight's task_ids. */
+async function loadFlightTaskRows(env: Env, taskIds: readonly string[]): Promise<ChildTaskRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT t.id AS id, t.status AS status, t.gate_owner AS gate_owner, t.result AS result,
+            t.assignee_agent_id AS assignee_agent_id,
+            (SELECT v.verdict FROM task_verdicts v WHERE v.task_id = t.id
+              ORDER BY v.decided_at DESC, v.id DESC LIMIT 1) AS latest_verdict,
+            (SELECT v.decided_by FROM task_verdicts v WHERE v.task_id = t.id
+              ORDER BY v.decided_at DESC, v.id DESC LIMIT 1) AS latest_verdict_by
+       FROM tasks t
+      WHERE t.id IN (SELECT value FROM json_each(?1))
+      ORDER BY t.id ASC`,
+  ).bind(JSON.stringify(taskIds)).all<ChildTaskRow>()
+  return rows.results ?? []
+}
+
+export type SystemLandOutcome =
+  | { landed: true }
+  | { landed: false; reason: StructuralBlockReason | 'flight_budget_policy_missing' | 'flight_meta_invalid' | 'transition_race' }
+
+/**
+ * System-land ONE finished parked flight (mupot#1540 r2 P1-A / P1-B / P2-1).
+ *
+ * Eligibility is the project completion gate's own structural rule
+ * (evaluateStructuralSignal, src/projects/completion-gate.ts) over this flight's tasks:
+ * every task done, a REAL gate (never ungated, never gate:agent-self-completion), a
+ * LATEST verdict of approved, decided by a principal other than the assignee, with
+ * evidence. That is stricter than landGovernedFlight's task predicate on purpose: nobody
+ * is vouching for this land but the gate, so only independently-gated work qualifies.
+ * Plus landGovernedFlight's budget-policy parity (budget_micro_usd set, recorded cost
+ * within it).
+ *
+ * Why the state judged here cannot change under us: every task is 'done', which is
+ * terminal (src/tasks/service.ts), and a verdict can only be written or reversed on a
+ * review/approved/rejected task — so the verdict history of a done task is frozen. The
+ * guarded UPDATE re-asserts what CAN still move (the flight is still waiting, every task
+ * still exists and is done, budget policy, project match, not a routine control flight).
+ *
+ * The land: status 'landed', score NULL (a system land is not a coherence measurement
+ * and must never read as throughput — 121ff12e), cost as recorded, gate_reason
+ * 'watchdog_system_land', and a flight_status_transitions receipt in the same batch.
+ * It writes NO flight_event_outbox row: that table's actor_kind CHECK admits only
+ * member|agent (0046), and attributing this land to the executor would forge the actor.
+ * Consumers of that table therefore do not see system lands — tracked in mupot#1547:
+ * projections landing evidence (src/projects/projections.ts), the stall detector's
+ * newest_flight_event_at (src/projects/stall-detector.ts), and the bus flight.landed event.
+ */
+export async function systemLandParkedFlight(env: Env, flight: FlightRow, nowMs: number): Promise<SystemLandOutcome> {
+  let meta = null
+  try {
+    meta = parseFlightMetaV1(JSON.parse(flight.meta) as unknown)
+  } catch {
+    meta = null
+  }
+  if (!meta) return { landed: false, reason: 'flight_meta_invalid' }
+  if (!Number.isSafeInteger(flight.budget_micro_usd) || (flight.budget_micro_usd as number) < 0
+    || flight.cost_micro_usd > (flight.budget_micro_usd as number)) {
+    return { landed: false, reason: 'flight_budget_policy_missing' }
+  }
+  const tasks = await loadFlightTaskRows(env, meta.task_ids)
+  if (tasks.length !== meta.task_ids.length) return { landed: false, reason: 'task_not_terminal' }
+  const signal = evaluateStructuralSignal(tasks)
+  if (!signal.ready) return { landed: false, reason: signal.reason ?? 'gate_not_pass' }
+
+  const [landed] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE flights
+          SET status = 'landed', score = NULL, gate_reason = 'watchdog_system_land', ended_at = ?3
+        WHERE id = ?1 AND tenant = ?2
+          AND status = 'waiting'
+          AND budget_micro_usd IS NOT NULL AND cost_micro_usd <= budget_micro_usd
+          AND json_valid(meta)
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(flights.meta, '$.task_ids') ref
+              LEFT JOIN tasks t ON t.id = ref.value
+             WHERE t.id IS NULL
+                OR t.status <> 'done'
+                OR (flights.project_id IS NOT NULL AND t.project_id IS NOT flights.project_id)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM routine_runs rr WHERE rr.flight_id = flights.id AND rr.tenant = flights.tenant
+          )
+        RETURNING id`,
+    ).bind(flight.id, env.TENANT_SLUG, nowMs),
+    env.DB.prepare(
+      `INSERT INTO flight_status_transitions
+         (id, tenant, flight_id, from_status, to_status, cause, created_at)
+       SELECT ?1, ?2, ?3, 'waiting', 'landed', 'watchdog_system_land', ?4
+        WHERE EXISTS (
+          SELECT 1 FROM flights
+           WHERE id = ?3 AND tenant = ?2 AND status = 'landed'
+             AND gate_reason = 'watchdog_system_land' AND ended_at = ?4
+        )`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, flight.id, nowMs),
+  ])
+  if ((landed?.results ?? []).length !== 1) return { landed: false, reason: 'transition_race' }
+  return { landed: true }
+}
+
 /** Actor the scheduled sweep reaps as. Authorized by canReapFlight branch 1. */
 export const WATCHDOG_SYSTEM_ACTOR: FlightActor = { kind: 'system', id: 'mupot-watchdog' }
 
@@ -515,6 +653,9 @@ export interface FlightWatchdogSweepResult {
   escalated: number
   /** Which flights escalated, so the count is attributable rather than just a number. */
   escalated_flight_ids: string[]
+  /** Finished, independently-approved parked flights the watchdog landed after the grace. */
+  system_landed: number
+  system_landed_flight_ids: string[]
   /** Reap attempted and refused/errored. Does not abort the sweep. */
   failed: number
   /** The scan hit its LIMIT: this pass is PARTIAL, not a clean sweep. */
@@ -553,12 +694,48 @@ export async function sweepStalledFlights(
   opts: { nowMs?: number; limit?: number } = {},
 ): Promise<FlightWatchdogSweepResult> {
   const nowMs = opts.nowMs ?? Date.now()
-  const scan = await scanStalledFlights(env, opts)
 
   let reaped = 0
   let escalated = 0
   let failed = 0
   const escalatedFlightIds: string[] = []
+
+  // FIRST, before the escalation window is read (so a finished flight past 24h is landed,
+  // not escalated): finished parked flights past the grace. Land the independently-
+  // approved ones; the rest cannot land and are escalated now (once), which also takes
+  // them out of this window, so ineligible rows can never pile up in it.
+  let systemLanded = 0
+  const systemLandedFlightIds: string[] = []
+  for (const flight of await listFinishedParkedFlights(env, nowMs, Math.min(Math.max(opts.limit ?? 100, 1), 500))) {
+    try {
+      const outcome = await systemLandParkedFlight(env, flight, nowMs)
+      if (outcome.landed) {
+        systemLanded += 1
+        systemLandedFlightIds.push(flight.id)
+        continue
+      }
+      // Not landable (or its guarded UPDATE matched nothing): escalate once. The claim is
+      // guarded on status='waiting', so a flight that landed concurrently is not claimed.
+      const claimed = await env.DB.prepare(
+        `UPDATE flights SET escalated_at = ?3
+          WHERE id = ?1 AND tenant = ?2 AND status = 'waiting' AND escalated_at IS NULL
+          RETURNING id`,
+      ).bind(flight.id, env.TENANT_SLUG, nowMs).all<{ id: string }>()
+      if ((claimed.results ?? []).length === 1) {
+        escalated += 1
+        escalatedFlightIds.push(flight.id)
+        console.warn(`[flight-watchdog] finished parked flight ${flight.id} cannot be system-landed: ${outcome.reason}`)
+      }
+    } catch (error) {
+      console.error(
+        `[flight-watchdog] system land threw for flight ${flight.id}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      )
+      failed += 1
+    }
+  }
+
+  const scan = await scanStalledFlights(env, opts)
 
   for (const { flight, evaluation } of scan.items) {
     if (evaluation.action === 'escalate') {
@@ -630,6 +807,8 @@ export async function sweepStalledFlights(
     reaped,
     escalated,
     escalated_flight_ids: escalatedFlightIds,
+    system_landed: systemLanded,
+    system_landed_flight_ids: systemLandedFlightIds,
     failed,
     capped: scan.capped,
     scanned: scan.scanned,

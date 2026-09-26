@@ -31,29 +31,25 @@
 --                         reject, a reopen, a missing task). resumed_at restarts the
 --                         running stall clock, so a flight that waited 5h at a gate is
 --                         not reaped the instant it is sent back for rework.
---      waiting → landed   (round 2, gate P0) when EVERY task is 'done' and every gated
---                         task's latest verdict is 'approved' — the SAME task predicate
---                         landGovernedFlight enforces (routine control flights excluded).
---                         A SYSTEM LAND: score NULL (a system land is not a coherence
---                         measurement and must never read as throughput), cost as
---                         recorded, gate_reason 'auto_landed_all_tasks_done', receipted in
---                         flight_status_transitions with that cause. Without this, 'done'
---                         being terminal meant an approved-and-closed flight that nobody
---                         landed stayed 'waiting' FOREVER: unreapable, re-escalated every
---                         sweep, holding scan slots and routine skip-overlap pins.
---                         It only ever fires from 'waiting', i.e. after the flight crossed
---                         a gate; an ungated all-'done' running flight is still the
---                         executor's to land (or the 60m reaper's). It deliberately writes
---                         NO flight_event_outbox row: that table's actor_kind admits only
---                         member|agent, and attributing a system land to the executor would
---                         be a forged actor. The transition receipt is the audit record.
+--      waiting → landed   NOT a trigger. The watchdog (src/flight/watchdog.ts,
+--                         systemLandParkedFlight) system-lands a waiting flight whose work is
+--                         finished and independently approved only after a GRACE window
+--                         (FLIGHT_SYSTEM_LAND_GRACE_MS, 6h) from waiting_since, so on the normal
+--                         path the executor lands first with its own cost, score and outbox
+--                         receipt. Round 2 did this in a trigger at the instant the last task
+--                         went done; that pre-empted every executor land (409
+--                         flight_not_in_air, cost/score/outbox lost) — gate r2 P1-A. The
+--                         system land is receipted here with cause 'watchdog_system_land'.
+--                         Eligibility is the project completion gate's structural rule
+--                         (independent, non-self gate; latest verdict approved; evidence) +
+--                         budget policy. It writes NO flight_event_outbox row (0046's CHECK
+--                         admits only member|agent); consumers that miss it: mupot#1547.
 --
---    ROUTINE CONTROL FLIGHTS ARE OUT OF SCOPE of every transition here (round 2): a flight
---    that is some routine_run's flight_id has an owner that already lands it with its own
---    receipt (src/routines/actions.ts completeControlTask → landControlFlight, which
---    REQUIRES the flight.landed outbox row) and whose pin semantics are #1369's. Auto-
---    landing it between those two calls made landControlFlight throw (caught by
---    tests/routine-actions.test.ts). Such a flight behaves exactly as on main.
+--    ROUTINE CONTROL FLIGHTS ARE OUT OF SCOPE of every transition here: a flight that is
+--    some routine_run's flight_id has an owner that lands it with its own receipt
+--    (src/routines/actions.ts completeControlTask → landControlFlight, which REQUIRES the
+--    flight.landed outbox row) and whose pin semantics are #1369's. It never enters
+--    'waiting', so it behaves exactly as on main.
 --
 --    Performance (round 2, gate P1-1): tasks carries no tenant column, so the triggers
 --    cannot scope by tenant; they scope by flight status instead, through
@@ -103,7 +99,7 @@ CREATE TABLE IF NOT EXISTS flight_status_transitions (
   flight_id              TEXT NOT NULL,
   from_status            TEXT NOT NULL CHECK (from_status IN ('running', 'waiting')),
   to_status              TEXT NOT NULL CHECK (to_status IN ('running', 'waiting', 'landed')),
-  cause                  TEXT NOT NULL CHECK (cause IN ('task_status', 'migration_backfill', 'auto_landed_all_tasks_done')),
+  cause                  TEXT NOT NULL CHECK (cause IN ('task_status', 'migration_backfill', 'watchdog_system_land')),
   cause_task_id          TEXT,
   cause_task_from_status TEXT,
   cause_task_to_status   TEXT,
@@ -238,84 +234,6 @@ BEGIN
      AND EXISTS (
        SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
         WHERE ref.value = NEW.id
-     );
-END;
-
--- ── A (round 2, gate P0): the exit from 'waiting' when the gated work is finished ─────
--- Same task predicate as landGovernedFlight (src/flight/service.ts) — task exists, matches
--- the flight's project, is 'done', and if gated its LATEST verdict is 'approved'. A routine
--- CONTROL flight is never auto-landed: its routine lands it with a receipt (see header).
--- Nothing here can land a flight whose work the gate did not approve.
-CREATE TRIGGER IF NOT EXISTS flights_auto_land_on_task_done
-AFTER UPDATE OF status ON tasks
-WHEN OLD.status IS NOT NEW.status
- AND NEW.status = 'done'
-BEGIN
-  INSERT INTO flight_status_transitions
-    (id, tenant, flight_id, from_status, to_status, cause,
-     cause_task_id, cause_task_from_status, cause_task_to_status, created_at)
-  SELECT lower(hex(randomblob(16))), f.tenant, f.id, 'waiting', 'landed', 'auto_landed_all_tasks_done',
-         NEW.id, OLD.status, NEW.status, unixepoch('now') * 1000
-    FROM flights f
-   WHERE f.status = 'waiting'
-     AND json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
-     AND json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') = 'array'
-     AND EXISTS (
-       SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
-        WHERE ref.value = NEW.id
-     )
-     AND NOT EXISTS (
-       SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
-         LEFT JOIN tasks t ON t.id = ref.value
-        WHERE t.id IS NULL
-           OR (f.project_id IS NOT NULL AND t.project_id IS NOT f.project_id)
-           OR t.status <> 'done'
-           OR (
-             t.gate_owner IS NOT NULL
-             AND COALESCE((
-               SELECT v.verdict FROM task_verdicts v
-                WHERE v.task_id = t.id
-                ORDER BY v.decided_at DESC, v.id DESC
-                LIMIT 1
-             ), '') <> 'approved'
-           )
-     )
-     AND NOT EXISTS (
-       SELECT 1 FROM routine_runs rr
-        WHERE rr.flight_id = f.id AND rr.tenant = f.tenant
-     );
-
-  UPDATE flights
-     SET status = 'landed',
-         score = NULL,
-         gate_reason = 'auto_landed_all_tasks_done',
-         ended_at = unixepoch('now') * 1000
-   WHERE status = 'waiting'
-     AND json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
-     AND json_type(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') = 'array'
-     AND EXISTS (
-       SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
-        WHERE ref.value = NEW.id
-     )
-     AND NOT EXISTS (
-       SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
-         LEFT JOIN tasks t ON t.id = ref.value
-        WHERE t.id IS NULL
-           OR (flights.project_id IS NOT NULL AND t.project_id IS NOT flights.project_id)
-           OR t.status <> 'done'
-           OR (
-             t.gate_owner IS NOT NULL
-             AND COALESCE((
-               SELECT v.verdict FROM task_verdicts v
-                WHERE v.task_id = t.id
-                ORDER BY v.decided_at DESC, v.id DESC
-                LIMIT 1
-             ), '') <> 'approved'
-           )
-     )
-     AND NOT EXISTS (
-       SELECT 1 FROM routine_runs rr
-        WHERE rr.flight_id = flights.id AND rr.tenant = flights.tenant
      );
 END;
 

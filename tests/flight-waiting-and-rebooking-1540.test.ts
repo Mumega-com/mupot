@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
-import { sweepStalledFlights } from '../src/flight/watchdog'
+import { FLIGHT_SYSTEM_LAND_GRACE_MS, sweepStalledFlights } from '../src/flight/watchdog'
 import { canonicalFlightMetaSql } from '../src/flight/meta-sql'
 import { createFlight, FlightIdempotencyConflictError } from '../src/flight/service'
 import { runRoutineScheduler } from '../src/routines/scheduler'
@@ -198,13 +198,26 @@ async function land(env: Env, flightId: string) {
   return invokeTool(execAuth(), env, 'flight_land', { flight_id: flightId, cost_micro_usd: 0, score: 0.9 }, ORIGIN)
 }
 
-/** Land a flight through the real gated path: review → approve → done (→ system land). */
+/** Land a flight through the real, NORMAL gated path: review → approve → done → executor flight_land. */
 async function flyToLanded(env: Env, taskIds: string[], extra: Record<string, unknown> = {}): Promise<string> {
   const id = await dispatchedId(env, taskIds, extra)
   for (const t of taskIds) await toReview(env, t)
   for (const t of taskIds) await verdict(env, t, 'approved')
   for (const t of taskIds) await close(env, t)
-  expect(flightRow(harness, id).status).toBe('landed')
+  const landed = await land(env, id)
+  expect(landed.ok, JSON.stringify(landed)).toBe(true)
+  return id
+}
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
+
+/** A finished, never-landed parked flight: review → approve → done, and the executor never lands. */
+async function zombie(env: Env, taskIds: string[]): Promise<string> {
+  const id = await dispatchedId(env, taskIds)
+  for (const t of taskIds) await toReview(env, t)
+  for (const t of taskIds) await verdict(env, t, 'approved')
+  for (const t of taskIds) await close(env, t)
+  expect(flightRow(harness, id).status).toBe('waiting')
   return id
 }
 
@@ -285,41 +298,152 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(early).toMatchObject({ ok: false, status: 409, error: 'flight_tasks_incomplete' })
   })
 
-  it('P0: approve + done SYSTEM-LANDS the waiting flight: score NULL, receipted, cost as recorded', async () => {
+  it('P1-A NORMAL PATH: approve → done → the EXECUTOR lands it (cost, score, outbox intact — not a 409)', async () => {
     const id = await dispatchedId(env, ['task-1', 'task-2'])
     await toReview(env, 'task-1')
     await toReview(env, 'task-2')
     await verdict(env, 'task-1', 'approved')
     await verdict(env, 'task-2', 'approved')
     await close(env, 'task-1')
-    // task-2 is approved but NOT done: approval alone is not completion.
-    expect(flightRow(harness, id).status).toBe('waiting')
     await close(env, 'task-2')
+    expect(flightRow(harness, id).status).toBe('waiting') // nothing lands it behind the executor's back
 
-    const landed = flightRow(harness, id)
-    expect(landed).toMatchObject({ status: 'landed', score: null, gate_reason: 'auto_landed_all_tasks_done', cost_micro_usd: 0 })
-    expect(landed.ended_at).toEqual(expect.any(Number))
+    const landed = await land(env, id)
+    expect(landed.ok, JSON.stringify(landed)).toBe(true)
+    expect(flightRow(harness, id)).toMatchObject({ status: 'landed', score: 0.9, gate_reason: '' })
+    expect(count(harness, `SELECT COUNT(*) AS n FROM flight_event_outbox WHERE flight_id = ? AND event_type = 'flight.landed'`, id)).toBe(1)
+  })
+
+  it('P1-A ZOMBIE: finished + approved, never landed → system-landed only AFTER the 6h grace', async () => {
+    const id = await zombie(env, ['task-1', 'task-2'])
+    const since = flightRow(harness, id).waiting_since as number
+
+    const early = await sweepStalledFlights(env, { nowMs: since + FLIGHT_SYSTEM_LAND_GRACE_MS - MIN })
+    expect(early).toMatchObject({ system_landed: 0, escalated: 0, reaped: 0 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+
+    const late = await sweepStalledFlights(env, { nowMs: since + FLIGHT_SYSTEM_LAND_GRACE_MS + MIN })
+    expect(late).toMatchObject({ system_landed: 1, system_landed_flight_ids: [id], escalated: 0 })
+    const row = flightRow(harness, id)
+    expect(row).toMatchObject({ status: 'landed', score: null, gate_reason: 'watchdog_system_land', cost_micro_usd: 0 })
+    expect(row.ended_at).toBe(since + FLIGHT_SYSTEM_LAND_GRACE_MS + MIN)
     expect(transitions(harness, id).at(-1)).toMatchObject({
-      from_status: 'waiting', to_status: 'landed', cause: 'auto_landed_all_tasks_done',
-      cause_task_id: 'task-2', cause_task_from_status: 'approved', cause_task_to_status: 'done',
+      from_status: 'waiting', to_status: 'landed', cause: 'watchdog_system_land',
     })
-    // No forged flight.landed actor: a system land writes no outbox row.
+    // Documented gap: no forged actor, so no outbox row for a system land.
     expect(count(harness, 'SELECT COUNT(*) AS n FROM flight_event_outbox WHERE flight_id = ?', id)).toBe(0)
-    // The executor's own land now finds nothing in the air.
     expect(await land(env, id)).toMatchObject({ ok: false, status: 409, error: 'flight_not_in_air' })
   })
 
-  it('P0: no system land unless the gate APPROVED — a done task whose latest verdict is not approved blocks it', async () => {
+  it('approval alone is not completion: approved-but-not-done work is never system-landed', async () => {
+    const id = await dispatchedId(env, ['task-1', 'task-2'])
+    await toReview(env, 'task-1')
+    await toReview(env, 'task-2')
+    await verdict(env, 'task-1', 'approved')
+    await verdict(env, 'task-2', 'approved')
+    await close(env, 'task-1') // task-2 approved, not done
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+  })
+
+  it('P1-B: a done task with NO approved verdict blocks the system land (escalated once instead)', async () => {
     const id = await dispatchedId(env, ['task-1', 'task-2'])
     await toReview(env, 'task-1')
     await toReview(env, 'task-2')
     await verdict(env, 'task-2', 'approved')
-    // Forge the shape the predicate must refuse: task-1 'done' with no approved verdict.
-    harness.sqlite.prepare(`UPDATE tasks SET status = 'done' WHERE id = 'task-1'`).run()
+    harness.sqlite.prepare(`UPDATE tasks SET status = 'done' WHERE id = 'task-1'`).run() // forged: never approved
+    await close(env, 'task-2')
+    const since = flightRow(harness, id).waiting_since as number
+    const sweep = await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })
+    expect(sweep).toMatchObject({ system_landed: 0, escalated: 1, escalated_flight_ids: [id] })
     expect(flightRow(harness, id).status).toBe('waiting')
-    await close(env, 'task-2') // last task done — but task-1 was never approved
+    // …and it leaves the window: the next sweep does not re-evaluate or re-escalate it.
+    expect(await sweepStalledFlights(env, { nowMs: since + 8 * HOUR })).toMatchObject({ system_landed: 0, escalated: 0 })
+  })
+
+  it('P1-B: SELF-GATED work (gate:agent-self-completion, closed by its own assignee) is never system-landed', async () => {
+    harness.sqlite.prepare(`UPDATE tasks SET gate_owner = 'gate:agent-self-completion' WHERE id = 'task-1'`).run()
+    const id = await dispatchedId(env, ['task-1'])
+    await toReview(env, 'task-1')
+    const own = await invokeTool(execAuth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved', note: 'mine' }, ORIGIN)
+    expect(own.ok, JSON.stringify(own)).toBe(true)
+    await close(env, 'task-1')
     expect(flightRow(harness, id).status).toBe('waiting')
-    expect(transitions(harness, id).some((row) => row.to_status === 'landed')).toBe(false)
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+  })
+
+  it('P1-B: an UNGATED task in the flight blocks the system land', async () => {
+    harness.sqlite.prepare(`UPDATE tasks SET gate_owner = NULL WHERE id = 'task-3'`).run()
+    const id = await dispatchedId(env, ['task-3', 'task-1'])
+    await close(env, 'task-3') // ungated, straight to done
+    await toReview(env, 'task-1') // → waiting (task-3 done, task-1 at the gate)
+    await verdict(env, 'task-1', 'approved')
+    await close(env, 'task-1')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+  })
+
+  it('P1-B: a SELF-VERDICT (approved by the assignee) blocks the system land', async () => {
+    const id = await dispatchedId(env, ['task-1'])
+    await toReview(env, 'task-1')
+    harness.sqlite.exec(`
+      INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+      VALUES ('v-self', 'task-1', 'approved', '${EXEC_AGENT}', '${new Date().toISOString()}');
+      UPDATE tasks SET status = 'approved' WHERE id = 'task-1';
+    `)
+    await close(env, 'task-1')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+  })
+
+  it('P2-2: the LATEST verdict decides — approved → reversed → rejected → closed-as-abandoned never system-lands', async () => {
+    const id = await dispatchedId(env, ['task-1', 'task-2'])
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'approved')
+    await tick()
+    const orgAdmin: AuthContext = {
+      ...gateAuth(), role: 'admin',
+      capabilities: [
+        ...gateAuth().capabilities ?? [],
+        { member_id: GATE_MEMBER, scope_type: 'org', scope_id: null, capability: 'admin' },
+      ],
+    }
+    const reversed = await invokeTool(orgAdmin, env, 'task_verdict_reverse', { task_id: 'task-1', reversal_reason: 'wrong call' }, ORIGIN)
+    expect(reversed.ok, JSON.stringify(reversed)).toBe(true)
+    await tick()
+    await verdict(env, 'task-1', 'rejected')
+    await close(env, 'task-1') // rejected → done = abandoned
+    await toReview(env, 'task-2') // → waiting: task-1 done, task-2 at the gate
+    await verdict(env, 'task-2', 'approved')
+    await close(env, 'task-2')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    const verdicts = harness.sqlite
+      .prepare(`SELECT verdict FROM task_verdicts WHERE task_id = 'task-1' ORDER BY decided_at ASC, id ASC`)
+      .all() as Array<{ verdict: string }>
+    expect(verdicts.map((v) => v.verdict)).toEqual(['approved', 'rejected'])
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+  })
+
+  it('P2-1: budget-policy parity — a zombie with budget_micro_usd NULL is not system-landed', async () => {
+    const id = await zombie(env, ['task-1'])
+    harness.sqlite.prepare('UPDATE flights SET budget_micro_usd = NULL WHERE id = ?').run(id)
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
+    expect(flightRow(harness, id).status).toBe('waiting')
+  })
+
+  it('a finished zombie past 24h is system-landed, not escalated as a slow human', async () => {
+    const id = await zombie(env, ['task-1'])
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 25 * HOUR })).toMatchObject({ system_landed: 1, escalated: 0 })
+    expect(flightRow(harness, id).status).toBe('landed')
   })
 
   it('P0 (4): a routine CONTROL flight is left to its routine — it never parks, so the 60m reaper still releases its overlap pin (#1369)', async () => {
@@ -366,7 +490,7 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(next.status).toBe('queued')
   })
 
-  it('P0: a waiting flight that becomes a routine control flight is not auto-landed (its routine lands it)', async () => {
+  it('P0: a waiting flight that becomes a routine control flight is never system-landed (its routine lands it)', async () => {
     const id = await dispatchedId(env, ['task-1'])
     await toReview(env, 'task-1')
     await verdict(env, 'task-1', 'approved')
@@ -390,6 +514,8 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     `)
     await close(env, 'task-1')
     expect(flightRow(harness, id).status).toBe('waiting')
+    const since = flightRow(harness, id).waiting_since as number
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
     expect(transitions(harness, id).some((row) => row.to_status === 'landed')).toBe(false)
   })
 
