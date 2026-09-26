@@ -134,7 +134,7 @@ describe('mupot#1504 adversarial round 1, P2-a — call sites survive a provisio
     expect(member).toBeDefined()
   })
 
-  it('JSON API accept (members/index.ts POST /invites/:id/accept): still 201s with the raw token', async () => {
+  it('JSON API accept (members/index.ts POST /invites/:id/accept): still 201s, now with token: null (mupot#1551)', async () => {
     harness = makeHarness()
     const { env } = envFor(harness)
 
@@ -145,9 +145,15 @@ describe('mupot#1504 adversarial round 1, P2-a — call sites survive a provisio
     }), env)
 
     expect(response.status).toBe(201)
-    const body = await response.json() as { member_id: string; token: { raw: string } | null }
+    const body = await response.json() as { member_id: string; token: null; next: string }
     expect(typeof body.member_id).toBe('string')
-    expect(typeof body.token?.raw).toBe('string')
+    expect(body.token).toBeNull()
+    expect(body.next).toBe('sign_in')
+
+    const tokenCount = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?`)
+      .get(body.member_id) as { n: number }
+    expect(tokenCount.n).toBe(0)
   })
 
   it("IM join (im/index.ts handleImMessage 'join' case): still confirms the join", async () => {

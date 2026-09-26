@@ -489,7 +489,7 @@ describe('GET /auth/callback — pending-invite link (A2)', () => {
     harness = makeHarness()
     const kv = memoryKv()
     const env = envFor(harness, kv)
-    const accepted = await acceptInvite(env, 'inv-legacy', 'Newcomer Nancy', { mintToken: false })
+    const accepted = await acceptInvite(env, 'inv-legacy', 'Newcomer Nancy')
     expect(accepted.ok).toBe(true)
     if (!accepted.ok) throw new Error('unreachable')
 

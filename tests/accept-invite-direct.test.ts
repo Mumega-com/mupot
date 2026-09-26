@@ -12,10 +12,11 @@
 //
 // Schema via createSqliteD1 + applyAllMigrations — no hand-written CREATE TABLE.
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { acceptInvite } from '../src/members'
+import * as membersService from '../src/members/service'
 import type { Env } from '../src/types'
 
 const TENANT = 'pot-a'
@@ -99,10 +100,13 @@ describe('acceptInvite — atomic single-use guard, called directly (P1-A)', () 
       .get(member!.id) as { n: number }
     expect(capCount.n).toBe(1)
 
+    // mupot#1551: acceptInvite never mints a token any more (function-boundary
+    // invariant, not a per-caller option) — the race winner gets no
+    // member_tokens row either.
     const tokenCount = harness.sqlite
       .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?`)
       .get(member!.id) as { n: number }
-    expect(tokenCount.n).toBe(1)
+    expect(tokenCount.n).toBe(0)
   })
 })
 
@@ -145,16 +149,20 @@ describe('acceptInvite — server-side display_name cap (WARN-B)', () => {
   })
 })
 
-describe('acceptInvite — mintToken option (WARN-C)', () => {
+// mupot#1551 (Athena's ruling, 2026-09-26): acceptInvite() can no longer mint
+// a token AT ALL — this used to be a per-caller `mintToken` option (WARN-C);
+// it is now a function-boundary invariant with no flag to flip. These tests
+// pin that boundary directly, not just its downstream symptom.
+describe('acceptInvite — never mints a token (mupot#1551, function boundary)', () => {
   let harness: SqliteD1Harness | undefined
-  afterEach(() => { harness?.close(); harness = undefined })
+  afterEach(() => { harness?.close(); harness = undefined; vi.restoreAllMocks() })
 
-  it('mintToken:false writes member+capability but NO member_tokens row, and returns token: null', async () => {
+  it('writes member+capability but NO member_tokens row, and returns token: null', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     seedInvite(harness, 'inv-no-token', 'notoken@example.com')
 
-    const result = await acceptInvite(env, 'inv-no-token', 'No Token', { mintToken: false })
+    const result = await acceptInvite(env, 'inv-no-token', 'No Token')
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error('unreachable')
     expect(result.value.token).toBeNull()
@@ -165,19 +173,23 @@ describe('acceptInvite — mintToken option (WARN-C)', () => {
     expect(tokenCount.n).toBe(0)
   })
 
-  it('mintToken:true (default, unchanged) still writes exactly one member_tokens row', async () => {
+  it('never even COMPUTES a raw token or its hash — mintRawToken/sha256Hex are not called', async () => {
     harness = makeHarness()
     const env = envFor(harness)
-    seedInvite(harness, 'inv-with-token', 'withtoken@example.com')
+    seedInvite(harness, 'inv-no-hash', 'nohash@example.com')
 
-    const result = await acceptInvite(env, 'inv-with-token', 'With Token')
+    const mintSpy = vi.spyOn(membersService, 'mintRawToken')
+    const hashSpy = vi.spyOn(membersService, 'sha256Hex')
+
+    const result = await acceptInvite(env, 'inv-no-hash', 'No Hash')
     expect(result.ok).toBe(true)
-    if (!result.ok) throw new Error('unreachable')
-    expect(result.value.token?.raw).toMatch(/^mupot_[0-9a-f]{64}$/)
 
-    const tokenCount = harness.sqlite
-      .prepare(`SELECT COUNT(*) AS n FROM member_tokens WHERE member_id = ?`)
-      .get(result.value.member_id) as { n: number }
-    expect(tokenCount.n).toBe(1)
+    // Neither helper is imported by src/members/index.ts's acceptInvite any
+    // more (the call sites were deleted, not merely gated behind an `if`
+    // that happens not to trigger) — asserting zero calls proves the code
+    // path structurally cannot produce a raw token, not just that this one
+    // run didn't.
+    expect(mintSpy).not.toHaveBeenCalled()
+    expect(hashSpy).not.toHaveBeenCalled()
   })
 })

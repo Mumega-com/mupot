@@ -7,7 +7,8 @@
 //
 // membersApp — HTTP surface mounted (by the Integrate phase) under its prefix:
 //   POST   /invites                      create an invite        (admin on org/dept)
-//   POST   /invites/:id/accept           redeem → mint member + capability + token
+//   POST   /invites/:id/accept           redeem → mint member + capability (mupot#1551:
+//                                         no token — identity is proven at login)
 //   GET    /members                      list members            (member+)
 //   GET    /members/:id                  read one member         (member+)
 //   PATCH  /members/:id                  suspend / reactivate    (admin)
@@ -46,13 +47,13 @@ import { assertBatchWritten, assertWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import { requireCapability, capabilityRank, actorMaxRankOnScope, exceedsTargetRankCeiling } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
-// sha256Hex/mintRawToken are imported ONLY for the invite-accept atomic batch.
+// mupot#1551: acceptInvite() no longer mints (Athena's ruling — that is a
+// function-boundary invariant now, not a per-caller option), so sha256Hex
+// and mintRawToken are no longer imported here at all.
 import {
   mintMemberToken,
   revokeMemberToken,
   isChannel as isChannelService,
-  sha256Hex,
-  mintRawToken,
   upsertCapabilityGrant,
   provisionHomeForMember,
 } from './service'
@@ -196,11 +197,18 @@ export interface AcceptInviteSuccess {
   member_id: string
   email: string
   capability: { scope_type: CapabilityScopeType; scope_id: string | null; capability: Capability }
-  // null when the caller opted out of minting (mupot#1436 round 2 WARN-C —
-  // the web invite-landing page authenticates by sending the human to log
-  // in, never by handing back a bearer, so it has no use for a token and
-  // must not mint/persist one just to discard it).
-  token: { id: string; label: 'workspace'; channel: ConnectionChannel; raw: string } | null
+  // mupot#1551 (Athena's ruling, 2026-09-26): acceptInvite is a PUBLIC,
+  // id-only redemption — it never has proof the caller controls
+  // `invite.email`, so it must never be able to hand back a bearer for it.
+  // That is now a FUNCTION-BOUNDARY invariant, not a per-caller option (the
+  // former `mintToken` flag is gone — every caller on main already passed
+  // `false` or relied on a default that had zero live true-callers). Always
+  // `null`; identity is proven at login instead (resolveHumanMemberId links
+  // this member by e-mail on first sign-in, same steal-protection the web
+  // door's pending-invite marker gives its own flow). A future AUTHENTICATED
+  // minter belongs on its own function (mintMemberToken, service.ts) — never
+  // grafted back onto this one.
+  token: null
 }
 
 export type AcceptInviteError =
@@ -245,12 +253,7 @@ export async function acceptInvite(
   env: Env,
   inviteId: string,
   displayName: string,
-  // mupot#1436 round 2 WARN-C. Defaults to true so the existing JSON API
-  // caller is unchanged; the web invite-landing page passes false.
-  options?: { mintToken?: boolean },
 ): Promise<AcceptInviteResult> {
-  const mintToken = options?.mintToken ?? true
-
   const invite = await env.DB.prepare(
     `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
             pairing_expires_at, capability, invited_by, accepted_at, created_at
@@ -297,11 +300,10 @@ export async function acceptInvite(
       : 'org'
   const scopeId: string | null = invite.squad_id ?? invite.department_id
 
-  // Mint the workspace token now (unless the caller opted out, WARN-C) so we
-  // can hand it back exactly once.
-  const rawToken = mintToken ? mintRawToken() : null
-  const tokenHash = rawToken !== null ? await sha256Hex(rawToken) : null
-  const tokenId = mintToken ? crypto.randomUUID() : null
+  // mupot#1551: NO raw token, NO hash, NO token id is ever computed on this
+  // path — not merely "computed then discarded". A public, id-only
+  // redemption must not even hold a raw bearer in memory for an email it
+  // has no proof the caller controls.
   const grantId = crypto.randomUUID()
   const acceptedAt = new Date().toISOString()
 
@@ -336,17 +338,9 @@ export async function acceptInvite(
         'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
       ).bind(grantId, member.id, scopeType, scopeId, invite.capability),
     ]
-    // WARN-C: only append (and only ever write) the token row when the caller
-    // asked to mint one — the array's length IS the write count assertBatchWritten
-    // below checks, so an HTML-path accept genuinely never inserts into
-    // member_tokens, not merely "never returns" its row.
-    if (mintToken && tokenId !== null && tokenHash !== null) {
-      writes.push(
-        env.DB.prepare(
-          'INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant) VALUES (?, ?, ?, ?, ?, ?)',
-        ).bind(tokenId, member.id, tokenHash, 'workspace', 'workspace', env.TENANT_SLUG),
-      )
-    }
+    // mupot#1551: acceptInvite never inserts into member_tokens — there is no
+    // conditional branch left to gate; this route mints a member and a
+    // capability grant, nothing else.
     // A2: D1 is the callback's authority for which member this accept minted.
     // 0156 allows this stamp on a legacy/plain-squad row; the KV marker's
     // member_id is only a pointer and must not be trusted blind.
@@ -382,15 +376,7 @@ export async function acceptInvite(
       // none), so read it from the invite, not the just-built member row.
       email: invite.email,
       capability: { scope_type: scopeType, scope_id: scopeId, capability: invite.capability },
-      token:
-        mintToken && tokenId !== null && rawToken !== null
-          ? {
-              id: tokenId,
-              label: 'workspace',
-              channel: 'workspace' as ConnectionChannel,
-              raw: rawToken,
-            }
-          : null,
+      token: null,
     },
   }
 }
@@ -423,6 +409,33 @@ membersApp.post('/invites/:id/accept', async (c) => {
   if (!isNonEmptyString(body.display_name)) return c.json({ error: 'invalid_display_name' }, 400)
   const displayName = body.display_name.trim()
 
+  // mupot#1551 Option A (defect class: public invite accept minting a bearer
+  // for an admin-typed, unverified email — a squatting enabler). This route
+  // is redeemed by the invite id alone, with NO proof the caller controls
+  // `invite.email` — that proof only exists at IdP login. Handing back a raw
+  // workspace bearer here was therefore a credential for an address nobody
+  // had verified. Athena's ruling (2026-09-26): this is now a FUNCTION
+  // boundary, not a per-caller flag — acceptInvite() itself can never mint a
+  // token (the former `mintToken` option is gone entirely; grepped clean on
+  // main, no caller ever passed `true`). This route and the dashboard's own
+  // /invite/:id door (src/dashboard/invite.ts, the only other caller) both
+  // simply get `token: null` back unconditionally.
+  //
+  // No KV pending-invite marker/cookie is planted here (contrast the web
+  // door, which plants one for its own follow-on browser redirect into
+  // /auth/login). Two reasons: (1) a JSON/API caller has no browser session
+  // for a cookie to attach to, and /auth/login's only intake for that marker
+  // is `getCookie(c, PENDING_INVITE_COOKIE)` (src/auth/index.ts) — there is
+  // no body/query-param intake an API client could drive today, so handing
+  // one back would be a dead value with nothing to consume it; wiring that
+  // up is a real feature (its own gate), not part of narrowing this mint.
+  // (2) it is not needed for the security property this fix protects: the
+  // member row this mints has no `human_login_identities` row yet, so the
+  // ORDINARY (non-invite) Google login already binds it by e-mail on first
+  // sign-in — resolveHumanMemberId's `NOT EXISTS(human_login_identities)`
+  // check (src/members/resolve-human-member.ts) is exactly the same
+  // steal-protection the pending-invite marker enforces for the web door,
+  // reached here via the plain login path instead of a special-cased one.
   const result = await acceptInvite(c.env, inviteId, displayName)
   if (!result.ok) {
     return c.json({ error: result.error }, acceptInviteErrorStatus(result.error))
@@ -437,11 +450,12 @@ membersApp.post('/invites/:id/accept', async (c) => {
   // plane, not IM), same receipt table, same idempotent/best-effort
   // contract — never blocks or is reflected in this response either way.
   //
-  // Adversarial round 1, P2-a: this call sits BEFORE the raw token response
-  // below — the token is returned EXACTLY ONCE, so an uncaught rejection
-  // here would burn it with no way to ever hand it back. `.catch` is
-  // defense in depth on top of provisionHomeForMember's own internal
-  // never-throws guarantee (src/members/service.ts).
+  // Adversarial round 1, P2-a: this call sat before the (now-removed) raw
+  // token response so an uncaught rejection could not burn a show-once
+  // token. mupot#1551: the route no longer hands one back at all, but the
+  // `.catch` stays as defense in depth on top of provisionHomeForMember's own
+  // internal never-throws guarantee (src/members/service.ts) — this call
+  // must never be allowed to turn a successful accept into a 500.
   await provisionHomeForMember(c.env, result.value.member_id, 'web').catch((err: unknown) => {
     console.error('members/index: provisionHomeForMember rejected unexpectedly (non-fatal)', {
       member_id: result.value.member_id, channel: 'web',
@@ -449,13 +463,19 @@ membersApp.post('/invites/:id/accept', async (c) => {
     })
   })
 
-  // Return the RAW token EXACTLY ONCE. It is never stored or returned again.
+  // mupot#1551: no raw bearer is ever minted on this public, unverified-email
+  // path — `token` is always null and `next` tells the caller identity is
+  // proven by signing in (Google), not by a value this response carries.
+  // protectRawTokenResponse's no-store/no-referrer headers stay: `member_id`
+  // and `capability` are still sensitive enough (org structure, who was just
+  // invited) to keep off caches and out of a Referer header.
   protectRawTokenResponse(c)
   return c.json(
     {
       member_id: result.value.member_id,
       capability: result.value.capability,
-      token: result.value.token,
+      token: null,
+      next: 'sign_in' as const,
     },
     201,
   )

@@ -18,6 +18,12 @@ function makeEnv(options: {
   const db = {
     prepare(sql: string) {
       const statement = {
+        // Exposed so `batch()` below can inspect which statements it was
+        // handed — acceptInvite's own token insert goes through
+        // `env.DB.batch(writes)`, never a standalone `.run()`, so a mock that
+        // only watched `.run()` calls (as this one used to) would never see
+        // it and the `writes` assertion below would pass vacuously.
+        __sql: sql,
         bind(..._values: unknown[]) {
           return statement
         },
@@ -84,8 +90,11 @@ function makeEnv(options: {
       }
       return statement
     },
-    async batch(_statements: unknown[]) {
-      return [{ meta: { changes: 1 } }, { meta: { changes: 1 } }, { meta: { changes: 1 } }]
+    async batch(statements: { __sql: string }[]) {
+      for (const stmt of statements) {
+        if (stmt.__sql.includes('INSERT INTO member_tokens')) options.writes?.push(stmt.__sql)
+      }
+      return statements.map(() => ({ meta: { changes: 1 } }))
     },
   }
 
@@ -109,7 +118,8 @@ function expectSensitiveTokenHeaders(res: Response) {
 }
 
 describe('member token responses', () => {
-  it('prevents caching or referrer leakage when an invite is redeemed', async () => {
+  it('mints NO bearer when an invite is redeemed over the public JSON route (mupot#1551)', async () => {
+    const writes: string[] = []
     const res = await membersApp.request(
       '/invites/invite-1/accept',
       {
@@ -117,16 +127,27 @@ describe('member token responses', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ display_name: 'Operator' }),
       },
-      makeEnv(),
+      makeEnv({ writes }),
     )
 
     expect(res.status).toBe(201)
     expectSensitiveTokenHeaders(res)
-    // mupot#1436 round 2 P1-C: this is the JSON path, which DOES hand the raw
-    // token back on purpose — assert it appears in the body EXACTLY ONCE and
-    // nowhere else (no header leak, e.g. a stray debug `X-Mupot-Token`).
-    await assertNoRawToken(res, undefined, { allowedInBody: 1 })
-    expect(((await res.json()) as { token: { raw: string } }).token.raw).toMatch(/^mupot_/)
+    // mupot#1551 (Athena's ruling, 2026-09-26): this route no longer hands a
+    // raw token back at all — an unauthenticated, id-only redemption must
+    // never mint a bearer for an email nobody has proven they control.
+    // allowedInBody: 0 (the default) — a regression here means a bearer
+    // leaked back into this response.
+    await assertNoRawToken(res)
+    const body = (await res.json()) as { member_id: string; token: unknown; next: string }
+    expect(body.token).toBeNull()
+    expect(body.next).toBe('sign_in')
+    // `writes` only ever records an `INSERT INTO member_tokens` statement
+    // handed to `db.batch(...)` (see makeEnv's `batch()` stub above, which
+    // inspects every statement in the array it's called with) — its length
+    // IS the member_tokens row count for this accept. Zero here is the
+    // table-count assertion; the mock has no real member_tokens table to
+    // COUNT(*) against.
+    expect(writes).toHaveLength(0)
   })
 
   it('prevents caching or referrer leakage when an administrator mints a token', async () => {

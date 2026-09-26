@@ -29,12 +29,12 @@ path.
    `:87-134`) reads the `invites` row and renders one of: not-found / already-used /
    telegram-only / ready-to-accept.
 4. `POST /invite/:id` (`src/dashboard/invite.ts:263-370`) calls `acceptInvite(env, id,
-   displayName, { mintToken: false })` — the same write path the JSON API uses
-   (`POST /invites/:id/accept`, `src/members/index.ts:243-395,403`). Atomic
-   (`env.DB.batch`): claim invite via a single-use `UPDATE ... WHERE accepted_at IS NULL`
-   (`:311`) → INSERT `members` (`:324`) → INSERT `capabilities` (`:335`, scope_type
-   squad/department/org — this row IS the squad-membership grant) → (web path skips
-   `member_tokens`) → UPDATE `invites.member_id` (`:353`).
+   displayName)` — the same write path the JSON API uses (`POST /invites/:id/accept`,
+   `src/members/index.ts`). Atomic (`env.DB.batch`): claim invite via a single-use
+   `UPDATE ... WHERE accepted_at IS NULL` (`:311`) → INSERT `members` (`:324`) → INSERT
+   `capabilities` (`:335`, scope_type squad/department/org — this row IS the
+   squad-membership grant) → (never `member_tokens` — see mupot#1551 below) → UPDATE
+   `invites.member_id` (`:353`).
 5. On success: plants KV `pending_invite_link:<id>` plus an `HttpOnly` cookie
    `mupot_pending_invite`, sets both (`src/dashboard/invite.ts:~351-369`).
 6. **(mupot#1504, adversarial round 1 P2-a repositioning)** Immediately AFTER the marker
@@ -73,8 +73,9 @@ path.
 **Third caller (not shown as a numbered step above — a separate route, not part of this
 sequence): `POST /invites/:id/accept`** (`src/members/index.ts`, the JSON API accept route
 used by CLI/non-browser callers) calls the SAME `provisionHomeForMember(...)`, `channel='web'`,
-right after its own `acceptInvite` success and before returning the raw token — see "Receipt(s)
-written" and "Known gaps" below.
+right after its own `acceptInvite` success, then returns `token: null, next: 'sign_in'` (see
+**mupot#1551** below — it mints no bearer either) — see "Receipt(s) written" and "Known gaps"
+below.
 
 **Note on "squad" vs. the MCP tools of the same name**: squad membership in this flow is the
 `capabilities` INSERT in step 4 — it is a **human-plane** write. The MCP tools
@@ -106,7 +107,7 @@ flow.
 - `capabilities` (`0002:29-37`): `id, member_id, scope_type, scope_id, capability`.
 - `human_login_identities` (`migrations/0143`): `id, tenant, provider, provider_subject,
   verified_email, member_id, linked_by_member_id, created_at, revoked_at`.
-- `member_tokens`: only for the JSON API path, never the web path.
+- `member_tokens`: **never**, on either path — see **mupot#1551** below.
 - **(mupot#1504)** `squads` + `capabilities` (`kind='home'` squad row + the member's own
   `admin` grant on it, `src/org/service.ts`'s `createHomeForMember`, unchanged by this
   work) and `member_home_provisioning_receipts` (`migrations/0161` — LIVE in production
@@ -164,9 +165,19 @@ throws and writes zero receipts; direct `channel` value coverage for `'web'`/`'i
 including a CHECK-constraint refusal test for an unrecognized channel),
 `tests/home-provisioning-call-site-safety.test.ts` (adversarial round 1, P2-a: with
 `provisionHomeForMember` itself mocked to reject, the web accept handler still 302s with the
-pending-invite KV marker and cookie set; the JSON API accept route still 201s with its raw
-token; the IM join reply still confirms the join — all three call sites' own `.catch`
-verified independently of the function's internal never-throws guarantee), and
+pending-invite KV marker and cookie set; the JSON API accept route still 201s with
+`token: null` and zero `member_tokens` rows (mupot#1551); the IM join reply still confirms
+the join — all three call sites' own `.catch` verified independently of the function's
+internal never-throws guarantee),
+`tests/members-sensitive-response.test.ts` (mupot#1551: the JSON accept response carries no
+raw token at all — `assertNoRawToken` with its default zero-occurrences budget, `token: null`,
+`next: 'sign_in'`, and zero `member_tokens` inserts observed at `env.DB.batch`, not merely at
+a standalone `.run()`),
+`tests/accept-invite-direct.test.ts` (mupot#1551: `acceptInvite()` itself never mints — a
+structural spy on `mintRawToken`/`sha256Hex` asserts they are never even called, not merely
+that their result goes unused),
+`tests/invite-accept-no-bearer-through-app.test.ts` (mupot#1551: the same contract through the
+real `ROUTES.members` ('/api/members') mount, not membersApp's bare un-prefixed path), and
 `tests/journey-new-member.test.ts` (full
 walk: admin creates squad → invites → invitee accepts → Google sign-in links identity → MCP
 OAuth consent seats an agent → task flow — steps 1-12; predates #1504 and still does not
@@ -175,6 +186,29 @@ side effect).
 
 ## Known gaps
 
+- **(FIXED by mupot#1551, 2026-09-26 — Option A)** `POST /invites/:id/accept` used to hand
+  back a raw workspace bearer for `invite.email` on nothing but the invite id — an
+  unauthenticated, id-only redemption with no proof the caller controlled that address. That
+  was a squatting enabler: mint the member row for an admin-typed email, get a live bearer for
+  it, before the real owner ever proves anything. `acceptInvite()` (`src/members/index.ts`) no
+  longer has a `mintToken` option at all — no caller on `main` ever passed `true`, so Athena's
+  ruling made "never mints" a **function-boundary invariant**, not a per-caller flag: no raw
+  token, no hash, and no `member_tokens` row are ever computed or written, on the JSON API
+  route or the web door. The JSON route now returns `token: null, next: 'sign_in'` (201); the
+  no-store/no-referrer headers stay (`member_id`/`capability` are still worth keeping off
+  caches). Identity is proven at Google login instead: the member this mints has no
+  `human_login_identities` row yet, so `resolveHumanMemberId`'s `NOT EXISTS
+  (human_login_identities)` check (`src/members/resolve-human-member.ts`) links it by e-mail on
+  the ORDINARY (non-invite) sign-in — the same steal-protection the web door's pending-invite
+  KV marker gives its own browser flow, reached here through the plain login path instead of a
+  special-cased one. The JSON route deliberately plants no KV marker/cookie of its own: an
+  API/CLI caller has no browser session for a cookie to attach to, and `/auth/login`'s only
+  intake for that marker is `getCookie(c, PENDING_INVITE_COOKIE)` (`src/auth/index.ts`) — there
+  is no body/query-param intake today, so a returned pending id would be a dead value with
+  nothing to consume it; wiring one up is a real feature for its own gate, not folded into this
+  fix. A bearer for a member minted this way can now only come from a verified login (session
+  cookie) or a future AUTHENTICATED mint (`mintMemberToken`/`POST /members/:id/tokens`, admin
+  only) — never from redeeming the invite itself.
 - **(FIXED by mupot#1504)** Home squad is now wired into this flow — see steps 5-6 above
   and the new `provisionHomeForMember` receipt row, called from THREE places: the browser
   web door (`src/dashboard/invite.ts`), the JSON API accept route
