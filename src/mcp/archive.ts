@@ -64,6 +64,12 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
       // mupot#1496 Round 3 scope cut: task archiving left this PR — see
       // https://github.com/Mumega-com/mupot/issues/1571.
       return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
+    case 'archive_refused_conflict':
+      // mupot#1496 Round 4 (Athena confirmation-pass BLOCK): a 0-row guarded
+      // write with no re-derivable refusal reason AND the row not actually
+      // archived — an unexplained write conflict (e.g. a benign race), never
+      // reported as a success. Caller should re-check state and retry.
+      return fail(409, 'archive_refused_conflict')
   }
 }
 
@@ -96,7 +102,9 @@ export const toolArchiveRow: ToolSpec = {
     ' or owns_active_agent (an agent_member_bindings row, a live agent-bound' +
     ' member_tokens row, or agents.owner_member_id pointing at a status=active agent).' +
     ' agents: requires the agent already be status=inactive (call deactivate_agent' +
-    ' first — this tool never deactivates implicitly).',
+    ' first — this tool never deactivates implicitly). archive_refused_conflict: a 0-row' +
+    ' write with no re-derivable refusal reason and the row not actually archived' +
+    ' (an unexplained write conflict, e.g. a benign race) — re-check state and retry.',
   inputSchema: {
     type: 'object',
     properties: {

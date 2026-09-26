@@ -86,6 +86,7 @@ export type ArchiveOutcome =
   | { ok: false; error: 'last_org_owner' }
   | { ok: false; error: 'must_deactivate_first'; tool: 'deactivate_agent' }
   | { ok: false; error: 'not_supported' }
+  | { ok: false; error: 'archive_refused_conflict' }
 
 export type UnarchiveOutcome =
   | { ok: true; status: 'unarchived'; receiptId: string }
@@ -238,6 +239,55 @@ async function isOrgScopeOwner(env: Env, memberId: string): Promise<boolean> {
   return (await targetLegacyRoleRank(env, memberId)) >= OWNER_RANK
 }
 
+/** mupot#1496 Round 4 (Athena, confirmation-pass BLOCK on f42b9996): the
+ *  last-org-owner refusal above is JS-only — a fast pre-check that reads
+ *  state, THEN a separate atomic write. Two owners archiving each other
+ *  concurrently can both pass the pre-check (each still sees the OTHER as an
+ *  active survivor before either write commits) and both writes then
+ *  succeed, leaving zero org owners. D1 serializes actual writes against a
+ *  given database, so embedding the SAME survivor predicate directly in the
+ *  guarded UPDATE's WHERE — as a correlated subquery evaluated at write time,
+ *  not at pre-read time — makes the two concurrent archives serialize on it:
+ *  whichever write commits first suspends its target; the second's WHERE
+ *  re-evaluates the survivor subquery against that now-committed state and
+ *  correctly finds no other owner, so its own UPDATE matches 0 rows.
+ *
+ *  Deliberately expressed with NO new bind parameters — `?5` (input.id) and
+ *  `?1` (env.TENANT_SLUG) are already bound by the caller's UPDATE, so this
+ *  fragment is spliced into that same statement's WHERE clause without
+ *  touching its bind order. Checks BOTH authority planes the JS-side
+ *  isOrgScopeOwner does (an org-scope capabilities row, or the legacy
+ *  users.role='owner' plane bridged by lower(email)) — never a second,
+ *  narrower copy of that logic. */
+function orgOwnerSurvivorGuardSQL(idParam: string, tenantParam: string): string {
+  // NOTE: every leaf check below is an EXISTS, deliberately — never a scalar
+  // `(SELECT role FROM users ...) = 'owner'` comparison. A scalar comparison
+  // against a subquery that finds no matching row returns SQL NULL, and
+  // `FALSE OR NULL` is NULL (three-valued logic), not FALSE — which a WHERE
+  // clause then treats as no-match, refusing rows that should have passed.
+  // This is exactly the mutation-invisible bug a first draft of this
+  // function had: it silently refused EVERY archive (not just an owner's),
+  // because the legacy-role EXISTS-shaped check was a scalar `=` compare
+  // whose NULL poisoned the surrounding OR. EXISTS never returns NULL.
+  return `(
+    NOT (
+      EXISTS (SELECT 1 FROM capabilities c WHERE c.member_id = ${idParam} AND c.scope_type = 'org' AND c.scope_id IS NULL AND c.capability = 'owner')
+      OR EXISTS (SELECT 1 FROM users u WHERE lower(u.email) = (SELECT lower(email) FROM members WHERE id = ${idParam}) AND u.role = 'owner')
+    )
+    OR EXISTS (
+      SELECT 1 FROM members m2
+       WHERE m2.id != ${idParam}
+         AND m2.status = 'active'
+         AND m2.archived_at IS NULL
+         AND (m2.tenant = ${tenantParam} OR m2.tenant IS NULL)
+         AND (
+           EXISTS (SELECT 1 FROM capabilities c2 WHERE c2.member_id = m2.id AND c2.scope_type = 'org' AND c2.scope_id IS NULL AND c2.capability = 'owner')
+           OR EXISTS (SELECT 1 FROM users u2 WHERE lower(u2.email) = lower(m2.email) AND u2.role = 'owner')
+         )
+    )
+  )`
+}
+
 /** Every reason members archival can be refused, independent of the write's own row count.
  *  Called BEFORE attempting the write (fast fail) and, if the guarded write still returns 0
  *  rows, called AGAIN to produce an honest, freshly-derived refusal instead of guessing. */
@@ -332,6 +382,11 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
   //    P1-2) — it is re-suspended, and archived_prior_status is refreshed to
   //    the TRUE current status via `archived_prior_status = status` (SQLite
   //    evaluates every SET expression against the pre-update row).
+  //  - orgOwnerSurvivorGuardSQL re-asserts the last-owner predicate at write
+  //    time (Round 4, Athena): the JS-side pre-check in checkMemberArchivable
+  //    is a fast fail only, not the actual guard — two owners archiving each
+  //    other concurrently must serialize on THIS clause, not both slip past a
+  //    pre-read that is already stale by the time either write lands.
   //  - the three agent-seat NOT EXISTS clauses re-assert checkMemberArchivable's
   //    "owns_active_agent" predicate at write time, not just at the pre-read.
   const stmts = [
@@ -346,6 +401,7 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
         WHERE id = ?5
           AND (tenant = ?1 OR tenant IS NULL)
           AND NOT (archived_at IS NOT NULL AND status = 'suspended')
+          AND ${orgOwnerSurvivorGuardSQL('?5', '?1')}
           AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.owner_member_id = ?5 AND a.status IN ('active','paused'))
           AND NOT EXISTS (
             SELECT 1 FROM agent_member_bindings b JOIN agents a ON a.id = b.agent_id
@@ -392,8 +448,21 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
     // re-assertion) rather than assuming "already archived".
     const recheck = await checkMemberArchivable(env, auth, input)
     if (recheck) return recheck
-    await backfillReceiptIfMissing(env, 'members', input.id, input.reason, input.actorMemberId)
-    return { ok: true, status: 'already_archived' }
+    // mupot#1496 Round 4 (Athena, confirmation-pass BLOCK): a 0-row write with
+    // NO refusal reason from the recheck is a success-shaped no-op unless the
+    // row is ACTUALLY archived right now — checkMemberArchivable only proves
+    // "nothing refuses archiving it", never "it IS archived". Returning
+    // ok:true/already_archived here when the member is still active and its
+    // tokens are still live would tell the caller (and the CLI's success
+    // count) the archive landed when it did not. Only report already_archived
+    // when isRowCurrentlyArchived confirms it; otherwise this is a genuine,
+    // unexplained write conflict (e.g. a benign race against another writer)
+    // and must be reported as one.
+    if (await isRowCurrentlyArchived(env, 'members', input.id)) {
+      await backfillReceiptIfMissing(env, 'members', input.id, input.reason, input.actorMemberId)
+      return { ok: true, status: 'already_archived' }
+    }
+    return { ok: false, error: 'archive_refused_conflict' }
   }
 
   assertWritten(results[1], 'archive_row.members.receipt', 1)
@@ -447,11 +516,20 @@ async function archiveAgent(env: Env, input: ArchiveInput): Promise<ArchiveOutco
     // pre-read and the write.
     const fresh = await env.DB.prepare('SELECT status, archived_at FROM agents WHERE id = ?1')
       .bind(input.id).first<{ status: string; archived_at: string | null }>()
-    if (fresh?.status !== 'inactive' && !fresh?.archived_at) {
+    if (fresh?.status !== 'inactive') {
       return { ok: false, error: 'must_deactivate_first', tool: 'deactivate_agent' }
     }
-    await backfillReceiptIfMissing(env, 'agents', input.id, input.reason, input.actorMemberId)
-    return { ok: true, status: 'already_archived' }
+    // mupot#1496 Round 4 (Athena, confirmation-pass BLOCK): the same
+    // success-shaped no-op as archiveMember — `status='inactive'` alone does
+    // not mean archived. Only report already_archived when
+    // isRowCurrentlyArchived confirms archived_at is actually set; a 0-row
+    // write against an inactive-but-not-archived row is an unexplained
+    // conflict, not a success to report.
+    if (await isRowCurrentlyArchived(env, 'agents', input.id)) {
+      await backfillReceiptIfMissing(env, 'agents', input.id, input.reason, input.actorMemberId)
+      return { ok: true, status: 'already_archived' }
+    }
+    return { ok: false, error: 'archive_refused_conflict' }
   }
   assertWritten(results[1], 'archive_row.agents.receipt', 1)
   return { ok: true, status: 'archived', receiptId }

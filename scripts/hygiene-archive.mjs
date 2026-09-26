@@ -20,6 +20,14 @@
 // entry, rather than silently expanding (and possibly re-matching a
 // different set of rows) on your behalf.
 //
+// mupot#1496 Round 3 scope cut: `table: "tasks"` is NOT SUPPORTED — the
+// server refuses both archive_row/unarchive_row and archive_plan_expand for
+// tasks with 409 not_supported (task archiving needs its own action-boundary
+// pass across ~10 task-mutating tools; tracked as
+// https://github.com/Mumega-com/mupot/issues/1571). Plan mode refuses any
+// `table: "tasks"` entry outright — literal {table,id} or `where`-shaped —
+// rather than letting it reach the server only to fail there.
+//
 // Usage:
 //   node scripts/hygiene-archive.mjs --plan plan.json
 //     → expands any `where` entries, prints the reviewed id list, writes
@@ -29,15 +37,10 @@
 //       if it still contains an unexpanded `where` entry.
 //   node scripts/hygiene-archive.mjs --plan plan.json.expanded.json --apply --unarchive
 //
-// plan.json is a JSON array of entries, either:
-//   { "table": "members"|"agents"|"squads"|"projects"|"tasks", "id": "<id>", "reason": "<reason>" }
-// or, tasks-only, a bulk filter that expands server-side via archive_plan_expand:
-//   { "table": "tasks", "where": { "status": ["open","in_progress"], "created_before": "2026-09-12",
-//     "project_ids": ["proj-1"] }, "reason": "<reason>" }
-// `where.status`, `where.created_before`, and `where.project_ids` are ALL required (the
-// server refuses an unscoped filter — there is no "match everything" shape). `reason` is
-// required on every entry. Pass `--unarchive` at PLAN time too, so the expansion uses
-// mode="archived" (matching already-archived tasks) instead of mode="live".
+// plan.json is a JSON array of literal entries:
+//   { "table": "members"|"agents"|"squads"|"projects", "id": "<id>", "reason": "<reason>" }
+// `reason` is required on every entry. There is currently no bulk/`where`-filter shape —
+// that existed only for tasks (see the scope-cut note above) and plan mode now refuses it.
 //
 // Note: archive_row('members') always suspends + revokes the member's live
 // tokens/sessions as part of archiving — there is no revoke flag to pass.
@@ -95,8 +98,12 @@ async function callAction(token, tool, args) {
   return { httpStatus: res.status, ...payload }
 }
 
-/** PLAN MODE ONLY: expand every `where`-shaped tasks entry into concrete
- *  {table,id,reason} rows via the read-only archive_plan_expand action. */
+/** PLAN MODE ONLY: validates every entry is a literal {table,id,reason} for
+ *  a supported table, refusing `table: "tasks"` (either shape) and any
+ *  `where`-shaped bulk filter — that shape existed only for tasks, which is
+ *  not supported (mupot#1496 Round 3 scope cut, #1571). Named `expandPlan`
+ *  for the CLI's two-step workflow shape; there is nothing left to expand
+ *  now that the only entries accepted are already literal. */
 async function expandPlan(token, rawPlan) {
   const expanded = []
   for (const entry of rawPlan) {
@@ -106,24 +113,29 @@ async function expandPlan(token, rawPlan) {
     if (!entry.reason || typeof entry.reason !== 'string') {
       throw new Error(`plan entry missing reason: ${JSON.stringify(entry)}`)
     }
-    if (entry.where) {
-      if (entry.table !== 'tasks') {
-        throw new Error(`plan entry has a 'where' filter but table is not 'tasks': ${JSON.stringify(entry)}`)
-      }
-      const mode = UNARCHIVE ? 'archived' : 'live'
-      const result = await callAction(token, 'archive_plan_expand', { table: 'tasks', mode, where: entry.where })
-      if (!result.ok) {
-        throw new Error(`archive_plan_expand failed: ${JSON.stringify(result)}`)
-      }
-      const { ids, truncated, count } = result.result
-      console.log(`plan: 'where' filter (mode=${mode}) matched ${count} id(s)${truncated ? ' — TRUNCATED at the 5000-row cap, review carefully' : ''}: ${JSON.stringify(ids)}`)
-      for (const id of ids) expanded.push({ table: 'tasks', id, reason: entry.reason })
-    } else {
-      if (!entry.table || !entry.id) {
-        throw new Error(`plan entry missing table/id: ${JSON.stringify(entry)}`)
-      }
-      expanded.push({ table: entry.table, id: entry.id, reason: entry.reason })
+    // mupot#1496 Round 3 scope cut / Round 4 (coordinator confirmation-pass
+    // finding): task archiving is not supported — refuse HERE, in plan mode,
+    // for both shapes (a literal {table:'tasks',id} and a `where`-shaped bulk
+    // filter), rather than letting either reach the server only to 409 there.
+    // The header used to advertise a tasks-only bulk-filter shape that no
+    // longer exists; this is the enforcement half of correcting that.
+    if (entry.table === 'tasks') {
+      throw new Error(
+        `plan entry table 'tasks' is not supported — task archiving was removed from ` +
+        `archive_row/unarchive_row/archive_plan_expand in mupot#1496 Round 3 (see ` +
+        `https://github.com/Mumega-com/mupot/issues/1571): ${JSON.stringify(entry)}`,
+      )
     }
+    if (entry.where) {
+      throw new Error(
+        `plan entry has a 'where' filter, but bulk filters were tasks-only and task ` +
+        `archiving is not supported: ${JSON.stringify(entry)}`,
+      )
+    }
+    if (!entry.table || !entry.id) {
+      throw new Error(`plan entry missing table/id: ${JSON.stringify(entry)}`)
+    }
+    expanded.push({ table: entry.table, id: entry.id, reason: entry.reason })
   }
   return expanded
 }

@@ -307,6 +307,42 @@ describe('archive substrate (mupot#1496)', () => {
     expect(result.ok).toBe(true) // mem-2 remains an owner
   })
 
+  it('mupot#1496 Round 4 (Athena confirmation-pass BLOCK): two owners archiving each other CONCURRENTLY — exactly one succeeds, one is refused last_org_owner, never both', async () => {
+    // mem-1 and mem-2 are the ONLY two org owners. Firing both archive calls
+    // concurrently (Promise.all) lets their JS-side pre-checks (checkMemberArchivable)
+    // interleave at their own await points — each can observe the OTHER as a
+    // still-active survivor before either write commits, which is exactly the
+    // race the write-time orgOwnerSurvivorGuardSQL clause exists to close. If that
+    // clause were absent (or a no-op — see the mutation below), BOTH writes would
+    // land, since both JS pre-checks pass before either UPDATE runs.
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner'),
+        ('cap-owner-mem2', 'mem-2', 'org', NULL, 'owner');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const [a, b] = await Promise.all([
+      invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'concurrent-a' }),
+      invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-2', reason: 'concurrent-b' }),
+    ])
+    const outcomes = [a, b]
+    const succeeded = outcomes.filter((o) => o.ok)
+    const refused = outcomes.filter((o) => !o.ok)
+    expect(succeeded.length).toBe(1)
+    expect(refused.length).toBe(1)
+    expect((refused[0] as { error?: string }).error).toBe('last_org_owner')
+
+    // Ground truth: at least one of the two is still active (never both
+    // suspended — the zero-owner outcome the guard exists to prevent).
+    const rows = await env.DB.prepare(
+      `SELECT id, status FROM members WHERE id IN ('mem-1','mem-2')`,
+    ).all<{ id: string; status: string }>()
+    const activeCount = (rows.results ?? []).filter((r) => r.status === 'active').length
+    expect(activeCount).toBe(1)
+  })
+
   it('refuses to archive a member who owns a currently-active agent via agents.owner_member_id', async () => {
     harness.sqlite.exec(`UPDATE agents SET owner_member_id='mem-1' WHERE id='agent-1';`) // agent-1 is status='active'
     const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
@@ -410,6 +446,52 @@ describe('archive substrate (mupot#1496)', () => {
     expect(tokenRow?.revoked_at).toBeNull() // still live — the refused archive touched nothing
   })
 
+  it('mupot#1496 Round 4 (Athena confirmation-pass BLOCK): a 0-row write with NO re-derivable refusal is a genuine conflict, not a success-shaped "already_archived"', async () => {
+    // mem-1 starts CLEAN (no interfering agent) so the pre-check
+    // (checkMemberArchivable, called BEFORE the atomic write) passes. The
+    // interference lands ONLY around the batch call itself — an agent-bound
+    // seat appears right before the guarded UPDATE runs (failing its
+    // write-time NOT EXISTS clause, 0 rows), then disappears again right
+    // after (before archiveMember's own POST-write recheck call) — the exact
+    // "state true at write time, false again by the time we re-derive a
+    // reason" shape a genuine concurrent race produces. The recheck finds
+    // NOTHING wrong and returns null; mem-1 is still status='active',
+    // archived_at IS NULL — isRowCurrentlyArchived must say false, so this
+    // must be reported as archive_refused_conflict, never a fabricated
+    // 'already_archived' (the row was never archived at all).
+    const originalBatch = env.DB.batch.bind(env.DB)
+    let batchCalls = 0
+    env.DB.batch = (async (stmts: Parameters<typeof originalBatch>[0]) => {
+      batchCalls += 1
+      if (batchCalls === 1) {
+        harness.sqlite.exec(`
+          INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+            VALUES ('${TENANT}', 'agent-1', 'mem-1', datetime('now'));
+        `) // agent-1 is status='active' in the base fixture.
+      }
+      const results = await originalBatch(stmts)
+      if (batchCalls === 1) {
+        harness.sqlite.exec(`DELETE FROM agent_member_bindings WHERE agent_id='agent-1' AND member_id='mem-1'`)
+      }
+      return results
+    }) as typeof env.DB.batch
+
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'race conflict' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('archive_refused_conflict')
+
+    const row = await env.DB.prepare('SELECT status, archived_at FROM members WHERE id = ?1').bind('mem-1')
+      .first<{ status: string; archived_at: string | null }>()
+    expect(row?.status).toBe('active') // never archived — a conflict, not a success
+    expect(row?.archived_at).toBeNull()
+    const { results: receipts } = await env.DB.prepare(
+      `SELECT id FROM archive_receipts WHERE entity_table='members' AND entity_id='mem-1'`,
+    ).all()
+    expect(receipts).toHaveLength(0) // no phantom receipt for a row that was never archived
+  })
+
   it('archives an agent already inactive (no live tokens)', async () => {
     const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'agents', id: 'agent-2', reason: 'dead agent' })
     expect(result.ok).toBe(true)
@@ -430,6 +512,40 @@ describe('archive substrate (mupot#1496)', () => {
     expect(result.detail).toEqual({ tool: 'deactivate_agent' })
     const row = await env.DB.prepare('SELECT archived_at FROM agents WHERE id = ?1').bind('agent-1').first<{ archived_at: string | null }>()
     expect(row?.archived_at).toBeNull()
+  })
+
+  it('mupot#1496 Round 4 (Athena confirmation-pass BLOCK, agent branch): a 0-row agent write with status still "inactive" and archived_at still NULL is a conflict, not "already_archived"', async () => {
+    // agent-2 is 'inactive' in the base fixture, so the pre-read passes. The
+    // guarded UPDATE's WHERE (status='inactive' AND archived_at IS NULL) is
+    // made to fail by flipping status to 'active' right as the batch runs,
+    // then flipping it back to 'inactive' before archiveAgent's own
+    // post-write fresh-read — the same transient-race shape the member
+    // branch's test above exercises. fresh.status ends up 'inactive' again
+    // and archived_at is still NULL: this must be archive_refused_conflict,
+    // never a fabricated already_archived (the row was never archived).
+    const originalBatch = env.DB.batch.bind(env.DB)
+    let batchCalls = 0
+    env.DB.batch = (async (stmts: Parameters<typeof originalBatch>[0]) => {
+      batchCalls += 1
+      if (batchCalls === 1) {
+        harness.sqlite.exec(`UPDATE agents SET status='active' WHERE id='agent-2'`)
+      }
+      const results = await originalBatch(stmts)
+      if (batchCalls === 1) {
+        harness.sqlite.exec(`UPDATE agents SET status='inactive' WHERE id='agent-2'`)
+      }
+      return results
+    }) as typeof env.DB.batch
+
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'agents', id: 'agent-2', reason: 'race conflict' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('archive_refused_conflict')
+    const row = await env.DB.prepare('SELECT status, archived_at FROM agents WHERE id = ?1').bind('agent-2')
+      .first<{ status: string; archived_at: string | null }>()
+    expect(row?.status).toBe('inactive')
+    expect(row?.archived_at).toBeNull() // never archived — a conflict, not a success
   })
 
   it('archives an empty squad (no active agents/members/tasks) and unarchives it back to active', async () => {
