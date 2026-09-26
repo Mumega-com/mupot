@@ -39,7 +39,13 @@ function makeD1(spendRow: { today_usd_micro: number; has_any: number } | null) {
   const memberStmt = {
     bind: (..._args: unknown[]) => memberStmt,
     first: vi.fn(async () => ({ id: 'member-1' })),
-    all: vi.fn(async () => ({ results: [] })),
+    // mupot#1551 round 3: loadAuthFromCookie's read-only fallback for a
+    // session with no stored loginIdentity issues decideIdentitylessAttach's
+    // own candidate lookup via `.all()` (unlike the plain `.first()` shape
+    // this stub otherwise answers) — this fixture's member is clean, so it
+    // must still resolve or the global capability floor 403s every request
+    // here before the Overview route's own light reads ever run.
+    all: vi.fn(async () => ({ results: [{ id: 'member-1', status: 'active', telegram_chat_id: null }] })),
     run: vi.fn(async () => ({ meta: { changes: 0 } })),
   }
   const capabilitiesStmt = {
@@ -50,10 +56,23 @@ function makeD1(spendRow: { today_usd_micro: number; has_any: number } | null) {
     })),
     run: vi.fn(async () => ({ meta: { changes: 0 } })),
   }
+  // mupot#1551 round 3: decideIdentitylessAttach's OWN telegram/identity/
+  // bearer checks must resolve to "nothing found", never fall through to the
+  // generic `stmt` above — that stub answers `.first()` with `spendRow`,
+  // which is truthy in 2 of these 5 fixtures and would otherwise read as a
+  // competing controller (a "live identity"/"live bearer"), denying the
+  // attach and 403ing the whole request before the spend chip ever renders.
+  const emptyStmt = {
+    bind: (..._args: unknown[]) => emptyStmt,
+    first: vi.fn(async () => null),
+    all: vi.fn(async () => ({ results: [] })),
+    run: vi.fn(async () => ({ meta: { changes: 0 } })),
+  }
   return {
     prepare: vi.fn((sql: string) => {
       if (sql.includes('FROM members')) return memberStmt
       if (sql.includes('FROM capabilities')) return capabilitiesStmt
+      if (sql.includes('FROM human_login_identities') || sql.includes('FROM member_tokens')) return emptyStmt
       return stmt
     }),
   }

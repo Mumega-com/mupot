@@ -57,6 +57,29 @@ describe('issued agent connection key end-to-end', () => {
           '2026-07-24T00:00:00.000Z',
           '${TENANT}'
         );
+      -- mupot#1551 round 3: operator-member's own workspace bearer (above) is
+      -- a live unbound token, which decideIdentitylessAttach correctly reads
+      -- as competing control for an IDENTITY-LESS row (the ruled shape a
+      -- fresh drive-by squat would look like). This operator is not a
+      -- squatter — they are the real, already-authenticated holder of both
+      -- the bearer AND the dashboard cookie session below — so their own
+      -- real login identity is seeded here, matching the (provider, subject)
+      -- the SESSIONS fallback stamps into the cookie session's record. A
+      -- linked identity resolves via registerWebSession's step 1 (the real
+      -- join key), which never even reaches decideIdentitylessAttach's
+      -- bearer check — that's what makes this the "legit" shape, not the
+      -- "seed enough to sneak past the bearer check" shape.
+      INSERT INTO human_login_identities
+        (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES (
+          'operator-identity',
+          '${TENANT}',
+          'local-test',
+          'operator@example.com',
+          'operator@example.com',
+          'operator-member',
+          '2026-07-24T00:00:00.000Z'
+        );
     `)
     env = {
       DB: harness.db,
@@ -74,6 +97,12 @@ describe('issued agent connection key end-to-end', () => {
           email: 'operator@example.com',
           role: 'member',
           createdAt: '2026-07-24T00:00:00.000Z',
+          // mupot#1551 round 3: matches the human_login_identities row
+          // seeded above — resolves via registerWebSession's real join key
+          // (step 1) instead of the read-only email fallback, which would
+          // otherwise correctly deny this operator's OWN bearer-token-
+          // holding, identity-less-looking row as competing control.
+          loginIdentity: { provider: 'local-test', subject: 'operator@example.com' },
         })
         return {
           async get(key: string) {

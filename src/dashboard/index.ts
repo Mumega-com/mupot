@@ -2850,6 +2850,14 @@ dashboardApp.post('/members/:id/tokens', async (c) => {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Label too long (max 64 chars).')), 400)
   }
   const channelRaw = typeof form.channel === 'string' ? form.channel : 'workspace'
+  // mupot#1551 round 3 (P2): same allowlist as the JSON API sibling
+  // (src/members/index.ts POST /members/:id/tokens) — isChannel's CHANNELS
+  // list (src/members/service.ts) already excludes 'directory', so this form
+  // cannot mint one either. Verified, not assumed — see
+  // tests/directory-channel-token-mint-refused.test.ts, which pins it so a
+  // future widening of CHANNELS cannot silently reopen
+  // decideIdentitylessAttach's directory-channel provisioning exemption
+  // (src/members/exclusive-control.ts) to a caller-chosen spoof.
   if (!isChannel(channelRaw)) {
     return c.html(shell(c.env, 'Access Tokens', errorBody('Invalid channel.')), 400)
   }

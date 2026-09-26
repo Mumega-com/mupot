@@ -4,9 +4,30 @@
 // contained the bug it was written to fix.
 
 import type { Env } from '../types'
-import { OWNER_LOGIN_EMAILS_KEY, resolveHumanMember, resolveHumanMemberId } from './resolve-human-member'
+import {
+  OWNER_LOGIN_EMAILS_KEY,
+  resolveHumanMemberForAttach,
+  resolveHumanMemberId,
+} from './resolve-human-member'
 
 export { OWNER_LOGIN_EMAILS_KEY }
+
+/**
+ * mupot#1551 round 2 (P0): thrown by findOrCreateHumanMember instead of
+ * silently inserting a duplicate member when resolveHumanMemberForAttach
+ * returns `denied`/`ambiguous`. Callers that can offer the human a distinct
+ * HTTP response (409/403) should catch this specifically; anything else
+ * falls through to their existing generic error handling (e.g. 500), which
+ * is strictly safer than what this replaces (an unconditional INSERT).
+ */
+export class MemberAttachDeniedError extends Error {
+  readonly code: 'member_attach_denied' | 'member_attach_ambiguous'
+  constructor(code: 'member_attach_denied' | 'member_attach_ambiguous', message: string) {
+    super(message)
+    this.name = 'MemberAttachDeniedError'
+    this.code = code
+  }
+}
 
 export async function resolveVerifiedHumanMemberId(
   env: Env,
@@ -27,13 +48,33 @@ export async function findOrCreateHumanMember(
   displayName: string,
   loginIdentity?: { provider: string; subject: string },
 ): Promise<string> {
-  const resolved = await resolveHumanMember(env, {
+  const result = await resolveHumanMemberForAttach(env, {
     tenant: env.TENANT_SLUG,
     provider: loginIdentity?.provider,
     providerSubject: loginIdentity?.subject,
     email,
   })
-  if (resolved) return resolved.id
+  if (result.kind === 'resolved') return result.member.id
+  if (result.kind === 'denied') {
+    console.error('findOrCreateHumanMember: attach denied — competing controller, refusing to insert', {
+      reason: result.reason,
+      has_login_identity: !!loginIdentity,
+    })
+    throw new MemberAttachDeniedError(
+      'member_attach_denied',
+      `member row is already under someone else's control (${result.reason})`,
+    )
+  }
+  if (result.kind === 'ambiguous') {
+    console.error('findOrCreateHumanMember: attach ambiguous — normalized email collision, refusing to insert', {
+      has_login_identity: !!loginIdentity,
+    })
+    throw new MemberAttachDeniedError(
+      'member_attach_ambiguous',
+      'normalized email matches more than one member',
+    )
+  }
+  // result.kind === 'not_found' — create as today.
 
   const memberId = crypto.randomUUID()
   await env.DB.prepare(

@@ -169,6 +169,16 @@ function dashboardEnv(
             results: [{ member_id: 'member-1', scope_type: 'org', scope_id: null, capability: 'member' }],
           }
         }
+        // mupot#1551 round 3: loadAuthFromCookie's read-only fallback for a
+        // session with no stored loginIdentity (decideIdentitylessAttach's
+        // own candidate lookup) — this fixture's member is clean
+        // (identity-less, token-less, telegram-less), so it must still
+        // resolve, or every 'member' fixture here 403s as a zero-capability
+        // drive-by before ever reaching the owner/admin-only checks these
+        // tests exist to exercise.
+        if (role === 'member' && query.includes('FROM members') && query.includes('telegram_chat_id')) {
+          return { results: [{ id: 'member-1', status: 'active', telegram_chat_id: null }] }
+        }
         return { results: [] }
       },
       first: async () => (role === 'member' && query.includes('FROM members') ? { id: 'member-1' } : null),

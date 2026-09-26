@@ -8,6 +8,7 @@
 
 import type { Env } from '../types'
 import { resolveLoginIdentity } from '../auth/login-identity'
+import { decideIdentitylessAttach, type CompetingControlReason } from './exclusive-control'
 
 export const OWNER_LOGIN_EMAILS_KEY = 'owner_login_emails'
 
@@ -16,12 +17,39 @@ export interface ResolveHumanMemberInput {
   provider?: string | null
   providerSubject?: string | null
   email?: string | null
+  /**
+   * Resolve ONLY via a live human_login_identities join key/email match
+   * (steps 1-2) — never fall through to the members.email bootstrap (step 3)
+   * or the owner-alias lookup (step 4). Set by a caller that wants to know
+   * "is this human ALREADY identified" without also triggering the
+   * identity-less-row bootstrap decision, so it can apply its OWN follow-up
+   * (see src/auth/sso.ts's autoEnrollSsoMember, which calls
+   * decideIdentitylessAttach itself on a miss here — mupot#1551).
+   */
+  identityOnly?: boolean
 }
 
 export interface ResolvedHumanMember {
   id: string
   status: string
 }
+
+/**
+ * mupot#1551 round 2 (P0): the tri-state a real ATTACH caller (one that would
+ * otherwise INSERT a new member on a miss — e.g. findOrCreateHumanMember)
+ * must consume instead of the collapsed `ResolvedHumanMember | null` the
+ * plain resolvers below return. Collapsing `denied`/`ambiguous` onto the same
+ * `null` a genuine `not_found` produces is exactly what let
+ * findOrCreateHumanMember insert a DUPLICATE member for a row that was
+ * already someone else's (a live directory-OAuth bearer, a Telegram bind, a
+ * case-variant collision) — the same class of bug the SSO fallback had
+ * before this file's first mupot#1551 pass, one caller over.
+ */
+export type ResolveHumanMemberAttachResult =
+  | { kind: 'resolved'; member: ResolvedHumanMember }
+  | { kind: 'denied'; reason: CompetingControlReason }
+  | { kind: 'ambiguous' }
+  | { kind: 'not_found' }
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase()
@@ -85,9 +113,13 @@ async function memberById(
  *    to that provider (0143: authorization is the join key, not a display
  *    email across providers).
  * 3. members.email. A supplied-but-missed join key may bootstrap ONLY a
- *    member with no live identity (steal protection). Email-only still
- *    resolves the primary members.email even if that member already has a
- *    live identity whose verified_email differs (write-once email drift).
+ *    member row under EXCLUSIVE CONTROL of no one — mupot#1551, Athena's
+ *    ruling: no live identity, no live unbound bearer, no Telegram bind, and
+ *    no case-insensitive email collision (decideIdentitylessAttach owns this
+ *    check; see src/members/exclusive-control.ts). Email-only (no join key)
+ *    still resolves the primary members.email even if that member already
+ *    has a live identity whose verified_email differs (write-once email
+ *    drift) — that branch never attaches anything, it only reads.
  * 4. owner_login_emails → unique org owner. Same join-key gate as step 2:
  *    never after a supplied-but-missed subject.
  * Missing identity table (migration not applied) falls through to email bootstrap.
@@ -101,17 +133,20 @@ export function isMissingHumanLoginIdentitiesTable(err: unknown): boolean {
   return /no such table:\s*human_login_identities/i.test(msg)
 }
 
-async function resolveHumanMemberRecord(
+async function resolveHumanMemberRecordRich(
   env: Env,
   input: ResolveHumanMemberInput,
   activeOnly: boolean,
-): Promise<ResolvedHumanMember | null> {
+): Promise<ResolveHumanMemberAttachResult> {
   const tenant = input.tenant
   const joinKeyPresent = !!(input.provider && input.providerSubject)
   try {
     if (input.provider && input.providerSubject) {
       const ident = await resolveLoginIdentity(env, tenant, input.provider, input.providerSubject)
-      if (ident) return memberById(env, tenant, ident.member_id, activeOnly)
+      if (ident) {
+        const member = await memberById(env, tenant, ident.member_id, activeOnly)
+        return member ? { kind: 'resolved', member } : { kind: 'not_found' }
+      }
     }
 
     const email = input.email ? normalizeEmail(input.email) : ''
@@ -137,67 +172,106 @@ async function resolveHumanMemberRecord(
               LIMIT 2`,
           ).bind(tenant, email).all<ResolvedHumanMember>()
       const rows = identByEmail.results ?? []
-      if (rows.length === 1) return rows[0]
-      if (rows.length > 1) return null
+      if (rows.length === 1) return { kind: 'resolved', member: rows[0] }
+      if (rows.length > 1) return { kind: 'ambiguous' }
     }
   } catch (err) {
     if (!isMissingHumanLoginIdentitiesTable(err)) throw err
   }
 
-  const email = input.email ? normalizeEmail(input.email) : ''
-  if (!email) return null
+  if (input.identityOnly) return { kind: 'not_found' }
 
-  // Bind (email, tenant) stays the mock-matched shape. Steal protection
-  // (NOT EXISTS live identity) applies only when a join key was supplied
-  // and missed — that is the fresh-subject takeover. Email-only must still
-  // resolve the member's own primary address when verified_email drifted.
-  try {
-    const byEmail = joinKeyPresent
-      ? await env.DB.prepare(
-          `SELECT id, status FROM members
-            WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
-              AND NOT EXISTS (
-                SELECT 1 FROM human_login_identities h
-                 WHERE h.tenant = members.tenant
-                   AND h.member_id = members.id
-                   AND h.revoked_at IS NULL
-              )
-            LIMIT 1`,
-        ).bind(email, tenant).first<ResolvedHumanMember>()
-      : await env.DB.prepare(
-          `SELECT id, status FROM members
-            WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
-            LIMIT 1`,
-        ).bind(email, tenant).first<ResolvedHumanMember>()
-    if (byEmail) return byEmail
-  } catch (err) {
-    if (!isMissingHumanLoginIdentitiesTable(err)) throw err
-    const byEmail = await env.DB.prepare(
-      `SELECT id, status FROM members
-        WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
-        LIMIT 1`,
-    ).bind(email, tenant).first<ResolvedHumanMember>()
-    if (byEmail) return byEmail
+  const email = input.email ? normalizeEmail(input.email) : ''
+  if (!email) return { kind: 'not_found' }
+
+  // Step 3, join-key-present branch (mupot#1551, Athena's ruling Option B):
+  // a supplied-but-missed join key may bootstrap ONLY a member row that is
+  // still under NO ONE's exclusive control — not merely one with no live
+  // identity. decideIdentitylessAttach also fails closed on a live unbound
+  // bearer (the legacy public-accept squat) or a bound Telegram chat, and on
+  // a case-insensitive email collision (never an arbitrary LIMIT-1 pick).
+  // This is the actual attach path — registerWebSession calls
+  // linkLoginIdentity right after this resolves — so it gets the strict
+  // predicate. Round 2 (P0): the decision's OWN kind is now returned intact,
+  // not collapsed to `null` — a real attach caller (findOrCreateHumanMember)
+  // must be able to refuse a denial/ambiguity instead of reading it as
+  // "no such member" and inserting a duplicate.
+  if (joinKeyPresent) {
+    const decision = await decideIdentitylessAttach(env, {
+      tenant,
+      normalizedEmail: email,
+      provider: input.provider ?? null,
+      subject: input.providerSubject ?? null,
+    })
+    if (decision.kind === 'eligible') {
+      if (!activeOnly || decision.status === 'active') {
+        return { kind: 'resolved', member: { id: decision.memberId, status: decision.status } }
+      }
+      // Eligible but excluded by this caller's own activeOnly filter (a
+      // suspended row) — same terminal shape as step 2's activeOnly filter:
+      // not a member candidate for this call, but also not a fresh signup
+      // target. Step 4 is join-key-gated below regardless, so this always
+      // ends the same way whether reported as not_found here or falling
+      // through — reported directly for a clearer signal to attach callers.
+      return { kind: 'not_found' }
+    }
+    if (decision.kind === 'denied_competing_control') return { kind: 'denied', reason: decision.reason }
+    if (decision.kind === 'ambiguous') return { kind: 'ambiguous' }
+    return { kind: 'not_found' }
   }
+
+  // Step 3, email-only branch (no join key at all): a pure resolve-by-email
+  // read, never followed by a linkLoginIdentity write from this branch's
+  // result (dashboard/projects.ts's own-member lookup; SSO's initial pass,
+  // which separately calls decideIdentitylessAttach itself on a miss — see
+  // src/auth/sso.ts). Deliberately left lenient: this is the write-once
+  // verified_email-drift invariant (mupot#1266 P0-2) — a member whose live
+  // identity's verified_email has drifted from members.email must still
+  // resolve via their own primary address.
+  const byEmail = await env.DB.prepare(
+    `SELECT id, status FROM members
+      WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
+      LIMIT 1`,
+  ).bind(email, tenant).first<ResolvedHumanMember>()
+  if (byEmail) return { kind: 'resolved', member: byEmail }
 
   // Step 4: same join-key gate as step 2. A missed subject must not
   // inherit the org owner via an operator alias.
-  if (joinKeyPresent) return null
   const ownerId = await ownerAliasMemberId(env, email)
-  return ownerId ? { id: ownerId, status: 'active' } : null
+  return ownerId ? { kind: 'resolved', member: { id: ownerId, status: 'active' } } : { kind: 'not_found' }
 }
 
 export function resolveHumanMember(
   env: Env,
   input: ResolveHumanMemberInput,
 ): Promise<ResolvedHumanMember | null> {
-  return resolveHumanMemberRecord(env, input, false)
+  return resolveHumanMemberRecordRich(env, input, false).then((r) =>
+    r.kind === 'resolved' ? r.member : null,
+  )
 }
 
 export async function resolveHumanMemberId(
   env: Env,
   input: ResolveHumanMemberInput,
 ): Promise<string | null> {
-  const member = await resolveHumanMemberRecord(env, input, true)
-  return member?.id ?? null
+  const rich = await resolveHumanMemberRecordRich(env, input, true)
+  return rich.kind === 'resolved' ? rich.member.id : null
+}
+
+/**
+ * resolveHumanMemberForAttach — the tri-state-aware entry point for any
+ * caller that would otherwise INSERT a new member on a plain `null` (e.g.
+ * findOrCreateHumanMember). `denied`/`ambiguous` must be refused, never
+ * silently treated as `not_found` — see ResolveHumanMemberAttachResult's own
+ * doc comment. `activeOnly` defaults to false, matching `resolveHumanMember`
+ * (an attach caller's job is to decide whether THIS candidate is safe to
+ * bind to, not to pre-filter by status the way a "who is allowed to act"
+ * check would).
+ */
+export function resolveHumanMemberForAttach(
+  env: Env,
+  input: ResolveHumanMemberInput,
+  activeOnly = false,
+): Promise<ResolveHumanMemberAttachResult> {
+  return resolveHumanMemberRecordRich(env, input, activeOnly)
 }

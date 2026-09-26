@@ -19,6 +19,12 @@
 // subject) → member_id join once a member already exists to bind to.
 
 import type { Env } from '../types'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
+import {
+  PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
+  PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+  PROVISIONING_EXEMPT_TOKEN_LABEL,
+} from '../members/exclusive-control'
 
 export interface LoginIdentityRecord {
   id: string
@@ -36,6 +42,12 @@ export type LinkLoginIdentityResult =
   | { ok: true; identity: LoginIdentityRecord; created: boolean }
   | { ok: false; error: 'identity_bound_to_other_member'; identity: LoginIdentityRecord }
   | { ok: false; error: 'identity_revoked'; identity: LoginIdentityRecord }
+  // mupot#1551 (Athena's ruling, Option B, point 4): requireExclusiveControl's
+  // conditional INSERT matched zero rows — a competing controller (bearer,
+  // Telegram bind, or another live identity) appeared for this member between
+  // the caller's decideIdentitylessAttach() read and this write. The link
+  // fails; it never lands on the losing side of that race.
+  | { ok: false; error: 'competing_control' }
 
 /**
  * resolveLoginIdentity — look up a LIVE (not revoked) login identity by its
@@ -68,6 +80,15 @@ export interface LinkLoginIdentityInput {
   verifiedEmail: string | null
   memberId: string
   linkedByMemberId?: string | null
+  // mupot#1551 (Athena's ruling, Option B, point 4): set by an
+  // identity-LESS-row bootstrap attach (resolve-human-member.ts step 3, via
+  // registerWebSession) — never by an ordinary re-resolve of an
+  // already-identified member. When true, the INSERT itself re-verifies
+  // exclusive control (no live identity / unbound bearer / Telegram bind for
+  // this member) inside the SAME statement that creates the row, so a
+  // competing credential landing between the caller's decideIdentitylessAttach
+  // read and this write makes the link FAIL atomically instead of racing it.
+  requireExclusiveControl?: boolean
 }
 
 /**
@@ -82,6 +103,9 @@ export interface LinkLoginIdentityInput {
  * - Existing REVOKED row for this join key → refused (identity_revoked); a
  *   revoked identity does not silently come back to life on next login. Fail
  *   closed and surface it, rather than quietly re-linking.
+ * - `requireExclusiveControl`, no existing row for this join key → the INSERT
+ *   runs as `INSERT ... SELECT ... WHERE NOT EXISTS(competing controller)`;
+ *   zero rows written → { ok: false, error: 'competing_control' }.
  */
 export async function linkLoginIdentity(
   env: Env,
@@ -110,6 +134,94 @@ export async function linkLoginIdentity(
 
   const id = crypto.randomUUID()
   const now = new Date().toISOString()
+
+  if (input.requireExclusiveControl) {
+    const nowSql = nowSqlUtc()
+    const result = await env.DB.prepare(
+      `INSERT INTO human_login_identities
+         (id, tenant, provider, provider_subject, verified_email, member_id, linked_by_member_id, created_at)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+        WHERE NOT EXISTS (
+          SELECT 1 FROM human_login_identities h2
+           WHERE h2.tenant = ?2 AND h2.member_id = ?6 AND h2.revoked_at IS NULL
+        )
+        AND NOT EXISTS (
+          -- Both exemptions below are CONTAINMENT, not proof of origin — an
+          -- org admin can mint a caller-chosen label/channel via
+          -- POST /members/:id/tokens (src/members/service.ts mintMemberToken)
+          -- and spoof either onto a row they already control. Not a
+          -- privilege escalation (they already hold mint power over the row),
+          -- but do not add a second guarantee on top of either exemption
+          -- without re-reading src/members/exclusive-control.ts's header,
+          -- which documents why no stronger anchor (e.g.
+          -- pot_provision_receipts) is reachable from the tenant's own D1,
+          -- and why the directory-channel exemption exists at all (mupot#1551
+          -- round 2 P0: mintDirectoryToken's own unbound connector token).
+          SELECT 1 FROM member_tokens t
+           WHERE t.tenant = ?2 AND t.member_id = ?6 AND t.agent_id IS NULL
+             AND NOT (t.label = ?9 AND t.channel = ?10)
+             AND t.channel != ?11
+             AND ${TOKEN_LIVE_PREDICATE('?12')}
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM members m
+           WHERE m.id = ?6 AND m.tenant = ?2 AND m.telegram_chat_id IS NOT NULL
+        )
+        AND EXISTS (
+          -- mupot#1551 (Athena BLOCK, both gates): row liveness was checked
+          -- in JS before this write, never inside it — a member archived or
+          -- suspended strictly between the caller's decideIdentitylessAttach
+          -- read and this INSERT must not get linked. Migration 0173's
+          -- archive_row also flips status to 'suspended' (belt), but this
+          -- checks archived_at directly too (suspenders) rather than trusting
+          -- that coupling to hold forever. EXISTS, not a scalar compare on a
+          -- LEFT JOIN column — status is NOT NULL by schema so the equality
+          -- check cannot silently flip on NULL, and archived_at's own NULL
+          -- is the correct "not archived" value, checked with IS NULL, never
+          -- a negated equality.
+          SELECT 1 FROM members m2
+           WHERE m2.id = ?6 AND m2.tenant = ?2
+             AND m2.status = 'active' AND m2.archived_at IS NULL
+        )`,
+    )
+      .bind(
+        id,
+        tenant,
+        provider,
+        providerSubject,
+        input.verifiedEmail,
+        input.memberId,
+        input.linkedByMemberId ?? null,
+        now,
+        PROVISIONING_EXEMPT_TOKEN_LABEL,
+        PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+        PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
+        nowSql,
+      )
+      .run()
+
+    const changes = Number(result.meta?.changes ?? 0)
+    if (changes === 0) {
+      return { ok: false, error: 'competing_control' }
+    }
+
+    return {
+      ok: true,
+      created: true,
+      identity: {
+        id,
+        tenant,
+        provider,
+        provider_subject: providerSubject,
+        verified_email: input.verifiedEmail,
+        member_id: input.memberId,
+        linked_by_member_id: input.linkedByMemberId ?? null,
+        created_at: now,
+        revoked_at: null,
+      },
+    }
+  }
+
   await env.DB.prepare(
     `INSERT INTO human_login_identities
        (id, tenant, provider, provider_subject, verified_email, member_id, linked_by_member_id, created_at)
