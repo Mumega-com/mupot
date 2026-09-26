@@ -469,6 +469,38 @@ export async function revokeAllAgentSessionsForAgent(
   }
 }
 
+/** revokeAllAgentSessionsForMember — sibling of revokeAllAgentSessionsForAgent,
+ *  keyed by the WELDED MEMBER instead of the agent. agent_sessions.member_id
+ *  is the human whose credential (member_tokens row) backs the session — see
+ *  this file's header. Used by archive_row('members') (mupot#1496): archiving
+ *  a member must kill every agent-bound runtime session that member's
+ *  credential backs, not just member_tokens/web_sessions, or a suspended
+ *  member's agent-bound sessions would keep authenticating. Same
+ *  self-guarding contract as the agent-keyed version: swallows "table not
+ *  migrated yet" so a currently-shipped caller keeps working unmodified in a
+ *  tenant pre-migration-0147. */
+export async function revokeAllAgentSessionsForMember(
+  env: Env,
+  tenant: string,
+  memberId: string,
+  reason: string,
+  nowMs: number = Date.now(),
+): Promise<{ revokedCount: number }> {
+  try {
+    const nowIso = new Date(nowMs).toISOString()
+    const result = await env.DB.prepare(
+      `UPDATE agent_sessions SET revoked_at = ?1, revoke_reason = ?2
+        WHERE tenant = ?3 AND member_id = ?4 AND revoked_at IS NULL`,
+    )
+      .bind(nowIso, reason, tenant, memberId)
+      .run()
+    return { revokedCount: Number(result.meta?.changes ?? 0) }
+  } catch (err) {
+    if (isMissingTableError(err)) return { revokedCount: 0 }
+    throw err
+  }
+}
+
 /** revokeAgentSessionByCredentialSafe — same contract as
  *  revokeAgentSessionByCredential, but swallows "table not migrated yet" —
  *  for wiring into revoke_agent_token, an existing live tool that must keep
