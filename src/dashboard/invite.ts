@@ -317,6 +317,20 @@ inviteApp.post('/:id', async (c) => {
         400,
       )
     }
+    // mupot#1551 slice 1: distinct copy from the member_already_exists
+    // fallback below — this is not "you already have an account", it is
+    // "whoever sent this invite can no longer vouch for it" (suspended,
+    // demoted, or the invite predates any real actor at all).
+    if (result.error === 'invite_inviter_no_longer_authorized') {
+      return c.html(
+        invitePageBody(
+          c.env.BRAND,
+          view.ctx,
+          'This invite can no longer be redeemed — ask whoever sent it to send a new one.',
+        ),
+        409,
+      )
+    }
     // member_already_exists
     return c.html(
       invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),
