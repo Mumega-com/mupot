@@ -3,8 +3,8 @@
 # wrangler.<yourpot>.toml, and apply migrations. The manual path may copy this template,
 # create the resources, and replace the <YOUR_*> placeholders before deployment.
 # This file is the BINDING CONTRACT every component builds against (see src/types.ts Env).
-name = "mupot"
-main = "src/index.ts"
+name = "mupot-alt-fixture-marker"
+main = "../../src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -13,7 +13,7 @@ command = "node scripts/generate-build-info.mjs"
 
 # ── tenant config (non-secret; secrets via `wrangler secret put`) ──
 [vars]
-TENANT_SLUG = "mumega"          # your org slug
+TENANT_SLUG = "alt-fixture-marker"
 # OWNER_TENANT_SLUG = "mumega"  # UNCOMMENT only on the operator's own pot deployment —
                                  # set to the SAME value as TENANT_SLUG above. Gates
                                  # env-level operator creds (e.g. POSTHOG_*) so they are
@@ -33,11 +33,6 @@ IDP_PROVIDER = "google"           # google | telegram
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
-POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
-                                  # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
-                                  # buttons. ONLY the exact string "true" enables; anything else = 503
-                                  # checkout_unavailable. Keep "false" until the create_pot webhook
-                                  # provisions the pot (today a buyer is billed and gets no pot).
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
 # routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
