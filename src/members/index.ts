@@ -43,7 +43,7 @@ import type {
 import { requireAuth } from '../auth'
 import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
-import { assertBatchWritten, assertWritten } from '../lib/receipt'
+import { assertWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
 import {
   requireCapability,
@@ -70,6 +70,11 @@ import { createProjectInvite, type CreateProjectInviteError } from './project-in
 // "does this member hold a live token" can never drift into a second,
 // differently-worded copy of what "live" means.
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+// mupot#1551 (case-insensitivity gate finding on #1557): the SAME normalizer
+// /auth/callback's own email-match check (pendingInviteEmailsMatch) already
+// uses — trim + lowercase, matching idx_members_email_lower (0146). Reused
+// here rather than re-deriving a second copy that could drift.
+import { normalizeInviteEmail } from '../auth/pending-invite-link'
 import {
   isAgentAccessCapability,
   removeAgentSquadAccess,
@@ -409,8 +414,21 @@ export async function acceptInvite(
 
   try {
     const writes = [
+      // mupot#1551 (case-insensitivity gate finding on #1557): members.email's
+      // UNIQUE index (0002) is CASE-SENSITIVE, while every member lookup in
+      // this codebase matches by lower(email) (idx_members_email_lower,
+      // 0146; INVITER_ACTIVE_MEMBER_SQL and RESERVED_INVITE_EMAIL_SQL above;
+      // normalizeInviteEmail's own callers). A concurrent write landing an
+      // email that differs only by case would sail past the UNIQUE
+      // constraint and mint a SECOND row lower(email)-ambiguous with the
+      // first. Guarded the same way as the other two writes in this batch —
+      // check-then-write in one statement, not a separate SELECT first — so
+      // this is closed atomically rather than merely reduced to "usually
+      // caught by the case-sensitive UNIQUE, sometimes not".
       env.DB.prepare(
-        'INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+         SELECT ?, ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM members WHERE lower(email) = lower(?))`,
       ).bind(
         member.id,
         member.email,
@@ -419,32 +437,46 @@ export async function acceptInvite(
         member.status,
         member.created_at,
         env.TENANT_SLUG,
+        member.email,
       ),
       // mupot#1551 slice 1: re-asserts INVITER_ACTIVE_MEMBER_SQL at write time
       // — the SAME fragment (and the SAME inviterId/env.TENANT_SLUG values,
       // captured once in JS above) the pre-check just ran. A 0-row result
       // here (inviter went inactive/left the tenant in the race window
-      // between that check and this write) makes assertBatchWritten below
-      // throw, landing in the catch and rolling the claim back — see the
-      // comment on the re-check above for why this is JS-checked first and
-      // SQL-reasserted here rather than the other way around.
+      // between that check and this write) makes the assertWritten calls
+      // below throw, landing in the catch and rolling the claim back — see
+      // the comment on the re-check above for why this is JS-checked first
+      // and SQL-reasserted here rather than the other way around.
+      //
+      // mupot#1551 (case-insensitivity follow-up): ALSO requires the member
+      // row above to actually exist (`id = ?`) — capabilities.member_id is a
+      // real FK (0002) into members(id). Without this, a member INSERT the
+      // lower(email) guard just above blocked (0 rows) still lets THIS
+      // statement attempt to insert a capabilities row pointing at a
+      // member.id that was never created, which fails the batch with a raw
+      // FOREIGN KEY constraint error instead of the clean, nameable
+      // member_already_exists this function exists to return.
       env.DB.prepare(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
          SELECT ?, ?, ?, ?, ?
-          WHERE EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL})`,
-      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, inviterId, env.TENANT_SLUG),
+          WHERE EXISTS (SELECT 1 FROM members WHERE id = ?)
+            AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL})`,
+      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, member.id, inviterId, env.TENANT_SLUG),
     ]
-    // mupot#1551: acceptInvite never inserts into member_tokens — there is no
-    // conditional branch left to gate; this route mints a member and a
-    // capability grant, nothing else.
+    // mupot#1551 (#1557, option A): acceptInvite never inserts into
+    // member_tokens — there is no conditional branch left to gate; this
+    // route mints a member and a capability grant, nothing else. (The
+    // case-insensitivity fix's own FK-safety guard for a member_tokens
+    // write no longer applies — there is no such write to guard.)
     // A2: D1 is the callback's authority for which member this accept minted.
     // 0156 allows this stamp on a legacy/plain-squad row; the KV marker's
     // member_id is only a pointer and must not be trusted blind.
     writes.push(
-      env.DB.prepare('UPDATE invites SET member_id = ? WHERE id = ? AND accepted_at IS NOT NULL').bind(
-        member.id,
-        inviteId,
-      ),
+      env.DB.prepare(
+        // mupot#1551: same FK-safety guard — invites.member_id is also a
+        // real FK (0154) into members(id).
+        'UPDATE invites SET member_id = ? WHERE id = ? AND accepted_at IS NOT NULL AND EXISTS (SELECT 1 FROM members WHERE id = ?)',
+      ).bind(member.id, inviteId, member.id),
     )
     const acceptWrites = await env.DB.batch(writes)
     // Receipt (#186): every mint row (member + capability, plus the token row
@@ -452,7 +484,16 @@ export async function acceptInvite(
     // throw on its own; a partial mint would hand out a show-once token bound
     // to a broken identity. Failure → the catch rolls the invite back so the
     // person can retry.
-    assertBatchWritten(acceptWrites, 'invite_accept_mint', 1)
+    //
+    // mupot#1551: labelled PER-STATEMENT (not one assertBatchWritten call
+    // over the whole array) so the catch below can tell "the member row's
+    // own lower(email) guard fired" (a real, nameable outcome —
+    // member_already_exists) apart from every other write's failure (which
+    // stays an unnamed 500, unchanged prior behavior).
+    assertWritten(acceptWrites[0], 'invite_accept_mint.member', 1)
+    for (let i = 1; i < acceptWrites.length; i += 1) {
+      assertWritten(acceptWrites[i], `invite_accept_mint[${i}]`, 1)
+    }
   } catch (err) {
     // Roll the invite back so the person can retry (e.g. duplicate email collision
     // on members.email UNIQUE). The conditional claim above already serialized us.
@@ -460,6 +501,14 @@ export async function acceptInvite(
       .bind(inviteId)
       .run()
     if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
+    // mupot#1551: the member INSERT's own lower(email) guard produced a
+    // 0-row receipt failure (a concurrent case-different email landed
+    // between the JS pre-check upstream and this write) — same outcome the
+    // pre-existing UNIQUE-violation branch above names, just reached through
+    // the guard instead of a case-exact constraint violation.
+    if (err instanceof Error && err.message.includes('invite_accept_mint.member')) {
+      return { ok: false, error: 'member_already_exists' }
+    }
     throw err
   }
 
@@ -866,8 +915,36 @@ membersApp.post(
     // producers with their own INSERT statements and do NOT run through this
     // handler — this issue's scope documents that gap (PR body) rather than
     // forking a second hand-copy of this check onto either of them.
+
+    // mupot#1551 (case-insensitivity gate finding on #1557): store the SAME
+    // normalized form the auth callback will later compare against
+    // (normalizeInviteEmail), and refuse outright when a member ALREADY
+    // exists whose email matches only by case — never the exact same string.
+    // An EXACT-case match is deliberately left to the checks that already
+    // own it (RESERVED_INVITE_EMAIL_SQL's org-admin-bypassable refusal right
+    // below, or — if neither refuses — the pre-existing case-sensitive
+    // members.email UNIQUE at accept time, unchanged). Only a CASE-DIFFERENT
+    // match is the actual bug this closes: `members.email`'s UNIQUE index
+    // (0002) is case-sensitive, so `ALICE@x.com` sailing past it while
+    // `alice@x.com` already exists would mint a SECOND row — both then
+    // ambiguous to every lower(email)-keyed lookup in this codebase
+    // (idx_members_email_lower/0146, INVITER_ACTIVE_MEMBER_SQL,
+    // RESERVED_INVITE_EMAIL_SQL above) — with no bypass, unlike the
+    // squatted-row check: letting even an org-admin create this would only
+    // fail later, differently, at accept.
+    const normalizedEmail = normalizeInviteEmail(body.email)
+    const trimmedRawEmail = body.email.trim()
+    const caseDifferentMember = await c.env.DB.prepare(
+      'SELECT id FROM members WHERE lower(email) = ? AND email != ? LIMIT 1',
+    )
+      .bind(normalizedEmail, trimmedRawEmail)
+      .first<{ id: string }>()
+    if (caseDifferentMember) {
+      return c.json({ error: 'member_already_exists' }, 409)
+    }
+
     const creatorIsOrgAdmin = isOrgAdmin(auth)
-    if (!creatorIsOrgAdmin && (await isInviteEmailReserved(c.env, body.email))) {
+    if (!creatorIsOrgAdmin && (await isInviteEmailReserved(c.env, normalizedEmail))) {
       return c.json({ error: 'invite_email_reserved' }, 409)
     }
 
@@ -882,7 +959,7 @@ membersApp.post(
       // and this INSERT landing (someone else's invite squats the row in
       // between). ?8 is the org-admin bypass flag, captured once in JS so
       // this statement and the pre-check can never see different answers to
-      // "is the creator org-admin".
+      // "is the creator org-admin". Stores normalizedEmail, not body.email.
       const result = await c.env.DB.prepare(
         `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
@@ -890,14 +967,14 @@ membersApp.post(
       )
         .bind(
           id,
-          body.email,
+          normalizedEmail,
           body.department_id,
           body.squad_id,
           body.capability,
           invitedBy,
           createdAt,
           creatorIsOrgAdmin ? 1 : 0,
-          body.email,
+          normalizedEmail,
           c.env.TENANT_SLUG,
         )
         .run()
@@ -913,7 +990,7 @@ membersApp.post(
       {
         invite: {
           id,
-          email: body.email,
+          email: normalizedEmail,
           department_id: body.department_id,
           squad_id: body.squad_id,
           capability: body.capability,
@@ -1241,9 +1318,9 @@ membersApp.delete(
     // UPDATE and the receipt INSERT used to be two SEPARATE .run() calls — a
     // failure on the receipt side (or a crash between the two calls) would
     // leave the binding cleared with NO durable trace of who did it, exactly
-    // the phantom-success class assertWritten/assertBatchWritten exist to
-    // catch elsewhere in this file (invite-accept's own mint batch, a few
-    // hundred lines up). Batched atomically now (same `DB.batch()` shape the
+    // the phantom-success class assertWritten exists to catch elsewhere in
+    // this file (invite-accept's own mint batch, a few hundred lines up).
+    // Batched atomically now (same `DB.batch()` shape the
     // suspend route above already uses for its UPDATE+UPDATE pair) so either
     // both writes land or neither does.
     //
