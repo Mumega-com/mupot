@@ -39,6 +39,12 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO project_squad_access (project_id, squad_id) VALUES ('proj-a', 'squad-web');
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-admin', 'admin@pot.test', 'Ada Admin', 'active', '${TENANT}');
+    -- mupot#1551 slice 1: acceptInvite now re-checks the inviter's CURRENT
+    -- standing at redemption — member-admin needs real authority on the
+    -- squad these invites target (department admin on dept-a inherits down
+    -- to squad-web) or every accept below refuses invite_inviter_no_longer_authorized.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin', 'member-admin', 'department', 'dept-a', 'admin');
     INSERT INTO invites (id, email, squad_id, capability, invited_by)
       VALUES ('inv-squad', 'squaduser@example.com', 'squad-web', 'member', 'member-admin');
     INSERT INTO invites (id, email, project_id, squad_id, pairing_hash, pairing_expires_at, capability, invited_by)

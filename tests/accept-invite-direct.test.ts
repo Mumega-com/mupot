@@ -28,6 +28,11 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Engineering');
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-admin', 'admin@pot.test', 'Ada Admin', 'active', '${TENANT}');
+    -- mupot#1551 slice 1: every invite this file seeds targets dept-a and is
+    -- invited_by member-admin — give them real standing there, or the new
+    -- redemption-time inviter re-check refuses every accept below.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin', 'member-admin', 'department', 'dept-a', 'admin');
   `)
   return harness
 }

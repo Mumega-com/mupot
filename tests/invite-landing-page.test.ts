@@ -29,6 +29,10 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Engineering');
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-admin', 'admin@pot.test', 'Ada Admin', 'active', '${TENANT}');
+    -- mupot#1551 slice 1: give member-admin real dept-a standing — acceptInvite
+    -- now re-checks the inviter at redemption, and inv-legacy targets dept-a.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin', 'member-admin', 'department', 'dept-a', 'admin');
     INSERT INTO invites (id, email, department_id, capability, invited_by)
       VALUES ('inv-legacy', 'newcomer@example.com', 'dept-a', 'member', 'member-admin');
     INSERT INTO invites (id, email, capability, invited_by, accepted_at)

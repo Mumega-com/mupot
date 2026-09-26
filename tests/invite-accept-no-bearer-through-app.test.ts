@@ -45,6 +45,12 @@ function makeHarness(): SqliteD1Harness {
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Engineering');
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-admin', 'admin@pot.test', 'Ada Admin', 'active', '${TENANT}');
+    -- mupot#1551 slice 1: acceptInvite now re-checks the inviter's CURRENT
+    -- standing at redemption — member-admin needs real authority on dept-a
+    -- or this accept refuses invite_inviter_no_longer_authorized instead of
+    -- reaching the no-bearer contract this file exists to prove.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin', 'member-admin', 'department', 'dept-a', 'admin');
     INSERT INTO invites (id, email, department_id, capability, invited_by)
       VALUES ('inv-through-app', 'throughapp@example.com', 'dept-a', 'member', 'member-admin');
   `)

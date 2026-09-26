@@ -48,6 +48,10 @@ function makeHarness(): SqliteD1Harness {
       VALUES ('squad-web', 'dept-a', 'squad-web', 'Web Squad');
     INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-admin', 'admin@pot.test', 'Ada Admin', 'active', '${TENANT}');
+    -- mupot#1551 slice 1: acceptInvite now re-checks the inviter's standing at
+    -- redemption; department admin on dept-a inherits down to squad-web too.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin', 'member-admin', 'department', 'dept-a', 'admin');
     INSERT INTO invites (id, email, department_id, capability, invited_by)
       VALUES ('inv-legacy', 'newcomer@example.com', 'dept-a', 'member', 'member-admin');
     INSERT INTO invites (id, email, squad_id, capability, invited_by)
