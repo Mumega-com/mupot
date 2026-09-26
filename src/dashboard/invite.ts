@@ -136,7 +136,11 @@ export async function loadInviteLanding(env: Env, inviteId: string): Promise<Inv
 
 // ── HTML ─────────────────────────────────────────────────────────────────────
 
-function esc(s: string): string {
+// mupot#1445: exported so the signed-out '/' landing page (src/dashboard/
+// index.ts) can reuse the exact same unauthenticated-safe escaping instead of
+// a second copy — both pages render config/DB strings (BRAND, org/invite
+// facts) into markup with no session behind them.
+export function esc(s: string): string {
   return s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -145,8 +149,10 @@ function esc(s: string): string {
 }
 
 /** Minimal self-contained shell — this page is unauthenticated and never
- *  shares dashboardApp's shell() (which renders the signed-in sidebar/nav). */
-function pageShell(brand: string, title: string, body: string) {
+ *  shares dashboardApp's shell() (which renders the signed-in sidebar/nav).
+ *  mupot#1445: also reused (not copied) by the signed-out '/' landing page —
+ *  the only other unauthenticated-by-design dashboard surface. */
+export function pageShell(brand: string, title: string, body: string) {
   return html`<!doctype html>
 <html lang="en">
   <head>
@@ -173,8 +179,15 @@ function pageShell(brand: string, title: string, body: string) {
       label { display: block; font-size: 14px; margin-bottom: 14px; }
       input[type="text"] { width: 100%; margin-top: 6px; padding: 8px 10px; font-size: 14px;
         border: 1px solid #e7e9e7; border-radius: 8px; }
-      button.btn { padding: 10px 18px; font-size: 14px; font-weight: 600; border-radius: 8px;
-        border: none; background: #96780A; color: #fff; cursor: pointer; }
+      /* mupot#1445: was scoped to the button element only — widened to plain
+         .btn so the signed-out landing page's link-styled CTA (a real
+         navigation to /auth/login, not a form submit) gets the identical
+         styling. Still matches every existing submit button on this page
+         unchanged. */
+      .btn { display: inline-block; padding: 10px 18px; font-size: 14px; font-weight: 600;
+        border-radius: 8px; border: none; background: #96780A; color: #fff; cursor: pointer;
+        text-decoration: none; }
+      .btn:hover { text-decoration: none; filter: brightness(1.05); }
       p.muted { color: #7a827d; font-size: 13px; }
       .warn { background: #fef3cd; border: 1px solid #f2d675; border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 16px; }
     </style>
