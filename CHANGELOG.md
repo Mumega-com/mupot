@@ -1,5 +1,142 @@
 # Changelog
 
+## [0.30.0] — 2026-09-26 (tagged; release/v0.30.0 at 09ea48f6)
+
+Kasra cut branch `release/v0.30.0` at `09ea48f6` and pushed the annotated tag `v0.30.0`
+— the first stable tag since `v0.25.0`. This took ROADMAP.md's option 2 (a release
+branch, `main` keeps moving, only P0s cherry-pick onto the branch) rather than freezing
+`main` outright; the two prior freeze attempts recorded in the 2026-09-06 status below
+were both invalidated by correct merges before their evidence bundles closed, and this
+sidesteps that by no longer asking `main` to hold still. "Stable" here means: the
+evidence below is bound to `09ea48f6` and does not roll forward to a later commit on
+either `main` or the release branch — 9033 tests / 564 files green at that SHA, `tsc
+--noEmit` clean, and live `/health` on 2026-09-26 answered
+`{"version":"0.30.0","commit":"09ea48f6c9a15bb02d6a9b4af59ef3023a87656a","clean":true}`,
+confirming the deployed commit is that exact SHA at verification time. `main` continues
+as the preview line; a `v0.30.x` patch tag only ever cherry-picks a P0 fix onto
+`release/v0.30.0` itself, never re-cuts from wherever `main` happens to be.
+
+### Since 2026-09-06
+
+54 PRs merged to `main` between the 2026-09-06 sweep (`1303648c`) and the tagged commit
+(`09ea48f6`), verified via `git log 1303648c..09ea48f6` and each PR number confirmed
+against its actual merge commit via the GitHub API (not the number quoted inside another
+PR's own commit message, which in a few cases named a *different*, superseded PR).
+
+**Onboarding door**
+- **#1433** — `move_agent_squad`, a governed home-squad re-provision path.
+- **#1438** — web invite-accept page, no-access landing, admin invite link (#1436 A1/A4/A5).
+- **#1451** — UC-1 new-member journey test, one `describe` per step.
+- **#1458** — A2 login-identity link + A3 plain squad accept (#1436).
+- **#1472** — private home squads: required `SquadScope`, `planeCoversScope`, no standing
+  grant into homes, elevation-to-home (FP-01 Slice 1 v2).
+- **#1487** — UC-1 step 5 live: Google callback links the invited member (#1442).
+- **#1490** — `project_access` chain v2: verdict bound to its own proposal, human origin
+  required, atomic grant+receipt.
+- **#1509** — the web onboarding door now provisions the member's home squad.
+- **#1515** — `team_bootstrap` successor: provenance-based adoption on both find-or-create
+  limbs (#1498).
+- **#1549** — signed-out landing + working Invite member button (#1445, #1444).
+
+**Telegram human-decision channel**
+- **#1407** — governed Telegram project onboarding.
+- **#1410** — human-decision-channel + agent-harness contracts and conformance spec (docs).
+- **#1411** — bind a Telegram identity to an existing member via project invite.
+- **#1420** — self-service Connect Telegram on My Account.
+- **#1422** — stop deriving the Connect Telegram deep link from the wrong bot.
+- **#1423** — IM settings hands the owner to My Account; post-tap guidance on Connect
+  Telegram.
+- **#1425** — harness-attested human origin: the member's own agent carries the human's
+  decision into `task_verdict`.
+
+**Pot provisioning & checkout**
+- **#1516** — `provisionSovereignPot` v2: real six-step provisioning, fail-closed
+  receipts, session-scoped ownership, receipted release (fixes #1285, supersedes #1507).
+- **#1523** — receipt redaction closes the invisible-character class, `admin_email`
+  refuses format/mark characters (fast-follow to #1516).
+- **#1543** — hotfix: anonymous pot checkout disabled behind
+  `POT_SELF_SERVE_CHECKOUT_ENABLED`, default off (#1518).
+
+**Flights & runtime receipts**
+- **#1374** — reap the run with the flight, so overlap cannot pin a dead cron.
+- **#1522** — poll-mode runner dispatch v4: lease-format split (P0), `reset(terminate)`
+  exit, `fleet_agents` dedup (supersedes #1514).
+- **#1542** — settle completed/failed only after the dispatch envelope was acked or its
+  lease lapsed (#1539).
+- **#1545** — flights wait at the gate, `timeout_ms` is live, no duplicate booking
+  (#1540; migration 0172).
+
+**Security fixes**
+- **#1350** — ceiling the *target's* rank: an org admin could delete, demote, suspend or
+  impersonate the owner.
+- **#1351** — resolve member identity for every role; the org owner could not enrol any
+  seat.
+- **#1353** — enforce token expiry on both `POST /mcp` bearer doors.
+- **#1355** — session-bound, auto-expiring elevation in place of standing admin.
+- **#1359** — the org owner could not mint a seat on his own pot.
+- **#1371** — credential lifecycle now sees the role-plane owner (#1366).
+- **#1379** — proved (measured, not just traced) that a `member` mint does not bound the
+  credential.
+- **#1460** — target-rank ceiling on dashboard key mint; validate SSO `default_role` at
+  config and enroll (#1453, #1454).
+
+**Docs**
+- **#1338** — recorded the 09-05 sweep and named why no version had been tagged.
+- **#1345** — restored the exact ROADMAP row label the release contract asserts.
+- **#1397** — 2026-09-10 roadmap: swarm-loop receipts, plumbing defects,
+  surface-reduction direction, Paperclip map.
+- **#1399** — mupot-core: the four things that stay, everything else an addon.
+- **#1431** — stopped promising a dead v0.26 for token per-key scoping.
+- **#1434** — fixed args-docstring drift on `task_update` and `task_verdict_reverse`.
+- **#1503** — workflows catalog: README schema + the first ten workflow docs (#1499).
+
+**Platform, task & gate mechanics**
+- **#1340** — added `cursor-agent`/`cursor-ide` to the runtime vocabulary.
+- **#1342** — exposed `autonomy` on `update_agent`, admin-only.
+- **#1346** — derive the rails "ship" line from autonomy; never tell an empty task list
+  to rest.
+- **#1347** — stamp a canonical `gate:<owner>` on `execute_with_approval` tasks — a bare
+  `lead` strands approvals.
+- **#1354** — unblocked CI: hono 4.13.7 + sharp 0.35.4 clear both blocking audits.
+- **#1364** — named the three `initialize` facts connecting agents still miss.
+- **#1373** — a task can be owned by a human, not only an agent.
+- **#1375** — surface stale and ambiguous gate wake outcomes.
+- **#1380** — path-owned proposal witness; control land fail-closes unless it resolves.
+- **#1387** — deleted the dead `liveness_fail` outcome and its unused threshold.
+- **#1393** — dropped the unpersisted `task_update` result arg; the artifact gate reads
+  `existing.result` only.
+- **#1435** — `agent_lifecycle` composite router, Jev-classified pilot.
+- **#1532** — revive an archived project with pre-existing non-seed tasks; reset the
+  stale cycle boundary.
+- **#1533** — recommit-due warning on `needs_you` + one-tap Recommit (s110).
+- **#1534** — per-project rendered wiki home (v0.50 goal item 4).
+
+### Known open at tag
+
+- **#1551** (P0, security) — public JSON invite accept mints a bearer for an unverified
+  email, and Google login then binds it to an identity-less member row by email match
+  alone: member-row squatting. Root cause and prerequisite for #1457. PR #1550 (the
+  #1457 fix) is parked on this.
+- **#1552** — copilot drawer close→reopen within 220ms leaves the drawer `display:none`
+  while `is-open` — a regression made live by #1549's global `[hidden]` rule.
+- **#1553** — dashboard `Accept` negotiation is a plain substring match, duplicated
+  across the root-landing carve-out and the capability-floor gate; q-values, case and
+  `+json` are ignored.
+- **#1544** — `#1518` follow-ups before pot self-serve checkout can be re-enabled:
+  webhook `create_pot` wiring, `client_reference_id` collision, abuse controls.
+- **#1541** — a pre-custody inbox consume / lease-attempt ack of a dispatch envelope
+  still wedges the task (residual of #1539).
+- **#1546** — rework after a gate rejection is impossible via re-dispatch:
+  `task_dispatch` never rebinds `execution_receipt_id`.
+- **#1547** — flight watchdog system-lands (#1540) write no `flight_event_outbox` row,
+  so landing evidence, the stall detector and the bus all miss them.
+- **#1548** — routines: `dispatch_flight` replay treats a waiting (gate-parked) child
+  flight as `reference_out_of_scope`.
+- **#1518** — public `/api/pots/checkout` creates real Stripe subscriptions but
+  `handlePotCreationCompleted` has no production caller — the Stripe webhook never
+  routes `metadata.action='create_pot'` (residual since #1232; found in #1516's gate;
+  this is why #1543 disabled checkout by default rather than shipping it live).
+
 ## Release status — 2026-09-06
 
 - **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
