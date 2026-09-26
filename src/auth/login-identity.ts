@@ -145,6 +145,15 @@ export async function linkLoginIdentity(
            WHERE h2.tenant = ?2 AND h2.member_id = ?6 AND h2.revoked_at IS NULL
         )
         AND NOT EXISTS (
+          -- The (label, channel) exemption below is CONTAINMENT, not proof of
+          -- origin — an org admin can mint a caller-chosen label/channel via
+          -- POST /members/:id/tokens (src/members/service.ts mintMemberToken)
+          -- and spoof this exact tuple onto a row they already control. Not a
+          -- privilege escalation (they already hold mint power over the row),
+          -- but do not add a second guarantee on top of this exemption
+          -- without re-reading src/members/exclusive-control.ts's header,
+          -- which documents why no stronger anchor (e.g.
+          -- pot_provision_receipts) is reachable from the tenant's own D1.
           SELECT 1 FROM member_tokens t
            WHERE t.tenant = ?2 AND t.member_id = ?6 AND t.agent_id IS NULL
              AND NOT (t.label = ?9 AND t.channel = ?10)
