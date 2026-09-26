@@ -49,3 +49,25 @@ export async function isSquadArchived(env: Env, squadId: string): Promise<boolea
   const row = await env.DB.prepare('SELECT status FROM squads WHERE id = ?1').bind(squadId).first<{ status: string }>()
   return row?.status === 'archived'
 }
+
+/**
+ * THE guard helper (mupot#1496 Round 3, Athena P0-1): archive state as an
+ * ACTION BOUNDARY, not just a listing filter. Round 2 wired
+ * TASK_NOT_ARCHIVED_SQL into every LIVE reader/lister, but every task-
+ * MUTATING tool (task_create on an archived squad; task_update/task_verdict/
+ * task_dispatch/task_dispatch_runtime_receipt/task_dispatch_lease_reset on an
+ * archived task) still happily wrote through — a task's own resolver is an
+ * "explicit reference by id" for a mutation exactly as much as loadTask is
+ * for dispatch, so it needs the SAME explicit check task_dispatch already
+ * added in Round 2, now shared instead of re-inlined per tool.
+ *
+ * Called at the TOP of each mutating tool's run(), immediately after the
+ * task/squad resolves and before any other validation or write —
+ * `tests/task-archive-readers.test.ts`'s seam test greps every task-mutating
+ * tool's registration in TOOLS for a call to this pair, so a new mutating
+ * tool that forgets the guard fails CI rather than shipping silently unguarded.
+ */
+export async function isTaskArchived(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind(taskId).first()
+  return row !== null
+}

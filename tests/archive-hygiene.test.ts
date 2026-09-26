@@ -181,6 +181,42 @@ describe('archive substrate (mupot#1496)', () => {
     expect(row?.status).toBe('suspended') // NOT flipped to 'active' — it was never active
   })
 
+  it('unarchive_row refuses a plain admin reactivating an owner (cannot_affect_higher_rank, the #1337 REACTIVATE direction)', async () => {
+    // An owner archives themselves-adjacent scenario is blocked elsewhere; here
+    // ORG_ADMIN (an org-scope 'admin', rank 4) archives mem-1 while mem-1 is
+    // still ordinary (allowed), then mem-1 is promoted to org owner AFTER
+    // archiving (simulating an owner who was archived before gaining rank, or
+    // a rank change during the archived window) — reactivating them must still
+    // require the same ceiling PATCH /members/:id enforces.
+    const archived = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(archived.ok).toBe(true)
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner');
+    `)
+    const result = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_affect_higher_rank')
+    const row = await env.DB.prepare('SELECT archived_at FROM members WHERE id = ?1').bind('mem-1').first<{ archived_at: string | null }>()
+    expect(row?.archived_at).not.toBeNull() // still archived — the reactivation was refused, not silently allowed
+  })
+
+  it('unarchive_row refuses a foreign-tenant member id (not_found)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, tenant, email, display_name, status, archived_at, archived_reason, archived_by_member_id)
+        VALUES ('mem-foreign', 'other-tenant', 'foreign@example.com', 'Foreign Member', 'suspended', datetime('now'), 'x', '${OPERATOR}');
+    `)
+    const result = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'members', id: 'mem-foreign', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(404)
+    expect(result.error).toBe('not_found')
+    // untouched
+    const row = await env.DB.prepare('SELECT archived_at FROM members WHERE id = ?1').bind('mem-foreign').first<{ archived_at: string | null }>()
+    expect(row?.archived_at).not.toBeNull()
+  })
+
   it('refuses to archive a member who outranks the actor (cannot_affect_higher_rank, the #1337 predicate)', async () => {
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
@@ -214,6 +250,40 @@ describe('archive substrate (mupot#1496)', () => {
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const result = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('last_org_owner')
+  })
+
+  it('a SQUAD-scoped owner does NOT count as a surviving org owner — refuses the last ORG owner regardless', async () => {
+    // mem-1 is the only ORG-scope owner. mem-2 holds 'owner' capability but
+    // ONLY on squad-1 — targetMaxRankAcrossScopes would (wrongly) count mem-2
+    // as "owner rank", but the org-scope-only last-owner check must not.
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner'),
+        ('cap-squad-owner-mem2', 'mem-2', 'squad', 'squad-1', 'owner');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const result = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('last_org_owner')
+  })
+
+  it('a SUSPENDED org owner does NOT count as a surviving owner', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner'),
+        ('cap-owner-mem2', 'mem-2', 'org', NULL, 'owner');
+      UPDATE members SET status='suspended' WHERE id='mem-2';
     `)
     const ownerActor = auth({
       capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
@@ -286,6 +356,60 @@ describe('archive substrate (mupot#1496)', () => {
     expect(result.ok).toBe(true) // agent-2 is inactive — no live seat risk either way
   })
 
+  it('refuses to archive a member bound to a PAUSED agent (not just active — paused is trivially resumable)', async () => {
+    harness.sqlite.exec(`
+      UPDATE agents SET status='paused' WHERE id='agent-1';
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-1', 'mem-1', datetime('now'));
+    `)
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('owns_active_agent')
+  })
+
+  it('refuses to archive a foreign-tenant member id (not_found, no receipt written)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, tenant, email, display_name, status)
+        VALUES ('mem-foreign', 'other-tenant', 'foreign2@example.com', 'Foreign Member Two', 'active');
+    `)
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-foreign', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(404)
+    expect(result.error).toBe('not_found')
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM archive_receipts WHERE entity_table='members' AND entity_id='mem-foreign'`,
+    ).all()
+    expect(results).toHaveLength(0)
+  })
+
+  it('a guarded UPDATE that writes 0 rows revokes NOTHING, even though the batch still runs the revoke statement', async () => {
+    // checkMemberArchivable never inspects archived_at/status (only self/
+    // rank/last-owner/seat) — so pre-setting archived_at+status='suspended'
+    // directly makes the PRE-CHECK pass cleanly while the guarded UPDATE's
+    // idempotency clause still matches 0 rows, the SAME "pre-check passes,
+    // write-time guard fails" shape a genuine concurrent race would produce
+    // (a binding/token landing between the pre-check and the batch would
+    // trip the seat-ownership NOT EXISTS clauses instead, but the guard's
+    // effect on the revoke statement is identical either way). Proves the
+    // P1-A fix: the token revoke is gated on THIS call's own archived_at/
+    // actor having actually landed via the members UPDATE, not fired merely
+    // because the batch executed.
+    harness.sqlite.exec(`
+      INSERT INTO member_tokens (id, member_id, tenant, token_hash) VALUES ('tok-race', 'mem-1', '${TENANT}', 'hash-race');
+      UPDATE members SET status='suspended', archived_at=datetime('now'), archived_reason='pre-existing',
+             archived_by_member_id='${OPERATOR}' WHERE id='mem-1';
+    `)
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'race attempt' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect((result.result as { status: string }).status).toBe('already_archived')
+    const tokenRow = await env.DB.prepare('SELECT revoked_at FROM member_tokens WHERE id = ?1').bind('tok-race')
+      .first<{ revoked_at: string | null }>()
+    expect(tokenRow?.revoked_at).toBeNull() // still live — the refused archive touched nothing
+  })
+
   it('archives an agent already inactive (no live tokens)', async () => {
     const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'agents', id: 'agent-2', reason: 'dead agent' })
     expect(result.ok).toBe(true)
@@ -340,22 +464,38 @@ describe('archive substrate (mupot#1496)', () => {
     expect(after?.archived_prior_status).toBeNull()
   })
 
-  it('archives a terminal task via the side table, leaving tasks.status completely untouched', async () => {
-    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'old done task' })
-    expect(result.ok).toBe(true)
-    const taskRow = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1').bind('task-1').first<{ status: string }>()
-    expect(taskRow?.status).toBe('done') // untouched, exactly as before archiving
+  // mupot#1496 Round 3 scope cut (adversarial gate round 2): task archiving
+  // left this PR — https://github.com/Mumega-com/mupot/issues/1571.
+  // migrations/0173's tasks_archive_state table and the Round 2 reader
+  // filters stay (see tests/task-archive-readers.test.ts) — only the TOOL's
+  // ability to WRITE a tasks_archive_state row is gone.
+  it('archive_row/unarchive_row refuse table:tasks with 409 not_supported', async () => {
+    const archived = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'x' })
+    expect(archived.ok).toBe(false)
+    if (archived.ok) return
+    expect(archived.status).toBe(409)
+    expect(archived.error).toBe('not_supported')
 
-    const stateRow = await env.DB.prepare('SELECT prior_status, archived_reason FROM tasks_archive_state WHERE task_id = ?1')
-      .bind('task-1').first<{ prior_status: string; archived_reason: string }>()
-    expect(stateRow).toMatchObject({ prior_status: 'done', archived_reason: 'old done task' })
+    const unarchived = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-1', reason: 'x' })
+    expect(unarchived.ok).toBe(false)
+    if (unarchived.ok) return
+    expect(unarchived.status).toBe(409)
+    expect(unarchived.error).toBe('not_supported')
 
-    const un = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-1', reason: 'restore' })
-    expect(un.ok).toBe(true)
-    const gone = await env.DB.prepare('SELECT task_id FROM tasks_archive_state WHERE task_id = ?1').bind('task-1').first()
-    expect(gone).toBeNull()
-    const stillDone = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1').bind('task-1').first<{ status: string }>()
-    expect(stillDone?.status).toBe('done')
+    // Never touched.
+    const stateRow = await env.DB.prepare('SELECT task_id FROM tasks_archive_state WHERE task_id = ?1').bind('task-1').first()
+    expect(stateRow).toBeNull()
+  })
+
+  it('archive_plan_expand always refuses 409 not_supported, regardless of input', async () => {
+    const result = await invoke(ORG_ADMIN, 'archive_plan_expand', {
+      table: 'tasks',
+      where: { status: ['open'], created_before: '2026-01-01', project_ids: ['proj-1'] },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('not_supported')
   })
 
   // ── refusals ───────────────────────────────────────────────────────────────
@@ -379,28 +519,6 @@ describe('archive substrate (mupot#1496)', () => {
     if (refused.ok) return
     expect(refused.error).toBe('active_dependents')
     expect(refused.detail).toEqual({ tasks: 1 })
-  })
-
-  it('refuses to archive a task with a live (unexpired) execution claim', async () => {
-    harness.sqlite.exec(`
-      UPDATE tasks SET status='in_progress', execution_claim_expires_at = ${Date.now() + 60_000} WHERE id='task-2';
-    `)
-    const refused = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
-    expect(refused.ok).toBe(false)
-    if (refused.ok) return
-    expect(refused.error).toBe('live_execution_claim')
-  })
-
-  it('refuses to archive a task that is on an in-air flight (status running/waiting)', async () => {
-    harness.sqlite.exec(`UPDATE tasks SET status='review' WHERE id='task-2';`)
-    harness.sqlite.exec(`
-      INSERT INTO flights (id, tenant, agent, goal, status, meta)
-        VALUES ('flight-1', '${TENANT}', 'agent-1', 'goal', 'running', '{"task_ids":["task-2"]}');
-    `)
-    const refused = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
-    expect(refused.ok).toBe(false)
-    if (refused.ok) return
-    expect(refused.error).toBe('in_air_flight')
   })
 
   it('rejects an unknown table at the schema level', async () => {
@@ -431,18 +549,6 @@ describe('archive substrate (mupot#1496)', () => {
     expect(results).toHaveLength(1)
   })
 
-  it('archiving an already-archived task is idempotent: no new receipt', async () => {
-    const first = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'r1' })
-    expect(first.ok).toBe(true)
-    const second = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'r2' })
-    expect(second.ok).toBe(true)
-    if (!second.ok) return
-    expect((second.result as { status: string }).status).toBe('already_archived')
-    const { results } = await env.DB.prepare(
-      `SELECT id FROM archive_receipts WHERE entity_table='tasks' AND entity_id='task-1' AND action='archive'`,
-    ).all()
-    expect(results).toHaveLength(1)
-  })
 
   it('unarchiving a row that is not archived returns not_archived, writes no receipt', async () => {
     const result = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'members', id: 'mem-1', reason: 'x' })
@@ -500,27 +606,4 @@ describe('archive substrate (mupot#1496)', () => {
     expect(result.status).toBe(403)
   })
 
-  // ── archive_plan_expand (bulk plan, tasks only) ──────────────────────────
-
-  it('archive_plan_expand filters by status/created_before/project_ids and excludes already-archived tasks', async () => {
-    harness.sqlite.exec(`
-      INSERT INTO tasks (id, squad_id, title, status, done_when, project_id, created_at) VALUES
-        ('task-3', 'squad-2', 'Task Three', 'done', 'n/a', 'proj-2', '2020-01-01 00:00:00');
-    `)
-    await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'already archived' })
-
-    const result = await invoke(ORG_ADMIN, 'archive_plan_expand', {
-      table: 'tasks',
-      where: { status: ['done'], created_before: '2021-01-01 00:00:00', project_ids: ['proj-2'] },
-    })
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    const { ids } = result.result as { ids: string[] }
-    expect(ids).toEqual(['task-3']) // task-1 matches the filter but is already archived; excluded
-  })
-
-  it('archive_plan_expand refuses a table other than tasks', async () => {
-    const result = await invoke(ORG_ADMIN, 'archive_plan_expand', { table: 'members', where: {} })
-    expect(result.ok).toBe(false)
-  })
 })

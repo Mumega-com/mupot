@@ -167,7 +167,7 @@ import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
-import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -777,6 +777,13 @@ function flightProjectFailure(error: FlightProjectError): ToolOutcome {
   if (error.code === 'project_access_forbidden') {
     return fail(403, 'forbidden', { need: 'project_write' })
   }
+  // mupot#1496 Round 3 (Athena P0-1): 409, not the generic 400 every other
+  // FlightProjectError code falls into — an archived task is a real,
+  // named conflict (same status task_dispatch's own refusal already uses),
+  // not a malformed request.
+  if (error.code === 'task_archived') {
+    return fail(409, 'task_archived')
+  }
   return fail(400, error.code)
 }
 
@@ -870,6 +877,9 @@ const toolTaskCreate: ToolSpec = {
 
     const squad = await loadSquad(env, squadId)
     if (!squad) return fail(404, 'squad_not_found')
+    // mupot#1496 Round 3 (Athena P0-1): archive state is an ACTION boundary —
+    // a squad can neither be shown as live (Round 2) nor written into.
+    if (await isSquadArchived(env, squad.id)) return fail(409, 'squad_archived')
 
     const grants = auth.capabilities ?? []
     if (!(await memberCanOnSquad(env, grants, squad.id, 'member'))) {
@@ -2237,10 +2247,11 @@ const toolTaskDispatch: ToolSpec = {
     // mupot#1496 Round 2 (Athena P0-1): loadTask resolves by id regardless of
     // archive state (an "explicit history read", per Athena's own framing) —
     // dispatch is NOT a history read, so an archived task must refuse here
-    // even though it successfully resolved above.
-    const archived = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1')
-      .bind(task.id).first()
-    if (archived) return fail(409, 'task_archived')
+    // even though it successfully resolved above. Round 3 scope cut removed
+    // the archive_row('tasks') WRITE path, but this READ-only guard (and
+    // tasks_archive_state itself) stays — harmless today, live again the
+    // moment the follow-up issue restores task archiving.
+    if (await isTaskArchived(env, task.id)) return fail(409, 'task_archived')
     if (task.status !== 'open' && task.status !== 'blocked' && task.status !== 'rejected') {
       return fail(409, 'task_not_runnable')
     }
@@ -2825,6 +2836,9 @@ const toolFlightDispatch: ToolSpec = {
     }
     const references = await validateFlightMetaReferences(env, meta, projectId)
     if (!references.ok) {
+      // mupot#1496 Round 3 (Athena P0-1): an archived task is a real, named
+      // conflict — 409, not folded into the generic not-found/400 mapping.
+      if (references.error === 'task_archived') return fail(409, 'task_archived', references.ref)
       const error = references.error === 'flight_task_scope_mismatch'
         ? 'flight_task_not_found'
         : references.error

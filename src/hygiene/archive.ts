@@ -43,7 +43,7 @@ import type { AuthContext, Env } from '../types'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import { revokeAllWebSessions } from '../auth/web-sessions'
 import { revokeAllAgentSessionsForMember } from '../auth/agent-sessions'
-import { exceedsTargetRankCeiling, targetMaxRankAcrossScopes, capabilityRank } from '../auth/capability'
+import { exceedsTargetRankCeiling, targetLegacyRoleRank, capabilityRank } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 
 export const ARCHIVABLE_TABLES = ['members', 'agents', 'squads', 'projects', 'tasks'] as const
@@ -85,12 +85,15 @@ export type ArchiveOutcome =
   | { ok: false; error: 'cannot_affect_higher_rank' }
   | { ok: false; error: 'last_org_owner' }
   | { ok: false; error: 'must_deactivate_first'; tool: 'deactivate_agent' }
+  | { ok: false; error: 'not_supported' }
 
 export type UnarchiveOutcome =
   | { ok: true; status: 'unarchived'; receiptId: string }
   | { ok: true; status: 'not_archived' }
   | { ok: false; error: 'not_found' }
   | { ok: false; error: 'invalid_reason' }
+  | { ok: false; error: 'cannot_affect_higher_rank' }
+  | { ok: false; error: 'not_supported' }
 
 function validReason(reason: string): boolean {
   const trimmed = reason.trim()
@@ -101,9 +104,21 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
-/** archiveRow — the single entry point for marking any of the five tables archived. */
+/** archiveRow — the single entry point for marking members/agents/squads/
+ *  projects archived. `tasks` is DELIBERATELY NOT SUPPORTED here (mupot#1496
+ *  Round 3 scope cut, adversarial gate round 2): archiving a task is an
+ *  action-boundary problem across ~10 mutating paths (task_update,
+ *  task_verdict, task_dispatch, task_dispatch_runtime_receipt,
+ *  task_dispatch_lease_reset, routine actions, flight dispatch, ...), not a
+ *  single-table write — tracked as its own scoped follow-up,
+ *  https://github.com/Mumega-com/mupot/issues/1571. migrations/0173's
+ *  `tasks_archive_state` table and the reader-side exclusions already wired
+ *  into task_list/task_board/task_dispatch/needs_you_list/routines/kanban
+ *  (Round 2) stay — they are correct and harmless with an always-empty
+ *  table, and go live the moment #1571 lands a real write path. */
 export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInput): Promise<ArchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
+  if (input.table === 'tasks') return { ok: false, error: 'not_supported' }
 
   switch (input.table) {
     case 'members':
@@ -114,25 +129,22 @@ export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInpu
       return archiveSquad(env, input)
     case 'projects':
       return archiveProject(env, input)
-    case 'tasks':
-      return archiveTask(env, input)
   }
 }
 
-export async function unarchiveRow(env: Env, input: UnarchiveInput): Promise<UnarchiveOutcome> {
+export async function unarchiveRow(env: Env, auth: AuthContext, input: UnarchiveInput): Promise<UnarchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
+  if (input.table === 'tasks') return { ok: false, error: 'not_supported' }
 
   switch (input.table) {
     case 'members':
-      return unarchiveMember(env, input)
+      return unarchiveMember(env, auth, input)
     case 'agents':
       return unarchiveSimple(env, 'agents', input, { statusColumn: null })
     case 'squads':
       return unarchiveSimple(env, 'squads', input, { statusColumn: 'status', restoreStatus: 'active' })
     case 'projects':
       return unarchiveProject(env, input)
-    case 'tasks':
-      return unarchiveTask(env, input)
   }
 }
 
@@ -156,17 +168,48 @@ async function insertReceiptUnconditional(
   return receiptId
 }
 
+/** True only when `id` is a row THIS TENANT considers currently enforced-
+ *  archived — the per-table "is this row archived" signal
+ *  (members/agents: archived_at IS NOT NULL; squads/projects: status =
+ *  'archived'), tenant-scoped where the table has a tenant column at all
+ *  (only `members` — agents/squads/projects have none; this D1 IS the pot,
+ *  single-tenant, so there is nothing to scope for them). Used to keep
+ *  backfillReceiptIfMissing from ever minting a receipt for a row that
+ *  isn't actually archived, or that belongs to a different tenant entirely
+ *  (adversarial P1-B). */
+async function isRowCurrentlyArchived(env: Env, table: 'members' | 'agents' | 'squads' | 'projects', id: string): Promise<boolean> {
+  if (table === 'members') {
+    const row = await env.DB.prepare(
+      'SELECT archived_at FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)',
+    ).bind(id, env.TENANT_SLUG).first<{ archived_at: string | null }>()
+    return row?.archived_at != null
+  }
+  if (table === 'agents') {
+    const row = await env.DB.prepare('SELECT archived_at FROM agents WHERE id = ?1').bind(id).first<{ archived_at: string | null }>()
+    return row?.archived_at != null
+  }
+  const row = await env.DB.prepare(`SELECT status FROM ${table} WHERE id = ?1`).bind(id).first<{ status: string }>()
+  return row?.status === 'archived'
+}
+
 /** Backfill a missing receipt for an already-enforced archive (adversarial P1-1 / Round 2):
  *  a prior call's state-flip could have landed while its OWN receipt attempt failed on an
  *  earlier, non-atomic build of this module, or a future bug could reintroduce the gap. The
- *  "already_archived" path self-heals rather than leaving a permanently unreceipted row. */
+ *  "already_archived" path self-heals rather than leaving a permanently unreceipted row.
+ *
+ *  mupot#1496 Round 3 (adversarial P1-B): gated on isRowCurrentlyArchived — a caller
+ *  reaching this function after a 0-row write (a race, or a genuinely-refused
+ *  archive that merely LOOKED clean on recheck) must never mint a phantom
+ *  receipt for a row this tenant does not currently consider archived, or
+ *  that belongs to a different tenant entirely. */
 async function backfillReceiptIfMissing(
   env: Env,
-  table: ArchivableTable,
+  table: 'members' | 'agents' | 'squads' | 'projects',
   id: string,
   reason: string,
   actorMemberId: string,
 ): Promise<void> {
+  if (!(await isRowCurrentlyArchived(env, table, id))) return
   const existing = await env.DB.prepare(
     `SELECT id FROM archive_receipts WHERE entity_table = ?1 AND entity_id = ?2 AND action = 'archive' LIMIT 1`,
   ).bind(table, id).first<{ id: string }>()
@@ -178,6 +221,23 @@ async function backfillReceiptIfMissing(
 
 const OWNER_RANK = capabilityRank('owner')
 
+/** True when `memberId` holds ORG-SCOPE owner standing specifically — an
+ *  org-scope `capabilities` row (capability='owner', scope_id IS NULL) OR
+ *  the legacy `users.role='owner'` plane (via targetLegacyRoleRank, the SAME
+ *  helper actorRankOnScopeFor/exceedsTargetRankCeiling already use for the
+ *  legacy plane — never a second copy). Deliberately NOT
+ *  targetMaxRankAcrossScopes, which is GLOBAL across every scope a member
+ *  holds a grant on and would count a merely SQUAD-scoped 'owner' capability
+ *  as an "org owner" — the exact over-counting the last-owner check exists
+ *  to avoid. */
+async function isOrgScopeOwner(env: Env, memberId: string): Promise<boolean> {
+  const capRow = await env.DB.prepare(
+    `SELECT 1 FROM capabilities WHERE member_id = ?1 AND scope_type = 'org' AND scope_id IS NULL AND capability = 'owner'`,
+  ).bind(memberId).first()
+  if (capRow) return true
+  return (await targetLegacyRoleRank(env, memberId)) >= OWNER_RANK
+}
+
 /** Every reason members archival can be refused, independent of the write's own row count.
  *  Called BEFORE attempting the write (fast fail) and, if the guarded write still returns 0
  *  rows, called AGAIN to produce an honest, freshly-derived refusal instead of guessing. */
@@ -188,20 +248,26 @@ async function checkMemberArchivable(env: Env, auth: AuthContext, input: Archive
     return { ok: false, error: 'cannot_affect_higher_rank' }
   }
 
-  const targetRank = await targetMaxRankAcrossScopes(env, input.id)
-  if (targetRank >= OWNER_RANK) {
-    // Reuses targetMaxRankAcrossScopes per OTHER member — the SAME canonical
-    // rank predicate everywhere else in this codebase, covering BOTH
-    // authority planes AND channel_capability_grants (which a hand-rolled
-    // capabilities-table-only UNION would miss — exactly the "one predicate,
-    // not a second copy" defect class this round's reviews kept finding).
-    // Short-circuits the moment one other owner is found; a rare, high-
-    // stakes action, so an O(members) worst case (no other owner exists) is
-    // an acceptable cost.
-    const others = await env.DB.prepare('SELECT id FROM members WHERE id != ?1').bind(input.id).all<{ id: string }>()
+  if (await isOrgScopeOwner(env, input.id)) {
+    // mupot#1496 Round 3 (Athena P0 — org-scope-only, not Round 2's
+    // targetMaxRankAcrossScopes, which is GLOBAL across every scope and
+    // would count a member who is merely a SQUAD-scoped owner as a
+    // surviving "org owner"). "Last owner" is specifically about the org's
+    // top-level owner standing, so the survivor count must check the SAME
+    // narrow thing: an org-scope capabilities row OR the legacy role plane
+    // (targetLegacyRoleRank — the same helper the rank-ceiling path already
+    // reuses, never a second hand-rolled copy). Excludes suspended/archived/
+    // foreign-tenant members from counting as a "surviving" owner — a
+    // suspended or archived owner cannot actually act, so is not a real
+    // safety net; only ACTIVE, same-tenant members count. Short-circuits the
+    // moment one other real owner is found; a rare, high-stakes action, so
+    // an O(members) worst case (no other owner exists) is an acceptable cost.
+    const others = await env.DB.prepare(
+      `SELECT id FROM members WHERE id != ?1 AND status = 'active' AND archived_at IS NULL AND (tenant = ?2 OR tenant IS NULL)`,
+    ).bind(input.id, env.TENANT_SLUG).all<{ id: string }>()
     let anotherOwnerExists = false
     for (const other of others.results ?? []) {
-      if ((await targetMaxRankAcrossScopes(env, other.id)) >= OWNER_RANK) {
+      if (await isOrgScopeOwner(env, other.id)) {
         anotherOwnerExists = true
         break
       }
@@ -224,15 +290,15 @@ async function checkMemberArchivable(env: Env, auth: AuthContext, input: Archive
   // requires every member_tokens SELECT in src/ to consume this export.
   const activeSeats = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM (
-       SELECT a.id FROM agents a WHERE a.owner_member_id = ?1 AND a.status = 'active'
+       SELECT a.id FROM agents a WHERE a.owner_member_id = ?1 AND a.status IN ('active','paused')
        UNION
        SELECT a.id FROM agent_member_bindings b
          JOIN agents a ON a.id = b.agent_id
-        WHERE b.member_id = ?1 AND a.status = 'active'
+        WHERE b.member_id = ?1 AND a.status IN ('active','paused')
        UNION
        SELECT a.id FROM member_tokens t
          JOIN agents a ON a.id = t.agent_id
-        WHERE t.member_id = ?1 AND t.agent_id IS NOT NULL AND a.status = 'active' AND ${TOKEN_LIVE_PREDICATE('?2')}
+        WHERE t.member_id = ?1 AND t.agent_id IS NOT NULL AND a.status IN ('active','paused') AND ${TOKEN_LIVE_PREDICATE('?2')}
      )`,
   ).bind(input.id, nowSqlUtc()).first<{ n: number }>()
   const activeAgents = activeSeats?.n ?? 0
@@ -244,8 +310,11 @@ async function checkMemberArchivable(env: Env, auth: AuthContext, input: Archive
 }
 
 async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): Promise<ArchiveOutcome> {
-  const row = await env.DB.prepare('SELECT id FROM members WHERE id = ?1')
-    .bind(input.id)
+  // mupot#1496 Round 3 (adversarial P1-B): tenant-scoped from the very first
+  // read — a foreign-tenant id must read as not_found here, not merely at
+  // the guarded UPDATE three steps later.
+  const row = await env.DB.prepare('SELECT id FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)')
+    .bind(input.id, env.TENANT_SLUG)
     .first<{ id: string }>()
   if (!row) return { ok: false, error: 'not_found' }
 
@@ -277,14 +346,14 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
         WHERE id = ?5
           AND (tenant = ?1 OR tenant IS NULL)
           AND NOT (archived_at IS NOT NULL AND status = 'suspended')
-          AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.owner_member_id = ?5 AND a.status = 'active')
+          AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.owner_member_id = ?5 AND a.status IN ('active','paused'))
           AND NOT EXISTS (
             SELECT 1 FROM agent_member_bindings b JOIN agents a ON a.id = b.agent_id
-             WHERE b.member_id = ?5 AND a.status = 'active'
+             WHERE b.member_id = ?5 AND a.status IN ('active','paused')
           )
           AND NOT EXISTS (
             SELECT 1 FROM member_tokens t JOIN agents a ON a.id = t.agent_id
-             WHERE t.member_id = ?5 AND t.agent_id IS NOT NULL AND a.status = 'active' AND ${TOKEN_LIVE_PREDICATE('?6')}
+             WHERE t.member_id = ?5 AND t.agent_id IS NOT NULL AND a.status IN ('active','paused') AND ${TOKEN_LIVE_PREDICATE('?6')}
           )`,
     ).bind(env.TENANT_SLUG, now, input.reason, input.actorMemberId, input.id, nowSqlUtc()),
     // The receipt is the VERY NEXT statement after the member UPDATE — not
@@ -298,11 +367,22 @@ async function archiveMember(env: Env, auth: AuthContext, input: ArchiveInput): 
         SELECT ?1, ?2, 'members', ?3, 'archive', ?4, ?5, m.archived_prior_status, ?6
           FROM members m WHERE m.id = ?3 AND changes() = 1`,
     ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, now),
-    // Unconditional (P2 fold): always attempt the revoke, not gated on a
-    // pre-read count — a 0-row UPDATE here is cheap and correct either way.
+    // mupot#1496 Round 3 (adversarial P1-A): NOT merely "unconditional" —
+    // gated on THIS call's own archive having actually landed, via an EXISTS
+    // matching the EXACT (archived_at, archived_by_member_id) the guarded
+    // UPDATE above just set. A refused archive (the UPDATE's WHERE matched 0
+    // rows — a race, or any dependent-safety predicate) must revoke NOTHING;
+    // `changes()` alone is not used here because it reflects only the
+    // IMMEDIATELY PRECEDING statement (the receipt insert, not the member
+    // UPDATE two statements back) — this EXISTS check is self-contained and
+    // correct regardless of statement ordering.
     env.DB.prepare(
-      `UPDATE member_tokens SET revoked_at = ?1 WHERE tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
-    ).bind(now, env.TENANT_SLUG, input.id),
+      `UPDATE member_tokens SET revoked_at = ?1
+        WHERE tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM members WHERE id = ?3 AND archived_at = ?1 AND archived_by_member_id = ?4
+          )`,
+    ).bind(now, env.TENANT_SLUG, input.id, input.actorMemberId),
   ]
 
   const results = await env.DB.batch(stmts)
@@ -492,92 +572,6 @@ async function archiveProject(env: Env, input: ArchiveInput): Promise<ArchiveOut
   return { ok: true, status: 'archived', receiptId }
 }
 
-// ── tasks (side table — tasks.status is NEVER written) ──────────────────────
-
-// Non-terminal flight statuses (P2 fold): flights.status CHECK is
-// ('preflight','held','running','waiting','sleeping','landed','failed') —
-// only landed/failed are terminal. Round 1 only covered running/waiting;
-// preflight/held/sleeping are equally "not actually done with this task yet".
-const IN_AIR_FLIGHT_STATUSES_SQL = `f.status NOT IN ('landed','failed')`
-
-async function taskArchivabilityBlocker(env: Env, taskId: string): Promise<ArchiveOutcome | null> {
-  const row = await env.DB.prepare('SELECT status, execution_claim_expires_at FROM tasks WHERE id = ?1')
-    .bind(taskId)
-    .first<{ status: string; execution_claim_expires_at: number | null }>()
-  if (!row) return { ok: false, error: 'not_found' }
-  if (row.status === 'in_progress' && row.execution_claim_expires_at !== null && row.execution_claim_expires_at > Date.now()) {
-    return { ok: false, error: 'live_execution_claim' }
-  }
-  const inAirRow = await env.DB.prepare(
-    `SELECT 1 FROM flights f
-      WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
-        AND (
-          EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = ?1)
-          OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = ?1)
-          OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = ?1))
-        )
-      LIMIT 1`,
-  ).bind(taskId).first()
-  if (inAirRow) return { ok: false, error: 'in_air_flight' }
-  return null
-}
-
-async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcome> {
-  const blocker = await taskArchivabilityBlocker(env, input.id)
-  if (blocker) return blocker
-
-  const existing = await env.DB.prepare('SELECT task_id FROM tasks_archive_state WHERE task_id = ?1')
-    .bind(input.id)
-    .first<{ task_id: string }>()
-  if (existing) {
-    await backfillReceiptIfMissing(env, 'tasks', input.id, input.reason, input.actorMemberId)
-    return { ok: true, status: 'already_archived' }
-  }
-
-  const now = nowIso()
-  const receiptId = crypto.randomUUID()
-  // Write-time re-assertion via INSERT ... SELECT ... WHERE: the SAME claim/
-  // in-air-flight predicates as taskArchivabilityBlocker, re-checked against
-  // the row AT WRITE TIME, not just the pre-read a moment ago.
-  const stmts = [
-    env.DB.prepare(
-      `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
-        SELECT t.id, ?1, ?2, ?3, t.status, ?1
-          FROM tasks t
-         WHERE t.id = ?4
-           AND NOT (
-             t.status = 'in_progress' AND t.execution_claim_expires_at IS NOT NULL
-             AND t.execution_claim_expires_at > ?5
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM flights f
-              WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
-                AND (
-                  EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = t.id)
-                  OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = t.id)
-                  OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = t.id))
-                )
-           )`,
-    ).bind(now, input.reason, input.actorMemberId, input.id, Date.now()),
-    env.DB.prepare(
-      `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
-        SELECT ?1, ?2, 'tasks', ?3, 'archive', ?4, ?5, s.prior_status, ?6
-          FROM tasks_archive_state s WHERE s.task_id = ?3 AND changes() = 1`,
-    ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, now),
-  ]
-  const results = await env.DB.batch(stmts)
-  if (rowsWritten(results[0]) === 0) {
-    // The row existed and passed the pre-check a moment ago; 0 rows here
-    // means the claim/flight state changed in between. Re-derive fresh.
-    const fresh = await taskArchivabilityBlocker(env, input.id)
-    if (fresh) return fresh
-    await backfillReceiptIfMissing(env, 'tasks', input.id, input.reason, input.actorMemberId)
-    return { ok: true, status: 'already_archived' }
-  }
-  assertWritten(results[1], 'archive_row.tasks.receipt', 1)
-  return { ok: true, status: 'archived', receiptId }
-}
-
 // ── unarchive: agents / squads ───────────────────────────────────────────────
 
 async function unarchiveSimple(
@@ -613,21 +607,34 @@ async function unarchiveSimple(
   return { ok: true, status: 'unarchived', receiptId }
 }
 
-async function unarchiveMember(env: Env, input: UnarchiveInput): Promise<UnarchiveOutcome> {
-  const row = await env.DB.prepare('SELECT id, archived_prior_status FROM members WHERE id = ?1')
-    .bind(input.id)
+async function unarchiveMember(env: Env, auth: AuthContext, input: UnarchiveInput): Promise<UnarchiveOutcome> {
+  // mupot#1496 Round 3 (adversarial P0-B): tenant-scoped, matching archiveMember's
+  // own convention (a legacy NULL-tenant row is still adoptable; a REAL foreign-
+  // tenant row is not found at all — never leak its existence cross-tenant).
+  const row = await env.DB.prepare(
+    'SELECT id, archived_prior_status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)',
+  )
+    .bind(input.id, env.TENANT_SLUG)
     .first<{ id: string; archived_prior_status: string | null }>()
   if (!row) return { ok: false, error: 'not_found' }
+
+  // mupot#1496 Round 3 (adversarial P0-B): reactivating an archived member is
+  // the SAME rank-ceiling-gated action as archiving one — a plain admin must
+  // not be able to reverse an owner's archive any more than they could have
+  // performed it. The exact #1337 predicate, not a second copy.
+  if (await exceedsTargetRankCeiling(env, auth, input.id)) {
+    return { ok: false, error: 'cannot_affect_higher_rank' }
+  }
 
   const restoreStatus = row.archived_prior_status ?? 'active'
   const now = nowIso()
   const receiptId = crypto.randomUUID()
   const stmts = [
     env.DB.prepare(
-      `UPDATE members SET status = ?1, archived_at = NULL, archived_reason = NULL,
+      `UPDATE members SET status = ?1, tenant = ?3, archived_at = NULL, archived_reason = NULL,
               archived_by_member_id = NULL, archived_prior_status = NULL
-        WHERE id = ?2 AND archived_at IS NOT NULL`,
-    ).bind(restoreStatus, input.id),
+        WHERE id = ?2 AND (tenant = ?3 OR tenant IS NULL) AND archived_at IS NOT NULL`,
+    ).bind(restoreStatus, input.id, env.TENANT_SLUG),
     env.DB.prepare(
       `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
         SELECT ?1, ?2, 'members', ?3, 'unarchive', ?4, ?5, 'archived', ?6
@@ -673,35 +680,3 @@ async function unarchiveProject(env: Env, input: UnarchiveInput): Promise<Unarch
   return { ok: true, status: 'unarchived', receiptId }
 }
 
-async function unarchiveTask(env: Env, input: UnarchiveInput): Promise<UnarchiveOutcome> {
-  const existing = await env.DB.prepare(
-    'SELECT task_id, prior_status FROM tasks_archive_state WHERE task_id = ?1',
-  ).bind(input.id).first<{ task_id: string; prior_status: string }>()
-  if (!existing) {
-    const taskRow = await env.DB.prepare('SELECT id FROM tasks WHERE id = ?1').bind(input.id).first<{ id: string }>()
-    if (!taskRow) return { ok: false, error: 'not_found' }
-    return { ok: true, status: 'not_archived' }
-  }
-
-  const now = nowIso()
-  const receiptId = crypto.randomUUID()
-  // tasks.status was never written by archiveTask, so unarchive is purely
-  // removing the side-table row + receipting the event — no restore write
-  // needed on tasks itself (see migrations/0173's header).
-  const stmts = [
-    env.DB.prepare('DELETE FROM tasks_archive_state WHERE task_id = ?1').bind(input.id),
-    // Gated on `changes() = 1` (the DELETE immediately above), NOT an
-    // unconditional VALUES row — a 0-row DELETE (a race removed it between
-    // the pre-read and here) must not still mint a receipt claiming an
-    // unarchive that never happened.
-    env.DB.prepare(
-      `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
-        SELECT ?1, ?2, 'tasks', ?3, 'unarchive', ?4, ?5, ?6, ?7
-        WHERE changes() = 1`,
-    ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, existing.prior_status, now),
-  ]
-  const results = await env.DB.batch(stmts)
-  if (rowsWritten(results[0]) === 0) return { ok: true, status: 'not_archived' }
-  assertWritten(results[1], 'unarchive_row.tasks.receipt', 1)
-  return { ok: true, status: 'unarchived', receiptId }
-}

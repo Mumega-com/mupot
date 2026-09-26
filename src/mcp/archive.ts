@@ -60,6 +60,10 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
       return fail(409, 'last_org_owner')
     case 'must_deactivate_first':
       return fail(409, 'must_deactivate_first', { tool: outcome.tool })
+    case 'not_supported':
+      // mupot#1496 Round 3 scope cut: task archiving left this PR — see
+      // https://github.com/Mumega-com/mupot/issues/1571.
+      return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
   }
 }
 
@@ -73,6 +77,10 @@ function unarchiveOutcomeToResult(outcome: Awaited<ReturnType<typeof unarchiveRo
       return fail(404, 'not_found')
     case 'invalid_reason':
       return fail(400, 'invalid_reason', 'reason must be 1-2000 characters')
+    case 'cannot_affect_higher_rank':
+      return fail(403, 'cannot_affect_higher_rank')
+    case 'not_supported':
+      return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
   }
 }
 
@@ -149,7 +157,7 @@ export const toolUnarchiveRow: ToolSpec = {
     const reason = str(args.reason)
     if (!reason) return fail(400, 'invalid_args', 'reason required')
 
-    const outcome = await unarchiveRow(env, {
+    const outcome = await unarchiveRow(env, auth, {
       table: args.table as ArchivableTable,
       id,
       reason,
@@ -178,25 +186,22 @@ export const toolUnarchiveRow: ToolSpec = {
 // reports `truncated: true` instead of silently dropping rows past it.
 
 const TASK_STATUS_VALUES = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
-const PLAN_EXPAND_LIMIT = 5000
 
-// A conservative, no-dependency ISO-8601-ish check: YYYY-MM-DD, optionally
-// with a T time component. Rejects garbage like 'zzzz' (which SQLite's
-// string comparison against created_at would otherwise happily "match"
-// everything against, since an un-parseable string still compares lexically).
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?)?$/
-
+// mupot#1496 Round 3 scope cut (adversarial gate round 2): task archiving
+// left this PR entirely — see archiveRow/unarchiveRow's file-header comment
+// in src/hygiene/archive.ts and https://github.com/Mumega-com/mupot/issues/1571.
+// archive_plan_expand's ONLY purpose was expanding a bulk TASK archive/
+// unarchive plan, so it now refuses unconditionally rather than doing
+// read-only work in service of a write path that no longer exists. Kept
+// registered (not deleted) so the follow-up issue can re-enable it by
+// reverting this one early-return, not by re-deriving the tool from scratch.
 export const toolArchivePlanExpand: ToolSpec = {
   name: 'archive_plan_expand',
   scope: 'org',
   min: 'admin',
   args: '{ table: "tasks", mode?: "live"|"archived", where: { status: string[] (>=1), created_before: string (ISO, required), project_ids: string[] (>=1, required) } }' +
-    ' -- read-only. Returns the ids a bulk archive/unarchive plan would touch, without' +
-    ' archiving anything. project_ids, created_before, and a non-empty status list are' +
-    ' ALL required — there is no unscoped "match everything" shape. mode="live" (default)' +
-    ' matches tasks with NO tasks_archive_state row (for an archive plan); mode="archived"' +
-    ' matches tasks that already HAVE one (for an unarchive plan). Result reports' +
-    ' truncated:true when more than 5000 rows matched.',
+    ' -- NOT SUPPORTED (mupot#1496 Round 3 scope cut): task archiving left this PR.' +
+    ' See https://github.com/Mumega-com/mupot/issues/1571. Always refuses 409 not_supported.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -216,52 +221,11 @@ export const toolArchivePlanExpand: ToolSpec = {
     required: ['table', 'where'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth) {
     const gateFail = requireOperatorOrgAdmin(auth)
     if (gateFail) return gateFail
 
-    if (args.table !== 'tasks') return fail(400, 'unsupported_table', 'only table=tasks supports plan expansion')
-    const mode = args.mode === 'archived' ? 'archived' : 'live'
-    const where = (args.where ?? {}) as {
-      status?: unknown
-      created_before?: unknown
-      project_ids?: unknown
-    }
-
-    if (!Array.isArray(where.status) || where.status.length === 0) {
-      return fail(400, 'invalid_args', 'where.status must be a non-empty array')
-    }
-    if (typeof where.created_before !== 'string' || !ISO_DATE_RE.test(where.created_before)) {
-      return fail(400, 'invalid_args', 'where.created_before must be an ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)')
-    }
-    if (!Array.isArray(where.project_ids) || where.project_ids.length === 0) {
-      return fail(400, 'invalid_args', 'where.project_ids must be a non-empty array')
-    }
-
-    const clauses: string[] = [mode === 'archived' ? 'ta.task_id IS NOT NULL' : 'ta.task_id IS NULL']
-    const binds: unknown[] = []
-    let n = 1
-
-    const statusPlaceholders = where.status.map(() => `?${n++}`).join(',')
-    clauses.push(`t.status IN (${statusPlaceholders})`)
-    binds.push(...where.status)
-
-    clauses.push(`t.created_at < ?${n++}`)
-    binds.push(where.created_before)
-
-    const projectPlaceholders = where.project_ids.map(() => `?${n++}`).join(',')
-    clauses.push(`t.project_id IN (${projectPlaceholders})`)
-    binds.push(...where.project_ids)
-
-    const sql = `SELECT t.id FROM tasks t
-                  LEFT JOIN tasks_archive_state ta ON ta.task_id = t.id
-                  WHERE ${clauses.join(' AND ')}
-                  ORDER BY t.created_at ASC
-                  LIMIT ${PLAN_EXPAND_LIMIT + 1}`
-    const { results } = await env.DB.prepare(sql).bind(...binds).all<{ id: string }>()
-    const truncated = results.length > PLAN_EXPAND_LIMIT
-    const ids = (truncated ? results.slice(0, PLAN_EXPAND_LIMIT) : results).map((r) => r.id)
-    return done({ table: 'tasks', mode, count: ids.length, truncated, ids })
+    return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
   },
 }
 

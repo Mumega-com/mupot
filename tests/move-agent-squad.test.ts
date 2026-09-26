@@ -841,4 +841,19 @@ describe('move_agent_squad', () => {
     expect(result.ok).toBe(true)
     expect((await agentRow(agentId))?.squad_id).toBe(TO_SQUAD)
   })
+
+  it('mupot#1496 Round 3 (adversarial P1-C): refuses moving an agent into an archived destination squad', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${TO_SQUAD}';`)
+    const before = await agentRow(agentId)
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('squad_archived')
+    expect(await agentRow(agentId)).toEqual(before)
+  })
 })

@@ -208,6 +208,32 @@ describe('task/squad archive-reader integration (functional)', () => {
     expect(result.error).toBe('squad_archived')
   })
 
+  it('refuses task_create onto an archived squad with 409 squad_archived', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status='archived' WHERE id='squad-1';`)
+    const result = await invoke(ORG_ADMIN, 'task_create', {
+      squad_id: 'squad-1',
+      title: 'New Task',
+      done_when: 'it is done',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('squad_archived')
+  })
+
+  it('refuses project_squad_set onto an archived squad with 409 squad_archived', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status='archived' WHERE id='squad-1';`)
+    const result = await invoke(ORG_ADMIN, 'project_squad_set', {
+      project_id: 'proj-1',
+      squad_id: 'squad-1',
+      access_level: 'write',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('squad_archived')
+  })
+
   it('refuses squad_member_add onto an archived squad with 409 squad_archived', async () => {
     harness.sqlite.exec(`UPDATE squads SET status='archived' WHERE id='squad-1';`)
     const result = await invoke(ORG_ADMIN, 'squad_member_add', { agent: 'agent-1', squad: 'squad-1', capability: 'member' })

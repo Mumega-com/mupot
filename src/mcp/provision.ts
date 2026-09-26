@@ -1424,6 +1424,9 @@ export const toolGrantAgentCapability: ToolSpec = {
     // this door, since a home's ONLY writer is the member's own
     // self-provisioning call.
     if (squad.kind === 'home') return fail(403, 'home_scope_not_grantable')
+    // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
+    // repopulated by granting a NEW agent capability onto it.
+    if (await isSquadArchived(env, squad.id)) return fail(409, 'squad_archived')
 
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
@@ -2178,6 +2181,9 @@ export const toolMoveAgentSquad: ToolSpec = {
       'SELECT id, department_id FROM squads WHERE id = ?1 LIMIT 1',
     ).bind(toSquad.id).first<{ id: string; department_id: string }>()
     if (!destRow) return fail(404, 'squad_not_found', { squad: toSquadRef })
+    // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
+    // repopulated by moving an agent into it.
+    if (await isSquadArchived(env, destRow.id)) return fail(409, 'squad_archived')
 
     if (agent.squad_id === destRow.id) {
       return fail(400, 'same_squad', {
