@@ -164,11 +164,12 @@ function seedBearer(
 
 /**
  * A "clean legacy identity-less" row, minted through the REAL `acceptInvite()`
- * (mintToken:false — the no-mint boundary Option A/#1557 makes the JSON
- * route's own default; a hand-rolled `INSERT INTO members` fixture would
- * drift from that function's actual columns/defaults and would not prove
- * anything about the real product path). Org-level invite: no department_id,
- * no squad_id, so `acceptInvite` grants org/member.
+ * (mupot#1557/#1551 option A: acceptInvite never mints a token now — that is
+ * a function-boundary invariant, not a per-caller option — so `token: null`
+ * is unconditional; a hand-rolled `INSERT INTO members` fixture would drift
+ * from that function's actual columns/defaults and would not prove anything
+ * about the real product path). Org-level invite: no department_id, no
+ * squad_id, so `acceptInvite` grants org/member.
  */
 async function acceptCleanInvite(
   harness: SqliteD1Harness,
@@ -179,10 +180,10 @@ async function acceptCleanInvite(
   harness.sqlite
     .prepare(`INSERT INTO invites (id, email, capability, invited_by) VALUES (?, ?, 'member', ?)`)
     .run(inviteId, email, 'seed-admin')
-  const accepted = await acceptInvite(env, inviteId, 'Compat Pin User', { mintToken: false })
+  const accepted = await acceptInvite(env, inviteId, 'Compat Pin User')
   if (!accepted.ok) throw new Error(`acceptInvite failed: ${accepted.error}`)
   if (accepted.value.token !== null) {
-    throw new Error('acceptInvite({mintToken:false}) unexpectedly minted a token')
+    throw new Error('acceptInvite() unexpectedly minted a token')
   }
   return accepted.value.member_id
 }
@@ -548,15 +549,16 @@ describe('GET /auth/callback (Google login) — exclusive-control attach end to 
     expect(row).toEqual({ member_id: memberId, provider: 'google', provider_subject: 'google-sub-clean' })
   })
 
-  it('API accept (real acceptInvite, mintToken:false, next:sign_in) → ordinary Google login → linked to THAT exact member, with the invite-granted capability intact', async () => {
+  it('API accept (real acceptInvite, no-mint function boundary, #1551 option A/#1557) → ordinary Google login → linked to THAT exact member, with the invite-granted capability intact', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     const env = envFor(harness, memoryKv())
 
     // Real invite acceptance through the actual member-creation code path —
-    // the JSON accept door's own no-mint boundary (Option A/#1557: this route
-    // now returns token:null and next:'sign_in', never a bearer for an
-    // unverified email). The org/member capability grant is acceptInvite's
+    // the JSON accept door's own no-mint boundary (mupot#1551 option A/#1557,
+    // merged 326f6b47: acceptInvite() never mints a token at all now — a
+    // function-boundary invariant, not a per-caller option — never a bearer
+    // for an unverified email). The org/member capability grant is acceptInvite's
     // own write, not a test fixture.
     const memberId = await acceptCleanInvite(harness, env, 'inv-api-then-login', 'apilogin@example.com')
     const grant = harness.sqlite
