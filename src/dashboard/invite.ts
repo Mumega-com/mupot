@@ -215,9 +215,19 @@ export function inviteAlreadyAcceptedBody(brand: string) {
 // hand back on this branch (acceptInvite never mints one here), so the ONLY
 // way forward is signing in — same pending-invite marker/cookie as the
 // fresh-member path lets /auth/login → /auth/callback link the identity.
-export function inviteLinkedExistingBody(brand: string) {
+//
+// #1457 round 2 (P2 "accept that grants nothing"): when `granted` is false
+// (a DIFFERENT — or identical — grant already governed this exact scope),
+// the invite is still consumed but nothing changed; say so rather than
+// implying the invite's own access just landed.
+export function inviteLinkedExistingBody(brand: string, granted: boolean, existingCapability?: Capability) {
+  const grantNote = granted
+    ? ''
+    : `<div class="warn">This invite did not change your access — your account already
+        had${existingCapability ? ` <code>${esc(existingCapability)}</code>` : ' different'} access here.</div>`
   return pageShell(brand, 'Sign in to continue', `
     <h1>Your invite is attached to your existing account</h1>
+    ${grantNote}
     <p class="muted">Sign in to continue.</p>
     <p><a href="/auth/login">Sign in →</a></p>`)
 }
@@ -313,13 +323,15 @@ inviteApp.post('/:id', async (c) => {
         400,
       )
     }
-    // member_already_exists (the last-resort UNIQUE-violation race — see
-    // acceptInvite's own doc comment) OR #1457's two existing-member
-    // refusals (member_belongs_to_other_tenant, member_not_active) — none of
-    // these are reachable through the ordinary happy path any more (a
-    // same-tenant active member is granted onto, not refused, per #1457),
-    // so one generic copy covers what's left without over-explaining an
-    // edge case to an anonymous visitor.
+    // member_already_exists (the last-resort UNIQUE-violation race, OR an
+    // unverified/foreign/suspended existing-member match — see acceptInvite's
+    // own doc comment) OR #1457's remaining existing-member refusals
+    // (member_belongs_to_other_tenant, member_not_active,
+    // existing_member_grant_refused) — none of these are reachable through
+    // the ordinary happy path any more (a verified, same-tenant, active,
+    // non-agent-bound member the inviter outranks is granted onto, not
+    // refused, per #1457), so one generic copy covers what's left without
+    // over-explaining an edge case to an anonymous visitor.
     return c.html(
       invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),
       409,
@@ -422,7 +434,7 @@ inviteApp.post('/:id', async (c) => {
   // moment to redirect straight past. Tell them plainly and hand them the
   // sign-in button instead of a silent 302.
   if (result.value.linked_existing) {
-    return c.html(inviteLinkedExistingBody(c.env.BRAND))
+    return c.html(inviteLinkedExistingBody(c.env.BRAND, result.value.granted, result.value.capability.capability))
   }
 
   return c.redirect('/auth/login')

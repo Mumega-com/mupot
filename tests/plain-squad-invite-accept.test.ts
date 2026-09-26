@@ -148,13 +148,23 @@ describe('A3 — plain squad invite accept', () => {
   // see tests/accept-invite-existing-member.test.ts for the full #1457
   // coverage; this one stays here specifically to prove the fix reaches a
   // SQUAD-scoped invite (not just org/department) since this file already
-  // owns the squad-grant fixtures.
-  it('#1457: an existing active member on the invited email is GRANTED ONTO the squad, not refused', async () => {
+  // owns the squad-grant fixtures. Round 2 (P0): the existing member must be
+  // VERIFIED (a live human_login_identities row matching the invite email)
+  // to be granted onto at all — this fixture seeds one. Round 2 (P1): the
+  // inviter (member-admin, this file's shared fixture) also needs a REAL
+  // rank to clear the target-rank-ceiling check — granted org 'admin' here
+  // rather than in the shared makeHarness, to avoid perturbing every other
+  // test in this file that reuses it.
+  it('#1457: an existing active VERIFIED member on the invited email is GRANTED ONTO the squad, not refused', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     harness.sqlite.exec(`
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-dup', 'squaduser@example.com', 'Already Here', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id)
+      VALUES ('ident-dup', '${TENANT}', 'google', 'sub-dup', 'squaduser@example.com', 'member-dup');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin-org', 'member-admin', 'org', NULL, 'admin');
     `)
     const result = await acceptInvite(env, 'inv-squad', 'Squad User', { mintToken: false })
     expect(result.ok).toBe(true)
