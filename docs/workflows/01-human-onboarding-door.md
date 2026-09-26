@@ -236,3 +236,33 @@ side effect).
 - A migration-numbering collision is on record: `0156` in #1436's PR collided with an
   unrelated open PR's own `0156` — resolved by whichever merged second (a documented
   convention, not a defect).
+
+## Second door: email one-time link/code (mupot#1564/#1442)
+
+Source: mupot#1564. Hadi, 2026-09-26: "we only have Google login — a big stone in front
+of onboarding." Code: `src/auth/email-login.ts`, `src/auth/email-sender.ts`, routes in
+`src/auth/index.ts` (`POST /auth/email/start`, `GET /auth/email/verify`,
+`POST /auth/email/verify`). Full rollout runbook: `docs/operations/email-login.md`.
+
+This is a SECOND door onto the SAME steps 7-9 above, not a parallel identity path.
+`POST /auth/email/start` emails a single-use link (`/auth/email/verify?t=&a=`) and a
+6-digit code; either one, once verified, calls `upsertUserByEmail` +
+`mintSession(..., { loginIdentity: { provider: 'email', subject: <normalized email> } })`
+— the EXACT pair `/auth/callback` calls for Google. `registerWebSession` (step 9's own
+caller) cannot tell which door produced the `(provider, subject)` pair; it just resolves
+it the same way. Verifying control of the mailbox here is treated as IdP-grade proof for
+mupot#1551's exclusive-control predicate (`decideIdentitylessAttach`) — the same standard
+Google's `email_verified: true` claim meets.
+
+Invite integration reuses the pending-invite cookie/KV marker verbatim (step 5 above):
+`/auth/email/start` reads the SAME `mupot_pending_invite` cookie `/auth/login` reads,
+binds it into the email attempt record instead of OAuth `state`, and email verification
+re-runs the SAME `decidePendingInviteLink`/`linkAcceptedInviteIdentity` D1-authoritative
+check (step 8's logic) before minting a session — never a second copy of that contract.
+
+Gated by `EMAIL_LOGIN_ENABLED` (default off); the signed-out landing
+(`src/dashboard/index.ts`'s `signedOutLandingBody`) and the "invite already used" page
+(`src/dashboard/invite.ts`'s `inviteAlreadyAcceptedBody`, via `/`) both show the email
+option only when the flag is on.
+
+Tests: `tests/email-login.test.ts`.

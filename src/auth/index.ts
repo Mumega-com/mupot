@@ -14,6 +14,7 @@
 //   - requireRole     : factory → middleware enforcing a minimum org role | 403
 
 import { Hono } from 'hono'
+import { csrf } from 'hono/csrf'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
@@ -59,6 +60,16 @@ import {
   linkAcceptedInviteIdentity,
   parsePendingInviteIdFromState,
 } from './pending-invite-link'
+import {
+  emailSentBody,
+  emailVerifyFailureBody,
+  isEmailLoginEnabled,
+  normalizeLoginEmail,
+  startEmailLogin,
+  verifyEmailLoginByCode,
+  verifyEmailLoginByToken,
+  type VerifyEmailLoginResult,
+} from './email-login'
 
 // ── tunables ──
 const COOKIE_NAME = 'mupot_session'
@@ -816,6 +827,176 @@ authApp.get('/handoff', async (c) => {
     loginIdentity: { provider: 'mumega', subject: res.claim.email },
   })
   return c.redirect('/')
+})
+
+// ── email one-time link/code sign-in (mupot#1564/#1442) ──────────────────────
+// A normal-login door beside Google. Every mutating route here is a
+// same-origin, cookie-relevant POST — csrf() is the SAME middleware
+// dashboardApp/inviteApp apply to their own cookie-authenticated mounts (an
+// Origin check on top of SameSite=Lax, never the single line of defense).
+authApp.use('/email/*', csrf())
+
+function acceptsHtml(c: Context<AppEnv>): boolean {
+  const accept = c.req.header('accept') ?? ''
+  return accept.includes('text/html')
+}
+
+/** Accepts either a same-origin HTML form POST (the real, no-JS UI) or a JSON
+ *  body (tests, or a future API caller) — never guesses at an unknown
+ *  content-type; an unparseable body just yields empty fields, which every
+ *  caller below already treats as "nothing submitted". */
+async function readEmailFormBody(c: Context<AppEnv>): Promise<Record<string, string>> {
+  const contentType = c.req.header('content-type')?.toLowerCase() ?? ''
+  try {
+    if (contentType.includes('application/json')) {
+      const body = (await c.req.json()) as Record<string, unknown>
+      const out: Record<string, string> = {}
+      for (const [k, v] of Object.entries(body)) if (typeof v === 'string') out[k] = v
+      return out
+    }
+    const body = await c.req.parseBody()
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(body)) if (typeof v === 'string') out[k] = v
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Common tail for both verify routes on a successful token/code check: apply
+ * the SAME pending-invite link contract the Google callback honors
+ * (mupot#1436 A2 — re-verified against D1 and the state↔cookie binding, never
+ * trusted from the KV attempt record alone), then mint the session through
+ * the EXACT SAME upsertUserByEmail/mintSession pair /callback uses, with
+ * `loginIdentity: { provider: 'email', subject: emailNormalized }`. This is
+ * the one seam that ties email login into #1551's exclusive-control
+ * predicate and the ordinary member-identity resolver — never a second copy.
+ */
+async function finishEmailLoginSuccess(
+  c: Context<AppEnv>,
+  emailNormalized: string,
+  pendingInviteId: string | null,
+): Promise<Response> {
+  const env = c.env
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+
+  if (pendingInviteId !== null) {
+    const cookiePendingId = getCookie(c, PENDING_INVITE_COOKIE)
+    const inviteDecision = await decidePendingInviteLink({
+      env,
+      statePendingId: pendingInviteId,
+      cookiePendingId,
+      idpEmail: emailNormalized,
+      orgName: env.BRAND || env.TENANT_SLUG,
+    })
+    if (inviteDecision.action === 'refuse') {
+      deleteCookie(c, PENDING_INVITE_COOKIE, { path: '/' })
+      return c.html(
+        inviteLoginMismatchBody(env.BRAND || env.TENANT_SLUG, {
+          orgName: inviteDecision.orgName,
+          squadName: inviteDecision.squadName,
+        }),
+        403,
+      )
+    }
+    if (inviteDecision.action === 'link') {
+      const linked = await linkAcceptedInviteIdentity(env, {
+        tenant: env.TENANT_SLUG,
+        provider: 'email',
+        providerSubject: emailNormalized,
+        verifiedEmail: emailNormalized,
+        memberId: inviteDecision.memberId,
+      })
+      deleteCookie(c, PENDING_INVITE_COOKIE, { path: '/' })
+      if (!linked.ok) {
+        return c.html(
+          inviteLoginMismatchBody(env.BRAND || env.TENANT_SLUG, {
+            orgName: env.BRAND || env.TENANT_SLUG,
+            squadName: null,
+          }),
+          403,
+        )
+      }
+    }
+  }
+
+  const derivedId = await deriveUserId('email', emailNormalized)
+  // allowBootstrapOwner=true: email login is a legitimate first-owner path,
+  // exactly like the pot's own Google login (both are the pot's OWN
+  // first-party sign-in doors — never the SSO handoff, which stays false).
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, true)
+  await mintSession(c, userId, emailNormalized, role, {
+    loginIdentity: { provider: 'email', subject: emailNormalized },
+  })
+  return c.redirect('/')
+}
+
+function emailVerifyFailureStatus(kind: 'invalid' | 'expired' | 'too_many_attempts'): 401 | 410 | 429 {
+  if (kind === 'expired') return 410
+  if (kind === 'too_many_attempts') return 429
+  return 401
+}
+
+async function respondEmailVerifyResult(c: Context<AppEnv>, result: VerifyEmailLoginResult): Promise<Response> {
+  if (result.kind === 'ok') return finishEmailLoginSuccess(c, result.emailNormalized, result.pendingInviteId)
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+  return c.html(emailVerifyFailureBody(c.env.BRAND || c.env.TENANT_SLUG, result.kind), emailVerifyFailureStatus(result.kind))
+}
+
+// POST /auth/email/start {email} → always 200, identical body, whether the
+// email is registered, unregistered, malformed, or rate-limited (no
+// account-existence oracle — see src/auth/email-login.ts's header).
+authApp.post('/email/start', async (c) => {
+  const env = c.env
+  if (!isEmailLoginEnabled(env)) return c.json({ error: 'not_found' }, 404)
+  c.header('Cache-Control', 'no-store')
+  c.header('Referrer-Policy', 'no-referrer')
+
+  const form = await readEmailFormBody(c)
+  const email = form.email ?? ''
+  const pendingInviteId = getCookie(c, PENDING_INVITE_COOKIE) ?? null
+  const ip = c.req.header('cf-connecting-ip')
+    ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+    ?? 'unknown'
+
+  await startEmailLogin({
+    env,
+    email,
+    ip,
+    pendingInviteId,
+    origin: new URL(c.req.url).origin,
+    waitUntil: (p) => c.executionCtx.waitUntil(p),
+  })
+
+  if (acceptsHtml(c)) {
+    return c.html(emailSentBody(env.BRAND || env.TENANT_SLUG, normalizeLoginEmail(email) || email))
+  }
+  return c.json({ ok: true, message: 'If this email can receive mail, a sign-in link and code were sent.' })
+})
+
+// GET /auth/email/verify?t=&a= → the emailed link.
+authApp.get('/email/verify', async (c) => {
+  const env = c.env
+  if (!isEmailLoginEnabled(env)) return c.json({ error: 'not_found' }, 404)
+  const token = c.req.query('t') ?? ''
+  const attemptId = c.req.query('a') ?? ''
+  const result = await verifyEmailLoginByToken(env, attemptId, token)
+  return respondEmailVerifyResult(c, result)
+})
+
+// POST /auth/email/verify {email, code} → the typed-in code (cross-device:
+// the code was sent alongside the link, so it can be typed into the SAME
+// browser/tab the flow started in even when the link itself was opened on a
+// different device).
+authApp.post('/email/verify', async (c) => {
+  const env = c.env
+  if (!isEmailLoginEnabled(env)) return c.json({ error: 'not_found' }, 404)
+  const form = await readEmailFormBody(c)
+  const result = await verifyEmailLoginByCode(env, form.email ?? '', form.code ?? '')
+  return respondEmailVerifyResult(c, result)
 })
 
 // GET /auth/logout → clear server-side session + cookie (= check out of this pot).

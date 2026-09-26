@@ -53,6 +53,7 @@ import { requireAuth } from '../auth'
 // src/auth/pending-invite-link.ts), which stays exactly as-is.
 import { pageShell, esc } from './invite'
 import { PENDING_INVITE_COOKIE } from '../auth/pending-invite-link'
+import { isEmailLoginEnabled } from '../auth/email-login'
 // Fine-grained RBAC — the dashboard's mutating handlers reuse the SAME gates the
 // JSON API uses (admin on org for tokens / departments; admin on the department for
 // a squad; lead on the squad for an agent). Identity is always server-derived.
@@ -351,16 +352,27 @@ function unauthenticatedRootWantsJson(c: Context<AppEnv>): boolean {
  */
 function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
   const brand = esc(env.BRAND)
+  const emailEnabled = isEmailLoginEnabled(env)
+  const withEmail = emailEnabled ? ' or email' : ''
   const intro = hasPendingInvite
     ? `<h1>Finish joining ${brand}</h1>
-       <p class="muted">You accepted an invite — sign in with the same Google account to finish.</p>`
+       <p class="muted">You accepted an invite — sign in with the same Google account${withEmail} to finish.</p>`
     : `<h1>${brand}</h1>
        <p class="muted">${brand} runs on mupot: your org's governed agent workforce — humans decide, agents execute.</p>`
+  const emailForm = emailEnabled
+    ? `<form method="post" action="/auth/email/start" style="margin-top:14px">
+         <label for="landing-email" class="muted" style="display:block;margin-bottom:6px">Or continue with email</label>
+         <input id="landing-email" name="email" type="email" autocomplete="email" required
+           style="width:100%;box-sizing:border-box;padding:10px 12px;font-size:16px;margin-bottom:10px;border-radius:8px;border:1px solid #cfd3d0" />
+         <button type="submit" class="btn" style="width:100%">Send me a sign-in link</button>
+       </form>`
+    : ''
   return pageShell(
     env.BRAND,
     hasPendingInvite ? 'Finish joining' : 'Sign in',
     `${intro}
     <p><a class="btn" href="/auth/login">Sign in with Google</a></p>
+    ${emailForm}
     <p class="muted">Have an invite? Open the link you were sent — it looks like <code>/invite/&hellip;</code>.</p>`,
   )
 }

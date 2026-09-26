@@ -216,10 +216,14 @@ export function inviteNotFoundBody(brand: string) {
 }
 
 export function inviteAlreadyAcceptedBody(brand: string) {
+  // mupot#1564: routes through '/' (not straight to /auth/login) so a pot with
+  // EMAIL_LOGIN_ENABLED='true' offers both Google and email here, same as
+  // every other "sign in" entry point — the landing page is the one place
+  // that decides which doors are shown.
   return pageShell(brand, 'Invite already used', `
     <h1>This invite has already been used</h1>
     <p class="muted">If this was you, sign in instead.</p>
-    <p><a href="/auth/login">Go to sign in →</a></p>`)
+    <p><a href="/">Go to sign in →</a></p>`)
 }
 
 export function inviteTelegramOnlyBody(brand: string, ctx: InviteLandingContext) {
