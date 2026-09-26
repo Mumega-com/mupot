@@ -669,6 +669,67 @@ describe('GET /auth/callback (Google login) — exclusive-control attach end to 
     expect(res.status).toBe(302)
     expect(identityCountForEmail(harness)).toBe(0)
   })
+
+  it('a SUSPENDED identity-less row is refused, not attached (status-scope pin — Athena YELLOW note)', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-suspended-clean', 'suspendedclean@example.com', { status: 'suspended' })
+    const env = envFor(harness, memoryKv())
+
+    const res = await googleLogin(env, 'suspendedclean@example.com', 'google-sub-suspended-clean')
+    expect(res.status).toBe(302) // login itself still succeeds, KV-only
+    expect(identityCountForEmail(harness)).toBe(0) // but no D1 identity/attach
+  })
+
+  it('P1-b: a competing bearer inserted INSIDE the callback\'s own race window makes the attach fail — proved through the real route, not a direct linkLoginIdentity call', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-race-http', 'racehttp@example.com')
+    const kv = memoryKv()
+
+    // Wrap env.DB so that the EXACT statement decideIdentitylessAttach uses
+    // for its bearer-liveness read (the last check before reporting
+    // 'eligible' — matched on its `AS present` alias, which the atomic
+    // guard's own NOT-EXISTS subquery never carries) inserts a competing
+    // legacy bearer immediately after it resolves — i.e. AFTER the read that
+    // found nothing, but BEFORE registerWebSession's subsequent
+    // linkLoginIdentity(requireExclusiveControl) INSERT runs. Single real
+    // HTTP request, single real event loop — this is not a mock of the
+    // guard, it is a real race landed inside the real route.
+    const realDb = harness.db as unknown as {
+      prepare: (sql: string) => { bind: (...a: unknown[]) => { first: (...a: unknown[]) => Promise<unknown> } }
+      batch: unknown
+    }
+    let injected = false
+    const racyDb = {
+      prepare(sql: string) {
+        const realStmt = realDb.prepare(sql)
+        if (!sql.includes('AS present FROM member_tokens')) return realStmt
+        return {
+          bind(...args: unknown[]) {
+            const bound = realStmt.bind(...args)
+            return {
+              first: async (...fa: unknown[]) => {
+                const r = await bound.first(...fa)
+                if (!injected) {
+                  injected = true
+                  seedBearer(harness!, 'mem-race-http') // the race: lands right here
+                }
+                return r
+              },
+            }
+          },
+        }
+      },
+      batch: realDb.batch,
+    } as unknown as Env['DB']
+    const env = { ...envFor(harness, kv), DB: racyDb } as unknown as Env
+
+    const res = await googleLogin(env, 'racehttp@example.com', 'google-sub-race-http')
+    expect(res.status).toBe(302) // login still succeeds (best-effort), just unlinked
+    expect(injected).toBe(true) // the race actually fired
+    expect(identityCountForEmail(harness)).toBe(0) // and the link did NOT land
+  })
 })
 
 describe('autoEnrollSsoMember — exclusive-control fallback (mupot#1551)', () => {
@@ -738,5 +799,112 @@ describe('autoEnrollSsoMember — exclusive-control fallback (mupot#1551)', () =
     const result = await autoEnrollSsoMember(env, { email: 'brandnew@example.com', provider: 'google' })
     expect(result).toMatchObject({ ok: true, isNew: true, role: 'member' })
     expect(memberCount(harness, 'brandnew@example.com')).toBe(1)
+  })
+
+  it('P3: pins ignoreLiveIdentity — a member whose live identity has a DIFFERENT verified_email still enrolls via primary email (mupot#1266 P0-2 drift, mutation-provable)', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-drift-sso', 'driftsso@example.com')
+    const env = ssoEnv(harness)
+    const linked = await linkLoginIdentity(env, {
+      tenant: TENANT,
+      provider: 'google',
+      providerSubject: 'sub-drift-sso',
+      verifiedEmail: 'other-address@example.com', // deliberately NOT driftsso@example.com
+      memberId: 'mem-drift-sso',
+    })
+    expect(linked.ok).toBe(true)
+
+    // resolveHumanMemberId's own identityOnly pre-check misses (verified_email
+    // differs), forcing the fallback; WITHOUT ignoreLiveIdentity that fallback
+    // would see this member's own live identity and deny it as competing
+    // control — exactly the false positive the flag exists to prevent.
+    const result = await autoEnrollSsoMember(env, { email: 'driftsso@example.com', provider: 'google' })
+    expect(result).toMatchObject({ ok: true, isNew: false, memberId: 'mem-drift-sso' })
+    expect(memberCount(harness, 'driftsso@example.com')).toBe(1) // no duplicate
+  })
+
+  it('P3: provisioning exemption (admin/dashboard seed) also holds on the SSO fallback path', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-admin-sso', 'adminsso@example.com')
+    seedBearer(harness, 'mem-admin-sso', {
+      label: PROVISIONING_EXEMPT_TOKEN_LABEL,
+      channel: PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+    })
+    const env = ssoEnv(harness)
+
+    const result = await autoEnrollSsoMember(env, { email: 'adminsso@example.com', provider: 'google' })
+    expect(result).toMatchObject({ ok: true, isNew: false, memberId: 'mem-admin-sso' })
+  })
+
+  it('P3: directory-connector exemption also holds on the SSO fallback path', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-directory-sso', 'directorysso@example.com')
+    seedBearer(harness, 'mem-directory-sso', { label: 'oauth:x', channel: 'directory' })
+    const env = ssoEnv(harness)
+
+    const result = await autoEnrollSsoMember(env, { email: 'directorysso@example.com', provider: 'google' })
+    expect(result).toMatchObject({ ok: true, isNew: false, memberId: 'mem-directory-sso' })
+  })
+})
+
+describe('P1-a: a login-time denial must also close loadAuthFromCookie\'s own fallback door', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+    vi.unstubAllGlobals()
+  })
+
+  it('squatter\'s workspace/workspace bearer on mem-sq: CEO Google login never leaves mem-sq reachable as GET /auth/me\'s memberId', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-sq', 'ceo@example.com')
+    seedBearer(harness, 'mem-sq') // label=workspace, channel=workspace, agent_id NULL, live
+    const env = envFor(harness, memoryKv())
+
+    const res = await googleLogin(env, 'ceo@example.com', 'google-sub-ceo')
+    expect(res.status).toBe(302) // login itself still succeeds
+    expect(identityCountForEmail(harness)).toBe(0) // attach was denied at login time
+
+    // The cookie from that login, used on a LATER request — this is exactly
+    // the second door: loadAuthFromCookie's own fallback used to re-resolve
+    // by email alone here and silently hand back mem-sq's authority.
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    const cookie = /mupot_session=([^;]+)/.exec(setCookie)?.[1]
+    expect(cookie).toBeTruthy()
+
+    const meRes = await authApp.request(
+      `${ORIGIN}/me`,
+      { headers: { cookie: `mupot_session=${cookie}` } },
+      env,
+    )
+    expect(meRes.status).toBe(200)
+    const body = (await meRes.json()) as { memberId?: string }
+    expect(body.memberId).not.toBe('mem-sq')
+    expect(body.memberId).toBeUndefined()
+  })
+
+  it('control case: a CLEAN identity-less row IS reachable the same way (the fallback still works when nothing is denied)', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-clean-me', 'cleanme@example.com')
+    const env = envFor(harness, memoryKv())
+
+    const res = await googleLogin(env, 'cleanme@example.com', 'google-sub-cleanme')
+    expect(res.status).toBe(302)
+    expect(identityCountForEmail(harness)).toBe(1) // attached normally
+
+    const setCookie = res.headers.get('set-cookie') ?? ''
+    const cookie = /mupot_session=([^;]+)/.exec(setCookie)?.[1]
+    const meRes = await authApp.request(
+      `${ORIGIN}/me`,
+      { headers: { cookie: `mupot_session=${cookie}` } },
+      env,
+    )
+    const body = (await meRes.json()) as { memberId?: string; webSessionMemberId?: string }
+    expect(body.webSessionMemberId ?? body.memberId).toBe('mem-clean-me')
   })
 })

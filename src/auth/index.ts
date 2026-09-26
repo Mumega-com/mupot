@@ -26,6 +26,7 @@ import {
   revokeLoginIdentity,
 } from './login-identity'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
+import { decideIdentitylessAttach } from '../members/exclusive-control'
 import {
   createWebSession,
   evaluateWebSession,
@@ -88,6 +89,22 @@ interface SessionRecord {
    * closed toward "no D1 registry entry", never toward "trust it anyway").
    */
   webSessionRegistered?: boolean
+  /**
+   * The verified (provider, subject) THIS login itself presented, persisted
+   * unconditionally at mint time — regardless of whether registerWebSession's
+   * D1 attach succeeded. mupot#1551 round 2 (P1-a): without this, a login
+   * whose attach was correctly DENIED (a competing bearer/Telegram/identity
+   * on the matching-email row) left `webSessionRegistered` unset, and
+   * loadAuthFromCookie's own fallback used to re-resolve by EMAIL ALONE on
+   * every subsequent request — silently granting the denied row's authority
+   * through a second door the login-time denial never touched. Storing the
+   * join key here lets that fallback retry the SAME guarded
+   * registerWebSession attach (idempotent, safe to repeat) instead of
+   * falling back to a lenient email match. Absent on sessions minted before
+   * this field existed — those degrade to a read-only eligibility check
+   * (decideIdentitylessAttach), never the old unconditional email lookup.
+   */
+  loginIdentity?: { provider: string; subject: string }
 }
 
 // Role precedence for the minimum-role gate: owner > admin > member.
@@ -364,6 +381,9 @@ async function mintSession(
     role,
     createdAt: new Date().toISOString(),
     ...(webSessionRegistered ? { webSessionRegistered: true } : {}),
+    // Persisted regardless of registration success — see the field's own
+    // doc comment (mupot#1551 round 2, P1-a).
+    ...(opts.loginIdentity ? { loginIdentity: opts.loginIdentity } : {}),
   }
   await c.env.SESSIONS.put(sessionKey(sessionId), JSON.stringify(record), {
     expirationTtl: SESSION_TTL_SECONDS,
@@ -1434,12 +1454,56 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
   // Identity resolution is an enhancement; it must never be able to take down auth.
   if (c.env.DB) {
     try {
-      const memberId =
-        auth.webSessionMemberId ??
-        (await resolveHumanMemberId(c.env, {
+      let memberId: string | null = auth.webSessionMemberId ?? null
+      if (!memberId && record.loginIdentity) {
+        // mupot#1551 round 2 (P1-a): this session HAS its own verified join
+        // key — retry the SAME guarded attach registerWebSession already
+        // tried at login time, never the lenient email-only lookup. Safe to
+        // repeat every request until it lands: registerWebSession's own
+        // resolveLoginIdentity check short-circuits instantly once linked,
+        // and requireExclusiveControl makes a still-denied row a no-op read
+        // (a failed conditional INSERT), never a silent grant.
+        const nowRegistered = await registerWebSession(
+          c.env,
+          sessionId,
+          record.email,
+          record.loginIdentity,
+        )
+        if (nowRegistered) {
+          // Newly linked on THIS request — persist the flag so future
+          // requests take the fast `webSessionMemberId` path above instead
+          // of retrying the write every time.
+          await c.env.SESSIONS.put(
+            sessionKey(sessionId),
+            JSON.stringify({ ...record, webSessionRegistered: true }),
+            { expirationTtl: SESSION_TTL_SECONDS },
+          )
+          const webSession = await loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
+          if (webSession.ok) {
+            auth.webSessionIdHash = webSession.session.id_hash
+            auth.webSessionMemberId = webSession.session.member_id
+            memberId = webSession.session.member_id
+          }
+        }
+        // Still denied/unresolved: memberId stays null. NEVER fall through to
+        // the old lenient email-only resolveHumanMemberId call below — that
+        // is exactly the second door a login-time denial must also close.
+      } else if (!memberId && !record.loginIdentity) {
+        // Legacy session minted before `loginIdentity` was persisted (or a
+        // channel that never had one). No join key to retry an attach with —
+        // apply the SAME read-only eligibility check the attach path itself
+        // would require, rather than the old unconditional email match. A
+        // denied/ambiguous/not_found row grants nothing; this never links
+        // (no subject to link with), it only decides whether it's safe to
+        // ACT as the row for this one request.
+        const decision = await decideIdentitylessAttach(c.env, {
           tenant: c.env.TENANT_SLUG,
-          email: auth.email,
-        }))
+          normalizedEmail: (auth.email ?? '').trim().toLowerCase(),
+        })
+        if (decision.kind === 'eligible') {
+          memberId = decision.memberId
+        }
+      }
       if (memberId) {
         auth.memberId = memberId
         auth.channel = 'dashboard'

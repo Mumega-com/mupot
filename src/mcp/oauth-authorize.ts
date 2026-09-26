@@ -38,6 +38,8 @@ import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
+import { linkLoginIdentity } from '../auth/login-identity'
+import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
@@ -1460,6 +1462,19 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         subject: googleUser.id,
       })
     } catch (err) {
+      // mupot#1551 round 2 (P0): a denial/ambiguity is NOT the same failure
+      // as a D1 outage — it means this email's member row is legitimately
+      // someone else's (or ambiguous) and must never silently become a
+      // second row. Distinct status, distinct body, no retry-with-same-input
+      // implied by a 500.
+      if (err instanceof MemberAttachDeniedError) {
+        console.error('[oauth-authorize] member attach refused:', err.code)
+        const status = err.code === 'member_attach_ambiguous' ? 409 : 403
+        return new Response(
+          'Could not connect this Google account to a mupot member. Contact an org admin.',
+          { status, headers: { 'Content-Type': 'text/plain' } },
+        )
+      }
       console.error('[oauth-authorize] member find-or-create failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Member provisioning failed', { status: 500 })
     }
@@ -1801,6 +1816,38 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     } catch (err) {
       console.error('[oauth-authorize] token mint failed:', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
       return new Response('Token mint failed', { status: 500 })
+    }
+
+    // mupot#1551 round 2 (adversarial gate P0): mint time is exactly when this
+    // flow has a verified (provider, subject) in hand for the CONNECTING
+    // HUMAN (pending.memberId — never mintMemberId, which is the AGENT's own
+    // member on the bound-consent path). Link it now so this member row is no
+    // longer identity-less going forward: the NEXT reconnect resolves by live
+    // identity (step 2, before decideIdentitylessAttach's directory-token
+    // exemption is even consulted), and an ordinary web Google login for the
+    // same subject is `eligible` by identity, not by a token exemption. Same
+    // guarded path as registerWebSession (src/auth/index.ts) —
+    // requireExclusiveControl re-verifies atomically, so this can never
+    // silently attach over a row that gained a competing controller between
+    // findOrCreateMember's earlier resolve and this write. Best-effort and
+    // non-fatal, same posture as the oauth_consent_receipts write below: a
+    // link failure here must not block an otherwise-successful connector
+    // login — the pre-existing (pre-this-fix) directory-token exemption in
+    // decideIdentitylessAttach is exactly the safety net for that case.
+    try {
+      const linked = await linkLoginIdentity(env, {
+        tenant: env.TENANT_SLUG,
+        provider: 'google',
+        providerSubject: pending.googleUserId,
+        verifiedEmail: pending.email,
+        memberId: pending.memberId,
+        requireExclusiveControl: true,
+      })
+      if (!linked.ok) {
+        console.error('[oauth-authorize] connector identity link refused (non-fatal):', linked.error)
+      }
+    } catch (err) {
+      console.error('[oauth-authorize] connector identity link failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
     }
 
     // mupot#903b P1-3 (adversarial review): "human X consented to bind to agent A

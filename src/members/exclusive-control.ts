@@ -69,12 +69,46 @@
 // not reachable from here at all, and `member_tokens` itself carries no
 // `minted_by`/provenance column. Nothing stronger than label/channel exists
 // inside the tenant's own database today.
+//
+// SECOND EXEMPTION — channel='directory' (round 2, adversarial gate P0,
+// 2026-09-26 — REGRESSION found against this PR's own head, not pre-existing
+// on main): `mintDirectoryToken` (src/mcp/oauth-authorize.ts) mints an
+// unbound (`agent_id IS NULL`), non-expiring (`expires_at IS NULL`) bearer
+// for the CONNECTING HUMAN's own member row on every "continue unbound" MCP
+// directory-OAuth consent — reached only AFTER a verified Google OAuth
+// exchange. Before this exemption, that token alone made the row read as
+// competing-controlled, so `findOrCreateHumanMember`
+// (src/members/human-identity.ts) saw a denial collapsed to `null` and
+// INSERTed a duplicate member — 500/UNIQUE on a plain reconnect, a second row
+// forever on a case-variant reconnect, and a connector-first human who later
+// tried an ordinary web Google login got zero identity/session. Prod count
+// at time of fix: 2 identity-less rows held a live unbound directory token
+// (4 tokens total); a 3rd denied row was the legacy workspace/workspace
+// squat shape and correctly stays denied.
+//
+// Real fix, not just the exemption: `src/mcp/oauth-authorize.ts` now calls
+// `linkLoginIdentity` (same guarded `requireExclusiveControl` path) for the
+// connecting human's own (provider, subject) at mint time, so any row that
+// mints a NEW directory token today also gains a real identity immediately
+// — this exemption only matters for the rows that already held one without
+// a linked identity before that fix shipped. Same containment framing as
+// admin/dashboard: `channel` is a fixed enum value on `member_tokens`
+// (migration 0020), but `mintMemberToken` (reached via the org-admin-gated
+// `POST /members/:id/tokens`) accepts ANY caller-chosen channel including
+// `'directory'`, so this is spoofable the same way and by the same actor who
+// already holds mint authority over the row — not a privilege escalation.
+// "No other live identity/token/telegram exists" falls out of the existing
+// structure for free: the telegram and identity checks above are
+// independent and unaffected, and this exemption only widens which BEARER
+// rows are excluded from the NOT-EXISTS scan below — a row that ALSO holds
+// some other non-exempt live bearer still trips the check on that other row.
 
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 
 export const PROVISIONING_EXEMPT_TOKEN_LABEL = 'admin'
 export const PROVISIONING_EXEMPT_TOKEN_CHANNEL = 'dashboard'
+export const PROVISIONING_EXEMPT_DIRECTORY_CHANNEL = 'directory'
 
 export interface DecideIdentitylessAttachInput {
   tenant: string
@@ -206,13 +240,16 @@ export async function decideIdentitylessAttach(
   }
 
   // 3. Any live, UNBOUND (agent_id IS NULL) member bearer, excluding only the
-  //    documented provisioning seed. Shared liveness predicate (revocation +
-  //    expiry) — never `revoked_at IS NULL` alone.
+  //    documented provisioning seed and the directory-OAuth connector's own
+  //    unbound token (see the module header — both are containment, not
+  //    provenance). Shared liveness predicate (revocation + expiry) — never
+  //    `revoked_at IS NULL` alone.
   const liveBearer = await env.DB.prepare(
     `SELECT 1 AS present FROM member_tokens t
       WHERE t.tenant = ?1 AND t.member_id = ?2 AND t.agent_id IS NULL
         AND NOT (t.label = ?3 AND t.channel = ?4)
-        AND ${TOKEN_LIVE_PREDICATE('?5')}
+        AND t.channel != ?5
+        AND ${TOKEN_LIVE_PREDICATE('?6')}
       LIMIT 1`,
   )
     .bind(
@@ -220,6 +257,7 @@ export async function decideIdentitylessAttach(
       candidate.id,
       PROVISIONING_EXEMPT_TOKEN_LABEL,
       PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+      PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
       nowSqlUtc(),
     )
     .first<{ present: number }>()

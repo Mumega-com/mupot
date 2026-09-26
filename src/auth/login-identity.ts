@@ -21,6 +21,7 @@
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 import {
+  PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
   PROVISIONING_EXEMPT_TOKEN_LABEL,
 } from '../members/exclusive-control'
@@ -145,19 +146,22 @@ export async function linkLoginIdentity(
            WHERE h2.tenant = ?2 AND h2.member_id = ?6 AND h2.revoked_at IS NULL
         )
         AND NOT EXISTS (
-          -- The (label, channel) exemption below is CONTAINMENT, not proof of
-          -- origin — an org admin can mint a caller-chosen label/channel via
+          -- Both exemptions below are CONTAINMENT, not proof of origin — an
+          -- org admin can mint a caller-chosen label/channel via
           -- POST /members/:id/tokens (src/members/service.ts mintMemberToken)
-          -- and spoof this exact tuple onto a row they already control. Not a
+          -- and spoof either onto a row they already control. Not a
           -- privilege escalation (they already hold mint power over the row),
-          -- but do not add a second guarantee on top of this exemption
+          -- but do not add a second guarantee on top of either exemption
           -- without re-reading src/members/exclusive-control.ts's header,
           -- which documents why no stronger anchor (e.g.
-          -- pot_provision_receipts) is reachable from the tenant's own D1.
+          -- pot_provision_receipts) is reachable from the tenant's own D1,
+          -- and why the directory-channel exemption exists at all (mupot#1551
+          -- round 2 P0: mintDirectoryToken's own unbound connector token).
           SELECT 1 FROM member_tokens t
            WHERE t.tenant = ?2 AND t.member_id = ?6 AND t.agent_id IS NULL
              AND NOT (t.label = ?9 AND t.channel = ?10)
-             AND ${TOKEN_LIVE_PREDICATE('?11')}
+             AND t.channel != ?11
+             AND ${TOKEN_LIVE_PREDICATE('?12')}
         )
         AND NOT EXISTS (
           SELECT 1 FROM members m
@@ -175,6 +179,7 @@ export async function linkLoginIdentity(
         now,
         PROVISIONING_EXEMPT_TOKEN_LABEL,
         PROVISIONING_EXEMPT_TOKEN_CHANNEL,
+        PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
         nowSql,
       )
       .run()
