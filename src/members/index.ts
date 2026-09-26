@@ -815,13 +815,18 @@ const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 // mupot#1551 slice 2 — the "squatted row" shape: a member row that (a) no
 // real human has ever proven ownership of (zero LIVE human_login_identities)
 // and (b) someone already holds a live bearer for (>=1 live member_tokens).
-// This is the enabler mupot#1457/#1550's adversarial gate traced the
-// takeover to: mint a member for an arbitrary invited email over the public
-// JSON accept (no identity proof required there), hold the token, then wait
-// for a HIGHER-capability invite to land on the SAME email. Refusing new
-// invites onto that exact shape (unless the creator is already org-admin —
-// an org-admin re-inviting a known operator is not the attack this closes)
-// makes the row un-targetable a second time without an org-admin's say-so.
+// This is the SHAPE mupot#1457/#1550's adversarial gate traced a takeover
+// to: mint a member for an arbitrary invited email, hold a token for it,
+// then wait for a HIGHER-capability invite to land on the SAME email. #1557
+// (merged onto this branch, mupot#1551 option A) closed the SPECIFIC
+// mechanism this comment originally described — the public JSON accept
+// itself no longer mints ANY token — but the shape it produced (an
+// identity-less row someone already holds a live bearer for) can still
+// arise other ways (an admin-minted token via POST /members/:id/tokens, a
+// Telegram/project bind, a future producer), so refusing a NEW invite onto
+// that exact shape (unless the creator is already org-admin — an org-admin
+// re-inviting a known operator is not the attack this closes) remains a
+// live, useful defense-in-depth rather than dead code for a closed door.
 //
 // One exported string, reused VERBATIM as both the pre-check's SELECT and
 // the creating INSERT's own WHERE guard below — never a second hand-copy.

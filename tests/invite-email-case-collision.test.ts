@@ -21,11 +21,13 @@
 //      atomic statement, not a separate SELECT-then-INSERT — so even an
 //      invite that predates this fix (or a genuine concurrent collision)
 //      cannot mint a case-ambiguous second row. Every OTHER statement in the
-//      same batch that references member.id (capabilities, member_tokens,
-//      the invites.member_id stamp — all real FKs into members(id)) is
-//      ALSO guarded on the member row actually existing, so a blocked
-//      member insert cannot cascade into a raw FOREIGN KEY error; it comes
-//      back as the same named `member_already_exists`.
+//      same batch that references member.id (capabilities and the
+//      invites.member_id stamp — both real FKs into members(id); #1557
+//      removed the member_tokens write from this function entirely, so
+//      there is no third one to guard) is ALSO guarded on the member row
+//      actually existing, so a blocked member insert cannot cascade into a
+//      raw FOREIGN KEY error; it comes back as the same named
+//      `member_already_exists`.
 //
 // MUTATION LEDGER (each mutated in place, confirmed RED, restored, `git
 // diff` verified clean):
@@ -176,7 +178,7 @@ describe('mupot#1551 — invite email case-collision (gate finding on #1557)', (
         VALUES ('member-bob-upper', 'BOB@example.com', 'Bob Upper', 'active', '${TENANT}');
     `)
 
-    const result = await acceptInvite(envFor(harness), 'inv-case', 'Bob', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-case', 'Bob')
     expect(result).toEqual({ ok: false, error: 'member_already_exists' })
 
     const row = harness.sqlite
@@ -212,7 +214,7 @@ describe('mupot#1551 — invite email case-collision (gate finding on #1557)', (
       return realBatch(statements)
     }) as typeof env.DB.batch
 
-    const result = await acceptInvite(env, 'inv-race-case', 'Carol', { mintToken: false })
+    const result = await acceptInvite(env, 'inv-race-case', 'Carol')
     expect(result).toEqual({ ok: false, error: 'member_already_exists' })
 
     const row = harness.sqlite

@@ -132,7 +132,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     grant(harness, 'inviter', 'squad', 'squad-web', 'admin')
     seedInvite(harness, 'inv-ok', 'newcomer@example.com', 'squad-web', 'member', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-ok', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-ok', 'Newcomer')
     expect(result.ok).toBe(true)
   })
 
@@ -170,7 +170,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     grant(harness, 'inviter', 'squad', 'squad-web', 'admin')
     seedInvite(harness, 'inv-suspended', 'newcomer@example.com', 'squad-web', 'member', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-suspended', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-suspended', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
 
     const row = inviteRow(harness, 'inv-suspended')
@@ -187,7 +187,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     // invite at mint time has since been revoked.
     seedInvite(harness, 'inv-revoked', 'newcomer@example.com', 'squad-web', 'member', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-revoked', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-revoked', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
   })
 
@@ -197,7 +197,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     grant(harness, 'inviter', 'squad', 'squad-other', 'admin')
     seedInvite(harness, 'inv-wrong-squad', 'newcomer@example.com', 'squad-web', 'member', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-wrong-squad', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-wrong-squad', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
   })
 
@@ -209,7 +209,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     // let this through; only the admin-or-better FLOOR refuses it.
     seedInvite(harness, 'inv-lead-only', 'newcomer@example.com', 'squad-web', 'observer', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-lead-only', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-lead-only', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
   })
 
@@ -222,7 +222,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     grant(harness, 'inviter', 'squad', 'squad-web', 'admin')
     seedInvite(harness, 'inv-ceiling', 'newcomer@example.com', 'squad-web', 'owner', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-ceiling', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-ceiling', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
   })
 
@@ -230,7 +230,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     harness = baseHarness()
     seedInvite(harness, 'inv-null-inviter', 'newcomer@example.com', 'squad-web', 'member', null)
 
-    const result = await acceptInvite(envFor(harness), 'inv-null-inviter', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-null-inviter', 'Newcomer')
     expect(result).toEqual({ ok: false, error: 'invite_inviter_no_longer_authorized' })
   })
 
@@ -240,7 +240,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
     grant(harness, 'inviter', 'org', null, 'admin')
     seedInvite(harness, 'inv-org-admin', 'newcomer@example.com', 'squad-web', 'member', 'inviter')
 
-    const result = await acceptInvite(envFor(harness), 'inv-org-admin', 'Newcomer', { mintToken: false })
+    const result = await acceptInvite(envFor(harness), 'inv-org-admin', 'Newcomer')
     expect(result.ok).toBe(true)
   })
 
@@ -260,7 +260,7 @@ describe('mupot#1551 slice 1 — inviter re-check at redemption', () => {
       return realBatch(statements)
     }) as typeof env.DB.batch
 
-    await expect(acceptInvite(env, 'inv-race', 'Newcomer', { mintToken: false })).rejects.toThrow(
+    await expect(acceptInvite(env, 'inv-race', 'Newcomer')).rejects.toThrow(
       /receipt_failed/,
     )
 
