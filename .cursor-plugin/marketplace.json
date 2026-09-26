@@ -1,0 +1,25 @@
+{
+  "name": "mupot",
+  "owner": {
+    "name": "Mumega",
+    "email": "hadi@mumega.com"
+  },
+  "metadata": {
+    "description": "Mumega pot plugins hosted in this repository. Not a Cursor Marketplace submission.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "mupot",
+      "source": "integrations/cursor-mupot-plugin",
+      "description": "Mumega pot MCP for Cursor + Grok Bot — identity, inbox, send, check-in; not a chatbot host",
+      "version": "0.1.0",
+      "author": {
+        "name": "Mumega",
+        "email": "hadi@mumega.com"
+      },
+      "keywords": ["mupot", "mumega", "mcp", "grok-bot", "agents"],
+      "logo": "assets/logo.svg"
+    }
+  ]
+}

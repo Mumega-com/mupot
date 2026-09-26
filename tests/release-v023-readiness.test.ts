@@ -119,7 +119,7 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     expect(changelog).toContain('## [0.23.0-rc.1] — 2026-07-10')
     expect(roadmap).toContain(`Current source version | \`${MUPOT_PUBLIC_API_VERSION}\``)
     expect(roadmap).toContain(`Next stable candidate | \`v${MUPOT_PUBLIC_API_VERSION}\``)
-    expect(roadmap).toContain('Last tagged release | `v0.25.0`')
+    expect(roadmap).toContain('Last tagged stable release | `v0.25.0`')
     // Stabilization deliberately removed broad product scope from the v0.30 contract.
     // A later roadmap change must assign a new target before implementation resumes.
     expect(roadmap).toContain(

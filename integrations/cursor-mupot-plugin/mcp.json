@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mupot": {
+      "url": "https://mupot.mumega.com/mcp?seat=${MUPOT_SEAT_QUERY}",
+      "headers": {
+        "Authorization": "Bearer ${MUPOT_TOKEN}",
+        "x-mupot-seat": "${MUPOT_SEAT_LABEL}"
+      }
+    }
+  }
+}
