@@ -18,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import type { FlightRow } from '../src/flight/service'
-import { FLIGHT_SYSTEM_LAND_GRACE_MS, sweepStalledFlights } from '../src/flight/watchdog'
+import { FLIGHT_SYSTEM_LAND_GRACE_MS, sweepStalledFlights, systemLandParkedFlight } from '../src/flight/watchdog'
 import { canonicalFlightMetaSql } from '../src/flight/meta-sql'
 import { createFlight, FlightIdempotencyConflictError } from '../src/flight/service'
 import { runRoutineScheduler } from '../src/routines/scheduler'
@@ -316,6 +316,10 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
 
   it('P1-A ZOMBIE: finished + approved, never landed → system-landed only AFTER the 6h grace', async () => {
     const id = await zombie(env, ['task-1', 'task-2'])
+    // Launched 10h ago: a launch-based grace would already be spent. The grace runs from
+    // when the flight PARKED.
+    harness.sqlite.prepare('UPDATE flights SET started_at = started_at - ?, created_at = created_at - ? WHERE id = ?')
+      .run(10 * HOUR, 10 * HOUR, id)
     const since = flightRow(harness, id).waiting_since as number
 
     const early = await sweepStalledFlights(env, { nowMs: since + FLIGHT_SYSTEM_LAND_GRACE_MS - MIN })
@@ -343,7 +347,9 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     await verdict(env, 'task-2', 'approved')
     await close(env, 'task-1') // task-2 approved, not done
     const since = flightRow(harness, id).waiting_since as number
-    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0 })
+    // Not finished, so it is not in the system-land window at all: neither landed nor
+    // escalated early — it is an ordinary gate wait, escalated only at 24h.
+    expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 0 })
     expect(flightRow(harness, id).status).toBe('waiting')
   })
 
@@ -435,6 +441,10 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     const id = await zombie(env, ['task-1'])
     harness.sqlite.prepare('UPDATE flights SET budget_micro_usd = NULL WHERE id = ?').run(id)
     const since = flightRow(harness, id).waiting_since as number
+    // Refused by the budget-policy check itself (landGovernedFlight parity), not merely by
+    // the guarded UPDATE matching nothing.
+    expect(await systemLandParkedFlight(env, flightRow(harness, id), since + 7 * HOUR))
+      .toEqual({ landed: false, reason: 'flight_budget_policy_missing' })
     expect(await sweepStalledFlights(env, { nowMs: since + 7 * HOUR })).toMatchObject({ system_landed: 0, escalated: 1 })
     expect(flightRow(harness, id).status).toBe('waiting')
   })
