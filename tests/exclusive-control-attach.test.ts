@@ -178,6 +178,18 @@ async function acceptCleanInvite(
   inviteId: string,
   email: string,
 ): Promise<string> {
+  // mupot#1559 (#1551 slice 1): acceptInvite now re-checks the inviter fresh
+  // from D1 at redemption — active member of this tenant, admin-or-better on
+  // the invite's own scope. `seed-admin` must be a REAL member with real
+  // standing, not a bare id string, or redemption now refuses
+  // invite_inviter_no_longer_authorized. INSERT OR IGNORE so this helper
+  // stays idempotent across the multiple invites a single test may create.
+  harness.sqlite.exec(`
+    INSERT OR IGNORE INTO members (id, email, display_name, status, tenant)
+      VALUES ('seed-admin', 'seed-admin@example.com', 'Seed Admin', 'active', '${TENANT}');
+    INSERT OR IGNORE INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-seed-admin-org', 'seed-admin', 'org', NULL, 'admin');
+  `)
   harness.sqlite
     .prepare(`INSERT INTO invites (id, email, capability, invited_by) VALUES (?, ?, 'member', ?)`)
     .run(inviteId, email, 'seed-admin')
