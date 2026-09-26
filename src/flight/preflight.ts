@@ -13,7 +13,19 @@
 
 export interface FlightSignals {
   // Hard prerequisites.
-  contextComplete: boolean // goal/KPI/owner + plan + data all loaded
+  //
+  // NAMING: `contextComplete` is about the BRIEF — is the goal/KPI/owner, plan and
+  // data loaded. It is NOT about the agent's context-WINDOW occupancy. The two
+  // senses of "context" are easy to conflate, and the mistake is one-directional
+  // and silent: a reader scanning this interface for a context-headroom check
+  // finds a field named `contextComplete` reading `true` and stops looking.
+  //
+  // There is no context-headroom signal here. Task 2e6db8ec ("airworthiness gate")
+  // asks for `agent_context_percent <= 70` and a token margin before GO; measured
+  // 2026-09-10, neither `agent_context_percent` nor `token_remaining` exists
+  // anywhere in src/, and `seat_status` carries presence rather than occupancy.
+  // So a flight can start at any context occupancy — this field does not gate it.
+  contextComplete: boolean // goal/KPI/owner + plan + data all loaded (NOT context-window headroom)
   toolsReachable: boolean // every tool/MCP the flight needs answers
   budgetRemainingMicroUsd: number // budget left in the window
   budgetEstimateMicroUsd: number // estimated cost of the whole flight
