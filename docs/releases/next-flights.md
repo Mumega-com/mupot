@@ -11,8 +11,8 @@ ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains 
 |---|---|
 | Current `main` | `0.30.0` — not pinned here; read `git rev-parse origin/main` |
 | Current production | `0.30.0` — read live `/health`; last recorded deploy `1303648c141eb5f5e9fa5efe76ef1776c6711011`, `clean:true`, 2026-09-05 (eleven-PR security and identity sweep). Equal to `main` at the time of writing; both move independently and this line ages on the next merge or deploy. |
-| Latest tagged stable release | `v0.25.0` |
-| Next stable candidate | `v0.30.0` |
+| Latest tagged stable release | `v0.30.0` — annotated tag on `release/v0.30.0` at `09ea48f6`, 2026-09-26 (ROADMAP option 2: release branch; `main` keeps moving) |
+| Next stable candidate | `v0.30.1` — P0 cherry-picks onto `release/v0.30.0` only |
 | Next development release | `v0.31.0` |
 
 The three states are intentionally different. Code on `main` is not necessarily

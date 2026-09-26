@@ -148,8 +148,8 @@ PR's own commit message, which in a few cases named a *different*, superseded PR
   Production and `main` are at the same commit at the time of writing — the first time
   they have agreed since the 2026-09-01 freeze attempt. Read the live `/health` endpoint
   for the authoritative answer; this line ages the moment anything merges.
-- **Latest tagged stable release:** `v0.25.0`. Unchanged for the eighth consecutive
-  status block. `v0.29.0` and `v0.30.0` have never been tagged. `v0.30.0-rc.1` exists at
+- **Tagged stable release as of 2026-09-06 (superseded by v0.30.0 on 2026-09-26):** `v0.25.0`. Unchanged for the eighth consecutive
+  status block at the time. `v0.29.0` and `v0.30.0` have never been tagged. `v0.30.0-rc.1` exists at
   `0bb9c256` (2026-09-03) and is superseded — 15 commits have landed on `main` since it
   was cut, including four security fixes and three identity fixes.
 - **The version number is not tracking the work.** `package.json` and `src/version.ts`
@@ -313,8 +313,8 @@ one label, against `UNIQUE(tenant, member_id, label)`); #1253 conflicts with #12
   almost immediately. Compare `git rev-parse origin/main` against live `/health` to see the
   real gap. Neither is a stable-release claim, because a stable release requires a tag, not
   a deployment.
-- **Latest tagged stable release:** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
-  currently has a release tag or GitHub release, so source-version headings below are
+- **Tagged stable release as of 2026-09-02 (superseded by v0.30.0 on 2026-09-26):** `v0.25.0`. Neither `v0.29.0` nor `v0.30.0`
+  had a release tag then or GitHub release, so source-version headings below are
   preview history, not a supported stable contract.
 - **v0.30.0 stabilization candidate:** PR #1239 landed as merge commit
   `f3389d65172b9660efaa82999675739046a987e9`, restoring a green main migration,
