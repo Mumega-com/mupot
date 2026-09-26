@@ -3,7 +3,29 @@
 import { html } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 
-export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): HtmlEscapedString | Promise<HtmlEscapedString> {
+export interface PricingPageOptions {
+  /**
+   * mupot#1518: whether anonymous self-serve checkout is on (isPotSelfServeCheckoutEnabled).
+   * Defaults to FALSE — a caller that forgets to pass it gets the disabled page, never a
+   * page whose buttons POST to a checkout that bills without provisioning.
+   */
+  checkoutEnabled?: boolean
+}
+
+/** Shown in place of the checkout flow while self-serve checkout is disabled (mupot#1518). */
+export const CHECKOUT_UNAVAILABLE_NOTICE = 'Self-serve checkout is temporarily unavailable. Contact us to set up a pot.'
+
+function tierCta(checkoutEnabled: boolean, tier: string, label: string): HtmlEscapedString | Promise<HtmlEscapedString> {
+  return checkoutEnabled
+    ? html`<button type="button" class="tier-cta" data-tier="${tier}">${label}</button>`
+    : html`<button type="button" class="tier-cta" disabled aria-disabled="true">Contact us</button>`
+}
+
+export function pricingPageHtml(
+  _origin: string = 'https://mupot.mumega.com',
+  options: PricingPageOptions = {},
+): HtmlEscapedString | Promise<HtmlEscapedString> {
+  const checkoutEnabled = options.checkoutEnabled === true
   return html`<!doctype html>
 <html lang="en">
   <head>
@@ -78,6 +100,11 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
       }
       .tier-card:not(.is-popular) .tier-cta { background: var(--raised); color: var(--text); border: 1px solid var(--line); }
       .tier-card:not(.is-popular) .tier-cta:hover { background: rgba(255,255,255,.08); }
+      .tier-cta[disabled] { cursor: not-allowed; opacity: .6; }
+      .checkout-notice {
+        background: var(--raised); border: 1px solid var(--gold); color: var(--text); border-radius: 12px;
+        padding: 16px 20px; margin-bottom: 32px; text-align: center; font-size: 15px;
+      }
     </style>
   </head>
   <body>
@@ -97,6 +124,8 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
         </div>
       </div>
 
+      ${checkoutEnabled ? '' : html`<p class="checkout-notice" role="status">${CHECKOUT_UNAVAILABLE_NOTICE}</p>`}
+
       <div class="pricing-grid">
         <div class="tier-card">
           <h2 class="tier-name">Starter</h2>
@@ -108,7 +137,7 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
             <li class="tier-feature">Isolated Cloudflare D1 Vault</li>
             <li class="tier-feature">Studio Dark Canvas UI</li>
           </ul>
-          <button type="button" class="tier-cta" data-tier="starter">Launch Starter Pot</button>
+          ${tierCta(checkoutEnabled, 'starter', 'Launch Starter Pot')}
         </div>
 
         <div class="tier-card is-popular">
@@ -123,7 +152,7 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
             <li class="tier-feature">Slack & Discord Outbound Alerts</li>
             <li class="tier-feature">Custom Domain & SSL Routing</li>
           </ul>
-          <button type="button" class="tier-cta" data-tier="pro">Launch Pro Pot</button>
+          ${tierCta(checkoutEnabled, 'pro', 'Launch Pro Pot')}
         </div>
 
         <div class="tier-card">
@@ -137,11 +166,18 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
             <li class="tier-feature">24/7 Autonomous Cron Routines</li>
             <li class="tier-feature">Synthetic Council Athena Reviews</li>
           </ul>
-          <button type="button" class="tier-cta" data-tier="scale">Launch Scale Pot</button>
+          ${tierCta(checkoutEnabled, 'scale', 'Launch Scale Pot')}
         </div>
       </div>
     </div>
-    <script>
+    ${checkoutEnabled ? checkoutScript() : ''}
+  </body>
+</html>`
+}
+
+// The only client code that POSTs to /api/pots/checkout. Rendered ONLY when checkout is enabled.
+function checkoutScript(): HtmlEscapedString | Promise<HtmlEscapedString> {
+  return html`<script>
       document.querySelectorAll('.tier-cta').forEach(function(btn) {
         btn.addEventListener('click', async function() {
           var tier = btn.getAttribute('data-tier');
@@ -172,7 +208,5 @@ export function pricingPageHtml(_origin: string = 'https://mupot.mumega.com'): H
           }
         });
       });
-    </script>
-  </body>
-</html>`
+    </script>`
 }

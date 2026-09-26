@@ -1,6 +1,7 @@
 // tests/pot-checkout-provisioning.test.ts — Unit tests for Self-Serve Pot Checkout & Provisioning (Flight 12).
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { Hono } from 'hono'
 import {
   checkSlugAvailability,
   createPotCheckoutSession,
@@ -113,6 +114,7 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
 
     const env = {
       STRIPE_SECRET_KEY: 'sk_test_placeholder_key',
+      POT_SELF_SERVE_CHECKOUT_ENABLED: 'true', // mupot#1518: off unless exactly "true"
       DB: harness.db,
     } as unknown as Env
 
@@ -138,6 +140,123 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     expect(calledBody).toContain('metadata%5Bslug%5D=novacorp')
     expect(calledBody).toContain('metadata%5Btier%5D=pro')
     expect(calledBody).toContain('unit_amount%5D=9900') // $99 for Pro
+  })
+
+  // mupot#1518 — createPotCheckoutSession is exported, so it carries its own guard in
+  // addition to the route's. With the flag anything but "true" it must refuse before the
+  // slug lookup (no D1) and before Stripe (no fetch). The root-app route tests live in
+  // tests/composition/pot-checkout-kill-switch.test.ts.
+  it.each([undefined, '', 'false', 'TRUE', '1', 'yes'])(
+    'createPotCheckoutSession refuses with flag %j — no D1 read, no Stripe fetch (#1518)',
+    async (flag) => {
+      const mockFetch = vi.fn()
+      const prepare = vi.fn()
+      const env = {
+        STRIPE_SECRET_KEY: 'sk_test_placeholder_key',
+        POT_SELF_SERVE_CHECKOUT_ENABLED: flag,
+        DB: { prepare },
+      } as unknown as Env
+
+      const result = await createPotCheckoutSession(
+        env,
+        { slug: 'novacorp', brand: 'Nova', tier: 'pro', ownerEmail: 'ceo@novacorp.com', origin: 'https://mupot.mumega.com' },
+        mockFetch as unknown as typeof fetch,
+      )
+
+      expect(result).toEqual({ ok: false, error: 'checkout_unavailable' })
+      expect(mockFetch).not.toHaveBeenCalled()
+      expect(prepare).not.toHaveBeenCalled()
+    },
+  )
+
+  it('createPotCheckoutSession does not echo Stripe error text (#1518)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response('{"error":{"message":"No such price: price_leaky_upstream_detail"}}', { status: 400 }),
+    )
+    const env = {
+      STRIPE_SECRET_KEY: 'sk_test_placeholder_key',
+      POT_SELF_SERVE_CHECKOUT_ENABLED: 'true',
+      DB: harness.db,
+    } as unknown as Env
+
+    const result = await createPotCheckoutSession(
+      env,
+      { slug: 'novacorp', brand: 'Nova', tier: 'pro', ownerEmail: 'ceo@novacorp.com', origin: 'https://mupot.mumega.com' },
+      mockFetch as unknown as typeof fetch,
+    )
+
+    expect(result).toEqual({ ok: false, error: 'checkout_failed' })
+    expect(JSON.stringify(result)).not.toContain('price_leaky_upstream_detail')
+  })
+
+  // mupot#1518 — the flag="true" route paths that need a slug lookup that SUCCEEDS (so they
+  // reach Stripe) run here, on real SQLite + applyAllMigrations(). workerd composition tests
+  // cannot host node:sqlite; the root-app mount/guard proofs are in
+  // tests/composition/pot-checkout-kill-switch.test.ts. publicPotsApp is mounted here at the
+  // same two prefixes src/index.ts uses.
+  describe('POST /checkout route with the flag on (#1518)', () => {
+    function mounted() {
+      const root = new Hono<{ Bindings: Env }>()
+      root.route('/api/pots/public', publicPotsApp)
+      root.route('/api/pots', publicPotsApp)
+      return root
+    }
+    function post(path: string) {
+      return new Request(`https://mupot.mumega.com${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ slug: 'novacorp', owner_email: 'ceo@novacorp.test', tier: 'pro' }),
+      })
+    }
+    const PATHS = ['/api/pots/checkout', '/api/pots/public/checkout']
+
+    it.each(PATHS)('flag "true": %s reaches stubbed Stripe and returns the session url', async (path) => {
+      const stripe = vi.fn(async () =>
+        new Response(JSON.stringify({ id: 'cs_test_stub', url: 'https://checkout.stripe.com/c/pay/cs_test_stub' }), { status: 200 }),
+      )
+      vi.stubGlobal('fetch', stripe)
+      const env = { STRIPE_SECRET_KEY: 'sk_test_placeholder_key', POT_SELF_SERVE_CHECKOUT_ENABLED: 'true', DB: harness.db } as unknown as Env
+
+      const res = await mounted().fetch(post(path), env)
+      vi.unstubAllGlobals()
+
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ ok: true, url: 'https://checkout.stripe.com/c/pay/cs_test_stub', session_id: 'cs_test_stub' })
+      expect(stripe).toHaveBeenCalledTimes(1)
+      expect(String((stripe.mock.calls[0] as unknown[])[0])).toBe('https://api.stripe.com/v1/checkout/sessions')
+    })
+
+    it.each(PATHS)('flag "true": Stripe error on %s -> 502 checkout_failed, upstream text in neither body nor logs', async (path) => {
+      const upstream = 'No such price: price_leaky_upstream_detail req_ABC123'
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: { message: upstream } }), { status: 400 })))
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+      const env = { STRIPE_SECRET_KEY: 'sk_test_placeholder_key', POT_SELF_SERVE_CHECKOUT_ENABLED: 'true', DB: harness.db } as unknown as Env
+
+      const res = await mounted().fetch(post(path), env)
+      vi.unstubAllGlobals()
+      const text = await res.text()
+
+      expect(res.status).toBe(502)
+      expect(JSON.parse(text)).toEqual({ ok: false, error: 'checkout_failed' })
+      expect(text).not.toContain('price_leaky_upstream_detail')
+      const logged = JSON.stringify(errors.mock.calls)
+      expect(logged).toContain('stripe_session_create_failed')
+      expect(logged).not.toContain('price_leaky_upstream_detail')
+      expect(logged).not.toContain('sk_test_placeholder_key')
+    })
+
+    it('flag "true": a thrown fetch -> 502 checkout_failed, exception text not echoed', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('socket reset price_leaky_upstream_detail') }))
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const env = { STRIPE_SECRET_KEY: 'sk_test_placeholder_key', POT_SELF_SERVE_CHECKOUT_ENABLED: 'true', DB: harness.db } as unknown as Env
+
+      const res = await mounted().fetch(post('/api/pots/checkout'), env)
+      vi.unstubAllGlobals()
+      const text = await res.text()
+      expect(res.status).toBe(502)
+      expect(text).not.toContain('price_leaky_upstream_detail')
+    })
   })
 
   it('provisions pot and emits BusEvent when checkout session completes', async () => {
@@ -191,8 +310,16 @@ describe('Public Pricing & Self-Serve Sovereign Pot Provisioning Portal (Flight 
     vi.unstubAllGlobals()
   })
 
-  it('renders public pricing page HTML', () => {
+  it('renders the disabled pricing page by default — no checkout POST wired (#1518)', () => {
     const pageHtml = pricingPageHtml('https://mupot.mumega.com').toString()
+    expect(pageHtml).toContain('Self-serve checkout is temporarily unavailable')
+    expect(pageHtml).not.toContain('/api/pots/checkout')
+    expect(pageHtml).toContain('$49')
+  })
+
+  it('renders public pricing page HTML', () => {
+    const pageHtml = pricingPageHtml('https://mupot.mumega.com', { checkoutEnabled: true }).toString()
+    expect(pageHtml).toContain('/api/pots/checkout')
     expect(pageHtml).toContain('Your Sovereign Agent Workforce')
     expect(pageHtml).toContain('Starter')
     expect(pageHtml).toContain('$49')
