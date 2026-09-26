@@ -60,6 +60,14 @@ function envForRole(role: 'owner' | 'admin' | 'member', publishRows: unknown[]):
     DB: {
       prepare: vi.fn((sql: string) => {
         if (sql.includes("t.status = 'approved'")) return makeStmt(publishRows)
+        // mupot#1551 round 3: decideIdentitylessAttach's own candidate lookup
+        // (loadAuthFromCookie's read-only fallback for a session with no
+        // stored loginIdentity) needs status + telegram_chat_id on the row —
+        // without them the member reads as suspended/telegram-bound and the
+        // global capability floor 403s before /approvals ever renders.
+        if (role === 'member' && sql.includes('FROM members') && sql.includes('telegram_chat_id')) {
+          return makeStmt([{ id: 'member-1', status: 'active', telegram_chat_id: null }])
+        }
         if (role === 'member' && sql.includes('FROM members')) return makeStmt([{ id: 'member-1' }], { id: 'member-1' })
         if (role === 'member' && sql.includes('FROM capabilities')) {
           return makeStmt([{ member_id: 'member-1', scope_type: 'squad', scope_id: 'sq-1', capability: 'member' }])

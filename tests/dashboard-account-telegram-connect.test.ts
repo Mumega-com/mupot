@@ -63,6 +63,26 @@ async function devLogin(env: Env): Promise<string> {
   return cookieFrom(res)
 }
 
+// mupot#1551 round 3: dev-login always supplies a real join key
+// (provider='local-test', subject=email) to registerWebSession, which now
+// runs the SAME exclusive-control predicate a Google login does. Per
+// Athena's ruling B3, a bound Telegram chat is control of the row — so a
+// FIRST login for a member whose Telegram is already bound (via the
+// invite/redeem flow, in these fixtures) is correctly refused UNLESS that
+// member already has a live login identity of their own to resolve through
+// (step 1, before the Telegram check is ever consulted). Seed one here for
+// every fixture that means "this is the member's own, already-established
+// account" — never for the fixture meant to prove the denial.
+function seedDevLoginIdentity(harness: SqliteD1Harness, memberId: string, email: string): void {
+  harness.sqlite
+    .prepare(
+      `INSERT INTO human_login_identities
+         (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+       VALUES (?, ?, 'local-test', ?, ?, ?, datetime('now'))`,
+    )
+    .run(`ident-${memberId}`, TENANT, email, email, memberId)
+}
+
 describe('dashboard My Account — Telegram connect/disconnect (integration through dashboardApp, real D1)', () => {
   let harness: SqliteD1Harness
 
@@ -182,6 +202,7 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       UPDATE members SET telegram_chat_id = '555000111', telegram_bound_at = '2026-09-15T00:00:00000000Z'
        WHERE id = 'member-bound';
     `)
+    seedDevLoginIdentity(harness, 'member-bound', 'bound@x.test')
     const env = makeEnv('bound@x.test')
     env.DB = harness.db
     const cookie = await devLogin(env)
@@ -192,6 +213,42 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     expect(body).toContain('id="tg-disconnect"')
     expect(body).toContain('data-member="member-bound"')
     expect(body).not.toContain('id="tg-connect"')
+  })
+
+  // mupot#1551 round 3: the shape Athena's ruling B3 exists to refuse — an
+  // IDENTITY-LESS member row (no linked human_login_identities) that already
+  // holds a bound Telegram chat. A first web login for that email must be
+  // denied, not silently attach (and then render "Connected" as if the web
+  // login itself were the one who bound it). Deliberately NOT seeding
+  // seedDevLoginIdentity here — that omission is the point of this test.
+  it('an IDENTITY-LESS member with a bound Telegram chat is DENIED a first web login — never silently attached', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant, telegram_chat_id, telegram_bound_at)
+      VALUES ('member-tg-only', 'tgonly@x.test', 'Telegram Only', 'active', '${TENANT}', '555000999', '2026-09-15T00:00:00000000Z');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-tg-only-org', 'member-tg-only', 'org', NULL, 'admin');
+    `)
+    const env = makeEnv('tgonly@x.test')
+    env.DB = harness.db
+    const cookie = await devLogin(env)
+
+    // No human_login_identities row exists for this join key, and the
+    // Telegram bind refuses the identity-less bootstrap attach — the login
+    // itself still succeeds (KV-only session, best-effort) but never bridges
+    // to member-tg-only's capabilities, so the SAME pre-existing
+    // zero-capability-drive-by floor that blocks 'nobody@x.test' above also
+    // blocks this request before /account ever renders: the org 'admin'
+    // grant this row actually holds is never reachable through it.
+    const res = await dashboardApp.request('/account', { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    expect(body).not.toContain('data-member="member-tg-only"')
+    expect(body).not.toContain('id="tg-disconnect"')
+
+    const identityCount = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE member_id = 'member-tg-only'`)
+      .get() as { n: number }
+    expect(identityCount.n).toBe(0)
   })
 
   // mupot#1425 round 3 (Athena): telegram_origin_bind_receipts (0155) was
@@ -209,6 +266,7 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       INSERT INTO telegram_origin_bind_receipts (id, tenant, member_id, agent_id, chat_id, message_id, created_at)
         VALUES ('receipt-1', '${TENANT}', 'member-bound', 'agent-kayhermes-bound', '555000111', '9001', '2026-09-15T00:00:00000000Z');
     `)
+    seedDevLoginIdentity(harness, 'member-bound', 'bound@x.test')
     const env = makeEnv('bound@x.test')
     env.DB = harness.db
     const cookie = await devLogin(env)
@@ -224,6 +282,7 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       UPDATE members SET telegram_chat_id = '555000222', telegram_bound_at = '2026-09-15T00:00:00000000Z'
        WHERE id = 'member-bound';
     `)
+    seedDevLoginIdentity(harness, 'member-bound', 'bound@x.test')
     const env = makeEnv('bound@x.test')
     env.DB = harness.db
     const cookie = await devLogin(env)
@@ -306,6 +365,14 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       ok: true,
       value: { member_id: 'member-admin', project_id: 'project-a', squad_id: 'squad-a', capability: 'admin' },
     })
+
+    // This admin's Telegram is now bound (via the redeem above) BEFORE their
+    // first web login — realistic (they connected via Telegram first), and
+    // per Athena's ruling B3 a Telegram binding is control, so their own
+    // first web login must resolve via a real identity, never by email
+    // alone. Seeded here rather than earlier so the sequence stays honest:
+    // Telegram bind happens first, THEN the admin's own web identity link.
+    seedDevLoginIdentity(harness, 'member-admin', 'admin@x.test')
 
     const dashEnv = makeEnv('admin@x.test')
     dashEnv.DB = harness.db

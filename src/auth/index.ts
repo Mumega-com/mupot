@@ -274,18 +274,21 @@ function isBootstrapEmail(value: string): boolean {
  * the caller writes the KV+cookie session (today's actual source of truth
  * for role/access) regardless of what this function returns.
  *
- * Returns true only on an actual new D1 row — the caller stamps that (and
- * ONLY that) onto the KV record's webSessionRegistered flag, which is what
- * gates whether loadAuthFromCookie ever issues the follow-up D1 read on
- * later requests for this session.
+ * Returns `{ registered: true, memberId }` only on an actual new D1 row —
+ * the caller stamps `registered` (and ONLY that) onto the KV record's
+ * webSessionRegistered flag, which is what gates whether loadAuthFromCookie
+ * ever issues the follow-up D1 read on later requests for this session.
+ * `memberId` is returned alongside so a caller retrying this SAME guarded
+ * attach later (loadAuthFromCookie's own fallback, mupot#1551 round 2 P1-a)
+ * can use it directly without a second D1 round trip to re-derive it.
  */
 async function registerWebSession(
   env: Env,
   sessionId: string,
   email: string | null,
   loginIdentity: { provider: string; subject: string } | undefined,
-): Promise<boolean> {
-  if (!loginIdentity || !email || !env.DB) return false
+): Promise<{ registered: boolean; memberId?: string }> {
+  if (!loginIdentity || !email || !env.DB) return { registered: false }
   try {
     const tenant = env.TENANT_SLUG
     // Join key first: (tenant, provider, provider_subject) is the authority
@@ -324,7 +327,7 @@ async function registerWebSession(
         providerSubject: loginIdentity.subject,
         email,
       })
-      if (!resolved) return false
+      if (!resolved) return { registered: false }
 
       // mupot#1551 (Athena's ruling, Option B, point 4): `resolved` above can
       // only have come from a fresh identity-less-row bootstrap attach here
@@ -343,7 +346,7 @@ async function registerWebSession(
         memberId: resolved,
         requireExclusiveControl: true,
       })
-      if (!linked.ok) return false
+      if (!linked.ok) return { registered: false }
       memberId = resolved
       loginIdentityId = linked.identity.id
     }
@@ -353,7 +356,7 @@ async function registerWebSession(
       memberId,
       loginIdentityId,
     })
-    return true
+    return { registered: true, memberId }
   } catch (err) {
     // Best-effort: the D1 registry write failed, but the KV+cookie session
     // is unaffected. Surface for operability; never rethrow. Includes the
@@ -362,7 +365,7 @@ async function registerWebSession(
     // running without those tables simply mints ordinary KV-only sessions
     // until the migration lands, exactly like before this change.
     console.error('registerWebSession failed (login still succeeded via KV session)', err)
-    return false
+    return { registered: false }
   }
 }
 
@@ -374,13 +377,13 @@ async function mintSession(
   opts: { secure?: boolean; loginIdentity?: { provider: string; subject: string } } = {},
 ): Promise<void> {
   const sessionId = randomId(32)
-  const webSessionRegistered = await registerWebSession(c.env, sessionId, email, opts.loginIdentity)
+  const registration = await registerWebSession(c.env, sessionId, email, opts.loginIdentity)
   const record: SessionRecord = {
     userId,
     email,
     role,
     createdAt: new Date().toISOString(),
-    ...(webSessionRegistered ? { webSessionRegistered: true } : {}),
+    ...(registration.registered ? { webSessionRegistered: true } : {}),
     // Persisted regardless of registration success — see the field's own
     // doc comment (mupot#1551 round 2, P1-a).
     ...(opts.loginIdentity ? { loginIdentity: opts.loginIdentity } : {}),
@@ -1463,27 +1466,26 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
         // resolveLoginIdentity check short-circuits instantly once linked,
         // and requireExclusiveControl makes a still-denied row a no-op read
         // (a failed conditional INSERT), never a silent grant.
-        const nowRegistered = await registerWebSession(
+        const retry = await registerWebSession(
           c.env,
           sessionId,
           record.email,
           record.loginIdentity,
         )
-        if (nowRegistered) {
+        if (retry.registered && retry.memberId) {
           // Newly linked on THIS request — persist the flag so future
           // requests take the fast `webSessionMemberId` path above instead
-          // of retrying the write every time.
+          // of retrying the write every time. registerWebSession hands back
+          // the memberId directly (mupot#1551 round 2) — no second D1 round
+          // trip through loadWebSession needed just to re-derive what this
+          // same call already resolved.
           await c.env.SESSIONS.put(
             sessionKey(sessionId),
             JSON.stringify({ ...record, webSessionRegistered: true }),
             { expirationTtl: SESSION_TTL_SECONDS },
           )
-          const webSession = await loadWebSession(c.env, c.env.TENANT_SLUG, sessionId)
-          if (webSession.ok) {
-            auth.webSessionIdHash = webSession.session.id_hash
-            auth.webSessionMemberId = webSession.session.member_id
-            memberId = webSession.session.member_id
-          }
+          memberId = retry.memberId
+          auth.webSessionMemberId = retry.memberId
         }
         // Still denied/unresolved: memberId stays null. NEVER fall through to
         // the old lenient email-only resolveHumanMemberId call below — that
@@ -1495,12 +1497,24 @@ async function loadAuthFromCookie(c: Context<AppEnv>): Promise<AuthContext | nul
         // would require, rather than the old unconditional email match. A
         // denied/ambiguous/not_found row grants nothing; this never links
         // (no subject to link with), it only decides whether it's safe to
-        // ACT as the row for this one request.
+        // ACT as the row for this one request. `ignoreLiveIdentity: true` —
+        // same reasoning as SSO's fallback (src/auth/sso.ts): a row that
+        // ALREADY has a live identity from a real prior login is not a fresh
+        // claim this read would be creating, it is already legitimately
+        // claimed — refusing to even READ it would be a false positive, not
+        // a fix (mupot#1551 round 3, kasra-review finding: an operator's own
+        // bearer-token-holding, already-identified member row 403ing here).
         const decision = await decideIdentitylessAttach(c.env, {
           tenant: c.env.TENANT_SLUG,
           normalizedEmail: (auth.email ?? '').trim().toLowerCase(),
+          ignoreLiveIdentity: true,
         })
-        if (decision.kind === 'eligible') {
+        // decideIdentitylessAttach itself never filters by status (its job
+        // is exclusive control, not liveness) — a suspended member must
+        // still not be handed authority here, the same activeOnly floor
+        // resolveHumanMemberForAttach's own wrapper applies for the real
+        // attach path.
+        if (decision.kind === 'eligible' && decision.status === 'active') {
           memberId = decision.memberId
         }
       }

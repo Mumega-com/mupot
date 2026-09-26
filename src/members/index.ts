@@ -1357,6 +1357,16 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
   if (typeof label !== 'string' || label.length > 64) return c.json({ error: 'invalid_label' }, 400)
 
   const channel: ConnectionChannel = body.channel === undefined ? 'workspace' : (body.channel as ConnectionChannel)
+  // mupot#1551 round 3 (P2): isChannelService's own allowlist (CHANNELS,
+  // src/members/service.ts) is ['workspace','im','dashboard'] — 'directory'
+  // is a valid ConnectionChannel at the TYPE level (mintDirectoryToken's own
+  // channel, src/mcp/oauth-authorize.ts) but was ALREADY excluded from this
+  // route's runtime allowlist before this fix; verified, not assumed — see
+  // tests/directory-channel-token-mint-refused.test.ts, which pins it
+  // (`invalid_channel`) so a future widening of CHANNELS to include
+  // 'directory' cannot silently reopen decideIdentitylessAttach's
+  // directory-channel provisioning exemption (src/members/exclusive-
+  // control.ts) to a caller-chosen spoof.
   if (!isChannelService(channel)) return c.json({ error: 'invalid_channel' }, 400)
 
   // Shared mint path — raw token returned EXACTLY ONCE; only the hash is persisted.

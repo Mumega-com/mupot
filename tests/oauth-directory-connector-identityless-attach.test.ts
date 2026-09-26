@@ -302,4 +302,62 @@ describe('directory-OAuth connector — identity-less attach (mupot#1551 round 2
     // Reconnecting now ALSO links the real identity going forward.
     expect(identityCount(harness, 'mem-legacy-connector')).toBe(1)
   })
+
+  it('P1-b: a competing bearer inserted BETWEEN google-callback and the consent POST makes the mint-time identity link fail — no identity linked (requireExclusiveControl pin)', async () => {
+    const oauthProvider = stubOAuthProvider()
+    const { env, kv } = httpEnv(harness, oauthProvider)
+
+    const authorizeReq = new Request(
+      `${ORIGIN}/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256`,
+    )
+    const authorizeRes = await handleOAuthAuthorize(authorizeReq, env)
+    const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+    stubGoogleFetch('racewindow@example.com', 'google-sub-racewindow')
+    const callbackReq = new Request(
+      `${ORIGIN}/oauth/google-callback?code=abc&state=${nonce}`,
+      { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } },
+    )
+    const callbackRes = await handleOAuthAuthorize(callbackReq, env)
+    expect(callbackRes.status).toBe(200)
+    const cookies = callbackRes.headers.getSetCookie
+      ? callbackRes.headers.getSetCookie()
+      : [callbackRes.headers.get('Set-Cookie') ?? '']
+    const consentCookieLine = cookies.find((c) => c.startsWith('mupot_oauth_consent=')) ?? ''
+    const consentNonce = /mupot_oauth_consent=([^;]+)/.exec(consentCookieLine)?.[1] ?? ''
+
+    // Read the freshly-created member id straight out of the pending-consent
+    // KV record the callback just wrote — the human is now sitting on the
+    // consent screen, memberId already resolved, identity NOT yet linked
+    // (that only happens at mint time, on the POST below).
+    const pendingRaw = await kv.get(`oauth-consent:${consentNonce}`, 'json')
+    const pending = pendingRaw as { memberId: string } | null
+    expect(pending?.memberId).toBeTruthy()
+    const memberId = pending!.memberId
+    expect(identityCount(harness, memberId)).toBe(0)
+
+    // THE RACE: a competing bearer lands on this exact row while the human
+    // is looking at the consent screen — e.g. a concurrent public invite
+    // accept on the same email, landing between the callback and the
+    // consent submission.
+    harness.sqlite.exec(`
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+        VALUES ('tok-race', '${memberId}', 'hash-race', 'workspace', 'workspace', datetime('now'), NULL, '${TENANT}');
+    `)
+
+    const form = new URLSearchParams({ consent_nonce: consentNonce, action: 'continue', agent_id: '' })
+    const consentReq = new Request(`${ORIGIN}/oauth/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: `mupot_oauth_consent=${consentNonce}` },
+      body: form.toString(),
+    })
+    const consentRes = await handleOAuthAuthorize(consentReq, env)
+
+    // The mint itself is unconditional (mintDirectoryToken doesn't check
+    // exclusive control) — the consent flow still completes...
+    expect(consentRes.status).toBe(302)
+    expect(directoryTokenCount(harness, memberId)).toBe(1)
+    // ...but the identity link, guarded by requireExclusiveControl, must
+    // fail atomically against the race — never land.
+    expect(identityCount(harness, memberId)).toBe(0)
+  })
 })

@@ -241,12 +241,18 @@ async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> 
   // exactly the second door a login-time denial (competing bearer/Telegram/
   // identity) must also stay closed behind. Read-only eligibility check
   // only: `eligible` acts as that member for this one request; denied/
-  // ambiguous/not_found grants nothing.
+  // ambiguous/not_found grants nothing. `ignoreLiveIdentity: true` — this
+  // never links a new identity, so a row that already has one from a real
+  // prior login is already legitimately claimed, not a fresh claim to
+  // refuse (mupot#1551 round 3, same reasoning as SSO's own fallback).
   const decision = await decideIdentitylessAttach(env, {
     tenant: env.TENANT_SLUG,
     normalizedEmail: auth.email.trim().toLowerCase(),
+    ignoreLiveIdentity: true,
   })
-  return decision.kind === 'eligible' ? decision.memberId : null
+  // decideIdentitylessAttach never filters by status itself — a suspended
+  // member must not be handed project authority through this fallback.
+  return decision.kind === 'eligible' && decision.status === 'active' ? decision.memberId : null
 }
 
 export async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {

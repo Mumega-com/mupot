@@ -13,6 +13,7 @@ import { authApp } from '../src/auth'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { autoEnrollSsoMember } from '../src/auth/sso'
 import { acceptInvite } from '../src/members'
+import { projectAccess } from '../src/dashboard/projects'
 import {
   decideIdentitylessAttach,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
@@ -906,5 +907,151 @@ describe('P1-a: a login-time denial must also close loadAuthFromCookie\'s own fa
     )
     const body = (await meRes.json()) as { memberId?: string; webSessionMemberId?: string }
     expect(body.webSessionMemberId ?? body.memberId).toBe('mem-clean-me')
+  })
+
+  it('a legacy session with no stored loginIdentity: a SUSPENDED clean row is still refused by the read-only fallback (status is not exclusive control)', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-legacy-suspended', 'legacysuspended@example.com', { status: 'suspended' })
+    const kv = memoryKv()
+    const env = envFor(harness, kv)
+    // Hand-craft a pre-mupot#1551-round-2 session: no loginIdentity field at
+    // all, exactly what every session minted before this fix looks like.
+    await kv.put(
+      'sess:legacy-sid',
+      JSON.stringify({
+        userId: 'legacy-user',
+        email: 'legacysuspended@example.com',
+        role: 'member',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }),
+    )
+
+    const meRes = await authApp.request(
+      `${ORIGIN}/me`,
+      { headers: { cookie: 'mupot_session=legacy-sid' } },
+      env,
+    )
+    const body = (await meRes.json()) as { memberId?: string }
+    expect(body.memberId).toBeUndefined()
+  })
+
+  it('P3 (round 3): pins ignoreLiveIdentity on the legacy no-loginIdentity fallback — an already-identified member (different join key) still resolves, not denied as competing control', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-legacy-identified', 'legacyidentified@example.com')
+    const linked = await linkLoginIdentity(
+      { DB: harness.db } as unknown as Env,
+      {
+        tenant: TENANT,
+        provider: 'saml',
+        providerSubject: 'sub-legacy-identified',
+        verifiedEmail: 'legacyidentified@example.com',
+        memberId: 'mem-legacy-identified',
+      },
+    )
+    expect(linked.ok).toBe(true)
+    const kv = memoryKv()
+    const env = envFor(harness, kv)
+    // No loginIdentity in THIS session — a plain KV-only login for the same
+    // email, reaching loadAuthFromCookie's read-only fallback rather than
+    // the retry-registerWebSession branch.
+    await kv.put(
+      'sess:legacy-sid-2',
+      JSON.stringify({
+        userId: 'legacy-user-2',
+        email: 'legacyidentified@example.com',
+        role: 'member',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }),
+    )
+
+    const meRes = await authApp.request(
+      `${ORIGIN}/me`,
+      { headers: { cookie: 'mupot_session=legacy-sid-2' } },
+      env,
+    )
+    const body = (await meRes.json()) as { memberId?: string }
+    expect(body.memberId).toBe('mem-legacy-identified')
+  })
+})
+
+describe('dashboard/projects.ts memberIdFor — via projectAccess (mupot#1551 round 3)', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => {
+    harness?.close()
+    harness = undefined
+  })
+
+  it('a squatted identity-less row (live bearer) never grants project authority through the email-only fallback', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-sq-proj', 'sqproj@example.com')
+    seedBearer(harness, 'mem-sq-proj')
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'owner')`,
+      )
+      .run(crypto.randomUUID(), 'mem-sq-proj')
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+
+    const access = await projectAccess(env, { tenant: TENANT, email: 'sqproj@example.com', role: 'member' } as any)
+    expect(access.workspaceAdmin).toBe(false)
+  })
+
+  it('a clean identity-less row resolves normally through the email-only fallback', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-clean-proj', 'cleanproj@example.com')
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'owner')`,
+      )
+      .run(crypto.randomUUID(), 'mem-clean-proj')
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+
+    const access = await projectAccess(env, { tenant: TENANT, email: 'cleanproj@example.com', role: 'member' } as any)
+    expect(access.workspaceAdmin).toBe(true)
+  })
+
+  it('P3 (round 3): pins ignoreLiveIdentity in memberIdFor — an already-identified member (different join key) still resolves project authority, not denied as competing control', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-identified-proj', 'identifiedproj@example.com')
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'owner')`,
+      )
+      .run(crypto.randomUUID(), 'mem-identified-proj')
+    const linked = await linkLoginIdentity(
+      { DB: harness.db } as unknown as Env,
+      {
+        tenant: TENANT,
+        provider: 'saml',
+        providerSubject: 'sub-identified-proj',
+        verifiedEmail: 'identifiedproj@example.com',
+        memberId: 'mem-identified-proj',
+      },
+    )
+    expect(linked.ok).toBe(true)
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+
+    const access = await projectAccess(env, { tenant: TENANT, email: 'identifiedproj@example.com', role: 'member' } as any)
+    expect(access.workspaceAdmin).toBe(true)
+  })
+
+  it('a SUSPENDED clean identity-less row does not leak authority through the email-only fallback either (status is not exclusive control)', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-suspended-proj', 'suspendedproj@example.com', { status: 'suspended' })
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'owner')`,
+      )
+      .run(crypto.randomUUID(), 'mem-suspended-proj')
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+
+    const access = await projectAccess(env, { tenant: TENANT, email: 'suspendedproj@example.com', role: 'member' } as any)
+    expect(access.workspaceAdmin).toBe(false)
   })
 })
