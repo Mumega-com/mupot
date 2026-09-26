@@ -248,7 +248,9 @@ describe('flight project attribution', () => {
 
   it('dispatches the maximum task set without exceeding the D1 bind budget', async () => {
     harness = makeHarness()
-    const taskIds = seedBulkTasks(harness, 200)
+    // In progress, not done: dispatching over already-done tasks is refused since #1540
+    // (flight_task_already_done). This test is about the D1 bind budget, not status.
+    const taskIds = seedBulkTasks(harness, 200, () => ({ status: 'in_progress' }))
     const { env, observations } = envWithBindBudget(harness)
 
     const response = await dispatch(harness, dispatchBody({

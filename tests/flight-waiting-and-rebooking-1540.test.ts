@@ -290,9 +290,10 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     await toReview(env, 'task-1')
     await toReview(env, 'task-2')
     await verdict(env, 'task-1', 'approved')
-    await close(env, 'task-1')
-    expect(flightRow(harness, id).status).toBe('waiting') // task-2 still at the gate
     await verdict(env, 'task-2', 'approved')
+    await close(env, 'task-1')
+    // task-2 is approved but NOT done: approval alone is not completion.
+    expect(flightRow(harness, id).status).toBe('waiting')
     await close(env, 'task-2')
 
     const landed = flightRow(harness, id)
@@ -321,7 +322,7 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     expect(transitions(harness, id).some((row) => row.to_status === 'landed')).toBe(false)
   })
 
-  it('P0 (4): a routine skip-overlap pin on a gated flight releases once its work is approved and closed', async () => {
+  it('P0 (4): a routine CONTROL flight is left to its routine — it never parks, so the 60m reaper still releases its overlap pin (#1369)', async () => {
     const id = await dispatchedId(env, ['task-1'])
     const due = new Date().toISOString()
     harness.sqlite.exec(`
@@ -351,9 +352,11 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     }), due, id, due, due)
 
     await toReview(env, 'task-1')
-    await verdict(env, 'task-1', 'approved')
-    await close(env, 'task-1')
-    expect(flightRow(harness, id).status).toBe('landed')
+    // Excluded from the waiting transition: its routine owns its lifecycle.
+    expect(flightRow(harness, id).status).toBe('running')
+    expect(transitions(harness, id)).toHaveLength(0)
+    const startedAt = flightRow(harness, id).started_at as number
+    expect(await sweepStalledFlights(env, { nowMs: startedAt + 62 * MIN })).toMatchObject({ reaped: 1 })
 
     const summary = await runRoutineScheduler(env, new Date(), 'worker-1540')
     expect(summary.occurrences_created).toBe(1)
@@ -361,6 +364,33 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
       .prepare(`SELECT status, result_summary FROM routine_runs WHERE routine_id = 'routine-r' AND id <> 'run-r'`)
       .get() as { status: string; result_summary: string | null }
     expect(next.status).toBe('queued')
+  })
+
+  it('P0: a waiting flight that becomes a routine control flight is not auto-landed (its routine lands it)', async () => {
+    const id = await dispatchedId(env, ['task-1'])
+    await toReview(env, 'task-1')
+    await verdict(env, 'task-1', 'approved')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-c', 'project-c', 'C', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-c', '${SQUAD_ID}', 'write');
+      INSERT INTO routines (
+        id, tenant, project_id, name, objective, status, trigger_kind, run_once_at,
+        cron_expression, timezone, next_run_at, overlap_policy, execution_mode,
+        responsible_squad_id, budget_micro_usd, max_attempts, retry_backoff_seconds,
+        max_occurrences, revision, enabled_by, enabled_at, created_by, created_at, updated_at
+      ) VALUES ('routine-c', '${TENANT}', 'project-c', 'routine-c', 'o', 'enabled', 'cron', NULL,
+        '* * * * *', 'UTC', '2026-01-01T00:00:00.000Z', 'skip', 'propose', '${SQUAD_ID}', 100000, 3, 300,
+        NULL, 1, 'o', '2026-01-01T00:00:00.000Z', 'o', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      INSERT INTO routine_runs (
+        id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, scheduled_for, status, attempt, flight_id, created_at, updated_at
+      ) VALUES ('run-c', '${TENANT}', 'project-c', 'routine-c', 1, '{}', 'manual:run-c', 'cron',
+        '2026-01-01T00:00:00.000Z', 'running', 1, '${id}', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `)
+    await close(env, 'task-1')
+    expect(flightRow(harness, id).status).toBe('waiting')
+    expect(transitions(harness, id).some((row) => row.to_status === 'landed')).toBe(false)
   })
 
   it('a reject sends it back to running and RESTARTS the stall clock; resubmission parks it again', async () => {

@@ -33,7 +33,7 @@
 --                         not reaped the instant it is sent back for rework.
 --      waiting → landed   (round 2, gate P0) when EVERY task is 'done' and every gated
 --                         task's latest verdict is 'approved' — the SAME task predicate
---                         landGovernedFlight enforces, plus its routine-proposal witness.
+--                         landGovernedFlight enforces (routine control flights excluded).
 --                         A SYSTEM LAND: score NULL (a system land is not a coherence
 --                         measurement and must never read as throughput), cost as
 --                         recorded, gate_reason 'auto_landed_all_tasks_done', receipted in
@@ -47,6 +47,13 @@
 --                         NO flight_event_outbox row: that table's actor_kind admits only
 --                         member|agent, and attributing a system land to the executor would
 --                         be a forged actor. The transition receipt is the audit record.
+--
+--    ROUTINE CONTROL FLIGHTS ARE OUT OF SCOPE of every transition here (round 2): a flight
+--    that is some routine_run's flight_id has an owner that already lands it with its own
+--    receipt (src/routines/actions.ts completeControlTask → landControlFlight, which
+--    REQUIRES the flight.landed outbox row) and whose pin semantics are #1369's. Auto-
+--    landing it between those two calls made landControlFlight throw (caught by
+--    tests/routine-actions.test.ts). Such a flight behaves exactly as on main.
 --
 --    Performance (round 2, gate P1-1): tasks carries no tenant column, so the triggers
 --    cannot scope by tenant; they scope by flight status instead, through
@@ -161,6 +168,7 @@ BEGIN
     FROM flights f
    WHERE f.status = 'running'
      AND json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = f.id AND rr.tenant = f.tenant)
      AND json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') = 'array'
      AND EXISTS (
        SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
@@ -182,6 +190,7 @@ BEGIN
          waiting_since = unixepoch('now') * 1000
    WHERE status = 'running'
      AND json_extract(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+     AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = flights.id AND rr.tenant = flights.tenant)
      AND json_type(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END, '$.task_ids') = 'array'
      AND EXISTS (
        SELECT 1 FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.task_ids') ref
@@ -234,9 +243,9 @@ END;
 
 -- ── A (round 2, gate P0): the exit from 'waiting' when the gated work is finished ─────
 -- Same task predicate as landGovernedFlight (src/flight/service.ts) — task exists, matches
--- the flight's project, is 'done', and if gated its LATEST verdict is 'approved' — plus the
--- same routine-proposal witness for a routine CONTROL flight. Nothing here can land a
--- flight whose work the gate did not approve.
+-- the flight's project, is 'done', and if gated its LATEST verdict is 'approved'. A routine
+-- CONTROL flight is never auto-landed: its routine lands it with a receipt (see header).
+-- Nothing here can land a flight whose work the gate did not approve.
 CREATE TRIGGER IF NOT EXISTS flights_auto_land_on_task_done
 AFTER UPDATE OF status ON tasks
 WHEN OLD.status IS NOT NEW.status
@@ -271,26 +280,9 @@ BEGIN
              ), '') <> 'approved'
            )
      )
-     AND (
-       json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id') IS NULL
-       OR NOT EXISTS (
-         SELECT 1 FROM routine_runs rr
-          WHERE rr.flight_id = f.id
-            AND rr.tenant = f.tenant
-            AND rr.id = json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id')
-       )
-       OR EXISTS (
-         SELECT 1
-           FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.receipt_refs') AS receipt_ref
-           JOIN routine_runs rr
-             ON rr.tenant = f.tenant
-            AND rr.flight_id = f.id
-            AND rr.id = json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.routine_run_id')
-          WHERE rr.proposal_json IS NOT NULL
-            AND json_valid(rr.proposal_json)
-            AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
-            AND receipt_ref.value = 'routine.proposal:' || rr.id
-       )
+     AND NOT EXISTS (
+       SELECT 1 FROM routine_runs rr
+        WHERE rr.flight_id = f.id AND rr.tenant = f.tenant
      );
 
   UPDATE flights
@@ -321,26 +313,9 @@ BEGIN
              ), '') <> 'approved'
            )
      )
-     AND (
-       json_type(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id') IS NULL
-       OR NOT EXISTS (
-         SELECT 1 FROM routine_runs rr
-          WHERE rr.flight_id = flights.id
-            AND rr.tenant = flights.tenant
-            AND rr.id = json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id')
-       )
-       OR EXISTS (
-         SELECT 1
-           FROM json_each(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.receipt_refs') AS receipt_ref
-           JOIN routine_runs rr
-             ON rr.tenant = flights.tenant
-            AND rr.flight_id = flights.id
-            AND rr.id = json_extract(CASE WHEN json_valid(flights.meta) THEN flights.meta ELSE '{}' END, '$.routine_run_id')
-          WHERE rr.proposal_json IS NOT NULL
-            AND json_valid(rr.proposal_json)
-            AND json_extract(rr.proposal_json, '$.version') = 'routine.proposal/v1'
-            AND receipt_ref.value = 'routine.proposal:' || rr.id
-       )
+     AND NOT EXISTS (
+       SELECT 1 FROM routine_runs rr
+        WHERE rr.flight_id = flights.id AND rr.tenant = flights.tenant
      );
 END;
 
@@ -352,6 +327,7 @@ SELECT lower(hex(randomblob(16))), f.tenant, f.id, 'running', 'waiting', 'migrat
   FROM flights f
  WHERE f.status = 'running'
    AND json_extract(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.schema') = 'mupot.flight.meta/v1'
+   AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = f.id AND rr.tenant = f.tenant)
    AND json_type(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') = 'array'
    AND NOT EXISTS (
      SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
