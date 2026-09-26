@@ -1,3 +1,5 @@
+import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN } from './meta'
+
 const JS_TRIM_CODEPOINTS = 'char(9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279)'
 
 function trimmedTextSql(value: string): string {
@@ -48,7 +50,7 @@ export function canonicalFlightMetaSql(flightAlias: string): string {
        WHERE meta_key.key NOT IN (
          'schema', 'goal_id', 'objective_id', 'squad_ids', 'task_ids', 'done_when',
          'artifact_refs', 'receipt_refs', 'confidentiality', 'publication_target', 'parent_flight_id',
-         'routine_run_id', 'routine_revision'
+         'routine_run_id', 'routine_revision', 'timeout_ms'
        )
     )
     AND NOT EXISTS (
@@ -86,6 +88,13 @@ export function canonicalFlightMetaSql(flightAlias: string): string {
       OR (
         json_type(${safeMeta}, '$.routine_revision') = 'integer'
         AND json_extract(${safeMeta}, '$.routine_revision') > 0
+      )
+    )
+    AND (
+      json_type(${safeMeta}, '$.timeout_ms') IS NULL
+      OR (
+        json_type(${safeMeta}, '$.timeout_ms') = 'integer'
+        AND json_extract(${safeMeta}, '$.timeout_ms') BETWEEN ${FLIGHT_META_TIMEOUT_MS_MIN} AND ${FLIGHT_META_TIMEOUT_MS_MAX}
       )
     )`
 }

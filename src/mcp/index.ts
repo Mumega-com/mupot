@@ -196,10 +196,19 @@ import {
   listFlightsForSquad,
   listIncompleteFlightTaskIds,
   FlightProjectError,
+  FlightIdempotencyConflictError,
   validateFlightProjectTarget,
   validateFlightTaskProjectConsistency,
   type FlightRow,
 } from '../flight/service'
+import {
+  findFinishedWorkConflict,
+  findFlightByClientRequestId,
+  parseClientRequestId,
+  parseRedispatchReason,
+  sameDispatchRequest,
+  type RedispatchReceiptInput,
+} from '../flight/rebooking'
 import { parseDispatchBody } from '../flight/routes'
 import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from '../flight/meta'
 // AUTH_CONTEXT_HEADER lives in a separate module (no cloudflare:workers dep) so
@@ -2626,7 +2635,13 @@ const toolFlightDispatch: ToolSpec = {
     + 'budgetEstimateMicroUsd/budget_estimate_micro_usd: number, recentProgress/recent_progress: number 0..1, '
     + 'progressPerStep/progress_per_step: number 0..1, wastePerStep/waste_per_step: number 0..1, '
     + 'stepSeconds/step_seconds: number), budget_micro_usd?: number, '
-    + 'executor_agent_id?: string (who FLIES the flight, if not the caller — requires lead on the executor\'s squad) }',
+    + 'executor_agent_id?: string (who FLIES the flight, if not the caller — requires lead on the executor\'s squad), '
+    + 'client_request_id?: string (idempotency key, <=200 chars, unique per dispatching agent — a retry with the '
+    + 'same key returns the ORIGINAL flight with idempotent_replay:true; the same key with a different request is '
+    + '409 client_request_id_conflict), '
+    + 'redispatch_landed_reason?: string (<=500 chars — explicit, receipted override of 409 flight_task_already_landed '
+    + '(a task_id already belongs to a LANDED flight) and 409 flight_task_already_done (a task_id is already done or '
+    + 'approved, whatever became of its earlier flight); requires lead on every flight squad) }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -2637,6 +2652,8 @@ const toolFlightDispatch: ToolSpec = {
       signals_json: STRING_SCHEMA,
       budget_micro_usd: OPTIONAL_NUMBER_SCHEMA,
       executor_agent_id: STRING_SCHEMA,
+      client_request_id: STRING_SCHEMA,
+      redispatch_landed_reason: STRING_SCHEMA,
     },
     required: ['squad_id', 'goal', 'meta_json', 'signals_json'],
     additionalProperties: false,
@@ -2804,6 +2821,59 @@ const toolFlightDispatch: ToolSpec = {
         : references.error
       return fail(error.endsWith('_not_found') ? 404 : 400, error, references.ref)
     }
+    // ── mupot#1540 C: duplicate-booking guards (src/flight/rebooking.ts) ────────
+    // Placed AFTER every authorization and reference check above, so neither the
+    // idempotent replay nor the landed-task refusal can tell an unauthorized caller
+    // anything about flights it could not have dispatched.
+    const clientRequestId = parseClientRequestId(args.client_request_id)
+    if (!clientRequestId.ok) return fail(400, 'invalid_client_request_id')
+    const redispatchReason = parseRedispatchReason(args.redispatch_landed_reason)
+    if (!redispatchReason.ok) return fail(400, 'invalid_redispatch_landed_reason')
+    const idempotentShape = {
+      agent: executorAgentId,
+      goal,
+      project_id: projectId ?? null,
+      budget_micro_usd: requestedBudget as number,
+      meta,
+    }
+    const replayOriginal = async (): Promise<ToolOutcome | null> => {
+      if (!clientRequestId.value) return null
+      const original = await findFlightByClientRequestId(env, auth.boundAgentId as string, clientRequestId.value)
+      if (!original) return null
+      if (!sameDispatchRequest(original, idempotentShape)) {
+        return fail(409, 'client_request_id_conflict', { flight_id: original.id })
+      }
+      // The ORIGINAL flight, as it stands now (it may since have landed or failed).
+      // No second row, no second envelope: the first call already delivered or failed it.
+      return done({ flight: flightWithParsedMeta(original, meta), idempotent_replay: true })
+    }
+    const replay = await replayOriginal()
+    if (replay) return replay
+
+    let redispatchReceipt: RedispatchReceiptInput | undefined
+    const finishedConflict = await findFinishedWorkConflict(env, meta.task_ids)
+    if (finishedConflict) {
+      const { error: conflictError, ...conflict } = finishedConflict
+      if (!redispatchReason.value) {
+        return fail(409, conflictError, conflict)
+      }
+      // The override re-spends on finished work, so it takes lead on every flight squad —
+      // the same bar as a budgeted dispatch — not the member floor of a booking.
+      for (const referencedSquad of referencedSquads) {
+        const bypassAppliesHere = workspaceAdmin && referencedSquad.kind !== 'home'
+        if (!bypassAppliesHere && !hasCapability(grants, 'squad', brandSquadScope(referencedSquad), 'lead')) {
+          return fail(403, 'flight_redispatch_forbidden', { need: 'lead', scope: 'squad', squad_id: referencedSquad.id })
+        }
+      }
+      // Written by createFlight in the SAME batch as the flight row. See rebooking.ts.
+      redispatchReceipt = {
+        actor: { kind: 'agent', id: auth.boundAgentId },
+        reason: redispatchReason.value,
+        landedFlightIds: conflict.landed_flight_ids,
+        taskIds: conflict.task_ids,
+      }
+    }
+
     const signals = parseJsonArg(args.signals_json)
     const parsed = parseDispatchBody({
       agent: executorAgentId,
@@ -2818,6 +2888,7 @@ const toolFlightDispatch: ToolSpec = {
       budget_micro_usd: requestedBudget,
       meta,
       signals,
+      ...(clientRequestId.value ? { client_request_id: clientRequestId.value } : {}),
     })
     if (!parsed.ok) return fail(400, parsed.error, parsed.detail)
     parsed.value.signals.budgetEstimateMicroUsd = requestedBudget as number
@@ -2825,8 +2896,21 @@ const toolFlightDispatch: ToolSpec = {
 
     let preflight
     try {
-      preflight = await dispatchFlight(env, parsed.value.flight, parsed.value.signals, parsed.value.opts)
+      preflight = await dispatchFlight(
+        env,
+        parsed.value.flight,
+        parsed.value.signals,
+        parsed.value.opts,
+        redispatchReceipt ? { redispatchReceipt } : {},
+      )
     } catch (error) {
+      if (error instanceof FlightIdempotencyConflictError) {
+        // Lost the race to a concurrent dispatch carrying the same key — the unique
+        // index refused our row. Answer exactly as a later retry would.
+        const raced = await replayOriginal()
+        if (raced) return raced
+        return fail(409, 'client_request_id_conflict')
+      }
       if (!(error instanceof FlightProjectError)) throw error
       return flightProjectFailure(error)
     }

@@ -10,6 +10,7 @@ import { createBus } from '../bus'
 import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
+import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -47,6 +48,15 @@ export interface FlightRow {
   started_at: number | null
   ended_at: number | null
   meta: string
+  // mupot#1540 (0172). Optional because hand-built rows (and pre-0172 reads) omit them.
+  /** Unix ms the flight entered 'waiting' (every task parked at a gate); NULL otherwise. */
+  waiting_since?: number | null
+  /** Unix ms of the last waiting → running (reject/reopen); restarts the stall clock. */
+  resumed_at?: number | null
+  /** Dispatcher-supplied idempotency key; unique per (tenant, dispatched_by_agent_id). */
+  client_request_id?: string | null
+  /** Unix ms the watchdog escalated the current wait (once per wait); NULL otherwise. */
+  escalated_at?: number | null
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null
@@ -65,6 +75,12 @@ export interface NewFlight {
   trigger_source?: TriggerSource
   budget_micro_usd?: number
   meta?: FlightMetaV1
+  /**
+   * Dispatcher-supplied idempotency key (mupot#1540 C). Unique per
+   * (tenant, dispatched_by_agent_id) — see 0172's partial unique index. A second
+   * INSERT with the same key throws FlightIdempotencyConflictError.
+   */
+  client_request_id?: string
 }
 
 export interface CreateFlightOptions {
@@ -72,12 +88,25 @@ export interface CreateFlightOptions {
   id?: string
   /** Internal atomic fence used by Routine dispatch before creating control work. */
   routineRunFence?: { runId: string; tenant: string }
+  /**
+   * mupot#1540: a receipted override of the finished-work refusal. Written in the SAME
+   * batch as the flight INSERT (see src/flight/rebooking.ts).
+   */
+  redispatchReceipt?: RedispatchReceiptInput
 }
 
 export class FlightCreateFenceError extends Error {
   constructor() {
     super('routine_dispatch_fenced')
     this.name = 'FlightCreateFenceError'
+  }
+}
+
+/** A concurrent dispatch already claimed this (dispatcher, client_request_id). */
+export class FlightIdempotencyConflictError extends Error {
+  constructor() {
+    super('flight_client_request_id_taken')
+    this.name = 'FlightIdempotencyConflictError'
   }
 }
 
@@ -145,6 +174,9 @@ export async function validateFlightProjectAttribution(env: Env, flight: NewFlig
 
 function mapFlightProjectInsertError(error: unknown): never {
   const message = error instanceof Error ? error.message : String(error)
+  if (message.includes('UNIQUE constraint failed') && message.includes('flights.client_request_id')) {
+    throw new FlightIdempotencyConflictError()
+  }
   if (message.includes('flight meta invalid')) throw new FlightProjectError('invalid_flight_meta')
   if (message.includes('flight project not found')) throw new FlightProjectError('project_not_found')
   if (message.includes('flight project archived')) throw new FlightProjectError('archived_project')
@@ -182,6 +214,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       JSON.stringify(f.meta ?? {}),
     ]
     if (fence) {
+      // Routine dispatch is idempotent by its own deterministic id (options.id) and never
+      // carries a client_request_id — the column is deliberately not written here.
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
@@ -196,7 +230,22 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
                )
           )`,
       ).bind(...values, fence.runId, fence.tenant).run()
+    } else if (f.client_request_id !== undefined || options.redispatchReceipt) {
+      const insert = env.DB.prepare(
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10)`,
+      ).bind(...values, f.client_request_id ?? null)
+      if (options.redispatchReceipt) {
+        const [inserted] = await env.DB.batch([insert, redispatchReceiptStatement(env, id, options.redispatchReceipt)])
+        result = inserted
+      } else {
+        result = await insert.run()
+      }
     } else {
+      // No key → the pre-0172 statement, byte for byte. Deploy-order safety: until an
+      // operator applies 0172, flights has no client_request_id column, and naming it on
+      // every insert would fail EVERY dispatch. Only a caller that opts into the key
+      // depends on the migration.
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9)`,
