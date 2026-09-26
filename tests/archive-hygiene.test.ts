@@ -181,28 +181,109 @@ describe('archive substrate (mupot#1496)', () => {
     expect(row?.status).toBe('suspended') // NOT flipped to 'active' — it was never active
   })
 
-  it('refuses to archive a member who holds org:owner capability', async () => {
+  it('refuses to archive a member who outranks the actor (cannot_affect_higher_rank, the #1337 predicate)', async () => {
     harness.sqlite.exec(`
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
         VALUES ('cap-owner', 'mem-1', 'org', NULL, 'owner');
     `)
+    // ORG_ADMIN's org-scope capability is 'admin' (rank 4) — mem-1 is now
+    // 'owner' (rank 5), so exceedsTargetRankCeiling refuses BEFORE any
+    // dependent-safety check runs, the same predicate PATCH /members/:id
+    // already enforces (mupot#1337).
     const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error).toBe('org_owner_protected')
+    expect(result.error).toBe('cannot_affect_higher_rank')
     const row = await env.DB.prepare('SELECT status, archived_at FROM members WHERE id = ?1').bind('mem-1')
       .first<{ status: string; archived_at: string | null }>()
     expect(row?.status).toBe('active')
     expect(row?.archived_at).toBeNull()
   })
 
-  it('refuses to archive a member who owns a currently-active agent', async () => {
+  it('refuses to archive the caller\'s own member row', async () => {
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: OPERATOR, reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('cannot_archive_self')
+  })
+
+  it('refuses to archive the last remaining org owner even for an actor of EQUAL rank', async () => {
+    // mem-1 is the ONLY owner in the tenant. An actor who is ALSO an owner
+    // (equal rank — exceedsTargetRankCeiling passes, since it is not
+    // STRICTLY greater) still cannot archive the last one out.
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+        VALUES ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const result = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('last_org_owner')
+  })
+
+  it('permits archiving an owner when ANOTHER owner remains', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('cap-owner-mem1', 'mem-1', 'org', NULL, 'owner'),
+        ('cap-owner-mem2', 'mem-2', 'org', NULL, 'owner');
+    `)
+    const ownerActor = auth({
+      capabilities: [{ member_id: OPERATOR, scope_type: 'org', scope_id: null, capability: 'owner' }],
+    })
+    const result = await invoke(ownerActor, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(true) // mem-2 remains an owner
+  })
+
+  it('refuses to archive a member who owns a currently-active agent via agents.owner_member_id', async () => {
     harness.sqlite.exec(`UPDATE agents SET owner_member_id='mem-1' WHERE id='agent-1';`) // agent-1 is status='active'
     const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.error).toBe('owns_active_agent')
     expect(result.detail).toEqual({ active_agents: 1 })
+  })
+
+  it('refuses to archive a member bound to an active agent via agent_member_bindings (the REAL seat link, not owner_member_id)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-1', 'mem-1', datetime('now'));
+    `) // agent-1 is status='active'; owner_member_id is NOT set on it
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-1', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('owns_active_agent')
+  })
+
+  it('refuses to archive a member holding a LIVE agent-bound member_tokens row for an active agent (not owner_member_id)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-1', 'mem-2', datetime('now'));
+      INSERT INTO member_tokens (id, member_id, agent_id, tenant, token_hash)
+        VALUES ('tok-seat', 'mem-2', 'agent-1', '${TENANT}', 'hash-seat');
+    `) // agent-1 is status='active'; owner_member_id is NOT set on it. The
+       // token is bound to mem-2 (agent_member_bindings satisfies the
+       // member_tokens_agent_binding_insert trigger); archiving mem-2, not
+       // mem-1, is the one this token's live-seat check should refuse.
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-2', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('owns_active_agent')
+  })
+
+  it('permits archiving a member whose agent-bound token is REVOKED, bound to an agent that is not active', async () => {
+    // agent-2 is status='inactive' in the fixture — neither the binding nor
+    // the (also revoked) token should refuse archiving mem-2.
+    harness.sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', 'agent-2', 'mem-2', datetime('now'));
+      INSERT INTO member_tokens (id, member_id, agent_id, tenant, token_hash, revoked_at)
+        VALUES ('tok-seat-dead', 'mem-2', 'agent-2', '${TENANT}', 'hash-seat-dead', datetime('now'));
+    `)
+    const result = await invoke(ORG_ADMIN, 'archive_row', { table: 'members', id: 'mem-2', reason: 'x' })
+    expect(result.ok).toBe(true) // agent-2 is inactive — no live seat risk either way
   })
 
   it('archives an agent already inactive (no live tokens)', async () => {

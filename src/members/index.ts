@@ -76,6 +76,7 @@ import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 // uses — trim + lowercase, matching idx_members_email_lower (0146). Reused
 // here rather than re-deriving a second copy that could drift.
 import { normalizeInviteEmail } from '../auth/pending-invite-link'
+import { isSquadArchived } from '../hygiene/filters'
 import {
   isAgentAccessCapability,
   removeAgentSquadAccess,
@@ -986,6 +987,11 @@ membersApp.post(
       if (!body.project_id || !body.squad_id || body.expires_in_seconds === null) {
         return c.json({ error: 'invalid_invite_scope' }, 400)
       }
+      // mupot#1496 Round 2 (Athena P0-1 / adversarial P1-3): an archived
+      // squad cannot be repopulated via an invite either.
+      if (await isSquadArchived(c.env, body.squad_id)) {
+        return c.json({ error: 'squad_archived' }, 409)
+      }
       const result = await createProjectInvite(c.env, auth, {
         email: body.member_id ? undefined : body.email,
         member_id: body.member_id ?? undefined,
@@ -1050,6 +1056,11 @@ membersApp.post(
     const creatorIsOrgAdmin = isOrgAdmin(auth)
     if (!creatorIsOrgAdmin && (await isInviteEmailReserved(c.env, normalizedEmail))) {
       return c.json({ error: 'invite_email_reserved' }, 409)
+    }
+
+    // mupot#1496 Round 2: same archived-squad refusal for a plain squad invite.
+    if (body.squad_id && (await isSquadArchived(c.env, body.squad_id))) {
+      return c.json({ error: 'squad_archived' }, 409)
     }
 
     const id = crypto.randomUUID()
@@ -1240,6 +1251,21 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
   // principal who could undo it.
   const ceiling = await targetRankCeiling(c, id)
   if (ceiling) return ceiling
+
+  // mupot#1496 Round 2 (adversarial P1-2): an ARCHIVED member (archive_row)
+  // must not be silently reactivated through this route while archived_at
+  // stays set — that would leave a member whose credentials were revoked and
+  // whose row is still flagged archived, back to status='active' and able to
+  // authenticate again, with archive_row's own idempotency check (which
+  // looks at archived_at AND status together) then unable to tell the
+  // difference between "still properly archived" and "reactivated behind its
+  // back". unarchive_row is the only door out of archived_at IS NOT NULL.
+  const archivedRow = await c.env.DB.prepare(
+    'SELECT archived_at FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL)',
+  ).bind(id, c.env.TENANT_SLUG).first<{ archived_at: string | null }>()
+  if (archivedRow?.archived_at) {
+    return c.json({ error: 'archived', detail: { tool: 'unarchive_row' } }, 409)
+  }
 
   let sessionsRevoked = 0
   const res = status === 'suspended'

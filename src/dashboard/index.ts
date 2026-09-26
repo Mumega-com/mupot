@@ -78,6 +78,7 @@ import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 // Shared creation paths — the dashboard handlers call the SAME service functions
 // the /api routes call, never re-implementing the write/validation logic.
 import { createDepartment, createSquad, createAgent, setAgentStatus, deleteAgent, updateUnitConfig } from '../org/service'
+import { SQUAD_ACTIVE_SQL } from '../hygiene/filters'
 import type { UnitConfigPatch } from '../org/service'
 import { createProject, getProject, updateProject } from '../projects/service'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
@@ -1797,7 +1798,7 @@ dashboardApp.post('/agents/:id/status', async (c) => {
     return c.json({ error: 'invalid_status', allowed: ['active', 'paused'] }, 400)
   }
   const result = await setAgentStatus(c.env, agentId, status)
-  if (!result.ok) return c.json({ error: result.error }, 404)
+  if (!result.ok) return c.json({ error: result.error }, result.error === 'archived' ? 409 : 404)
   return c.json({ ok: true })
 })
 
@@ -3296,8 +3297,11 @@ async function loadDepartments(env: Env): Promise<Department[]> {
 // squad's own legitimate viewers reach it through an explicit-grant-checked
 // path (canOnSquad/canOnSquadAuth), never through this org-wide listing.
 async function loadSquads(env: Env): Promise<Squad[]> {
+  // mupot#1496 Round 2 (Athena P0-1): an archived squad must not show as
+  // live in the org-wide picker/tree/sidebar this helper feeds.
   const rows = await env.DB.prepare(
-    `SELECT id, department_id, slug, name, charter, created_at FROM squads WHERE kind != 'home' ORDER BY created_at ASC, name ASC`,
+    `SELECT id, department_id, slug, name, charter, created_at FROM squads
+      WHERE kind != 'home' AND ${SQUAD_ACTIVE_SQL()} ORDER BY created_at ASC, name ASC`,
   ).all<Squad>()
   return rows.results ?? []
 }

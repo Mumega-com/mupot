@@ -10,7 +10,10 @@
 // Gate: org-admin only (hasWorkspaceAdmin), operator principal only (no
 // agent-bound caller) — matching move_agent_squad/team_bootstrap's bar for a
 // broad, cross-entity administrative action, not the narrower single-scope
-// admin bar deactivate_agent uses.
+// admin bar deactivate_agent uses. NOTE: this means an agent-bound bearer
+// (including Kasra's own welded credential) can never call archive_row/
+// unarchive_row/archive_plan_expand — applying a plan requires an unbound
+// org-admin bearer or an operator dashboard session, not an agent seat.
 
 import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
@@ -49,8 +52,12 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
       return fail(409, 'in_air_flight')
     case 'owns_active_agent':
       return fail(409, 'owns_active_agent', outcome.counts)
-    case 'org_owner_protected':
-      return fail(409, 'org_owner_protected')
+    case 'cannot_archive_self':
+      return fail(409, 'cannot_archive_self')
+    case 'cannot_affect_higher_rank':
+      return fail(403, 'cannot_affect_higher_rank')
+    case 'last_org_owner':
+      return fail(409, 'last_org_owner')
     case 'must_deactivate_first':
       return fail(409, 'must_deactivate_first', { tool: outcome.tool })
   }
@@ -76,9 +83,12 @@ export const toolArchiveRow: ToolSpec = {
   args: '{ table: "members"|"agents"|"squads"|"projects"|"tasks", id: string, reason: string }' +
     ' -- org-admin only, operator principal only (no agent-bound caller).' +
     ' members: archiving ALWAYS suspends the member and revokes its live tokens/web' +
-    ' sessions/agent sessions; refuses if the member holds org:owner or owns a' +
-    ' currently-active agent. agents: requires the agent already be status=inactive' +
-    ' (call deactivate_agent first — this tool never deactivates implicitly).',
+    ' sessions/agent sessions; refuses cannot_archive_self, cannot_affect_higher_rank' +
+    ' (the same #1337 rank-ceiling predicate PATCH /members/:id uses), last_org_owner,' +
+    ' or owns_active_agent (an agent_member_bindings row, a live agent-bound' +
+    ' member_tokens row, or agents.owner_member_id pointing at a status=active agent).' +
+    ' agents: requires the agent already be status=inactive (call deactivate_agent' +
+    ' first — this tool never deactivates implicitly).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -101,7 +111,7 @@ export const toolArchiveRow: ToolSpec = {
     const reason = str(args.reason)
     if (!reason) return fail(400, 'invalid_args', 'reason required')
 
-    const outcome = await archiveRow(env, {
+    const outcome = await archiveRow(env, auth, {
       table: args.table as ArchivableTable,
       id,
       reason,
@@ -156,26 +166,50 @@ export const toolUnarchiveRow: ToolSpec = {
 // other four tables are archived one id at a time via archive_row directly —
 // widening this to a generic filter DSL across all five tables is scope this
 // brief did not ask for.
+//
+// ROUND 2 hardening (adversarial P1-5 on PR #1561): `where:{}` used to return
+// EVERY non-archived task including client projects — now project_ids (non-
+// empty) AND a valid ISO created_before AND at least one status are ALL
+// required, so a plan can never accidentally be "everything". `mode` picks
+// which side of tasks_archive_state to match: 'live' (default) for an
+// archive plan, 'archived' for an unarchive plan — Round 1's expander always
+// filtered to non-archived, so a bulk `--unarchive` plan silently expanded to
+// the WRONG set (tasks that were never archived). The 5000-row cap now
+// reports `truncated: true` instead of silently dropping rows past it.
 
 const TASK_STATUS_VALUES = ['open', 'in_progress', 'blocked', 'done', 'review', 'approved', 'rejected']
+const PLAN_EXPAND_LIMIT = 5000
+
+// A conservative, no-dependency ISO-8601-ish check: YYYY-MM-DD, optionally
+// with a T time component. Rejects garbage like 'zzzz' (which SQLite's
+// string comparison against created_at would otherwise happily "match"
+// everything against, since an un-parseable string still compares lexically).
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z?)?$/
 
 export const toolArchivePlanExpand: ToolSpec = {
   name: 'archive_plan_expand',
   scope: 'org',
   min: 'admin',
-  args: '{ table: "tasks", where: { status?: string[], created_before?: string (ISO), project_ids?: string[] } }' +
-    ' -- read-only. Returns the ids a bulk archive plan would touch, without archiving anything.',
+  args: '{ table: "tasks", mode?: "live"|"archived", where: { status: string[] (>=1), created_before: string (ISO, required), project_ids: string[] (>=1, required) } }' +
+    ' -- read-only. Returns the ids a bulk archive/unarchive plan would touch, without' +
+    ' archiving anything. project_ids, created_before, and a non-empty status list are' +
+    ' ALL required — there is no unscoped "match everything" shape. mode="live" (default)' +
+    ' matches tasks with NO tasks_archive_state row (for an archive plan); mode="archived"' +
+    ' matches tasks that already HAVE one (for an unarchive plan). Result reports' +
+    ' truncated:true when more than 5000 rows matched.',
   inputSchema: {
     type: 'object',
     properties: {
       table: { type: 'string', enum: ['tasks'] },
+      mode: { type: 'string', enum: ['live', 'archived'] },
       where: {
         type: 'object',
         properties: {
-          status: { type: 'array', items: { type: 'string', enum: TASK_STATUS_VALUES } },
+          status: { type: 'array', items: { type: 'string', enum: TASK_STATUS_VALUES }, minItems: 1 },
           created_before: STRING_SCHEMA,
-          project_ids: { type: 'array', items: { type: 'string' } },
+          project_ids: { type: 'array', items: STRING_SCHEMA, minItems: 1 },
         },
+        required: ['status', 'created_before', 'project_ids'],
         additionalProperties: false,
       },
     },
@@ -187,39 +221,47 @@ export const toolArchivePlanExpand: ToolSpec = {
     if (gateFail) return gateFail
 
     if (args.table !== 'tasks') return fail(400, 'unsupported_table', 'only table=tasks supports plan expansion')
+    const mode = args.mode === 'archived' ? 'archived' : 'live'
     const where = (args.where ?? {}) as {
       status?: unknown
       created_before?: unknown
       project_ids?: unknown
     }
 
-    const clauses: string[] = ["ta.task_id IS NULL"] // never re-offer an already-archived task
+    if (!Array.isArray(where.status) || where.status.length === 0) {
+      return fail(400, 'invalid_args', 'where.status must be a non-empty array')
+    }
+    if (typeof where.created_before !== 'string' || !ISO_DATE_RE.test(where.created_before)) {
+      return fail(400, 'invalid_args', 'where.created_before must be an ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)')
+    }
+    if (!Array.isArray(where.project_ids) || where.project_ids.length === 0) {
+      return fail(400, 'invalid_args', 'where.project_ids must be a non-empty array')
+    }
+
+    const clauses: string[] = [mode === 'archived' ? 'ta.task_id IS NOT NULL' : 'ta.task_id IS NULL']
     const binds: unknown[] = []
     let n = 1
 
-    if (Array.isArray(where.status) && where.status.length > 0) {
-      const placeholders = where.status.map(() => `?${n++}`).join(',')
-      clauses.push(`t.status IN (${placeholders})`)
-      binds.push(...where.status)
-    }
-    if (typeof where.created_before === 'string' && where.created_before.trim().length > 0) {
-      clauses.push(`t.created_at < ?${n++}`)
-      binds.push(where.created_before)
-    }
-    if (Array.isArray(where.project_ids) && where.project_ids.length > 0) {
-      const placeholders = where.project_ids.map(() => `?${n++}`).join(',')
-      clauses.push(`t.project_id IN (${placeholders})`)
-      binds.push(...where.project_ids)
-    }
+    const statusPlaceholders = where.status.map(() => `?${n++}`).join(',')
+    clauses.push(`t.status IN (${statusPlaceholders})`)
+    binds.push(...where.status)
+
+    clauses.push(`t.created_at < ?${n++}`)
+    binds.push(where.created_before)
+
+    const projectPlaceholders = where.project_ids.map(() => `?${n++}`).join(',')
+    clauses.push(`t.project_id IN (${projectPlaceholders})`)
+    binds.push(...where.project_ids)
 
     const sql = `SELECT t.id FROM tasks t
                   LEFT JOIN tasks_archive_state ta ON ta.task_id = t.id
                   WHERE ${clauses.join(' AND ')}
                   ORDER BY t.created_at ASC
-                  LIMIT 5000`
+                  LIMIT ${PLAN_EXPAND_LIMIT + 1}`
     const { results } = await env.DB.prepare(sql).bind(...binds).all<{ id: string }>()
-    const ids = results.map((r) => r.id)
-    return done({ table: 'tasks', count: ids.length, ids })
+    const truncated = results.length > PLAN_EXPAND_LIMIT
+    const ids = (truncated ? results.slice(0, PLAN_EXPAND_LIMIT) : results).map((r) => r.id)
+    return done({ table: 'tasks', mode, count: ids.length, truncated, ids })
   },
 }
 

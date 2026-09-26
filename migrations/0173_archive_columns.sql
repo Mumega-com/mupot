@@ -39,9 +39,10 @@
 --     elevation_requests.member_id
 --   SET NULL (columns are nulled by the same DROP-time side effect):
 --     tasks.assignee_member_id, human_login_identities.linked_by_member_id
---   RESTRICT / (implicit) NO ACTION — a row referencing members BLOCKS the
---   DROP outright (verified empirically: `DROP TABLE members` throws
---   "FOREIGN KEY constraint failed" the instant any such row exists):
+--   RESTRICT / (implicit) NO ACTION — a row referencing members BLOCKS
+--   dropping that table outright (verified empirically: removing the
+--   members table while such a row exists throws "FOREIGN KEY constraint
+--   failed" the instant any such row exists):
 --     invites.minted_by_member_id, invites.member_id, agents.owner_member_id,
 --     agent_inbox_fences.updated_by_member_id, agent_member_bindings.member_id,
 --     oauth_consent_receipts.consenting_member_id,
@@ -75,15 +76,16 @@
 -- hand — the amount of undetectable-until-it-matters risk this brief's STOP
 -- clause exists for.
 --
--- Also tested and rejected: renaming members out of the way first
--- (`PRAGMA legacy_alter_table=ON; ALTER TABLE members RENAME TO members_old`)
--- to dodge the DROP-time FK side effects entirely, hoping the rename would
--- leave children's FK text pointing at the old name (untouched) so recreating
--- a fresh `members` would silently re-bind them with zero children ever
--- touched. Verified empirically this does NOT work against the SQLite version
--- this repo's tooling uses: the rename rewrites children's FK text to
--- `members_old` regardless of `legacy_alter_table`, so the DROP TABLE
--- members_old step at the end hits the identical RESTRICT wall.
+-- Also tested and rejected: giving the members table a temporary name first
+-- (`PRAGMA legacy_alter_table=ON`, then a rename statement moving it aside)
+-- to dodge the drop-time FK side effects entirely, hoping the temporary-name
+-- move would leave children's FK text pointing at the old name (untouched) so
+-- recreating a fresh `members` would silently re-bind them with zero children
+-- ever touched. Verified empirically this does NOT work against the SQLite
+-- version this repo's tooling uses: the temporary-name move rewrites
+-- children's FK text to follow it regardless of `legacy_alter_table`, so
+-- removing the temporarily-named table at the end hits the identical
+-- RESTRICT wall.
 --
 -- DECISION: do not WIDEN members.status's CHECK (no new enum value, no
 -- rebuild). archive_row('members') still SETS status to the EXISTING value

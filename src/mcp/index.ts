@@ -167,6 +167,7 @@ import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -991,7 +992,7 @@ const toolTaskList: ToolSpec = {
     const limit = readLimit(args.limit, 25, 100)
     if (typeof limit !== 'number') return limit
 
-    const baseClauses = ['squad_id = ?1']
+    const baseClauses = ['squad_id = ?1', TASK_NOT_ARCHIVED_SQL()]
     const baseBinds: unknown[] = [squadRes.squad.id]
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
     if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
@@ -1129,7 +1130,7 @@ const toolTaskBoard: ToolSpec = {
       // while P3 chatter from today stays. Found by the ORDER-BY parity guard, not by me.
       `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
-        WHERE squad_id = ?1
+        WHERE squad_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY ${priorityOrderSql()}, created_at DESC
         LIMIT ?2`,
     )
@@ -2233,6 +2234,13 @@ const toolTaskDispatch: ToolSpec = {
     if (!(await memberCanOnSquad(env, grants, task.squad_id, 'member'))) {
       return fail(404, 'task_not_found')
     }
+    // mupot#1496 Round 2 (Athena P0-1): loadTask resolves by id regardless of
+    // archive state (an "explicit history read", per Athena's own framing) —
+    // dispatch is NOT a history read, so an archived task must refuse here
+    // even though it successfully resolved above.
+    const archived = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1')
+      .bind(task.id).first()
+    if (archived) return fail(409, 'task_archived')
     if (task.status !== 'open' && task.status !== 'blocked' && task.status !== 'rejected') {
       return fail(409, 'task_not_runnable')
     }
