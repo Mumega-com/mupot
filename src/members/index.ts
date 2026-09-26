@@ -51,6 +51,7 @@ import {
   actorMaxRankOnScope,
   exceedsTargetRankCeiling,
   currentMemberRankOnScope,
+  currentMemberRankAtLeastSql,
   isOrgAdmin,
 } from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
@@ -195,7 +196,17 @@ interface InviteRow {
 // (src/members/project-invites.ts) — one exported string, never a second
 // hand-copy that can drift. NULL tenant is legacy-row-belongs-to-this-pot,
 // the same convention every other tenant check in this file already uses.
-export const INVITER_ACTIVE_MEMBER_SQL = "id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL)"
+//
+// mupot#1551 round 2: a FACTORY (not a fixed string) — the capabilities
+// INSERT below now embeds this alongside currentMemberRankAtLeastSql, whose
+// own generated text repeats the inviter id and other params several times
+// each. Mixing bare `?` with numbered `?N` in one statement is fragile (and
+// this repo's own sqlite-D1 test harness only remaps `?N` occurrences), so
+// that ONE statement is fully `?N`-numbered end to end — every caller here
+// picks whichever numbers land correctly in ITS OWN statement, same shape as
+// RESERVED_INVITE_EMAIL_SQL below.
+export const INVITER_ACTIVE_MEMBER_SQL = (idParam: string, tenantParam: string): string =>
+  `id = ${idParam} AND status = 'active' AND (tenant = ${tenantParam} OR tenant IS NULL)`
 
 // ── app ──────────────────────────────────────────────────────────────────────
 
@@ -265,6 +276,10 @@ export type AcceptInviteError =
   // the invite's own scope, and an invite capability above what the inviter
   // could grant on that scope TODAY.
   | 'invite_inviter_no_longer_authorized'
+  // mupot#1551 round 2 (adversarial P1-3): redemption onto a home squad —
+  // see the creation-time refusal in parseInvite (same error name) for the
+  // primitive this closes.
+  | 'home_scope_not_invitable'
 
 export type AcceptInviteResult =
   | { ok: true; value: AcceptInviteSuccess }
@@ -338,6 +353,21 @@ export async function acceptInvite(
       : 'org'
   const scopeId: string | null = invite.squad_id ?? invite.department_id
 
+  // mupot#1551 round 2 (adversarial P1-3): refuse redeeming onto a home
+  // scope too — defense-in-depth for any home-squad invite that predates
+  // the creation-time refusal just above (parseInvite's own squad branch),
+  // or reaches this function through a future producer that forgets it.
+  // Same error name createProjectInvite already uses for its own home-squad
+  // refusal (src/members/project-invites.ts).
+  if (scopeType === 'squad' && scopeId) {
+    const squad = await env.DB.prepare('SELECT kind FROM squads WHERE id = ? LIMIT 1')
+      .bind(scopeId)
+      .first<{ kind: string }>()
+    if (squad?.kind === 'home') {
+      return { ok: false, error: 'home_scope_not_invitable' }
+    }
+  }
+
   // mupot#1551 slice 1 — re-check the INVITER at redemption, mirroring
   // redeemTelegramProjectInvite's own minter re-check (project-invites.ts
   // ~L862-905): an invite's authority to grant a capability is only as good
@@ -367,14 +397,23 @@ export async function acceptInvite(
   if (inviterId === null) {
     return { ok: false, error: 'invite_inviter_no_longer_authorized' }
   }
-  const inviter = await env.DB.prepare(`SELECT id FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL} LIMIT 1`)
+  const inviter = await env.DB.prepare(
+    `SELECT id FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?1', '?2')} LIMIT 1`,
+  )
     .bind(inviterId, env.TENANT_SLUG)
     .first<{ id: string }>()
   if (!inviter) {
     return { ok: false, error: 'invite_inviter_no_longer_authorized' }
   }
+  // The one number both halves of the re-check compare against: the inviter
+  // must clear BOTH the admin-or-better floor AND the invite's own capability
+  // — folded into a single threshold since RANK is a total order (whichever
+  // of the two is higher is the real bar). Computed once here and reused
+  // verbatim as the JS pre-check's comparison AND the SQL re-assert's bound
+  // parameter below, so the two can never compare against different numbers.
+  const requiredRank = Math.max(capabilityRank('admin'), capabilityRank(invite.capability))
   const inviterRank = await currentMemberRankOnScope(env, inviterId, scopeType, scopeId)
-  if (inviterRank < capabilityRank('admin') || capabilityRank(invite.capability) > inviterRank) {
+  if (inviterRank < requiredRank) {
     return { ok: false, error: 'invite_inviter_no_longer_authorized' }
   }
 
@@ -425,10 +464,29 @@ export async function acceptInvite(
       // check-then-write in one statement, not a separate SELECT first — so
       // this is closed atomically rather than merely reduced to "usually
       // caught by the case-sensitive UNIQUE, sometimes not".
+      // mupot#1551 round 2 (Athena BLOCK, P0 addendum — found while adding
+      // this round's own tests, not in the original finding): the email
+      // guard alone let this statement SUCCEED even when the capabilities
+      // INSERT below was about to be blocked by a revoked/insufficient
+      // inviter — D1's `.batch()` does not roll back an earlier statement
+      // because a LATER one wrote 0 rows (only a thrown error rolls back the
+      // whole batch), so a bare email-collision guard here would silently
+      // ORPHAN a member row with no capability grant at all whenever the
+      // inviter's authority evaporates in the race window. This statement
+      // now re-asserts the IDENTICAL inviter-active + inviter-rank facts the
+      // capabilities INSERT re-asserts — same exported fragments, not a
+      // hand-copy — so a revoked/insufficient inviter blocks BOTH writes
+      // atomically instead of leaving a capability-less member behind.
       env.DB.prepare(
         `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-         SELECT ?, ?, ?, ?, ?, ?, ?
-          WHERE NOT EXISTS (SELECT 1 FROM members WHERE lower(email) = lower(?))`,
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+          WHERE NOT EXISTS (SELECT 1 FROM members WHERE lower(email) = lower(?2))
+            AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?8', '?7')})
+            AND ${currentMemberRankAtLeastSql(scopeType, {
+              inviterIdParam: '?8',
+              scopeIdParam: '?9',
+              requiredRankParam: '?10',
+            })}`,
       ).bind(
         member.id,
         member.email,
@@ -437,7 +495,9 @@ export async function acceptInvite(
         member.status,
         member.created_at,
         env.TENANT_SLUG,
-        member.email,
+        inviterId,
+        scopeId,
+        requiredRank,
       ),
       // mupot#1551 slice 1: re-asserts INVITER_ACTIVE_MEMBER_SQL at write time
       // — the SAME fragment (and the SAME inviterId/env.TENANT_SLUG values,
@@ -449,19 +509,38 @@ export async function acceptInvite(
       // and SQL-reasserted here rather than the other way around.
       //
       // mupot#1551 (case-insensitivity follow-up): ALSO requires the member
-      // row above to actually exist (`id = ?`) — capabilities.member_id is a
+      // row above to actually exist (`id = ?2`) — capabilities.member_id is a
       // real FK (0002) into members(id). Without this, a member INSERT the
       // lower(email) guard just above blocked (0 rows) still lets THIS
       // statement attempt to insert a capabilities row pointing at a
       // member.id that was never created, which fails the batch with a raw
       // FOREIGN KEY constraint error instead of the clean, nameable
       // member_already_exists this function exists to return.
+      //
+      // mupot#1551 round 2 (Athena BLOCK, P0 on PR #1559): the rank half of
+      // the inviter re-check used to be JS-only — a capability revoked in
+      // the window between the JS pre-check above and THIS write landing
+      // (e.g. `DELETE FROM capabilities` racing this exact accept) sailed
+      // through, because nothing at write time re-asked "is the inviter
+      // STILL admin-or-better on this scope, right now". currentMemberRankAtLeastSql
+      // (src/auth/capability.ts) is the SAME comparison currentMemberRankOnScope
+      // just ran in JS, re-run here as SQL against the CURRENT row set — a
+      // 0-row result now also covers "the inviter's rank dropped below
+      // requiredRank since the JS check", not just "the inviter went
+      // inactive". Fully `?N`-numbered (not mixed with bare `?`) because
+      // several params below repeat multiple times in the generated text —
+      // see INVITER_ACTIVE_MEMBER_SQL's own comment for why.
       env.DB.prepare(
         `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         SELECT ?, ?, ?, ?, ?
-          WHERE EXISTS (SELECT 1 FROM members WHERE id = ?)
-            AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL})`,
-      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, member.id, inviterId, env.TENANT_SLUG),
+         SELECT ?1, ?2, ?3, ?4, ?5
+          WHERE EXISTS (SELECT 1 FROM members WHERE id = ?2)
+            AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?6', '?7')})
+            AND ${currentMemberRankAtLeastSql(scopeType, {
+              inviterIdParam: '?6',
+              scopeIdParam: '?4',
+              requiredRankParam: '?8',
+            })}`,
+      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, inviterId, env.TENANT_SLUG, requiredRank),
     ]
     // mupot#1551 (#1557, option A): acceptInvite never inserts into
     // member_tokens — there is no conditional branch left to gate; this
@@ -501,13 +580,23 @@ export async function acceptInvite(
       .bind(inviteId)
       .run()
     if (isUniqueViolation(err)) return { ok: false, error: 'member_already_exists' }
-    // mupot#1551: the member INSERT's own lower(email) guard produced a
-    // 0-row receipt failure (a concurrent case-different email landed
-    // between the JS pre-check upstream and this write) — same outcome the
-    // pre-existing UNIQUE-violation branch above names, just reached through
-    // the guard instead of a case-exact constraint violation.
+    // mupot#1551 round 2: the member INSERT's WHERE now combines TWO
+    // independent reasons a 0-row result could mean (see the guard's own
+    // comment) — a concurrent case-different email collision, OR the
+    // inviter's authority evaporating in the same race window (round 2's
+    // fix: this statement re-asserts the identical inviter-active +
+    // inviter-rank facts the capabilities INSERT does, so neither write
+    // lands and orphans the other). `assertWritten`'s 0-row signal alone
+    // cannot tell which; one cheap follow-up SELECT (using the SAME
+    // lower(email) fact the guard itself checked) disambiguates so the
+    // caller gets the CORRECT name, not a generic one — a rolled-back
+    // accept from a revoked inviter must not claim "member_already_exists"
+    // when no such member does.
     if (err instanceof Error && err.message.includes('invite_accept_mint.member')) {
-      return { ok: false, error: 'member_already_exists' }
+      const collision = await env.DB.prepare('SELECT 1 FROM members WHERE lower(email) = lower(?) LIMIT 1')
+        .bind(member.email)
+        .first<{ 1: number }>()
+      return { ok: false, error: collision ? 'member_already_exists' : 'invite_inviter_no_longer_authorized' }
     }
     throw err
   }
@@ -526,9 +615,11 @@ export async function acceptInvite(
   }
 }
 
-function acceptInviteErrorStatus(error: AcceptInviteError): 400 | 404 | 409 {
+function acceptInviteErrorStatus(error: AcceptInviteError): 400 | 403 | 404 | 409 {
   if (error === 'invite_not_found') return 404
   if (error === 'invalid_display_name') return 400
+  // Matches createProjectInvite's own status for the SAME error name.
+  if (error === 'home_scope_not_invitable') return 403
   return 409
 }
 
@@ -754,10 +845,18 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     }
     if (!isNonEmptyString(body.squad_id)) return c.json({ error: 'invalid_squad_id' }, 400)
     const squadId = body.squad_id.trim()
-    const squad = await c.env.DB.prepare('SELECT id FROM squads WHERE id = ? LIMIT 1')
+    const squad = await c.env.DB.prepare('SELECT id, kind FROM squads WHERE id = ? LIMIT 1')
       .bind(squadId)
-      .first<{ id: string }>()
+      .first<{ id: string; kind: string }>()
     if (!squad) return c.json({ error: 'squad_not_found' }, 404)
+    // mupot#1551 round 2 (adversarial P1-3): everyone is admin on their OWN
+    // home squad (createHomeForMember's exact-match grant) — without this,
+    // ANY member could POST /invites onto their own home squad at admin and
+    // mint a tenant member row for an arbitrary email, the #1551 squat
+    // primitive itself, self-service and with no other capability needed.
+    // Same refusal, same error name, createProjectInvite already uses for
+    // its own project-squad-access door (src/members/project-invites.ts).
+    if (squad.kind === 'home') return c.json({ error: 'home_scope_not_invitable' }, 403)
     c.set('inviteBody', {
       kind: 'squad',
       email: body.email as string,

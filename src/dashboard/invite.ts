@@ -331,6 +331,15 @@ inviteApp.post('/:id', async (c) => {
         409,
       )
     }
+    // mupot#1551 round 2 (adversarial P1-3): distinct from both branches
+    // above — a home-squad invite is refused categorically, not because of
+    // who sent it or who already holds the email.
+    if (result.error === 'home_scope_not_invitable') {
+      return c.html(
+        invitePageBody(c.env.BRAND, view.ctx, 'This invite can no longer be redeemed.'),
+        403,
+      )
+    }
     // member_already_exists
     return c.html(
       invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),

@@ -1665,4 +1665,63 @@ describe('team_bootstrap_release + isSlugBaseReserved (P1-1) — the receipted r
     ).toThrow(/immutable/)
     expect(() => harness.sqlite.exec(`UPDATE squads SET name = 'Renamed' WHERE id = 'squad-immutable'`)).not.toThrow()
   })
+
+  // mupot#1551 round 2 (Athena P1) — this producer used to store
+  // `h.email.trim()` verbatim (no normalization) and never checked the
+  // squatted-row shape POST /invites refuses onto — "two tools, one
+  // predicate" only holds if EVERY invite-creating tool actually runs it.
+  describe('mupot#1551 round 2 — email normalization + squatted-row guard', () => {
+    it('normalizes a mixed-case human email — stored AND echoed lowercased', async () => {
+      const outcome = await invokeTool(
+        orgAdminAuth(),
+        env,
+        'team_bootstrap',
+        {
+          slug_base: 'normcase',
+          name: 'NormCase',
+          department: DEPT_ID,
+          humans: [{ email: 'Mixed.Case@Example.com', capability: 'member' }],
+        },
+        CTX,
+      )
+      expect(outcome.ok).toBe(true)
+      if (!outcome.ok) return
+      const result = outcome.result as Record<string, unknown>
+      const invites = result.invites as Array<Record<string, unknown>>
+      expect(invites).toHaveLength(1)
+      expect(invites[0].email).toBe('mixed.case@example.com')
+      const row = harness.sqlite
+        .prepare(`SELECT email FROM invites WHERE id = ?`)
+        .get(invites[0].id as string) as { email: string }
+      expect(row.email).toBe('mixed.case@example.com')
+    })
+
+    it('refuses onto a squatted row (identity-less + live token) — UNCONDITIONAL, even for org-admin', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant)
+          VALUES ('member-squat', 'squatted@example.com', 'Squat', 'active', '${TENANT}');
+        INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant)
+          VALUES ('tok-squat', 'member-squat', 'hash-squat', 'workspace', 'workspace', '${TENANT}');
+      `)
+      const outcome = await invokeTool(
+        orgAdminAuth(),
+        env,
+        'team_bootstrap',
+        {
+          slug_base: 'squatteam',
+          name: 'SquatTeam',
+          department: DEPT_ID,
+          humans: [{ email: 'squatted@example.com', capability: 'member' }],
+        },
+        CTX,
+      )
+      expect(outcome.ok).toBe(false)
+      if (outcome.ok) return
+      expect(outcome.error).toBe('provisioning_failed')
+      const invites = harness.sqlite
+        .prepare(`SELECT COUNT(*) AS n FROM invites WHERE email = 'squatted@example.com'`)
+        .get() as { n: number }
+      expect(invites.n).toBe(0)
+    })
+  })
 })

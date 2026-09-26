@@ -160,6 +160,10 @@ import { createProject } from '../projects/service'
 import { assertBatchWritten, assertWritten } from '../lib/receipt'
 import { createSquad, isValidSlug, isNonEmptyString, prepareAgentCreate } from './service'
 import { resolveDepartmentRef } from './resolve'
+// mupot#1551 round 2 (Athena P1): the SAME normalizer + squatted-row guard
+// POST /invites uses — see the invite-insert loop below.
+import { normalizeInviteEmail } from '../auth/pending-invite-link'
+import { RESERVED_INVITE_EMAIL_SQL } from '../members'
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const PROJECT_SLUG_SUFFIX = '-prj'
@@ -819,10 +823,15 @@ export async function teamBootstrap(
 
   // ── which humans still need a fresh invite (idempotency), reporting the
   //    STORED capability for one that already exists (P2-2) ────────────────
+  // mupot#1551 round 2 (Athena P1): normalized the SAME way POST /invites
+  // does (normalizeInviteEmail, trim + lowercase) — this producer used to
+  // store `h.email.trim()` verbatim, so a differently-cased duplicate of an
+  // email already invited/held by another member sailed past every
+  // lower(email)-keyed check the rest of this codebase relies on.
   const inviteRows: TeamBootstrapInvite[] = []
   const invitesToInsert: { id: string; email: string; capability: Capability }[] = []
   for (const h of humans) {
-    const email = h.email.trim()
+    const email = normalizeInviteEmail(h.email)
     const existing = await findLiveInvite(env, squad.id, email)
     if (existing) {
       inviteRows.push({ id: existing.id, email, capability: existing.capability, created: false })
@@ -912,15 +921,34 @@ export async function teamBootstrap(
   // separate, already-committed statements. Stop at the first failure rather
   // than skipping ahead: a systemic fault should not scatter partial state
   // across every remaining human.
+  // mupot#1551 round 2 (Athena P1): the SAME squatted-row guard POST
+  // /invites uses (RESERVED_INVITE_EMAIL_SQL, src/members/index.ts), not a
+  // second hand-copy — "two tools, one predicate". UNCONDITIONAL here,
+  // unlike POST /invites' org-admin bypass: this tool's own floor
+  // (toolTeamBootstrap.min = 'admin', scope 'org' — re-derived above via
+  // hasWorkspaceAdmin) already requires org-admin to invoke AT ALL, so an
+  // "unless org-admin" bypass would be a permanent no-op here, not a real
+  // exception for a known re-inviter — it would make this guard provide
+  // zero protection in the one path it exists to close.
   let insertedInviteCount = 0
   let inviteFailure: unknown = null
   for (const invite of invitesToInsert) {
     try {
       const result = await env.DB.prepare(
         `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+          WHERE NOT ${RESERVED_INVITE_EMAIL_SQL('?2', '?8')}`,
       )
-        .bind(invite.id, invite.email, departmentId, squad.id, invite.capability, actorMemberId, now)
+        .bind(
+          invite.id,
+          invite.email,
+          departmentId,
+          squad.id,
+          invite.capability,
+          actorMemberId,
+          now,
+          tenant,
+        )
         .run()
       assertWritten(result, 'team_bootstrap.invite_insert', 1)
       insertedInviteCount += 1

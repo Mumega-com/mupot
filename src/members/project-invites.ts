@@ -14,6 +14,10 @@ import {
 } from '../auth/capability'
 import { sha256Hex } from './service'
 import { claimTimestamp } from '../lib/claim-timestamp'
+// mupot#1551 round 2 (adversarial P1-2, same class as #1558): the SAME
+// normalizer POST /invites uses — see createProjectInvite's own email
+// handling below and redeemTelegramProjectInvite's member-mint guard.
+import { normalizeInviteEmail } from '../auth/pending-invite-link'
 
 const CAPABILITIES: readonly Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -531,7 +535,11 @@ export async function createProjectInvite(
     if (!isNonEmptyString(input.member_id)) return { ok: false, error: 'invalid_member_id' }
     memberId = input.member_id.trim()
   } else {
-    email = typeof input.email === 'string' ? input.email.trim() : ''
+    // mupot#1551 round 2 (adversarial P1-2): normalized the SAME way
+    // POST /invites does — this used to store `input.email.trim()` verbatim,
+    // so a differently-cased duplicate of an already-invited/held email
+    // sailed past every lower(email)-keyed check elsewhere in this codebase.
+    email = typeof input.email === 'string' ? normalizeInviteEmail(input.email) : ''
     if (email.length > 254 || !EMAIL_RE.test(email)) return { ok: false, error: 'invalid_email' }
   }
   if (!isNonEmptyString(input.project_id)) return { ok: false, error: 'invalid_project_id' }
@@ -915,12 +923,25 @@ export async function redeemTelegramProjectInvite(
       claimedAt,
     )
     : env.DB.prepare(
+      // mupot#1551 round 2 (adversarial P1-2, same class as #1558): this
+      // comment used to read "the member-INSERT's own UNIQUE constraints
+      // already make ITS failure throw... no analogous silent-0-rows gap
+      // exists there" — true only for an EXACT-case duplicate.
+      // members.email's UNIQUE index (0002) is case-sensitive, while every
+      // member lookup elsewhere in this codebase matches by lower(email)
+      // (idx_members_email_lower/0146) — a differently-cased duplicate
+      // sailed straight through. `?2` (invite.email) is reused for the
+      // collision check, not a second bound value, so the two can never
+      // compare against different emails.
       `INSERT INTO members (
          id, email, display_name, telegram_chat_id, status, created_at, tenant
        )
        SELECT ?1, ?2, ?3, ?4, 'active', ?5, ?6
         WHERE EXISTS (
           SELECT 1 FROM invites WHERE id = ?7 AND accepted_at = ?8
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM members WHERE lower(email) = lower(?2)
         )`,
     ).bind(
       memberId,
@@ -944,9 +965,13 @@ export async function redeemTelegramProjectInvite(
   // true if bindMemberStatement's own UPDATE (same batch, same transaction)
   // matched MEMBER_BIND_ELIGIBLE_SQL and wrote THIS unique-per-claim value —
   // it is proof of this claim's write, not a fact that could have been true
-  // already. Net-new invites are unaffected: the member-INSERT's own UNIQUE
-  // constraints already make ITS failure throw (batch-wide rollback), so no
-  // analogous silent-0-rows gap exists there.
+  // already. Net-new invites: correction, mupot#1551 round 2 — this used to
+  // claim the member-INSERT's own UNIQUE constraints made its failure throw
+  // with "no analogous silent-0-rows gap"; that was true only for an
+  // EXACT-case duplicate. The INSERT's own `NOT EXISTS (lower(email)...)`
+  // guard (added this round) IS a silent-0-rows gap for a case-DIFFERENT
+  // duplicate, handled below by the `results.some(...)` check plus a
+  // disambiguating follow-up query.
   const memberBindLandedGuard = invite.member_id !== null
     ? `
        AND ${MEMBER_BIND_LANDED_GUARD_SQL}`
@@ -954,6 +979,21 @@ export async function redeemTelegramProjectInvite(
   const memberBindLandedParams = invite.member_id !== null
     ? [memberId, claimedAt]
     : []
+  // mupot#1551 round 2 (adversarial P1-2 follow-up, found while adding this
+  // round's own lower(email) guard to the net-new member INSERT above): the
+  // capabilities INSERT below references `memberId` — capabilities.member_id
+  // is a real FK (0002) into members(id). D1's `.batch()` does not roll back
+  // an EARLIER statement because a LATER one wrote as expected; it also does
+  // not stop a LATER statement from running (and hitting a hard FK error)
+  // just because an EARLIER one wrote 0 rows. Net-new path only (the bind
+  // path's target member already exists by construction) — mirrors the SAME
+  // FK-safety guard acceptInvite's own capabilities INSERT carries
+  // (src/members/index.ts).
+  const netNewMemberExistsGuard = invite.member_id === null
+    ? `
+       AND EXISTS (SELECT 1 FROM members WHERE id = ?)`
+    : ''
+  const netNewMemberExistsParams = invite.member_id === null ? [memberId] : []
 
   try {
     const results = await env.DB.batch([
@@ -995,7 +1035,7 @@ export async function redeemTelegramProjectInvite(
          SELECT ?, ?, 'squad', ?, ?
           WHERE EXISTS (
             SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
-          )${memberBindLandedGuard}
+          )${memberBindLandedGuard}${netNewMemberExistsGuard}
          ON CONFLICT (member_id, scope_type, scope_id) DO UPDATE SET capability =
            CASE WHEN ? > ${RANK_SQL_CASE('capabilities.capability')}
                 THEN excluded.capability
@@ -1004,9 +1044,17 @@ export async function redeemTelegramProjectInvite(
       ).bind(
         grantId, memberId, invite.squad_id, invite.capability, invite.id, claimedAt,
         ...memberBindLandedParams,
+        ...netNewMemberExistsParams,
         capabilityRank(invite.capability),
       ),
       env.DB.prepare(
+        // mupot#1551 round 2: ALSO needs netNewMemberExistsGuard — without
+        // it, this statement's own EXISTS(invites WHERE accepted_at=claimedAt)
+        // is satisfied by CLAIM_INVITE_SQL's write alone (same batch, same
+        // transaction, evaluated before the post-batch rollback below can
+        // run), so it marked the webhook 'completed' even when the member
+        // INSERT above was blocked — leaving the receipt un-retryable for a
+        // redemption that did NOT actually happen.
         `UPDATE telegram_webhook_receipts
             SET state = 'completed', response_text = ?, completed_at = ?
           WHERE tenant = ?
@@ -1016,7 +1064,7 @@ export async function redeemTelegramProjectInvite(
             AND state = 'processing'
             AND EXISTS (
               SELECT 1 FROM invites WHERE id = ? AND accepted_at = ?
-            )${memberBindLandedGuard}`,
+            )${memberBindLandedGuard}${netNewMemberExistsGuard}`,
       ).bind(
         responseText,
         now,
@@ -1027,10 +1075,41 @@ export async function redeemTelegramProjectInvite(
         invite.id,
         claimedAt,
         ...memberBindLandedParams,
+        ...netNewMemberExistsParams,
       ),
     ])
 
     if (results.length !== 4 || results.some((result) => rowsChanged(result) !== 1)) {
+      // mupot#1551 round 2 (adversarial P1-2): the net-new member INSERT's
+      // NEW lower(email) guard (above) can now ALSO be why this batch wrote
+      // fewer rows than expected — disambiguate it from every OTHER 0-row
+      // reason (pairing code invalid/expired, wrong Telegram id, …) with one
+      // cheap follow-up SELECT, using the SAME fact the guard itself
+      // checked, so this specific case is named `member_already_exists`
+      // rather than folded into the generic pairing-code bucket.
+      if (invite.member_id === null) {
+        const collision = await env.DB.prepare('SELECT 1 FROM members WHERE lower(email) = lower(?) LIMIT 1')
+          .bind(invite.email)
+          .first<{ 1: number }>()
+        if (collision) {
+          // Roll back the claim explicitly. Every OTHER reason this branch
+          // is reached (invalid/expired pairing code, wrong Telegram id, …)
+          // already left `accepted_at` untouched, because CLAIM_INVITE_SQL's
+          // OWN wide WHERE (pairing/project/squad/capability/email/expiry/
+          // webhook-state) failed too in those cases — nothing to undo. THIS
+          // case is different: the claim's conditions were fully satisfied
+          // (comparing the invite to itself), only the member INSERT's own
+          // lower(email) guard (added this round) refused — and a 0-row
+          // conditional write commits normally in D1's `.batch()` rather
+          // than rolling back the whole transaction, unlike the exact-case
+          // duplicate this same shape used to THROW on (a real rollback for
+          // free, before this round's guard existed).
+          await env.DB.prepare('UPDATE invites SET accepted_at = NULL WHERE id = ? AND accepted_at = ?')
+            .bind(invite.id, claimedAt)
+            .run()
+          return { ok: false, error: 'member_already_exists' }
+        }
+      }
       return { ok: false, error: 'invalid_or_expired_pairing_code' }
     }
   } catch (error) {

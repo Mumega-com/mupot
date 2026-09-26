@@ -1404,6 +1404,59 @@ describe('Telegram project invitation service', () => {
       .toEqual({ state: 'processing' })
   })
 
+  // mupot#1551 round 2 (adversarial P1-2, same class as #1558): createProjectInvite
+  // used to store `input.email.trim()` verbatim — a differently-cased
+  // duplicate of an already-existing member's email sailed past the
+  // case-sensitive members.email UNIQUE at redemption time.
+  it('mupot#1551 round 2: createProjectInvite normalizes a mixed-case email — stored lowercased', async () => {
+    const created = await createInvite('Mixed.Case@Example.TEST')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    expect(created.value.invite.email).toBe('mixed.case@example.test')
+    const row = harness.sqlite
+      .prepare('SELECT email FROM invites WHERE id = ?')
+      .get(created.value.invite.id) as { email: string }
+    expect(row.email).toBe('mixed.case@example.test')
+  })
+
+  it('mupot#1551 round 2: refuses redemption when the invited email matches an existing member by CASE ONLY — refused, rolled back, no partial writes', async () => {
+    const created = await createInvite('Case.Different@Example.test')
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    // A member with the SAME email, different case — the exact gap the
+    // case-sensitive UNIQUE constraint alone would have missed.
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, telegram_chat_id, status, tenant)
+      VALUES ('member-case-different', 'case.different@example.test', 'Existing', '9003999', 'active', '${TENANT}');
+    `)
+    reserveUpdate('update-case-different-member', VALID_REQUEST_DIGEST, '9003998')
+
+    const result = await redeemTelegramProjectInvite(env, {
+      pairing_code: created.value.pairing_code,
+      telegram_user_id: '9003998',
+      display_name: 'New Telegram Identity',
+      update_id: 'update-case-different-member',
+      request_digest: VALID_REQUEST_DIGEST,
+    })
+
+    expect(result).toEqual({ ok: false, error: 'member_already_exists' })
+    expect(harness.sqlite.prepare('SELECT accepted_at FROM invites WHERE id = ?').get(created.value.invite.id))
+      .toEqual({ accepted_at: null })
+    // Exactly one member row for this email — the pre-existing one, not a
+    // second, differently-cased mint.
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM members WHERE lower(email) = 'case.different@example.test'
+    `).get()).toEqual({ count: 1 })
+    expect(harness.sqlite.prepare(`
+      SELECT COUNT(*) AS count FROM capabilities WHERE member_id = 'member-case-different'
+    `).get()).toEqual({ count: 0 })
+    // Round 2 P0-class addendum (same as acceptInvite's own fix): the
+    // webhook receipt must stay retryable — 'completed' here would mean a
+    // redemption that never actually happened can never be retried.
+    expect(harness.sqlite.prepare(`SELECT state FROM telegram_webhook_receipts WHERE update_id = 'update-case-different-member'`).get())
+      .toEqual({ state: 'processing' })
+  })
+
   it('rejects a browser/API supplied Telegram identity without claiming a legacy invite', async () => {
     harness.sqlite.exec(`
       INSERT INTO invites (id, email, capability, invited_by)

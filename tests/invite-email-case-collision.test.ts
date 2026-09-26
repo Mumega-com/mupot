@@ -148,8 +148,17 @@ describe('mupot#1551 — invite email case-collision (gate finding on #1557)', (
       capability: 'member',
     })
     expect(res.status, await res.clone().text()).toBe(201)
-    const body = (await res.json()) as { invite: { email: string } }
+    const body = (await res.json()) as { invite: { id: string; email: string } }
     expect(body.invite.email).toBe('newcomer@example.com')
+    // M12 (survivor pin, adversarial round on PR #1559): the response body
+    // echoing lowercase is not proof the STORED row is lowercase — a caller
+    // that echoes its own already-normalized local variable would pass this
+    // check even if the actual INSERT wrote the raw, mixed-case value.
+    // Read the row back from D1 directly.
+    const row = harness.sqlite
+      .prepare(`SELECT email FROM invites WHERE id = ?`)
+      .get(body.invite.id) as { email: string }
+    expect(row.email).toBe('newcomer@example.com')
   })
 
   it('create invite for the SAME exact-case email as an existing member — governed by the existing (unchanged) checks, not this one', async () => {

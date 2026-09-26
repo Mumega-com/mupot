@@ -193,6 +193,23 @@ const RANK: Record<Capability, number> = {
   owner: 5,
 }
 
+/**
+ * mupot#1551 round 2 (Athena BLOCK, P0): the SQL-side mirror of the RANK
+ * ladder above — generated FROM `RANK`'s own entries at module load, not a
+ * second hand-typed `CASE 'owner' THEN 5 …` mapping that could silently
+ * drift from it. `src/members/project-invites.ts` had its own hand-copy of
+ * exactly this mapping (mupot#1411 P2-E round 4) before this export existed;
+ * that copy now imports this one instead of carrying a parallel literal.
+ * `column` is the SQL expression yielding a capability string (e.g.
+ * `'c.capability'` or `'capabilities.capability'`); an unrecognized value
+ * (should never happen — the column is CHECK-constrained) maps to 0, never a
+ * NULL that could make a `>=` comparison silently vanish.
+ */
+export const RANK_SQL_CASE = (column: string): string =>
+  `(CASE ${column} ${Object.entries(RANK)
+    .map(([cap, rank]) => `WHEN '${cap}' THEN ${rank}`)
+    .join(' ')} ELSE 0 END)`
+
 function meets(have: Capability, min: Capability): boolean {
   return RANK[have] >= RANK[min]
 }
@@ -953,6 +970,114 @@ export async function currentMemberRankOnScope(
     }
   }
   return max
+}
+
+/** The SAME role-plane bridge `targetLegacyRoleRank` computes in JS
+ *  (members.email -> lower() -> users.role, owner=5/admin=4/else 0),
+ *  expressed as a scalar SQL subquery so it can be compared inline. Shares
+ *  `RANK.owner`/`RANK.admin`'s numeric VALUES (not a re-typed 5/4) — the
+ *  ladder positions those two names occupy, wherever `RANK` is edited. */
+const legacyRoleRankSql = (memberIdParam: string): string =>
+  `(CASE (
+      SELECT u.role FROM members m2
+        JOIN users u ON lower(u.email) = lower(m2.email)
+       WHERE m2.id = ${memberIdParam}
+       LIMIT 1
+    ) WHEN 'owner' THEN ${RANK.owner} WHEN 'admin' THEN ${RANK.admin} ELSE 0 END)`
+
+/**
+ * mupot#1551 round 2 (Athena BLOCK, P0 on PR #1559): the SQL mirror of
+ * `currentMemberRankOnScope` above — a boolean EXISTS(...)-shaped fragment
+ * asking "does this member's rank on this EXACT scope meet or exceed
+ * `requiredRank`", meant to be embedded directly in the WHERE clause of the
+ * write it gates (acceptInvite's capabilities INSERT, src/members/index.ts),
+ * not read via a separate SELECT first.
+ *
+ * WHY THIS EXISTS: `currentMemberRankOnScope` is a JS pre-check — accurate
+ * at the moment it runs, but acceptInvite claims the invite and writes the
+ * grant in a LATER, separate `env.DB.batch()` call. A capability revoked in
+ * that window (the exact race the adversarial gate demonstrated: delete the
+ * inviter's grant between the JS check and the batch) is invisible to a
+ * JS-only re-check — only a predicate re-evaluated AT WRITE TIME, in the
+ * same statement, closes it. `INVITER_ACTIVE_MEMBER_SQL`'s existence check
+ * gets exactly this treatment already; this extends the SAME discipline to
+ * the RANK half of the re-check, which was previously JS-only.
+ *
+ * Mirrors `hasCapability`'s own three scope shapes (this file's own
+ * inheritance note, top of file): an org grant covers every scope except a
+ * home squad; a department grant covers its own squads (same exception); a
+ * squad grant covers only itself — INCLUDING a home squad, since that is an
+ * exact match, not inheritance. `RANK_SQL_CASE` (above) is the SAME
+ * ladder-mapping `currentMemberRankOnScope` computes against in JS
+ * (`RANK[cap]`) — generated from the same `RANK` object, never a second
+ * hand-copy. tests/capability-rank-sql-seam.test.ts pins the two equal
+ * across a scenario matrix: grants seeded once, the JS function and this SQL
+ * fragment both run against the SAME rows, asserted to agree on every case
+ * — proof by matching behavior, not by code inspection.
+ *
+ * Every placeholder argument is a caller-chosen `?N` STRING (not a bound
+ * value) — the caller decides where each one lands in ITS OWN statement's
+ * numbering and binds accordingly (same factory-function shape as
+ * `RESERVED_INVITE_EMAIL_SQL`). `scopeIdParam` is ignored for `'org'` (an
+ * org invite's own scope_id is always NULL — nothing here reads it).
+ */
+export function currentMemberRankAtLeastSql(
+  scopeType: CapabilityScopeType,
+  params: { inviterIdParam: string; scopeIdParam: string; requiredRankParam: string },
+): string {
+  const { inviterIdParam, scopeIdParam, requiredRankParam } = params
+  const roleRankAtLeast = `${legacyRoleRankSql(inviterIdParam)} >= ${requiredRankParam}`
+  const orgGrantAtLeast = `EXISTS (
+      SELECT 1 FROM capabilities c
+       WHERE c.member_id = ${inviterIdParam} AND c.scope_type = 'org'
+         AND ${RANK_SQL_CASE('c.capability')} >= ${requiredRankParam}
+    )`
+
+  if (scopeType === 'org') {
+    return `(${orgGrantAtLeast} OR ${roleRankAtLeast})`
+  }
+
+  if (scopeType === 'department') {
+    const deptGrantAtLeast = `EXISTS (
+        SELECT 1 FROM capabilities c
+         WHERE c.member_id = ${inviterIdParam} AND c.scope_type = 'department' AND c.scope_id = ${scopeIdParam}
+           AND ${RANK_SQL_CASE('c.capability')} >= ${requiredRankParam}
+      )`
+    return `(${orgGrantAtLeast} OR ${deptGrantAtLeast} OR ${roleRankAtLeast})`
+  }
+
+  // squad — see hasCapability's own squad branch for the shape this mirrors.
+  const squadExactAtLeast = `EXISTS (
+      SELECT 1 FROM capabilities c
+       WHERE c.member_id = ${inviterIdParam} AND c.scope_type = 'squad' AND c.scope_id = ${scopeIdParam}
+         AND ${RANK_SQL_CASE('c.capability')} >= ${requiredRankParam}
+    )`
+  // channel_capability_grants never covers a home squad at all (resolveCapabilities'
+  // own UNION branch drops those rows before hasCapability ever sees them) —
+  // unlike the capabilities table's exact-squad row above, which DOES cover home.
+  const channelExactAtLeast = `EXISTS (
+      SELECT 1 FROM channel_capability_grants ccg
+       JOIN squads s2 ON s2.id = ccg.squad_id
+       WHERE ccg.member_id = ${inviterIdParam} AND ccg.squad_id = ${scopeIdParam} AND s2.kind != 'home'
+         AND ${RANK_SQL_CASE('ccg.capability')} >= ${requiredRankParam}
+    )`
+  const deptOfSquadAtLeast = `EXISTS (
+      SELECT 1 FROM capabilities c
+       JOIN squads sq ON sq.id = ${scopeIdParam}
+       WHERE c.member_id = ${inviterIdParam} AND c.scope_type = 'department' AND c.scope_id = sq.department_id
+         AND ${RANK_SQL_CASE('c.capability')} >= ${requiredRankParam}
+    )`
+  return `(
+      EXISTS (SELECT 1 FROM squads WHERE id = ${scopeIdParam})
+      AND (
+        ${squadExactAtLeast}
+        OR ${channelExactAtLeast}
+        OR (
+          (SELECT kind FROM squads WHERE id = ${scopeIdParam}) != 'home'
+          AND (${orgGrantAtLeast} OR ${deptOfSquadAtLeast} OR ${roleRankAtLeast})
+        )
+      )
+    )`
 }
 
 // ── surface-capability gate (#106) ────────────────────────────────────────────
