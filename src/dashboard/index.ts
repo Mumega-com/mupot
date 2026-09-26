@@ -316,10 +316,13 @@ dashboardApp.use('*', async (c, next) => {
 
 // ── auth gate (redirect HTML callers to login instead of 401 JSON) ───────────
 
-// mupot#1445: GET / has no JSON representation, but an API-style caller
-// (curl, monitoring, the test harness) explicitly asking for JSON on the bare
-// root should still get the original blind redirect, never the landing page —
-// same ?format=json / Accept precedent the capability-floor gate below uses.
+// mupot#1445: GET / has no JSON representation. An API-style caller (curl, a
+// monitoring probe, a JS fetch — anything that explicitly asks for JSON, or
+// passes ?format=json) must never be handed the HTML landing page NOR a 302
+// to an HTML login page — round 2 (Athena, correctness): such a caller now
+// gets requireAuth's own 401 JSON straight back (see the auth-gate below).
+// Same ?format=json / Accept precedent the capability-floor gate further down
+// uses for the identical judgment call on a different route.
 function unauthenticatedRootWantsJson(c: Context<AppEnv>): boolean {
   const accept = c.req.header('accept') ?? ''
   return (
@@ -337,11 +340,13 @@ function unauthenticatedRootWantsJson(c: Context<AppEnv>): boolean {
  * middleware above — nothing extra needed here.
  *
  * hasPendingInvite: true when the browser carries the mupot_pending_invite
- * cookie (planted by invite.ts's POST /invite/:id right before it redirects
- * here) — the visitor already accepted an invite and just needs to finish by
- * signing in with the SAME Google account. The button target is identical
- * either way; /auth/login (untouched) is what actually binds the pending
- * marker into OAuth state.
+ * cookie. invite.ts's POST /invite/:id plants that cookie and then redirects
+ * straight to /auth/login (NOT here) — this copy is shown only if the person
+ * later lands back on '/' while the cookie is still live within its TTL, e.g.
+ * they back out of the Google account chooser, or the OAuth round-trip fails
+ * and they navigate home. Either way the button target is identical;
+ * /auth/login (untouched) is what actually binds the pending marker into
+ * OAuth state.
  */
 function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
   const brand = esc(env.BRAND)
@@ -360,21 +365,36 @@ function signedOutLandingBody(env: Env, hasPendingInvite: boolean) {
 }
 
 dashboardApp.use('*', async (c, next) => {
-  // Run the shared requireAuth. It either sets c.get('auth') and calls next(),
-  // or short-circuits with a 401 JSON response (no auth populated).
+  // Run the shared requireAuth. It either sets c.get('auth') and calls next()
+  // (returning undefined here), or short-circuits by RETURNING its own 401
+  // JSON response directly (no auth populated, next() never called). Capture
+  // that return value — round 2 (Athena, correctness): an API-style caller
+  // hitting root gets THAT exact response hand back verbatim below, never a
+  // second hand-rolled copy of its shape that could drift from the original.
   let proceeded = false
-  await requireAuth(c, async () => {
+  const authResult = await requireAuth(c, async () => {
     proceeded = true
   })
   if (!proceeded || !c.get('auth')) {
-    // mupot#1445: exact root + GET + HTML-navigating only. Every other
-    // unauthenticated path (including GET / itself when the caller explicitly
-    // wants JSON) keeps the original blind redirect — this is a landing page
-    // for a stranger who has never heard of this org, not a widened auth
-    // surface, and it must not spread past root.
-    if (c.req.method === 'GET' && c.req.path === '/' && !unauthenticatedRootWantsJson(c)) {
-      const hasPendingInvite = Boolean(getCookie(c, PENDING_INVITE_COOKIE))
-      return c.html(signedOutLandingBody(c.env, hasPendingInvite))
+    // mupot#1445 + round 2 (Athena, correctness): everything in this block is
+    // scoped to the EXACT root. Every other unauthenticated path keeps the
+    // plain blind redirect, unconditionally — regardless of Accept — and
+    // this must never widen past root.
+    if (c.req.path === '/') {
+      // A non-HTML/API caller (explicit JSON Accept, or ?format=json) gets
+      // requireAuth's own 401 — a 302 to an HTML login PAGE is meaningless to
+      // a caller that will never render HTML, and the landing page below is
+      // a browser-only surface, not an API contract.
+      if (unauthenticatedRootWantsJson(c)) {
+        return authResult instanceof Response ? authResult : c.json({ error: 'unauthenticated' }, 401)
+      }
+      // HTML-navigating GET / — the actual landing page (mupot#1445). Any
+      // other method on root (POST/HEAD/OPTIONS/…) falls through to the
+      // plain redirect below, same as every other path.
+      if (c.req.method === 'GET') {
+        const hasPendingInvite = Boolean(getCookie(c, PENDING_INVITE_COOKIE))
+        return c.html(signedOutLandingBody(c.env, hasPendingInvite))
+      }
     }
     // Unauthenticated → send the browser to the login flow.
     return c.redirect('/auth/login')
@@ -474,24 +494,56 @@ dashboardApp.use('*', async (c, next) => {
   return c.html(shell(c.env, 'No access', noDashboardAccessBody(auth)), 403)
 })
 
+// mupot#1444: the placeholder the topbar Invite CTA is swapped in from below
+// (never the real markup's class/id substrings — see the reveal middleware's
+// comment for why). Shared constant so the emit site and the resolve site can
+// never drift apart.
+const TOPBAR_INVITE_CTA_PLACEHOLDER = '<!--mupot-invite-cta-->'
+
+/** The real topbar Invite CTA — only ever produced by the reveal middleware
+ *  below, for a confirmed isOrgAdmin(auth), never present in the template. */
+function topbarInviteCtaHtml(): string {
+  return '<a class="topbar-invite" id="topbar-invite" href="/admin/members#invite-form">Invite member</a>'
+}
+
 // Addon discoverability is part of the server-rendered shell, not a client-side
 // privilege hint. Keep the shell template role-agnostic and reveal this one
 // operator-only entry after the authenticated route response has been rendered.
 //
-// mupot#1444: the topbar "Invite member" link rides the SAME reveal — same
-// isOrgAdmin() threshold /admin/members' own GET handler requires (line
-// ~1930), so a viewer who cannot reach that page never sees a button that
-// would just 403. A dead OR 403-leading button is the defect class this
-// closes; template stays role-agnostic (`hidden` by default), auth-derived
-// reveal happens once, here, after render — not duplicated per route.
+// mupot#1444 round 2 (P1, adversarial gate): the topbar Invite CTA USED TO
+// follow this exact same "emit `hidden`, strip the attribute here" recipe —
+// and that recipe is broken by construction. The `hidden` attribute's UA
+// default is a plain `display: none`, and ANY author stylesheet rule that
+// sets `display` on the same element outranks a UA rule regardless of
+// selector specificity. This file's own `.topbar-invite{display:inline-flex}`
+// did exactly that: a non-admin's browser rendered a live, clickable,
+// 403-leading link at 112x34, `hidden` attribute present and utterly inert.
+// (P2.1 below closes this for nav-addons — which has the identical exposure
+// via `.nav-link{display:flex}` — with a global `[hidden]{display:none
+// !important}` rule; that fix stays valid for any FUTURE `display:`-bearing
+// class too, which is why it's the fix there. It cannot be the WHOLE fix
+// here, because the incident report demands the current bug be provably
+// gone, not just outranked by specificity — see below.)
+//
+// The fix for topbar-invite is a different shape, not just a stronger CSS
+// rule: the template never emits the CTA's class/id/href AT ALL for a
+// non-admin — it emits an inert HTML comment placeholder that shares no
+// selector with `.topbar-invite`. There is no stylesheet in existence that
+// can un-hide bytes that were never sent. This handler is the ONLY place
+// that ever decides which bytes replace the placeholder, computed fresh
+// per request from `isOrgAdmin(auth)` — the SAME predicate /admin/members'
+// own GET handler requires — never a client-visible toggle.
 dashboardApp.use('*', async (c, next) => {
   await next()
-  if (!isOrgAdmin(c.get('auth')) || !c.res.headers.get('content-type')?.includes('text/html')) return
+  if (!c.res.headers.get('content-type')?.includes('text/html')) return
 
+  const admin = isOrgAdmin(c.get('auth'))
   const body = await c.res.text()
-  const revealed = body
-    .replace('id="nav-addons" hidden', 'id="nav-addons"')
-    .replace('id="topbar-invite" hidden', 'id="topbar-invite"')
+  const revealed = admin
+    ? body
+        .replace('id="nav-addons" hidden', 'id="nav-addons"')
+        .replace(TOPBAR_INVITE_CTA_PLACEHOLDER, topbarInviteCtaHtml())
+    : body.replace(TOPBAR_INVITE_CTA_PLACEHOLDER, '')
   c.res = new Response(revealed, c.res)
 })
 
@@ -3609,6 +3661,16 @@ export function shell(
         --warn: #d29922;
       }
       * { box-sizing: border-box; }
+      /* mupot#1444 round 2 (P2.1, adversarial gate): the hidden attribute's
+         UA default (a plain display:none) is BEATEN by any author rule that
+         sets display on the same element — nav-addons' own .nav-link (which
+         sets display:flex) and this file's own .topbar-invite (display:
+         inline-flex) both did exactly that, so the hidden attribute alone
+         never actually hid either element. !important here outranks every
+         such rule regardless of specificity or declaration order, closing
+         the whole class at once instead of chasing it one display
+         declaration at a time. */
+      [hidden] { display: none !important; }
       html, body { margin: 0; padding: 0; }
       body {
         background: var(--bg); color: var(--text);
@@ -4617,7 +4679,7 @@ export function shell(
           <div class="cloud-pill">
             <span class="cloud-pill-dot">◆</span> YOUR CLOUD · CF
           </div>
-          <a class="topbar-invite" id="topbar-invite" hidden href="/admin/members#invite-form">Invite member</a>
+          ${raw(TOPBAR_INVITE_CTA_PLACEHOLDER)}
         </header>
 
         <main>${body}</main>

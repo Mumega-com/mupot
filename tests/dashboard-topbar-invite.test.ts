@@ -1,15 +1,34 @@
-// Topbar "Invite member" — mupot#1444.
+// Topbar "Invite member" — mupot#1444, plus round-2 adversarial-gate fixes.
 //
-// Was a <button> with no handler at all — a dead control that did nothing on
-// click. Fixed to a real link to the actual producer, /admin/members's own
-// #invite-form (there is exactly ONE invite form; this never adds a second).
-// It must also only ever be shown to a viewer who can actually reach that
+// Round 1: was a <button> with no handler at all — a dead control that did
+// nothing on click. Fixed to a real link to the actual producer,
+// /admin/members's own #invite-form (there is exactly ONE invite form; this
+// never adds a second). Shown only to a viewer who can actually reach that
 // form — the SAME isOrgAdmin() threshold /admin/members' own GET handler
-// requires (src/dashboard/index.ts) — so a viewer who cannot invite never
-// sees a control that would just 403. The template renders it hidden by
-// default (role-agnostic shell, same precedent as the pre-existing
-// nav-addons reveal) and a post-render middleware strips the `hidden`
-// attribute only for an org admin.
+// requires.
+//
+// Round 1's MECHANISM was itself defective (adversarial gate P1): the
+// template rendered `<a class="topbar-invite" ... hidden>` and a post-render
+// middleware stripped the `hidden` attribute for an admin. But the `hidden`
+// attribute's UA default is a plain `display: none`, and this PR's OWN
+// `.topbar-invite { display: inline-flex }` rule — an author rule — outranks
+// that UA default regardless of specificity. A non-admin's browser rendered
+// a live, clickable, 403-leading link the whole time; `hidden` was present
+// and completely inert.
+//
+// Round 2 fix, two parts:
+//   1. (P1) The template no longer emits the CTA's class/id/href for anyone —
+//      it emits an inert HTML-comment placeholder that shares no selector
+//      with `.topbar-invite`. The reveal middleware resolves that placeholder
+//      into the real anchor (admin) or removes it entirely (everyone else).
+//      There is no `hidden` attribute anywhere in this flow for CSS to
+//      defeat — a non-admin's response contains ZERO occurrences of
+//      "topbar-invite" at all, not a hidden one.
+//   2. (P2.1) A global `[hidden] { display: none !important }` rule was added
+//      to shell()'s CSS, closing the identical exposure that nav-addons
+//      still has via `.nav-link { display: flex }` (nav-addons itself keeps
+//      the hidden-attribute-toggle mechanism; this global rule is what now
+//      makes that safe).
 //
 // requireAuth is mocked (same technique as tests/admin-members-invite-link.
 // test.ts) so this test drives the AuthContext directly instead of
@@ -86,11 +105,6 @@ function envFor(harness: SqliteD1Harness): Env {
   } as unknown as Env
 }
 
-/** Pull the exact <a id="topbar-invite" ...> tag out of the rendered shell. */
-function topbarInviteTag(body: string): string | undefined {
-  return body.match(/<a[^>]*\bid="topbar-invite"[^>]*>/)?.[0]
-}
-
 describe('topbar "Invite member" (mupot#1444)', () => {
   let harness: SqliteD1Harness | undefined
 
@@ -100,7 +114,7 @@ describe('topbar "Invite member" (mupot#1444)', () => {
     harness = undefined
   })
 
-  it('org admin: topbar-invite is a real, VISIBLE link to /admin/members#invite-form', async () => {
+  it('org admin: topbar-invite is present as a real link to /admin/members#invite-form, no hidden attribute', async () => {
     harness = makeHarness()
     authState.current = adminAuth()
 
@@ -108,14 +122,16 @@ describe('topbar "Invite member" (mupot#1444)', () => {
     expect(res.status).toBe(200)
     const body = await res.text()
 
-    const tag = topbarInviteTag(body)
+    const tag = body.match(/<a[^>]*\bid="topbar-invite"[^>]*>/)?.[0]
     expect(tag).toBeDefined()
+    expect(tag).toContain('class="topbar-invite"')
     expect(tag).toContain('href="/admin/members#invite-form"')
-    // Revealed — not left `hidden` for the viewer who is allowed to invite.
     expect(tag).not.toContain('hidden')
+    // The placeholder must never survive into a real response either way.
+    expect(body).not.toContain('<!--mupot-invite-cta-->')
   })
 
-  it('signed-in member without invite authority: topbar-invite stays hidden (not a usable control)', async () => {
+  it('signed-in member without invite authority: NO trace of topbar-invite anywhere in the response — not present, not hidden', async () => {
     harness = makeHarness()
     authState.current = memberAuth()
 
@@ -123,12 +139,23 @@ describe('topbar "Invite member" (mupot#1444)', () => {
     expect(res.status).toBe(200)
     const body = await res.text()
 
-    const tag = topbarInviteTag(body)
-    // Either omitted entirely or present-but-hidden — either way, unusable.
-    if (tag) {
-      expect(tag).toContain('hidden')
-    } else {
-      expect(tag).toBeUndefined()
-    }
+    // The exact defect class round 2 closes: the ELEMENT must be a true
+    // absence, not a `hidden`-flagged presence a stylesheet could un-hide.
+    // (The static `.topbar-invite { ... }` CSS RULE is fine to keep in the
+    // stylesheet for every viewer — it styles the element IF it's ever
+    // inserted; it is not itself the defect, so this checks for the actual
+    // <a ...> tag, not a blind substring match that would also catch the CSS.)
+    expect(body).not.toMatch(/<a[^>]*\bclass="topbar-invite"/)
+    expect(body).not.toMatch(/<a[^>]*\bid="topbar-invite"/)
+    expect(body).not.toContain('<!--mupot-invite-cta-->')
+  })
+
+  it('shell CSS carries the global [hidden] { display: none !important } rule (P2.1)', async () => {
+    harness = makeHarness()
+    authState.current = adminAuth()
+
+    const res = await dashboardApp.fetch(new Request('https://pot.test/'), envFor(harness))
+    const body = await res.text()
+    expect(body).toMatch(/\[hidden\]\s*\{\s*display:\s*none\s*!important/)
   })
 })
