@@ -9,16 +9,24 @@ numbers.
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.30.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. |
-| Current production version | `0.30.0` | Last recorded deploy `1303648c` (2026-09-05); live `/health` is authoritative. Equal to `main` at the time of writing; both move independently. |
-| Last tagged release | `v0.25.0` | Project Routines and Needs You. The last STABLE tag; unchanged since. |
+| Current production version | `0.30.0` | Last recorded deploy `09ea48f6` (2026-09-26); live `/health` is authoritative. `main` and production may already have diverged again — both move independently. |
+| Last tagged stable release | `v0.30.0` | Tagged 2026-09-26, `release/v0.30.0` frozen at `09ea48f6`. First stable tag since `v0.25.0`. |
 | Superseded prerelease | `v0.30.0-rc.1` | Cut at `0bb9c256` (2026-09-03). 15 commits have landed since, including four security and three identity fixes. Not a candidate. |
-| Next stable candidate | `v0.30.0` | Stabilization-only. See the freeze problem below before planning against it. |
+| Next stable candidate | `v0.30.1` | P0 cherry-picks onto `release/v0.30.0` only — never a re-cut from wherever `main` happens to be. |
 | Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
 
-`0.30.0` is the version the source reports. It is **not** a stable release: no `v0.30.0`
-tag or GitHub release exists. Deployment alone does not make a capability stable.
+`0.30.0` is the version the source has reported since 2026-08-21. `v0.30.0` is now also a
+tag and a release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) — the source
+version string and the release tag agree for the first time since `v0.25.0`. `main`
+continues past that point as preview; nothing on `main` after `09ea48f6` is covered by
+the `v0.30.0` evidence bundle.
 
-## Why no version has been tagged since v0.25.0
+## Why no version was tagged between v0.25.0 and v0.30.0
+
+**2026-09-26 — option 2, below, was taken on Hadi's direction: `release/v0.30.0` was cut
+and frozen at `09ea48f6`, tagged `v0.30.0`, and `main` was left free to keep moving.** The
+analysis below is the historical record of why that decision was needed and is otherwise
+unchanged.
 
 This section exists because the answer is structural, not a matter of remaining effort.
 
@@ -71,6 +79,13 @@ containment with `git merge-base --is-ancestor`, because the version field could
 Cheapest correction, when the release path is next touched: bump on merge to `main` so
 the reported version becomes a receipt rather than a label. Deliberately not done
 mid-flight — it touches the release path, which is the thing currently under repair.
+
+**2026-09-26 update:** the `v0.30.0` tag and `release/v0.30.0` branch now give containment
+a name — "stable" points at one exact SHA (`09ea48f6`) instead of an ancestry check
+against a moving target. That is a release-process fix, not a version-string fix: the
+bump-on-merge correction above is still owed. `package.json`/`src/version.ts` will keep
+reading `0.30.0` on `main` after this tag, including through commits the tag does not
+cover, until that correction lands.
 
 ## Versioning truth — source cuts exist, release tags are still owed
 
