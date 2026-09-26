@@ -143,20 +143,52 @@ describe('A3 — plain squad invite accept', () => {
     expect(await tg.text()).toMatch(/redeemed in Telegram/i)
   })
 
-  it('P1-A: acceptInvite rollback clears member_id with accepted_at', async () => {
+  // #1457: this used to assert 'member_already_exists' (a dead end) for the
+  // exact same-email collision this fixture sets up. That was the defect —
+  // see tests/accept-invite-existing-member.test.ts for the full #1457
+  // coverage; this one stays here specifically to prove the fix reaches a
+  // SQUAD-scoped invite (not just org/department) since this file already
+  // owns the squad-grant fixtures. Round 2 (P0): the existing member must be
+  // VERIFIED (a live human_login_identities row matching the invite email)
+  // to be granted onto at all — this fixture seeds one. Round 2 (P1): the
+  // inviter (member-admin, this file's shared fixture) also needs a REAL
+  // rank to clear the target-rank-ceiling check — granted org 'admin' here
+  // rather than in the shared makeHarness, to avoid perturbing every other
+  // test in this file that reuses it.
+  it('#1457: an existing active VERIFIED member on the invited email is GRANTED ONTO the squad, not refused', async () => {
     harness = makeHarness()
     const env = envFor(harness)
     harness.sqlite.exec(`
       INSERT INTO members (id, email, display_name, status, tenant)
       VALUES ('member-dup', 'squaduser@example.com', 'Already Here', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id)
+      VALUES ('ident-dup', '${TENANT}', 'google', 'sub-dup', 'squaduser@example.com', 'member-dup');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-member-admin-org', 'member-admin', 'org', NULL, 'admin');
     `)
     const result = await acceptInvite(env, 'inv-squad', 'Squad User', { mintToken: false })
-    expect(result).toEqual({ ok: false, error: 'member_already_exists' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.value.member_id).toBe('member-dup')
+    expect(result.value.linked_existing).toBe(true)
+    expect(result.value.token).toBeNull()
+
     const row = harness.sqlite
       .prepare(`SELECT accepted_at, member_id FROM invites WHERE id = 'inv-squad'`)
       .get() as { accepted_at: string | null; member_id: string | null }
-    expect(row.accepted_at).toBeNull()
-    expect(row.member_id).toBeNull()
+    expect(row.accepted_at).not.toBeNull()
+    expect(row.member_id).toBe('member-dup')
+
+    // No second member row was minted for the collided email.
+    const memberCount = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM members WHERE email = 'squaduser@example.com'`)
+      .get() as { n: number }
+    expect(memberCount.n).toBe(1)
+
+    const cap = harness.sqlite
+      .prepare(`SELECT scope_type, scope_id, capability FROM capabilities WHERE member_id = 'member-dup'`)
+      .get()
+    expect(cap).toEqual({ scope_type: 'squad', scope_id: 'squad-web', capability: 'member' })
   })
 })
 

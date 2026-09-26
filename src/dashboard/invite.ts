@@ -209,6 +209,29 @@ export function inviteAlreadyAcceptedBody(brand: string) {
     <p><a href="/auth/login">Go to sign in →</a></p>`)
 }
 
+// #1457: rendered when acceptInvite() grants onto a PRE-EXISTING member
+// (linked_existing) instead of minting a fresh one — e.g. the person already
+// signed in with Google before opening this invite link. No token exists to
+// hand back on this branch (acceptInvite never mints one here), so the ONLY
+// way forward is signing in — same pending-invite marker/cookie as the
+// fresh-member path lets /auth/login → /auth/callback link the identity.
+//
+// #1457 round 2 (P2 "accept that grants nothing"): when `granted` is false
+// (a DIFFERENT — or identical — grant already governed this exact scope),
+// the invite is still consumed but nothing changed; say so rather than
+// implying the invite's own access just landed.
+export function inviteLinkedExistingBody(brand: string, granted: boolean, existingCapability?: Capability) {
+  const grantNote = granted
+    ? ''
+    : `<div class="warn">This invite did not change your access — your account already
+        had${existingCapability ? ` <code>${esc(existingCapability)}</code>` : ' different'} access here.</div>`
+  return pageShell(brand, 'Sign in to continue', `
+    <h1>Your invite is attached to your existing account</h1>
+    ${grantNote}
+    <p class="muted">Sign in to continue.</p>
+    <p><a href="/auth/login">Sign in →</a></p>`)
+}
+
 export function inviteTelegramOnlyBody(brand: string, ctx: InviteLandingContext) {
   return pageShell(brand, 'Telegram invite', `
     <h1>This invite is redeemed in Telegram</h1>
@@ -300,7 +323,15 @@ inviteApp.post('/:id', async (c) => {
         400,
       )
     }
-    // member_already_exists
+    // member_already_exists (the last-resort UNIQUE-violation race, OR an
+    // unverified/foreign/suspended existing-member match — see acceptInvite's
+    // own doc comment) OR #1457's remaining existing-member refusals
+    // (member_belongs_to_other_tenant, member_not_active,
+    // existing_member_grant_refused) — none of these are reachable through
+    // the ordinary happy path any more (a verified, same-tenant, active,
+    // non-agent-bound member the inviter outranks is granted onto, not
+    // refused, per #1457), so one generic copy covers what's left without
+    // over-explaining an edge case to an anonymous visitor.
     return c.html(
       invitePageBody(c.env.BRAND, view.ctx, 'An account already exists for this email. Sign in instead.'),
       409,
@@ -395,6 +426,16 @@ inviteApp.post('/:id', async (c) => {
       error_class: err instanceof Error ? err.constructor.name : typeof err, err,
     })
   })
+
+  // #1457: the accept just landed on a PRE-EXISTING member rather than
+  // minting a fresh one — the marker/cookie above are already written
+  // (unchanged) so /auth/login → /auth/callback can still link this
+  // person's Google identity, but there is no "welcome, you're new here"
+  // moment to redirect straight past. Tell them plainly and hand them the
+  // sign-in button instead of a silent 302.
+  if (result.value.linked_existing) {
+    return c.html(inviteLinkedExistingBody(c.env.BRAND, result.value.granted, result.value.capability.capability))
+  }
 
   return c.redirect('/auth/login')
 })
