@@ -11,6 +11,7 @@ import type { PreflightResult } from './preflight'
 import type { FlightMetaV1 } from './meta'
 import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
 import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -118,6 +119,12 @@ export type FlightProjectErrorCode =
   | 'project_access_forbidden'
   | 'flight_task_not_found'
   | 'flight_task_project_mismatch'
+  // mupot#1496 Round 3 (Athena P0-1): deliberately 'task_archived', not
+  // 'flight_task_archived' — the SAME externally-visible error string
+  // task_dispatch's own archived-task refusal already returns (src/mcp/
+  // index.ts), so a caller sees one consistent code regardless of which
+  // dispatch surface it went through.
+  | 'task_archived'
 
 export class FlightProjectError extends Error {
   constructor(readonly code: FlightProjectErrorCode) {
@@ -153,18 +160,39 @@ export async function validateFlightTaskProjectConsistency(
     for (let offset = 0; offset < meta.task_ids.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
       const chunk = meta.task_ids.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
       const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+      // mupot#1496 Round 3 (Athena P0-1): excludes an archived task from
+      // resolving at all, so it falls into the "missing" set below — the
+      // subsequent archived-specific lookup then reports it correctly as
+      // task_archived rather than the generic flight_task_not_found.
       const rows = await env.DB.prepare(
-        `SELECT id, project_id FROM tasks WHERE id IN (${placeholders})`,
+        `SELECT id, project_id FROM tasks WHERE id IN (${placeholders}) AND ${TASK_NOT_ARCHIVED_SQL()}`,
       ).bind(...chunk).all<{ id: string; project_id: string | null }>()
       for (const task of rows.results ?? []) tasks.set(task.id, task)
     }
-    if (meta.task_ids.some((taskId) => !tasks.has(taskId))) {
+    const missing = meta.task_ids.filter((taskId) => !tasks.has(taskId))
+    if (missing.length > 0) {
+      if (await anyTaskArchived(env, missing)) throw new FlightProjectError('task_archived')
       throw new FlightProjectError('flight_task_not_found')
     }
     if (meta.task_ids.some((taskId) => tasks.get(taskId)?.project_id !== projectId)) {
       throw new FlightProjectError('flight_task_project_mismatch')
     }
   }
+}
+
+/** True when ANY of the given task ids has a tasks_archive_state row — used
+ *  to distinguish "archived" from "genuinely nonexistent" once a task has
+ *  already fallen out of an archived-excluding resolve query. */
+async function anyTaskArchived(env: Env, taskIds: readonly string[]): Promise<boolean> {
+  for (let offset = 0; offset < taskIds.length; offset += D1_TASK_ID_QUERY_CHUNK_SIZE) {
+    const chunk = taskIds.slice(offset, offset + D1_TASK_ID_QUERY_CHUNK_SIZE)
+    const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
+    const row = await env.DB.prepare(
+      `SELECT 1 FROM tasks_archive_state WHERE task_id IN (${placeholders}) LIMIT 1`,
+    ).bind(...chunk).first()
+    if (row) return true
+  }
+  return false
 }
 
 export async function validateFlightProjectAttribution(env: Env, flight: NewFlight): Promise<void> {

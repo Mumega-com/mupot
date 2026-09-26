@@ -1197,6 +1197,15 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
           charter TEXT, budget_cap_cents INTEGER, budget_window TEXT NOT NULL DEFAULT 'day',
           kind TEXT NOT NULL DEFAULT 'work',
+          -- mupot#1496 Round 4: isSquadArchived (src/hygiene/filters.ts) does an
+          -- unconditional SELECT status FROM squads, and grant_agent_capability
+          -- (src/mcp/provision.ts) calls it unconditionally as of Round 3's
+          -- squad_archived guard. A hand-written fixture lacking a purely-additive
+          -- column another shared tool now unconditionally reads is exactly the
+          -- failure mode documented on tasks above (migrations/0079/0150) and on
+          -- member_tokens above (migrations/0099) -- same class, third instance in
+          -- this one file. Prefer the real migration harness for new fixtures.
+          status TEXT NOT NULL DEFAULT 'active',
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE agents (
@@ -1315,6 +1324,17 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         );
         CREATE TABLE task_dispatch_runtime_receipts (
           tenant TEXT NOT NULL, dispatch_receipt_id TEXT NOT NULL, stage TEXT NOT NULL
+        );
+        -- mupot#1496 Round 4 (Athena, confirmation-pass BLOCK): flight_dispatch's
+        -- meta validation (src/flight/meta.ts's validateFlightMetaReferences,
+        -- Round 3) queries tasks_archive_state via TASK_NOT_ARCHIVED_SQL
+        -- unconditionally for every task_id in the flight's meta, and this fixture
+        -- dispatches a flight with meta.task_ids set -- same "purely-additive table a
+        -- shared surface now unconditionally reads" failure as the squads.status
+        -- column above. Always empty here; no task in this fixture is archived.
+        CREATE TABLE tasks_archive_state (
+          task_id TEXT PRIMARY KEY, archived_at TEXT NOT NULL, archived_reason TEXT NOT NULL,
+          archived_by_member_id TEXT NOT NULL, prior_status TEXT NOT NULL, created_at TEXT NOT NULL
         );
 
         INSERT INTO departments VALUES ('dept-home', 'home', 'Home');

@@ -1,4 +1,5 @@
 import type { Env, Squad } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export const FLIGHT_META_V1_SCHEMA = 'mupot.flight.meta/v1' as const
 
@@ -111,7 +112,18 @@ export function parseFlightMetaV1(raw: unknown): FlightMetaV1 | null {
 
 export type FlightMetaReferenceResult =
   | { ok: true }
-  | { ok: false; error: 'flight_squad_not_found' | 'flight_task_not_found' | 'flight_task_scope_mismatch' | 'flight_task_project_mismatch'; ref: string }
+  | {
+      ok: false
+      error:
+        | 'flight_squad_not_found'
+        | 'flight_task_not_found'
+        | 'flight_task_scope_mismatch'
+        | 'flight_task_project_mismatch'
+        // mupot#1496 Round 3 (Athena P0-1) — same externally-visible code
+        // task_dispatch and validateFlightTaskProjectConsistency both use.
+        | 'task_archived'
+      ref: string
+    }
 
 const D1_ID_QUERY_CHUNK_SIZE = 90
 
@@ -147,11 +159,16 @@ export async function validateFlightMetaReferences(
   if (missingSquad) return { ok: false, error: 'flight_squad_not_found', ref: missingSquad }
 
   const stmts = []
+  // mupot#1496 Round 3 (Athena P0-1): an archived task never resolves here —
+  // it falls into the `!task` branch below, which now distinguishes
+  // "archived" from "genuinely nonexistent" via a targeted follow-up lookup.
   for (let offset = 0; offset < meta.task_ids.length; offset += D1_ID_QUERY_CHUNK_SIZE) {
     const chunk = meta.task_ids.slice(offset, offset + D1_ID_QUERY_CHUNK_SIZE)
     const placeholders = chunk.map((_, index) => `?${index + 1}`).join(',')
     stmts.push(
-      env.DB.prepare(`SELECT id, squad_id, project_id FROM tasks WHERE id IN (${placeholders})`).bind(...chunk),
+      env.DB.prepare(
+        `SELECT id, squad_id, project_id FROM tasks WHERE id IN (${placeholders}) AND ${TASK_NOT_ARCHIVED_SQL()}`,
+      ).bind(...chunk),
     )
   }
   const taskRows: Array<{ id: string; squad_id: string; project_id: string | null }> = []
@@ -164,7 +181,11 @@ export async function validateFlightMetaReferences(
   const tasksById = new Map(taskRows.map((row) => [row.id, row]))
   for (const taskId of meta.task_ids) {
     const task = tasksById.get(taskId)
-    if (!task) return { ok: false, error: 'flight_task_not_found', ref: taskId }
+    if (!task) {
+      const archived = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind(taskId).first()
+      if (archived) return { ok: false, error: 'task_archived', ref: taskId }
+      return { ok: false, error: 'flight_task_not_found', ref: taskId }
+    }
     if (!meta.squad_ids.includes(task.squad_id)) {
       return { ok: false, error: 'flight_task_scope_mismatch', ref: taskId }
     }

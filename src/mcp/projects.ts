@@ -13,6 +13,7 @@ import type { ProjectMutationError } from '../projects/service'
 import { projectSelectSql } from '../projects/columns'
 import { deployProject } from '../projects/deploy'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
+import { isSquadArchived } from '../hygiene/filters'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
 import {
   defaultCircuitBreakerDeps,
@@ -564,6 +565,9 @@ const toolProjectSquadSet: ToolSpec = {
     const squadId = str(args.squad_id)
     if (!projectId) return fail(400, 'invalid_project_id')
     if (!squadId) return fail(400, 'invalid_squad_id')
+    // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
+    // repopulated by granting it project access.
+    if (await isSquadArchived(env, squadId)) return fail(409, 'squad_archived')
     const result = await upsertProjectSquadAccess(env, projectId, squadId, args.access_level)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'squad_access_set', projectId, { squad_id: squadId })

@@ -14,6 +14,7 @@ import type { Env, AuthContext, Task, Squad, Project, TaskPriority } from '../ty
 import { requireAuth } from '../auth'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
 import { actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export const kanbanApp = new Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>()
 
@@ -104,7 +105,7 @@ export async function loadKanbanData(
       FROM tasks t
       JOIN squads s ON t.squad_id = s.id
       LEFT JOIN agents a ON t.assignee_agent_id = a.id
-      WHERE t.project_id = ?1 AND s.kind != 'home'${squadFilter}
+      WHERE t.project_id = ?1 AND s.kind != 'home' AND ${TASK_NOT_ARCHIVED_SQL('t')}${squadFilter}
       ORDER BY s.name ASC, ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
     `).bind(
       project.id,
@@ -169,7 +170,7 @@ export async function loadKanbanData(
       JOIN squads s ON t.squad_id = s.id
       LEFT JOIN projects p ON t.project_id = p.id
       LEFT JOIN agents a ON t.assignee_agent_id = a.id
-      WHERE s.kind != 'home'${squadFilter}
+      WHERE s.kind != 'home' AND ${TASK_NOT_ARCHIVED_SQL('t')}${squadFilter}
       ORDER BY s.name ASC, ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
     `).bind(
       ...(isAllAccessible ? [] : [JSON.stringify(accessibleSquadIds ?? [])]),
@@ -256,7 +257,7 @@ export async function loadKanbanData(
     FROM tasks t
     LEFT JOIN projects p ON t.project_id = p.id
     LEFT JOIN agents a ON t.assignee_agent_id = a.id
-    WHERE t.squad_id = ?1
+    WHERE t.squad_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL('t')}
     ORDER BY ${actionableStatusOrderSql('t.status')}, ${priorityOrderSql('t.priority')}, t.updated_at DESC
   `).bind(targetSquadId).all<KanbanTaskRow>()
 

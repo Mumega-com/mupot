@@ -1282,21 +1282,37 @@ export async function updateUnitConfig(
 
 // ── agent mutations ───────────────────────────────────────────────────────────
 
-export type SetStatusResult = { ok: true } | { ok: false; error: 'not_found' }
+export type SetStatusResult = { ok: true } | { ok: false; error: 'not_found' | 'archived' }
 
 /**
  * Pause or resume an agent by updating its status column.
  * Returns ok:true on success or ok:false + 'not_found' when the id does not exist.
+ *
+ * mupot#1496 Round 2 (adversarial P1-2): refuses while the agent is archived
+ * (archived_at IS NOT NULL) — otherwise a pause/resume toggle could silently
+ * flip an archived agent back to 'active', with archive_row's own
+ * must_deactivate_first guard then unable to tell "still properly archived"
+ * from "reactivated behind its back" the next time someone re-archives it.
+ * unarchive_row is the only door out of archived_at IS NOT NULL.
  */
 export async function setAgentStatus(
   env: Env,
   agentId: string,
   status: AgentStatus,
 ): Promise<SetStatusResult> {
-  const result = await env.DB.prepare('UPDATE agents SET status = ? WHERE id = ?')
+  const result = await env.DB.prepare(
+    `UPDATE agents SET status = ?1 WHERE id = ?2 AND archived_at IS NULL`,
+  )
     .bind(status, agentId)
     .run()
-  if (!result.meta.changes) return { ok: false, error: 'not_found' }
+  if (!result.meta.changes) {
+    const row = await env.DB.prepare('SELECT archived_at FROM agents WHERE id = ?1')
+      .bind(agentId)
+      .first<{ archived_at: string | null }>()
+    if (!row) return { ok: false, error: 'not_found' }
+    if (row.archived_at) return { ok: false, error: 'archived' }
+    return { ok: false, error: 'not_found' }
+  }
   return { ok: true }
 }
 

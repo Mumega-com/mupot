@@ -743,28 +743,49 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
     )
     expect(withObjects.length).toBeGreaterThan(20) // sanity: corpus is large enough for this to mean something
 
+    // The AUTHORITATIVE probe set — the exact (file, type, name) triples verifyGroundTruth
+    // actually checks. Earlier drafts of this test re-derived "which object represents this
+    // file" with a local heuristic (its first `objects[]` entry that looks unwiped) instead of
+    // asking this real function, and that heuristic silently diverged from it whenever a LATER
+    // migration rebuilt an object under the same name (this repo's own established row-
+    // preserving CHECK-widen convention, e.g. 0020_oauth_channel.sql rebuilding member_tokens
+    // and recreating `idx_member_tokens_member`, which 0002_members.sql's objects[] also lists)
+    // — ground truth correctly attributes the live object to the rebuilding file, so dropping
+    // the heuristic's pick reported a DIFFERENT file than this test expected. Corpus-size drift
+    // (a new migration shifting which position below lands on) is exactly what surfaces one of
+    // these pre-existing divergences — not a defect in ground truth itself, a defect in
+    // re-deriving its answer instead of calling it. Building the drop target FROM
+    // `selectGroundTruthProbes`'s own output makes this immune to that whole class by
+    // construction, for any future corpus size.
+    const probes = selectGroundTruthProbes(SCHEMA_CHAIN)
+    const probeByFile = new Map(probes.map((p) => [p.file, p]))
+
     const legacyFractions = [0, 0.25, 0.5, 0.75, 1]
     const legacyIndices = new Set(
       legacyFractions.map((f) => Math.min(withObjects.length - 1, Math.floor(f * (withObjects.length - 1)))),
     )
-    const targetPos = withObjects.findIndex((_, i) => !legacyIndices.has(i))
+    // Walk forward from the first non-legacy-sample position until landing on a file that IS
+    // actually probed (a file whose only surviving object doesn't stably survive the rest of
+    // the chain — e.g. this repo's one documented exception, 0061 — legitimately has none).
+    const targetPos = withObjects.findIndex((_, i) => !legacyIndices.has(i) && probeByFile.has(withObjects[i].entry.file))
     expect(targetPos).toBeGreaterThanOrEqual(0) // sanity: such a position exists
     const target = withObjects[targetPos]
+    const probe = probeByFile.get(target.entry.file)
+    expect(probe).toBeDefined()
+    if (!probe) throw new Error('unreachable')
 
     const db = createSqliteD1()
     const exec = execViaSqlite(db)
     const first = await applySchemaChain(exec, { chain: SCHEMA_CHAIN })
     expect(first.failed).toBeUndefined()
 
-    // Find one real object this file created that survived to the end of the chain (i.e. it
-    // is actually present in the final schema) and drop it directly — simulating a
+    // Drop EXACTLY the object ground truth actually probes for this file — simulating a
     // splitter/apply bug that silently lost exactly this one migration deep in the corpus.
-    const survivingObject = target.entry.objects.find((obj) =>
-      db.sqlite.prepare(`SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?`).get(obj.type, obj.name),
-    )
-    expect(survivingObject).toBeDefined()
-    if (!survivingObject) throw new Error('unreachable')
-    db.sqlite.exec(`DROP ${survivingObject.type.toUpperCase()} ${survivingObject.name};`)
+    const existsBeforeDrop = db.sqlite
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?`)
+      .get(probe.type, probe.name)
+    expect(existsBeforeDrop).toBeDefined()
+    db.sqlite.exec(`DROP ${probe.type.toUpperCase()} ${probe.name};`)
 
     const alreadyApplied = recordedSetFromDb(db)
     const second = await applySchemaChain(exec, { chain: SCHEMA_CHAIN, alreadyApplied })

@@ -100,6 +100,7 @@ import {
 } from '../auth/agent-sessions'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import { isSlugBaseReserved, slugBaseFromSquadSlug } from '../org/team-bootstrap'
+import { isSquadArchived } from '../hygiene/filters'
 import {
   type ToolSpec,
   fail,
@@ -493,6 +494,13 @@ const toolCreateAgent: ToolSpec = {
     const squadResult = await resolveSquadRef(env, squadRef)
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const squad = squadResult.value
+
+    // mupot#1496 Round 2 (Athena P0-1 / adversarial P1-3): an archived squad
+    // must not be repopulated. resolveSquadRef doesn't know about
+    // squads.status (a brand-new column the Squad type predates) — checked
+    // directly here rather than widening that shared type/resolver for one
+    // write-time gate.
+    if (await isSquadArchived(env, squad.id)) return fail(409, 'squad_archived')
 
     // Gate: lead on the squad (org/department admin inherit down via memberCanOnSquad).
     const grants = auth.capabilities ?? []
@@ -1416,6 +1424,9 @@ export const toolGrantAgentCapability: ToolSpec = {
     // this door, since a home's ONLY writer is the member's own
     // self-provisioning call.
     if (squad.kind === 'home') return fail(403, 'home_scope_not_grantable')
+    // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
+    // repopulated by granting a NEW agent capability onto it.
+    if (await isSquadArchived(env, squad.id)) return fail(409, 'squad_archived')
 
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
@@ -2170,6 +2181,9 @@ export const toolMoveAgentSquad: ToolSpec = {
       'SELECT id, department_id FROM squads WHERE id = ?1 LIMIT 1',
     ).bind(toSquad.id).first<{ id: string; department_id: string }>()
     if (!destRow) return fail(404, 'squad_not_found', { squad: toSquadRef })
+    // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
+    // repopulated by moving an agent into it.
+    if (await isSquadArchived(env, destRow.id)) return fail(409, 'squad_archived')
 
     if (agent.squad_id === destRow.id) {
       return fail(400, 'same_squad', {
@@ -2682,6 +2696,8 @@ const toolSquadMemberAdd: ToolSpec = {
     if (!agentResult.ok) return resolveFail(agentResult.reason, 'agent_not_found')
     const squadResult = await resolveSquadRef(env, squadRef)
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
+    // mupot#1496 Round 2: an archived squad cannot be repopulated.
+    if (await isSquadArchived(env, squadResult.value.id)) return fail(409, 'squad_archived')
 
     const outcome = await addSquadMember({
       env,

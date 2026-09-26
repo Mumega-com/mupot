@@ -18,6 +18,7 @@ import {
   verdictIsHuman,
 } from '../tasks/service'
 import type { Env, Project, Task } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { projectVisibilityClause } from '../projects/access'
 import { executeProjectAccessGrant, projectAccessLevelRank } from '../projects/service'
 import { getMemberHomeSquad } from '../org/service'
@@ -638,10 +639,15 @@ async function validateActionScope(
   if (action.kind === 'dispatch_flight') {
     const remaining = Math.max(0, policy.budget_micro_usd - Number(run.cost_micro_usd))
     if (action.input.budget_micro_usd > remaining) return 'budget_exceeded'
+    // mupot#1496 Round 2 (Athena P0-1): same exclusion as
+    // prepareFlightMetaForAction's sibling query below — an archived task
+    // falls out of the exact-count match, converging to the SAME
+    // reference_out_of_scope this validation gate already returns.
     const rows = await env.DB.prepare(
       `SELECT id FROM tasks
         WHERE project_id = ? AND squad_id = ?
-          AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+          AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(
       run.project_id,
       policy.responsible_squad_id,
@@ -1117,10 +1123,14 @@ async function executeFlightAction(
   }
   const existing = await loadExisting()
   if (existing) return existingOutcome(existing)
+  // mupot#1496 Round 2 (Athena P0-1): an archived task simply won't be
+  // returned here, so it falls out of the exact-count match below and the
+  // EXISTING reference_out_of_scope refusal fires — no new error code needed.
   const tasks = await env.DB.prepare(
     `SELECT id, done_when FROM tasks
       WHERE project_id = ? AND squad_id = ?
-        AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))`,
+        AND id IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   ).bind(
     run.project_id, policy.responsible_squad_id, JSON.stringify(action.input.task_ids),
   ).all<{ id: string; done_when: string }>()

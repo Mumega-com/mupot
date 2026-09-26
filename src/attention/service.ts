@@ -13,6 +13,7 @@ import {
 } from '../projects/stall-detector'
 import type { RoutinePrincipal } from '../routines/access'
 import { routineTablesReady } from '../routines/schema-ready'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -357,6 +358,7 @@ async function sourceRows(
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'review' AND t.gate_owner IS NOT NULL${projectClause}
+      AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
   `, [...gateBinds, ...projectScope], cursor)
 
@@ -409,6 +411,7 @@ async function sourceRows(
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'blocked' AND t.assignee_agent_id IS NULL AND t.gate_owner IS NOT NULL${projectClause}
+      AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
   `, projectScope, cursor)
 
@@ -426,6 +429,7 @@ async function sourceRows(
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'approved' AND t.gate_owner = ? AND t.result IS NOT NULL${projectClause}
+      AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
   `, [CONTENT_GATE_OWNER, ...projectScope], cursor)
 

@@ -221,4 +221,24 @@ describe('grant_agent_capability real schema (mupot#685)', () => {
       }).toThrow()
     },
   )
+
+  it('mupot#1496 Round 3 (adversarial P1-C): refuses granting a capability onto an archived squad', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${TARGET_SQUAD_ID}';`)
+    const result = await invokeTool(
+      operatorAuth(),
+      env,
+      'grant_agent_capability',
+      { agent: AGENT_ID, squad: TARGET_SQUAD_ID, capability: 'member' },
+      'https://pot.test',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('squad_archived')
+    const grants = harness.sqlite.prepare(
+      `SELECT COUNT(*) AS count FROM capabilities
+       WHERE member_id = ? AND scope_type = 'squad' AND scope_id = ?`,
+    ).get(AGENT_MEMBER_ID, TARGET_SQUAD_ID) as { count: number }
+    expect(grants.count).toBe(0)
+  })
 })
