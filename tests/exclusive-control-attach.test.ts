@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { autoEnrollSsoMember } from '../src/auth/sso'
+import { acceptInvite } from '../src/members'
 import {
   decideIdentitylessAttach,
   PROVISIONING_EXEMPT_TOKEN_CHANNEL,
@@ -161,6 +162,31 @@ function seedBearer(
     )
 }
 
+/**
+ * A "clean legacy identity-less" row, minted through the REAL `acceptInvite()`
+ * (mintToken:false — the no-mint boundary Option A/#1557 makes the JSON
+ * route's own default; a hand-rolled `INSERT INTO members` fixture would
+ * drift from that function's actual columns/defaults and would not prove
+ * anything about the real product path). Org-level invite: no department_id,
+ * no squad_id, so `acceptInvite` grants org/member.
+ */
+async function acceptCleanInvite(
+  harness: SqliteD1Harness,
+  env: Env,
+  inviteId: string,
+  email: string,
+): Promise<string> {
+  harness.sqlite
+    .prepare(`INSERT INTO invites (id, email, capability, invited_by) VALUES (?, ?, 'member', ?)`)
+    .run(inviteId, email, 'seed-admin')
+  const accepted = await acceptInvite(env, inviteId, 'Compat Pin User', { mintToken: false })
+  if (!accepted.ok) throw new Error(`acceptInvite failed: ${accepted.error}`)
+  if (accepted.value.token !== null) {
+    throw new Error('acceptInvite({mintToken:false}) unexpectedly minted a token')
+  }
+  return accepted.value.member_id
+}
+
 describe('decideIdentitylessAttach — unit (mutation-proved)', () => {
   let harness: SqliteD1Harness | undefined
   afterEach(() => {
@@ -209,16 +235,16 @@ describe('decideIdentitylessAttach — unit (mutation-proved)', () => {
     expect(result).toEqual({ kind: 'not_found' })
   })
 
-  it('eligible: a clean identity-less, token-less, telegram-less row (compatibility pin — C deferred)', async () => {
+  it('eligible: a clean identity-less, token-less, telegram-less row from a REAL acceptInvite() (compatibility pin — C deferred)', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
-    seedMember(harness, 'mem-clean', 'clean@example.com')
-    const env = { DB: harness.db } as unknown as Env
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+    const memberId = await acceptCleanInvite(harness, env, 'inv-clean-unit', 'clean@example.com')
     const result = await decideIdentitylessAttach(env, {
       tenant: TENANT,
       normalizedEmail: 'clean@example.com',
     })
-    expect(result).toEqual({ kind: 'eligible', memberId: 'mem-clean', status: 'active' })
+    expect(result).toEqual({ kind: 'eligible', memberId, status: 'active' })
   })
 
   it('denied: telegram-bound row', async () => {
@@ -507,11 +533,11 @@ describe('GET /auth/callback (Google login) — exclusive-control attach end to 
     vi.unstubAllGlobals()
   })
 
-  it('clean legacy identity-less row still attaches (compatibility pin — C deferred, do not remove without a migration)', async () => {
+  it('clean legacy identity-less row from a REAL acceptInvite() still attaches (compatibility pin — C deferred, do not remove without a migration)', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
-    seedMember(harness, 'mem-clean', 'clean@example.com')
     const env = envFor(harness, memoryKv())
+    const memberId = await acceptCleanInvite(harness, env, 'inv-clean-e2e', 'clean@example.com')
 
     const res = await googleLogin(env, 'clean@example.com', 'google-sub-clean')
     expect(res.status).toBe(302)
@@ -519,7 +545,50 @@ describe('GET /auth/callback (Google login) — exclusive-control attach end to 
     const row = harness.sqlite
       .prepare(`SELECT member_id, provider, provider_subject FROM human_login_identities`)
       .get() as { member_id: string; provider: string; provider_subject: string }
-    expect(row).toEqual({ member_id: 'mem-clean', provider: 'google', provider_subject: 'google-sub-clean' })
+    expect(row).toEqual({ member_id: memberId, provider: 'google', provider_subject: 'google-sub-clean' })
+  })
+
+  it('API accept (real acceptInvite, mintToken:false, next:sign_in) → ordinary Google login → linked to THAT exact member, with the invite-granted capability intact', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    const env = envFor(harness, memoryKv())
+
+    // Real invite acceptance through the actual member-creation code path —
+    // the JSON accept door's own no-mint boundary (Option A/#1557: this route
+    // now returns token:null and next:'sign_in', never a bearer for an
+    // unverified email). The org/member capability grant is acceptInvite's
+    // own write, not a test fixture.
+    const memberId = await acceptCleanInvite(harness, env, 'inv-api-then-login', 'apilogin@example.com')
+    const grant = harness.sqlite
+      .prepare(`SELECT scope_type, capability FROM capabilities WHERE member_id = ?`)
+      .get(memberId) as { scope_type: string; capability: string } | undefined
+    expect(grant).toEqual({ scope_type: 'org', capability: 'member' })
+    // No bearer, no identity, no Telegram bind yet — this member is
+    // genuinely identity-less at this point, exactly the row Cause 2
+    // describes, except this time it was never squatted.
+    expect(identityCountForEmail(harness)).toBe(0)
+
+    // The real human now completes an ordinary IdP login with the SAME
+    // (verified) email the invite was addressed to.
+    const res = await googleLogin(env, 'apilogin@example.com', 'google-sub-apilogin')
+    expect(res.status).toBe(302)
+
+    expect(identityCountForEmail(harness)).toBe(1)
+    const row = harness.sqlite
+      .prepare(
+        `SELECT member_id, provider, provider_subject FROM human_login_identities`,
+      )
+      .get() as { member_id: string; provider: string; provider_subject: string }
+    // Linked to THAT exact member the invite minted — not a lookalike, not a
+    // duplicate.
+    expect(row.member_id).toBe(memberId)
+    expect(row).toEqual({ member_id: memberId, provider: 'google', provider_subject: 'google-sub-apilogin' })
+    // The capability the invite granted survives untouched — the login
+    // attached an identity, it did not re-provision the member.
+    const grantAfter = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM capabilities WHERE member_id = ?`)
+      .get(memberId) as { n: number }
+    expect(grantAfter.n).toBe(1)
   })
 
   it('pot-provisioned admin/dashboard member still attaches', async () => {

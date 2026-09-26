@@ -44,6 +44,31 @@
 // ruling forbids. If a future audit finds another legitimate token-bearing
 // email row shape, it must be inventoried and added here explicitly, never
 // assumed.
+//
+// SPOOFABILITY (kasra-review gate on PR #1557, flagged 2026-09-26): this
+// exemption is `label`/`channel` only, and `mintMemberToken`
+// (src/members/service.ts, reached via the org-admin-gated
+// `POST /members/:id/tokens`) accepts a CALLER-CHOSEN label/channel — an org
+// admin can mint a token with label='admin', channel='dashboard' onto ANY
+// member row they can already reach, making that row read as
+// provisioning-exempt to this predicate. This is NOT a privilege escalation:
+// an org admin who can already mint a token for a row already holds standing
+// authority over it, so spoofing this exemption hands them nothing they
+// didn't already have. It DOES mean the exemption is containment (a marker
+// the real seeder happens to write), never proof of origin — do not build
+// anything security-load-bearing on it beyond "let the documented seed path
+// through."
+//
+// A stronger anchor was investigated and rejected: `pot_provision_receipts`
+// (migration 0169) DOES record the seeded admin's `member_id` in its
+// `seed_identities` step detail (json_extract-able, `src/pots/service.ts`
+// ~line 1710) for BOTH the direct-API and Stripe self-serve provisioning
+// paths (they converge on the same `seedPotIdentities` call) — but that table
+// lives in the ORCHESTRATOR's own D1 (the same D1 as `pots`, migration 0145),
+// never in the tenant pot's own D1 this predicate queries via `env.DB`. It is
+// not reachable from here at all, and `member_tokens` itself carries no
+// `minted_by`/provenance column. Nothing stronger than label/channel exists
+// inside the tenant's own database today.
 
 import type { Env } from '../types'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
