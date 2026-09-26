@@ -47,6 +47,16 @@ function makeEnv(options: {
             } as T
           }
           if (sql.includes('SELECT id, status FROM members')) return { id: 'member-1', status: 'active' } as T
+          // mupot#1551 slice 1: acceptInvite's new inviter re-check
+          // (INVITER_ACTIVE_MEMBER_SQL, src/members/index.ts) — this
+          // fixture's invite is invited_by: 'owner-user', so the re-check
+          // must resolve it to a live, active row or the previously-201
+          // mint below would now 409. Matched on a substring unique to that
+          // query so it can never collide with the `lower(email)` branch
+          // below.
+          if (sql.includes('FROM members') && sql.includes("status = 'active'")) {
+            return { id: 'owner-user' } as T
+          }
           if (sql.includes('SELECT id, display_name FROM members')) {
             return { id: 'member-1', display_name: 'Operator' } as T
           }
@@ -75,7 +85,18 @@ function makeEnv(options: {
         // tests/members-agent-capability-route.test.ts.
         async all<T>() {
           if (sql.includes('SELECT member_id, scope_type, scope_id, capability') && sql.includes('FROM capabilities')) {
-            return { results: [] as T[] }
+            // mupot#1551 slice 1: this same resolveCapabilities query now
+            // also runs for the invite's INVITER ('owner-user') inside
+            // currentMemberRankOnScope, in addition to the pre-existing
+            // mint-ceiling TARGET lookup this fixture was built for. bind()
+            // above is a no-op (args discarded), so both calls hit this one
+            // branch regardless of which member id they asked for — an
+            // org-admin row here satisfies the inviter re-check (the
+            // fixture's invite is capability:'admin' on org scope) without
+            // changing the mint-ceiling test's own outcome: the mint actor
+            // is a session-role 'owner' there (rank 5), which this grant
+            // (rank 4) still never exceeds.
+            return { results: [{ member_id: 'owner-user', scope_type: 'org', scope_id: null, capability: 'admin' }] as T[] }
           }
           throw new Error(`unexpected all query: ${sql}`)
         },

@@ -45,7 +45,14 @@ import { isMissingWebSessionsTableError } from '../auth/web-sessions'
 import { csrf } from 'hono/csrf'
 import { assertBatchWritten, assertWritten } from '../lib/receipt'
 // The FROZEN capability API — everyone codes against these exact signatures.
-import { requireCapability, capabilityRank, actorMaxRankOnScope, exceedsTargetRankCeiling } from '../auth/capability'
+import {
+  requireCapability,
+  capabilityRank,
+  actorMaxRankOnScope,
+  exceedsTargetRankCeiling,
+  currentMemberRankOnScope,
+  isOrgAdmin,
+} from '../auth/capability'
 // Shared token lifecycle — the single mint/revoke path (also used by the dashboard).
 // mupot#1551: acceptInvite() no longer mints (Athena's ruling — that is a
 // function-boundary invariant now, not a per-caller option), so sha256Hex
@@ -58,6 +65,11 @@ import {
   provisionHomeForMember,
 } from './service'
 import { createProjectInvite, type CreateProjectInviteError } from './project-invites'
+// mupot#1551 slice 1: the SAME live-token predicate every bearer lookup in
+// this codebase already shares (see that module's header) — reused here so
+// "does this member hold a live token" can never drift into a second,
+// differently-worded copy of what "live" means.
+import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import {
   isAgentAccessCapability,
   removeAgentSquadAccess,
@@ -156,9 +168,29 @@ interface InviteRow {
   pairing_expires_at: string | null
   capability: Capability
   invited_by: string | null
+  // mupot#1551 slice 1: 0154's minter-identity column. Plain-invite producers
+  // (POST /invites, team_bootstrap) never set this — only the Telegram/project
+  // door (createProjectInvite) does — so it is NULL on every row this function
+  // ever redeems today. Selected anyway so `invited_by`'s own documented
+  // ambiguity (memberId OR a pure-login userId, src/members/project-invites.ts:661)
+  // has a real fallback the moment a future producer starts setting it, instead
+  // of silently reading undefined.
+  minted_by_member_id: string | null
   accepted_at: string | null
   created_at: string
 }
+
+// mupot#1551 slice 1: the inviter re-check predicate — a plain boolean fact
+// ("does a row for this member id exist, active, in this tenant") re-used
+// VERBATIM in two places: the JS pre-check below (fails fast, before the
+// invite is ever claimed) and the capabilities INSERT's own guard at write
+// time (closes the race between that pre-check and the write landing — e.g.
+// the inviter is suspended in the interval). Same discipline as
+// MEMBER_BIND_ELIGIBLE_SQL / redeemTelegramProjectInvite
+// (src/members/project-invites.ts) — one exported string, never a second
+// hand-copy that can drift. NULL tenant is legacy-row-belongs-to-this-pot,
+// the same convention every other tenant check in this file already uses.
+export const INVITER_ACTIVE_MEMBER_SQL = "id = ? AND status = 'active' AND (tenant = ? OR tenant IS NULL)"
 
 // ── app ──────────────────────────────────────────────────────────────────────
 
@@ -220,6 +252,14 @@ export type AcceptInviteError =
   // (JSON API, web invite-landing form) inherits the same limit rather than
   // each re-implementing (and potentially forgetting) its own.
   | 'invalid_display_name'
+  // mupot#1551 slice 1: the INVITER's authority, re-checked fresh from D1 at
+  // redemption — not the mint-time snapshot. Covers all three of: no known
+  // inviter (invited_by AND minted_by_member_id both NULL — a D1-inserted
+  // row with no server-derived actor at all), the inviter no longer an
+  // active member of this tenant, the inviter no longer admin-or-better on
+  // the invite's own scope, and an invite capability above what the inviter
+  // could grant on that scope TODAY.
+  | 'invite_inviter_no_longer_authorized'
 
 export type AcceptInviteResult =
   | { ok: true; value: AcceptInviteSuccess }
@@ -256,7 +296,8 @@ export async function acceptInvite(
 ): Promise<AcceptInviteResult> {
   const invite = await env.DB.prepare(
     `SELECT id, email, department_id, project_id, squad_id, pairing_hash,
-            pairing_expires_at, capability, invited_by, accepted_at, created_at
+            pairing_expires_at, capability, invited_by, minted_by_member_id,
+            accepted_at, created_at
        FROM invites WHERE id = ? LIMIT 1`,
   )
     .bind(inviteId)
@@ -279,6 +320,59 @@ export async function acceptInvite(
     return { ok: false, error: 'invalid_display_name' }
   }
 
+  // A3-2: squad-first. The grant is the same capabilities INSERT this
+  // function already owns for org/department — not a memberships-table
+  // write (that table is the #1161 agent plane). Computed here (not just
+  // before the mint below) because the inviter re-check right after needs
+  // the invite's own scope to ask "admin-or-better on THIS scope", not some
+  // other one.
+  const scopeType: CapabilityScopeType = invite.squad_id
+    ? 'squad'
+    : invite.department_id
+      ? 'department'
+      : 'org'
+  const scopeId: string | null = invite.squad_id ?? invite.department_id
+
+  // mupot#1551 slice 1 — re-check the INVITER at redemption, mirroring
+  // redeemTelegramProjectInvite's own minter re-check (project-invites.ts
+  // ~L862-905): an invite's authority to grant a capability is only as good
+  // as the inviter's CURRENT standing, re-derived fresh from D1 the moment
+  // the invite is actually spent — up to 7 days stale otherwise (suspended
+  // since, demoted since, or a row a script inserted with no real actor
+  // behind it at all). Runs BEFORE any mutation (same WARN-B discipline as
+  // the display-name check above) so the common case never even claims the
+  // invite; the capabilities INSERT below re-asserts the identical
+  // INVITER_ACTIVE_MEMBER_SQL fact as defense-in-depth against the narrow
+  // race between this check and that write landing (same shape as PR #1550
+  // round 2's verified-identity re-check — a dropped pre-check there still
+  // got caught at write time, just as a 500 instead of a clean 409; that is
+  // the accepted trade-off for the sliver of cases this JS check cannot
+  // itself close).
+  //
+  // invited_by is documented as ambiguous — auth.memberId ?? auth.userId at
+  // mint time (POST /invites) — so a pure legacy web login with no member
+  // row leaves invited_by holding a `users.id`, not a `members.id`; that
+  // case is indistinguishable here from "no member row" and is refused the
+  // same way (fail closed, never treated as elevation). minted_by_member_id
+  // is the unambiguous fallback 0154 added for exactly this gap; plain
+  // invites never set it today (see InviteRow's comment above), so this is
+  // forward-looking, not dead code — the moment a producer starts setting
+  // it, this re-check picks it up with no further change.
+  const inviterId = invite.invited_by ?? invite.minted_by_member_id
+  if (inviterId === null) {
+    return { ok: false, error: 'invite_inviter_no_longer_authorized' }
+  }
+  const inviter = await env.DB.prepare(`SELECT id FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL} LIMIT 1`)
+    .bind(inviterId, env.TENANT_SLUG)
+    .first<{ id: string }>()
+  if (!inviter) {
+    return { ok: false, error: 'invite_inviter_no_longer_authorized' }
+  }
+  const inviterRank = await currentMemberRankOnScope(env, inviterId, scopeType, scopeId)
+  if (inviterRank < capabilityRank('admin') || capabilityRank(invite.capability) > inviterRank) {
+    return { ok: false, error: 'invite_inviter_no_longer_authorized' }
+  }
+
   // Mint the member. The email comes from the INVITE (server-trusted), never a
   // caller-supplied value — callers only ever supply the display name.
   const member: Member = {
@@ -290,20 +384,12 @@ export async function acceptInvite(
     created_at: new Date().toISOString(),
   }
 
-  // A3-2: squad-first. The grant is the same capabilities INSERT this
-  // function already owns for org/department — not a memberships-table
-  // write (that table is the #1161 agent plane).
-  const scopeType: CapabilityScopeType = invite.squad_id
-    ? 'squad'
-    : invite.department_id
-      ? 'department'
-      : 'org'
-  const scopeId: string | null = invite.squad_id ?? invite.department_id
-
-  // mupot#1551: NO raw token, NO hash, NO token id is ever computed on this
-  // path — not merely "computed then discarded". A public, id-only
-  // redemption must not even hold a raw bearer in memory for an email it
-  // has no proof the caller controls.
+  // mupot#1551 (#1557, option A): NO raw token, NO hash, NO token id is ever
+  // computed on this path — not merely "computed then discarded". A public,
+  // id-only redemption must not even hold a raw bearer in memory for an
+  // email it has no proof the caller controls. scopeType/scopeId are
+  // computed earlier now (see the inviter re-check above), not re-declared
+  // here.
   const grantId = crypto.randomUUID()
   const acceptedAt = new Date().toISOString()
 
@@ -334,9 +420,19 @@ export async function acceptInvite(
         member.created_at,
         env.TENANT_SLUG,
       ),
+      // mupot#1551 slice 1: re-asserts INVITER_ACTIVE_MEMBER_SQL at write time
+      // — the SAME fragment (and the SAME inviterId/env.TENANT_SLUG values,
+      // captured once in JS above) the pre-check just ran. A 0-row result
+      // here (inviter went inactive/left the tenant in the race window
+      // between that check and this write) makes assertBatchWritten below
+      // throw, landing in the catch and rolling the claim back — see the
+      // comment on the re-check above for why this is JS-checked first and
+      // SQL-reasserted here rather than the other way around.
       env.DB.prepare(
-        'INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)',
-      ).bind(grantId, member.id, scopeType, scopeId, invite.capability),
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+         SELECT ?, ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL})`,
+      ).bind(grantId, member.id, scopeType, scopeId, invite.capability, inviterId, env.TENANT_SLUG),
     ]
     // mupot#1551: acceptInvite never inserts into member_tokens — there is no
     // conditional branch left to gate; this route mints a member and a
@@ -667,6 +763,45 @@ const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
   return requireCapability(inviteScope, 'admin')(c, next)
 }
 
+// mupot#1551 slice 2 — the "squatted row" shape: a member row that (a) no
+// real human has ever proven ownership of (zero LIVE human_login_identities)
+// and (b) someone already holds a live bearer for (>=1 live member_tokens).
+// This is the enabler mupot#1457/#1550's adversarial gate traced the
+// takeover to: mint a member for an arbitrary invited email over the public
+// JSON accept (no identity proof required there), hold the token, then wait
+// for a HIGHER-capability invite to land on the SAME email. Refusing new
+// invites onto that exact shape (unless the creator is already org-admin —
+// an org-admin re-inviting a known operator is not the attack this closes)
+// makes the row un-targetable a second time without an org-admin's say-so.
+//
+// One exported string, reused VERBATIM as both the pre-check's SELECT and
+// the creating INSERT's own WHERE guard below — never a second hand-copy.
+// `datetime('now')` is inlined (not a bound param) the same way
+// src/flight-spine/attestations.ts's simple liveness checks do — no caller
+// here needs a frozen/pinned clock.
+export const RESERVED_INVITE_EMAIL_SQL = (emailParam: string, tenantParam: string): string => `EXISTS (
+    SELECT 1 FROM members m
+     WHERE lower(m.email) = lower(${emailParam})
+       AND (m.tenant = ${tenantParam} OR m.tenant IS NULL)
+       AND NOT EXISTS (
+         SELECT 1 FROM human_login_identities h
+          WHERE h.member_id = m.id AND h.revoked_at IS NULL
+       )
+       AND EXISTS (
+         SELECT 1 FROM member_tokens t
+          WHERE t.member_id = m.id AND ${TOKEN_LIVE_PREDICATE("datetime('now')")}
+       )
+  )`
+
+/** JS-side pre-check (fails fast with a clean 409, before ever attempting the
+ *  INSERT) built from the exact same fragment the guarded INSERT re-asserts. */
+async function isInviteEmailReserved(env: Env, email: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT ${RESERVED_INVITE_EMAIL_SQL('?1', '?2')} AS reserved`)
+    .bind(email, env.TENANT_SLUG)
+    .first<{ reserved: number }>()
+  return row?.reserved === 1
+}
+
 function projectInviteErrorStatus(error: CreateProjectInviteError): 400 | 403 | 404 | 409 {
   if (
     error === 'project_not_found'
@@ -720,17 +855,55 @@ membersApp.post(
       }
     }
 
+    // mupot#1551 slice 2: refuse a new invite onto a squatted row (see
+    // RESERVED_INVITE_EMAIL_SQL above for the exact shape and why) unless the
+    // creator is already org-admin. Checked here — the non-project branch of
+    // THIS handler, the one producer this PR scopes to — not inside
+    // parseInvite, which has no `auth` to read the bypass from.
+    //
+    // team_bootstrap.ts's own per-human invite INSERT (src/org/team-bootstrap.ts
+    // ~L917-925) and createProjectInvite's Telegram/project door are separate
+    // producers with their own INSERT statements and do NOT run through this
+    // handler — this issue's scope documents that gap (PR body) rather than
+    // forking a second hand-copy of this check onto either of them.
+    const creatorIsOrgAdmin = isOrgAdmin(auth)
+    if (!creatorIsOrgAdmin && (await isInviteEmailReserved(c.env, body.email))) {
+      return c.json({ error: 'invite_email_reserved' }, 409)
+    }
+
     const id = crypto.randomUUID()
     const createdAt = new Date().toISOString()
     // invited_by = the acting principal (member if present, else the web user id).
     const invitedBy = auth.memberId ?? auth.userId
 
     try {
-      await c.env.DB.prepare(
-        'INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      // Guarded write — re-asserts the SAME RESERVED_INVITE_EMAIL_SQL fact
+      // the pre-check above just read, closing the race between that read
+      // and this INSERT landing (someone else's invite squats the row in
+      // between). ?8 is the org-admin bypass flag, captured once in JS so
+      // this statement and the pre-check can never see different answers to
+      // "is the creator org-admin".
+      const result = await c.env.DB.prepare(
+        `INSERT INTO invites (id, email, department_id, squad_id, capability, invited_by, created_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+          WHERE ?8 = 1 OR NOT ${RESERVED_INVITE_EMAIL_SQL('?9', '?10')}`,
       )
-        .bind(id, body.email, body.department_id, body.squad_id, body.capability, invitedBy, createdAt)
+        .bind(
+          id,
+          body.email,
+          body.department_id,
+          body.squad_id,
+          body.capability,
+          invitedBy,
+          createdAt,
+          creatorIsOrgAdmin ? 1 : 0,
+          body.email,
+          c.env.TENANT_SLUG,
+        )
         .run()
+      if (!result.meta || result.meta.changes === 0) {
+        return c.json({ error: 'invite_email_reserved' }, 409)
+      }
     } catch (err) {
       if (isUniqueViolation(err)) return c.json({ error: 'invite_exists' }, 409)
       throw err

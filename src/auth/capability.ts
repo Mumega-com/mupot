@@ -884,6 +884,77 @@ export async function exceedsTargetRankCeiling(
   return exceedsTargetRankCeilingGivenRanks(auth.memberId ?? null, actorRank, targetMemberId, targetRank)
 }
 
+// Highest-to-lowest so the first `hasCapability` hit is already the ceiling —
+// no need to scan every rank and take a max.
+const RANKS_DESC: Capability[] = ['owner', 'admin', 'lead', 'member', 'observer']
+
+/**
+ * mupot#1551 slice 1: a MEMBER's (not a live session's) current effective
+ * rank on one exact scope, re-derived fresh from D1 — the quantity a
+ * redemption-time re-check needs when the acting principal at MINT time is
+ * long gone and only their `members.id` survives in a `invited_by` column.
+ *
+ * Deliberately NOT `targetMaxRankAcrossScopes` (that is the TARGET's global
+ * ceiling — the highest rank anywhere, used to decide whether someone may be
+ * acted ON). An invite's authority to grant a capability is scope-LOCAL: a
+ * squad-admin on squad A must not still authorize an invite once redeemed
+ * against squad A after being demoted there, even if they separately picked
+ * up 'owner' on an unrelated squad B in the meantime — mirroring
+ * `actorRankOnScopeFor`'s own org-scope-local (not global) actor comparison
+ * in `exceedsTargetRankCeiling` above (mupot#1411 A1).
+ *
+ * Folds in the legacy role-plane rank (`targetLegacyRoleRank` — the bootstrap
+ * org owner/admin `users.role` bridge) exactly the way `actorRankOnScopeFor`
+ * folds in a LIVE session's `auth.role`: gated by `planeCoversScope('role', …)`
+ * on a squad scope (never covers a home squad), unconditionally on org/
+ * department (no `kind` concept reaches those scope types). Unlike
+ * `actorRankOnScopeFor`, there is no live session here to read a role off —
+ * `targetLegacyRoleRank` is the only way to ask "does this member's role
+ * plane cover this?" without one.
+ */
+export async function currentMemberRankOnScope(
+  env: Env,
+  memberId: string,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<number> {
+  const grants = await resolveCapabilities(env, memberId)
+  const roleRank = await targetLegacyRoleRank(env, memberId)
+
+  if (scopeType === 'squad') {
+    if (!scopeId) return 0
+    const scope = await loadSquadScope(env, scopeId)
+    // Unknown/deleted squad row: fail closed, same as actorRankOnSquad.
+    if (!scope) return 0
+    let max = planeCoversScope('role', scope) ? roleRank : 0
+    for (const cap of RANKS_DESC) {
+      if (hasCapability(grants, 'squad', scope, cap)) {
+        max = Math.max(max, RANK[cap])
+        break
+      }
+    }
+    return max
+  }
+
+  if (scopeType === 'department' && !scopeId) return 0
+
+  let max = roleRank
+  for (const cap of RANKS_DESC) {
+    // Both branches are exhaustive here: scopeType is 'org' | 'department'
+    // (the 'squad' case already returned above) and the department branch is
+    // only reached once scopeId is known non-null by the guard above.
+    const resolves =
+      scopeType === 'org'
+        ? hasCapability(grants, 'org', null, cap)
+        : hasCapability(grants, 'department', scopeId ?? '', cap)
+    if (resolves) {
+      max = Math.max(max, RANK[cap])
+      break
+    }
+  }
+  return max
+}
+
 // ── surface-capability gate (#106) ────────────────────────────────────────────
 // Per-surface capabilities (e.g. 'outreach:send-gated', 'budget:write',
 // 'content:write') are stored as free-text rows in the gate_grants table.
