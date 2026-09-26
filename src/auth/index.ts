@@ -309,12 +309,22 @@ async function registerWebSession(
       })
       if (!resolved) return false
 
+      // mupot#1551 (Athena's ruling, Option B, point 4): `resolved` above can
+      // only have come from a fresh identity-less-row bootstrap attach here
+      // (this function always supplies both provider and subject, so
+      // resolveHumanMemberId's step 2 is always skipped and step 3 always
+      // runs the strict decideIdentitylessAttach branch) or the vanishingly
+      // rare step-1 race. Either way this INSERT must re-verify exclusive
+      // control atomically — a competing bearer/Telegram bind/identity
+      // landing between that read and this write must make the link fail,
+      // not land.
       const linked = await linkLoginIdentity(env, {
         tenant,
         provider: loginIdentity.provider,
         providerSubject: loginIdentity.subject,
         verifiedEmail: email,
         memberId: resolved,
+        requireExclusiveControl: true,
       })
       if (!linked.ok) return false
       memberId = resolved
