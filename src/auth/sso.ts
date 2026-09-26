@@ -4,6 +4,7 @@ import type { Env } from '../types'
 import { getJSON, setJSON } from '../dashboard/settings'
 import { createBus } from '../bus'
 import { resolveHumanMemberId } from '../members/resolve-human-member'
+import { decideIdentitylessAttach } from '../members/exclusive-control'
 
 // mupot#1454: the ONLY roles a self-service SSO auto-enrollment may hand a
 // brand-new member. Deliberately excludes 'admin' (and every capability above
@@ -54,6 +55,11 @@ export interface AutoEnrollResult {
   // member's role is always the (validated) SsoDefaultRole from config.
   role: 'member' | 'admin' | SsoDefaultRole
   isNew: boolean
+  // 'invalid_email' | 'sso_domain_not_allowed' | 'member_suspended' — pre-existing.
+  // 'member_row_competing_control' | 'member_email_ambiguous' — mupot#1551: the
+  // resolver missed but decideIdentitylessAttach found the row is already
+  // someone else's, or the normalized email is ambiguous. Neither ever
+  // enrolls or duplicates.
   error?: string
 }
 
@@ -140,21 +146,46 @@ export async function autoEnrollSsoMember(
 
   const bus = createBus(env)
 
-  const resolvedId = await resolveHumanMemberId(env, {
+  // mupot#1551 (Athena's ruling, Option B): `identityOnly` stops the resolver
+  // at steps 1-2 (a live identity's own join key or verified_email) — it
+  // never falls through to resolveHumanMemberRecord's members.email bootstrap
+  // (step 3) or owner-alias lookup (step 4), which this function replaces
+  // below with its OWN, explicit, checked fallback instead of letting the
+  // resolver silently apply its lenient (no-subject) email match.
+  const identityResolvedId = await resolveHumanMemberId(env, {
     tenant: env.TENANT_SLUG,
     provider: profile.provider || null,
     email,
+    identityOnly: true,
   })
-  let existingId = resolvedId
+  let existingId = identityResolvedId
   if (!existingId) {
-    // UNIQUE members.email: a resolver miss (write-once verified_email drift)
-    // must not INSERT a colliding row. Treat the existing row as the member.
-    const colliding = await env.DB.prepare(
-      `SELECT id FROM members WHERE lower(email) = ?1 AND tenant = ?2 LIMIT 1`,
-    )
-      .bind(email, env.TENANT_SLUG)
-      .first<{ id: string }>()
-    existingId = colliding?.id ?? null
+    // UNIQUE members.email means a resolver miss (write-once verified_email
+    // drift, a genuinely suspended row, or a competing-controlled row) must
+    // not INSERT a colliding row — but it also must not silently REUSE a row
+    // that is already someone else's. The old raw `SELECT ... LIMIT 1`
+    // fallback here had no such check at all, so a denial could never even be
+    // expressed; decideIdentitylessAttach's tri-state result is authoritative
+    // instead. `ignoreLiveIdentity: true` — this call never links a new
+    // identity, so a row that already has ONE (just under a different
+    // verified_email — the drift case) is still safe to report back; only a
+    // live unbound bearer or a Telegram bind refuses enrollment outright.
+    const decision = await decideIdentitylessAttach(env, {
+      tenant: env.TENANT_SLUG,
+      normalizedEmail: email,
+      provider: profile.provider || null,
+      subject: null,
+      ignoreLiveIdentity: true,
+    })
+    if (decision.kind === 'eligible') {
+      existingId = decision.memberId
+    } else if (decision.kind === 'denied_competing_control') {
+      return { ok: false, email, role: 'member', isNew: false, error: 'member_row_competing_control' }
+    } else if (decision.kind === 'ambiguous') {
+      return { ok: false, email, role: 'member', isNew: false, error: 'member_email_ambiguous' }
+    }
+    // 'not_found' → existingId stays null → falls through to provisioning a
+    // brand-new member below, exactly as before.
   }
   if (existingId) {
     const existing = await env.DB.prepare(
