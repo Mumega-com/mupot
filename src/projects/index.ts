@@ -3,6 +3,7 @@ import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
+import { resolveHumanMemberId } from '../members/resolve-human-member'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -145,13 +146,28 @@ function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
+/**
+ * mupot#1578: this used to run its own raw query selecting a members.id by
+ * a bare `email` match (scoped to tenant + status='active') — with
+ * no idea about mupot#1551's exclusive-control predicate
+ * (src/members/exclusive-control.ts). A members row already under someone
+ * else's exclusive control (a live unbound bearer token, e.g. the legacy
+ * public-accept squat — or a bound Telegram chat) is exactly the shape
+ * decideIdentitylessAttach exists to refuse, but the raw query found it
+ * anyway and handed out whatever capabilities that row already held (an
+ * org-owner grant, in the reported shape) to anyone who could complete a
+ * login with that email — even though that SAME login's own identity attach
+ * was correctly refused elsewhere. resolveHumanMemberId is the ONE function
+ * that consults decideIdentitylessAttach for a bare-email, no-join-key read
+ * (its own email-only branch, src/members/resolve-human-member.ts) — reused
+ * here, not copied, so this route can never drift back to a hand-rolled
+ * lookup. A CI ratchet (scripts/check-member-email-authority-lookup.mjs)
+ * forbids reintroducing the raw pattern anywhere outside the resolver.
+ */
 async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
   if (auth.memberId) return auth.memberId
   if (!auth.email) return null
-  const member = await env.DB.prepare(
-    "SELECT id FROM members WHERE email = ? AND tenant = ? AND status = 'active'",
-  ).bind(auth.email, env.TENANT_SLUG).first<{ id: string }>()
-  return member?.id ?? null
+  return resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
 }
 
 async function grantsFor(env: Env, auth: AuthContext): Promise<CapabilityGrant[]> {

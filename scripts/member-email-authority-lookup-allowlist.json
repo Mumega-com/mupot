@@ -1,0 +1,10 @@
+{
+  "_why": "Files with a raw `FROM members ... WHERE ... email` lookup outside the shared resolver (src/members/resolve-human-member.ts, src/members/exclusive-control.ts — hardcoded exempt, never listed here) that scripts/check-member-email-authority-lookup.mjs (mupot#1578) does not fail on, because each one PRE-DATES this ratchet and is not an authority read: src/members/index.ts and src/members/project-invites.ts use it only as an INSERT-time duplicate/collision guard (never to resolve an acting member for a session); src/members/squad-seed.ts is admin/seed-only provisioning, not a request-time auth path; src/auth/index.ts uses it only to check a legacy session's member STATUS (suspend-and-kill), never to assign auth.memberId or capabilities from the result. RATCHET: this list may only shrink. A file leaving it (because the pattern was cleaned up) is fine; a file being ADDED is not — route the lookup through resolveHumanMemberId instead. A listed file that no longer contains the pattern is also an error (stale exemption).",
+  "_measured": "2026-09-27, against origin/main 681e2dab, mupot#1578",
+  "files": [
+    "src/auth/index.ts",
+    "src/members/index.ts",
+    "src/members/project-invites.ts",
+    "src/members/squad-seed.ts"
+  ]
+}

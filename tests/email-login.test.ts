@@ -829,4 +829,96 @@ describe('GET/POST /auth/email/verify', () => {
       .get(invitedMember.member_id) as { n: number }
     expect(identitiesOnInvitedMember.n).toBe(0)
   })
+
+  // mupot#1581 P2-4: finishEmailLoginSuccess's check 2 used to be a hand-copied
+  // `SELECT role FROM users WHERE email = ?1` — a second, independent read of the exact
+  // row upsertUserByEmail's own step 1 reads again moments later. The fix collapses this
+  // to a single call to upsertUserByEmail, gated on its RETURNED role — the value that
+  // actually becomes the session role, not a snapshot of it taken separately.
+  it('a legacy mixed-case owner row (Boss@Pot.test) is still refused for a lower-case login attempt', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role) VALUES ('user-boss', 'Boss@Pot.test', 'owner');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'boss@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+    // upsertUserByEmail's own lookup is exact-case (no COLLATE NOCASE on users.email) —
+    // proving the refusal did not itself mint a SECOND, lower-cased 'member' row.
+    const rows = harness.sqlite.prepare(`SELECT email, role FROM users`).all() as Array<{ email: string; role: string }>
+    expect(rows).toEqual([{ email: 'Boss@Pot.test', role: 'owner' }])
+  })
+
+  it('an admin row (not just owner) is also refused', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role) VALUES ('user-admin-role', 'admin-role@pot.test', 'admin');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'admin-role@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+  })
+
+  it('the invite branch is ALSO gated on an existing non-member users row, before the invite link ever writes', async () => {
+    harness = makeHarness()
+    // inv-squad (from makeHarness) is for newcomer@example.com — give that exact email an
+    // existing OWNER users row before accepting the invite.
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role) VALUES ('user-newcomer-owner', 'newcomer@example.com', 'owner');
+    `)
+    const env = envFor(harness, memoryKv())
+
+    const acceptRes = await inviteApp.fetch(
+      new Request(`${ORIGIN}/inv-squad`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+        body: new URLSearchParams({ display_name: 'New Comer' }),
+      }),
+      env,
+    )
+    expect(acceptRes.status).toBe(302)
+    const setCookie = acceptRes.headers.get('set-cookie') ?? ''
+    const pendingMatch = new RegExp(`${PENDING_INVITE_COOKIE}=([^;]+)`).exec(setCookie)
+    if (!pendingMatch) throw new Error('invite accept did not set pending-invite cookie')
+    const pendingCookie = `${PENDING_INVITE_COOKIE}=${pendingMatch[1]}`
+
+    const { token, attemptId } = await startAndCapture(env, 'newcomer@example.com', pendingCookie)
+    const res = await confirmToken(env, token, attemptId, pendingCookie)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+
+    // The invite's own D1-authoritative link (linkAcceptedInviteIdentity) must never have
+    // run — the users-role gate sits BEFORE the whole invite/no-invite if/else.
+    const invitedMember = harness.sqlite
+      .prepare(`SELECT member_id FROM invites WHERE id = 'inv-squad'`)
+      .get() as { member_id: string | null }
+    expect(invitedMember.member_id).toBeTruthy()
+    const identitiesOnInvitedMember = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE member_id = ?`)
+      .get(invitedMember.member_id) as { n: number }
+    expect(identitiesOnInvitedMember.n).toBe(0)
+  })
+
+  it('check 1 (foreign live identity) still fires when the STORED identity email is mixed-case', async () => {
+    // Regression pin: check 1 (`lower(verified_email) = ?2`) must keep normalizing the
+    // STORED side of the comparison, not just the incoming attempt's email — a mixed-case
+    // verified_email already sitting in human_login_identities from an older write path
+    // must not slip past the lower() guard.
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-foreign', 'someone@pot.test', 'Someone', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('hli-foreign', '${TENANT}', 'google', 'google-sub-foreign', 'Foreign@Example.com', 'member-foreign', datetime('now'));
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'foreign@example.com')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+  })
 })

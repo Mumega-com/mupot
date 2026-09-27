@@ -28,7 +28,11 @@ function makeUsersDB(seed: Row[] = [], opts: { throwOnInsertEmail?: boolean } = 
           return api
         },
         async first<T>(): Promise<T | null> {
-          if (sql.includes('WHERE email')) {
+          // Match on 'email' generically (mupot#1581 P2-4: findUserByEmail's real query is
+          // `WHERE lower(email) = ...`, not `WHERE email = ...` — a narrower 'WHERE email'
+          // substring check would silently stop matching and route every email lookup into
+          // the id/count branches instead).
+          if (sql.includes('email')) {
             return (byEmail.get(args[0] as string) ?? null) as T | null
           }
           if (sql.includes('WHERE id')) {
@@ -120,7 +124,7 @@ describe('upsertUserByEmail — cross-path dedup (#262)', () => {
             return api
           },
           async first<T>(): Promise<T | null> {
-            if (sql.includes('WHERE email')) {
+            if (sql.includes('email')) {
               return (committed ? winner : null) as T | null // miss pre-race, hit post-race
             }
             if (sql.includes('WHERE id')) return null as T | null

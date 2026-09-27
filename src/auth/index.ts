@@ -923,8 +923,13 @@ async function finishEmailLoginSuccess(
   // (decidePendingInviteLink is read-only, but linkAcceptedInviteIdentity —
   // and the no-invite branch's eventual mintSession — both write): a token/
   // code already being consumed at verify time is an accepted sunk cost, but
-  // no session, cookie, or `users`/identity row may ever be written past
-  // this point once either check below fires.
+  // no session, cookie, `members`, or identity row may ever be written past
+  // this point once either check below fires. (mupot#1581 P2-4: check 2's
+  // own write — the `users` row upsertUserByEmail may INSERT when this
+  // exact email has never logged in before — is the one exception, and is
+  // deliberate: it only ever creates the org's baseline `role='member'`
+  // row, the same row this email would get from any successful login
+  // anyway, so a later refusal in this function still grants nothing.)
   const foreignIdentity = await env.DB.prepare(
     `SELECT 1 AS present FROM human_login_identities
       WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL AND provider != 'email'
@@ -935,10 +940,32 @@ async function finishEmailLoginSuccess(
   if (foreignIdentity) {
     return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
   }
-  const existingUser = await env.DB.prepare(`SELECT role FROM users WHERE email = ?1`)
-    .bind(emailNormalized)
-    .first<{ role: OrgRole }>()
-  if (existingUser && existingUser.role !== 'member') {
+
+  // mupot#1581 P2-4: this used to be a hand-copied `SELECT role FROM users
+  // WHERE email = ?1` — a SEPARATE, earlier read of the exact row
+  // upsertUserByEmail's own step 1 reads again moments later, purely so
+  // this file could gate BEFORE either branch's own write. Two reads of the
+  // same row, separated in time, is a check-then-write gap in its own
+  // right (a write landing between the two — a role change, a concurrent
+  // first login — is exactly what "check, then act on a stale check" means)
+  // on top of being a hand-copy of the predicate upsertUserByEmail already
+  // owns. Call upsertUserByEmail itself, ONCE, right here — before either
+  // branch below performs its own write — and gate on `role`, the value
+  // that IS the session role, not a snapshot taken a moment earlier and
+  // trusted to still be true. When a `users` row already exists for this
+  // email, upsertUserByEmail's step 1 is a pure read (no INSERT), so a
+  // refusal here still writes nothing; findUserByEmail is that read,
+  // extracted so this is genuinely the SAME query, not a second copy.
+  // allowBootstrapOwner=FALSE, always, for email (adversarial gate P0-2,
+  // "also pass allowBootstrapOwner=false for email — Google keeps it"):
+  // unlike Google's own /callback (the legitimate first-owner ceremony),
+  // email login must never auto-mint the pot's first-ever owner on a virgin
+  // pot — proving mailbox control is weaker evidence than an IdP-verified
+  // identity, and "first owner" is exactly the highest-value grant a
+  // "prove you can read an inbox" door should not be trusted to hand out.
+  const derivedId = await deriveUserId('email', emailNormalized)
+  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, false)
+  if (role !== 'member') {
     return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
   }
 
@@ -997,19 +1024,27 @@ async function finishEmailLoginSuccess(
     // email are NOT the same authority: the members row can already be
     // under someone else's exclusive control (a live identity, an unbound
     // bearer, a Telegram bind — mupot#1551, decideIdentitylessAttach). Gate
-    // on the SAME predicate the identity bridge itself applies, BEFORE
-    // upsertUserByEmail ever runs:
+    // on the SAME predicate the identity bridge itself applies:
     //   - a live ('email', subject) identity already exists → returning
     //     user, always safe (idempotent re-login, no attach decision needed).
     //   - no live identity yet, but decideIdentitylessAttach says 'eligible'
     //     or 'not_found' → safe to proceed; registerWebSession (inside
     //     mintSession below) performs the real, atomically-guarded attach.
     //   - 'denied_competing_control' or 'ambiguous' → REFUSE THE WHOLE
-    //     LOGIN. No `users` row is touched, no session is minted. The
-    //     caller already proved mailbox control to reach this function, so
-    //     this refusal carries no account-existence oracle beyond "this
-    //     email is already linked elsewhere" — it never names the other
-    //     provider/method.
+    //     LOGIN. No session is minted, no `members`/identity row is ever
+    //     touched. mupot#1581 P2-4 moved the `users`-role gate (above,
+    //     before this whole if/else) to reuse upsertUserByEmail's own
+    //     result instead of a second hand-copied read — the one accepted
+    //     side effect of that reuse is that upsertUserByEmail may already
+    //     have INSERTed a fresh role='member' `users` row for a genuinely
+    //     new email by the time a denial fires here (previously it never
+    //     ran at all on this branch's refusal). That row grants nothing
+    //     beyond the org's baseline role and is exactly the row a brand new
+    //     email would get from a successful login anyway — refusing here
+    //     still writes no session, cookie, members row, or identity link,
+    //     which is the property that actually matters; it is not a fresh
+    //     account-existence oracle either, since the response is identical
+    //     whether or not that row already existed.
     const existingEmailIdentity = await resolveLoginIdentity(env, tenant, 'email', emailNormalized)
     if (!existingEmailIdentity) {
       const decision = await decideIdentitylessAttach(env, {
@@ -1024,15 +1059,8 @@ async function finishEmailLoginSuccess(
     }
   }
 
-  const derivedId = await deriveUserId('email', emailNormalized)
-  // allowBootstrapOwner=FALSE, always, for email (adversarial gate P0-2,
-  // "also pass allowBootstrapOwner=false for email — Google keeps it"):
-  // unlike Google's own /callback (the legitimate first-owner ceremony),
-  // email login must never auto-mint the pot's first-ever owner on a virgin
-  // pot — proving mailbox control is weaker evidence than an IdP-verified
-  // identity, and "first owner" is exactly the highest-value grant a
-  // "prove you can read an inbox" door should not be trusted to hand out.
-  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, false)
+  // userId/role were already resolved by the upsertUserByEmail call above —
+  // before either branch's own write — and are not re-derived here.
   await mintSession(c, userId, emailNormalized, role, {
     loginIdentity: { provider: 'email', subject: emailNormalized },
   })
@@ -1534,6 +1562,35 @@ authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────
 
 /**
+ * findUserByEmail — the one `users` email lookup, normalized once here.
+ * upsertUserByEmail's own step 1 and step 4 (re-resolve after an
+ * insert/UNIQUE race) both call this instead of inlining the query twice,
+ * and any caller that needs to GATE on a user's pre-existing role WITHOUT
+ * itself deciding to upsert (mupot#1581 P2-4 — finishEmailLoginSuccess used
+ * to keep a hand-copied `SELECT role FROM users WHERE email = ?1` for
+ * exactly this, a second predicate that could silently drift from this
+ * one) should call this directly rather than re-copying the query. Read-
+ * only: never inserts.
+ */
+async function findUserByEmail(env: Env, email: string | null): Promise<{ id: string; role: OrgRole } | null> {
+  const normEmail = email ? email.trim().toLowerCase() : null
+  if (!normEmail) return null
+  // lower(email) — NOT a plain `email = ?1` — because `users.email`'s UNIQUE constraint
+  // (migration 0001) is case-SENSITIVE, the same gap 0146 already closed for
+  // `members.email` (idx_members_email_lower). Without this, a legacy mixed-case row
+  // (created before every write path consistently lower-cased its input) is invisible to
+  // a lower-cased lookup — mupot#1581 P2-4: finishEmailLoginSuccess's `users`-role gate
+  // (and upsertUserByEmail's OWN dedup step 1) would both silently miss such a row and
+  // mint a SECOND, distinct 'member' row instead of recognizing the existing
+  // owner/admin one. `ORDER BY created_at ASC` makes the (legal but unlikely) case of two
+  // differently-cased rows for one email a deterministic pick, same convention as
+  // resolve-human-member.ts's own case-collision handling.
+  return env.DB.prepare('SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC LIMIT 1')
+    .bind(normEmail)
+    .first<{ id: string; role: OrgRole }>()
+}
+
+/**
  * Upsert the user row and return their CANONICAL id + org role. First user EVER to
  * log in becomes 'owner' (bootstrap); everyone after defaults to 'member'. An
  * existing user's role is preserved — never demoted/escalated by a login.
@@ -1563,12 +1620,8 @@ export async function upsertUserByEmail(
 
   // 1. Email match wins (the dedup key). Reuse the existing user regardless of which
   //    AuthN path created them. Never clobber their id or role.
-  if (normEmail) {
-    const byEmail = await env.DB.prepare('SELECT id, role FROM users WHERE email = ?1')
-      .bind(normEmail)
-      .first<{ id: string; role: OrgRole }>()
-    if (byEmail) return { id: byEmail.id, role: byEmail.role }
-  }
+  const byEmail = await findUserByEmail(env, normEmail)
+  if (byEmail) return { id: byEmail.id, role: byEmail.role }
 
   // 2. No email match → id match (emailless legacy users, idempotent re-runs).
   const byId = await env.DB.prepare('SELECT role FROM users WHERE id = ?1')
@@ -1599,12 +1652,8 @@ export async function upsertUserByEmail(
   }
 
   // Re-resolve (email-first) to return the canonical row after the insert/race.
-  if (normEmail) {
-    const row = await env.DB.prepare('SELECT id, role FROM users WHERE email = ?1')
-      .bind(normEmail)
-      .first<{ id: string; role: OrgRole }>()
-    if (row) return { id: row.id, role: row.role }
-  }
+  const row = await findUserByEmail(env, normEmail)
+  if (row) return { id: row.id, role: row.role }
   const row2 = await env.DB.prepare('SELECT id, role FROM users WHERE id = ?1')
     .bind(preferredId)
     .first<{ id: string; role: OrgRole }>()

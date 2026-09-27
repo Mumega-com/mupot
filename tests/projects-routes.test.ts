@@ -618,4 +618,72 @@ describe('projectsApp', () => {
     expect((await fetch(harness, '/visible-child/squads/missing', 'PUT', { access_level: 'write' })).status).toBe(404)
     expect((await fetch(harness, '/visible-child/squads/squad-b', 'DELETE')).status).toBe(404)
   })
+
+  describe('memberIdFor email-only resolution (mupot#1578)', () => {
+    // A session that never resolved `auth.memberId` (e.g. an identity attach that was
+    // refused, or a legacy session with no `loginIdentity`) still carries `auth.email` —
+    // memberIdFor's job is deciding whether that email is safe to treat as an acting
+    // member. seedSquattedMember reproduces the exact reported shape: a live, UNBOUND
+    // workspace bearer token PLUS an org-admin capability grant already sitting on the
+    // row, with no linked identity — decideIdentitylessAttach must refuse it.
+    function seedMemberRow(
+      harness: SqliteD1Harness,
+      id: string,
+      email: string,
+      opts: { withLiveBearer?: boolean } = {},
+    ): void {
+      harness.sqlite
+        .prepare(
+          `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+           VALUES (?, 'pot-a', ?, ?, 'active', datetime('now'))`,
+        )
+        .run(id, email, id)
+      harness.sqlite
+        .prepare(
+          `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+           VALUES (?, ?, 'org', NULL, 'admin')`,
+        )
+        .run(crypto.randomUUID(), id)
+      if (opts.withLiveBearer) {
+        harness.sqlite
+          .prepare(
+            `INSERT INTO member_tokens
+               (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
+             VALUES (?, ?, ?, 'workspace', 'workspace', datetime('now'), NULL, 'pot-a', NULL, NULL)`,
+          )
+          .run(crypto.randomUUID(), id, crypto.randomUUID())
+      }
+    }
+
+    it('a squatted row (live bearer + org-admin grant) grants nothing to an email-only session — GET empty, PATCH 403', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      seedMemberRow(harness, 'squatter', 'victim@pot.test', { withLiveBearer: true })
+      // Identity attach for this login was already refused elsewhere (decideIdentitylessAttach
+      // denied the live bearer) — auth carries the verified email but NO memberId/capabilities,
+      // exactly what loadAuthFromCookie leaves on a denial.
+      as(actor({ email: 'victim@pot.test' }))
+
+      const list = await fetch(harness, '/')
+      expect(list.status).toBe(200)
+      await expect(list.json()).resolves.toMatchObject({ projects: [] })
+
+      const patch = await fetch(harness, '/visible-child', 'PATCH', { name: 'Pwned' })
+      expect(patch.status).toBe(403)
+      await expect(patch.json()).resolves.toMatchObject({ error: 'forbidden', need: 'admin' })
+    })
+
+    it('a genuinely unclaimed row (no bearer, no telegram) still resolves for its own email — legitimate member unchanged', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      seedMemberRow(harness, 'real-member', 'member@pot.test', { withLiveBearer: false })
+      harness.sqlite.exec(`
+        UPDATE capabilities SET scope_type = 'squad', scope_id = 'squad-a' WHERE member_id = 'real-member';
+      `)
+      as(actor({ email: 'member@pot.test' }))
+
+      const detail = await fetch(harness, '/visible-child')
+      expect(detail.status).toBe(200)
+    })
+  })
 })

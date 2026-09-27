@@ -184,61 +184,99 @@ async function resolveHumanMemberRecordRich(
   const email = input.email ? normalizeEmail(input.email) : ''
   if (!email) return { kind: 'not_found' }
 
-  // Step 3, join-key-present branch (mupot#1551, Athena's ruling Option B):
-  // a supplied-but-missed join key may bootstrap ONLY a member row that is
-  // still under NO ONE's exclusive control — not merely one with no live
-  // identity. decideIdentitylessAttach also fails closed on a live unbound
-  // bearer (the legacy public-accept squat) or a bound Telegram chat, and on
-  // a case-insensitive email collision (never an arbitrary LIMIT-1 pick).
-  // This is the actual attach path — registerWebSession calls
-  // linkLoginIdentity right after this resolves — so it gets the strict
-  // predicate. Round 2 (P0): the decision's OWN kind is now returned intact,
-  // not collapsed to `null` — a real attach caller (findOrCreateHumanMember)
-  // must be able to refuse a denial/ambiguity instead of reading it as
-  // "no such member" and inserting a duplicate.
+  // Step 3 (mupot#1551, Athena's ruling Option B): a members row may be
+  // bootstrapped/read from bare email ONLY when it is under NO ONE's
+  // exclusive control — not merely one with no live identity.
+  // decideIdentitylessAttach fails closed on a live unbound bearer (the
+  // legacy public-accept squat) or a bound Telegram chat, and on a
+  // case-insensitive email collision (never an arbitrary LIMIT-1 pick).
+  // exclusiveControlEligibility below is this same decision, classified
+  // into the tri-state result shape, shared by BOTH sub-branches so there
+  // is exactly one place that turns a decideIdentitylessAttach outcome into
+  // a ResolveHumanMemberAttachResult.
   if (joinKeyPresent) {
-    const decision = await decideIdentitylessAttach(env, {
+    // Join-key-present: the actual attach path — registerWebSession calls
+    // linkLoginIdentity right after this resolves — so it gets the full
+    // predicate (a live identity under a DIFFERENT join key is refused;
+    // ignoreLiveIdentity is never set here). Round 2 (P0): the decision's
+    // OWN kind is returned intact, not collapsed to `null` — a real attach
+    // caller (findOrCreateHumanMember) must be able to refuse a
+    // denial/ambiguity instead of reading it as "no such member" and
+    // inserting a duplicate.
+    return exclusiveControlEligibility(
+      env,
       tenant,
-      normalizedEmail: email,
-      provider: input.provider ?? null,
-      subject: input.providerSubject ?? null,
-    })
-    if (decision.kind === 'eligible') {
-      if (!activeOnly || decision.status === 'active') {
-        return { kind: 'resolved', member: { id: decision.memberId, status: decision.status } }
-      }
-      // Eligible but excluded by this caller's own activeOnly filter (a
-      // suspended row) — same terminal shape as step 2's activeOnly filter:
-      // not a member candidate for this call, but also not a fresh signup
-      // target. Step 4 is join-key-gated below regardless, so this always
-      // ends the same way whether reported as not_found here or falling
-      // through — reported directly for a clearer signal to attach callers.
-      return { kind: 'not_found' }
-    }
-    if (decision.kind === 'denied_competing_control') return { kind: 'denied', reason: decision.reason }
-    if (decision.kind === 'ambiguous') return { kind: 'ambiguous' }
-    return { kind: 'not_found' }
+      email,
+      { provider: input.provider ?? null, subject: input.providerSubject ?? null },
+      activeOnly,
+    )
   }
 
   // Step 3, email-only branch (no join key at all): a pure resolve-by-email
   // read, never followed by a linkLoginIdentity write from this branch's
-  // result (dashboard/projects.ts's own-member lookup; SSO's initial pass,
-  // which separately calls decideIdentitylessAttach itself on a miss — see
-  // src/auth/sso.ts). Deliberately left lenient: this is the write-once
-  // verified_email-drift invariant (mupot#1266 P0-2) — a member whose live
-  // identity's verified_email has drifted from members.email must still
-  // resolve via their own primary address.
-  const byEmail = await env.DB.prepare(
-    `SELECT id, status FROM members
-      WHERE lower(email) = ?1 AND tenant = ?2 ${activeOnly ? "AND status = 'active'" : ''}
-      LIMIT 1`,
-  ).bind(email, tenant).first<ResolvedHumanMember>()
-  if (byEmail) return { kind: 'resolved', member: byEmail }
+  // result (dashboard/projects.ts's own-member lookup, mupot#1578; SSO's
+  // initial pass, which separately calls decideIdentitylessAttach itself on
+  // a miss — see src/auth/sso.ts). `ignoreLiveIdentity: true` preserves the
+  // write-once verified_email-drift invariant (mupot#1266 P0-2) — a member
+  // whose live identity's verified_email has drifted from members.email
+  // must still resolve via their own primary address — while STILL refusing
+  // a row under someone else's exclusive control (a live unbound bearer or
+  // a bound Telegram chat). This used to be a plain `SELECT id, status FROM
+  // members WHERE lower(email) = ... LIMIT 1` with no exclusive-control
+  // check at all (mupot#1578: that raw shape is exactly what let a caller
+  // read a squatted row's capabilities even though the SAME email's own
+  // identity attach would be refused).
+  const decision = await exclusiveControlEligibility(
+    env,
+    tenant,
+    email,
+    { ignoreLiveIdentity: true },
+    activeOnly,
+  )
+  if (decision.kind !== 'not_found') return decision
 
-  // Step 4: same join-key gate as step 2. A missed subject must not
-  // inherit the org owner via an operator alias.
+  // Step 4: same "no join key" gate as step 2/3. A missed subject (or, here,
+  // no subject at all) must not inherit the org owner via an operator alias
+  // when the email itself resolved to nothing.
   const ownerId = await ownerAliasMemberId(env, email)
   return ownerId ? { kind: 'resolved', member: { id: ownerId, status: 'active' } } : { kind: 'not_found' }
+}
+
+/**
+ * exclusiveControlEligibility — run decideIdentitylessAttach and classify its
+ * tri-state result into a ResolveHumanMemberAttachResult, honoring this
+ * function's own `activeOnly` floor on an eligible row. Shared by both the
+ * join-key-present branch (full check) and the email-only branch
+ * (`ignoreLiveIdentity: true`) so there is exactly one place that turns a
+ * decideIdentitylessAttach decision into the resolver's result shape.
+ */
+async function exclusiveControlEligibility(
+  env: Env,
+  tenant: string,
+  normalizedEmail: string,
+  opts: { provider?: string | null; subject?: string | null; ignoreLiveIdentity?: boolean },
+  activeOnly: boolean,
+): Promise<ResolveHumanMemberAttachResult> {
+  const decision = await decideIdentitylessAttach(env, {
+    tenant,
+    normalizedEmail,
+    provider: opts.provider ?? null,
+    subject: opts.subject ?? null,
+    ignoreLiveIdentity: opts.ignoreLiveIdentity,
+  })
+  if (decision.kind === 'eligible') {
+    if (!activeOnly || decision.status === 'active') {
+      return { kind: 'resolved', member: { id: decision.memberId, status: decision.status } }
+    }
+    // Eligible but excluded by this caller's own activeOnly filter (a
+    // suspended row) — not a member candidate for this call, but also not a
+    // fresh signup target. Reported directly rather than falling through,
+    // for a clearer signal to attach callers.
+    return { kind: 'not_found' }
+  }
+  if (decision.kind === 'denied_competing_control') return { kind: 'denied', reason: decision.reason }
+  if (decision.kind === 'ambiguous') return { kind: 'ambiguous' }
+  return { kind: 'not_found' }
 }
 
 export function resolveHumanMember(

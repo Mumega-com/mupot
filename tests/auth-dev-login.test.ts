@@ -23,7 +23,7 @@ function makeEnv(overrides: Partial<Env> = {}) {
       prepare(sql: string) {
         let boundArgs: unknown[] = []
         const first = async <T>(args: unknown[]): Promise<T | null> => {
-          if (sql.includes('WHERE email')) {
+          if (sql.includes('email')) {
             const email = args[0] as string
             return ([...users.values()].find((u) => u.email === email) ?? null) as T | null
           }
