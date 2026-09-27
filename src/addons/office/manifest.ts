@@ -15,20 +15,19 @@
 // SLICE 2 (mupot#1580 T2) implements the office_* tools named below in
 // authorityRequests.surfaceGrants and wires the connectorRequirements binding
 // through configureAddon. This slice declares the manifest, registers it, proves
-// it validates + passes the runtime contract, and ships the health-check
-// function (src/addons/office/health.ts) that slice 2's tools will call before
-// any WordPress write.
-//
-// KNOWN FRAMEWORK GAP (do not route around — see the PR description):
-// src/addons/service.ts's installAddon (line ~2611) hard-refuses any manifest
-// whose kind/trustClass is not exactly ('native','native_reviewed'), and the
-// addon_installations/addon_receipts tables carry a SQL CHECK
-// (trust_class = 'native_reviewed') at the schema level (migrations/0050_addons.sql,
-// compiled into src/pots/schema-chain.generated.ts). So `addon_install` for THIS
-// manifest returns { ok:false, reason:'invalid_state' } today, by design of the
-// current schema — not a bug in this addon. Extending the lifecycle to persist an
-// external_isolated installation is a schema-migration + trust-boundary decision
-// for Athena/Kasra-core, out of scope for this builder slice.
+// it validates + passes the runtime contract, ships the health-check function
+// (src/addons/office/health.ts) that slice 2's tools will call before any
+// WordPress write, and (coordinator decision, same PR) closes the addon-door
+// gap this manifest first exposed: `addon_install` now accepts a
+// kind:'external_mcp' manifest once it passes installAddon's
+// externalIsolationViolation checks (src/addons/service.ts) — rank_grants
+// empty, every surfaceGrants capability namespaced under one of this
+// manifest's own departments, every connectorRequirement bindingKind exactly
+// 'vault_connector', no loops, and eventSubscriptions restricted to an
+// allowlist. addon_installations/addon_receipts' trust_class CHECK was widened
+// to admit 'external_isolated' by migrations/0175_addon_external_isolated.sql.
+// This manifest satisfies every invariant (verified in
+// tests/mcpwp-office-addon.test.ts) and installs for real.
 
 import { MUPOT_PUBLIC_API_VERSION } from '../../version'
 import type { AddonManifestV1 } from '../contract'

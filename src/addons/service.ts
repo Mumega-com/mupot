@@ -5,6 +5,7 @@ import {
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules'
+import type { AddonManifestV1 } from './contract'
 import {
   assertAddonRuntimeContract,
   getRegisteredAddon,
@@ -24,13 +25,22 @@ import type { LoopManifest } from '../loops/manifest'
 
 export type AddonState = 'installed' | 'configured' | 'active' | 'disabled' | 'archived'
 
+// Single source of truth for the persisted trust_class vocabulary — mirrors
+// AddonManifestV1['trustClass'] (contract.ts) exactly, so widening the manifest's
+// trust vocabulary and forgetting to widen the persistence layer becomes a type error
+// instead of a silent runtime mismatch. Widened from the bare 'native_reviewed' literal
+// alongside migrations/0175_addon_external_isolated.sql (mupot#1580) — see
+// externalIsolationViolation below for what an 'external_isolated' installAddon call
+// additionally requires of the manifest before this value is ever persisted.
+export type AddonTrustClass = AddonManifestV1['trustClass']
+
 export interface AddonInstallation {
   id: string
   tenant: string
   addonKey: string
   installedVersion: string
   publisher: string
-  trustClass: 'native_reviewed'
+  trustClass: AddonTrustClass
   manifestSha256: string
   mupotCompatibility: string
   state: AddonState
@@ -58,7 +68,7 @@ export interface AddonReceipt {
   addonKey: string
   installedVersion: string
   publisher: string
-  trustClass: 'native_reviewed'
+  trustClass: AddonTrustClass
   mupotCompatibility: string
   manifestSha256: string
   actorId: string
@@ -100,6 +110,76 @@ export interface AddonLifecycleDeps {
   beforeOperationCompleted?: (event: AddonOperationLifecycleEvent) => void | Promise<void>
 }
 
+// ── External-isolated addon invariants (mupot#1580) ─────────────────────────────
+//
+// A native addon is compiled into the host and reviewed with it — its manifest is
+// trusted the same way the rest of src/ is. An external_mcp addon's ONLY trust
+// boundary is its own MCP endpoint (this pot never runs the addon's code), so
+// installAddon enforces a strictly narrower manifest shape for kind:'external_mcp'
+// before it will ever persist trust_class:'external_isolated' to
+// addon_installations/addon_receipts (migrations/0175_addon_external_isolated.sql
+// widened the CHECK that makes that persist possible at all). Checked in installAddon
+// only — a native addon's manifest is unaffected and unchecked by this function.
+export type AddonExternalInvariantViolation =
+  | 'rank_grants'
+  | 'surface_grant_namespace'
+  | 'connector_binding_kind'
+  | 'loops_not_allowed'
+  | 'event_subscription_allowlist'
+
+// The only event topics an external addon may subscribe to. Deliberately narrow and
+// hand-enumerated (not "whatever the bus happens to define today") — widening this set
+// is a review-worthy decision, not a side effect of adding an unrelated event elsewhere.
+const EXTERNAL_ADDON_EVENT_ALLOWLIST: ReadonlySet<string> = new Set([
+  'task.completed',
+  'message.created',
+])
+
+/**
+ * Returns the FIRST isolation invariant an external_mcp manifest violates, or null if
+ * it satisfies all of them. Order is not significant (each invariant is independently
+ * mutation-tested) — checked in a fixed order only so a violating manifest always
+ * reports the same reason.
+ *
+ *   (a) authorityRequests.rankGrants must be empty — an external addon never gets rank;
+ *       rank is a core-surface authority this pot's own reviewed code holds, not
+ *       something an isolated MCP endpoint can be handed.
+ *   (b) every surfaceGrants[].capability must be namespaced under one of the manifest's
+ *       OWN declared departments (moduleKey + '.') — never a bare/core-surface name. A
+ *       native addon can request e.g. 'addon.something'; an external one may only ever
+ *       request '<its own department>.*'.
+ *   (c) every connectorRequirements[].bindingKind must be exactly 'vault_connector' —
+ *       'internal_adapter' (and the 'either' escape hatch, which allows
+ *       'internal_adapter') would let an external addon read first-party in-pot data
+ *       without ever going through the vault's credential boundary.
+ *   (d) loops must be empty and eventSubscriptions must be a subset of
+ *       EXTERNAL_ADDON_EVENT_ALLOWLIST — loops are autonomous approval-gated behavior
+ *       this pot's own reviewed loop templates drive; an external addon does not get to
+ *       declare one, and its event surface is capped to the two topics named above.
+ */
+export function externalIsolationViolation(manifest: AddonManifestV1): AddonExternalInvariantViolation | null {
+  if (manifest.authorityRequests.rankGrants.length > 0) return 'rank_grants'
+
+  const ownNamespaces = manifest.departments.map((department) => `${department.moduleKey}.`)
+  for (const grant of manifest.authorityRequests.surfaceGrants) {
+    if (!ownNamespaces.some((prefix) => grant.capability.startsWith(prefix))) {
+      return 'surface_grant_namespace'
+    }
+  }
+
+  for (const connector of manifest.connectorRequirements) {
+    if (connector.bindingKind !== 'vault_connector') return 'connector_binding_kind'
+  }
+
+  if (manifest.loops.length > 0) return 'loops_not_allowed'
+
+  for (const event of manifest.eventSubscriptions) {
+    if (!EXTERNAL_ADDON_EVENT_ALLOWLIST.has(event)) return 'event_subscription_allowlist'
+  }
+
+  return null
+}
+
 export type AddonFailureReason =
   | 'addon_not_registered'
   | 'manifest_digest_drift'
@@ -108,6 +188,7 @@ export type AddonFailureReason =
   | 'not_authorized'
   | 'operation_busy'
   | 'fence_lost'
+  | `addon_external_invariant:${AddonExternalInvariantViolation}`
   | AddonBindingFailureReason
 
 export type AddonMutationResult =
@@ -124,7 +205,7 @@ interface InstallationRow {
   addon_key: string
   installed_version: string
   publisher: string
-  trust_class: 'native_reviewed'
+  trust_class: AddonTrustClass
   manifest_sha256: string
   mupot_compatibility: string
   state: AddonState
@@ -152,7 +233,7 @@ interface ReceiptRow {
   addon_key: string
   installed_version: string
   publisher: string
-  trust_class: 'native_reviewed'
+  trust_class: AddonTrustClass
   mupot_compatibility: string
   manifest_sha256: string
   actor_id: string
@@ -2608,7 +2689,13 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
   } catch {
     return { ok: false, reason: 'invalid_state' }
   }
-  if (entry.manifest.kind !== 'native' || entry.manifest.trustClass !== 'native_reviewed') {
+  if (entry.manifest.kind === 'native') {
+    if (entry.manifest.trustClass !== 'native_reviewed') return { ok: false, reason: 'invalid_state' }
+  } else if (entry.manifest.kind === 'external_mcp') {
+    if (entry.manifest.trustClass !== 'external_isolated') return { ok: false, reason: 'invalid_state' }
+    const violation = externalIsolationViolation(entry.manifest)
+    if (violation) return { ok: false, reason: `addon_external_invariant:${violation}` }
+  } else {
     return { ok: false, reason: 'invalid_state' }
   }
 
