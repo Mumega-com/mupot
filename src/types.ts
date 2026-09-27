@@ -64,6 +64,9 @@ export interface Env {
   // Live roster push channel (ADR #473). Optional: declared in wrangler but inert
   // until REALTIME_PRESENCE=1. See src/registry/realtime.ts + PresenceChannelDO.
   PRESENCE_CHANNEL?: DurableObjectNamespace
+  // Body-free seat-events channel: one hibernating WebSocket per fleet host (src/agents/seat-events.ts).
+  // Optional binding; inert until REALTIME_SEAT_EVENTS=1.
+  SEAT_EVENTS?: DurableObjectNamespace
   // Durable task pipeline (issue #7, migration 0012).  Optional: only present
   // when the [[workflows]] binding is declared in wrangler.toml.  Code that
   // calls the binding should guard `if (env.TASK_WORKFLOW)` or use the
@@ -154,6 +157,9 @@ export interface Env {
   // GET /api/presence/live + publish-on-mutation. Off by default — query-time
   // presence remains sufficient for the coordination loop.
   REALTIME_PRESENCE?: string
+  // Set to "1" to enable /api/fleet/events (ticket + WebSocket), the message.created → SeatEventsDO
+  // fan-out, and the /api/inbox/stream fence for agents with a live seat-events grant.
+  REALTIME_SEAT_EVENTS?: string
   // secrets (present at runtime only)
   OAUTH_CLIENT_ID?: string
   OAUTH_CLIENT_SECRET?: string

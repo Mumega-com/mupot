@@ -19,6 +19,7 @@ import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { redactSecretPatterns } from '../lib/redact'
 
@@ -559,6 +560,37 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // `as`: BusEvent's payload is `unknown` by default (the switch on `event.type` does
       // not narrow the generic) — same cast this case already relied on for `p` above.
       const p = event.payload as MessageCreatedPayload
+      // Seat-events leg (src/agents/seat-events.ts): a body-free hint to the one fleet host
+      // holding this agent. Off unless REALTIME_SEAT_EVENTS=1.
+      //
+      // mupot#1589 P1-3: this leg is now fully ISOLATED from Hermes delivery below — an error
+      // here is caught and logged (never thrown) so it can never cancel or delay the Hermes
+      // leg. It used to run first and throw on any DO non-2xx, which meant a DO outage (or the
+      // P1-2 DoS surface) silently cancelled Hermes for every message in the pot: 4 retries,
+      // all seat-only failures, 0 Hermes calls, then DLQ. Hermes' own outcome (below) is the
+      // ONLY thing that decides ack/retry now, exactly as it always did when the seat leg
+      // succeeded — so a retry driven by Hermes can re-publish a seat hint, but a seat failure
+      // alone can never trigger a retry, and therefore can never cause a DUPLICATE Hermes call
+      // (there is no retry to cause one). The DO already dedups a re-published hint by id, and
+      // the host floor dedups by id/seq — a harmless duplicate hint either way.
+      try {
+        const seat = await publishSeatHint(env, event.tenant, event.payload)
+        if (!seat.ok) {
+          console.error('bus: message.created — seat hint publish failed (isolated, not retried)', {
+            tenant: event.tenant,
+            message_id: p?.message_id,
+            error: seat.error,
+            metric: 'seat_events.hint_publish_failed',
+          })
+        }
+      } catch (err) {
+        console.error('bus: message.created — seat hint publish threw (isolated, not retried)', {
+          tenant: event.tenant,
+          message_id: p?.message_id,
+          error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
+          metric: 'seat_events.hint_publish_failed',
+        })
+      }
       const outcome = await deliverMessageCreatedEvent(env, event as BusEvent<MessageCreatedPayload>)
       const logCtx = {
         tenant: event.tenant,
