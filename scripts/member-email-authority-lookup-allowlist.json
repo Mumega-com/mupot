@@ -1,10 +1,12 @@
 {
-  "_why": "Files with a raw `FROM members ... WHERE ... email` lookup outside the shared resolver (src/members/resolve-human-member.ts, src/members/exclusive-control.ts — hardcoded exempt, never listed here) that scripts/check-member-email-authority-lookup.mjs (mupot#1578) does not fail on, because each one PRE-DATES this ratchet and is not an authority read: src/members/index.ts and src/members/project-invites.ts use it only as an INSERT-time duplicate/collision guard (never to resolve an acting member for a session); src/members/squad-seed.ts is admin/seed-only provisioning, not a request-time auth path; src/auth/index.ts uses it only to check a legacy session's member STATUS (suspend-and-kill), never to assign auth.memberId or capabilities from the result. RATCHET: this list may only shrink. A file leaving it (because the pattern was cleaned up) is fine; a file being ADDED is not — route the lookup through resolveHumanMemberId instead. A listed file that no longer contains the pattern is also an error (stale exemption).",
-  "_measured": "2026-09-27, against origin/main 681e2dab, mupot#1578",
-  "files": [
-    "src/auth/index.ts",
-    "src/members/index.ts",
-    "src/members/project-invites.ts",
-    "src/members/squad-seed.ts"
-  ]
+  "_why": "Per-file EXACT match count for a raw `FROM members ... email` lookup outside the shared resolver (src/members/resolve-human-member.ts, src/members/exclusive-control.ts -- hardcoded exempt, never listed here) that scripts/check-member-email-authority-lookup.mjs (mupot#1578, hardened mupot#1583 round 1 P1) does not fail on, because each PRE-DATES this ratchet and is not an authority-resolution read: src/auth/capability.ts:1011 (legacyRoleRankSql) and src/hygiene/archive.ts (orgOwnerSurvivorGuardSQL, 0 matches after the round-2 window fix -- both are role-plane BRIDGES for an ALREADY-KNOWN member id, filtered by id/scope, never a 'find the member by email' read); src/members/index.ts and src/members/project-invites.ts use it only as an INSERT-time duplicate/collision guard (never to resolve an acting member for a session); src/members/squad-seed.ts is admin/seed-only provisioning, not a request-time auth path; src/auth/index.ts uses it only to check a legacy session's member STATUS (suspend-and-kill), never to assign auth.memberId or capabilities from the result; src/pots/service.ts:550 (readFullSeedIdentityState) runs against the TENANT POT's D1 over the Cloudflare REST API from the ORCHESTRATOR during provisioning (executeD1Query, not env.DB -- a completely different execution context; resolveHumanMemberId cannot even reach that database), checking whether a pot is already fully seeded, never resolving a live request's acting member. RATCHET: each count may only shrink (vs both this file's own declared count matching reality, and the merge target's per-file count). A file leaving the list, or its count dropping (with the entry updated to match), is fine; a count growing -- here or vs the merge target, even via 'swapping' matches from one file to another -- is not. Route a genuinely new authority-resolution lookup through resolveHumanMemberId instead.",
+  "_measured": "2026-09-27, against origin/main 681e2dab plus this PR's own round-1 commit, mupot#1578/#1583 round 1 P1",
+  "files": {
+    "src/auth/capability.ts": 1,
+    "src/auth/index.ts": 1,
+    "src/members/index.ts": 4,
+    "src/members/project-invites.ts": 2,
+    "src/members/squad-seed.ts": 1,
+    "src/pots/service.ts": 1
+  }
 }

@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
 import type { Env } from '../src/types'
 
+// mupot#1583 round 1 P3: match this EXACT query text, not a loose `sql.includes('email')`
+// substring — a real change to findUserByEmail's own query (src/auth/index.ts) must break
+// this test visibly, not silently keep "matching" via a substring that happened to still
+// be present.
+const FIND_USER_BY_EMAIL_SQL =
+  'SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC, id ASC LIMIT 1'
+
 function makeEnv(overrides: Partial<Env> = {}) {
   const sessions = new Map<string, string>()
   const users = new Map<string, { id: string; email: string | null; role: 'owner' | 'admin' | 'member' }>()
@@ -23,9 +30,9 @@ function makeEnv(overrides: Partial<Env> = {}) {
       prepare(sql: string) {
         let boundArgs: unknown[] = []
         const first = async <T>(args: unknown[]): Promise<T | null> => {
-          if (sql.includes('email')) {
+          if (sql === FIND_USER_BY_EMAIL_SQL) {
             const email = args[0] as string
-            return ([...users.values()].find((u) => u.email === email) ?? null) as T | null
+            return ([...users.values()].find((u) => u.email?.toLowerCase() === email) ?? null) as T | null
           }
           if (sql.includes('WHERE id')) {
             const id = args[0] as string

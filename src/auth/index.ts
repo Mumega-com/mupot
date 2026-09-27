@@ -1582,10 +1582,14 @@ async function findUserByEmail(env: Env, email: string | null): Promise<{ id: st
   // a lower-cased lookup — mupot#1581 P2-4: finishEmailLoginSuccess's `users`-role gate
   // (and upsertUserByEmail's OWN dedup step 1) would both silently miss such a row and
   // mint a SECOND, distinct 'member' row instead of recognizing the existing
-  // owner/admin one. `ORDER BY created_at ASC` makes the (legal but unlikely) case of two
-  // differently-cased rows for one email a deterministic pick, same convention as
-  // resolve-human-member.ts's own case-collision handling.
-  return env.DB.prepare('SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC LIMIT 1')
+  // owner/admin one. `ORDER BY created_at ASC, id ASC` makes the (legal but unlikely) case
+  // of two differently-cased rows for one email a deterministic pick, same convention as
+  // resolve-human-member.ts's own case-collision handling — `id ASC` is the tiebreaker for
+  // two rows sharing the same `created_at` (timestamp precision here is per-second, so a
+  // concurrent-insert race can genuinely produce that tie; without it, `created_at ASC`
+  // alone falls back to whatever order SQLite happens to return equal-timestamp rows in,
+  // which is not a documented guarantee).
+  return env.DB.prepare('SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC, id ASC LIMIT 1')
     .bind(normEmail)
     .first<{ id: string; role: OrgRole }>()
 }

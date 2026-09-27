@@ -7,6 +7,13 @@ import { describe, expect, it } from 'vitest'
 import { upsertUserByEmail } from '../src/auth/index'
 import type { Env } from '../src/types'
 
+// mupot#1583 round 1 P3: the mocks below match this EXACT query text, not a loose
+// `sql.includes('email')` substring — a real change to findUserByEmail's own query
+// (src/auth/index.ts) must break this test visibly, not silently keep "matching" via a
+// substring that happened to still be present.
+const FIND_USER_BY_EMAIL_SQL =
+  'SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC, id ASC LIMIT 1'
+
 type Row = { id: string; email: string | null; role: 'owner' | 'admin' | 'member' }
 
 // Minimal stateful in-memory `users` table with the UNIQUE(email) constraint, driven
@@ -28,11 +35,7 @@ function makeUsersDB(seed: Row[] = [], opts: { throwOnInsertEmail?: boolean } = 
           return api
         },
         async first<T>(): Promise<T | null> {
-          // Match on 'email' generically (mupot#1581 P2-4: findUserByEmail's real query is
-          // `WHERE lower(email) = ...`, not `WHERE email = ...` — a narrower 'WHERE email'
-          // substring check would silently stop matching and route every email lookup into
-          // the id/count branches instead).
-          if (sql.includes('email')) {
+          if (sql === FIND_USER_BY_EMAIL_SQL) {
             return (byEmail.get(args[0] as string) ?? null) as T | null
           }
           if (sql.includes('WHERE id')) {
@@ -124,7 +127,7 @@ describe('upsertUserByEmail — cross-path dedup (#262)', () => {
             return api
           },
           async first<T>(): Promise<T | null> {
-            if (sql.includes('email')) {
+            if (sql === FIND_USER_BY_EMAIL_SQL) {
               return (committed ? winner : null) as T | null // miss pre-race, hit post-race
             }
             if (sql.includes('WHERE id')) return null as T | null

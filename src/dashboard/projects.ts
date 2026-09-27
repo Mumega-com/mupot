@@ -6,8 +6,7 @@ import type {
   ProjectAccessLevel,
   ProjectStatus,
 } from '../types'
-import { resolveCapabilities } from '../auth/capability'
-import { decideIdentitylessAttach } from '../members/exclusive-control'
+import { resolveCapabilities, sessionMemberId } from '../auth/capability'
 import { parseFlightMetaV1 } from '../flight/meta'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import type { FlightRow } from '../flight/service'
@@ -231,32 +230,19 @@ export interface ProjectFlightsResult {
   scanLimited: boolean
 }
 
-async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
-  if (auth.memberId) return auth.memberId
-  if (auth.webSessionMemberId) return auth.webSessionMemberId
-  if (!auth.email) return null
-  // mupot#1551 round 2 (P1-a): this fallback has no session join key to
-  // retry a guarded attach with (AuthContext carries no provider/subject),
-  // so it must not fall back to a lenient email-only lookup either — that is
-  // exactly the second door a login-time denial (competing bearer/Telegram/
-  // identity) must also stay closed behind. Read-only eligibility check
-  // only: `eligible` acts as that member for this one request; denied/
-  // ambiguous/not_found grants nothing. `ignoreLiveIdentity: true` — this
-  // never links a new identity, so a row that already has one from a real
-  // prior login is already legitimately claimed, not a fresh claim to
-  // refuse (mupot#1551 round 3, same reasoning as SSO's own fallback).
-  const decision = await decideIdentitylessAttach(env, {
-    tenant: env.TENANT_SLUG,
-    normalizedEmail: auth.email.trim().toLowerCase(),
-    ignoreLiveIdentity: true,
-  })
-  // decideIdentitylessAttach never filters by status itself — a suspended
-  // member must not be handed project authority through this fallback.
-  return decision.kind === 'eligible' && decision.status === 'active' ? decision.memberId : null
-}
-
 export async function projectAccess(env: Env, auth: AuthContext): Promise<ProjectAccess> {
-  const memberId = await memberIdFor(env, auth)
+  // mupot#1583 round 1 (P0): this used to re-derive a memberId from bare
+  // `auth.email` via decideIdentitylessAttach on every request when neither
+  // auth.memberId nor auth.webSessionMemberId was set. That is a second,
+  // independently-audited identity door beside the cookie loader's own
+  // guarded resolution (loadAuthFromCookie, src/auth/index.ts) — and
+  // src/projects/index.ts's sibling fallback (through the full resolver)
+  // proved exactly how such a door drifts into a real escalation (an
+  // owner_login_emails alias inheriting owner project access with no join
+  // key ever checked). sessionMemberId (src/auth/capability.ts) is now the
+  // ONE place either file reads "which member is this session" — see its
+  // own doc comment.
+  const memberId = sessionMemberId(auth)
   const grants = memberId ? auth.capabilities ?? await resolveCapabilities(env, memberId) : []
   const visibility = projectReadAccessFromGrants(auth, grants)
   const [readableSquadIds, taskableSquadIds] = await Promise.all([

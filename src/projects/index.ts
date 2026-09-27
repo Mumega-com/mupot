@@ -2,8 +2,7 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
-import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
-import { resolveHumanMemberId } from '../members/resolve-human-member'
+import { isOrgAdmin, resolveCapabilities, sessionMemberId } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -146,32 +145,22 @@ function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
-/**
- * mupot#1578: this used to run its own raw query selecting a members.id by
- * a bare `email` match (scoped to tenant + status='active') — with
- * no idea about mupot#1551's exclusive-control predicate
- * (src/members/exclusive-control.ts). A members row already under someone
- * else's exclusive control (a live unbound bearer token, e.g. the legacy
- * public-accept squat — or a bound Telegram chat) is exactly the shape
- * decideIdentitylessAttach exists to refuse, but the raw query found it
- * anyway and handed out whatever capabilities that row already held (an
- * org-owner grant, in the reported shape) to anyone who could complete a
- * login with that email — even though that SAME login's own identity attach
- * was correctly refused elsewhere. resolveHumanMemberId is the ONE function
- * that consults decideIdentitylessAttach for a bare-email, no-join-key read
- * (its own email-only branch, src/members/resolve-human-member.ts) — reused
- * here, not copied, so this route can never drift back to a hand-rolled
- * lookup. A CI ratchet (scripts/check-member-email-authority-lookup.mjs)
- * forbids reintroducing the raw pattern anywhere outside the resolver.
- */
-async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
-  if (auth.memberId) return auth.memberId
-  if (!auth.email) return null
-  return resolveHumanMemberId(env, { tenant: env.TENANT_SLUG, email: auth.email })
-}
-
 async function grantsFor(env: Env, auth: AuthContext): Promise<CapabilityGrant[]> {
-  const memberId = await memberIdFor(env, auth)
+  // mupot#1583 round 1 (P0): this used to fall back to resolveHumanMemberId
+  // on a bare `auth.email` when auth.memberId was unset. mupot#1578's own
+  // fix (a raw, unguarded `members` query) was replaced with the resolver —
+  // but the resolver's email-only branch still walks to its own step 4
+  // (owner_login_emails -> the unique org owner), so an ordinary member
+  // logging in via an email address the org happens to list as an owner
+  // alias inherited the owner's project access on every request, with no
+  // join key (no OAuth identity) ever checked for THIS read. The cookie
+  // loader (loadAuthFromCookie, src/auth/index.ts) already resolves
+  // identity under guard at session-load time — a request-time handler
+  // must read THAT decision (sessionMemberId, src/auth/capability.ts),
+  // never re-derive one from bare email. See sessionMemberId's own doc
+  // comment for the shared-helper rationale (mirrored in
+  // src/dashboard/projects.ts, so the two can never drift apart again).
+  const memberId = sessionMemberId(auth)
   if (!memberId) return []
   return auth.capabilities ?? resolveCapabilities(env, memberId)
 }
