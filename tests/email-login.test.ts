@@ -24,6 +24,25 @@
 // (DEFECT CLASS B). And GET consumed the emailed link outright — a
 // login-CSRF and mail-scanner-prefetch hazard (P1-2).
 //
+// ADVERSARIAL GATE ROUND 2 (kasra-review + Athena BLOCK, 2026-09-26, PR
+// #1574 head c3e5bf75): round 1's Class A fix held completely (Athena's
+// round-2 concurrent PoCs all confirmed green). ONE P0 remained, Class B by
+// a THIRD table: `finishEmailLoginSuccess`'s `upsertUserByEmail(…, false)`
+// still returned an EXISTING `users` row's role by bare email match —
+// `allowBootstrapOwner=false` only ever gated ROW CREATION, never an
+// existing row's inherited role. Three proven shapes, all closed by the
+// SAME two checks (a live NON-email identity anywhere in the tenant whose
+// verified_email matches, or an existing `users` row with role != 'member'
+// — see src/auth/index.ts's finishEmailLoginSuccess for the full reasoning):
+// A1 an org-owner-alias email whose OWN identity lives on a different
+// member; A2 a powerless duplicate members row (#1162) beside the real
+// owner, whose identity's verified_email drifted (#1266 P0-2) onto the
+// duplicate's literal email; A3 a legacy owner/admin `users` row with NO
+// members row at all (#1324) — decideIdentitylessAttach never even runs for
+// it. Also P1: the /start rate-limit checks ran in Promise.all, so an IP
+// already refused by its OWN ceiling still touched (and could exhaust) a
+// FRESH victim email's separate counter on every further request.
+//
 // MUTATION LEDGER (break -> fail -> restore), verified by hand:
 //   1. single-use dropped (drop `consumed_at IS NULL` from the consuming
 //      UPDATE's WHERE clause)
@@ -42,10 +61,21 @@
 //      no `code_attempts < 5` condition)
 //      -> "6 concurrent wrong codes exhaust the cap" fails (a 7th, correct,
 //      guess still succeeds instead of being refused)
-//   6. DEFECT CLASS B gate removed (skip the decideIdentitylessAttach check
-//      before upsertUserByEmail)
+//   6. DEFECT CLASS B (round 1) gate removed (skip the decideIdentitylessAttach
+//      check before upsertUserByEmail)
 //      -> "Google-linked owner's email cannot sign in as that owner" fails
 //      (302 + owner role instead of 403)
+//   7. DEFECT CLASS B (round 2) foreign-identity check removed
+//      -> A1 and A2 both fail (302 + session instead of 403)
+//   8. DEFECT CLASS B (round 2) `users.role !== 'member'` check removed
+//      -> A3 fails (302 + session instead of 403)
+//   9. P1 rate-limit ordering reverted to Promise.all
+//      -> "an IP already over its own limit never touches a NEW victim
+//      email's counter" fails (the victim's counter row exists / count=1)
+//  10. code-consume's `consumed_at IS NULL` (code path) or its
+//      `changes === 0` check dropped
+//      -> "5 concurrent confirms with the SAME correct code mint exactly
+//      one session" fails (>1 winner)
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { authApp } from '../src/auth'
@@ -277,6 +307,27 @@ describe('POST /auth/email/start', () => {
     )
     for (const res of responses) expect(res.status).toBe(200) // identical 200 regardless — no oracle
     expect(log.calls.length).toBe(3)
+    log.restore()
+  })
+
+  // ── P1 (round 2): rate-limit ORDERING — an IP already over its own limit
+  // must never touch a fresh victim's per-email counter ──────────────────
+  it('an IP already over its own limit never touches a NEW victim email\'s counter', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, memoryKv())
+    const log = captureConsoleLog()
+    const ip = '198.51.100.7'
+    for (let i = 0; i < 10; i += 1) {
+      await authApp.fetch(postJson('/email/start', { email: `burn${i}@example.com` }, undefined, ip), env, noopCtx())
+    }
+    expect(log.calls.length).toBe(10) // the IP's own ceiling
+    const res = await authApp.fetch(postJson('/email/start', { email: 'victim@example.com' }, undefined, ip), env, noopCtx())
+    expect(res.status).toBe(200) // still 200, identical body — no oracle
+    expect(log.calls.length).toBe(10) // no 11th send
+    const row = harness.sqlite
+      .prepare(`SELECT count FROM email_login_rate_limits WHERE scope = 'start_email' AND key = 'victim@example.com'`)
+      .get() as { count: number } | undefined
+    expect(row).toBeUndefined() // the email counter was never even touched
     log.restore()
   })
 })
@@ -613,5 +664,169 @@ describe('GET/POST /auth/email/verify', () => {
     const verify = await authApp.fetch(getReq('/email/verify?t=a&a=b'), env, noopCtx())
     expect(start.status).toBe(404)
     expect(verify.status).toBe(404)
+  })
+
+  // ── P2 test pins (round 2) ────────────────────────────────────────────
+  it('P2: 5 concurrent confirms with the SAME correct code mint exactly one session (consume guard, code path)', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, memoryKv())
+    const { code } = await startAndCapture(env, 'concurrent-right-code@example.com')
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => verifyCode(env, 'concurrent-right-code@example.com', code)),
+    )
+    const winners = results.filter((r) => r.status === 302)
+    expect(winners).toHaveLength(1)
+    for (const res of results) expect([302, 401]).toContain(res.status)
+  })
+
+  it('P2: /verify has its own per-IP ceiling, independent of the per-attempt code cap', async () => {
+    harness = makeHarness()
+    const env = envFor(harness, memoryKv())
+    const { attemptId } = await startAndCapture(env, 'verify-ip-limit@example.com')
+    const ip = '203.0.113.55'
+    const confirmWithIp = (t: string) =>
+      authApp.fetch(postJson('/email/verify', { t, a: attemptId }, undefined, ip), env, noopCtx())
+    // 30 wrong-token confirms — each independently 'invalid' (no per-attempt
+    // guess cap applies to the token path), never consuming or exhausting
+    // anything OTHER than the shared verify_ip bucket itself.
+    for (let i = 0; i < 30; i += 1) {
+      const res = await confirmWithIp(`wrong-token-${i}`)
+      expect(res.status).toBe(401)
+    }
+    const thirtyFirst = await confirmWithIp('wrong-token-31')
+    expect(thirtyFirst.status).toBe(429)
+  })
+
+  it('P2: POST /auth/email/verify refuses a cross-origin FORM submission (csrf() is active on this mount)', async () => {
+    // hono's csrf() only guards form-shaped content types (the ones a real
+    // cross-site <form> can submit without a CORS preflight) — a JSON POST
+    // is already blocked by the browser's own CORS preflight, so csrf()
+    // deliberately does not re-check the Origin for it. This test uses the
+    // SAME content-type a real browser form submission uses (see
+    // src/auth/index.ts's readEmailFormBody / the confirm page's own
+    // <form>), which is exactly the shape csrf() exists to protect.
+    harness = makeHarness()
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'csrf-check@example.com')
+    const res = await authApp.fetch(
+      new Request(`${ORIGIN}/email/verify`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', Origin: 'https://evil.example' },
+        body: new URLSearchParams({ t: token, a: attemptId }),
+      }),
+      env,
+      noopCtx(),
+    )
+    expect(res.status).toBe(403)
+  })
+
+  // ── DEFECT CLASS B round 2 (kasra-review + Athena BLOCK, 2026-09-26):
+  // "email login must never inherit authority from ANY email-keyed row it
+  // did not itself verify." Round 1's decideIdentitylessAttach gate only
+  // ever inspects the ONE members row `lower(email)` matches — these three
+  // shapes all reach `upsertUserByEmail`/`users` authority through a row
+  // round 1's gate never looks at. ───────────────────────────────────────
+  it('A1: an org-owner-alias email whose OWN live (non-email) identity is on a DIFFERENT member is refused', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-owner', 'realowner@pot.test', 'Real Owner', 'active', '${TENANT}');
+      INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@example.com"]');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('hli-alias', '${TENANT}', 'google', 'google-sub-alias', 'alias@example.com', 'member-owner', datetime('now'));
+      INSERT INTO users (id, email, role) VALUES ('user-owner', 'realowner@pot.test', 'owner');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'alias@example.com')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+    const emailIdentity = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE provider = 'email' AND provider_subject = 'alias@example.com'`)
+      .get() as { n: number }
+    expect(emailIdentity.n).toBe(0)
+  })
+
+  it('A2: a powerless duplicate members row (#1162 shape) is refused — no identity link lands on the duplicate', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      -- mem-hadi: the REAL owner. Its own members.email need not equal the
+      -- live identity's verified_email at all (write-once drift, #1266
+      -- P0-2) — here it simply differs, which is what makes the duplicate
+      -- row (below) the ONE decideIdentitylessAttach finds by literal email.
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('mem-hadi', 'hadi-internal@pot.test', 'Hadi (real owner)', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('hli-hadi', '${TENANT}', 'google', 'google-sub-hadi', 'hadi@digid.ca', 'mem-hadi', datetime('now'));
+      INSERT INTO users (id, email, role) VALUES ('user-hadi', 'hadi-internal@pot.test', 'owner');
+      -- The powerless duplicate: literally the email address people type,
+      -- with no identity or capability of its own.
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('mem-duplicate', 'hadi@digid.ca', 'Hadi (duplicate)', 'active', '${TENANT}');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'hadi@digid.ca')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+    const duplicateIdentities = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE member_id = 'mem-duplicate'`)
+      .get() as { n: number }
+    expect(duplicateIdentities.n).toBe(0)
+  })
+
+  it('A3: a legacy owner/admin in `users` with NO members row at all is refused (mupot#1324 shape)', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role) VALUES ('user-legacy-owner', 'legacy-owner@pot.test', 'owner');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'legacy-owner@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+    const me = await authApp.fetch(getReq('/me'), env, noopCtx())
+    expect(me.status).toBe(401) // never authenticated at all
+  })
+
+  it('invite branch is ALSO gated: accepting an invite for an email a live Google identity already claims elsewhere is refused', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant)
+        VALUES ('member-claimed-elsewhere', 'claimed@elsewhere.test', 'Claimed', 'active', '${TENANT}');
+      INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
+        VALUES ('hli-claimed', '${TENANT}', 'google', 'google-sub-claimed', 'newcomer@example.com', 'member-claimed-elsewhere', datetime('now'));
+    `)
+    const env = envFor(harness, memoryKv())
+
+    const acceptRes = await inviteApp.fetch(
+      new Request(`${ORIGIN}/inv-squad`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+        body: new URLSearchParams({ display_name: 'New Comer' }),
+      }),
+      env,
+    )
+    expect(acceptRes.status).toBe(302)
+    const setCookie = acceptRes.headers.get('set-cookie') ?? ''
+    const pendingMatch = new RegExp(`${PENDING_INVITE_COOKIE}=([^;]+)`).exec(setCookie)
+    if (!pendingMatch) throw new Error('invite accept did not set pending-invite cookie')
+    const pendingCookie = `${PENDING_INVITE_COOKIE}=${pendingMatch[1]}`
+
+    const { token, attemptId } = await startAndCapture(env, 'newcomer@example.com', pendingCookie)
+    const res = await confirmToken(env, token, attemptId, pendingCookie)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+
+    // The invite's own member (from acceptInvite, a THIRD row distinct from
+    // member-claimed-elsewhere) must never receive an email identity either.
+    const invitedMember = harness.sqlite
+      .prepare(`SELECT member_id FROM invites WHERE id = 'inv-squad'`)
+      .get() as { member_id: string | null }
+    expect(invitedMember.member_id).toBeTruthy()
+    const identitiesOnInvitedMember = harness.sqlite
+      .prepare(`SELECT COUNT(*) AS n FROM human_login_identities WHERE member_id = ?`)
+      .get(invitedMember.member_id) as { n: number }
+    expect(identitiesOnInvitedMember.n).toBe(0)
   })
 })

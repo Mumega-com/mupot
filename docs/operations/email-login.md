@@ -106,8 +106,8 @@ do not read an earlier version of this section as still accurate.**
   /auth/email/verify` now touches no database state at all — it renders a static confirm
   page whose own `POST` (csrf()-protected, same as every other cookie-relevant mount
   here) is the only thing that ever consumes.
-- **Identity/authority separation (DEFECT CLASS B, this round).** An ordinary (no-invite)
-  email login now REFUSES the entire login — no `users` row touched, no session minted —
+- **Identity/authority separation (DEFECT CLASS B, round 1).** An ordinary (no-invite)
+  email login refuses the entire login — no `users` row touched, no session minted —
   when the member row matching that email is already under someone else's exclusive
   control (a live Google/other identity, an unbound bearer, a Telegram bind —
   `decideIdentitylessAttach`, mupot#1551). Before this fix, `upsertUserByEmail` was a
@@ -117,13 +117,47 @@ do not read an earlier version of this section as still accurate.**
   ever linked. Email login also NEVER auto-mints the pot's first-ever owner
   (`allowBootstrapOwner=false`, always) — only Google's own `/callback` (the legitimate
   first-owner ceremony) can do that.
+- **Identity/authority separation, round 2 (a THIRD table).** Round 1's gate only ever
+  inspects the ONE `members` row `lower(email)` happens to match. Three more shapes
+  reached `users.role` (or a wrong member's identity table) through a row that gate never
+  looks at: (a) an org-owner-alias email whose OWN live identity is bound to a DIFFERENT
+  member (`org_settings.owner_login_emails`); (b) a powerless duplicate `members` row
+  (mupot#1162) sitting beside the real owner, whose identity's `verified_email` drifted
+  (mupot#1266 P0-2) onto the duplicate's own literal email; (c) a legacy owner/admin
+  `users` row with NO `members` row at all (mupot#1324) — `decideIdentitylessAttach`
+  never even runs for it, so `not_found` reads as safe. Closed by two UNCONDITIONAL
+  checks, run on BOTH the invite and no-invite branches, BEFORE either branch's own
+  writes: (1) refuse if a LIVE, non-`'email'`-provider identity exists ANYWHERE in the
+  tenant whose `verified_email` matches this email (independent of which `members` row
+  any OTHER lookup would have found); (2) refuse if a `users` row for this email already
+  exists with `role != 'member'`. A token/code already consumed at verify time is an
+  accepted sunk cost; no session/cookie/user/identity row is ever written past either
+  refusal.
+- **Rate-limit ordering (P1, round 2).** `/start`'s per-IP and per-email checks now run
+  SEQUENTIALLY, IP first — the email counter is touched ONLY when the IP itself is still
+  under its own ceiling. Before this, both increments fired unconditionally in parallel,
+  so an attacker whose IP had ALREADY exceeded its own ceiling could keep burning a FRESH
+  victim email's separate 3-per-window budget on every further request from that same IP.
 - **CSRF.** `/auth/email/*` runs the same `csrf()` (Origin-check) middleware every other
-  cookie-relevant mount in this codebase applies (`dashboardApp`, `inviteApp`).
+  cookie-relevant mount in this codebase applies (`dashboardApp`, `inviteApp`). Note:
+  hono's `csrf()` only guards form-shaped content types
+  (`application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`) — the ones a
+  real cross-site `<form>` can submit without a CORS preflight — which is exactly the
+  shape every real caller here uses (the confirm page's own `<form>`, the code-entry
+  form); a JSON POST is already blocked by the browser's own CORS preflight and is not
+  separately re-checked.
 - **Accepted simplification, stated plainly.** Rate-limit windows are fixed 10-minute
   buckets, not a sliding window — a caller at a bucket boundary can see up to 2x the
   stated ceiling across two adjacent buckets. This is a precision tradeoff, not a
   concurrency gap: the property this round's fix guarantees is atomicity (no caller can
   ever exceed the ceiling THROUGH a race), not exact sliding-window accounting.
+- **Brute-force bound, stated numerically.** Per email per 10-minute window: at most 3
+  `/start` calls, each producing one attempt capped at 5 code guesses — 15 guesses/window.
+  Across a day (144 ten-minute windows): 144 × 15 = **~2,160 guesses/day** against a
+  1-in-1,000,000 code space, before the fixed-window boundary doubling above is even
+  counted (up to ~4,320/day worst case at window edges). This is the ceiling the design
+  accepts, not a target to defend further this round — a follow-up may tighten it (e.g. a
+  per-email daily cap) if it proves too generous in practice.
 - **Not yet built (follow-up, not this round):** neither `email_login_attempts` nor
   `email_login_rate_limits` rows are ever swept/expired — they accumulate in D1
   indefinitely at whatever volume the door sees. Filed as a follow-up, not fixed here.

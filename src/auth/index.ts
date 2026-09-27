@@ -900,6 +900,48 @@ async function finishEmailLoginSuccess(
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', 'no-referrer')
 
+  // mupot#1564 adversarial gate round 2 (kasra-review + Athena BLOCK,
+  // 2026-09-26, PR #1574): "email login must never inherit authority from
+  // ANY email-keyed row it did not itself verify." Round 1's gate
+  // (decideIdentitylessAttach, below) only ever inspects the ONE members row
+  // `lower(email)` happens to match — it says nothing about (a) a LIVE,
+  // non-email identity bound to a DIFFERENT member whose OWN verified_email
+  // happens to equal this address (an org-owner-alias Google login, or the
+  // #1162 dual-member shape: a powerless "hadi@digid.ca" member row sits
+  // beside the real owner mem-hadi, whose Google identity's verified_email
+  // is 'hadi@digid.ca' by drift — mupot#1266 P0-2 write-once email drift is
+  // a FEATURE for that member's own resolution, but a HAZARD here, because
+  // decideIdentitylessAttach's row lookup finds the OTHER, powerless row and
+  // calls it eligible), or (b) a `users` row for this exact email that
+  // already carries owner/admin standing from a STRONGER door (Google,
+  // bootstrap, handoff) with NO members row to even gate on (mupot#1324: a
+  // legacy owner/admin login has no members bridge at all, so
+  // decideIdentitylessAttach never even runs for them — `not_found`, which
+  // round 1's gate correctly treats as safe-to-proceed, but that is exactly
+  // the hole here). BOTH checks run UNCONDITIONALLY, on BOTH the pending-
+  // invite and no-invite branches below, BEFORE either branch's own writes
+  // (decidePendingInviteLink is read-only, but linkAcceptedInviteIdentity —
+  // and the no-invite branch's eventual mintSession — both write): a token/
+  // code already being consumed at verify time is an accepted sunk cost, but
+  // no session, cookie, or `users`/identity row may ever be written past
+  // this point once either check below fires.
+  const foreignIdentity = await env.DB.prepare(
+    `SELECT 1 AS present FROM human_login_identities
+      WHERE tenant = ?1 AND lower(verified_email) = ?2 AND revoked_at IS NULL AND provider != 'email'
+      LIMIT 1`,
+  )
+    .bind(tenant, emailNormalized)
+    .first<{ present: number }>()
+  if (foreignIdentity) {
+    return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
+  }
+  const existingUser = await env.DB.prepare(`SELECT role FROM users WHERE email = ?1`)
+    .bind(emailNormalized)
+    .first<{ role: OrgRole }>()
+  if (existingUser && existingUser.role !== 'member') {
+    return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
+  }
+
   if (pendingInviteId !== null) {
     const cookiePendingId = getCookie(c, PENDING_INVITE_COOKIE)
     const inviteDecision = await decidePendingInviteLink({

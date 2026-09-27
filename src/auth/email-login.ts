@@ -188,13 +188,24 @@ export async function startEmailLogin(input: StartEmailLoginInput): Promise<void
     return
   }
 
-  // Both checks ALWAYS run — no ip==='unknown' bypass (adversarial gate: a
-  // request with no resolvable IP must land in its own shared 'unknown'
-  // bucket and still be capped, never skip the ceiling outright).
-  const [emailOk, ipOk] = await Promise.all([
-    underRateLimit(env, input.tenant, 'start_email', emailNormalized, RATE_LIMIT_EMAIL_MAX, startedAt),
-    underRateLimit(env, input.tenant, 'start_ip', input.ip, RATE_LIMIT_IP_START_MAX, startedAt),
-  ])
+  // IP check FIRST, sequentially — never Promise.all (adversarial gate
+  // round 2, P1): both increments used to fire unconditionally in parallel,
+  // so an attacker whose IP had ALREADY exceeded its own ceiling still burnt
+  // a slot of ANY new victim's per-email budget on every further request
+  // from that same IP — an already-blocked IP could keep locking fresh
+  // victims out of their 3-per-window email budget for the rest of the
+  // window. The email counter is now touched ONLY when the IP itself is
+  // still under its own ceiling — an IP already refused never reaches the
+  // email counter at all, for any email.
+  //
+  // ip==='unknown' still has NO bypass here (adversarial gate round 1): it
+  // is its own shared bucket and is capped exactly like a real IP; this
+  // reordering only changes WHEN the email counter is touched, never
+  // whether the IP counter itself is enforced.
+  const ipOk = await underRateLimit(env, input.tenant, 'start_ip', input.ip, RATE_LIMIT_IP_START_MAX, startedAt)
+  const emailOk = ipOk
+    ? await underRateLimit(env, input.tenant, 'start_email', emailNormalized, RATE_LIMIT_EMAIL_MAX, startedAt)
+    : false
 
   if (emailOk && ipOk) {
     const attemptId = randomHex(16)
