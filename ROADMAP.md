@@ -9,17 +9,47 @@ numbers.
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.30.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. |
-| Current production version | `0.30.0` | Last recorded deploy `09ea48f6` (2026-09-26); live `/health` is authoritative. `main` and production may already have diverged again — both move independently. |
+| Current production version | `0.30.0` | Last recorded deploy `681e2dab` (2026-09-27); live `/health` reported `{"version":"0.30.0","commit":"681e2dabb4868c38a41fce9762c5877bd72dad87","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
 | Last tagged stable release | `v0.30.0` | Tagged 2026-09-26, `release/v0.30.0` frozen at `09ea48f6`. First stable tag since `v0.25.0`. |
 | Superseded prerelease | `v0.30.0-rc.1` | Cut at `0bb9c256` (2026-09-03). 15 commits have landed since, including four security and three identity fixes. Not a candidate. |
 | Next stable candidate | `v0.30.1` | P0 cherry-picks onto `release/v0.30.0` only — never a re-cut from wherever `main` happens to be. |
-| Future development target | `v0.31.0` | Canonical receiver, Agent Computers, and Recovery; held until `v0.30.0` is stable. |
+| Future development target | `v0.31.0` | `v0.30.0` is now tagged stable, so the prior hold has lifted. See "Next flight — v0.31.0 'Office'" below for the flight in progress and the capability ledger further down for the receiver/Agent Computers/Recovery scope still queued. |
 
 `0.30.0` is the version the source has reported since 2026-08-21. `v0.30.0` is now also a
 tag and a release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) — the source
 version string and the release tag agree for the first time since `v0.25.0`. `main`
 continues past that point as preview; nothing on `main` after `09ea48f6` is covered by
 the `v0.30.0` evidence bundle.
+
+## Next flight — v0.31.0 "Office"
+
+Flight `flight-20260927-office-v0310` is the active flight targeting `v0.31.0`.
+Board task ids: `fc18d543`, `faa6ab68`, `25edda37`, `be686091`.
+
+Scope:
+
+- MCPWP office addon slices 1–2 (#1580; PR #1582, branch `flight/office-addon-s1`,
+  head `3915a7f3`, base `main` `681e2dab`). Build-only as of this writing — not
+  merged, not deployed.
+- Auth residuals (#1583; see [CHANGELOG.md](CHANGELOG.md) "In flight — not yet
+  merged" for the exact diff scope). Not merged as of this writing.
+- Tag `v0.31.0` once both land and the release gate passes.
+
+Gate rule (Hadi, 2026-09-16): P0 blocks, P1 ships with a follow-up issue, two
+adversarial gate rounds maximum per artifact.
+
+This flight does not reconcile the wider `v0.31.0` capability-ledger scope
+already reserved below (canonical Mupot-to-Codex receiver, governed realtime
+push, isolated Agent Computers) — that reconciliation is Kasra-core's and
+Hadi's call, not made in this document.
+
+### After v0.31.0
+
+- Agent profiles, `agent_of_choice`, and steward design — #1564.
+- Machines — #1572.
+- Templates (#1570) on evidence #1569, plus attention #1562.
+- Holdco — #1577.
+- UX IA — #1067.
 
 ## Why no version was tagged between v0.25.0 and v0.30.0
 

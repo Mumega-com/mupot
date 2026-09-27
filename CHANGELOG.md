@@ -138,6 +138,55 @@ PR's own commit message, which in a few cases named a *different*, superseded PR
   routes `metadata.action='create_pot'` (residual since #1232; found in #1516's gate;
   this is why #1543 disabled checkout by default rather than shipping it live).
 
+## [Unreleased] — main since v0.30.0
+
+`main` at `681e2dab` (2026-09-27) is 6 commits ahead of the `v0.30.0` tag
+(`09ea48f6`), verified via `git log 09ea48f6..origin/main` and each PR's merge
+commit confirmed against the GitHub API (`gh pr view <n> --json mergeCommit`).
+None of this is tagged — `v0.30.0` remains the latest stable tag (see
+ROADMAP.md's "Current version" table for the live production SHA).
+
+- **#1554** — `8122b3fc` docs: CHANGELOG.md + ROADMAP.md for the `v0.30.0` tag.
+- **#1557** — `326f6b47` Option A: public JSON invite accept no longer mints a
+  bearer — identity must be proven at login, closing the mupot#1551 member-row
+  squatting P0. Deployed `db6161ed`.
+- **#1559** — `9cab33d8` mupot#1551 slice 1: inviter re-checked at redemption
+  time via a SQL rank mirror, reserved-email refusal, `lower(email)` collision
+  guard, home-squad refusal (#1558). Deployed `b6e2676c`.
+- **#1561** — `ac312ba8` archive substrate (#1496): `archived_at` /
+  `archived_reason` / `archived_by` / `archived_prior_status` on
+  members/agents/squads/projects; `squads.status` CHECK; `tasks_archive_state`
+  side table; receipted `archive_row` / `unarchive_row` / `archive_plan_expand`;
+  `scripts/hygiene-archive.mjs`. Migration 0173. Task archiving deferred to
+  #1571. Deployed `6854cfa8` (0173 applied first).
+- **#1560** — `83d82dce` Option B: one exclusive-control attach predicate for
+  identity-less member attach, shared by Google login, SSO, and connector
+  attach; liveness leaf inside the guarded INSERT; session-retry re-derives via
+  `loadWebSession`. **Release note:** a web session minted before this deploy,
+  for a member who also holds their own CLI bearer, loses `memberId` until
+  re-login. Deployed `78deff4f`.
+- **#1574** — `681e2dab` email one-time link/code sign-in beside Google.
+  Migration 0174 (`email_login_attempts`, `email_login_rate_limits`); every
+  gate is one atomic D1 statement; per-email and per-IP fixed windows; 5-guess
+  cap; single-use consume; `GET` verify renders a confirm page, `POST`
+  consumes; login refused when a live non-email identity shares the verified
+  email, or the resolved row is a non-member user; flag `EMAIL_LOGIN_ENABLED`;
+  Resend. Deployed 2026-09-27 00:39Z, version `a8a37e24` (0174 applied first).
+
+Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
+#1562, #1564, #1569, #1570, #1572, #1577, #1580.
+
+### In flight — not yet merged
+
+- **PR #1583** (`flight/auth-residuals`) — `/api/projects` authority becomes
+  the session member (`sessionMemberId`), never re-resolved from email;
+  resolver step 4 (`owner_login_emails`) removed as dead and dangerous;
+  `findUserByEmail` fails closed on case-variant collisions; CI ratchet
+  `check-member-email-authority-lookup` (allowlist per-file counts);
+  `tests/auth-dev-login` rewritten onto the real SQLite harness (#1578,
+  #1581). Not deployed; state it as merged only once `gh pr view 1583` reports
+  `MERGED`.
+
 ## Release status — 2026-09-06
 
 - **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`

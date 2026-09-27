@@ -107,6 +107,81 @@ The stronger runtime identity proof is Ed25519 signed attach/detach:
 an agent has a registered public key, the older bearer attach route refuses it to
 avoid an auth downgrade.
 
+## Login Identity Attach: Exclusive Control
+
+mupot#1551 (member-row squatting P0) established that an identity-less
+`members` row (no live `human_login_identities` row) is not the same thing as
+an unclaimed row — it can already be under someone else's control through a
+different credential class. `src/members/exclusive-control.ts`'s
+`decideIdentitylessAttach` is the one predicate every identity-first attach
+path must consult before treating such a row as safe to bind to a new human
+presenting a matching, IdP-verified email.
+
+The check, cheapest-first, on the unique `members` row matching
+`lower(email)` (a case-insensitive collision returns `ambiguous`, never an
+arbitrary pick):
+
+1. **Telegram bind** — `members.telegram_chat_id IS NOT NULL` (mupot#1411's
+   IM credential; no extra query, already on the candidate row).
+2. **Any live login identity** — a `human_login_identities` row for this
+   member with `revoked_at IS NULL`, regardless of provider/subject
+   (skippable only by a pure read that never links a new identity off the
+   result, e.g. SSO auto-enrollment's resolver-miss fallback in
+   `src/auth/sso.ts`).
+3. **Any live, unbound member bearer** — a `member_tokens` row with
+   `agent_id IS NULL` and the shared `TOKEN_LIVE_PREDICATE` liveness check
+   (never `revoked_at IS NULL` alone), excluding only two documented, narrow
+   provisioning exemptions: the admin/dashboard seed token minted in the same
+   batch as the member row (`src/pots/service.ts`), and the directory-OAuth
+   connector's own unbound token minted at MCP consent
+   (`mintDirectoryToken`, `src/mcp/oauth-authorize.ts`). Both are containment
+   markers, not proof of origin, and both are spoofable only by an actor (an
+   org admin minting a token) who already holds standing authority over the
+   row.
+
+A row that clears all three is `eligible`; the first failing check returns a
+distinct `denied_competing_control` reason (`telegram_bound` /
+`live_login_identity` / `live_member_bearer`) — never collapsed onto the same
+`null` a genuine `not_found` produces, since collapsing the two is exactly
+what let an earlier version of the SSO fallback silently reuse a denied row
+instead of refusing it.
+
+**Shared by:** the ordinary login bootstrap
+(`src/members/resolve-human-member.ts` step 3, reached from
+`registerWebSession` in `src/auth/index.ts`) and enterprise SSO
+auto-enrollment's resolver-miss fallback (`src/auth/sso.ts`). Email login
+(mupot#1574) reuses the exact same `registerWebSession` →
+`resolveHumanMemberId` → `decideIdentitylessAttach` path with
+`provider: 'email'` — there is no second identity resolver. See
+[docs/operations/email-login.md](operations/email-login.md).
+
+**What is refused:** an ordinary (no-invite) login refuses the entire
+attempt — no `users` row touched, no session minted — when the matching
+member row is already under someone else's exclusive control. A `users` row
+for the presenting email that already carries `role != 'member'` is a
+second, independent refusal (mupot#1574 round 2): an email-keyed lookup into
+`users` must never grant `users.role` on the strength of an email match
+alone, only after the member-identity attach itself would be allowed. Email
+login additionally never auto-mints the pot's first-ever owner
+(`allowBootstrapOwner=false`, always) — only Google's own `/callback` can run
+that ceremony.
+
+**Read-only; the race is closed at write time, not here:**
+`decideIdentitylessAttach` never writes. The actual attach
+(`linkLoginIdentity`'s `requireExclusiveControl`) re-runs an equivalent check
+at write time to close the race this read alone cannot.
+
+**Residual work (mupot#1583, in flight, not yet merged):** `/api/projects`
+today re-resolves authority from the caller's email on each request rather
+than trusting the session's own `sessionMemberId`; resolver step 4
+(`owner_login_emails`, an org-owner-email alias table in
+`src/members/resolve-human-member.ts`) is a second, weaker email-keyed
+authority lookup that sits outside this predicate entirely — PR #1583 removes
+it as dead and dangerous rather than folding it in, and makes
+`findUserByEmail` fail closed on case-variant collisions in the same change.
+See [CHANGELOG.md](../CHANGELOG.md) "In flight — not yet merged" for exact
+state.
+
 ## Authorization Model
 
 The canonical capability implementation is `src/auth/capability.ts`.
