@@ -23,15 +23,19 @@
 //     `capabilities`"). The org-admin bar is `hasWorkspaceAdmin(auth)` — the fine-grained
 //     capability-grant equivalent of isOrgAdmin, checking an org-scope 'admin' (or higher)
 //     capability grant OR the legacy owner/admin session-role escape.
-//   - AddonActor.role only participates in ONE check inside the service layer — authorized()
-//     at src/addons/service.ts:315 (`role === 'owner' || role === 'admin'`) — which the
-//     service re-derives as its OWN defense-in-depth gate (never trusts the route's gate
-//     alone) and stamps into receipts (actor_id) for audit. So the correct translation is NOT
-//     "copy auth.role" (that would always be 'member' and every call would 403 at the service
-//     layer) — it is: once hasWorkspaceAdmin(auth) is true, the MCP caller has proven the SAME
-//     semantic bar isOrgAdmin gates on, so actor.role is the literal 'admin' (never 'owner' —
-//     we do not claim a rank the caller didn't prove; 'admin' is what authorized() needs and
-//     is what the ladder's admin/owner equivalence already treats the same way).
+//   - AddonActor.role participates in TWO checks inside the service layer: authorized()
+//     (`role === 'owner' || role === 'admin'`, src/addons/service.ts) and, since mupot#1587
+//     P1-C, archiveAddon's OWN stricter `role !== 'owner'` refusal when the manifest's
+//     retention.purgeRequiresOwner is true (every manifest today) — the service re-derives
+//     both as its OWN defense-in-depth gates (never trusts the route's gate alone) and
+//     stamps role into receipts (actor_id) for audit. So the correct translation is NOT
+//     "copy auth.role" (that would always be 'member' and every call would 403 at the
+//     service layer) — it is: claim EXACTLY the rank the caller proved, no more, using the
+//     SAME capability-floor mechanism at each rung. Once hasWorkspaceAdmin(auth) is true,
+//     actor.role is at least 'admin'; if the caller can ALSO prove an org-scope 'owner'
+//     grant (or the legacy owner session-role), actor.role is 'owner' — see
+//     resolveAdminEntry's own comment for why this second rung was added and why it is a
+//     no-op for install/configure/activate/disable.
 //   - actor.id is ALWAYS auth.memberId — server-derived from the bearer token, never from
 //     caller-supplied args. No tool below reads an identity field out of `args`.
 //
@@ -57,6 +61,7 @@ import {
   type AddonMutationResult,
 } from '../addons/service'
 import { validateBindingInputs } from '../addons/bindings'
+import { hasCapability } from '../auth/capability'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -89,6 +94,7 @@ function mutationOutcome(result: MutationFailure) {
     // other "this manifest/installation cannot transition right now" refusal.
     case 'addon_external_invariant:rank_grants':
     case 'addon_external_invariant:multiple_departments':
+    case 'addon_external_invariant:core_department_collision':
     case 'addon_external_invariant:agent_template_namespace':
     case 'addon_external_invariant:metric_namespace':
     case 'addon_external_invariant:surface_grant_namespace':
@@ -137,9 +143,22 @@ async function resolveAdminEntry(
   const entry = getRegisteredAddon(key)
   if (!entry) return { ok: false, outcome: fail(404, 'addon_not_registered') }
 
-  // 'admin' — never 'owner' — see the file docstring: this claims exactly the rank the
-  // caller proved via hasWorkspaceAdmin, no more.
-  return { ok: true, key, entry, actor: { id: auth.memberId, role: 'admin' } }
+  // mupot#1587 P1-C: 'admin' unless the caller can ALSO prove 'owner' specifically —
+  // still "claims exactly the rank the caller proved," just now able to prove one rung
+  // higher via the SAME capability-floor mechanism hasWorkspaceAdmin already uses
+  // ('org', null, 'owner' — an exact-or-higher floor check, not a guess). This mirrors
+  // hasWorkspaceAdmin's own two-plane check (fine-grained capability grant OR the
+  // legacy session-role escape) so a legacy owner session is recognized the same way.
+  // Needed because archiveAddon (src/addons/service.ts) now refuses a non-owner actor
+  // outright when the manifest's retention.purgeRequiresOwner is true (every manifest
+  // today) — before this fix, EVERY MCP caller of addon_archive, including a genuine
+  // org owner, was permanently claimed down to 'admin' and could never archive anything
+  // through this tool. install/configure/activate/disable are unaffected: authorized()
+  // treats owner and admin identically for those four, so this is a no-op for them.
+  const isProvenOwner = auth.capabilities !== undefined
+    ? hasCapability(auth.capabilities, 'org', null, 'owner')
+    : auth.role === 'owner'
+  return { ok: true, key, entry, actor: { id: auth.memberId, role: isProvenOwner ? 'owner' : 'admin' } }
 }
 
 const KEY_SCHEMA = {
@@ -252,6 +271,20 @@ const toolAddonArchive: ToolSpec = {
   async run(auth, env, args) {
     const resolved = await resolveAdminEntry(auth, args)
     if (!resolved.ok) return resolved.outcome
+    // P1-3 (kasra-review adversarial round 1, PR #1588): resolveAdminEntry's
+    // isProvenOwner check reads auth.capabilities, and an agent-bound bearer
+    // carries its OWNER MEMBER's capabilities (resolveCapabilities(c.env,
+    // row.member_id), src/mcp/index.ts) — so an agent whose token was minted under
+    // an owner member satisfies the org:owner capability check above even though
+    // the actual PRINCIPAL making this call is an agent, not an operator. That
+    // defeats retention.purgeRequiresOwner's entire point (every registered
+    // manifest sets it true): a human decision to permanently retire an addon
+    // installation. Mirrors src/mcp/archive.ts:31's operator-principal bar for the
+    // identical reason — a capability borrowed through an agent seat is not proof
+    // an operator made this call.
+    if (resolved.entry.manifest.retention.purgeRequiresOwner && auth.boundAgentId) {
+      return fail(403, 'operator_principal_required')
+    }
     const result = await archiveAddon(env, resolved.actor, resolved.key)
     if (!result.ok) return mutationOutcome(result)
     return mutationSuccess(resolved.key, result)

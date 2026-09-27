@@ -175,6 +175,7 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
+import { OFFICE_TOOLS } from './office'
 import { ROUTINE_TOOLS } from './routines'
 import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
@@ -5830,6 +5831,7 @@ export const TOOLS: ToolSpec[] = [
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
+  ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
   ...RUNNER_TOOLS,
   ...FLIGHT_SPINE_TOOLS,

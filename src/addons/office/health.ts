@@ -69,11 +69,11 @@ function isRedirect(response: Response): boolean {
     || (response.status >= 300 && response.status < 400)
 }
 
-interface SiteConnectorConfig {
+export interface SiteConnectorConfig {
   readonly siteUrl: string
 }
 
-function parseSiteConnectorConfig(meta: string | null): SiteConnectorConfig | null {
+export function parseSiteConnectorConfig(meta: string | null): SiteConnectorConfig | null {
   if (!meta) return null
   try {
     const value = JSON.parse(meta) as unknown
@@ -125,6 +125,32 @@ export async function checkMcpwpOfficeHealth(
     // and always probed the wrong endpoint for any non-root install).
     const basePath = base.pathname.endsWith('/') ? base.pathname.slice(0, -1) : base.pathname
     const endpoint = new URL(`${basePath}${MCPWP_MCP_PATH}`, base.origin)
+
+    // mupot#1587 P1-A (round-2 gate on #1582): assertPublicHttpsUrl above only ever
+    // validated `config.siteUrl` (i.e. `base`) — but `endpoint` is then REBUILT by
+    // concatenating `basePath` (attacker/operator-controlled: it comes straight from
+    // the stored siteUrl's own pathname) into a new URL string and re-parsing it. The
+    // WHATWG URL parser treats a string beginning `//` as SCHEME-RELATIVE — it takes
+    // everything after the slashes as a NEW AUTHORITY (host), not a path segment — so
+    // a stored siteUrl of `https://blog.example.com//169.254.169.254/x` yields
+    // `basePath = '//169.254.169.254/x'`, and `new URL(basePath + MCPWP_MCP_PATH,
+    // base.origin)` silently resolves to `https://169.254.169.254/x/wp-json/...` —an
+    // entirely different, private/metadata host — with the vaulted Basic credential
+    // still attached by authenticatedFetch below. A leading `\\` reaches the same
+    // outcome (the URL parser normalizes backslashes to forward slashes for special
+    // schemes before this same scheme-relative rule applies). Re-validating `endpoint`
+    // from scratch (assertPublicHttpsUrl again, not just re-checking the host inline)
+    // AND requiring its origin to be BYTE-IDENTICAL to `base`'s origin closes this:
+    // any string that caused the rebuild to change host, port, or scheme is refused
+    // here, before authenticatedFetch is ever called — zero fetches, credential never
+    // sent. This must run on every request; it is not a one-time check on `siteUrl`.
+    try {
+      assertPublicHttpsUrl(endpoint.href)
+    } catch {
+      return unavailable('invalid_site_url')
+    }
+    if (endpoint.origin !== base.origin) return unavailable('invalid_site_url')
+
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), MCPWP_OFFICE_HEALTH_TIMEOUT_MS)
     try {

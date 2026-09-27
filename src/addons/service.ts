@@ -9,6 +9,7 @@ import type { AddonManifestV1 } from './contract'
 import {
   assertAddonRuntimeContract,
   getRegisteredAddon,
+  listRegisteredAddons,
   type AddonCatalogEntry,
 } from './registry'
 import {
@@ -123,6 +124,7 @@ export interface AddonLifecycleDeps {
 export type AddonExternalInvariantViolation =
   | 'rank_grants'
   | 'multiple_departments'
+  | 'core_department_collision'
   | 'agent_template_namespace'
   | 'metric_namespace'
   | 'surface_grant_namespace'
@@ -130,6 +132,23 @@ export type AddonExternalInvariantViolation =
   | 'connector_binding_kind'
   | 'loops_not_allowed'
   | 'event_subscription_allowlist'
+
+// mupot#1587 P2 — the set of department moduleKeys owned by a currently-registered
+// NATIVE addon (kind:'native'). Derived from the addon registry every call, never
+// hardcoded: growth/agency/web-ops are native today only because
+// marketing-cro-monitor (kind:'native') declares them in ITS departments[] — if that
+// ever changes, this set changes with it, with no edit needed here. An external_mcp
+// manifest is refused if its OWN department collides with any key in this set (see
+// 'core_department_collision' below) — a manifest declaring only `growth` must not be
+// able to co-own a native department the way it could a genuinely new one.
+function nativeCoreDepartmentKeys(): ReadonlySet<string> {
+  const keys = new Set<string>()
+  for (const entry of listRegisteredAddons()) {
+    if (entry.manifest.kind !== 'native') continue
+    for (const department of entry.manifest.departments) keys.add(department.moduleKey)
+  }
+  return keys
+}
 
 // The only event topics an external addon may subscribe to. Deliberately narrow and
 // hand-enumerated (not "whatever the bus happens to define today") — widening this set
@@ -140,9 +159,15 @@ const EXTERNAL_ADDON_EVENT_ALLOWLIST: ReadonlySet<string> = new Set([
 ])
 
 /** True iff `value` is namespaced under `moduleKey` — i.e. is `moduleKey` followed by a
- *  literal '.', never a same-prefix lookalike ('growth' must not match 'growthx.foo'). */
+ *  literal '.', never a same-prefix lookalike ('growth' must not match 'growthx.foo'),
+ *  AND followed by a real, non-empty, non-wildcard segment (mupot#1587 P3: 'office.'
+ *  and 'office.*' both used to pass — the bare prefix or a bare wildcard names nothing
+ *  specific and must not count as "namespaced under office"). */
 function isNamespacedUnder(value: string, moduleKey: string): boolean {
-  return value.startsWith(`${moduleKey}.`)
+  const prefix = `${moduleKey}.`
+  if (!value.startsWith(prefix)) return false
+  const rest = value.slice(prefix.length)
+  return rest.length > 0 && rest !== '*'
 }
 
 /**
@@ -172,11 +197,15 @@ function isNamespacedUnder(value: string, moduleKey: string): boolean {
  *       native addon can request e.g. 'addon.something'; an external one may only ever
  *       request '<its own department>.*'.
  *   (e) every approvalPolicies[].action must EITHER be namespaced under departments[0]'s
- *       moduleKey OR exactly match one of connectorRequirements[].slot (the one
- *       exemption contract.ts's own write-connector invariant requires — a policy named
- *       after a connector slot the addon itself declared). Without this, an external
- *       addon could declare a plausible-sounding, unnamespaced action name (e.g.
- *       'publish' or 'automate') that happens to collide with — or looks like — a
+ *       moduleKey OR exactly match one of connectorRequirements[].slot WHERE that
+ *       connector's capability is 'write' (the one exemption contract.ts's own
+ *       write-connector invariant requires — a policy named after a REQUIRED-write
+ *       connector slot the addon itself declared; mupot#1587 P3 narrowed this from
+ *       "any declared slot" to write-capability slots only, so a read-only decoy slot
+ *       can no longer launder an unnamespaced action past this check). Without this, an
+ *       external addon could declare a plausible-sounding, unnamespaced action name
+ *       (e.g. 'publish' or 'automate', or a core-looking one like
+ *       'promote_recommendation') that happens to collide with — or looks like — a
  *       core-surface approval gate; namespacing removes that ambiguity entirely.
  *   (f) every connectorRequirements[].bindingKind must be exactly 'vault_connector' —
  *       'internal_adapter' (and the 'either' escape hatch, which allows
@@ -205,6 +234,13 @@ export function externalIsolationViolation(manifest: AddonManifestV1): AddonExte
   // to trip multiple_departments to reach that department in the first place).
   const ownDepartment = manifest.departments[0]?.moduleKey ?? ''
 
+  // mupot#1587 P2: refuse an external manifest whose OWN department collides with a
+  // department a currently-registered NATIVE addon already owns (e.g. 'growth') —
+  // checked before the per-field namespace checks below, since every one of those
+  // checks is meaningless (and would pass trivially) if ownDepartment is itself a
+  // core surface the manifest has no right to co-own.
+  if (nativeCoreDepartmentKeys().has(ownDepartment)) return 'core_department_collision'
+
   for (const template of manifest.agentTemplates) {
     if (template.departmentModuleKey !== ownDepartment) return 'agent_template_namespace'
   }
@@ -217,9 +253,21 @@ export function externalIsolationViolation(manifest: AddonManifestV1): AddonExte
     if (!isNamespacedUnder(grant.capability, ownDepartment)) return 'surface_grant_namespace'
   }
 
-  const connectorSlots = new Set(manifest.connectorRequirements.map((connector) => connector.slot))
+  // mupot#1587 P3: the exemption is for EXACTLY contract.ts's own write-connector
+  // invariant (validateAddonManifest: a capability:'write' connectorRequirements
+  // entry requires an approvalPolicy named after its slot) — narrowed to
+  // capability==='write' slots only. Before this fix, ANY declared slot (including
+  // a read-only decoy) exempted its same-named action from namespacing, which would
+  // let an external manifest launder an unnamespaced, core-sounding action name
+  // (e.g. 'promote_recommendation') past this check by declaring a same-named
+  // connector slot that contract.ts's invariant never actually required a policy for.
+  const writeConnectorSlots = new Set(
+    manifest.connectorRequirements
+      .filter((connector) => connector.capability === 'write')
+      .map((connector) => connector.slot),
+  )
   for (const policy of manifest.approvalPolicies) {
-    if (!isNamespacedUnder(policy.action, ownDepartment) && !connectorSlots.has(policy.action)) {
+    if (!isNamespacedUnder(policy.action, ownDepartment) && !writeConnectorSlots.has(policy.action)) {
       return 'approval_policy_namespace'
     }
   }
@@ -487,9 +535,36 @@ function authorized(actor: AddonActor): boolean {
   return actor.role === 'owner' || actor.role === 'admin'
 }
 
-function hasNoAuthorityGrants(entry: AddonCatalogEntry): boolean {
-  return entry.manifest.authorityRequests.rankGrants.length === 0
-    && entry.manifest.authorityRequests.surfaceGrants.length === 0
+// mupot#1580 T2 / #1587: configureAddon/activateAddon's authority-grant gate.
+//
+// Originally "every addon's authorityRequests must be entirely empty" — an MVP
+// placeholder from before any registered addon (native or external) had a nonempty
+// authorityRequests at all. mcpwp-office (slice 1, #1582) is the FIRST manifest to
+// declare authorityRequests.surfaceGrants — three office.* tool names slice 2 (this
+// PR) implements — so the placeholder now genuinely blocks real use, not just
+// hypothetical future use. Reported and fixed here rather than routed around
+// silently (see the PR body for the full trade-off).
+//
+// The narrowed rule: rankGrants must ALWAYS be empty, for every kind — there is no
+// reviewed workflow anywhere in this codebase for granting an addon RANK, native or
+// external, and none is added by this change. surfaceGrants may be nonempty ONLY for
+// kind:'external_mcp', and ONLY because trustGateViolation (checked immediately
+// before this function runs, at every one of installAddon/configureAddon/
+// activateAddon — not install alone, per the #1587 P2 fix) already re-validates
+// externalIsolationViolation for that manifest on every call, which independently
+// guarantees every surfaceGrants[].capability is namespaced under the addon's own
+// single, exclusively-owned department (never rank, never another department,
+// never a bare/core-looking action). A kind:'native' manifest gets NO such
+// narrowing: a compiled-in addon's manifest has no equivalent per-field isolation
+// proof, so requesting ANY authority (rank or surface) is refused exactly as
+// before this change — marketing-cro-monitor/fixture/fixture-with-loop/
+// project-link/workflow-circuits all declare empty authorityRequests today, so
+// this change is a byte-identical no-op for every currently-registered addon
+// except mcpwp-office.
+function authorityGrantsAllowed(entry: AddonCatalogEntry): boolean {
+  if (entry.manifest.authorityRequests.rankGrants.length > 0) return false
+  if (entry.manifest.authorityRequests.surfaceGrants.length === 0) return true
+  return entry.manifest.kind === 'external_mcp'
 }
 
 // Exported so migrations that repair installation identity drift (e.g. a
@@ -2900,7 +2975,7 @@ export async function configureAddon(
   if (!matchesRegisteredIdentity(existing, entry)) {
     return { ok: false, reason: 'manifest_digest_drift' }
   }
-  if (!hasNoAuthorityGrants(entry) || !['installed', 'configured', 'disabled'].includes(existing.state)) {
+  if (!authorityGrantsAllowed(entry) || !['installed', 'configured', 'disabled'].includes(existing.state)) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
 
@@ -2909,7 +2984,14 @@ export async function configureAddon(
   const configuredAt = new Date().toISOString()
   const firstConfiguration = existing.state === 'installed'
   const checks = JSON.stringify({
-    authorityRequests: 'empty',
+    // 'empty' when the manifest requests no authority at all (every addon before
+    // mcpwp-office); 'namespaced_external_isolated' records the #1580/#1587
+    // narrowing above — surfaceGrants present, but only because trustGateViolation
+    // already proved every one is namespaced under this external_mcp addon's own
+    // department (see authorityGrantsAllowed's doc comment).
+    authorityRequests: entry.manifest.authorityRequests.surfaceGrants.length === 0
+      ? 'empty'
+      : 'namespaced_external_isolated',
     connectorRequirements: 'preflight_passed',
     bindingCount: requestedBindings.length,
   })
@@ -3101,7 +3183,7 @@ export async function activateAddon(
   }
   const gateViolation = trustGateViolation(entry.manifest)
   if (gateViolation) return { ok: false, reason: gateViolation, state: existing.state }
-  if (!hasNoAuthorityGrants(entry)) {
+  if (!authorityGrantsAllowed(entry)) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
   let bindingPreflight: Awaited<ReturnType<typeof preflightAddonBindings>>
@@ -3205,7 +3287,10 @@ export async function activateAddon(
     const activatedAt = transitionTiming.now
     const sideEffectIds = JSON.stringify(claims.map((claim) => claim.id))
     const checks = JSON.stringify({
-      authorityRequests: 'empty',
+      // See the identical field in configureAddon above.
+      authorityRequests: entry.manifest.authorityRequests.surfaceGrants.length === 0
+        ? 'empty'
+        : 'namespaced_external_isolated',
       connectorRequirements: 'preflight_passed',
       bindingCount: bindingPreflight.bindings.length,
       departments: departmentClaims.map((claim) => ({
@@ -3676,6 +3761,24 @@ export async function archiveAddon(
   key: string,
 ): Promise<AddonMutationResult> {
   if (!authorized(actor)) return { ok: false, reason: 'not_authorized' }
+
+  // mupot#1587 P1-C (Athena, round 2): archiveAddon is the one teardown action that
+  // permanently ends an installation's lifecycle — the real analogue to the manifest's
+  // `retention.purgeRequiresOwner` (validateAddonManifest forces this field to literally
+  // `true` for every manifest today — contract.ts's validateRetention — so this check is
+  // universal, not office-specific). `authorized()` above treats owner and admin as
+  // equally authorized for every OTHER addon-door action (install/configure/activate/
+  // disable); archive is the one action retention explicitly names as owner-only, so it
+  // gets its own, stricter check, ahead of any state lookup — an admin caller is refused
+  // outright, before this function reveals anything about the installation's current
+  // state. Checked BEFORE loadLiveInstallation, on purpose: whether the addon is not yet
+  // registered, not installed, live, or already archived, a non-owner caller of an addon
+  // that requires owner-gated purge gets the SAME 'not_authorized' outcome — no
+  // state-dependent branch ever answers a non-owner's archive call differently.
+  const entry = getRegisteredAddon(key)
+  if (entry?.manifest.retention.purgeRequiresOwner && actor.role !== 'owner') {
+    return { ok: false, reason: 'not_authorized' }
+  }
 
   const live = await loadLiveInstallation(env, key)
   if (!live) {

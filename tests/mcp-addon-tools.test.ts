@@ -79,6 +79,10 @@ function auth(memberId: string, capabilities: CapabilityGrant[]): AuthContext {
 }
 
 const orgAdmin = auth('admin-member', [grant('admin', 'org', null)])
+// mupot#1587 P1-C: archiveAddon now refuses a non-owner actor when the manifest's
+// retention.purgeRequiresOwner is true (every manifest today) — an org:admin GRANT
+// (orgAdmin above) is not enough for archive specifically, only org:owner is.
+const orgOwner = auth('owner-member', [grant('owner', 'org', null)])
 const grantlessMember = auth('grantless-member', [])
 const squadAdminOnly = auth('squad-admin-member', [grant('admin', 'squad', 'squad-X')])
 
@@ -233,7 +237,39 @@ describe('addon lifecycle MCP tools — org-admin happy path', () => {
     expect(disabled.ok).toBe(true)
     if (disabled.ok) expect(disabled.result).toMatchObject({ key: ADDON_KEY, state: 'disabled' })
 
-    const archived = await invokeTool(orgAdmin, db.env, 'addon_archive', { key: ADDON_KEY }, ORIGIN)
+    // mupot#1587 P1-C: archive requires org:owner specifically, not just org:admin —
+    // see orgOwner's doc comment above.
+    const adminArchiveAttempt = await invokeTool(orgAdmin, db.env, 'addon_archive', { key: ADDON_KEY }, ORIGIN)
+    expect(adminArchiveAttempt.ok).toBe(false)
+    if (!adminArchiveAttempt.ok) expect(adminArchiveAttempt.error).toBe('forbidden')
+
+    const archived = await invokeTool(orgOwner, db.env, 'addon_archive', { key: ADDON_KEY }, ORIGIN)
+    expect(archived.ok).toBe(true)
+    if (archived.ok) expect(archived.result).toMatchObject({ key: ADDON_KEY, state: 'archived' })
+  })
+
+  // P1-3 (kasra-review adversarial round 1, PR #1588): resolveAdminEntry's
+  // isProvenOwner check reads auth.capabilities, and an agent-bound bearer carries
+  // its OWNER MEMBER's capabilities (resolveCapabilities(c.env, row.member_id),
+  // src/mcp/index.ts) — so a bearer minted under an owner member satisfied the
+  // org:owner capability check even though the actual PRINCIPAL making the call was
+  // an agent, not an operator, defeating retention.purgeRequiresOwner's entire
+  // point. Mirrors src/mcp/archive.ts's operator-principal bar for the same reason.
+  it('addon_archive refuses an agent-bound bearer even when it carries an owner member\'s capabilities (P1-3)', async () => {
+    const db = makeDb()
+    await invokeTool(orgAdmin, db.env, 'addon_install', { key: ADDON_KEY }, ORIGIN)
+    await invokeTool(orgAdmin, db.env, 'addon_configure', { key: ADDON_KEY }, ORIGIN)
+    await invokeTool(orgAdmin, db.env, 'addon_activate', { key: ADDON_KEY }, ORIGIN)
+    await invokeTool(orgAdmin, db.env, 'addon_disable', { key: ADDON_KEY }, ORIGIN)
+
+    const agentBoundOwner: AuthContext = { ...orgOwner, boundAgentId: 'ag-owner' }
+    const agentArchiveAttempt = await invokeTool(agentBoundOwner, db.env, 'addon_archive', { key: ADDON_KEY }, ORIGIN)
+    expect(agentArchiveAttempt.ok).toBe(false)
+    if (!agentArchiveAttempt.ok) expect(agentArchiveAttempt.error).toBe('operator_principal_required')
+
+    // The REAL owner member (no boundAgentId) still succeeds — this is not a
+    // blanket archive lockout, only an agent-seat one.
+    const archived = await invokeTool(orgOwner, db.env, 'addon_archive', { key: ADDON_KEY }, ORIGIN)
     expect(archived.ok).toBe(true)
     if (archived.ok) expect(archived.result).toMatchObject({ key: ADDON_KEY, state: 'archived' })
   })

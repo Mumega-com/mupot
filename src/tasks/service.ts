@@ -522,7 +522,12 @@ function isUniqueViolation(error: unknown): boolean {
 // NOT proposal-bound (unlike resolveProposalVerdict, src/routines/actions.ts)
 // — a reversal targets the verdict actually sitting on the task right now,
 // whatever put it there.
-async function findLatestVerdict(env: Env, taskId: string): Promise<TaskVerdict | null> {
+// Exported (mupot#1580 T2) so a gate-scoped caller — e.g. the mcpwp-office addon's
+// office.publish_post, src/addons/office/service.ts — can check "does this task
+// currently carry a live (non-reversed) verdict, and what is it" using the SAME read
+// reverseTaskVerdict/detectVerdictReversalRequest already trust, rather than
+// hand-rolling a second copy of this query.
+export async function findLatestVerdict(env: Env, taskId: string): Promise<TaskVerdict | null> {
   return env.DB.prepare(
     `SELECT id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id, reversed_at
        FROM task_verdicts WHERE task_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1`,

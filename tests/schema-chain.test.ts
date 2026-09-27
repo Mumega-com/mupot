@@ -718,13 +718,25 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
     // six files falling out of coverage — 109 > 103.5 passed while 7 real objects were droppable
     // without ground truth noticing. A file may legitimately contribute no probe only when a LATER
     // migration drops or renames every object it creates, and that later file is probed instead.
-    // Today that is exactly one file, so the shortfall is pinned at 1 rather than a percentage:
+    // Today that is exactly two files, so the shortfall is pinned at 2 rather than a percentage:
     // any new exclusion has to be justified here deliberately, not absorbed by a slack window.
+    //
+    // mupot#1587 P1-B added the second exclusion: migrations/0089_backfill_addon_manifest_v0_29
+    // .sql's ONLY object is the trigger `addon_installations_identity_is_immutable` (it does its
+    // own DROP TRIGGER + CREATE TRIGGER of the exact same name, for an unrelated backfill reason —
+    // see that file's header). migrations/0178_addon_isolation_class_immutable.sql now redefines
+    // that SAME trigger name again, later in the chain (to also cover isolation_class — see its
+    // header), so 0178 is the file ground truth probes for that object going forward, and 0089's
+    // one-and-only object is superseded — the exact "a later migration drops or renames every
+    // object it creates" case this comment already documented, now instantiated a second time.
     const unprobed = SCHEMA_CHAIN.filter(
       (entry) => entry.objects.length > 0 && !new Set(probes.map((p) => p.file)).has(entry.file),
     ).map((entry) => entry.file)
-    expect(unprobed).toEqual(['0061_task_project_access_on_attribution.sql'])
-    expect(probes.length).toBe(withSurvivingObject - 1)
+    expect(unprobed).toEqual([
+      '0061_task_project_access_on_attribution.sql',
+      '0089_backfill_addon_manifest_v0_29.sql',
+    ])
+    expect(probes.length).toBe(withSurvivingObject - 2)
 
     // Every probed file must be distinct (one probe per file, not per object).
     expect(new Set(probes.map((p) => p.file)).size).toBe(probes.length)
