@@ -964,7 +964,20 @@ async function finishEmailLoginSuccess(
   // identity, and "first owner" is exactly the highest-value grant a
   // "prove you can read an inbox" door should not be trusted to hand out.
   const derivedId = await deriveUserId('email', emailNormalized)
-  const { id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, false)
+  let userId: string
+  let role: OrgRole
+  try {
+    ;({ id: userId, role } = await upsertUserByEmail(env, derivedId, emailNormalized, false))
+  } catch (err) {
+    // mupot#1583 round 2: two (or more) `users` rows collide on the same normalized
+    // email (a data anomaly, not a live attack by itself) — refuse rather than let
+    // upsertUserByEmail's ORDER BY silently pick a winner. No session, cookie, or
+    // write past this point, same as every other refusal in this function.
+    if (err instanceof AmbiguousUserEmailError) {
+      return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
+    }
+    throw err
+  }
   if (role !== 'member') {
     return c.html(emailIdentityConflictBody(env.BRAND || env.TENANT_SLUG), 403)
   }
@@ -1562,6 +1575,28 @@ authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
 // ── user upsert (AuthZ side) ─────────────────────────────────────────────────
 
 /**
+ * mupot#1583 round 2 (Athena BLOCK): thrown by findUserByEmail/upsertUserByEmail when
+ * MORE THAN ONE `users` row matches the same normalized (lower-cased) email. This
+ * function's own doc comment states the invariant — "VERIFIED EMAIL is the cross-path
+ * dedup key... a given verified email maps to exactly ONE user" — and an
+ * `ORDER BY ... LIMIT 1` pick that silently honors ONE of several colliding rows (an
+ * older 'member' row and a newer case-variant 'owner' row, say) is exactly the
+ * "silently pick a winner" move that invariant forbids: whichever row the ORDER BY
+ * happens to prefer decides the session's role, invisibly to every caller. Every
+ * caller either catches this to refuse the specific login attempt
+ * (finishEmailLoginSuccess) or lets it propagate — an uncaught throw becomes a 500,
+ * never a session minted for the wrong row.
+ */
+export class AmbiguousUserEmailError extends Error {
+  readonly count: number
+  constructor(count: number) {
+    super(`ambiguous users.email match (${count} rows for one normalized email)`)
+    this.name = 'AmbiguousUserEmailError'
+    this.count = count
+  }
+}
+
+/**
  * findUserByEmail — the one `users` email lookup, normalized once here.
  * upsertUserByEmail's own step 1 and step 4 (re-resolve after an
  * insert/UNIQUE race) both call this instead of inlining the query twice,
@@ -1570,7 +1605,9 @@ authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
  * to keep a hand-copied `SELECT role FROM users WHERE email = ?1` for
  * exactly this, a second predicate that could silently drift from this
  * one) should call this directly rather than re-copying the query. Read-
- * only: never inserts.
+ * only: never inserts. Reads ALL rows for the normalized email (no LIMIT) and
+ * throws AmbiguousUserEmailError on more than one — see that class's doc
+ * comment for why an ORDER BY + LIMIT 1 pick is exactly the bug this closes.
  */
 async function findUserByEmail(env: Env, email: string | null): Promise<{ id: string; role: OrgRole } | null> {
   const normEmail = email ? email.trim().toLowerCase() : null
@@ -1582,16 +1619,16 @@ async function findUserByEmail(env: Env, email: string | null): Promise<{ id: st
   // a lower-cased lookup — mupot#1581 P2-4: finishEmailLoginSuccess's `users`-role gate
   // (and upsertUserByEmail's OWN dedup step 1) would both silently miss such a row and
   // mint a SECOND, distinct 'member' row instead of recognizing the existing
-  // owner/admin one. `ORDER BY created_at ASC, id ASC` makes the (legal but unlikely) case
-  // of two differently-cased rows for one email a deterministic pick, same convention as
-  // resolve-human-member.ts's own case-collision handling — `id ASC` is the tiebreaker for
-  // two rows sharing the same `created_at` (timestamp precision here is per-second, so a
-  // concurrent-insert race can genuinely produce that tie; without it, `created_at ASC`
-  // alone falls back to whatever order SQLite happens to return equal-timestamp rows in,
-  // which is not a documented guarantee).
-  return env.DB.prepare('SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC, id ASC LIMIT 1')
+  // owner/admin one.
+  const rows = await env.DB.prepare(
+    'SELECT id, role FROM users WHERE lower(email) = ?1 ORDER BY created_at ASC, id ASC',
+  )
     .bind(normEmail)
-    .first<{ id: string; role: OrgRole }>()
+    .all<{ id: string; role: OrgRole }>()
+  const results = rows.results ?? []
+  if (results.length === 0) return null
+  if (results.length > 1) throw new AmbiguousUserEmailError(results.length)
+  return results[0]
 }
 
 /**

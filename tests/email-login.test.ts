@@ -851,6 +851,58 @@ describe('GET/POST /auth/email/verify', () => {
     expect(rows).toEqual([{ email: 'Boss@Pot.test', role: 'owner' }])
   })
 
+  // mupot#1583 round 2 (Athena BLOCK): findUserByEmail's `ORDER BY created_at ASC LIMIT 1`
+  // silently picked the OLDER row when two `users` rows collided on the same normalized
+  // email — an older 'member' row shadowed a newer case-variant 'owner' row, so email
+  // login returned 302 and minted a MEMBER session instead of refusing. findUserByEmail now
+  // reads ALL matching rows and throws AmbiguousUserEmailError on more than one;
+  // finishEmailLoginSuccess catches it and refuses, the same 403 as every other conflict.
+  it('mupot#1583: an older member row shadowing a newer case-variant owner row is refused (ambiguity), not silently logged in as the member', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role, created_at) VALUES ('user-old-member', 'shadow@pot.test', 'member', '2020-01-01 00:00:00');
+      INSERT INTO users (id, email, role, created_at) VALUES ('user-new-owner', 'Shadow@Pot.test', 'owner', '2024-01-01 00:00:00');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'shadow@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+    // Neither row touched — no session-role escalation AND no silent member login either.
+    const rows = harness.sqlite
+      .prepare(`SELECT email, role FROM users ORDER BY created_at`)
+      .all() as Array<{ email: string; role: string }>
+    expect(rows).toEqual([
+      { email: 'shadow@pot.test', role: 'member' },
+      { email: 'Shadow@Pot.test', role: 'owner' },
+    ])
+  })
+
+  it('two member rows differing only by case are ALSO refused (ambiguity itself is the refusal, independent of role)', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role, created_at) VALUES ('user-dup-1', 'dup@pot.test', 'member', '2020-01-01 00:00:00');
+      INSERT INTO users (id, email, role, created_at) VALUES ('user-dup-2', 'Dup@Pot.test', 'member', '2024-01-01 00:00:00');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'dup@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(403)
+    expect(sessionCookieFrom(res)).toBeNull()
+  })
+
+  it('a single lowercase member row still logs in normally (unchanged by the ambiguity fix)', async () => {
+    harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO users (id, email, role) VALUES ('user-single-row', 'single-row@pot.test', 'member');
+    `)
+    const env = envFor(harness, memoryKv())
+    const { token, attemptId } = await startAndCapture(env, 'single-row@pot.test')
+    const res = await confirmToken(env, token, attemptId)
+    expect(res.status).toBe(302)
+    expect(sessionCookieFrom(res)).not.toBeNull()
+  })
+
   it('an admin row (not just owner) is also refused', async () => {
     harness = makeHarness()
     harness.sqlite.exec(`
