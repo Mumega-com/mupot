@@ -262,6 +262,25 @@ export interface Env {
   // Non-secret; set in wrangler.toml [vars]. e.g. https://inkwell-api.mumega.com.
   // Must be https + a public host (executor SSRF-guards it). Absent ⇒ executor 503.
   INKWELL_API_URL?: string
+  // Email one-time link/code sign-in — a normal-login door beside Google
+  // (mupot#1564/#1442, Hadi 2026-09-26: "we only have Google login — a big
+  // stone in front of onboarding"). Off unless EXACTLY "true", same posture
+  // as POT_SELF_SERVE_CHECKOUT_ENABLED (src/pots/checkout-flag.ts) — read via
+  // isEmailLoginEnabled() in src/auth/email-login.ts. Landing hides the email
+  // option and /auth/email/* 404s when unset/false.
+  EMAIL_LOGIN_ENABLED?: string
+  // 'console' (dev/test — logs the link+code, never sends real mail) or unset
+  // (Resend, the only real provider today). LOCAL_TEST_AUTH=1 also forces the
+  // console sender regardless of this value. See src/auth/email-sender.ts.
+  EMAIL_PROVIDER?: string
+  // Same secret/var names as workers/inkwell-api's own request-code Resend
+  // sender (src/routes/auth.ts) — one Resend key/from-address pair serves
+  // both workers. Secret via `wrangler secret put RESEND_API_KEY`;
+  // RESEND_FROM_EMAIL is non-secret (a from-address) and may live in [vars].
+  // Missing either in prod: the /email/start route still 200s (no oracle),
+  // logs one structured error, and never sends.
+  RESEND_API_KEY?: string
+  RESEND_FROM_EMAIL?: string
   // Optional service binding to the pot's Inkwell API worker. When the pot and its
   // Inkwell live on the SAME Cloudflare zone, a public-edge fetch to INKWELL_API_URL
   // loops back and times out (CF 522). This binding routes the content-write

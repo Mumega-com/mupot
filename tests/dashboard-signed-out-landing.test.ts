@@ -148,4 +148,34 @@ describe('GET / signed-out landing (mupot#1445)', () => {
     expect(res.status).toBe(302)
     expect(res.headers.get('location')).toBe('/auth/login')
   })
+
+  // mupot#1564/#1442 — email login is a second door on this SAME landing page.
+  it('hides the "Continue with email" form when EMAIL_LOGIN_ENABLED is unset', async () => {
+    const res = await dashboardApp.fetch(get('/'), envFor())
+    const body = await res.text()
+    expect(body).not.toContain('/auth/email/start')
+  })
+
+  it('hides the email form when EMAIL_LOGIN_ENABLED is any value other than the exact string "true"', async () => {
+    const res = await dashboardApp.fetch(get('/'), { ...envFor(), EMAIL_LOGIN_ENABLED: 'TRUE' } as Env)
+    const body = await res.text()
+    expect(body).not.toContain('/auth/email/start')
+  })
+
+  it('shows the "Continue with email" form when EMAIL_LOGIN_ENABLED==="true"', async () => {
+    const res = await dashboardApp.fetch(get('/'), { ...envFor(), EMAIL_LOGIN_ENABLED: 'true' } as Env)
+    expect(res.status).toBe(200)
+    const body = await res.text()
+    expect(body).toContain('/auth/email/start')
+    expect(body).toContain('Sign in with Google') // Google stays, email is BESIDE it, not instead of it
+  })
+
+  it('with a pending invite AND email login enabled, the "finish joining" copy mentions email too', async () => {
+    const res = await dashboardApp.fetch(
+      get('/', { Cookie: `${PENDING_INVITE_COOKIE}=some-pending-id` }),
+      { ...envFor(), EMAIL_LOGIN_ENABLED: 'true' } as Env,
+    )
+    const body = await res.text()
+    expect(body).toContain('sign in with the same Google account or email to finish')
+  })
 })

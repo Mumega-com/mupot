@@ -38,6 +38,19 @@ POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout 
                                   # buttons. ONLY the exact string "true" enables; anything else = 503
                                   # checkout_unavailable. Keep "false" until the create_pot webhook
                                   # provisions the pot (today a buyer is billed and gets no pot).
+# EMAIL_LOGIN_ENABLED = "true"    # mupot#1564/#1442: email one-time link/code sign-in beside Google
+                                  # (POST /auth/email/start, GET/POST /auth/email/verify). ONLY the
+                                  # exact string "true" enables; anything else/unset = 404 on those
+                                  # routes and the landing page hides the "Continue with email" form.
+                                  # Requires RESEND_API_KEY (secret, below) + RESEND_FROM_EMAIL (var,
+                                  # below) in production, or EMAIL_PROVIDER="console"/LOCAL_TEST_AUTH=1
+                                  # for local dev (logs the link+code instead of sending real mail).
+# EMAIL_PROVIDER = "console"      # dev/test only — see src/auth/email-sender.ts. Leave unset in prod
+                                  # (Resend is the only real provider today).
+# RESEND_FROM_EMAIL = "Mumega <login@mumega.com>"  # non-secret from-address. SAME var name as
+                                  # workers/inkwell-api's own request-code sender — one Resend key
+                                  # can serve both workers. Secret RESEND_API_KEY is set via
+                                  # `wrangler secret put RESEND_API_KEY` — see below, NOT here.
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
 # routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
@@ -166,6 +179,19 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 # Until these secrets are set the GHL channel is inert (fails closed):
 #   - Outbound sends return { ok: false, reason: 'not_configured' }
 #   - Inbound webhook returns 503 { error: 'not_configured' }
+
+# ── Email login secrets (mupot#1564/#1442) ──
+# npx wrangler secret put RESEND_API_KEY   # Resend API key — sends the sign-in link+code email.
+#                                           # SAME var name workers/inkwell-api's own request-code
+#                                           # sender uses (src/routes/auth.ts) — one Resend key/from
+#                                           # pair can serve both workers.
+# RESEND_FROM_EMAIL is NON-secret (a from-address) — set it in [vars] above, not here.
+# Rollout: 1) APPLY migrations/0174_email_login_attempts.sql FIRST (email_login_attempts +
+# email_login_rate_limits — every route below reads/writes these unconditionally once the flag is
+# on), 2) wrangler secret put RESEND_API_KEY, 3) set RESEND_FROM_EMAIL + EMAIL_LOGIN_ENABLED="true"
+# in [vars], 4) deploy. Missing RESEND_API_KEY/RESEND_FROM_EMAIL with EMAIL_LOGIN_ENABLED="true":
+# /auth/email/start still 200s (no account-existence oracle) and logs one structured error; nothing
+# sends. See docs/operations/email-login.md for the full runbook.
 
 # ── Hermes push delivery (mumega-com#970) — bus consumer's outbound leg for
 # message.created (and future) events. Same shared secret as the Telegram bridge's

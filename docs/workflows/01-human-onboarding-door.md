@@ -236,3 +236,53 @@ side effect).
 - A migration-numbering collision is on record: `0156` in #1436's PR collided with an
   unrelated open PR's own `0156` — resolved by whichever merged second (a documented
   convention, not a defect).
+
+## Second door: email one-time link/code (mupot#1564/#1442)
+
+Source: mupot#1564. Hadi, 2026-09-26: "we only have Google login — a big stone in front
+of onboarding." Code: `src/auth/email-login.ts`, `src/auth/email-sender.ts`, routes in
+`src/auth/index.ts` (`POST /auth/email/start`, `GET /auth/email/verify`,
+`POST /auth/email/verify`). Full rollout runbook: `docs/operations/email-login.md`.
+
+This is a SECOND door onto the SAME steps 7-9 above, not a parallel identity path.
+`POST /auth/email/start` emails a single-use link (`/auth/email/verify?t=&a=`) and a
+6-digit code. `GET /auth/email/verify` renders a confirm page ONLY — it touches no
+database state (adversarial gate P1-2: a bare GET used to consume the link outright,
+which both a login-CSRF `<img>` and a mail-scanner prefetch could trigger with zero
+human intent). Only `POST /auth/email/verify` (the confirm page's own button, or the
+typed-in-code form) ever consumes, atomically, in D1
+(`migrations/0174_email_login_attempts.sql`). Once verified, and once DEFECT-CLASS-B's
+gate (below) clears, it calls `upsertUserByEmail(..., allowBootstrapOwner=false)` +
+`mintSession(..., { loginIdentity: { provider: 'email', subject: <normalized email> } })`
+— the same pair `/auth/callback` calls for Google, except email NEVER auto-mints the
+first-ever owner (Google's own callback is the only legitimate first-owner ceremony).
+`registerWebSession` (step 9's own caller) cannot tell which door produced the
+`(provider, subject)` pair; it just resolves it the same way. Verifying control of the
+mailbox here is treated as IdP-grade proof for mupot#1551's exclusive-control predicate
+(`decideIdentitylessAttach`) — the same standard Google's `email_verified: true` claim
+meets.
+
+**Identity/authority gate (adversarial gate P0-2, added round 1):** for an ORDINARY
+(no-invite) email login, `src/auth/index.ts`'s `finishEmailLoginSuccess` checks
+`decideIdentitylessAttach` itself BEFORE ever calling `upsertUserByEmail` — if the member
+row matching that email is already under someone else's exclusive control (a live
+identity, an unbound bearer, a Telegram bind), the WHOLE login is refused, not just the
+identity link. Before this gate existed, `upsertUserByEmail`'s own email-keyed lookup
+into `users` could hand back an existing `role: 'owner'` row regardless of whether the
+members-side attach would ever be allowed — a Google-linked owner's email could sign in
+as that owner with no email identity ever linked to the member. The invite-linked path
+(pending-invite cookie present) is exempt from this extra gate: its authority comes
+directly from the invite's own D1 row + email match, the same as Google's invite branch.
+
+Invite integration reuses the pending-invite cookie/KV marker verbatim (step 5 above):
+`/auth/email/start` reads the SAME `mupot_pending_invite` cookie `/auth/login` reads,
+binds it into the email attempt record instead of OAuth `state`, and email verification
+re-runs the SAME `decidePendingInviteLink`/`linkAcceptedInviteIdentity` D1-authoritative
+check (step 8's logic) before minting a session — never a second copy of that contract.
+
+Gated by `EMAIL_LOGIN_ENABLED` (default off); the signed-out landing
+(`src/dashboard/index.ts`'s `signedOutLandingBody`) and the "invite already used" page
+(`src/dashboard/invite.ts`'s `inviteAlreadyAcceptedBody`, via `/`) both show the email
+option only when the flag is on.
+
+Tests: `tests/email-login.test.ts`.
