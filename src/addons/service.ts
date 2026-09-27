@@ -5,6 +5,7 @@ import {
   getRegistered as getRegisteredDepartment,
 } from '../departments/registry'
 import './modules'
+import type { AddonManifestV1 } from './contract'
 import {
   assertAddonRuntimeContract,
   getRegisteredAddon,
@@ -24,13 +25,22 @@ import type { LoopManifest } from '../loops/manifest'
 
 export type AddonState = 'installed' | 'configured' | 'active' | 'disabled' | 'archived'
 
+// Single source of truth for the persisted trust_class vocabulary — mirrors
+// AddonManifestV1['trustClass'] (contract.ts) exactly, so widening the manifest's
+// trust vocabulary and forgetting to widen the persistence layer becomes a type error
+// instead of a silent runtime mismatch. Widened from the bare 'native_reviewed' literal
+// alongside migrations/0175_addon_external_isolated.sql (mupot#1580) — see
+// externalIsolationViolation below for what an 'external_isolated' installAddon call
+// additionally requires of the manifest before this value is ever persisted.
+export type AddonTrustClass = AddonManifestV1['trustClass']
+
 export interface AddonInstallation {
   id: string
   tenant: string
   addonKey: string
   installedVersion: string
   publisher: string
-  trustClass: 'native_reviewed'
+  trustClass: AddonTrustClass
   manifestSha256: string
   mupotCompatibility: string
   state: AddonState
@@ -58,7 +68,7 @@ export interface AddonReceipt {
   addonKey: string
   installedVersion: string
   publisher: string
-  trustClass: 'native_reviewed'
+  trustClass: AddonTrustClass
   mupotCompatibility: string
   manifestSha256: string
   actorId: string
@@ -100,6 +110,158 @@ export interface AddonLifecycleDeps {
   beforeOperationCompleted?: (event: AddonOperationLifecycleEvent) => void | Promise<void>
 }
 
+// ── External-isolated addon invariants (mupot#1580) ─────────────────────────────
+//
+// A native addon is compiled into the host and reviewed with it — its manifest is
+// trusted the same way the rest of src/ is. An external_mcp addon's ONLY trust
+// boundary is its own MCP endpoint (this pot never runs the addon's code), so
+// installAddon enforces a strictly narrower manifest shape for kind:'external_mcp'
+// before it will ever persist trust_class:'external_isolated' to
+// addon_installations/addon_receipts (migrations/0175_addon_external_isolated.sql
+// widened the CHECK that makes that persist possible at all). Checked in installAddon
+// only — a native addon's manifest is unaffected and unchecked by this function.
+export type AddonExternalInvariantViolation =
+  | 'rank_grants'
+  | 'multiple_departments'
+  | 'agent_template_namespace'
+  | 'metric_namespace'
+  | 'surface_grant_namespace'
+  | 'approval_policy_namespace'
+  | 'connector_binding_kind'
+  | 'loops_not_allowed'
+  | 'event_subscription_allowlist'
+
+// The only event topics an external addon may subscribe to. Deliberately narrow and
+// hand-enumerated (not "whatever the bus happens to define today") — widening this set
+// is a review-worthy decision, not a side effect of adding an unrelated event elsewhere.
+const EXTERNAL_ADDON_EVENT_ALLOWLIST: ReadonlySet<string> = new Set([
+  'task.completed',
+  'message.created',
+])
+
+/** True iff `value` is namespaced under `moduleKey` — i.e. is `moduleKey` followed by a
+ *  literal '.', never a same-prefix lookalike ('growth' must not match 'growthx.foo'). */
+function isNamespacedUnder(value: string, moduleKey: string): boolean {
+  return value.startsWith(`${moduleKey}.`)
+}
+
+/**
+ * Returns the FIRST isolation invariant an external_mcp manifest violates, or null if
+ * it satisfies all of them, checked in the fixed order below (each is independently
+ * mutation-tested). Called from installAddon, configureAddon, AND activateAddon (one
+ * shared predicate, re-checked at every write, not install alone) — a manifest that
+ * started compliant and was somehow swapped for a violating one under the same
+ * registered key is refused at the next write, not just the first.
+ *
+ * "Own namespace" MEANS: departments[0].moduleKey — the addon's OWN single department
+ * — never any other registered department (an external manifest must not be able to
+ * declare `growth`/`agency`, existing native departments, alongside its own, and then
+ * aim a grant/metric/template/policy at THEIR namespace instead).
+ *
+ *   (a) authorityRequests.rankGrants must be empty — an external addon never gets rank;
+ *       rank is a core-surface authority this pot's own reviewed code holds, not
+ *       something an isolated MCP endpoint can be handed.
+ *   (b) every agentTemplates[].departmentModuleKey must equal departments[0]'s
+ *       moduleKey — an external addon cannot template an agent into a department it
+ *       doesn't own.
+ *   (c) every metrics[].ownerDepartment must equal departments[0]'s moduleKey — same
+ *       reasoning as (b), applied to the manifest's declared metric ownership.
+ *   (d) every authorityRequests.surfaceGrants[].capability must be namespaced under
+ *       departments[0]'s moduleKey (moduleKey + '.', a real dotted-namespace prefix,
+ *       never a same-string-prefix lookalike) — never a bare/core-surface name. A
+ *       native addon can request e.g. 'addon.something'; an external one may only ever
+ *       request '<its own department>.*'.
+ *   (e) every approvalPolicies[].action must EITHER be namespaced under departments[0]'s
+ *       moduleKey OR exactly match one of connectorRequirements[].slot (the one
+ *       exemption contract.ts's own write-connector invariant requires — a policy named
+ *       after a connector slot the addon itself declared). Without this, an external
+ *       addon could declare a plausible-sounding, unnamespaced action name (e.g.
+ *       'publish' or 'automate') that happens to collide with — or looks like — a
+ *       core-surface approval gate; namespacing removes that ambiguity entirely.
+ *   (f) every connectorRequirements[].bindingKind must be exactly 'vault_connector' —
+ *       'internal_adapter' (and the 'either' escape hatch, which allows
+ *       'internal_adapter') would let an external addon read first-party in-pot data
+ *       without ever going through the vault's credential boundary.
+ *   (g) loops must be empty and eventSubscriptions must be a subset of
+ *       EXTERNAL_ADDON_EVENT_ALLOWLIST — loops are autonomous approval-gated behavior
+ *       this pot's own reviewed loop templates drive; an external addon does not get to
+ *       declare one, and its event surface is capped to the two topics named above.
+ *   (h) departments must declare EXACTLY ONE entry. Checked LAST (not first) so a
+ *       manifest that declares 2+ departments but keeps every (b)-(g) field pointed at
+ *       departments[0] alone — the shape that would otherwise slip past every per-field
+ *       check above — is still caught here, while a manifest that violates (b)-(g)
+ *       AND has multiple departments reports the more specific reason.
+ */
+export function externalIsolationViolation(manifest: AddonManifestV1): AddonExternalInvariantViolation | null {
+  if (manifest.authorityRequests.rankGrants.length > 0) return 'rank_grants'
+
+  // ownDepartment is checked against departments[0] REGARDLESS of how many departments
+  // are declared — a manifest declaring extra departments (e.g. 'office' + 'growth')
+  // whose OTHER fields still all point at departments[0] alone would otherwise slip
+  // past every per-field namespace check below only to be caught by the
+  // multiple_departments structural check at the very end. Both orderings catch it;
+  // this one keeps each per-field check independently testable (a manifest can violate
+  // ONLY agent_template_namespace, or ONLY metric_namespace, etc., without also having
+  // to trip multiple_departments to reach that department in the first place).
+  const ownDepartment = manifest.departments[0]?.moduleKey ?? ''
+
+  for (const template of manifest.agentTemplates) {
+    if (template.departmentModuleKey !== ownDepartment) return 'agent_template_namespace'
+  }
+
+  for (const metric of manifest.metrics) {
+    if (metric.ownerDepartment !== ownDepartment) return 'metric_namespace'
+  }
+
+  for (const grant of manifest.authorityRequests.surfaceGrants) {
+    if (!isNamespacedUnder(grant.capability, ownDepartment)) return 'surface_grant_namespace'
+  }
+
+  const connectorSlots = new Set(manifest.connectorRequirements.map((connector) => connector.slot))
+  for (const policy of manifest.approvalPolicies) {
+    if (!isNamespacedUnder(policy.action, ownDepartment) && !connectorSlots.has(policy.action)) {
+      return 'approval_policy_namespace'
+    }
+  }
+
+  for (const connector of manifest.connectorRequirements) {
+    if (connector.bindingKind !== 'vault_connector') return 'connector_binding_kind'
+  }
+
+  if (manifest.loops.length > 0) return 'loops_not_allowed'
+
+  for (const event of manifest.eventSubscriptions) {
+    if (!EXTERNAL_ADDON_EVENT_ALLOWLIST.has(event)) return 'event_subscription_allowlist'
+  }
+
+  // Structural gate, checked last: exactly one declared department — this is what
+  // "own namespace" MEANS (see the doc comment above). Placed last so a manifest that
+  // ALSO happens to violate a per-field check above reports that more specific reason
+  // first; a manifest with 2+ departments but every field still pointing at
+  // departments[0] alone reaches here and is refused.
+  if (manifest.departments.length !== 1) return 'multiple_departments'
+
+  return null
+}
+
+/**
+ * Shared trust gate — called from installAddon, configureAddon, and activateAddon
+ * (P2 fix: was install-only). Returns the AddonFailureReason to refuse with, or null
+ * if the manifest's (kind, trustClass) pairing and — for external_mcp — its isolation
+ * invariants are all satisfied.
+ */
+function trustGateViolation(manifest: AddonManifestV1): AddonFailureReason | null {
+  if (manifest.kind === 'native') {
+    return manifest.trustClass === 'native_reviewed' ? null : 'invalid_state'
+  }
+  if (manifest.kind === 'external_mcp') {
+    if (manifest.trustClass !== 'external_isolated') return 'invalid_state'
+    const violation = externalIsolationViolation(manifest)
+    return violation ? `addon_external_invariant:${violation}` : null
+  }
+  return 'invalid_state'
+}
+
 export type AddonFailureReason =
   | 'addon_not_registered'
   | 'manifest_digest_drift'
@@ -108,6 +270,7 @@ export type AddonFailureReason =
   | 'not_authorized'
   | 'operation_busy'
   | 'fence_lost'
+  | `addon_external_invariant:${AddonExternalInvariantViolation}`
   | AddonBindingFailureReason
 
 export type AddonMutationResult =
@@ -124,7 +287,10 @@ interface InstallationRow {
   addon_key: string
   installed_version: string
   publisher: string
+  // LEGACY (migrations/0175) — always 'native_reviewed', never derived from the
+  // manifest. See AddonTrustClass's doc comment and isolation_class below.
   trust_class: 'native_reviewed'
+  isolation_class: AddonTrustClass
   manifest_sha256: string
   mupot_compatibility: string
   state: AddonState
@@ -152,7 +318,9 @@ interface ReceiptRow {
   addon_key: string
   installed_version: string
   publisher: string
+  // LEGACY (migrations/0175) — always 'native_reviewed'. See isolation_class.
   trust_class: 'native_reviewed'
+  isolation_class: AddonTrustClass
   mupot_compatibility: string
   manifest_sha256: string
   actor_id: string
@@ -234,7 +402,7 @@ const INSTALLATION_COLUMNS = `
   id, tenant, addon_key, installed_version, publisher, trust_class,
   manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
   latest_actor_id, latest_receipt_id, installed_at, configured_at,
-  activated_at, disabled_at, archived_at, updated_at, last_error
+  activated_at, disabled_at, archived_at, updated_at, last_error, isolation_class
 `
 
 function installationFromRow(row: InstallationRow): AddonInstallation {
@@ -244,7 +412,9 @@ function installationFromRow(row: InstallationRow): AddonInstallation {
     addonKey: row.addon_key,
     installedVersion: row.installed_version,
     publisher: row.publisher,
-    trustClass: row.trust_class,
+    // isolation_class (migrations/0175), NOT the legacy trust_class column — see
+    // AddonTrustClass's doc comment.
+    trustClass: row.isolation_class,
     manifestSha256: row.manifest_sha256,
     mupotCompatibility: row.mupot_compatibility,
     state: row.state,
@@ -300,7 +470,8 @@ function receiptFromRow(row: ReceiptRow): AddonReceipt {
     addonKey: row.addon_key,
     installedVersion: row.installed_version,
     publisher: row.publisher,
-    trustClass: row.trust_class,
+    // isolation_class (migrations/0175), NOT the legacy trust_class column.
+    trustClass: row.isolation_class,
     mupotCompatibility: row.mupot_compatibility,
     manifestSha256: row.manifest_sha256,
     actorId: row.actor_id,
@@ -937,10 +1108,10 @@ function transitionReceiptStatement(
       id, tenant, installation_id, action, previous_state, next_state,
       addon_key, installed_version, publisher, trust_class,
       mupot_compatibility, manifest_sha256, actor_id, outcome,
-      side_effect_ids, checks, created_at
+      side_effect_ids, checks, created_at, isolation_class
     ) VALUES (
       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-      ?11, ?12, ?13, 'pass', ?14, ?15, ?16
+      ?11, ?12, ?13, 'pass', ?14, ?15, ?16, ?17
     )
   `).bind(
     receipt.id,
@@ -952,13 +1123,17 @@ function transitionReceiptStatement(
     installation.addonKey,
     installation.installedVersion,
     installation.publisher,
-    installation.trustClass,
+    // trust_class is LEGACY (migrations/0175) — always the literal
+    // 'native_reviewed', never derived from the manifest. isolation_class
+    // (appended below) carries the addon's real trust class.
+    'native_reviewed',
     installation.mupotCompatibility,
     installation.manifestSha256,
     operation.actor_id,
     receipt.sideEffectIds,
     receipt.checks,
     receipt.createdAt,
+    installation.trustClass,
   )
 }
 
@@ -1807,7 +1982,7 @@ async function loadCompletedDisableOperationEvidence(
      WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
        AND action = 'disable' AND previous_state = ?11 AND next_state = 'disabled'
        AND addon_key = ?4 AND installed_version = ?5 AND publisher = ?6
-       AND trust_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
+       AND isolation_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
        AND actor_id = ?10 AND outcome = 'pass'
      LIMIT 1
   `).bind(
@@ -1856,7 +2031,7 @@ async function loadCompletedArchiveOperationEvidence(
      WHERE id = ?1 AND tenant = ?2 AND installation_id = ?3
        AND action = 'archive' AND previous_state = 'disabled' AND next_state = 'archived'
        AND addon_key = ?4 AND installed_version = ?5 AND publisher = ?6
-       AND trust_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
+       AND isolation_class = ?7 AND mupot_compatibility = ?8 AND manifest_sha256 = ?9
        AND actor_id = ?10 AND outcome = 'pass'
      LIMIT 1
   `).bind(
@@ -2384,7 +2559,7 @@ export async function getAddonReceipts(env: Env, installationId: string): Promis
     SELECT sequence, id, tenant, installation_id, action, previous_state, next_state,
            addon_key, installed_version, publisher, trust_class,
            mupot_compatibility, manifest_sha256, actor_id, outcome,
-           side_effect_ids, checks, error_code, created_at
+           side_effect_ids, checks, error_code, created_at, isolation_class
       FROM addon_receipts
      WHERE tenant = ?1 AND installation_id = ?2
      ORDER BY sequence DESC
@@ -2608,9 +2783,8 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
   } catch {
     return { ok: false, reason: 'invalid_state' }
   }
-  if (entry.manifest.kind !== 'native' || entry.manifest.trustClass !== 'native_reviewed') {
-    return { ok: false, reason: 'invalid_state' }
-  }
+  const gateViolation = trustGateViolation(entry.manifest)
+  if (gateViolation) return { ok: false, reason: gateViolation }
 
   const existing = await loadLiveInstallation(env, key)
   if (existing) {
@@ -2631,30 +2805,33 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
         INSERT INTO addon_installations (
           id, tenant, addon_key, installed_version, publisher, trust_class,
           manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
-          latest_actor_id, latest_receipt_id, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'installed', NULL, ?9, ?9, ?10, ?11, ?11)
+          latest_actor_id, latest_receipt_id, installed_at, updated_at, isolation_class
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'installed', NULL, ?9, ?9, ?10, ?11, ?11, ?12)
       `).bind(
         installationId,
         env.TENANT_SLUG,
         entry.manifest.key,
         entry.manifest.version,
         entry.manifest.publisher,
-        entry.manifest.trustClass,
+        // trust_class is LEGACY (migrations/0175) — always 'native_reviewed'.
+        // isolation_class (appended below) carries the addon's real trust class.
+        'native_reviewed',
         entry.manifestSha256,
         entry.manifest.mupotCompatibility,
         actor.id,
         receiptId,
         createdAt,
+        entry.manifest.trustClass,
       ),
       env.DB.prepare(`
         INSERT INTO addon_receipts (
           id, tenant, installation_id, action, previous_state, next_state,
           addon_key, installed_version, publisher, trust_class,
           mupot_compatibility, manifest_sha256, actor_id, outcome,
-          side_effect_ids, checks, created_at
+          side_effect_ids, checks, created_at, isolation_class
         ) VALUES (
           ?1, ?2, ?3, 'install', NULL, 'installed', ?4, ?5, ?6, ?7,
-          ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+          ?8, ?9, ?10, 'pass', '[]', ?11, ?12, ?13
         )
       `).bind(
         receiptId,
@@ -2663,12 +2840,13 @@ export async function installAddon(env: Env, actor: AddonActor, key: string): Pr
         entry.manifest.key,
         entry.manifest.version,
         entry.manifest.publisher,
-        entry.manifest.trustClass,
+        'native_reviewed',
         entry.manifest.mupotCompatibility,
         entry.manifestSha256,
         actor.id,
         checks,
         createdAt,
+        entry.manifest.trustClass,
       ),
       env.DB.prepare(`
         SELECT ${INSTALLATION_COLUMNS}
@@ -2714,6 +2892,8 @@ export async function configureAddon(
   } catch {
     return { ok: false, reason: 'invalid_state' }
   }
+  const gateViolation = trustGateViolation(entry.manifest)
+  if (gateViolation) return { ok: false, reason: gateViolation }
 
   const existing = await loadLiveInstallation(env, key)
   if (!existing) return { ok: false, reason: 'invalid_state' }
@@ -2757,10 +2937,10 @@ export async function configureAddon(
             id, tenant, installation_id, action, previous_state, next_state,
             addon_key, installed_version, publisher, trust_class,
             mupot_compatibility, manifest_sha256, actor_id, outcome,
-            side_effect_ids, checks, created_at
+            side_effect_ids, checks, created_at, isolation_class
           ) VALUES (
             ?1, ?2, ?3, 'configure', 'installed', 'configured',
-            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12, ?13
           )
         `).bind(
           receiptId,
@@ -2769,12 +2949,13 @@ export async function configureAddon(
           existing.addonKey,
           existing.installedVersion,
           existing.publisher,
-          existing.trustClass,
+          'native_reviewed',
           existing.mupotCompatibility,
           existing.manifestSha256,
           actor.id,
           checks,
           configuredAt,
+          existing.trustClass,
         ),
         env.DB.prepare(`
           SELECT ${INSTALLATION_COLUMNS}
@@ -2791,10 +2972,10 @@ export async function configureAddon(
             id, tenant, installation_id, action, previous_state, next_state,
             addon_key, installed_version, publisher, trust_class,
             mupot_compatibility, manifest_sha256, actor_id, outcome,
-            side_effect_ids, checks, created_at
+            side_effect_ids, checks, created_at, isolation_class
           ) VALUES (
             ?1, ?2, ?3, 'preflight', NULL, NULL,
-            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pass', '[]', ?11, ?12, ?13
           )
         `).bind(
           receiptId,
@@ -2803,12 +2984,13 @@ export async function configureAddon(
           existing.addonKey,
           existing.installedVersion,
           existing.publisher,
-          existing.trustClass,
+          'native_reviewed',
           existing.mupotCompatibility,
           existing.manifestSha256,
           actor.id,
           checks,
           configuredAt,
+          existing.trustClass,
         ),
       ]
 
@@ -2917,6 +3099,8 @@ export async function activateAddon(
   } catch {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }
+  const gateViolation = trustGateViolation(entry.manifest)
+  if (gateViolation) return { ok: false, reason: gateViolation, state: existing.state }
   if (!hasNoAuthorityGrants(entry)) {
     return { ok: false, reason: 'invalid_state', state: existing.state }
   }

@@ -1,0 +1,81 @@
+-- 0175_addon_external_isolated.sql — add an isolation_class column so an
+-- external_mcp addon (trustClass 'external_isolated') can be installed at all
+-- (mupot#1580, coordinator decision: "close the gap in this PR").
+--
+-- ============================================================================
+-- WHY trust_class IS NOT WIDENED / addon_installations + addon_receipts ARE
+-- NOT REBUILT (STOP-and-report, same discipline as 0173's members/tasks
+-- sections — read those before touching this file again)
+-- ============================================================================
+-- The first version of this migration DID rebuild both tables (CREATE ..._new,
+-- copy rows, DROP, RENAME, inside PRAGMA foreign_keys=off — the same shape
+-- 0042/0158/0165/0171 use). That is WRONG for these two specific tables and
+-- was caught by adversarial review before merge, reproduced on wrangler local
+-- D1 with a single seeded installation row:
+--
+--   D1 applies an entire migration file inside ONE transaction. Within that
+--   transaction, DROP TABLE on a table that other tables hold live
+--   ON DELETE RESTRICT foreign keys to is an implicit DELETE of every row —
+--   and RESTRICT fires IMMEDIATELY, it is never deferred, regardless of any
+--   `PRAGMA foreign_keys` setting. 0173's own investigation (see that file's
+--   header) independently confirmed the identical wall for `members`, INCLUDING
+--   that the "rename table aside first, PRAGMA legacy_alter_table=ON" trick
+--   this migration's first version also tried does NOT dodge it: SQLite
+--   rewrites children's FK text to follow the temporary name regardless of
+--   that pragma, so the final DROP still fails the same way.
+--
+--   addon_installations has 7 tables holding a live RESTRICT FK to it —
+--   addon_operations, addon_operation_failures, addon_resource_ownership,
+--   addon_binding_generations, addon_connector_bindings,
+--   marketing_monitor_runs, marketing_recommendations — and addon_receipts
+--   itself is also referenced back FROM addon_installations
+--   (latest_receipt_id, DEFERRABLE but still RESTRICT). Production already
+--   has live rows (marketing-cro-monitor is active) — `wrangler d1 migrations
+--   apply --remote` with the rebuild shape would fail on the very first
+--   populated tenant and block every later migration in the same deploy.
+--
+--   The local node:sqlite test harness (tests/helpers/migrations.ts) could
+--   not see this: it applies each migration file as its own statement batch
+--   outside a wrapping transaction (or with FK enforcement genuinely
+--   toggleable per-connection), which is not how D1 actually runs a
+--   migration. tests/addon-single-transaction-migration.test.ts (new, this
+--   revision) wraps migration 0175 in an explicit BEGIN/COMMIT before
+--   applying it — matching D1's real semantics — with a seeded installation +
+--   receipt row already present, and mutation-proves the fix: reverting the
+--   migration to the old rebuild shape puts that test back to failing with
+--   `FOREIGN KEY constraint failed`.
+--
+-- DECISION (mirrors 0173's members/squads shape exactly): do not touch
+-- trust_class or its CHECK, and do not rebuild either table. ADD a NEW column,
+-- `isolation_class`, to both addon_installations and addon_receipts — a plain
+-- ADD COLUMN with a DEFAULT is proven safe on a populated table (0173: SQLite
+-- backfills the DEFAULT for every existing row before evaluating the CHECK;
+-- ADD COLUMN never touches FK-referencing children at all, since no row is
+-- ever deleted or moved).
+--
+-- `trust_class` becomes LEGACY from this migration forward: every row, old
+-- and new, keeps trust_class = 'native_reviewed' forever (its CHECK is
+-- unchanged and still enforces exactly that one value) — it is NEVER a lie,
+-- because it is retired, not repurposed; src/addons/service.ts stops reading
+-- it as the addon's real trust class and writes the literal 'native_reviewed'
+-- into it on every insert, same as before this feature existed. `isolation_class`
+-- is the new, real source of truth for an installation/receipt's trust class
+-- (native_reviewed | external_isolated) — every reader in
+-- src/addons/service.ts now maps AddonInstallation.trustClass /
+-- AddonReceipt.trustClass from THIS column, never trust_class.
+--
+-- No triggers change: every existing trigger that compares
+-- installation.trust_class = receipt.trust_class (addon_receipts_snapshot_
+-- matches_installation, addon_transition_receipts_match_installation) keeps
+-- comparing the legacy column, which is internally consistent by
+-- construction (both sides are always 'native_reviewed', for every row,
+-- forever) — those triggers are not weakened or bypassed, they simply stop
+-- being the thing that carries the addon's real trust class.
+
+ALTER TABLE addon_installations
+  ADD COLUMN isolation_class TEXT NOT NULL DEFAULT 'native_reviewed'
+    CHECK (isolation_class IN ('native_reviewed', 'external_isolated'));
+
+ALTER TABLE addon_receipts
+  ADD COLUMN isolation_class TEXT NOT NULL DEFAULT 'native_reviewed'
+    CHECK (isolation_class IN ('native_reviewed', 'external_isolated'));
