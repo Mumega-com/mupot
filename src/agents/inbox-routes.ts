@@ -27,6 +27,7 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
+import { activeSeatEventGrant, isSeatEventsEnabled } from './seat-events'
 
 const MAX_BODY_BYTES = 8192
 
@@ -128,6 +129,16 @@ inboxApp.get('/stream', async (c) => {
   const id = await resolveMemberByToken(c.env, bearerToken(c.req.header('authorization')))
   if (!id) return c.json({ error: 'unauthorized' }, 401) // generic — no auth oracle
   if (!id.boundAgentId) return c.json({ error: 'not_agent_bound' }, 403)
+
+  // One notification consumer per agent: once an agent's hints are granted to a fleet host
+  // (seat_event_grants), this per-agent poller is closed to it, so a Herdr seatlink and an
+  // Orca host can never both be prompting the same seat. Revoking the grant reopens it.
+  if (isSeatEventsEnabled(c.env)) {
+    const grant = await activeSeatEventGrant(c.env, id.boundAgentId)
+    if (grant) {
+      return c.json({ error: 'notify_owned_by_fleet_host', host_agent_id: grant.host_agent_id }, 409)
+    }
+  }
 
   const sinceQ = c.req.query('since')
   let since: number | undefined

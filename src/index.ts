@@ -45,6 +45,7 @@ import { loopsApp } from './loops/routes'
 import { fleetCheckinApp } from './fleet/checkin-routes'
 import { fleetControlApp } from './fleet/control-routes'
 import { fleetAttachApp } from './fleet/attach-routes'
+import { seatEventsApp } from './agents/seat-events-routes'
 import { flightsApp } from './flight/routes'
 import { radarApp } from './dashboard/radar-routes'
 import { studioApp } from './dashboard/studio'
@@ -83,6 +84,8 @@ export { AgentDO } from './agents/agent-do'
 export { SquadCoordinatorDO } from './agents/squad-do'
 // Gated live-roster WebSocket channel (ADR #473) — see src/registry/realtime.ts.
 export { PresenceChannelDO } from './registry/presence-channel-do'
+// Body-free seat-events channel, one socket per fleet host — see src/agents/seat-events.ts.
+export { SeatEventsDO } from './agents/seat-events-do'
 // Workflow class — the CF Workflows runtime discovers it via this named export.
 // The class_name in [[workflows]] must match: "TaskWorkflow".
 export { TaskWorkflow } from './workflows/task-workflow'
@@ -144,6 +147,9 @@ app.route('/api/loops', loopsApp)
 app.route('/api/router', routerApp)
 // Flock check-in (Flock #45): agents POST presence with their member-token (bearer).
 // Inbound only — the pot needs no egress. Mounted before the dashboard '/' catch-all.
+// Seat events (one body-free WebSocket per fleet host). Mounted before the other /api/fleet
+// apps and the dashboard catch-all so every path under it answers JSON, never a redirect.
+app.route('/api/fleet/events', seatEventsApp)
 app.route('/api/fleet', fleetCheckinApp)
 app.route('/api/fleet', fleetControlApp)
 // Agent self-attach/detach (Step 2a): the agent runtime reports ITSELF as running/stopped.

@@ -3205,9 +3205,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0176_seat_event_grants.sql",
+    sha256: "be59694f9f179cc2a1343ee3ec5de43db302c627285f603f6faf59c60ce6ca29",
+    statements: [
+      "-- 0176_seat_event_grants.sql — explicit authorization for one fleet host to receive body-free\n-- inbox hints for one agent over the seat-events channel (src/agents/seat-events.ts).\n--\n-- host_agent_id is the identity whose Ed25519 key (agent_keys) signs the host's ticket\n-- requests. A grant is the ONLY thing that lets that host subscribe to agent_id; a host key\n-- alone authorizes nothing, and fleet_agents.host (self-reported) is never consulted.\n--\n-- One live grant per agent: the partial unique index is the durable half of the\n-- one-consumer-per-UUID fence. Moving an agent between hosts (or from Herdr to Orca) is an\n-- explicit revoke + grant, recorded with who did it and why.\n\nCREATE TABLE IF NOT EXISTS seat_event_grants (\n  id                   TEXT PRIMARY KEY,\n  tenant               TEXT NOT NULL,\n  host_agent_id        TEXT NOT NULL CHECK (length(trim(host_agent_id)) BETWEEN 1 AND 64),\n  agent_id             TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,\n  project_id           TEXT REFERENCES projects(id) ON DELETE CASCADE,\n  granted_by_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  reason               TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 500),\n  created_at           TEXT NOT NULL CHECK (length(trim(created_at)) > 0),\n  revoked_at           TEXT,\n  revoked_by_member_id TEXT REFERENCES members(id) ON DELETE RESTRICT,\n  CHECK ((revoked_at IS NULL) = (revoked_by_member_id IS NULL))\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_seat_event_grants_one_live_host\n  ON seat_event_grants(tenant, agent_id)\n  WHERE revoked_at IS NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_seat_event_grants_host\n  ON seat_event_grants(tenant, host_agent_id)\n  WHERE revoked_at IS NULL;",
+    ],
+    objects: [
+      { type: "table", name: "seat_event_grants" },
+      { type: "index", name: "idx_seat_event_grants_one_live_host" },
+      { type: "index", name: "idx_seat_event_grants_host" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "47173cc24ff81d0a47a1dab174a2a3ba0b2d1f3b95b059b69b8d93e50f4a796a"
+export const SCHEMA_CHAIN_DIGEST: string = "ec3a9a0f1d501cfe9baaf21015090fbedfac76ffbf2a5b89357daf6738415478"

@@ -19,6 +19,7 @@ import { postAgentActivity } from '../channels'
 import { getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
+import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { redactSecretPatterns } from '../lib/redact'
 
@@ -559,6 +560,15 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // `as`: BusEvent's payload is `unknown` by default (the switch on `event.type` does
       // not narrow the generic) — same cast this case already relied on for `p` above.
       const p = event.payload as MessageCreatedPayload
+      // Seat-events leg FIRST (src/agents/seat-events.ts): a body-free hint to the one fleet host
+      // holding this agent. Off unless REALTIME_SEAT_EVENTS=1. A failed publish throws so the
+      // Queue retries; a retry that re-publishes is harmless (the DO and the host both drop a
+      // hint id they have already seen). Runs before Hermes so a Hermes outage cannot starve it.
+      const seat = await publishSeatHint(env, event.tenant, event.payload)
+      if (!seat.ok) {
+        console.error('bus: message.created — seat hint publish failed', { tenant: event.tenant, message_id: p?.message_id, error: seat.error })
+        throw new Error(`message.created seat hint failed: ${seat.error}`)
+      }
       const outcome = await deliverMessageCreatedEvent(env, event as BusEvent<MessageCreatedPayload>)
       const logCtx = {
         tenant: event.tenant,

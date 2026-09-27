@@ -32,6 +32,7 @@ IDP_PROVIDER = "google"           # google | telegram
 # PUBLIC_ORIGIN = "https://mupot.example.com"
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
+# REALTIME_SEAT_EVENTS = "1"      # opt-in body-free seat-events channel (/api/fleet/events). Off by default.
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
                                   # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
@@ -100,6 +101,9 @@ queue = "mupot-events"
 [[queues.consumers]]
 queue = "mupot-events"
 max_batch_size = 10
+# Seat-event hints ride this queue (src/agents/seat-events.ts), so batching delay is hint latency.
+# Unset, the platform default batch timeout applies; 1s bounds the queue's share of commit->hint.
+max_batch_timeout = 1
 max_retries = 3
 dead_letter_queue = "mupot-events-dlq"
 
@@ -146,9 +150,19 @@ class_name = "PresenceChannelDO"
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
 
+# Body-free seat-events channel: one hibernating WebSocket per fleet host. Binding always
+# declared so the class can deploy; inert until REALTIME_SEAT_EVENTS=1 under [vars].
+[[durable_objects.bindings]]
+name = "SEAT_EVENTS"
+class_name = "SeatEventsDO"
+
 [[migrations]]
 tag = "v2"
 new_classes = ["PresenceChannelDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SeatEventsDO"]
 
 # ── durable task pipeline (issue #7) ──
 # Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute

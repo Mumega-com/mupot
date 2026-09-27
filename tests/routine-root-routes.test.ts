@@ -8,6 +8,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 vi.mock('../src/agents/agent-do', () => ({ AgentDO: class {} }))
 vi.mock('../src/agents/squad-do', () => ({ SquadCoordinatorDO: class {} }))
 vi.mock('../src/registry/presence-channel-do', () => ({ PresenceChannelDO: class {} }))
+vi.mock('../src/agents/seat-events-do', () => ({ SeatEventsDO: class {} }))
 vi.mock('../src/workflows/task-workflow', () => ({ TaskWorkflow: class {} }))
 vi.mock('../src/mcp/oauth-api-handler', () => ({ McpOAuthApiHandler: class {} }))
 vi.mock('@cloudflare/workers-oauth-provider', () => ({

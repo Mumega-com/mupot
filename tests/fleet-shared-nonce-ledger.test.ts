@@ -50,6 +50,7 @@ describe('fleet shared nonce ledger', () => {
       'fleet-detach:v1': 300,
       'agent-inbox:v1': 300,
       'runner-receipt:v1': 300,
+      'seat-events-ticket:v1': 300,
     })
     expect(SHARED_NONCE_RETENTION_SEC).toBe(600)
 
