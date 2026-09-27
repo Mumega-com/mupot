@@ -34,7 +34,6 @@
     "tests/agent-messages.test.ts",
     "tests/agent-token-lifecycle.test.ts",
     "tests/auth-bootstrap-owner.test.ts",
-    "tests/auth-dev-login.test.ts",
     "tests/auth-member-bridge.test.ts",
     "tests/billing-plan-setter.test.ts",
     "tests/boot-context.test.ts",
