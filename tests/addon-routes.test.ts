@@ -416,6 +416,16 @@ describe('addon lifecycle routes', () => {
         description: 'Deterministic workflow-graph engine: gated node/edge circuits agents drive through MCP tools.',
         state: null,
       },
+      {
+        key: 'mcpwp-office',
+        name: 'Office (WordPress)',
+        version: '1.0.0',
+        publisher: 'mumega',
+        trustClass: 'external_isolated',
+        kind: 'external_mcp',
+        description: 'WordPress as each pot’s office — publish and review content through the mcpwp MCP endpoint under gate.',
+        state: null,
+      },
     ])
     for (const addon of body.addons) {
       expect(Object.keys(addon).sort()).toEqual([
