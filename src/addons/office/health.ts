@@ -90,9 +90,10 @@ function parseSiteConnectorConfig(meta: string | null): SiteConnectorConfig | nu
  * checkMcpwpOfficeHealth — the mcpwp-office addon's own health probe.
  *
  * Resolves the bound 'wordpress_site' connector by id, asserts its stored
- * siteUrl is a public https origin (SSRF guard — throws BEFORE any fetch), then
- * POSTs a JSON-RPC `initialize` request to `<origin>/wp-json/mcpwp/v1/mcp`
- * through the connector's one-shot authenticatedFetch:
+ * siteUrl is a public https URL (SSRF guard — throws BEFORE any fetch), then
+ * POSTs a JSON-RPC `initialize` request to `<siteUrl-path>/wp-json/mcpwp/v1/mcp`
+ * (the FULL stored path, not just the origin — a subdirectory WordPress install
+ * needs its own path preserved) through the connector's one-shot authenticatedFetch:
  *   - 200 (any well-formed response)      -> { status: 'available' }               (both checks pass)
  *   - 401 or 403                          -> { status: 'failed', reason: 'key_invalid' }
  *   - any other non-2xx, redirect, thrown, or timed-out response
@@ -110,14 +111,20 @@ export async function checkMcpwpOfficeHealth(
     const config = parseSiteConnectorConfig(connector.meta)
     if (!config) return unavailable('invalid_site_config')
 
-    let origin: string
+    let base: URL
     try {
-      origin = assertPublicHttpsUrl(config.siteUrl).origin
+      base = assertPublicHttpsUrl(config.siteUrl)
     } catch {
       return unavailable('invalid_site_url')
     }
 
-    const endpoint = new URL(MCPWP_MCP_PATH, origin)
+    // Resolve against the FULL stored URL, not just its origin — a WordPress site
+    // installed under a subdirectory (e.g. https://example.com/blog) must probe
+    // https://example.com/blog/wp-json/mcpwp/v1/mcp, not the bare-origin path (P3
+    // fix: `new URL(MCPWP_MCP_PATH, base.origin)` silently dropped `base.pathname`
+    // and always probed the wrong endpoint for any non-root install).
+    const basePath = base.pathname.endsWith('/') ? base.pathname.slice(0, -1) : base.pathname
+    const endpoint = new URL(`${basePath}${MCPWP_MCP_PATH}`, base.origin)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), MCPWP_OFFICE_HEALTH_TIMEOUT_MS)
     try {

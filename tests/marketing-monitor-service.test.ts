@@ -32,6 +32,7 @@ const migrations = [
   '../migrations/0043_member_tokens_tenant.sql',
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
+  '../migrations/0175_addon_external_isolated.sql',
   '../migrations/0053_marketing_monitor_runs.sql',
   // 0099 adds member_tokens.expires_at/last_used_at, which the bearer lookup now
   // references. Omitting it here does not skip a feature — it makes the auth query

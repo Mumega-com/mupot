@@ -88,7 +88,11 @@ function mutationOutcome(result: MutationFailure) {
     // (src/addons/service.ts externalIsolationViolation) — same 409 bucket as any
     // other "this manifest/installation cannot transition right now" refusal.
     case 'addon_external_invariant:rank_grants':
+    case 'addon_external_invariant:multiple_departments':
+    case 'addon_external_invariant:agent_template_namespace':
+    case 'addon_external_invariant:metric_namespace':
     case 'addon_external_invariant:surface_grant_namespace':
+    case 'addon_external_invariant:approval_policy_namespace':
     case 'addon_external_invariant:connector_binding_kind':
     case 'addon_external_invariant:loops_not_allowed':
     case 'addon_external_invariant:event_subscription_allowlist':

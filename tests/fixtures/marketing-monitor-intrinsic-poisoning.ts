@@ -24,6 +24,7 @@ const migrations = [
   'migrations/0043_member_tokens_tenant.sql',
   'migrations/0050_addons.sql',
   'migrations/0052_addon_bindings.sql',
+  'migrations/0175_addon_external_isolated.sql',
   'migrations/0053_marketing_monitor_runs.sql',
 ]
 

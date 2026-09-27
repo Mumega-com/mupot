@@ -144,6 +144,10 @@ function installationRow(value: AddonInstallation) {
     archived_at: value.archivedAt,
     updated_at: value.updatedAt,
     last_error: value.lastError,
+    // isolation_class (migrations/0175) is what installationFromRow actually reads for
+    // AddonInstallation.trustClass now — trust_class above is legacy/frozen at
+    // 'native_reviewed' and no longer carries the real value.
+    isolation_class: value.trustClass,
   }
 }
 

@@ -18,15 +18,19 @@
 // it validates + passes the runtime contract, ships the health-check function
 // (src/addons/office/health.ts) that slice 2's tools will call before any
 // WordPress write, and (coordinator decision, same PR) closes the addon-door
-// gap this manifest first exposed: `addon_install` now accepts a
-// kind:'external_mcp' manifest once it passes installAddon's
-// externalIsolationViolation checks (src/addons/service.ts) — rank_grants
-// empty, every surfaceGrants capability namespaced under one of this
-// manifest's own departments, every connectorRequirement bindingKind exactly
-// 'vault_connector', no loops, and eventSubscriptions restricted to an
-// allowlist. addon_installations/addon_receipts' trust_class CHECK was widened
-// to admit 'external_isolated' by migrations/0175_addon_external_isolated.sql.
-// This manifest satisfies every invariant (verified in
+// gap this manifest first exposed: `addon_install`/`addon_configure`/
+// `addon_activate` now accept a kind:'external_mcp' manifest once it passes
+// externalIsolationViolation (src/addons/service.ts, checked at every one of
+// those three writes, not install alone) — rankGrants empty, every
+// surfaceGrants/metrics/agentTemplates entry namespaced under this manifest's
+// OWN single department (never any other registered department), every
+// connectorRequirement bindingKind exactly 'vault_connector', no loops, and
+// eventSubscriptions restricted to an allowlist. addon_installations/
+// addon_receipts gained a NEW `isolation_class` column (migrations/
+// 0175_addon_external_isolated.sql — an ADD COLUMN, not a rebuild; see that
+// file for why the legacy `trust_class` column is untouched) that is the real
+// source of truth for an installation's trust class going forward. This
+// manifest satisfies every invariant (verified in
 // tests/mcpwp-office-addon.test.ts) and installs for real.
 
 import { MUPOT_PUBLIC_API_VERSION } from '../../version'
@@ -100,13 +104,19 @@ export const McpwpOfficeAddon: AddonManifestV1 = {
     // "a required, capability:'write' connectorRequirements entry must have an
     // approvalPolicy whose action equals its slot" — connectorRequirements[0].slot is
     // 'wordpress_site', so an action of that exact name is required independent of the
-    // domain-level 'publish' policy below).
+    // domain-level 'office.publish' policy below). This is also the one approvalPolicies
+    // action externalIsolationViolation exempts from its own-department-namespace
+    // requirement (src/addons/service.ts) — it is named after a connector slot this
+    // manifest itself declares, not a bare/unnamespaced action.
     { action: 'wordpress_site', requiredCapability: 'lead', selfApproval: false },
-    // The domain-level "publish = with review" policy named in the brief. Distinct from
-    // the binding-gate policy above: this one gates the office.publish_post tool itself
-    // (slice 2), the way WordpressChannel's own content-publish work-type requires 'lead'
-    // (src/departments/channels/wordpress-channel.ts).
-    { action: 'publish', requiredCapability: 'lead', selfApproval: false },
+    // The domain-level "publish = with review" policy named in the brief. Namespaced
+    // under this addon's own 'office' department (externalIsolationViolation's
+    // approval_policy_namespace invariant — an external addon may not declare an
+    // unnamespaced action like bare 'publish', which could read as a core-surface gate).
+    // Distinct from the binding-gate policy above: this one gates the
+    // office.publish_post tool itself (slice 2), the way WordpressChannel's own
+    // content-publish work-type requires 'lead' (src/departments/channels/wordpress-channel.ts).
+    { action: 'office.publish', requiredCapability: 'lead', selfApproval: false },
   ],
   healthChecks: ['wordpress_site_endpoint_reachable', 'wordpress_site_key_valid'],
   retention: { disablePreservesData: true, purgeRequiresOwner: true },

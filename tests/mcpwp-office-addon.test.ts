@@ -4,8 +4,9 @@
 // Schema: real D1 (node:sqlite via createSqliteD1) + applyAllMigrations() — this file
 // imports production code (src/addons/service.ts's installAddon/disableAddon/
 // archiveAddon), so per scripts/check-test-schema-source.mjs it must build its schema
-// from the committed migration chain (migrations/0175_addon_external_isolated.sql is
-// what makes an 'external_isolated' trust_class row persistable at all).
+// from the committed migration chain (migrations/0175_addon_external_isolated.sql adds
+// the isolation_class column that makes an 'external_isolated' row persistable at all —
+// an ADD COLUMN, not a table rebuild; see that file's header for why).
 
 import type { AddonManifestV1 } from '../src/addons/contract'
 import { describe, expect, it } from 'vitest'
@@ -19,7 +20,9 @@ import {
 import { getRegistered as getRegisteredDepartment } from '../src/departments/registry'
 import { McpwpOfficeAddon } from '../src/addons/office/manifest'
 import {
+  activateAddon,
   archiveAddon,
+  configureAddon,
   disableAddon,
   externalIsolationViolation,
   installAddon,
@@ -43,8 +46,8 @@ function realEnv(harness: SqliteD1Harness): Env {
 
 function installationRow(harness: SqliteD1Harness, addonKey: string) {
   return harness.sqlite.prepare(
-    `SELECT state, trust_class FROM addon_installations WHERE tenant = ? AND addon_key = ?`,
-  ).get(TENANT, addonKey) as { state: string; trust_class: string } | undefined
+    `SELECT state, trust_class, isolation_class FROM addon_installations WHERE tenant = ? AND addon_key = ?`,
+  ).get(TENANT, addonKey) as { state: string; trust_class: string; isolation_class: string } | undefined
 }
 
 function receiptCount(harness: SqliteD1Harness, addonKey: string): number {
@@ -70,6 +73,60 @@ async function registerViolatingVariant(overrides: Partial<AddonManifestV1>): Pr
   const variant: AddonManifestV1 = { ...McpwpOfficeAddon, ...overrides, key }
   await registerAddon(variant)
   return key
+}
+
+/**
+ * Seeds an 'installed' row (+ its matching install receipt) DIRECTLY via SQL for an
+ * already-registered key — bypassing installAddon's own trustGateViolation entirely.
+ * This is what lets the configureAddon/activateAddon tests below prove those two
+ * functions independently re-check the SAME shared predicate, rather than merely
+ * inheriting install's earlier refusal: for a violating manifest, installAddon would
+ * refuse before ever creating this row, so the only way to exercise configureAddon's/
+ * activateAddon's OWN gate is to hand-seed a row as if install had (incorrectly)
+ * succeeded — mirroring exactly the two-statement shape installAddon's own batch writes.
+ */
+function seedInstalledRow(harness: SqliteD1Harness, key: string, actorId = 'owner-1'): void {
+  const entry = getRegisteredAddon(key)
+  if (!entry) throw new Error(`fixture error: ${key} is not registered`)
+  const installationId = `seed-install-${key}`
+  const receiptId = `seed-receipt-${key}`
+  const now = '2026-01-01T00:00:00.000Z'
+  // addon_installations' FK to addon_receipts is DEFERRABLE INITIALLY DEFERRED — but
+  // that only defers to the END OF THE ENCLOSING TRANSACTION. Two separate .run() calls
+  // in autocommit mode are each their own implicit transaction, so the deferred check
+  // still fires immediately after the FIRST insert (before the receipt exists) and
+  // throws FOREIGN KEY constraint failed. An explicit BEGIN/COMMIT around both — exactly
+  // how installAddon's own env.DB.batch() commits both statements atomically — defers
+  // the check to COMMIT, by which point both rows exist.
+  harness.sqlite.exec('BEGIN')
+  try {
+    harness.sqlite.prepare(`
+      INSERT INTO addon_installations (
+        id, tenant, addon_key, installed_version, publisher, trust_class,
+        manifest_sha256, mupot_compatibility, state, latest_previous_state, installed_by,
+        latest_actor_id, latest_receipt_id, installed_at, updated_at, isolation_class
+      ) VALUES (?, ?, ?, ?, ?, 'native_reviewed', ?, ?, 'installed', NULL, ?, ?, ?, ?, ?, ?)
+    `).run(
+      installationId, TENANT, entry.manifest.key, entry.manifest.version, entry.manifest.publisher,
+      entry.manifestSha256, entry.manifest.mupotCompatibility, actorId, actorId, receiptId, now, now,
+      entry.manifest.trustClass,
+    )
+    harness.sqlite.prepare(`
+      INSERT INTO addon_receipts (
+        id, tenant, installation_id, action, previous_state, next_state,
+        addon_key, installed_version, publisher, trust_class,
+        mupot_compatibility, manifest_sha256, actor_id, outcome,
+        side_effect_ids, checks, created_at, isolation_class
+      ) VALUES (?, ?, ?, 'install', NULL, 'installed', ?, ?, ?, 'native_reviewed', ?, ?, ?, 'pass', '[]', '{}', ?, ?)
+    `).run(
+      receiptId, TENANT, installationId, entry.manifest.key, entry.manifest.version, entry.manifest.publisher,
+      entry.manifest.mupotCompatibility, entry.manifestSha256, actorId, now, entry.manifest.trustClass,
+    )
+    harness.sqlite.exec('COMMIT')
+  } catch (error) {
+    harness.sqlite.exec('ROLLBACK')
+    throw error
+  }
 }
 
 describe('mcpwp-office addon manifest', () => {
@@ -131,7 +188,7 @@ describe('mcpwp-office addon manifest', () => {
   it('gates publish with review and satisfies the write-connector approval-policy invariant', () => {
     expect(McpwpOfficeAddon.approvalPolicies).toEqual(expect.arrayContaining([
       { action: 'wordpress_site', requiredCapability: 'lead', selfApproval: false },
-      { action: 'publish', requiredCapability: 'lead', selfApproval: false },
+      { action: 'office.publish', requiredCapability: 'lead', selfApproval: false },
     ]))
   })
 
@@ -193,16 +250,18 @@ describe('mcpwp-office addon manifest', () => {
 
   // ── The addon door, proven open (mupot#1580 coordinator decision) ───────────
   //
-  // src/addons/service.ts installAddon now accepts kind:'external_mcp' once the
-  // manifest passes externalIsolationViolation, and
-  // migrations/0175_addon_external_isolated.sql widened addon_installations/
-  // addon_receipts' trust_class CHECK to admit 'external_isolated'. This section
-  // proves the REAL manifest installs, that install is followed all the way
-  // through disable (data preserved) and archive (refused for a non-owner actor),
-  // and that each of installAddon's four isolation invariants independently
-  // refuses a manifest that violates it.
+  // src/addons/service.ts installAddon/configureAddon/activateAddon now accept
+  // kind:'external_mcp' once the manifest passes externalIsolationViolation, and
+  // migrations/0175_addon_external_isolated.sql added the isolation_class column
+  // (NOT a trust_class rebuild — see that file's header for why: D1 applies a
+  // migration in one transaction, and 7 live tables hold ON DELETE RESTRICT FKs
+  // to addon_installations, so a drop/recreate would fail on any populated tenant).
+  // This section proves the REAL manifest installs, that install is followed all
+  // the way through disable (data preserved) and archive (refused for a
+  // non-owner actor), and that each isolation invariant independently refuses a
+  // manifest that violates it.
 
-  it('installs the real mcpwp-office manifest and persists trust_class external_isolated', async () => {
+  it('installs the real mcpwp-office manifest and persists isolation_class external_isolated', async () => {
     const harness = realHarness()
     const result = await installAddon(realEnv(harness), { id: 'owner-1', role: 'owner' }, 'mcpwp-office')
 
@@ -213,12 +272,15 @@ describe('mcpwp-office addon manifest', () => {
     expect(result.installation.trustClass).toBe('external_isolated')
     expect(result.installation.addonKey).toBe('mcpwp-office')
 
-    // Not just the TS-typed return value — the widened SQL CHECK actually accepted
-    // the row. A pre-0175 CHECK (trust_class = 'native_reviewed') would abort this
-    // INSERT and installAddon would surface it as write_failed instead.
+    // Not just the TS-typed return value — the widened schema actually accepted the
+    // row. A pre-0175 schema (no isolation_class column at all) would abort this
+    // INSERT and installAddon would surface it as write_failed instead. trust_class
+    // (legacy, migrations/0175) stays frozen at 'native_reviewed' forever — never a
+    // lie, because it's retired, not repurposed; isolation_class is the real value.
     expect(installationRow(harness, 'mcpwp-office')).toEqual({
       state: 'installed',
-      trust_class: 'external_isolated',
+      trust_class: 'native_reviewed',
+      isolation_class: 'external_isolated',
     })
     harness.close()
   })
@@ -251,7 +313,8 @@ describe('mcpwp-office addon manifest', () => {
     expect(disabled.state).toBe('disabled')
     expect(installationRow(harness, 'mcpwp-office')).toEqual({
       state: 'disabled',
-      trust_class: 'external_isolated',
+      trust_class: 'native_reviewed',
+      isolation_class: 'external_isolated',
     })
     // "Disable preserves data" — the addon_receipts append-only ledger keeps every
     // prior receipt (install's) and only ADDS the disable receipt; nothing is deleted.
@@ -285,7 +348,8 @@ describe('mcpwp-office addon manifest', () => {
     expect(refused).toEqual({ ok: false, reason: 'not_authorized' })
     expect(installationRow(harness, 'mcpwp-office')).toEqual({
       state: 'disabled',
-      trust_class: 'external_isolated',
+      trust_class: 'native_reviewed',
+      isolation_class: 'external_isolated',
     })
     harness.close()
   })
@@ -327,6 +391,30 @@ describe('mcpwp-office addon manifest', () => {
         expected: 'rank_grants',
       },
       {
+        name: 'agent_template_namespace',
+        overrides: {
+          agentTemplates: [{ ...McpwpOfficeAddon.agentTemplates[0], departmentModuleKey: 'fixture' }],
+        },
+        expected: 'agent_template_namespace',
+      },
+      {
+        // 'fixture' must ALSO be declared (assertAddonRuntimeContract requires a
+        // metric's ownerDepartment to be one of the manifest's OWN declared
+        // departments) — this is deliberately the ONE case that also has 2
+        // departments, and still reports metric_namespace, not multiple_departments,
+        // because externalIsolationViolation checks metrics against departments[0]
+        // ('office') BEFORE its final "exactly one department" check.
+        name: 'metric_namespace',
+        overrides: {
+          departments: [{ moduleKey: 'office', required: true }, { moduleKey: 'fixture', required: true }],
+          // 'fixture.pings' is a REAL descriptor FixtureModule emits (departments/
+          // modules/fixture.ts) — assertAddonRuntimeContract requires the descriptor
+          // to actually exist under the claimed owner, not just the owner to be declared.
+          metrics: [{ descriptorKey: 'fixture.pings', ownerDepartment: 'fixture' }],
+        },
+        expected: 'metric_namespace',
+      },
+      {
         name: 'surface_grant_namespace',
         overrides: {
           authorityRequests: {
@@ -337,6 +425,37 @@ describe('mcpwp-office addon manifest', () => {
           },
         },
         expected: 'surface_grant_namespace',
+      },
+      {
+        // P3 fix, round 1 SURVIVOR: isNamespacedUnder requires the literal '.' boundary
+        // ('office.') — a bare `startsWith(moduleKey)` would let 'officeX.exploit' pass
+        // as if it were namespaced under 'office', since the strings share a prefix
+        // without sharing a namespace. Same-string-prefix lookalike, not a real dotted
+        // child of departments[0].
+        name: 'surface_grant_namespace_prefix_lookalike',
+        overrides: {
+          authorityRequests: {
+            rankGrants: [],
+            surfaceGrants: [
+              {
+                subjectRef: 'site-operator',
+                capability: 'officeX.exploit',
+                reason: 'invariant probe — prefix lookalike must not pass as namespaced',
+              },
+            ],
+          },
+        },
+        expected: 'surface_grant_namespace',
+      },
+      {
+        name: 'approval_policy_namespace',
+        overrides: {
+          approvalPolicies: [
+            { action: 'wordpress_site', requiredCapability: 'lead', selfApproval: false },
+            { action: 'automate', requiredCapability: 'lead', selfApproval: false },
+          ],
+        },
+        expected: 'approval_policy_namespace',
       },
       {
         name: 'connector_binding_kind',
@@ -363,6 +482,16 @@ describe('mcpwp-office addon manifest', () => {
         overrides: { eventSubscriptions: ['agent.wake'] },
         expected: 'event_subscription_allowlist',
       },
+      {
+        // Every other field still points at departments[0] ('office') alone — the
+        // shape that would slip past every per-field namespace check above and is
+        // only caught by the final "exactly one department" structural gate.
+        name: 'multiple_departments',
+        overrides: {
+          departments: [{ moduleKey: 'office', required: true }, { moduleKey: 'fixture', required: true }],
+        },
+        expected: 'multiple_departments',
+      },
     ]
 
     for (const testCase of cases) {
@@ -384,6 +513,49 @@ describe('mcpwp-office addon manifest', () => {
 
     it('passes with zero violations for the real, unmodified manifest', () => {
       expect(externalIsolationViolation(McpwpOfficeAddon)).toBeNull()
+    })
+  })
+
+  // P2 fix: the trust gate (kind/trustClass pairing + externalIsolationViolation) is a
+  // SHARED predicate, called from installAddon, configureAddon, AND activateAddon — not
+  // install alone. These two tests seed an 'installed' row directly (see
+  // seedInstalledRow's doc comment) for a manifest registered with a rank_grants
+  // violation, so installAddon is never involved — proving configureAddon/activateAddon
+  // check the SAME predicate independently, not merely inheriting install's refusal.
+  describe('the shared trust gate is also enforced at configure and activate', () => {
+    const violatingOverrides: Partial<AddonManifestV1> = {
+      authorityRequests: {
+        rankGrants: [{
+          subjectRef: 'site-operator',
+          capability: 'member',
+          scopeType: 'org',
+          scopeRef: null,
+          reason: 'invariant probe — must be refused',
+        }],
+        surfaceGrants: McpwpOfficeAddon.authorityRequests.surfaceGrants,
+      },
+    }
+
+    it('configureAddon refuses', async () => {
+      const harness = realHarness()
+      const key = await registerViolatingVariant(violatingOverrides)
+      seedInstalledRow(harness, key)
+
+      const result = await configureAddon(realEnv(harness), { id: 'owner-1', role: 'owner' }, key)
+
+      expect(result).toEqual({ ok: false, reason: 'addon_external_invariant:rank_grants' })
+      harness.close()
+    })
+
+    it('activateAddon refuses', async () => {
+      const harness = realHarness()
+      const key = await registerViolatingVariant(violatingOverrides)
+      seedInstalledRow(harness, key)
+
+      const result = await activateAddon(realEnv(harness), { id: 'owner-1', role: 'owner' }, key)
+
+      expect(result).toEqual({ ok: false, reason: 'addon_external_invariant:rank_grants', state: 'installed' })
+      harness.close()
     })
   })
 })
