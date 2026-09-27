@@ -263,6 +263,36 @@ export function isOrgAdmin(auth: AuthContext | null | undefined): boolean {
   return hasCapability(auth.capabilities, 'org', null, 'admin')
 }
 
+/**
+ * sessionMemberId — the ONE way a request handler may read "which member is
+ * this session" (mupot#1583 round 1, P0). Pure and synchronous, on purpose:
+ * `auth.memberId` / `auth.webSessionMemberId` are exactly what the cookie
+ * loader (`loadAuthFromCookie`, src/auth/index.ts) already resolved UNDER
+ * GUARD at session-load time — retrying that resolution per-request, from
+ * bare `auth.email`, is not a safe shortcut, it is a SECOND, independently
+ * audited door onto the same authority.
+ *
+ * mupot#1583 round 1 found exactly that door open twice: src/projects/
+ * index.ts's memberIdFor called resolveHumanMemberId(email-only), whose
+ * resolver walks all the way to step 4 (owner_login_emails -> the unique
+ * org owner) — a plain member logging in via email at an address the org
+ * happened to register as an owner alias inherited the owner's private
+ * project access on every GET/PATCH, with no join key (no OAuth identity)
+ * ever checked for THAT request. src/dashboard/projects.ts's own
+ * memberIdFor was more conservative (decideIdentitylessAttach only, never
+ * the resolver's owner-alias step 4) but still re-derived identity from
+ * email on every request instead of trusting what the cookie loader already
+ * decided — a second, harder-to-audit copy of the same decision.
+ *
+ * The fix is not a better email check — it is deleting the email path
+ * entirely. A member whose identity attach was refused (or never happened)
+ * gets `null` here, exactly like a session that never resolved at all;
+ * there is no fallback door left to close later.
+ */
+export function sessionMemberId(auth: AuthContext): string | null {
+  return auth.memberId ?? auth.webSessionMemberId ?? null
+}
+
 // ── resolve (load grants, fail-closed) ─────────────────────────────────────────
 
 /**

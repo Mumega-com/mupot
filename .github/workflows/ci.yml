@@ -240,6 +240,35 @@ jobs:
       - name: Guard — squad-scope capability checks must not force a bare id past SquadScope
         run: node scripts/check-bare-squad-id-authz.mjs
 
+  member-email-authority-lookup:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is REQUIRED — same reason as the other file-allowlist ratchets above:
+      # this one compares its allowlist against the merge target, and a shallow clone cannot
+      # read it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Ratchet (mupot#1578 defect class, hardened mupot#1583 round 1 P1): a `members` row
+      # must never be resolved by a raw, hand-rolled email-column comparison (any operator,
+      # either operand order, alias-qualified or wrapped in lower/upper/trim/instr, single
+      # literal or several concatenated with `+`) outside the shared identity resolver
+      # (src/members/resolve-human-member.ts + src/members/exclusive-control.ts, the
+      # exclusive-control predicate it consults) — src/projects/index.ts's memberIdFor used
+      # to run exactly such a raw query, handing out a squatted row's capabilities to anyone
+      # who could complete a login with that row's email, even though the SAME login's own
+      # identity attach was correctly refused by the resolver. The allowlist tracks an EXACT
+      # per-file match count and may only shrink, per file, never grow (including by moving
+      # matches into a different file). Self-tests FIRST — same discipline as the other
+      # ratchets: a gate with no tests of its own is the shape this gate exists to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/check-member-email-authority-lookup.test.mjs
+      - name: Guard — members must be resolved by email only through the shared resolver
+        run: node scripts/check-member-email-authority-lookup.mjs
+
   schema-chain-fresh:
     runs-on: ubuntu-latest
     steps:

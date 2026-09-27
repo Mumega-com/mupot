@@ -85,4 +85,22 @@ describe('identity owner-alias + write-once verified_email regression (P0, 587eb
     expect(result.memberId).toBe('mem-owner')
     expect(result.isNew).toBe(false)
   })
+
+  // mupot#1583 round 1 (P0): step 4 (owner_login_emails -> the unique org owner) was
+  // DELETED from the resolver's email-only (no-join-key) branch entirely, not merely
+  // re-gated — no caller shape was ever both reachable and safe (P0-1 above already
+  // forbids the join-key-present "fresh subject" shape; this pins the OTHER, no-join-key
+  // shape a request-time read can reach, which src/projects/index.ts's memberIdFor briefly
+  // exploited this round). Before this fix landed, deleting step 4 from the source would
+  // NOT have failed a single one of this suite's existing tests — this is the test that
+  // closes that gap.
+  it('P0-3: a bare email-only resolve (no join key at all) must never acquire the owner via an alias', async () => {
+    await env.DB.prepare(`INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', ?1)`)
+      .bind(JSON.stringify(['alias@gmail.test']))
+      .run()
+    // No members row exists for 'alias@gmail.test' at all — the ONLY way this could ever
+    // resolve to something is via the (now-deleted) owner-alias step.
+    const id = await resolveHumanMemberId(env, { tenant: TENANT, email: 'alias@gmail.test' })
+    expect(id).toBeNull()
+  })
 })

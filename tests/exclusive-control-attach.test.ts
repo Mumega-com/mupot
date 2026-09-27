@@ -1105,14 +1105,25 @@ describe('P1-a: a login-time denial must also close loadAuthFromCookie\'s own fa
   })
 })
 
-describe('dashboard/projects.ts memberIdFor — via projectAccess (mupot#1551 round 3)', () => {
+describe('dashboard/projects.ts sessionMemberId — via projectAccess (mupot#1551 round 3; mupot#1583 round 1 P0)', () => {
   let harness: SqliteD1Harness | undefined
   afterEach(() => {
     harness?.close()
     harness = undefined
   })
 
-  it('a squatted identity-less row (live bearer) never grants project authority through the email-only fallback', async () => {
+  // mupot#1583 round 1 (P0): dashboard/projects.ts's memberIdFor used to fall back to
+  // decideIdentitylessAttach on bare `auth.email` when neither auth.memberId nor
+  // auth.webSessionMemberId was set (round 3's own fix, below, kept it narrower than
+  // src/projects/index.ts's sibling -- never the full resolver, never owner_login_emails --
+  // but it was still a SECOND, independently-audited identity door beside the cookie
+  // loader's own guarded resolution). Deleted entirely: `sessionMemberId`
+  // (src/auth/capability.ts) now reads ONLY `auth.memberId ?? auth.webSessionMemberId`.
+  // The four cases below (squatted/clean/identified/suspended) are the SAME fixtures round
+  // 3 used to prove the OLD fallback's own correctness -- kept here, with corrected
+  // expectations, so this file's history of what was tried and why stays legible.
+
+  it('a squatted identity-less row (live bearer) never grants project authority via a bare email session', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedMember(harness, 'mem-sq-proj', 'sqproj@example.com')
@@ -1128,7 +1139,7 @@ describe('dashboard/projects.ts memberIdFor — via projectAccess (mupot#1551 ro
     expect(access.workspaceAdmin).toBe(false)
   })
 
-  it('a clean identity-less row resolves normally through the email-only fallback', async () => {
+  it('a clean identity-less row ALSO grants nothing via a bare email session -- the email path is gone, not merely narrowed', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedMember(harness, 'mem-clean-proj', 'cleanproj@example.com')
@@ -1140,10 +1151,10 @@ describe('dashboard/projects.ts memberIdFor — via projectAccess (mupot#1551 ro
     const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
 
     const access = await projectAccess(env, { tenant: TENANT, email: 'cleanproj@example.com', role: 'member' } as any)
-    expect(access.workspaceAdmin).toBe(true)
+    expect(access.workspaceAdmin).toBe(false)
   })
 
-  it('P3 (round 3): pins ignoreLiveIdentity in memberIdFor — an already-identified member (different join key) still resolves project authority, not denied as competing control', async () => {
+  it('an already-identified member (auth.memberId already resolved) resolves project authority regardless of email/identity state', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedMember(harness, 'mem-identified-proj', 'identifiedproj@example.com')
@@ -1165,11 +1176,38 @@ describe('dashboard/projects.ts memberIdFor — via projectAccess (mupot#1551 ro
     expect(linked.ok).toBe(true)
     const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
 
-    const access = await projectAccess(env, { tenant: TENANT, email: 'identifiedproj@example.com', role: 'member' } as any)
+    // The session carries the ALREADY-RESOLVED memberId (what loadAuthFromCookie sets after
+    // a real, guarded attach) -- sessionMemberId reads this directly, no email involved.
+    const access = await projectAccess(env, {
+      tenant: TENANT,
+      email: 'identifiedproj@example.com',
+      memberId: 'mem-identified-proj',
+      role: 'member',
+    } as any)
     expect(access.workspaceAdmin).toBe(true)
   })
 
-  it('a SUSPENDED clean identity-less row does not leak authority through the email-only fallback either (status is not exclusive control)', async () => {
+  it('an already-identified member via webSessionMemberId (email-login bridge) also resolves project authority', async () => {
+    harness = createSqliteD1()
+    applyAllMigrations(harness.sqlite)
+    seedMember(harness, 'mem-ws-proj', 'wsproj@example.com')
+    harness.sqlite
+      .prepare(
+        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'org', NULL, 'owner')`,
+      )
+      .run(crypto.randomUUID(), 'mem-ws-proj')
+    const env = { DB: harness.db, TENANT_SLUG: TENANT } as unknown as Env
+
+    const access = await projectAccess(env, {
+      tenant: TENANT,
+      email: 'wsproj@example.com',
+      webSessionMemberId: 'mem-ws-proj',
+      role: 'member',
+    } as any)
+    expect(access.workspaceAdmin).toBe(true)
+  })
+
+  it('a SUSPENDED clean identity-less row does not leak authority via a bare email session either', async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedMember(harness, 'mem-suspended-proj', 'suspendedproj@example.com', { status: 'suspended' })

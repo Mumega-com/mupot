@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
-import { isOrgAdmin, resolveCapabilities } from '../auth/capability'
+import { isOrgAdmin, resolveCapabilities, sessionMemberId } from '../auth/capability'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -145,17 +145,22 @@ function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
-async function memberIdFor(env: Env, auth: AuthContext): Promise<string | null> {
-  if (auth.memberId) return auth.memberId
-  if (!auth.email) return null
-  const member = await env.DB.prepare(
-    "SELECT id FROM members WHERE email = ? AND tenant = ? AND status = 'active'",
-  ).bind(auth.email, env.TENANT_SLUG).first<{ id: string }>()
-  return member?.id ?? null
-}
-
 async function grantsFor(env: Env, auth: AuthContext): Promise<CapabilityGrant[]> {
-  const memberId = await memberIdFor(env, auth)
+  // mupot#1583 round 1 (P0): this used to fall back to resolveHumanMemberId
+  // on a bare `auth.email` when auth.memberId was unset. mupot#1578's own
+  // fix (a raw, unguarded `members` query) was replaced with the resolver —
+  // but the resolver's email-only branch still walks to its own step 4
+  // (owner_login_emails -> the unique org owner), so an ordinary member
+  // logging in via an email address the org happens to list as an owner
+  // alias inherited the owner's project access on every request, with no
+  // join key (no OAuth identity) ever checked for THIS read. The cookie
+  // loader (loadAuthFromCookie, src/auth/index.ts) already resolves
+  // identity under guard at session-load time — a request-time handler
+  // must read THAT decision (sessionMemberId, src/auth/capability.ts),
+  // never re-derive one from bare email. See sessionMemberId's own doc
+  // comment for the shared-helper rationale (mirrored in
+  // src/dashboard/projects.ts, so the two can never drift apart again).
+  const memberId = sessionMemberId(auth)
   if (!memberId) return []
   return auth.capabilities ?? resolveCapabilities(env, memberId)
 }

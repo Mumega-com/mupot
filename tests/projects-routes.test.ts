@@ -396,7 +396,17 @@ describe('projectsApp', () => {
     })
   })
 
-  it('resolves a dashboard member from the authenticated email within this tenant', async () => {
+  it('mupot#1583 round 1 (P0): a bare authenticated email, with no memberId already resolved, grants NOTHING — see the dedicated describe block below', async () => {
+    // This test used to assert the OPPOSITE: that a plain `auth.email` (no memberId) would
+    // resolve to whatever `members` row matched it and inherit that row's capabilities. That
+    // was mupot#1578/#1583's own defect class — a request-time handler re-deriving identity
+    // from bare email instead of trusting only what the cookie loader (loadAuthFromCookie,
+    // src/auth/index.ts) already resolved under guard. `sessionMemberId` (src/auth/capability.ts)
+    // now reads ONLY `auth.memberId ?? auth.webSessionMemberId` — an email with neither set
+    // gets an empty list, full stop, regardless of what any `members` row says. See
+    // "grantsFor never re-derives identity from bare email" below for the full regression
+    // suite (squatted row, owner_login_emails alias, and the two ways a legitimately
+    // identified session — memberId or webSessionMemberId — stays unaffected).
     harness = makeHarness()
     seedProjects(harness)
     harness.sqlite.exec(`
@@ -406,9 +416,7 @@ describe('projectsApp', () => {
     as(actor({ email: 'member-a@pot.test' }))
 
     const response = await fetch(harness, '/')
-    await expect(response.json()).resolves.toMatchObject({
-      projects: [{ id: 'parent', parent_context: true }, { id: 'visible-child' }],
-    })
+    await expect(response.json()).resolves.toMatchObject({ projects: [] })
   })
 
   it('honors exact squad edges plus org capability administration without trusting request identity', async () => {
@@ -617,5 +625,120 @@ describe('projectsApp', () => {
     expect((await fetch(harness, '/missing', 'PATCH', { name: 'Missing' })).status).toBe(404)
     expect((await fetch(harness, '/visible-child/squads/missing', 'PUT', { access_level: 'write' })).status).toBe(404)
     expect((await fetch(harness, '/visible-child/squads/squad-b', 'DELETE')).status).toBe(404)
+  })
+
+  describe('grantsFor never re-derives identity from bare email (mupot#1578, mupot#1583 round 1 P0)', () => {
+    // mupot#1583 round 1: routing memberIdFor through resolveHumanMemberId(email-only)
+    // (this PR's OWN #1578 fix, one round earlier) opened a WORSE hole than it closed —
+    // the resolver's email-only branch walked all the way to its step 4
+    // (owner_login_emails -> the unique org owner), so a plain member logging in via an
+    // email address the org happens to register as an owner alias inherited the owner's
+    // private project access, with no join key (no OAuth identity) ever checked for that
+    // request. The fix is not a better email check — it is deleting the email path from
+    // grantsFor entirely: `sessionMemberId(auth)` (src/auth/capability.ts) reads ONLY
+    // `auth.memberId ?? auth.webSessionMemberId`, exactly what the cookie loader
+    // (loadAuthFromCookie, src/auth/index.ts) already resolved under guard at
+    // session-load time. A session that carries `auth.email` but neither field set — an
+    // identity attach that was refused, denied, or simply never ran — gets NOTHING here,
+    // regardless of what any DB row keyed by that email says.
+    function seedMemberRow(
+      harness: SqliteD1Harness,
+      id: string,
+      email: string,
+      opts: { withLiveBearer?: boolean } = {},
+    ): void {
+      harness.sqlite
+        .prepare(
+          `INSERT INTO members (id, tenant, email, display_name, status, created_at)
+           VALUES (?, 'pot-a', ?, ?, 'active', datetime('now'))`,
+        )
+        .run(id, email, id)
+      harness.sqlite
+        .prepare(
+          `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+           VALUES (?, ?, 'org', NULL, 'admin')`,
+        )
+        .run(crypto.randomUUID(), id)
+      if (opts.withLiveBearer) {
+        harness.sqlite
+          .prepare(
+            `INSERT INTO member_tokens
+               (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, revoked_at)
+             VALUES (?, ?, ?, 'workspace', 'workspace', datetime('now'), NULL, 'pot-a', NULL, NULL)`,
+          )
+          .run(crypto.randomUUID(), id, crypto.randomUUID())
+      }
+    }
+
+    it('a squatted row (live bearer + org-admin grant) grants nothing to an email-only session — GET empty, PATCH 403', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      seedMemberRow(harness, 'squatter', 'victim@pot.test', { withLiveBearer: true })
+      // Identity attach for this login was already refused elsewhere (decideIdentitylessAttach
+      // denied the live bearer) — auth carries the verified email but NO memberId/capabilities,
+      // exactly what loadAuthFromCookie leaves on a denial.
+      as(actor({ email: 'victim@pot.test' }))
+
+      const list = await fetch(harness, '/')
+      expect(list.status).toBe(200)
+      await expect(list.json()).resolves.toMatchObject({ projects: [] })
+
+      const patch = await fetch(harness, '/visible-child', 'PATCH', { name: 'Pwned' })
+      expect(patch.status).toBe(403)
+      await expect(patch.json()).resolves.toMatchObject({ error: 'forbidden', need: 'admin' })
+    })
+
+    it('mupot#1583 P0: an owner_login_emails alias session (no members row for the alias at all) gets nothing — GET empty, PATCH 403', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      // The REAL org owner: a distinct member row/email, holding org-owner capability and
+      // a private project of their own.
+      seedMemberRow(harness, 'real-owner', 'owner@pot.test', { withLiveBearer: false })
+      harness.sqlite.exec(`
+        INSERT INTO org_settings (key, value) VALUES ('owner_login_emails', '["alias@pot.test"]');
+      `)
+      // The session: an email login as the ALIAS address. No members row exists for
+      // 'alias@pot.test' at all — the only way this could ever resolve to the owner is via
+      // the resolver's (now-deleted) step 4. auth.memberId/webSessionMemberId are unset,
+      // exactly what a real cookie-loaded session for this login would carry.
+      as(actor({ email: 'alias@pot.test' }))
+
+      const list = await fetch(harness, '/')
+      expect(list.status).toBe(200)
+      await expect(list.json()).resolves.toMatchObject({ projects: [] })
+
+      const patch = await fetch(harness, '/visible-child', 'PATCH', { name: 'Pwned' })
+      expect(patch.status).toBe(403)
+      await expect(patch.json()).resolves.toMatchObject({ error: 'forbidden', need: 'admin' })
+    })
+
+    it('an identified member (auth.memberId already resolved by the cookie loader) is unaffected', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      seedMemberRow(harness, 'real-member', 'member@pot.test', { withLiveBearer: false })
+      harness.sqlite.exec(`
+        UPDATE capabilities SET scope_type = 'squad', scope_id = 'squad-a' WHERE member_id = 'real-member';
+      `)
+      // A legitimate session carries the ALREADY-RESOLVED memberId (what loadAuthFromCookie
+      // sets after a real, guarded attach) — never a bare email the route would have to
+      // re-resolve itself.
+      as(actor({ memberId: 'real-member', email: 'member@pot.test' }))
+
+      const detail = await fetch(harness, '/visible-child')
+      expect(detail.status).toBe(200)
+    })
+
+    it('an identified member via webSessionMemberId (email-login/no-loginIdentity bridge) is unaffected', async () => {
+      harness = makeHarness()
+      seedProjects(harness)
+      seedMemberRow(harness, 'real-member-2', 'member2@pot.test', { withLiveBearer: false })
+      harness.sqlite.exec(`
+        UPDATE capabilities SET scope_type = 'squad', scope_id = 'squad-a' WHERE member_id = 'real-member-2';
+      `)
+      as(actor({ webSessionMemberId: 'real-member-2', email: 'member2@pot.test' }))
+
+      const detail = await fetch(harness, '/visible-child')
+      expect(detail.status).toBe(200)
+    })
   })
 })
