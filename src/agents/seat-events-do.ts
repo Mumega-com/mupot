@@ -13,11 +13,17 @@ import { DurableObject } from 'cloudflare:workers'
 import type { Env } from '../types'
 import { reciprocateWebSocketClose } from '../registry/realtime'
 import {
+  AUTH_DEADLINE_SEC,
+  createConnectClock,
+  createJunkTracker,
   normalizeHint,
+  podSocketCapExceeded,
   RecentIds,
   SeatEventsHub,
   storageTicketStore,
+  type ConnectClock,
   type HubSocket,
+  type JunkTracker,
   type SocketState,
 } from './seat-events'
 
@@ -34,6 +40,11 @@ export class SeatEventsDO extends DurableObject<Env> {
   private readonly recent = new RecentIds()
   private readonly nowSec = () => Math.floor(Date.now() / 1000)
   private readonly tickets: ReturnType<typeof storageTicketStore>
+  // mupot#1589 P1-2: these two survive across fetch()/webSocketMessage() calls for the DO's
+  // lifetime (a fresh SeatEventsHub is built per call, but these are constructed once here
+  // and threaded through `deps` every time — same pattern as `recent`/`tickets` above).
+  private readonly junk: JunkTracker = createJunkTracker()
+  private readonly clock: ConnectClock = createConnectClock(this.nowSec)
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -49,6 +60,8 @@ export class SeatEventsDO extends DurableObject<Env> {
       tickets: this.tickets,
       nowSec: this.nowSec,
       recent: this.recent,
+      junk: this.junk,
+      clock: this.clock,
     })
   }
 
@@ -82,8 +95,17 @@ export class SeatEventsDO extends DurableObject<Env> {
       return Response.json({ ok: true, ...(await this.hub().publish(hint)) })
     }
     if (url.pathname === '/connect' && req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+      // mupot#1589 P1-2: bound how many sockets this DO will hold open at all, authenticated
+      // or not, BEFORE accepting a new one — the Worker route's ticket-presence gate keeps
+      // most junk out, but this is the DO's own floor regardless of what got past it.
+      if (podSocketCapExceeded(this.ctx.getWebSockets().length)) {
+        return Response.json({ error: 'seat_events_at_capacity' }, { status: 503 })
+      }
       const pair = new WebSocketPair()
       this.ctx.acceptWebSocket(pair[1])
+      const wrapped = this.wrapOnce(pair[1])
+      this.hub().noteConnected(wrapped)
+      await this.ctx.storage.setAlarm(Date.now() + AUTH_DEADLINE_SEC * 1000)
       return new Response(null, { status: 101, webSocket: pair[0] })
     }
     return new Response('not found', { status: 404 })
@@ -96,5 +118,15 @@ export class SeatEventsDO extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     // Subscriptions live on the socket's attachment and die with it: nothing to clean up.
     reciprocateWebSocketClose(ws, code, reason)
+  }
+
+  /** Sweeps for sockets that connected and never completed hello (mupot#1589 P1-2's auth
+   *  deadline). Reschedules itself while any socket is still unauthenticated; otherwise lets
+   *  the alarm lapse (mirrors PresenceChannelDO's scheduleExpiryAlarm pattern: recompute,
+   *  never assume). */
+  async alarm(): Promise<void> {
+    this.hub().enforceAuthDeadline()
+    const stillPending = this.ctx.getWebSockets().some((ws) => this.wrapOnce(ws).getState() === null)
+    if (stillPending) await this.ctx.storage.setAlarm(Date.now() + AUTH_DEADLINE_SEC * 1000)
   }
 }

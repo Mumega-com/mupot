@@ -27,7 +27,7 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
-import { activeSeatEventGrant, isSeatEventsEnabled } from './seat-events'
+import { activeSeatEventGrant, hostMayReceive, isSeatEventsEnabled } from './seat-events'
 
 const MAX_BODY_BYTES = 8192
 
@@ -133,10 +133,20 @@ inboxApp.get('/stream', async (c) => {
   // One notification consumer per agent: once an agent's hints are granted to a fleet host
   // (seat_event_grants), this per-agent poller is closed to it, so a Herdr seatlink and an
   // Orca host can never both be prompting the same seat. Revoking the grant reopens it.
+  //
+  // mupot#1589 P2-1: the fence predicate must equal the DELIVERY predicate, or a live grant
+  // row can leave an agent fenced from BOTH channels — a suspended host member, a deleted
+  // host key, or a project the agent no longer has (any of `hostMayReceive`'s joins) still
+  // 409'd here even though the fleet host could never actually receive a hint. Reusing
+  // `hostMayReceive` (the SAME query `publish`/`claim` authorize against) rather than a
+  // second, narrower "does a row exist" check closes that gap structurally.
   if (isSeatEventsEnabled(c.env)) {
     const grant = await activeSeatEventGrant(c.env, id.boundAgentId)
     if (grant) {
-      return c.json({ error: 'notify_owned_by_fleet_host', host_agent_id: grant.host_agent_id }, 409)
+      const stillEligible = await hostMayReceive(c.env, grant.host_agent_id, id.boundAgentId)
+      if (stillEligible) {
+        return c.json({ error: 'notify_owned_by_fleet_host', host_agent_id: grant.host_agent_id }, 409)
+      }
     }
   }
 

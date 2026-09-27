@@ -3219,9 +3219,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_seat_event_grants_host" },
     ],
   },
+  {
+    file: "0177_seat_events_ticket_rate_limit.sql",
+    sha256: "7f0a85842fca3f47010a5d55bf2a753d4a78ddab6418d5389ae11286628765e2",
+    statements: [
+      "-- 0177_seat_events_ticket_rate_limit.sql — mupot#1589 adversarial gate round 1 (kasra-review),\n-- P3: \"POST /ticket without authentication costs one D1 read and one Ed25519 verify per\n-- request, with no rate limit.\" That route has no bearer, so the only atomic-guard seam it\n-- can use is the SAME one 0174 built for email-login (a fixed-window UPSERT counter, never a\n-- KV-style read-then-write) — see src/agents/seat-events.ts's `underTicketRateLimit`, keyed on\n-- the connecting IP (never the caller-asserted, unverified-at-that-point host_agent_id).\n--\n-- A dedicated table rather than reusing `email_login_rate_limits`: that table's `scope` column\n-- is CHECK-constrained to email-login's own three scopes, and it is a live, already-applied\n-- table this branch has no reason to touch. The SEAM being reused is the atomic-UPSERT\n-- pattern, not the table.\n--\n-- Fixed 10-minute buckets, not a sliding window — same accepted simplification as\n-- email_login_rate_limits (see that migration's own header): the property being guaranteed is\n-- atomicity under concurrency, not exact sliding-window precision.\n\nCREATE TABLE IF NOT EXISTS seat_events_ticket_rate_limits (\n  tenant        TEXT    NOT NULL,\n  key           TEXT    NOT NULL, -- the resolved cf-connecting-ip value (or 'unknown')\n  window_start  TEXT    NOT NULL, -- ISO instant the 10-minute bucket started\n  count         INTEGER NOT NULL DEFAULT 0,\n  PRIMARY KEY (tenant, key, window_start)\n);",
+    ],
+    objects: [
+      { type: "table", name: "seat_events_ticket_rate_limits" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "ec3a9a0f1d501cfe9baaf21015090fbedfac76ffbf2a5b89357daf6738415478"
+export const SCHEMA_CHAIN_DIGEST: string = "07e46dae5c615dc1a1f60ce74dbaaa86bf2f48058c57062c3b030b0e6c40c494"

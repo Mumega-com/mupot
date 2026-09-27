@@ -46,10 +46,35 @@ export const RECENT_HINT_IDS = 1024
 export const CLOSE_TICKET_INVALID = 4401
 export const CLOSE_NO_SUBSCRIPTIONS = 4409
 
+// mupot#1589 P1-2: an unauthenticated WebSocket could reach SeatEventsDO's /connect and
+// `acceptWebSocket` ran before any credential was checked. The Worker route now refuses an
+// upgrade with no well-formed ticket in the query string before it ever calls the DO
+// (seat-events-routes.ts); the ticket itself is still redeemed exactly once, over the hello
+// frame, exactly as before (`onMessage` below) — this is the outer gate, not a protocol
+// change. These are the DO-side belt-and-braces controls for what happens between accept and
+// a completed hello: a size cap and a junk-frame cap on every frame, a cap on how many
+// concurrent authenticated sockets one host may hold, and an auth deadline that closes a
+// socket that connects and never completes hello at all.
+export const CLOSE_AUTH_TIMEOUT = 4408
+export const CLOSE_PROTOCOL_ABUSE = 4400
+export const AUTH_DEADLINE_SEC = 15
+export const MAX_FRAME_BYTES = 4096
+export const MAX_JUNK_FRAMES = 20
+export const MAX_SOCKETS_PER_HOST = 8
+export const MAX_SOCKETS_PER_POT = 500
+
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/
 const SIG_B64URL_RE = /^[A-Za-z0-9_-]{80,120}$/
 const TICKET_RE = /^[A-Za-z0-9_-]{43}$/
+
+/** Format-only check, used by the Worker route to refuse an upgrade with no
+ *  credential-shaped ticket before the DO is ever called (mupot#1589 P1-2). It does NOT
+ *  prove the ticket is real — only `tickets.take()` (single-use, DO-storage-backed) does
+ *  that, over the hello frame, exactly as before. */
+export function isWellFormedTicket(s: string): boolean {
+  return TICKET_RE.test(s)
+}
 
 export function isSeatEventsEnabled(env: Env): boolean {
   return env.REALTIME_SEAT_EVENTS === SEAT_EVENTS_FLAG && env.SEAT_EVENTS !== undefined
@@ -212,9 +237,16 @@ async function agentHasProject(env: Env, agentId: string, projectId: string): Pr
   return row !== null
 }
 
+/** Tri-state, not boolean (mupot#1589 P2-3): a transient D1 error is NOT the same fact as
+ *  "no grant". `claim()` and `publish()` below must tell them apart — a blip must never read
+ *  as a definitive revocation. Only `hostMayReceive`'s boolean callers (ticket verification's
+ *  per-agent filter, and any caller that already fails closed on its own) collapse 'error'
+ *  into false. */
+export type SeatAuthorization = 'granted' | 'not_granted' | 'error'
+
 /** The per-disclosure check. One indexed query: live grant for (host, agent), agent active,
  *  host key still bound to an active member, project (if scoped) still reachable. */
-export async function hostMayReceive(env: Env, hostAgentId: string, agentId: string): Promise<boolean> {
+export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
   try {
     const row = await env.DB.prepare(
       `SELECT 1 AS x
@@ -230,10 +262,62 @@ export async function hostMayReceive(env: Env, hostAgentId: string, agentId: str
                  WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'))
         LIMIT 1`,
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()
-    return row !== null
+    return row !== null ? 'granted' : 'not_granted'
   } catch {
-    return false // fail closed: a DB error discloses nothing
+    return 'error' // transient — distinct from a definitive not_granted (P2-3)
   }
+}
+
+/** Boolean collapse of authorizeSeatDelivery, for callers that only need yes/no and already
+ *  fail closed on their own path (ticket verification's per-agent grant filter, and tests). */
+export async function hostMayReceive(env: Env, hostAgentId: string, agentId: string): Promise<boolean> {
+  return (await authorizeSeatDelivery(env, hostAgentId, agentId)) === 'granted'
+}
+
+// ── ticket-mint rate limit (mupot#1589 P3) ─────────────────────────────────────────────────
+//
+// POST /ticket has no bearer — anyone can cost the pot one D1 read (loadActiveAgentKey) and
+// one Ed25519 verify per request, with no rate limit at all. The key CANNOT be the caller-
+// asserted host_agent_id (unverified at this point in the request — a caller could spread
+// load across host ids it does not even own to dodge a per-host ceiling); it has to be
+// something the platform derives itself. Same seam as email-login's `underRateLimit`
+// (src/auth/email-login.ts): an UPSERT whose `DO UPDATE ... WHERE count < ?` makes "check the
+// ceiling and record this call" ONE atomic statement, never a KV-style read-then-write —
+// see MEMORY feedback_kv_read_compare_put_is_not_a_guard_under_concurrency.md.
+export const TICKET_RATE_LIMIT_WINDOW_SEC = 600 // 10-minute fixed buckets, same convention as email-login
+export const TICKET_RATE_LIMIT_MAX_PER_IP = 60
+
+export async function underTicketRateLimit(
+  env: Env,
+  ip: string,
+  nowMs: number = Date.now(),
+  max: number = TICKET_RATE_LIMIT_MAX_PER_IP,
+): Promise<boolean> {
+  const windowStart = new Date(
+    Math.floor(nowMs / (TICKET_RATE_LIMIT_WINDOW_SEC * 1000)) * TICKET_RATE_LIMIT_WINDOW_SEC * 1000,
+  ).toISOString()
+  try {
+    const result = await env.DB.prepare(
+      `INSERT INTO seat_events_ticket_rate_limits (tenant, key, window_start, count)
+       VALUES (?1, ?2, ?3, 1)
+       ON CONFLICT (tenant, key, window_start) DO UPDATE SET count = count + 1
+        WHERE count < ?4`,
+    ).bind(env.TENANT_SLUG, ip, windowStart, max).run()
+    return Number(result.meta?.changes ?? 0) > 0
+  } catch (err) {
+    // Fail CLOSED on D1 trouble — same posture as email-login and the enroll-mint limiter: a
+    // crypto-verifying, unauthenticated, D1-reading endpoint must refuse when its own guard
+    // breaks, not open the tap.
+    console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    return false
+  }
+}
+
+/** Pure threshold — the DO's /connect handler calls this with `ctx.getWebSockets().length`
+ *  before ever calling acceptWebSocket (mupot#1589 P1-2 capacity control). Kept pure and
+ *  exported so the boundary itself is unit-testable without workerd. */
+export function podSocketCapExceeded(currentOpenSockets: number): boolean {
+  return currentOpenSockets >= MAX_SOCKETS_PER_POT
 }
 
 // ── signed ticket request ─────────────────────────────────────────────────────────────────
@@ -390,7 +474,11 @@ export interface HubDeps {
   nowSec?: () => number
   /** Bounded memory of recently published hint ids; survives across calls while the DO is awake. */
   recent?: RecentIds
-  authorize?: (host: string, agent: string) => Promise<boolean>
+  authorize?: (host: string, agent: string) => Promise<SeatAuthorization>
+  /** Per-socket junk-frame counter; survives across calls while the DO is awake (mupot#1589 P1-2). */
+  junk?: JunkTracker
+  /** Per-socket connect-time clock backing the auth deadline (mupot#1589 P1-2). */
+  clock?: ConnectClock
 }
 
 export class RecentIds {
@@ -402,6 +490,44 @@ export class RecentIds {
     this.ids.add(id)
     if (this.ids.size > this.max) this.ids.delete(this.ids.values().next().value as string)
     return true
+  }
+}
+
+/** Counts non-conforming frames per socket (mupot#1589 P1-2 — PROBE-G: 1000 junk frames left a
+ *  socket open forever with zero replies). Keyed on the `HubSocket` wrapper's own identity,
+ *  which the DO shell keeps stable per real WebSocket for the DO's lifetime (`wrapOnce`'s
+ *  cache) — a WeakMap here never grows unbounded and needs no eviction of its own. */
+export interface JunkTracker {
+  /** Increment and return the new count for this socket. */
+  bump(sock: HubSocket): number
+}
+
+export function createJunkTracker(): JunkTracker {
+  const counts = new WeakMap<HubSocket, number>()
+  return {
+    bump(sock) {
+      const n = (counts.get(sock) ?? 0) + 1
+      counts.set(sock, n)
+      return n
+    },
+  }
+}
+
+/** Records when a socket was first seen, for the auth deadline (mupot#1589 P1-2). */
+export interface ConnectClock {
+  markConnected(sock: HubSocket): void
+  connectedAt(sock: HubSocket): number | undefined
+}
+
+export function createConnectClock(nowSec: () => number): ConnectClock {
+  const times = new WeakMap<HubSocket, number>()
+  return {
+    markConnected(sock) {
+      if (!times.has(sock)) times.set(sock, nowSec())
+    },
+    connectedAt(sock) {
+      return times.get(sock)
+    },
   }
 }
 
@@ -423,37 +549,79 @@ export async function backlogFor(env: Env, agent: string, since: number): Promis
 export class SeatEventsHub {
   private readonly nowSec: () => number
   private readonly recent: RecentIds
-  private readonly authorize: (host: string, agent: string) => Promise<boolean>
+  private readonly authorize: (host: string, agent: string) => Promise<SeatAuthorization>
+  private readonly junk: JunkTracker
+  private readonly clock: ConnectClock
 
   constructor(private readonly env: Env, private readonly deps: HubDeps) {
     this.nowSec = deps.nowSec ?? (() => Math.floor(Date.now() / 1000))
     this.recent = deps.recent ?? new RecentIds()
-    this.authorize = deps.authorize ?? ((host, agent) => hostMayReceive(env, host, agent))
+    this.authorize = deps.authorize ?? ((host, agent) => authorizeSeatDelivery(env, host, agent))
+    this.junk = deps.junk ?? createJunkTracker()
+    this.clock = deps.clock ?? createConnectClock(this.nowSec)
   }
 
-  /** The only client frame: `{type:'hello', v, ticket, since:{agent:seq}}`. Anything else is ignored. */
+  /** Record that `sock` was just accepted, for enforceAuthDeadline's clock (mupot#1589 P1-2).
+   *  Call exactly once per socket, right after accept, before any message can arrive. */
+  noteConnected(sock: HubSocket): void {
+    this.clock.markConnected(sock)
+  }
+
+  /** Close any socket that connected (per the connect clock) at least AUTH_DEADLINE_SEC ago
+   *  and never completed hello (no state set) — mupot#1589 P1-2. The Worker route and this
+   *  DO's /connect already refuse an upgrade with no well-formed ticket at all before ever
+   *  accepting, so in normal operation this finds nothing to close; it exists so a socket
+   *  that slips past that outer gate (a syntactically valid but forged/expired ticket, or a
+   *  client that opens the socket and then never sends hello) cannot sit open forever. */
+  enforceAuthDeadline(): number {
+    let closed = 0
+    const now = this.nowSec()
+    for (const sock of this.deps.sockets()) {
+      if (sock.getState()) continue
+      const at = this.clock.connectedAt(sock)
+      if (at === undefined || now - at < AUTH_DEADLINE_SEC) continue
+      this.closeSocket(sock, CLOSE_AUTH_TIMEOUT, 'auth_timeout')
+      closed++
+    }
+    return closed
+  }
+
+  /** The only client frame: `{type:'hello', v, ticket, since:{agent:seq}}`. Anything else
+   *  (oversized, unparseable, wrong type, or already-subscribed) is junk-counted, and the
+   *  socket is closed once MAX_JUNK_FRAMES is exceeded (mupot#1589 P1-2 — PROBE-G: 1000 junk
+   *  frames used to leave a socket open forever, replying to nothing). */
   async onMessage(sock: HubSocket, raw: string | ArrayBuffer): Promise<void> {
-    if (typeof raw !== 'string') return
+    const byteLength = typeof raw === 'string' ? new TextEncoder().encode(raw).byteLength : raw.byteLength
+    if (byteLength > MAX_FRAME_BYTES) return this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, 'frame_too_large')
+    if (typeof raw !== 'string') return this.junkFrame(sock) // the wire protocol is JSON text only
     let f: Record<string, unknown>
     try {
       f = JSON.parse(raw)
     } catch {
-      return
+      return this.junkFrame(sock)
     }
-    if (f?.type !== 'hello') return
+    if (f?.type !== 'hello') return this.junkFrame(sock)
     if (sock.getState()) return sock.send(encodeFrame({ type: 'error', reason: 'already_subscribed' }))
     if (f.v !== SEAT_EVENTS_PROTOCOL) return this.reject(sock, 'protocol_unsupported')
     if (typeof f.ticket !== 'string' || !TICKET_RE.test(f.ticket)) return this.reject(sock, 'ticket_invalid')
     const rec = await this.deps.tickets.take(await sha256Hex(f.ticket))
     if (!rec || rec.expires_at < this.nowSec()) return this.reject(sock, 'ticket_invalid')
 
+    // mupot#1589 P1-2 defence in depth: bound how many concurrent AUTHENTICATED sockets one
+    // host may hold. A well-behaved host holds exactly one — the same-host reconnect path
+    // below (claim → 'newer_connection_same_host') supersedes rather than adding a second —
+    // so this is a ceiling against a compromised or buggy host key, not the normal path.
+    const heldByHost = this.deps.sockets().filter((s) => s.getState()?.host === rec.host).length
+    if (heldByHost >= MAX_SOCKETS_PER_HOST) return this.reject(sock, 'host_socket_limit')
+
     const since = (f.since && typeof f.since === 'object' ? f.since : {}) as Record<string, unknown>
     const subs: { agent: string; ok: boolean; reason?: string }[] = []
     const mine: string[] = []
     for (const agent of rec.agents) {
       // Re-check at redeem: a grant revoked between mint and connect must not open.
-      if (!(await this.authorize(rec.host, agent))) {
-        subs.push({ agent, ok: false, reason: 'not_granted' })
+      const status = await this.authorize(rec.host, agent)
+      if (status !== 'granted') {
+        subs.push({ agent, ok: false, reason: status === 'error' ? 'authorization_error' : 'not_granted' })
         continue
       }
       const conflict = await this.claim(sock, rec.host, agent)
@@ -478,6 +646,19 @@ export class SeatEventsHub {
     }
   }
 
+  private junkFrame(sock: HubSocket): void {
+    const n = this.junk.bump(sock)
+    if (n > MAX_JUNK_FRAMES) this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, 'junk_frames')
+  }
+
+  private closeSocket(sock: HubSocket, code: number, reason: string): void {
+    try {
+      sock.close(code, reason)
+    } catch {
+      // already gone
+    }
+  }
+
   /** One live socket per agent. Same host reconnecting supersedes its old socket; another host
    *  that is still authorized keeps the agent (the grant table makes this unreachable unless a
    *  grant moved while an old socket lived — then the old holder is evicted as revoked). */
@@ -486,7 +667,13 @@ export class SeatEventsHub {
       if (other === sock) continue
       const st = other.getState()
       if (!st?.agents.includes(agent)) continue
-      if (st.host !== host && (await this.authorize(st.host, agent))) return 'held_by_other_host'
+      if (st.host !== host) {
+        // mupot#1589 P2-3: a transient error must not read as a confirmed loss of the OTHER
+        // host's grant — only 'not_granted' lets a newcomer steal the agent from a still-live
+        // holder. 'error' defers to the existing holder, same as 'granted' would.
+        const otherStatus = await this.authorize(st.host, agent)
+        if (otherStatus !== 'not_granted') return 'held_by_other_host'
+      }
       const frame: ServerFrame =
         st.host === host
           ? { type: 'superseded', agent, reason: 'newer_connection_same_host' }
@@ -522,9 +709,16 @@ export class SeatEventsHub {
     for (const sock of this.deps.sockets()) {
       const st = sock.getState()
       if (!st?.agents.includes(hint.to_agent)) continue
-      if (!(await this.authorize(st.host, hint.to_agent))) {
+      const status = await this.authorize(st.host, hint.to_agent)
+      if (status === 'not_granted') {
         this.drop(sock, st, hint.to_agent, { type: 'revoked', agent: hint.to_agent, reason: 'grant_revoked' })
         revoked++
+        continue
+      }
+      if (status === 'error') {
+        // mupot#1589 P2-3: a transient D1 error is not a revocation. Skip this ONE hint for
+        // this socket — the grant, the socket and every OTHER subscription stay exactly as
+        // they were; the Queue's own retry (or the next hint) covers the disclosure.
         continue
       }
       try {
