@@ -372,6 +372,7 @@ function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
     // other "this manifest/installation cannot transition right now" refusal.
     case 'addon_external_invariant:rank_grants':
     case 'addon_external_invariant:multiple_departments':
+    case 'addon_external_invariant:core_department_collision':
     case 'addon_external_invariant:agent_template_namespace':
     case 'addon_external_invariant:metric_namespace':
     case 'addon_external_invariant:surface_grant_namespace':

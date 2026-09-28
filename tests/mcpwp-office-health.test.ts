@@ -94,6 +94,76 @@ describe('mcpwp-office health check', () => {
     harness.close()
   })
 
+  // mupot#1587 P1-A: the r2 subdirectory-path-preservation fix had NO test at all —
+  // "reverting it leaves 13/13 health tests green" (the issue's own words). This pins
+  // it: a WordPress install under a subdirectory must be probed at that subdirectory's
+  // own path, not the bare origin. Revert the basePath logic in health.ts and this
+  // must go red.
+  it('pins subdirectory-path preservation: a siteUrl with a path probes that path, not the bare origin', async () => {
+    const harness = makeHarness()
+    const connectorId = await connectorFixture(harness, 'https://wordpress.example.com/blog', 'wordpress-secret-subdir')
+    const fetchSpy = vi.fn(async () => new Response(
+      JSON.stringify({ jsonrpc: '2.0', id: 'mupot-office-health', result: {} }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
+
+    expect(result).toEqual({ status: 'available', observations: [] })
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    const [rawUrl] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string]
+    const url = new URL(String(rawUrl))
+    expect(url.origin).toBe('https://wordpress.example.com')
+    expect(url.pathname).toBe('/blog/wp-json/mcpwp/v1/mcp')
+    harness.close()
+  })
+
+  // mupot#1587 P1-A (round-2 gate on #1582): the endpoint is REBUILT from the stored
+  // siteUrl's own pathname (basePath) concatenated into a new URL string — a pathname
+  // beginning `//` is parsed by the WHATWG URL spec as SCHEME-RELATIVE, silently
+  // changing the HOST the probe (and its vaulted Basic credential) is sent to. Both
+  // vectors below must make ZERO fetch calls and never send the credential anywhere —
+  // reverting the endpoint.origin === base.origin re-check (or the second
+  // assertPublicHttpsUrl call) must turn these red.
+  it('refuses an SSRF vector where the stored path is scheme-relative (leading //) — zero fetches', async () => {
+    const harness = makeHarness()
+    const secret = 'wordpress-secret-ssrf-slashslash'
+    const connectorId = await connectorFixture(
+      harness,
+      'https://blog.example.com//169.254.169.254/x',
+      secret,
+    )
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
+
+    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(JSON.stringify(result)).not.toContain(secret)
+    harness.close()
+  })
+
+  it('refuses an SSRF vector where the stored path starts with a backslash — zero fetches', async () => {
+    const harness = makeHarness()
+    const secret = 'wordpress-secret-ssrf-backslash'
+    const connectorId = await connectorFixture(
+      harness,
+      'https://blog.example.com/\\10.0.0.5',
+      secret,
+    )
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
+
+    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(JSON.stringify(result)).not.toContain(secret)
+    harness.close()
+  })
+
   it('reports key_invalid on a 401 without following up or leaking the response body', async () => {
     const harness = makeHarness()
     const secret = 'wordpress-app-password-wrong'

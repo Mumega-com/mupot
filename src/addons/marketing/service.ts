@@ -3,7 +3,7 @@ import type { Env } from '../../types'
 import { createFlight as canonicalCreateFlight } from '../../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../../flight/meta'
 import { createTask as canonicalCreateTask } from '../../tasks/service'
-import type { AddonActor } from '../service'
+import type { AddonActor, AddonTrustClass } from '../service'
 import { getRegisteredAddon } from '../registry'
 import '../modules'
 import {
@@ -137,7 +137,19 @@ interface InstallationRow {
   addon_key: string
   installed_version: string
   publisher: string
+  // LEGACY (migrations/0175) — always 'native_reviewed' for this addon (marketing-cro-
+  // monitor is kind:'native' and can never be anything else). Still selected/inserted
+  // where a snapshot column of the SAME name exists on another table (e.g.
+  // marketing_monitor_runs.trust_class), but no longer used for IDENTITY comparison
+  // against entry.manifest.trustClass — see isolation_class below (mupot#1587 P2).
   trust_class: 'native_reviewed'
+  // The real trust-class source of truth since migrations/0175 — see
+  // src/addons/service.ts's AddonTrustClass/AddonInstallation doc comments. Always
+  // equal to trust_class for this addon in practice (marketing-cro-monitor is native,
+  // so isolation_class can only ever be 'native_reviewed' too), but this is the column
+  // every identity comparison in this file now reads, matching the convention every
+  // other addon reader in src/addons/service.ts already follows.
+  isolation_class: AddonTrustClass
   mupot_compatibility: string
   manifest_sha256: string
   state: string
@@ -423,7 +435,9 @@ function exactRegisteredIdentity(installation: InstallationRow): boolean {
     && installation.addon_key === entry?.manifest.key
     && installation.installed_version === entry.manifest.version
     && installation.publisher === entry.manifest.publisher
-    && installation.trust_class === entry.manifest.trustClass
+    // mupot#1587 P2: isolation_class (migrations/0175), NOT the legacy trust_class
+    // column — see AddonTrustClass's doc comment in src/addons/service.ts.
+    && installation.isolation_class === entry.manifest.trustClass
     && installation.mupot_compatibility === entry.manifest.mupotCompatibility
     && installation.manifest_sha256 === entry.manifestSha256
 }
@@ -434,7 +448,7 @@ async function loadLiveContext(captured: CapturedDatabase): Promise<
 > {
   const installation = await captured.db.prepare(`
     SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
-           mupot_compatibility, manifest_sha256, state
+           isolation_class, mupot_compatibility, manifest_sha256, state
       FROM addon_installations
      WHERE tenant = ?1 AND addon_key = ?2 AND state <> 'archived'
      LIMIT 1
@@ -1090,7 +1104,7 @@ function scopedRunSelect(limitClause: string): string {
          AND installation.addon_key = ?2
          AND installation.installed_version = ?3
          AND installation.publisher = ?4
-         AND installation.trust_class = ?5
+         AND installation.isolation_class = ?5
          AND installation.mupot_compatibility = ?6
          AND installation.manifest_sha256 = ?7
          AND installation.state <> 'archived'
@@ -1392,7 +1406,7 @@ async function loadPersistedActiveInstallation(
 > {
   const installation = await captured.db.prepare(`
     SELECT id, tenant, addon_key, installed_version, publisher, trust_class,
-           mupot_compatibility, manifest_sha256, state
+           isolation_class, mupot_compatibility, manifest_sha256, state
       FROM addon_installations
      WHERE id = ?1 AND tenant = ?2
      LIMIT 1
@@ -1892,7 +1906,7 @@ export async function getLatestMarketingRecommendation(
          AND installation.addon_key = ?4
          AND installation.installed_version = ?5
          AND installation.publisher = ?6
-         AND installation.trust_class = ?7
+         AND installation.isolation_class = ?7
          AND installation.mupot_compatibility = ?8
          AND installation.manifest_sha256 = ?9
        ORDER BY recommendation.prepared_at DESC, recommendation.id DESC

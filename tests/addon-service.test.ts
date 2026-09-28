@@ -2217,7 +2217,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     expect(await activateAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'active' })
     expect(db.operations()[0].lease_token).not.toBe(staleToken)
     expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
 
     barrier.release()
     expect(await stale).toEqual({ ok: false, reason: 'fence_lost' })
@@ -2364,7 +2364,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
           ok: true,
           state: 'disabled',
         })
-        expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+        expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
           ok: true,
           state: 'archived',
         })
@@ -2579,7 +2579,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
         state: 'disabled',
         installation: { latestPreviousState: state },
       })
-      expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+      expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
         ok: true,
         state: 'archived',
       })
@@ -2601,7 +2601,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     `).run('b'.repeat(64))
 
     expect(await disableAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'disabled' })
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({ ok: true, state: 'archived' })
     expect(db.resources()).toEqual([expect.objectContaining({ active: 0 })])
     expect(db.departments()).toEqual([expect.objectContaining({ active: 0 })])
     expect(db.receipts().filter((receipt) => ['disable', 'archive'].includes(receipt.action))).toEqual([
@@ -2642,7 +2642,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       state: 'disabled',
       installation: { id: active.id },
     })
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
       ok: true,
       state: 'archived',
       installation: { id: active.id },
@@ -2674,7 +2674,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       state: 'disabled',
       installation: { id: active.id },
     })
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
       ok: true,
       state: 'archived',
       installation: { id: active.id },
@@ -3103,7 +3103,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       ok: false,
       reason: 'write_failed',
     })
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toEqual({
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'fence_lost',
     })
@@ -3112,7 +3112,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
     deps.afterInstallationDisabled = undefined
     await disableAddon(db.env, admin, 'fixture-addon', deps)
     const receiptCountBeforeArchive = db.receipts().length
-    const archived = await archiveAddon(db.env, admin, 'fixture-addon')
+    const archived = await archiveAddon(db.env, owner, 'fixture-addon')
 
     expect(archived).toMatchObject({
       ok: true,
@@ -3120,7 +3120,10 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       installation: {
         id: active.id,
         latestPreviousState: 'disabled',
-        latestActorId: admin.id,
+        // mupot#1587 P1-C: archive now requires the OWNER specifically
+        // (retention.purgeRequiresOwner) — the archiving actor is `owner`, not the
+        // `admin` who performed the earlier disable.
+        latestActorId: owner.id,
       },
     })
     expect(db.installations()).toEqual([expect.objectContaining({ id: active.id, state: 'archived' })])
@@ -3134,7 +3137,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       expect.objectContaining({
         previous_state: 'disabled',
         next_state: 'archived',
-        actor_id: admin.id,
+        actor_id: owner.id,
         side_effect_ids: '[]',
       }),
     ])
@@ -3165,7 +3168,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       BEGIN SELECT RAISE(ABORT, 'archive secret detail'); END
     `)
 
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toEqual({
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'write_failed',
     })
@@ -3186,7 +3189,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       id: failedOperation?.id,
       status: 'completed',
       error_code: null,
-      actor_id: admin.id,
+      actor_id: owner.id,
     })
   })
 
@@ -3205,7 +3208,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       UPDATE departments SET active = 0 WHERE id = ?
     `).run(departmentId)
 
-    expect(await archiveAddon(db.env, admin, 'fixture-addon')).toMatchObject({
+    expect(await archiveAddon(db.env, owner, 'fixture-addon')).toMatchObject({
       ok: true,
       state: 'archived',
       installation: { id: first.id },
@@ -3348,7 +3351,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       },
     )
 
-    expect(await archiveAddon(racingEnv, admin, 'fixture-addon')).toEqual({
+    expect(await archiveAddon(racingEnv, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'fence_lost',
     })
@@ -3377,7 +3380,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       },
     )
 
-    expect(await archiveAddon(racingEnv, admin, 'fixture-addon')).toEqual({
+    expect(await archiveAddon(racingEnv, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'write_failed',
     })
@@ -3400,7 +3403,7 @@ describe('addon activation, disable, reactivation, and archive service', () => {
       },
     )
 
-    expect(await archiveAddon(racingEnv, admin, 'fixture-addon')).toEqual({
+    expect(await archiveAddon(racingEnv, owner, 'fixture-addon')).toEqual({
       ok: false,
       reason: 'write_failed',
     })

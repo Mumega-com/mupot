@@ -329,13 +329,8 @@ describe('mcpwp-office addon manifest', () => {
   // analogue (the one teardown action that permanently ends an installation's lifecycle
   // and releases its resource ownership), so this test exercises retention's intent —
   // "a non-owner cannot tear the addon down" — through archiveAddon rather than a
-  // fabricated 'purge' call. Reported to the coordinator as a residual naming gap: this
-  // does not distinguish 'owner' from 'admin' (authorized() treats both as authorized,
-  // same as install/configure/activate/disable), so it proves "refused for member",
-  // not "refused for anyone-but-literally-owner" — a stricter reading of
-  // purgeRequiresOwner would need a new, narrower authorization predicate, which is new
-  // scope beyond this PR's install-door fix.
-  it('archive (the nearest real analogue to "purge") is refused for a non-owner actor, and the addon stays disabled', async () => {
+  // fabricated 'purge' call.
+  it('archive (the nearest real analogue to "purge") is refused for a non-owner member, and the addon stays disabled', async () => {
     const harness = realHarness()
     const owner = { id: 'owner-1', role: 'owner' as const }
     const installed = await installAddon(realEnv(harness), owner, 'mcpwp-office')
@@ -351,6 +346,41 @@ describe('mcpwp-office addon manifest', () => {
       trust_class: 'native_reviewed',
       isolation_class: 'external_isolated',
     })
+    harness.close()
+  })
+
+  // mupot#1587 P1-C fix (Athena, round 2): the test above only proved "refused for
+  // member" — `authorized()` alone already refuses a plain member for EVERY addon-door
+  // action, so it never exercised `retention.purgeRequiresOwner` at all. This is the
+  // real regression proof: an ADMIN, who passes `authorized()` and could install/
+  // configure/activate/disable this exact addon a moment earlier, must now be refused
+  // archive specifically, because the manifest's retention says purge requires the
+  // owner. Mutation-proved below (removing the purgeRequiresOwner check in
+  // archiveAddon must turn this red).
+  it('archive is refused for an admin actor when the manifest requires purgeRequiresOwner, and the addon stays disabled', async () => {
+    const harness = realHarness()
+    const owner = { id: 'owner-1', role: 'owner' as const }
+    const admin = { id: 'admin-1', role: 'admin' as const }
+    const installed = await installAddon(realEnv(harness), admin, 'mcpwp-office')
+    expect(installed.ok).toBe(true)
+    const disabled = await disableAddon(realEnv(harness), admin, 'mcpwp-office')
+    expect(disabled.ok).toBe(true)
+
+    const refused = await archiveAddon(realEnv(harness), admin, 'mcpwp-office')
+
+    expect(refused).toEqual({ ok: false, reason: 'not_authorized' })
+    expect(installationRow(harness, 'mcpwp-office')).toEqual({
+      state: 'disabled',
+      trust_class: 'native_reviewed',
+      isolation_class: 'external_isolated',
+    })
+
+    // The SAME addon, archived by the real owner, still succeeds — the fix refuses
+    // admin specifically, not everyone.
+    const archivedByOwner = await archiveAddon(realEnv(harness), owner, 'mcpwp-office')
+    expect(archivedByOwner.ok).toBe(true)
+    if (!archivedByOwner.ok) throw new Error('unreachable')
+    expect(archivedByOwner.state).toBe('archived')
     harness.close()
   })
 
@@ -389,6 +419,22 @@ describe('mcpwp-office addon manifest', () => {
           },
         },
         expected: 'rank_grants',
+      },
+      {
+        // mupot#1587 P2: an external manifest's OWN department must not collide with a
+        // department a currently-registered NATIVE addon already owns. 'growth' is
+        // owned by marketing-cro-monitor (kind:'native') — declaring it here, with
+        // every other department-referencing field emptied out (so nothing ELSE trips
+        // first), proves the collision is caught, and specifically as
+        // core_department_collision (checked before any per-field namespace check).
+        name: 'core_department_collision',
+        overrides: {
+          departments: [{ moduleKey: 'growth', required: true }],
+          agentTemplates: [],
+          metrics: [],
+          authorityRequests: { rankGrants: [], surfaceGrants: [] },
+        },
+        expected: 'core_department_collision',
       },
       {
         name: 'agent_template_namespace',
@@ -446,6 +492,40 @@ describe('mcpwp-office addon manifest', () => {
           },
         },
         expected: 'surface_grant_namespace',
+      },
+      {
+        // mupot#1587 P3: the bare namespace prefix, with nothing after the dot, must
+        // not count as "namespaced under office" — before the fix, 'office.'
+        // .startsWith('office.') was true.
+        name: 'surface_grant_namespace_bare_prefix',
+        overrides: {
+          authorityRequests: {
+            rankGrants: [],
+            surfaceGrants: [
+              { subjectRef: 'site-operator', capability: 'office.', reason: 'invariant probe — bare prefix' },
+            ],
+          },
+        },
+        expected: 'surface_grant_namespace',
+      },
+      {
+        // mupot#1587 P3: the connector-slot exemption for approvalPolicies is narrowed
+        // to capability:'write' slots only (matching contract.ts's own write-connector
+        // invariant exactly) — a READ-only decoy slot sharing a name with a
+        // core-looking action ('promote_recommendation', marketing-cro-monitor's own
+        // approval action) must NOT exempt that action from namespacing.
+        name: 'approval_policy_namespace_read_only_slot_decoy',
+        overrides: {
+          connectorRequirements: [
+            ...McpwpOfficeAddon.connectorRequirements,
+            { slot: 'promote_recommendation', accepts: ['mcpwp'], required: false, capability: 'read', bindingKind: 'vault_connector' },
+          ],
+          approvalPolicies: [
+            { action: 'wordpress_site', requiredCapability: 'lead', selfApproval: false },
+            { action: 'promote_recommendation', requiredCapability: 'lead', selfApproval: false },
+          ],
+        },
+        expected: 'approval_policy_namespace',
       },
       {
         name: 'approval_policy_namespace',
@@ -513,6 +593,28 @@ describe('mcpwp-office addon manifest', () => {
 
     it('passes with zero violations for the real, unmodified manifest', () => {
       expect(externalIsolationViolation(McpwpOfficeAddon)).toBeNull()
+    })
+
+    // mupot#1587 P3: a bare wildcard segment must not count as namespaced either —
+    // 'office.*' names no SPECIFIC capability. UNIT-LEVEL ONLY (not run through the
+    // registerViolatingVariant + installAddon integration path like the cases above):
+    // contract.ts's own validateAddonManifest ALREADY refuses any surfaceGrants
+    // capability containing '*' at registration time (invalid_surface_capability,
+    // src/addons/contract.ts's validateSurfaceGrant) — so this exact manifest can never
+    // reach externalIsolationViolation through the real installAddon door at all. This
+    // test proves the pure function's OWN defense-in-depth is also correct, independent
+    // of that earlier, more fundamental gate.
+    it('refuses surface_grant_namespace for a bare wildcard segment (unit-level; contract.ts blocks it at registration)', () => {
+      const variant: AddonManifestV1 = {
+        ...McpwpOfficeAddon,
+        authorityRequests: {
+          rankGrants: [],
+          surfaceGrants: [
+            { subjectRef: 'site-operator', capability: 'office.*', reason: 'invariant probe — wildcard' },
+          ],
+        },
+      }
+      expect(externalIsolationViolation(variant)).toBe('surface_grant_namespace')
     })
   })
 
