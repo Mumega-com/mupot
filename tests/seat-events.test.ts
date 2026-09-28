@@ -995,6 +995,24 @@ describe('WebSocket abuse controls (P1-2)', () => {
     // ...and cannot smuggle its way past the pending cap by pointing at authenticated headroom.
     expect(podAcceptRefusal({ authenticated: 1, pending: MAX_PENDING_SOCKETS_PER_POT })).toBe('pending_full')
   })
+
+  it('a pending flood AT its own cap never touches an already-authenticated host (mupot#1594 P1-A)', () => {
+    // The whole point of the SEPARATE cap: with the pot nowhere near its authenticated ceiling,
+    // a pending flood refuses ONLY new pending connections (a distinct reason, 'pending_full',
+    // never 'pot_full') — an authenticated host already holding a socket is on a completely
+    // different counter that this flood never increments or evicts from. Before mupot#1594,
+    // both shared ONE counter (podSocketCapExceeded on ctx.getWebSockets().length), so the
+    // SAME 200-forged-socket flood that fills this pending bucket would have read as the
+    // authenticated pot being full too — "at 500 pending sockets the DO returns 503 to
+    // everyone, Orca included."
+    const floodedPending = { authenticated: 3, pending: MAX_PENDING_SOCKETS_PER_POT }
+    expect(podAcceptRefusal(floodedPending)).toBe('pending_full')
+    expect(podAcceptRefusal(floodedPending)).not.toBe('pot_full')
+    // The authenticated axis alone still has to hit ITS OWN ceiling to refuse — a pending
+    // flood, however large, cannot push it there.
+    expect(podAcceptRefusal({ authenticated: 3, pending: 1_000_000 })).toBe('pending_full')
+    expect(podAcceptRefusal({ authenticated: MAX_SOCKETS_PER_POT, pending: 0 })).toBe('pot_full')
+  })
 })
 
 // ═════════════ mupot#1589 P3: ticket-mint rate limit ═════════════

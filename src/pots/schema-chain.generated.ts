@@ -3253,9 +3253,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "office_publish_freezes" },
     ],
   },
+  {
+    file: "0180_seat_events_route_precheck.sql",
+    sha256: "99891b5d3e197a348fd1ee9bfe46acbcd612dc7546458c326e88ecab97030a1c",
+    statements: [
+      "-- 0180_seat_events_route_precheck.sql — mupot#1594 (gate on #1593 @ f9212ca0, comment\n-- 5860990271, P1-A): \"anonymous lockout of the seat-events channel via forged-ticket\n-- sockets.\" The Worker route (seat-events-routes.ts, GET /) was refusing an upgrade on\n-- SHAPE only (isWellFormedTicket: 43 chars of the right alphabet) — never on whether the\n-- ticket was ever actually minted. 200/200 forged tickets reached SeatEventsDO's /connect,\n-- each consuming one of the pot's 500 socket slots and one acceptWebSocket call.\n--\n-- Two NEW tables, both additive (no rebuild of any parent table):\n--\n-- 1. seat_events_tickets — the route-level, pre-DO existence+expiry check. Minted alongside\n--    the DO-storage record (src/agents/seat-events-routes.ts POST /ticket), scoped by\n--    tenant (the \"audience\" check) and expiry. The route does one indexed SELECT against\n--    THIS table before ever forwarding a WebSocket upgrade to the DO — a forged 43-char\n--    string has a 2^-256 chance of matching a real hash, the same unforgeability guarantee\n--    a signed token would give, without minting a brand-new HMAC secret that would need a\n--    `wrangler secret put` in prod before this could ever take effect (this table needs no\n--    such rollout step — see src/agents/seat-events.ts's `ticketPreCheck` docstring for the\n--    full reasoning). The SINGLE-USE burn stays exactly where it always was — DO storage's\n--    `tickets.take()` — untouched by this migration; this table is a stateless \"does this\n--    look real\" gate, never the source of the one-redemption guarantee.\n--\n-- 2. seat_events_upgrade_rate_limits — same atomic fixed-window UPSERT…WHERE count<cap shape\n--    as 0177's seat_events_ticket_rate_limits, but scoped to the UPGRADE route (GET /), which\n--    had no rate limit at all: an attacker holding zero real tickets can still cost one D1\n--    SELECT per forged attempt via table 1 above, with no ceiling before this. A SEPARATE\n--    table (not a shared one with a new `scope` column) because 0177's table has no scope\n--    column and no CHECK to add one to without touching that already-applied table's shape.\n\nCREATE TABLE IF NOT EXISTS seat_events_tickets (\n  tenant      TEXT    NOT NULL,\n  hash        TEXT    NOT NULL, -- sha256Hex(ticket), same hash the DO's storage key derives from\n  expires_at  INTEGER NOT NULL, -- unix seconds, mirrors the DO-storage TicketRecord.expires_at\n  created_at  TEXT    NOT NULL,\n  PRIMARY KEY (tenant, hash)\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_seat_events_tickets_expiry\n  ON seat_events_tickets(expires_at);",
+      "\n\nCREATE TABLE IF NOT EXISTS seat_events_upgrade_rate_limits (\n  tenant        TEXT    NOT NULL,\n  key           TEXT    NOT NULL, -- cf-connecting-ip, IPv6 bucketed to its /64 (see ipRateLimitKey)\n  window_start  TEXT    NOT NULL,\n  count         INTEGER NOT NULL DEFAULT 0,\n  PRIMARY KEY (tenant, key, window_start)\n);",
+    ],
+    objects: [
+      { type: "table", name: "seat_events_tickets" },
+      { type: "index", name: "idx_seat_events_tickets_expiry" },
+      { type: "table", name: "seat_events_upgrade_rate_limits" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a3133bfebb9275a29df8ce8dd434c4543b21c0ed4baf8e7553f9d0e73875bf11"
+export const SCHEMA_CHAIN_DIGEST: string = "49d10789decbd8f63f21fb8912dd4e37be2f5a892ecf73cf8085fcc61adeaf5f"

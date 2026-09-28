@@ -29,8 +29,10 @@ const M = [
   // mupot#1594 P2-C: grant scope — host standing to create, rank ceiling to revoke
   ['host must have standing in the target squad to be granted (P2-C)', 'src/agents/seat-events.ts', "if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id))) {", 'if (false) {'],
   ['a lead cannot revoke a grant a higher-rank principal created (P2-C)', 'src/agents/seat-events-routes.ts', "if (hasCapability(creatorGrants, 'org', null, 'admin')) {", 'if (false) {'],
-  // mupot#1594 P3: the 404-vs-403 agent-existence oracle must be uniform
-  ['grant-target existence oracle is uniform, never distinguishes missing from no-standing (P3)', 'src/agents/seat-events-routes.ts', "if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) return { ok: true }", 'if (row) return { ok: true }'],
+  // mupot#1594 P3: the 404-vs-403 agent-existence oracle must be uniform. Isolated from the
+  // combined rank-ceiling mutation above (P1-1 entry) by weakening the RANK MINIMUM instead
+  // of deleting the whole condition — a below-lead member must still be refused.
+  ['grant-target existence oracle is uniform, never distinguishes missing from no-standing (P3)', 'src/agents/seat-events-routes.ts', "await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')", "await canOnSquad(c.env, principal.grants, row.squad_id, 'member')"],
   // mupot#1594 P2-B: the Herdr fence must fail CLOSED on a D1 error, never open
   ['fence fails CLOSED on a transient D1 error, never opens (P2-B)', 'src/agents/inbox-routes.ts', "if (status === 'error') {\n        return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' })\n      }", ''],
   // mupot#1594 P1-A: route-level ticket pre-check, upgrade rate limit, hibernation-safe deadline
@@ -64,7 +66,7 @@ const M = [
   // mupot#1589 P1-1: agent-bound refusal + org-admin/squad-lead rank ceiling on grant writes
   ['agent-bound token refused on grant writes (P1-1)', 'src/agents/seat-events-routes.ts', 'if (id.boundAgentId) return { ok: false, status: 403, error: \'operator_principal_required\' }', ''],
   ['grants need org admin OR squad lead, never below (P1-1)', 'src/agents/seat-events-routes.ts', "if (hasCapability(principal.grants, 'org', null, 'admin')) return { ok: true }", 'return { ok: true }'],
-  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "if (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')) return { ok: true }", 'return { ok: true }'],
+  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) return { ok: true }", 'if (row) return { ok: true }'],
   // mupot#1589 P1-2: refuse an upgrade with no credential-shaped ticket before the DO is reached
   ['ticket presence+format gate before the DO is reached (P1-2)', 'src/agents/seat-events-routes.ts', "if (!ticket || !isWellFormedTicket(ticket)) return c.json({ error: 'ticket_required' }, 401, NO_STORE)", ''],
   // NOTE: this one lives entirely in the DO shell (seat-events-do.ts), which this test suite
