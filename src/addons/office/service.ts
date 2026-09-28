@@ -49,7 +49,7 @@
 // collector, not a synchronous emit path any tool call can invoke. Reported, not
 // built around — see the PR body.
 
-import type { Env, AuthContext, Task, Capability } from '../../types'
+import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../types'
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { listAddonInstallations } from '../service'
 import { listAddonBindings, type AddonBinding } from '../bindings'
@@ -62,7 +62,14 @@ import {
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { parseSiteConnectorConfig } from './health'
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
-import { writeVerdict, VerdictRaceError, type TaskActor } from '../../tasks/service'
+import {
+  VerdictRaceError,
+  buildVerdictStatements,
+  assertVerdictWritable,
+  emitVerdictBusEvent,
+  type TaskActor,
+  type WriteVerdictInput,
+} from '../../tasks/service'
 import { canonicalJson, sha256Hex } from '../../lib/canonical-json'
 import { claimTimestamp } from '../../lib/claim-timestamp'
 
@@ -86,6 +93,11 @@ export type OfficeRefusalReason =
   | 'self_verdict'
   | 'agent_approval_forbidden'
   | 'payload_not_frozen'
+  | 'expected_hash_required'
+  | 'payload_mismatch'
+  | 'unreconciled_prior_publish'
+  | 'freeze_not_found'
+  | 'already_reconciled'
   | 'binding_changed'
   | 'publish_claimed'
   | 'invalid_site_config'
@@ -220,15 +232,56 @@ interface OfficePublishFreezeRecord {
   readonly payloadSha256: string
 }
 
-// P0-1 (kasra-review + Athena, PR #1588 round 1): computes the EXACT payload a
-// human approval binds — task.title/task.body (this addon's only content fields;
-// office.publish_post takes NO title/content from its caller, see src/mcp/office.ts)
-// plus the currently active installation/connector/site — as canonical JSON + its
-// sha256 (src/lib/canonical-json.ts, the same digest helper manifest hashing uses).
-// Pure computation: no DB write. Called from reviewOfficeApproval BEFORE writeVerdict
-// so an approval that cannot be bound to a live, resolvable target is refused rather
-// than minted as 'approved' with nothing real behind it.
+interface PriorOfficeFreezeRow {
+  claimed_at: string | null
+  outcome: string | null
+}
+
+// mupot#1592 P3 ("reconcile-before-reapprove against WordPress"): a freeze that was
+// CLAIMED (office.publish_post committed to exactly one WordPress fetch) but never
+// reached an outcome (the worker died mid-fetch, or the fetch itself timed out) is
+// AMBIGUOUS — the post may or may not actually exist on the WordPress site. Minting
+// a brand-new freeze over it (the ordinary rework-loop refreeze) would let a second
+// approval authorize a second fetch against content that may already be live,
+// double-posting. Refused here, at the one chokepoint every fresh freeze (review-
+// entry AND rework re-entry) goes through, until an operator manually confirms the
+// real outcome via office.reconcile_stalled_publish (checks WordPress by hand, then
+// records what actually happened) — see that tool for the real recovery path this
+// replaces the old, never-reachable "reject + re-approve" doc claim with (reject
+// requires status='review'; a claimed freeze only exists once the task is already
+// 'approved', where reject is refused by reviewOfficeApproval's own not_in_review
+// check — that path never worked).
+async function unreconciledPriorFreezeExists(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?1`,
+  ).bind(taskId).first<PriorOfficeFreezeRow>()
+  return row !== null && row.claimed_at !== null && row.outcome === null
+}
+
+// mupot#1592 NEW-1 (r2 adversarial follow-up on PR #1588): computes the EXACT
+// payload a human approval will bind — task.title/task.body (this addon's only
+// content fields; office.publish_post takes NO title/content from its caller, see
+// src/mcp/office.ts) plus the currently active installation/connector/site — as
+// canonical JSON + its sha256 (src/lib/canonical-json.ts, the same digest helper
+// manifest hashing uses). Pure computation: no DB write.
+//
+// Called the moment a gate:office task ENTERS review (freezeOfficeTaskOnReviewEntry
+// below) — NOT at approval time (round 1's design). "Freeze at click, not freeze at
+// sight": a freeze built from the row read INSIDE the approve call binds whatever
+// the row says at THAT moment, and nothing stopped a requester from editing title/
+// body right up to the moment of approval — a human could list a benign body, an
+// agent could swap it, and the human's approval would silently bind the swap. Now
+// office.review_approval never re-reads task.title/body itself at all: it only
+// VALIDATES a caller-supplied `expected_payload_sha256` against the hash already
+// frozen here, refusing on mismatch — closing the window entirely rather than
+// re-opening a smaller one. (Independently, src/mcp/index.ts's task_update and
+// src/tasks/index.ts's PATCH now also refuse title/body/note/reason edits outright
+// while status='review' — belt-and-suspenders, not a substitute for this.)
 async function buildOfficePublishFreeze(env: Env, task: Task): Promise<OfficeResult<OfficePublishFreezeRecord>> {
+  if (await unreconciledPriorFreezeExists(env, task.id)) {
+    return { ok: false, reason: 'unreconciled_prior_publish' }
+  }
+
   const installationId = await resolveActiveOfficeInstallationId(env)
   if (!installationId) return { ok: false, reason: 'addon_inactive' }
 
@@ -255,10 +308,12 @@ async function buildOfficePublishFreeze(env: Env, task: Task): Promise<OfficeRes
   }
 }
 
-// Persists (or REFRESHES, on a rework loop's second approval) the frozen payload.
-// The upsert resets claimed_by/claimed_at/outcome/outcome_detail/completed_at to
-// NULL on every fresh approval — a NEW approval always mints a NEW, unclaimed
-// one-shot slot; it never revives a previously claimed/executed/failed one. Called
+// Persists (or REFRESHES, on a rework loop's re-entry into review) the frozen
+// payload. The upsert resets claimed_by/claimed_at/outcome/outcome_detail/
+// completed_at AND verdict_id/voided_at/voided_reason to NULL on every fresh
+// freeze — a NEW review-entry always mints a NEW, unclaimed, unbound, unvoided
+// one-shot slot; it never revives a previously claimed/executed/failed/voided one.
+// Called
 // ONLY after writeVerdict has actually landed the 'approved' status (see
 // reviewOfficeApproval) — a verdict that lost its race never persists a freeze for
 // a status change that didn't happen.
@@ -280,6 +335,9 @@ async function persistOfficePublishFreeze(
       site_origin = excluded.site_origin,
       frozen_by = excluded.frozen_by,
       frozen_at = excluded.frozen_at,
+      verdict_id = NULL,
+      voided_at = NULL,
+      voided_reason = NULL,
       claimed_by = NULL,
       claimed_at = NULL,
       outcome = NULL,
@@ -297,6 +355,38 @@ async function persistOfficePublishFreeze(
   ).run()
 }
 
+// mupot#1592 NEW-1 — the ONE call site that freezes a gate:office task's publish
+// payload: the moment it ENTERS review (src/mcp/index.ts's task_update, src/tasks/
+// index.ts's PATCH — both on the ordinary transition AND after a successful
+// reversal lands the task back in 'review', since a rework loop needs a fresh,
+// unbound freeze exactly like a first-time review-entry does). Best-effort by
+// design, matching round 1's original approval-time behavior: a human's decision
+// to move content into review must never be blocked on WordPress infra readiness
+// (addon inactive, no connector, bad site config) — when a freeze cannot be built,
+// this silently leaves NO freeze row (or an unreconciled prior one untouched), and
+// office.review_approval's own `payload_not_frozen`/`unreconciled_prior_publish`
+// refusal then correctly, permanently blocks the actual WordPress write until a
+// fresh review-entry (once the infra or the reconciliation gap is fixed) CAN bind
+// a real target. Callers must not surface this as a request failure — the task_
+// update/PATCH call that triggered it already succeeded on its own terms.
+export async function freezeOfficeTaskOnReviewEntry(env: Env, task: Task, requestedBy: string): Promise<void> {
+  const built = await buildOfficePublishFreeze(env, task)
+  if (built.ok) {
+    await persistOfficePublishFreeze(env, task.id, requestedBy, built.value)
+  }
+}
+
+// mupot#1592 NEW-1 — the shared edit-lock predicate src/mcp/index.ts's task_update
+// and src/tasks/index.ts's PATCH both call before applying a title/body/note/reason
+// change: once a gate:office task is in 'review', a human is actively looking at
+// (or about to look at) a payload whose hash is already frozen — the row must not
+// change under them at all. One predicate, reused by both write surfaces, so a
+// future third write path cannot forget it the way task_update's own P2-2 gap
+// (skipping the base squad-scope check) proved a second, unreviewed call site does.
+export function officeTaskContentLocked(task: Pick<Task, 'gate_owner' | 'status'>): boolean {
+  return task.gate_owner === OFFICE_GATE_OWNER && task.status === 'review'
+}
+
 // ── office.list_pending_approvals ───────────────────────────────────────────────
 
 export interface OfficePendingApproval {
@@ -304,6 +394,15 @@ export interface OfficePendingApproval {
   readonly title: string
   readonly body: string
   readonly created_at: string
+  // mupot#1592 NEW-1: the hash of whatever was frozen when this task entered
+  // review (src/addons/office/service.ts's freezeOfficeTaskOnReviewEntry) — the
+  // EXACT value a caller must echo back as `expected_payload_sha256` to
+  // office.review_approval for an 'approved' verdict to land. null when no freeze
+  // exists yet (addon not active/bound at review-entry time, or the prior freeze
+  // is unreconciled) — approving is still possible in that state (a human may
+  // reject unconditionally), but approving is refused until a fresh review-entry
+  // can bind a real target.
+  readonly payload_sha256: string | null
 }
 
 export async function listOfficePendingApprovals(
@@ -325,11 +424,19 @@ export async function listOfficePendingApprovals(
   // check, so it does not by itself stop a cross-squad body leak. Filtered here,
   // per row, with the SAME canActOnSquad predicate task_verdict's own base guard
   // uses (src/tasks/index.ts) — no cross-squad body reaches the caller.
+  //
+  // LEFT JOIN office_publish_freezes (mupot#1592 NEW-1): surfaces the frozen
+  // payload's hash on the SAME surface a human reads title/body from — "the human
+  // sees a benign body" in the adversarial repro is exactly this listing. A NULL
+  // voided_at only: a voided freeze must not be echoed back as if it were still
+  // live and approvable.
   const candidates = await env.DB.prepare(`
-    SELECT id, title, body, created_at, squad_id
-      FROM tasks
-     WHERE gate_owner = ?1 AND status = 'review'
-     ORDER BY created_at ASC
+    SELECT t.id as id, t.title as title, t.body as body, t.created_at as created_at, t.squad_id as squad_id,
+           f.payload_sha256 as payload_sha256
+      FROM tasks t
+      LEFT JOIN office_publish_freezes f ON f.task_id = t.id AND f.voided_at IS NULL
+     WHERE t.gate_owner = ?1 AND t.status = 'review'
+     ORDER BY t.created_at ASC
      LIMIT ?2
   `).bind(OFFICE_GATE_OWNER, bounded).all<OfficePendingApproval & { squad_id: string }>()
 
@@ -337,7 +444,7 @@ export async function listOfficePendingApprovals(
   const allowed = await Promise.all(rows.map((row) => canActOnSquad(env, auth, row.squad_id)))
   const value = rows
     .filter((_row, index) => allowed[index])
-    .map(({ id, title, body, created_at }) => ({ id, title, body, created_at }))
+    .map(({ id, title, body, created_at, payload_sha256 }) => ({ id, title, body, created_at, payload_sha256 }))
 
   return { ok: true, value }
 }
@@ -348,10 +455,23 @@ export interface OfficeReviewApprovalInput {
   readonly task: Task
   readonly verdict: 'approved' | 'rejected'
   readonly note: string | null
+  // mupot#1592 NEW-1: required for an 'approved' verdict — the payload_sha256 the
+  // caller read off office.list_pending_approvals (or the task body's own
+  // surfacing, where cheap) BEFORE deciding. Compared against what was frozen at
+  // review-entry; a mismatch means the row the human looked at is not the row this
+  // call is about to bind, and is refused before any state change. Ignored for
+  // 'rejected' — a rejection commits to no WordPress write, so there is nothing
+  // for the hash to protect.
+  readonly expectedPayloadSha256: string | null
 }
 
 export interface OfficeReviewApprovalOutcome {
   readonly task: Task
+}
+
+interface OfficeFreezeBindingRow {
+  payload_sha256: string
+  voided_at: string | null
 }
 
 export async function reviewOfficeApproval(
@@ -359,7 +479,7 @@ export async function reviewOfficeApproval(
   auth: AuthContext,
   input: OfficeReviewApprovalInput,
 ): Promise<OfficeResult<OfficeReviewApprovalOutcome>> {
-  const { task, verdict, note } = input
+  const { task, verdict, note, expectedPayloadSha256 } = input
 
   // Content-binding check: this tool may only decide tasks that are ACTUALLY gated
   // under this addon's own gate namespace — never an arbitrary task, even one the
@@ -418,42 +538,94 @@ export async function reviewOfficeApproval(
     return { ok: false, reason: 'not_authorized' }
   }
 
-  // P0-1: freeze the exact publish target BEFORE writing the verdict — read-only
-  // (no DB write yet), so an approval that cannot be bound to a live, resolvable
-  // WordPress target is refused outright rather than minted as 'approved' with
-  // nothing real behind it. Rejections need no freeze at all.
-  // A human's decision to approve CONTENT is independent of whether a WordPress
-  // target is currently resolvable (installed/active/bound) — refusing the
-  // approval itself on infra state would block a human decision on operational
-  // readiness, which this gate is not for. When no freeze can be built (addon
-  // inactive, no connector, bad site config), the approval still lands, but
-  // WITHOUT a frozen payload — office.publish_post's own `payload_not_frozen`
-  // refusal then correctly, permanently blocks the actual WordPress write until a
-  // fresh approval (reject + re-approve) CAN bind a real target. No security
-  // property depends on refusing the verdict here: publish is fail-closed either way.
-  let freeze: OfficePublishFreezeRecord | null = null
+  // mupot#1592 NEW-1: for an 'approved' verdict, the caller must prove they are
+  // approving the EXACT payload frozen at review-entry (freezeOfficeTaskOnReviewEntry
+  // — see that function and buildOfficePublishFreeze's doc comments for why this
+  // replaces round 1's approval-time freeze entirely). No fetch, no state change,
+  // happens before this check. A rejection needs no hash at all: it authorizes no
+  // WordPress write and reviewOfficeApproval never re-reads task.title/body itself.
   if (verdict === 'approved') {
-    const built = await buildOfficePublishFreeze(env, task)
-    if (built.ok) freeze = built.value
+    if (!expectedPayloadSha256) return { ok: false, reason: 'expected_hash_required' }
+    const freezeRow = await env.DB.prepare(
+      `SELECT payload_sha256, voided_at FROM office_publish_freezes WHERE task_id = ?1`,
+    ).bind(task.id).first<OfficeFreezeBindingRow>()
+    if (!freezeRow || freezeRow.voided_at !== null) return { ok: false, reason: 'payload_not_frozen' }
+    if (freezeRow.payload_sha256 !== expectedPayloadSha256) return { ok: false, reason: 'payload_mismatch' }
   }
 
   try {
-    const written = await writeVerdict(
+    const written = await writeOfficeVerdictAndBindFreeze(
       env,
-      { task, verdict, note, decidedBy: gateResult.principal.id },
+      task,
+      verdict,
+      note,
+      gateResult.principal.id,
       gateResult.principal.actor as TaskActor | undefined,
     )
-    // Persisted only once the verdict has ACTUALLY landed (writeVerdict throws
-    // VerdictRaceError otherwise, caught below) — a verdict that lost its race
-    // never leaves a freeze row behind for a status change that never happened.
-    if (freeze) {
-      await persistOfficePublishFreeze(env, task.id, gateResult.principal.id, freeze)
-    }
     return { ok: true, value: { task: written.task } }
   } catch (error) {
     if (error instanceof VerdictRaceError) return { ok: false, reason: 'verdict_race' }
     throw error
   }
+}
+
+// mupot#1592 NEW-2/NEW-4 (r2 adversarial follow-up on PR #1588): writes the verdict
+// AND binds (approved) or voids (rejected) the ALREADY-frozen payload in the SAME
+// D1 batch, anchored on the verdict row's own id — the exact landed-PROOF pattern
+// buildVerdictStatements' own two statements already use (src/tasks/service.ts),
+// and the same extension point src/im/origin-verdict.ts's commitOriginDecision
+// already uses to append ITS OWN statements to this same batch shape. Deliberately
+// bypasses writeVerdict() (which now refuses 'gate:office' outright, NEW-2's own
+// fix forcing every OTHER verdict surface through this one) rather than duplicating
+// its logic — assertVerdictWritable/buildVerdictStatements/emitVerdictBusEvent are
+// the SAME shared primitives writeVerdict itself is built from.
+async function writeOfficeVerdictAndBindFreeze(
+  env: Env,
+  task: Task,
+  verdict: 'approved' | 'rejected',
+  note: string | null,
+  decidedBy: string,
+  actor?: TaskActor,
+): Promise<{ task: Task; verdict: TaskVerdict }> {
+  await assertVerdictWritable(env, task)
+  // gate:office tasks are never routine-created (resolveVerdictProposalId only
+  // ever resolves for gate:routines) — passing null explicitly rather than paying
+  // for the lookup writeVerdict's own auto-resolution would otherwise perform.
+  const input: WriteVerdictInput = { task, verdict, note, decidedBy, proposalId: null }
+  const { statements, verdictRow, newStatus, now } = buildVerdictStatements(env, input)
+
+  // Anchored on `verdictRow.id` — a value this call minted itself before the batch
+  // ran (buildVerdictStatements' own crypto.randomUUID()), so `EXISTS (SELECT 1
+  // FROM task_verdicts WHERE id = ?)` can only be true if the verdict INSERT two
+  // statements above it in this SAME batch actually landed (its own EXISTS guard
+  // held) — never a leftover row from a different call.
+  if (verdict === 'approved') {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE office_publish_freezes SET verdict_id = ?1
+          WHERE task_id = ?2 AND voided_at IS NULL AND EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?3)`,
+      ).bind(verdictRow.id, task.id, verdictRow.id),
+    )
+  } else {
+    statements.push(
+      env.DB.prepare(
+        `UPDATE office_publish_freezes SET voided_at = ?1, voided_reason = 'rejected'
+          WHERE task_id = ?2 AND voided_at IS NULL AND EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?3)`,
+      ).bind(now, task.id, verdictRow.id),
+    )
+  }
+
+  const results = await env.DB.batch(statements)
+  if (!results[0]?.meta?.changes) {
+    // Race lost: the task is no longer 'review'. The verdict INSERT and the
+    // freeze bind/void statement are both, by construction, no-ops in this same
+    // transaction (their EXISTS guards cannot be satisfied) — nothing to roll back.
+    throw new VerdictRaceError(task.id)
+  }
+
+  const updatedTask: Task = { ...task, status: newStatus, updated_at: now }
+  await emitVerdictBusEvent(env, task, input, newStatus, now, actor)
+  return { task: updatedTask, verdict: verdictRow }
 }
 
 // ── office.publish_post ──────────────────────────────────────────────────────────
@@ -593,6 +765,15 @@ export async function publishOfficePost(
   // construction, either no verdict yet or a rejected/reversed one. No fetch either way.
   if (task.status !== 'approved') return { ok: false, reason: 'not_approved' }
 
+  // P3 (mupot#1592): publish_post had no squad check at all — a caller holding
+  // office department capability org-wide/department-wide but with no standing on
+  // THIS task's squad could still trigger its WordPress write. Same predicate
+  // office.review_approval's own P2-2 fix already applies to the decision; the
+  // execution deserves no less.
+  if (!(await canActOnSquad(env, auth, task.squad_id))) {
+    return { ok: false, reason: 'not_authorized' }
+  }
+
   if (!(await hasOfficeCapability(env, auth, resolveOfficePublishRequiredCapability()))) {
     return { ok: false, reason: 'not_authorized' }
   }
@@ -640,14 +821,43 @@ export async function publishOfficePost(
   // a second WordPress POST from actually happening; proven live by the
   // adversarial gate, 3 concurrent calls -> 3 fetches, 3 live posts). 0 rows
   // changed means someone else already claimed this exact approval — refused with
-  // NO fetch, and this row is NEVER un-claimed by this addon: a failed or timed-out
-  // publish (P3-3) needs a fresh human approval (reject + re-approve mints a brand
-  // new, unclaimed row via persistOfficePublishFreeze's upsert), never an automatic
-  // retry against the same claim.
+  // NO fetch, and this row is NEVER un-claimed by this addon (migrations/0181's
+  // trigger backstops that in the DB itself): a failed or timed-out publish needs
+  // office.reconcile_stalled_publish (an operator manually confirms the real
+  // WordPress outcome) before a fresh review-entry can mint a brand new, unclaimed
+  // row — see buildOfficePublishFreeze's unreconciledPriorFreezeExists guard. The
+  // OLD comment here claimed "reject + re-approve" as that recovery path; that
+  // never actually worked (reject requires status='review', and a claimed freeze
+  // only exists once the task is already 'approved' — reviewOfficeApproval's own
+  // not_in_review check always refused it). The REAL recovery path for an
+  // ERRANT approval (never claimed, or the human approved the wrong thing) is an
+  // org owner/admin verdict reversal (task_update/PATCH status:'review' with a
+  // reversal_reason) — src/tasks/service.ts's reverseTaskVerdict voids this freeze
+  // and the resulting review-entry mints a fresh one, exactly like any other
+  // rework loop.
+  //
+  // mupot#1592 NEW-2/NEW-3: the claim's OWN WHERE clause re-derives, atomically, in
+  // the SAME conditional UPDATE — not from the `task` argument this call was handed,
+  // which could be stale by the time this statement runs — that (a) the task is
+  // STILL 'approved' right now (NEW-3: a reversal landing between this function's
+  // entry and this exact statement must not let the claim through with a stale
+  // 'approved' read), and (b) this freeze's verdict_id is STILL the task's current,
+  // live (unreversed), approved verdict (NEW-2: closes the same gap independently —
+  // even if a reversal's freeze-void step were somehow skipped, a reversed verdict
+  // can never satisfy this subquery again).
   const claimant = auth.boundAgentId ?? auth.memberId ?? auth.userId
   const claim = await env.DB.prepare(`
     UPDATE office_publish_freezes SET claimed_by = ?1, claimed_at = ?2
-     WHERE task_id = ?3 AND claimed_at IS NULL
+     WHERE task_id = ?3
+       AND claimed_at IS NULL
+       AND voided_at IS NULL
+       AND verdict_id IS NOT NULL
+       AND verdict_id = (
+         SELECT id FROM task_verdicts
+          WHERE task_id = ?3 AND verdict = 'approved' AND reversed_at IS NULL
+          ORDER BY decided_at DESC, id DESC LIMIT 1
+       )
+       AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')
   `).bind(claimant, claimTimestamp(), task.id).run()
   if ((claim.meta?.changes ?? 0) === 0) return { ok: false, reason: 'publish_claimed' }
 
@@ -670,4 +880,70 @@ export async function publishOfficePost(
   if (!marked) return { ok: false, reason: 'verdict_race' }
 
   return published
+}
+
+// ── office.reconcile_stalled_publish ──────────────────────────────────────────────
+//
+// mupot#1592 P3 ("a documented recovery path that actually works... reconcile-
+// before-reapprove against WordPress"): the ONE way out of the "claimed but
+// outcome unknown" state buildOfficePublishFreeze's unreconciledPriorFreezeExists
+// guard refuses to freeze over. Org owner/admin only, by design — this tool asks
+// the operator to state what they found on the LIVE WordPress site by hand (there
+// is no automated WordPress-side reconciliation call in this addon; see the file
+// header's "known, reported gaps" — building one is future work, not fabricated
+// here), and records exactly that, nothing inferred. Only after this lands can a
+// fresh review-entry mint a new, unclaimed freeze for this task again.
+export interface OfficeReconcileInput {
+  readonly task: Task
+  readonly outcome: 'done' | 'failed'
+  readonly detail: string | null
+  // Only meaningful (and required) when outcome === 'done' — what the operator
+  // found actually live on WordPress after checking by hand.
+  readonly postId: number | null
+  readonly articleUrl: string | null
+}
+
+interface OfficeFreezeReconcileRow {
+  claimed_at: string | null
+  outcome: string | null
+}
+
+export async function reconcileStalledOfficePublish(
+  env: Env,
+  auth: AuthContext,
+  input: OfficeReconcileInput,
+): Promise<OfficeResult<{ task: Task }>> {
+  const { task, outcome, detail, postId, articleUrl } = input
+
+  if (task.gate_owner !== OFFICE_GATE_OWNER) return { ok: false, reason: 'wrong_gate' }
+  // Deliberately org-owner/admin only, not department capability — this tool
+  // OVERRIDES the automated one-shot claim's recorded outcome with a human's
+  // manual, out-of-band observation of the real WordPress site. That is a strictly
+  // higher-trust action than an ordinary office-department approval.
+  if (!isOrgAdmin(auth)) return { ok: false, reason: 'not_authorized' }
+  if (outcome === 'done' && (postId === null || articleUrl === null)) {
+    return { ok: false, reason: 'invalid_site_config' }
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?1`,
+  ).bind(task.id).first<OfficeFreezeReconcileRow>()
+  if (!row) return { ok: false, reason: 'freeze_not_found' }
+  if (row.claimed_at === null || row.outcome !== null) return { ok: false, reason: 'already_reconciled' }
+
+  const now = new Date().toISOString()
+  const outcomeDetail = outcome === 'done'
+    ? JSON.stringify({ postId, articleUrl, reconciledBy: auth.memberId ?? auth.userId, note: detail })
+    : (detail?.trim() ? detail.trim() : 'reconciled_failed')
+
+  await env.DB.prepare(
+    `UPDATE office_publish_freezes SET outcome = ?1, outcome_detail = ?2, completed_at = ?3 WHERE task_id = ?4`,
+  ).bind(outcome, outcomeDetail, now, task.id).run()
+
+  if (outcome === 'done' && postId !== null && articleUrl !== null) {
+    const marked = await markOfficeTaskPublished(env, task.id, { postId, articleUrl })
+    if (!marked) return { ok: false, reason: 'verdict_race' }
+  }
+
+  return { ok: true, value: { task } }
 }

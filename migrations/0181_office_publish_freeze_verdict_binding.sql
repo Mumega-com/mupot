@@ -40,15 +40,22 @@ ALTER TABLE office_publish_freezes ADD COLUMN voided_reason TEXT;
 
 -- P3 (mupot#1592): "no DB trigger keeps a claimed row claimed" — claimed_at is the
 -- one-shot execution guard office.publish_post's atomic claim UPDATE depends on
--- (migrations/0179); nothing in application code ever clears it back to NULL, but
--- nothing stopped a direct/future writer from doing so either, which would silently
--- re-open a one-shot slot for a WordPress write that already happened. Backstop,
--- mirroring the append-only style of migrations/0069/0089's task_verdicts trigger:
--- once claimed_at is set, an UPDATE that would null it back out is refused.
+-- (migrations/0179); nothing in application code ever clears it back to NULL in
+-- place, but nothing stopped a direct/future writer from doing so either, which
+-- would silently re-open a one-shot slot for a WordPress write that already
+-- happened. Scoped to `frozen_at` UNCHANGED — office.review_approval's own
+-- rework-loop refreeze (src/addons/office/service.ts's persistOfficePublishFreeze)
+-- is a full INSERT ... ON CONFLICT DO UPDATE that legitimately resets claimed_at to
+-- NULL for a BRAND NEW freeze generation, stamping a fresh `frozen_at`
+-- (claimTimestamp(), src/lib/claim-timestamp.ts — unique enough per call that two
+-- genuinely different freeze events never share one) in the SAME statement; that
+-- must keep working. What this closes is a writer that clears claimed_at WITHOUT
+-- any new freeze existing — an in-place un-claim on the SAME generation, which is
+-- the only shape that would let a claimed one-shot slot be spent twice.
 CREATE TRIGGER IF NOT EXISTS office_publish_freezes_claim_append_only
 BEFORE UPDATE OF claimed_at ON office_publish_freezes
 FOR EACH ROW
-WHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL
+WHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL AND NEW.frozen_at = OLD.frozen_at
 BEGIN
-  SELECT RAISE(ABORT, 'office_publish_freezes.claimed_at is append-only once set');
+  SELECT RAISE(ABORT, 'office_publish_freezes.claimed_at is append-only within one freeze generation');
 END;

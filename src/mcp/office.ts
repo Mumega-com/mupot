@@ -23,6 +23,7 @@ import {
   listOfficePendingApprovals,
   publishOfficePost,
   reviewOfficeApproval,
+  reconcileStalledOfficePublish,
   type OfficeRefusalReason,
 } from '../addons/office/service'
 import '../addons/office/manifest'
@@ -45,6 +46,10 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'not_in_review':
     case 'not_approved':
     case 'payload_not_frozen':
+    case 'payload_mismatch':
+    case 'unreconciled_prior_publish':
+    case 'freeze_not_found':
+    case 'already_reconciled':
     case 'binding_changed':
     case 'publish_claimed':
     case 'invalid_site_config':
@@ -56,6 +61,8 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'write_failed':
     case 'verdict_race':
       return 409
+    case 'expected_hash_required':
+      return 400
     default:
       return 400
   }
@@ -117,13 +124,17 @@ const toolOfficeReviewApproval: ToolSpec = {
   name: 'office.review_approval',
   scope: 'squad (of the office task) — the office-gate verdict decision',
   min: 'member',
-  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string }',
+  args: '{ task_id: string, verdict: "approved"|"rejected", note?: string, expected_payload_sha256?: string }' +
+    ' -- expected_payload_sha256 is REQUIRED for verdict:"approved" — the payload_sha256 read off' +
+    ' office.list_pending_approvals BEFORE deciding; a mismatch (or a missing/voided freeze) refuses' +
+    ' the approval before any state change (mupot#1592 NEW-1).',
   inputSchema: {
     type: 'object',
     properties: {
       task_id: STRING_SCHEMA,
       verdict: STRING_SCHEMA,
       note: STRING_SCHEMA,
+      expected_payload_sha256: STRING_SCHEMA,
     },
     required: ['task_id', 'verdict'],
     additionalProperties: false,
@@ -136,10 +147,64 @@ const toolOfficeReviewApproval: ToolSpec = {
       return fail(400, 'invalid_verdict', { accepted: ['approved', 'rejected'] })
     }
     const note = str(args.note)
+    const expectedPayloadSha256 = str(args.expected_payload_sha256)
 
     const taskRes = await getTask(env, taskRef)
     if (!taskRes.ok) return taskRes
-    const result = await reviewOfficeApproval(env, auth, { task: taskRes.task, verdict, note })
+    const result = await reviewOfficeApproval(env, auth, {
+      task: taskRes.task,
+      verdict,
+      note,
+      expectedPayloadSha256,
+    })
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    return done({ task: result.value.task })
+  },
+}
+
+// mupot#1592 P3 ("a documented recovery path that actually works ... reconcile-
+// before-reapprove against WordPress"): org owner/admin only. See
+// reconcileStalledOfficePublish's own doc comment (src/addons/office/service.ts)
+// for the full reasoning — this records what an operator found by hand on the
+// live WordPress site for a freeze that was claimed but never reached an outcome,
+// and is the ONLY way to unblock a fresh review-entry freeze on that task again.
+const toolOfficeReconcileStalledPublish: ToolSpec = {
+  name: 'office.reconcile_stalled_publish',
+  scope: 'org owner/admin — manual recovery for a claimed-but-unconfirmed publish',
+  min: 'member',
+  args: '{ task_id: string, outcome: "done"|"failed", detail?: string, post_id?: number, article_url?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      outcome: STRING_SCHEMA,
+      detail: STRING_SCHEMA,
+      post_id: { type: 'number' },
+      article_url: STRING_SCHEMA,
+    },
+    required: ['task_id', 'outcome'],
+    additionalProperties: false,
+  },
+  async run(auth: AuthContext, env, args) {
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const outcome = args.outcome
+    if (outcome !== 'done' && outcome !== 'failed') {
+      return fail(400, 'invalid_outcome', { accepted: ['done', 'failed'] })
+    }
+    const detail = str(args.detail)
+    const postId = typeof args.post_id === 'number' ? args.post_id : null
+    const articleUrl = str(args.article_url)
+
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const result = await reconcileStalledOfficePublish(env, auth, {
+      task: taskRes.task,
+      outcome,
+      detail,
+      postId,
+      articleUrl,
+    })
     if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
     return done({ task: result.value.task })
   },
@@ -149,4 +214,5 @@ export const OFFICE_TOOLS: ToolSpec[] = [
   toolOfficePublishPost,
   toolOfficeListPendingApprovals,
   toolOfficeReviewApproval,
+  toolOfficeReconcileStalledPublish,
 ]

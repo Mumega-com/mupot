@@ -38,7 +38,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability, canOnSquad as sharedCanOnSquad } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, NonHumanVerdictRefusedError } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, NonHumanVerdictRefusedError, DedicatedGatePredicateRequiredError } from '../tasks/service'
 import { evaluateVerdictGates } from '../tasks/index'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
@@ -731,6 +731,9 @@ async function verdictReply(
     }
     if (err instanceof NonHumanVerdictRefusedError) {
       return `"${task.title}" gates a member's project access request and needs your decision — the verdict was not recorded.`
+    }
+    if (err instanceof DedicatedGatePredicateRequiredError) {
+      return `"${task.title}" has to be approved through its own tool, not from here — ask an office-department member to use office.review_approval instead.`
     }
     throw err
   }
