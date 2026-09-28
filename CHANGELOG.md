@@ -178,6 +178,21 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
 
 ### In flight — not yet merged
 
+- **mupot#1596** (branch `kasra/openapi-public-split`) — `GET /openapi.json`
+  (Custom GPT Actions discovery, unauthenticated by design) used to serve the
+  entire 144-tool registry, disclosing the admin surface by name and input
+  schema (`mint_agent_token`, `grant_agent_capability`, `revoke_*`,
+  `archive_row`/`unarchive_row`, `addon_archive`, and more) even though every
+  tool already enforced its own authz server-side (P2 disclosure, not an
+  access break). It now serves an explicit, committed allowlist
+  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below only, 91 of 144
+  tools) with a runtime min-capability floor as a second independent gate. A
+  new authenticated `GET /openapi.full.json` (org-admin bearer) serves the
+  full registry for internal tooling. CI ratchet
+  `scripts/check-openapi-public-allowlist.mjs` (self-tested, mutation-proven:
+  adding an admin tool to the allowlist, or reverting the route to bypass the
+  filter, both fail the build). See `docs/connect-mcp-client.md`. Not merged
+  or deployed.
 - **PR #1583** (`flight/auth-residuals`) — `/api/projects` authority becomes
   the session member (`sessionMemberId`), never re-resolved from email;
   resolver step 4 (`owner_login_emails`) removed as dead and dangerous;
