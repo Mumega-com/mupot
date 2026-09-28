@@ -3271,9 +3271,22 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_seat_events_upgrade_rate_limits_window" },
     ],
   },
+  {
+    file: "0181_office_publish_freeze_verdict_binding.sql",
+    sha256: "4a4d1565821a45d09ff46f22359da445c0e1a488230dc6f5789ba1b1f82218a1",
+    statements: [
+      "-- 0181_office_publish_freeze_verdict_binding.sql — mupot#1592 (r2 adversarial follow-up\n-- on PR #1588, comment 5860750102, NEW-1/NEW-2/NEW-4): 0179's office_publish_freezes\n-- froze the payload at APPROVAL time, built from whatever the row said inside the\n-- approve call — \"freeze at click, not freeze at sight\". A requester who can still edit\n-- title/body up to the moment of approval (task_update/PATCH have no office-aware lock)\n-- can swap content after a human has already looked at the pending-approvals list, and\n-- the human's approval then binds whatever the swapped row currently says. Separately,\n-- the freeze was never bound to the SPECIFIC verdict that approved it — reverse + reject\n-- left a stale freeze row an agent could re-approve through the GENERIC task_verdict tool\n-- (which office.review_approval's own extra checks never run for) and publish the\n-- rejected content anyway.\n--\n-- Code-side fix (src/addons/office/service.ts, src/tasks/service.ts,\n-- src/im/origin-verdict.ts, src/mcp/index.ts, src/tasks/index.ts):\n--   1. the freeze is now built the moment a gate:office task ENTERS review (the\n--      \"approval request\" itself), not at approval — office.review_approval only\n--      VALIDATES a caller-supplied `expected_payload_sha256` against this already-\n--      frozen hash and refuses on mismatch; it never re-reads task.title/body itself.\n--   2. title/body/note/reason edits are refused outright while a gate:office task is\n--      in 'review' (src/mcp/index.ts's task_update, src/tasks/index.ts's PATCH) — the\n--      row a human is looking at cannot change under them at all, belt-and-suspenders\n--      with (1)'s hash check.\n--   3. the freeze row is bound to the verdict that approved it (`verdict_id`) in the\n--      SAME batch as the verdict write (buildVerdictStatements' own landed-PROOF\n--      anchor, reused rather than re-derived — see office/service.ts's\n--      writeOfficeVerdictAndBindFreeze), and voided (`voided_at`) in the same\n--      transaction a reject or reversal lands. office.publish_post's one-shot claim\n--      re-checks, IN ITS OWN CONDITIONAL UPDATE, that this freeze's verdict_id is\n--      still the task's current, unreversed, approved verdict AND not voided.\n--   4. the generic task_verdict surface (HTTP /:id/verdict, MCP task_verdict, the IM\n--      human_origin path) now refuses outright to decide a gate:office task at all —\n--      every office verdict must go through office.review_approval's own predicate.\n--\n-- ADD COLUMN + a new trigger only — office_publish_freezes (0179) is a brand-new leaf\n-- table this addon owns outright, no children of its own, so this never touches\n-- `tasks`/`task_verdicts`/any addon_* parent table or their CHECK constraints.\nALTER TABLE office_publish_freezes ADD COLUMN verdict_id TEXT;",
+      "\nALTER TABLE office_publish_freezes ADD COLUMN voided_at TEXT;",
+      "\nALTER TABLE office_publish_freezes ADD COLUMN voided_reason TEXT;",
+      "\n\n-- P3 (mupot#1592): \"no DB trigger keeps a claimed row claimed\" — claimed_at is the\n-- one-shot execution guard office.publish_post's atomic claim UPDATE depends on\n-- (migrations/0179); nothing in application code ever clears it back to NULL, but\n-- nothing stopped a direct/future writer from doing so either, which would silently\n-- re-open a one-shot slot for a WordPress write that already happened. Backstop,\n-- mirroring the append-only style of migrations/0069/0089's task_verdicts trigger:\n-- once claimed_at is set, an UPDATE that would null it back out is refused.\nCREATE TRIGGER IF NOT EXISTS office_publish_freezes_claim_append_only\nBEFORE UPDATE OF claimed_at ON office_publish_freezes\nFOR EACH ROW\nWHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL\nBEGIN\n  SELECT RAISE(ABORT, 'office_publish_freezes.claimed_at is append-only once set');\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "office_publish_freezes_claim_append_only" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5efde6b60dfc02e27248873dd9cbd189994db16d92082500372554796e4efede"
+export const SCHEMA_CHAIN_DIGEST: string = "cea0de1b0b7e3ed6480c15bd62572da2e015ef2211c48f5706b50737d0d2ee32"
