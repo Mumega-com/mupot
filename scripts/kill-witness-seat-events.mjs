@@ -26,6 +26,20 @@ const M = [
   ['ticket single-use (delete on take)', 'src/agents/seat-events.ts', 'if (rec) await storage.delete(key)', ''],
   ['ticket expiry', 'src/agents/seat-events.ts', 'if (!rec || rec.expires_at < this.nowSec())', 'if (!rec)'],
   ['expired tickets purged', 'src/agents/seat-events.ts', 'if (dead.length) await storage.delete(dead)', ''],
+  // mupot#1594 P2-C: grant scope — host standing to create, rank ceiling to revoke
+  ['host must have standing in the target squad to be granted (P2-C)', 'src/agents/seat-events.ts', "if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id))) {", 'if (false) {'],
+  ['a lead cannot revoke a grant a higher-rank principal created (P2-C)', 'src/agents/seat-events-routes.ts', "if (hasCapability(creatorGrants, 'org', null, 'admin')) {", 'if (false) {'],
+  // mupot#1594 P3: the 404-vs-403 agent-existence oracle must be uniform
+  ['grant-target existence oracle is uniform, never distinguishes missing from no-standing (P3)', 'src/agents/seat-events-routes.ts', "if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) return { ok: true }", 'if (row) return { ok: true }'],
+  // mupot#1594 P2-B: the Herdr fence must fail CLOSED on a D1 error, never open
+  ['fence fails CLOSED on a transient D1 error, never opens (P2-B)', 'src/agents/inbox-routes.ts', "if (status === 'error') {\n        return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' })\n      }", ''],
+  // mupot#1594 P1-A: route-level ticket pre-check, upgrade rate limit, hibernation-safe deadline
+  ['upgrade route pre-checks the ticket before ever forwarding to the DO (P1-A)', 'src/agents/seat-events-routes.ts', "if (!(await ticketPreCheckPasses(c.env, await sha256Hex(ticket)))) {\n    return c.json({ error: 'ticket_invalid' }, 401, NO_STORE)\n  }", ''],
+  ['ticket pre-check fails CLOSED on a D1 error (P1-A)', 'src/agents/seat-events.ts', "return row !== null\n  } catch (err) {\n    console.error('[seat-events] ticket pre-check failed", "return true\n  } catch (err) {\n    console.error('[seat-events] ticket pre-check failed"],
+  ['upgrade route is rate-limited per IP, independent of /ticket (P1-A)', 'src/agents/seat-events-routes.ts', "if (!(await underUpgradeRateLimit(c.env, clientIp(c)))) return c.json({ error: 'rate_limited' }, 429, NO_STORE)", ''],
+  ['authenticated sockets are capped separately from pending ones (P1-A)', 'src/agents/seat-events.ts', "if (counts.authenticated >= MAX_SOCKETS_PER_POT) return 'pot_full'", 'if (false) return \'pot_full\''],
+  ['pending sockets get their OWN small cap (P1-A)', 'src/agents/seat-events.ts', "if (counts.pending >= MAX_PENDING_SOCKETS_PER_POT) return 'pending_full'", 'if (false) return \'pending_full\''],
+  ['a pending sweep is never postponed by a later connect (P1-A)', 'src/agents/seat-events.ts', 'if (existing === null || desired < existing) return desired', 'return desired'],
   // revoked ownership
   ['re-authorize at redeem', 'src/agents/seat-events.ts', "if (status !== 'granted') {", 'if (false) {'],
   ['re-authorize every hint', 'src/agents/seat-events.ts', "if (status === 'not_granted') {", 'if (false) {'],
@@ -42,7 +56,7 @@ const M = [
   ['old socket dropped on supersede/move', 'src/agents/seat-events.ts', '      this.drop(other, st, agent, frame)\n', ''],
   ['legacy stream fenced for granted agents', 'src/agents/inbox-routes.ts', '    if (grant) {', '    if (false) {'],
   // mupot#1589 P2-1: the fence must equal the delivery predicate, not just "a row exists"
-  ['fence predicate equals delivery predicate (P2-1)', 'src/agents/inbox-routes.ts', 'const stillEligible = await hostMayReceive(c.env, grant.host_agent_id, id.boundAgentId)', 'const stillEligible = true'],
+  ['fence predicate equals delivery predicate (P2-1)', 'src/agents/inbox-routes.ts', 'const status = await authorizeSeatDelivery(c.env, grant.host_agent_id, id.boundAgentId)', "const status = 'granted' as const"],
   // HTTP surface
   ['upgrade strips Authorization/Cookie', 'src/agents/seat-events-routes.ts', "presenceLiveDoUpgradeRequest(new URL('https://seat-events/connect'), c.req.raw)", "new Request('https://seat-events/connect', c.req.raw)"],
   ['ticket response no-store', 'src/agents/seat-events-routes.ts', "const NO_STORE = { 'Cache-Control': 'no-store' }", 'const NO_STORE = {}'],
@@ -53,8 +67,11 @@ const M = [
   ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "if (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')) return { ok: true }", 'return { ok: true }'],
   // mupot#1589 P1-2: refuse an upgrade with no credential-shaped ticket before the DO is reached
   ['ticket presence+format gate before the DO is reached (P1-2)', 'src/agents/seat-events-routes.ts', "if (!ticket || !isWellFormedTicket(ticket)) return c.json({ error: 'ticket_required' }, 401, NO_STORE)", ''],
-  ['pod socket cap enforced before accept (P1-2)', 'src/agents/seat-events-do.ts', 'if (podSocketCapExceeded(this.ctx.getWebSockets().length)) {', 'if (false) {'],
-  ['auth deadline closes a never-authenticated socket (P1-2)', 'src/agents/seat-events.ts', 'if (at === undefined || now - at < AUTH_DEADLINE_SEC) continue', 'continue'],
+  // NOTE: this one lives entirely in the DO shell (seat-events-do.ts), which this test suite
+  // never instantiates (no workerd) — pre-existing structural gap, unchanged by mupot#1594;
+  // podAcceptRefusal's OWN thresholds are witnessed directly (P1-A entries below).
+  ['pod socket cap enforced before accept (P1-2)', 'src/agents/seat-events-do.ts', 'const refusal = podAcceptRefusal({ authenticated, pending })', 'const refusal = null'],
+  ['auth deadline closes a never-authenticated socket, reading its OWN attachment not an in-memory map (P1-2/P1-4)', 'src/agents/seat-events.ts', 'if (at === undefined || now - at < AUTH_DEADLINE_SEC) continue', 'continue'],
   ['oversized frame closed (P1-2)', 'src/agents/seat-events.ts', 'if (byteLength > MAX_FRAME_BYTES) return this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, \'frame_too_large\')', ''],
   ['junk frames close the socket past the cap (P1-2)', 'src/agents/seat-events.ts', 'if (n > MAX_JUNK_FRAMES) this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, \'junk_frames\')', ''],
   ['per-host socket cap (P1-2)', 'src/agents/seat-events.ts', 'if (heldByHost >= MAX_SOCKETS_PER_HOST) return this.reject(sock, \'host_socket_limit\')', ''],

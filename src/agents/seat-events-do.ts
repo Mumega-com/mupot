@@ -14,25 +14,41 @@ import type { Env } from '../types'
 import { reciprocateWebSocketClose } from '../registry/realtime'
 import {
   AUTH_DEADLINE_SEC,
-  createConnectClock,
   createJunkTracker,
+  nextAuthDeadlineAlarm,
   normalizeHint,
-  podSocketCapExceeded,
+  podAcceptRefusal,
   RecentIds,
   SeatEventsHub,
   storageTicketStore,
-  type ConnectClock,
   type HubSocket,
   type JunkTracker,
   type SocketState,
 } from './seat-events'
 
+// mupot#1594 P1-A: the socket's ENTIRE attachment payload. `sub` is the existing
+// {host, agents} SocketState once hello succeeds; `connectedAt` is written once, at accept,
+// and never overwritten — it is what enforceAuthDeadline reads, and because it lives on the
+// real WebSocket's own serializeAttachment payload (not an in-memory map keyed off a wrapper
+// object) it survives hibernation and DO eviction, unlike the in-memory `ConnectClock` this
+// replaces.
+interface Attachment {
+  connectedAt?: number
+  sub?: SocketState
+}
+
 function wrap(ws: WebSocket): HubSocket {
+  const read = (): Attachment => (ws.deserializeAttachment() as Attachment | null) ?? {}
   return {
     send: (d) => ws.send(d),
     close: (code, reason) => ws.close(code, reason),
-    getState: () => (ws.deserializeAttachment() as SocketState | null) ?? null,
-    setState: (s) => ws.serializeAttachment(s),
+    getState: () => read().sub ?? null,
+    setState: (s) => ws.serializeAttachment({ ...read(), sub: s }),
+    getConnectedAt: () => read().connectedAt,
+    markConnected: (nowSec) => {
+      const cur = read()
+      if (cur.connectedAt === undefined) ws.serializeAttachment({ ...cur, connectedAt: nowSec })
+    },
   }
 }
 
@@ -44,7 +60,6 @@ export class SeatEventsDO extends DurableObject<Env> {
   // lifetime (a fresh SeatEventsHub is built per call, but these are constructed once here
   // and threaded through `deps` every time — same pattern as `recent`/`tickets` above).
   private readonly junk: JunkTracker = createJunkTracker()
-  private readonly clock: ConnectClock = createConnectClock(this.nowSec)
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -61,7 +76,6 @@ export class SeatEventsDO extends DurableObject<Env> {
       nowSec: this.nowSec,
       recent: this.recent,
       junk: this.junk,
-      clock: this.clock,
     })
   }
 
@@ -95,17 +109,31 @@ export class SeatEventsDO extends DurableObject<Env> {
       return Response.json({ ok: true, ...(await this.hub().publish(hint)) })
     }
     if (url.pathname === '/connect' && req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      // mupot#1589 P1-2: bound how many sockets this DO will hold open at all, authenticated
-      // or not, BEFORE accepting a new one — the Worker route's ticket-presence gate keeps
-      // most junk out, but this is the DO's own floor regardless of what got past it.
-      if (podSocketCapExceeded(this.ctx.getWebSockets().length)) {
-        return Response.json({ error: 'seat_events_at_capacity' }, { status: 503 })
+      // mupot#1589 P1-2 / mupot#1594 P1-A: bound how many sockets this DO will hold open,
+      // BEFORE accepting a new one — the Worker route's pre-check gate keeps most junk out,
+      // but this is the DO's own floor regardless of what got past it. Authenticated and
+      // pending sockets are counted, and capped, SEPARATELY: a flood of never-authenticated
+      // connections must never be able to starve the authenticated-host budget.
+      const existing = this.wrapped()
+      const authenticated = existing.filter((s) => s.getState() !== null).length
+      const pending = existing.length - authenticated
+      const refusal = podAcceptRefusal({ authenticated, pending })
+      if (refusal) {
+        const error = refusal === 'pot_full' ? 'seat_events_at_capacity' : 'seat_events_pending_at_capacity'
+        return Response.json({ error }, { status: 503 })
       }
       const pair = new WebSocketPair()
       this.ctx.acceptWebSocket(pair[1])
       const wrapped = this.wrapOnce(pair[1])
       this.hub().noteConnected(wrapped)
-      await this.ctx.storage.setAlarm(Date.now() + AUTH_DEADLINE_SEC * 1000)
+      // mupot#1594 P1-A: never postpone a pending sweep. setAlarm() REPLACES any existing
+      // alarm rather than taking the earlier of the two, so every prior connect that called
+      // it unconditionally could push the deadline out indefinitely by reconnecting faster
+      // than AUTH_DEADLINE_SEC. nextAuthDeadlineAlarm is pure and only returns a timestamp
+      // when arming it actually brings the deadline EARLIER (or none was pending at all).
+      const desired = Date.now() + AUTH_DEADLINE_SEC * 1000
+      const next = nextAuthDeadlineAlarm(await this.ctx.storage.getAlarm(), desired)
+      if (next !== null) await this.ctx.storage.setAlarm(next)
       return new Response(null, { status: 101, webSocket: pair[0] })
     }
     return new Response('not found', { status: 404 })

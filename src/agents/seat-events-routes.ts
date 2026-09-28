@@ -16,15 +16,20 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { resolveCapabilities, hasCapability, canOnSquad } from '../auth/capability'
 import { presenceLiveDoUpgradeRequest } from '../registry/realtime'
 import {
+  activeSeatEventGrant,
   createSeatEventGrant,
   isSeatEventsEnabled,
   isWellFormedTicket,
   mintTicketSecret,
+  recordTicketPreCheck,
   revokeSeatEventGrant,
   seatEventsChannelName,
+  sha256Hex,
   SEAT_EVENTS_PROTOCOL,
+  ticketPreCheckPasses,
   TICKET_TTL_SEC,
   underTicketRateLimit,
+  underUpgradeRateLimit,
   verifyTicketRequest,
 } from './seat-events'
 
@@ -66,18 +71,26 @@ async function resolveGrantPrincipal(c: Ctx): Promise<GrantPrincipal> {
 // self-serve is the product direction," so a squad lead may authorize/revoke a seat-events
 // grant for an agent on their own squad without needing org admin. Never cross-squad: the
 // squad is re-resolved fresh from the agents row, never from anything caller-asserted.
+//
+// mupot#1594 P3: "make the 404-vs-403 agent-existence oracle uniform." This used to answer
+// 404 agent_not_found for a missing agent but 403 forbidden for an existing one the caller
+// has no standing on — two distinguishable codes that let ANY caller with grant-write access
+// to at least one squad enumerate which agent ids exist, tenant-wide, for free. Collapsed
+// onto ONE response for both cases, same convention messages.ts's sendToRef already uses for
+// `send_target_not_visible` (existence and no-visibility give the identical 404): a
+// non-admin principal who cannot act on `targetAgentId` learns nothing about whether it
+// exists at all.
 async function authorizeGrantTarget(
   c: Ctx,
   principal: { grants: CapabilityGrant[] },
   targetAgentId: string,
-): Promise<{ ok: true } | { ok: false; status: 403 | 404; error: string }> {
+): Promise<{ ok: true } | { ok: false; status: 404; error: string }> {
   if (hasCapability(principal.grants, 'org', null, 'admin')) return { ok: true }
   const row = await c.env.DB.prepare('SELECT squad_id FROM agents WHERE id = ?1 LIMIT 1')
     .bind(targetAgentId)
     .first<{ squad_id: string }>()
-  if (!row) return { ok: false, status: 404, error: 'agent_not_found' }
-  if (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')) return { ok: true }
-  return { ok: false, status: 403, error: 'forbidden' }
+  if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) return { ok: true }
+  return { ok: false, status: 404, error: 'agent_not_visible' }
 }
 
 function clientIp(c: Ctx): string {
@@ -106,6 +119,15 @@ seatEventsApp.post('/ticket', async (c) => {
   if (!v.ok) return c.json({ error: v.error, detail: v.detail }, v.status, NO_STORE)
   const { ticket, hash } = await mintTicketSecret()
   const expiresAt = Math.floor(Date.now() / 1000) + TICKET_TTL_SEC
+  // mupot#1594 P1-A: write the route's OWN pre-check record (migration 0180) BEFORE asking
+  // the DO to store its copy. If this write fails, refuse outright — minting a ticket the
+  // upgrade route could never later pass its pre-check on on is worse than a 503 here.
+  try {
+    await recordTicketPreCheck(c.env, hash, expiresAt)
+  } catch (err) {
+    console.error('[seat-events] ticket pre-check write failed:', err instanceof Error ? err.message : err)
+    return c.json({ error: 'ticket_store_failed' }, 503, NO_STORE)
+  }
   const stored = await stub(c.env).fetch(
     new Request('https://seat-events/ticket', {
       method: 'POST',
@@ -124,6 +146,10 @@ seatEventsApp.post('/ticket', async (c) => {
 seatEventsApp.get('/', async (c) => {
   if (!isSeatEventsEnabled(c.env)) return c.json({ error: 'seat_events_disabled' }, 404)
   if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') return c.json({ error: 'expected_websocket' }, 426)
+  // mupot#1594 P1-A: the upgrade route itself had NO rate limit — only /ticket did — even
+  // though the upgrade is what actually costs the DO an accepted socket. Same atomic
+  // per-IP (/64-bucketed) pattern as /ticket.
+  if (!(await underUpgradeRateLimit(c.env, clientIp(c)))) return c.json({ error: 'rate_limited' }, 429, NO_STORE)
   // mupot#1589 P1-2: refuse an upgrade with no credential-shaped ticket BEFORE the DO is ever
   // called — a bare `Upgrade: websocket` with nothing else used to reach acceptWebSocket with
   // zero authentication. This is a presence+format gate only (mirrors PresenceChannelDO's own
@@ -131,6 +157,15 @@ seatEventsApp.get('/', async (c) => {
   // once, over the hello frame, exactly as before — see seat-events.ts's onMessage.
   const ticket = c.req.query('ticket')
   if (!ticket || !isWellFormedTicket(ticket)) return c.json({ error: 'ticket_required' }, 401, NO_STORE)
+  // mupot#1594 P1-A: format alone used to be enough to reach the DO — 200/200 forged 43-char
+  // strings did in the adversarial probe, each spending a socket slot. Verify the ticket was
+  // actually minted, for THIS tenant, and has not expired (one indexed D1 SELECT, no DO
+  // round-trip) before ever forwarding the upgrade. The single-use burn is untouched: it
+  // still happens exactly once, inside the DO, over the hello frame — see
+  // ticketPreCheckPasses's own docstring for why this is not a weaker check than a signature.
+  if (!(await ticketPreCheckPasses(c.env, await sha256Hex(ticket)))) {
+    return c.json({ error: 'ticket_invalid' }, 401, NO_STORE)
+  }
   // Forward ONLY the WebSocket hop headers: no Authorization, no Cookie reaches the DO.
   return stub(c.env).fetch(presenceLiveDoUpgradeRequest(new URL('https://seat-events/connect'), c.req.raw))
 })
@@ -151,7 +186,15 @@ seatEventsApp.post('/grants', async (c) => {
     reason: typeof b.reason === 'string' ? b.reason : '',
   })
   if (!res.ok) {
-    const status = res.reason === 'agent_already_granted' ? 409 : res.reason === 'db_error' ? 500 : res.reason === 'invalid_args' ? 400 : 404
+    // mupot#1594: 'host_no_squad_standing' is a REAL authorization refusal on an existing,
+    // visible agent (the caller already passed authorizeGrantTarget's oracle-safe check
+    // above) — 403, not folded into the generic 404 default below.
+    const status =
+      res.reason === 'agent_already_granted' ? 409 :
+      res.reason === 'db_error' ? 500 :
+      res.reason === 'invalid_args' ? 400 :
+      res.reason === 'host_key_missing' || res.reason === 'project_access_denied' || res.reason === 'host_no_squad_standing' ? 403 :
+      404
     return c.json({ error: res.reason }, status)
   }
   return c.json({ ok: true, id: res.id })
@@ -163,6 +206,24 @@ seatEventsApp.delete('/grants/:agent', async (c) => {
   const agentId = c.req.param('agent')
   const target = await authorizeGrantTarget(c, principal, agentId)
   if (!target.ok) return c.json({ error: target.error }, target.status)
+  // mupot#1594 P2-C: "a squad lead may revoke only grants inside their own authority" — a
+  // lead's revoke rank ceiling was the TARGET's squad only (authorizeGrantTarget above); it
+  // never looked at who actually WROTE the live grant. A lead of the agent's own squad could
+  // therefore revoke a grant an ORG ADMIN had explicitly created, silently undoing a
+  // higher-rank decision. An org admin is exempt (can revoke anything, by definition). The
+  // creator's capability is re-checked LIVE, at revoke time — not the rank they held when
+  // they created the grant — matching this codebase's standing re-check convention elsewhere
+  // (authorizeSeatDelivery, hostMayReceive): authority that has since been revoked cannot
+  // still gate a lead out, and authority since GRANTED must not either.
+  if (!hasCapability(principal.grants, 'org', null, 'admin')) {
+    const live = await activeSeatEventGrant(c.env, agentId)
+    if (live) {
+      const creatorGrants = await resolveCapabilities(c.env, live.granted_by_member_id)
+      if (hasCapability(creatorGrants, 'org', null, 'admin')) {
+        return c.json({ error: 'forbidden_higher_authority' }, 403)
+      }
+    }
+  }
   return c.json(await revokeSeatEventGrant(c.env, { agentId, memberId: principal.memberId }))
 })
 

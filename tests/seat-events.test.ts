@@ -19,26 +19,33 @@ import {
   MAX_AGENTS_PER_TICKET,
   MAX_FRAME_BYTES,
   MAX_JUNK_FRAMES,
+  MAX_PENDING_SOCKETS_PER_POT,
   MAX_SOCKETS_PER_HOST,
+  MAX_SOCKETS_PER_POT,
   RecentIds,
   SeatEventsHub,
   TICKET_RATE_LIMIT_MAX_PER_IP,
   TICKET_TTL_SEC,
+  UPGRADE_RATE_LIMIT_MAX_PER_IP,
   backlogFor,
   canonicalTicketMessage,
-  createConnectClock,
   createJunkTracker,
   createSeatEventGrant,
   hintFromPayload,
   hostMayReceive,
+  ipRateLimitKey,
   isWellFormedTicket,
   mintTicketSecret,
+  nextAuthDeadlineAlarm,
   normalizeHint,
-  podSocketCapExceeded,
+  podAcceptRefusal,
   publishSeatHint,
+  recordTicketPreCheck,
   revokeSeatEventGrant,
   sha256Hex,
+  ticketPreCheckPasses,
   underTicketRateLimit,
+  underUpgradeRateLimit,
   verifyTicketRequest,
   type HubSocket,
   type SeatAuthorization,
@@ -110,6 +117,12 @@ async function world(): Promise<World> {
     INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at) VALUES
       ('${TENANT}', '${HOST1}', '${k1.x}', 'Ed25519', 'host1-m', ${NOW}),
       ('${TENANT}', '${HOST2}', '${k2.x}', 'Ed25519', 'host2-m', ${NOW});
+    -- mupot#1594 P2-C: HOST1/HOST2 are fleet-host identities, not agents rows — their OWNING
+    -- members (agent_keys.member_id) need standing on squad 's1' (home of A1-A3) so the
+    -- existing grant() helper used throughout this suite keeps passing hostHasStandingInSquad.
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+      ('cap-host1-s1', 'host1-m', 'squad', 's1', 'member'),
+      ('cap-host2-s1', 'host2-m', 'squad', 's1', 'member');
   `)
   const env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
   return { h, env, k1, k2 }
@@ -140,10 +153,16 @@ async function seatToken(w: World, agent: string, member: string, raw: string): 
     VALUES ('tok-${raw}', '${member}', '${await hashMemberToken(raw)}', '', 'workspace', datetime('now'), '${TENANT}', '${agent}')`)
 }
 
+// mupot#1594 P1-A: `attachment` stands in for the real WebSocket's serializeAttachment
+// payload — a plain object living on the socket instance ITSELF, never on any hub/tracker
+// object. That is what makes "drop the in-memory state, keep the attachment" testable: a
+// test simulates hibernation by building a BRAND NEW SeatEventsHub (fresh junk/recent, like a
+// freshly-woken DO instance) over the SAME FakeSocket instances — the attachment survives
+// that exactly like a real WebSocket's does across a real hibernate/evict cycle.
 class FakeSocket implements HubSocket {
   sent: string[] = []
   closed: { code: number; reason: string } | null = null
-  private state: SocketState | null = null
+  private attachment: { connectedAt?: number; sub?: SocketState } = {}
   send(d: string) {
     if (this.closed) throw new Error('closed')
     this.sent.push(d)
@@ -152,10 +171,16 @@ class FakeSocket implements HubSocket {
     this.closed = { code, reason }
   }
   getState() {
-    return this.state
+    return this.attachment.sub ?? null
   }
   setState(s: SocketState) {
-    this.state = s
+    this.attachment = { ...this.attachment, sub: s }
+  }
+  getConnectedAt() {
+    return this.attachment.connectedAt
+  }
+  markConnected(nowSec: number) {
+    if (this.attachment.connectedAt === undefined) this.attachment = { ...this.attachment, connectedAt: nowSec }
   }
   frames(): Record<string, any>[] {
     return this.sent.map((s) => JSON.parse(s))
@@ -198,8 +223,7 @@ function hubFor(w: World, opts: { now?: () => number; authorize?: (host: string,
   const tickets = memTickets(nowSec)
   const recent = new RecentIds()
   const junk = createJunkTracker()
-  const clock = createConnectClock(nowSec)
-  const hub = () => new SeatEventsHub(w.env, { sockets: () => sockets, tickets, nowSec, recent, authorize: opts.authorize, junk, clock })
+  const hub = () => new SeatEventsHub(w.env, { sockets: () => sockets, tickets, nowSec, recent, authorize: opts.authorize, junk })
   async function ticketFor(host: string, agents: string[], ttl = TICKET_TTL_SEC) {
     const { ticket, hash } = await mintTicketSecret()
     await tickets.put(hash, { host, agents, expires_at: nowSec() + ttl })
@@ -218,7 +242,15 @@ function hubFor(w: World, opts: { now?: () => number; authorize?: (host: string,
     await hub().onMessage(s, JSON.stringify({ type: 'hello', v: 1, ticket, since }))
     return s
   }
-  return { sockets, tickets, hub, ticketFor, connect, acceptRaw }
+  /** mupot#1594 P1-A: simulate a hibernate/evict cycle — a BRAND NEW SeatEventsHub, with
+   *  fresh (empty) junk/recent trackers, built over the SAME socket instances. Anything the
+   *  hub kept in its OWN memory (junk counts, hint dedup) is gone, exactly like a real DO
+   *  instance's fields after eviction; anything on the sockets' own attachments (state,
+   *  connectedAt) survives, exactly like real WebSocket attachments do. */
+  function hibernate() {
+    return new SeatEventsHub(w.env, { sockets: () => sockets, tickets, nowSec, authorize: opts.authorize, recent: new RecentIds(), junk: createJunkTracker() })
+  }
+  return { sockets, tickets, hub, ticketFor, connect, acceptRaw, hibernate }
 }
 
 const hintFor = (agent: string, m: { id: string; seq: number }, extra: Record<string, unknown> = {}): SeatHint =>
@@ -752,7 +784,7 @@ describe('redirect / bearer leakage (HTTP surface)', () => {
     expect(hub.tickets.map.has(await sha256Hex(body.ticket))).toBe(true)
   })
 
-  it('the WebSocket upgrade reaches the DO without Authorization or Cookie, given a well-formed ticket', async () => {
+  it('the WebSocket upgrade reaches the DO without Authorization or Cookie, given a well-formed, pre-checked ticket', async () => {
     const w = await world()
     let seen: string[] = []
     const hub = hubFor(w)
@@ -761,7 +793,12 @@ describe('redirect / bearer leakage (HTTP surface)', () => {
       REALTIME_SEAT_EVENTS: '1',
       SEAT_EVENTS: namespaceOver(hub, (req) => (seen = [...req.headers.keys()])),
     } as unknown as Env
-    await seatEventsApp.request(`/?ticket=${'A'.repeat(43)}`, {
+    const ticket = 'A'.repeat(43)
+    // mupot#1594 P1-A: the route now pre-checks the ticket against seat_events_tickets before
+    // ever forwarding — a shape-only ticket with no matching row would be refused at 401
+    // without reaching the DO at all (covered by the forged-ticket test below).
+    await recordTicketPreCheck(env, await sha256Hex(ticket), Math.floor(Date.now() / 1000) + TICKET_TTL_SEC)
+    await seatEventsApp.request(`/?ticket=${ticket}`, {
       headers: { Upgrade: 'websocket', Authorization: 'Bearer secret', Cookie: 'sid=1', 'Sec-WebSocket-Key': 'k' },
     }, env)
     expect(seen).toContain('upgrade')
@@ -795,7 +832,10 @@ describe('redirect / bearer leakage (HTTP surface)', () => {
     w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
       VALUES ('tok-host', 'host1-m', '${await hashMemberToken('member-tok')}', '', 'workspace', datetime('now'), '${TENANT}')`)
     const member = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer member-tok' }, body }, w.env)
-    expect(member.status).toBe(403)
+    // host1-m holds only 'member' (not 'lead'+) on s1 from world()'s own fixture (mupot#1594
+    // P2-C standing) — below authorizeGrantTarget's rank ceiling, so the uniform 404 oracle
+    // applies (mupot#1594 P3), same as a nonexistent agent would.
+    expect(member.status).toBe(404)
     w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-a', 'host1-m', 'org', NULL, 'admin')`)
     const admin = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer member-tok' }, body }, w.env)
     expect(admin.status).toBe(200)
@@ -843,13 +883,16 @@ describe('grant writer authorization (P1-1)', () => {
     `)
     const body = JSON.stringify({ host_agent_id: HOST1, agent_id: A1, reason: 'x' }) // A1 is on s1, not s2
     const create = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer other-tok' }, body }, w.env)
-    expect(create.status).toBe(403)
+    // mupot#1594 P3: uniform existence oracle — no standing on A1's squad reads identically
+    // to A1 not existing at all (404 agent_not_visible), never a distinguishable 403.
+    expect(create.status).toBe(404)
+    expect(await create.json()).toMatchObject({ error: 'agent_not_visible' })
     await grant(w, HOST1, A1)
     const revoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer other-tok' } }, w.env)
-    expect(revoke.status).toBe(403)
+    expect(revoke.status).toBe(404)
   })
 
-  it('a member below lead (a plain squad member) is refused', async () => {
+  it('a member below lead (a plain squad member) is refused, same uniform oracle', async () => {
     const w = await world()
     w.h.sqlite.exec(`
       INSERT INTO members (id, display_name, status, tenant) VALUES ('junior-m', 'Junior', 'active', '${TENANT}');
@@ -859,7 +902,20 @@ describe('grant writer authorization (P1-1)', () => {
     `)
     const body = JSON.stringify({ host_agent_id: HOST1, agent_id: A1, reason: 'x' })
     const create = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer junior-tok' }, body }, w.env)
-    expect(create.status).toBe(403)
+    expect(create.status).toBe(404)
+    expect(await create.json()).toMatchObject({ error: 'agent_not_visible' })
+  })
+
+  // ═════════════ mupot#1594 P3: uniform 404 existence oracle on a TRULY missing agent ═════════
+  it('a truly nonexistent agent id gets the SAME 404 agent_not_visible as no-standing', async () => {
+    const w = await world()
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-lead2', 'seat1-m', '${await hashMemberToken('lead-tok-2')}', '', 'workspace', datetime('now'), '${TENANT}')`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead2', 'seat1-m', 'squad', 's1', 'lead')`)
+    const body = JSON.stringify({ host_agent_id: HOST1, agent_id: 'does-not-exist', reason: 'x' })
+    const r = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer lead-tok-2' }, body }, w.env)
+    expect(r.status).toBe(404)
+    expect(await r.json()).toMatchObject({ error: 'agent_not_visible' })
   })
 })
 
@@ -928,11 +984,16 @@ describe('WebSocket abuse controls (P1-2)', () => {
     expect(sockets.slice(0, MAX_SOCKETS_PER_HOST).every((s) => s.of('ready')[0]?.subscriptions[0]?.ok)).toBe(true)
   })
 
-  it('podSocketCapExceeded is a pure threshold on the open-socket count', () => {
-    expect(podSocketCapExceeded(0)).toBe(false)
-    expect(podSocketCapExceeded(499)).toBe(false)
-    expect(podSocketCapExceeded(500)).toBe(true)
-    expect(podSocketCapExceeded(501)).toBe(true)
+  it('podAcceptRefusal thresholds authenticated and pending SEPARATELY (mupot#1594 P1-A)', () => {
+    expect(podAcceptRefusal({ authenticated: 0, pending: 0 })).toBeNull()
+    expect(podAcceptRefusal({ authenticated: MAX_SOCKETS_PER_POT - 1, pending: 0 })).toBeNull()
+    expect(podAcceptRefusal({ authenticated: MAX_SOCKETS_PER_POT, pending: 0 })).toBe('pot_full')
+    expect(podAcceptRefusal({ authenticated: MAX_SOCKETS_PER_POT + 1, pending: 0 })).toBe('pot_full')
+    // A pending flood never counts against the authenticated ceiling...
+    expect(podAcceptRefusal({ authenticated: 0, pending: MAX_PENDING_SOCKETS_PER_POT - 1 })).toBeNull()
+    expect(podAcceptRefusal({ authenticated: 0, pending: MAX_PENDING_SOCKETS_PER_POT })).toBe('pending_full')
+    // ...and cannot smuggle its way past the pending cap by pointing at authenticated headroom.
+    expect(podAcceptRefusal({ authenticated: 1, pending: MAX_PENDING_SOCKETS_PER_POT })).toBe('pending_full')
   })
 })
 
@@ -991,5 +1052,231 @@ describe('Herdr fence parity (P2-1)', () => {
     const open = await inboxApp.request('/stream', { headers: { Authorization: `Bearer ${raw}` }, signal: ac.signal }, on)
     expect(open.status).toBe(200)
     ac.abort()
+  })
+})
+
+// ═════════════ mupot#1594 P2-B: the fence must fail CLOSED on a D1 error, never open ═════════════
+describe('Herdr fence fails CLOSED on a D1 error (P2-B)', () => {
+  it('a transient D1 error re-authorizing the grant refuses 503, never opens the legacy stream', async () => {
+    const w = await world()
+    const raw = 'seat-fence-b-token'
+    w.h.sqlite.exec(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+      VALUES ('${TENANT}', '${A1}', 'seat1-m', datetime('now'))`)
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id)
+      VALUES ('tok-fence-b', 'seat1-m', '${await hashMemberToken(raw)}', '', 'workspace', datetime('now'), '${TENANT}', '${A1}')`)
+    await grant(w, HOST1, A1)
+    // Only authorizeSeatDelivery's own query (aliased `seat_event_grants g`) fails — the
+    // PRIOR activeSeatEventGrant lookup (unaliased) must still succeed so the fence code path
+    // actually reaches the failing call, exactly like the P2-3 publish test's flakyDb.
+    const flakyDb = new Proxy(w.env.DB as unknown as Record<string, unknown>, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('seat_event_grants g')) throw new Error('D1_ERROR: transient')
+            return (t.prepare as (s: string) => unknown)(sql)
+          }
+        }
+        const v = (t as Record<string, unknown>)[k as string]
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v
+      },
+    })
+    const on = { ...w.env, DB: flakyDb, REALTIME_SEAT_EVENTS: '1', SEAT_EVENTS: {} } as unknown as Env
+    const r = await inboxApp.request('/stream', { headers: { Authorization: `Bearer ${raw}` } }, on)
+    // Before the fix, hostMayReceive's boolean collapse turned this 'error' into `false` —
+    // "not eligible" — so `stillEligible` was false, the fence fell through, and the legacy
+    // stream opened 200 wide open. It must now refuse, not open.
+    expect(r.status).toBe(503)
+    expect(await r.json()).toMatchObject({ error: 'fence_check_failed' })
+    expect(r.headers.get('retry-after')).toBe('2')
+  })
+})
+
+// ═════════════ mupot#1594 P2-C: grant scope — host standing to create, rank ceiling to revoke ═════════════
+describe('grant scope: host standing and revoke rank ceiling (P2-C)', () => {
+  it('a lead of s1 cannot route an s1 agent to a host with no standing in s1', async () => {
+    const w = await world()
+    const k3 = await keypair()
+    w.h.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('orphan-m', 'Orphan', 'active', '${TENANT}');
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+        VALUES ('${TENANT}', 'orphan-host', '${k3.x}', 'Ed25519', 'orphan-m', ${NOW});
+    `)
+    // orphan-m has NO capability row anywhere, and 'orphan-host' is not an agents row at all —
+    // neither of hostHasStandingInSquad's two seams is satisfied.
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-lead3', 'seat1-m', '${await hashMemberToken('lead-tok-3')}', '', 'workspace', datetime('now'), '${TENANT}')`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead3', 'seat1-m', 'squad', 's1', 'lead')`)
+    const body = JSON.stringify({ host_agent_id: 'orphan-host', agent_id: A1, reason: 'route to orphan' })
+    const r = await seatEventsApp.request('/grants', { method: 'POST', headers: { Authorization: 'Bearer lead-tok-3' }, body }, w.env)
+    expect(r.status).toBe(403)
+    expect(await r.json()).toMatchObject({ error: 'host_no_squad_standing' })
+  })
+
+  it('a host that IS itself an agent registered to the target squad passes ("registered to it")', async () => {
+    const w = await world()
+    const k3 = await keypair()
+    // A3 is already an `agents` row on s1 (world()'s own fixture) — no memberships row, no
+    // capability grant, just squad_id = 's1'. That alone must satisfy standing.
+    w.h.sqlite.exec(`INSERT INTO agent_keys (tenant, agent_id, pubkey, algo, member_id, created_at)
+      VALUES ('${TENANT}', '${A3}', '${k3.x}', 'Ed25519', 'admin', ${NOW})`)
+    const r = await createSeatEventGrant(w.env, { hostAgentId: A3, agentId: A1, memberId: 'admin', reason: 'A3 hosts A1' })
+    expect(r.ok).toBe(true)
+  })
+
+  it('a lead cannot revoke a grant an org admin created; an org admin can revoke anything', async () => {
+    const w = await world()
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin-org', 'admin', 'org', NULL, 'admin')`)
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-admin', 'admin', '${await hashMemberToken('admin-tok')}', '', 'workspace', datetime('now'), '${TENANT}')`)
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-lead4', 'seat1-m', '${await hashMemberToken('lead-tok-4')}', '', 'workspace', datetime('now'), '${TENANT}')`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead4', 'seat1-m', 'squad', 's1', 'lead')`)
+    // The ORG ADMIN creates the grant (higher authority than the s1 lead).
+    const created = await createSeatEventGrant(w.env, { hostAgentId: HOST1, agentId: A1, memberId: 'admin', reason: 'admin-created' })
+    expect(created.ok).toBe(true)
+    // The s1 lead — who otherwise passes authorizeGrantTarget (lead on A1's own squad) — is
+    // refused: this grant is outside their authority because a higher-rank principal made it.
+    const leadRevoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer lead-tok-4' } }, w.env)
+    expect(leadRevoke.status).toBe(403)
+    expect(await leadRevoke.json()).toMatchObject({ error: 'forbidden_higher_authority' })
+    // The org admin can revoke it (their own creation, or anyone else's — org admin is exempt).
+    const adminRevoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer admin-tok' } }, w.env)
+    expect(adminRevoke.status).toBe(200)
+    expect(await adminRevoke.json()).toMatchObject({ revoked: 1 })
+  })
+
+  it('a lead CAN revoke a grant created by another lead (peer authority, not higher)', async () => {
+    const w = await world()
+    w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
+      VALUES ('tok-lead5', 'seat1-m', '${await hashMemberToken('lead-tok-5')}', '', 'workspace', datetime('now'), '${TENANT}')`)
+    w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead5', 'seat1-m', 'squad', 's1', 'lead')`)
+    await grant(w, HOST1, A1) // created by 'admin' via the grant() helper, but 'admin' holds no org-admin capability in THIS world()
+    const revoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer lead-tok-5' } }, w.env)
+    expect(revoke.status).toBe(200)
+  })
+})
+
+// ═════════════ mupot#1594 P1-A: route-level ticket pre-check before the DO is ever reached ═════════════
+describe('route-level ticket pre-check (P1-A)', () => {
+  it('200 forged tickets reach 0 DO fetches — all refused with 401 at the route', async () => {
+    const w = await world()
+    let doFetches = 0
+    const hub = hubFor(w)
+    const env = {
+      ...w.env,
+      REALTIME_SEAT_EVENTS: '1',
+      SEAT_EVENTS: namespaceOver(hub, () => { doFetches++ }),
+    } as unknown as Env
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+    for (let i = 0; i < 200; i++) {
+      const forged = Array.from({ length: 43 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('')
+      const r = await seatEventsApp.request(`/?ticket=${forged}`, {
+        headers: { Upgrade: 'websocket', 'Sec-WebSocket-Key': 'k', 'cf-connecting-ip': `203.0.${Math.floor(i / 50)}.${i % 50}` },
+      }, env)
+      expect(r.status).toBe(401)
+    }
+    expect(doFetches).toBe(0)
+  })
+
+  it('a minted, unexpired ticket passes the pre-check; the same hash fails once expired', async () => {
+    const w = await world()
+    const hash = await sha256Hex('z'.repeat(43))
+    await recordTicketPreCheck(w.env, hash, NOW + 30, () => NOW)
+    expect(await ticketPreCheckPasses(w.env, hash, () => NOW)).toBe(true)
+    expect(await ticketPreCheckPasses(w.env, hash, () => NOW + 31)).toBe(false)
+  })
+
+  it('a D1 error during the pre-check fails CLOSED', async () => {
+    const w = await world()
+    const flakyDb = new Proxy(w.env.DB as unknown as Record<string, unknown>, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('seat_events_tickets')) throw new Error('D1_ERROR: transient')
+            return (t.prepare as (s: string) => unknown)(sql)
+          }
+        }
+        const v = (t as Record<string, unknown>)[k as string]
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v
+      },
+    })
+    expect(await ticketPreCheckPasses({ ...w.env, DB: flakyDb } as unknown as Env, 'whatever')).toBe(false)
+  })
+
+  it('POST /ticket refuses 503 (never mints) when the pre-check write itself fails', async () => {
+    const w = await world()
+    const flakyDb = new Proxy(w.env.DB as unknown as Record<string, unknown>, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('INSERT INTO seat_events_tickets')) throw new Error('D1_ERROR: transient')
+            return (t.prepare as (s: string) => unknown)(sql)
+          }
+        }
+        const v = (t as Record<string, unknown>)[k as string]
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v
+      },
+    })
+    const env2 = { ...w.env, DB: flakyDb } as unknown as Env
+    await grant({ ...w, env: env2 } as World, HOST1, A1)
+    const req = await signedRequest(w.k1, { host: HOST1, agents: [A1], ts: Math.floor(Date.now() / 1000) })
+    const r = await seatEventsApp.request('/ticket', { method: 'POST', body: JSON.stringify(req) }, { ...env2, REALTIME_SEAT_EVENTS: '1', SEAT_EVENTS: namespaceOver(hubFor(w)) } as unknown as Env)
+    expect(r.status).toBe(503)
+  })
+})
+
+// ═════════════ mupot#1594 P1-A: the upgrade route's own rate limit, /64-bucketed ═════════════
+describe('upgrade rate limit (P1-A)', () => {
+  it('the upgrade route 429s once its own per-IP ceiling is hit', async () => {
+    const w = await world()
+    const hub = hubFor(w)
+    const env = { ...w.env, REALTIME_SEAT_EVENTS: '1', SEAT_EVENTS: namespaceOver(hub) } as unknown as Env
+    const headers = { Upgrade: 'websocket', 'Sec-WebSocket-Key': 'k', 'cf-connecting-ip': '198.51.100.42' }
+    let last: Response | null = null
+    for (let i = 0; i < UPGRADE_RATE_LIMIT_MAX_PER_IP; i++) {
+      last = await seatEventsApp.request('/?ticket=' + 'B'.repeat(43), { headers }, env)
+    }
+    expect(last?.status).toBe(401) // allowed through the limiter; refused by the (never-minted) pre-check
+    const over = await seatEventsApp.request('/?ticket=' + 'B'.repeat(43), { headers }, env)
+    expect(over.status).toBe(429)
+  })
+
+  it('the ticket-mint and upgrade limiters are INDEPENDENT buckets', async () => {
+    const w = await world()
+    const ip = '198.51.100.77'
+    for (let i = 0; i < TICKET_RATE_LIMIT_MAX_PER_IP; i++) await underTicketRateLimit(w.env, ip, NOW * 1000)
+    expect(await underTicketRateLimit(w.env, ip, NOW * 1000)).toBe(false) // ticket bucket exhausted
+    expect(await underUpgradeRateLimit(w.env, ip, NOW * 1000)).toBe(true) // upgrade bucket untouched
+  })
+
+  it('ipRateLimitKey buckets IPv6 to its /64, defeating rotation within the block; IPv4 passes through', () => {
+    expect(ipRateLimitKey('2001:db8:aaaa:bbbb:1::1')).toBe(ipRateLimitKey('2001:db8:aaaa:bbbb:2::2'))
+    expect(ipRateLimitKey('2001:db8:aaaa:bbbb::1')).not.toBe(ipRateLimitKey('2001:db8:cccc:dddd::1'))
+    expect(ipRateLimitKey('203.0.113.5')).toBe('203.0.113.5')
+    expect(ipRateLimitKey('unknown')).toBe('unknown')
+  })
+})
+
+// ═════════════ mupot#1594 P1-A: hibernation-safe auth deadline; never-postponed sweep ═════════════
+describe('auth-deadline hibernation safety (P1-A)', () => {
+  it('a pending socket past the deadline is closed after a SIMULATED HIBERNATION (fresh hub, same socket)', async () => {
+    const w = await world()
+    let now = NOW
+    const hub = hubFor(w, { now: () => now })
+    const pending = hub.acceptRaw() // connectedAt written via the ORIGINAL hub/DO instance
+    now += AUTH_DEADLINE_SEC
+    // Simulate the DO being evicted and rebuilt: fresh junk/recent trackers, same sockets.
+    const revived = hub.hibernate()
+    expect(revived.enforceAuthDeadline()).toBe(1)
+    expect(pending.closed).toMatchObject({ code: CLOSE_AUTH_TIMEOUT, reason: 'auth_timeout' })
+  })
+
+  it('nextAuthDeadlineAlarm never postpones a pending sweep; it DOES bring one earlier', () => {
+    const armed = NOW * 1000 + AUTH_DEADLINE_SEC * 1000
+    expect(nextAuthDeadlineAlarm(null, armed)).toBe(armed) // nothing pending: arm it
+    // A connect 5s later asks for a deadline 5s FURTHER OUT than the one already armed.
+    expect(nextAuthDeadlineAlarm(armed, armed + 5_000)).toBeNull()
+    // A deadline that would fire EARLIER than what's armed DOES get taken.
+    expect(nextAuthDeadlineAlarm(armed, armed - 5_000)).toBe(armed - 5_000)
   })
 })
