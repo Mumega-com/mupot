@@ -102,6 +102,23 @@ describe('loadApprovals — can_verdict/can_approve/can_reject decoration (mupot
     expect(out.items[0]).toMatchObject({ can_verdict: true, can_approve: true, can_reject: true })
   })
 
+  // mupot#1592 NEW-2: gate:office has its OWN dedicated verdict tool
+  // (office.review_approval) with its own hash-binding invariant this
+  // dashboard's generic Approve/Reject buttons (POST /:id/verdict) cannot
+  // enforce — src/tasks/service.ts's writeVerdict now refuses to decide it at
+  // all. can_verdict/can_approve/can_reject must be FALSE here even for a
+  // caller who holds the gate:office grant AND squad membership — anything
+  // else renders a button that always 409s.
+  it('REACHABLE false branch: gate:office is refused outright — the dedicated tool owns this decision, not the generic verdict route', async () => {
+    seedMember(harness.sqlite, 'member-office-1')
+    seedSquadCapability(harness.sqlite, 'member-office-1', 'squad-1', 'member')
+    seedReviewTask(harness.sqlite, 'task-office-1', 'squad-1', 'gate:office')
+    seedGrant(harness.sqlite, 'gate:office', 'member', 'member-office-1')
+    const out = await loadApprovals(envFor(harness), memberAuth('member-office-1'))
+    expect(out.items).toHaveLength(1)
+    expect(out.items[0]).toMatchObject({ can_verdict: false, can_approve: false, can_reject: false })
+  })
+
   it('REACHABLE false branch: gate:loops held without outreach:send-gated — can_approve false, can_reject true, can_verdict true', async () => {
     seedMember(harness.sqlite, 'member-3')
     seedSquadCapability(harness.sqlite, 'member-3', 'squad-1', 'member')

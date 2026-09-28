@@ -28,6 +28,7 @@
 import type { Env, Task, AuthContext, OrgKind } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache } from '../tasks/index'
+import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
 
 export interface ApprovalItem {
@@ -181,6 +182,16 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
     rows.map(async (row) => {
       const gateOwner = row.gate_owner
       if (!gateOwner || !(await canActOnSquad(env, auth, row.squad_id, 'member', deptCache))) {
+        return { ...row, can_verdict: false, can_approve: false, can_reject: false }
+      }
+      // mupot#1592 NEW-2: a gate namespace with its OWN dedicated verdict tool
+      // (today: gate:office → office.review_approval) can never be decided
+      // through the generic verdict route this dashboard's Approve/Reject
+      // buttons POST to (src/tasks/service.ts's writeVerdict now refuses it
+      // outright) — mirror that here so the dashboard never renders a button
+      // that always 409s. Structurally absent, not disabled, matching this
+      // module's own can_verdict/can_approve/can_reject contract.
+      if (hasDedicatedGatePredicate(gateOwner)) {
         return { ...row, can_verdict: false, can_approve: false, can_reject: false }
       }
       const task = { squad_id: row.squad_id, gate_owner: gateOwner, assignee_agent_id: row.assignee_agent_id }

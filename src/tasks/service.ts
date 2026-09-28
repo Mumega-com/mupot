@@ -1732,6 +1732,14 @@ export async function emitVerdictBusEvent(
 // addons/* already depends on tasks/service.ts; the reverse import would cycle.
 const GATE_OWNERS_WITH_DEDICATED_PREDICATE = new Set<string>(['gate:office'])
 
+// Exported so READ-side surfaces (src/dashboard/approvals.ts's can_approve/
+// can_reject) can mirror this WRITE-side refusal instead of drifting from it —
+// the #1081-era lesson (a read-side predicate that doesn't match the write
+// route shows an Approve button that always 409s). Same function, same set.
+export function hasDedicatedGatePredicate(gateOwner: string | null): boolean {
+  return gateOwner !== null && GATE_OWNERS_WITH_DEDICATED_PREDICATE.has(gateOwner)
+}
+
 export class DedicatedGatePredicateRequiredError extends Error {
   constructor(taskId: string, gateOwner: string) {
     super(
