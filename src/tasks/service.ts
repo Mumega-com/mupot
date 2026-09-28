@@ -538,7 +538,20 @@ function isUniqueViolation(error: unknown): boolean {
 // "pre-state scope guard the same call mutates" lesson #1388's own review
 // found elsewhere: enforce the invariant IN the WHERE clause of the write
 // that could violate it, not only in a check that ran a moment earlier.
-function buildTaskSubmittedResultStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
+//
+// callerAgentId is bound EXPLICITLY (auth.boundAgentId from the tool, passed
+// through — never re-derived from `existing`/`next`). Binding
+// `existing.assignee_agent_id` here instead would be a tautology (the row
+// compared to itself) that ALWAYS matches regardless of who is actually
+// calling — mutation-proven: with the JS assignee check disabled, a
+// non-assignee agent's call still landed `ok:true` against that version of
+// this WHERE clause, because nothing in it ever looked at who the caller was.
+function buildTaskSubmittedResultStatement(
+  env: Env,
+  existing: Task,
+  next: Task,
+  callerAgentId: string,
+): D1PreparedStatement {
   return env.DB.prepare(
     `UPDATE tasks
         SET status = ?, result = ?, gate_owner = ?, updated_at = ?
@@ -554,7 +567,7 @@ function buildTaskSubmittedResultStatement(env: Env, existing: Task, next: Task)
     next.id,
     existing.updated_at,
     existing.project_id,
-    existing.assignee_agent_id,
+    callerAgentId,
   )
 }
 
@@ -562,8 +575,9 @@ export async function persistTaskSubmittedResult(
   env: Env,
   existing: Task,
   next: Task,
+  callerAgentId: string,
 ): Promise<void> {
-  const result = await buildTaskSubmittedResultStatement(env, existing, next).run()
+  const result = await buildTaskSubmittedResultStatement(env, existing, next, callerAgentId).run()
   if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
 }
 

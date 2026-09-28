@@ -2584,7 +2584,7 @@ const toolTaskSubmitResult: ToolSpec = {
     stampTaskUpdate(next, existing.status, new Date().toISOString())
 
     try {
-      await persistTaskSubmittedResult(env, existing, next)
+      await persistTaskSubmittedResult(env, existing, next, auth.boundAgentId)
     } catch (error) {
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
       throw error
