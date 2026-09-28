@@ -114,6 +114,8 @@ function makeEnv(opts: {
   doStatus?: number
   doBody?: string
   throwDoFetch?: boolean
+  throwFleetLookup?: boolean
+  missingAgentBinding?: boolean
   duplicateSlug?: boolean
   fullInbox?: boolean
 } = {}) {
@@ -135,11 +137,30 @@ function makeEnv(opts: {
       headers: { 'content-type': 'application/json' },
     })
   })
+  const db = opts.throwFleetLookup
+    ? {
+        prepare(sql: string) {
+          if (sql.includes('FROM fleet_agents') && sql.includes('last_reported_at')) {
+            return {
+              bind() {
+                return {
+                  async first() {
+                    throw new Error('fleet liveness lookup unavailable')
+                  },
+                }
+              },
+            }
+          }
+          return harness.db.prepare(sql)
+        },
+        batch: harness.db.batch.bind(harness.db),
+      }
+    : harness.db
   const env = {
     TENANT_SLUG: TENANT,
-    DB: harness.db,
+    DB: db,
     BUS: { send: vi.fn(async (event: BusEvent) => { busEvents.push(event) }) },
-    AGENT: {
+    AGENT: opts.missingAgentBinding ? undefined : {
       idFromName: vi.fn((id: string) => `do:${id}`),
       get: vi.fn(() => ({ fetch: doFetch })),
     },
@@ -231,6 +252,27 @@ describe('shared external-agent wake routing', () => {
     expect(doFetch).toHaveBeenCalledOnce()
     expect(messages).toHaveLength(1)
     expect(messages[0].to_agent).toBe(AGENT_SLUG)
+  })
+
+  it('falls back to a durable canonical wake when the fleet liveness lookup throws', async () => {
+    const { env, harness, doFetch } = makeEnv({ throwFleetLookup: true, doStatus: 503 })
+
+    const response = await wakeViaMcp(env, { reason: 'liveness-lookup-unavailable' })
+
+    expect(response.status).toBe(200)
+    expect(doFetch).not.toHaveBeenCalled()
+    expect(storedMessages(harness)).toHaveLength(1)
+    expect(storedMessages(harness)[0].to_agent).toBe(AGENT_ID)
+  })
+
+  it('falls back to a durable canonical wake when the AgentDO binding is unavailable', async () => {
+    const { env, harness } = makeEnv({ external: 'none', missingAgentBinding: true })
+
+    const response = await wakeViaMcp(env, { reason: 'agent-binding-unavailable' })
+
+    expect(response.status).toBe(200)
+    expect(storedMessages(harness)).toHaveLength(1)
+    expect(storedMessages(harness)[0].to_agent).toBe(AGENT_ID)
   })
 
   it('returns fixed wake_failed when AgentDO and fallback both fail without reflecting raw bodies', async () => {

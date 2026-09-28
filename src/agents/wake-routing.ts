@@ -103,7 +103,23 @@ async function emitRoutedObservation(
 /** Select and execute exactly one wake route for a server-resolved canonical agent. */
 export async function routeAgentWake(env: Env, input: WakeRouteInput): Promise<WakeRouteResult> {
   const idempotencyKey = `wake:${crypto.randomUUID()}`
-  const external = await getFleetAgentLiveness(env, input.agent.id)
+  let external: Awaited<ReturnType<typeof getFleetAgentLiveness>>
+  try {
+    external = await getFleetAgentLiveness(env, input.agent.id)
+  } catch {
+    // Fleet presence selects a route; it must not make a valid wake request fail with an opaque
+    // internal error. The canonical agent id is already server-resolved, so durable delivery is
+    // the safe route when that optional selection read is unavailable.
+    const fallback = await deliverWakeEnvelope(
+      env,
+      input,
+      input.agent.id,
+      'fallback_inbox',
+      idempotencyKey,
+    )
+    if (fallback.ok) await emitRoutedObservation(env, input, fallback.route)
+    return fallback
+  }
 
   if (external.live && external.runtime && external.agentId) {
     const result = await deliverWakeEnvelope(
@@ -117,9 +133,9 @@ export async function routeAgentWake(env: Env, input: WakeRouteInput): Promise<W
     return result
   }
 
-  const stub = env.AGENT.get(env.AGENT.idFromName(input.agent.id))
   let response: Response | null = null
   try {
+    const stub = env.AGENT.get(env.AGENT.idFromName(input.agent.id))
     response = await stub.fetch(`${DO_ORIGIN}/wake`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
