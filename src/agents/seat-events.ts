@@ -34,10 +34,16 @@
 import type { Env, MessageCreatedPayload } from '../types'
 import { loadActiveAgentKey } from '../fleet/agent-keys'
 import { burnSharedAgentNonce, sharedNonceWindowSec } from '../fleet/shared-nonce-ledger'
-import { canOnSquad, resolveCapabilities } from '../auth/capability'
+import { canOnSquad, capabilityRank, currentMemberRankAtLeastSql, resolveCapabilities } from '../auth/capability'
 
 export const SEAT_EVENTS_FLAG = '1'
 export const SEAT_EVENTS_PROTOCOL = 1
+// mupot#1595 P1: internal Worker→DO header carrying the ticket's already-verified host, set
+// ONLY by seatEventsApp's GET / handler (after atomically consuming the ticket) and read ONLY
+// by SeatEventsDO's /connect — never forwarded from, or influenced by, anything client-sent
+// (presenceLiveDoUpgradeRequest's own hop-header allowlist doesn't include it, so a
+// client-supplied header of this name is dropped before this one is set on top).
+export const SEAT_EVENTS_HOST_HEADER = 'x-seat-events-host'
 export const TICKET_SIG_DOMAIN = 'seat-events-ticket:v1'
 export const TICKET_WINDOW_SEC = sharedNonceWindowSec(TICKET_SIG_DOMAIN)
 export const TICKET_TTL_SEC = 60
@@ -253,24 +259,47 @@ export async function createSeatEventGrant(
 
 export async function revokeSeatEventGrant(
   env: Env,
-  input: { agentId: string; memberId: string },
+  // mupot#1595 P2 (codex round-2 review): "bind the authorized grant to the revoke update."
+  // Without `grantId`, this always revoked WHATEVER live grant currently exists for the
+  // agent — so a caller who authorized against grant A (read separately, before this call)
+  // could end up revoking grant B if A was itself revoked and replaced in between (a
+  // concurrent revoke-and-replace race). Passing the exact row id the caller already
+  // checked turns "revoke the live grant" into "revoke THAT grant, if it is still live" —
+  // 0 rows changed means it moved, and the caller must re-authorize against whatever is
+  // live NOW rather than silently acting on it.
+  input: { agentId: string; memberId: string; grantId?: string },
   now: () => string = () => new Date().toISOString(),
 ): Promise<{ ok: boolean; revoked: number }> {
   const res = await env.DB.prepare(
-    `UPDATE seat_event_grants SET revoked_at = ?1, revoked_by_member_id = ?2
-      WHERE tenant = ?3 AND agent_id = ?4 AND revoked_at IS NULL`,
-  ).bind(now(), input.memberId, env.TENANT_SLUG, input.agentId).run()
+    input.grantId
+      ? `UPDATE seat_event_grants SET revoked_at = ?1, revoked_by_member_id = ?2
+          WHERE tenant = ?3 AND agent_id = ?4 AND id = ?5 AND revoked_at IS NULL`
+      : `UPDATE seat_event_grants SET revoked_at = ?1, revoked_by_member_id = ?2
+          WHERE tenant = ?3 AND agent_id = ?4 AND revoked_at IS NULL`,
+  ).bind(...(input.grantId ? [now(), input.memberId, env.TENANT_SLUG, input.agentId, input.grantId] : [now(), input.memberId, env.TENANT_SLUG, input.agentId])).run()
   return { ok: true, revoked: Number(res.meta?.changes ?? 0) }
+}
+
+/** mupot#1595 P2 (codex round-2 review): "a suspended or archived creator's authority must
+ *  not impose a revoke ceiling" — resolveCapabilities reads capability rows with no status
+ *  filter at all, so a suspended member's stale admin/owner row would otherwise still block
+ *  a squad lead's revoke forever. A principal who cannot currently authenticate must not be
+ *  able to exercise authority through a row this codebase never re-validates for them. */
+export async function isMemberActive(env: Env, memberId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT 1 AS x FROM members WHERE id = ?1 AND tenant = ?2 AND status = 'active'`)
+    .bind(memberId, env.TENANT_SLUG)
+    .first()
+  return row !== null
 }
 
 export async function activeSeatEventGrant(
   env: Env,
   agentId: string,
-): Promise<{ host_agent_id: string; project_id: string | null; granted_by_member_id: string } | null> {
+): Promise<{ id: string; host_agent_id: string; project_id: string | null; granted_by_member_id: string } | null> {
   return env.DB.prepare(
-    `SELECT host_agent_id, project_id, granted_by_member_id FROM seat_event_grants
+    `SELECT id, host_agent_id, project_id, granted_by_member_id FROM seat_event_grants
       WHERE tenant = ?1 AND agent_id = ?2 AND revoked_at IS NULL LIMIT 1`,
-  ).bind(env.TENANT_SLUG, agentId).first<{ host_agent_id: string; project_id: string | null; granted_by_member_id: string }>()
+  ).bind(env.TENANT_SLUG, agentId).first<{ id: string; host_agent_id: string; project_id: string | null; granted_by_member_id: string }>()
 }
 
 async function agentHasProject(env: Env, agentId: string, projectId: string): Promise<boolean> {
@@ -290,8 +319,28 @@ async function agentHasProject(env: Env, agentId: string, projectId: string): Pr
  *  into false. */
 export type SeatAuthorization = 'granted' | 'not_granted' | 'error'
 
+// mupot#1595 P1 (codex round-2 review on 4dff34d2): "the new host-standing requirement is
+// checked only when the grant is created." authorizeSeatDelivery is the SHARED gate mint
+// (hostMayReceive), redeem (onMessage's re-check), the Herdr fence, and every published hint
+// all run through — folding host-squad-standing in HERE, as one more AND clause on the
+// SAME query, revalidates it on every one of those at once, for EVERY grant including ones
+// created before this requirement existed (nothing here reads when the grant was created).
+// Mirrors hostHasStandingInSquad's two branches (createSeatEventGrant, above) but as SQL,
+// reusing currentMemberRankAtLeastSql — the SAME embeddable rank-ladder fragment
+// acceptInvite's write-time re-check uses (src/auth/capability.ts) — rather than a second,
+// JS-side round trip per disclosure.
+const HOST_STANDING_SQL = `(
+  EXISTS (SELECT 1 FROM agents ha WHERE ha.id = g.host_agent_id AND ha.squad_id = a.squad_id)
+  OR ${currentMemberRankAtLeastSql('squad', {
+    inviterIdParam: 'k.member_id',
+    scopeIdParam: 'a.squad_id',
+    requiredRankParam: String(capabilityRank('member')),
+  })}
+)`
+
 /** The per-disclosure check. One indexed query: live grant for (host, agent), agent active,
- *  host key still bound to an active member, project (if scoped) still reachable. */
+ *  host key still bound to an active member, host still has standing in the agent's squad,
+ *  project (if scoped) still reachable. */
 export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agentId: string): Promise<SeatAuthorization> {
   try {
     const row = await env.DB.prepare(
@@ -306,6 +355,7 @@ export async function authorizeSeatDelivery(env: Env, hostAgentId: string, agent
                   JOIN project_squad_access psa ON psa.squad_id = ms.squad_id
                   JOIN projects p ON p.id = psa.project_id
                  WHERE ms.agent_id = g.agent_id AND p.id = g.project_id AND p.status = 'active'))
+          AND ${HOST_STANDING_SQL}
         LIMIT 1`,
     ).bind(env.TENANT_SLUG, hostAgentId, agentId).first()
     return row !== null ? 'granted' : 'not_granted'
@@ -338,8 +388,17 @@ export const TICKET_RATE_LIMIT_MAX_PER_IP = 60
 // so bucketing any finer just charges the attacker nothing to rotate. IPv4 passes through
 // unchanged (a /32 rotation costs a real address). Applied to BOTH the ticket-mint limiter
 // and the upgrade-route limiter below, so neither can be walked around the same way.
+// mupot#1595 P3 (kasra-review round 1): an IPv4-mapped IPv6 address (::ffff:a.b.c.d) IS the
+// same client as the plain IPv4 address it carries. Without this, EVERY IPv4-mapped address
+// (and ::1) expanded and truncated to the identical "0:0:0:0" /64 prefix — a shared-bucket
+// DoS: any one of them exhausting the bucket rate-limits every unrelated address that also
+// happens to arrive IPv4-mapped, none of them able to tell.
+const IPV4_MAPPED_RE = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i
+
 export function ipRateLimitKey(ip: string): string {
   if (!ip || ip === 'unknown') return 'unknown'
+  const mapped = ip.match(IPV4_MAPPED_RE)
+  if (mapped) return mapped[1] // key by the embedded IPv4 address, same as a native IPv4 client
   if (!ip.includes(':')) return ip // IPv4 (or an already-opaque non-IP fallback)
   const [head, tail] = ip.split('::')
   const headParts = head ? head.split(':').filter(Boolean) : []
@@ -348,6 +407,20 @@ export function ipRateLimitKey(ip: string): string {
     ? [...headParts, ...Array(Math.max(8 - headParts.length - tailParts.length, 0)).fill('0'), ...tailParts]
     : ip.split(':')
   return full.slice(0, 4).join(':') || 'unknown'
+}
+
+// mupot#1595 P2 (kasra-review round 1): "the rate-limit tables grow without bound... nothing
+// deletes old windows." Best-effort, event-driven cleanup — same convention as
+// recordTicketPreCheck's own opportunistic purge below. A prune failure must NEVER fail the
+// rate-limit decision itself (the try/catch swallows it, logs, and moves on) — pruning is
+// housekeeping, not part of the security property.
+async function pruneRateLimitTable(env: Env, table: 'seat_events_ticket_rate_limits' | 'seat_events_upgrade_rate_limits', nowMs: number, windowSec: number): Promise<void> {
+  try {
+    const cutoff = new Date(nowMs - 2 * windowSec * 1000).toISOString()
+    await env.DB.prepare(`DELETE FROM ${table} WHERE tenant = ?1 AND window_start < ?2`).bind(env.TENANT_SLUG, cutoff).run()
+  } catch (err) {
+    console.error(`[seat-events] ${table} prune failed (non-fatal):`, err instanceof Error ? err.message : err)
+  }
 }
 
 export async function underTicketRateLimit(
@@ -366,6 +439,7 @@ export async function underTicketRateLimit(
        ON CONFLICT (tenant, key, window_start) DO UPDATE SET count = count + 1
         WHERE count < ?4`,
     ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).run()
+    await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits', nowMs, TICKET_RATE_LIMIT_WINDOW_SEC)
     return Number(result.meta?.changes ?? 0) > 0
   } catch (err) {
     // Fail CLOSED on D1 trouble — same posture as email-login and the enroll-mint limiter: a
@@ -399,6 +473,7 @@ export async function underUpgradeRateLimit(
        ON CONFLICT (tenant, key, window_start) DO UPDATE SET count = count + 1
         WHERE count < ?4`,
     ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).run()
+    await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits', nowMs, UPGRADE_RATE_LIMIT_WINDOW_SEC)
     return Number(result.meta?.changes ?? 0) > 0
   } catch (err) {
     console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
@@ -423,24 +498,31 @@ export async function underUpgradeRateLimit(
 // before it did anything; this migration-only table needs no such rollout step to take
 // effect the moment it deploys.
 //
-// The SINGLE-USE burn is UNTOUCHED — it still happens exactly once, inside the DO, over the
-// hello frame (`tickets.take()`). This table is a stateless pre-check only: it is not
-// deleted at redemption, so a captured, already-redeemed ticket can pass THIS gate again
-// inside its TTL window and reach the DO, where it is refused instantly as `ticket_invalid`
-// (one cheap round trip, no socket left open, no state disclosed). That residual is bounded
-// by TICKET_TTL_SEC (60s) and by MAX_PENDING_SOCKETS_PER_POT — a different, much smaller
-// class of exposure than the unbounded anonymous-forgery lockout this closes.
+// mupot#1595 P1 (kasra-review round 1, Probe Z2): the ORIGINAL pre-check was existence-only,
+// never burned — one minted ticket got 80/80 upgrades forwarded to the DO from 80 distinct
+// /64s inside its 60s TTL, each spending a pending-socket slot, before the DO's OWN burn
+// (`tickets.take()`, at hello) ever saw it. The DO's single-use burn is UNTOUCHED and still
+// happens exactly once, over the hello frame — this is a SEPARATE, EARLIER single-use gate:
+// the route now burns the SAME ticket a second time, atomically, via `UPDATE ... SET used_at
+// ... WHERE used_at IS NULL ... RETURNING` — the exact seam src/auth/email-login.ts's
+// `consumed_at` redemption already uses (`VerifyEmailLoginResult`'s UPDATE...RETURNING). One
+// ticket now opens exactly one upgrade attempt, full stop; a captured, already-redeemed
+// ticket is refused instantly (401) with no socket ever accepted.
 export async function recordTicketPreCheck(
   env: Env,
   hash: string,
+  hostAgentId: string,
   expiresAt: number,
   nowSec: () => number = () => Math.floor(Date.now() / 1000),
 ): Promise<void> {
   const now = nowSec()
   await env.DB.prepare(
-    `INSERT INTO seat_events_tickets (tenant, hash, expires_at, created_at) VALUES (?1, ?2, ?3, ?4)
-     ON CONFLICT (tenant, hash) DO UPDATE SET expires_at = excluded.expires_at, created_at = excluded.created_at`,
-  ).bind(env.TENANT_SLUG, hash, expiresAt, new Date(now * 1000).toISOString()).run()
+    `INSERT INTO seat_events_tickets (tenant, hash, host_agent_id, expires_at, used_at, created_at)
+     VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+     ON CONFLICT (tenant, hash) DO UPDATE SET
+       host_agent_id = excluded.host_agent_id, expires_at = excluded.expires_at,
+       used_at = NULL, created_at = excluded.created_at`,
+  ).bind(env.TENANT_SLUG, hash, hostAgentId, expiresAt, new Date(now * 1000).toISOString()).run()
   // Opportunistic cleanup, event-driven like the DO's own purgeExpired — never a timer. Uses
   // the SAME injected clock as the row it just wrote, so a test (or a clock skew) can never
   // have this delete the row it just inserted out from under itself.
@@ -449,21 +531,33 @@ export async function recordTicketPreCheck(
     .run()
 }
 
-/** Fail CLOSED on a D1 error (same posture as underTicketRateLimit) — a broken pre-check
- *  must refuse the upgrade, never silently let a possibly-forged ticket through to the DO. */
-export async function ticketPreCheckPasses(
+export type ConsumeTicketPreCheckResult =
+  | { ok: true; hostAgentId: string }
+  | { ok: false; reason: 'invalid' | 'error' }
+
+/** Atomic single-use burn (mupot#1595 P1). Fails CLOSED on a D1 error (same posture as
+ *  underTicketRateLimit) — a broken pre-check must refuse the upgrade, never silently let a
+ *  possibly-forged or already-used ticket through to the DO. The tenant conjunct is bound,
+ *  never string-interpolated, so a ticket hash cannot be redeemed cross-tenant even if two
+ *  tenants' hashes ever collided (astronomically unlikely, still checked). */
+export async function consumeTicketPreCheck(
   env: Env,
   hash: string,
   nowSec: () => number = () => Math.floor(Date.now() / 1000),
-): Promise<boolean> {
+): Promise<ConsumeTicketPreCheckResult> {
   try {
+    const now = nowSec()
     const row = await env.DB.prepare(
-      `SELECT 1 AS x FROM seat_events_tickets WHERE tenant = ?1 AND hash = ?2 AND expires_at >= ?3 LIMIT 1`,
-    ).bind(env.TENANT_SLUG, hash, nowSec()).first()
-    return row !== null
+      `UPDATE seat_events_tickets
+          SET used_at = ?4
+        WHERE tenant = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3
+       RETURNING host_agent_id`,
+    ).bind(env.TENANT_SLUG, hash, now, new Date(now * 1000).toISOString()).first<{ host_agent_id: string }>()
+    if (!row) return { ok: false, reason: 'invalid' }
+    return { ok: true, hostAgentId: row.host_agent_id }
   } catch (err) {
-    console.error('[seat-events] ticket pre-check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
-    return false
+    console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
+    return { ok: false, reason: 'error' }
   }
 }
 
@@ -481,6 +575,19 @@ export function podAcceptRefusal(counts: { authenticated: number; pending: numbe
   if (counts.authenticated >= MAX_SOCKETS_PER_POT) return 'pot_full'
   if (counts.pending >= MAX_PENDING_SOCKETS_PER_POT) return 'pending_full'
   return null
+}
+
+// mupot#1595 P1 (kasra-review round 1): the pot-wide pending cap alone still let ONE host
+// (one holder of a granted key, minting fresh single-use tickets fast enough) fill the whole
+// 64-slot pending budget by itself, locking out every OTHER host's reconnect — the same
+// lockout shape, one level down, now that a ticket is single-use. Since the route atomically
+// consumes the ticket and therefore KNOWS its real host before ever calling the DO, it hands
+// that host to /connect (an internal, Worker-to-DO-only header — never client-controlled),
+// and the DO caps PENDING sockets per host independently of the pot-wide pending cap.
+export const MAX_PENDING_SOCKETS_PER_HOST = MAX_SOCKETS_PER_HOST
+
+export function pendingHostCapExceeded(currentPendingForHost: number): boolean {
+  return currentPendingForHost >= MAX_PENDING_SOCKETS_PER_HOST
 }
 
 // ── signed ticket request ─────────────────────────────────────────────────────────────────
@@ -637,8 +744,42 @@ export interface HubSocket {
    *  markConnected() has run. */
   getConnectedAt(): number | undefined
   /** Idempotent — the FIRST call wins, so nothing can postpone a socket's own deadline by
-   *  re-triggering whatever path calls this. */
-  markConnected(nowSec: number): void
+   *  re-triggering whatever path calls this. `pendingHost`, when given, is the route's
+   *  already-verified ticket host (mupot#1595 P1), recorded alongside connectedAt so the DO
+   *  can cap pending sockets per host before any hello ever arrives. */
+  markConnected(nowSec: number, pendingHost?: string): void
+  /** mupot#1595 P1: the host recorded by markConnected, or undefined for a socket that
+   *  connected with no host (shouldn't happen post-fix) or before this field existed. */
+  getPendingHost(): string | undefined
+}
+
+/** mupot#1595 P1 (codex round-2 review): what a WebSocket's attachment holds in the CURRENT
+ *  shape — never read directly; always go through decodeSocketAttachment below, which also
+ *  recognizes the legacy pre-mupot#1594 shape. */
+export interface RawAttachment {
+  connectedAt?: number
+  pendingHost?: string
+  sub?: SocketState
+}
+
+/** A socket accepted by the PREVIOUSLY deployed code (before mupot#1594) wrote its
+ *  attachment as the bare SocketState itself — {host, agents} — directly, via the old
+ *  `setState: (s) => ws.serializeAttachment(s)`. After this code deploys and wakes such a
+ *  hibernated socket, reading `.sub` off that raw value finds nothing: the socket is
+ *  misclassified as pending — hints silently skipped (publish() checks `getState()`), and
+ *  because it also has no `connectedAt`, the auth-deadline sweep can never time it out while
+ *  it sits in the pending count forever. Recognize the legacy shape (host + agents present,
+ *  neither `sub` nor `connectedAt` present — the new format ALWAYS writes at least one of
+ *  those) and decode it as already-authenticated. Once any NEW write touches this socket
+ *  (e.g. `claim`/`drop` calling setState again), it is rewritten in the current format and
+ *  this branch no longer applies to it — self-healing, no migration step needed. */
+export function decodeSocketAttachment(raw: unknown): RawAttachment {
+  if (!raw || typeof raw !== 'object') return {}
+  const r = raw as Record<string, unknown>
+  if (typeof r.host === 'string' && Array.isArray(r.agents) && r.sub === undefined && r.connectedAt === undefined) {
+    return { sub: { host: r.host, agents: r.agents as string[] } }
+  }
+  return r as RawAttachment
 }
 
 export interface HubDeps {
@@ -695,6 +836,19 @@ export function nextAuthDeadlineAlarm(existing: number | null, desired: number):
   return null
 }
 
+/** mupot#1595 P2 (codex round-2 review): after a sweep, the DO used to rearm the alarm at a
+ *  fresh `now + AUTH_DEADLINE_SEC` for whatever pending sockets survived — but a socket that
+ *  connected even 1s after the one that triggered the sweep can then survive to nearly
+ *  DOUBLE its true deadline (swept together with the first at t=15, rearmed for a full new
+ *  interval, so it isn't checked again until t=30 instead of its own real deadline at
+ *  t≈16). Pure: given the connectedAt (unix seconds) of every socket STILL pending after a
+ *  sweep, returns the EARLIEST real deadline (ms) to arm next, or null when nothing is
+ *  pending (let the alarm lapse, same as before). */
+export function nextSweepAlarmMs(pendingConnectedAtSec: readonly number[]): number | null {
+  if (pendingConnectedAtSec.length === 0) return null
+  return (Math.min(...pendingConnectedAtSec) + AUTH_DEADLINE_SEC) * 1000
+}
+
 export async function backlogFor(env: Env, agent: string, since: number): Promise<{ unread: number; complete: boolean; hints: SeatHint[] }> {
   const cols = HINT_FIELDS.filter((f) => f !== 'to_agent').join(', ')
   const rows = await env.DB.prepare(
@@ -727,9 +881,12 @@ export class SeatEventsHub {
    *  exactly once per socket, right after accept, before any message can arrive. mupot#1594
    *  P1-A: this now writes through `sock.markConnected`, which is backed by the socket's OWN
    *  attachment (serializeAttachment), not an in-memory map — so the deadline this establishes
-   *  survives hibernation and DO eviction, and a hub rebuilt after either still sees it. */
-  noteConnected(sock: HubSocket): void {
-    sock.markConnected(this.nowSec())
+   *  survives hibernation and DO eviction, and a hub rebuilt after either still sees it.
+   *  mupot#1595 P1: `pendingHost`, when the route forwarded one (it always does post-fix —
+   *  the ticket is consumed before the DO is ever called, so the host is already known),
+   *  is recorded too, for the per-host pending cap. */
+  noteConnected(sock: HubSocket, pendingHost?: string): void {
+    sock.markConnected(this.nowSec(), pendingHost)
   }
 
   /** Close any socket that connected (per its OWN attachment, mupot#1594 P1-A) at least
@@ -780,6 +937,18 @@ export class SeatEventsHub {
     // so this is a ceiling against a compromised or buggy host key, not the normal path.
     const heldByHost = this.deps.sockets().filter((s) => s.getState()?.host === rec.host).length
     if (heldByHost >= MAX_SOCKETS_PER_HOST) return this.reject(sock, 'host_socket_limit')
+
+    // mupot#1595 P2 (codex round-2 review): the pot-wide authenticated cap was enforced only
+    // at DO accept time, while the socket was still pending — many pending sockets (each
+    // individually under the pending cap, which doesn't count against this one) can complete
+    // hello in the same DO wake and each pass this check independently, together exceeding
+    // MAX_SOCKETS_PER_POT authenticated sockets. Re-check it HERE, at the actual
+    // pending→authenticated transition, before this hello is allowed to succeed — `this` sock
+    // is still pending (getState() === null) so it is correctly excluded from its own count.
+    const authenticatedNow = this.deps.sockets().filter((s) => s.getState() !== null).length
+    if (podAcceptRefusal({ authenticated: authenticatedNow, pending: 0 }) === 'pot_full') {
+      return this.reject(sock, 'pot_at_capacity')
+    }
 
     const since = (f.since && typeof f.since === 'object' ? f.since : {}) as Record<string, unknown>
     const subs: { agent: string; ok: boolean; reason?: string }[] = []

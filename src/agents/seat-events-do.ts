@@ -15,39 +15,36 @@ import { reciprocateWebSocketClose } from '../registry/realtime'
 import {
   AUTH_DEADLINE_SEC,
   createJunkTracker,
+  decodeSocketAttachment,
   nextAuthDeadlineAlarm,
+  nextSweepAlarmMs,
   normalizeHint,
+  pendingHostCapExceeded,
   podAcceptRefusal,
   RecentIds,
+  SEAT_EVENTS_HOST_HEADER,
   SeatEventsHub,
   storageTicketStore,
   type HubSocket,
   type JunkTracker,
-  type SocketState,
 } from './seat-events'
 
-// mupot#1594 P1-A: the socket's ENTIRE attachment payload. `sub` is the existing
-// {host, agents} SocketState once hello succeeds; `connectedAt` is written once, at accept,
-// and never overwritten — it is what enforceAuthDeadline reads, and because it lives on the
-// real WebSocket's own serializeAttachment payload (not an in-memory map keyed off a wrapper
-// object) it survives hibernation and DO eviction, unlike the in-memory `ConnectClock` this
-// replaces.
-interface Attachment {
-  connectedAt?: number
-  sub?: SocketState
-}
-
+// mupot#1594 P1-A / mupot#1595 P1: the socket's ENTIRE attachment payload is read through
+// `decodeSocketAttachment` (seat-events.ts), which ALSO recognizes the legacy pre-mupot#1594
+// shape (a bare {host, agents} written directly by the previously deployed code) and decodes
+// it as authenticated — see that function's own docstring for the rollout hazard this closes.
 function wrap(ws: WebSocket): HubSocket {
-  const read = (): Attachment => (ws.deserializeAttachment() as Attachment | null) ?? {}
+  const read = () => decodeSocketAttachment(ws.deserializeAttachment())
   return {
     send: (d) => ws.send(d),
     close: (code, reason) => ws.close(code, reason),
     getState: () => read().sub ?? null,
     setState: (s) => ws.serializeAttachment({ ...read(), sub: s }),
     getConnectedAt: () => read().connectedAt,
-    markConnected: (nowSec) => {
+    getPendingHost: () => read().pendingHost,
+    markConnected: (nowSec, pendingHost) => {
       const cur = read()
-      if (cur.connectedAt === undefined) ws.serializeAttachment({ ...cur, connectedAt: nowSec })
+      if (cur.connectedAt === undefined) ws.serializeAttachment({ ...cur, connectedAt: nowSec, pendingHost })
     },
   }
 }
@@ -122,10 +119,24 @@ export class SeatEventsDO extends DurableObject<Env> {
         const error = refusal === 'pot_full' ? 'seat_events_at_capacity' : 'seat_events_pending_at_capacity'
         return Response.json({ error }, { status: 503 })
       }
+      // mupot#1595 P1: the route atomically consumes the ticket before ever calling here, so
+      // it already knows — and hands us — the ticket's real host. Cap PENDING sockets per
+      // host too: single-use burn stops the SAME ticket reopening the pending budget, but one
+      // host minting many DISTINCT valid tickets fast enough could still fill the whole
+      // shared pending cap by itself. Trust this header only because it is set by our OWN
+      // Worker route, never forwarded from anything client-sent (see the header's own
+      // docstring in seat-events.ts).
+      const pendingHost = req.headers.get(SEAT_EVENTS_HOST_HEADER) ?? undefined
+      if (pendingHost) {
+        const pendingForHost = existing.filter((s) => s.getState() === null && s.getPendingHost() === pendingHost).length
+        if (pendingHostCapExceeded(pendingForHost)) {
+          return Response.json({ error: 'seat_events_host_pending_at_capacity' }, { status: 503 })
+        }
+      }
       const pair = new WebSocketPair()
       this.ctx.acceptWebSocket(pair[1])
       const wrapped = this.wrapOnce(pair[1])
-      this.hub().noteConnected(wrapped)
+      this.hub().noteConnected(wrapped, pendingHost)
       // mupot#1594 P1-A: never postpone a pending sweep. setAlarm() REPLACES any existing
       // alarm rather than taking the earlier of the two, so every prior connect that called
       // it unconditionally could push the deadline out indefinitely by reconnecting faster
@@ -149,12 +160,20 @@ export class SeatEventsDO extends DurableObject<Env> {
   }
 
   /** Sweeps for sockets that connected and never completed hello (mupot#1589 P1-2's auth
-   *  deadline). Reschedules itself while any socket is still unauthenticated; otherwise lets
-   *  the alarm lapse (mirrors PresenceChannelDO's scheduleExpiryAlarm pattern: recompute,
-   *  never assume). */
+   *  deadline). Reschedules itself at the EARLIEST surviving pending socket's own real
+   *  deadline (mupot#1595 P2, codex round-2 review) — not a fresh `now + AUTH_DEADLINE_SEC`,
+   *  which could nearly double a survivor's effective deadline when it connected any time
+   *  after the socket that triggered this sweep. Lets the alarm lapse when nothing is
+   *  pending (mirrors PresenceChannelDO's scheduleExpiryAlarm pattern: recompute, never
+   *  assume). */
   async alarm(): Promise<void> {
     this.hub().enforceAuthDeadline()
-    const stillPending = this.ctx.getWebSockets().some((ws) => this.wrapOnce(ws).getState() === null)
-    if (stillPending) await this.ctx.storage.setAlarm(Date.now() + AUTH_DEADLINE_SEC * 1000)
+    const pendingConnectedAt = this.ctx.getWebSockets()
+      .map((ws) => this.wrapOnce(ws))
+      .filter((s) => s.getState() === null)
+      .map((s) => s.getConnectedAt())
+      .filter((t): t is number => t !== undefined)
+    const next = nextSweepAlarmMs(pendingConnectedAt)
+    if (next !== null) await this.ctx.storage.setAlarm(next)
   }
 }

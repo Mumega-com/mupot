@@ -207,6 +207,40 @@ function sessionCookieFrom(res: Response): string | null {
   return match ? `mupot_session=${match[1]}` : null
 }
 
+// mupot#1595 round 2 (kasra-review, reproduced on pristine main 8444aa53): the rate limiter
+// buckets by a FIXED 10-minute window computed from the real wall clock
+// (RATE_LIMIT_WINDOW_SECONDS, src/auth/email-login.ts:129's `underRateLimit`). A test that
+// sends several requests in sequence (or even concurrently — Promise.all still costs real
+// wall-clock time across D1 round trips) can straddle a real window boundary mid-burst: the
+// counter this test is asserting on RESETS partway through, for a reason that has nothing to
+// do with the rate limiter's own correctness. Reproduced directly: `BOUNDARY_LEAD_MS=3000
+// NODE_OPTIONS="--import <preload>" npx vitest run tests/email-login.test.ts` forces the real
+// clock to sit ~3s before a boundary, and "an IP already over its own limit never touches a
+// new victim email's counter" fails with `expected 11 to be 10` — the exact CI failure.
+//
+// Fix the TEST: pin the clock to the MIDDLE of the CURRENT real window (never near an edge)
+// for the whole burst, so every request in it computes the SAME `windowStart`, then restore
+// the real clock unconditionally. Deliberately relative to the real `Date.now()` at the
+// moment the wrapper is entered — not a hardcoded distant constant — because some callers
+// create real-time-stamped fixtures (an email-login attempt's `expires_at`, ~10-15 min TTL)
+// just BEFORE entering the pinned block; jumping the clock to an unrelated fixed epoch would
+// make those fixtures read as already-expired relative to the fake "now" instead of just
+// avoiding the boundary. Staying within the current window keeps the fake clock within
+// minutes of whatever real time the fixture was stamped with.
+// Mirrors src/auth/email-login.ts's own (unexported) RATE_LIMIT_WINDOW_SECONDS = 600.
+const RATE_LIMIT_WINDOW_MS = 600_000
+
+async function withPinnedRateLimitClock<T>(fn: () => Promise<T>): Promise<T> {
+  const now = Date.now()
+  const pinned = Math.floor(now / RATE_LIMIT_WINDOW_MS) * RATE_LIMIT_WINDOW_MS + RATE_LIMIT_WINDOW_MS / 2
+  vi.useFakeTimers({ now: pinned, toFake: ['Date'] })
+  try {
+    return await fn()
+  } finally {
+    vi.useRealTimers()
+  }
+}
+
 async function sha256Hex(raw: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw))
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -249,14 +283,16 @@ describe('POST /auth/email/start', () => {
     const env = envFor(harness, memoryKv())
     const log = captureConsoleLog()
     const email = 'ratelimited@example.com'
-    for (let i = 0; i < 3; i += 1) {
-      const res = await authApp.fetch(postJson('/email/start', { email }), env, noopCtx())
-      expect(res.status).toBe(200)
-    }
-    expect(log.calls.length).toBe(3)
-    const fourth = await authApp.fetch(postJson('/email/start', { email }), env, noopCtx())
-    expect(fourth.status).toBe(200)
-    expect(log.calls.length).toBe(3)
+    await withPinnedRateLimitClock(async () => {
+      for (let i = 0; i < 3; i += 1) {
+        const res = await authApp.fetch(postJson('/email/start', { email }), env, noopCtx())
+        expect(res.status).toBe(200)
+      }
+      expect(log.calls.length).toBe(3)
+      const fourth = await authApp.fetch(postJson('/email/start', { email }), env, noopCtx())
+      expect(fourth.status).toBe(200)
+      expect(log.calls.length).toBe(3)
+    })
     log.restore()
   })
 
@@ -264,14 +300,16 @@ describe('POST /auth/email/start', () => {
     harness = makeHarness()
     const env = envFor(harness, memoryKv())
     const log = captureConsoleLog()
-    for (let i = 0; i < 10; i += 1) {
-      const res = await authApp.fetch(postJson('/email/start', { email: `user${i}@example.com` }, undefined, '203.0.113.9'), env, noopCtx())
-      expect(res.status).toBe(200)
-    }
-    expect(log.calls.length).toBe(10)
-    const eleventh = await authApp.fetch(postJson('/email/start', { email: 'user-eleven@example.com' }, undefined, '203.0.113.9'), env, noopCtx())
-    expect(eleventh.status).toBe(200)
-    expect(log.calls.length).toBe(10)
+    await withPinnedRateLimitClock(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        const res = await authApp.fetch(postJson('/email/start', { email: `user${i}@example.com` }, undefined, '203.0.113.9'), env, noopCtx())
+        expect(res.status).toBe(200)
+      }
+      expect(log.calls.length).toBe(10)
+      const eleventh = await authApp.fetch(postJson('/email/start', { email: 'user-eleven@example.com' }, undefined, '203.0.113.9'), env, noopCtx())
+      expect(eleventh.status).toBe(200)
+      expect(log.calls.length).toBe(10)
+    })
     log.restore()
   })
 
@@ -302,11 +340,13 @@ describe('POST /auth/email/start', () => {
     const env = envFor(harness, memoryKv())
     const log = captureConsoleLog()
     const email = 'burst@example.com'
-    const responses = await Promise.all(
-      Array.from({ length: 4 }, () => authApp.fetch(postJson('/email/start', { email }), env, noopCtx())),
-    )
-    for (const res of responses) expect(res.status).toBe(200) // identical 200 regardless — no oracle
-    expect(log.calls.length).toBe(3)
+    await withPinnedRateLimitClock(async () => {
+      const responses = await Promise.all(
+        Array.from({ length: 4 }, () => authApp.fetch(postJson('/email/start', { email }), env, noopCtx())),
+      )
+      for (const res of responses) expect(res.status).toBe(200) // identical 200 regardless — no oracle
+      expect(log.calls.length).toBe(3)
+    })
     log.restore()
   })
 
@@ -317,17 +357,19 @@ describe('POST /auth/email/start', () => {
     const env = envFor(harness, memoryKv())
     const log = captureConsoleLog()
     const ip = '198.51.100.7'
-    for (let i = 0; i < 10; i += 1) {
-      await authApp.fetch(postJson('/email/start', { email: `burn${i}@example.com` }, undefined, ip), env, noopCtx())
-    }
-    expect(log.calls.length).toBe(10) // the IP's own ceiling
-    const res = await authApp.fetch(postJson('/email/start', { email: 'victim@example.com' }, undefined, ip), env, noopCtx())
-    expect(res.status).toBe(200) // still 200, identical body — no oracle
-    expect(log.calls.length).toBe(10) // no 11th send
-    const row = harness.sqlite
-      .prepare(`SELECT count FROM email_login_rate_limits WHERE scope = 'start_email' AND key = 'victim@example.com'`)
-      .get() as { count: number } | undefined
-    expect(row).toBeUndefined() // the email counter was never even touched
+    await withPinnedRateLimitClock(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        await authApp.fetch(postJson('/email/start', { email: `burn${i}@example.com` }, undefined, ip), env, noopCtx())
+      }
+      expect(log.calls.length).toBe(10) // the IP's own ceiling
+      const res = await authApp.fetch(postJson('/email/start', { email: 'victim@example.com' }, undefined, ip), env, noopCtx())
+      expect(res.status).toBe(200) // still 200, identical body — no oracle
+      expect(log.calls.length).toBe(10) // no 11th send
+      const row = harness.sqlite
+        .prepare(`SELECT count FROM email_login_rate_limits WHERE scope = 'start_email' AND key = 'victim@example.com'`)
+        .get() as { count: number } | undefined
+      expect(row).toBeUndefined() // the email counter was never even touched
+    })
     log.restore()
   })
 })
@@ -689,12 +731,16 @@ describe('GET/POST /auth/email/verify', () => {
     // 30 wrong-token confirms — each independently 'invalid' (no per-attempt
     // guess cap applies to the token path), never consuming or exhausting
     // anything OTHER than the shared verify_ip bucket itself.
-    for (let i = 0; i < 30; i += 1) {
-      const res = await confirmWithIp(`wrong-token-${i}`)
-      expect(res.status).toBe(401)
-    }
-    const thirtyFirst = await confirmWithIp('wrong-token-31')
-    expect(thirtyFirst.status).toBe(429)
+    // mupot#1595 round 2: same 10-minute real-clock window as the /start limiter — pinned
+    // for the same reason (see withPinnedRateLimitClock's own docstring).
+    await withPinnedRateLimitClock(async () => {
+      for (let i = 0; i < 30; i += 1) {
+        const res = await confirmWithIp(`wrong-token-${i}`)
+        expect(res.status).toBe(401)
+      }
+      const thirtyFirst = await confirmWithIp('wrong-token-31')
+      expect(thirtyFirst.status).toBe(429)
+    })
   })
 
   it('P2: POST /auth/email/verify refuses a cross-origin FORM submission (csrf() is active on this mount)', async () => {

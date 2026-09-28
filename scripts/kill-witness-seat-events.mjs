@@ -36,9 +36,50 @@ const M = [
   // mupot#1594 P2-B: the Herdr fence must fail CLOSED on a D1 error, never open
   ['fence fails CLOSED on a transient D1 error, never opens (P2-B)', 'src/agents/inbox-routes.ts', "if (status === 'error') {\n        return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' })\n      }", ''],
   // mupot#1594 P1-A: route-level ticket pre-check, upgrade rate limit, hibernation-safe deadline
-  ['upgrade route pre-checks the ticket before ever forwarding to the DO (P1-A)', 'src/agents/seat-events-routes.ts', "if (!(await ticketPreCheckPasses(c.env, await sha256Hex(ticket)))) {\n    return c.json({ error: 'ticket_invalid' }, 401, NO_STORE)\n  }", ''],
-  ['ticket pre-check fails CLOSED on a D1 error (P1-A)', 'src/agents/seat-events.ts', "return row !== null\n  } catch (err) {\n    console.error('[seat-events] ticket pre-check failed", "return true\n  } catch (err) {\n    console.error('[seat-events] ticket pre-check failed"],
+  ['upgrade route pre-checks (consumes) the ticket before ever forwarding to the DO (P1-A)', 'src/agents/seat-events-routes.ts', "if (!consumed.ok) return c.json({ error: 'ticket_invalid' }, 401, NO_STORE)", ''],
+  // mupot#1595 P3 (kasra-review round 1): the ORIGINAL version of this entry mutated the
+  // SUCCESS return (`return row !== null` → `true`), never the catch — so it was mislabelled
+  // as witnessing fail-closed when it actually witnessed nothing about the error path at all.
+  // Now targets the catch's own `return` directly.
+  ['ticket pre-check consume fails CLOSED on a D1 error (P1-A / P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return { ok: false, reason: 'error' }", "console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return { ok: true, hostAgentId: 'x' }"],
   ['upgrade route is rate-limited per IP, independent of /ticket (P1-A)', 'src/agents/seat-events-routes.ts', "if (!(await underUpgradeRateLimit(c.env, clientIp(c)))) return c.json({ error: 'rate_limited' }, 429, NO_STORE)", ''],
+  // mupot#1595 P1 (kasra-review round 1, Probe Z2): the ticket pre-check is now SINGLE-USE —
+  // an atomic UPDATE ... WHERE used_at IS NULL. Without that conjunct the SAME ticket reopens
+  // the pre-check indefinitely within its TTL.
+  ['ticket pre-check consume is single-use (used_at IS NULL) (P1)', 'src/agents/seat-events.ts', 'WHERE tenant = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3', 'WHERE tenant = ?1 AND hash = ?2 AND expires_at >= ?3'],
+  // mupot#1595 P3 (kasra-review round 1): the tenant conjunct in the SAME consume query —
+  // survived the original round because no test proved cross-tenant rejection.
+  ['ticket pre-check consume is tenant-scoped (P3)', 'src/agents/seat-events.ts', 'WHERE tenant = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3', 'WHERE ?1 = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3'],
+  // mupot#1595 P3 (kasra-review round 1): IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) used to
+  // collapse into the SAME shared bucket as every other IPv4-mapped address (and ::1).
+  ['IPv4-mapped IPv6 addresses key by their embedded IPv4 address (P3)', 'src/agents/seat-events.ts', 'const mapped = ip.match(IPV4_MAPPED_RE)', 'const mapped = null'],
+  // mupot#1595 P2 (kasra-review round 1, Probe Z5): "nothing deletes old windows" — neither
+  // rate-limit table pruned itself.
+  ["ticket rate-limit table is pruned (P2)", 'src/agents/seat-events.ts', "await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits', nowMs, TICKET_RATE_LIMIT_WINDOW_SEC)", ''],
+  ["upgrade rate-limit table is pruned (P2)", 'src/agents/seat-events.ts', "await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits', nowMs, UPGRADE_RATE_LIMIT_WINDOW_SEC)", ''],
+  // mupot#1595 P3 (kasra-review round 1): "underUpgradeRateLimit's catch mutated to fail
+  // open: survived. No test covers it." Same gap existed, unnoticed, in underTicketRateLimit.
+  ['underTicketRateLimit fails CLOSED on a D1 error (P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return false", "console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return true"],
+  ['underUpgradeRateLimit fails CLOSED on a D1 error (P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return false", "console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return true"],
+  // mupot#1595 P1 (codex round-2 review): host squad standing is revalidated on EVERY
+  // delivery decision (mint/redeem/fence/hint), not only checked at grant creation.
+  ['host standing is revalidated on every delivery, not just at grant creation (P1)', 'src/agents/seat-events.ts', 'AND ${HOST_STANDING_SQL}', ''],
+  // mupot#1595 P1 (codex round-2 review): legacy (pre-mupot#1594) socket attachments must be
+  // decoded as authenticated, or a hibernated socket from the previous deploy is silently
+  // treated as pending forever after this code wakes it.
+  ['legacy socket attachment shape is decoded as authenticated (P1)', 'src/agents/seat-events.ts', "if (typeof r.host === 'string' && Array.isArray(r.agents) && r.sub === undefined && r.connectedAt === undefined) {", 'if (false) {'],
+  // mupot#1595 P2 (codex round-2 review): the pot-wide authenticated cap must be re-checked
+  // at the pending→authenticated transition (hello), not only at DO accept time.
+  ['authenticated cap re-checked at hello, not only at accept (P2)', 'src/agents/seat-events.ts', "if (podAcceptRefusal({ authenticated: authenticatedNow, pending: 0 }) === 'pot_full') {", 'if (false) {'],
+  // mupot#1595 P2 (codex round-2 review): the alarm reschedules at the EARLIEST surviving
+  // pending socket's own deadline, not a fresh now+AUTH_DEADLINE_SEC.
+  ['alarm reschedules at the earliest pending deadline, not a fresh interval (P2)', 'src/agents/seat-events.ts', 'return (Math.min(...pendingConnectedAtSec) + AUTH_DEADLINE_SEC) * 1000', 'return (Math.max(...pendingConnectedAtSec) + AUTH_DEADLINE_SEC) * 1000'],
+  // mupot#1595 P1/P2 (codex round-2 review): grant scope — creator's EFFECTIVE authority on
+  // the target squad (not just org-scope admin) gates a lead's revoke; a suspended creator's
+  // stale capability rows must not; the revoke is bound to the exact grant id just authorized.
+  ['revoke ceiling compares EFFECTIVE rank on the target squad, not org-scope only (P1)', 'src/agents/seat-events-routes.ts', 'if (creatorRank > revokerRank) {', 'if (false) {'],
+  ["a suspended creator's stale capability rows do not impose a revoke ceiling (P2)", 'src/agents/seat-events-routes.ts', 'live.granted_by_member_id !== principal.memberId && (await isMemberActive(c.env, live.granted_by_member_id))', 'live.granted_by_member_id !== principal.memberId && true'],
+  ['revoke is bound to the exact grant id just authorized, not just agent_id (P2)', 'src/agents/seat-events.ts', "input.grantId\n      ? `UPDATE seat_event_grants", "false\n      ? `UPDATE seat_event_grants"],
   ['authenticated sockets are capped separately from pending ones (P1-A)', 'src/agents/seat-events.ts', "if (counts.authenticated >= MAX_SOCKETS_PER_POT) return 'pot_full'", 'if (false) return \'pot_full\''],
   ['pending sockets get their OWN small cap (P1-A)', 'src/agents/seat-events.ts', "if (counts.pending >= MAX_PENDING_SOCKETS_PER_POT) return 'pending_full'", 'if (false) return \'pending_full\''],
   ['a pending sweep is never postponed by a later connect (P1-A)', 'src/agents/seat-events.ts', 'if (existing === null || desired < existing) return desired', 'return desired'],
