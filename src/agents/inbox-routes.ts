@@ -27,7 +27,7 @@ import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { sendToRef, readAgentInbox } from './messages'
 import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
-import { activeSeatEventGrant, hostMayReceive, isSeatEventsEnabled } from './seat-events'
+import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from './seat-events'
 
 const MAX_BODY_BYTES = 8192
 
@@ -136,17 +136,33 @@ inboxApp.get('/stream', async (c) => {
   //
   // mupot#1589 P2-1: the fence predicate must equal the DELIVERY predicate, or a live grant
   // row can leave an agent fenced from BOTH channels — a suspended host member, a deleted
-  // host key, or a project the agent no longer has (any of `hostMayReceive`'s joins) still
-  // 409'd here even though the fleet host could never actually receive a hint. Reusing
-  // `hostMayReceive` (the SAME query `publish`/`claim` authorize against) rather than a
-  // second, narrower "does a row exist" check closes that gap structurally.
+  // host key, or a project the agent no longer has (any of `authorizeSeatDelivery`'s joins)
+  // still 409'd here even though the fleet host could never actually receive a hint. Reusing
+  // the SAME query `publish`/`claim` authorize against (rather than a second, narrower "does
+  // a row exist" check) closes that gap structurally.
+  //
+  // mupot#1594 P2-B: this used to call `hostMayReceive`, the BOOLEAN collapse of
+  // authorizeSeatDelivery — which maps its 'error' outcome to `false`, i.e. "not eligible",
+  // exactly like a confirmed `not_granted`. A transient D1 error therefore read as "the fleet
+  // host cannot receive" and `stillEligible` came out false, so the fence fell through and
+  // the LEGACY stream opened wide (200) with no fence at all — fail OPEN on a D1 blip, the
+  // opposite of every other tri-state consumer in this file (authorizeSeatDelivery's own
+  // 'error' branch exists precisely so callers can tell a blip from a real revocation).
+  // Consume the tri-state directly: 'error' refuses closed (503, retryable — the caller
+  // already has an open-or-fenced answer waiting once D1 recovers), 'granted' fences (409,
+  // unchanged from before), and only a DEFINITIVE 'not_granted' opens the legacy stream.
   if (isSeatEventsEnabled(c.env)) {
     const grant = await activeSeatEventGrant(c.env, id.boundAgentId)
     if (grant) {
-      const stillEligible = await hostMayReceive(c.env, grant.host_agent_id, id.boundAgentId)
-      if (stillEligible) {
+      const status = await authorizeSeatDelivery(c.env, grant.host_agent_id, id.boundAgentId)
+      if (status === 'error') {
+        return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' })
+      }
+      if (status === 'granted') {
         return c.json({ error: 'notify_owned_by_fleet_host', host_agent_id: grant.host_agent_id }, 409)
       }
+      // status === 'not_granted': the fleet host could never actually receive delivery
+      // either, so the legacy stream must not stay dark. Fall through and open it.
     }
   }
 

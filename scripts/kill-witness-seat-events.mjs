@@ -26,6 +26,83 @@ const M = [
   ['ticket single-use (delete on take)', 'src/agents/seat-events.ts', 'if (rec) await storage.delete(key)', ''],
   ['ticket expiry', 'src/agents/seat-events.ts', 'if (!rec || rec.expires_at < this.nowSec())', 'if (!rec)'],
   ['expired tickets purged', 'src/agents/seat-events.ts', 'if (dead.length) await storage.delete(dead)', ''],
+  // mupot#1594 P2-C: grant scope — host standing to create, rank ceiling to revoke
+  ['host must have standing in the target squad to be granted (P2-C)', 'src/agents/seat-events.ts', "if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id))) {", 'if (false) {'],
+  // NOTE: the round-1 "org-admin-only" revoke ceiling entry that lived here was retargeted
+  // and superseded by mupot#1595's "revoke ceiling compares EFFECTIVE rank..." and "a
+  // suspended creator's..." entries below (round 1's exact org-only line no longer exists —
+  // the check now compares effective rank on the target squad, not org scope alone).
+  // mupot#1594 P3: the 404-vs-403 agent-existence oracle must be uniform. Isolated from the
+  // combined rank-ceiling mutation above (P1-1 entry) by weakening the RANK MINIMUM instead
+  // of deleting the whole condition — a below-lead member must still be refused.
+  ['grant-target existence oracle is uniform, never distinguishes missing from no-standing (P3)', 'src/agents/seat-events-routes.ts', "await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')", "await canOnSquad(c.env, principal.grants, row.squad_id, 'member')"],
+  // mupot#1594 P2-B: the Herdr fence must fail CLOSED on a D1 error, never open
+  ['fence fails CLOSED on a transient D1 error, never opens (P2-B)', 'src/agents/inbox-routes.ts', "if (status === 'error') {\n        return c.json({ error: 'fence_check_failed' }, 503, { 'Retry-After': '2', 'Cache-Control': 'no-store' })\n      }", ''],
+  // mupot#1594 P1-A: route-level ticket pre-check, upgrade rate limit, hibernation-safe deadline
+  ['upgrade route pre-checks (consumes) the ticket before ever forwarding to the DO (P1-A)', 'src/agents/seat-events-routes.ts', "if (!consumed.ok) return c.json({ error: 'ticket_invalid' }, 401, NO_STORE)", ''],
+  // mupot#1595 P3 (kasra-review round 1): the ORIGINAL version of this entry mutated the
+  // SUCCESS return (`return row !== null` → `true`), never the catch — so it was mislabelled
+  // as witnessing fail-closed when it actually witnessed nothing about the error path at all.
+  // Now targets the catch's own `return` directly.
+  ['ticket pre-check consume fails CLOSED on a D1 error (P1-A / P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return { ok: false, reason: 'error' }", "console.error('[seat-events] ticket pre-check consume failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return { ok: true, hostAgentId: 'x' }"],
+  ['upgrade route is rate-limited per IP, independent of /ticket (P1-A)', 'src/agents/seat-events-routes.ts', "if (!(await underUpgradeRateLimit(c.env, clientIp(c)))) return c.json({ error: 'rate_limited' }, 429, NO_STORE)", ''],
+  // mupot#1595 P1 (kasra-review round 1, Probe Z2): the ticket pre-check is now SINGLE-USE —
+  // an atomic UPDATE ... WHERE used_at IS NULL. Without that conjunct the SAME ticket reopens
+  // the pre-check indefinitely within its TTL.
+  ['ticket pre-check consume is single-use (used_at IS NULL) (P1)', 'src/agents/seat-events.ts', 'WHERE tenant = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3', 'WHERE tenant = ?1 AND hash = ?2 AND expires_at >= ?3'],
+  // mupot#1595 P3 (kasra-review round 1): the tenant conjunct in the SAME consume query —
+  // survived the original round because no test proved cross-tenant rejection.
+  ['ticket pre-check consume is tenant-scoped (P3)', 'src/agents/seat-events.ts', 'WHERE tenant = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3', 'WHERE ?1 = ?1 AND hash = ?2 AND used_at IS NULL AND expires_at >= ?3'],
+  // mupot#1595 P3 (kasra-review round 1): IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) used to
+  // collapse into the SAME shared bucket as every other IPv4-mapped address (and ::1).
+  ['IPv4-mapped IPv6 addresses key by their embedded IPv4 address (P3)', 'src/agents/seat-events.ts', 'const mapped = ip.match(IPV4_MAPPED_RE)', 'const mapped = null'],
+  // mupot#1595 P2 (kasra-review round 1, Probe Z5): "nothing deletes old windows" — neither
+  // rate-limit table pruned itself.
+  ["ticket rate-limit table is pruned (P2)", 'src/agents/seat-events.ts', "await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits', nowMs, TICKET_RATE_LIMIT_WINDOW_SEC)", ''],
+  ["upgrade rate-limit table is pruned (P2)", 'src/agents/seat-events.ts', "await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits', nowMs, UPGRADE_RATE_LIMIT_WINDOW_SEC)", ''],
+  // mupot#1595 P3 (kasra-review round 1): "underUpgradeRateLimit's catch mutated to fail
+  // open: survived. No test covers it." Same gap existed, unnoticed, in underTicketRateLimit.
+  ['underTicketRateLimit fails CLOSED on a D1 error (P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return false", "console.error('[seat-events] ticket rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return true"],
+  ['underUpgradeRateLimit fails CLOSED on a D1 error (P3)', 'src/agents/seat-events.ts', "console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return false", "console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)\n    return true"],
+  // mupot#1595 P1 (codex round-2 review): host squad standing is revalidated on EVERY
+  // delivery decision (mint/redeem/fence/hint), not only checked at grant creation.
+  ['host standing is revalidated on every delivery, not just at grant creation (P1)', 'src/agents/seat-events.ts', 'AND ${HOST_STANDING_SQL}', ''],
+  // mupot#1595 P1 (codex round-2 review): legacy (pre-mupot#1594) socket attachments must be
+  // decoded as authenticated, or a hibernated socket from the previous deploy is silently
+  // treated as pending forever after this code wakes it.
+  ['legacy socket attachment shape is decoded as authenticated (P1)', 'src/agents/seat-events.ts', "if (typeof r.host === 'string' && Array.isArray(r.agents) && r.sub === undefined && r.connectedAt === undefined) {", 'if (false) {'],
+  // mupot#1595 P2 (codex round-2 review): the pot-wide authenticated cap must be re-checked
+  // at the pending→authenticated transition (hello), not only at DO accept time.
+  ['authenticated cap re-checked at hello, not only at accept (P2)', 'src/agents/seat-events.ts', "if (podAcceptRefusal({ authenticated: authenticatedNow, pending: 0 }) === 'pot_full') {", 'if (false) {'],
+  // mupot#1595 P2 (codex round-2 review): the alarm reschedules at the EARLIEST surviving
+  // pending socket's own deadline, not a fresh now+AUTH_DEADLINE_SEC.
+  ['alarm reschedules at the earliest pending deadline, not a fresh interval (P2)', 'src/agents/seat-events.ts', 'return (Math.min(...pendingConnectedAtSec) + AUTH_DEADLINE_SEC) * 1000', 'return (Math.max(...pendingConnectedAtSec) + AUTH_DEADLINE_SEC) * 1000'],
+  // mupot#1595 P1/P2 (codex round-2 review): grant scope — creator's EFFECTIVE authority on
+  // the target squad (not just org-scope admin) gates a lead's revoke; a suspended creator's
+  // stale capability rows must not; the revoke is bound to the exact grant id just authorized.
+  ['revoke ceiling compares EFFECTIVE rank on the target squad, not org-scope only (P1)', 'src/agents/seat-events-routes.ts', 'if (creatorRank > revokerRank) {', 'if (false) {'],
+  ["a suspended creator's stale capability rows do not impose a revoke ceiling (P2)", 'src/agents/seat-events-routes.ts', 'live.granted_by_member_id !== principal.memberId && (await isMemberActive(c.env, live.granted_by_member_id))', 'live.granted_by_member_id !== principal.memberId && true'],
+  ['revoke is bound to the exact grant id just authorized, not just agent_id (P2)', 'src/agents/seat-events.ts', "input.grantId\n      ? `UPDATE seat_event_grants", "false\n      ? `UPDATE seat_event_grants"],
+  // mupot#1595 addendum (kasra-review, PR comment 5877155417): the retry loop itself — proven
+  // by a test that injects a REAL concurrent revoke-and-replace through the D1 harness,
+  // landing between the rank check and the write.
+  ['DELETE /grants/:agent retries against a grant that changed underneath it (addendum)', 'src/agents/seat-events-routes.ts', 'for (let attempt = 0; attempt < 3; attempt++) {', 'for (let attempt = 0; attempt < 1; attempt++) {'],
+  // mupot#1595 adversarial round 2 (P1, alarm hot loop): a socket the sweep just closed stays
+  // in sockets() (real workerd: readyState CLOSING until the peer acks, sometimes never) with
+  // its STALE connectedAt unchanged — feeding that into nextSweepAlarmMs armed an alarm in
+  // the past, which fires immediately and never stops. Miniflare: 15,887 alarms in 66s with 3
+  // half-open clients; fixed: 2 alarms in 31s.
+  ['pendingDeadlines excludes a socket this hub already closed (P1 hot loop)', 'src/agents/seat-events.ts', 'if (sock.getState() !== null || sock.isClosed()) continue', 'if (sock.getState() !== null) continue'],
+  ['closeSocket stamps closedAt so it can be excluded later (P1 hot loop)', 'src/agents/seat-events.ts', 'sock.markClosed(this.nowSec())\n    try {\n      sock.close(code, reason)', 'try {\n      sock.close(code, reason)'],
+  ['a closed socket no longer counts toward the per-host authenticated cap (P1 hot loop)', 'src/agents/seat-events.ts', "s.getState()?.host === rec.host && !s.isClosed()", 's.getState()?.host === rec.host'],
+  ['a closed socket no longer counts toward the pot-wide authenticated recheck at hello (P1 hot loop)', 'src/agents/seat-events.ts', "s.getState() !== null && !s.isClosed()", 's.getState() !== null'],
+  // mupot#1595 P2-a (adversarial round 2): prune ONLY on the first request of a brand-new
+  // window (RETURNING count === 1) — not on every call, including over-limit ones.
+  ['ticket rate-limit prunes only on a fresh window, not every call (P2-a)', 'src/agents/seat-events.ts', "if (result?.count === 1) {\n      await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits'", "if (true) {\n      await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits'"],
+  ['upgrade rate-limit prunes only on a fresh window, not every call (P2-a)', 'src/agents/seat-events.ts', "if (result?.count === 1) {\n      await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits'", "if (true) {\n      await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits'"],
+  ['authenticated sockets are capped separately from pending ones (P1-A)', 'src/agents/seat-events.ts', "if (counts.authenticated >= MAX_SOCKETS_PER_POT) return 'pot_full'", 'if (false) return \'pot_full\''],
+  ['pending sockets get their OWN small cap (P1-A)', 'src/agents/seat-events.ts', "if (counts.pending >= MAX_PENDING_SOCKETS_PER_POT) return 'pending_full'", 'if (false) return \'pending_full\''],
+  ['a pending sweep is never postponed by a later connect (P1-A)', 'src/agents/seat-events.ts', 'if (existing === null || desired < existing) return desired', 'return desired'],
   // revoked ownership
   ['re-authorize at redeem', 'src/agents/seat-events.ts', "if (status !== 'granted') {", 'if (false) {'],
   ['re-authorize every hint', 'src/agents/seat-events.ts', "if (status === 'not_granted') {", 'if (false) {'],
@@ -42,19 +119,22 @@ const M = [
   ['old socket dropped on supersede/move', 'src/agents/seat-events.ts', '      this.drop(other, st, agent, frame)\n', ''],
   ['legacy stream fenced for granted agents', 'src/agents/inbox-routes.ts', '    if (grant) {', '    if (false) {'],
   // mupot#1589 P2-1: the fence must equal the delivery predicate, not just "a row exists"
-  ['fence predicate equals delivery predicate (P2-1)', 'src/agents/inbox-routes.ts', 'const stillEligible = await hostMayReceive(c.env, grant.host_agent_id, id.boundAgentId)', 'const stillEligible = true'],
+  ['fence predicate equals delivery predicate (P2-1)', 'src/agents/inbox-routes.ts', 'const status = await authorizeSeatDelivery(c.env, grant.host_agent_id, id.boundAgentId)', "const status = 'granted' as const"],
   // HTTP surface
   ['upgrade strips Authorization/Cookie', 'src/agents/seat-events-routes.ts', "presenceLiveDoUpgradeRequest(new URL('https://seat-events/connect'), c.req.raw)", "new Request('https://seat-events/connect', c.req.raw)"],
   ['ticket response no-store', 'src/agents/seat-events-routes.ts', "const NO_STORE = { 'Cache-Control': 'no-store' }", 'const NO_STORE = {}'],
   ['JSON catch-all, never a redirect', 'src/agents/seat-events-routes.ts', "seatEventsApp.all('*', (c) => c.json({ error: 'not_found' }, 404))", ''],
   // mupot#1589 P1-1: agent-bound refusal + org-admin/squad-lead rank ceiling on grant writes
   ['agent-bound token refused on grant writes (P1-1)', 'src/agents/seat-events-routes.ts', 'if (id.boundAgentId) return { ok: false, status: 403, error: \'operator_principal_required\' }', ''],
-  ['grants need org admin OR squad lead, never below (P1-1)', 'src/agents/seat-events-routes.ts', "if (hasCapability(principal.grants, 'org', null, 'admin')) return { ok: true }", 'return { ok: true }'],
-  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "if (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead')) return { ok: true }", 'return { ok: true }'],
+  ['grants need org admin OR squad lead, never below (P1-1)', 'src/agents/seat-events-routes.ts', "if (hasCapability(principal.grants, 'org', null, 'admin')) {", 'if (true) {'],
+  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "} else if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) {", '} else if (row) {'],
   // mupot#1589 P1-2: refuse an upgrade with no credential-shaped ticket before the DO is reached
   ['ticket presence+format gate before the DO is reached (P1-2)', 'src/agents/seat-events-routes.ts', "if (!ticket || !isWellFormedTicket(ticket)) return c.json({ error: 'ticket_required' }, 401, NO_STORE)", ''],
-  ['pod socket cap enforced before accept (P1-2)', 'src/agents/seat-events-do.ts', 'if (podSocketCapExceeded(this.ctx.getWebSockets().length)) {', 'if (false) {'],
-  ['auth deadline closes a never-authenticated socket (P1-2)', 'src/agents/seat-events.ts', 'if (at === undefined || now - at < AUTH_DEADLINE_SEC) continue', 'continue'],
+  // NOTE: this one lives entirely in the DO shell (seat-events-do.ts), which this test suite
+  // never instantiates (no workerd) — pre-existing structural gap, unchanged by mupot#1594;
+  // podAcceptRefusal's OWN thresholds are witnessed directly (P1-A entries below).
+  ['pod socket cap enforced before accept (P1-2)', 'src/agents/seat-events-do.ts', 'const refusal = podAcceptRefusal({ authenticated, pending })', 'const refusal = null'],
+  ['auth deadline closes a never-authenticated socket, reading its OWN attachment not an in-memory map (P1-2/P1-4)', 'src/agents/seat-events.ts', 'if (at === undefined || now - at < AUTH_DEADLINE_SEC) continue', 'continue'],
   ['oversized frame closed (P1-2)', 'src/agents/seat-events.ts', 'if (byteLength > MAX_FRAME_BYTES) return this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, \'frame_too_large\')', ''],
   ['junk frames close the socket past the cap (P1-2)', 'src/agents/seat-events.ts', 'if (n > MAX_JUNK_FRAMES) this.closeSocket(sock, CLOSE_PROTOCOL_ABUSE, \'junk_frames\')', ''],
   ['per-host socket cap (P1-2)', 'src/agents/seat-events.ts', 'if (heldByHost >= MAX_SOCKETS_PER_HOST) return this.reject(sock, \'host_socket_limit\')', ''],
