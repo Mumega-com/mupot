@@ -1,4 +1,4 @@
--- 0181_office_publish_freeze_verdict_binding.sql — mupot#1592 (r2 adversarial follow-up
+-- 0182_office_publish_freeze_verdict_binding.sql — mupot#1592 (r2 adversarial follow-up
 -- on PR #1588, comment 5860750102, NEW-1/NEW-2/NEW-4): 0179's office_publish_freezes
 -- froze the payload at APPROVAL time, built from whatever the row said inside the
 -- approve call — "freeze at click, not freeze at sight". A requester who can still edit

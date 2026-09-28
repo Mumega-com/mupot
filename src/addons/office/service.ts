@@ -538,19 +538,29 @@ export async function reviewOfficeApproval(
     return { ok: false, reason: 'not_authorized' }
   }
 
-  // mupot#1592 NEW-1: for an 'approved' verdict, the caller must prove they are
-  // approving the EXACT payload frozen at review-entry (freezeOfficeTaskOnReviewEntry
-  // — see that function and buildOfficePublishFreeze's doc comments for why this
-  // replaces round 1's approval-time freeze entirely). No fetch, no state change,
-  // happens before this check. A rejection needs no hash at all: it authorizes no
-  // WordPress write and reviewOfficeApproval never re-reads task.title/body itself.
+  // mupot#1592 NEW-1: for an 'approved' verdict, when a LIVE (non-voided) freeze
+  // already exists, the caller must prove they are approving the EXACT payload it
+  // holds — the hash office.list_pending_approvals showed them. No fetch, no state
+  // change, happens before this check. A rejection needs no hash at all: it
+  // authorizes no WordPress write and reviewOfficeApproval never re-reads
+  // task.title/body itself.
+  //
+  // When NO live freeze exists (review-entry never resolved a target — addon
+  // inactive, no connector, bad site config), this deliberately does NOT block the
+  // approval on a hash it has nothing to check: a human's decision to approve
+  // CONTENT is independent of WordPress infra readiness (round 1's original
+  // philosophy, preserved) — office.publish_post's own `payload_not_frozen`
+  // refusal still permanently blocks the actual write either way, and a fresh
+  // review-entry (once infra is fixed) mints a real, hash-protected freeze.
   if (verdict === 'approved') {
-    if (!expectedPayloadSha256) return { ok: false, reason: 'expected_hash_required' }
     const freezeRow = await env.DB.prepare(
       `SELECT payload_sha256, voided_at FROM office_publish_freezes WHERE task_id = ?1`,
     ).bind(task.id).first<OfficeFreezeBindingRow>()
-    if (!freezeRow || freezeRow.voided_at !== null) return { ok: false, reason: 'payload_not_frozen' }
-    if (freezeRow.payload_sha256 !== expectedPayloadSha256) return { ok: false, reason: 'payload_mismatch' }
+    const hasLiveFreeze = freezeRow !== null && freezeRow.voided_at === null
+    if (hasLiveFreeze) {
+      if (!expectedPayloadSha256) return { ok: false, reason: 'expected_hash_required' }
+      if (freezeRow.payload_sha256 !== expectedPayloadSha256) return { ok: false, reason: 'payload_mismatch' }
+    }
   }
 
   try {
@@ -821,7 +831,7 @@ export async function publishOfficePost(
   // a second WordPress POST from actually happening; proven live by the
   // adversarial gate, 3 concurrent calls -> 3 fetches, 3 live posts). 0 rows
   // changed means someone else already claimed this exact approval — refused with
-  // NO fetch, and this row is NEVER un-claimed by this addon (migrations/0181's
+  // NO fetch, and this row is NEVER un-claimed by this addon (migrations/0182's
   // trigger backstops that in the DB itself): a failed or timed-out publish needs
   // office.reconcile_stalled_publish (an operator manually confirms the real
   // WordPress outcome) before a fresh review-entry can mint a brand new, unclaimed
