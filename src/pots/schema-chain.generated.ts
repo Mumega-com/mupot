@@ -3271,9 +3271,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_seat_events_upgrade_rate_limits_window" },
     ],
   },
+  {
+    file: "0183_task_result_submissions.sql",
+    sha256: "83bd90ec3d82a15c43a384da637059f5e1049a819bc2ab23483bcc91d6bfea26",
+    statements: [
+      "-- 0183 — task_result_submissions receipts (mupot#1586).\n--\n-- WHY THIS TABLE EXISTS\n--\n-- A hand-worked task (assigned to an agent but never claimed via\n-- task_dispatch_runtime_receipt's 'runtime_consumed' stage, nor executed by\n-- the in-Worker AgentDO cortex cycle — execute.ts's own finishTask writes\n-- `result` directly for that path) had NO supported way to report its\n-- completion evidence back onto the row at all: task_update refuses an\n-- unknown `result` field (#1388's own fix, closing a transient-value gate\n-- forgery), and task_dispatch_runtime_receipt only accepts a receipt for a\n-- task that was actually dispatched (execution_receipt_id set). The task\n-- sat in_progress forever with the evidence stuck in a chat message or a\n-- manual note. See src/mcp/index.ts's toolTaskSubmitResult (the new\n-- `task_submit_result` tool) for the write path this table is the receipt of.\n--\n-- Mirrors verdict_reversals (0118) and gate_owner_reassignments (0113):\n--   * seq AUTOINCREMENT monotonic ordering key\n--   * NO foreign key to tasks (receipts outlive subject rows)\n--   * append-only, enforced by triggers\n--   * the full result text is NOT duplicated here — it already lives on\n--     tasks.result; this row is WHO submitted it and WHEN, plus the exact\n--     artifact claim that was verified, for an audit trail independent of\n--     whatever later overwrites (or reversal) touches the task row itself.\n\nCREATE TABLE IF NOT EXISTS task_result_submissions (\n  seq                    INTEGER PRIMARY KEY AUTOINCREMENT, -- monotonic; the ordering key\n  id                     TEXT NOT NULL UNIQUE,              -- UUID, the external handle\n  tenant                 TEXT NOT NULL,\n  task_id                TEXT NOT NULL,                     -- deliberately NOT a foreign key\n  squad_id               TEXT NOT NULL,\n  submitted_by_agent_id  TEXT NOT NULL,                     -- the assignee who submitted (== tasks.assignee_agent_id at submit time)\n  artifact_path          TEXT NOT NULL CHECK (length(trim(artifact_path)) > 0),\n  artifact_sha256        TEXT NOT NULL CHECK (length(artifact_sha256) = 64 AND artifact_sha256 = lower(artifact_sha256)),\n  result_digest          TEXT NOT NULL CHECK (length(result_digest) = 64 AND result_digest = lower(result_digest)), -- sha256 of the full submitted result text\n  created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_task_result_submissions_task\n  ON task_result_submissions(tenant, task_id, seq DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_task_result_submissions_agent\n  ON task_result_submissions(tenant, submitted_by_agent_id, seq DESC);",
+      "\n\n-- Append-only, enforced.\nCREATE TRIGGER task_result_submissions_no_update\nBEFORE UPDATE ON task_result_submissions\nBEGIN\n  SELECT RAISE(ABORT, 'task_result_submissions is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER task_result_submissions_no_delete\nBEFORE DELETE ON task_result_submissions\nBEGIN\n  SELECT RAISE(ABORT, 'task_result_submissions is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "task_result_submissions" },
+      { type: "index", name: "idx_task_result_submissions_task" },
+      { type: "index", name: "idx_task_result_submissions_agent" },
+      { type: "trigger", name: "task_result_submissions_no_update" },
+      { type: "trigger", name: "task_result_submissions_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5efde6b60dfc02e27248873dd9cbd189994db16d92082500372554796e4efede"
+export const SCHEMA_CHAIN_DIGEST: string = "4a4cf1b455780f96d562b4122a4437529e7a0217ede17fc97c6bc93664404b26"

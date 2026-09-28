@@ -2477,7 +2477,7 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
 //     different principal's task_update, exactly as before.
 //   - the same verifyTaskArtifactShape gate every other review-entry path
 //     enforces, checked on the INCOMING result before anything is written.
-//   - an append-only receipt (task_result_submissions, migrations/0181)
+//   - an append-only receipt (task_result_submissions, migrations/0183)
 //     records who submitted, when, and the exact verified artifact claim
 //     (invariant (d)) — independent of whatever later happens to the task
 //     row (a verdict, a reversal, a second rework cycle).

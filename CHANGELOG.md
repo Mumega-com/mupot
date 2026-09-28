@@ -186,6 +186,21 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
   `tests/auth-dev-login` rewritten onto the real SQLite harness (#1578,
   #1581). Not deployed; state it as merged only once `gh pr view 1583` reports
   `MERGED`.
+- **mupot#1586** (`kasra/task-result-path-1586`) — new `task_submit_result`
+  MCP tool: the agent ASSIGNEE of a hand-worked (never-dispatched) task can
+  now report its completion evidence and enter `review` in one atomic step,
+  closing the board deadlock where such a task (`task_update` refuses an
+  unknown `result` field since #1388; `task_dispatch_runtime_receipt` 409s
+  `task_not_runnable` for anything never dispatched) sat `in_progress`
+  forever. Same `verifyTaskArtifactShape` gate every other review-entry path
+  enforces; assignee-only, refuses a live `execution_receipt_id` (a dispatched
+  task keeps using `task_dispatch_runtime_receipt`, unchanged), only from
+  `in_progress` (immutable once in `review` until sent back), append-only
+  receipt in the new `task_result_submissions` table (migration 0183 —
+  renumbered from an initial 0181 to avoid colliding with 0181/0182 reserved
+  for the v0.31.0 release PR and mupot#1592). `assignee_cannot_self_close`
+  and the runtime-receipt path are untouched. Not merged; state it as merged
+  only once `gh pr view` on this PR reports `MERGED`.
 
 ## Release status — 2026-09-06
 
