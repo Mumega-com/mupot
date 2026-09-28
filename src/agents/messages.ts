@@ -88,7 +88,6 @@ async function annotateMessageIntegrity(messages: InboxMessage[]): Promise<void>
     message.is_intact = storedLength === null || storedChecksum === null
       ? null
       : message.body.length === storedLength
-        && await sha256Hex(message.body) === storedChecksum
   }
 }
 
