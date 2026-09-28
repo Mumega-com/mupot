@@ -28,7 +28,10 @@ const M = [
   ['expired tickets purged', 'src/agents/seat-events.ts', 'if (dead.length) await storage.delete(dead)', ''],
   // mupot#1594 P2-C: grant scope — host standing to create, rank ceiling to revoke
   ['host must have standing in the target squad to be granted (P2-C)', 'src/agents/seat-events.ts', "if (!(await hostHasStandingInSquad(env, input.hostAgentId, agent.squad_id))) {", 'if (false) {'],
-  ['a lead cannot revoke a grant a higher-rank principal created (P2-C)', 'src/agents/seat-events-routes.ts', "if (hasCapability(creatorGrants, 'org', null, 'admin')) {", 'if (false) {'],
+  // NOTE: the round-1 "org-admin-only" revoke ceiling entry that lived here was retargeted
+  // and superseded by mupot#1595's "revoke ceiling compares EFFECTIVE rank..." and "a
+  // suspended creator's..." entries below (round 1's exact org-only line no longer exists —
+  // the check now compares effective rank on the target squad, not org scope alone).
   // mupot#1594 P3: the 404-vs-403 agent-existence oracle must be uniform. Isolated from the
   // combined rank-ceiling mutation above (P1-1 entry) by weakening the RANK MINIMUM instead
   // of deleting the whole condition — a below-lead member must still be refused.
@@ -80,6 +83,23 @@ const M = [
   ['revoke ceiling compares EFFECTIVE rank on the target squad, not org-scope only (P1)', 'src/agents/seat-events-routes.ts', 'if (creatorRank > revokerRank) {', 'if (false) {'],
   ["a suspended creator's stale capability rows do not impose a revoke ceiling (P2)", 'src/agents/seat-events-routes.ts', 'live.granted_by_member_id !== principal.memberId && (await isMemberActive(c.env, live.granted_by_member_id))', 'live.granted_by_member_id !== principal.memberId && true'],
   ['revoke is bound to the exact grant id just authorized, not just agent_id (P2)', 'src/agents/seat-events.ts', "input.grantId\n      ? `UPDATE seat_event_grants", "false\n      ? `UPDATE seat_event_grants"],
+  // mupot#1595 addendum (kasra-review, PR comment 5877155417): the retry loop itself — proven
+  // by a test that injects a REAL concurrent revoke-and-replace through the D1 harness,
+  // landing between the rank check and the write.
+  ['DELETE /grants/:agent retries against a grant that changed underneath it (addendum)', 'src/agents/seat-events-routes.ts', 'for (let attempt = 0; attempt < 3; attempt++) {', 'for (let attempt = 0; attempt < 1; attempt++) {'],
+  // mupot#1595 adversarial round 2 (P1, alarm hot loop): a socket the sweep just closed stays
+  // in sockets() (real workerd: readyState CLOSING until the peer acks, sometimes never) with
+  // its STALE connectedAt unchanged — feeding that into nextSweepAlarmMs armed an alarm in
+  // the past, which fires immediately and never stops. Miniflare: 15,887 alarms in 66s with 3
+  // half-open clients; fixed: 2 alarms in 31s.
+  ['pendingDeadlines excludes a socket this hub already closed (P1 hot loop)', 'src/agents/seat-events.ts', 'if (sock.getState() !== null || sock.isClosed()) continue', 'if (sock.getState() !== null) continue'],
+  ['closeSocket stamps closedAt so it can be excluded later (P1 hot loop)', 'src/agents/seat-events.ts', 'sock.markClosed(this.nowSec())\n    try {\n      sock.close(code, reason)', 'try {\n      sock.close(code, reason)'],
+  ['a closed socket no longer counts toward the per-host authenticated cap (P1 hot loop)', 'src/agents/seat-events.ts', "s.getState()?.host === rec.host && !s.isClosed()", 's.getState()?.host === rec.host'],
+  ['a closed socket no longer counts toward the pot-wide authenticated recheck at hello (P1 hot loop)', 'src/agents/seat-events.ts', "s.getState() !== null && !s.isClosed()", 's.getState() !== null'],
+  // mupot#1595 P2-a (adversarial round 2): prune ONLY on the first request of a brand-new
+  // window (RETURNING count === 1) — not on every call, including over-limit ones.
+  ['ticket rate-limit prunes only on a fresh window, not every call (P2-a)', 'src/agents/seat-events.ts', "if (result?.count === 1) {\n      await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits'", "if (true) {\n      await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits'"],
+  ['upgrade rate-limit prunes only on a fresh window, not every call (P2-a)', 'src/agents/seat-events.ts', "if (result?.count === 1) {\n      await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits'", "if (true) {\n      await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits'"],
   ['authenticated sockets are capped separately from pending ones (P1-A)', 'src/agents/seat-events.ts', "if (counts.authenticated >= MAX_SOCKETS_PER_POT) return 'pot_full'", 'if (false) return \'pot_full\''],
   ['pending sockets get their OWN small cap (P1-A)', 'src/agents/seat-events.ts', "if (counts.pending >= MAX_PENDING_SOCKETS_PER_POT) return 'pending_full'", 'if (false) return \'pending_full\''],
   ['a pending sweep is never postponed by a later connect (P1-A)', 'src/agents/seat-events.ts', 'if (existing === null || desired < existing) return desired', 'return desired'],
@@ -106,8 +126,8 @@ const M = [
   ['JSON catch-all, never a redirect', 'src/agents/seat-events-routes.ts', "seatEventsApp.all('*', (c) => c.json({ error: 'not_found' }, 404))", ''],
   // mupot#1589 P1-1: agent-bound refusal + org-admin/squad-lead rank ceiling on grant writes
   ['agent-bound token refused on grant writes (P1-1)', 'src/agents/seat-events-routes.ts', 'if (id.boundAgentId) return { ok: false, status: 403, error: \'operator_principal_required\' }', ''],
-  ['grants need org admin OR squad lead, never below (P1-1)', 'src/agents/seat-events-routes.ts', "if (hasCapability(principal.grants, 'org', null, 'admin')) return { ok: true }", 'return { ok: true }'],
-  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) return { ok: true }", 'if (row) return { ok: true }'],
+  ['grants need org admin OR squad lead, never below (P1-1)', 'src/agents/seat-events-routes.ts', "if (hasCapability(principal.grants, 'org', null, 'admin')) {", 'if (true) {'],
+  ['grant rank ceiling checks the TARGET agent\'s own squad, not a caller-asserted one (P1-1)', 'src/agents/seat-events-routes.ts', "} else if (row && (await canOnSquad(c.env, principal.grants, row.squad_id, 'lead'))) {", '} else if (row) {'],
   // mupot#1589 P1-2: refuse an upgrade with no credential-shaped ticket before the DO is reached
   ['ticket presence+format gate before the DO is reached (P1-2)', 'src/agents/seat-events-routes.ts', "if (!ticket || !isWellFormedTicket(ticket)) return c.json({ error: 'ticket_required' }, 401, NO_STORE)", ''],
   // NOTE: this one lives entirely in the DO shell (seat-events-do.ts), which this test suite

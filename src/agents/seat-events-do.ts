@@ -46,6 +46,13 @@ function wrap(ws: WebSocket): HubSocket {
       const cur = read()
       if (cur.connectedAt === undefined) ws.serializeAttachment({ ...cur, connectedAt: nowSec, pendingHost })
     },
+    // mupot#1595 (adversarial round 2): stamped by the hub's own closeSocket(), independent
+    // of the real WebSocket's readyState — see pendingDeadlines()'s own docstring.
+    markClosed: (nowSec) => {
+      const cur = read()
+      if (cur.closedAt === undefined) ws.serializeAttachment({ ...cur, closedAt: nowSec })
+    },
+    isClosed: () => read().closedAt !== undefined,
   }
 }
 
@@ -77,8 +84,16 @@ export class SeatEventsDO extends DurableObject<Env> {
   }
 
   private cache = new WeakMap<WebSocket, HubSocket>()
+  // mupot#1595 (adversarial round 2): only a socket the RUNTIME still reports OPEN counts
+  // toward anything — a socket in CLOSING (readyState 2, e.g. one we called .close() on that
+  // the peer hasn't ack'd — sometimes never, for a half-open raw-TCP client) or CLOSED must
+  // never occupy a pending/authenticated/per-host slot. This is the DO-shell half of the fix;
+  // pendingDeadlines()'s closedAt exclusion (seat-events.ts) is the workerd-independent half
+  // that makes the core property unit-testable without a real WebSocket.
   private wrapped(): HubSocket[] {
-    return this.ctx.getWebSockets().map((ws) => this.wrapOnce(ws))
+    return this.ctx.getWebSockets()
+      .filter((ws) => ws.readyState === WebSocket.OPEN)
+      .map((ws) => this.wrapOnce(ws))
   }
   private wrapOnce(ws: WebSocket): HubSocket {
     let w = this.cache.get(ws)
@@ -144,7 +159,12 @@ export class SeatEventsDO extends DurableObject<Env> {
       // when arming it actually brings the deadline EARLIER (or none was pending at all).
       const desired = Date.now() + AUTH_DEADLINE_SEC * 1000
       const next = nextAuthDeadlineAlarm(await this.ctx.storage.getAlarm(), desired)
-      if (next !== null) await this.ctx.storage.setAlarm(next)
+      // mupot#1595 (adversarial round 2): a hard floor on every alarm this DO ever arms — 1s
+      // out at minimum, regardless of what either pure function computes. Belt-and-braces
+      // against the hot-loop class (a near-past or already-past timestamp fires immediately,
+      // recomputes the same thing, fires again) even if some future change reintroduces a
+      // stale-timestamp path neither `nextAuthDeadlineAlarm` nor `pendingDeadlines` catches.
+      if (next !== null) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 1000))
       return new Response(null, { status: 101, webSocket: pair[0] })
     }
     return new Response('not found', { status: 404 })
@@ -165,15 +185,22 @@ export class SeatEventsDO extends DurableObject<Env> {
    *  which could nearly double a survivor's effective deadline when it connected any time
    *  after the socket that triggered this sweep. Lets the alarm lapse when nothing is
    *  pending (mirrors PresenceChannelDO's scheduleExpiryAlarm pattern: recompute, never
-   *  assume). */
+   *  assume).
+   *
+   *  mupot#1595 (adversarial round 2): a socket THIS sweep just closed used to stay in the
+   *  pending-deadline list — in real workerd it can sit in `ctx.getWebSockets()` with
+   *  `readyState CLOSING` until the peer acks (sometimes never, for a half-open raw-TCP
+   *  client), and its `connectedAt` never advances. Re-arming at that stale, already-past
+   *  timestamp fired immediately, closed nothing new, and recomputed the SAME stale
+   *  timestamp forever — Miniflare measured 15,887 alarms in 66s with 3 half-open clients.
+   *  `this.hub().pendingDeadlines()` now excludes anything the hub has closed (`markClosed`,
+   *  workerd-independent) AND `wrapped()` excludes anything the RUNTIME no longer reports
+   *  OPEN — either alone would have closed this; both together cover the pure-logic and the
+   *  real-workerd cases. The `now + 1000ms` floor is the last-resort backstop. */
   async alarm(): Promise<void> {
-    this.hub().enforceAuthDeadline()
-    const pendingConnectedAt = this.ctx.getWebSockets()
-      .map((ws) => this.wrapOnce(ws))
-      .filter((s) => s.getState() === null)
-      .map((s) => s.getConnectedAt())
-      .filter((t): t is number => t !== undefined)
-    const next = nextSweepAlarmMs(pendingConnectedAt)
-    if (next !== null) await this.ctx.storage.setAlarm(next)
+    const hub = this.hub()
+    hub.enforceAuthDeadline()
+    const next = nextSweepAlarmMs(hub.pendingDeadlines())
+    if (next !== null) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 1000))
   }
 }

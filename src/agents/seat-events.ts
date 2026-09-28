@@ -437,10 +437,17 @@ export async function underTicketRateLimit(
       `INSERT INTO seat_events_ticket_rate_limits (tenant, key, window_start, count)
        VALUES (?1, ?2, ?3, 1)
        ON CONFLICT (tenant, key, window_start) DO UPDATE SET count = count + 1
-        WHERE count < ?4`,
-    ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).run()
-    await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits', nowMs, TICKET_RATE_LIMIT_WINDOW_SEC)
-    return Number(result.meta?.changes ?? 0) > 0
+        WHERE count < ?4
+       RETURNING count`,
+    ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).first<{ count: number }>()
+    // mupot#1595 P2-a (adversarial round 2): prune only on the FIRST request of a brand-new
+    // window (RETURNING count === 1 — the INSERT branch fired, never the DO UPDATE branch,
+    // which always leaves count >= 2). An over-limit call (WHERE skipped, RETURNING nothing,
+    // `result === null`) or a mid-window increment must never ALSO pay for a table scan.
+    if (result?.count === 1) {
+      await pruneRateLimitTable(env, 'seat_events_ticket_rate_limits', nowMs, TICKET_RATE_LIMIT_WINDOW_SEC)
+    }
+    return result !== null
   } catch (err) {
     // Fail CLOSED on D1 trouble — same posture as email-login and the enroll-mint limiter: a
     // crypto-verifying, unauthenticated, D1-reading endpoint must refuse when its own guard
@@ -471,10 +478,13 @@ export async function underUpgradeRateLimit(
       `INSERT INTO seat_events_upgrade_rate_limits (tenant, key, window_start, count)
        VALUES (?1, ?2, ?3, 1)
        ON CONFLICT (tenant, key, window_start) DO UPDATE SET count = count + 1
-        WHERE count < ?4`,
-    ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).run()
-    await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits', nowMs, UPGRADE_RATE_LIMIT_WINDOW_SEC)
-    return Number(result.meta?.changes ?? 0) > 0
+        WHERE count < ?4
+       RETURNING count`,
+    ).bind(env.TENANT_SLUG, ipRateLimitKey(ip), windowStart, max).first<{ count: number }>()
+    if (result?.count === 1) {
+      await pruneRateLimitTable(env, 'seat_events_upgrade_rate_limits', nowMs, UPGRADE_RATE_LIMIT_WINDOW_SEC)
+    }
+    return result !== null
   } catch (err) {
     console.error('[seat-events] upgrade rate-limit check failed (refusing, fail-closed):', err instanceof Error ? err.message : err)
     return false
@@ -516,12 +526,16 @@ export async function recordTicketPreCheck(
   nowSec: () => number = () => Math.floor(Date.now() / 1000),
 ): Promise<void> {
   const now = nowSec()
+  // mupot#1595 (adversarial round 2): NO `ON CONFLICT ... DO UPDATE` branch. The previous
+  // version reset `used_at` back to NULL on any conflict — an UN-BURN path: a colliding
+  // (tenant, hash) row (or any future caller that re-mints the same hash) would silently
+  // un-consume an already-burned ticket, defeating consumeTicketPreCheck's entire single-use
+  // guarantee. A genuine collision (astronomically unlikely — hash is SHA-256 of a fresh
+  // 256-bit secret) now throws a UNIQUE-constraint error, caught by the route's own
+  // try/catch → 503 `ticket_store_failed`. A safe failure, never a silent un-burn.
   await env.DB.prepare(
     `INSERT INTO seat_events_tickets (tenant, hash, host_agent_id, expires_at, used_at, created_at)
-     VALUES (?1, ?2, ?3, ?4, NULL, ?5)
-     ON CONFLICT (tenant, hash) DO UPDATE SET
-       host_agent_id = excluded.host_agent_id, expires_at = excluded.expires_at,
-       used_at = NULL, created_at = excluded.created_at`,
+     VALUES (?1, ?2, ?3, ?4, NULL, ?5)`,
   ).bind(env.TENANT_SLUG, hash, hostAgentId, expiresAt, new Date(now * 1000).toISOString()).run()
   // Opportunistic cleanup, event-driven like the DO's own purgeExpired — never a timer. Uses
   // the SAME injected clock as the row it just wrote, so a test (or a clock skew) can never
@@ -751,6 +765,19 @@ export interface HubSocket {
   /** mupot#1595 P1: the host recorded by markConnected, or undefined for a socket that
    *  connected with no host (shouldn't happen post-fix) or before this field existed. */
   getPendingHost(): string | undefined
+  /** mupot#1595 P1 (adversarial round 2 on the round-2 alarm fix): stamp this WHENEVER the
+   *  hub closes a socket (any reason). In real workerd, a socket we called `.close()` on
+   *  stays in `ctx.getWebSockets()` with `readyState === CLOSING` until the peer acks —
+   *  sometimes never, for a half-open raw-TCP client — and its `connectedAt` never changes.
+   *  Without this flag, `enforceAuthDeadline`'s own closes kept feeding that STALE
+   *  `connectedAt` back into the next alarm computation forever: Miniflare reproduced
+   *  15,887 alarms in 66s with 3 half-open clients. Idempotent. */
+  markClosed(nowSec: number): void
+  /** True once markClosed has run. Every pending/authenticated COUNT (accept-time caps,
+   *  the hello-time recheck, the alarm's own pending-deadline list) must exclude a closed
+   *  socket — it no longer occupies a real slot, whatever the runtime's own teardown timing
+   *  happens to be. */
+  isClosed(): boolean
 }
 
 /** mupot#1595 P1 (codex round-2 review): what a WebSocket's attachment holds in the CURRENT
@@ -759,6 +786,7 @@ export interface HubSocket {
 export interface RawAttachment {
   connectedAt?: number
   pendingHost?: string
+  closedAt?: number
   sub?: SocketState
 }
 
@@ -935,7 +963,11 @@ export class SeatEventsHub {
     // host may hold. A well-behaved host holds exactly one — the same-host reconnect path
     // below (claim → 'newer_connection_same_host') supersedes rather than adding a second —
     // so this is a ceiling against a compromised or buggy host key, not the normal path.
-    const heldByHost = this.deps.sockets().filter((s) => s.getState()?.host === rec.host).length
+    // mupot#1595 (adversarial round 2): both counts below now also exclude a socket this hub
+    // has already closed — a closed socket lingering in sockets() (real workerd: readyState
+    // CLOSING until the peer acks; the test double: nothing ever splices it out) must not go
+    // on counting against either cap forever.
+    const heldByHost = this.deps.sockets().filter((s) => s.getState()?.host === rec.host && !s.isClosed()).length
     if (heldByHost >= MAX_SOCKETS_PER_HOST) return this.reject(sock, 'host_socket_limit')
 
     // mupot#1595 P2 (codex round-2 review): the pot-wide authenticated cap was enforced only
@@ -945,7 +977,7 @@ export class SeatEventsHub {
     // MAX_SOCKETS_PER_POT authenticated sockets. Re-check it HERE, at the actual
     // pending→authenticated transition, before this hello is allowed to succeed — `this` sock
     // is still pending (getState() === null) so it is correctly excluded from its own count.
-    const authenticatedNow = this.deps.sockets().filter((s) => s.getState() !== null).length
+    const authenticatedNow = this.deps.sockets().filter((s) => s.getState() !== null && !s.isClosed()).length
     if (podAcceptRefusal({ authenticated: authenticatedNow, pending: 0 }) === 'pot_full') {
       return this.reject(sock, 'pot_at_capacity')
     }
@@ -988,11 +1020,37 @@ export class SeatEventsHub {
   }
 
   private closeSocket(sock: HubSocket, code: number, reason: string): void {
+    // mupot#1595 (adversarial round 2): stamp closed FIRST, unconditionally — even a socket
+    // that's "already gone" (close() throws) must be marked, or it stays eligible to be
+    // recounted as pending/authenticated forever.
+    sock.markClosed(this.nowSec())
     try {
       sock.close(code, reason)
     } catch {
       // already gone
     }
+  }
+
+  /** mupot#1595 P1 (adversarial round 2 on the round-2 alarm fix): the connectedAt of every
+   *  socket that is STILL pending (no hello yet) AND not already closed by this hub. Feeding
+   *  a CLOSED socket's stale connectedAt into nextSweepAlarmMs was the hot-loop bug: in real
+   *  workerd, a socket enforceAuthDeadline just closed can sit in ctx.getWebSockets() with
+   *  readyState CLOSING until the peer acks — sometimes never, for a half-open raw-TCP client
+   *  — and its connectedAt never advances, so the alarm re-arms at a timestamp already in the
+   *  past and fires again immediately. Miniflare reproduced 15,887 alarms in 66s with 3
+   *  half-open clients; with this exclusion, 2 alarms in 31s (round-1 behaviour restored).
+   *  Deliberately Hub-level (not DO-shell-only) so it is unit-testable without workerd: the
+   *  DO additionally filters by real `readyState === OPEN` (belt and braces for a socket that
+   *  entered CLOSING via a path this hub never called `.close()` on), but the CORE fix — never
+   *  recount a socket THIS hub already closed — lives here. */
+  pendingDeadlines(): number[] {
+    const out: number[] = []
+    for (const sock of this.deps.sockets()) {
+      if (sock.getState() !== null || sock.isClosed()) continue
+      const at = sock.getConnectedAt()
+      if (at !== undefined) out.push(at)
+    }
+    return out
   }
 
   /** One live socket per agent. Same host reconnecting supersedes its old socket; another host

@@ -37,12 +37,19 @@
 --    table (not a shared one with a new `scope` column) because 0177's table has no scope
 --    column and no CHECK to add one to without touching that already-applied table's shape.
 --
--- DEPLOY ORDERING (kasra-review round 2, P3): this migration MUST be applied BEFORE this
--- code deploys, not "before or with" — the upgrade route's ticket pre-check and the
--- ticket-mint route's pre-check WRITE both hard-depend on `seat_events_tickets` existing.
--- Deploying the code first makes every mint 503 and every upgrade 401/429: the channel goes
--- fully dark (fails closed, but dark) until the migration lands. See the Deploy checklist in
--- docs/fleet/seat-events-channel.md.
+-- DEPLOY ORDERING (kasra-review round 2, P3): apply 0180 BEFORE deploying this code — the
+-- upgrade route's ticket pre-check and the ticket-mint route's pre-check WRITE both
+-- hard-depend on `seat_events_tickets` existing. Deploying the code first makes every mint
+-- 503 and every upgrade 401/429: the channel goes fully dark (fails closed, but dark) until
+-- the migration lands. See the Deploy checklist in docs/fleet/seat-events-channel.md.
+--
+-- mupot#1595 adversarial round 2 (P2-a): pruneRateLimitTable's DELETE (seat-events.ts) had
+-- no covering index on either limiter table — an unindexed scan on every call, including
+-- over-limit calls that changed nothing. Both limiters now only prune on the FIRST request
+-- of a brand-new window (see underTicketRateLimit/underUpgradeRateLimit), and both tables
+-- get a (tenant, window_start) index HERE — 0177's `seat_events_ticket_rate_limits` is
+-- already applied in prod, but a NEW index on an existing table is additive (no rebuild), so
+-- it can still land in this migration rather than needing its own.
 
 CREATE TABLE IF NOT EXISTS seat_events_tickets (
   tenant         TEXT    NOT NULL,
@@ -64,3 +71,11 @@ CREATE TABLE IF NOT EXISTS seat_events_upgrade_rate_limits (
   count         INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (tenant, key, window_start)
 );
+
+-- P2-a: covering index for pruneRateLimitTable's `DELETE ... WHERE tenant = ?1 AND
+-- window_start < ?2` on BOTH limiter tables (0177's already-applied ticket-mint table too).
+CREATE INDEX IF NOT EXISTS idx_seat_events_ticket_rate_limits_window
+  ON seat_events_ticket_rate_limits(tenant, window_start);
+
+CREATE INDEX IF NOT EXISTS idx_seat_events_upgrade_rate_limits_window
+  ON seat_events_upgrade_rate_limits(tenant, window_start);

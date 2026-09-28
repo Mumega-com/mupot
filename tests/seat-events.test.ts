@@ -184,7 +184,7 @@ async function seatToken(w: World, agent: string, member: string, raw: string): 
 class FakeSocket implements HubSocket {
   sent: string[] = []
   closed: { code: number; reason: string } | null = null
-  private attachment: { connectedAt?: number; pendingHost?: string; sub?: SocketState } = {}
+  private attachment: { connectedAt?: number; pendingHost?: string; closedAt?: number; sub?: SocketState } = {}
   send(d: string) {
     if (this.closed) throw new Error('closed')
     this.sent.push(d)
@@ -206,6 +206,20 @@ class FakeSocket implements HubSocket {
   }
   markConnected(nowSec: number, pendingHost?: string) {
     if (this.attachment.connectedAt === undefined) this.attachment = { ...this.attachment, connectedAt: nowSec, pendingHost }
+  }
+  // mupot#1595 (adversarial round 2): a real WebSocket we call .close() on STAYS in
+  // ctx.getWebSockets() with readyState CLOSING until the peer acks (sometimes never, for a
+  // half-open raw-TCP client) — this FakeSocket already models that faithfully by design:
+  // nothing ever removes a socket from the `sockets` array on close (only one test manually
+  // splices, to simulate a network drop). isClosed() reads the ATTACHMENT's closedAt —
+  // deliberately NOT derived from `this.closed` (set by close(), below) — so that a mutation
+  // deleting the production closeSocket()'s `sock.markClosed(...)` call is actually
+  // observable here, exactly as it would be against the real attachment-backed wrap().
+  markClosed(nowSec: number) {
+    if (this.attachment.closedAt === undefined) this.attachment = { ...this.attachment, closedAt: nowSec }
+  }
+  isClosed() {
+    return this.attachment.closedAt !== undefined
   }
   frames(): Record<string, any>[] {
     return this.sent.map((s) => JSON.parse(s))
@@ -1098,6 +1112,22 @@ describe('ticket rate limit (P3)', () => {
     expect(live).toBeTruthy()
   })
 
+  // mupot#1595 P2-a (adversarial round 2): pruneRateLimitTable ran an unindexed DELETE on
+  // EVERY call, including over-limit calls that changed nothing. Prune only fires on the
+  // FIRST request of a brand-new window (RETURNING count === 1).
+  it('pruning runs only on the FIRST request of a new window, never on a mid-window increment', async () => {
+    const w = await world()
+    const ip = '203.0.113.230'
+    expect(await underTicketRateLimit(w.env, ip, NOW * 1000)).toBe(true) // count=1: fresh window, prunes
+    const staleWindowStart = new Date(NOW * 1000 - 3 * TICKET_RATE_LIMIT_WINDOW_SEC * 1000).toISOString()
+    w.h.sqlite.exec(
+      `INSERT INTO seat_events_ticket_rate_limits (tenant, key, window_start, count) VALUES ('${TENANT}', 'stale-ip-3', '${staleWindowStart}', 5)`,
+    )
+    expect(await underTicketRateLimit(w.env, ip, NOW * 1000)).toBe(true) // count=2: mid-window, must NOT prune
+    const stale = w.h.sqlite.prepare(`SELECT 1 AS x FROM seat_events_ticket_rate_limits WHERE key = 'stale-ip-3'`).get()
+    expect(stale).toBeTruthy() // still there — the second call never pruned
+  })
+
   // mupot#1595 P3 (kasra-review round 1): "underUpgradeRateLimit's catch mutated to fail
   // open: survived. No test covers it." — neither limiter had a dedicated error-path test.
   it('underTicketRateLimit fails CLOSED on a D1 error', async () => {
@@ -1130,6 +1160,19 @@ describe('upgrade rate limit table is also pruned (P2)', () => {
     await underUpgradeRateLimit(w.env, '203.0.113.202', NOW * 1000)
     const stale = w.h.sqlite.prepare(`SELECT 1 AS x FROM seat_events_upgrade_rate_limits WHERE key = 'stale-ip-2'`).get()
     expect(stale).toBeUndefined()
+  })
+
+  it('pruning runs only on the FIRST request of a new window (P2-a)', async () => {
+    const w = await world()
+    const ip = '203.0.113.231'
+    expect(await underUpgradeRateLimit(w.env, ip, NOW * 1000)).toBe(true) // count=1: fresh, prunes
+    const staleWindowStart = new Date(NOW * 1000 - 3 * UPGRADE_RATE_LIMIT_WINDOW_SEC * 1000).toISOString()
+    w.h.sqlite.exec(
+      `INSERT INTO seat_events_upgrade_rate_limits (tenant, key, window_start, count) VALUES ('${TENANT}', 'stale-ip-4', '${staleWindowStart}', 5)`,
+    )
+    expect(await underUpgradeRateLimit(w.env, ip, NOW * 1000)).toBe(true) // count=2: mid-window
+    const stale = w.h.sqlite.prepare(`SELECT 1 AS x FROM seat_events_upgrade_rate_limits WHERE key = 'stale-ip-4'`).get()
+    expect(stale).toBeTruthy()
   })
 
   it('underUpgradeRateLimit fails CLOSED on a D1 error', async () => {
@@ -1356,15 +1399,58 @@ describe('grant scope: host standing and revoke rank ceiling (P2-C)', () => {
     expect(live?.host_agent_id).toBe(HOST2)
   })
 
-  it('DELETE /grants/:agent retries and succeeds against a grant that changed underneath it', async () => {
+  // mupot#1595 addendum (kasra-review, PR comment 5877155417): the ORIGINAL version of this
+  // test never actually changed anything underneath the request — it was a plain single
+  // revoke that succeeded on its first try, so a mutation deleting the retry loop entirely
+  // survived unnoticed. This version injects a REAL concurrent revoke-and-replace through the
+  // D1 harness, landing exactly between the route's rank-check read and its conditional
+  // write, so the assertion can only pass if the retry loop actually re-authorizes and
+  // revokes the NEW row — not the stale one it first read.
+  it('DELETE /grants/:agent RE-AUTHORIZES and revokes the REPLACEMENT grant when the original is revoked-and-replaced between the rank check and the write', async () => {
     const w = await world()
     w.h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
       VALUES ('tok-lead9', 'seat1-m', '${await hashMemberToken('lead-tok-9')}', '', 'workspace', datetime('now'), '${TENANT}')`)
     w.h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lead9', 'seat1-m', 'squad', 's1', 'lead')`)
-    await grant(w, HOST1, A1) // creator 'admin', no org-admin capability in this world() — a peer, revocable
-    const revoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer lead-tok-9' } }, w.env)
+    const first = await createSeatEventGrant(w.env, { hostAgentId: HOST1, agentId: A1, memberId: 'admin', reason: 'first' })
+    expect(first.ok).toBe(true)
+    const firstId = (first as { id: string }).id
+    const secondId = crypto.randomUUID()
+
+    let injected = false
+    const racyDb = new Proxy(w.env.DB as unknown as Record<string, unknown>, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            // Fires exactly once: the FIRST time the route's conditional revoke UPDATE
+            // (bound to `firstId`) is prepared — i.e. right after the rank check already
+            // read and authorized against grant `firstId`, before that UPDATE runs.
+            if (!injected && sql.includes('UPDATE seat_event_grants') && sql.includes('AND id = ?5')) {
+              injected = true
+              w.h.sqlite.exec(`
+                UPDATE seat_event_grants SET revoked_at = '2026-01-01T00:00:00Z', revoked_by_member_id = 'admin'
+                  WHERE id = '${firstId}' AND revoked_at IS NULL;
+                INSERT INTO seat_event_grants (id, tenant, host_agent_id, agent_id, project_id, granted_by_member_id, reason, created_at)
+                  VALUES ('${secondId}', '${TENANT}', '${HOST2}', '${A1}', NULL, 'admin', 'second', '2026-01-01T00:00:01Z');
+              `)
+            }
+            return (t.prepare as (s: string) => unknown)(sql)
+          }
+        }
+        const v = (t as Record<string, unknown>)[k as string]
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v
+      },
+    })
+    const env2 = { ...w.env, DB: racyDb } as unknown as Env
+    const revoke = await seatEventsApp.request('/grants/' + A1, { method: 'DELETE', headers: { Authorization: 'Bearer lead-tok-9' } }, env2)
+    expect(injected).toBe(true) // sanity: the race actually landed where intended
     expect(revoke.status).toBe(200)
     expect(await revoke.json()).toMatchObject({ revoked: 1 })
+    // The row ACTUALLY revoked must be the SECOND grant — proof the retry loop re-read and
+    // re-authorized against the replacement, rather than a broader query wiping whatever
+    // happened to be live (which would also report revoked:1 but for the wrong reason).
+    const secondRow = w.h.sqlite.prepare(`SELECT revoked_at FROM seat_event_grants WHERE id = '${secondId}'`).get() as { revoked_at: string | null }
+    expect(secondRow.revoked_at).not.toBeNull()
+    expect(await activeSeatEventGrant(w.env, A1)).toBeNull()
   })
 })
 
@@ -1491,6 +1577,22 @@ describe('route-level ticket pre-check (P1-A)', () => {
       },
     })
     expect(await consumeTicketPreCheck({ ...w.env, DB: flakyDb } as unknown as Env, 'whatever')).toEqual({ ok: false, reason: 'error' })
+  })
+
+  // mupot#1595 adversarial round 2 (item 5): recordTicketPreCheck used to have an
+  // `ON CONFLICT ... DO UPDATE SET used_at = NULL` branch — an UN-BURN path. A colliding
+  // (tenant, hash) mint would silently reset an already-consumed ticket back to usable,
+  // defeating consumeTicketPreCheck's whole single-use guarantee. Removed entirely: a
+  // genuine collision now throws (caught by the route's own try/catch → 503), never un-burns.
+  it('recordTicketPreCheck THROWS on a duplicate hash rather than un-burning an already-consumed ticket', async () => {
+    const w = await world()
+    const hash = await sha256Hex('w'.repeat(43))
+    await recordTicketPreCheck(w.env, hash, HOST1, NOW + 30, () => NOW)
+    expect(await consumeTicketPreCheck(w.env, hash, () => NOW)).toEqual({ ok: true, hostAgentId: HOST1 })
+    // A second mint colliding on the SAME hash must NOT reset used_at back to NULL.
+    await expect(recordTicketPreCheck(w.env, hash, HOST1, NOW + 30, () => NOW)).rejects.toThrow()
+    // The ticket stays burned — proof there was no silent un-burn.
+    expect(await consumeTicketPreCheck(w.env, hash, () => NOW)).toEqual({ ok: false, reason: 'invalid' })
   })
 
   it('POST /ticket refuses 503 (never mints) when the pre-check write itself fails', async () => {
@@ -1644,6 +1746,53 @@ describe('auth-deadline hibernation safety (P1-A)', () => {
     expect(nextSweepAlarmMs([b, a])).toBe((a + AUTH_DEADLINE_SEC) * 1000) // order-independent
   })
 
+  // ═════ mupot#1595 P1 (adversarial round 2 on the round-2 alarm fix): a socket the sweep
+  // just closed stays in `sockets()` (real workerd: readyState CLOSING until the peer acks,
+  // sometimes never, for a half-open raw-TCP client) with its STALE connectedAt unchanged.
+  // Feeding that into nextSweepAlarmMs armed an alarm in the past — fires immediately,
+  // recomputes the same stale timestamp, never stops. Miniflare: 15,887 alarms in 66s with 3
+  // half-open clients; with the fix, 2 alarms in 31s. ═════
+  it('a socket closed by the sweep is excluded from the NEXT pending-deadline computation — no hot loop', () => {
+    let now = NOW
+    const sockets: FakeSocket[] = []
+    const hub = new SeatEventsHub({} as Env, { sockets: () => sockets, tickets: memTickets(() => now), nowSec: () => now, recent: new RecentIds(), junk: createJunkTracker() })
+    const pending = new FakeSocket()
+    sockets.push(pending)
+    hub.noteConnected(pending)
+    now += AUTH_DEADLINE_SEC
+    expect(hub.enforceAuthDeadline()).toBe(1)
+    expect(pending.closed).toMatchObject({ code: CLOSE_AUTH_TIMEOUT, reason: 'auth_timeout' })
+    // The FakeSocket STAYS in `sockets` (nothing splices it — exactly like a real CLOSING
+    // WebSocket) with its ORIGINAL (now stale) connectedAt untouched. Before this fix,
+    // pendingDeadlines() would still return that stale timestamp forever.
+    expect(pending.getConnectedAt()).toBe(NOW) // unchanged — still the ORIGINAL connect time
+    expect(hub.pendingDeadlines()).toEqual([]) // excluded: the hub already closed it
+    expect(nextSweepAlarmMs(hub.pendingDeadlines())).toBeNull() // the alarm may lapse — no loop
+  })
+
+  it('a bounded alarm-loop simulation over one minute produces at most 2 alarms, and frees the pending slot', () => {
+    let now = NOW
+    const sockets: FakeSocket[] = []
+    const hub = new SeatEventsHub({} as Env, { sockets: () => sockets, tickets: memTickets(() => now), nowSec: () => now, recent: new RecentIds(), junk: createJunkTracker() })
+    const pending = new FakeSocket()
+    sockets.push(pending)
+    hub.noteConnected(pending)
+    let alarms = 0
+    let armedAtMs = (now + AUTH_DEADLINE_SEC) * 1000 // the deadline armed at connect time
+    const endAtMs = (now + 60) * 1000 // simulate one minute of real time
+    while (armedAtMs <= endAtMs && alarms < 1000) {
+      now = Math.floor(armedAtMs / 1000)
+      alarms++
+      hub.enforceAuthDeadline()
+      const next = nextSweepAlarmMs(hub.pendingDeadlines())
+      if (next === null) break
+      armedAtMs = Math.max(next, armedAtMs + 1000) // mirrors the DO's own >= now+1000ms floor
+    }
+    expect(alarms).toBeLessThanOrEqual(2)
+    expect(hub.pendingDeadlines()).toEqual([]) // the pending slot is freed, not held forever
+    expect(pending.closed).not.toBeNull()
+  })
+
   // ═════ mupot#1595 P1 (codex round-2 review): decode legacy socket attachments after
   // rollout — a socket accepted by the PREVIOUSLY deployed code wrote its attachment as the
   // bare SocketState itself, not {sub: SocketState}. ═════
@@ -1686,5 +1835,51 @@ describe('authenticated cap re-checked at hello, not only at accept (P2)', () =>
     const hub = hubFor(w)
     const s = await hub.connect(await hub.ticketFor(HOST1, [A1]))
     expect(s.of('ready')[0]?.subscriptions[0]).toMatchObject({ agent: A1, ok: true })
+  })
+
+  // mupot#1595 (adversarial round 2, kill-witness round): a socket THIS hub already closed
+  // (markClosed set — e.g. by the auth-deadline sweep, or any other close path) must not go
+  // on counting toward the pot-wide authenticated cap forever, exactly like the accept-time
+  // and per-host cases.
+  it('a CLOSED socket no longer counts toward the pot-wide authenticated recheck at hello', async () => {
+    const w = await world()
+    const hub = hubFor(w)
+    for (let i = 0; i < MAX_SOCKETS_PER_POT; i++) {
+      const s = hub.acceptRaw()
+      s.setState({ host: `filler-host-${i}`, agents: [`filler-agent-${i}`] })
+    }
+    // Close ONE of the fillers directly (it stays in `sockets` — nothing splices it, exactly
+    // like a real CLOSING-state WebSocket) — freeing exactly one authenticated slot.
+    hub.sockets[0].markClosed(NOW)
+    await grant(w, HOST1, A1)
+    const newcomer = await hub.connect(await hub.ticketFor(HOST1, [A1]))
+    expect(newcomer.of('ready')[0]?.subscriptions[0]).toMatchObject({ agent: A1, ok: true })
+  })
+})
+
+// ═════════════ mupot#1595 (adversarial round 2, kill-witness round): a closed socket must
+// not count toward the PER-HOST authenticated cap either ═════════════
+describe('a closed socket does not count toward the per-host authenticated cap', () => {
+  it('a CLOSED socket frees its slot in MAX_SOCKETS_PER_HOST for a new connection from the same host', async () => {
+    const w = await world()
+    const agents = Array.from({ length: MAX_SOCKETS_PER_HOST }, (_, i) => `hb-agent-${i}`)
+    w.h.sqlite.exec(
+      agents.map((a) => `INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${a}', 's1', '${a}', '${a}', 'member', 'm', 'active')`).join(';\n'),
+    )
+    for (const a of agents) await grant(w, HOST1, a)
+    const hub = hubFor(w)
+    const sockets = []
+    for (const a of agents) sockets.push(await hub.connect(await hub.ticketFor(HOST1, [a])))
+    expect(sockets.every((s) => s.of('ready')[0]?.subscriptions[0]?.ok)).toBe(true) // all MAX_SOCKETS_PER_HOST filled
+    // Close ONE of them directly, simulating a lingering CLOSING-state socket that stays in
+    // `sockets` (real workerd) without ever being spliced out.
+    sockets[0].markClosed(NOW)
+    const extraAgent = 'hb-agent-extra'
+    w.h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('${extraAgent}', 's1', '${extraAgent}', '${extraAgent}', 'member', 'm', 'active')`)
+    await grant(w, HOST1, extraAgent)
+    const extra = await hub.connect(await hub.ticketFor(HOST1, [extraAgent]))
+    // Before this fix, the closed socket still counted, so this (MAX_SOCKETS_PER_HOST + 1)th
+    // hello would have been refused `host_socket_limit`.
+    expect(extra.of('ready')[0]?.subscriptions[0]).toMatchObject({ agent: extraAgent, ok: true })
   })
 })

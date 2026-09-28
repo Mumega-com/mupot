@@ -242,7 +242,7 @@ Migration `0176_seat_event_grants.sql` is **already applied** on prod D1; a late
 `0177_seat_events_ticket_rate_limit.sql` (P3) on top, and **this branch (mupot#1594) adds
 `0180_seat_events_route_precheck.sql`** — two new, purely additive tables (`seat_events_tickets`,
 the route-level ticket pre-check; `seat_events_upgrade_rate_limits`, the upgrade route's own
-rate limiter) — apply it before or with the merge. No prod secret needs provisioning for any of
+rate limiter) — apply 0180 BEFORE deploying. No prod secret needs provisioning for any of
 this PR's fixes (the ticket pre-check deliberately uses a D1 table instead of a new signing
 secret — see "Route-level ticket pre-check" above).
 
