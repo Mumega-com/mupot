@@ -202,6 +202,19 @@ describe('update_agent — self lane (mupot#1288, reworked post-gate PR #1289)',
     expect(result.detail).toEqual({ need: 'admin', scope: 'squad' })
   })
 
+  it('a non-bound member with only squad lead is refused (403 forbidden need=admin scope=squad)', async () => {
+    const leadGrant: CapabilityGrant[] = [
+      { member_id: 'member-lead', scope_type: 'squad', scope_id: squadId, capability: 'lead' },
+    ]
+    const result = await invoke(auth({ capabilities: leadGrant }), { agent: selfAgentId, model: 'claude-fable-5-1' })
+    console.log('OBSERVED_STATUS_3_LEAD:', JSON.stringify(result))
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(403)
+    expect(result.error).toBe('forbidden')
+    expect(result.detail).toEqual({ need: 'admin', scope: 'squad' })
+  })
+
   // ── positive self-patch + audit + self_report ────────────────────────────
   it('self-patches model + purpose without admin, audited to the agent itself, self_report:true on the event', async () => {
     const result = await invoke(
