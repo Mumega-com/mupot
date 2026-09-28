@@ -1227,6 +1227,45 @@ describe('mupot#1592 freeze/verdict binding', () => {
     harness.close()
   })
 
+  // NEW-3, ISOLATED from NEW-2: the test above is ALSO satisfied by the
+  // verdict_id/reversed_at binding alone (reversal always sets reversed_at,
+  // which independently breaks the claim's verdict_id subquery) — mutating away
+  // ONLY the claim's `EXISTS (... status = 'approved')` conjunct leaves that
+  // test green. This one isolates the status re-check on its own: task.status is
+  // changed away from 'approved' WITHOUT touching task_verdicts at all (a raw
+  // write, simulating any future/other code path that flips status without
+  // knowing about this addon's verdict-binding invariant) — verdict_id stays
+  // valid and unreversed, so ONLY the status re-check can catch this.
+  it('NEW-3 isolated: the claim also re-derives status=\'approved\' independently of the verdict_id binding', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-race-status-only')
+    seedActiveOfficeInstallation(harness, connectorId)
+    mockWriteCapableOfficeBinding()
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+
+    const staleTask = await testEnv.DB.prepare(`SELECT * FROM tasks WHERE id = ?1`).bind(taskId).first<Task>()
+    expect(staleTask?.status).toBe('approved')
+
+    // Raw write — status flips away from 'approved' with NO reversal, no
+    // task_verdicts change at all. freeze.verdict_id is still bound to the
+    // still-unreversed approved verdict.
+    harness.sqlite.prepare(`UPDATE tasks SET status = 'in_progress' WHERE id = ?`).run(taskId)
+    const freezeRow = harness.sqlite.prepare(`SELECT verdict_id FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { verdict_id: string | null }
+    expect(freezeRow.verdict_id).not.toBeNull()
+
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const publishResult = await publishOfficePost(testEnv, officeLead(departmentId), { task: staleTask as Task })
+    expect(publishResult.ok).toBe(false)
+    if (!publishResult.ok) expect(publishResult.reason).toBe('publish_claimed')
+    expect(fetchSpy).not.toHaveBeenCalled()
+    harness.close()
+  })
+
   it('reverse voids the freeze and re-entering review mints a fresh, unbound one; reject also voids; a stale pre-rework hash is refused after content actually changes', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
