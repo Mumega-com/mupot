@@ -91,7 +91,13 @@ import {
   NonHumanVerdictRefusedError,
   detectVerdictReversalRequest,
   reverseTaskVerdict,
+  persistTaskSubmittedResult,
 } from '../tasks/service'
+// mupot#1586 — the same completion-size ceiling execute.ts's own finishTask
+// enforces on the in-Worker path (~16KB), reused here rather than a second
+// constant, so a hand-worked completion cannot bloat the row in a way the
+// AgentDO path already guards against.
+import { MAX_RESULT_CHARS } from '../agents/execute'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
@@ -2436,6 +2442,186 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
       if (error instanceof TaskDispatchRuntimeReceiptError) return runtimeReceiptFailure(error)
       throw error
     }
+  },
+}
+
+// task_submit_result — mupot#1586. Symmetric to task_dispatch_runtime_receipt
+// (above), but for a task that was NEVER dispatched: assigned to an agent
+// and worked by hand (a flight task, a CLI agent operating outside the
+// AgentDO execute cycle, etc.). Before this tool existed, that task had NO
+// supported way to reach 'review' at all — task_update refuses an unknown
+// `result` field (#1388's fix, closing a forged-result gate bypass), and
+// task_dispatch_runtime_receipt 409s task_not_runnable for anything that was
+// never dispatched. The task sat in_progress forever with its evidence
+// trapped in a chat note.
+//
+// SCOPE, deliberately narrow:
+//   - agent-assignee ONLY (mirrors the artifact gate's own scoping in
+//     task_update: `result` is meaningless for a human/member-owned task,
+//     which was never gated on it either — see gate BLOCK finding #4).
+//   - the CALLER must equal the CURRENT assignee_agent_id (invariant (b):
+//     no peer can submit a result for someone else's task).
+//   - only from 'in_progress' (invariant (c): once the row is 'review' this
+//     branch is unreachable for a second call — the result is immutable
+//     until a rejection sends the task back to 'in_progress' for rework,
+//     the existing legal transition, at which point a fresh submission is
+//     allowed again, same as any other in_progress task).
+//   - refuses outright when the task carries a live execution_receipt_id
+//     (invariant (e): a DISPATCHED task's completion is
+//     task_dispatch_runtime_receipt's job, which carries its own far
+//     stronger independent-gate check — this tool must never become a
+//     second, weaker door onto the same row).
+//   - never writes 'done' — only 'review'. assigneeSelfClose/
+//     assigneeCannotMutateOwnAssignment are untouched by this tool
+//     (invariant (a)): review→done still requires task_verdict or a
+//     different principal's task_update, exactly as before.
+//   - the same verifyTaskArtifactShape gate every other review-entry path
+//     enforces, checked on the INCOMING result before anything is written.
+//   - an append-only receipt (task_result_submissions, migrations/0181)
+//     records who submitted, when, and the exact verified artifact claim
+//     (invariant (d)) — independent of whatever later happens to the task
+//     row (a verdict, a reversal, a second rework cycle).
+const toolTaskSubmitResult: ToolSpec = {
+  name: 'task_submit_result',
+  scope: 'assigned task (agent assignee only)',
+  min: 'member',
+  args: '{ task_id: string, result: string, gate_owner?: string }' +
+    ' -- the agent ASSIGNEE of a hand-worked (never-dispatched) task reports its completion' +
+    ' evidence and moves it into review in one atomic step. result must state both' +
+    ' "Artifact: <path>" and "SHA256: <64-hex>" (verifyTaskArtifactShape, the same shape every' +
+    ' other review-entry path enforces). gate_owner is required to enter review — pass it here' +
+    ' in the form "gate:<owner>" if the task does not already carry one; once set it is' +
+    ' immutable except via task_update by an org owner/admin.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      result: STRING_SCHEMA,
+      gate_owner: STRING_SCHEMA,
+    },
+    required: ['task_id', 'result'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const resultText = typeof args.result === 'string' ? args.result : ''
+    if (!resultText.trim()) return fail(400, 'invalid_args', 'result required')
+    if (resultText.length > MAX_RESULT_CHARS) {
+      return fail(400, 'invalid_args', `result exceeds ${MAX_RESULT_CHARS} chars`)
+    }
+
+    // An agent-bound caller only. A pure human/dashboard session has no
+    // assignee_agent_id it could ever match, and letting a member id through
+    // here would just fail the assignee check below with a confusing error —
+    // name the real reason instead.
+    if (!auth.boundAgentId) {
+      return fail(409, 'agent_binding_required', 'task_submit_result is for an agent-bound caller reporting its own work')
+    }
+
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const existing = taskRes.task
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+
+    // INVARIANT (b) — only the task's current agent assignee may submit.
+    if (!existing.assignee_agent_id || existing.assignee_agent_id !== auth.boundAgentId) {
+      return fail(403, 'not_task_assignee', 'only the task\'s current agent assignee may submit a completion result')
+    }
+
+    // INVARIANT (e) — a dispatched task keeps its existing runtime-receipt path.
+    if (existing.execution_receipt_id) {
+      return fail(409, 'task_dispatched', 'this task has an active dispatch/execution receipt — report completion via task_dispatch_runtime_receipt, not task_submit_result')
+    }
+
+    // INVARIANT (c) — immutable once in review. Only reachable from in_progress;
+    // a rejected task must first be moved back to in_progress (task_update, the
+    // existing legal rejected→in_progress transition) before resubmitting.
+    if (existing.status !== 'in_progress') {
+      return fail(409, 'task_not_in_progress', {
+        status: existing.status,
+        detail: 'a completion result can only be submitted while the task is in_progress; once in review the result is immutable until the task is sent back to in_progress',
+      })
+    }
+
+    const next: Task = { ...existing, result: resultText }
+
+    // gate_owner: required to enter review, same rule as task_update. This tool
+    // may only SET a currently-null gate_owner — never change or clear an
+    // existing one (that stays the org owner/admin-only task_update path).
+    if (args.gate_owner !== undefined) {
+      if (existing.gate_owner !== null) {
+        return fail(409, 'gate_owner_immutable', 'once set, gate_owner can only be changed or cleared by an org owner/admin via task_update')
+      }
+      const trimmed = str(args.gate_owner)
+      if (!trimmed || !isValidGateOwnerForm(trimmed)) {
+        return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
+      }
+      next.gate_owner = trimmed
+    }
+    if (!next.gate_owner) {
+      return fail(409, 'gate_required_for_review', 'a task can only enter review with a gate_owner set')
+    }
+
+    // PROVENANCE-SAFE ARTIFACT GATE (mupot#76e25fc2, FLIGHT-07B) — same shape
+    // check as every other review-entry path, applied to the INCOMING result:
+    // this tool IS the write path for it, so there is nothing already on the
+    // row to fall back to checking.
+    const artifactCheck = verifyTaskArtifactShape(resultText)
+    if (!artifactCheck.verified) {
+      return fail(409, 'artifact_verification_failed', {
+        reason: artifactCheck.reason,
+        ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+        detail: 'a completion result must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done',
+      })
+    }
+
+    next.status = 'review'
+    stampTaskUpdate(next, existing.status, new Date().toISOString())
+
+    try {
+      await persistTaskSubmittedResult(env, existing, next)
+    } catch (error) {
+      if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
+      throw error
+    }
+
+    // Append-only receipt (invariant (d)): who submitted, when, and the exact
+    // verified artifact claim — independent of the full result text, which
+    // already lives on tasks.result and may be superseded by a later rework
+    // cycle without losing this record of the original submission.
+    const resultDigest = await sha256Hex(resultText)
+    await env.DB.prepare(
+      `INSERT INTO task_result_submissions
+         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
+    ).bind(
+      crypto.randomUUID(),
+      env.TENANT_SLUG,
+      next.id,
+      next.squad_id,
+      auth.boundAgentId,
+      artifactCheck.path,
+      artifactCheck.sha256Claimed,
+      resultDigest,
+    ).run()
+
+    next.github_issue_url = await mirrorTaskUpdate(env, next, { statusChanged: true })
+
+    const actor = { kind: 'agent' as const, id: auth.boundAgentId }
+    await emitTaskEvent(env, 'task.updated', next, actor)
+
+    // Same review-wake every other entering-review path fires (task_update),
+    // so a gate owner learns about a hand-worked completion the same way it
+    // learns about a dispatched one.
+    const gateWake = await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+    next.gate_wake_notice = gateWake.notice
+
+    return done({ task: next, gate_wake: gateWake })
   },
 }
 
@@ -5783,6 +5969,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskVerdictReverse,
   toolTaskDispatch,
   toolTaskDispatchRuntimeReceipt,
+  toolTaskSubmitResult,
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,

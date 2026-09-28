@@ -517,6 +517,56 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
 }
 
+// persistTaskSubmittedResult — mupot#1586. The WRITE half of task_submit_result
+// (src/mcp/index.ts): a hand-worked task's assignee reporting completion
+// evidence into `result` while landing 'review', in one atomic statement.
+//
+// Deliberately its OWN statement builder, not a reuse of
+// buildTaskUpdateStatement — that function's SET list excludes `result` ON
+// PURPOSE (#1388's fix for a transient-value gate forgery: task_update must
+// never let a caller-supplied `result` merge into the row unverified). This
+// path is verified BEFORE it ever reaches here (verifyTaskArtifactShape, in
+// the tool), and is the one write path this repo intends to let write
+// `result` and `status` together.
+//
+// The WHERE clause repeats every precondition the tool already checked in JS
+// (status='in_progress', assignee match, no live execution_receipt_id) — not
+// redundantly, but because a JS pre-check and the write are two different
+// points in time. A concurrent racer (a verdict landing, a dispatch claiming
+// the row, a second submit) between the read and this write must not be able
+// to land a result the pre-check never actually saw. This is the same
+// "pre-state scope guard the same call mutates" lesson #1388's own review
+// found elsewhere: enforce the invariant IN the WHERE clause of the write
+// that could violate it, not only in a check that ran a moment earlier.
+function buildTaskSubmittedResultStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
+  return env.DB.prepare(
+    `UPDATE tasks
+        SET status = ?, result = ?, gate_owner = ?, updated_at = ?
+      WHERE id = ? AND updated_at = ? AND project_id IS ?
+        AND status = 'in_progress'
+        AND assignee_agent_id = ?
+        AND execution_receipt_id IS NULL`,
+  ).bind(
+    next.status,
+    next.result,
+    next.gate_owner,
+    next.updated_at,
+    next.id,
+    existing.updated_at,
+    existing.project_id,
+    existing.assignee_agent_id,
+  )
+}
+
+export async function persistTaskSubmittedResult(
+  env: Env,
+  existing: Task,
+  next: Task,
+): Promise<void> {
+  const result = await buildTaskSubmittedResultStatement(env, existing, next).run()
+  if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
+}
+
 // findLatestVerdict — the task-bound "latest verdict" read, shared by
 // reverseTaskVerdict and detectVerdictReversalRequest below. Deliberately
 // NOT proposal-bound (unlike resolveProposalVerdict, src/routines/actions.ts)
