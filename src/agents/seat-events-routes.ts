@@ -121,7 +121,7 @@ seatEventsApp.post('/ticket', async (c) => {
   const expiresAt = Math.floor(Date.now() / 1000) + TICKET_TTL_SEC
   // mupot#1594 P1-A: write the route's OWN pre-check record (migration 0180) BEFORE asking
   // the DO to store its copy. If this write fails, refuse outright — minting a ticket the
-  // upgrade route could never later pass its pre-check on on is worse than a 503 here.
+  // upgrade route could never later pass its pre-check on is worse than a 503 here.
   try {
     await recordTicketPreCheck(c.env, hash, expiresAt)
   } catch (err) {

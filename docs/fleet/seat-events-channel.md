@@ -17,8 +17,9 @@ the channel is live but nothing is currently subscribed.
   and opened the legacy stream. Now fails CLOSED (503) — see "Herdr fence" below.
 - **P2-C** (grant scope): a grant's host had no standing check at all, and a squad lead's
   revoke had no rank ceiling against a higher-authority creator. See "Authorization" below.
-- **P3**: 404-vs-403 existence oracle unified, ticket stripped from any logged URL, a timeout
-  on the seat-hint publish, IPv6 rate-limit bucketing.
+- **P3**: 404-vs-403 existence oracle unified, a timeout on the seat-hint publish, IPv6
+  rate-limit bucketing. (Audited for any logging of a ticket-bearing URL on this surface —
+  found none to strip; noted so a future log line doesn't reintroduce it.)
 
 **mupot#1589 adversarial gate (kasra-review, round 1) found five P1s against that exact commit,
 two of them live in prod with no grant required to reach.** `kasra/seat-events-p1-fixes`
