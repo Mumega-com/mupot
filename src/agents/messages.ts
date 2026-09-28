@@ -1127,15 +1127,6 @@ async function recipientVisibleOnSenderSquads(
   recipient: { id: string; squad_id: string },
 ): Promise<boolean> {
   if (await canOnSquad(env, grants, recipient.squad_id, 'observer')) return true
-  const rows = await env.DB.prepare('SELECT squad_id FROM memberships WHERE agent_id = ?1')
-    .bind(recipient.id)
-    .all<{ squad_id: string }>()
-  const seen = new Set<string>([recipient.squad_id])
-  for (const row of rows.results ?? []) {
-    if (!row.squad_id || seen.has(row.squad_id)) continue
-    seen.add(row.squad_id)
-    if (await canOnSquad(env, grants, row.squad_id, 'observer')) return true
-  }
   return false
 }
 
