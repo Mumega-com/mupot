@@ -1,0 +1,278 @@
+{
+  "agent": "mupot-sage",
+  "bootstrap": {
+    "context_dir": "/mnt/HC_Volume_104325311/mupot-worktrees/mupot-sage/mupot-sage",
+    "state_version": 1,
+    "bootstrapped_at": "2026-08-09T23:53:14Z",
+    "survey": {
+      "path": "/mnt/HC_Volume_104325311/mumega.com/agents/river/context/mupot-survey-2026-08-09.md",
+      "sha256": "03073a1425fa8c49ce90d4a2ee0eefe4150ba21020051c2866f8fdea30c0a5d6",
+      "bytes": 20335
+    }
+  },
+  "graph": {
+    "db": "/home/mumega/mupot/.code-review-graph/graph.db",
+    "head": {
+      "git_head_sha": "3f5750bb933937b85f5bb01c5672397df6c294f5",
+      "git_branch": "fix/remove-home-capability-ceiling",
+      "last_updated": "2026-08-09T23:50:24",
+      "last_build_type": "incremental",
+      "schema_version": 9
+    },
+    "top5_non_test_flows": [
+      {
+        "id": 11629,
+        "name": "read",
+        "entry": "src/addons/marketing/adapters/posthog.ts::read",
+        "node_count": 22,
+        "file_count": 5,
+        "criticality": 0.8477,
+        "path_head": [
+          31612,
+          31610,
+          32357
+        ]
+      },
+      {
+        "id": 11643,
+        "name": "run",
+        "entry": "src/mcp/loops.ts::run",
+        "node_count": 29,
+        "file_count": 6,
+        "criticality": 0.8321,
+        "path_head": [
+          33415,
+          33361,
+          33349
+        ]
+      },
+      {
+        "id": 11647,
+        "name": "createTaskThenFail",
+        "entry": "tests/marketing-monitor-opportunities.test.ts::createTaskThenFail",
+        "node_count": 34,
+        "file_count": 7,
+        "criticality": 0.8282,
+        "path_head": [
+          38727,
+          34195,
+          34192
+        ]
+      },
+      {
+        "id": 11648,
+        "name": "createTaskThenApprove",
+        "entry": "tests/marketing-monitor-opportunities.test.ts::createTaskThenApprove",
+        "node_count": 34,
+        "file_count": 7,
+        "criticality": 0.8282,
+        "path_head": [
+          38737,
+          34195,
+          34192
+        ]
+      },
+      {
+        "id": 11651,
+        "name": "alarm",
+        "entry": "src/agents/agent-do.ts::AgentDO.alarm",
+        "node_count": 117,
+        "file_count": 27,
+        "criticality": 0.8269,
+        "path_head": [
+          31954,
+          31955,
+          32008
+        ]
+      }
+    ]
+  },
+  "queries": {
+    "last_run": "2026-08-10T02:46:46.464322+00:00",
+    "graph_head": "3f5750bb933937b85f5bb01c5672397df6c294f5 (fix/remove-home-capability-ceiling)",
+    "resolve_agent_loom": {
+      "found": true,
+      "id": "17aa283f-8cdb-4c1f-864f-1974ee45a033",
+      "slug": "loom",
+      "role": "flight-controller",
+      "status": "active",
+      "model": "gpt-5.4"
+    },
+    "flight_list_squad_core_limit3": {
+      "squad_id": "squad-core",
+      "count": 3,
+      "flights": [
+        {
+          "id": "9f5e0147",
+          "status": "running",
+          "gate": "go",
+          "score": 0.9674,
+          "agent": "c855f82c"
+        },
+        {
+          "id": "e72f156c",
+          "status": "held",
+          "gate": "no_go",
+          "score": 0.0051,
+          "agent": "c855f82c"
+        },
+        {
+          "id": "f0194587",
+          "status": "held",
+          "gate": "no_go",
+          "score": 0.0051,
+          "agent": "c855f82c"
+        }
+      ]
+    },
+    "flight_list_squad_core_full": {
+      "squad_id": "squad-core",
+      "count": 16,
+      "running": [
+        "9f5e0147",
+        "94e5195c",
+        "48aa940e",
+        "0c9ba110",
+        "9bdab4ab",
+        "409a2fbc"
+      ],
+      "held": [
+        {
+          "id": "fafc987f",
+          "score": 0.13111339374215644,
+          "reason": "low_readiness",
+          "agent": "river"
+        },
+        {
+          "id": "e72f156c",
+          "score": 0.005080218046913022,
+          "reason": "context_incomplete,tools_unreachable,low_readiness"
+        },
+        {
+          "id": "f0194587",
+          "score": 0.005080218046913022,
+          "reason": "same"
+        },
+        {
+          "id": "2e3400c5",
+          "score": 0.005080218046913022,
+          "reason": "same"
+        },
+        {
+          "id": "00b2ef4b",
+          "score": 0.005080218046913022,
+          "reason": "same"
+        },
+        {
+          "id": "50e1cd28",
+          "score": 0.005080218046913022,
+          "reason": "same"
+        }
+      ],
+      "landed": [
+        "3fa4e1ce",
+        "9348207b",
+        "927b9250",
+        "724ebfae"
+      ]
+    },
+    "prod_health": {
+      "service": "mupot",
+      "version": "0.29.0",
+      "commit": "d0aa015c77a54ef1dbdcfadcb3122e481999a72b",
+      "built_at": "2026-08-10T00:10:47.107Z",
+      "checked_at": "2026-08-10T00:31:47.150111+00:00",
+      "note": "0087 (#862) + #870 + #864 confirmed ancestors of deployed commit; river bound member holds lead on squad-core -> ceiling triggers live-removed"
+    },
+    "status_river": {
+      "member_id": "6488fd23-f31e-4245-dfdb-7687a4d7d58d",
+      "bound_agent_id": "f23a6c2c-7377-492f-8d69-96c3946a7148",
+      "capabilities": [
+        {
+          "scope_type": "squad",
+          "scope_id": "squad-core",
+          "capability": "lead"
+        }
+      ],
+      "note": "lead grant on bound member proves 0087 applied (0071 trigger would ABORT)"
+    },
+    "mcp_tools_total": 82,
+    "tool_schemas_captured": [
+      "mint_agent_token",
+      "register_agent_key",
+      "provision_agent_connection",
+      "list_agent_tokens",
+      "revoke_agent_token",
+      "flight_dispatch",
+      "flight_get",
+      "flight_list",
+      "flight_land",
+      "send",
+      "broadcast",
+      "task_list",
+      "task_board"
+    ],
+    "f_series": {
+      "872": "OPEN (deploy effectively DONE - prod d0aa015)",
+      "873": "OPEN",
+      "874": "OPEN",
+      "875": "OPEN",
+      "876": "OPEN",
+      "877": "OPEN",
+      "878": "OPEN",
+      "879": "OPEN",
+      "880": "OPEN",
+      "881": "OPEN"
+    },
+    "github_repo": "Mumega-com/mupot",
+    "herdr": {
+      "protocol": 19,
+      "agents_live": [
+        "muvps_river",
+        "muvps_loom",
+        "muvps_athena",
+        "muvps_kasra",
+        "muvps_mubot"
+      ],
+      "kasra_state_change_seq": 392,
+      "worktrees_mumega": 19,
+      "worktrees_mupot": 114,
+      "mupot_worktrees_detached": 24,
+      "mupot_worktrees_no_branch": 24,
+      "mupot_worktrees_open": 0,
+      "phantom_running_flights_no_seat": [
+        "94e5195c",
+        "48aa940e",
+        "0c9ba110",
+        "9bdab4ab",
+        "409a2fbc"
+      ]
+    }
+  },
+  "learned_facts": [
+    "Graph HEAD is on branch fix/remove-home-capability-ceiling @ 3f5750bb; schema v9, incremental build, postprocessed 2026-07-30, last updated 2026-08-09T23:50:24Z.",
+    "Highest-risk non-test flow is 'read' (posthog marketing adapter, crit 0.8477, 22 nodes/5 files) \u2014 it is a connector-backed fetch flow that touches SSRF guards, crypto/decrypt, and sibling adapters inkwell/mcpwp.",
+    "'read' flow's risk_index on the entry node says caller_count=0 / untested, yet internal nodes (isConnectorType, useConnectorById, posthogHost) DO have TESTED_BY edges \u2014 risk_index appears stale or per-entry-node only.",
+    "createTaskThenFail/createTaskThenApprove are helper functions inside a test file (not 'it:' blocks) \u2014 hence they pass the non-test filter but live in tests/marketing-monitor-opportunities.test.ts.",
+    "alarm (AgentDO.alarm) is the widest flow: 117 nodes / 27 files, spans agents, tasks service, connectors/crypto, mcp loops.",
+    "SOS/mupot MCP gateway is reachable read-only with the river token: resolve_agent(loom) -> Loom active flight-controller (gpt-5.4); flight_list(squad-core) shows FLIGHT A running (score 0.9674, gate go) after two held no_go attempts (score 0.0051, empty signals_json root cause per flight goal text).",
+    "All squad-core flights belong to agent c855f82c (kasra seat).",
+    "PROD DEPLOYED 2026-08-10T00:10:47Z: d0aa015 v0.29.0 incl. 0087 (#862), #870 operator guards, #864 flight_dispatch dispatch, #867/#868/#869/#884. Verified /health; river bound member (f23a6c2c) holds lead on squad-core -> 0071 ceiling triggers live-removed.",
+    "Key gen: member tokens = mupot_ + 64hex, SHA-256 hash-only storage, show-once raw (members/service.ts:44); agent-bound mint = atomic 4-row batch; connector secrets AES-GCM-256+HKDF (connectors/crypto.ts:112-199); agent keys Ed25519 public-only (0041). NO expiry field on member_tokens.",
+    "Misbinding PROVEN: loom.token mupot_4c7d42ea welded to dara (a5e5fa29); athena.token 85c7.. welded to kasra - both replaced fail-closed 2026-08-09. Auth trusts member_tokens.agent_id verbatim (mcp/index.ts:278); no auto-detection.",
+    "Mint paths leak raw: mint_agent_token + provision_agent_connection return raw in response (#876); raw landed in session transcript on disk 2026-08-09.",
+    "Flight readiness: api path scores honestly (0.9674 FLIGHT A w/ real signals; 0.0051 = signals_json={} floor; SAGE-01 0.1311 low_readiness); ROUTINE path rubber-stamps go/score=1 AFTER send (src/routines/dispatch.ts:559-582) - #861.",
+    "6 running flights on squad-core are cost-0 phantoms pre-#864 (no envelope sent); F-03 done_when: reconcile failed/dispatch_not_delivered, do NOT force-land (Loom).",
+    "flight_dispatch has NO priority field (#887); cross-squad send blocked by observer-on-target-squad (sendToRef) -> river cannot reach loom on mupot (#885).",
+    "F-series #872-#881 all OPEN; 0087 merged+deployed but DB-level rank-check backstop (tasks 3c8d483e/d782da4b) NOT yet landed - app-layer-only window open; deactivate_agent + gates.ts authz sweep pending (F-04)."
+  ],
+  "notes": [
+    "_herdr-api-schema.json",
+    "_herdr-mupot-worktrees-raw.json",
+    "_herdr-snapshot-raw.json",
+    "_mupot-flight-list-raw.json",
+    "graph-top-risks.md",
+    "herdr-to-mupot-data-map.md",
+    "report-keys-flights-2026-08-09.md"
+  ]
+}
