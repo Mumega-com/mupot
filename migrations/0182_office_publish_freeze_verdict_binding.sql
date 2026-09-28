@@ -43,8 +43,11 @@ ALTER TABLE office_publish_freezes ADD COLUMN voided_reason TEXT;
 -- (migrations/0179); nothing in application code ever clears it back to NULL in
 -- place, but nothing stopped a direct/future writer from doing so either, which
 -- would silently re-open a one-shot slot for a WordPress write that already
--- happened. Scoped to `frozen_at` UNCHANGED — office.review_approval's own
--- rework-loop refreeze (src/addons/office/service.ts's persistOfficePublishFreeze)
+-- happened. Scoped to `frozen_at` UNCHANGED — the review-entry freeze hook's own
+-- rework-loop refreeze (src/addons/office/service.ts's freezeOfficeTaskOnReviewEntry
+-- / persistOfficePublishFreeze, called from src/mcp/index.ts's task_update and
+-- src/tasks/index.ts's PATCH on every entry into review, not from
+-- office.review_approval any more — see this file's own header)
 -- is a full INSERT ... ON CONFLICT DO UPDATE that legitimately resets claimed_at to
 -- NULL for a BRAND NEW freeze generation, stamping a fresh `frozen_at`
 -- (claimTimestamp(), src/lib/claim-timestamp.ts — unique enough per call that two
