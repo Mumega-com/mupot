@@ -51,14 +51,13 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'unreconciled_prior_publish':
     case 'freeze_not_found':
     case 'already_reconciled':
-    case 'reconcile_check_failed':
+    case 'reconcile_candidate_found':
+    case 'reconcile_check_unavailable':
+    case 'reconcile_retry_required':
     case 'binding_changed':
     case 'publish_claimed':
     case 'invalid_site_config':
     case 'invalid_site_url':
-    case 'key_invalid':
-    case 'redirect_blocked':
-    case 'validation_rejected':
     case 'publish_outcome_unknown':
     case 'write_failed':
     case 'verdict_race':
@@ -177,11 +176,23 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
   args: '{ task_id: string, outcome: "done"|"failed", detail?: string, post_id?: number, article_url?: string,' +
     ' override_reason?: string }' +
     ' -- this tool queries the live WordPress site by the claim\'s idempotency key BEFORE' +
-    ' accepting any outcome (mupot#1610); a "found" result always wins over whatever is' +
-    ' requested here. override_reason is ONLY consulted when that live check cannot run at' +
-    ' all (a revoked/misconfigured connector, or the site itself unreachable) — a non-empty' +
-    ' reason then accepts the requested outcome at the caller\'s own explicit, audited risk;' +
-    ' it can never override a "found" result.',
+    ' accepting any outcome; the requested outcome/post_id/article_url are NEVER trusted' +
+    ' on their own. Three results only: (1) the post is POSITIVELY found (an exact' +
+    ' idempotency-slug match, parsed, with a real id and link) -> marked done with the' +
+    ' discovered post, always, regardless of what was requested here; a trashed match is' +
+    ' recorded as found-but-not-live, never as a false "live" receipt. (2) SOME evidence' +
+    ' exists that is not a clean match (a malformed exact-slug match, or any title/time' +
+    ' search hit) -> refused as reconcile_candidate_found; this is NEVER overridable —' +
+    ' resolve the actual post by hand (accept it as done, or delete it) before retrying.' +
+    ' (3) no evidence either way (network/DNS/TLS failure, a revoked connector, the' +
+    ' connector has drifted to a different site, or every lookup came back genuinely' +
+    ' empty) -> refused as reconcile_check_unavailable. override_reason is the ONLY way to' +
+    ' clear result (3), and only after this same task has been reconciled at least twice' +
+    ' with the checks spaced at least 30 seconds apart (a single blip returns' +
+    ' reconcile_retry_required instead — try again rather than override on the first ask).' +
+    ' The override is human-only (an agent-bound caller is always refused), requires a' +
+    ' non-empty reason, and is permanently recorded in the receipt with who invoked it.' +
+    ' It can never accept result (1) or (2).',
   inputSchema: {
     type: 'object',
     properties: {

@@ -66,23 +66,32 @@ export type OfficeRefusalReason =
   | 'unreconciled_prior_publish'
   | 'freeze_not_found'
   | 'already_reconciled'
-  | 'reconcile_check_failed'
+  // r3 (kasra-review adversarial gate ROUND 2 on #1614): 'reconcile_check_failed'
+  // (r1/r2's single catch-all for "could not get an authoritative answer") is
+  // SPLIT into two reasons with different overridability, per THE CLASS
+  // ("failing to find something is not evidence it's absent"):
+  //   - reconcile_candidate_found: SOME evidence exists (a malformed exact
+  //     idempotency-slug match, or any title/time fallback hit) — NEVER
+  //     overridable, a human must resolve the actual post directly.
+  //   - reconcile_check_unavailable: no evidence either way — a network/DNS/
+  //     TLS failure, a revoked connector, origin drift, OR every lookup came
+  //     back genuinely, cleanly empty. THE ONLY reason the human override may
+  //     ever accept, and only once retried (see reconcile_retry_required).
+  | 'reconcile_candidate_found'
+  | 'reconcile_check_unavailable'
+  | 'reconcile_retry_required'
   | 'binding_changed'
   | 'publish_claimed'
   | 'invalid_site_config'
   | 'invalid_site_url'
-  | 'key_invalid'
-  | 'redirect_blocked'
-  | 'validation_rejected'
-  // r2 P1-1 (kasra-review adversarial gate on #1614): an AMBIGUOUS publish
-  // outcome (abort/timeout/network error after the request was sent, any 5xx,
-  // or a 2xx whose body does not parse as a real post) is never a definitive
-  // 'failed' — see wordpressPublish's WordpressPublishResult. The freeze row's
-  // own `outcome` column is left NULL in this case (never written at all), so
-  // unreconciledPriorFreezeExists / office.reconcile_stalled_publish's own
-  // WordPress check gate any future action on the task; this is the reason
-  // returned to the immediate caller, distinct from every DEFINITE failure
-  // reason above.
+  // r3 P1-2 (kasra-review ROUND 2 adversarial gate): 'key_invalid' (401/403),
+  // 'redirect_blocked' (3xx) and 'validation_rejected' (every other 4xx) are
+  // RETIRED as definite-failure reasons — wordpressPublish no longer produces
+  // them. A response-phase WAF, a save_post redirect, or a rest_after_insert
+  // validation error can all follow a real, already-committed WordPress
+  // INSERT, so none of those statuses may definitively clear the guard
+  // anymore (see wordpressPublish's own header). Any post-send outcome other
+  // than a parsed 2xx success is 'publish_outcome_unknown' below.
   | 'publish_outcome_unknown'
   | 'write_failed'
   | 'verdict_race'

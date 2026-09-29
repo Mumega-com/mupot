@@ -320,6 +320,22 @@ async function approveOfficeTask(testEnv: Env, taskId: string): Promise<void> {
   if (!result.ok) throw new Error(`fixture error: could not approve office task: ${JSON.stringify(result)}`)
 }
 
+/** r3 (kasra-review adversarial gate ROUND 2 on #1614): an `overrideReason`
+ *  is only ever honoured once THIS claim has recorded 2+
+ *  `reconcile_check_unavailable` attempts spaced >= 30s apart
+ *  (RECONCILE_RETRY_MIN_INTERVAL_MS). Rather than a real 30s sleep or fake
+ *  timers (which would also have to fake the abort-timeout `setTimeout`s
+ *  inside wordpressPublish/lookupWordpressPostBySlug), this seeds a FIRST
+ *  attempt timestamp far enough in the past directly on the freeze row —
+ *  the exact state a real second `office.reconcile_stalled_publish` call
+ *  would have left behind after a genuine first attempt. */
+function seedPriorReconcileAttempt(harness: SqliteD1Harness, taskId: string, secondsAgo = 40): void {
+  const attemptAt = new Date(Date.now() - secondsAgo * 1000).toISOString()
+  harness.sqlite.prepare(
+    `UPDATE office_publish_freezes SET outcome_detail = ? WHERE task_id = ? AND outcome IS NULL`,
+  ).run(JSON.stringify({ reconcileAttempts: [attemptAt] }), taskId)
+}
+
 const officeLead = (departmentId: string) => auth('lead-1', [grant('department', departmentId, 'lead')])
 const officeMember = (departmentId: string) => auth('member-1', [grant('department', departmentId, 'member')])
 const wrongDeptCaller = (unrelatedDepartmentId: string) => auth('outsider-1', [grant('department', unrelatedDepartmentId, 'lead')])
@@ -1143,13 +1159,17 @@ describe('r2 P2-1: idempotency_key is generation-scoped, never reused across a r
     expect(gen1.idempotency_key).not.toBeNull()
 
     // The only real way out: an operator reconciles the stalled claim first —
-    // the live WordPress check must confirm genuine absence (re-stub fetch;
-    // the publish attempt's always-throwing stub would otherwise read as
-    // check_failed here too).
+    // r3: a clean-empty WordPress check is `reconcile_check_unavailable`, not
+    // "confirmed absent" — clearing it now needs a retried, audited override.
     harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ?`).run(new Date(Date.now() - 60_000).toISOString(), taskId)
+    seedPriorReconcileAttempt(harness, taskId)
     const owner = orgOwnerAuth()
     vi.stubGlobal('fetch', vi.fn(async () => new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })))
-    const reconciled = await invokeTool(owner, testEnv, 'office.reconcile_stalled_publish', { task_id: taskId, outcome: 'failed', detail: 'confirmed absent' }, ORIGIN)
+    const reconciled = await invokeTool(
+      owner, testEnv, 'office.reconcile_stalled_publish',
+      { task_id: taskId, outcome: 'failed', detail: 'confirmed absent', override_reason: 'checked wp-admin by hand, nothing there' },
+      ORIGIN,
+    )
     if (!reconciled.ok) throw new Error(`fixture error: reconcile failed: ${JSON.stringify(reconciled)}`)
 
     // NOW a fresh review-entry can mint generation 2 — task.status is still
@@ -1182,7 +1202,7 @@ describe('r2 P2-1: idempotency_key is generation-scoped, never reused across a r
 // target the FROZEN site_origin this exact claim was aimed at, never whatever
 // the connector's meta happens to point at NOW.
 describe('r2 P2-2: reconcile refuses when the connector has drifted from the frozen site_origin', () => {
-  it('refuses (reconcile_check_failed) when the connector now points at a different origin, with zero WordPress requests', async () => {
+  it('refuses (reconcile_check_unavailable) when the connector now points at a different origin, with zero WordPress requests', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r2-p2-2')
@@ -1206,7 +1226,7 @@ describe('r2 P2-2: reconcile refuses when the connector has drifted from the fro
     const reconciled = await invokeTool(owner, testEnv, 'office.reconcile_stalled_publish', { task_id: taskId, outcome: 'failed' }, ORIGIN)
 
     expect(reconciled.ok).toBe(false)
-    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_failed')
+    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_unavailable')
     expect(lookupFetchSpy).not.toHaveBeenCalled()
     const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
     expect(freeze.outcome).toBeNull()
@@ -1214,12 +1234,14 @@ describe('r2 P2-2: reconcile refuses when the connector has drifted from the fro
   })
 })
 
-// r2 P3-1 (kasra-review adversarial gate on #1614): a revoked connector (or a
-// permanently dead site) must not strand the task forever behind
-// reconcile_check_failed — an org owner/admin can explicitly, auditedly accept
-// the risk. A 'found' result must remain non-overridable.
-describe('r2 P3-1: an audited human override unblocks a reconcile the live check can never complete', () => {
-  it('refuses without an override_reason, accepts (with an audit trail) when one is given', async () => {
+// r3 (kasra-review adversarial gate ROUND 2 on #1614): a revoked connector (or
+// a permanently dead site) must not strand the task forever behind
+// reconcile_check_unavailable — an org owner/admin can explicitly, auditedly
+// accept the risk, but ONLY once the check has been retried (r2 P2-1: a
+// single transient blip must never be enough), and NEVER over a `found` or
+// `reconcile_candidate_found` result.
+describe('r3 P3-1/P2-1: an audited, retried human override unblocks a reconcile the live check can never complete', () => {
+  it('refuses on the first ask (reconcile_check_unavailable, even with an override_reason) — retried and audited when one is given', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r2-p3-1')
@@ -1242,8 +1264,24 @@ describe('r2 P3-1: an audited human override unblocks a reconcile the live check
       ORIGIN,
     )
     expect(withoutOverride.ok).toBe(false)
-    if (!withoutOverride.ok) expect(withoutOverride.error).toBe('reconcile_check_failed')
+    if (!withoutOverride.ok) expect(withoutOverride.error).toBe('reconcile_check_unavailable')
 
+    // r2 P2-1: a FIRST attempt at overriding, with no prior recorded attempt,
+    // is refused as needing a retry — a single blip is never enough.
+    const overrideTooSoon = await invokeTool(
+      owner, testEnv, 'office.reconcile_stalled_publish',
+      {
+        task_id: taskId, outcome: 'done', post_id: 100, article_url: 'https://wordpress.example.com/?p=100',
+        override_reason: 'connector revoked during a credential rotation; confirmed live on WordPress by hand via the site admin',
+      },
+      ORIGIN,
+    )
+    expect(overrideTooSoon.ok).toBe(false)
+    if (!overrideTooSoon.ok) expect(overrideTooSoon.error).toBe('reconcile_retry_required')
+
+    // A THIRD call, now that a prior attempt is recorded far enough in the
+    // past, is override-eligible.
+    seedPriorReconcileAttempt(harness, taskId)
     const withOverride = await invokeTool(
       owner, testEnv, 'office.reconcile_stalled_publish',
       {
@@ -1262,6 +1300,156 @@ describe('r2 P3-1: an audited human override unblocks a reconcile the live check
     const detail = JSON.parse(freeze.outcome_detail) as { overridden: boolean; overrideReason: string }
     expect(detail.overridden).toBe(true)
     expect(detail.overrideReason).toContain('connector revoked')
+    harness.close()
+  })
+})
+
+// r3 (kasra-review adversarial gate ROUND 2 on #1614 — the SECOND BLOCK on
+// this class): every named case the reviewer's own probe (zz-probe-1614-r2)
+// used to prove r2's "absent" fallback was NOT authoritative, ported into a
+// real committed regression: a REALISTIC fake WordPress server (post_type
+// filtering — /wp/v2/posts never returns a page — and WordPress's own search
+// semantics: a `-term` is an EXCLUSION), run through the real fetch path.
+// Every scenario below must end with AT MOST ONE post in the fake site's
+// store, whether or not an operator ever calls reconcile at all.
+interface FakeWpPostR3 { id: number; slug: string; status: string; title: string; content: string; type: string; date: number }
+type PostSendMode = 'ok' | 'throwAfterInsert' | '403AfterInsert' | '302AfterInsert' | '400AfterInsert'
+
+/** WordPress's own `search=` semantics, simplified to the one rule that
+ *  matters here: a `-term` is an EXCLUSION (`NOT LIKE`), so a title that
+ *  contains a hyphen-prefixed number (e.g. "-3%") excludes itself from its
+ *  own search — the exact WordPress behavior r2's title/time fallback search
+ *  silently assumed away. */
+function wpSearchMatchesR3(post: FakeWpPostR3, search: string): boolean {
+  const terms = search.split(/\s+/).filter(Boolean)
+  const hay = `${post.title} ${post.content}`.toLowerCase()
+  return terms.every((term) => (
+    term.startsWith('-') && term.length > 1
+      ? !hay.includes(term.slice(1).toLowerCase())
+      : hay.includes(term.toLowerCase())
+  ))
+}
+
+function fakeWordpressR3(opts: {
+  postMode?: PostSendMode
+  forceStatus?: string
+  forceType?: string
+  rewriteSlugAndTitle?: (post: { slug: string; title: string }) => { slug: string; title: string }
+  clockSkewMs?: number
+}) {
+  const posts: FakeWpPostR3[] = []
+  const requests: string[] = []
+  let nextId = 100
+  const f = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input))
+    const method = init?.method ?? 'GET'
+    requests.push(`${method} ${url.pathname}${decodeURIComponent(url.search)}`)
+    if (method === 'POST') {
+      const body = JSON.parse(String(init?.body)) as { title: string; content: string; slug: string; status: string }
+      const rewritten = opts.rewriteSlugAndTitle?.({ slug: body.slug, title: body.title }) ?? { slug: body.slug, title: body.title }
+      let slug = rewritten.slug
+      let n = 2
+      while (posts.some((p) => p.slug === slug)) slug = `${rewritten.slug}-${n++}`
+      const post: FakeWpPostR3 = {
+        id: nextId++, slug, title: rewritten.title, content: body.content,
+        status: opts.forceStatus ?? body.status, type: opts.forceType ?? 'post',
+        date: Date.now() + (opts.clockSkewMs ?? 0),
+      }
+      posts.push(post)
+      switch (opts.postMode) {
+        case 'throwAfterInsert': throw new DOMException('The operation was aborted.', 'AbortError')
+        case '403AfterInsert': return new Response('<html>403 Forbidden (WAF)</html>', { status: 403 })
+        case '302AfterInsert': return new Response(null, { status: 302, headers: { location: `https://${url.host}/wp-admin/` } })
+        case '400AfterInsert': return new Response('{"code":"plugin_validation"}', { status: 400 })
+        default: return new Response(JSON.stringify({ id: post.id, link: `https://${url.host}/?p=${post.id}`, slug }), { status: 201 })
+      }
+    }
+    // GET — only ever returns post_type=post, exactly like the real /wp/v2/posts endpoint.
+    let matches = posts.filter((p) => p.type === 'post')
+    const slug = url.searchParams.get('slug')
+    if (slug !== null) matches = matches.filter((p) => p.slug === slug)
+    const statuses = url.searchParams.get('status')?.split(',')
+    if (statuses) matches = matches.filter((p) => statuses.includes(p.status))
+    const search = url.searchParams.get('search')
+    if (search !== null) matches = matches.filter((p) => wpSearchMatchesR3(p, search))
+    const after = url.searchParams.get('after')
+    if (after !== null) matches = matches.filter((p) => p.date > Date.parse(after))
+    return new Response(
+      JSON.stringify(matches.map((p) => ({ id: p.id, link: `https://${url.host}/?p=${p.id}`, slug: p.slug, status: p.status }))),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  }) as unknown as typeof fetch
+  return { f, posts, requests }
+}
+
+async function reverseAndReapproveR3(testEnv: Env, taskId: string): Promise<boolean> {
+  const owner = orgOwnerAuth()
+  const rev = await invokeTool(owner, testEnv, 'task_update', { task_id: taskId, status: 'review', reversal_reason: 'retrying' }, ORIGIN)
+  if (!rev.ok) return false
+  const hash = await officeFreezeHash(testEnv, taskId)
+  const args: Record<string, unknown> = { task_id: taskId, verdict: 'approved' }
+  if (hash) args.expected_payload_sha256 = hash
+  const approved = await invokeTool(owner, testEnv, 'office.review_approval', args, ORIGIN)
+  return approved.ok
+}
+
+describe('r3: THE CLASS — every "looks absent but might not be" scenario ends with at most 1 post', () => {
+  it.each([
+    ['N1 custom editorial status (a workflow plugin, not core WordPress)', { postMode: 'throwAfterInsert', forceStatus: 'pending-review' } as const],
+    ['N2 slug AND title both edited between the ambiguous publish and reconcile', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: () => ({ slug: 'q4-recap-final', title: 'Q4 recap (updated)' }) } as const],
+    ['N3 slug rewritten + a "-term" in the title (WordPress search treats it as an exclusion)', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: (p: { slug: string; title: string }) => ({ slug: `${p.slug}-en`, title: p.title }) } as const],
+    ['N4 post type switched to page (Post Type Switcher)', { postMode: 'throwAfterInsert', forceType: 'page' } as const],
+    ['N5 slug rewritten + WordPress clock 20 minutes behind', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: (p: { slug: string; title: string }) => ({ slug: `${p.slug}-x`, title: p.title }), clockSkewMs: -20 * 60_000 } as const],
+    ['N6 403 after insert (a response-phase WAF, e.g. ModSecurity leakage rule)', { postMode: '403AfterInsert' } as const],
+    ['N7 302 after insert (a plugin redirecting in save_post)', { postMode: '302AfterInsert' } as const],
+    ['N8 400 after insert (a plugin erroring in rest_after_insert_post)', { postMode: '400AfterInsert' } as const],
+  ] as const)('%s', async (_name, wpOpts) => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const title = 'Costs fell -3% in Q4' // deliberately carries a "-term" for N3
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r3-scenario')
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const task = await createTask(
+      testEnv, { squad_id: squadId, title, done_when: 'post is live', gate_owner: 'gate:office' }, { skipMirror: true, skipEvent: true },
+    )
+    await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'in_progress' }, ORIGIN)
+    await invokeTool(orgOwnerAuth('seed'), testEnv, 'task_update', { task_id: task.id, status: 'review' }, ORIGIN)
+    const taskId = task.id
+    await approveOfficeTask(testEnv, taskId)
+
+    const wp = fakeWordpressR3(wpOpts)
+    vi.stubGlobal('fetch', wp.f)
+    const publish1 = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(publish1.ok).toBe(false) // every scenario here is ambiguous or a post-send WAF/redirect/4xx — never a clean 2xx
+    expect(wp.posts.length).toBe(1) // WordPress DID receive and store the post
+
+    harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`)
+      .run(new Date(Date.now() - 60_000).toISOString(), taskId)
+
+    // The operator, seeing no visible outcome, reasonably believes it failed —
+    // this must NEVER be accepted without a retried, audited override.
+    const reconcile1 = await invokeTool(
+      orgOwnerAuth(), testEnv, 'office.reconcile_stalled_publish', { task_id: taskId, outcome: 'failed', detail: 'looked stalled' }, ORIGIN,
+    )
+    if (reconcile1.ok) {
+      // The only way this could legitimately succeed on the FIRST attempt is
+      // a genuine 'found' (this scenario's post matched exactly) — in which
+      // case the task must be 'done', never a laundered 'failed'.
+      const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+      expect(row.status).toBe('done')
+    } else {
+      expect(['reconcile_candidate_found', 'reconcile_check_unavailable']).toContain((reconcile1 as { error: string }).error)
+      // Reverse + re-approve + republish must still be blocked — the guard
+      // was never cleared.
+      const reapproved = await reverseAndReapproveR3(testEnv, taskId)
+      if (reapproved) {
+        const publish2 = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+        expect(publish2.ok).toBe(false)
+      }
+    }
+
+    expect(wp.posts.length).toBe(1) // AT MOST ONE post, in every case, through every path taken
     harness.close()
   })
 })
@@ -2613,7 +2801,7 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     harness.close()
   })
 
-  it('a matched element with an id but no link is check_failed — NEVER read as absent (the exact P1-2 bug)', async () => {
+  it('a matched element with an id but no link is reconcile_candidate_found — NEVER read as absent, NEVER overridable (the exact P1-2/P1-3 bug)', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-malformed')
@@ -2641,16 +2829,29 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     )
 
     expect(reconciled.ok).toBe(false)
-    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_failed')
+    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_candidate_found')
     // Short-circuits on the malformed match — the trashed-slug and fallback
     // search queries never even run.
     expect(fetchSpy).toHaveBeenCalledOnce()
     const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
     expect(freeze.outcome).toBeNull()
+
+    // r3 P1-3: a candidate is NEVER overridable, even with a reason and even
+    // after a prior attempt is on record.
+    seedPriorReconcileAttempt(harness, taskId)
+    const overrideAttempt = await invokeTool(
+      owner, testEnv, 'office.reconcile_stalled_publish',
+      { task_id: taskId, outcome: 'failed', override_reason: 'id-only element, assume broken' },
+      ORIGIN,
+    )
+    expect(overrideAttempt.ok).toBe(false)
+    if (!overrideAttempt.ok) expect(overrideAttempt.error).toBe('reconcile_candidate_found')
+    const freezeAfter = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
+    expect(freezeAfter.outcome).toBeNull()
     harness.close()
   })
 
-  it('a 5xx or timeout on the lookup itself is check_failed — never treated as absent', async () => {
+  it('a 5xx or timeout on the lookup itself is reconcile_check_unavailable — never treated as absent', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-5xx')
@@ -2668,13 +2869,13 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     )
 
     expect(reconciled.ok).toBe(false)
-    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_failed')
+    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_unavailable')
     const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
     expect(freeze.outcome).toBeNull()
     harness.close()
   })
 
-  it('the post genuinely never reached WordPress — reconcile checks every avenue (slug, trashed slug, title search), confirms absence, and honours the operator\'s own outcome unchanged', async () => {
+  it('the post genuinely never reached WordPress — reconcile checks every avenue (slug, trashed slug, title search), but a clean-empty result is STILL NOT proof of absence: it refuses (reconcile_check_unavailable), and only a retried, audited override can clear it', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-absent')
@@ -2685,27 +2886,42 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     vi.stubGlobal('fetch', wp.f)
 
     const owner = orgOwnerAuth()
-    const reconciled = await invokeTool(
+    // r3: THE CLASS — "failing to find something is not evidence it's absent."
+    // A clean-empty result across every avenue no longer auto-honours the
+    // operator's plain 'failed' — it is exactly as unresolved as a network
+    // failure, and requires the SAME retried override to clear.
+    const firstAttempt = await invokeTool(
       owner, testEnv, 'office.reconcile_stalled_publish',
       { task_id: taskId, outcome: 'failed', detail: 'confirmed absent on WordPress' },
       ORIGIN,
     )
-
-    expect(reconciled.ok).toBe(true)
+    expect(firstAttempt.ok).toBe(false)
+    if (!firstAttempt.ok) expect(firstAttempt.error).toBe('reconcile_check_unavailable')
     // r2 P1-2: slug, then `<slug>__trashed`, then the title/window fallback
-    // search — all three come back empty before "absent" is accepted.
+    // search — all three ran before this refusal.
     expect(wp.f).toHaveBeenCalledTimes(3)
     expect(wp.requests[0]).toContain(`slug=mupot-office-${idempotencyKey}`)
     expect(wp.requests[1]).toContain(`slug=mupot-office-${idempotencyKey}__trashed`)
     expect(wp.requests[2]).toContain('search=')
+    const stillOpen = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
+    expect(stillOpen.outcome).toBeNull() // guard NOT cleared by the plain 'failed' claim
+
+    // A human override, once retried, IS the only way to clear it.
+    seedPriorReconcileAttempt(harness, taskId)
+    const overridden = await invokeTool(
+      owner, testEnv, 'office.reconcile_stalled_publish',
+      { task_id: taskId, outcome: 'failed', detail: 'confirmed absent on WordPress', override_reason: 'checked wp-admin twice by hand, nothing there' },
+      ORIGIN,
+    )
+    expect(overridden.ok).toBe(true)
 
     const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
-    expect(row.status).toBe('approved') // never marked done — the operator said 'failed' and WordPress agrees
+    expect(row.status).toBe('approved') // never marked done — the operator said 'failed'
     const freeze = harness.sqlite.prepare(
       `SELECT outcome, outcome_detail FROM office_publish_freezes WHERE task_id = ?`,
     ).get(taskId) as { outcome: string; outcome_detail: string }
     expect(freeze.outcome).toBe('failed')
-    expect(freeze.outcome_detail).toBe('confirmed absent on WordPress')
+    expect(JSON.parse(freeze.outcome_detail)).toMatchObject({ overridden: true })
     harness.close()
   })
 
@@ -2727,7 +2943,7 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     )
 
     expect(reconciled.ok).toBe(false)
-    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_failed')
+    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_unavailable')
     expect(fetchSpy).toHaveBeenCalledOnce()
 
     const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
