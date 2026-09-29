@@ -1549,6 +1549,69 @@ describe('mupot#1592 freeze/verdict binding', () => {
 // office.reconcile_stalled_publish (org owner/admin, manual WordPress check) is
 // the only way out.
 describe('mupot#1592 reconcile-before-reapprove', () => {
+  // mupot#1602 r1 adversarial gate P2-4: `isOrgAdmin(auth)` alone is satisfied
+  // by an agent-bound bearer carrying its owner member's org-admin caps — an
+  // agent could forge a reconcile('done', ...) with a fabricated post_id/
+  // article_url, or clear the double-post guard with 'failed' while a real
+  // fetch was still in flight. No human need be involved either way.
+  it('refuses an agent-bound bearer outright, even with org-admin capabilities — a human must reconcile', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-reconcile-agent')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    harness.sqlite.prepare(
+      `UPDATE office_publish_freezes SET claimed_by = 'ghost-worker', claimed_at = ? WHERE task_id = ?`,
+    ).run(new Date(Date.now() - 60_000).toISOString(), taskId)
+
+    const agentBoundOwner: AuthContext = { ...orgOwnerAuth(), boundAgentId: 'agent-kayhermes' }
+    const result = await invokeTool(
+      agentBoundOwner, testEnv, 'office.reconcile_stalled_publish',
+      { task_id: taskId, outcome: 'done', post_id: 999, article_url: 'https://evil.example/fabricated' },
+      ORIGIN,
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('not_authorized')
+    const row = harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(taskId) as { status: string; result: string | null }
+    expect(row.status).toBe('approved')
+    expect(row.result).toBeNull()
+    const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
+    expect(freeze.outcome).toBeNull()
+    harness.close()
+  })
+
+  // mupot#1602 r1 adversarial gate P3-3: reconciling a claim that could still
+  // be a live in-flight fetch would clear the double-post guard early.
+  it('refuses to reconcile a claim that is not yet stale enough to be genuinely stalled', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-reconcile-fresh')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    // claimed_at = now — well within the fetch's own timeout window.
+    harness.sqlite.prepare(
+      `UPDATE office_publish_freezes SET claimed_by = 'ghost-worker', claimed_at = ? WHERE task_id = ?`,
+    ).run(new Date().toISOString(), taskId)
+
+    const owner = orgOwnerAuth()
+    const result = await invokeTool(
+      owner, testEnv, 'office.reconcile_stalled_publish',
+      { task_id: taskId, outcome: 'failed' },
+      ORIGIN,
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('publish_claimed')
+    const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
+    expect(freeze.outcome).toBeNull()
+    harness.close()
+  })
+
   it('refuses to mint a fresh freeze while a prior one is claimed-but-unconfirmed, until an org admin reconciles it', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)

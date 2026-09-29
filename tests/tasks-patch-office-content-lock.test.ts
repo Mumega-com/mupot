@@ -121,3 +121,56 @@ describe('PATCH /:id — office content lock (REST parity with MCP task_update)'
     expect(freeze).toBeUndefined()
   })
 })
+
+// mupot#1602 r1 adversarial gate P3-1: "the HTTP /:id/verdict 409 mapping ...
+// [is] not referenced by any test." src/tasks/service.ts's writeVerdict refuses
+// ANY gate:office task unconditionally (before any capability check), so the
+// generic verdict route must map that refusal to a clean 409, never an
+// unhandled 500 — every OTHER verdict surface (MCP task_verdict, the Telegram
+// human_origin path) has this covered by mcpwp-office-tools.test.ts and
+// task-verdict-human-origin.test.ts respectively; this is the HTTP twin.
+describe('POST /:id/verdict — refuses gate:office outright (REST parity with MCP task_verdict)', () => {
+  function verdictRequest(body: unknown) {
+    return new Request(`https://pot.test/${TASK_ID}/verdict`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Cookie: 'mupot_session=owner-session',
+        Origin: 'https://pot.test',
+      },
+      body: JSON.stringify(body),
+    })
+  }
+
+  it('refuses to approve a gate:office task with a clean 409, not a 500', async () => {
+    seedTask({ status: 'review', gateOwner: 'gate:office' })
+    const res = await tasksApp.fetch(verdictRequest({ verdict: 'approved' }), makeEnv())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as { error: string }
+    expect(json.error).toBe('dedicated_gate_predicate_required')
+
+    const row = harness!.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(TASK_ID) as { status: string }
+    expect(row.status).toBe('review')
+    const verdictCount = harness!.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(TASK_ID) as { n: number }
+    expect(verdictCount.n).toBe(0)
+  })
+
+  it('refuses to reject a gate:office task the same way', async () => {
+    seedTask({ status: 'review', gateOwner: 'gate:office' })
+    const res = await tasksApp.fetch(verdictRequest({ verdict: 'rejected' }), makeEnv())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as { error: string }
+    expect(json.error).toBe('dedicated_gate_predicate_required')
+  })
+
+  it('does NOT refuse an ordinary gate on the same route (regression pin — the refusal is scoped to gate:office only)', async () => {
+    seedTask({ status: 'review', gateOwner: 'gate:reviewer' })
+    const res = await tasksApp.fetch(verdictRequest({ verdict: 'approved' }), makeEnv())
+    // Whatever this refuses/allows for an unrelated gate is out of scope here;
+    // the point is it must NOT be 'dedicated_gate_predicate_required'.
+    if (res.status === 409) {
+      const json = (await res.json()) as { error: string }
+      expect(json.error).not.toBe('dedicated_gate_predicate_required')
+    }
+  })
+})
