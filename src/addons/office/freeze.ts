@@ -33,9 +33,10 @@
 // writeOfficeVerdictAndBindFreeze in service.ts and officeTaskContentLocked below.
 
 import type { Env, Task, Capability } from '../../types'
-import { listAddonInstallations } from '../service'
+import { listAddonInstallations, externalIsolationViolation } from '../service'
 import { listAddonBindings, type AddonBinding } from '../bindings'
 import { getRegisteredAddon } from '../registry'
+import { manifestSha256 } from '../contract'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { parseSiteConnectorConfig } from './health'
@@ -65,14 +66,33 @@ export type OfficeRefusalReason =
   | 'unreconciled_prior_publish'
   | 'freeze_not_found'
   | 'already_reconciled'
+  // r3 (kasra-review adversarial gate ROUND 2 on #1614): 'reconcile_check_failed'
+  // (r1/r2's single catch-all for "could not get an authoritative answer") is
+  // SPLIT into two reasons with different overridability, per THE CLASS
+  // ("failing to find something is not evidence it's absent"):
+  //   - reconcile_candidate_found: SOME evidence exists (a malformed exact
+  //     idempotency-slug match, or any title/time fallback hit) — NEVER
+  //     overridable, a human must resolve the actual post directly.
+  //   - reconcile_check_unavailable: no evidence either way — a network/DNS/
+  //     TLS failure, a revoked connector, origin drift, OR every lookup came
+  //     back genuinely, cleanly empty. THE ONLY reason the human override may
+  //     ever accept, and only once retried (see reconcile_retry_required).
+  | 'reconcile_candidate_found'
+  | 'reconcile_check_unavailable'
+  | 'reconcile_retry_required'
   | 'binding_changed'
   | 'publish_claimed'
   | 'invalid_site_config'
   | 'invalid_site_url'
-  | 'unreachable'
-  | 'key_invalid'
-  | 'redirect_blocked'
-  | 'bad_response'
+  // r3 P1-2 (kasra-review ROUND 2 adversarial gate): 'key_invalid' (401/403),
+  // 'redirect_blocked' (3xx) and 'validation_rejected' (every other 4xx) are
+  // RETIRED as definite-failure reasons — wordpressPublish no longer produces
+  // them. A response-phase WAF, a save_post redirect, or a rest_after_insert
+  // validation error can all follow a real, already-committed WordPress
+  // INSERT, so none of those statuses may definitively clear the guard
+  // anymore (see wordpressPublish's own header). Any post-send outcome other
+  // than a parsed 2xx success is 'publish_outcome_unknown' below.
+  | 'publish_outcome_unknown'
   | 'write_failed'
   | 'verdict_race'
 
@@ -96,6 +116,39 @@ export async function resolveActiveOfficeInstallationId(env: Env): Promise<strin
     (row) => row.addonKey === OFFICE_ADDON_KEY && row.state === 'active' && row.trustClass === 'external_isolated',
   )
   return installation?.id ?? null
+}
+
+// r2 P3-2 (kasra-review adversarial gate on #1614): "nothing below the app
+// enforces who may hold capability_v2='write' ... the publish path does not
+// re-assert installationMayHoldWriteCapabilityBinding or the installation
+// digest — resolveActiveOfficeInstallationId checks only state and trust
+// class." Used ONLY by office.publish_post (the actual WordPress WRITE) —
+// stricter than resolveActiveOfficeInstallationId above (which
+// buildOfficePublishFreeze/the approval path still use: a human's content
+// decision is deliberately independent of infra/manifest readiness, see this
+// file's other comments). Re-derives, at the write itself, the SAME two
+// invariants src/addons/bindings.ts's installationMayHoldWriteCapabilityBinding
+// requires before a write binding may even be configured: the installation's
+// OWN manifest_sha256 still matches what manifestSha256() computes for the
+// CURRENTLY REGISTERED manifest (a stale/tampered installation row cannot
+// coast on an identity check that ran once at configure time), and
+// externalIsolationViolation still finds nothing. Neither call is free, but
+// this runs once per publish attempt, never in a hot loop.
+export async function resolveEligibleActiveOfficeInstallationId(env: Env): Promise<OfficeResult<string>> {
+  const installationId = await resolveActiveOfficeInstallationId(env)
+  if (!installationId) return { ok: false, reason: 'addon_inactive' }
+  const entry = getRegisteredAddon(OFFICE_ADDON_KEY)
+  if (!entry) return { ok: false, reason: 'addon_inactive' }
+  const installations = await listAddonInstallations(env)
+  const installation = installations.find((row) => row.id === installationId)
+  if (!installation) return { ok: false, reason: 'addon_inactive' }
+  if (installation.manifestSha256 !== await manifestSha256(entry.manifest)) {
+    return { ok: false, reason: 'addon_inactive' }
+  }
+  if (externalIsolationViolation(entry.manifest) !== null) {
+    return { ok: false, reason: 'addon_inactive' }
+  }
+  return { ok: true, value: installationId }
 }
 
 export interface OfficeConnectorBinding {
@@ -230,6 +283,20 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
 // completed_at AND verdict_id/voided_at/voided_reason to NULL on every fresh
 // freeze — a NEW review-entry always mints a NEW, unclaimed, unbound, unvoided
 // one-shot slot; it never revives a previously claimed/executed/failed/voided one.
+//
+// r2 P2-1 (kasra-review adversarial gate on #1614): idempotency_key MUST also
+// reset to NULL here. The ON CONFLICT clause previously omitted it entirely,
+// so `COALESCE(idempotency_key, ?)` at claim time (src/addons/office/
+// service.ts's publishOfficePost) kept GENERATION 1's key forever across every
+// refreeze — the comment at the claim site claimed otherwise. Reproduced: an
+// ambiguous publish leaves the row unclaimed-again after a rework loop, the
+// SECOND claim reuses the FIRST generation's slug, WordPress stores it
+// uniquified (`…-2`), and if generation 2 later stalls, reconcile's WordPress
+// lookup finds GENERATION 1's post and force-writes 'done' with generation
+// 1's URL — a false execution receipt for content that was never actually
+// generation 2's. Resetting to NULL here means the next claim always mints a
+// brand-new, generation-unique key (mirrors every other one-shot field this
+// upsert already resets).
 export async function persistOfficePublishFreeze(
   env: Env,
   taskId: string,
@@ -253,6 +320,7 @@ export async function persistOfficePublishFreeze(
       voided_reason = NULL,
       claimed_by = NULL,
       claimed_at = NULL,
+      idempotency_key = NULL,
       outcome = NULL,
       outcome_detail = NULL,
       completed_at = NULL,

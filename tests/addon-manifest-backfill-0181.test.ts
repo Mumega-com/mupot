@@ -153,6 +153,37 @@ function applyInTransaction(sqlite: { exec(sql: string): void }, sql: string): v
   }
 }
 
+// r2 P3-3 (kasra-review adversarial gate on #1614): the FIRST version of the
+// four real-lifecycle tests below built through 0184 (so their OWN setup
+// configureAddon/activateAddon calls — which need addon_connector_bindings.
+// capability_v2 to exist — would work) and THEN re-applied 0181's raw SQL a
+// second time as the "real" migration event under test. 0181's own SQL
+// unconditionally does `DROP TRIGGER IF EXISTS addon_connector_bindings_
+// revoke_only; CREATE TRIGGER ... (its OWN, pre-0184 body)` — reapplying it
+// AFTER 0184 had already widened that trigger silently REVERTED the widening,
+// leaving a schema no real deploy ever produces (capability_v2 column present,
+// but NOT protected by the live trigger) for the remainder of each test.
+//
+// Fix: split 0184 into its two independent statements — the ADD COLUMN (which
+// must exist BEFORE setup runs, and is never touched again) and the trigger
+// DROP+CREATE (which must run AFTER 0181's own re-application, to end at the
+// REAL final shape: 0181 then 0184, in that order, exactly like a real
+// deploy). Applying the ALTER once, then 0181, then the trigger recreation, is
+// row/statement-for-statement identical to running the real chain
+// (...0181, 0184) against a database that already had capability_v2 forced in
+// early purely so setup can use it — the ALTER itself is a complete no-op the
+// second the column already exists, so it is never reapplied.
+const MIGRATION_0184_FULL_SQL = readFileSync(
+  join(MIGRATIONS_DIR, '0184_addon_connector_bindings_write_capability.sql'), 'utf8',
+)
+const MIGRATION_0184_TRIGGER_BOUNDARY = 'DROP TRIGGER IF EXISTS addon_connector_bindings_revoke_only;'
+const MIGRATION_0184_TRIGGER_BOUNDARY_INDEX = MIGRATION_0184_FULL_SQL.indexOf(MIGRATION_0184_TRIGGER_BOUNDARY)
+if (MIGRATION_0184_TRIGGER_BOUNDARY_INDEX === -1) {
+  throw new Error('0184 migration no longer contains the expected trigger boundary — update this split')
+}
+const MIGRATION_0184_ALTER_SQL = MIGRATION_0184_FULL_SQL.slice(0, MIGRATION_0184_TRIGGER_BOUNDARY_INDEX)
+const MIGRATION_0184_TRIGGER_SQL = MIGRATION_0184_FULL_SQL.slice(MIGRATION_0184_TRIGGER_BOUNDARY_INDEX)
+
 function buildDbThrough(migrationFile: string) {
   const harness = createSqliteD1()
   for (const file of priorMigrations(migrationFile)) {
@@ -666,8 +697,33 @@ function queryOne(
 }
 
 describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bindings heal through the real lifecycle', () => {
+  // T2b (mupot#1580, migrations/0184), r2 P3-3 (kasra-review adversarial gate
+  // on #1614): the FOUR tests below drive the REAL installAddon/configureAddon/
+  // activateAddon lifecycle (this branch's CURRENT src/addons code — see this
+  // file's own header, point 9: "the real ... lifecycle ... succeed with the
+  // CURRENT code"), both to build their "before" fixture state and to prove the
+  // "after" state works. src/addons/bindings.ts's listAddonBindings
+  // unconditionally selects addon_connector_bindings.capability_v2 (added by
+  // 0184) for EVERY addon's configure/activate call, not just write-capable
+  // ones, so a DB frozen at 0180/0181 needs that column before ANY setup call
+  // can run, regardless of which addon is being configured.
+  //
+  // Each test therefore: builds through 0180 (unchanged from every other test
+  // in this file), applies ONLY 0184's ADD COLUMN statement (MIGRATION_0184_
+  // ALTER_SQL, see that constant's own doc comment for why the trigger half is
+  // deliberately NOT applied here), runs its setup + downgrade, re-applies
+  // 0181 in full (MIGRATION_SQL — this is the migration actually under test),
+  // and THEN applies 0184's trigger DROP+CREATE (MIGRATION_0184_TRIGGER_SQL) —
+  // ending at the exact same final schema a real deploy reaches (0181, then
+  // 0184, in that order), never at the earlier BLOCKED-and-BLOCKing state
+  // (capability_v2 present but unprotected by the live trigger) re-running
+  // 0181 alone after 0184 would silently produce. The digest/trigger-byte-
+  // identity assertions earlier in this file (which DO care about the exact
+  // pre/post-0181 boundary, before 0184 exists at all) are untouched by any of
+  // this and still build through 0180 with no 0184 SQL applied at all.
   it('marketing-cro-monitor (active, live generation + binding + a completed run, PRE-EXISTING split) heals and runMarketingMonitor succeeds post-migration', async () => {
     const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    applyInTransaction(harness.sqlite, MIGRATION_0184_ALTER_SQL)
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -749,6 +805,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
       ).toBe(PRE_EXISTING_SPLIT_DIGEST)
 
       applyInTransaction(sqlite, MIGRATION_SQL)
+      applyInTransaction(sqlite, MIGRATION_0184_TRIGGER_SQL)
 
       // Healed: installation at the NEW digest, generation and binding
       // brought forward to match it (not to the installation's old value —
@@ -793,6 +850,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
 
   it('a disabled addon with a live (uniform, no-split) old-identity generation activates successfully post-migration', async () => {
     const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    applyInTransaction(harness.sqlite, MIGRATION_0184_ALTER_SQL)
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -825,6 +883,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
       })
 
       applyInTransaction(sqlite, MIGRATION_SQL)
+      applyInTransaction(sqlite, MIGRATION_0184_TRIGGER_SQL)
 
       expect(
         queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE id = ?`, generation.id)
@@ -842,6 +901,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
 
   it('a configured (not yet active) addon reconfigures and activates successfully post-migration', async () => {
     const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    applyInTransaction(harness.sqlite, MIGRATION_0184_ALTER_SQL)
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -869,6 +929,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
       })
 
       applyInTransaction(sqlite, MIGRATION_SQL)
+      applyInTransaction(sqlite, MIGRATION_0184_TRIGGER_SQL)
 
       expectOk(
         await configureAddon(env, lifecycleOwner, 'fixture-addon-with-loop', {}),
@@ -882,6 +943,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
 
   it('workflow-circuits (active, uniform old-identity generation, no connector bindings) heals with no split', async () => {
     const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    applyInTransaction(harness.sqlite, MIGRATION_0184_ALTER_SQL)
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -910,6 +972,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
       })
 
       applyInTransaction(sqlite, MIGRATION_SQL)
+      applyInTransaction(sqlite, MIGRATION_0184_TRIGGER_SQL)
 
       expect(
         queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, installation.id)

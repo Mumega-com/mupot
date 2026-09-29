@@ -16,7 +16,7 @@ import {
   type AddonInstallation,
 } from '../src/addons/service'
 import { resolveConnectorByIdWithMeta } from '../src/connectors/service'
-import type { AddonManifestV1 } from '../src/addons/contract'
+import { manifestSha256, type AddonManifestV1 } from '../src/addons/contract'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -29,6 +29,7 @@ const migrations = [
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
   '../migrations/0175_addon_external_isolated.sql',
+  '../migrations/0184_addon_connector_bindings_write_capability.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const owner = { id: 'owner-1', role: 'owner' } as const
@@ -240,12 +241,53 @@ describe('addon connector bindings', () => {
       reason: 'adapter_type_mismatch',
     })
 
+    // T2b (mupot#1580, migrations/0184): preflightAddonBindings now checks
+    // manifest_digest_drift BEFORE evaluating whether any write-capability
+    // connectorRequirements entry is permitted (installationMayHoldWriteCapabilityBinding)
+    // — identity match is the more fundamental check, and every real call site
+    // only ever passes the LIVE registered manifest (getRegisteredAddon), never
+    // caller input, so this ordering has no reachable security effect. A
+    // structuredClone with a MUTATED capability field is, by construction, no
+    // longer the same manifest object the installation's manifest_sha256 was
+    // computed over (capability is part of what manifestSha256 hashes) — it now
+    // fails identity BEFORE the capability policy ever runs, which is what this
+    // asserts. (A real, unmutated 'native' manifest that somehow declared
+    // 'write' would still correctly hit capability_mismatch — installationMayHoldWriteCapabilityBinding
+    // refuses any manifest.kind !== 'external_mcp' — see the write-widened
+    // 'external_isolated'-only pin below.)
     const writeManifest: AddonManifestV1 = structuredClone(entry.manifest)
     writeManifest.connectorRequirements[0].capability = 'write'
     await expect(preflightAddonBindings(env, installation, writeManifest, [firstPartyBinding])).resolves.toEqual({
       ok: false,
-      reason: 'capability_mismatch',
+      reason: 'manifest_digest_drift',
     })
+  })
+
+  // T2b (mupot#1580): a NATIVE addon (kind:'native') can never obtain a
+  // write-capability binding, full stop — installationMayHoldWriteCapabilityBinding
+  // (src/addons/bindings.ts) refuses any manifest.kind !== 'external_mcp' before
+  // ever looking at trustClass/isolation invariants. The ONLY way to exercise
+  // this leaf specifically (as opposed to the digest-drift leaf the previous
+  // test hits) is to make the installation's OWN manifestSha256 genuinely match
+  // a fabricated native+write manifest — a real registered native manifest can
+  // never legitimately reach this state (none declares a 'write' connector
+  // requirement), so this constructs the digest by hand via the SAME
+  // manifestSha256() the real registry uses, never a stand-in.
+  it('refuses a write-capability connector requirement on a NATIVE addon even when its manifest digest genuinely matches the installation (capability_mismatch, not digest drift)', async () => {
+    const installation = await installMarketing(env)
+    const entry = getRegisteredAddon('marketing-cro-monitor')
+    if (!entry) throw new Error('marketing addon missing')
+
+    const nativeWriteManifest: AddonManifestV1 = structuredClone(entry.manifest)
+    nativeWriteManifest.connectorRequirements[0].capability = 'write'
+    const matchingInstallation: AddonInstallation = {
+      ...installation,
+      manifestSha256: await manifestSha256(nativeWriteManifest),
+    }
+
+    await expect(
+      preflightAddonBindings(env, matchingInstallation, nativeWriteManifest, [firstPartyBinding]),
+    ).resolves.toEqual({ ok: false, reason: 'capability_mismatch' })
   })
 
   it.each([
