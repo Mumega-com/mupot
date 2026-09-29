@@ -14,6 +14,7 @@ import {
   classifyProject,
   runAudit,
   toMarkdown,
+  escapeMdCell,
   buildIndexes,
   computeSnapshotAsOf,
   toEpochMs,
@@ -323,6 +324,30 @@ describe('runAudit + toMarkdown', () => {
     const memberSection = md.split('## agents')[0]
     expect(memberSection.indexOf('DNU Cursor')).toBe(-1) // sanity: agent name not leaked into member table
     expect(memberSection.indexOf('Hadi ChatGPT DNU')).toBeLessThan(memberSection.indexOf('| mem-hadi |'))
+  })
+
+  it('escapeMdCell escapes backslash before pipe so a cell cannot break out', () => {
+    // a\|b : backslash then pipe. Pipe-only escaping would yield a\\| which re-exposes the pipe.
+    expect(escapeMdCell('a\\|b')).toBe('a\\\\\\|b')
+    expect(escapeMdCell('x|y')).toBe('x\\|y')
+    expect(escapeMdCell('back\\slash')).toBe('back\\\\slash')
+    expect(escapeMdCell('l1\nl2')).toBe('l1 l2')
+    expect(escapeMdCell(undefined)).toBe('')
+    // Every pipe in the output must be preceded by an odd run of backslashes (i.e. escaped).
+    const out = escapeMdCell('a\\|b||\\\\|c')
+    for (const m of out.matchAll(/(\\*)\|/g)) expect(m[1].length % 2).toBe(1)
+  })
+
+  it('toMarkdown escapes backslash+pipe in name and reason cells', () => {
+    const data = baseData({
+      squads: [{ id: 'sq1', slug: 's', name: 'ev\\|il', kind: 'work', created_at: '2026-09-01T00:00:00.000Z' }],
+    })
+    const result = runAudit(data, { asOf: ASOF })
+    const md = toMarkdown(result, data)
+    const row = md.split('\n').find((l) => l.startsWith('| sq1 |')) ?? ''
+    expect(row).toContain('ev\\\\\\|il')
+    // Unescaped-pipe count in the row == 5 (4 columns), nothing broke out.
+    expect(row.replace(/\\./g, '').split('|').length - 1).toBe(5)
   })
 
   it('never emits a class outside the documented set', () => {
