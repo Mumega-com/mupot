@@ -11,6 +11,44 @@
   disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
   to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
   `/openapi.full.json` (#1608). #1596 stays open.
+- **mupot#1586** (`kasra/task-result-path-1586`) — new `task_submit_result`
+  MCP tool: the agent ASSIGNEE of a hand-worked (never-dispatched) task can
+  now report its completion evidence and enter `review` in one atomic step,
+  closing the board deadlock where such a task (`task_update` refuses an
+  unknown `result` field since #1388; `task_dispatch_runtime_receipt` 409s
+  `task_not_runnable` for anything never dispatched) sat `in_progress`
+  forever. Same `verifyTaskArtifactShape` gate every other review-entry path
+  enforces (a shape check only — it does not open a file or match a hash);
+  assignee-only, refuses a live `execution_receipt_id` or an in-flight
+  unconsumed dispatch (a dispatched task keeps using
+  `task_dispatch_runtime_receipt`, unchanged), only from `in_progress`
+  (immutable once in `review` until sent back). The task's `gate_owner` must
+  be an INDEPENDENT, live, credentialed gate (`hasIndependentRuntimeGate` —
+  the same predicate the runtime-receipt path's `completed` stage requires,
+  factored into shared SQL fragments both paths now call so they cannot
+  drift); this tool never accepts `gate_owner` as an argument — the assignee
+  cannot choose its own reviewer, and a task without an independent gate
+  already set (by its creator or an admin via `task_update`) cannot enter
+  review through this door at all. The UPDATE and the append-only receipt
+  INSERT (new `task_result_submissions` table, migration 0183) land in one
+  `env.DB.batch` — an INSERT failure rolls the UPDATE back too, so a task can
+  never reach `review` without its receipt. **Migration 0183 must be applied
+  before this code is deployed** — the batch fails closed (a clean error, no
+  partial state) if it is not, but the tool is non-functional until it is.
+  `assignee_cannot_self_close` is untouched. Two adversarial gate rounds:
+  round 1 found the missing-`result`-writer gap and a tautological
+  defense-in-depth guard (fixed to bind the real caller); round 2 (kasra-review,
+  PR comment 5882361732) BLOCKed on a P0 self-close bypass via
+  `gate:agent-self-completion` or an unheld gate, plus two P1s (a
+  never-consumed in-flight dispatch bypassing the runtime-receipt fence; the
+  UPDATE/INSERT non-atomicity) — all fixed and mutation-tested. Athena
+  reviewed GREEN with one P1 tracked separately as #1613. Migration 0183
+  renumbered from an initial 0181 to avoid colliding with 0181/0182 reserved
+  for the v0.31.0 release PR and mupot#1592. `task_submit_result` is
+  member-tier and deliberately left out of #1603's public `/openapi.json`
+  allowlist (private by default; add it only if a Custom GPT facade needs
+  it). Not merged; state it as merged only once `gh pr view` on this PR
+  reports `MERGED`.
 
 ## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
 

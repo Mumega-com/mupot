@@ -517,6 +517,17 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
 }
 
+// task_submit_result's write (mupot#1586) lives entirely in src/mcp/index.ts's
+// toolTaskSubmitResult, not here — round 1 of the adversarial gate required
+// the UPDATE's WHERE clause to embed the SAME independent-gate and
+// in-flight-dispatch SQL fragments the runtime-receipt path uses
+// (src/tasks/runtime-receipts.ts), and the UPDATE plus its append-only
+// receipt INSERT to land in one `env.DB.batch`. service.ts importing from
+// runtime-receipts.ts would be circular (runtime-receipts.ts already imports
+// isValidGateOwnerForm from here), so the statement-building stays where all
+// three pieces (the fragments, the task row helpers, the batch) are already
+// safely reachable without a new import cycle.
+
 // findLatestVerdict — the task-bound "latest verdict" read, shared by
 // reverseTaskVerdict and detectVerdictReversalRequest below. Deliberately
 // NOT proposal-bound (unlike resolveProposalVerdict, src/routines/actions.ts)

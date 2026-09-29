@@ -157,11 +157,23 @@ const TERMINAL_RUNTIME_RECEIPT_STAGES_SQL = TERMINAL_RUNTIME_RECEIPT_STAGES.map(
  * doc comment). `'reset_terminated'` is the real terminal disposition `adminResetDispatchLease`
  * now writes for `terminate: true` — see its doc comment for the exact repair semantics.
  */
-export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Promise<boolean> {
-  const row = await env.DB.prepare(`
+/**
+ * inFlightDispatchReceiptExistsSql — the correlated `EXISTS(...)` mirror of
+ * hasInFlightDispatchReceipt's own query, for embedding directly inside a
+ * WRITE's WHERE clause (mupot#1586 P1-2) rather than trusting only a JS
+ * pre-check (a TOCTOU window between the read and the write). Shares
+ * TERMINAL_RUNTIME_RECEIPT_STAGES_SQL with hasInFlightDispatchReceipt itself
+ * (below, which now calls this same fragment) so the JS pre-check and the
+ * WHERE-embedded re-assertion can never disagree on which stages settle a
+ * dispatch. taskIdExpr is a raw SQL expression (a column ref or an
+ * already-safe bound-parameter placeholder) — never interpolate untrusted
+ * caller input here.
+ */
+export function inFlightDispatchReceiptExistsSql(p: { tenantParam: string; taskIdExpr: string }): string {
+  return `EXISTS (
     SELECT 1
       FROM task_dispatch_receipts d
-     WHERE d.tenant = ?1 AND d.task_id = ?2
+     WHERE d.tenant = ${p.tenantParam} AND d.task_id = ${p.taskIdExpr}
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_receipts newer
           WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
@@ -170,10 +182,15 @@ export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Prom
        )
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_runtime_receipts r
-          WHERE r.tenant = ?1 AND r.dispatch_receipt_id = d.id
+          WHERE r.tenant = ${p.tenantParam} AND r.dispatch_receipt_id = d.id
             AND r.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
        )
-     LIMIT 1
+  )`
+}
+
+export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT 1 WHERE ${inFlightDispatchReceiptExistsSql({ tenantParam: '?1', taskIdExpr: '?2' })}
   `).bind(env.TENANT_SLUG, taskId).first<{ 1: number }>()
   return row !== null
 }
@@ -243,6 +260,83 @@ interface ReceiptRow extends Omit<TaskDispatchRuntimeReceipt, 'artifact_refs'> {
 const SHA256_RE = /^[0-9a-f]{64}$/
 const STAGES = new Set<TaskDispatchRuntimeStage>(['runtime_consumed', 'completed', 'failed'])
 
+/**
+ * independentGateHolderExistsSql — the boolean SQL fragment proving a task's
+ * gate_owner is a LIVE, INDEPENDENT (not-the-assignee) credentialed gate —
+ * never null, never `gate:agent-self-completion`, and actually held by some
+ * OTHER active agent with a live workspace credential and member/lead/admin/
+ * owner standing on the task's squad, department, or org. Factored out
+ * (mupot#1586 P0) so every writer that requires this — the runtime-receipt
+ * `completed` UPDATE below and `task_submit_result`'s UPDATE
+ * (src/mcp/index.ts) — shares ONE copy instead of two that can drift (see
+ * feedback_two_tools_two_copies_of_one_predicate in the standing catalog).
+ * `hasIndependentRuntimeGate` below is the JS pre-check built on this SAME
+ * fragment; a WRITE that changes state on this condition should use BOTH —
+ * the JS check for a clear, typed refusal on the common path, and this
+ * fragment re-asserted INSIDE the write's own WHERE clause so a TOCTOU race
+ * between the check and the write cannot land the state anyway.
+ *
+ * All `*Expr`/`*Param` values are raw SQL expressions (a column reference
+ * such as `tasks.gate_owner`) or already-safe bound-parameter placeholders
+ * (`?4`) — NEVER interpolate untrusted caller input into this function.
+ */
+export function independentGateHolderExistsSql(p: {
+  gateOwnerExpr: string
+  assigneeIdExpr: string
+  squadIdExpr: string
+  tenantParam: string
+  nowParam: string
+}): string {
+  return `(
+    ${p.gateOwnerExpr} IS NOT NULL
+    AND ${p.gateOwnerExpr} <> 'gate:agent-self-completion'
+    AND EXISTS (
+      SELECT 1
+        FROM gate_grants grant_row
+        JOIN agents gate_agent
+          ON grant_row.principal_type = 'agent'
+         AND gate_agent.id = grant_row.principal_id
+         AND gate_agent.status = 'active'
+       WHERE grant_row.capability = ${p.gateOwnerExpr}
+         AND gate_agent.id <> ${p.assigneeIdExpr}
+         AND EXISTS (
+           SELECT 1
+             FROM member_tokens t
+             JOIN members gate_member
+               ON gate_member.id = t.member_id AND gate_member.status = 'active'
+            WHERE t.agent_id = gate_agent.id
+              AND t.tenant = ${p.tenantParam}
+              AND ${TOKEN_LIVE_PREDICATE(p.nowParam)}
+              AND (
+                EXISTS (
+                  SELECT 1
+                    FROM capabilities capability
+                   WHERE capability.member_id = t.member_id
+                     AND capability.capability IN ('member', 'lead', 'admin', 'owner')
+                     AND (
+                       capability.scope_type = 'org'
+                       OR (capability.scope_type = 'squad' AND capability.scope_id = ${p.squadIdExpr})
+                       OR (
+                         capability.scope_type = 'department'
+                         AND capability.scope_id = (
+                           SELECT task_squad.department_id FROM squads task_squad WHERE task_squad.id = ${p.squadIdExpr}
+                         )
+                       )
+                     )
+                )
+                OR EXISTS (
+                  SELECT 1
+                    FROM channel_capability_grants channel_grant
+                   WHERE channel_grant.member_id = t.member_id
+                     AND channel_grant.squad_id = ${p.squadIdExpr}
+                     AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
+                )
+              )
+         )
+    )
+  )`
+}
+
 export async function hasIndependentRuntimeGate(
   env: Env,
   gateOwner: string | null | undefined,
@@ -255,50 +349,11 @@ export async function hasIndependentRuntimeGate(
     || !isValidGateOwnerForm(gateOwner)
   ) return false
   const row = await env.DB.prepare(`
-    SELECT 1 AS allowed
-      FROM gate_grants grant_row
-      JOIN agents gate_agent
-        ON grant_row.principal_type = 'agent'
-       AND gate_agent.id = grant_row.principal_id
-       AND gate_agent.status = 'active'
-      JOIN squads task_squad ON task_squad.id = ?4
-     WHERE grant_row.capability = ?1
-       AND gate_agent.id <> ?2
-       AND EXISTS (
-         SELECT 1
-           FROM member_tokens t
-           JOIN members gate_member
-             ON gate_member.id = t.member_id AND gate_member.status = 'active'
-          WHERE t.agent_id = gate_agent.id
-            AND t.tenant = ?3
-            AND ${TOKEN_LIVE_PREDICATE('?5')}
-            AND (
-              EXISTS (
-                SELECT 1
-                  FROM capabilities capability
-                 WHERE capability.member_id = t.member_id
-                   AND capability.capability IN ('member', 'lead', 'admin', 'owner')
-                   AND (
-                     capability.scope_type = 'org'
-                     OR (capability.scope_type = 'squad' AND capability.scope_id = ?4)
-                     OR (
-                       capability.scope_type = 'department'
-                       AND capability.scope_id = task_squad.department_id
-                     )
-                   )
-              )
-              OR EXISTS (
-                SELECT 1
-                  FROM channel_capability_grants channel_grant
-                 WHERE channel_grant.member_id = t.member_id
-                   AND channel_grant.squad_id = ?4
-                   AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
-              )
-            )
-       )
-     LIMIT 1
+    SELECT 1 WHERE ${independentGateHolderExistsSql({
+      gateOwnerExpr: '?1', assigneeIdExpr: '?2', tenantParam: '?3', squadIdExpr: '?4', nowParam: '?5',
+    })}
   `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
-    .first<{ allowed: number }>()
+    .first<{ 1: number }>()
   return row !== null
 }
 
@@ -856,57 +911,10 @@ export async function recordTaskDispatchRuntimeReceipt(
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status = 'in_progress' AND execution_receipt_id = ?5
-               AND gate_owner IS NOT NULL
-               AND gate_owner <> 'gate:agent-self-completion'
-               AND EXISTS (
-                 SELECT 1
-                   FROM gate_grants grant_row
-                   JOIN agents gate_agent
-                     ON grant_row.principal_type = 'agent'
-                    AND gate_agent.id = grant_row.principal_id
-                    AND gate_agent.status = 'active'
-                  WHERE grant_row.capability = tasks.gate_owner
-                    AND gate_agent.id <> tasks.assignee_agent_id
-                    AND EXISTS (
-                      SELECT 1
-                        FROM member_tokens t
-                        JOIN members gate_member
-                          ON gate_member.id = t.member_id AND gate_member.status = 'active'
-                       WHERE t.agent_id = gate_agent.id
-                         AND t.tenant = ?6
-                         AND ${TOKEN_LIVE_PREDICATE('?8')}
-                         AND (
-                           EXISTS (
-                             SELECT 1
-                               FROM capabilities capability
-                              WHERE capability.member_id = t.member_id
-                                AND capability.capability IN ('member', 'lead', 'admin', 'owner')
-                                AND (
-                                  capability.scope_type = 'org'
-                                  OR (
-                                    capability.scope_type = 'squad'
-                                    AND capability.scope_id = tasks.squad_id
-                                  )
-                                  OR (
-                                    capability.scope_type = 'department'
-                                    AND capability.scope_id = (
-                                      SELECT task_squad.department_id
-                                        FROM squads task_squad
-                                       WHERE task_squad.id = tasks.squad_id
-                                    )
-                                  )
-                                )
-                           )
-                           OR EXISTS (
-                             SELECT 1
-                               FROM channel_capability_grants channel_grant
-                              WHERE channel_grant.member_id = t.member_id
-                                AND channel_grant.squad_id = tasks.squad_id
-                                AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
-                           )
-                         )
-                    )
-               )
+               AND ${independentGateHolderExistsSql({
+                 gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
+                 squadIdExpr: 'tasks.squad_id', tenantParam: '?6', nowParam: '?8',
+               })}
                AND EXISTS (
                  SELECT 1 FROM task_dispatch_runtime_receipts consumed
                   WHERE consumed.tenant = ?6

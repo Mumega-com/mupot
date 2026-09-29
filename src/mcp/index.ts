@@ -93,6 +93,11 @@ import {
   reverseTaskVerdict,
   DedicatedGatePredicateRequiredError,
 } from '../tasks/service'
+// mupot#1586 — the same completion-size ceiling execute.ts's own finishTask
+// enforces on the in-Worker path (~16KB), reused here rather than a second
+// constant, so a hand-worked completion cannot bloat the row in a way the
+// AgentDO path already guards against.
+import { MAX_RESULT_CHARS } from '../agents/execute'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
@@ -104,8 +109,12 @@ import {
   loadLatestDispatchReceiptsForTasks,
   adminResetDispatchLease,
   hasInFlightDispatchReceipt,
+  hasIndependentRuntimeGate,
+  independentGateHolderExistsSql,
+  inFlightDispatchReceiptExistsSql,
   type TaskDispatchRuntimeStage,
 } from '../tasks/runtime-receipts'
+import { claimTimestamp } from '../lib/claim-timestamp'
 // #22 v1 ATC ranking: pure scorer + the radar's existing agent runtime-state
 // loader (dashboard/radar.ts already uses this same loader for the fleet
 // view — not a new query shape).
@@ -2476,6 +2485,245 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
       if (error instanceof TaskDispatchRuntimeReceiptError) return runtimeReceiptFailure(error)
       throw error
     }
+  },
+}
+
+// task_submit_result — mupot#1586. Symmetric to task_dispatch_runtime_receipt
+// (above), but for a task that was NEVER dispatched: assigned to an agent
+// and worked by hand (a flight task, a CLI agent operating outside the
+// AgentDO execute cycle, etc.). Before this tool existed, that task had NO
+// supported way to reach 'review' at all — task_update refuses an unknown
+// `result` field (#1388's fix, closing a forged-result gate bypass), and
+// task_dispatch_runtime_receipt 409s task_not_runnable for anything that was
+// never dispatched. The task sat in_progress forever with its evidence
+// trapped in a chat note.
+//
+// SCOPE, deliberately narrow:
+//   - agent-assignee ONLY (mirrors the artifact gate's own scoping in
+//     task_update: `result` is meaningless for a human/member-owned task,
+//     which was never gated on it either — see gate BLOCK finding #4).
+//   - the CALLER must equal the CURRENT assignee_agent_id (invariant (b):
+//     no peer can submit a result for someone else's task).
+//   - only from 'in_progress' (invariant (c): once the row is 'review' this
+//     branch is unreachable for a second call — the result is immutable
+//     until a rejection sends the task back to 'in_progress' for rework,
+//     the existing legal transition, at which point a fresh submission is
+//     allowed again, same as any other in_progress task).
+//   - refuses outright when the task carries a live execution_receipt_id, or
+//     an in-flight (dispatched but not yet consumed) dispatch receipt
+//     (invariant (e): a DISPATCHED task's completion — consumed or still in
+//     flight — is task_dispatch_runtime_receipt's job, which carries its own
+//     far stronger independent-gate check; this tool must never become a
+//     second, weaker door onto the same row). KNOWN LIMITATION (kasra-review
+//     round 1 P3, accepted as-is): a runtime `failed` settle leaves
+//     execution_receipt_id set permanently, so a task whose dispatch failed
+//     can never use this tool afterward either — the only way back is an
+//     operator's `task_dispatch_lease_reset`/redispatch, same as it already
+//     is for the runtime-receipt path itself.
+//   - requires the task's gate_owner to be an INDEPENDENT, live,
+//     credentialed gate (hasIndependentRuntimeGate — the SAME predicate the
+//     runtime-receipt path's `completed` stage requires), re-asserted inside
+//     the UPDATE's own WHERE clause, not only in JS (kasra-review round 1
+//     P0: an assignee holding only member+ could set gate_owner to
+//     'gate:agent-self-completion' via task_update while in_progress, submit
+//     here with no independent check at all, self-verdict via task_verdict's
+//     own assignee-may-decide-this-one-gate design, then close via
+//     task_update — a full self-close lap this tool must never open). This
+//     tool never accepts gate_owner as an argument (round 1 P1-1 — the
+//     assignee must not be able to pick its own reviewer); the gate must
+//     already be set independently (by the task's creator, or an admin via
+//     task_update) before a completion can be submitted at all.
+//   - never writes 'done' — only 'review'. assigneeSelfClose/
+//     assigneeCannotMutateOwnAssignment are untouched by this tool
+//     (invariant (a)): review→done still requires task_verdict or a
+//     different principal's task_update, exactly as before.
+//   - the same verifyTaskArtifactShape gate every other review-entry path
+//     enforces (a SHAPE check only — see that module's own header for what
+//     it does and does not verify), checked on the INCOMING result before
+//     anything is written.
+//   - the UPDATE and the append-only receipt INSERT (task_result_submissions,
+//     migrations/0183 — must be applied before this code is deployed, since
+//     the INSERT half of the same atomic batch would otherwise fail every
+//     call) land in ONE `env.DB.batch` (round 1 P1-3): the INSERT's own
+//     WHERE requires proof, inside the SAME transaction, that the paired
+//     UPDATE actually landed (the `MEMBER_BIND_LANDED_GUARD_SQL` pattern,
+//     src/members/project-invites.ts), and a D1 batch is one transaction —
+//     if the INSERT is refused for any reason (a trigger, the table missing
+//     because 0183 was not yet applied), the whole batch rolls back and the
+//     UPDATE half rolls back with it. No call can ever move the task to
+//     'review' while failing to record who submitted it and when
+//     (invariant (d)).
+const toolTaskSubmitResult: ToolSpec = {
+  name: 'task_submit_result',
+  scope: 'assigned task (agent assignee only)',
+  min: 'member',
+  args: '{ task_id: string, result: string }' +
+    ' -- the agent ASSIGNEE of a hand-worked (never-dispatched) task reports its completion' +
+    ' evidence and moves it into review in one atomic step. result must state both' +
+    ' "Artifact: <path>" and "SHA256: <64-hex>" (verifyTaskArtifactShape, the same shape every' +
+    ' other review-entry path enforces — a shape check only, not a verified hash match).' +
+    ' The task must already carry an INDEPENDENT gate_owner (set by its creator or an admin via' +
+    ' task_update, never by this tool — the assignee cannot choose its own reviewer): live,' +
+    ' credentialed, held by some agent other than the assignee, and never' +
+    ' "gate:agent-self-completion". A dispatched task (live execution_receipt_id, or an' +
+    ' in-flight unconsumed dispatch) is refused — use task_dispatch_runtime_receipt instead.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      task_id: STRING_SCHEMA,
+      result: STRING_SCHEMA,
+    },
+    required: ['task_id', 'result'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskRef = str(args.task_id)
+    if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
+    const resultText = typeof args.result === 'string' ? args.result : ''
+    if (!resultText.trim()) return fail(400, 'invalid_args', 'result required')
+    if (resultText.length > MAX_RESULT_CHARS) {
+      return fail(400, 'invalid_args', `result exceeds ${MAX_RESULT_CHARS} chars`)
+    }
+
+    // An agent-bound caller only. A pure human/dashboard session has no
+    // assignee_agent_id it could ever match, and letting a member id through
+    // here would just fail the assignee check below with a confusing error —
+    // name the real reason instead.
+    if (!auth.boundAgentId) {
+      return fail(409, 'agent_binding_required', 'task_submit_result is for an agent-bound caller reporting its own work')
+    }
+    const callerAgentId = auth.boundAgentId
+
+    const taskRes = await getTask(env, taskRef)
+    if (!taskRes.ok) return taskRes
+    const existing = taskRes.task
+
+    const grants = auth.capabilities ?? []
+    if (!(await memberCanOnSquad(env, grants, existing.squad_id, 'member'))) {
+      return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
+    }
+
+    // INVARIANT (b) — only the task's current agent assignee may submit.
+    if (!existing.assignee_agent_id || existing.assignee_agent_id !== callerAgentId) {
+      return fail(403, 'not_task_assignee', 'only the task\'s current agent assignee may submit a completion result')
+    }
+
+    // INVARIANT (e) — a dispatched task keeps its existing runtime-receipt path,
+    // whether it has already been consumed (execution_receipt_id set) or is
+    // still in flight (dispatched, not yet consumed — kasra-review round 1
+    // P1-2: an assignee could otherwise race a live dispatch by moving the
+    // task back to in_progress itself and submitting here before the runtime
+    // ever touches it, skipping the envelope/lease fence and the independent
+    // -gate check that path enforces).
+    if (existing.execution_receipt_id) {
+      return fail(409, 'task_dispatched', 'this task has an active dispatch/execution receipt — report completion via task_dispatch_runtime_receipt, not task_submit_result')
+    }
+    if (await hasInFlightDispatchReceipt(env, existing.id)) {
+      return fail(409, 'task_dispatch_in_flight', 'this task has an undelivered/unsettled dispatch — report completion via task_dispatch_runtime_receipt, or wait for it to settle, before using task_submit_result')
+    }
+
+    // INVARIANT (c) — immutable once in review. Only reachable from in_progress;
+    // a rejected task must first be moved back to in_progress (task_update, the
+    // existing legal rejected→in_progress transition) before resubmitting.
+    if (existing.status !== 'in_progress') {
+      return fail(409, 'task_not_in_progress', {
+        status: existing.status,
+        detail: 'a completion result can only be submitted while the task is in_progress; once in review the result is immutable until the task is sent back to in_progress',
+      })
+    }
+
+    // P0 (kasra-review round 1): the task's gate_owner must be an INDEPENDENT,
+    // live, credentialed gate — the SAME predicate the runtime-receipt path's
+    // `completed` stage requires. This tool never accepts gate_owner as an
+    // argument (P1-1) — the gate must already be set that way by someone
+    // other than the assignee (the task's creator, or an admin via
+    // task_update) before a completion can be submitted at all. Covers both
+    // the no-gate case and 'gate:agent-self-completion' (hasIndependentRuntimeGate
+    // returns false for both, and for a gate no live independent agent holds).
+    if (!(await hasIndependentRuntimeGate(env, existing.gate_owner, callerAgentId, existing.squad_id))) {
+      return fail(409, 'independent_gate_required', {
+        gate_owner: existing.gate_owner,
+        detail: existing.gate_owner
+          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
+          : 'a task can only enter review through task_submit_result once it carries an independent gate_owner — ask the task\'s creator or an admin to set one via task_update; this tool never accepts gate_owner itself, so the assignee cannot choose its own reviewer',
+      })
+    }
+
+    // PROVENANCE-SAFE ARTIFACT GATE (mupot#76e25fc2, FLIGHT-07B) — same SHAPE
+    // check as every other review-entry path (not a verified hash match — see
+    // that module's own header), applied to the INCOMING result: this tool IS
+    // the write path for it, so there is nothing already on the row to fall
+    // back to checking.
+    const artifactCheck = verifyTaskArtifactShape(resultText)
+    if (!artifactCheck.verified) {
+      return fail(409, 'artifact_verification_failed', {
+        reason: artifactCheck.reason,
+        ...(artifactCheck.path ? { path: artifactCheck.path } : {}),
+        detail: 'a completion result must state both "Artifact: <path>" and "SHA256: <64-hex>" — prose describing intended work is not evidence of work done',
+      })
+    }
+
+    const next: Task = { ...existing, result: resultText, status: 'review' }
+    // claimTimestamp(), not a bare Date().toISOString() — this value is also
+    // the landed-proof the paired INSERT's WHERE checks inside the SAME
+    // batch (P1-3 below); a bare timestamp can collide across two calls
+    // landing in the same millisecond (mupot#1425 P0-2), which would let the
+    // wrong call's receipt (or no receipt at all) satisfy the guard.
+    stampTaskUpdate(next, existing.status, claimTimestamp())
+
+    // P0 + P1-2 + P1-3, all atomic: the UPDATE re-asserts every guard above
+    // (assignee identity, in_progress, no live/in-flight dispatch, the
+    // independent-gate fragment) INSIDE its own WHERE clause — a TOCTOU
+    // race between the JS pre-checks above and this write cannot land a
+    // result the checks never actually saw — and the receipt INSERT is
+    // conditioned on THIS UPDATE having landed, in the same `env.DB.batch`
+    // (one transaction): if the INSERT is refused for any reason, the whole
+    // batch rolls back, so 'review' can never land without its receipt.
+    const now = nowSqlUtc()
+    const resultDigest = await sha256Hex(resultText)
+    const receiptId = crypto.randomUUID()
+    const updateStmt = env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'review', result = ?1, updated_at = ?2
+        WHERE id = ?3 AND updated_at = ?4 AND project_id IS ?5
+          AND status = 'in_progress'
+          AND assignee_agent_id = ?6
+          AND execution_receipt_id IS NULL
+          AND NOT ${inFlightDispatchReceiptExistsSql({ tenantParam: '?7', taskIdExpr: 'tasks.id' })}
+          AND ${independentGateHolderExistsSql({
+            gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
+            squadIdExpr: 'tasks.squad_id', tenantParam: '?7', nowParam: '?8',
+          })}`,
+    ).bind(
+      next.result, next.updated_at, next.id, existing.updated_at, existing.project_id,
+      callerAgentId, env.TENANT_SLUG, now,
+    )
+    const insertStmt = env.DB.prepare(
+      `INSERT INTO task_result_submissions
+         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+        WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND updated_at = ?9 AND status = 'review')`,
+    ).bind(
+      receiptId, env.TENANT_SLUG, next.id, next.squad_id, callerAgentId,
+      artifactCheck.path, artifactCheck.sha256Claimed, resultDigest, next.updated_at,
+    )
+    const results = await env.DB.batch([updateStmt, insertStmt])
+    if (!results[0]?.meta?.changes) {
+      return fail(409, 'task_update_conflict')
+    }
+
+    next.github_issue_url = await mirrorTaskUpdate(env, next, { statusChanged: true })
+
+    const actor = { kind: 'agent' as const, id: callerAgentId }
+    await emitTaskEvent(env, 'task.updated', next, actor)
+
+    // Same review-wake every other entering-review path fires (task_update),
+    // so a gate owner learns about a hand-worked completion the same way it
+    // learns about a dispatched one.
+    const gateWake = await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
+    next.gate_wake_notice = gateWake.notice
+
+    return done({ task: next, gate_wake: gateWake })
   },
 }
 
@@ -5823,6 +6071,7 @@ export const TOOLS: ToolSpec[] = [
   toolTaskVerdictReverse,
   toolTaskDispatch,
   toolTaskDispatchRuntimeReceipt,
+  toolTaskSubmitResult,
   toolTaskIntakeAudit,
   toolRemember,
   toolRecall,
