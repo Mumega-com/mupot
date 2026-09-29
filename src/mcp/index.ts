@@ -234,6 +234,7 @@ import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
 import { selfReportAtBoot } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
+import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -6455,9 +6456,30 @@ mcpApp.post('/', async (c) => {
   return c.json({ ok: false, tool: outcome.tool, error: outcome.error, detail: outcome.detail }, outcome.status)
 })
 
-function openApiSpec(origin: string): Record<string, unknown> {
+// Capability tiers that may ever appear in the PUBLIC (unauthenticated) OpenAPI spec.
+// 'lead' | 'admin' | 'owner' never do, regardless of what PUBLIC_TOOL_ALLOWLIST says — this
+// is the second, independent layer of mupot#1596's fix (see openapi-public-allowlist.ts's
+// module header for the full design). A tool's min changing after it was allowlisted, or an
+// allowlist typo naming an admin tool, is caught HERE, not just by the CI ratchet.
+const PUBLIC_SPEC_MAX_CAPABILITY: ReadonlySet<Capability | 'authenticated'> = new Set([
+  'authenticated',
+  'observer',
+  'member',
+])
+
+/** The exact tool set the PUBLIC /openapi.json may disclose. Exported for
+ * scripts/check-openapi-public-allowlist.mjs's structural check and for tests — never
+ * reimplement this filter inline at a call site (see the module header on
+ * openapi-public-allowlist.ts: two call sites computing "which tools are public" is exactly
+ * the drift this fix exists to prevent). */
+export function publicToolSpecs(): ToolSpec[] {
+  const allow = new Set(PUBLIC_TOOL_ALLOWLIST)
+  return TOOLS.filter((spec) => allow.has(spec.name) && PUBLIC_SPEC_MAX_CAPABILITY.has(spec.min))
+}
+
+function openApiSpec(origin: string, tools: ToolSpec[], description: string): Record<string, unknown> {
   const paths: Record<string, unknown> = {}
-  for (const spec of TOOLS) {
+  for (const spec of tools) {
     paths[`/actions/${spec.name}`] = {
       post: {
         operationId: spec.name,
@@ -6505,7 +6527,7 @@ function openApiSpec(origin: string): Record<string, unknown> {
     info: {
       title: 'Mupot Digid Actions',
       version: MUPOT_PUBLIC_API_VERSION,
-      description: 'Custom GPT Actions facade for the Digid Mupot tool surface.',
+      description,
     },
     servers: [{ url: origin }],
     components: {
@@ -6520,9 +6542,44 @@ function openApiSpec(origin: string): Record<string, unknown> {
   }
 }
 
+const PUBLIC_OPENAPI_DESCRIPTION =
+  'Custom GPT Actions facade for the Digid Mupot tool surface — public, unauthenticated ' +
+  'discovery. Lists only tools at member capability or below (PUBLIC_TOOL_ALLOWLIST in ' +
+  'src/mcp/openapi-public-allowlist.ts); every tool still enforces its own authz server-side. ' +
+  'For the full tool registry (including admin-tier tools), see GET /openapi.full.json ' +
+  '(requires an org-admin bearer token).'
+
+const FULL_OPENAPI_DESCRIPTION =
+  'Full mupot tool registry, including admin-tier tools — org-admin only. Never publish or ' +
+  'cache this response; it is a map of the entire admin surface (mint_agent_token, ' +
+  'grant_agent_capability, revoke_*, archive/unarchive, and more).'
+
+// mupot#1596: GET /openapi.json is UNAUTHENTICATED by design (Custom GPT Actions needs
+// unauthenticated discovery) — so it must be an explicit ALLOWLIST, never the raw TOOLS
+// registry. Do not change this call to pass TOOLS directly; see publicToolSpecs() above and
+// scripts/check-openapi-public-allowlist.mjs, which fails the build on exactly that
+// regression.
+function publicOpenApiSpec(origin: string): Record<string, unknown> {
+  return openApiSpec(origin, publicToolSpecs(), PUBLIC_OPENAPI_DESCRIPTION)
+}
+
 mcpActionsApp.get('/openapi.json', (c) => {
   const url = new URL(c.req.url)
-  return c.json(openApiSpec(url.origin))
+  return c.json(publicOpenApiSpec(url.origin))
+})
+
+// Full registry, gated behind the same member-bearer + org-admin check every other
+// admin-tier read in this file uses (authenticateMember + hasWorkspaceAdmin — see e.g. the
+// /actions/:tool handler below). Cheap: no new auth seam, reuses the existing one.
+mcpActionsApp.get('/openapi.full.json', async (c) => {
+  const auth = await authenticateMember(c)
+  if (!auth) return c.json({ error: 'unauthenticated' }, 401)
+  if (auth.tenant !== c.env.TENANT_SLUG) {
+    return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
+  }
+  if (!hasWorkspaceAdmin(auth)) return c.json({ error: 'forbidden', need: 'org:admin' }, 403)
+  const url = new URL(c.req.url)
+  return c.json(openApiSpec(url.origin, TOOLS, FULL_OPENAPI_DESCRIPTION))
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {
