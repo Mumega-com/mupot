@@ -91,6 +91,7 @@ import {
   NonHumanVerdictRefusedError,
   detectVerdictReversalRequest,
   reverseTaskVerdict,
+  DedicatedGatePredicateRequiredError,
 } from '../tasks/service'
 import { loadKanbanData } from '../dashboard/kanban-routes'
 import type { TaskStatus } from '../tasks/service'
@@ -176,6 +177,7 @@ import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
+import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { ROUTINE_TOOLS } from './routines'
 import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
@@ -1254,6 +1256,24 @@ const toolTaskUpdate: ToolSpec = {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
 
+    // mupot#1592 NEW-1, keyed per mupot#1602 r2 on freeze existence rather than
+    // gate_owner (r2 BLOCK P1 — see officeTaskContentLocked's own doc comment,
+    // src/addons/office/freeze.ts, for the R3 repro this closes): a task with a
+    // LIVE frozen payload cannot have its title/body changed while that freeze
+    // is live — the payload was already frozen (with a hash a human may already
+    // have read off office.list_pending_approvals). Refused outright rather than
+    // silently voiding the freeze: simpler to reason about, and
+    // belt-and-suspenders with office.review_approval's own write-time
+    // live-content re-check (src/addons/office/service.ts).
+    if (
+      (args.title !== undefined || args.body !== undefined || args.note !== undefined || args.reason !== undefined) &&
+      (await officeTaskContentLocked(env, existing.id))
+    ) {
+      return fail(409, 'office_payload_frozen', {
+        detail: 'title/body cannot be edited while a gate:office task is in review — an org owner/admin must reverse the verdict, or wait for office.review_approval to decide it',
+      })
+    }
+
     const next: Task = { ...existing }
     let changed = false
     let reversesVerdict = false
@@ -1694,6 +1714,17 @@ const toolTaskUpdate: ToolSpec = {
     if (existing.status !== 'review' && next.status === 'review' && next.gate_owner) {
       gateWake = await wakeGateOwnerOnReview(env, next, actor, auth.memberId as string)
       next.gate_wake_notice = gateWake.notice
+    }
+
+    // mupot#1592 NEW-1: the SAME entering-review transition freezes a gate:office
+    // task's publish payload — fires on the ordinary path above AND on a
+    // successful reversal landing back in 'review' (a rework loop needs a fresh,
+    // unbound freeze exactly like a first-time review-entry does; the reversal
+    // branch above already re-derives next.status/next.updated_at from its own
+    // outcome before this runs). Best-effort — see freezeOfficeTaskOnReviewEntry's
+    // own doc comment for why a failure here must never fail this call.
+    if (existing.status !== 'review' && next.status === 'review' && next.gate_owner === OFFICE_GATE_OWNER) {
+      await freezeOfficeTaskOnReviewEntry(env, next, auth.memberId as string)
     }
 
     // GATE REASSIGNMENT RECEIPT + WAKE.
@@ -2163,6 +2194,14 @@ const toolTaskVerdict: ToolSpec = {
         // remains visible on /needs for a real human to decide.
         return fail(409, 'non_human_verdict_refused', {
           detail: 'this task gates a project_access proposal and requires a human decider (a member, or a harness-attested human_origin)',
+        })
+      }
+      if (err instanceof DedicatedGatePredicateRequiredError) {
+        // mupot#1592 NEW-2: e.g. gate:office → office.review_approval owns
+        // this decision (frozen-payload hash binding); refuse rather than
+        // decide it through the generic surface.
+        return fail(409, 'dedicated_gate_predicate_required', {
+          detail: `task.gate_owner (${task.gate_owner}) must be decided through its own dedicated tool, not task_verdict`,
         })
       }
       throw err

@@ -604,6 +604,23 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
   // Step 1 — CLOSE THE GATE FIRST, unconditionally, before anything else.
   await markVerdictReversed(env, existing.id, next.updated_at)
 
+  // Step 1b (mupot#1592 NEW-2) — office.publish_post's frozen-payload binding must
+  // die with the verdict it was bound to. Idempotent (WHERE voided_at IS NULL, like
+  // every other step here) and scoped to the one gate namespace that has a freeze
+  // table at all — a plain UPDATE by task_id, no batch needed: publishOfficePost's
+  // own claim guard already re-derives "is there a live, unreversed, approved
+  // verdict bound to this exact freeze" from task_verdicts directly (see
+  // src/addons/office/service.ts), so even a failed/skipped write here is not a
+  // silent hole — this just closes it explicitly and promptly, one step after the
+  // gate-closing write, matching this function's own "order is the fix" design
+  // rather than papering over it with an in-JS check the DB schema can't see.
+  if (existing.gate_owner === 'gate:office') {
+    await env.DB.prepare(
+      `UPDATE office_publish_freezes SET voided_at = ?1, voided_reason = 'reversed'
+        WHERE task_id = ?2 AND voided_at IS NULL`,
+    ).bind(next.updated_at, existing.id).run()
+  }
+
   // Step 2 — the FULL task update (status flip + whatever else this PATCH
   // also changed) — skipped entirely when existing.status is ALREADY
   // 'review': by construction (detectVerdictReversalRequest's own
@@ -1700,11 +1717,47 @@ export async function emitVerdictBusEvent(
   }
 }
 
+// GATE_OWNERS_WITH_DEDICATED_PREDICATE — mupot#1592 (NEW-2, r2 adversarial follow-up
+// on PR #1588): a gate namespace in this set has its OWN human-verdict tool with its
+// OWN extra invariants the generic verdict surfaces (HTTP /:id/verdict, MCP
+// task_verdict, IM's plain verdictReply, the harness-attested-origin path — see the
+// matching check in src/im/origin-verdict.ts's dryRunAuthorize) cannot know about.
+// 'gate:office' is the first member: office.review_approval (src/addons/office/
+// service.ts) binds its verdict to a payload frozen at review-entry and refuses on a
+// hash mismatch; the generic surfaces have no such check, so letting them decide a
+// gate:office task at all is exactly how a rejected/reversed approval got laundered
+// back to 'approved' through task_verdict in the adversarial repro. A literal string
+// set (matching this file's existing style for 'gate:routines' in
+// controlTaskGatesProjectAccess above) rather than an imported addon constant —
+// addons/* already depends on tasks/service.ts; the reverse import would cycle.
+const GATE_OWNERS_WITH_DEDICATED_PREDICATE = new Set<string>(['gate:office'])
+
+// Exported so READ-side surfaces (src/dashboard/approvals.ts's can_approve/
+// can_reject) can mirror this WRITE-side refusal instead of drifting from it —
+// the #1081-era lesson (a read-side predicate that doesn't match the write
+// route shows an Approve button that always 409s). Same function, same set.
+export function hasDedicatedGatePredicate(gateOwner: string | null): boolean {
+  return gateOwner !== null && GATE_OWNERS_WITH_DEDICATED_PREDICATE.has(gateOwner)
+}
+
+export class DedicatedGatePredicateRequiredError extends Error {
+  constructor(taskId: string, gateOwner: string) {
+    super(
+      `dedicated_gate_predicate_required: task ${taskId}'s gate_owner (${gateOwner}) has its own ` +
+      'human-verdict tool and cannot be decided through the generic verdict surface',
+    )
+    this.name = 'DedicatedGatePredicateRequiredError'
+  }
+}
+
 export async function writeVerdict(
   env: Env,
   input: WriteVerdictInput,
   actor?: TaskActor,
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
+  if (input.task.gate_owner && GATE_OWNERS_WITH_DEDICATED_PREDICATE.has(input.task.gate_owner)) {
+    throw new DedicatedGatePredicateRequiredError(input.task.id, input.task.gate_owner)
+  }
   await assertVerdictWritable(env, input.task)
 
   // P2-4 (FP-01 Slice 2 v2 round 2): refuse a non-human verdict AT THE

@@ -1,0 +1,81 @@
+-- 0182_office_publish_freeze_verdict_binding.sql — mupot#1592 (r2 adversarial follow-up
+-- on PR #1588, comment 5860750102, NEW-1/NEW-2/NEW-4): 0179's office_publish_freezes
+-- froze the payload at APPROVAL time, built from whatever the row said inside the
+-- approve call — "freeze at click, not freeze at sight". A requester who can still edit
+-- title/body up to the moment of approval (task_update/PATCH have no office-aware lock)
+-- can swap content after a human has already looked at the pending-approvals list, and
+-- the human's approval then binds whatever the swapped row currently says. Separately,
+-- the freeze was never bound to the SPECIFIC verdict that approved it — reverse + reject
+-- left a stale freeze row an agent could re-approve through the GENERIC task_verdict tool
+-- (which office.review_approval's own extra checks never run for) and publish the
+-- rejected content anyway.
+--
+-- Code-side fix (src/addons/office/service.ts, src/tasks/service.ts,
+-- src/im/origin-verdict.ts, src/mcp/index.ts, src/tasks/index.ts):
+--   1. the freeze is now built the moment a gate:office task ENTERS review (the
+--      "approval request" itself), not at approval — office.review_approval only
+--      VALIDATES a caller-supplied `expected_payload_sha256` against this already-
+--      frozen hash and refuses on mismatch; it never re-reads task.title/body itself.
+--   2. title/body/note/reason edits are refused outright while a gate:office task is
+--      in 'review' (src/mcp/index.ts's task_update, src/tasks/index.ts's PATCH) — the
+--      row a human is looking at cannot change under them at all, belt-and-suspenders
+--      with (1)'s hash check.
+--   3. the freeze row is bound to the verdict that approved it (`verdict_id`) in the
+--      SAME batch as the verdict write (buildVerdictStatements' own landed-PROOF
+--      anchor, reused rather than re-derived — see office/service.ts's
+--      writeOfficeVerdictAndBindFreeze), and voided (`voided_at`) in the same
+--      transaction a reject or reversal lands. office.publish_post's one-shot claim
+--      re-checks, IN ITS OWN CONDITIONAL UPDATE, that this freeze's verdict_id is
+--      still the task's current, unreversed, approved verdict AND not voided.
+--   4. the generic task_verdict surface (HTTP /:id/verdict, MCP task_verdict, the IM
+--      human_origin path) now refuses outright to decide a gate:office task at all —
+--      every office verdict must go through office.review_approval's own predicate.
+--
+-- ADD COLUMN + a new trigger only — office_publish_freezes (0179) is a brand-new leaf
+-- table this addon owns outright, no children of its own, so this never touches
+-- `tasks`/`task_verdicts`/any addon_* parent table or their CHECK constraints.
+ALTER TABLE office_publish_freezes ADD COLUMN verdict_id TEXT;
+ALTER TABLE office_publish_freezes ADD COLUMN voided_at TEXT;
+ALTER TABLE office_publish_freezes ADD COLUMN voided_reason TEXT;
+-- mupot#1602 r1 adversarial gate P3-2: a monotonic per-row generation counter,
+-- bumped by persistOfficePublishFreeze's upsert on EVERY fresh freeze (see below).
+-- Not yet applied anywhere (this PR is unmerged), so widened here in place rather
+-- than as a follow-up 0183 ALTER.
+ALTER TABLE office_publish_freezes ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;
+
+-- P3 (mupot#1592): "no DB trigger keeps a claimed row claimed" — claimed_at is the
+-- one-shot execution guard office.publish_post's atomic claim UPDATE depends on
+-- (migrations/0179); nothing in application code ever clears it back to NULL in
+-- place, but nothing stopped a direct/future writer from doing so either, which
+-- would silently re-open a one-shot slot for a WordPress write that already
+-- happened.
+--
+-- mupot#1602 r1 adversarial gate P3-2: the FIRST version of this trigger scoped
+-- itself on `frozen_at` UNCHANGED — proven bypassable by bumping `frozen_at` alone
+-- in an otherwise bare `UPDATE ... SET claimed_at = NULL, frozen_at = '...new...'`,
+-- which passed (a single-column un-claim with no frozen_at change was correctly
+-- refused, but this second shape wasn't). `frozen_at` is attacker/writer-settable
+-- in the SAME statement that clears `claimed_at`, so it is not a safe "this is a
+-- real new generation" witness on its own. `generation` is: the ONLY writer that
+-- increments it is persistOfficePublishFreeze's own upsert
+-- (`generation = office_publish_freezes.generation + 1`), so requiring
+-- `NEW.generation > OLD.generation` whenever `claimed_at` is cleared means an
+-- un-claim can only ever ride along with a REAL new freeze generation, not a
+-- bare column bump. (A caller with raw SQL access could still set `generation`
+-- itself — that is a different trust boundary entirely; a DB trigger's job here
+-- is to backstop every ordinary application write path, not a full SQL-injection
+-- adversary.) The review-entry freeze hook's own rework-loop refreeze
+-- (src/addons/office/freeze.ts's freezeOfficeTaskOnReviewEntry /
+-- persistOfficePublishFreeze, called on every entry into review — see this
+-- file's own header) is a full INSERT ... ON CONFLICT DO UPDATE that legitimately
+-- resets claimed_at to NULL AND bumps generation in the SAME statement; that
+-- keeps working. What this closes is a writer that clears claimed_at WITHOUT a
+-- real new generation — an in-place un-claim, which is the only shape that would
+-- let a claimed one-shot slot be spent twice.
+CREATE TRIGGER IF NOT EXISTS office_publish_freezes_claim_append_only
+BEFORE UPDATE OF claimed_at ON office_publish_freezes
+FOR EACH ROW
+WHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL AND NEW.generation = OLD.generation
+BEGIN
+  SELECT RAISE(ABORT, 'office_publish_freezes.claimed_at is append-only within one freeze generation');
+END;

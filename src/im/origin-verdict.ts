@@ -156,6 +156,7 @@ export type HumanOriginFailureReason =
   | 'origin_rate_limited'
   | 'origin_not_gate_authorized'
   | 'project_write_forbidden'
+  | 'gate_requires_dedicated_predicate'
 
 export type HumanOriginResolution =
   | { replayed: true }
@@ -330,6 +331,16 @@ async function dryRunAuthorize(
   task: Task,
   gateOwner: string,
 ): Promise<DryRunResult> {
+  // (0) mupot#1592 NEW-2 — 'gate:office' has its own dedicated human-verdict tool
+  // (office.review_approval, src/addons/office/service.ts) with its own extra
+  // invariant (a caller-supplied payload hash must match what was frozen at
+  // review-entry) this harness-attested-origin path has no way to check. Mirrors
+  // the identical refusal src/tasks/service.ts's writeVerdict now raises for the
+  // HTTP/MCP/plain-IM verdict surfaces — this is the ONE remaining verdict path
+  // that bypasses writeVerdict entirely (it builds its own D1 batch below), so it
+  // needs its own copy of the same one-line check, not a second predicate.
+  if (gateOwner === 'gate:office') return { ok: false, reason: 'gate_requires_dedicated_predicate' }
+
   // (1) the calling agent must be OWNED by a member — agents.owner_member_id
   // (0155), re-read fresh every call, never cached across a session. Setting
   // this column is itself now rank-ceilinged AND org-scope-floored

@@ -176,4 +176,23 @@ describe('IM verdictReply — gate:loops surface cap now enforced (mupot#1081)',
     expect(reply).toMatch(/Rejected/)
     expect(taskVerdictCount(harness.sqlite, 'task-5')).toBe(1)
   })
+
+  // mupot#1602 r1 adversarial gate P3-1: "IM verdictReply [is] not referenced by
+  // any test." writeVerdict refuses ANY gate:office task unconditionally
+  // (src/tasks/service.ts) — verdictReply must surface that as a clear reply,
+  // never an unhandled throw, and must never write a verdict.
+  it('mupot#1602 r1 P3-1: refuses a gate:office task via plain Telegram approve — office.review_approval owns this decision', async () => {
+    seedMember(harness.sqlite, 'member-office', 'chat-office')
+    seedSquadMemberCapability(harness.sqlite, 'member-office')
+    seedGrant(harness.sqlite, 'gate:office', 'member', 'member-office')
+    seedReviewTask(harness.sqlite, 'task-office', 'gate:office', null)
+
+    const env = envFor(harness)
+    const reply = await handleImMessage(env, 'chat-office', 'approve task-office')
+
+    expect(reply).toMatch(/office\.review_approval/)
+    expect(taskVerdictCount(harness.sqlite, 'task-office')).toBe(0)
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get('task-office') as { status: string }
+    expect(row.status).toBe('review')
+  })
 })
