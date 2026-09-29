@@ -33,7 +33,6 @@
 // manifest satisfies every invariant (verified in
 // tests/mcpwp-office-addon.test.ts) and installs for real.
 
-import { MUPOT_PUBLIC_API_VERSION } from '../../version'
 import type { AddonManifestV1 } from '../contract'
 import { registerAddon } from '../registry'
 import '../../departments/modules/office'
@@ -45,7 +44,15 @@ export const McpwpOfficeAddon: AddonManifestV1 = {
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'external_isolated',
-  mupotCompatibility: `^${MUPOT_PUBLIC_API_VERSION}`,
+  // Pinned as a literal, like the native addons' mupotCompatibility — NOT
+  // derived from MUPOT_PUBLIC_API_VERSION. An external_isolated addon gets
+  // no one-minor grace band (supportsAdditiveNativePreviousMinor is native-
+  // only by design: "external addons remain on strict semver compatibility"),
+  // so a derived value meant every version bump, patches included, would
+  // drift every live installation's identity and need its own backfill
+  // migration (found in mupot#1604's adversarial gate). Bump this by hand
+  // alongside the native manifests' compat strings at each release.
+  mupotCompatibility: '^0.31.0',
   kind: 'external_mcp',
   description: 'WordPress as each pot’s office — publish and review content through the mcpwp MCP endpoint under gate.',
   departments: [{ moduleKey: 'office', required: true }],
