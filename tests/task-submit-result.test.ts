@@ -151,7 +151,7 @@ function submissionRows(harness: SqliteD1Harness): Array<{ submitted_by_agent_id
 }
 
 describe('task_submit_result (mupot#1586)', () => {
-  it('happy path: assignee submits verified evidence against a genuinely independent gate and the task lands review', async () => {
+  it('happy path: assignee submits shape-checked evidence against a genuinely independent gate and the task lands review', async () => {
     const { harness, env } = freshEnv()
     seed(harness.sqlite)
 
@@ -166,7 +166,7 @@ describe('task_submit_result (mupot#1586)', () => {
     expect(row.result).toBe(VALID_RESULT)
   })
 
-  it('invariant (d): records an audit receipt — who submitted, and the verified artifact claim', async () => {
+  it('invariant (d): records an audit receipt — who submitted, and the shape-checked artifact claim', async () => {
     const { harness, env } = freshEnv()
     seed(harness.sqlite)
 
