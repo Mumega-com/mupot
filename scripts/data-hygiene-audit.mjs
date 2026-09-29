@@ -698,6 +698,17 @@ function nameFor(kind, id, data) {
   return row.display_name || row.name || row.slug || id
 }
 
+// Escape a value for use inside a markdown table cell. Backslash MUST be escaped
+// first, otherwise a value like `a\|b` would have its pipe-escape neutralised by
+// the preceding backslash and the pipe would break out of the cell. Newlines are
+// collapsed so a value cannot start a new table row.
+export function escapeMdCell(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\r?\n/g, ' ')
+}
+
 export function toMarkdown(result, data) {
   const lines = []
   lines.push(`# Data hygiene audit — as of ${result.asOf}`, '')
@@ -706,8 +717,8 @@ export function toMarkdown(result, data) {
     lines.push(`## ${kind} (${rows.length})`, '')
     lines.push('| id | name | class | reason |', '|---|---|---|---|')
     for (const r of rows) {
-      const name = nameFor(kind, r.id, data)
-      const reason = (r.reasons[0] || '').replace(/\|/g, '\\|')
+      const name = escapeMdCell(nameFor(kind, r.id, data))
+      const reason = escapeMdCell(r.reasons[0] || '')
       lines.push(`| ${r.id} | ${name} | ${r.class} | ${reason} |`)
     }
     lines.push('')
