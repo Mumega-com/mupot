@@ -20,7 +20,9 @@
 --   * append-only, enforced by triggers
 --   * the full result text is NOT duplicated here — it already lives on
 --     tasks.result; this row is WHO submitted it and WHEN, plus the exact
---     artifact claim that was verified, for an audit trail independent of
+--     artifact claim that was shape-checked (verifyTaskArtifactShape —
+--     Artifact:/SHA256: present and well-formed; NOT a verified hash match,
+--     see that module's own header), for an audit trail independent of
 --     whatever later overwrites (or reversal) touches the task row itself.
 
 CREATE TABLE IF NOT EXISTS task_result_submissions (

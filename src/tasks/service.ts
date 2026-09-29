@@ -517,69 +517,16 @@ function isUniqueViolation(error: unknown): boolean {
   return error instanceof Error && /UNIQUE constraint failed/i.test(error.message)
 }
 
-// persistTaskSubmittedResult — mupot#1586. The WRITE half of task_submit_result
-// (src/mcp/index.ts): a hand-worked task's assignee reporting completion
-// evidence into `result` while landing 'review', in one atomic statement.
-//
-// Deliberately its OWN statement builder, not a reuse of
-// buildTaskUpdateStatement — that function's SET list excludes `result` ON
-// PURPOSE (#1388's fix for a transient-value gate forgery: task_update must
-// never let a caller-supplied `result` merge into the row unverified). This
-// path is verified BEFORE it ever reaches here (verifyTaskArtifactShape, in
-// the tool), and is the one write path this repo intends to let write
-// `result` and `status` together.
-//
-// The WHERE clause repeats every precondition the tool already checked in JS
-// (status='in_progress', assignee match, no live execution_receipt_id) — not
-// redundantly, but because a JS pre-check and the write are two different
-// points in time. A concurrent racer (a verdict landing, a dispatch claiming
-// the row, a second submit) between the read and this write must not be able
-// to land a result the pre-check never actually saw. This is the same
-// "pre-state scope guard the same call mutates" lesson #1388's own review
-// found elsewhere: enforce the invariant IN the WHERE clause of the write
-// that could violate it, not only in a check that ran a moment earlier.
-//
-// callerAgentId is bound EXPLICITLY (auth.boundAgentId from the tool, passed
-// through — never re-derived from `existing`/`next`). Binding
-// `existing.assignee_agent_id` here instead would be a tautology (the row
-// compared to itself) that ALWAYS matches regardless of who is actually
-// calling — mutation-proven: with the JS assignee check disabled, a
-// non-assignee agent's call still landed `ok:true` against that version of
-// this WHERE clause, because nothing in it ever looked at who the caller was.
-function buildTaskSubmittedResultStatement(
-  env: Env,
-  existing: Task,
-  next: Task,
-  callerAgentId: string,
-): D1PreparedStatement {
-  return env.DB.prepare(
-    `UPDATE tasks
-        SET status = ?, result = ?, gate_owner = ?, updated_at = ?
-      WHERE id = ? AND updated_at = ? AND project_id IS ?
-        AND status = 'in_progress'
-        AND assignee_agent_id = ?
-        AND execution_receipt_id IS NULL`,
-  ).bind(
-    next.status,
-    next.result,
-    next.gate_owner,
-    next.updated_at,
-    next.id,
-    existing.updated_at,
-    existing.project_id,
-    callerAgentId,
-  )
-}
-
-export async function persistTaskSubmittedResult(
-  env: Env,
-  existing: Task,
-  next: Task,
-  callerAgentId: string,
-): Promise<void> {
-  const result = await buildTaskSubmittedResultStatement(env, existing, next, callerAgentId).run()
-  if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
-}
+// task_submit_result's write (mupot#1586) lives entirely in src/mcp/index.ts's
+// toolTaskSubmitResult, not here — round 1 of the adversarial gate required
+// the UPDATE's WHERE clause to embed the SAME independent-gate and
+// in-flight-dispatch SQL fragments the runtime-receipt path uses
+// (src/tasks/runtime-receipts.ts), and the UPDATE plus its append-only
+// receipt INSERT to land in one `env.DB.batch`. service.ts importing from
+// runtime-receipts.ts would be circular (runtime-receipts.ts already imports
+// isValidGateOwnerForm from here), so the statement-building stays where all
+// three pieces (the fragments, the task row helpers, the batch) are already
+// safely reachable without a new import cycle.
 
 // findLatestVerdict — the task-bound "latest verdict" read, shared by
 // reverseTaskVerdict and detectVerdictReversalRequest below. Deliberately

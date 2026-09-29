@@ -10,6 +10,19 @@
 // scripts/check-mcp-tool-seam.mjs enforces) — the same discipline as
 // tests/task-update-artifact-gate-e2e.test.ts and
 // tests/task-dispatch-runtime-receipts.test.ts.
+//
+// kasra-review round 1 (PR #1600 comment 5882361732) BLOCKed on a P0: the
+// assignee could self-close via `gate:agent-self-completion` (no independent
+// holder required) or a peer/orphan gate nobody genuinely held. The fix
+// requires the task's gate_owner to be an INDEPENDENT, live, credentialed
+// gate (hasIndependentRuntimeGate — the SAME predicate the runtime-receipt
+// path's `completed` stage requires) and drops `gate_owner` as an argument
+// to this tool entirely (P1-1) — the gate must already be set, by someone
+// other than the assignee, before a completion can be submitted. This file's
+// fixtures now build a genuine independent gate holder (GATE_AGENT_ID) the
+// same way tests/task-dispatch-runtime-receipts.test.ts does, and add
+// coverage for both P0 repros, P1-2 (in-flight dispatch), and P1-3 (atomic
+// batch — an INSERT failure must roll the UPDATE back too).
 
 import { describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
@@ -23,37 +36,67 @@ const SQUAD_ID = 'squad-1'
 const URL = 'https://pot.test'
 const MEMBER_ID = 'member-assignee'
 const OTHER_MEMBER_ID = 'member-other'
+const GATE_MEMBER_ID = 'member-gate'
 const ASSIGNEE_ID = 'agent-assignee'
 const OTHER_AGENT_ID = 'agent-other'
+const GATE_AGENT_ID = 'agent-gate'
+const GATE_TOKEN_ID = 'token-gate'
 const TASK_ID = 'task-under-test'
+const T0 = '2026-09-29T00:00:00.000Z'
 const VALID_SHA = 'a'.repeat(64)
 const VALID_RESULT = `Built + tested.\nArtifact: /tmp/marker.txt\nSHA256: ${VALID_SHA}`
+const INDEPENDENT_GATE = 'gate:reviewer'
 
 interface SeedOpts {
   status?: string
   gateOwner?: string | null
   assigneeAgentId?: string | null
   executionReceiptId?: string | null
+  /** Seed a live, credentialed GATE_AGENT_ID holding INDEPENDENT_GATE (default true —
+   *  most tests need a genuinely independent gate to reach the code under test at all). */
+  independentGateHolder?: boolean
+  /** Insert an in-flight (dispatched, unconsumed) task_dispatch_receipts row for P1-2. */
+  inFlightDispatch?: boolean
 }
 
 function seed(sqlite: SqliteD1Harness['sqlite'], opts: SeedOpts = {}): void {
   const status = opts.status ?? 'in_progress'
-  const gateOwner = opts.gateOwner === undefined ? 'gate:reviewer' : opts.gateOwner
+  const gateOwner = opts.gateOwner === undefined ? INDEPENDENT_GATE : opts.gateOwner
   const assignee = opts.assigneeAgentId === undefined ? ASSIGNEE_ID : opts.assigneeAgentId
   const executionReceiptId = opts.executionReceiptId ?? null
+  const independentGateHolder = opts.independentGateHolder ?? true
 
   sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'test-dept', 'Test Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('${SQUAD_ID}', '${DEPT_ID}', 'squad-one', 'Squad One');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${ASSIGNEE_ID}', '${SQUAD_ID}', 'assignee', 'Assignee', 'active');
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${OTHER_AGENT_ID}', '${SQUAD_ID}', 'other', 'Other', 'active');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${GATE_AGENT_ID}', '${SQUAD_ID}', 'gate-holder', 'Gate Holder', 'active');
     INSERT INTO members (id, display_name, status, tenant) VALUES ('${MEMBER_ID}', 'Assignee Member', 'active', '${TENANT}');
     INSERT INTO members (id, display_name, status, tenant) VALUES ('${OTHER_MEMBER_ID}', 'Other Member', 'active', '${TENANT}');
+    INSERT INTO members (id, display_name, status, tenant) VALUES ('${GATE_MEMBER_ID}', 'Gate Member', 'active', '${TENANT}');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-assignee', '${MEMBER_ID}', 'squad', '${SQUAD_ID}', 'admin');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('cap-other', '${OTHER_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'admin');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-gate', '${GATE_MEMBER_ID}', 'squad', '${SQUAD_ID}', 'member');
   `)
+  if (independentGateHolder) {
+    sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '${T0}');
+      INSERT INTO member_tokens (
+        id, member_id, token_hash, label, channel, created_at, revoked_at,
+        agent_id, tenant, expires_at
+      ) VALUES (
+        '${GATE_TOKEN_ID}', '${GATE_MEMBER_ID}', 'hash-gate-1', 'gate', 'workspace', '${T0}', NULL,
+        '${GATE_AGENT_ID}', '${TENANT}', '2099-01-01T00:00:00.000Z'
+      );
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gate-grant-1', '${INDEPENDENT_GATE}', 'agent', '${GATE_AGENT_ID}', '${MEMBER_ID}', '${T0}');
+    `)
+  }
   const gateOwnerLiteral = gateOwner === null ? 'NULL' : `'${gateOwner}'`
   const assigneeLiteral = assignee === null ? 'NULL' : `'${assignee}'`
   const executionReceiptLiteral = executionReceiptId === null ? 'NULL' : `'${executionReceiptId}'`
@@ -61,6 +104,15 @@ function seed(sqlite: SqliteD1Harness['sqlite'], opts: SeedOpts = {}): void {
     INSERT INTO tasks (id, squad_id, title, body, status, done_when, gate_owner, result, assignee_agent_id, execution_receipt_id)
     VALUES ('${TASK_ID}', '${SQUAD_ID}', 'Task under test', 'body', '${status}', 'a real predicate', ${gateOwnerLiteral}, NULL, ${assigneeLiteral}, ${executionReceiptLiteral});
   `)
+  if (opts.inFlightDispatch) {
+    sqlite.exec(`
+      INSERT INTO task_dispatch_receipts (
+        id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, claimed_at, consumed_at, attempts
+      ) VALUES (
+        'dispatch-1', '${TENANT}', '${TASK_ID}', '${SQUAD_ID}', '${ASSIGNEE_ID}', 'member', '${MEMBER_ID}', '${T0}', NULL, NULL, 1
+      );
+    `)
+  }
 }
 
 function auth(opts: { agentId: string; memberId: string }): AuthContext {
@@ -99,7 +151,7 @@ function submissionRows(harness: SqliteD1Harness): Array<{ submitted_by_agent_id
 }
 
 describe('task_submit_result (mupot#1586)', () => {
-  it('happy path: assignee submits verified evidence and the task lands review', async () => {
+  it('happy path: assignee submits verified evidence against a genuinely independent gate and the task lands review', async () => {
     const { harness, env } = freshEnv()
     seed(harness.sqlite)
 
@@ -112,22 +164,6 @@ describe('task_submit_result (mupot#1586)', () => {
     const row = taskRow(harness)
     expect(row.status).toBe('review')
     expect(row.result).toBe(VALID_RESULT)
-  })
-
-  it('happy path: gate_owner supplied on the call when the task had none yet', async () => {
-    const { harness, env } = freshEnv()
-    seed(harness.sqlite, { gateOwner: null })
-
-    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
-      task_id: TASK_ID,
-      result: VALID_RESULT,
-      gate_owner: 'gate:reviewer',
-    }, URL)
-
-    expect(res.ok, JSON.stringify(res)).toBe(true)
-    const row = taskRow(harness)
-    expect(row.status).toBe('review')
-    expect(row.gate_owner).toBe('gate:reviewer')
   })
 
   it('invariant (d): records an audit receipt — who submitted, and the verified artifact claim', async () => {
@@ -178,7 +214,7 @@ describe('task_submit_result (mupot#1586)', () => {
     expect(res).toMatchObject({ ok: false, status: 403, error: 'not_task_assignee' })
   })
 
-  it('invariant (e): a dispatched task (live execution_receipt_id) is refused — use task_dispatch_runtime_receipt instead', async () => {
+  it('invariant (e): a dispatched-and-consumed task (live execution_receipt_id) is refused — use task_dispatch_runtime_receipt instead', async () => {
     const { harness, env } = freshEnv()
     seed(harness.sqlite, { executionReceiptId: 'dispatch-receipt-1' })
 
@@ -188,6 +224,20 @@ describe('task_submit_result (mupot#1586)', () => {
     }, URL)
 
     expect(res).toMatchObject({ ok: false, status: 409, error: 'task_dispatched' })
+    const row = taskRow(harness)
+    expect(row.status).toBe('in_progress')
+  })
+
+  it('invariant (e) / P1-2: an in-flight (dispatched, unconsumed) task is refused — closes the race around the runtime-receipt envelope/lease fence', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite, { inFlightDispatch: true })
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
+    }, URL)
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_dispatch_in_flight' })
     const row = taskRow(harness)
     expect(row.status).toBe('in_progress')
   })
@@ -243,31 +293,113 @@ describe('task_submit_result (mupot#1586)', () => {
     expect(row.status).toBe('review')
   })
 
-  it('gate_required_for_review: refuses when no gate_owner exists and none is supplied', async () => {
+  // ── P0 (kasra-review round 1, PR comment 5882361732): the assignee closes its own task ──
+
+  it('P0 repro 1 BLOCKED: gate_owner argument no longer exists on the schema at all (unknown field)', async () => {
     const { harness, env } = freshEnv()
-    seed(harness.sqlite, { gateOwner: null })
+    seed(harness.sqlite, { gateOwner: null, independentGateHolder: false })
 
     const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
       task_id: TASK_ID,
       result: VALID_RESULT,
+      gate_owner: 'gate:agent-self-completion',
     }, URL)
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'gate_required_for_review' })
+    expect(res.status).toBe(400)
+    expect(res.error).toBe('invalid_args')
+    const row = taskRow(harness)
+    expect(row.status).toBe('in_progress')
   })
 
-  it('gate_owner_immutable: cannot overwrite an existing gate_owner through this tool', async () => {
+  it('P0 repro 2 BLOCKED: assignee sets gate_owner:\'gate:agent-self-completion\' via task_update, then task_submit_result refuses (no independent holder)', async () => {
     const { harness, env } = freshEnv()
-    seed(harness.sqlite, { gateOwner: 'gate:reviewer' })
+    seed(harness.sqlite, { gateOwner: null, independentGateHolder: false })
+
+    const setGate = await invokeTool(assigneeAuth(), env, 'task_update', {
+      task_id: TASK_ID,
+      gate_owner: 'gate:agent-self-completion',
+    }, URL)
+    expect(setGate.ok, JSON.stringify(setGate)).toBe(true)
 
     const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
       task_id: TASK_ID,
       result: VALID_RESULT,
-      gate_owner: 'gate:someone-else',
+    }, URL)
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'independent_gate_required' })
+    const row = taskRow(harness)
+    expect(row.status).toBe('in_progress')
+
+    // Full exploit chain proven broken at step 1: task_verdict never even gets a
+    // task in 'review' to decide.
+    const verdict = await invokeTool(assigneeAuth(), env, 'task_verdict', { task_id: TASK_ID, verdict: 'approved' }, URL)
+    expect(verdict.ok).toBe(false)
+  })
+
+  it('P0 repro 3 BLOCKED: an orphan gate_owner (valid shape, nobody holds it) is refused the same way', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite, { gateOwner: 'gate:nobody-holds-this', independentGateHolder: false })
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
+    }, URL)
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'independent_gate_required' })
+  })
+
+  it('P0: a peer agent holding a colluding gate does NOT trip the self-completion refusal (a colluding-peer gate is a P1-1 concern, filed separately, and remains outside this tool\'s own argument surface — it can only be set by task_update/an admin)', async () => {
+    const { harness, env } = freshEnv()
+    // The independent holder IS a genuinely different, live-credentialed agent —
+    // this is the legitimate shape the fix requires, not a bypass.
+    seed(harness.sqlite)
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
+    }, URL)
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+  })
+
+  it('independent_gate_required: refuses when no gate_owner exists at all', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite, { gateOwner: null, independentGateHolder: false })
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
     }, URL)
 
-    expect(res).toMatchObject({ ok: false, status: 409, error: 'gate_owner_immutable' })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'independent_gate_required' })
+  })
+
+  it('independent_gate_required: refuses when the gate exists but its holder\'s credential has been revoked', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite)
+    harness.sqlite.exec(`UPDATE member_tokens SET revoked_at = '${T0}' WHERE id = '${GATE_TOKEN_ID}'`)
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
+    }, URL)
+
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'independent_gate_required' })
+  })
+
+  // ── P1-3: the UPDATE and the receipt INSERT are one atomic batch ──
+
+  it('P1-3: an INSERT failure (migration not applied) rolls the UPDATE back too — the task never lands review without its receipt', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite)
+    harness.sqlite.exec('DROP TABLE task_result_submissions')
+
+    const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
+      task_id: TASK_ID,
+      result: VALID_RESULT,
+    }, URL)
+
+    expect(res.ok).toBe(false)
     const row = taskRow(harness)
-    expect(row.gate_owner).toBe('gate:reviewer')
+    expect(row.status).toBe('in_progress')
+    expect(row.result).toBeNull()
   })
 
   it('artifact gate: refuses refusal prose the same way every other review-entry path does', async () => {
@@ -323,7 +455,7 @@ describe('task_submit_result (mupot#1586)', () => {
     // before ever reaching the guard this test targets. Valid evidence is
     // seeded directly on the row so the artifact gate does not refuse first
     // either — assigneeSelfClose is the ONLY guard under test.
-    seed(harness.sqlite, { gateOwner: null })
+    seed(harness.sqlite, { gateOwner: null, independentGateHolder: false })
     harness.sqlite.exec(`UPDATE tasks SET result = '${VALID_RESULT.replace(/'/g, "''")}' WHERE id = '${TASK_ID}'`)
 
     const res = await invokeTool(assigneeAuth(), env, 'task_update', { task_id: TASK_ID, status: 'done' }, URL)
