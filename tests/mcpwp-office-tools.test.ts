@@ -32,7 +32,7 @@ import { activateAddon, installAddon } from '../src/addons/service'
 import { createTask } from '../src/tasks/service'
 import * as bindingsModule from '../src/addons/bindings'
 import { publishOfficePost } from '../src/addons/office/service'
-import { resolveActiveOfficeInstallationId } from '../src/addons/office/freeze'
+import { resolveActiveOfficeInstallationId, buildOfficePublishFreeze } from '../src/addons/office/freeze'
 import type { Task } from '../src/types'
 
 const TENANT = 'tenant-office-tools'
@@ -48,6 +48,27 @@ function makeHarness(): SqliteD1Harness {
 
 function env(harness: SqliteD1Harness): Env {
   return { DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: MASTER_KEY } as Env
+}
+
+/** mupot#1602 r1 P1: a deterministic interleave — wraps `db.prepare` so that the
+ *  FIRST call whose SQL contains `match` runs `interleave()` (synchronously,
+ *  before the real statement executes), simulating another request's write
+ *  landing in the exact window between reviewOfficeApproval's hash SELECT and
+ *  its verdict batch. Fires once; every other call passes through untouched. */
+function envWithInterleave(harness: SqliteD1Harness, match: string, interleave: () => void): Env {
+  let fired = false
+  const realDb = harness.db
+  const wrappedDb = {
+    ...realDb,
+    prepare(sql: string) {
+      if (!fired && sql.includes(match)) {
+        fired = true
+        interleave()
+      }
+      return realDb.prepare(sql)
+    },
+  }
+  return { DB: wrappedDb, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: MASTER_KEY } as unknown as Env
 }
 
 function auth(memberId: string, capabilities: CapabilityGrant[], role: AuthContext['role'] = 'member'): AuthContext {
@@ -1148,6 +1169,108 @@ describe('office.review_approval', () => {
 // exercise the FULL request->review->approve->reverse->rework lifecycle rather
 // than a single tool call, unlike the suites above.
 describe('mupot#1592 freeze/verdict binding', () => {
+  // mupot#1602 r1 adversarial gate P1 (check-then-write race, deterministic):
+  // reviewOfficeApproval's hash compare is a plain SELECT — this proves the
+  // write ITSELF (not just that earlier read) still refuses when the freeze
+  // changes underneath it. Uses envWithInterleave to land the interleaving
+  // mutation at the EXACT point the adversarial repro needs: after the hash
+  // SELECT has already matched (so the early check alone cannot catch this —
+  // if it fired before that SELECT, `payload_mismatch` would trip immediately
+  // and this test would not be exercising the batch-level extraGuard at all),
+  // but before writeOfficeVerdictAndBindFreeze's verdict batch executes.
+  it('P1 deterministic race: a freeze that changes between the hash check and the verdict batch cannot be bound', async () => {
+    const harness = makeHarness()
+    const realEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-p1-race')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(realEnv, squadId)
+    const owner = orgOwnerAuth()
+
+    // Human A's view: read BEFORE anything races.
+    const hashSeenByA = await officeFreezeHash(realEnv, taskId)
+    expect(hashSeenByA).not.toBeNull()
+
+    // Precompute what a rework to 'EVIL BODY' would freeze — buildOfficePublishFreeze
+    // is async (sha256Hex uses crypto.subtle) and cannot run inside the synchronous
+    // interleave callback below, so it is computed up front and inserted via raw SQL
+    // at interleave time, matching exactly what freezeOfficeTaskOnReviewEntry would
+    // have produced for that content.
+    const liveTask = await realEnv.DB.prepare(`SELECT * FROM tasks WHERE id = ?1`).bind(taskId).first<Task>()
+    const evilTask: Task = { ...(liveTask as Task), body: 'EVIL BODY' }
+    const evilFreezeResult = await buildOfficePublishFreeze(realEnv, evilTask)
+    if (!evilFreezeResult.ok) throw new Error(`fixture error: could not build evil freeze: ${JSON.stringify(evilFreezeResult)}`)
+    const evilFreeze = evilFreezeResult.value
+    expect(evilFreeze.payloadSha256).not.toBe(hashSeenByA)
+
+    // Interleaves right before the verdict batch's own `UPDATE tasks ... WHERE
+    // status = 'review'` statement is BUILT (buildVerdictStatements, src/tasks/
+    // service.ts) — synchronous SQLite, so it completes before env.DB.batch()
+    // executes the batch moments later: B rejects the freeze A already read,
+    // the agent reworks the body and re-enters review, minting a FRESH freeze
+    // bound to DIFFERENT bytes — all in the window A's approval call is still
+    // inside, after A's own hash check already matched the OLD freeze.
+    const raceEnv = envWithInterleave(
+      harness,
+      "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'",
+      () => {
+        harness.sqlite.prepare(`UPDATE tasks SET status = 'rejected', updated_at = datetime('now') WHERE id = ?`).run(taskId)
+        harness.sqlite.prepare(
+          `UPDATE office_publish_freezes SET voided_at = datetime('now'), voided_reason = 'rejected' WHERE task_id = ? AND voided_at IS NULL`,
+        ).run(taskId)
+        harness.sqlite.prepare(
+          `UPDATE tasks SET status = 'in_progress', body = 'EVIL BODY', updated_at = datetime('now') WHERE id = ?`,
+        ).run(taskId)
+        harness.sqlite.prepare(`UPDATE tasks SET status = 'review', updated_at = datetime('now') WHERE id = ?`).run(taskId)
+        harness.sqlite.prepare(`
+          INSERT INTO office_publish_freezes (
+            task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, frozen_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(task_id) DO UPDATE SET
+            payload_json = excluded.payload_json, payload_sha256 = excluded.payload_sha256,
+            installation_id = excluded.installation_id, connector_id = excluded.connector_id,
+            site_origin = excluded.site_origin, frozen_by = excluded.frozen_by, frozen_at = excluded.frozen_at,
+            verdict_id = NULL, voided_at = NULL, voided_reason = NULL, claimed_by = NULL, claimed_at = NULL,
+            outcome = NULL, outcome_detail = NULL, completed_at = NULL,
+            generation = office_publish_freezes.generation + 1
+        `).run(
+          taskId, evilFreeze.payloadJson, evilFreeze.payloadSha256,
+          evilFreeze.installationId, evilFreeze.connectorId, evilFreeze.siteOrigin,
+          'agent-rework', new Date().toISOString(),
+        )
+      },
+    )
+
+    const result = await invokeTool(
+      owner, raceEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: hashSeenByA },
+      ORIGIN,
+    )
+
+    // The write itself refused — a race loss, not a clean approval of stale bytes.
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('verdict_race')
+
+    // The task is 'review' (B's rework), NOT 'approved' under A's stale hash.
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(row.status).toBe('review')
+    // A's verdict never landed at all.
+    const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }
+    expect(verdictCount.n).toBe(0)
+    // The fresh (evil) freeze is still unbound — A's stale approval never touched it.
+    const freeze = harness.sqlite.prepare(`SELECT verdict_id, payload_sha256 FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { verdict_id: string | null; payload_sha256: string }
+    expect(freeze.verdict_id).toBeNull()
+    expect(freeze.payload_sha256).toBe(evilFreeze.payloadSha256)
+
+    // publish never fetches — nothing was ever bound to authorize it.
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const publishAttempt = await invokeTool(owner, realEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(publishAttempt.ok).toBe(false)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    harness.close()
+  })
+
   it('refuses a payload hash mismatch outright — no fetch, no verdict written, no task state change', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
