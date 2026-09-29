@@ -137,7 +137,7 @@ function seedUnrelatedDepartment(harness: SqliteD1Harness): string {
  * activateAddon would have left them for mcpwp-office — see the file header for why
  * this bypasses those functions directly instead of calling them.
  */
-function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: string): string {
+function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: string, digest: string = SHA): string {
   const installationId = 'inst-office-tools-1'
   const installReceipt = 'recpt-office-install-1'
   const configureReceipt = 'recpt-office-configure-1'
@@ -154,7 +154,7 @@ function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: str
       ) VALUES (?, ?, 'mcpwp-office', '1.0.0', 'mumega', 'native_reviewed',
         ?, '^0.31.0', 'installed', NULL, ?, ?, ?, '2026-01-01T00:00:00.000Z',
         '2026-01-01T00:00:00.000Z', 'external_isolated')
-    `).run(installationId, TENANT, SHA, actorId, actorId, installReceipt)
+    `).run(installationId, TENANT, digest, actorId, actorId, installReceipt)
     harness.sqlite.prepare(`
       INSERT INTO addon_receipts (
         id, tenant, installation_id, action, previous_state, next_state,
@@ -164,7 +164,7 @@ function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: str
       ) VALUES (?, ?, ?, 'install', NULL, 'installed', 'mcpwp-office', '1.0.0', 'mumega',
         'native_reviewed', '^0.31.0', ?, ?, 'pass', '[]', '{}', '2026-01-01T00:00:00.000Z',
         'external_isolated')
-    `).run(installReceipt, TENANT, installationId, SHA, actorId)
+    `).run(installReceipt, TENANT, installationId, digest, actorId)
 
     harness.sqlite.prepare(`
       UPDATE addon_installations
@@ -181,7 +181,7 @@ function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: str
       ) VALUES (?, ?, ?, 'configure', 'installed', 'configured', 'mcpwp-office', '1.0.0',
         'mumega', 'native_reviewed', '^0.31.0', ?, ?, 'pass', '[]', '{}',
         '2026-01-01T00:01:00.000Z', 'external_isolated')
-    `).run(configureReceipt, TENANT, installationId, SHA, actorId)
+    `).run(configureReceipt, TENANT, installationId, digest, actorId)
 
     // addon_binding_generations_fence_installation (migrations/0052) requires the
     // installation's CURRENT state/latest_receipt_id to match expected_installation_
@@ -196,14 +196,14 @@ function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: str
         configured_by, configured_at, revoked_at, previous_generation_id,
         expected_installation_state, base_receipt_id
       ) VALUES (?, ?, ?, ?, 1, ?, ?, '2026-01-01T00:01:00.000Z', NULL, NULL, 'configured', ?)
-    `).run(generationId, TENANT, installationId, 'e'.repeat(64), SHA, actorId, configureReceipt)
+    `).run(generationId, TENANT, installationId, 'e'.repeat(64), digest, actorId, configureReceipt)
     harness.sqlite.prepare(`
       INSERT INTO addon_connector_bindings (
         id, tenant, installation_id, generation_id, slot, adapter, binding_kind,
         capability, connector_id, manifest_sha256, configured_by, configured_at, revoked_at
       ) VALUES ('binding-office-1', ?, ?, ?, 'wordpress_site', 'mcpwp', 'vault_connector',
         'read', ?, ?, ?, '2026-01-01T00:01:00.000Z', NULL)
-    `).run(TENANT, installationId, generationId, connectorId, SHA, actorId)
+    `).run(TENANT, installationId, generationId, connectorId, digest, actorId)
 
     harness.sqlite.prepare(`
       UPDATE addon_installations
@@ -220,7 +220,7 @@ function seedActiveOfficeInstallation(harness: SqliteD1Harness, connectorId: str
       ) VALUES (?, ?, ?, 'activate', 'configured', 'active', 'mcpwp-office', '1.0.0',
         'mumega', 'native_reviewed', '^0.31.0', ?, ?, 'pass', '[]', '{}',
         '2026-01-01T00:02:00.000Z', 'external_isolated')
-    `).run(activateReceipt, TENANT, installationId, SHA, actorId)
+    `).run(activateReceipt, TENANT, installationId, digest, actorId)
 
     harness.sqlite.exec('COMMIT')
   } catch (error) {
@@ -557,6 +557,35 @@ describe('T2b: the real write-capable binding lifecycle', () => {
   // UPDATE cannot forge one, only a fresh INSERT, which preflightAddonBindings
   // itself will never produce for this slot since capability is derived
   // entirely from the manifest, never caller input).
+
+  // r2 P3-2 (kasra-review adversarial gate on #1614): "nothing below the app
+  // enforces ... the publish path does not re-assert ... the installation
+  // digest". addon_installations_identity_is_immutable (migrations/0178) makes
+  // manifest_sha256 UPDATE-immutable on a live row, so the only way to
+  // construct a stale/tampered identity is a fresh INSERT with a digest that
+  // never matches the currently registered manifest at all — seedActiveOfficeInstallation's
+  // `digest` parameter does exactly that.
+  it('refuses to publish when the installation row\'s manifest_sha256 does not match the currently registered manifest (a stale/tampered identity), with zero fetches', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r2-p3-2')
+    const staleDigest = 'f'.repeat(64) // deliberately NOT what manifestSha256(McpwpOfficeAddon) computes
+    seedActiveOfficeInstallation(harness, connectorId, staleDigest)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const result = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('addon_inactive')
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(row.status).toBe('approved')
+    harness.close()
+  })
 })
 
 describe('office.publish_post', () => {

@@ -3,6 +3,11 @@
 -- double-post guard (blocks T2b)"), flagged in the final #1602 adversarial
 -- round as a precondition for T2b write bindings going live.
 --
+-- DEPLOY ORDER: MIGRATE FIRST, THEN DEPLOY — see migrations/0184's header.
+-- src/addons/office/service.ts's publish claim writes idempotency_key
+-- unconditionally; new code against a pre-migration schema fails the claim
+-- UPDATE outright (no such column).
+--
 -- office.reconcile_stalled_publish previously let an org admin mark a stalled
 -- (claimed-but-no-outcome) publish 'failed' purely on their own say-so, with no
 -- automated check of whether WordPress actually received the post. Once writes

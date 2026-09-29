@@ -1,4 +1,22 @@
 -- 0184_addon_connector_bindings_write_capability.sql — T2b (mupot#1580):
+--
+-- ============================================================================
+-- DEPLOY ORDER: MIGRATE FIRST, THEN DEPLOY CODE (opposite of migrations/0181's
+-- code-first precedent — see kasra-review's adversarial gate on mupot#1614)
+-- ============================================================================
+-- src/addons/bindings.ts's listAddonBindings unconditionally selects
+-- addon_connector_bindings.capability_v2 for EVERY addon's configure/activate
+-- read, not only write-capable ones. Four-quadrant check (old/new code x
+-- before/after this migration, on a real wrangler D1 built via the real
+-- lifecycle): NEW CODE on the PRE-migration schema throws `no such column:
+-- binding.capability_v2` — hits office, preflightAddonBindings generally, and
+-- the marketing dashboard page; disabling then reactivating workflow-circuits
+-- returns write_failed and leaves it disabled. OLD CODE on the POST-migration
+-- schema is unaffected (it reads the untouched legacy `capability` column).
+-- `wrangler d1 migrations apply --remote`, THEN deploy the new Worker code —
+-- never the other order. migrations/0185 carries the identical requirement
+-- for the SAME reason (office_publish_freezes.idempotency_key).
+--
 -- addon_connector_bindings.capability is CHECK'd to the single literal 'read'
 -- (migrations/0052_addon_bindings.sql) — there is no way, even with raw SQL, to
 -- construct a 'write' binding, and src/addons/bindings.ts's preflightAddonBindings
