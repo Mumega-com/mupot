@@ -56,10 +56,10 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'publish_claimed':
     case 'invalid_site_config':
     case 'invalid_site_url':
-    case 'unreachable':
     case 'key_invalid':
     case 'redirect_blocked':
-    case 'bad_response':
+    case 'validation_rejected':
+    case 'publish_outcome_unknown':
     case 'write_failed':
     case 'verdict_race':
       return 409
@@ -174,7 +174,14 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
   name: 'office.reconcile_stalled_publish',
   scope: 'org owner/admin — manual recovery for a claimed-but-unconfirmed publish',
   min: 'member',
-  args: '{ task_id: string, outcome: "done"|"failed", detail?: string, post_id?: number, article_url?: string }',
+  args: '{ task_id: string, outcome: "done"|"failed", detail?: string, post_id?: number, article_url?: string,' +
+    ' override_reason?: string }' +
+    ' -- this tool queries the live WordPress site by the claim\'s idempotency key BEFORE' +
+    ' accepting any outcome (mupot#1610); a "found" result always wins over whatever is' +
+    ' requested here. override_reason is ONLY consulted when that live check cannot run at' +
+    ' all (a revoked/misconfigured connector, or the site itself unreachable) — a non-empty' +
+    ' reason then accepts the requested outcome at the caller\'s own explicit, audited risk;' +
+    ' it can never override a "found" result.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -183,6 +190,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
       detail: STRING_SCHEMA,
       post_id: { type: 'number' },
       article_url: STRING_SCHEMA,
+      override_reason: STRING_SCHEMA,
     },
     required: ['task_id', 'outcome'],
     additionalProperties: false,
@@ -197,6 +205,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
     const detail = str(args.detail)
     const postId = typeof args.post_id === 'number' ? args.post_id : null
     const articleUrl = str(args.article_url)
+    const overrideReason = str(args.override_reason)
 
     const taskRes = await getTask(env, taskRef)
     if (!taskRes.ok) return taskRes
@@ -206,6 +215,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
       detail,
       postId,
       articleUrl,
+      overrideReason,
     })
     if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
     return done({ task: result.value.task })

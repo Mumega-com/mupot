@@ -33,9 +33,10 @@
 // writeOfficeVerdictAndBindFreeze in service.ts and officeTaskContentLocked below.
 
 import type { Env, Task, Capability } from '../../types'
-import { listAddonInstallations } from '../service'
+import { listAddonInstallations, externalIsolationViolation } from '../service'
 import { listAddonBindings, type AddonBinding } from '../bindings'
 import { getRegisteredAddon } from '../registry'
+import { manifestSha256 } from '../contract'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import { parseSiteConnectorConfig } from './health'
@@ -70,10 +71,19 @@ export type OfficeRefusalReason =
   | 'publish_claimed'
   | 'invalid_site_config'
   | 'invalid_site_url'
-  | 'unreachable'
   | 'key_invalid'
   | 'redirect_blocked'
-  | 'bad_response'
+  | 'validation_rejected'
+  // r2 P1-1 (kasra-review adversarial gate on #1614): an AMBIGUOUS publish
+  // outcome (abort/timeout/network error after the request was sent, any 5xx,
+  // or a 2xx whose body does not parse as a real post) is never a definitive
+  // 'failed' — see wordpressPublish's WordpressPublishResult. The freeze row's
+  // own `outcome` column is left NULL in this case (never written at all), so
+  // unreconciledPriorFreezeExists / office.reconcile_stalled_publish's own
+  // WordPress check gate any future action on the task; this is the reason
+  // returned to the immediate caller, distinct from every DEFINITE failure
+  // reason above.
+  | 'publish_outcome_unknown'
   | 'write_failed'
   | 'verdict_race'
 
@@ -97,6 +107,39 @@ export async function resolveActiveOfficeInstallationId(env: Env): Promise<strin
     (row) => row.addonKey === OFFICE_ADDON_KEY && row.state === 'active' && row.trustClass === 'external_isolated',
   )
   return installation?.id ?? null
+}
+
+// r2 P3-2 (kasra-review adversarial gate on #1614): "nothing below the app
+// enforces who may hold capability_v2='write' ... the publish path does not
+// re-assert installationMayHoldWriteCapabilityBinding or the installation
+// digest — resolveActiveOfficeInstallationId checks only state and trust
+// class." Used ONLY by office.publish_post (the actual WordPress WRITE) —
+// stricter than resolveActiveOfficeInstallationId above (which
+// buildOfficePublishFreeze/the approval path still use: a human's content
+// decision is deliberately independent of infra/manifest readiness, see this
+// file's other comments). Re-derives, at the write itself, the SAME two
+// invariants src/addons/bindings.ts's installationMayHoldWriteCapabilityBinding
+// requires before a write binding may even be configured: the installation's
+// OWN manifest_sha256 still matches what manifestSha256() computes for the
+// CURRENTLY REGISTERED manifest (a stale/tampered installation row cannot
+// coast on an identity check that ran once at configure time), and
+// externalIsolationViolation still finds nothing. Neither call is free, but
+// this runs once per publish attempt, never in a hot loop.
+export async function resolveEligibleActiveOfficeInstallationId(env: Env): Promise<OfficeResult<string>> {
+  const installationId = await resolveActiveOfficeInstallationId(env)
+  if (!installationId) return { ok: false, reason: 'addon_inactive' }
+  const entry = getRegisteredAddon(OFFICE_ADDON_KEY)
+  if (!entry) return { ok: false, reason: 'addon_inactive' }
+  const installations = await listAddonInstallations(env)
+  const installation = installations.find((row) => row.id === installationId)
+  if (!installation) return { ok: false, reason: 'addon_inactive' }
+  if (installation.manifestSha256 !== await manifestSha256(entry.manifest)) {
+    return { ok: false, reason: 'addon_inactive' }
+  }
+  if (externalIsolationViolation(entry.manifest) !== null) {
+    return { ok: false, reason: 'addon_inactive' }
+  }
+  return { ok: true, value: installationId }
 }
 
 export interface OfficeConnectorBinding {
@@ -231,6 +274,20 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
 // completed_at AND verdict_id/voided_at/voided_reason to NULL on every fresh
 // freeze — a NEW review-entry always mints a NEW, unclaimed, unbound, unvoided
 // one-shot slot; it never revives a previously claimed/executed/failed/voided one.
+//
+// r2 P2-1 (kasra-review adversarial gate on #1614): idempotency_key MUST also
+// reset to NULL here. The ON CONFLICT clause previously omitted it entirely,
+// so `COALESCE(idempotency_key, ?)` at claim time (src/addons/office/
+// service.ts's publishOfficePost) kept GENERATION 1's key forever across every
+// refreeze — the comment at the claim site claimed otherwise. Reproduced: an
+// ambiguous publish leaves the row unclaimed-again after a rework loop, the
+// SECOND claim reuses the FIRST generation's slug, WordPress stores it
+// uniquified (`…-2`), and if generation 2 later stalls, reconcile's WordPress
+// lookup finds GENERATION 1's post and force-writes 'done' with generation
+// 1's URL — a false execution receipt for content that was never actually
+// generation 2's. Resetting to NULL here means the next claim always mints a
+// brand-new, generation-unique key (mirrors every other one-shot field this
+// upsert already resets).
 export async function persistOfficePublishFreeze(
   env: Env,
   taskId: string,
@@ -254,6 +311,7 @@ export async function persistOfficePublishFreeze(
       voided_reason = NULL,
       claimed_by = NULL,
       claimed_at = NULL,
+      idempotency_key = NULL,
       outcome = NULL,
       outcome_detail = NULL,
       completed_at = NULL,

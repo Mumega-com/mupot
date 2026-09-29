@@ -75,7 +75,7 @@ import {
 import { claimTimestamp } from '../../lib/claim-timestamp'
 import {
   OFFICE_GATE_OWNER,
-  resolveActiveOfficeInstallationId,
+  resolveEligibleActiveOfficeInstallationId,
   resolveOfficeConnectorBinding,
   resolveOfficeSiteOrigin,
   officeConnectorSatisfiesRequirement,
@@ -524,11 +524,34 @@ function isRedirect(response: Response): boolean {
 // marketing mcpwp adapter already conform to (safeImmediateResult's secret-scrubbing
 // walk depends on this shape). The publish outcome rides in `observations[0]` on
 // success; there is no secret in it (postId/articleUrl are WordPress-assigned, public).
+//
+// r2 P1-1 (kasra-review adversarial gate on #1614): `reason` here is an INTERNAL
+// classification, never surfaced directly — it also carries the three AMBIGUOUS
+// markers (AMBIGUOUS_PUBLISH_REASONS below), which wordpressPublish translates
+// into `{ kind: 'ambiguous' }` before returning. It must never be confused with
+// OfficeRefusalReason (the PUBLIC reason a definite failure returns) — the two
+// used to be the same type, which is exactly how an ambiguous outcome was able
+// to masquerade as a definite 'failed' before this fix.
 interface WpPublishConnectorResult {
   readonly status: 'available' | 'unavailable' | 'failed'
   readonly observations: readonly [OfficePublishPostOutcome] | readonly []
-  readonly reason?: OfficeRefusalReason
+  readonly reason?: string
 }
+
+// r2 P1-1: the only three ways a POST can land in a state where WordPress MAY
+// have already created the post but this call cannot confirm it — as opposed to
+// a DEFINITE non-delivery (bad config, an SSRF refusal before ever sending, a
+// redirect, 401/403, or a 4xx WordPress used to definitively reject the
+// request). Every one of these must leave office_publish_freezes.outcome NULL
+// (never write 'failed') so the one-shot claim stays "unreconciled" and
+// office.reconcile_stalled_publish's live WordPress check is REQUIRED before
+// any re-approval can ever POST again.
+const AMBIGUOUS_PUBLISH_REASONS = new Set(['network_error', 'server_error', 'unparseable_response'])
+
+export type WordpressPublishResult =
+  | { readonly kind: 'delivered'; readonly value: OfficePublishPostOutcome }
+  | { readonly kind: 'definite_failure'; readonly reason: OfficeRefusalReason }
+  | { readonly kind: 'ambiguous' }
 
 async function wordpressPublish(
   env: Env,
@@ -536,9 +559,10 @@ async function wordpressPublish(
   title: string,
   content: string,
   slug: string,
-): Promise<OfficeResult<OfficePublishPostOutcome>> {
+): Promise<WordpressPublishResult> {
   const result = await useConnectorById<WpPublishConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
     const config = parseSiteConnectorConfig(connector.meta)
+    // Pre-send failures: WordPress never saw this request at all — definite.
     if (!config) return { status: 'unavailable', reason: 'invalid_site_config', observations: [] }
 
     let base: URL
@@ -552,78 +576,140 @@ async function wordpressPublish(
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WP_PUBLISH_TIMEOUT_MS)
     try {
-      const response = await connector.authenticatedFetch(endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'user-agent': 'mupot-office-addon-publish/1.0' },
-        redirect: 'manual',
-        signal: controller.signal,
-        // mupot#1610: `slug` is this claim's idempotency key (OFFICE_SLUG_PREFIX +
-        // the value stamped onto office_publish_freezes.idempotency_key at claim
-        // time) — WordPress assigns it as the post's own slug, which is what lets
-        // reconcileStalledOfficePublish find this exact post later by a stable,
-        // pre-agreed identifier rather than trusting a human's unverified say-so.
-        body: JSON.stringify({ title, content, status: 'publish', slug }),
-      })
+      let response: Response
+      try {
+        response = await connector.authenticatedFetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'user-agent': 'mupot-office-addon-publish/1.0' },
+          redirect: 'manual',
+          signal: controller.signal,
+          // mupot#1610: `slug` is this claim's idempotency key (OFFICE_SLUG_PREFIX +
+          // the value stamped onto office_publish_freezes.idempotency_key at claim
+          // time) — WordPress assigns it as the post's own slug, which is what lets
+          // reconcileStalledOfficePublish find this exact post later by a stable,
+          // pre-agreed identifier rather than trusting a human's unverified say-so.
+          body: JSON.stringify({ title, content, status: 'publish', slug }),
+        })
+      } catch {
+        // r2 P1-1: abort, timeout, or any network error AFTER the request left this
+        // Worker — WordPress may have received and fully processed it before the
+        // connection broke. AMBIGUOUS, never 'failed'.
+        return { status: 'failed', reason: 'network_error', observations: [] }
+      }
       if (response.status === 401 || response.status === 403) {
+        // WordPress rejected the request outright on auth — it never reached the
+        // post-creation logic. DEFINITE.
         return { status: 'failed', reason: 'key_invalid', observations: [] }
       }
-      if (isRedirect(response)) return { status: 'failed', reason: 'redirect_blocked', observations: [] }
-      if (!response.ok) return { status: 'failed', reason: 'unreachable', observations: [] }
+      if (isRedirect(response)) {
+        // A redirect is an HTTP-level response from in front of the REST endpoint
+        // handler (canonicalization, a login/SSO gate) — the endpoint's own
+        // post-creation code never ran. DEFINITE.
+        return { status: 'failed', reason: 'redirect_blocked', observations: [] }
+      }
+      if (response.status >= 500) {
+        // r2 P1-1: a 5xx can mean WordPress's own handler already INSERTed the
+        // post row and then a LATER hook (save_post, a plugin) fataled — the
+        // response code alone cannot distinguish "never created" from "created,
+        // then errored downstream". AMBIGUOUS, never 'failed'.
+        return { status: 'failed', reason: 'server_error', observations: [] }
+      }
+      if (!response.ok) {
+        // Every remaining non-2xx is a 4xx OTHER than 401/403 — a validation
+        // rejection WordPress definitively returned synchronously (bad title
+        // shape, invalid status transition, etc.). DEFINITE.
+        return { status: 'failed', reason: 'validation_rejected', observations: [] }
+      }
       const body = (await response.json().catch(() => null)) as { id?: number; link?: string } | null
       if (!body || typeof body.id !== 'number' || typeof body.link !== 'string' || !body.link) {
-        return { status: 'failed', reason: 'bad_response', observations: [] }
+        // r2 P1-1: a 2xx with a body we cannot parse as a real post (a PHP
+        // notice/warning prepended ahead of the JSON is the textbook case) means
+        // the HTTP layer says success but we cannot read back what was created —
+        // we cannot rule out that WordPress actually created the post. AMBIGUOUS.
+        return { status: 'failed', reason: 'unparseable_response', observations: [] }
       }
       return { status: 'available', observations: [{ postId: body.id, articleUrl: body.link }] }
-    } catch {
-      return { status: 'failed', reason: 'unreachable', observations: [] }
     } finally {
       clearTimeout(timer)
     }
   })
-  if (!result) return { ok: false, reason: 'connector_not_bound' }
-  if (result.status === 'available' && result.observations[0]) return { ok: true, value: result.observations[0] }
-  return { ok: false, reason: result.reason ?? 'unreachable' }
+  if (!result) return { kind: 'definite_failure', reason: 'connector_not_bound' }
+  if (result.status === 'available' && result.observations[0]) return { kind: 'delivered', value: result.observations[0] }
+  const reason = result.reason ?? 'network_error'
+  if (AMBIGUOUS_PUBLISH_REASONS.has(reason)) return { kind: 'ambiguous' }
+  return { kind: 'definite_failure', reason: reason as OfficeRefusalReason }
 }
 
 // mupot#1610: office.reconcile_stalled_publish's own live WordPress check, called
-// BEFORE the double-post guard is ever cleared. Queries by the exact `slug`
-// office.publish_post's one claim attempt would have stamped onto the post it
-// created — the same GET .../wp/v2/posts?slug=... shape src/addons/marketing/
-// adapters/mcpwp.ts's monitor source already uses against this same connector
-// type, reusing its SSRF guard (origin-only, assertPublicHttpsUrl) and timeout
-// pattern. A found/absent/check-failed trichotomy, never a boolean: "the fetch
-// itself failed" must never be read as "the post is absent" — that would let a
-// simple network blip clear the guard exactly as unsafely as trusting an
-// unverified human claim did before this fix.
+// BEFORE the double-post guard is ever cleared. A found/absent/check-failed
+// trichotomy, never a boolean: "the fetch itself failed" must never be read as
+// "the post is absent" — that would let a simple network blip clear the guard
+// exactly as unsafely as trusting an unverified human claim did before this fix.
+//
+// r2 P1-2 (kasra-review adversarial gate on #1614): the ORIGINAL version queried
+// only `?slug=<exact>&status=publish` and read `[]` as absent. The post can
+// still genuinely exist and simply not match that one query:
+//   - NOT PUBLISHED YET: pending/draft/private/future (an editorial-workflow
+//     plugin, a role downgrade, an owner moving it back to draft).
+//   - TRASHED: WordPress renames a trashed post's own slug to `<slug>__trashed`
+//     — the ORIGINAL slug value no longer exists in the posts table at all.
+//   - REWRITTEN: a translation/permalink plugin, or a `wp_insert_post_data` /
+//     `wp_unique_post_slug` filter, can change the stored slug outright.
+// Fixed by querying BOTH `<slug>` and `<slug>__trashed`, across every status
+// (`context=edit` — requires the authenticated connector user to actually have
+// edit_posts/read_private_posts capability; a query that can't see a status the
+// site's user lacks rights to is a known, accepted limitation, not silently
+// papered over — it still falls through to the fallback search below). ANY
+// element that does not have the expected shape (numeric `id`, non-empty
+// string `link`) is `check_failed`, never "absent" (an id with no link was
+// previously read as absent — the exact bug). If BOTH slug queries come back
+// with genuinely ZERO elements (never a malformed one), a slug can still have
+// been rewritten out from under this idempotency key entirely — an empty
+// result alone must never clear the guard. Fallback: search by the frozen
+// TITLE in a `[claimed_at - margin, now]` window; ANY candidate there — even
+// one we cannot confirm is the same post — refuses (`check_failed`), because
+// we cannot rule out that it is. Only "checked every avenue, found genuinely
+// nothing anywhere" is 'absent'.
 type WordpressSlugLookupResult =
   | { status: 'found'; postId: number; articleUrl: string }
   | { status: 'absent' }
   | { status: 'check_failed' }
 
-interface WpSlugLookupConnectorResult {
-  readonly status: 'available' | 'unavailable' | 'failed'
-  readonly observations: readonly [{ postId: number; articleUrl: string }] | readonly []
+// Every WordPress post status this addon's own connector user might plausibly
+// be able to see via `context=edit` — publish is included so a race with a
+// genuinely-published post (found by the primary path anyway) is harmless.
+const WP_ALL_STATUSES = 'publish,future,draft,pending,private,trash'
+const WP_RECONCILE_SEARCH_MARGIN_MS = 15 * 60 * 1000
+
+interface WpRawPost {
+  readonly id?: unknown
+  readonly link?: unknown
 }
 
-async function lookupWordpressPostBySlug(
+interface WpLookupConnectorResult {
+  readonly status: 'available' | 'unavailable' | 'failed'
+  readonly observations: readonly [unknown] | readonly []
+}
+
+/** One GET request through the vaulted connector, returning the raw parsed JSON
+ *  body. Exactly one `authenticatedFetch` call per `useConnectorById` use (the
+ *  vault's own one-shot-per-access contract) — lookupWordpressPostBySlug below
+ *  calls this multiple times, each a fresh, independent vault access. */
+async function wpReconcileGet(
   env: Env,
   connectorId: string,
-  slug: string,
-): Promise<WordpressSlugLookupResult> {
-  const result = await useConnectorById<WpSlugLookupConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
+  buildEndpoint: (base: URL) => URL,
+): Promise<{ ok: true; body: unknown } | { ok: false }> {
+  const result = await useConnectorById<WpLookupConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
     const config = parseSiteConnectorConfig(connector.meta)
     if (!config) return { status: 'unavailable', observations: [] }
-
     let base: URL
     try {
       base = assertPublicHttpsUrl(config.siteUrl)
     } catch {
       return { status: 'unavailable', observations: [] }
     }
-
-    const endpoint = new URL(WP_POSTS_PATH, base.origin)
-    endpoint.searchParams.set('slug', slug)
-    endpoint.searchParams.set('status', 'publish')
+    const endpoint = buildEndpoint(base)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WP_PUBLISH_TIMEOUT_MS)
     try {
@@ -634,24 +720,73 @@ async function lookupWordpressPostBySlug(
         signal: controller.signal,
       })
       if (isRedirect(response) || !response.ok) return { status: 'failed', observations: [] }
-      const body = (await response.json().catch(() => null)) as Array<{ id?: number; link?: string }> | null
-      if (!Array.isArray(body)) return { status: 'failed', observations: [] }
-      const match = body[0]
-      if (!match || typeof match.id !== 'number' || typeof match.link !== 'string' || !match.link) {
-        return { status: 'available', observations: [] }
-      }
-      return { status: 'available', observations: [{ postId: match.id, articleUrl: match.link }] }
+      const body = await response.json().catch(() => null)
+      if (body === null) return { status: 'failed', observations: [] }
+      return { status: 'available', observations: [body] }
     } catch {
       return { status: 'failed', observations: [] }
     } finally {
       clearTimeout(timer)
     }
   })
-  if (!result) return { status: 'check_failed' }
-  if (result.status === 'failed') return { status: 'check_failed' }
-  if (result.status === 'unavailable') return { status: 'check_failed' }
-  const found = result.observations[0]
-  return found ? { status: 'found', postId: found.postId, articleUrl: found.articleUrl } : { status: 'absent' }
+  if (!result || result.status !== 'available') return { ok: false }
+  const body = result.observations[0]
+  return body === undefined ? { ok: false } : { ok: true, body }
+}
+
+/** Validates one candidate element strictly. `undefined` = genuinely no match at
+ *  this slug (element absent from the array); `null` = a match exists but is
+ *  malformed (check_failed territory, never "absent"). */
+function firstValidWpPost(body: unknown): { postId: number; articleUrl: string } | null | undefined {
+  if (!Array.isArray(body)) return null
+  if (body.length === 0) return undefined
+  const match = body[0] as WpRawPost
+  if (typeof match !== 'object' || match === null) return null
+  if (typeof match.id !== 'number' || typeof match.link !== 'string' || !match.link) return null
+  return { postId: match.id, articleUrl: match.link }
+}
+
+async function lookupWordpressPostBySlug(
+  env: Env,
+  connectorId: string,
+  slug: string,
+  title: string,
+  claimedAtIso: string,
+): Promise<WordpressSlugLookupResult> {
+  for (const slugCandidate of [slug, `${slug}__trashed`]) {
+    const fetched = await wpReconcileGet(env, connectorId, (base) => {
+      const endpoint = new URL(WP_POSTS_PATH, base.origin)
+      endpoint.searchParams.set('slug', slugCandidate)
+      endpoint.searchParams.set('status', WP_ALL_STATUSES)
+      endpoint.searchParams.set('context', 'edit')
+      return endpoint
+    })
+    if (!fetched.ok) return { status: 'check_failed' }
+    const match = firstValidWpPost(fetched.body)
+    if (match === null) return { status: 'check_failed' }
+    if (match !== undefined) return { status: 'found', postId: match.postId, articleUrl: match.articleUrl }
+  }
+
+  // Both slug variants came back genuinely empty (never malformed) — a slug can
+  // still have been rewritten out from under this idempotency key. Fallback:
+  // does ANY post matching the frozen title exist in a window around the
+  // claim? Any candidate at all refuses; only truly nothing anywhere is absent.
+  const claimedAtMs = Date.parse(claimedAtIso)
+  const windowStart = Number.isNaN(claimedAtMs)
+    ? undefined
+    : new Date(claimedAtMs - WP_RECONCILE_SEARCH_MARGIN_MS).toISOString()
+  const searched = await wpReconcileGet(env, connectorId, (base) => {
+    const endpoint = new URL(WP_POSTS_PATH, base.origin)
+    endpoint.searchParams.set('search', title)
+    endpoint.searchParams.set('status', WP_ALL_STATUSES)
+    endpoint.searchParams.set('context', 'edit')
+    if (windowStart) endpoint.searchParams.set('after', windowStart)
+    return endpoint
+  })
+  if (!searched.ok) return { status: 'check_failed' }
+  if (!Array.isArray(searched.body)) return { status: 'check_failed' }
+  if (searched.body.length > 0) return { status: 'check_failed' }
+  return { status: 'absent' }
 }
 
 /**
@@ -727,8 +862,12 @@ export async function publishOfficePost(
   // Re-resolve the CURRENTLY active target and refuse if it has drifted since
   // approval (an install/connector/site rebind after a human approved THIS content
   // must never silently redirect the write — the other half of P0-1's binding).
-  const installationId = await resolveActiveOfficeInstallationId(env)
-  if (!installationId) return { ok: false, reason: 'addon_inactive' }
+  // r2 P3-2: the stricter resolver — re-proves the installation's manifest
+  // digest still matches the registered manifest and that no external-isolation
+  // invariant is violated, not merely state+trustClass (see its own doc comment).
+  const eligibleInstallation = await resolveEligibleActiveOfficeInstallationId(env)
+  if (!eligibleInstallation.ok) return eligibleInstallation
+  const installationId = eligibleInstallation.value
   const bindingResult = await resolveOfficeConnectorBinding(env, installationId)
   if (!bindingResult.ok) return bindingResult
   const siteOrigin = await resolveOfficeSiteOrigin(env, bindingResult.value.connectorId)
@@ -816,11 +955,24 @@ export async function publishOfficePost(
   const published = await wordpressPublish(env, bindingResult.value.connectorId, frozenPayload.title, frozenPayload.content, slug)
   const now = new Date().toISOString()
 
-  if (!published.ok) {
+  // r2 P1-1: an AMBIGUOUS outcome writes NOTHING to office_publish_freezes —
+  // `outcome` stays NULL, exactly as it was the instant this call claimed the
+  // row. unreconciledPriorFreezeExists (freeze.ts) and office.
+  // reconcile_stalled_publish's own guard (`outcome IS NULL`) both key on that
+  // column being untouched, which is what forces reconcile's live WordPress
+  // check to run before any rework loop can mint a fresh, unclaimed freeze —
+  // see this function's own header and reconcileStalledOfficePublish's header
+  // for the full reasoning. The row stays claimed forever until an operator
+  // reconciles it; there is no automatic retry.
+  if (published.kind === 'ambiguous') {
+    return { ok: false, reason: 'publish_outcome_unknown' }
+  }
+
+  if (published.kind === 'definite_failure') {
     await env.DB.prepare(
       `UPDATE office_publish_freezes SET outcome = 'failed', outcome_detail = ?1, completed_at = ?2 WHERE task_id = ?3`,
     ).bind(published.reason, now, task.id).run()
-    return published
+    return { ok: false, reason: published.reason }
   }
 
   await env.DB.prepare(
@@ -830,7 +982,7 @@ export async function publishOfficePost(
   const marked = await markOfficeTaskPublished(env, task.id, published.value)
   if (!marked) return { ok: false, reason: 'verdict_race' }
 
-  return published
+  return { ok: true, value: published.value }
 }
 
 // ── office.reconcile_stalled_publish ──────────────────────────────────────────────
@@ -867,6 +1019,24 @@ export async function publishOfficePost(
 // migration/deploy — see migrations/0185's header) has nothing to look up;
 // falls back to the pre-existing, purely-manual-attestation behavior for that
 // one row only.
+//
+// r2 P2-2 (kasra-review adversarial gate on #1614): the lookup used to follow
+// the connector's CURRENT siteUrl. Repro: after the claim, the connector's meta
+// was moved to a different site; the lookup queried THAT site, found nothing,
+// and accepted 'failed'. The lookup now refuses (`reconcile_check_failed`,
+// override-able) unless the connector's current origin still equals the
+// FROZEN `site_origin` this exact claim targeted.
+//
+// r2 P3-1 (kasra-review adversarial gate on #1614): a revoked connector or a
+// permanently dead site left `reconcile_check_failed` with NO way out — the
+// task could never be republished. `overrideReason`, when a non-empty string,
+// lets an org owner/admin accept their OWN requested outcome at their own
+// attested risk whenever the automated check cannot run at all (origin drift
+// or check_failed) — NEVER when the check actually ran and found the post
+// LIVE (that result is never overridable; see the 'found' branch below). The
+// override is audited in outcome_detail (the addon's own established receipt
+// mechanism — see this file's header) with the reason, who invoked it, and
+// that it happened.
 export interface OfficeReconcileInput {
   readonly task: Task
   readonly outcome: 'done' | 'failed'
@@ -877,6 +1047,10 @@ export interface OfficeReconcileInput {
   // the discovered postId/articleUrl are used instead.
   readonly postId: number | null
   readonly articleUrl: string | null
+  // r2 P3-1: a non-empty, explicit, audited reason to accept the operator's
+  // own outcome even though the automated WordPress check could not run
+  // (origin drift or check_failed). Never bypasses a 'found' result.
+  readonly overrideReason: string | null
 }
 
 interface OfficeFreezeReconcileRow {
@@ -884,6 +1058,8 @@ interface OfficeFreezeReconcileRow {
   outcome: string | null
   connector_id: string
   idempotency_key: string | null
+  site_origin: string
+  payload_json: string
 }
 
 export async function reconcileStalledOfficePublish(
@@ -892,6 +1068,7 @@ export async function reconcileStalledOfficePublish(
   input: OfficeReconcileInput,
 ): Promise<OfficeResult<{ task: Task }>> {
   const { task, outcome: requestedOutcome, detail, postId: requestedPostId, articleUrl: requestedArticleUrl } = input
+  const overrideReason = input.overrideReason?.trim() ? input.overrideReason.trim() : null
 
   if (task.gate_owner !== OFFICE_GATE_OWNER) return { ok: false, reason: 'wrong_gate' }
   // mupot#1602 r1 P2-4: `isOrgAdmin(auth)` alone is satisfiable by an agent-bound
@@ -907,7 +1084,7 @@ export async function reconcileStalledOfficePublish(
   }
 
   const row = await env.DB.prepare(
-    `SELECT claimed_at, outcome, connector_id, idempotency_key FROM office_publish_freezes WHERE task_id = ?1`,
+    `SELECT claimed_at, outcome, connector_id, idempotency_key, site_origin, payload_json FROM office_publish_freezes WHERE task_id = ?1`,
   ).bind(task.id).first<OfficeFreezeReconcileRow>()
   if (!row) return { ok: false, reason: 'freeze_not_found' }
   if (row.claimed_at === null || row.outcome !== null) return { ok: false, reason: 'already_reconciled' }
@@ -928,21 +1105,40 @@ export async function reconcileStalledOfficePublish(
   let postId = requestedPostId
   let articleUrl = requestedArticleUrl
   let verifiedLive = false
+  let overridden = false
   if (row.idempotency_key) {
-    const slug = `${OFFICE_SLUG_PREFIX}${row.idempotency_key}`
-    const lookup = await lookupWordpressPostBySlug(env, row.connector_id, slug)
-    if (lookup.status === 'check_failed') return { ok: false, reason: 'reconcile_check_failed' }
-    if (lookup.status === 'found') {
-      outcome = 'done'
-      postId = lookup.postId
-      articleUrl = lookup.articleUrl
-      verifiedLive = true
+    // r2 P2-2: the connector's CURRENT origin must still equal the FROZEN
+    // site_origin this exact claim targeted — never trust whatever the
+    // connector happens to point at NOW.
+    const currentOrigin = await resolveOfficeSiteOrigin(env, row.connector_id)
+    if (currentOrigin !== row.site_origin) {
+      if (!overrideReason) return { ok: false, reason: 'reconcile_check_failed' }
+      overridden = true
+    } else {
+      const frozen = JSON.parse(row.payload_json) as { title: string }
+      const slug = `${OFFICE_SLUG_PREFIX}${row.idempotency_key}`
+      const lookup = await lookupWordpressPostBySlug(env, row.connector_id, slug, frozen.title, row.claimed_at)
+      if (lookup.status === 'check_failed') {
+        if (!overrideReason) return { ok: false, reason: 'reconcile_check_failed' }
+        overridden = true
+      } else if (lookup.status === 'found') {
+        // r2 P3-1: a 'found' result is NEVER overridable — live evidence wins
+        // outright regardless of what the operator asked for or attested.
+        outcome = 'done'
+        postId = lookup.postId
+        articleUrl = lookup.articleUrl
+        verifiedLive = true
+      }
+      // status 'absent': fall through with the operator's own requested outcome,
+      // unchanged — see header.
     }
-    // status 'absent': fall through with the operator's own requested outcome,
-    // unchanged — see header.
   }
 
   const now = new Date().toISOString()
+  // Non-overridden 'failed' stays a PLAIN STRING, exactly as before this round
+  // (existing callers/tests read outcome_detail as free text in that case) —
+  // the override audit trail only changes the shape of the (new, rare)
+  // overridden path, never the pre-existing ones.
   const outcomeDetail = outcome === 'done'
     ? JSON.stringify({
         postId,
@@ -950,8 +1146,16 @@ export async function reconcileStalledOfficePublish(
         reconciledBy: auth.memberId ?? auth.userId,
         note: detail,
         ...(verifiedLive ? { verifiedLiveOnWordpress: true } : {}),
+        ...(overridden ? { overridden: true, overrideReason } : {}),
       })
-    : (detail?.trim() ? detail.trim() : 'reconciled_failed')
+    : overridden
+      ? JSON.stringify({
+          note: detail?.trim() ? detail.trim() : 'reconciled_failed',
+          reconciledBy: auth.memberId ?? auth.userId,
+          overridden: true,
+          overrideReason,
+        })
+      : (detail?.trim() ? detail.trim() : 'reconciled_failed')
 
   // mupot#1602 r1 P3-3: guard the WRITE itself on `outcome IS NULL` (not only the
   // SELECT above) — closes the TOCTOU between that read and this UPDATE (two
