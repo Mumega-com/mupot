@@ -193,14 +193,30 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
   unknown `result` field since #1388; `task_dispatch_runtime_receipt` 409s
   `task_not_runnable` for anything never dispatched) sat `in_progress`
   forever. Same `verifyTaskArtifactShape` gate every other review-entry path
-  enforces; assignee-only, refuses a live `execution_receipt_id` (a dispatched
-  task keeps using `task_dispatch_runtime_receipt`, unchanged), only from
-  `in_progress` (immutable once in `review` until sent back), append-only
-  receipt in the new `task_result_submissions` table (migration 0183 —
-  renumbered from an initial 0181 to avoid colliding with 0181/0182 reserved
-  for the v0.31.0 release PR and mupot#1592). `assignee_cannot_self_close`
-  and the runtime-receipt path are untouched. Not merged; state it as merged
-  only once `gh pr view` on this PR reports `MERGED`.
+  enforces (a shape check only, never a verified hash match); assignee-only,
+  refuses a live `execution_receipt_id` or an in-flight unconsumed dispatch (a
+  dispatched task keeps using `task_dispatch_runtime_receipt`, unchanged),
+  only from `in_progress` (immutable once in `review` until sent back). The
+  task's `gate_owner` must be an INDEPENDENT, live, credentialed gate
+  (`hasIndependentRuntimeGate` — the same predicate the runtime-receipt
+  path's `completed` stage requires, factored into shared SQL fragments both
+  paths now call so they cannot drift); this tool never accepts `gate_owner`
+  as an argument — the assignee cannot choose its own reviewer, and a task
+  without an independent gate already set (by its creator or an admin via
+  `task_update`) cannot enter review through this door at all. The UPDATE and
+  the append-only receipt INSERT (new `task_result_submissions` table,
+  migration 0183) land in one `env.DB.batch` — an INSERT failure rolls the
+  UPDATE back too, so a task can never reach `review` without its receipt.
+  **Migration 0183 must be applied before this code is deployed** — the batch
+  fails closed (a clean error, no partial state) if it is not, but the tool
+  is non-functional until it is. `assignee_cannot_self_close` is untouched.
+  Round 2 (kasra-review, PR comment 5882361732): fixed a P0 self-close bypass
+  via `gate:agent-self-completion` or an unheld gate, and two P1s (a
+  never-consumed in-flight dispatch bypassing the runtime-receipt fence; the
+  UPDATE/INSERT non-atomicity). Migration 0183 renumbered from an initial
+  0181 to avoid colliding with 0181/0182 reserved for the v0.31.0 release PR
+  and mupot#1592. Not merged; state it as merged only once `gh pr view` on
+  this PR reports `MERGED`.
 
 ## Release status — 2026-09-06
 
