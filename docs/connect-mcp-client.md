@@ -114,10 +114,36 @@ member — the pot never reads an identity field from the arguments.
 
 ## Custom GPT / OpenAPI Actions
 
-For a Custom GPT that speaks OpenAPI instead of MCP, the same tools are exposed
-as REST at `POST /actions/:tool` (bearer auth, same member token), described by
-the public `GET /openapi.json` (unauthenticated discovery). Use this only when
-your client can't speak MCP JSON-RPC — `/mcp` is the primary surface.
+For a Custom GPT that speaks OpenAPI instead of MCP, tools are exposed as REST
+at `POST /actions/:tool` (bearer auth, same member token). Every tool can be
+*called* this way — capability is still enforced per-call, server-side — but
+discovery is split into two specs (mupot#1596):
+
+- **`GET /openapi.json`** — unauthenticated, for Custom GPT Actions discovery.
+  Lists only the tools at member capability or below (`authenticated` /
+  `observer` / `member`), from the explicit, committed allowlist in
+  `src/mcp/openapi-public-allowlist.ts`. This used to list the entire tool
+  registry — 144 tools including the whole admin surface (`mint_agent_token`,
+  `grant_agent_capability`, `revoke_*`, `archive_row`/`unarchive_row`,
+  `addon_archive`, and more) by name and input schema. Every tool already
+  enforced its own authz, so that was disclosure rather than an access break,
+  but an unauthenticated map of the admin surface is not something to hand
+  out for free. A tool at member-tier-or-below that a Custom GPT config
+  already calls is unaffected; a new tool is private by default until someone
+  adds its name to the allowlist.
+- **`GET /openapi.full.json`** — the full tool registry (all 144), gated the
+  same way any other admin-tier read in this codebase is: `authenticateMember`
+  + `hasWorkspaceAdmin` (org-admin bearer required). For internal tooling that
+  legitimately needs the whole surface, not for a public Custom GPT config.
+
+Use `/actions/:tool` only when your client can't speak MCP JSON-RPC — `/mcp`
+is the primary surface. **Known gap (#1609):** a JSON-RPC `tools/list` on
+`POST /mcp` still returns every registered tool, with input schemas, to any
+valid token regardless of capability, and tokens are easy to obtain (open
+client registration, self-serve sign-in). So the allowlist removes the
+*unauthenticated* admin map, not the authenticated one; #1596 stays open until
+`tools/list` is filtered by the caller's capability floor. (`GET /mcp/tools` is
+not a public listing: it returns `401` without a token and `404` with one.)
 
 ## Troubleshooting
 

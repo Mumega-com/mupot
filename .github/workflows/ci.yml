@@ -215,6 +215,34 @@ jobs:
       - name: Guard — MCP tool tests must enter through invokeTool
         run: node scripts/check-mcp-tool-seam.mjs
 
+  openapi-public-allowlist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The guard uses the TypeScript compiler API (already a devDependency) to read every
+      # ToolSpec declaration in src/mcp/*.ts — needs node_modules.
+      - run: npm ci
+      # Ratchet (mupot#1596): GET /openapi.json is UNAUTHENTICATED (built for Custom GPT
+      # Actions discovery) and used to serve the entire 144-tool registry, including the
+      # admin surface by name and input schema (mint_agent_token, grant_agent_capability,
+      # revoke_*, archive_row/unarchive_row, addon_archive, and more) — every tool still
+      # enforces its own authz server-side, so this was disclosure, not an access break, but
+      # it handed an attacker a map of the admin surface for free. src/mcp/index.ts now
+      # filters to an explicit, committed allowlist (src/mcp/openapi-public-allowlist.ts).
+      # This is a hard gate, not a shrink-only baseline: an allowlisted tool above member
+      # capability, an allowlist entry that isn't a real tool, or the /openapi.json route no
+      # longer calling publicOpenApiSpec() (the structural anti-bypass check) all fail here,
+      # every run, not just on growth.
+      # Self-tests FIRST — same discipline as the sibling ratchets: a gate with no tests of
+      # its own is the shape these gates exist to reject.
+      - name: Ratchet self-tests
+        run: node --test tests/check-openapi-public-allowlist.test.mjs
+      - name: Guard — public /openapi.json must stay an explicit, member-tier-or-below allowlist
+        run: node scripts/check-openapi-public-allowlist.mjs
+
   bare-squad-id-authz:
     runs-on: ubuntu-latest
     steps:

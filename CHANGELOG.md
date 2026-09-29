@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased] — main since v0.31.0
+
+- **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
+  GPT Actions discovery) now serves an explicit, committed allowlist
+  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
+  instead of the whole registry, with a runtime min-capability floor. A new
+  org-admin-gated `GET /openapi.full.json` serves the full registry. CI ratchet
+  `scripts/check-openapi-public-allowlist.mjs`. **Not a full fix for admin-tool
+  disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
+  to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
+  `/openapi.full.json` (#1608). #1596 stays open.
+
 ## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
 
 `main` at `d954c1ab` is 14 commits ahead of the `v0.30.0` tag (`09ea48f6`),

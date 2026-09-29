@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { jsonRpcCodeForToolFailure, mcpActionsApp, mcpApp } from '../src/mcp'
+import { jsonRpcCodeForToolFailure, mcpActionsApp, mcpApp, TOOLS } from '../src/mcp'
 import { MUPOT_PUBLIC_API_VERSION } from '../src/version'
 import type { CapabilityGrant, Env } from '../src/types'
 
@@ -163,13 +163,13 @@ describe('JSON-RPC error codes for tool failures', () => {
 })
 
 describe('custom GPT Actions compatibility', () => {
-  it('serves an OpenAPI schema with actions for every MCP tool', async () => {
+  it('serves a public OpenAPI schema (allowlisted tools only) with the same schema shape as before', async () => {
     const res = await mcpActionsApp.request('https://pot.example/openapi.json', {}, makeEnv())
     expect(res.status).toBe(200)
     const body = await res.json() as {
       openapi: string
       info: { version: string }
-      paths: Record<string, unknown>
+      paths: Record<string, { post: { requestBody: { content: { 'application/json': { schema: unknown } } } } }>
       components: { securitySchemes: Record<string, unknown> }
     }
     expect(body.openapi).toBe('3.0.3')
@@ -177,6 +177,12 @@ describe('custom GPT Actions compatibility', () => {
     expect(body.paths['/actions/status']).toBeTruthy()
     expect(body.paths['/actions/task_create']).toBeTruthy()
     expect(body.components.securitySchemes.bearerAuth).toMatchObject({ type: 'http', scheme: 'bearer' })
+    // mupot#1596: allowlisted tools keep the exact same requestBody schema they always had —
+    // the fix filters WHICH tools appear, it never reshapes a surviving tool's contract.
+    const taskCreate = TOOLS.find((t) => t.name === 'task_create')!
+    expect(body.paths['/actions/task_create'].post.requestBody.content['application/json'].schema).toEqual(
+      taskCreate.inputSchema,
+    )
   })
 
   it('calls an action with the same bearer-token principal', async () => {
