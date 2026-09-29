@@ -11,11 +11,21 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 vi.setConfig({ testTimeout: 60_000 })
 import { manifestSha256 } from '../src/addons/contract'
 import { getRegisteredAddon } from '../src/addons/registry'
-import { matchesRegisteredIdentity, type AddonInstallation } from '../src/addons/service'
+import {
+  activateAddon,
+  configureAddon,
+  disableAddon,
+  installAddon,
+  matchesRegisteredIdentity,
+  type AddonInstallation,
+} from '../src/addons/service'
+import { runMarketingMonitor } from '../src/addons/marketing/service'
+import { createMarketingMonitorFixtureSource } from './fixtures/marketing-monitor'
+import type { Env } from '../src/types'
 import '../src/addons/modules/index'
 import '../src/addons/modules/fixture-with-loop'
 
-// 0181_backfill_addon_manifest_v0_30.sql repairs any live addon_installations
+// 0181_backfill_addon_manifest_v0_31.sql repairs any live addon_installations
 // rows left at an OLD manifest identity after the v0.31.0 version bump moved
 // MUPOT_PUBLIC_API_VERSION 0.30.0 -> 0.31.0. Five native manifests moved
 // ^0.29.0 -> ^0.30.0; mcpwp-office's manifest derives its compat string from
@@ -29,9 +39,10 @@ import '../src/addons/modules/fixture-with-loop'
 // them — that:
 //   1. the migration's hardcoded digest constants are what manifestSha256()
 //      actually produces for each addon's OLD and NEW manifest identity;
-//   2. the recreated trigger is byte-identical to what sqlite_master itself
-//      recorded for it immediately after 0178 — not a hand-typed copy
-//      comparison, so a transcription slip cannot pass silently;
+//   2. all three recreated triggers are byte-identical to what
+//      sqlite_master itself recorded for them beforehand — not a
+//      hand-typed copy comparison, so a transcription slip cannot pass
+//      silently;
 //   3. the migration is idempotent;
 //   4. its WHERE guard is addon_key AND the exact OLD manifest_sha256 AND
 //      the exact OLD mupot_compatibility together — a row whose addon_key
@@ -45,13 +56,27 @@ import '../src/addons/modules/fixture-with-loop'
 //      backfill — a receipt insert using the NEW identity succeeds, one
 //      using the stale OLD identity is rejected by
 //      addon_receipts_snapshot_matches_installation;
-//   8. the identity-immutable trigger the migration has to DROP mid-file to
-//      perform the repair is restored and still enforcing afterward.
+//   8. all three triggers the migration has to DROP mid-file to perform the
+//      repair are restored and still enforcing afterward;
+//   9. (round-1 P0) a live addon_binding_generations/addon_connector_bindings
+//      row heals to match its parent installation, INCLUDING a pre-existing
+//      split where the generation was already at neither the old nor the
+//      new digest (prod's real marketing-cro-monitor state) — built through
+//      the REAL installAddon/configureAddon/activateAddon/disableAddon/
+//      runMarketingMonitor lifecycle, not hand-written INSERTs, so every
+//      trigger-enforced invariant on those tables is satisfied the same way
+//      production satisfies it. After migrating, the real
+//      runMarketingMonitor and activateAddon calls succeed with the CURRENT
+//      code — assertions on migration output alone are not enough.
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-const TARGET_MIGRATION = '0181_backfill_addon_manifest_v0_30.sql'
+const TARGET_MIGRATION = '0181_backfill_addon_manifest_v0_31.sql'
 const MIGRATION_SQL = readFileSync(join(MIGRATIONS_DIR, TARGET_MIGRATION), 'utf8')
-const TRIGGER_NAME = 'addon_installations_identity_is_immutable'
+const TRIGGER_NAMES = [
+  'addon_installations_identity_is_immutable',
+  'addon_binding_generations_revoke_only',
+  'addon_connector_bindings_revoke_only',
+] as const
 
 interface AddonFixture {
   key: string
@@ -129,11 +154,11 @@ function applyInTransaction(sqlite: { exec(sql: string): void }, sql: string): v
 }
 
 function buildDbThrough(migrationFile: string) {
-  const { sqlite, close } = createSqliteD1()
+  const harness = createSqliteD1()
   for (const file of priorMigrations(migrationFile)) {
-    sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
-  return { sqlite, close }
+  return harness
 }
 
 function triggerSql(sqlite: { prepare(sql: string): { get(...args: unknown[]): unknown } }, name: string): string {
@@ -220,7 +245,7 @@ function rowById(list: InstallationRow[], id: string): InstallationRow {
   return row
 }
 
-describe('0181_backfill_addon_manifest_v0_30 — digest constants (load-bearing)', () => {
+describe('0181_backfill_addon_manifest_v0_31 — digest constants (load-bearing)', () => {
   it('the migration file\'s hardcoded NEW digests equal manifestSha256() of the registered manifests', async () => {
     for (const { key, newCompat, newDigest } of ADDONS) {
       const entry = getRegisteredAddon(key)
@@ -245,32 +270,36 @@ describe('0181_backfill_addon_manifest_v0_30 — digest constants (load-bearing)
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — trigger recreated byte-identical to sqlite_master (not a hand copy)', () => {
-  it('the trigger body after 0181 is byte-identical to what sqlite_master recorded immediately after 0178', () => {
-    // Two full migration-chain builds (one through 0178, one through 0180 +
-    // this migration) — reliably slower than the single-build tests above
-    // under this suite's concurrent load; the default 15s timeout is too
-    // tight even though nothing here is actually stuck.
-    const after0178 = buildDbThrough('0178_addon_isolation_class_immutable.sql')
-    let expectedSql: string
+describe('0181_backfill_addon_manifest_v0_31 — all three recreated triggers are byte-identical to sqlite_master (not a hand copy)', () => {
+  it('every trigger body after 0181 is byte-identical to what sqlite_master recorded for it beforehand', () => {
+    // Two full migration-chain builds (one through 0180, the baseline every
+    // one of these three triggers already has by then — the installation
+    // trigger as 0178 left it, the two binding/generation triggers exactly
+    // as 0052 defined them, untouched by anything in between — and one
+    // through 0180 + this migration) — reliably slower than the
+    // single-build tests above under this suite's concurrent load; the
+    // default 15s timeout is too tight even though nothing here is stuck.
+    const before = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const expectedSql = new Map<string, string>()
     try {
-      expectedSql = triggerSql(after0178.sqlite, TRIGGER_NAME)
+      for (const name of TRIGGER_NAMES) expectedSql.set(name, triggerSql(before.sqlite, name))
     } finally {
-      after0178.close()
+      before.close()
     }
 
     const { sqlite, close } = buildSeededDb()
     try {
       applyInTransaction(sqlite, MIGRATION_SQL)
-      const actualSql = triggerSql(sqlite, TRIGGER_NAME)
-      expect(actualSql).toBe(expectedSql)
+      for (const name of TRIGGER_NAMES) {
+        expect(triggerSql(sqlite, name)).toBe(expectedSql.get(name))
+      }
     } finally {
       close()
     }
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — idempotence', () => {
+describe('0181_backfill_addon_manifest_v0_31 — idempotence', () => {
   it('applying the migration twice changes nothing the second time', () => {
     const { sqlite, close } = buildSeededDb()
     try {
@@ -291,7 +320,7 @@ describe('0181_backfill_addon_manifest_v0_30 — idempotence', () => {
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — WHERE guard (populated DB, one BEGIN/COMMIT, D1 semantics)', () => {
+describe('0181_backfill_addon_manifest_v0_31 — WHERE guard (populated DB, one BEGIN/COMMIT, D1 semantics)', () => {
   it('touches only rows at exactly the old identity, across any tenant, applied inside one transaction', () => {
     const { sqlite, close } = buildSeededDb()
     try {
@@ -344,7 +373,7 @@ describe('0181_backfill_addon_manifest_v0_30 — WHERE guard (populated DB, one 
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — the actual goal: freeze is lifted', () => {
+describe('0181_backfill_addon_manifest_v0_31 — the actual goal: freeze is lifted', () => {
   function installationFor(row: InstallationRow, extra: Partial<AddonInstallation> = {}): AddonInstallation {
     return {
       id: row.id,
@@ -411,7 +440,7 @@ describe('0181_backfill_addon_manifest_v0_30 — the actual goal: freeze is lift
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — addon_receipts stay consistent with the repaired installation', () => {
+describe('0181_backfill_addon_manifest_v0_31 — addon_receipts stay consistent with the repaired installation', () => {
   it('a new receipt using the NEW identity is accepted; one using the stale OLD identity is rejected', () => {
     const { sqlite, close } = buildSeededDb()
     try {
@@ -471,7 +500,7 @@ describe('0181_backfill_addon_manifest_v0_30 — addon_receipts stay consistent 
   })
 })
 
-describe('0181_backfill_addon_manifest_v0_30 — identity-immutable trigger survives the repair', () => {
+describe('0181_backfill_addon_manifest_v0_31 — identity-immutable trigger survives the repair', () => {
   it('a plain UPDATE of manifest_sha256/mupot_compatibility/isolation_class is rejected again after the migration commits', () => {
     const { sqlite, close } = buildSeededDb()
     try {
@@ -488,6 +517,452 @@ describe('0181_backfill_addon_manifest_v0_30 — identity-immutable trigger surv
       expect(() =>
         sqlite.exec(`UPDATE addon_installations SET isolation_class = 'native_reviewed' WHERE id = 'inst-office'`),
       ).toThrow(/addon installation identity is immutable/)
+    } finally {
+      close()
+    }
+  })
+})
+
+// ============================================================================
+// Round-1 P0: live addon_binding_generations / addon_connector_bindings
+// heal too, proven through the REAL lifecycle (not hand-written INSERTs).
+// ============================================================================
+//
+// Every row below is written by the actual installAddon/configureAddon/
+// activateAddon/disableAddon/runMarketingMonitor functions against a real,
+// fully-migrated sqlite D1, so every trigger-enforced invariant on
+// addon_installations, addon_binding_generations, addon_connector_bindings,
+// addon_receipts and marketing_monitor_runs is satisfied exactly the way
+// production satisfies it — the class of risk a hand-rolled INSERT cannot
+// rule out for itself. `downgradeIdentity` then time-travels ONLY the
+// identity columns (manifest_sha256, mupot_compatibility) backward, inside
+// a DROP/mutate/CREATE-trigger transaction identical in shape to what 0181
+// itself does, to represent "as this looked immediately before the version
+// bump" — production's actual before/after is a code deploy, never a SQL
+// statement; this is test scaffolding to reach that state, not a claim that
+// downgrading identity is itself a supported operation.
+
+const lifecycleOwner = { id: 'owner-1', role: 'owner' as const }
+
+function envForLifecycle(harness: { db: unknown }, tenant = 'mumega'): Env {
+  return { DB: harness.db, TENANT_SLUG: tenant } as Env
+}
+
+function expectOk<T extends { ok: boolean }>(result: T, label: string): T {
+  if (!result.ok) throw new Error(`${label} failed: ${JSON.stringify(result)}`)
+  return result
+}
+
+// Byte-identical to what 0052_addon_bindings.sql defines and what the
+// "all three recreated triggers" test above independently proves 0181
+// restores — reused here only to let this scaffolding put the DB back into
+// an enforcing state after a deliberate downgrade, not asserted on directly.
+const RESTORE_BINDING_TRIGGERS_SQL = `
+CREATE TRIGGER addon_binding_generations_revoke_only
+  BEFORE UPDATE ON addon_binding_generations
+  WHEN OLD.revoked_at IS NOT NULL
+    OR NEW.revoked_at IS NULL
+    OR length(NEW.revoked_at) <> 24
+    OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.revoked_at) IS NOT NEW.revoked_at
+    OR NEW.revoked_at < OLD.configured_at
+    OR NEW.id IS NOT OLD.id
+    OR NEW.tenant IS NOT OLD.tenant
+    OR NEW.installation_id IS NOT OLD.installation_id
+    OR NEW.configuration_sha256 IS NOT OLD.configuration_sha256
+    OR NEW.binding_count IS NOT OLD.binding_count
+    OR NEW.manifest_sha256 IS NOT OLD.manifest_sha256
+    OR NEW.configured_by IS NOT OLD.configured_by
+    OR NEW.configured_at IS NOT OLD.configured_at
+    OR NEW.previous_generation_id IS NOT OLD.previous_generation_id
+    OR NEW.expected_installation_state IS NOT OLD.expected_installation_state
+    OR NEW.base_receipt_id IS NOT OLD.base_receipt_id
+BEGIN
+  SELECT RAISE(ABORT, 'addon binding generations are append-only except revocation');
+END;
+
+CREATE TRIGGER addon_connector_bindings_revoke_only
+  BEFORE UPDATE ON addon_connector_bindings
+  WHEN OLD.revoked_at IS NOT NULL
+    OR NEW.revoked_at IS NULL
+    OR length(NEW.revoked_at) <> 24
+    OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.revoked_at) IS NOT NEW.revoked_at
+    OR NEW.revoked_at < OLD.configured_at
+    OR NEW.id IS NOT OLD.id
+    OR NEW.tenant IS NOT OLD.tenant
+    OR NEW.installation_id IS NOT OLD.installation_id
+    OR NEW.generation_id IS NOT OLD.generation_id
+    OR NEW.slot IS NOT OLD.slot
+    OR NEW.adapter IS NOT OLD.adapter
+    OR NEW.binding_kind IS NOT OLD.binding_kind
+    OR NEW.capability IS NOT OLD.capability
+    OR NEW.connector_id IS NOT OLD.connector_id
+    OR NEW.manifest_sha256 IS NOT OLD.manifest_sha256
+    OR NEW.configured_by IS NOT OLD.configured_by
+    OR NEW.configured_at IS NOT OLD.configured_at
+BEGIN
+  SELECT RAISE(ABORT, 'addon bindings are append-only except revocation');
+END;
+`
+
+const RESTORE_INSTALLATION_TRIGGER_SQL = `
+CREATE TRIGGER addon_installations_identity_is_immutable
+  BEFORE UPDATE OF id, tenant, addon_key, installed_version, publisher,
+    trust_class, manifest_sha256, mupot_compatibility, installed_by, isolation_class
+  ON addon_installations
+  WHEN NEW.id IS NOT OLD.id
+    OR NEW.tenant IS NOT OLD.tenant
+    OR NEW.addon_key IS NOT OLD.addon_key
+    OR NEW.installed_version IS NOT OLD.installed_version
+    OR NEW.publisher IS NOT OLD.publisher
+    OR NEW.trust_class IS NOT OLD.trust_class
+    OR NEW.manifest_sha256 IS NOT OLD.manifest_sha256
+    OR NEW.mupot_compatibility IS NOT OLD.mupot_compatibility
+    OR NEW.installed_by IS NOT OLD.installed_by
+    OR NEW.isolation_class IS NOT OLD.isolation_class
+BEGIN
+  SELECT RAISE(ABORT, 'addon installation identity is immutable');
+END;
+`
+
+function downgradeIdentity(sqlite: { exec(sql: string): void }, mutate: () => void): void {
+  sqlite.exec('BEGIN')
+  try {
+    sqlite.exec('DROP TRIGGER addon_installations_identity_is_immutable')
+    sqlite.exec('DROP TRIGGER addon_binding_generations_revoke_only')
+    sqlite.exec('DROP TRIGGER addon_connector_bindings_revoke_only')
+    mutate()
+    sqlite.exec(RESTORE_INSTALLATION_TRIGGER_SQL)
+    sqlite.exec(RESTORE_BINDING_TRIGGERS_SQL)
+    sqlite.exec('COMMIT')
+  } catch (error) {
+    sqlite.exec('ROLLBACK')
+    throw error
+  }
+}
+
+// A digest that is neither any addon's OLD nor NEW identity — stands in for
+// prod's real, already-drifted marketing-cro-monitor generation
+// (76369cbe970b…, per the adversarial review's live read), whose exact
+// manifest content this repo has no way to reconstruct. The heal logic
+// keys off "does this live row match its installation", not off any
+// specific stale value, so an arbitrary-but-fixed placeholder proves the
+// same thing prod's real value would.
+const PRE_EXISTING_SPLIT_DIGEST = '76369cbe' + '0'.repeat(56)
+
+interface LifecycleRow {
+  id: string
+  manifest_sha256: string
+  mupot_compatibility?: string
+}
+
+function queryOne(
+  sqlite: { prepare(sql: string): { get(...args: unknown[]): unknown } },
+  sql: string,
+  ...args: unknown[]
+): LifecycleRow {
+  const row = sqlite.prepare(sql).get(...args) as LifecycleRow | undefined
+  if (!row) throw new Error(`query returned no row: ${sql}`)
+  return row
+}
+
+describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bindings heal through the real lifecycle', () => {
+  it('marketing-cro-monitor (active, live generation + binding + a completed run, PRE-EXISTING split) heals and runMarketingMonitor succeeds post-migration', async () => {
+    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const { sqlite, close } = harness
+    try {
+      const env = envForLifecycle(harness)
+      const window = { start: '2026-07-01T00:00:00.000Z', end: '2026-07-01T23:59:59.999Z' }
+
+      // marketing-cro-monitor's departments (agency/growth/web-ops) are
+      // pro/scale-gated (src/departments/modules/agency.ts) — a brand-new
+      // fixture DB fails closed to the 'free' tier (src/billing/entitlement.ts),
+      // which cannot activate them at all. Unrelated to this migration; just
+      // the entitlement this addon's own departments require to run.
+      sqlite.exec(`INSERT INTO org_settings (key, value) VALUES ('billing_state', '{"tier":"scale"}')`)
+
+      // Build through the REAL lifecycle, at whatever identity is currently
+      // registered on this branch (the NEW, post-bump manifests).
+      expectOk(await installAddon(env, lifecycleOwner, 'marketing-cro-monitor'), 'install marketing')
+      expectOk(
+        await configureAddon(env, lifecycleOwner, 'marketing-cro-monitor', {
+          bindings: [{ slot: 'web_analytics', adapter: 'first_party', bindingKind: 'internal_adapter' }],
+        }),
+        'configure marketing',
+      )
+      expectOk(await activateAddon(env, lifecycleOwner, 'marketing-cro-monitor'), 'activate marketing')
+      const firstRun = await runMarketingMonitor(env, lifecycleOwner, { window }, {
+        sourceFactory: ({ runId, window: requestedWindow }) => [createMarketingMonitorFixtureSource({
+          runId,
+          observedAt: '2026-07-01T12:00:00.000Z',
+          window: requestedWindow,
+        })],
+      })
+      expectOk(firstRun, 'first (pre-migration) marketing monitor run')
+
+      const installation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'marketing-cro-monitor'`,
+      )
+      const generation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE tenant = 'mumega' AND installation_id = ? AND revoked_at IS NULL`,
+        installation.id,
+      )
+      const binding = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_connector_bindings WHERE tenant = 'mumega' AND installation_id = ? AND revoked_at IS NULL`,
+        installation.id,
+      )
+
+      // Time-travel: installation to the OLD (^0.29.0) identity, but
+      // generation + binding + the completed run to a THIRD, already-split
+      // digest — prod's actual state (0089 moved the installation in
+      // August and never touched the generation).
+      downgradeIdentity(sqlite, () => {
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[0].oldDigest}', mupot_compatibility = '${ADDONS[0].oldCompat}' WHERE id = '${installation.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_binding_generations SET manifest_sha256 = '${PRE_EXISTING_SPLIT_DIGEST}' WHERE id = '${generation.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_connector_bindings SET manifest_sha256 = '${PRE_EXISTING_SPLIT_DIGEST}' WHERE id = '${binding.id}'`,
+        )
+        // marketing_monitor_runs is separately guarded by its own
+        // immutability trigger ("marketing monitor runs are immutable
+        // except guarded finalization") — not dropped here, so the
+        // pre-migration run keeps whatever digest real-lifecycle code wrote
+        // it with. 0181 does not touch this table (round-1 P2, accepted:
+        // pre-migration runs drop out of manifest_sha256-filtered views;
+        // not this migration's job to fix), so this test does not assert
+        // on it either way.
+      })
+
+      // Sanity precondition: the split is real before migrating.
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, installation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[0].oldDigest)
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE id = ?`, generation.id)
+          .manifest_sha256,
+      ).toBe(PRE_EXISTING_SPLIT_DIGEST)
+
+      applyInTransaction(sqlite, MIGRATION_SQL)
+
+      // Healed: installation at the NEW digest, generation and binding
+      // brought forward to match it (not to the installation's old value —
+      // proving the heal is keyed to the parent installation's CURRENT
+      // state, exactly as the review required).
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, installation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[0].newDigest)
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE id = ?`, generation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[0].newDigest)
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_connector_bindings WHERE id = ?`, binding.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[0].newDigest)
+
+      // The pre-migration run still exists, untouched by 0181 (P2,
+      // accepted: it drops out of manifest_sha256-filtered views; not this
+      // migration's job to fix).
+      expect(
+        sqlite.prepare(`SELECT COUNT(*) AS n FROM marketing_monitor_runs WHERE installation_id = ?`).get(installation.id),
+      ).toEqual({ n: 1 })
+
+      // The actual goal, with the CURRENT (new) code: a fresh monitor run
+      // succeeds. Before the P0 fix this returned binding_generation_not_live.
+      const secondRun = await runMarketingMonitor(env, lifecycleOwner, {
+        window: { start: '2026-07-02T00:00:00.000Z', end: '2026-07-02T23:59:59.999Z' },
+      }, {
+        sourceFactory: ({ runId, window: requestedWindow }) => [createMarketingMonitorFixtureSource({
+          runId,
+          observedAt: '2026-07-02T12:00:00.000Z',
+          window: requestedWindow,
+        })],
+      })
+      expectOk(secondRun, 'second (post-migration) marketing monitor run')
+    } finally {
+      close()
+    }
+  })
+
+  it('a disabled addon with a live (uniform, no-split) old-identity generation activates successfully post-migration', async () => {
+    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const { sqlite, close } = harness
+    try {
+      const env = envForLifecycle(harness)
+
+      expectOk(await installAddon(env, lifecycleOwner, 'fixture-addon'), 'install fixture-addon')
+      expectOk(await configureAddon(env, lifecycleOwner, 'fixture-addon', {}), 'configure fixture-addon')
+      expectOk(await activateAddon(env, lifecycleOwner, 'fixture-addon'), 'activate fixture-addon')
+      expectOk(await disableAddon(env, lifecycleOwner, 'fixture-addon'), 'disable fixture-addon')
+
+      const installation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'fixture-addon'`,
+      )
+      const generation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE tenant = 'mumega' AND installation_id = ? AND revoked_at IS NULL`,
+        installation.id,
+      )
+
+      // Uniform downgrade — installation and its generation both to the
+      // SAME old digest, no split (matches prod's workflow-circuits shape:
+      // "installation = generation").
+      downgradeIdentity(sqlite, () => {
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[3].oldDigest}', mupot_compatibility = '${ADDONS[3].oldCompat}' WHERE id = '${installation.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_binding_generations SET manifest_sha256 = '${ADDONS[3].oldDigest}' WHERE id = '${generation.id}'`,
+        )
+      })
+
+      applyInTransaction(sqlite, MIGRATION_SQL)
+
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE id = ?`, generation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[3].newDigest)
+
+      // Before the P0 fix this returned write_failed with no self-service
+      // way back (reconfiguring an addon with no connector requirements is
+      // an idempotent no-op that never mints a new generation).
+      expectOk(await activateAddon(env, lifecycleOwner, 'fixture-addon'), 'reactivate fixture-addon post-migration')
+    } finally {
+      close()
+    }
+  })
+
+  it('a configured (not yet active) addon reconfigures and activates successfully post-migration', async () => {
+    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const { sqlite, close } = harness
+    try {
+      const env = envForLifecycle(harness)
+
+      expectOk(await installAddon(env, lifecycleOwner, 'fixture-addon-with-loop'), 'install fixture-addon-with-loop')
+      expectOk(await configureAddon(env, lifecycleOwner, 'fixture-addon-with-loop', {}), 'configure fixture-addon-with-loop')
+
+      const installation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'fixture-addon-with-loop'`,
+      )
+      const generation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE tenant = 'mumega' AND installation_id = ? AND revoked_at IS NULL`,
+        installation.id,
+      )
+
+      downgradeIdentity(sqlite, () => {
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[4].oldDigest}', mupot_compatibility = '${ADDONS[4].oldCompat}' WHERE id = '${installation.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_binding_generations SET manifest_sha256 = '${ADDONS[4].oldDigest}' WHERE id = '${generation.id}'`,
+        )
+      })
+
+      applyInTransaction(sqlite, MIGRATION_SQL)
+
+      expectOk(
+        await configureAddon(env, lifecycleOwner, 'fixture-addon-with-loop', {}),
+        'idempotent reconfigure post-migration',
+      )
+      expectOk(await activateAddon(env, lifecycleOwner, 'fixture-addon-with-loop'), 'activate post-migration')
+    } finally {
+      close()
+    }
+  })
+
+  it('workflow-circuits (active, uniform old-identity generation, no connector bindings) heals with no split', async () => {
+    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const { sqlite, close } = harness
+    try {
+      const env = envForLifecycle(harness)
+
+      expectOk(await installAddon(env, lifecycleOwner, 'workflow-circuits'), 'install workflow-circuits')
+      expectOk(await configureAddon(env, lifecycleOwner, 'workflow-circuits', {}), 'configure workflow-circuits')
+      expectOk(await activateAddon(env, lifecycleOwner, 'workflow-circuits'), 'activate workflow-circuits')
+
+      const installation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'workflow-circuits'`,
+      )
+      const generation = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE tenant = 'mumega' AND installation_id = ? AND revoked_at IS NULL`,
+        installation.id,
+      )
+
+      downgradeIdentity(sqlite, () => {
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[2].oldDigest}', mupot_compatibility = '${ADDONS[2].oldCompat}' WHERE id = '${installation.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_binding_generations SET manifest_sha256 = '${ADDONS[2].oldDigest}' WHERE id = '${generation.id}'`,
+        )
+      })
+
+      applyInTransaction(sqlite, MIGRATION_SQL)
+
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, installation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[2].newDigest)
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_binding_generations WHERE id = ?`, generation.id)
+          .manifest_sha256,
+      ).toBe(ADDONS[2].newDigest)
+      expectOk(await disableAddon(env, lifecycleOwner, 'workflow-circuits'), 'disable workflow-circuits post-migration (proves it is live, not frozen)')
+    } finally {
+      close()
+    }
+  })
+
+  it('installed-only addons (project-link, mcpwp-office: no generation) are untouched by the generation/binding heal and still flip to the new identity', async () => {
+    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const { sqlite, close } = harness
+    try {
+      const env = envForLifecycle(harness)
+
+      expectOk(await installAddon(env, lifecycleOwner, 'project-link'), 'install project-link')
+      expectOk(await installAddon(env, lifecycleOwner, 'mcpwp-office'), 'install mcpwp-office')
+
+      const link = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'project-link'`,
+      )
+      const office = queryOne(
+        sqlite,
+        `SELECT id, manifest_sha256 FROM addon_installations WHERE tenant = 'mumega' AND addon_key = 'mcpwp-office'`,
+      )
+      expect(
+        sqlite.prepare(`SELECT COUNT(*) AS n FROM addon_binding_generations WHERE installation_id IN (?, ?)`).get(link.id, office.id),
+      ).toEqual({ n: 0 })
+
+      downgradeIdentity(sqlite, () => {
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[1].oldDigest}', mupot_compatibility = '${ADDONS[1].oldCompat}' WHERE id = '${link.id}'`,
+        )
+        sqlite.exec(
+          `UPDATE addon_installations SET manifest_sha256 = '${ADDONS[5].oldDigest}', mupot_compatibility = '${ADDONS[5].oldCompat}' WHERE id = '${office.id}'`,
+        )
+      })
+
+      applyInTransaction(sqlite, MIGRATION_SQL)
+
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, link.id).manifest_sha256,
+      ).toBe(ADDONS[1].newDigest)
+      expect(
+        queryOne(sqlite, `SELECT id, manifest_sha256 FROM addon_installations WHERE id = ?`, office.id).manifest_sha256,
+      ).toBe(ADDONS[5].newDigest)
     } finally {
       close()
     }
