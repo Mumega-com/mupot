@@ -49,7 +49,7 @@ const NATIVE_WITH_RANK_GRANT: AddonManifestV1 = {
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'native_reviewed',
-  mupotCompatibility: '^0.29.0',
+  mupotCompatibility: '^0.30.0',
   kind: 'native',
   description: 'P2-1 pin fixture: a native addon requesting a rank grant.',
   departments: [{ moduleKey: FixtureModule.key, required: true }],

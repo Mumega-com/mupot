@@ -42,18 +42,22 @@ describe('addon registry', () => {
 
   it('preserves an additive previous-minor lifecycle identity for compiled native addons', async () => {
     const registry = createAddonRegistry()
+    // One minor behind MUPOT_PUBLIC_API_VERSION (currently 0.31.0) — the
+    // exact boundary supportsAdditiveNativePreviousMinor grants native
+    // addons. Bump alongside every future API-version bump, same as the
+    // real native manifests in src/addons/ (see migrations/0181's header).
     const manifest = {
       ...FixtureAddon,
       key: 'previous-minor-native-addon',
       version: '1.0.0',
-      mupotCompatibility: '^0.29.0',
+      mupotCompatibility: '^0.30.0',
     }
 
     await registry.register(manifest)
 
     expect(registry.get(manifest.key)?.manifest).toMatchObject({
       version: '1.0.0',
-      mupotCompatibility: '^0.29.0',
+      mupotCompatibility: '^0.30.0',
     })
   })
 
@@ -65,7 +69,7 @@ describe('addon registry', () => {
       key: 'previous-minor-external-addon',
       trustClass: 'external_isolated',
       kind: 'external_mcp',
-      mupotCompatibility: '^0.29.0',
+      mupotCompatibility: '^0.30.0',
       departments: [],
       metrics: [],
       consoleSections: [],

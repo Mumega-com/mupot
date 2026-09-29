@@ -204,10 +204,11 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
 
 ## Release status — 2026-09-06
 
-- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
-  commit.** Any SHA written here is false the moment the commit writing it is merged, so
-  read it with `git rev-parse origin/main`.
-- **Current production deployment:** `0.30.0` at
+- **Source version as of 2026-09-06:** `0.30.0` on `main`. **This document does not pin
+  the `main` commit.** Any SHA written here is false the moment the commit writing it is
+  merged, so read it with `git rev-parse origin/main`. (This section is historical; read
+  ROADMAP.md's "Current version" table for what the source reports today.)
+- **Production deployment as of 2026-09-06:** `0.30.0` at
   `1303648c141eb5f5e9fa5efe76ef1776c6711011`, `clean:true`, built 2026-09-05T11:08:03Z.
   Production and `main` are at the same commit at the time of writing — the first time
   they have agreed since the 2026-09-01 freeze attempt. Read the live `/health` endpoint
@@ -364,10 +365,11 @@ one label, against `UNIQUE(tenant, member_id, label)`); #1253 conflicts with #12
 
 ## Release status — 2026-09-02 (superseded by the entry above)
 
-- **Current source version:** `0.30.0` on `main`. **This document does not pin the `main`
-  commit.** Any SHA written here is false the moment the commit writing it is merged, so
-  read it with `git rev-parse origin/main`.
-- **Current production deployment:** `0.30.0`. Read the exact commit and `clean` flag from
+- **Source version as of 2026-09-02:** `0.30.0` on `main`. **This document does not pin
+  the `main` commit.** Any SHA written here is false the moment the commit writing it is
+  merged, so read it with `git rev-parse origin/main`. (This section is historical; read
+  ROADMAP.md's "Current version" table for what the source reports today.)
+- **Production deployment as of 2026-09-02:** `0.30.0`. Read the exact commit and `clean` flag from
   the live `/health` endpoint. A SHA is recorded here only when a deployment happens, and a
   deployment is a gated event, so this line does not rot on every merge the way a `main` SHA
   does. Most recent recorded deployment: `7d58d36be5a67a6e859f4513bc9fc65523aab1a8`,
