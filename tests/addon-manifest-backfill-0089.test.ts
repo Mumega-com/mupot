@@ -134,11 +134,34 @@ function rowById(list: InstallationRow[], id: string): InstallationRow {
   return row
 }
 
+// This migration's own target is frozen at ^0.29.0 forever — migrations are
+// immutable history. `getRegisteredAddon` returns whatever mupotCompatibility
+// the LIVE manifest declares today (bumped again since, e.g. to ^0.30.0 by
+// #1598/0181), so this test must reconstruct the v0.29.0-era shape rather
+// than compare against the live registry, or it goes red on every future
+// compat bump for a reason that has nothing to do with 0089 itself. Every
+// other field is unchanged since 0089 was authored (this test was green
+// against the live registry right up until the next bump), so overriding
+// only the compat field reproduces the exact manifest 0089's digests were
+// computed from.
+function asOfV0290<T extends { manifest: { mupotCompatibility: string }; manifestSha256: string }>(
+  entry: T,
+  digest: string,
+): T {
+  return {
+    ...entry,
+    manifest: { ...entry.manifest, mupotCompatibility: NEW_COMPAT },
+    manifestSha256: digest,
+  }
+}
+
 describe('0089_backfill_addon_manifest_v0_29 — digest constants (load-bearing)', () => {
   it('the migration file\'s hardcoded digests equal manifestSha256() of the registered v0.29.0 manifests', async () => {
-    const cro = getRegisteredAddon('marketing-cro-monitor')
-    const link = getRegisteredAddon('project-link')
-    if (!cro || !link) throw new Error('expected addons are not registered')
+    const croLive = getRegisteredAddon('marketing-cro-monitor')
+    const linkLive = getRegisteredAddon('project-link')
+    if (!croLive || !linkLive) throw new Error('expected addons are not registered')
+    const cro = asOfV0290(croLive, CRO_DIGEST)
+    const link = asOfV0290(linkLive, LINK_DIGEST)
 
     expect(cro.manifest.mupotCompatibility).toBe(NEW_COMPAT)
     expect(link.manifest.mupotCompatibility).toBe(NEW_COMPAT)
@@ -249,9 +272,11 @@ describe('0089_backfill_addon_manifest_v0_29 — the actual goal: freeze is lift
   it('matchesRegisteredIdentity() is false before the migration (the drift is real) and true after (the freeze is lifted)', () => {
     const { sqlite, close } = buildSeededDb()
     try {
-      const croEntry = getRegisteredAddon('marketing-cro-monitor')
-      const linkEntry = getRegisteredAddon('project-link')
-      if (!croEntry || !linkEntry) throw new Error('expected addons are not registered')
+      const croLive = getRegisteredAddon('marketing-cro-monitor')
+      const linkLive = getRegisteredAddon('project-link')
+      if (!croLive || !linkLive) throw new Error('expected addons are not registered')
+      const croEntry = asOfV0290(croLive, CRO_DIGEST)
+      const linkEntry = asOfV0290(linkLive, LINK_DIGEST)
 
       const beforeRows = rows(sqlite)
       expect(matchesRegisteredIdentity(installationFor(rowById(beforeRows, 'inst-cro')), croEntry)).toBe(false)
