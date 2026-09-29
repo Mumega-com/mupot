@@ -1,5 +1,189 @@
 # Changelog
 
+## [Unreleased] — main since v0.31.0
+
+- **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
+  GPT Actions discovery) now serves an explicit, committed allowlist
+  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
+  instead of the whole registry, with a runtime min-capability floor. A new
+  org-admin-gated `GET /openapi.full.json` serves the full registry. CI ratchet
+  `scripts/check-openapi-public-allowlist.mjs`. **Not a full fix for admin-tool
+  disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
+  to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
+  `/openapi.full.json` (#1608). #1596 stays open.
+
+## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
+
+`main` at `d954c1ab` is 14 commits ahead of the `v0.30.0` tag (`09ea48f6`),
+verified via `git log 09ea48f6..origin/main` and each PR's merge commit
+confirmed against the GitHub API (`gh pr view <n> --json mergeCommit`). Hadi
+approved cutting `v0.31.0` "Office" for this window; `package.json`/
+`src/version.ts` moved to `0.31.0` in #1604, which merged and deployed
+2026-09-29. Live `/health` confirms `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}`.
+Kasra-core cuts `release/v0.31.0` and the annotated tag against this commit
+range — this entry does not pin which exact commit the tag lands on (this
+document does not pin `main`, the same rule every prior entry follows); read
+the tag itself, not a SHA copied in here.
+
+- **#1554** — `8122b3fc` docs: CHANGELOG.md + ROADMAP.md for the `v0.30.0` tag.
+- **#1557** — `326f6b47` Option A: public JSON invite accept no longer mints a
+  bearer — identity must be proven at login, closing the mupot#1551 member-row
+  squatting P0. Deployed `db6161ed`.
+- **#1559** — `9cab33d8` mupot#1551 slice 1: inviter re-checked at redemption
+  time via a SQL rank mirror, reserved-email refusal, `lower(email)` collision
+  guard, home-squad refusal (#1558). Deployed `b6e2676c`.
+- **#1561** — `ac312ba8` archive substrate (#1496): `archived_at` /
+  `archived_reason` / `archived_by` / `archived_prior_status` on
+  members/agents/squads/projects; `squads.status` CHECK; `tasks_archive_state`
+  side table; receipted `archive_row` / `unarchive_row` / `archive_plan_expand`;
+  `scripts/hygiene-archive.mjs`. Migration 0173. Task archiving deferred to
+  #1571. Deployed `6854cfa8` (0173 applied first).
+- **#1560** — `83d82dce` Option B: one exclusive-control attach predicate for
+  identity-less member attach, shared by Google login, SSO, and connector
+  attach; liveness leaf inside the guarded INSERT; session-retry re-derives via
+  `loadWebSession`. **Release note:** a web session minted before this deploy,
+  for a member who also holds their own CLI bearer, loses `memberId` until
+  re-login. Deployed `78deff4f`.
+- **#1574** — `681e2dab` email one-time link/code sign-in beside Google.
+  Migration 0174 (`email_login_attempts`, `email_login_rate_limits`); every
+  gate is one atomic D1 statement; per-email and per-IP fixed windows; 5-guess
+  cap; single-use consume; `GET` verify renders a confirm page, `POST`
+  consumes; login refused when a live non-email identity shares the verified
+  email, or the resolved row is a non-member user; flag `EMAIL_LOGIN_ENABLED`;
+  Resend. Deployed 2026-09-27 00:39Z, version `a8a37e24` (0174 applied first).
+
+Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
+#1562, #1564, #1569, #1570, #1572, #1577, #1580.
+
+**Auth residuals**
+
+- **#1583** — `f10db713` `/api/projects` authority becomes the session member
+  (`sessionMemberId`), never re-resolved from email; resolver step 4
+  (`owner_login_emails`) removed as dead and dangerous; `findUserByEmail`
+  fails closed on case-variant collisions; CI ratchet
+  `check-member-email-authority-lookup` (allowlist per-file counts);
+  `tests/auth-dev-login` rewritten onto the real SQLite harness (#1578,
+  #1581). Merged 2026-09-27, deployed.
+
+**MCPWP office addon (mupot#1580, v0.31.0 "Office")**
+
+- **#1582** — `921dbcda` slice 1: `AddonManifestV1` for `mcpwp-office`
+  ("WordPress as each pot's office"), `kind: 'external_mcp'` /
+  `trustClass: 'external_isolated'`, a required `office` department, a
+  `site-operator` agent template, one `wordpress_site` connector requirement,
+  and the three `office.*` surface grants slice 2 implements. Closes the
+  install-lifecycle gap the manifest exposed: `installAddon` now accepts an
+  `external_mcp`/`external_isolated` manifest. Migration 0175
+  (`isolation_class` `ADD COLUMN`). Two adversarial gate rounds; round-2
+  follow-ups filed as #1587. Deployed.
+- **#1588** — `8444aa53` slice 2: implements `office.publish_post`,
+  `office.list_pending_approvals`, `office.review_approval`, and closes out
+  #1587. The payload is frozen at approval time
+  (`office_publish_freezes`, migration 0179) and claimed one-shot before any
+  WordPress fetch (`claimed_at IS NULL` → claimed, no un-claim, no retry) —
+  but binding that freeze to the payload hash the human was actually shown
+  was not yet built (#1592 NEW-1), and the generic `task_verdict` could
+  still re-approve a `gate:office` task after a reversal (#1592 NEW-2), so
+  the review gate was not yet a human-only guarantee. Migration 0178 widens
+  the isolation-class identity triggers. Deployed. **Publishing remained
+  inert at merge**: `preflightAddonBindings` (`src/addons/bindings.ts`)
+  refuses any `capability: 'write'` connector requirement by schema `CHECK`
+  (`migrations/0052_addon_bindings.sql` allows `'read'` only), and
+  `wordpress_site` is the only write-capability connector requirement in the
+  codebase, so `mcpwp-office` could not reach `configured`/`active` through
+  the real lifecycle. T2b (enabling write bindings) needed both this and
+  #1592 resolved first — see "Known limitations" below for current status.
+
+**Seat-events channel (Orca fleet hosts)**
+
+- **#1593** — `508796fe` fixes the P1s from the #1589 adversarial gate that
+  were already live in prod at Hadi's canary commit `f51ca408`
+  (`REALTIME_SEAT_EVENTS=1`, supersedes #1589): an agent-bound token could
+  create/revoke seat-event grants (no rank ceiling); `GET /api/fleet/events`
+  accepted an unauthenticated upgrade with no auth deadline, frame cap, or
+  connection cap. Migrations 0176 (`seat_event_grants`) + 0177
+  (`seat_events_ticket_rate_limit`). Deployed.
+- **#1595** — `5f13fb57` hardening from the #1593 gate (mupot#1594): the
+  upgrade route now checks a route-level D1 ticket record before the DO is
+  reached (closing a forged-ticket anonymous-lockout path), per-IP upgrade
+  rate limiting bucketed to the IPv6 /64, the auth deadline moved off an
+  in-memory clock onto the socket's own hibernation-safe attachment,
+  pending/authenticated socket caps split, the legacy-stream fence now fails
+  closed on a D1 error instead of open, and grant scope requires standing on
+  both the target agent's squad and the destination host with an
+  effective-rank revoke ceiling. Migration 0180. Deployed 2026-09-28,
+  `/health` `5f13fb57`, 0180 applied first. One P3 follow-up filed as #1597.
+  A supervised Orca canary seat (`orca-mupot-claude`) and host identity
+  (`orca-hadi-mac`) exist for event-delivery testing.
+
+**Security**
+
+- **#1601** — bumped the `ip-address` override to `^10.7.2`, patching
+  GHSA-rpw4-54j3-4h4q and GHSA-2vr4-cq9g-pvrc, and closed the same class of
+  gap in the pot's own SSRF guard (`src/lib/ssrf.ts`): NAT64-embedded
+  addresses (`64:ff9b::/96`, `64:ff9b:1::/48`) previously fell through to
+  "other global IPv6 → allow" and could carry the cloud-metadata payload
+  (`64:ff9b::a9fe:a9fe` ≡ `169.254.169.254`). Both prefixes are now blocked
+  outright via structural comparison against the fully-expanded address, not
+  a `startsWith` a differently-spelled address could dodge. 22 new tests in
+  `tests/lib-ssrf.test.ts`, the guard's first dedicated unit coverage.
+  Merged, deployed.
+
+**v0.31.0 version bump + native-addon identity backfill**
+
+- **#1604** — `d954c1ab` `package.json`/`src/version.ts` `0.30.0` → `0.31.0`.
+  The bump alone would have crashed the Worker at boot:
+  `assertAddonRuntimeContract` grants a *native* addon only a one-minor
+  grace band, and five native manifests (marketing-cro-monitor,
+  project-link, workflow-circuits, fixture-addon, fixture-addon-with-loop)
+  were pinned two minors behind at `^0.29.0` — bumped to `^0.30.0`.
+  `mcpwp-office`'s compat, previously derived live from
+  `MUPOT_PUBLIC_API_VERSION`, is now pinned as a literal `^0.31.0` (an
+  `external_isolated` addon gets no grace band at all, so a derived value
+  would have needed an identity backfill on every future bump, patches
+  included). Migration 0181 backfills all six addons' identity, and — after
+  a round-1 adversarial BLOCK — also heals every *live*
+  `addon_binding_generations`/`addon_connector_bindings` row to match its
+  parent installation (keyed to the installation, not a hardcoded old
+  digest, excluding archived rows), because those two tables keep their own
+  immutable `manifest_sha256` snapshot that moving only the installation
+  would otherwise leave stranded. Tested through the real
+  `installAddon`/`configureAddon`/`activateAddon`/`disableAddon`/
+  `runMarketingMonitor` lifecycle, not hand-written INSERTs. Two adversarial
+  gate rounds (max). Merged and **deployed 2026-09-29**: code first as
+  Cloudflare version `6d1d7c6c`, then migration 0181 applied immediately in
+  the same window. Post-deploy checks showed **0 identity drift and 0
+  generation/binding split** across every affected installation. 0181 also
+  healed a live production defect that had existed since migration 0089
+  (August): marketing-cro-monitor's binding generation had drifted from its
+  installation's identity and the CRO monitor had most likely been failing
+  silently since — see mupot#1606.
+
+**Known limitations in this release**
+
+- **Office publishing is still inert.** `mcpwp-office` cannot reach
+  `configured`/`active` — `preflightAddonBindings` refuses its one
+  `capability: 'write'` connector requirement by schema `CHECK`
+  (`migrations/0052_addon_bindings.sql` allows `'read'` only) — and even
+  once that schema gap is resolved, T2b (turning write bindings on) is
+  separately blocked on mupot#1592 (PR #1602, in review as of this writing):
+  binding the human's approval to the exact payload hash shown and to the
+  verdict that approved it. The three `office.*` tools shipped and are
+  tested, but nothing can publish through them today.
+- **The public `/openapi.json` still discloses the full tool registry**,
+  including admin-only tools, to any unauthenticated caller. Fix in
+  progress under PR #1603 (in review as of this writing): an explicit
+  public/internal allowlist.
+
+Known follow-ups still open: #1587 (slice-1 gate follow-ups — its fixes
+shipped in #1588, though the issue itself is still open on GitHub), #1591
+(seat-events prod/main DO reconciliation + project-scope filtering — the P1s
+were fixed at merge, P2s remain), #1597 (bring the seat-events Miniflare
+regression harness into the repo/CI), #1605 (SSRF: remaining IPv4-in-IPv6
+embeddings and non-global v6 ranges), #1607 (addon identity backfills:
+receipts and monitor-run history still carry stale digest copies; a disabled
+row backfilled before a later archive/disable can hit `fence_lost`).
+
 ## [0.30.0] — 2026-09-26 (tagged; release/v0.30.0 at 09ea48f6)
 
 Kasra cut branch `release/v0.30.0` at `09ea48f6` and pushed the annotated tag `v0.30.0`
@@ -137,70 +321,6 @@ PR's own commit message, which in a few cases named a *different*, superseded PR
   `handlePotCreationCompleted` has no production caller — the Stripe webhook never
   routes `metadata.action='create_pot'` (residual since #1232; found in #1516's gate;
   this is why #1543 disabled checkout by default rather than shipping it live).
-
-## [Unreleased] — main since v0.30.0
-
-`main` at `681e2dab` (2026-09-27) is 6 commits ahead of the `v0.30.0` tag
-(`09ea48f6`), verified via `git log 09ea48f6..origin/main` and each PR's merge
-commit confirmed against the GitHub API (`gh pr view <n> --json mergeCommit`).
-None of this is tagged — `v0.30.0` remains the latest stable tag (see
-ROADMAP.md's "Current version" table for the live production SHA).
-
-- **#1554** — `8122b3fc` docs: CHANGELOG.md + ROADMAP.md for the `v0.30.0` tag.
-- **#1557** — `326f6b47` Option A: public JSON invite accept no longer mints a
-  bearer — identity must be proven at login, closing the mupot#1551 member-row
-  squatting P0. Deployed `db6161ed`.
-- **#1559** — `9cab33d8` mupot#1551 slice 1: inviter re-checked at redemption
-  time via a SQL rank mirror, reserved-email refusal, `lower(email)` collision
-  guard, home-squad refusal (#1558). Deployed `b6e2676c`.
-- **#1561** — `ac312ba8` archive substrate (#1496): `archived_at` /
-  `archived_reason` / `archived_by` / `archived_prior_status` on
-  members/agents/squads/projects; `squads.status` CHECK; `tasks_archive_state`
-  side table; receipted `archive_row` / `unarchive_row` / `archive_plan_expand`;
-  `scripts/hygiene-archive.mjs`. Migration 0173. Task archiving deferred to
-  #1571. Deployed `6854cfa8` (0173 applied first).
-- **#1560** — `83d82dce` Option B: one exclusive-control attach predicate for
-  identity-less member attach, shared by Google login, SSO, and connector
-  attach; liveness leaf inside the guarded INSERT; session-retry re-derives via
-  `loadWebSession`. **Release note:** a web session minted before this deploy,
-  for a member who also holds their own CLI bearer, loses `memberId` until
-  re-login. Deployed `78deff4f`.
-- **#1574** — `681e2dab` email one-time link/code sign-in beside Google.
-  Migration 0174 (`email_login_attempts`, `email_login_rate_limits`); every
-  gate is one atomic D1 statement; per-email and per-IP fixed windows; 5-guess
-  cap; single-use consume; `GET` verify renders a confirm page, `POST`
-  consumes; login refused when a live non-email identity shares the verified
-  email, or the resolved row is a non-member user; flag `EMAIL_LOGIN_ENABLED`;
-  Resend. Deployed 2026-09-27 00:39Z, version `a8a37e24` (0174 applied first).
-
-Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
-#1562, #1564, #1569, #1570, #1572, #1577, #1580.
-
-### In flight — not yet merged
-
-- **mupot#1596** (branch `kasra/openapi-public-split`) — `GET /openapi.json`
-  (Custom GPT Actions discovery, unauthenticated by design) used to serve the
-  entire 144-tool registry, disclosing the admin surface by name and input
-  schema (`mint_agent_token`, `grant_agent_capability`, `revoke_*`,
-  `archive_row`/`unarchive_row`, `addon_archive`, and more) even though every
-  tool already enforced its own authz server-side (P2 disclosure, not an
-  access break). It now serves an explicit, committed allowlist
-  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below only, 91 of 144
-  tools) with a runtime min-capability floor as a second independent gate. A
-  new authenticated `GET /openapi.full.json` (org-admin bearer) serves the
-  full registry for internal tooling. CI ratchet
-  `scripts/check-openapi-public-allowlist.mjs` (self-tested, mutation-proven:
-  adding an admin tool to the allowlist, or reverting the route to bypass the
-  filter, both fail the build). See `docs/connect-mcp-client.md`. Not merged
-  or deployed.
-- **PR #1583** (`flight/auth-residuals`) — `/api/projects` authority becomes
-  the session member (`sessionMemberId`), never re-resolved from email;
-  resolver step 4 (`owner_login_emails`) removed as dead and dangerous;
-  `findUserByEmail` fails closed on case-variant collisions; CI ratchet
-  `check-member-email-authority-lookup` (allowlist per-file counts);
-  `tests/auth-dev-login` rewritten onto the real SQLite harness (#1578,
-  #1581). Not deployed; state it as merged only once `gh pr view 1583` reports
-  `MERGED`.
 
 ## Release status — 2026-09-06
 

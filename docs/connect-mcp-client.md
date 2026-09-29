@@ -137,9 +137,13 @@ discovery is split into two specs (mupot#1596):
   legitimately needs the whole surface, not for a public Custom GPT config.
 
 Use `/actions/:tool` only when your client can't speak MCP JSON-RPC — `/mcp`
-is the primary surface, and `GET /mcp/tools` (also unauthenticated) already
-lists every tool's name/scope/min_capability/args without a schema dump —
-that's an intentional, much smaller disclosure the allowlist doesn't touch.
+is the primary surface. **Known gap (#1609):** a JSON-RPC `tools/list` on
+`POST /mcp` still returns every registered tool, with input schemas, to any
+valid token regardless of capability, and tokens are easy to obtain (open
+client registration, self-serve sign-in). So the allowlist removes the
+*unauthenticated* admin map, not the authenticated one; #1596 stays open until
+`tools/list` is filtered by the caller's capability floor. (`GET /mcp/tools` is
+not a public listing: it returns `401` without a token and `404` with one.)
 
 ## Troubleshooting
 
