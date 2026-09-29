@@ -8,17 +8,16 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.30.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. |
-| Current production version | `0.30.0` | Last recorded deploy `681e2dab` (2026-09-27); live `/health` reported `{"version":"0.30.0","commit":"681e2dabb4868c38a41fce9762c5877bd72dad87","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
-| Last tagged stable release | `v0.30.0` | Tagged 2026-09-26, `release/v0.30.0` frozen at `09ea48f6`. First stable tag since `v0.25.0`. |
-| Superseded prerelease | `v0.30.0-rc.1` | Cut at `0bb9c256` (2026-09-03). 15 commits have landed since, including four security and three identity fixes. Not a candidate. |
-| Next stable candidate | `v0.30.1` | P0 cherry-picks onto `release/v0.30.0` only — never a re-cut from wherever `main` happens to be. |
-| Future development target | `v0.31.0` | `v0.30.0` is now tagged stable, so the prior hold has lifted. See "Next flight — v0.31.0 'Office'" below for the flight in progress and the capability ledger further down for the receiver/Agent Computers/Recovery scope still queued. |
+| Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` by this PR (`kasra/release-v0.31.0`, the version-bump + native-addon-identity-backfill half of the "Office" release; see mupot#1598 for the docs-only half narrating the feature scope). |
+| Current production version | `0.30.0` | Last recorded deploy `5f13fb57` (2026-09-28); live `/health` reported `{"version":"0.30.0","commit":"5f13fb579b5606d765ca466b851ac8d009dec8dd","clean":true}` at verification time and remains the authoritative source. The `0.31.0` bump has not deployed yet — `main` and production may diverge until it does. |
+| Last tagged stable release | `v0.31.0` | **Tag pending at merge.** Hadi approved cutting `v0.31.0` for the Office scope (mupot#1598); this PR bumps the version string ahead of the tag, and Kasra-core cuts `release/v0.31.0` and the annotated tag immediately after this PR merges — no git tag exists as of this commit. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
+| Next stable candidate | `v0.31.1` | P0 cherry-picks onto `release/v0.31.0` only, once cut — never a re-cut from wherever `main` happens to be. |
+| Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this bump and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
 
-`0.30.0` is the version the source has reported since 2026-08-21. `v0.30.0` is now also a
-tag and a release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) — the source
-version string and the release tag agree for the first time since `v0.25.0`. `main`
-continues past that point as preview; nothing on `main` after `09ea48f6` is covered by
+`0.31.0` is the version the source reports as of this commit (bumped from `0.30.0` by
+this PR). `v0.30.0` remains the only version with a real git tag and release branch
+(`release/v0.30.0` at `09ea48f6`, 2026-09-26) until `v0.31.0`'s tag is cut at merge.
+`main` continues past `09ea48f6` as preview; nothing on `main` after it is covered by
 the `v0.30.0` evidence bundle.
 
 ## Next flight — v0.31.0 "Office"
