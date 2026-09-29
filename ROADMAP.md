@@ -8,38 +8,43 @@ numbers.
 
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` by this PR (`kasra/release-v0.31.0`, the version-bump + native-addon-identity-backfill half of the "Office" release; see mupot#1598 for the docs-only half narrating the feature scope). |
-| Current production version | `0.30.0` | Last recorded deploy `5f13fb57` (2026-09-28); live `/health` reported `{"version":"0.30.0","commit":"5f13fb579b5606d765ca466b851ac8d009dec8dd","clean":true}` at verification time and remains the authoritative source. The `0.31.0` bump has not deployed yet — `main` and production may diverge until it does. |
-| Last tagged stable release | `v0.31.0` | **Tag pending at merge.** Hadi approved cutting `v0.31.0` for the Office scope (mupot#1598); this PR bumps the version string ahead of the tag, and Kasra-core cuts `release/v0.31.0` and the annotated tag immediately after this PR merges — no git tag exists as of this commit. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
+| Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
+| Current production version | `0.31.0` | Last recorded deploy `d954c1ab` (2026-09-29); live `/health` reported `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
+| Last tagged stable release | `v0.31.0` | Deployed 2026-09-29 (#1604, code first as Cloudflare version `6d1d7c6c`, migration 0181 applied immediately after — 0 identity drift, 0 generation/binding split on the post-deploy check). **The annotated git tag itself is pending**: Kasra-core cuts `release/v0.31.0` and pushes `v0.31.0` against this commit range next — no tag object exists as of this commit, so read the tag, not a SHA copied in here, once it lands. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
 | Next stable candidate | `v0.31.1` | P0 cherry-picks onto `release/v0.31.0` only, once cut — never a re-cut from wherever `main` happens to be. |
-| Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this bump and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
+| Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this release and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
 
-`0.31.0` is the version the source reports as of this commit (bumped from `0.30.0` by
-this PR). `v0.30.0` remains the only version with a real git tag and release branch
-(`release/v0.30.0` at `09ea48f6`, 2026-09-26) until `v0.31.0`'s tag is cut at merge.
-`main` continues past `09ea48f6` as preview; nothing on `main` after it is covered by
-the `v0.30.0` evidence bundle.
+`0.31.0` is the version the source reports as of this commit, and (as of 2026-09-29) the
+version live in production too — the source version string and the deployed version
+agree for the first time since `v0.30.0`. `v0.30.0` remains the only version with a real
+git tag and release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) until
+`v0.31.0`'s annotated tag is cut. `main` continues past `d954c1ab` as preview; nothing on
+`main` after it is covered by whatever evidence bundle the `v0.31.0` tag ends up bound to.
 
-## Next flight — v0.31.0 "Office"
+## Shipped — v0.31.0 "Office" (2026-09-29)
 
-Flight `flight-20260927-office-v0310` is the active flight targeting `v0.31.0`.
-Board task ids: `fc18d543`, `faa6ab68`, `25edda37`, `be686091`.
+Flight `flight-20260927-office-v0310`, complete. Board task ids: `fc18d543`,
+`faa6ab68`, `25edda37`, `be686091`. Full commit-level detail lives in
+[CHANGELOG.md](CHANGELOG.md)'s `[0.31.0]` entry; this section only summarizes.
 
-Scope:
-
-- MCPWP office addon slices 1–2 (#1580; PR #1582, branch `flight/office-addon-s1`,
-  head `3915a7f3`, base `main` `681e2dab`). Build-only as of this writing — not
-  merged, not deployed.
-- Auth residuals (#1583; see [CHANGELOG.md](CHANGELOG.md) "In flight — not yet
-  merged" for the exact diff scope). Not merged as of this writing.
-- Tag `v0.31.0` once both land and the release gate passes.
+Landed and deployed: MCPWP office addon slices 1–2 (#1580; PR #1582, #1588),
+auth residuals (#1583), the seat-events channel for fleet hosts and its
+hardening (#1593, #1595 — a separate, concurrent Hadi-led effort that landed
+in the same window, not originally named in this flight), an SSRF/dependency
+security fix (#1601), and the v0.31.0 version bump + native-addon identity
+backfill (#1604). Office publishing remains inert (mupot#1592, PR #1602 in
+review) and the public `/openapi.json` still discloses admin tools (PR #1603
+in review) — see CHANGELOG.md "Known limitations" for both.
 
 Gate rule (Hadi, 2026-09-16): P0 blocks, P1 ships with a follow-up issue, two
 adversarial gate rounds maximum per artifact.
 
-This flight does not reconcile the wider `v0.31.0` capability-ledger scope
+This flight did not reconcile the wider `v0.31.0` capability-ledger scope
 already reserved below (canonical Mupot-to-Codex receiver, governed realtime
-push, isolated Agent Computers) — that reconciliation is Kasra-core's and
+push, isolated Agent Computers) — none of that shipped in it, and `v0.31.0`
+is now the tag for the Office scope above instead. The capability ledger's
+four `v0.31.0` rows further down name a version that has already shipped
+different work; reassigning them to their real target is Kasra-core's and
 Hadi's call, not made in this document.
 
 ### After v0.31.0
@@ -883,6 +888,14 @@ security review, recovery evidence, legible costs, and one reproducible Mumega/D
 study. Feature count alone cannot satisfy the GA gate.
 
 ## Capability ledger
+
+**2026-09-29 note:** `v0.31.0` shipped and deployed (see "Shipped — v0.31.0
+'Office'" above) for the Office addon + auth-residuals + seat-events scope.
+The four rows below still labelled `v0.31.0` (receiver/runner, realtime
+push, runtime receipts, Agent Computers) did **not** ship in it — none of
+that work has started. They keep the `v0.31.0` label only until Kasra-core/
+Hadi assign them a real target version; read it as "not yet targeted," not
+as a claim about what the tagged `v0.31.0` contains.
 
 | Capability | Release state | Activation |
 |---|---|---|
