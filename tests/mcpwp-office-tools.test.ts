@@ -31,7 +31,8 @@ import '../src/mcp/office'
 import { activateAddon, installAddon } from '../src/addons/service'
 import { createTask } from '../src/tasks/service'
 import * as bindingsModule from '../src/addons/bindings'
-import { resolveActiveOfficeInstallationId, publishOfficePost } from '../src/addons/office/service'
+import { publishOfficePost } from '../src/addons/office/service'
+import { resolveActiveOfficeInstallationId } from '../src/addons/office/freeze'
 import type { Task } from '../src/types'
 
 const TENANT = 'tenant-office-tools'
@@ -681,34 +682,27 @@ describe('office.publish_post', () => {
     harness.close()
   })
 
-  it('refuses when the installation was never active, with zero fetches (no target was ever resolvable to freeze)', async () => {
+  it('refuses to APPROVE when the installation was never active — no target was ever resolvable to freeze (mupot#1602 r1 P2-2)', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
-    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
     // installAddon only — never configured/activated, so listAddonInstallations sees
-    // state='installed', not 'active', at BOTH approval and publish time. The
-    // approval still lands (a human's decision to approve content is independent
-    // of infra readiness — see reviewOfficeApproval's comment), but with no frozen
-    // payload (buildOfficePublishFreeze itself returns addon_inactive and is
-    // skipped), so publish now correctly reports 'payload_not_frozen' rather than
-    // re-deriving 'addon_inactive' a second time — see the dedicated
-    // 'installation is active at publish time but was not at approval time' case
-    // below for the case where it WAS active at approval and then went inactive.
+    // state='installed', not 'active', at review-entry time. buildOfficePublishFreeze
+    // returns addon_inactive and freezeOfficeTaskOnReviewEntry silently leaves no
+    // freeze row. Round 1's design let the APPROVAL land anyway ("independent of
+    // infra readiness") and only publish refused; mupot#1602 r1 P2-2 closed that
+    // as a success-shaped no-op on the addon's own main producer of content —
+    // approval itself now refuses with no live freeze to bind.
     await installAddon(testEnv, { id: 'owner-1', role: 'owner' }, 'mcpwp-office')
     const taskId = await makeOfficeTask(testEnv, squadId)
-    await approveOfficeTask(testEnv, taskId)
+    const owner = orgOwnerAuth()
 
-    const fetchSpy = vi.fn()
-    vi.stubGlobal('fetch', fetchSpy)
-
-    const result = await invokeTool(
-      officeLead(departmentId), testEnv, 'office.publish_post',
-      { task_id: taskId }, ORIGIN,
-    )
+    const result = await invokeTool(owner, testEnv, 'office.review_approval', { task_id: taskId, verdict: 'approved' }, ORIGIN)
 
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error).toBe('payload_not_frozen')
-    expect(fetchSpy).not.toHaveBeenCalled()
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(row.status).toBe('review')
     harness.close()
   })
 
@@ -870,14 +864,44 @@ describe('office.review_approval', () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-approve-happy')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    const owner = orgOwnerAuth()
+    const expectedPayloadSha256 = await officeFreezeHash(testEnv, taskId)
+    expect(expectedPayloadSha256).not.toBeNull()
+
+    const result = await invokeTool(
+      owner, testEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: expectedPayloadSha256 },
+      ORIGIN,
+    )
+
+    expect(result.ok).toBe(true)
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(row.status).toBe('approved')
+    harness.close()
+  })
+
+  // mupot#1602 r1 adversarial gate P2-2: round 1's design let this succeed as a
+  // no-op ("a human's decision to approve content is independent of WordPress
+  // infra readiness") — the tool's own description already promised otherwise
+  // ("a mismatch (or a missing/voided freeze) refuses the approval"). Now it does.
+  it('refuses to approve when no live freeze exists at all — no WordPress infra was ever resolvable', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    // No installation/connector seeded — the review-entry freeze hook silently
+    // leaves no freeze row (addon_inactive).
     const taskId = await makeOfficeTask(testEnv, squadId)
     const owner = orgOwnerAuth()
 
     const result = await invokeTool(owner, testEnv, 'office.review_approval', { task_id: taskId, verdict: 'approved' }, ORIGIN)
 
-    expect(result.ok).toBe(true)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('payload_not_frozen')
     const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
-    expect(row.status).toBe('approved')
+    expect(row.status).toBe('review')
     harness.close()
   })
 
@@ -1417,7 +1441,10 @@ describe('mupot#1592 reconcile-before-reapprove', () => {
     // exact ambiguous state a real timeout/crash mid-publish leaves behind.
     harness.sqlite.prepare(
       `UPDATE office_publish_freezes SET claimed_by = 'ghost-worker', claimed_at = ? WHERE task_id = ?`,
-    ).run(new Date().toISOString(), taskId)
+      // Backdated well past RECONCILE_MIN_STALENESS_MS (mupot#1602 r1 P3-3) — a
+      // reconcile call must refuse a claim that could still be a live in-flight
+      // fetch; this simulates one old enough to be genuinely stalled.
+    ).run(new Date(Date.now() - 60_000).toISOString(), taskId)
 
     // Org admin reverses the (never-actually-executed) approval to get the task
     // back into review — the review-entry hook fires but must NOT mint a fresh
@@ -1503,7 +1530,10 @@ describe('mupot#1592 reconcile-before-reapprove', () => {
     await approveOfficeTask(testEnv, taskId)
     harness.sqlite.prepare(
       `UPDATE office_publish_freezes SET claimed_by = 'ghost-worker', claimed_at = ? WHERE task_id = ?`,
-    ).run(new Date().toISOString(), taskId)
+      // Backdated well past RECONCILE_MIN_STALENESS_MS (mupot#1602 r1 P3-3) — a
+      // reconcile call must refuse a claim that could still be a live in-flight
+      // fetch; this simulates one old enough to be genuinely stalled.
+    ).run(new Date(Date.now() - 60_000).toISOString(), taskId)
 
     const fetchSpy = vi.fn()
     vi.stubGlobal('fetch', fetchSpy)

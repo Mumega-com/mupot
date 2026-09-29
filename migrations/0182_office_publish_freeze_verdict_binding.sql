@@ -37,28 +37,45 @@
 ALTER TABLE office_publish_freezes ADD COLUMN verdict_id TEXT;
 ALTER TABLE office_publish_freezes ADD COLUMN voided_at TEXT;
 ALTER TABLE office_publish_freezes ADD COLUMN voided_reason TEXT;
+-- mupot#1602 r1 adversarial gate P3-2: a monotonic per-row generation counter,
+-- bumped by persistOfficePublishFreeze's upsert on EVERY fresh freeze (see below).
+-- Not yet applied anywhere (this PR is unmerged), so widened here in place rather
+-- than as a follow-up 0183 ALTER.
+ALTER TABLE office_publish_freezes ADD COLUMN generation INTEGER NOT NULL DEFAULT 1;
 
 -- P3 (mupot#1592): "no DB trigger keeps a claimed row claimed" — claimed_at is the
 -- one-shot execution guard office.publish_post's atomic claim UPDATE depends on
 -- (migrations/0179); nothing in application code ever clears it back to NULL in
 -- place, but nothing stopped a direct/future writer from doing so either, which
 -- would silently re-open a one-shot slot for a WordPress write that already
--- happened. Scoped to `frozen_at` UNCHANGED — the review-entry freeze hook's own
--- rework-loop refreeze (src/addons/office/service.ts's freezeOfficeTaskOnReviewEntry
--- / persistOfficePublishFreeze, called from src/mcp/index.ts's task_update and
--- src/tasks/index.ts's PATCH on every entry into review, not from
--- office.review_approval any more — see this file's own header)
--- is a full INSERT ... ON CONFLICT DO UPDATE that legitimately resets claimed_at to
--- NULL for a BRAND NEW freeze generation, stamping a fresh `frozen_at`
--- (claimTimestamp(), src/lib/claim-timestamp.ts — unique enough per call that two
--- genuinely different freeze events never share one) in the SAME statement; that
--- must keep working. What this closes is a writer that clears claimed_at WITHOUT
--- any new freeze existing — an in-place un-claim on the SAME generation, which is
--- the only shape that would let a claimed one-shot slot be spent twice.
+-- happened.
+--
+-- mupot#1602 r1 adversarial gate P3-2: the FIRST version of this trigger scoped
+-- itself on `frozen_at` UNCHANGED — proven bypassable by bumping `frozen_at` alone
+-- in an otherwise bare `UPDATE ... SET claimed_at = NULL, frozen_at = '...new...'`,
+-- which passed (a single-column un-claim with no frozen_at change was correctly
+-- refused, but this second shape wasn't). `frozen_at` is attacker/writer-settable
+-- in the SAME statement that clears `claimed_at`, so it is not a safe "this is a
+-- real new generation" witness on its own. `generation` is: the ONLY writer that
+-- increments it is persistOfficePublishFreeze's own upsert
+-- (`generation = office_publish_freezes.generation + 1`), so requiring
+-- `NEW.generation > OLD.generation` whenever `claimed_at` is cleared means an
+-- un-claim can only ever ride along with a REAL new freeze generation, not a
+-- bare column bump. (A caller with raw SQL access could still set `generation`
+-- itself — that is a different trust boundary entirely; a DB trigger's job here
+-- is to backstop every ordinary application write path, not a full SQL-injection
+-- adversary.) The review-entry freeze hook's own rework-loop refreeze
+-- (src/addons/office/freeze.ts's freezeOfficeTaskOnReviewEntry /
+-- persistOfficePublishFreeze, called on every entry into review — see this
+-- file's own header) is a full INSERT ... ON CONFLICT DO UPDATE that legitimately
+-- resets claimed_at to NULL AND bumps generation in the SAME statement; that
+-- keeps working. What this closes is a writer that clears claimed_at WITHOUT a
+-- real new generation — an in-place un-claim, which is the only shape that would
+-- let a claimed one-shot slot be spent twice.
 CREATE TRIGGER IF NOT EXISTS office_publish_freezes_claim_append_only
 BEFORE UPDATE OF claimed_at ON office_publish_freezes
 FOR EACH ROW
-WHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL AND NEW.frozen_at = OLD.frozen_at
+WHEN OLD.claimed_at IS NOT NULL AND NEW.claimed_at IS NULL AND NEW.generation = OLD.generation
 BEGIN
   SELECT RAISE(ABORT, 'office_publish_freezes.claimed_at is append-only within one freeze generation');
 END;
