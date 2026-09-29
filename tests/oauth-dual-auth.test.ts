@@ -199,12 +199,63 @@ describe('C4 regression — member API key door', () => {
     expect(body.tools.map((t) => t.name)).toContain('orient')
   })
 
-  it('GET /openapi.json via mcpActionsApp', async () => {
+  it('GET /openapi.json via mcpActionsApp — public allowlist only, no bearer needed', async () => {
+    // Deliberately no authorization header: mupot#1596 requires this route stay
+    // unauthenticated for Custom GPT Actions discovery, while no longer disclosing the
+    // admin surface.
     const res = await mcpActionsApp.request('https://pot.example/openapi.json', {}, env)
     expect(res.status).toBe(200)
     const body = await res.json() as { openapi: string; paths: Record<string, unknown> }
     expect(body.openapi).toBe('3.0.3')
+    // Allowlisted, member-tier-or-below tool: present.
     expect(body.paths['/actions/status']).toBeTruthy()
+    expect(body.paths['/actions/task_create']).toBeTruthy()
+    // Admin/lead-tier tools named in mupot#1596 as the disclosed surface: absent.
+    for (const admin of [
+      'mint_agent_token',
+      'grant_agent_capability',
+      'revoke_agent_token',
+      'revoke_agent_session',
+      'revoke_gate_capability',
+      'archive_row',
+      'unarchive_row',
+      'addon_archive',
+      'create_agent',
+      'wake_agent',
+    ]) {
+      expect(body.paths[`/actions/${admin}`]).toBeUndefined()
+    }
+  })
+
+  it('GET /openapi.full.json via mcpActionsApp — org-admin bearer sees the admin surface', async () => {
+    const res = await mcpActionsApp.request(
+      'https://pot.example/openapi.full.json',
+      { headers: bearerHeaders },
+      env,
+    )
+    expect(res.status).toBe(200)
+    const body = await res.json() as { openapi: string; paths: Record<string, unknown> }
+    expect(body.openapi).toBe('3.0.3')
+    expect(body.paths['/actions/mint_agent_token']).toBeTruthy()
+    expect(body.paths['/actions/status']).toBeTruthy()
+  })
+
+  it('GET /openapi.full.json via mcpActionsApp — unauthenticated refused', async () => {
+    const res = await mcpActionsApp.request('https://pot.example/openapi.full.json', {}, env)
+    expect(res.status).toBe(401)
+  })
+
+  it('GET /openapi.full.json via mcpActionsApp — non-admin member bearer refused', async () => {
+    const nonAdminEnv = makeEnvWithMemberKey([])
+    const res = await mcpActionsApp.request(
+      'https://pot.example/openapi.full.json',
+      { headers: bearerHeaders },
+      nonAdminEnv,
+    )
+    expect(res.status).toBe(403)
+    const body = await res.json() as { error: string; need?: string }
+    expect(body.error).toBe('forbidden')
+    expect(body.need).toBe('org:admin')
   })
 
   it('POST /actions/status via member key (mcpActionsApp)', async () => {
