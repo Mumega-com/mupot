@@ -224,6 +224,7 @@ export interface OfficeReviewApprovalOutcome {
 
 interface OfficeFreezeBindingRow {
   payload_sha256: string
+  payload_json: string
   voided_at: string | null
 }
 
@@ -304,12 +305,35 @@ export async function reviewOfficeApproval(
   // all: it authorizes no WordPress write.
   if (verdict === 'approved') {
     const freezeRow = await env.DB.prepare(
-      `SELECT payload_sha256, voided_at FROM office_publish_freezes WHERE task_id = ?1`,
+      `SELECT payload_sha256, payload_json, voided_at FROM office_publish_freezes WHERE task_id = ?1`,
     ).bind(task.id).first<OfficeFreezeBindingRow>()
     const hasLiveFreeze = freezeRow !== null && freezeRow.voided_at === null
     if (!hasLiveFreeze) return { ok: false, reason: 'payload_not_frozen' }
     if (!expectedPayloadSha256) return { ok: false, reason: 'expected_hash_required' }
     if (freezeRow.payload_sha256 !== expectedPayloadSha256) return { ok: false, reason: 'payload_mismatch' }
+
+    // mupot#1602 r2 BLOCK P1 (2nd adversarial round on this class): a freeze
+    // existing, unvoided, with a hash that matches what the human read is NOT
+    // enough — it must also still describe the task's CURRENT content. Neither
+    // "unvoided" nor "hash matches the human's own stale read" catches a freeze
+    // that has quietly stopped describing the live task (R2: a CI failure exits
+    // review with no void, because voidOfficeFreezeOnReviewExit was never wired
+    // into anything, see freeze.ts's corrected header; R3: reassigning gate_owner
+    // away disables the OLD edit lock, which was keyed on gate_owner, not on a
+    // freeze existing). Re-derived here in JS as a fast, clear refusal — the
+    // AUTHORITATIVE re-check is the SQL-level guard inside
+    // writeOfficeVerdictAndBindFreeze below, re-read inside the SAME transaction
+    // as the write, which is what actually closes both repros (this JS check can
+    // itself race; the SQL one cannot).
+    let frozen: { title?: unknown; content?: unknown }
+    try {
+      frozen = JSON.parse(freezeRow.payload_json) as { title?: unknown; content?: unknown }
+    } catch {
+      return { ok: false, reason: 'payload_stale' }
+    }
+    if (frozen.title !== task.title || frozen.content !== task.body) {
+      return { ok: false, reason: 'payload_stale' }
+    }
   }
 
   try {
@@ -368,9 +392,43 @@ async function writeOfficeVerdictAndBindFreeze(
   // human hashed, or it has already been bound/voided, the tasks UPDATE itself
   // matches 0 rows and the whole verdict is a no-op (VerdictRaceError), not just
   // the freeze-bind statement below.
+  //
+  // mupot#1602 r2 BLOCK P1 (2nd adversarial round, the actual fix for this
+  // class): the guard above only re-checks the FREEZE row against itself
+  // (unvoided, hash matches, unbound) — it never asked whether the freeze still
+  // describes the TASK. R2/R3's repros both leave a freeze that is unvoided and
+  // still hash-matches the human's stale read while the task's live title/body
+  // have moved on (a CI failure exiting review with no void; an admin
+  // reassigning gate_owner away and back, which disabled the OLD gate_owner-
+  // keyed edit lock in between). `title = json_extract(payload_json, '$.title')
+  // AND body = json_extract(payload_json, '$.content')` is a CORRELATED
+  // comparison against the outer UPDATE's own `tasks` row (unqualified
+  // title/body resolve outward here because office_publish_freezes has no such
+  // columns) — the live content and the frozen content, read fresh inside this
+  // same transaction, must be byte-identical or this whole verdict is a no-op.
+  //
+  // Chose a direct field comparison via SQLite's built-in json_extract() over
+  // either hashing inside SQL or a separately-maintained "live content hash"
+  // column: D1/SQLite ships no SHA-256 (or any cryptographic hash) function and
+  // there is no way to invoke the Worker's crypto.subtle from a WHERE clause, so
+  // "recompute the canonical hash inside SQL" is not actually available without
+  // a compiled extension this project does not ship. A live-content hash column
+  // on `tasks`, kept current by "every task write remembers to update it",
+  // reintroduces EXACTLY the "trust every writer" failure class that already
+  // produced two BLOCKs on this issue (the gate_owner-keyed edit lock and the
+  // freeze-on-review-entry hook were both per-writer and both incomplete).
+  // json_extract(payload_json, ...) vs tasks.title/tasks.body compares the SAME
+  // two ground-truth values every other part of this addon already trusts — no
+  // derived state, no new column, nothing for a future writer to forget to
+  // maintain, re-evaluated fresh by every caller's own transaction.
   const extraGuard = verdict === 'approved'
     ? {
-        sql: 'EXISTS (SELECT 1 FROM office_publish_freezes WHERE task_id = ? AND payload_sha256 = ? AND voided_at IS NULL AND verdict_id IS NULL)',
+        sql: `EXISTS (
+          SELECT 1 FROM office_publish_freezes f
+           WHERE f.task_id = ? AND f.payload_sha256 = ? AND f.voided_at IS NULL AND f.verdict_id IS NULL
+             AND title = json_extract(f.payload_json, '$.title')
+             AND body = json_extract(f.payload_json, '$.content')
+        )`,
         params: [task.id, expectedPayloadSha256],
       }
     : undefined
@@ -390,7 +448,13 @@ async function writeOfficeVerdictAndBindFreeze(
       env.DB.prepare(
         `UPDATE office_publish_freezes SET verdict_id = ?1
           WHERE task_id = ?2 AND payload_sha256 = ?3 AND voided_at IS NULL AND verdict_id IS NULL
-            AND EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?4)`,
+            AND EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?4)
+            AND EXISTS (
+              SELECT 1 FROM tasks t
+               WHERE t.id = office_publish_freezes.task_id
+                 AND t.title = json_extract(office_publish_freezes.payload_json, '$.title')
+                 AND t.body = json_extract(office_publish_freezes.payload_json, '$.content')
+            )`,
       ).bind(verdictRow.id, task.id, expectedPayloadSha256, verdictRow.id),
     )
   } else {

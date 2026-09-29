@@ -1168,6 +1168,188 @@ describe('office.review_approval', () => {
 // (verdict + freeze bind land in one batch). Separate describe block: these
 // exercise the FULL request->review->approve->reverse->rework lifecycle rather
 // than a single tool call, unlike the suites above.
+describe('mupot#1602 r2 BLOCK P1: stale-freeze replay (R2/R3)', () => {
+  // R3 (as described in the gate comment): an admin reassigns gate_owner away
+  // from 'gate:office' (the OLD lock, keyed on gate_owner, turned OFF), the
+  // agent edits, the gate is reassigned back, and the cycle-1 freeze publishes.
+  // Under the FIX, the edit-lock now keys on freeze existence, not gate_owner —
+  // reassigning gate_owner away must NOT unlock a task with a live freeze.
+  it('R3: reassigning gate_owner away and back does not unlock editing, and a raw-SQL bypass of the edit still cannot publish stale content', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r3')
+    seedActiveOfficeInstallation(harness, connectorId)
+    mockWriteCapableOfficeBinding()
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    const hashSeenByHuman = await officeFreezeHash(testEnv, taskId)
+    expect(hashSeenByHuman).not.toBeNull()
+    const owner = orgOwnerAuth()
+
+    // Reassign gate_owner AWAY from gate:office — org owner/admin, mandatory
+    // reason, allowed on a review-status task per BLOCK-2's own escape hatch.
+    const reassignAway = await invokeTool(
+      owner, testEnv, 'task_update',
+      { task_id: taskId, gate_owner: 'gate:reviewer', gate_owner_reason: 'testing reassignment' },
+      ORIGIN,
+    )
+    if (!reassignAway.ok) throw new Error(`fixture error: could not reassign gate_owner away: ${JSON.stringify(reassignAway)}`)
+
+    // The edit lock must STILL refuse — a live freeze exists regardless of the
+    // task's CURRENT gate_owner. This is the actual fix: R3 cannot even reach
+    // the "edited" state through the normal API any more.
+    const editAttempt = await invokeTool(owner, testEnv, 'task_update', { task_id: taskId, body: 'EVIL BODY via normal edit' }, ORIGIN)
+    expect(editAttempt.ok).toBe(false)
+    if (!editAttempt.ok) expect(editAttempt.error).toBe('office_payload_frozen')
+
+    // Reassign gate_owner back — the freeze, and the task's real content, are
+    // both exactly as they were.
+    const reassignBack = await invokeTool(
+      owner, testEnv, 'task_update',
+      { task_id: taskId, gate_owner: 'gate:office', gate_owner_reason: 'restoring office gate' },
+      ORIGIN,
+    )
+    if (!reassignBack.ok) throw new Error(`fixture error: could not reassign gate_owner back: ${JSON.stringify(reassignBack)}`)
+
+    // Defense in depth: even a RAW bypass of the edit lock (simulating some
+    // future/other write path this addon has not anticipated — exactly the
+    // "don't trust every writer" lesson from the 1st and 2nd BLOCKs on this
+    // class) must not let a stale approval publish. Direct SQL, no tool call.
+    harness.sqlite.prepare(`UPDATE tasks SET body = 'EVIL BODY via raw bypass' WHERE id = ?`).run(taskId)
+
+    const staleApprove = await invokeTool(
+      owner, testEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: hashSeenByHuman },
+      ORIGIN,
+    )
+    expect(staleApprove.ok).toBe(false)
+    if (!staleApprove.ok) expect(staleApprove.error).toBe('payload_stale')
+
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(row.status).toBe('review')
+    const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }
+    expect(verdictCount.n).toBe(0)
+
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const publishAttempt = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(publishAttempt.ok).toBe(false)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    harness.close()
+  })
+
+  // R2 (as described in the gate comment): a CI failure exits review WITHOUT
+  // voiding the freeze (there is no hook that does — see freeze.ts's corrected
+  // header); the agent edits; a later re-entry into review republishes the
+  // CI-rejected version. Simulated here via the SAME raw-SQL shape
+  // src/tasks/service.ts's syncCiResultToTask actually uses (`UPDATE tasks SET
+  // status = 'in_progress' ... WHERE status = 'review'`), since that function
+  // has no office awareness and never will (no more per-writer hooks).
+  it('R2: a CI-failure-style exit from review with no void does not unlock editing, and a raw-SQL bypass still cannot publish the CI-rejected content', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r2')
+    seedActiveOfficeInstallation(harness, connectorId)
+    mockWriteCapableOfficeBinding()
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    const hashSeenByHuman = await officeFreezeHash(testEnv, taskId)
+    expect(hashSeenByHuman).not.toBeNull()
+    const owner = orgOwnerAuth()
+
+    // syncCiResultToTask's exact failure-path shape: `UPDATE tasks SET result = ?,
+    // status = 'in_progress', updated_at = ? WHERE status = 'review' AND id IN (...)`
+    // — no office awareness, no void.
+    harness.sqlite.prepare(`UPDATE tasks SET result = 'CI: failure', status = 'in_progress' WHERE id = ? AND status = 'review'`).run(taskId)
+    const freezeStillLive = harness.sqlite.prepare(`SELECT voided_at FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { voided_at: string | null }
+    expect(freezeStillLive.voided_at).toBeNull()
+
+    // The edit lock must STILL refuse, even though status is no longer 'review'
+    // — a live freeze exists regardless of the task's CURRENT status.
+    const editAttempt = await invokeTool(owner, testEnv, 'task_update', { task_id: taskId, body: 'CI-REJECTED CONTENT via normal edit' }, ORIGIN)
+    expect(editAttempt.ok).toBe(false)
+    if (!editAttempt.ok) expect(editAttempt.error).toBe('office_payload_frozen')
+
+    // Defense in depth, same as R3: a raw bypass of the edit, then re-entering
+    // review (github-execute.ts's own unconditional `status = 'review'` write
+    // has this exact shape and, per Kasra-core's ruling, is deliberately NOT
+    // hooked into anything office-specific).
+    harness.sqlite.prepare(`UPDATE tasks SET body = 'CI-REJECTED CONTENT via raw bypass' WHERE id = ?`).run(taskId)
+    harness.sqlite.prepare(`UPDATE tasks SET status = 'review' WHERE id = ?`).run(taskId)
+
+    const staleApprove = await invokeTool(
+      owner, testEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: hashSeenByHuman },
+      ORIGIN,
+    )
+    expect(staleApprove.ok).toBe(false)
+    if (!staleApprove.ok) expect(staleApprove.error).toBe('payload_stale')
+
+    const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }
+    expect(verdictCount.n).toBe(0)
+
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const publishAttempt = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(publishAttempt.ok).toBe(false)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    harness.close()
+  })
+
+  // Isolates the SQL-level write-time guard specifically (not the JS-level
+  // pre-check reviewOfficeApproval also does) — uses the SAME deterministic
+  // envWithInterleave technique as the P1 race test to land the content drift
+  // AFTER the JS check has already read (and matched) the ORIGINAL content,
+  // but before the verdict batch executes. Proves the AUTHORITATIVE guard
+  // (the one re-read inside the same transaction as the write) independently
+  // of the fast-path JS refusal.
+  it('R2/R3 isolated: the write-time guard alone refuses a stale approval even when the JS pre-check would have passed', async () => {
+    const harness = makeHarness()
+    const realEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-r2r3-isolated')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(realEnv, squadId)
+    const owner = orgOwnerAuth()
+    const hashSeenByHuman = await officeFreezeHash(realEnv, taskId)
+    expect(hashSeenByHuman).not.toBeNull()
+
+    // Interleaves right before the verdict batch's own `UPDATE tasks ... WHERE
+    // status = 'review'` statement is BUILT — after reviewOfficeApproval's own
+    // JS-level payload_stale check already read and matched the ORIGINAL
+    // content (freeze row untouched at that point), but before the batch that
+    // actually flips status executes. Mutates the task's live body directly, a
+    // stand-in for R2/R3's drift mechanism landing in that exact window.
+    const raceEnv = envWithInterleave(
+      harness,
+      "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'",
+      () => {
+        harness.sqlite.prepare(`UPDATE tasks SET body = 'DRIFTED CONTENT' WHERE id = ?`).run(taskId)
+      },
+    )
+
+    const result = await invokeTool(
+      owner, raceEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: hashSeenByHuman },
+      ORIGIN,
+    )
+    // raceEnv only intercepts the ONE named statement (the verdict batch's tasks
+    // UPDATE) — every earlier read within this same call, including
+    // reviewOfficeApproval's own JS-level payload_stale check (a `SELECT`, not
+    // the intercepted `UPDATE`), passes through untouched and sees the
+    // pre-interleave data, exactly as intended.
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('verdict_race')
+
+    const row = harness.sqlite.prepare(`SELECT status, body FROM tasks WHERE id = ?`).get(taskId) as { status: string; body: string }
+    expect(row.status).toBe('review')
+    expect(row.body).toBe('DRIFTED CONTENT')
+    const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }
+    expect(verdictCount.n).toBe(0)
+    harness.close()
+  })
+})
+
 describe('mupot#1592 freeze/verdict binding', () => {
   // mupot#1602 r1 adversarial gate P1 (check-then-write race, deterministic):
   // reviewOfficeApproval's hash compare is a plain SELECT — this proves the
@@ -1304,6 +1486,75 @@ describe('mupot#1592 freeze/verdict binding', () => {
     expect(row.status).toBe('review')
     const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get(taskId) as { n: number }
     expect(verdictCount.n).toBe(0)
+    harness.close()
+  })
+
+  // mupot#1602 r1 adversarial gate P3 (missing test, per r2's own audit): P2-3's
+  // fix pins the exact freeze generation publishOfficePost read (`frozen_at`) in
+  // its claim's own WHERE and returns payload via RETURNING — this is the
+  // dedicated regression test for that pin, isolated with the SAME
+  // envWithInterleave technique as the P1/R2/R3 tests: a fresh freeze generation
+  // (different frozen_at, different content) lands in the window between
+  // publishOfficePost's routing-metadata read and its claim statement executing.
+  it('the frozen_at pin: a freeze that changes generation between the routing read and the claim cannot be published', async () => {
+    const harness = makeHarness()
+    const realEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-frozen-at-pin')
+    seedActiveOfficeInstallation(harness, connectorId)
+    mockWriteCapableOfficeBinding()
+    const taskId = await makeOfficeTask(realEnv, squadId)
+    await approveOfficeTask(realEnv, taskId)
+
+    const before = harness.sqlite.prepare(`SELECT frozen_at, payload_json FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { frozen_at: string; payload_json: string }
+    // The REAL, currently-bound verdict id — kept BOUND on the fresh generation
+    // below too, so verdict_id/status stay valid and `frozen_at` is the ONLY
+    // thing distinguishing the two generations. Without this, the fresh
+    // generation's own verdict_id/status would independently fail the claim,
+    // masking whether the frozen_at pin itself does anything (the same
+    // vacuous-test trap NEW-3's first attempt fell into).
+    const verdict = harness.sqlite.prepare(`SELECT id FROM task_verdicts WHERE task_id = ?`).get(taskId) as { id: string }
+
+    const raceEnv = envWithInterleave(
+      harness,
+      'UPDATE office_publish_freezes SET claimed_by = ?1, claimed_at = ?2',
+      () => {
+        // A fresh, ALREADY-BOUND generation lands right before the claim —
+        // collapsed into raw SQL here since the interleave callback is
+        // synchronous (representing what a reversal + edit + re-approve cycle,
+        // all landing inside this one window, would leave behind). New
+        // frozen_at, new content, SAME bound verdict_id/unvoided as a normal
+        // successful approval — frozen_at is the only differentiator.
+        harness.sqlite.prepare(`UPDATE tasks SET body = 'FRESH CYCLE CONTENT' WHERE id = ?`).run(taskId)
+        harness.sqlite.prepare(`
+          UPDATE office_publish_freezes
+             SET payload_json = ?, payload_sha256 = 'fresh-generation-hash',
+                 frozen_at = ?, verdict_id = ?, voided_at = NULL, voided_reason = NULL,
+                 claimed_by = NULL, claimed_at = NULL, outcome = NULL, outcome_detail = NULL,
+                 completed_at = NULL, generation = generation + 1
+           WHERE task_id = ?
+        `).run(
+          JSON.stringify({ ...JSON.parse(before.payload_json), content: 'FRESH CYCLE CONTENT' }),
+          new Date(Date.now() + 1000).toISOString(),
+          verdict.id,
+          taskId,
+        )
+      },
+    )
+
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+
+    const result = await invokeTool(officeLead(departmentId), raceEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('publish_claimed')
+    expect(fetchSpy).not.toHaveBeenCalled()
+
+    // The fresh generation is untouched by the failed claim — still unclaimed,
+    // free to be approved and published on its own terms later.
+    const after = harness.sqlite.prepare(`SELECT frozen_at, claimed_at FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { frozen_at: string; claimed_at: string | null }
+    expect(after.frozen_at).not.toBe(before.frozen_at)
+    expect(after.claimed_at).toBeNull()
     harness.close()
   })
 

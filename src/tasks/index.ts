@@ -802,15 +802,17 @@ tasksApp.patch('/:id', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
-  // mupot#1592 NEW-1 — REST parity with the MCP task_update guard: a gate:office
-  // task's title/body cannot change while a human is reviewing it (the payload was
-  // already frozen the moment this task entered review). officeTaskContentLocked
-  // (src/addons/office/freeze.ts) — ONE predicate, imported statically. That
-  // module has zero dependency on this file (unlike addons/office/service.ts,
-  // which imports canActOnSquad/evaluateVerdictGates FROM here), so this is
-  // cycle-free — see mupot#1602 r1 P0's fix for why the dynamic-import/literal-
-  // string workarounds this file used to carry are gone.
-  if ((body.title !== undefined || body.body !== undefined) && officeTaskContentLocked(existing)) {
+  // mupot#1592 NEW-1 — REST parity with the MCP task_update guard, keyed per
+  // mupot#1602 r2 on freeze existence rather than gate_owner (see
+  // officeTaskContentLocked's own doc comment, src/addons/office/freeze.ts, for
+  // the R3 repro this closes): a task with a LIVE frozen payload cannot have its
+  // title/body changed while that freeze is live. officeTaskContentLocked — ONE
+  // predicate, imported statically. That module has zero dependency on this file
+  // (unlike addons/office/service.ts, which imports canActOnSquad/
+  // evaluateVerdictGates FROM here), so this is cycle-free — see mupot#1602 r1
+  // P0's fix for why the dynamic-import/literal-string workarounds this file
+  // used to carry are gone.
+  if ((body.title !== undefined || body.body !== undefined) && (await officeTaskContentLocked(c.env, existing.id))) {
     return c.json({
       error: 'office_payload_frozen',
       detail: 'title/body cannot be edited while a gate:office task is in review — an org owner/admin must reverse the verdict, or wait for office.review_approval to decide it',

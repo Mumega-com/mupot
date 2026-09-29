@@ -15,10 +15,22 @@
 //
 // This module has ZERO dependency on src/tasks/index.ts or src/tasks/service.ts —
 // everything it needs (addon installation/binding/connector resolution, canonical
-// JSON hashing) lives in leaf modules of its own. Every caller — src/mcp/index.ts,
-// src/tasks/index.ts, src/addons/office/service.ts, src/agents/execute.ts,
-// src/tasks/runtime-receipts.ts, src/integrations/github-execute.ts — imports this
-// module STATICALLY. No dynamic import() of this addon anywhere in the codebase.
+// JSON hashing) lives in leaf modules of its own. Its actual callers today —
+// src/mcp/index.ts's task_update, src/tasks/index.ts's PATCH /:id, and
+// src/addons/office/service.ts — import it STATICALLY. No dynamic import() of
+// this addon anywhere in the codebase.
+//
+// mupot#1602 r2 (2nd adversarial BLOCK on this class): an EARLIER version of this
+// comment claimed freezeOfficeTaskOnReviewEntry/voidOfficeFreezeOnReviewExit were
+// also wired into src/agents/execute.ts's finishTask, src/tasks/runtime-
+// receipts.ts's 'completed' stage, src/integrations/github-execute.ts, and
+// src/tasks/service.ts's syncCiResultToTask. That was never true — none of those
+// four call this module at all, so a gate:office task moved through any of them
+// keeps whatever freeze it already had, live and unvoided, regardless of what the
+// task's title/body become afterward (R2/R3 below). Per Kasra-core's explicit
+// ruling after the 2nd BLOCK: no more per-writer hooks. The fix is the ONE
+// invariant at the actual write — see reviewOfficeApproval/
+// writeOfficeVerdictAndBindFreeze in service.ts and officeTaskContentLocked below.
 
 import type { Env, Task, Capability } from '../../types'
 import { listAddonInstallations } from '../service'
@@ -49,6 +61,7 @@ export type OfficeRefusalReason =
   | 'payload_not_frozen'
   | 'expected_hash_required'
   | 'payload_mismatch'
+  | 'payload_stale'
   | 'unreconciled_prior_publish'
   | 'freeze_not_found'
   | 'already_reconciled'
@@ -257,20 +270,30 @@ export async function persistOfficePublishFreeze(
 }
 
 // mupot#1592 NEW-1 — the ONE call site that freezes a gate:office task's publish
-// payload: the moment it ENTERS review. Wired into EVERY writer that can move a
-// gate:office task into review (mupot#1602 r1 P2-1's "enumerate every writer"
-// finding): src/mcp/index.ts's task_update, src/tasks/index.ts's PATCH, and — since
-// office is meant to be the MAIN agent-authored content flow (r1 P2-2) —
-// src/agents/execute.ts's finishTask, src/tasks/runtime-receipts.ts's 'completed'
-// stage, and src/integrations/github-execute.ts's PR-linking write. Best-effort by
-// design: a human's decision (or an agent's completion) must never be blocked on
-// WordPress infra readiness (addon inactive, no connector, bad site config) — when
-// a freeze cannot be built, this silently leaves NO freeze row (or an unreconciled
-// prior one untouched), and office.review_approval's own `payload_not_frozen`/
-// `unreconciled_prior_publish` refusal then correctly, permanently blocks the
-// actual WordPress write until a fresh review-entry CAN bind a real target.
-// Callers must not surface this as a request failure — the write that triggered it
-// already succeeded on its own terms.
+// payload: the moment it ENTERS review via src/mcp/index.ts's task_update or
+// src/tasks/index.ts's PATCH /:id (the only two callers — see this file's header).
+// Best-effort by design: a human's decision to move content into review must
+// never be blocked on WordPress infra readiness (addon inactive, no connector,
+// bad site config) — when a freeze cannot be built, this silently leaves NO
+// freeze row (or an unreconciled prior one untouched), and office.
+// review_approval's own `payload_not_frozen`/`unreconciled_prior_publish`
+// refusal then correctly, permanently blocks the actual WordPress write until a
+// fresh review-entry CAN bind a real target. Callers must not surface this as a
+// request failure — the write that triggered it already succeeded on its own
+// terms.
+//
+// mupot#1602 r2 (2nd adversarial BLOCK on this class): this hook is NOT wired
+// into every writer that can move a gate:office task into or out of review
+// (src/agents/execute.ts's finishTask, src/tasks/runtime-receipts.ts,
+// src/integrations/github-execute.ts, src/tasks/service.ts's
+// syncCiResultToTask all bypass it entirely) — an earlier version of this file
+// claimed otherwise and was wrong. That is now BY DESIGN, not a gap: r2's fix
+// is the single write-time invariant in service.ts's
+// writeOfficeVerdictAndBindFreeze (the freeze must still describe the task's
+// LIVE content, re-checked at approval, regardless of which writer left the
+// task in whatever state it is in) plus officeTaskContentLocked's
+// freeze-existence-based lock below — neither depends on every writer
+// remembering to call something.
 export async function freezeOfficeTaskOnReviewEntry(env: Env, task: Task, requestedBy: string): Promise<void> {
   const built = await buildOfficePublishFreeze(env, task)
   if (built.ok) {
@@ -278,24 +301,28 @@ export async function freezeOfficeTaskOnReviewEntry(env: Env, task: Task, reques
   }
 }
 
-// mupot#1602 r1 P2-1 ("void the freeze on every exit from review, not only reject
-// and reversal"): src/tasks/service.ts's syncCiResultToTask moves a task back to
-// 'in_progress' on a failing CI run — an exit from review this addon's own edit-
-// lock (officeTaskContentLocked below) never sees, because it is not a task_update/
-// PATCH call at all. Idempotent (voided_at IS NULL guard); safe to call on a
-// non-office task (no-op via the caller's own gate_owner check, not enforced here)
-// or a task with no freeze row at all (0 rows, no error).
-export async function voidOfficeFreezeOnReviewExit(env: Env, taskId: string, reason: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE office_publish_freezes SET voided_at = ?1, voided_reason = ?2 WHERE task_id = ?3 AND voided_at IS NULL`,
-  ).bind(new Date().toISOString(), reason, taskId).run()
-}
-
-// mupot#1592 NEW-1 — the shared edit-lock predicate src/mcp/index.ts's task_update
-// and src/tasks/index.ts's PATCH both call before applying a title/body/note/reason
-// change: once a gate:office task is in 'review', a human is actively looking at
-// (or about to look at) a payload whose hash is already frozen — the row must not
-// change under them at all. One predicate, reused by both write surfaces.
-export function officeTaskContentLocked(task: Pick<Task, 'gate_owner' | 'status'>): boolean {
-  return task.gate_owner === OFFICE_GATE_OWNER && task.status === 'review'
+// mupot#1602 r2 BLOCK P1 (2nd adversarial round on this class): the edit lock
+// used to key on `task.gate_owner === 'gate:office' && task.status === 'review'`
+// — both fields an ordinary org-admin action can flip independently of any
+// freeze. Repro R3: an admin reassigns gate_owner AWAY from 'gate:office' (the
+// lock now reads false regardless of status), the agent edits title/body
+// freely, the admin reassigns gate_owner back to 'gate:office' — the STALE
+// freeze from before the edit is still live (nothing voided it; reassigning
+// gate_owner never touches office_publish_freezes) and still hash-matches
+// itself, so a human approving what they now see would bind a freeze that no
+// longer describes it. Fixed by keying the lock on the ACTUAL thing being
+// protected — does a LIVE (non-voided) freeze exist for this task at all —
+// instead of the two fields whose relationship to "a freeze exists" a caller
+// can sever. A task with no freeze has nothing this lock protects and is left
+// alone regardless of gate_owner/status; this is also why the value in a
+// LIVE freeze existing is now checked directly rather than re-derived from
+// gate_owner, matching writeOfficeVerdictAndBindFreeze's own live-content
+// re-check (service.ts) as the SAME "check the thing itself, not a proxy for
+// it" fix, at the two remaining places this addon makes a promise about a
+// frozen payload.
+export async function officeTaskContentLocked(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM office_publish_freezes WHERE task_id = ?1 AND voided_at IS NULL LIMIT 1`,
+  ).bind(taskId).first()
+  return row !== null
 }

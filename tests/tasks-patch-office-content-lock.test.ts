@@ -35,6 +35,18 @@ function seedTask(opts: { status: string; gateOwner: string | null }) {
   `)
 }
 
+/** mupot#1602 r2: the edit lock now keys on "a live freeze exists for this task",
+ *  not on gate_owner/status (see officeTaskContentLocked's own doc comment) — a
+ *  test asserting the lock fires must actually seed a freeze row, a raw insert
+ *  being enough since the lock only checks existence + voided_at, never the
+ *  payload contents. */
+function seedFreeze(taskId: string): void {
+  harness!.sqlite.exec(`
+    INSERT INTO office_publish_freezes (task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin, frozen_by, frozen_at)
+    VALUES ('${taskId}', '{}', 'deadbeef', 'inst-1', 'conn-1', 'https://wordpress.example.com', 'test-fixture', datetime('now'));
+  `)
+}
+
 function makeEnv(): Env {
   return {
     TENANT_SLUG: 'mumega',
@@ -71,6 +83,7 @@ function patch(body: unknown) {
 describe('PATCH /:id — office content lock (REST parity with MCP task_update)', () => {
   it('refuses a title edit while a gate:office task is in review', async () => {
     seedTask({ status: 'review', gateOwner: 'gate:office' })
+    seedFreeze(TASK_ID)
     const res = await tasksApp.fetch(patch({ title: 'swapped title' }), makeEnv())
     expect(res.status).toBe(409)
     const json = (await res.json()) as { error: string }
@@ -81,6 +94,7 @@ describe('PATCH /:id — office content lock (REST parity with MCP task_update)'
 
   it('refuses a body edit while a gate:office task is in review', async () => {
     seedTask({ status: 'review', gateOwner: 'gate:office' })
+    seedFreeze(TASK_ID)
     const res = await tasksApp.fetch(patch({ body: '<script>alert(1)</script>' }), makeEnv())
     expect(res.status).toBe(409)
     const json = (await res.json()) as { error: string }
@@ -89,9 +103,32 @@ describe('PATCH /:id — office content lock (REST parity with MCP task_update)'
     expect(row.body).toBe('original body')
   })
 
-  it('does NOT lock a task gated under a different namespace', async () => {
+  it('does NOT lock a task gated under a different namespace, with no freeze row', async () => {
     seedTask({ status: 'review', gateOwner: 'gate:reviewer' })
     const res = await tasksApp.fetch(patch({ title: 'legit edit' }), makeEnv())
+    expect(res.status).toBe(200)
+  })
+
+  // mupot#1602 r2 BLOCK P1 (R3): the OLD lock keyed on gate_owner === 'gate:office'
+  // — reassigning gate_owner away turned the lock off regardless of whether a
+  // freeze existed. The NEW lock keys on freeze existence alone: a live freeze
+  // still locks editing even when gate_owner currently reads something else
+  // (this is exactly the state R3's repro passes through mid-attack).
+  it('R3 regression: STILL locks a live freeze even when gate_owner has been reassigned away from gate:office', async () => {
+    seedTask({ status: 'review', gateOwner: 'gate:reviewer' })
+    seedFreeze(TASK_ID)
+    const res = await tasksApp.fetch(patch({ title: 'swapped while gate reassigned' }), makeEnv())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as { error: string }
+    expect(json.error).toBe('office_payload_frozen')
+  })
+
+  // The converse: a gate:office task with NO live freeze (never entered review
+  // through a path that could freeze it, or the freeze was voided) is not locked
+  // — there is nothing this lock protects yet/any more.
+  it('does NOT lock a gate:office task with no live freeze at all', async () => {
+    seedTask({ status: 'review', gateOwner: 'gate:office' })
+    const res = await tasksApp.fetch(patch({ title: 'no freeze yet' }), makeEnv())
     expect(res.status).toBe(200)
   })
 

@@ -47,6 +47,7 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'not_approved':
     case 'payload_not_frozen':
     case 'payload_mismatch':
+    case 'payload_stale':
     case 'unreconciled_prior_publish':
     case 'freeze_not_found':
     case 'already_reconciled':

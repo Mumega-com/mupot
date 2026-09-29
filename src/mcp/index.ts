@@ -1255,15 +1255,18 @@ const toolTaskUpdate: ToolSpec = {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
 
-    // mupot#1592 NEW-1: a gate:office task's title/body cannot change while a human
-    // is reviewing it — the payload was already frozen (with a hash a human may
-    // already have read off office.list_pending_approvals) the moment this task
-    // entered review. Refused outright rather than silently voiding the freeze:
-    // simpler to reason about, and belt-and-suspenders with office.review_approval's
-    // own hash-mismatch check (src/addons/office/service.ts's officeTaskContentLocked).
+    // mupot#1592 NEW-1, keyed per mupot#1602 r2 on freeze existence rather than
+    // gate_owner (r2 BLOCK P1 — see officeTaskContentLocked's own doc comment,
+    // src/addons/office/freeze.ts, for the R3 repro this closes): a task with a
+    // LIVE frozen payload cannot have its title/body changed while that freeze
+    // is live — the payload was already frozen (with a hash a human may already
+    // have read off office.list_pending_approvals). Refused outright rather than
+    // silently voiding the freeze: simpler to reason about, and
+    // belt-and-suspenders with office.review_approval's own write-time
+    // live-content re-check (src/addons/office/service.ts).
     if (
       (args.title !== undefined || args.body !== undefined || args.note !== undefined || args.reason !== undefined) &&
-      officeTaskContentLocked(existing)
+      (await officeTaskContentLocked(env, existing.id))
     ) {
       return fail(409, 'office_payload_frozen', {
         detail: 'title/body cannot be edited while a gate:office task is in review — an org owner/admin must reverse the verdict, or wait for office.review_approval to decide it',
