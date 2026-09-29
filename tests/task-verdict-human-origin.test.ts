@@ -1163,4 +1163,52 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.human_origin).toEqual({ applied: false, reason: 'task_not_named' })
     expect(result.verdict.decided_by).toBe('agent-named-wrong')
   })
+
+  // mupot#1602 r1 adversarial gate P3-1: "the Telegram human_origin refusal
+  // (origin-verdict.ts dryRunAuthorize) is not referenced by any test... a
+  // regression there would approve (though not publish) a gate:office task."
+  // gate:office has its own dedicated verdict tool (office.review_approval);
+  // dryRunAuthorize refuses it as its OWN, first check, before any origin
+  // conjunct — and since the task_verdict tool's non-origin FALLBACK path
+  // also routes through writeVerdict (which independently refuses gate:office,
+  // NEW-2), this is a hard failure end to end, not merely "human_origin
+  // didn't apply, fell back to agent authority" like every other conjunct
+  // above.
+  it('mupot#1602 r1 P3-1: a gate:office task refuses via the Telegram human_origin path — not merely "not applied", a hard failure end to end', async () => {
+    seedAgent(harness.sqlite, 'agent-office-origin')
+    harness.sqlite.prepare(
+      `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES ('grant-office-agent-origin', 'gate:office', 'agent', 'agent-office-origin', 'test-granter', datetime('now'))`,
+    ).run()
+    seedMember(harness.sqlite, 'member-office-origin', { telegramChatId: '5559999' })
+    // Every OTHER origin conjunct satisfied (owner, chat fence, no conflict of
+    // interest, squad membership) so the flow genuinely REACHES dryRunAuthorize's
+    // gate:office check rather than being refused earlier for an unrelated
+    // reason — otherwise this test would pass whether or not that check exists.
+    setAgentOwner(harness.sqlite, 'agent-office-origin', 'member-office-origin')
+    seedSquadMemberCapability(harness.sqlite, 'member-office-origin')
+    harness.sqlite.prepare(
+      `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES ('grant-office-member-origin', 'gate:office', 'member', 'member-office-origin', 'test-granter', datetime('now'))`,
+    ).run()
+    harness.sqlite.prepare(
+      `INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, result, created_at, updated_at)
+       VALUES (?, ?, 'Publish: origin test', 'body', 'done', 'review', 'gate:office', NULL, NULL, datetime('now'), datetime('now'))`,
+    ).run('office-task-origin-1', SQUAD)
+
+    const res = await invokeVerdict(env, harnessAuth('agent-office-origin'), {
+      task_id: 'office-task-origin-1',
+      verdict: 'approved',
+      human_origin: origin({ text: 'approve office-task-origin-1', chat_id: '5559999', user_id: '5559999' }),
+    })
+
+    expect(res.ok).toBe(false)
+    if (res.ok) throw new Error('expected refusal')
+    expect(res.error).toBe('dedicated_gate_predicate_required')
+
+    const row = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get('office-task-origin-1') as { status: string }
+    expect(row.status).toBe('review')
+    const verdictCount = harness.sqlite.prepare(`SELECT COUNT(*) as n FROM task_verdicts WHERE task_id = ?`).get('office-task-origin-1') as { n: number }
+    expect(verdictCount.n).toBe(0)
+  })
 })

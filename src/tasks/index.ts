@@ -25,9 +25,10 @@ import { requireAuth } from '../auth'
 // row on PATCH), so we check inline rather than as static route middleware.
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
+import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
@@ -801,6 +802,23 @@ tasksApp.patch('/:id', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
+  // mupot#1592 NEW-1 — REST parity with the MCP task_update guard, keyed per
+  // mupot#1602 r2 on freeze existence rather than gate_owner (see
+  // officeTaskContentLocked's own doc comment, src/addons/office/freeze.ts, for
+  // the R3 repro this closes): a task with a LIVE frozen payload cannot have its
+  // title/body changed while that freeze is live. officeTaskContentLocked — ONE
+  // predicate, imported statically. That module has zero dependency on this file
+  // (unlike addons/office/service.ts, which imports canActOnSquad/
+  // evaluateVerdictGates FROM here), so this is cycle-free — see mupot#1602 r1
+  // P0's fix for why the dynamic-import/literal-string workarounds this file
+  // used to carry are gone.
+  if ((body.title !== undefined || body.body !== undefined) && (await officeTaskContentLocked(c.env, existing.id))) {
+    return c.json({
+      error: 'office_payload_frozen',
+      detail: 'title/body cannot be edited while a gate:office task is in review — an org owner/admin must reverse the verdict, or wait for office.review_approval to decide it',
+    }, 409)
+  }
+
   // Apply only provided fields; validate each.
   const next: Task = { ...existing }
 
@@ -1194,6 +1212,23 @@ tasksApp.patch('/:id', async (c) => {
     next,
     auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   )
+
+  // mupot#1592 NEW-1 — REST parity with the MCP task_update hook: freezes a
+  // gate:office task's publish payload the moment it enters review (ordinary
+  // transition OR a successful reversal landing back in 'review'). STATIC import
+  // of src/addons/office/freeze.ts — mupot#1602 r1 P0: a `const office = await
+  // import('../addons/office/service')` here previously bricked the bundled
+  // Worker outright ("Top-level await in module is unsettled" — esbuild's
+  // Workers-target bundle cannot resolve a dynamic import() sitting in a graph
+  // that also has a real cycle; vitest never bundles, so the unit suite never saw
+  // it). freeze.ts has ZERO dependency on this file (or tasks/service.ts), unlike
+  // addons/office/service.ts (which imports canActOnSquad/evaluateVerdictGates
+  // FROM this file) — so this static import is cycle-free. Best-effort; see
+  // freezeOfficeTaskOnReviewEntry's own doc comment for why a failure here must
+  // never fail this request.
+  if (existing.status !== 'review' && next.status === 'review' && next.gate_owner === OFFICE_GATE_OWNER) {
+    await freezeOfficeTaskOnReviewEntry(c.env, next, auth.memberId || auth.boundAgentId || 'unknown')
+  }
 
   return c.json({ task: next })
 })
@@ -1648,6 +1683,16 @@ tasksApp.post('/:id/verdict', async (c) => {
       return c.json({
         error: 'non_human_verdict_refused',
         detail: 'this task gates a project_access proposal and requires a human decider',
+      }, 409)
+    }
+    if (err instanceof DedicatedGatePredicateRequiredError) {
+      // mupot#1592 NEW-2: this gate namespace has its own human-verdict tool
+      // (today: gate:office → office.review_approval) with its own extra
+      // invariants this generic route cannot enforce — refuse cleanly rather
+      // than decide it here.
+      return c.json({
+        error: 'dedicated_gate_predicate_required',
+        detail: `task.gate_owner (${task.gate_owner}) must be decided through its own dedicated tool, not the generic verdict endpoint`,
       }, 409)
     }
     throw err // propagate unexpected errors (5xx)
