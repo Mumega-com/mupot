@@ -153,6 +153,7 @@ function applyInTransaction(sqlite: { exec(sql: string): void }, sql: string): v
   }
 }
 
+
 function buildDbThrough(migrationFile: string) {
   const harness = createSqliteD1()
   for (const file of priorMigrations(migrationFile)) {
@@ -666,8 +667,28 @@ function queryOne(
 }
 
 describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bindings heal through the real lifecycle', () => {
+  // T2b (mupot#1580, migrations/0184): the FOUR tests below drive the REAL
+  // installAddon/configureAddon/activateAddon lifecycle (this branch's
+  // CURRENT src/addons code — see this file's own header, point 9: "the real
+  // ... lifecycle ... succeed with the CURRENT code"), both to build their
+  // "before" fixture state and to prove the "after" state works. src/addons/
+  // bindings.ts's listAddonBindings unconditionally selects addon_connector_
+  // bindings.capability_v2 (added by 0184) for EVERY addon's configure/
+  // activate call, not just write-capable ones, so a DB frozen at 0180/0181
+  // no longer has a column current code needs regardless of which addon is
+  // being configured. Building through 0184 (rather than 0180) does not
+  // change what THIS suite tests: 0184 only ADD COLUMNs onto
+  // addon_connector_bindings (a table none of these tests' assertions probe)
+  // and is itself a no-op against the empty addon tables buildDbThrough
+  // produces before each test's own installAddon call runs — the 0181
+  // migration under test still runs exactly once, for real, via this file's
+  // own `applyInTransaction(sqlite, MIGRATION_SQL)` further down in each test,
+  // against rows these tests create and then deliberately downgrade. The
+  // digest/trigger-byte-identity assertions earlier in this file (which DO
+  // care about the exact pre/post-0181 boundary) are untouched by this and
+  // still build through 0180 unchanged.
   it('marketing-cro-monitor (active, live generation + binding + a completed run, PRE-EXISTING split) heals and runMarketingMonitor succeeds post-migration', async () => {
-    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const harness = buildDbThrough('0184_addon_connector_bindings_write_capability.sql')
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -792,7 +813,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
   })
 
   it('a disabled addon with a live (uniform, no-split) old-identity generation activates successfully post-migration', async () => {
-    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const harness = buildDbThrough('0184_addon_connector_bindings_write_capability.sql')
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -841,7 +862,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
   })
 
   it('a configured (not yet active) addon reconfigures and activates successfully post-migration', async () => {
-    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const harness = buildDbThrough('0184_addon_connector_bindings_write_capability.sql')
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)
@@ -881,7 +902,7 @@ describe('0181_backfill_addon_manifest_v0_31 — P0 fix: live generations and bi
   })
 
   it('workflow-circuits (active, uniform old-identity generation, no connector bindings) heals with no split', async () => {
-    const harness = buildDbThrough('0180_seat_events_route_precheck.sql')
+    const harness = buildDbThrough('0184_addon_connector_bindings_write_capability.sql')
     const { sqlite, close } = harness
     try {
       const env = envForLifecycle(harness)

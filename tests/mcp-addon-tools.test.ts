@@ -39,6 +39,7 @@ const migrations = [
   '../migrations/0050_addons.sql',
   '../migrations/0052_addon_bindings.sql',
   '../migrations/0175_addon_external_isolated.sql',
+  '../migrations/0184_addon_connector_bindings_write_capability.sql',
 ].map((path) => readFileSync(new URL(path, import.meta.url), 'utf8'))
 
 const TENANT = 'tenant-a'

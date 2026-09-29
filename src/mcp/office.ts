@@ -51,6 +51,7 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'unreconciled_prior_publish':
     case 'freeze_not_found':
     case 'already_reconciled':
+    case 'reconcile_check_failed':
     case 'binding_changed':
     case 'publish_claimed':
     case 'invalid_site_config':

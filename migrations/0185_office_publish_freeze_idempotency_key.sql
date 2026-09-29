@@ -1,0 +1,43 @@
+-- 0185_office_publish_freeze_idempotency_key.sql — mupot#1610 ("office:
+-- reconcile_stalled_publish must verify WordPress before clearing the
+-- double-post guard (blocks T2b)"), flagged in the final #1602 adversarial
+-- round as a precondition for T2b write bindings going live.
+--
+-- office.reconcile_stalled_publish previously let an org admin mark a stalled
+-- (claimed-but-no-outcome) publish 'failed' purely on their own say-so, with no
+-- automated check of whether WordPress actually received the post. Once writes
+-- are real (this release), a timeout AFTER WordPress accepted the POST,
+-- followed by reconcile('failed') and a fresh approval, produces a genuine
+-- double post. The fix (src/addons/office/service.ts) is to query the MCPWP
+-- site for the post by a stable identifier BEFORE ever clearing the guard —
+-- WordPress has no idempotency-key concept of its own, so this migration adds
+-- one: a per-freeze-generation random value, stamped into the WordPress post's
+-- own `slug` field at publish time (office.publish_post's one-shot claim UPDATE
+-- now also sets it, COALESCE'd so it is never overwritten once set), so
+-- reconcile can look the post up with `GET .../wp/v2/posts?slug=<key>` even
+-- with zero durable local record of the fetch's outcome.
+--
+-- Plain ADD COLUMN on office_publish_freezes — the same shape 0182 already
+-- used for verdict_id/voided_at/voided_reason/generation on this exact table,
+-- nullable, no CHECK, no rebuild: office_publish_freezes is a LEAF table (no
+-- other table holds a live FK to it — `grep -rn "REFERENCES office_publish_
+-- freezes" migrations/` is empty) with no RESTRICT concern either way, but a
+-- plain nullable ADD COLUMN is the smallest possible diff regardless.
+--
+-- Nullable, not backfilled: every EXISTING row (there are none in prod today —
+-- office has never reached 'active' before this release, see migrations/
+-- 0184's header) has no WordPress post associated with a slug that was never
+-- minted, so there is nothing to backfill; reconcileStalledOfficePublish treats
+-- a NULL idempotency_key as "no live check possible" and falls back to the
+-- pre-existing, purely-manual-attestation behavior for that one row only —
+-- every NEW claim from this release forward always has one (the claim UPDATE
+-- sets it unconditionally via COALESCE(idempotency_key, ?), so it can only ever
+-- be NULL for a row claimed before this migration/deploy).
+--
+-- No trigger changes: office_publish_freezes has exactly one trigger today
+-- (office_publish_freezes_claim_append_only, migrations/0182), scoped to
+-- `BEFORE UPDATE OF claimed_at` — it does not enumerate every column the way
+-- addon_connector_bindings_revoke_only does, so adding a new column here does
+-- not widen or narrow what that trigger already protects.
+
+ALTER TABLE office_publish_freezes ADD COLUMN idempotency_key TEXT;

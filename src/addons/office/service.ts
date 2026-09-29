@@ -90,6 +90,13 @@ export { OFFICE_ADDON_KEY, OFFICE_GATE_OWNER, OFFICE_WORDPRESS_SLOT } from './fr
 const OFFICE_DEPARTMENT_SLUG = 'office'
 const WP_PUBLISH_TIMEOUT_MS = 8_000
 const WP_POSTS_PATH = '/wp-json/wp/v2/posts'
+// mupot#1610: every claim mints (or, on a fixture predating this feature,
+// leaves NULL) a random idempotency key, stamped into the WordPress post's own
+// `slug` field at publish time — WordPress has no native idempotency concept,
+// so this is what lets office.reconcile_stalled_publish look a post up by a
+// stable identifier after a timeout/crash leaves the outcome unknown, with zero
+// durable local record of whether the fetch itself landed.
+const OFFICE_SLUG_PREFIX = 'mupot-office-'
 // mupot#1602 r1 P3-3: a publish can legitimately still be in flight for up to
 // WP_PUBLISH_TIMEOUT_MS — reconciling a claim as 'failed'/'done' mid-flight would
 // clear the double-post guard while the original fetch could still land. Require
@@ -528,6 +535,7 @@ async function wordpressPublish(
   connectorId: string,
   title: string,
   content: string,
+  slug: string,
 ): Promise<OfficeResult<OfficePublishPostOutcome>> {
   const result = await useConnectorById<WpPublishConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
     const config = parseSiteConnectorConfig(connector.meta)
@@ -549,7 +557,12 @@ async function wordpressPublish(
         headers: { 'content-type': 'application/json', 'user-agent': 'mupot-office-addon-publish/1.0' },
         redirect: 'manual',
         signal: controller.signal,
-        body: JSON.stringify({ title, content, status: 'publish' }),
+        // mupot#1610: `slug` is this claim's idempotency key (OFFICE_SLUG_PREFIX +
+        // the value stamped onto office_publish_freezes.idempotency_key at claim
+        // time) — WordPress assigns it as the post's own slug, which is what lets
+        // reconcileStalledOfficePublish find this exact post later by a stable,
+        // pre-agreed identifier rather than trusting a human's unverified say-so.
+        body: JSON.stringify({ title, content, status: 'publish', slug }),
       })
       if (response.status === 401 || response.status === 403) {
         return { status: 'failed', reason: 'key_invalid', observations: [] }
@@ -570,6 +583,75 @@ async function wordpressPublish(
   if (!result) return { ok: false, reason: 'connector_not_bound' }
   if (result.status === 'available' && result.observations[0]) return { ok: true, value: result.observations[0] }
   return { ok: false, reason: result.reason ?? 'unreachable' }
+}
+
+// mupot#1610: office.reconcile_stalled_publish's own live WordPress check, called
+// BEFORE the double-post guard is ever cleared. Queries by the exact `slug`
+// office.publish_post's one claim attempt would have stamped onto the post it
+// created — the same GET .../wp/v2/posts?slug=... shape src/addons/marketing/
+// adapters/mcpwp.ts's monitor source already uses against this same connector
+// type, reusing its SSRF guard (origin-only, assertPublicHttpsUrl) and timeout
+// pattern. A found/absent/check-failed trichotomy, never a boolean: "the fetch
+// itself failed" must never be read as "the post is absent" — that would let a
+// simple network blip clear the guard exactly as unsafely as trusting an
+// unverified human claim did before this fix.
+type WordpressSlugLookupResult =
+  | { status: 'found'; postId: number; articleUrl: string }
+  | { status: 'absent' }
+  | { status: 'check_failed' }
+
+interface WpSlugLookupConnectorResult {
+  readonly status: 'available' | 'unavailable' | 'failed'
+  readonly observations: readonly [{ postId: number; articleUrl: string }] | readonly []
+}
+
+async function lookupWordpressPostBySlug(
+  env: Env,
+  connectorId: string,
+  slug: string,
+): Promise<WordpressSlugLookupResult> {
+  const result = await useConnectorById<WpSlugLookupConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
+    const config = parseSiteConnectorConfig(connector.meta)
+    if (!config) return { status: 'unavailable', observations: [] }
+
+    let base: URL
+    try {
+      base = assertPublicHttpsUrl(config.siteUrl)
+    } catch {
+      return { status: 'unavailable', observations: [] }
+    }
+
+    const endpoint = new URL(WP_POSTS_PATH, base.origin)
+    endpoint.searchParams.set('slug', slug)
+    endpoint.searchParams.set('status', 'publish')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), WP_PUBLISH_TIMEOUT_MS)
+    try {
+      const response = await connector.authenticatedFetch(endpoint, {
+        method: 'GET',
+        headers: { 'user-agent': 'mupot-office-addon-reconcile/1.0' },
+        redirect: 'manual',
+        signal: controller.signal,
+      })
+      if (isRedirect(response) || !response.ok) return { status: 'failed', observations: [] }
+      const body = (await response.json().catch(() => null)) as Array<{ id?: number; link?: string }> | null
+      if (!Array.isArray(body)) return { status: 'failed', observations: [] }
+      const match = body[0]
+      if (!match || typeof match.id !== 'number' || typeof match.link !== 'string' || !match.link) {
+        return { status: 'available', observations: [] }
+      }
+      return { status: 'available', observations: [{ postId: match.id, articleUrl: match.link }] }
+    } catch {
+      return { status: 'failed', observations: [] }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+  if (!result) return { status: 'check_failed' }
+  if (result.status === 'failed') return { status: 'check_failed' }
+  if (result.status === 'unavailable') return { status: 'check_failed' }
+  const found = result.observations[0]
+  return found ? { status: 'found', postId: found.postId, articleUrl: found.articleUrl } : { status: 'absent' }
 }
 
 /**
@@ -702,8 +784,17 @@ export async function publishOfficePost(
   // additional, independent defense-in-depth atop the generation pin, not a
   // substitute for it.
   const claimant = auth.boundAgentId ?? auth.memberId ?? auth.userId
+  // mupot#1610: mints a fresh idempotency key candidate on every call, but
+  // COALESCE means only the WINNING claimant's value is ever actually stored —
+  // the same one-shot-claim discipline as claimed_by/claimed_at themselves.
+  // Never overwritten once set: a row can only be claimed once per generation
+  // (this same UPDATE's own WHERE), and a fresh generation (rework loop) always
+  // INSERTs a brand-new row via persistOfficePublishFreeze's upsert, never
+  // reuses an old idempotency_key.
+  const idempotencyKeyCandidate = crypto.randomUUID()
   const claimed = await env.DB.prepare(`
-    UPDATE office_publish_freezes SET claimed_by = ?1, claimed_at = ?2
+    UPDATE office_publish_freezes SET claimed_by = ?1, claimed_at = ?2,
+           idempotency_key = COALESCE(idempotency_key, ?5)
      WHERE task_id = ?3
        AND frozen_at = ?4
        AND claimed_at IS NULL
@@ -715,12 +806,14 @@ export async function publishOfficePost(
           ORDER BY decided_at DESC, id DESC LIMIT 1
        )
        AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')
-    RETURNING payload_json
-  `).bind(claimant, claimTimestamp(), task.id, freezeRow.frozen_at).first<{ payload_json: string }>()
+    RETURNING payload_json, idempotency_key
+  `).bind(claimant, claimTimestamp(), task.id, freezeRow.frozen_at, idempotencyKeyCandidate)
+    .first<{ payload_json: string; idempotency_key: string }>()
   if (!claimed) return { ok: false, reason: 'publish_claimed' }
 
   const frozenPayload = JSON.parse(claimed.payload_json) as { title: string; content: string }
-  const published = await wordpressPublish(env, bindingResult.value.connectorId, frozenPayload.title, frozenPayload.content)
+  const slug = `${OFFICE_SLUG_PREFIX}${claimed.idempotency_key}`
+  const published = await wordpressPublish(env, bindingResult.value.connectorId, frozenPayload.title, frozenPayload.content, slug)
   const now = new Date().toISOString()
 
   if (!published.ok) {
@@ -745,18 +838,43 @@ export async function publishOfficePost(
 // mupot#1592 P3 ("a documented recovery path that actually works... reconcile-
 // before-reapprove against WordPress"): the ONE way out of the "claimed but
 // outcome unknown" state freeze.ts's unreconciledPriorFreezeExists guard refuses to
-// freeze over. Org owner/admin only, by design — this tool asks the operator to
-// state what they found on the LIVE WordPress site by hand (there is no automated
-// WordPress-side reconciliation call in this addon; see the file header's "known,
-// reported gaps" — building one is future work, not fabricated here), and records
-// exactly that, nothing inferred. Only after this lands can a fresh review-entry
-// mint a new, unclaimed freeze for this task again.
+// freeze over. Org owner/admin only, by design.
+//
+// mupot#1610 (flagged in the final #1602 adversarial round as a precondition for
+// T2b write bindings going live): a purely manual "the operator says failed" used
+// to clear the one-shot double-post guard with NO automated check of whether
+// WordPress actually received the post — once writes are real, a timeout AFTER
+// WordPress accepted the POST, followed by reconcile('failed') and a fresh
+// approval, is a genuine double post. Before ever clearing the guard, this now
+// queries the MCPWP site for the post by the idempotency key stamped into its
+// `slug` at claim time (lookupWordpressPostBySlug, above) using the SAME
+// connector the original publish attempt targeted (freeze row's OWN connector_id
+// — never "whatever is currently bound", which may have rotated since):
+//   - FOUND live on WordPress: the operator's requested outcome is OVERRIDDEN —
+//     this is always reconciled 'done', with the DISCOVERED postId/articleUrl,
+//     never the operator's (a 'failed' claim in the face of live evidence would
+//     re-open the guard for a second post against content that already exists).
+//   - CONFIRMED ABSENT: the operator's exact requested outcome (done or failed)
+//     is honoured unchanged — this is also the legitimate path for a post
+//     published entirely outside this addon's own slug-tagged flow, which an
+//     idempotency-key lookup can never find by design.
+//   - THE CHECK ITSELF FAILS (network error, revoked/misconfigured connector,
+//     invalid site config): refused outright, `reconcile_check_failed` — a
+//     failed check is never read as "absent"; that would let a simple network
+//     blip clear the guard exactly as unsafely as trusting an unverified human
+//     claim did before this fix.
+// A row with no idempotency_key (only possible for a claim made before this
+// migration/deploy — see migrations/0185's header) has nothing to look up;
+// falls back to the pre-existing, purely-manual-attestation behavior for that
+// one row only.
 export interface OfficeReconcileInput {
   readonly task: Task
   readonly outcome: 'done' | 'failed'
   readonly detail: string | null
   // Only meaningful (and required) when outcome === 'done' — what the operator
-  // found actually live on WordPress after checking by hand.
+  // found actually live on WordPress after checking by hand. Ignored (and may be
+  // omitted) whenever the live WordPress check below finds the post itself —
+  // the discovered postId/articleUrl are used instead.
   readonly postId: number | null
   readonly articleUrl: string | null
 }
@@ -764,6 +882,8 @@ export interface OfficeReconcileInput {
 interface OfficeFreezeReconcileRow {
   claimed_at: string | null
   outcome: string | null
+  connector_id: string
+  idempotency_key: string | null
 }
 
 export async function reconcileStalledOfficePublish(
@@ -771,7 +891,7 @@ export async function reconcileStalledOfficePublish(
   auth: AuthContext,
   input: OfficeReconcileInput,
 ): Promise<OfficeResult<{ task: Task }>> {
-  const { task, outcome, detail, postId, articleUrl } = input
+  const { task, outcome: requestedOutcome, detail, postId: requestedPostId, articleUrl: requestedArticleUrl } = input
 
   if (task.gate_owner !== OFFICE_GATE_OWNER) return { ok: false, reason: 'wrong_gate' }
   // mupot#1602 r1 P2-4: `isOrgAdmin(auth)` alone is satisfiable by an agent-bound
@@ -782,12 +902,12 @@ export async function reconcileStalledOfficePublish(
   // come from a human, never an agent forging one with its owner's caps.
   if (auth.boundAgentId) return { ok: false, reason: 'not_authorized' }
   if (!isOrgAdmin(auth)) return { ok: false, reason: 'not_authorized' }
-  if (outcome === 'done' && (postId === null || articleUrl === null)) {
+  if (requestedOutcome === 'done' && (requestedPostId === null || requestedArticleUrl === null)) {
     return { ok: false, reason: 'invalid_site_config' }
   }
 
   const row = await env.DB.prepare(
-    `SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?1`,
+    `SELECT claimed_at, outcome, connector_id, idempotency_key FROM office_publish_freezes WHERE task_id = ?1`,
   ).bind(task.id).first<OfficeFreezeReconcileRow>()
   if (!row) return { ok: false, reason: 'freeze_not_found' }
   if (row.claimed_at === null || row.outcome !== null) return { ok: false, reason: 'already_reconciled' }
@@ -801,9 +921,36 @@ export async function reconcileStalledOfficePublish(
     return { ok: false, reason: 'publish_claimed' }
   }
 
+  // mupot#1610: the live WordPress check, BEFORE anything about the guard is
+  // touched. See this function's header for the found/absent/check-failed
+  // trichotomy and why each branch is handled the way it is.
+  let outcome = requestedOutcome
+  let postId = requestedPostId
+  let articleUrl = requestedArticleUrl
+  let verifiedLive = false
+  if (row.idempotency_key) {
+    const slug = `${OFFICE_SLUG_PREFIX}${row.idempotency_key}`
+    const lookup = await lookupWordpressPostBySlug(env, row.connector_id, slug)
+    if (lookup.status === 'check_failed') return { ok: false, reason: 'reconcile_check_failed' }
+    if (lookup.status === 'found') {
+      outcome = 'done'
+      postId = lookup.postId
+      articleUrl = lookup.articleUrl
+      verifiedLive = true
+    }
+    // status 'absent': fall through with the operator's own requested outcome,
+    // unchanged — see header.
+  }
+
   const now = new Date().toISOString()
   const outcomeDetail = outcome === 'done'
-    ? JSON.stringify({ postId, articleUrl, reconciledBy: auth.memberId ?? auth.userId, note: detail })
+    ? JSON.stringify({
+        postId,
+        articleUrl,
+        reconciledBy: auth.memberId ?? auth.userId,
+        note: detail,
+        ...(verifiedLive ? { verifiedLiveOnWordpress: true } : {}),
+      })
     : (detail?.trim() ? detail.trim() : 'reconciled_failed')
 
   // mupot#1602 r1 P3-3: guard the WRITE itself on `outcome IS NULL` (not only the

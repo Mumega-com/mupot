@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import { resolveConnectorByIdWithMeta } from '../connectors/service'
 import { manifestSha256, type AddonManifestV1 } from './contract'
 import type { AddonInstallation } from './service'
+import { externalIsolationViolation } from './service'
 
 export type AddonBindingKind = 'internal_adapter' | 'vault_connector'
 
@@ -60,6 +61,12 @@ export function validateBindingInputs(
   return { ok: true, bindings }
 }
 
+// T2b (mupot#1580): 'read' | 'write' — see migrations/0184's header for why this
+// is sourced from the NEW capability_v2 column, never the legacy capability
+// column (frozen at 'read' forever, exactly like AddonInstallation.trustClass /
+// installation.isolation_class after migrations/0175).
+export type AddonBindingCapability = 'read' | 'write'
+
 export interface AddonBinding {
   id: string
   tenant: string
@@ -68,7 +75,7 @@ export interface AddonBinding {
   slot: string
   adapter: string
   bindingKind: AddonBindingKind
-  capability: 'read'
+  capability: AddonBindingCapability
   connectorId: string | null
   manifestSha256: string
   configuredBy: string
@@ -128,7 +135,10 @@ interface BindingRow {
   slot: string
   adapter: string
   binding_kind: AddonBindingKind
+  // LEGACY (migrations/0184) — always 'read', never derived from the manifest.
+  // See AddonBindingCapability's doc comment and capability_v2 below.
   capability: 'read'
+  capability_v2: AddonBindingCapability
   connector_id: string | null
   manifest_sha256: string
   configured_by: string
@@ -170,7 +180,7 @@ function bindingFromRow(row: BindingRow): AddonBinding {
     slot: row.slot,
     adapter: row.adapter,
     bindingKind: row.binding_kind,
-    capability: row.capability,
+    capability: row.capability_v2,
     connectorId: row.connector_id,
     manifestSha256: row.manifest_sha256,
     configuredBy: row.configured_by,
@@ -215,6 +225,7 @@ export async function listAddonBindings(env: Env, installationId: string): Promi
   const result = await env.DB.prepare(`
     SELECT binding.id, binding.tenant, binding.installation_id, binding.generation_id,
            binding.slot, binding.adapter, binding.binding_kind, binding.capability,
+           binding.capability_v2,
            binding.connector_id, binding.manifest_sha256, binding.configured_by,
            binding.configured_at, binding.revoked_at
       FROM addon_connector_bindings AS binding
@@ -295,21 +306,74 @@ function validInput(value: unknown): value is AddonBindingInput {
     && (input.connectorId === undefined || (typeof input.connectorId === 'string' && input.connectorId.length > 0))
 }
 
+// T2b (mupot#1580): true iff THIS installation, for THIS exact live manifest,
+// is allowed to hold a write-capability connector binding at all. Every leaf is
+// re-proved here, at bind-preflight time, rather than trusted from an earlier
+// gate in the same request — preflightAddonBindings has its own callers
+// (addonBindingConfigurationMatches, the catch-branch reconciliation paths in
+// configureAddon) that do not all run through trustGateViolation first, so this
+// function must never rely on trustGateViolation having already run.
+//
+//   - manifest.kind === 'external_mcp': native addons can never ask for this —
+//     trustGateViolation (src/addons/service.ts) already refuses any 'native'
+//     manifest whose trustClass isn't 'native_reviewed', and no native manifest
+//     in this repo declares a 'write' connectorRequirements entry regardless.
+//   - manifest.trustClass === 'external_isolated': the REGISTERED manifest's own
+//     declared trust posture — an external_mcp addon that somehow declared
+//     'native_reviewed' would already be refused by trustGateViolation, but this
+//     function does not assume that ran.
+//   - installation.trustClass === 'external_isolated': the LIVE installation
+//     row's OWN isolation_class (src/addons/service.ts maps AddonInstallation.
+//     trustClass from installation.isolation_class, migrations/0175) — independent
+//     confirmation that THIS installed row, not merely the currently-registered
+//     manifest object, is external_isolated. A digest-matched installation for a
+//     manifest that has since been re-registered with a different trustClass
+//     would fail here even if the in-memory manifest object looked right.
+//   - externalIsolationViolation(manifest) === null: the SAME structural
+//     invariant check (rankGrants empty, every surfaceGrant/metric/agentTemplate/
+//     approvalPolicy namespaced under the manifest's own single department, no
+//     disallowed event subscription, exactly one department) installAddon/
+//     configureAddon/activateAddon each re-run on every call — re-proved here
+//     too, so a manifest that violates its own external-addon invariants can
+//     never obtain a write-capability binding even if some future caller of
+//     preflightAddonBindings forgets to call trustGateViolation first.
+//
+// A 'read' connectorRequirements entry never reaches this function at all (see
+// the call site below) — this gate exists ONLY to decide whether a 'write'
+// entry may be honoured.
+function installationMayHoldWriteCapabilityBinding(
+  installation: AddonInstallation,
+  manifest: AddonManifestV1,
+): boolean {
+  return manifest.kind === 'external_mcp'
+    && manifest.trustClass === 'external_isolated'
+    && installation.trustClass === 'external_isolated'
+    && externalIsolationViolation(manifest) === null
+}
+
 export async function preflightAddonBindings(
   env: Env,
   installation: AddonInstallation,
   manifest: AddonManifestV1,
   requestedBindings?: readonly AddonBindingInput[],
 ): Promise<AddonBindingPreflight> {
-  if (manifest.connectorRequirements.some(({ capability }) => capability !== 'read')) {
-    return { ok: false, reason: 'capability_mismatch' }
-  }
   if (
     installation.tenant !== env.TENANT_SLUG
     || installation.addonKey !== manifest.key
     || installation.manifestSha256 !== await manifestSha256(manifest)
   ) {
     return { ok: false, reason: 'manifest_digest_drift' }
+  }
+  // T2b (mupot#1580): a manifest may declare a 'write' connectorRequirements
+  // entry ONLY when installationMayHoldWriteCapabilityBinding holds for it —
+  // otherwise every write-declaring entry refuses the WHOLE preflight, exactly
+  // as the old flat "any write requirement at all is refused" check did for
+  // every manifest before T2b. A manifest with zero 'write' requirements is
+  // completely unaffected (mayHoldWrite is never even evaluated).
+  if (manifest.connectorRequirements.some(({ capability }) => capability === 'write')) {
+    if (!installationMayHoldWriteCapabilityBinding(installation, manifest)) {
+      return { ok: false, reason: 'capability_mismatch' }
+    }
   }
 
   const generation = requestedBindings === undefined
@@ -373,7 +437,11 @@ export async function preflightAddonBindings(
       slot: input.slot,
       adapter: input.adapter,
       bindingKind: input.bindingKind,
-      capability: 'read',
+      // Entirely manifest-derived, never caller-supplied — AddonBindingInput has
+      // no capability field at all (see the type above), so a caller cannot ask
+      // for a capability the addon's own registered manifest does not declare
+      // for this exact slot.
+      capability: requirement.capability,
       connectorId,
       manifestSha256: installation.manifestSha256,
       configuredBy: '',
@@ -474,11 +542,16 @@ export async function configureAddonBindings(
     installation.latestReceiptId,
   ))
   for (const binding of bindings) {
+    // `capability` (legacy) is always the literal 'read' — see migrations/0184's
+    // header for why it is frozen forever and never repurposed. `capability_v2`
+    // is bound from `binding.capability`, which preflightAddonBindings above
+    // derived entirely from the manifest's OWN declared requirement for this
+    // slot (never from caller input).
     statements.push(env.DB.prepare(`
       INSERT INTO addon_connector_bindings (
         id, tenant, installation_id, generation_id, slot, adapter, binding_kind, capability,
-        connector_id, manifest_sha256, configured_by, configured_at, revoked_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'read', ?8, ?9, ?10, ?11, NULL)
+        capability_v2, connector_id, manifest_sha256, configured_by, configured_at, revoked_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'read', ?8, ?9, ?10, ?11, ?12, NULL)
     `).bind(
       binding.id,
       binding.tenant,
@@ -487,6 +560,7 @@ export async function configureAddonBindings(
       binding.slot,
       binding.adapter,
       binding.bindingKind,
+      binding.capability,
       binding.connectorId,
       binding.manifestSha256,
       binding.configuredBy,

@@ -65,6 +65,7 @@ export type OfficeRefusalReason =
   | 'unreconciled_prior_publish'
   | 'freeze_not_found'
   | 'already_reconciled'
+  | 'reconcile_check_failed'
   | 'binding_changed'
   | 'publish_claimed'
   | 'invalid_site_config'
