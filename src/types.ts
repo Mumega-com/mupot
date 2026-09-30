@@ -318,12 +318,26 @@ export interface Env {
   // or unset, returns 503 checkout_unavailable before any DB read or Stripe call, and
   // /pricing renders its plan buttons disabled. Read via isPotSelfServeCheckoutEnabled().
   POT_SELF_SERVE_CHECKOUT_ENABLED?: string
+  // mupot#1618 MCP Events (protocol 2026-07-28): OFF unless exactly the string "true". Off =>
+  // every request is byte-identical to before: 2026-07-28 is not negotiated and server/discover
+  // and events/* are method_not_found. Served only on the full /mcp door, never on
+  // /mcp/profile/needs-you, whatever the value. Read via isEventsEnabled() in src/mcp/events.ts.
+  EVENTS_ENABLED?: string
+  // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
+  // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
+  // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.
+  EVENTS_CALLBACK_HOSTS?: string
   SUPABASE_WEBHOOK_SECRET?: string
   // TypeSafe Jev (System One) — used only by the agent_lifecycle intent path.
   // Absent ⇒ that path returns classifier_unavailable (no guess, no execute).
   // Explicit `action` never reads this. Secret via `wrangler secret put` if
   // a deployment wants the free-text path; this pilot does not deploy it.
   TYPESAFE_API_KEY?: string
+  // Decision port (src/decisions). Absent/unknown DECISION_ADAPTER => 'human' (defer to a
+  // human; no model call). DECISION_GATEWAY_ID optionally routes the Workers AI adapter
+  // through a Cloudflare AI Gateway.
+  DECISION_ADAPTER?: string
+  DECISION_GATEWAY_ID?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
@@ -747,6 +761,11 @@ export type BusEventType =
                       // (result.meta.changes > 0), so a capped, fenced, or idempotent-
                       // duplicate send produces no event. See MessageCreatedPayload.
   | 'member.auto_enrolled'
+  // mupot#1618 PR 2: one MCP Events webhook delivery attempt (queue job produced ONLY by the
+  // message.created consumer leg and by its own retries). Internal-only: createBus().emit, the sos
+  // addon's /publish and /bridge and the /bus/emit allowlist all refuse it
+  // (src/bus/internal-events.ts), and the consumer rebuilds every fact of the delivery from D1.
+  | 'mcp.event.delivery'
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
   | 'pot.self_serve_provisioned'

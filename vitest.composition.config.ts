@@ -43,8 +43,22 @@
 // stripped silently by the options schema rather than erroring, so passing them looks like
 // it works and does nothing. Use `--max-workers=1 --no-isolate` if isolation matters.
 
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
-import { cloudflareTest } from '@cloudflare/vitest-pool-workers'
+import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers'
+
+// The COMMITTED migration chain, split into queries, handed to the workerd side as a binding.
+// Composition tests that need a database build it with applyD1Migrations(env.MUPOT_DB,
+// env.TEST_MIGRATIONS) — the real schema, never a hand-written one or a prepare() double
+// (scripts/check-test-schema-source.mjs).
+//
+// The splitter emits comment-only fragments (a migration ending in a `-- note`), which D1
+// rejects with "SQL code did not contain a statement". Those carry no SQL; drop them, and ONLY
+// them — every real statement is passed through unmodified.
+const migrations = (await readD1Migrations(fileURLToPath(new URL('./migrations', import.meta.url)))).map((m) => ({
+  ...m,
+  queries: m.queries.filter((q) => q.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim().length > 0),
+}))
 
 export default defineConfig({
   plugins: [
@@ -60,7 +74,8 @@ export default defineConfig({
         // that #916/#943 already found is MORE transactional than the platform it models).
         // This is the closest thing to production D1 available without live Cloudflare
         // credentials — same D1 implementation class Wrangler/Miniflare ship, not a shim.
-        d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe' },
+        d1Databases: { D1_BATCH_PROBE: 'd1-batch-probe', MUPOT_DB: 'mupot-db' },
+        bindings: { TEST_MIGRATIONS: migrations },
       },
     }),
   ],

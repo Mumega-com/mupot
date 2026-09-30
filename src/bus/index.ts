@@ -8,6 +8,7 @@
 // Every event is tenant-stamped from the request's AuthContext on the API path,
 // so a caller cannot publish across tenant boundaries via this surface.
 
+import { isInternalOnlyEventType } from './internal-events'
 import { Hono } from 'hono'
 import type { Env, AuthContext, BusEvent, BusEventType, BusPort } from '../types'
 
@@ -31,7 +32,7 @@ const EVENT_TYPES: readonly BusEventType[] = [
 ]
 
 function isBusEventType(v: unknown): v is BusEventType {
-  return typeof v === 'string' && (EVENT_TYPES as readonly string[]).includes(v)
+  return typeof v === 'string' && !isInternalOnlyEventType(v) && (EVENT_TYPES as readonly string[]).includes(v)
 }
 
 /**
@@ -42,6 +43,8 @@ function isBusEventType(v: unknown): v is BusEventType {
 export function createBus(env: Env): BusPort {
   return {
     async emit(event: BusEvent): Promise<void> {
+      // mupot#1618: internal-only job types can never be produced through the shared emitter.
+      if (isInternalOnlyEventType(event.type)) throw new Error('bus: internal-only event type cannot be emitted')
       const stamped: BusEvent = {
         ...event,
         ts: event.ts && event.ts.length > 0 ? event.ts : new Date().toISOString(),

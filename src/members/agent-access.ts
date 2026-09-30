@@ -389,6 +389,13 @@ export async function commitRemoveAgentSquadAccess(
   env: Env,
   input: RemoveAgentSquadAccessInput,
   extraStatementsFor: (priorCapability: AgentAccessCapability | null) => D1PreparedStatement[],
+  // Default false keeps the historical behaviour: the hook only runs when the
+  // service's own read found something to remove. A caller whose extra statement
+  // carries a write-time guard (the dashboard Access panel's receipt) sets this
+  // true so the guard also rides the batch when that read found nothing: the two
+  // DELETEs below are unguarded, and a grant that lands between the read and the
+  // batch would otherwise be deleted with no receipt.
+  options: { evaluateExtrasWhenAbsent?: boolean } = {},
 ): Promise<AgentSquadAccessResult> {
   const state = await loadAgentBindingState(env, input.agentId)
   if (!state) return { ok: false, error: 'agent_not_found' }
@@ -408,7 +415,9 @@ export async function commitRemoveAgentSquadAccess(
     capability: 'member',
   })
   const removing = prior.membership !== null || prior.capability !== null
-  const extras = removing ? extraStatementsFor(prior.capability) : []
+  const extras = removing || options.evaluateExtrasWhenAbsent
+    ? extraStatementsFor(prior.capability)
+    : []
   const writes = await env.DB.batch([
     ...extras,
     env.DB.prepare(
