@@ -4,6 +4,8 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mcpApp } from '../src/mcp'
+import { sendAgentMessage } from '../src/agents/messages'
+import { readAfterSeq } from '../src/mcp/events'
 import { sha256Hex } from '../src/members/service'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -243,8 +245,8 @@ describe('events/list', () => {
       expect(e.payloadSchema).toMatchObject({ type: 'object', additionalProperties: false })
     }
     expect(events[0].payloadSchema).toMatchObject({
-      properties: { message_id: {}, seq: {}, kind: {}, request_id: {} },
-      required: ['message_id', 'seq', 'kind', 'request_id'],
+      properties: { message_id: {}, seq: {}, read_after_seq: {}, kind: {}, request_id: {} },
+      required: ['message_id', 'seq', 'read_after_seq', 'kind', 'request_id'],
     })
     expect(events[1].payloadSchema).toMatchObject({
       properties: { item_id: {}, project_id: {}, kind: {} },
@@ -302,5 +304,82 @@ describe('events/subscribe + events/unsubscribe are not implemented and write no
     const r = await rawRpc(m, subscribeParams, BOUND_ADMIN, false, sql)
     expect(r.status).toBe(401)
     expect(sql).toEqual([])
+  })
+})
+
+// ── the catalogue's own read instruction must actually work (Athena BLOCK_P1) ──────────────
+describe('message.created read instruction is TRUE end to end (real SQL)', () => {
+  const SYSTEM = { system: true, reason: 'test fixture' } as const
+
+  async function deliver(to: string, body: string): Promise<{ id: string; seq: number }> {
+    const r = await sendAgentMessage(
+      makeEnv({}, []),
+      { fromAgent: 'agent-b', fromMember: 'member-agent-b', toAgent: to, body },
+      SYSTEM,
+    )
+    if (!r.ok) throw new Error(`fixture send failed: ${r.reason}`)
+    // The seq the event payload would carry: read from the row, not from the send result.
+    const row = harness.sqlite.prepare('SELECT seq FROM agent_messages WHERE id = ?').all(r.id)[0] as { seq: number } | undefined
+    if (!row) throw new Error('fixture row missing')
+    return { id: r.id, seq: Number(row.seq) }
+  }
+
+  /** Call the inbox tool exactly as the catalogue instructs, as the bound agent-a bearer. */
+  async function inboxAsCatalogueSays(readAfter: number, bearer: Bearer = 'bound-admin') {
+    const r = await rawRpc('tools/call', { name: 'inbox', arguments: { peek: true, since_seq: readAfter, limit: 1 } }, { bearer }, true)
+    expect(r.status).toBe(200)
+    const sc = (JSON.parse(r.text) as { result: { structuredContent: { messages: { id: string; seq: number; body: string; to_agent?: string }[] } } }).result.structuredContent
+    return sc.messages
+  }
+
+  async function catalogueMessageCreated(): Promise<Record<string, unknown>> {
+    const r = await rawRpc('events/list', {}, BOUND_ADMIN, true)
+    const events = parse(r.text).result?.events as Record<string, unknown>[]
+    return events.find((e) => e.name === 'message.created') as Record<string, unknown>
+  }
+
+  it('the catalogue text names inbox with read_after_seq and never message_get', async () => {
+    const def = await catalogueMessageCreated()
+    const text = JSON.stringify(def)
+    expect(text).toContain('inbox {\\"peek\\":true,\\"since_seq\\":<read_after_seq>,\\"limit\\":1}')
+    expect(text).toContain('read_after_seq')
+    expect(text).not.toContain('message_get')
+    expect(text).not.toMatch(/pass as since_seq to inbox\.? *$/)
+  })
+
+  it('readAfterSeq is seq-1 and never negative', () => {
+    expect(readAfterSeq(5)).toBe(4)
+    expect(readAfterSeq(1)).toBe(0)
+    expect(readAfterSeq(0)).toBe(0)
+  })
+
+  it("returns exactly the triggering message for the bound agent, with older and newer rows present", async () => {
+    const older = await deliver('agent-a', 'older unread')
+    const trigger = await deliver('agent-a', 'the trigger')
+    const newer = await deliver('agent-a', 'newer')
+    const foreign = await deliver('agent-b', 'someone elses mail')
+    expect(new Set([older.seq, trigger.seq, newer.seq, foreign.seq]).size).toBe(4)
+
+    const got = await inboxAsCatalogueSays(readAfterSeq(trigger.seq))
+    expect(got.map((m) => m.id)).toEqual([trigger.id])
+    expect(got[0].body).toBe('the trigger')
+    expect(got.map((m) => m.id)).not.toContain(foreign.id)
+  })
+
+  it('the naive since_seq=seq (the bug) would SKIP the triggering row', async () => {
+    const trigger = await deliver('agent-a', 'the trigger')
+    const later = await deliver('agent-a', 'later')
+    const naive = await inboxAsCatalogueSays(trigger.seq)
+    expect(naive.map((m) => m.id)).toEqual([later.id])
+  })
+
+  it('a foreign agent’s message id / seq yields nothing for the reader', async () => {
+    const foreign = await deliver('agent-b', 'private to agent-b')
+    const got = await inboxAsCatalogueSays(readAfterSeq(foreign.seq)) // agent-a reading
+    expect(got.map((m) => m.id)).not.toContain(foreign.id)
+    expect(got).toEqual([])
+    // and the mirror: agent-b's own token does see it, proving the row is really there
+    const own = await inboxAsCatalogueSays(readAfterSeq(foreign.seq), 'bound-nogrants')
+    expect(own.map((m) => m.id)).toEqual([foreign.id])
   })
 })

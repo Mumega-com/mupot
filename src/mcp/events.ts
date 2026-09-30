@@ -80,25 +80,50 @@ function noArgs(): Record<string, unknown> {
   return { type: 'object', properties: {}, additionalProperties: false }
 }
 
+// How to read the message an event points at (verified against src/mcp/index.ts toolInbox and
+// src/agents/messages.ts readAgentInboxForReader): `inbox` is own-inbox scoped (to_agent = the
+// bound agent), `since_seq` is EXCLUSIVE (seq > since_seq) and requires peek=true, and a peek
+// returns only rows that are still UNREAD and visible to the caller's seat partition.
+// `message_get` is sender-scoped (rows the caller WROTE) and can NOT read an incoming delivery,
+// so it must never appear here. Hence `read_after_seq = seq - 1` (never negative).
+export const MESSAGE_READ_INSTRUCTION =
+  'inbox {"peek":true,"since_seq":<read_after_seq>,"limit":1}'
+
 const MESSAGE_CREATED: EventDefinition = {
   name: 'message.created',
   description:
     "A new message was delivered to the authenticated agent's own inbox. The inbox is implied by the " +
-    'authenticated principal; there are no filter arguments. The payload is a body-free summary: read the ' +
-    'message with the inbox or message_get tool. Messages the agent sent itself do not produce this event.',
+    'authenticated principal; there are no filter arguments. The payload is a body-free summary. To read ' +
+    `the message, call the inbox tool exactly as ${MESSAGE_READ_INSTRUCTION} using the payload's ` +
+    'read_after_seq (since_seq is exclusive, so read_after_seq is seq - 1); the first returned message ' +
+    'is the one that triggered the event. inbox reads only your own inbox and, with peek, returns only ' +
+    'messages that are still unread, so a message already consumed by another reader is no longer returned. ' +
+    'Messages the agent sent itself do not produce this event.',
   delivery: ['webhook'],
   inputSchema: noArgs(),
   payloadSchema: {
     type: 'object',
     properties: {
-      message_id: { type: 'string', description: 'Message id; pass to message_get.' },
-      seq: { type: 'number', description: 'Inbox sequence number; pass as since_seq to inbox.' },
+      message_id: { type: 'string', description: 'Message id (identification only; not a read handle).' },
+      seq: { type: 'integer', minimum: 1, description: 'Inbox sequence number of the triggering message.' },
+      read_after_seq: {
+        type: 'integer',
+        minimum: 0,
+        description:
+          'seq - 1 (never negative). Pass as since_seq to ' + MESSAGE_READ_INSTRUCTION +
+          ' (since_seq is exclusive); the first returned message is the triggering one.',
+      },
       kind: { type: 'string', description: 'Message kind (e.g. message, task, request).' },
       request_id: { type: ['string', 'null'], description: 'Correlation id when the sender set one, else null.' },
     },
-    required: ['message_id', 'seq', 'kind', 'request_id'],
+    required: ['message_id', 'seq', 'read_after_seq', 'kind', 'request_id'],
     additionalProperties: false,
   },
+}
+
+/** The `read_after_seq` a delivery must carry for a given inbox seq. PR 2's delivery MUST use this. */
+export function readAfterSeq(seq: number): number {
+  return Math.max(0, seq - 1)
 }
 
 const NEEDS_YOU_CREATED: EventDefinition = {
