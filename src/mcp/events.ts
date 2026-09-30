@@ -1,18 +1,16 @@
 // src/mcp/events.ts — MCP Events (protocol 2026-07-28), PR 1 of 2 (mupot#1618).
 //
 // SCOPE OF THIS FILE: protocol negotiation, the `server/discover` result, and the static
-// `events/list` catalogue. Pure: nothing in this module reads or writes D1, KV, or queues, or
-// makes a fetch. events/subscribe + events/unsubscribe live in ./events-subscriptions.ts,
-// callback URL validation / signing / verification in ./events-webhook.ts, delivery in
-// ../bus/events-delivery.ts (PR 2, mupot#1618).
+// `events/list` catalogue. There is NO subscribe/delivery machinery here: events/subscribe and
+// events/unsubscribe are registered as method names only and refuse. Nothing in this module
+// reads or writes D1, KV, queues, or makes a fetch.
 //
 // Spec: https://developers.openai.com/plugins/build/mcp-events
 //
-// Everything is behind EVENTS_ENABLED (default OFF). With the flag off, `server/discover`
-// does not advertise `events`, every events/* method is method-not-found, and the delivery hook
-// in the queue consumer is not called, so shipping this changes nothing observable for the prod
-// surface except the (additive) `server/discover` method and 2026-07-28 negotiation for a
-// client that explicitly asks for it.
+// EVERYTHING here is behind EVENTS_ENABLED (default OFF): version negotiation, `server/discover`,
+// and events/*. With the flag off, every request (including `initialize` asking for exactly
+// 2026-07-28, and `server/discover`) is byte-identical to origin/main, so merging changes
+// nothing for the live ChatGPT connector.
 
 import type { Env } from '../types'
 
@@ -35,29 +33,30 @@ export function isEventsEnabled(env: Pick<Env, 'EVENTS_ENABLED'>): boolean {
 }
 
 /**
- * Version negotiation. ONLY an exact request for 2026-07-28 gets 2026-07-28; anything else
- * (absent, non-string, unknown, 2025-06-18, older) gets the legacy version — the default is
- * deliberately NOT switched, so no existing client can be moved by this change.
+ * Version negotiation. Flag OFF: always the legacy version (the pre-change behaviour, whatever the
+ * client asked). Flag ON: ONLY an exact, case- and whitespace-sensitive request for 2026-07-28 gets
+ * 2026-07-28; anything else (absent, non-string, unknown, ' 2026-07-28', older) keeps the legacy
+ * version, so no existing client can be moved by this change.
  */
-export function negotiateProtocolVersion(params: unknown): string {
-  if (typeof params === 'object' && params !== null && !Array.isArray(params)) {
+export function negotiateProtocolVersion(params: unknown, enabled: boolean): string {
+  if (enabled && typeof params === 'object' && params !== null && !Array.isArray(params)) {
     const requested = (params as Record<string, unknown>).protocolVersion
     if (requested === EVENTS_PROTOCOL_VERSION) return EVENTS_PROTOCOL_VERSION
   }
   return LEGACY_PROTOCOL_VERSION
 }
 
-/** Capabilities for a NEW-protocol response. `events` only when the flag is on. */
-export function eventsProtocolCapabilities(enabled: boolean): Record<string, unknown> {
-  return enabled ? { tools: {}, events: {} } : { tools: {} }
+/** Capabilities for a 2026-07-28 response. Only ever called with the flag on. */
+export function eventsProtocolCapabilities(): Record<string, unknown> {
+  return { tools: {}, events: {} }
 }
 
-/** `server/discover` result (spec: resultType, supportedVersions, capabilities). */
-export function serverDiscoverResult(enabled: boolean): Record<string, unknown> {
+/** `server/discover` result (spec: resultType, supportedVersions, capabilities). Flag-on only. */
+export function serverDiscoverResult(): Record<string, unknown> {
   return {
     resultType: 'complete',
     supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-    capabilities: eventsProtocolCapabilities(enabled),
+    capabilities: eventsProtocolCapabilities(),
   }
 }
 
@@ -82,57 +81,70 @@ function noArgs(): Record<string, unknown> {
   return { type: 'object', properties: {}, additionalProperties: false }
 }
 
+// How to read the message an event points at (verified against src/mcp/index.ts toolInbox and
+// src/agents/messages.ts readAgentInboxForReader): `inbox` is own-inbox scoped (to_agent = the
+// bound agent), `since_seq` is EXCLUSIVE (seq > since_seq) and requires peek=true, and a peek
+// returns only rows that are still UNREAD and visible to the caller's seat partition.
+// `message_get` is sender-scoped (rows the caller WROTE) and can NOT read an incoming delivery,
+// so it must never appear here. Hence `read_after_seq = seq - 1` (never negative).
+export const MESSAGE_READ_INSTRUCTION =
+  'inbox {"peek":true,"since_seq":<read_after_seq>,"limit":1}'
+
 const MESSAGE_CREATED: EventDefinition = {
   name: 'message.created',
   description:
     "A new message was delivered to the authenticated agent's own inbox. The inbox is implied by the " +
-    'authenticated principal; there are no filter arguments. The payload is a body-free summary: read the ' +
-    'message with the inbox or message_get tool. Messages the agent sent itself do not produce this event.',
+    'authenticated principal; there are no filter arguments. The payload is a body-free summary. To read ' +
+    `the message, call the inbox tool exactly as ${MESSAGE_READ_INSTRUCTION} using the payload's ` +
+    'read_after_seq (since_seq is exclusive, so read_after_seq is seq - 1); the first returned message ' +
+    'is the one that triggered the event. inbox reads only your own inbox and, with peek, returns only ' +
+    'messages that are still unread, so a message already consumed by another reader is no longer returned. ' +
+    'Messages the agent sent itself do not produce this event.',
   delivery: ['webhook'],
   inputSchema: noArgs(),
   payloadSchema: {
     type: 'object',
     properties: {
-      message_id: { type: 'string', description: 'Message id; pass to message_get.' },
-      seq: { type: 'number', description: 'Inbox sequence number; pass as since_seq to inbox.' },
+      message_id: { type: 'string', description: 'Message id (identification only; not a read handle).' },
+      seq: { type: 'integer', minimum: 1, description: 'Inbox sequence number of the triggering message.' },
+      read_after_seq: {
+        type: 'integer',
+        minimum: 0,
+        description:
+          'seq - 1 (never negative). Pass as since_seq to ' + MESSAGE_READ_INSTRUCTION +
+          ' (since_seq is exclusive); the first returned message is the triggering one.',
+      },
       kind: { type: 'string', description: 'Message kind (e.g. message, task, request).' },
       request_id: { type: ['string', 'null'], description: 'Correlation id when the sender set one, else null.' },
     },
-    required: ['message_id', 'seq', 'kind', 'request_id'],
+    required: ['message_id', 'seq', 'read_after_seq', 'kind', 'request_id'],
     additionalProperties: false,
   },
 }
 
-const NEEDS_YOU_CREATED: EventDefinition = {
-  name: 'needs_you.created',
-  description:
-    'A new item appeared in the needs-you (attention) queue visible to the authenticated principal. There are ' +
-    'no filter arguments; visibility follows the principal\'s existing access. The payload is a body-free ' +
-    'summary: read the item with the needs_you_list tool.',
-  delivery: ['webhook'],
-  inputSchema: noArgs(),
-  payloadSchema: {
-    type: 'object',
-    properties: {
-      item_id: { type: 'string', description: 'Needs-you item id.' },
-      project_id: { type: 'string', description: 'Owning project id, when the item belongs to one.' },
-      kind: { type: 'string', description: 'Item kind.' },
-    },
-    required: ['item_id', 'kind'],
-    additionalProperties: false,
-  },
+/** The `read_after_seq` a delivery must carry for a given inbox seq. PR 2's delivery MUST use this. */
+export function readAfterSeq(seq: number): number {
+  return Math.max(0, seq - 1)
 }
 
 /**
- * The v1 catalogue for a principal.
+ * v1 advertises ONLY message.created (the #1618 contract). To add an event later: add an entry here
+ * naming the tool a subscriber reads it with; the catalogue then lists it only for a principal who
+ * passes that tool's own floor.
+ */
+const CATALOGUE: readonly { def: EventDefinition; readTool: string }[] = [
+  { def: MESSAGE_CREATED, readTool: 'inbox' },
+]
+
+/**
+ * The catalogue for a principal.
  *  - `bound`: the session is bound to an agent (auth.boundAgentId). An unbound / zero-capability
  *    directory session has no inbox and gets an EMPTY catalogue (not a filtered full one).
- *  - `canReadNeedsYou`: the principal could already call needs_you_list (its floor). The catalogue
- *    never advertises an event whose read tool the principal could not call.
+ *  - `mayCallTool`: whether the principal passes the named read tool's OWN floor. The caller (index.ts)
+ *    derives it from the live tool registry entry, so the catalogue can never advertise an event whose
+ *    read tool the principal could not call, and cannot drift from the tool's declared minimum.
  */
-export function eventCatalogue(opts: { bound: boolean; canReadNeedsYou: boolean }): EventDefinition[] {
+export function eventCatalogue(opts: { bound: boolean; mayCallTool: (toolName: string) => boolean }): EventDefinition[] {
   if (!opts.bound) return []
-  const out: EventDefinition[] = [structuredClone(MESSAGE_CREATED)]
-  if (opts.canReadNeedsYou) out.push(structuredClone(NEEDS_YOU_CREATED))
-  return out
+  return CATALOGUE.filter((e) => opts.mayCallTool(e.readTool)).map((e) => structuredClone(e.def))
 }

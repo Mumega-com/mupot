@@ -287,6 +287,28 @@ gate-specific verdict route rather than being completed by direct status writes.
 - Production self-hosting still needs backup, rollback, incident, and upgrade
   runbooks. Track this in GitHub issue #272.
 
+## Secret-env taker (`secret_env_request` / `secret_env_status`)
+
+- **Who may call.** An agent-bound seat holding at least `observer`, or an unbound
+  principal holding at least `member`, in either case on a grant that is NOT on a
+  `kind='home'` squad (org, department, or work-squad scope). Home squads are what
+  `bootstrap_self` gives every verified Google account, so home-only standing is refused.
+  A zero-capability directory session gets `403`.
+- **Names.** Refused: the hand-kept denylist, every key of the `Env` interface, every field
+  of every `*Env`/`*Secrets` interface, names read through `accessor(env).X` / `(env as T).X`,
+  and the reserved prefixes (`LOOP_SECRET_`, `DISCORD_BOT_TOKEN_`). A ratchet test fails when
+  a new one is not reviewed into `src/secret-env/env-reviewed-names.ts`.
+- **Abuse bounds.** At most 5 pending requests and 10 requests per hour per requester,
+  enforced in one guarded `INSERT ... SELECT ... WHERE COUNT` statement.
+- **Approvals card.** Shows the requester's member id, email and channel; for an agent
+  requester it also names the agent and the humans behind it.
+- **Known open (pre-existing on main, not introduced or fixed here).** `bindSecretEnv` has no
+  atomic claim before the Cloudflare PUT. If a second admin rejects a request while the first
+  admin's bind is in flight, the CF secret is written and the binding can still flip to
+  `bound` under a request that was rejected. It needs two admins acting on the same request.
+  The proper fix is a claim-before-fetch state machine (`pending -> binding -> bound|failed`),
+  tracked separately.
+
 ## Operator Checklist
 
 Before trusting a new pot or new integration:
