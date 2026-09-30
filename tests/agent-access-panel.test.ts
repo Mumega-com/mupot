@@ -190,6 +190,13 @@ describe('invariants at the route layer', () => {
     expectUntouched(harness, { cap: null, mem: null })
   })
 
+  it('a session with no member id cannot act, even as a legacy-role owner: the change could not be recorded', async () => {
+    const { harness, env } = makeEnv()
+    const memberless: AuthContext = { userId: 'u-x', email: null, role: 'owner', tenant: TENANT }
+    expect(await applyAgentAccessChange(env, memberless, change())).toMatchObject({ ok: false, error: 'actor_member_required', status: 403 })
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
   it('(1) a squad admin who is not org admin is refused', async () => {
     const { harness, env } = makeEnv()
     const sq = humanAuth('m-sqadmin', [grant('m-sqadmin', 'squad', 'sq-core', 'admin')])
@@ -285,7 +292,10 @@ describe('invariants at the route layer', () => {
       INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-o', 'm-rava', 'squad', 'sq-core', 'owner');
     `)
     expect(await applyAgentAccessChange(env, owner(), change({ expectedPrior: 'owner' }))).toMatchObject({ ok: false, error: 'owner_access_untouchable' })
-    expect(await applyAgentAccessChange(env, owner(), change({ expectedPrior: 'none' }))).toMatchObject({ ok: false })
+    // whatever the admin's page claimed, a live owner row is refused as owner access
+    expect(await applyAgentAccessChange(env, owner(), change({ expectedPrior: 'none' }))).toMatchObject({ ok: false, error: 'owner_access_untouchable' })
+    expect(await applyAgentAccessChange(env, owner(), change({ expectedPrior: 'lead' }))).toMatchObject({ ok: false, error: 'owner_access_untouchable' })
+    expect(await applyAgentAccessChange(env, owner(), change({ action: 'revoke', expectedPrior: 'lead' }))).toMatchObject({ ok: false, error: 'owner_access_untouchable' })
     expect(rava(harness)).toEqual({ cap: 'owner', mem: 'owner' })
     expect(receipts(harness)).toHaveLength(0)
   })
@@ -476,6 +486,34 @@ describe('the guard re-asserted inside the batch', () => {
     // a fresh grant lands at a different level than the admin saw
     seedRava(harness, 'admin')
     expect(await driveRevoke(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'admin', mem: 'admin' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('revoke through the route: a grant that lands between the service read and the batch is not deleted without a receipt', async () => {
+    const { harness, env } = makeEnv()
+    seedRava(harness, 'lead')
+    let sawServiceRead = false
+    const racing = {
+      prepare: (sql: string) => {
+        // the service's own prior read of the membership row: by then the route's
+        // pre-checks have passed. A concurrent revoke removes the rows just before it.
+        if (!sawServiceRead && sql.includes('FROM memberships') && sql.includes('LIMIT 1')) {
+          sawServiceRead = true
+          harness.sqlite.exec("DELETE FROM memberships WHERE id = 'ms-sq-core'; DELETE FROM capabilities WHERE id = 'cap-rava-sq-core'")
+        }
+        return env.DB.prepare(sql)
+      },
+      batch: async (statements: Parameters<Env['DB']['batch']>[0]) => {
+        // and a fresh grant lands at a level the admin never saw, right before the batch
+        seedRava(harness, 'admin')
+        return env.DB.batch(statements)
+      },
+    }
+    const raced = { ...env, DB: racing } as unknown as Env
+    const result = await applyAgentAccessChange(raced, hadi(), change({ action: 'revoke', expectedPrior: 'lead' }))
+    expect(sawServiceRead).toBe(true)
+    expect(result.ok).toBe(false)
     expect(rava(harness)).toEqual({ cap: 'admin', mem: 'admin' })
     expect(receipts(harness)).toHaveLength(0)
   })
