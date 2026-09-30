@@ -322,6 +322,10 @@ export interface Env {
   // server/discover does not advertise `events` and events/* methods are method-not-found.
   // Read via isEventsEnabled() in src/mcp/events.ts.
   EVENTS_ENABLED?: string
+  // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
+  // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
+  // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.
+  EVENTS_CALLBACK_HOSTS?: string
   SUPABASE_WEBHOOK_SECRET?: string
   // TypeSafe Jev (System One) — used only by the agent_lifecycle intent path.
   // Absent ⇒ that path returns classifier_unavailable (no guess, no execute).
@@ -751,6 +755,10 @@ export type BusEventType =
                       // (result.meta.changes > 0), so a capped, fenced, or idempotent-
                       // duplicate send produces no event. See MessageCreatedPayload.
   | 'member.auto_enrolled'
+  // mupot#1618 PR 2: one MCP Events webhook delivery attempt (queue job produced by the
+  // message.created consumer leg and by its own retries). Deliberately NOT in the /bus/emit
+  // allowlist (src/bus/index.ts EVENT_TYPES): only the consumer can enqueue it.
+  | 'mcp.event.delivery'
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'
   | 'pot.self_serve_provisioned'

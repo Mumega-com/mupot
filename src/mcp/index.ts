@@ -197,6 +197,7 @@ import {
   negotiateProtocolVersion,
   serverDiscoverResult,
 } from './events'
+import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
@@ -6473,9 +6474,13 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
       return rpcResult(id, { events: catalogue })
     }
 
-    // events/subscribe and events/unsubscribe: registered, but this build stores nothing and
-    // sends nothing (delivery is PR 2).
-    return rpcError(id, -32601, 'not_implemented', { method, reason: 'events_delivery_not_implemented_in_this_build' })
+    // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on and an
+    // authenticated caller; the handlers refuse unbound / zero-capability sessions themselves.
+    const floorOk = callerFloorOk(auth, hasWorkspaceAdmin(auth))
+    const out = method === 'events/subscribe'
+      ? await eventsSubscribe(c.env, auth, floorOk, body.params)
+      : await eventsUnsubscribe(c.env, auth, floorOk, body.params)
+    return out.ok ? rpcResult(id, out.result) : rpcError(id, out.code, out.message, out.data, out.status)
   }
 
   return rpcError(id, -32601, 'method_not_found', method)

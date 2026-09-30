@@ -1,16 +1,18 @@
 // src/mcp/events.ts — MCP Events (protocol 2026-07-28), PR 1 of 2 (mupot#1618).
 //
 // SCOPE OF THIS FILE: protocol negotiation, the `server/discover` result, and the static
-// `events/list` catalogue. There is NO subscribe/delivery machinery here: events/subscribe and
-// events/unsubscribe are registered as method names only and refuse. Nothing in this module
-// reads or writes D1, KV, queues, or makes a fetch.
+// `events/list` catalogue. Pure: nothing in this module reads or writes D1, KV, or queues, or
+// makes a fetch. events/subscribe + events/unsubscribe live in ./events-subscriptions.ts,
+// callback URL validation / signing / verification in ./events-webhook.ts, delivery in
+// ../bus/events-delivery.ts (PR 2, mupot#1618).
 //
 // Spec: https://developers.openai.com/plugins/build/mcp-events
 //
 // Everything is behind EVENTS_ENABLED (default OFF). With the flag off, `server/discover`
-// does not advertise `events` and every events/* method is method-not-found, so shipping this
-// changes nothing observable for the prod surface except the (additive) `server/discover`
-// method and 2026-07-28 negotiation for a client that explicitly asks for it.
+// does not advertise `events`, every events/* method is method-not-found, and the delivery hook
+// in the queue consumer is not called, so shipping this changes nothing observable for the prod
+// surface except the (additive) `server/discover` method and 2026-07-28 negotiation for a
+// client that explicitly asks for it.
 
 import type { Env } from '../types'
 

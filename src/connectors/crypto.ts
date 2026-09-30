@@ -46,6 +46,8 @@ export type ConnectorType =
   | 'notion'
   | 'supabase'
   | 'custom'
+/** HKDF domain for a secret the vault protects that is NOT a connector row (distinct `info`). */
+export type VaultDomain = ConnectorType | 'mcp_events'
 export type ConnectorScopeType = 'squad' | 'agent' | 'pot'
 
 const VALID_TYPES: readonly ConnectorType[] = [
@@ -129,7 +131,7 @@ async function importMasterKey(masterKeyHex: string): Promise<CryptoKey> {
 async function deriveConnectorKey(
   masterKeyHex: string,
   connectorId: string,
-  type: ConnectorType,
+  type: VaultDomain,
 ): Promise<CryptoKey> {
   const master = await importMasterKey(masterKeyHex)
   const info = `mupot_connector_${type}_v1`
@@ -157,7 +159,7 @@ async function deriveConnectorKey(
 export async function encryptConnectorSecret(
   masterKeyHex: string,
   connectorId: string,
-  type: ConnectorType,
+  type: VaultDomain,
   plaintext: string,
 ): Promise<string> {
   if (!plaintext) throw new Error('connector-crypto: plaintext must be non-empty')
@@ -179,7 +181,7 @@ export async function encryptConnectorSecret(
 export async function decryptConnectorSecret(
   masterKeyHex: string,
   connectorId: string,
-  type: ConnectorType,
+  type: VaultDomain,
   encryptedBase64: string,
 ): Promise<string> {
   if (!encryptedBase64) {

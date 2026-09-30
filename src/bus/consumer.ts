@@ -21,6 +21,8 @@ import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATC
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
+import { isEventsEnabled } from '../mcp/events'
+import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './events-delivery'
 import { redactSecretPatterns } from '../lib/redact'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
@@ -591,6 +593,20 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           metric: 'seat_events.hint_publish_failed',
         })
       }
+      // MCP Events leg (mupot#1618 PR 2, src/bus/events-delivery.ts): fan the SAME event out to
+      // webhook subscriptions. Flag OFF => not called at all (no DB read, no queue message).
+      // Isolated like the seat leg above: a failure here is logged and never retries the Hermes leg.
+      if (isEventsEnabled(env)) {
+        try {
+          await enqueueMessageCreatedDeliveries(env, event)
+        } catch (err) {
+          console.error('bus: message.created — mcp events enqueue failed (isolated, not retried)', {
+            tenant: event.tenant,
+            message_id: p?.message_id,
+            error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
+          })
+        }
+      }
       const outcome = await deliverMessageCreatedEvent(env, event as BusEvent<MessageCreatedPayload>)
       const logCtx = {
         tenant: event.tenant,
@@ -623,6 +639,12 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           console.error('bus: message.created — delivery failed', { ...logCtx, outcome })
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
+    }
+    case 'mcp.event.delivery': {
+      // mupot#1618 PR 2: one signed webhook attempt. Retries are scheduled by the delivery module
+      // itself (own attempt counter + delaySeconds); this only throws on an infrastructure fault.
+      await deliverSubscriptionEvent(env, event.payload)
+      return true
     }
     case 'pot.self_serve_provisioning_incomplete': {
       // Deliberately NOT grouped with the committed-effect observations below. That branch
