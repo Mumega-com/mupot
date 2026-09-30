@@ -291,7 +291,7 @@ describe('secret_env_request — per-requester cap and hourly limit (atomic)', (
   })
 })
 
-describe('secret_env_request — a rejected or expired request frees the name', () => {
+describe('secret_env_request — a rejected request frees the name', () => {
   it('rejected request frees the name for another requester', async () => {
     const db = makeDb()
     const { rejectSecretEnv } = await import('../src/secret-env/service')
@@ -303,20 +303,5 @@ describe('secret_env_request — a rejected or expired request frees the name', 
     if (!clash.ok) expect(clash.error).toBe('binding_name_conflict')
     await rejectSecretEnv(db.env, { requestId: (first.result as { request_id: string }).request_id, actorId: 'admin' })
     expect((await invokeTool(auth('member-2'), db.env, 'secret_env_request', REQ('OPENAI_API_KEY'), ORIGIN)).ok).toBe(true)
-  })
-  it('an expired pending request frees its name, drops from the queue, and cannot be bound', async () => {
-    const db = makeDb()
-    const { listPendingSecretEnvRequests, bindSecretEnv } = await import('../src/secret-env/service')
-    const first = await invokeTool(member, db.env, 'secret_env_request', REQ('OPENAI_API_KEY'), ORIGIN)
-    if (!first.ok) throw new Error('setup')
-    const oldId = (first.result as { request_id: string }).request_id
-    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString()
-    db.exec(`UPDATE secret_env_requests SET created_at = '${old}'`)
-    db.exec(`UPDATE secret_env_bindings SET created_at = '${old}'`)
-    expect(await listPendingSecretEnvRequests(db.env)).toHaveLength(0)
-    const bound = await bindSecretEnv(db.env, { requestId: oldId, values: { OPENAI_API_KEY: 'x' }, actorId: 'admin' })
-    expect(bound).toEqual({ ok: false, error: 'request_expired' })
-    const again = await invokeTool(auth('member-2'), db.env, 'secret_env_request', REQ('OPENAI_API_KEY'), ORIGIN)
-    expect(again.ok).toBe(true)
   })
 })

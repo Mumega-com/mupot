@@ -7,7 +7,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { invokeTool, mcpActionsApp } from '../src/mcp/index'
 import {
-  requestSecretEnv, bindSecretEnv, listPendingSecretEnvRequests, PENDING_REQUEST_TTL_MS,
+  requestSecretEnv, listPendingSecretEnvRequests,
 } from '../src/secret-env/service'
 import { secretEnvApprovalsSection } from '../src/dashboard/secret-env'
 import type { AuthContext, Env } from '../src/types'
@@ -172,9 +172,9 @@ describe('reserved prefixes are pinned through the tool path', () => {
   })
 })
 
-describe('pending cap ignores EXPIRED pending rows', () => {
-  it('5 expired pending requests do not lock the requester out', async () => {
-    const old = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 60_000).toISOString()
+describe('pending cap counts ALL pending rows (no expiry)', () => {
+  it('5 old pending requests still block a sixth from the same requester', async () => {
+    const old = '2020-01-01T00:00:00.000Z'
     for (let i = 0; i < 5; i++) {
       harness.sqlite.exec(
         `INSERT INTO secret_env_requests (id, tenant, reason, schema_json, status, requested_by, created_at)
@@ -182,78 +182,6 @@ describe('pending cap ignores EXPIRED pending rows', () => {
       )
     }
     const out = await requestSecretEnv(env, { keys: [{ name: 'FRESH_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-1' })
-    expect(out.ok).toBe(true)
-  })
-})
-
-describe('bindSecretEnv closes the TTL-boundary race at the write', () => {
-  it('a name re-taken during the CF round-trip is NOT flipped to bound under the old request', async () => {
-    const first = await requestSecretEnv(env, { keys: [{ name: 'RACE_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-a' })
-    if (!first.ok) throw new Error('setup')
-    const old = new Date(Date.now() - PENDING_REQUEST_TTL_MS + 5_000).toISOString() // 5s from expiry: passes the read check
-    harness.sqlite.exec(`UPDATE secret_env_requests SET created_at = '${old}'`)
-    harness.sqlite.exec(`UPDATE secret_env_bindings SET created_at = '${old}'`)
-    let second: Awaited<ReturnType<typeof requestSecretEnv>> | null = null
-    const fetchImpl = (async () => {
-      // during the CF PUT: TTL elapses and another requester re-takes the name
-      const expired = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 1_000).toISOString()
-      harness.sqlite.exec(`UPDATE secret_env_requests SET created_at = '${expired}' WHERE id = '${first.request.id}'`)
-      harness.sqlite.exec(`UPDATE secret_env_bindings SET created_at = '${expired}' WHERE request_id = '${first.request.id}'`)
-      second = await requestSecretEnv(env, { keys: [{ name: 'RACE_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-b' })
-      return new Response(JSON.stringify({ success: true }), { status: 200 })
-    }) as unknown as typeof fetch
-    const res = await bindSecretEnv(env, { requestId: first.request.id, values: { RACE_KEY: 'old-admin-value' }, actorId: 'admin-1', fetchImpl })
-    expect(second?.ok).toBe(true)
-    expect(res).toEqual({ ok: false, error: 'request_state_changed' })
-    const binding = harness.sqlite.prepare(`SELECT status, request_id FROM secret_env_bindings WHERE binding_name = 'RACE_KEY'`).get() as { status: string; request_id: string }
-    expect(binding.status).toBe('pending')
-    expect(binding.request_id).toBe(second && second.ok ? second.request.id : 'x')
-    const oldReq = harness.sqlite.prepare(`SELECT status FROM secret_env_requests WHERE id = ?`).get(first.request.id) as { status: string }
-    expect(oldReq.status).toBe('pending')
-  })
-})
-
-describe('bindSecretEnv commit guards, each isolated', () => {
-  const okFetch = (during: () => void) => (async () => {
-    during()
-    return new Response(JSON.stringify({ success: true }), { status: 200 })
-  }) as unknown as typeof fetch
-  const state = (name: string) => harness.sqlite.prepare(
-    `SELECT b.status AS b, r.status AS r FROM secret_env_bindings b JOIN secret_env_requests r ON r.id = b.request_id WHERE b.binding_name = ?`,
-  ).get(name) as { b: string; r: string }
-
-  it('request expires during the CF round-trip (name NOT re-taken): nothing flips', async () => {
-    const first = await requestSecretEnv(env, { keys: [{ name: 'EXP_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-a' })
-    if (!first.ok) throw new Error('setup')
-    const res = await bindSecretEnv(env, {
-      requestId: first.request.id, values: { EXP_KEY: 'v' }, actorId: 'admin-1',
-      fetchImpl: okFetch(() => {
-        const expired = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 1_000).toISOString()
-        harness.sqlite.exec(`UPDATE secret_env_requests SET created_at = '${expired}'`)
-      }),
-    })
-    expect(res).toEqual({ ok: false, error: 'request_state_changed' })
-    expect(state('EXP_KEY')).toEqual({ b: 'pending', r: 'pending' })
-  })
-
-  it('binding re-taken during the round-trip while the request row is still fresh: nothing flips', async () => {
-    const first = await requestSecretEnv(env, { keys: [{ name: 'TAKE_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-a' })
-    if (!first.ok) throw new Error('setup')
-    const res = await bindSecretEnv(env, {
-      requestId: first.request.id, values: { TAKE_KEY: 'v' }, actorId: 'admin-1',
-      fetchImpl: okFetch(() => {
-        // only the binding row ages out and is re-owned by another request
-        const expired = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 1_000).toISOString()
-        harness.sqlite.exec(`UPDATE secret_env_bindings SET created_at = '${expired}' WHERE binding_name = 'TAKE_KEY'`)
-        harness.sqlite.exec(
-          `UPDATE secret_env_bindings SET request_id = 'other-req', requested_by = 'req-b', created_at = '${new Date().toISOString()}' WHERE binding_name = 'TAKE_KEY'`,
-        )
-      }),
-    })
-    expect(res).toEqual({ ok: false, error: 'request_state_changed' })
-    const b = harness.sqlite.prepare(`SELECT status, request_id FROM secret_env_bindings WHERE binding_name = 'TAKE_KEY'`).get() as { status: string; request_id: string }
-    expect(b).toEqual({ status: 'pending', request_id: 'other-req' })
-    const r = harness.sqlite.prepare(`SELECT status FROM secret_env_requests WHERE id = ?`).get(first.request.id) as { status: string }
-    expect(r.status).toBe('pending')
+    expect(out).toEqual({ ok: false, error: 'too_many_pending_requests' })
   })
 })
