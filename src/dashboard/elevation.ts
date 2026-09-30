@@ -375,7 +375,7 @@ function actionChecklist(actions: string[]): Html {
         const def = ELEVATION_ACTIONS[a]
         return html`
           <label style="display:flex;gap:10px;align-items:flex-start;margin:10px 0;">
-            <input type="checkbox" name="actions" value="${a}" checked style="margin-top:3px;" />
+            <input type="checkbox" name="actions" form="decide-form" value="${a}" checked style="margin-top:3px;" />
             <span>
               <strong>${def?.label ?? a}</strong> ${def ? effectBadge(def.effect) : ''}
               <div style="font-size:12.5px;color:var(--dim);">${def?.description ?? ''}</div>
