@@ -62,7 +62,7 @@ function secretEnvRequestCardHtml(r: PublicSecretEnvRequest): string {
       <div class="appr-head">
         <div>
           <div class="appr-title">${adapterLabel}</div>
-          <div class="appr-meta">${esc(r.requested_by)} · ${when}</div>
+          <div class="appr-meta">Requested by <code>${esc(r.requested_by)}</code> · ${esc(r.requester_email ?? 'no email on file')} · via ${esc(r.requester_channel ?? 'unknown channel')} · ${when}</div>
         </div>
       </div>
       <div class="appr-body">${esc(r.reason)}</div>

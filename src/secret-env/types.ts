@@ -14,4 +14,7 @@ export interface PublicSecretEnvRequest {
   status: SecretEnvRequestStatus
   requested_by: string
   created_at: string
+  /** Admin-queue enrichment (listPendingSecretEnvRequests only): who asked. */
+  requester_email?: string | null
+  requester_channel?: string | null
 }

@@ -10,11 +10,28 @@
 import type { Env } from '../types'
 import { requestSecretEnv, getSecretEnvStatus } from '../secret-env/service'
 import type { SecretEnvKeySpec } from '../secret-env/types'
+import { holdsCapabilityFloor } from '../auth/capability'
+import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 const STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const MAX_KEYS_PER_REQUEST = 20
+
+/**
+ * Caller gate for BOTH secret-env tools. `min: 'authenticated'` admits ANY verified
+ * Google account (directory signup is self-serve, capabilities [], no bound agent), which
+ * let a stranger write requests into the admin queue, squat binding names and probe
+ * which bindings exist. The floor is therefore enforced HERE, inside the tool:
+ *   - an agent-bound session (auth.boundAgentId), OR
+ *   - a principal holding at least `member` on SOME scope (holdsCapabilityFloor is the
+ *     repo's scope-agnostic floor helper; org admins/owners satisfy it too).
+ * A zero-capability, unbound directory session gets 403. This is deliberately not a
+ * registry `min: 'member'`: an observer-rank agent-bound seat legitimately calls these.
+ */
+function secretEnvCallerAllowed(auth: AuthContext): boolean {
+  return auth.boundAgentId != null || holdsCapabilityFloor(auth, 'member')
+}
 
 type ToolFailure = Extract<ReturnType<typeof fail>, { ok: false }>
 
@@ -44,7 +61,7 @@ function parseKeySpecs(raw: unknown): SecretEnvKeySpec[] | ToolFailure {
 
 const toolSecretEnvRequest: ToolSpec = {
   name: 'secret_env_request',
-  scope: 'org (any authenticated principal proposes an env schema — no values, ever)',
+  scope: 'org (agent-bound seat or member-on-some-scope proposes an env schema — no values, ever)',
   min: 'authenticated',
   args: '{ keys: [{ name: string, purpose: string }], reason: string, adapter_hint?: string }',
   inputSchema: {
@@ -60,6 +77,7 @@ const toolSecretEnvRequest: ToolSpec = {
   async run(auth, env, args) {
     // The actor is always resolved from auth, never trusted from args (same
     // pattern as every other tool — see index.ts comment on the tool surface).
+    if (!secretEnvCallerAllowed(auth)) return fail(403, 'forbidden', { need: 'agent_bound_or_member' })
     const requestedBy = auth.memberId ?? auth.userId
     if (!requestedBy) return fail(403, 'unauthenticated')
 
@@ -76,8 +94,9 @@ const toolSecretEnvRequest: ToolSpec = {
       reason,
       adapterHint,
       requestedBy,
+      requestedChannel: auth.channel ?? null,
     })
-    if (!result.ok) return fail(400, result.error)
+    if (!result.ok) return fail(result.error === 'too_many_pending_requests' || result.error === 'rate_limited' ? 409 : 400, result.error)
 
     return done({
       request_id: result.request.id,
@@ -88,7 +107,7 @@ const toolSecretEnvRequest: ToolSpec = {
 
 const toolSecretEnvStatus: ToolSpec = {
   name: 'secret_env_status',
-  scope: 'org (any authenticated principal reads binding state — statuses only, never values)',
+  scope: 'org (agent-bound seat or member-on-some-scope reads binding state — statuses only, never values)',
   min: 'authenticated',
   args: '{ names: string[] }',
   inputSchema: {
@@ -98,6 +117,7 @@ const toolSecretEnvStatus: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (!secretEnvCallerAllowed(auth)) return fail(403, 'forbidden', { need: 'agent_bound_or_member' })
     const requestedBy = auth.memberId ?? auth.userId
     if (!requestedBy) return fail(403, 'unauthenticated')
 

@@ -40,6 +40,15 @@ const MAX_PURPOSE_LENGTH = 280
 const MAX_REASON_LENGTH = 500
 const MAX_ADAPTER_HINT_LENGTH = 64
 
+// Abuse bounds per requester (hotfix: any verified account used to be able to
+// file unlimited pending requests and squat binding names). Enforced ATOMICALLY in
+// the guarded INSERT below, not by a read-then-write.
+export const MAX_PENDING_REQUESTS_PER_REQUESTER = 5
+export const MAX_REQUESTS_PER_REQUESTER_PER_HOUR = 10
+/** A pending request older than this is EXPIRED: it no longer holds its binding
+ * names, no longer counts toward the cap, and is no longer shown or bindable. */
+export const PENDING_REQUEST_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
 // ── row shapes (D1) ──────────────────────────────────────────────────────────
 
 interface SecretEnvRequestRow {
@@ -74,10 +83,12 @@ interface SecretEnvBindingRow {
 interface SecretEnvRequestSchema {
   keys: SecretEnvKeySpec[]
   adapterHint: string | null
+  /** Connection channel the requester used (server-derived from auth, never args). Shown to the approving admin. */
+  requestedChannel?: string | null
 }
 
 function parseRequestSchema(schemaJson: string): SecretEnvRequestSchema {
-  const parsed = JSON.parse(schemaJson) as { keys?: unknown; adapterHint?: unknown }
+  const parsed = JSON.parse(schemaJson) as { keys?: unknown; adapterHint?: unknown; requestedChannel?: unknown }
   const keys = Array.isArray(parsed.keys)
     ? parsed.keys.filter((entry): entry is SecretEnvKeySpec => (
         typeof entry === 'object' && entry !== null
@@ -86,7 +97,8 @@ function parseRequestSchema(schemaJson: string): SecretEnvRequestSchema {
       ))
     : []
   const adapterHint = typeof parsed.adapterHint === 'string' ? parsed.adapterHint : null
-  return { keys, adapterHint }
+  const requestedChannel = typeof parsed.requestedChannel === 'string' ? parsed.requestedChannel : null
+  return { keys, adapterHint, requestedChannel }
 }
 
 function toPublicRequest(row: SecretEnvRequestRow): PublicSecretEnvRequest {
@@ -156,6 +168,8 @@ export interface RequestSecretEnvParams {
   reason: string
   adapterHint: string | null
   requestedBy: string
+  /** Server-derived connection channel of the caller (recorded for the admin queue). */
+  requestedChannel?: string | null
 }
 
 export type RequestSecretEnvResult =
@@ -171,7 +185,7 @@ export async function requestSecretEnv(
   env: Env,
   params: RequestSecretEnvParams,
 ): Promise<RequestSecretEnvResult> {
-  const { keys, reason, adapterHint, requestedBy } = params
+  const { keys, reason, adapterHint, requestedBy, requestedChannel = null } = params
 
   if (!requestedBy.trim()) return { ok: false, error: 'requested_by_required' }
   if (!reason.trim()) return { ok: false, error: 'reason_required' }
@@ -198,40 +212,62 @@ export async function requestSecretEnv(
   // Pre-check existing bindings for every requested name (there is a UNIQUE
   // (tenant, binding_name) constraint on secret_env_bindings, so a blind
   // INSERT would race/collide on retry or on a second agent requesting the
-  // same name). pending/bound names are a hard conflict; revoked names are
-  // reused in place (UPDATE, not a fresh INSERT) below.
+  // same name). bound and LIVE-pending names are a hard conflict; revoked names
+  // and EXPIRED pending names are reused in place (UPDATE, not a fresh INSERT)
+  // below. This read is advisory (fast error codes) — the authoritative guard is
+  // the conditional write in the batch, which re-checks everything atomically.
+  const nowMs = Date.now()
+  const now = new Date(nowMs).toISOString()
+  const expiryCutoff = new Date(nowMs - PENDING_REQUEST_TTL_MS).toISOString()
+  const hourCutoff = new Date(nowMs - 60 * 60 * 1000).toISOString()
+
   const names = keys.map((key) => key.name)
   const namePlaceholders = names.map((_, index) => `?${index + 2}`).join(', ')
   const existingResult = await env.DB.prepare(
-    `SELECT id, binding_name, status FROM secret_env_bindings
+    `SELECT id, binding_name, status, created_at FROM secret_env_bindings
       WHERE tenant = ?1 AND binding_name IN (${namePlaceholders})`,
   )
     .bind(env.TENANT_SLUG, ...names)
-    .all<{ id: string; binding_name: string; status: SecretEnvBindingStatus }>()
+    .all<{ id: string; binding_name: string; status: SecretEnvBindingStatus; created_at: string }>()
 
   const existingByName = new Map(
     (existingResult.results ?? []).map((row) => [row.binding_name, row] as const),
   )
   for (const name of names) {
     const existing = existingByName.get(name)
-    if (existing && (existing.status === 'pending' || existing.status === 'bound')) {
+    if (existing && (existing.status === 'bound' || (existing.status === 'pending' && existing.created_at >= expiryCutoff))) {
       return { ok: false, error: 'binding_name_conflict' }
     }
   }
 
   const id = crypto.randomUUID()
-  const now = new Date().toISOString()
-  const schemaJson = JSON.stringify({ keys, adapterHint } satisfies SecretEnvRequestSchema)
+  const schemaJson = JSON.stringify({ keys, adapterHint, requestedChannel } satisfies SecretEnvRequestSchema)
 
+  // The request row is inserted ONLY IF, evaluated inside this one statement:
+  //   - the requester has fewer than MAX_PENDING live pending requests,
+  //   - the requester has filed fewer than MAX_PER_HOUR requests in the last hour,
+  //   - none of the names is bound or live-pending.
+  // D1 executes each statement atomically, so N concurrent callers cannot all pass
+  // a stale count (a KV/read-compare-put counter would). Every binding statement
+  // below is in turn conditional on THIS request row existing, so a refused request
+  // leaves no orphan binding rows.
+  const nameListPlaceholders = names.map((_, index) => `?${index + 9}`).join(', ')
   const statements = [
     env.DB.prepare(
       `INSERT INTO secret_env_requests (id, tenant, reason, schema_json, status, requested_by, decided_by, created_at, decided_at)
-       VALUES (?1, ?2, ?3, ?4, 'pending', ?5, NULL, ?6, NULL)`,
-    ).bind(id, env.TENANT_SLUG, reason, schemaJson, requestedBy, now),
+       SELECT ?1, ?2, ?3, ?4, 'pending', ?5, NULL, ?6, NULL
+        WHERE (SELECT COUNT(*) FROM secret_env_requests
+                WHERE tenant = ?2 AND requested_by = ?5 AND status = 'pending' AND created_at >= ?7) < ${MAX_PENDING_REQUESTS_PER_REQUESTER}
+          AND (SELECT COUNT(*) FROM secret_env_requests
+                WHERE tenant = ?2 AND requested_by = ?5 AND created_at >= ?8) < ${MAX_REQUESTS_PER_REQUESTER_PER_HOUR}
+          AND NOT EXISTS (SELECT 1 FROM secret_env_bindings
+                WHERE tenant = ?2 AND binding_name IN (${nameListPlaceholders})
+                  AND (status = 'bound' OR (status = 'pending' AND created_at >= ?7)))`,
+    ).bind(id, env.TENANT_SLUG, reason, schemaJson, requestedBy, now, expiryCutoff, hourCutoff, ...names),
   ]
 
   for (const key of keys) {
-    // Only 'revoked' rows can reach here (pending/bound already rejected above).
+    // Only 'revoked' / expired-'pending' rows can reach here (live pending/bound refused above).
     const existing = existingByName.get(key.name)
     if (existing) {
       statements.push(
@@ -239,14 +275,17 @@ export async function requestSecretEnv(
           `UPDATE secret_env_bindings
               SET purpose = ?1, adapter_hint = ?2, status = 'pending', requested_by = ?3,
                   bound_by = NULL, request_id = ?4, created_at = ?5, bound_at = NULL, revoked_at = NULL
-            WHERE id = ?6 AND tenant = ?7`,
-        ).bind(key.purpose, adapterHint, requestedBy, id, now, existing.id, env.TENANT_SLUG),
+            WHERE id = ?6 AND tenant = ?7
+              AND (status = 'revoked' OR (status = 'pending' AND created_at < ?8))
+              AND EXISTS (SELECT 1 FROM secret_env_requests WHERE id = ?4 AND tenant = ?7)`,
+        ).bind(key.purpose, adapterHint, requestedBy, id, now, existing.id, env.TENANT_SLUG, expiryCutoff),
       )
     } else {
       statements.push(
         env.DB.prepare(
           `INSERT INTO secret_env_bindings (id, tenant, binding_name, purpose, adapter_hint, status, requested_by, bound_by, request_id, created_at, bound_at, revoked_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, ?7, ?8, NULL, NULL)`,
+           SELECT ?1, ?2, ?3, ?4, ?5, 'pending', ?6, NULL, ?7, ?8, NULL, NULL
+            WHERE EXISTS (SELECT 1 FROM secret_env_requests WHERE id = ?7 AND tenant = ?2)`,
         ).bind(crypto.randomUUID(), env.TENANT_SLUG, key.name, key.purpose, adapterHint, requestedBy, id, now),
       )
     }
@@ -254,13 +293,32 @@ export async function requestSecretEnv(
 
   // Atomic: the request row and every one of its binding rows land together
   // or not at all — no partial request-with-no-bindings state is observable.
+  let batchResults: Awaited<ReturnType<typeof env.DB.batch>>
   try {
-    await env.DB.batch(statements)
+    batchResults = await env.DB.batch(statements)
   } catch (err) {
     if (isSecretEnvBindingUniqueViolation(err)) {
       return { ok: false, error: 'binding_name_conflict' }
     }
     throw err
+  }
+
+  if (rowsWritten(batchResults[0]) !== 1) {
+    // The guarded INSERT refused. Diagnose (read-only, advisory) which bound tripped.
+    const pendingCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM secret_env_requests
+        WHERE tenant = ?1 AND requested_by = ?2 AND status = 'pending' AND created_at >= ?3`,
+    ).bind(env.TENANT_SLUG, requestedBy, expiryCutoff).first<{ n: number }>()
+    if ((pendingCount?.n ?? 0) >= MAX_PENDING_REQUESTS_PER_REQUESTER) {
+      return { ok: false, error: 'too_many_pending_requests' }
+    }
+    const hourCount = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM secret_env_requests WHERE tenant = ?1 AND requested_by = ?2 AND created_at >= ?3`,
+    ).bind(env.TENANT_SLUG, requestedBy, hourCutoff).first<{ n: number }>()
+    if ((hourCount?.n ?? 0) >= MAX_REQUESTS_PER_REQUESTER_PER_HOUR) {
+      return { ok: false, error: 'rate_limited' }
+    }
+    return { ok: false, error: 'binding_name_conflict' }
   }
 
   await writeSecretEnvAudit(env, {
@@ -289,16 +347,25 @@ export async function requestSecretEnv(
 
 /** Admin queue for /approvals — pending requests for this tenant only. */
 export async function listPendingSecretEnvRequests(env: Env): Promise<PublicSecretEnvRequest[]> {
+  const expiryCutoff = new Date(Date.now() - PENDING_REQUEST_TTL_MS).toISOString()
+  // LEFT JOIN members so the approving admin sees WHO asked (id + email + channel);
+  // a request from a principal with no member row still renders, with nulls.
   const rows = await env.DB.prepare(
-    `SELECT id, tenant, reason, schema_json, status, requested_by, decided_by, created_at, decided_at
-       FROM secret_env_requests
-      WHERE tenant = ?1 AND status = 'pending'
-      ORDER BY created_at ASC`,
+    `SELECT r.id, r.tenant, r.reason, r.schema_json, r.status, r.requested_by, r.decided_by, r.created_at, r.decided_at,
+            m.email AS requester_email
+       FROM secret_env_requests r
+       LEFT JOIN members m ON m.id = r.requested_by
+      WHERE r.tenant = ?1 AND r.status = 'pending' AND r.created_at >= ?2
+      ORDER BY r.created_at ASC`,
   )
-    .bind(env.TENANT_SLUG)
-    .all<SecretEnvRequestRow>()
+    .bind(env.TENANT_SLUG, expiryCutoff)
+    .all<SecretEnvRequestRow & { requester_email: string | null }>()
 
-  return (rows.results ?? []).map(toPublicRequest)
+  return (rows.results ?? []).map((row) => ({
+    ...toPublicRequest(row),
+    requester_email: row.requester_email ?? null,
+    requester_channel: parseRequestSchema(row.schema_json).requestedChannel ?? null,
+  }))
 }
 
 // ── getSecretEnvStatus ───────────────────────────────────────────────────────
@@ -373,6 +440,9 @@ export async function bindSecretEnv(
 
   if (!request) return { ok: false, error: 'request_not_found' }
   if (request.status !== 'pending') return { ok: false, error: 'request_not_pending' }
+  if (request.created_at < new Date(Date.now() - PENDING_REQUEST_TTL_MS).toISOString()) {
+    return { ok: false, error: 'request_expired' }
+  }
 
   const cfConfig = getSecretEnvCfConfig(env)
   if (!cfConfig) return { ok: false, error: 'secret_env_ops_unconfigured' }
