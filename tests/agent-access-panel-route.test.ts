@@ -100,7 +100,8 @@ describe('GET /agents/:id — the Access panel', () => {
     expect(body).toContain('<h2>Access</h2>')
     expect(body).toContain('Core Platform')
     expect(body).toContain('department Engineering')
-    expect(body).toContain('name="expected_prior" value="observer"')
+    expect(body).toContain('name="expected_capability" value="observer"')
+    expect(body).toContain('name="expected_membership" value="observer"')
     expect(body).toContain('value="revoke"')
     expect(body).toContain('name="reason"')
     // home squad is listed but not editable
@@ -110,6 +111,23 @@ describe('GET /agents/:id — the Access panel', () => {
     expect(body).not.toContain('value="owner"')
     // never a token
     expect(body).not.toMatch(/mupot_[A-Za-z0-9]/)
+  })
+
+  it("shows both rows and a plain note when they disagree (Rava's real shape: capability observer, membership member)", async () => {
+    const { harness, env } = setup()
+    harness.sqlite.exec("UPDATE memberships SET capability = 'member' WHERE id = 'ms-core'")
+    authState.current = asHadi()
+    const body = await (await dashboardApp.request(`${ORIGIN}/agents/rava`, {}, env)).text()
+    expect(body).toContain('name="expected_capability" value="observer"')
+    expect(body).toContain('name="expected_membership" value="member"')
+    expect(body).toContain('Rows disagree')
+    expect(body).toContain('saving will set both to the level you choose')
+    const res = await post(env, '/agents/rava/access', {
+      squad_id: 'sq-core', capability: 'lead', expected_capability: 'observer', expected_membership: 'member', action: 'set',
+    })
+    expect(await res.text()).toContain('Rava is now lead on Core Platform. Effective on its next request.')
+    expect(harness.sqlite.prepare('SELECT prior_capability, prior_membership, new_capability FROM agent_access_receipts').all())
+      .toEqual([{ prior_capability: 'observer', prior_membership: 'member', new_capability: 'lead' }])
   })
 
   it('does not render the panel for a non-admin who can still read the agent', async () => {
@@ -132,7 +150,7 @@ describe('GET /agents/:id — the Access panel', () => {
     authState.current = asHadi()
     const body = await (await dashboardApp.request(`${ORIGIN}/agents/nobind`, {}, env)).text()
     expect(body).toContain('no welded identity')
-    expect(body).not.toContain('name="expected_prior"')
+    expect(body).not.toContain('name="expected_capability"')
   })
 })
 
@@ -141,7 +159,7 @@ describe('POST /agents/:id/access', () => {
     const { harness, env } = setup()
     authState.current = asHadi()
     const res = await post(env, '/agents/rava/access', {
-      squad_id: 'sq-core', capability: 'lead', expected_prior: 'observer', action: 'set', reason: 'Hadi asked',
+      squad_id: 'sq-core', capability: 'lead', expected_capability: 'observer', expected_membership: 'observer', action: 'set', reason: 'Hadi asked',
     })
     const body = await res.text()
     expect(res.status).toBe(200)
@@ -153,8 +171,8 @@ describe('POST /agents/:id/access', () => {
   it('enrolls on another squad and revokes', async () => {
     const { harness, env } = setup()
     authState.current = asHadi()
-    expect((await post(env, '/agents/rava/access', { squad_id: 'sq-ops', capability: 'member', expected_prior: 'none', action: 'set' })).status).toBe(200)
-    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-ops', expected_prior: 'member', action: 'revoke' })
+    expect((await post(env, '/agents/rava/access', { squad_id: 'sq-ops', capability: 'member', expected_capability: 'none', expected_membership: 'none', action: 'set' })).status).toBe(200)
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-ops', expected_capability: 'member', expected_membership: 'member', action: 'revoke' })
     expect(await res.text()).toContain('Rava no longer has access to Ops Desk.')
     expect(rows(harness).map((r) => (r as { action: string }).action)).toEqual(['enroll', 'revoke'])
   })
@@ -168,7 +186,7 @@ describe('POST /agents/:id/access', () => {
         ('c-rava-owner', 'm-rava', 'squad', 'sq-ops', 'owner');
     `)
     authState.current = { userId: 'm-own', email: null, role: 'member', tenant: TENANT, memberId: 'm-own', capabilities: [g('m-own', 'owner')] }
-    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_prior: 'observer', action: 'set' })
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })
     const body = await res.text()
     expect(res.status).toBe(403)
     expect(body).toContain('owner standing on another scope')
@@ -180,7 +198,7 @@ describe('POST /agents/:id/access', () => {
     const { harness, env } = setup()
     authState.current = asHadi()
     const res = await post(env, '/agents/rava/access',
-      { squad_id: 'sq-core', capability: 'admin', expected_prior: 'observer', action: 'set' }, 'https://evil.test')
+      { squad_id: 'sq-core', capability: 'admin', expected_capability: 'observer', expected_membership: 'observer', action: 'set' }, 'https://evil.test')
     expect(res.status).toBe(403)
     expect(rows(harness)).toHaveLength(0)
     expect((harness.sqlite.prepare("SELECT capability FROM capabilities WHERE id = 'c-core'").get() as { capability: string }).capability).toBe('observer')
@@ -189,7 +207,7 @@ describe('POST /agents/:id/access', () => {
   it('refuses an agent-bound session, before it can learn whether the agent exists', async () => {
     const { harness, env } = setup()
     authState.current = { ...asHadi(), boundAgentId: 'rava' }
-    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'admin', expected_prior: 'observer', action: 'set' })
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'admin', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })
     expect(res.status).toBe(403)
     expect((await post(env, '/agents/ghost/access', { squad_id: 'sq-core' })).status).toBe(403)
     expect(rows(harness)).toHaveLength(0)
@@ -198,7 +216,7 @@ describe('POST /agents/:id/access', () => {
   it('refuses a non-admin with 403 for an existing and a missing agent alike', async () => {
     const { harness, env } = setup()
     authState.current = { userId: 'm-obs', email: null, role: 'member', tenant: TENANT, memberId: 'm-obs', capabilities: [g('m-obs', 'observer')] }
-    expect((await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'admin', expected_prior: 'observer', action: 'set' })).status).toBe(403)
+    expect((await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'admin', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })).status).toBe(403)
     expect((await post(env, '/agents/ghost/access', { squad_id: 'sq-core' })).status).toBe(403)
     expect(rows(harness)).toHaveLength(0)
   })
@@ -206,12 +224,12 @@ describe('POST /agents/:id/access', () => {
   it('maps refusals to statuses with a plain message and no change', async () => {
     const { harness, env } = setup()
     authState.current = asHadi()
-    const owner = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'owner', expected_prior: 'observer', action: 'set' })
+    const owner = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'owner', expected_capability: 'observer', expected_membership: 'observer', action: 'set' })
     expect(owner.status).toBe(400)
-    const home = await post(env, '/agents/rava/access', { squad_id: 'sq-home', capability: 'lead', expected_prior: 'member', action: 'set' })
+    const home = await post(env, '/agents/rava/access', { squad_id: 'sq-home', capability: 'lead', expected_capability: 'member', expected_membership: 'member', action: 'set' })
     expect(home.status).toBe(409)
     expect(await home.text()).toContain('A home squad cannot be changed here.')
-    const stale = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_prior: 'admin', action: 'set' })
+    const stale = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_capability: 'admin', expected_membership: 'admin', action: 'set' })
     expect(stale.status).toBe(409)
     expect(rows(harness)).toHaveLength(0)
   })
@@ -220,7 +238,7 @@ describe('POST /agents/:id/access', () => {
     const { harness, env } = setup()
     harness.sqlite.exec("UPDATE squads SET name = 'Core <img src=x onerror=alert(1)>' WHERE id = 'sq-core'")
     authState.current = asHadi()
-    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_prior: 'observer', action: 'set', reason: '<script>1</script>' })
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_capability: 'observer', expected_membership: 'observer', action: 'set', reason: '<script>1</script>' })
     const body = await res.text()
     expect(body).not.toContain('<img src=x')
     expect(body).not.toContain('<script>1')

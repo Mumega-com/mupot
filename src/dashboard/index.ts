@@ -2004,7 +2004,8 @@ dashboardApp.post('/agents/:id/access', async (c) => {
     squadId: field('squad_id'),
     action: rawAction === 'revoke' ? 'revoke' : 'set',
     capability: field('capability'),
-    expectedPrior: field('expected_prior'),
+    expectedCapability: field('expected_capability'),
+    expectedMembership: field('expected_membership'),
     reason: field('reason'),
   })
   const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id) : null

@@ -22,17 +22,23 @@ CREATE TABLE IF NOT EXISTS agent_access_receipts (
   actor_member_id   TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,  -- the HUMAN who acted
   agent_id          TEXT NOT NULL REFERENCES agents(id)  ON DELETE RESTRICT,
   squad_id          TEXT NOT NULL REFERENCES squads(id)  ON DELETE RESTRICT,
-  prior_capability  TEXT CHECK (prior_capability IN ('observer','member','lead','admin')),
+  prior_capability  TEXT CHECK (prior_capability IN ('observer','member','lead','admin')),  -- the capabilities row before, NULL = none
+  prior_membership  TEXT CHECK (prior_membership IN ('observer','member','lead','admin')),  -- the memberships row before, NULL = none
   new_capability    TEXT CHECK (new_capability   IN ('observer','member','lead','admin')),
   action            TEXT NOT NULL CHECK (action IN ('enroll','change','revoke')),
   reason            TEXT CHECK (reason IS NULL OR length(reason) <= 500),
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  -- the action label must agree with the two capability columns
+  -- The action label must agree with the capability columns. The two tables can differ
+  -- (or hold only one row), so a receipt records BOTH priors: a change to either row is
+  -- never hidden behind the other. A 'change' must move at least one row to the new level.
   CHECK (
-    (action = 'enroll' AND prior_capability IS NULL     AND new_capability IS NOT NULL)
-    OR (action = 'change' AND prior_capability IS NOT NULL AND new_capability IS NOT NULL
-        AND prior_capability <> new_capability)
-    OR (action = 'revoke' AND prior_capability IS NOT NULL AND new_capability IS NULL)
+    (action = 'enroll' AND prior_capability IS NULL AND prior_membership IS NULL
+        AND new_capability IS NOT NULL)
+    OR (action = 'change' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)
+        AND new_capability IS NOT NULL
+        AND (prior_capability IS NOT new_capability OR prior_membership IS NOT new_capability))
+    OR (action = 'revoke' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)
+        AND new_capability IS NULL)
   )
 );
 

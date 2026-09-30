@@ -19,8 +19,10 @@ rotates a token. After a change the page says, for example, "Rava is now lead on
 Platform. Effective on its next request."
 
 The panel is rendered only for an org admin who is not an agent-bound session. The
-home squad row, archived squad rows, owner rows and rows whose membership and capability
-tables disagree are listed but have no controls.
+home squad row, archived squad rows and owner rows are listed but have no controls. A
+squad where the capability and membership rows differ, or where only one exists, is
+editable: the panel shows both current values with a note ("Rows disagree — saving will set
+both to the level you choose") and a save writes the chosen level to both.
 
 ## How the write goes through the existing machinery
 
@@ -62,8 +64,8 @@ in-batch guard (`guardSql`). Never a scalar compare.
 | 3 | Admin and above are human-only: any agent-bound session is refused | `auth.boundAgentId` set: refused for every level, before the agent is even looked up | actor must not be any agent-bound member |
 | 4 | No home or archived squads | squad `kind = 'home'`, the agent's home squad id, `status <> 'active'` | `squads.kind <> 'home' AND status = 'active'` leaf, and the agent's current home squad must still equal the one the plan was computed against (so a home squad that moved between read and write rolls the batch back) |
 | 5 | An agent cannot change its own access | target's bound member equals actor; actor is any bound member | actor has no `agent_member_bindings` row |
-| 6 | No silent widening | the form carries the level the admin saw (`expected_prior`); no default level; a squad where the membership and capability rows disagree is refused (`rows_disagree`), so a receipt can never hide a drop on one table | compare-and-swap in BOTH tables: `none` means neither row exists, otherwise the capability row AND the membership row have that level. A set to the level already held is answered `unchanged`, and the receipt `CHECK` (`prior <> new`) would refuse it anyway |
-| 7 | Org-scope-local actor rank; floor of admin for the target rank ceiling | `exceedsTargetRankCeiling` (org-scope-local actor vs the target's global rank) | the agent's member holds nothing above admin on any plane that ceiling reads: capability rows on any work scope, `channel_capability_grants` on a non-home squad, and the legacy role plane (`members.email` to `users.role`, case-insensitive). Home-squad grants are excluded, as `targetMaxRankAcrossScopes` does. The JS side has the same floor (`target_above_admin_floor`), so an org owner acting on an agent that holds owner elsewhere is refused with a specific message rather than a generic write-time one |
+| 6 | No silent widening | the form carries TWO expectations, `expected_capability` and `expected_membership` (each a level or `none`), and there is no default level. Each is compared to its own table's live row; a mismatch on either is `stale_state` | compare-and-swap per table, inside the batch: the capability row must equal its own expectation and the membership row must equal its own (`none` = no row). A set to the level already held in both tables is answered `unchanged`; a set that repairs one table is a real change and is receipted |
+| 7 | Org-scope-local actor rank; floor of admin for the target rank ceiling | `exceedsTargetRankCeiling` (org-scope-local actor vs the target's global rank) | the agent's member holds nothing above admin on any plane that ceiling reads: capability rows on any work scope, `channel_capability_grants` on a non-home squad, and the legacy role plane (`legacyRoleAboveSql` in `src/auth/capability.ts`: the same `members.email` to `users.role` bridge `legacyRoleRankSql` uses, built from one shared fragment, as an EXISTS over every bridged users row rather than a LIMIT 1 scalar). Home-squad grants are excluded, as `targetMaxRankAcrossScopes` does. The JS side has the same floor (`target_above_admin_floor`), so an org owner acting on an agent that holds owner elsewhere is refused with a specific message rather than a generic write-time one |
 | 8 | Receipt iff access changed | outcome read from the receipt row | receipt statement is in the same batch and carries the guard |
 
 Also in the batch: the target's welded identity must still be the member that was
@@ -83,15 +85,18 @@ matching the resulting rows.
 
 ## Receipts: `agent_access_receipts` (migration 0187)
 
-Columns: `id`, `actor_member_id`, `agent_id`, `squad_id`, `prior_capability`
-(NULL on enroll), `new_capability` (NULL on revoke), `action`
+Columns: `id`, `actor_member_id`, `agent_id`, `squad_id`, `prior_capability` and
+`prior_membership` (each NULL when that table had no row; both NULL on enroll),
+`new_capability` (NULL on revoke), `action`
 (`enroll` | `change` | `revoke`), `reason`, `created_at`.
 
 - Create-only migration: no parent table is dropped or rebuilt.
 - Foreign keys to `members`, `agents` and `squads` are `ON DELETE RESTRICT`.
 - Append-only: `BEFORE UPDATE` and `BEFORE DELETE` triggers raise, in the style of
   `oauth_consent_receipts` (0091).
-- A table `CHECK` ties `action` to the two capability columns and refuses `owner`.
+- A table `CHECK` ties `action` to the capability columns and refuses `owner`. A `change`
+  must move at least one of the two rows to the new level, so a receipt is never written
+  for a change that touched neither.
 
 ## Not covered
 

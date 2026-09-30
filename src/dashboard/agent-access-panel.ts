@@ -27,6 +27,7 @@ import {
   currentMemberRankAtLeastSql,
   exceedsTargetRankCeiling,
   isOrgAdmin,
+  legacyRoleAboveSql,
   RANK_SQL_CASE,
   sessionMemberId,
   targetMaxRankAcrossScopes,
@@ -66,7 +67,6 @@ export type AccessRefusal =
   | 'insufficient_rank'
   | 'target_outranks_actor'
   | 'target_above_admin_floor'
-  | 'rows_disagree'
   | 'owner_access_untouchable'
   | 'stale_state'
   | 'nothing_to_revoke'
@@ -80,8 +80,10 @@ export interface AccessChangeInput {
   action: AccessAction
   /** Required for 'set'. There is no default level: an omitted level is refused. */
   capability: string
-  /** What the admin SAW: 'none' or the level shown on the page. Compared at write time. */
-  expectedPrior: string
+  /** What the admin SAW in the capability row: 'none' or a level. Compared at write time. */
+  expectedCapability: string
+  /** What the admin SAW in the membership row: 'none' or a level. Compared independently. */
+  expectedMembership: string
   reason: string
 }
 
@@ -127,7 +129,10 @@ export interface ReceiptPlan {
   agentId: string
   squadId: string
   agentMemberId: string
-  prior: AgentAccessCapability | null
+  /** The capability row's level when the plan was made (null = no row). */
+  priorCapability: AgentAccessCapability | null
+  /** The membership row's level when the plan was made (null = no row). */
+  priorMembership: AgentAccessCapability | null
   next: AgentAccessCapability | null
   action: 'enroll' | 'change' | 'revoke'
   reason: string | null
@@ -138,10 +143,11 @@ export interface ReceiptPlan {
 
 // Parameter map (every ?N is bound once, used many times):
 //   ?1 receipt id      ?2 actor member   ?3 agent id     ?4 squad id
-//   ?5 prior level     ?6 new level      ?7 action       ?8 reason
+//   ?5 prior capability level   ?6 new level      ?7 action       ?8 reason
 //   ?9 tenant          ?10 required squad rank           ?11 agent's member id
 //   ?12 org-admin floor / target-rank ceiling floor
 //   ?13 the agent's home squad as planned
+//   ?14 prior membership level
 function guardSql(plan: ReceiptPlan): string {
   const orgAdmin = currentMemberRankAtLeastSql('org', {
     inviterIdParam: '?2',
@@ -158,10 +164,12 @@ function guardSql(plan: ReceiptPlan): string {
   const memRow = (cap: string | null): string =>
     `EXISTS (SELECT 1 FROM memberships WHERE agent_id = ?3 AND squad_id = ?4${cap ? ` AND capability = ${cap}` : ''})`
 
-  // Compare-and-swap on what the admin saw. 'none' means neither row exists.
-  const priorMatches = plan.prior === null
-    ? `NOT ${capRow(null)} AND NOT ${memRow(null)}`
-    : `${capRow('?5')} AND ${memRow('?5')}`
+  // Compare-and-swap, per row, on what the admin saw: each table must still hold ITS OWN
+  // expected value ('none' = no row). The two rows are independent expectations, so an
+  // agent whose rows differ (capability observer, membership member) or that has only one
+  // of them can still be managed, while a change to EITHER row after the plan rolls back.
+  const capMatches = plan.priorCapability === null ? `NOT ${capRow(null)}` : capRow('?5')
+  const memMatches = plan.priorMembership === null ? `NOT ${memRow(null)}` : memRow('?14')
   return [
     // (1) the actor is a live member of this tenant
     `EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?2', '?9')})`,
@@ -175,33 +183,32 @@ function guardSql(plan: ReceiptPlan): string {
     `NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE member_id = ?2)`,
     // the target identity is still the welded one we authorized
     `EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ?9 AND agent_id = ?3 AND member_id = ?11)`,
-    // owner access is never touched from here. An owner CAPABILITY row cannot pass
-    // priorMatches below (it demands prior 'none' or a non-owner level), so only the
-    // membership table needs its own leaf.
-    `NOT ${memRow("'owner'")}`,
+    // owner access is never touched from here: the two compare-and-swap leaves below
+    // accept only 'none' or a non-owner level per table, so an owner row in either
+    // table cannot pass.
     // (7) target rank ceiling, floor of admin: the agent's member holds nothing above
     // admin on ANY plane exceedsTargetRankCeiling / targetMaxRankAcrossScopes reads:
     //   - capability rows on any work scope (home-squad grants excluded, as there),
     //   - channel_capability_grants on a non-home squad (resolveCapabilities' second
     //     branch, same join and same home filter),
-    //   - the legacy role plane (members.email -> lower() -> users.role, the same
-    //     bridge as targetLegacyRoleRank / legacyRoleRankSql), which is global.
+    //   - the legacy role plane, via legacyRoleAboveSql (src/auth/capability.ts): the
+    //     same members.email -> users.role bridge legacyRoleRankSql / targetLegacyRoleRank
+    //     use, as an EXISTS over every bridged users row, which is global.
     `NOT EXISTS (SELECT 1 FROM capabilities t WHERE t.member_id = ?11 AND ${RANK_SQL_CASE('t.capability')} > ?12
         AND NOT (t.scope_type = 'squad' AND EXISTS (SELECT 1 FROM squads hs WHERE hs.id = t.scope_id AND hs.kind = 'home')))`,
     `NOT EXISTS (SELECT 1 FROM channel_capability_grants ccg JOIN squads cs ON cs.id = ccg.squad_id
         WHERE ccg.member_id = ?11 AND cs.kind <> 'home' AND ${RANK_SQL_CASE('ccg.capability')} > ?12)`,
-    `NOT EXISTS (SELECT 1 FROM members rm JOIN users ru ON lower(ru.email) = lower(rm.email)
-        WHERE rm.id = ?11 AND ${RANK_SQL_CASE('ru.role')} > ?12)`,
+    `NOT ${legacyRoleAboveSql('?11', '?12')}`,
     // the agent's CURRENT home squad is the one this plan was computed against. The
     // route refuses the agent's home squad as a target; if the home moved between that
     // read and this write, the refusal was about a different squad. Equality here also
     // makes the target squad (planned as not-home) still not-home.
     `EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND squad_id = ?13)`,
-    // (6) the level the admin saw is still the level in BOTH tables (a disagreement
-    // between membership and capability rows is refused, never silently overwritten). A set to the level
-    // already held cannot get past here as a receipt either: the table CHECK demands
-    // prior <> new for 'change', and 'enroll' demands prior NULL.
-    priorMatches,
+    // (6) each table still holds the level the admin saw for IT. A set to the level
+    // already held in both cannot get past as a receipt either: the table CHECK demands
+    // a change, and 'enroll' demands both priors NULL.
+    capMatches,
+    memMatches,
   ].map((leaf) => `(${leaf})`).join('\n      AND ')
 }
 
@@ -209,15 +216,15 @@ function guardSql(plan: ReceiptPlan): string {
 export function receiptStatement(env: Env, plan: ReceiptPlan) {
   return env.DB.prepare(
     `INSERT INTO agent_access_receipts
-       (id, actor_member_id, agent_id, squad_id, prior_capability, new_capability, action, reason)
+       (id, actor_member_id, agent_id, squad_id, prior_capability, prior_membership, new_capability, action, reason)
      SELECT CASE WHEN ${guardSql(plan)} THEN ?1 END,
-            ?2, ?3, ?4, ?5, ?6, ?7, ?8`,
+            ?2, ?3, ?4, ?5, ?14, ?6, ?7, ?8`,
   ).bind(
     plan.receiptId,
     plan.actorMemberId,
     plan.agentId,
     plan.squadId,
-    plan.prior,
+    plan.priorCapability,
     plan.next,
     plan.action,
     plan.reason,
@@ -226,6 +233,7 @@ export function receiptStatement(env: Env, plan: ReceiptPlan) {
     plan.agentMemberId,
     ACTOR_RANK_FLOOR,
     plan.homeSquadId,
+    plan.priorMembership,
   )
 }
 
@@ -293,12 +301,16 @@ export async function applyAgentAccessChange(
     next = input.capability
   }
 
-  let prior: AgentAccessCapability | null = null
-  if (input.expectedPrior !== 'none') {
-    if (input.expectedPrior === 'owner') return fail('owner_access_untouchable', 403)
-    if (!isAgentAccessCapability(input.expectedPrior)) return fail('invalid_expected_prior', 400)
-    prior = input.expectedPrior
+  // Two independent expectations, one per table. 'owner' is never expected or touched.
+  const parsePrior = (value: string): AgentAccessCapability | null | 'owner' | 'invalid' => {
+    if (value === 'none') return null
+    if (value === 'owner') return 'owner'
+    return isAgentAccessCapability(value) ? value : 'invalid'
   }
+  const priorCapability = parsePrior(input.expectedCapability)
+  const priorMembership = parsePrior(input.expectedMembership)
+  if (priorCapability === 'owner' || priorMembership === 'owner') return fail('owner_access_untouchable', 403)
+  if (priorCapability === 'invalid' || priorMembership === 'invalid') return fail('invalid_expected_prior', 400)
 
   const reason = input.reason.trim()
   if (reason.length > REASON_MAX_LENGTH) return fail('invalid_reason', 400)
@@ -308,7 +320,8 @@ export async function applyAgentAccessChange(
   const requiredRank = Math.max(
     ACTOR_RANK_FLOOR,
     next ? capabilityRank(next) : 0,
-    prior ? capabilityRank(prior) : 0,
+    priorCapability ? capabilityRank(priorCapability) : 0,
+    priorMembership ? capabilityRank(priorMembership) : 0,
   )
   const actorRank = await actorRankOnScopeFor(env, auth, 'squad', squad.id)
   if (actorRank < requiredRank) return fail('insufficient_rank', 403)
@@ -319,19 +332,23 @@ export async function applyAgentAccessChange(
   const live = await currentCapability(env, binding.memberId, squad.id)
   const liveMembership = await currentMembership(env, agent.id, squad.id)
   if (live === 'owner' || liveMembership === 'owner') return fail('owner_access_untouchable', 403)
-  if (live !== liveMembership) return fail('rows_disagree', 409)
   // Same agreement the SQL guard demands, in JS: the ceiling above is per-plane, this
   // is the agent's own standing floor (admin) across every plane, so an org owner gets
   // a specific refusal instead of a generic write-time one.
   if ((await targetMaxRankAcrossScopes(env, binding.memberId)) > ACTOR_RANK_FLOOR) {
     return fail('target_above_admin_floor', 403)
   }
-  if (input.action === 'revoke' && prior === null) return fail('nothing_to_revoke', 409)
-  if ((live ?? 'none') !== (prior ?? 'none')) return fail('stale_state', 409)
-  // A set to the level already held is a no-op: answered here, and refused again
-  // by the receipt CHECK (prior <> new) and the compare-and-swap in SQL, so it can never
-  // leave a receipt behind.
-  if (input.action === 'set' && prior !== null && prior === next) return fail('unchanged', 409)
+  if (input.action === 'revoke' && priorCapability === null && priorMembership === null) {
+    return fail('nothing_to_revoke', 409)
+  }
+  // Each table must still hold what the admin saw for it (also asserted in SQL).
+  if (live !== priorCapability || liveMembership !== priorMembership) return fail('stale_state', 409)
+  // A set to the level already held in BOTH tables is a no-op: answered here, and refused
+  // again by the receipt CHECK and the compare-and-swap in SQL, so it can never leave a
+  // receipt behind. A set that would repair one table (rows differ) is a real change.
+  if (input.action === 'set' && priorCapability === next && priorMembership === next) {
+    return fail('unchanged', 409)
+  }
 
   const plan: ReceiptPlan = {
     receiptId: crypto.randomUUID(),
@@ -339,9 +356,12 @@ export async function applyAgentAccessChange(
     agentId: agent.id,
     squadId: squad.id,
     agentMemberId: binding.memberId,
-    prior,
+    priorCapability,
+    priorMembership,
     next,
-    action: input.action === 'revoke' ? 'revoke' : prior === null ? 'enroll' : 'change',
+    action: input.action === 'revoke'
+      ? 'revoke'
+      : priorCapability === null && priorMembership === null ? 'enroll' : 'change',
     reason: reason === '' ? null : reason,
     requiredRank,
     homeSquadId: agent.squad_id,
@@ -412,7 +432,6 @@ const REFUSAL_TEXT: Record<AccessRefusal, string> = {
   insufficient_rank: 'You need admin on that squad to set this level.',
   target_outranks_actor: 'This agent holds standing above yours elsewhere, so you cannot change it.',
   target_above_admin_floor: 'This agent holds owner standing on another scope. Agent access is only changed for agents whose standing is admin or below, even for an org owner.',
-  rows_disagree: 'This agent\'s membership and capability rows for that squad disagree. An engineer needs to reconcile them before the level can be changed here.',
   owner_access_untouchable: 'Owner access is never changed from this panel.',
   stale_state: 'This agent\'s access changed since you loaded the page. Reload and try again.',
   nothing_to_revoke: 'There is no access on that squad to revoke.',
@@ -525,15 +544,22 @@ export function agentAccessPanel(
       return html`<li>${label}: <code>${row.capability ?? row.membership ?? '—'}</code>
         <span class="dim">archived squad, not editable here</span></li>`
     }
-    if (row.capability === null || row.membership !== row.capability || row.capability === 'owner') {
-      return html`<li>${label}: <code>${row.capability ?? '—'}</code>
-        <span class="dim">membership and capability rows disagree, or owner access; not editable here</span></li>`
+    if (row.capability === 'owner' || row.membership === 'owner') {
+      return html`<li>${label}: <code>${row.capability ?? row.membership}</code>
+        <span class="dim">owner access, not editable here</span></li>`
     }
-    return html`<li>${label}: <code>${row.capability}</code>
+    const shownCapability = row.capability ?? 'none'
+    const shownMembership = row.membership ?? 'none'
+    const differs = shownCapability !== shownMembership
+    const preselect = row.capability ?? row.membership
+    return html`<li>${label}: <code>${preselect}</code>
+      ${differs ? html`<p class="dim">Capability row: <code>${shownCapability}</code>, membership row:
+        <code>${shownMembership}</code>. Rows disagree — saving will set both to the level you choose.</p>` : ''}
       <form method="post" action="${action}" autocomplete="off" class="inline">
         <input type="hidden" name="squad_id" value="${row.squadId}" />
-        <input type="hidden" name="expected_prior" value="${row.capability}" />
-        <label>Level <select name="capability" required>${levelOptions(row.capability)}</select></label>
+        <input type="hidden" name="expected_capability" value="${shownCapability}" />
+        <input type="hidden" name="expected_membership" value="${shownMembership}" />
+        <label>Level <select name="capability" required>${levelOptions(preselect)}</select></label>
         <label>Reason <input name="reason" maxlength="${REASON_MAX_LENGTH}" placeholder="optional" /></label>
         <button type="submit" name="action" value="set" class="btn">Change level</button>
         <button type="submit" name="action" value="revoke" class="btn secondary">Revoke</button>
@@ -542,7 +568,8 @@ export function agentAccessPanel(
   const enroll = view.choosable.length === 0
     ? html`<p class="dim">No other squad is available to enroll this agent in.</p>`
     : html`<form method="post" action="${action}" autocomplete="off">
-        <input type="hidden" name="expected_prior" value="none" />
+        <input type="hidden" name="expected_capability" value="none" />
+        <input type="hidden" name="expected_membership" value="none" />
         <input type="hidden" name="action" value="set" />
         <label>Squad <select name="squad_id" required>
           <option value="" selected disabled>Choose a squad</option>

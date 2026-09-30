@@ -78,15 +78,18 @@ function humanAuth(memberId: string, grants: CapabilityGrant[], role: AuthContex
 const hadi = (): AuthContext => humanAuth('m-hadi', [grant('m-hadi', 'org', null, 'admin')])
 const owner = (): AuthContext => humanAuth('m-owner', [grant('m-owner', 'org', null, 'owner')])
 
-function change(overrides: Partial<AccessChangeInput> = {}): AccessChangeInput {
+/** `expectedPrior` is shorthand for "both tables held this"; the two expectations can also be given separately. */
+function change(overrides: Partial<AccessChangeInput> & { expectedPrior?: string } = {}): AccessChangeInput {
+  const { expectedPrior, ...rest } = overrides
   return {
     agentRef: 'rava',
     squadId: 'sq-core',
     action: 'set',
     capability: 'lead',
-    expectedPrior: 'none',
+    expectedCapability: expectedPrior ?? 'none',
+    expectedMembership: expectedPrior ?? 'none',
     reason: '',
-    ...overrides,
+    ...rest,
   }
 }
 
@@ -111,6 +114,15 @@ function seedRava(h: SqliteD1Harness, capability: AgentAccessCapability, squad =
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-${squad}', 'm-rava', 'squad', '${squad}', '${capability}');
   `)
 }
+
+function seedRows(h: SqliteD1Harness, cap: string | null, mem: string | null, squad = 'sq-core'): void {
+  if (mem) h.sqlite.exec(`INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('ms-${squad}', 'rava', '${squad}', '${mem}')`)
+  if (cap) h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-${squad}', 'm-rava', 'squad', '${squad}', '${cap}')`)
+}
+
+const priors = (h: SqliteD1Harness) =>
+  (receipts(h) as Array<Record<string, unknown>>).map((r) => [r.action, r.prior_capability, r.prior_membership, r.new_capability])
+
 
 function expectUntouched(h: SqliteD1Harness, before: { cap: string | null; mem: string | null }, squad = 'sq-core'): void {
   expect(rava(h, squad)).toEqual(before)
@@ -272,26 +284,95 @@ describe('invariants at the route layer', () => {
     expect(receipts(harness)).toHaveLength(0)
   })
 
-  it('(6) membership and capability rows that disagree are refused, never overwritten under a receipt that hides it', async () => {
+  // Two independent expectations, one per table (the panel must be able to manage the
+  // agents that actually exist: differing rows, capability-only, membership-only).
+  it("(6) Rava's real shape (capability observer, membership member) can be raised, and BOTH priors are recorded", async () => {
     const { harness, env } = makeEnv()
-    harness.sqlite.exec(`
-      INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('ms-d', 'rava', 'sq-core', 'admin');
-      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-d', 'm-rava', 'squad', 'sq-core', 'member');
-    `)
-    for (const expectedPrior of ['member', 'admin', 'none']) {
-      expect(await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedPrior }))).toMatchObject({ ok: false, error: 'rows_disagree', status: 409 })
+    seedRows(harness, 'observer', 'member')
+    const result = await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedCapability: 'observer', expectedMembership: 'member' }))
+    expect(result.ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'lead' })
+    expect(priors(harness)).toEqual([['change', 'observer', 'member', 'lead']])
+  })
+
+  it('(6) a single shared expectation against differing rows is stale, never silently applied', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'observer', 'member')
+    for (const expectedPrior of ['observer', 'member', 'none']) {
+      expect(await applyAgentAccessChange(env, hadi(), change({ expectedPrior }))).toMatchObject({ ok: false, error: 'stale_state' })
     }
-    expect(await applyAgentAccessChange(env, hadi(), change({ action: 'revoke', expectedPrior: 'member' }))).toMatchObject({ ok: false, error: 'rows_disagree' })
-    expect(rava(harness)).toEqual({ cap: 'member', mem: 'admin' })
+    expect(rava(harness)).toEqual({ cap: 'observer', mem: 'member' })
     expect(receipts(harness)).toHaveLength(0)
   })
 
-  it('(6) a row present in only one table is a disagreement too', async () => {
+  it('(6) each row is checked against its OWN expectation: wrong capability, wrong membership', async () => {
     const { harness, env } = makeEnv()
-    harness.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-only', 'm-rava', 'squad', 'sq-core', 'member')")
-    expect(await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedPrior: 'member' }))).toMatchObject({ ok: false, error: 'rows_disagree' })
-    expect(rava(harness)).toEqual({ cap: 'member', mem: null })
+    seedRows(harness, 'observer', 'member')
+    expect(await applyAgentAccessChange(env, hadi(), change({ expectedCapability: 'admin', expectedMembership: 'member' }))).toMatchObject({ ok: false, error: 'stale_state' })
+    expect(await applyAgentAccessChange(env, hadi(), change({ expectedCapability: 'observer', expectedMembership: 'admin' }))).toMatchObject({ ok: false, error: 'stale_state' })
+    expect(rava(harness)).toEqual({ cap: 'observer', mem: 'member' })
     expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) a capability-only agent (no membership row) can be changed and revoked', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'member', null)
+    expect((await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedCapability: 'member', expectedMembership: 'none' }))).ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'lead' })
+    expect((await applyAgentAccessChange(env, hadi(), change({ action: 'revoke', expectedPrior: 'lead' }))).ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: null, mem: null })
+    expect(priors(harness)).toEqual([['change', 'member', null, 'lead'], ['revoke', 'lead', 'lead', null]])
+  })
+
+  it('(6) a capability-only agent can be revoked directly', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'admin', null)
+    expect((await applyAgentAccessChange(env, hadi(), change({ action: 'revoke', expectedCapability: 'admin', expectedMembership: 'none' }))).ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: null, mem: null })
+    expect(priors(harness)).toEqual([['revoke', 'admin', null, null]])
+  })
+
+  it('(6) a membership-only agent can be changed and revoked', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, null, 'member')
+    expect((await applyAgentAccessChange(env, hadi(), change({ capability: 'observer', expectedCapability: 'none', expectedMembership: 'member' }))).ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: 'observer', mem: 'observer' })
+    open?.close()
+    const b = makeEnv()
+    seedRows(b.harness, null, 'lead')
+    expect((await applyAgentAccessChange(b.env, hadi(), change({ action: 'revoke', expectedCapability: 'none', expectedMembership: 'lead' }))).ok).toBe(true)
+    expect(rava(b.harness)).toEqual({ cap: null, mem: null })
+    expect(priors(b.harness)).toEqual([['revoke', null, 'lead', null]])
+  })
+
+  it('(6) setting the level one table already holds repairs the other (a real change, receipted)', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'lead', null)
+    expect((await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedCapability: 'lead', expectedMembership: 'none' }))).ok).toBe(true)
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'lead' })
+    expect(priors(harness)).toEqual([['change', 'lead', null, 'lead']])
+  })
+
+  it('(6) claiming owner as an expectation is refused up front, even when no owner row exists', async () => {
+    const { harness, env } = makeEnv()
+    expect(await applyAgentAccessChange(env, owner(), change({ expectedCapability: 'owner', expectedMembership: 'none' }))).toMatchObject({ error: 'owner_access_untouchable', status: 403 })
+    expect(await applyAgentAccessChange(env, owner(), change({ expectedCapability: 'none', expectedMembership: 'owner' }))).toMatchObject({ error: 'owner_access_untouchable', status: 403 })
+    expect(await applyAgentAccessChange(env, owner(), change({ expectedCapability: 'bogus', expectedMembership: 'none' }))).toMatchObject({ error: 'invalid_expected_prior', status: 400 })
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('(6) owner in only one table is refused as owner access, whichever table', async () => {
+    const a = makeEnv()
+    seedRows(a.harness, 'owner', null)
+    expect(await applyAgentAccessChange(a.env, owner(), change({ expectedCapability: 'owner', expectedMembership: 'none' }))).toMatchObject({ error: 'owner_access_untouchable' })
+    expect(await applyAgentAccessChange(a.env, owner(), change({ expectedCapability: 'none', expectedMembership: 'none' }))).toMatchObject({ error: 'owner_access_untouchable' })
+    expect(receipts(a.harness)).toHaveLength(0)
+    open?.close()
+    const b = makeEnv()
+    seedRows(b.harness, null, 'owner')
+    expect(await applyAgentAccessChange(b.env, owner(), change({ expectedCapability: 'none', expectedMembership: 'none' }))).toMatchObject({ error: 'owner_access_untouchable' })
+    expect(rava(b.harness)).toEqual({ cap: null, mem: 'owner' })
+    expect(receipts(b.harness)).toHaveLength(0)
   })
 
   it('(6) setting the level already held is refused and leaves no receipt', async () => {
@@ -347,20 +428,23 @@ describe('invariants at the route layer', () => {
 
 // ── the in-batch guard, one leaf at a time (past the route's pre-checks) ─────
 
-function plan(overrides: Partial<ReceiptPlan> = {}): ReceiptPlan {
+/** `prior` is shorthand for "both tables held this"; priorCapability / priorMembership set them separately. */
+function plan(overrides: Partial<ReceiptPlan> & { prior?: AgentAccessCapability | null } = {}): ReceiptPlan {
+  const { prior, ...rest } = overrides
   return {
     receiptId: crypto.randomUUID(),
     actorMemberId: 'm-hadi',
     agentId: 'rava',
     squadId: 'sq-core',
     agentMemberId: 'm-rava',
-    prior: null,
+    priorCapability: prior ?? null,
+    priorMembership: prior ?? null,
     next: 'lead',
     action: 'enroll',
     reason: null,
     requiredRank: 4,
     homeSquadId: 'sq-home',
-    ...overrides,
+    ...rest,
   }
 }
 
@@ -478,13 +562,69 @@ describe('the guard re-asserted inside the batch', () => {
     expectUntouched(harness, { cap: null, mem: null })
   })
 
-  it('(6) in the batch: the membership row drifting from the capability row after the plan rolls back', async () => {
+  // Drift between read and write, on EACH row separately, driven straight at the guard.
+  it('(6) in the batch: only the CAPABILITY row changes after the plan: rolled back, no receipt', async () => {
     const { harness, env } = makeEnv()
-    seedRava(harness, 'member')
-    const p = plan({ prior: 'member', next: 'lead', action: 'change' })
+    seedRows(harness, 'observer', 'member')
+    const p = plan({ priorCapability: 'observer', priorMembership: 'member', next: 'lead', action: 'change' })
+    harness.sqlite.exec("UPDATE capabilities SET capability = 'admin' WHERE id = 'cap-rava-sq-core'")
+    expect(await driveSet(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'admin', mem: 'member' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) in the batch: only the MEMBERSHIP row changes after the plan: rolled back, no receipt', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'observer', 'member')
+    const p = plan({ priorCapability: 'observer', priorMembership: 'member', next: 'lead', action: 'change' })
     harness.sqlite.exec("UPDATE memberships SET capability = 'admin' WHERE id = 'ms-sq-core'")
     expect(await driveSet(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'observer', mem: 'admin' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) in the batch: a membership row appears after a capability-only plan: rolled back', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'member', null)
+    const p = plan({ priorCapability: 'member', priorMembership: null, next: 'lead', action: 'change' })
+    seedRows(harness, null, 'admin')
+    expect(await driveSet(env, p)).toBe('threw')
     expect(rava(harness)).toEqual({ cap: 'member', mem: 'admin' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) in the batch: a capability row appears after a membership-only plan: rolled back', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, null, 'member')
+    const p = plan({ priorCapability: null, priorMembership: 'member', next: 'lead', action: 'change' })
+    seedRows(harness, 'admin', null)
+    expect(await driveSet(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'admin', mem: 'member' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) in the batch: a row disappears after the plan (either one): rolled back', async () => {
+    const a = makeEnv()
+    seedRows(a.harness, 'observer', 'member')
+    const p = plan({ priorCapability: 'observer', priorMembership: 'member', next: 'lead', action: 'change' })
+    a.harness.sqlite.exec("DELETE FROM memberships WHERE id = 'ms-sq-core'")
+    expect(await driveSet(a.env, p)).toBe('threw')
+    expect(receipts(a.harness)).toHaveLength(0)
+    open?.close()
+    const b = makeEnv()
+    seedRows(b.harness, 'observer', 'member')
+    b.harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'cap-rava-sq-core'")
+    expect(await driveSet(b.env, p)).toBe('threw')
+    expect(receipts(b.harness)).toHaveLength(0)
+  })
+
+  it('(6) in the batch: revoke with only one row drifting rolls back, and the other row is not deleted', async () => {
+    const { harness, env } = makeEnv()
+    seedRows(harness, 'lead', 'lead')
+    const p = plan({ priorCapability: 'lead', priorMembership: 'lead', next: null, action: 'revoke' })
+    harness.sqlite.exec("UPDATE memberships SET capability = 'admin' WHERE id = 'ms-sq-core'")
+    expect(await driveRevoke(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'admin' })
     expect(receipts(harness)).toHaveLength(0)
   })
 
@@ -517,6 +657,32 @@ describe('the guard re-asserted inside the batch', () => {
     `)
     expect(await exceedsTargetRankCeiling(env, hadi(), 'm-rava')).toBe(false)
     expect(await driveSet(env, plan())).toBe('committed')
+  })
+
+  it('(7) legacy-role bridge, several users rows: a second row differing only in case still counts (EXISTS, not LIMIT 1)', async () => {
+    const { harness, env } = makeEnv()
+    const p = plan()
+    harness.sqlite.exec(`
+      UPDATE members SET email = 'rava@example.test' WHERE id = 'm-rava';
+      INSERT INTO users (id, email, role) VALUES ('u-r1', 'Rava@example.test', 'member'), ('u-r2', 'RAVA@example.test', 'owner');
+    `)
+    expect(await driveSet(env, p)).toBe('threw')
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('(7) legacy-role bridge, empty and missing email: NULL bridges to nothing; an empty-string pair bridges (stricter than the JS ceiling, never looser)', async () => {
+    const a = makeEnv()
+    a.harness.sqlite.exec("INSERT INTO users (id, email, role) VALUES ('u-any', 'nobody@example.test', 'owner')")
+    expect(await driveSet(a.env, plan())).toBe('committed') // m-rava has a NULL email
+    open?.close()
+    const b = makeEnv()
+    b.harness.sqlite.exec(`
+      UPDATE members SET email = '' WHERE id = 'm-rava';
+      INSERT INTO users (id, email, role) VALUES ('u-empty', '', 'owner');
+    `)
+    expect(await exceedsTargetRankCeiling(b.env, hadi(), 'm-rava')).toBe(false) // JS: an empty email never bridges
+    expect(await driveSet(b.env, plan())).toBe('threw') // SQL: same bridge as legacyRoleRankSql, so it refuses
+    expectUntouched(b.harness, { cap: null, mem: null })
   })
 
   function channelGrant(h: SqliteD1Harness, squad: string, capability: string): void {
@@ -721,16 +887,25 @@ describe('receipts', () => {
 
   it('the table refuses owner and a label that disagrees with its capability columns', async () => {
     const { harness } = makeEnv()
-    const insert = (prior: string | null, next: string | null, action: string) => () => harness.sqlite.prepare(
-      `INSERT INTO agent_access_receipts (id, actor_member_id, agent_id, squad_id, prior_capability, new_capability, action)
-       VALUES (?, 'm-hadi', 'rava', 'sq-core', ?, ?, ?)`,
-    ).run(crypto.randomUUID(), prior, next, action)
-    expect(insert(null, 'owner', 'enroll')).toThrow()
-    expect(insert('lead', 'lead', 'change')).toThrow()
-    expect(insert('lead', 'admin', 'enroll')).toThrow()
-    expect(insert(null, 'lead', 'revoke')).toThrow()
-    expect(insert(null, null, 'enroll')).toThrow()
-    expect(insert(null, 'lead', 'enroll')).not.toThrow()
+    const insert = (pc: string | null, pm: string | null, next: string | null, action: string) => () => harness.sqlite.prepare(
+      `INSERT INTO agent_access_receipts (id, actor_member_id, agent_id, squad_id, prior_capability, prior_membership, new_capability, action)
+       VALUES (?, 'm-hadi', 'rava', 'sq-core', ?, ?, ?, ?)`,
+    ).run(crypto.randomUUID(), pc, pm, next, action)
+    expect(insert(null, null, 'owner', 'enroll')).toThrow()
+    expect(insert('owner', null, 'lead', 'change')).toThrow()
+    expect(insert(null, 'owner', 'lead', 'change')).toThrow()
+    expect(insert('lead', 'lead', 'lead', 'change')).toThrow() // moves neither row
+    expect(insert('lead', null, 'admin', 'enroll')).toThrow()
+    expect(insert(null, 'lead', 'admin', 'enroll')).toThrow()
+    expect(insert(null, null, 'lead', 'revoke')).toThrow()
+    expect(insert('lead', null, 'lead', 'revoke')).toThrow()
+    expect(insert(null, null, null, 'enroll')).toThrow()
+    expect(insert(null, null, 'lead', 'change')).toThrow()
+    expect(insert(null, null, 'lead', 'enroll')).not.toThrow()
+    expect(insert('lead', null, 'lead', 'change')).not.toThrow() // repairs the membership row
+    expect(insert(null, 'member', 'lead', 'change')).not.toThrow()
+    expect(insert('lead', 'member', null, 'revoke')).not.toThrow()
+    expect(insert(null, 'member', null, 'revoke')).not.toThrow()
   })
 
   it('concurrent identical changes produce exactly one receipt and one ok', async () => {
