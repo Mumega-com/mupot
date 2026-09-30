@@ -6548,8 +6548,9 @@ async function handleJsonRpc(
       return rpcResult(id, { events: catalogue })
     }
 
-    // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on and an
-    // authenticated caller; the handlers refuse unbound / zero-capability sessions themselves.
+    // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on, on the
+    // full /mcp door (never the profile door), and an authenticated caller; the handlers refuse
+    // unbound / zero-capability sessions themselves.
     const floorOk = callerFloorOk(auth, hasWorkspaceAdmin(auth))
     const out = method === 'events/subscribe'
       ? await eventsSubscribe(c.env, auth, floorOk, body.params)
