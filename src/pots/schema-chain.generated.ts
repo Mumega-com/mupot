@@ -3348,9 +3348,35 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0186_decision_receipts.sql",
+    sha256: "bc5715bf059c47ff79067d21eb11ae7f3114a06a3eb31817ef273101d8b46a17",
+    statements: [
+      "-- 0186_decision_receipts.sql — receipts for the decision-model port (src/decisions).\n--\n-- WHY: a decision model (TypeSafe Jev today; any small classifier/judge later) may RANK or\n-- PROPOSE, never AUTHORIZE. Every call through decide() writes exactly one receipt, success\n-- or failure, so the proposal, the exact model version that produced it, and what it was\n-- shown (as HASHES only) are auditable. The raw input text is never stored.\n--\n-- CREATE-only: no existing table is rebuilt (D1 runs a migration file as one transaction and\n-- FK RESTRICT is never deferred; nothing here touches an existing table's rows).\n--\n-- Append-only, same no_update/no_delete trigger pair as oauth_consent_receipts (0091) and\n-- agent_audit (0086). A human's later accept/override is a SEPARATE append-only row type\n-- (decision_outcomes), never an UPDATE of the receipt. This migration adds no writer for it.\n\nCREATE TABLE IF NOT EXISTS decision_receipts (\n  id             TEXT PRIMARY KEY,\n  tenant         TEXT,\n  use_case       TEXT NOT NULL,\n  data_class     TEXT NOT NULL,\n  adapter_id     TEXT NOT NULL,\n  model          TEXT,\n  model_version  TEXT,             -- exact id the provider RETURNED, not an alias\n  criteria_hash  TEXT NOT NULL,    -- sha256 hex of canonical {criteriaVersion, questions}\n  input_hash     TEXT NOT NULL,    -- sha256 hex of canonical {useCase, dataClass, fenced state}\n  answers_json   TEXT CHECK (answers_json IS NULL OR json_valid(answers_json)),\n  threshold_json TEXT NOT NULL,\n  outcome        TEXT NOT NULL CHECK (outcome IN ('proposed', 'declined_low_confidence', 'failed', 'deferred_to_human')),\n  reason         TEXT,\n  latency_ms     INTEGER NOT NULL,\n  input_tokens   INTEGER,\n  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_decision_receipts_use_case\n  ON decision_receipts(use_case, created_at DESC);",
+      "\n\nCREATE TRIGGER decision_receipts_no_update\nBEFORE UPDATE ON decision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'decision_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER decision_receipts_no_delete\nBEFORE DELETE ON decision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'decision_receipts is append-only: DELETE is forbidden');\nEND;",
+      "\n\nCREATE TABLE IF NOT EXISTS decision_outcomes (\n  id               TEXT PRIMARY KEY,\n  receipt_id       TEXT NOT NULL REFERENCES decision_receipts(id) ON DELETE RESTRICT,\n  actor_member_id  TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  outcome          TEXT NOT NULL CHECK (outcome IN ('accepted', 'overridden')),\n  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_decision_outcomes_receipt\n  ON decision_outcomes(receipt_id, created_at DESC);",
+      "\n\n-- Only a receipt that actually carried a proposal can be accepted or overridden.\nCREATE TRIGGER decision_outcomes_only_proposed\nBEFORE INSERT ON decision_outcomes\nWHEN COALESCE((SELECT outcome FROM decision_receipts WHERE id = NEW.receipt_id), '') <> 'proposed'\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes: receipt is not a proposed decision');\nEND;",
+      "\n\nCREATE TRIGGER decision_outcomes_no_update\nBEFORE UPDATE ON decision_outcomes\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER decision_outcomes_no_delete\nBEFORE DELETE ON decision_outcomes\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "decision_receipts" },
+      { type: "index", name: "idx_decision_receipts_use_case" },
+      { type: "trigger", name: "decision_receipts_no_update" },
+      { type: "trigger", name: "decision_receipts_no_delete" },
+      { type: "table", name: "decision_outcomes" },
+      { type: "index", name: "idx_decision_outcomes_receipt" },
+      { type: "trigger", name: "decision_outcomes_only_proposed" },
+      { type: "trigger", name: "decision_outcomes_no_update" },
+      { type: "trigger", name: "decision_outcomes_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "21b880ece72f00b755b663c81a35f3987715c6b03598aed66a45334df9aaf8e8"
+export const SCHEMA_CHAIN_DIGEST: string = "4b0a18cd53030f90b71990d07aabe9f436fd633012501d109e8bb0aa94dbd2f5"
