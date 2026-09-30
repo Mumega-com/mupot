@@ -185,3 +185,19 @@ describe('pending cap counts ALL pending rows (no expiry)', () => {
     expect(out).toEqual({ ok: false, error: 'too_many_pending_requests' })
   })
 })
+
+describe('same revoked name requested concurrently', () => {
+  it('exactly one request lands; the loser leaves no orphan request row', async () => {
+    const { rejectSecretEnv } = await import('../src/secret-env/service')
+    const seed = await requestSecretEnv(env, { keys: [{ name: 'CONTEND_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-0' })
+    if (!seed.ok) throw new Error('setup')
+    await rejectSecretEnv(env, { requestId: seed.request.id, actorId: 'admin' }) // binding now 'revoked' (reuse path)
+    const [a, b] = await Promise.all(['req-a', 'req-b'].map((who) =>
+      requestSecretEnv(env, { keys: [{ name: 'CONTEND_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: who })))
+    expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1)
+    const loser = a.ok ? b : a
+    expect(loser).toEqual({ ok: false, error: 'binding_name_conflict' })
+    const pending = (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM secret_env_requests WHERE status = 'pending'`).get() as { n: number }).n
+    expect(pending).toBe(1)
+  })
+})
