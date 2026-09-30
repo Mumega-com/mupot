@@ -83,7 +83,8 @@ deviceApp.get('/', async (c) => {
   const auth = await peekSessionAuth(c)
   if (!auth) return c.redirect('/auth/login')
   const csrf = await issueDeviceCsrf(c.env)
-  const html = renderEnterCodePage(csrf, auth, null)
+  const prefill = c.req.query('code') ?? c.req.query('user_code') ?? null
+  const html = renderEnterCodePage(csrf, auth, null, prefill)
   return htmlResponse(c, html, csrf)
 })
 
@@ -174,18 +175,20 @@ ${body}
 </html>`
 }
 
-function renderEnterCodePage(csrf: string, auth: AuthContext, error: string | null): string {
+function renderEnterCodePage(csrf: string, auth: AuthContext, error: string | null, prefillCode?: string | null): string {
+  const codeVal = prefillCode ? escapeHtml(prefillCode) : ''
   const body = `
 <p class="hint">Type the code shown on the agent screen, then continue. Pending requests are not listed here.</p>
 ${error ? `<p class="error">${escapeHtml(error)}</p>` : ''}
 <form method="POST" action="/device/preview" class="card">
   <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
   <label for="user_code">Code</label><br>
-  <input class="code-input" id="user_code" name="user_code" autocomplete="one-time-code" required maxlength="12" placeholder="XXXX-XXXX">
+  <input class="code-input" id="user_code" name="user_code" autocomplete="one-time-code" required maxlength="12" placeholder="XXXX-XXXX" value="${codeVal}">
   <div class="actions">
     <button type="submit">Continue</button>
   </div>
-</form>`
+</form>
+<p class="hint">Need to coin a key manually instead? Open <a href="/enroll">/enroll</a>.</p>`
   return pageShell('Approve agent access', auth, body)
 }
 
