@@ -21,6 +21,10 @@ changes should be edited in that PR. Line numbers drift; the function or file
 names are the durable handle. Where I could not confirm something I say
 **not verified**.
 
+Last re-checked 2026-09-30, after #1622 (decision port), #1626 (Access panel),
+#1629 and #1633 (MCP Events) merged. Line numbers in `src/mcp/index.ts` and
+`src/types.ts` were re-located then.
+
 ## Summary
 
 | Area | Status | One line |
@@ -28,6 +32,9 @@ names are the durable handle. Where I could not confirm something I say
 | Identity and ranks | works, with a known dual-plane wrinkle | 5 ranks on 3 scope types |
 | Gates and receipts | partial | gate primitive and append-only verdicts work; "independent" is weaker than it sounds (#1613) |
 | MCP door | partial | POST `/mcp`, two auth doors; `tools/list` is unfiltered (#1609) |
+| MCP Events (protocol 2026-07-28) | partial: merged, flag off, unproven against a real client | subscriptions, callback verification, signed delivery, receipts; follow-ups #1635 #1636 |
+| Decision port | works as a library; no caller | `decide()` is called only by tests; default adapter defers to a human |
+| Agent Access panel | works | org-admin control to set an agent's squad access level, with an in-batch receipt |
 | Addons framework | partial | manifest v1, install/configure/activate, read+write bindings; two open defects (#1606, #1607) |
 | Office publish flow | partial | code path complete; first live publish not exercised end to end (#1617) |
 | `task_submit_result` | works, with a gate caveat | assignee-submitted evidence into review (#1613) |
@@ -40,7 +47,7 @@ names are the durable handle. Where I could not confirm something I say
 | Fact | Status | Source |
 |---|---|---|
 | Ranks: observer 1 < member 2 < lead 3 < admin 4 < owner 5 | works | `src/auth/capability.ts:188-194` |
-| Scope types: `org`, `department`, `squad`; a grant is member × scope → capability | works | `src/types.ts:719`; `migrations/0002_members.sql` (`capabilities`) |
+| Scope types: `org`, `department`, `squad`; a grant is member × scope → capability | works | `src/types.ts:733`; `migrations/0002_members.sql` (`capabilities`) |
 | Capabilities are re-resolved from D1 on every request (revocation is immediate) | works | `src/mcp/oauth-authorize.ts:1164-1167`; described in `docs/connect-mcp-client.md` |
 | A member's private `kind='home'` squad is not covered by org, department, or legacy-role authority; only an exact squad grant or a time-boxed elevation reaches it | works | `planeCoversScope`, `src/auth/capability.ts:178`; `canOnSquadAuth` `:555-` |
 | Two authority planes exist: capability grants and the legacy `auth.role` owner/admin. Grants-only helpers such as `canOnSquad` cannot see the role plane | partial | comment at `src/auth/capability.ts:521-553`; the OAuth consent picker is grants-only (`src/mcp/oauth-authorize.ts:458-474`, mumega-com#1218) |
@@ -56,7 +63,7 @@ Members hold identity and permission roles only.
   and the archive columns (`migrations/0002_members.sql`,
   `0040_members_tenant.sql:22`, `0154_project_invite_member_bind.sql:22`,
   `0173_archive_columns.sql:167-170`; TypeScript shape `Member`,
-  `src/types.ts:689-696`).
+  `src/types.ts:703-710`).
 - What a person may do is the set of capability grants above. There is no
   business-role or profile field (job title, function, responsibilities) on a
   member. I checked the `ALTER TABLE members` statements in `migrations/` and the
@@ -66,28 +73,96 @@ Members hold identity and permission roles only.
   `src/mcp/oauth-authorize.ts:1717`); that is the agent's permission role, not a
   business profile either.
 
+## Agent Access panel (#1626)
+
+An org-admin control on the agent page (`/agents/:id`) that sets which squad an
+agent sits on and at which access level, or revokes it.
+
+| Fact | Status | Source |
+|---|---|---|
+| `POST /agents/:id/access` is refused for an agent-bound session (`agent_session_forbidden`) or a non-org-admin (`org_admin_required`) before the agent is even resolved, so a non-admin cannot probe which agents exist | works | `src/dashboard/index.ts:1988-1994` |
+| Levels are `observer`, `member`, `lead`, `admin`, never `owner`; there is no default level (an omitted one is refused); a `home` squad is immutable | works | `ACCESS_LEVELS`, `src/dashboard/agent-access-panel.ts:45`; refusals `invalid_capability`, `home_squad_immutable`, `owner_access_untouchable` |
+| The change is written through `setAgentSquadAccess` / `removeAgentSquadAccess` (`src/members/agent-access.ts`); this module adds one `INSERT` into `agent_access_receipts` in the same D1 batch, carrying the authority guards as `EXISTS` leaves, and the reported outcome is read back from the receipt row | works | header comment, `src/dashboard/agent-access-panel.ts:1-22` |
+| `agent_access_receipts` is append-only (no-update and no-delete triggers); each row records actor, agent, squad, prior capability and membership, new capability, action (`enroll`, `change`, `revoke`), reason | works | `migrations/0187_agent_access_receipts.sql` |
+| Migration 0187 applied to production | **not verified** here | the repo cannot show a live D1 state; check with the release operator |
+| One test in this area is timing-dependent: `agent-access-panel` "raising and lowering are both changes" orders receipts by `created_at` | partial | open issue #1634 |
+
+This panel is how a human gives an agent the squad access that the OAuth consent
+rule in [`connect-from-chatgpt.md`](../connect-from-chatgpt.md) looks at.
+
 ## Gates and receipts
 
 | Fact | Status | Source |
 |---|---|---|
 | A task may carry `gate_owner` (a capability string such as `gate:outreach`); the review → approved/rejected transition requires the caller to hold it via `gate_grants` | works | `migrations/0007_gates.sql` header; `migrations/0008_gate_grants.sql`; `src/tasks/service.ts:17-21` |
-| Verdicts are append-only receipts; reversal is a separate receipted path | works | `migrations/0007_gates.sql`; `0118_verdict_reversals.sql`; `0162_task_verdicts_reversal_update_exception.sql`; tools `task_verdict` (`src/mcp/index.ts:2003`), `task_verdict_reverse` |
+| Verdicts are append-only receipts; reversal is a separate receipted path | works | `migrations/0007_gates.sql`; `0118_verdict_reversals.sql`; `0162_task_verdicts_reversal_update_exception.sql`; tools `task_verdict` (`src/mcp/index.ts:2018`), `task_verdict_reverse` |
 | Named gate lanes (`gate:athena`, `gate:kasra-core`, `gate:addons`, ...) | works | `src/gates/lanes.ts` |
 | A verdict may carry harness-attested human origin (Telegram message) so an agent can carry a human's decision | works (merged) | `5b114bd2` / #1425, `src/im/origin-verdict.ts` |
 | Other receipt tables: OAuth consent, dispatch, runtime, execution, membership, pot provisioning | works | `migrations/0091`, `0047`, `0138`, `0123`, `0115`, `0169` |
 | "Independent gate" compares agent ids only and ignores `agents.owner_member_id`, so an assignee can pick a sibling agent of the same human as its reviewer | partial | open issue #1613 |
 
+## Decision port (`src/decisions/`, #1622)
+
+A microkernel for small decision models (a classifier or judge) behind one
+entry point, so the model can be swapped without touching callers or policy.
+Design doc: [`decision-port.md`](./decision-port.md).
+
+| Fact | Status | Source |
+|---|---|---|
+| `decide(env, request, config)` is the single entry; no type in the port carries an authorize or allow field: a model output is data, never a permission | works | `src/decisions/decide.ts:211`; `src/decisions/port.ts`; `tests/decisions-port.test.ts` |
+| **Nothing in `src/` outside `src/decisions/` imports `decide()`.** Only tests call it. (`src/loops/decisions` is an unrelated module with a similar name.) | works, unused | grep of `src/` for imports of `decisions/decide` and `decisions/registry` |
+| Default adapter is `human` (always `deferred_to_human`, sends nothing); `DECISION_ADAPTER` may select `workers-ai` or `typesafe`; an unknown value falls back to `human` | works | `selectAdapter`, `src/decisions/registry.ts:9-19`; `src/types.ts:336-339` |
+| One `decision_receipts` row per call, success or failure; raw input is never stored (hashes only); no-update and no-delete triggers | works | `migrations/0189_decision_receipts.sql:37-47`; `docs/architecture/decision-port.md` |
+| `decision_outcomes` (a human's later accept or override) exists as an append-only table; no code writes it yet | partial | `migrations/0189_decision_receipts.sql:49-74`; `docs/architecture/decision-port.md` |
+| Migration 0189 applied to production | **not verified** here | release operator's record |
+| Known gaps to close before the first caller or reader: `INSERT OR REPLACE` can rewrite a receipt, a `choice` answer is not required to match the top probability, `tenant` is nullable | partial | open issue #1635 |
+
+Because there is no caller, none of those gaps is reachable from production
+today; the issue says they must land before one is wired.
+
 ## The MCP door
 
 | Fact | Status | Source |
 |---|---|---|
-| `POST /mcp`, JSON-RPC 2.0; methods `initialize`, `notifications/initialized`, `tools/list`, `tools/call` | works | `src/mcp/index.ts:6382-6430` |
-| `initialize` reports `protocolVersion: '2025-06-18'` | works | `src/mcp/index.ts:6389` |
+| `POST /mcp`, JSON-RPC 2.0; methods `initialize`, `notifications/initialized`, `tools/list`, `tools/call`; plus `server/discover` and `events/*` only when `EVENTS_ENABLED` is exactly `"true"` (see [MCP Events](#mcp-events-protocol-2026-07-28)) | works | `handleJsonRpc`, `src/mcp/index.ts:6425-6561` |
+| `initialize` reports `protocolVersion: '2025-06-18'` unless the flag is on **and** the client explicitly asks for `2026-07-28`; every other request takes the legacy branch | works | `src/mcp/index.ts:6440-6457`; `negotiateProtocolVersion`, `src/mcp/events.ts:19-22, 41-47` |
 | Two auth doors: `mupot_…` member bearer, and OAuth 2.1 (DCR, PKCE S256, refresh) | works | `docs/connect-mcp-client.md`; `src/index.ts:266-295` |
-| `tools/list` returns the whole registry (documented as 144 tools; the count was not re-measured for this page) to any valid token, regardless of capability | partial | `src/mcp/index.ts:6400-6402`; open issue #1609 |
+| `tools/list` returns the whole registry (146 tools: `TOOLS.length` measured on `main` when this page was updated; #1609's title and older docs still say 144) to any valid token, regardless of capability | partial | `src/mcp/index.ts:6472`; open issue #1609 |
 | Public `GET /openapi.json` is an explicit allowlist; `/openapi.full.json` is org-admin gated but admits agent-bound org-admin bearers | partial | #1603 (merged); open issue #1608; `scripts/check-openapi-public-allowlist.mjs` |
-| MCP server-to-client events (protocol 2026-07-28) so a subscribed chat is notified of inbox messages | spec | open spike #1618 |
+| Curated read-only door `POST /mcp/profile/needs-you`: same auth as `/mcp`, `tools/list` only for an authenticated caller and only the allowlist, `tools/call` outside it refused `tool_not_in_profile` | works | `src/mcp/index.ts:6464-6471, 6485-6487`; `src/mcp/profile-needs-you.ts`; [`connect-chatgpt-needs-you-profile.md`](../connect-chatgpt-needs-you-profile.md); #1624 |
+| MCP server-to-client events (protocol 2026-07-28) so a subscribed chat is notified of inbox messages | partial: merged, **off**, unproven against a real client | [MCP Events](#mcp-events-protocol-2026-07-28) below; open spike #1618 |
 | Bridge-based receive for hosted seats | works | [`docs/host-a-seat.md`](../host-a-seat.md) |
+
+## MCP Events (protocol 2026-07-28)
+
+So a subscribed client (ChatGPT) can be told when an agent's inbox gets a message.
+Merged in two PRs: #1629 (negotiation, `server/discover`, `events/list`) and #1633
+(subscribe, unsubscribe, callback verification, signed delivery, receipts). Design,
+limits and refusal codes: [`mcp-events.md`](./mcp-events.md).
+
+**Everything is behind `EVENTS_ENABLED`, which is on only for the exact string
+`"true"`** (`isEventsEnabled`, `src/mcp/events.ts:30-33`). Per the release
+operator it is off in production and `EVENTS_CALLBACK_HOSTS` is unset; I could not
+confirm either from outside, because `/mcp` refuses an unauthenticated probe
+(**not verified** here).
+
+| Fact | Status | Source |
+|---|---|---|
+| Flag off or anything but `"true"`: `initialize` keeps the legacy version, `server/discover` and `events/*` fall through to `method_not_found` before any auth or DB work, and the queue consumer never calls the fan-out hook | works | `src/mcp/index.ts:6438, 6440-6457, 6520, 6561`; `src/bus/consumer.ts:605`; `src/bus/events-delivery.ts:55, 163` |
+| Events are served only on the full `/mcp` door, never on `/mcp/profile/needs-you` | works | `src/mcp/index.ts:6438` |
+| One event exists, `message.created` (the bound agent's own inbox, body-free payload); any other name is refused `unknown_event` | works | `src/mcp/events.ts:94`; `docs/architecture/mcp-events.md` |
+| `events/subscribe` needs a bound, active agent session; the subscription id includes the principal; TTL 5 min to 24 h (default 1 h); 10 active subscriptions per agent; 5 verification attempts per agent per 10 minutes | works | `src/mcp/events-subscriptions.ts:20-28, 164`; `TTL_*` constants |
+| The callback URL must be HTTPS and its hostname must exactly match an entry of `EVENTS_CALLBACK_HOSTS`; **the default (empty) refuses every URL** | works | `validateCallbackUrl`, `src/mcp/events-webhook.ts:54-76`; `src/types.ts:329` |
+| Before a subscription is stored, a signed challenge is POSTed to the callback and must be echoed; all outbound requests use `redirect: 'manual'` and a 10 s timeout | works | `verifyCallback`, `src/mcp/events-webhook.ts:254`; `postSigned` `:193-210`; `CALLBACK_TIMEOUT_MS` `:19` |
+| The signing secret is stored only as vault ciphertext (domain `mcp_events`); subscribing fails closed if `CONNECTOR_MASTER_KEY` is unset | works | `src/mcp/events-subscriptions.ts`; `src/connectors/crypto.ts`; `docs/architecture/mcp-events.md` |
+| Delivery: the consumer's `message.created` case enqueues one `mcp.event.delivery` job per active subscription; the job carries only `{subscription_id, message_id}` and everything else is re-derived from D1 at delivery; up to 5 attempts with exponential backoff; one append-only receipt per attempt | works | `src/bus/events-delivery.ts:28-31, 54-92, 162`; `migrations/0188_mcp_event_subscriptions.sql:57, 86-92` |
+| Per-subscription cap of 30 new events per minute; the excess gets a terminal `refused` receipt | partial | `MAX_DELIVERIES_PER_MINUTE`, `src/bus/events-delivery.ts:31, 235`; open issue #1636 |
+| Migration 0188 applied to production | **not verified** here | release operator's record |
+| **A real ChatGPT client, or the Workers runtime, completing the subscribe, verify, deliver loop** | **not proven** | the tests use the node SQLite D1 harness and a stubbed `fetch`; `redirect: 'manual'` on `workerd` and DNS rebinding (the allowlist is the mitigation) are noted as unverified in `docs/architecture/mcp-events.md` |
+| Known gaps: flood-induced event loss, a swallowed marker-delete failure, `INSERT OR REPLACE` on the append-only receipts, unbounded table growth | partial | open issue #1636 |
+
+The design doc also states that the callback-validation design still needs Hadi's
+acceptance before the flag or `EVENTS_CALLBACK_HOSTS` is set anywhere.
 
 ## Addons framework
 
@@ -128,9 +203,9 @@ connector binding. Tools (`src/mcp/office.ts`): `office.publish_post`,
 
 | Fact | Status | Source |
 |---|---|---|
-| The agent assignee of a hand-worked, never-dispatched task reports `result` (must state `Artifact: <path>` and `SHA256: <64-hex>`, a shape check only) and enters `review` in one step | works | `src/mcp/index.ts:2556-2569`; #1600 |
+| The agent assignee of a hand-worked, never-dispatched task reports `result` (must state `Artifact: <path>` and `SHA256: <64-hex>`, a shape check only) and enters `review` in one step | works | `src/mcp/index.ts:2572-2580` (spec); #1600 |
 | Receipt row and status flip land in one `DB.batch`; table `task_result_submissions` | works | `migrations/0183_task_result_submissions.sql`; #1600 |
-| The task must already carry an independent gate; the tool never accepts `gate_owner` | works, but see #1613 | `src/mcp/index.ts:2565-2569`; the "independent" predicate is the one #1613 says is too weak |
+| The task must already carry an independent gate; the tool never accepts `gate_owner` | works, but see #1613 | `src/mcp/index.ts:2658-2663`; the "independent" predicate is the one #1613 says is too weak |
 | After a rejection, the assignee can move the task back to review with the rejected result still on the row, no fresh receipt | partial | open issue #1613 (P2) |
 | Human-held gates (`gate:hadi`) cannot use it | partial | open issue #1613 (P3) |
 
@@ -185,7 +260,10 @@ before relying on it).
 | #1615 | Office reconcile: persist candidate evidence; accept-as-done path; post-meta marker | office |
 | #1616 | Office: MCPWP connector auth via API key; post meta as idempotency key | office |
 | #1617 | Office: first live publish not yet exercised end to end | office |
-| #1618 | Spike: MCP Events so a subscribed ChatGPT chat is notified of inbox messages | MCP door |
+| #1618 | Spike: MCP Events so a subscribed ChatGPT chat is notified of inbox messages (PR 1 and PR 2 merged, flag off) | MCP door |
+| #1634 | Flaky test: agent-access-panel orders receipts by `created_at` | access panel |
+| #1635 | Decision port (#1622) P2/P3 follow-ups | decision port |
+| #1636 | MCP Events PR2 (#1633) follow-ups | MCP Events |
 
 ## What I did not check
 
