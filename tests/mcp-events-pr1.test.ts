@@ -405,7 +405,8 @@ describe('message.created read instruction is TRUE end to end (real SQL)', () =>
     expect(text).not.toContain('message_get')
     // verify-the-id instruction + the signed-reader caveat (Athena/adversarial r2)
     expect(text).toContain("ALWAYS VERIFY that the returned message's id equals the event's message_id")
-    expect(text).toContain('no longer readable')
+    expect(def.description as string).toContain('no longer readable') // in the event description itself, not only the payload notes
+    expect((def.payloadSchema as { properties: { read_after_seq: { description: string } } }).properties.read_after_seq.description).toContain('no longer readable')
     expect(text).toContain('consumer_fenced')
     expect(text).not.toContain('first returned message is the triggering')
     expect(text).not.toMatch(/pass as since_seq to inbox\.? *$/)
