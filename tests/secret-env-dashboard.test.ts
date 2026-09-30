@@ -225,6 +225,23 @@ describe('GET /approvals — secret-env section', () => {
     expect(body).toContain(`/admin/secret-env/${created.request.id}/reject`)
   })
 
+  it('shows WHO asked on each request: member id, email and channel', async () => {
+    const { env, harness } = makeEnv()
+    authState.current = auth('admin')
+    harness.sqlite.exec(`INSERT INTO members (id, email, display_name) VALUES ('mem-req-9', 'asker@example.test', 'Asker')`)
+    const created = await requestSecretEnv(env, {
+      keys: validKeys, reason: 'Need Notion access', adapterHint: null,
+      requestedBy: 'mem-req-9', requestedChannel: 'chan-probe-7',
+    })
+    if (!created.ok) throw new Error('setup: requestSecretEnv failed')
+
+    const res = await dashboardApp.fetch(new Request('https://pot.test/approvals'), env)
+    const body = await res.text()
+    expect(body).toContain('mem-req-9')
+    expect(body).toContain('asker@example.test')
+    expect(body).toContain('chan-probe-7')
+  })
+
   it('non-admin never sees the secret-env section, even though a request is pending', async () => {
     const { env } = makeEnv()
     authState.current = auth('admin')
