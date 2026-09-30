@@ -2,6 +2,51 @@
 
 ## [Unreleased] — main since v0.31.0
 
+**Recorded deploy (release operator's record, 2026-09-29):** Cloudflare version
+`64881dd4`, built from the #1614 merge commit `5f69d7ae`. Live `/health` is the
+authoritative source and this line was not re-verified when written; it ages on
+the next deploy. Migrations 0184 and 0185 must be applied **before** the code
+that reads them (see their DEPLOY ORDER headers); whether they were applied for
+this deploy is not stated here.
+
+- **#1614** (mupot#1580, #1610 — T2b) — write-capable connector bindings, and
+  the idempotency and reconcile semantics office publishing depends on.
+  - Migration `0184_addon_connector_bindings_write_capability.sql` adds
+    `addon_connector_bindings.capability_v2` (`'read' | 'write'`); the legacy
+    `capability` column stays frozen at `'read'`. `preflightAddonBindings`
+    honours a `'write'` connector requirement only when
+    `installationMayHoldWriteCapabilityBinding` holds: `external_mcp` manifest,
+    `external_isolated` trust class on both manifest and live installation, and
+    no external-isolation violation, re-proved at every call
+    (`src/addons/bindings.ts`). `mcpwp-office`'s `wordpress_site` slot is the
+    only write requirement in the repo.
+  - Migration `0185_office_publish_freeze_idempotency_key.sql` adds
+    `office_publish_freezes.idempotency_key`. The one-shot publish claim stamps
+    it (`COALESCE`, never overwritten) and it is written into the WordPress
+    post `slug` (`src/addons/office/service.ts`).
+  - Publish outcomes are classified `delivered` / `definite_failure` /
+    `ambiguous`. Only a definite failure may record `outcome='failed'`; an
+    ambiguous outcome leaves `outcome` NULL, the claim stays unreconciled, and a
+    rework loop cannot mint a fresh unclaimed freeze.
+  - `office.reconcile_stalled_publish` checks WordPress by the idempotency slug
+    before clearing the double-post guard and never treats a failed or empty
+    lookup as proof of absence: any candidate evidence is
+    `reconcile_candidate_found` (not overridable); no answer is
+    `reconcile_check_unavailable` (the only case an audited human override may
+    accept, after a retry).
+  - Not yet done: the first live publish end to end (#1617), MCPWP API-key auth
+    and post-meta idempotency marker (#1616), reconcile evidence persistence
+    (#1615), freeze-lock cleanup (#1612).
+- **#1602** (mupot#1592) — approval binding for office publishing. The payload
+  is frozen when a `gate:office` task enters `review`
+  (`freezeOfficeTaskOnReviewEntry`); `office.review_approval` requires the
+  caller to echo `expected_payload_sha256`; the freeze is bound to the approving
+  verdict in the same D1 batch; the verdict write re-checks the freeze and the
+  live task content inside the write; `task_update` and `PATCH /api/tasks/:id`
+  refuse title/body edits while such a task is in review; the generic verdict
+  surfaces refuse `gate:office` tasks (`DedicatedGatePredicateRequiredError`).
+  Migration `0182_office_publish_freeze_verdict_binding.sql`.
+
 - **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
   GPT Actions discovery) now serves an explicit, committed allowlist
   (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
@@ -11,7 +56,7 @@
   disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
   to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
   `/openapi.full.json` (#1608). #1596 stays open.
-- **mupot#1586** (`kasra/task-result-path-1586`) — new `task_submit_result`
+- **#1600** (mupot#1586) — new `task_submit_result`
   MCP tool: the agent ASSIGNEE of a hand-worked (never-dispatched) task can
   now report its completion evidence and enter `review` in one atomic step,
   closing the board deadlock where such a task (`task_update` refuses an
@@ -47,8 +92,7 @@
   for the v0.31.0 release PR and mupot#1592. `task_submit_result` is
   member-tier and deliberately left out of #1603's public `/openapi.json`
   allowlist (private by default; add it only if a Custom GPT facade needs
-  it). Not merged; state it as merged only once `gh pr view` on this PR
-  reports `MERGED`.
+  it). Merged as #1600 (`294a6dbf`).
 
 ## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
 
@@ -212,6 +256,11 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
   including admin-only tools, to any unauthenticated caller. Fix in
   progress under PR #1603 (in review as of this writing): an explicit
   public/internal allowlist.
+
+*Superseded after the tag:* both limitations above described the tagged release.
+On `main` since, #1602 and #1614 address the first (see `[Unreleased]`; first
+live publish still unverified, #1617) and #1603 addresses the unauthenticated
+half of the second (authenticated `tools/list` disclosure remains, #1609).
 
 Known follow-ups still open: #1587 (slice-1 gate follow-ups — its fixes
 shipped in #1588, though the issue itself is still open on GitHub), #1591
