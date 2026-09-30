@@ -71,6 +71,29 @@ CREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_sub
 CREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_event
   ON event_delivery_receipts(subscription_id, event_id);
 
+-- event_delivery_enqueued: one row per (subscription, event) that has had a delivery job enqueued.
+-- The INSERT OR IGNORE that writes it is the dedupe: a retry of the whole message.created queue
+-- message (e.g. because another consumer leg threw) cannot enqueue a second job for the same
+-- (subscription, event). Not append-only (a failed queue send removes its own marker).
+CREATE TABLE IF NOT EXISTS event_delivery_enqueued (
+  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE RESTRICT,
+  event_id        TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  PRIMARY KEY (subscription_id, event_id)
+);
+
+-- event_verification_attempts: one row per callback-verification attempt an agent STARTS (whether
+-- it later succeeds or fails). The per-agent rate limit is an atomic INSERT ... SELECT ... WHERE
+-- (count in window) < limit against this table.
+CREATE TABLE IF NOT EXISTS event_verification_attempts (
+  id           TEXT PRIMARY KEY,
+  tenant       TEXT NOT NULL,
+  agent_id     TEXT NOT NULL,
+  attempted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_verification_attempts_agent
+  ON event_verification_attempts(tenant, agent_id, attempted_at);
+
 CREATE TRIGGER event_delivery_receipts_no_update
 BEFORE UPDATE ON event_delivery_receipts
 BEGIN

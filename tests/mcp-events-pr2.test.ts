@@ -3,6 +3,8 @@
 import { createHmac } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mcpApp } from '../src/mcp'
+import { sosApp } from '../src/addons/sos'
+import { createBus } from '../src/bus'
 import { sendAgentMessage } from '../src/agents/messages'
 import { handleQueue } from '../src/bus/consumer'
 import {
@@ -10,10 +12,12 @@ import {
   MAX_DELIVERY_ATTEMPTS,
   deliverSubscriptionEvent,
   enqueueMessageCreatedDeliveries,
+  eventIdFor,
   type DeliveryJob,
 } from '../src/bus/events-delivery'
-import { revokeSubscriptionForAgent, MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT } from '../src/mcp/events-subscriptions'
-import { standardWebhooksSignature, validateCallbackUrl } from '../src/mcp/events-webhook'
+import { revokeSubscriptionForAgent, MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT, MAX_VERIFICATION_ATTEMPTS, subscriptionAad, subscriptionId } from '../src/mcp/events-subscriptions'
+import { standardWebhooksSignature, timingSafeEqualStr, validateCallbackUrl } from '../src/mcp/events-webhook'
+import { decryptConnectorSecret, encryptConnectorSecret } from '../src/connectors/crypto'
 import { sha256Hex } from '../src/members/service'
 import type { BusEvent, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -169,6 +173,8 @@ interface SubRow {
   token_id: string
   revoke_reason: string | null
 }
+/** Simulate the 10-minute verification-attempt window having passed. */
+const resetVerifyWindow = (): void => { harness.sqlite.exec('DELETE FROM event_verification_attempts') }
 const subs = (): SubRow[] => harness.sqlite.prepare('SELECT * FROM event_subscriptions ORDER BY created_at').all() as unknown as SubRow[]
 const receipts = (): Record<string, unknown>[] =>
   harness.sqlite.prepare('SELECT * FROM event_delivery_receipts ORDER BY created_at, rowid').all() as Record<string, unknown>[]
@@ -292,7 +298,7 @@ describe('events/subscribe', () => {
     expect(row.secret_ciphertext.length).toBeGreaterThan(40)
     expect(row.secret_fingerprint).toMatch(/^[0-9a-f]{8}$/)
     // Deliver once so receipts and delivery logs exist too.
-    await deliverSubscriptionEvent(makeEnv(), job(row.id))
+    await deliverSubscriptionEvent(makeEnv(), msgJob(row.id))
     await rpc('events/subscribe', subParams({}, { secret: SECRET_B }))
     for (const s of [SECRET_A, SECRET_B]) {
       const raw2 = s.slice('whsec_'.length)
@@ -355,6 +361,7 @@ describe('events/subscribe', () => {
 
   it('ttlMs: default, clamped to min and max, null is not granted as "no expiry", invalid refused', async () => {
     const gap = async (ttlMs: unknown) => {
+      resetVerifyWindow()
       const r = await rpc('events/subscribe', subParams({ ttlMs }, { url: `https://${HOST}/t/${String(ttlMs)}` }))
       return r.body.error ? r.body.error.code : Date.parse(r.body.result?.refreshBefore as string) - Date.now()
     }
@@ -369,14 +376,48 @@ describe('events/subscribe', () => {
     expect(Date.parse(dflt.body.result?.refreshBefore as string) - Date.now()).toBeGreaterThan(3_500_000)
   })
 
-  it('caps active subscriptions per agent', async () => {
+  it('caps active subscriptions per agent (a refresh of an existing one still works at the cap)', async () => {
     for (let i = 0; i < MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT; i++) {
+      resetVerifyWindow()
       await subscribeOk('bound-admin', subParams({}, { url: `https://${HOST}/n${i}` }))
     }
+    resetVerifyWindow()
     const r = await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/overflow` }))
     expect(r.body.error?.message).toBe('subscription_limit')
-    // A refresh of an existing one is still fine at the cap.
+    resetVerifyWindow()
     await subscribeOk('bound-admin', subParams({}, { url: `https://${HOST}/n0` }))
+  })
+
+  it('re-subscribing a REVOKED or EXPIRED row counts against the cap (subscribe 10, unsubscribe, subscribe 10 new, re-subscribe the first 10)', async () => {
+    const cap = MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT
+    const sub = async (tag: string, i: number) => {
+      resetVerifyWindow()
+      return rpc('events/subscribe', subParams({}, { url: `https://${HOST}/${tag}${i}` }))
+    }
+    for (let i = 0; i < cap; i++) expect((await sub('a', i)).body.error).toBeUndefined()
+    for (let i = 0; i < cap; i++) await rpc('events/unsubscribe', subParams({}, { url: `https://${HOST}/a${i}` }))
+    for (let i = 0; i < cap; i++) expect((await sub('b', i)).body.error).toBeUndefined()
+    for (let i = 0; i < cap; i++) expect((await sub('a', i)).body.error?.message, `a${i}`).toBe('subscription_limit')
+    expect(subs().filter((r) => r.status === 'active')).toHaveLength(cap)
+    // expired rows behave the same
+    harness.sqlite.exec(`UPDATE event_subscriptions SET status = 'expired' WHERE status = 'revoked'`)
+    for (let i = 0; i < cap; i++) expect((await sub('a', i)).body.error?.message).toBe('subscription_limit')
+    expect(subs().filter((r) => r.status === 'active')).toHaveLength(cap)
+  })
+
+  it('the cap holds under concurrency: count + insert is ONE guarded statement (14 parallel subscribes, 8 slots already used)', async () => {
+    for (let i = 0; i < 8; i++) {
+      harness.sqlite.exec(`INSERT INTO event_subscriptions (id, tenant, agent_id, member_id, token_id, event_name, callback_url, secret_ciphertext, secret_fingerprint, status, refresh_before, created_at, last_refreshed_at)
+        VALUES ('sub_seed${i}', '${TENANT}', 'agent-a', 'member-agent-a', 'tok-ba', 'message.created', 'https://${HOST}/seed${i}', 'x', 'deadbeef', 'active', '2099-01-01T00:00:00.000Z', '${T0}', '${T0}')`)
+    }
+    const env = makeEnv()
+    const results = await Promise.all(Array.from({ length: 14 }, (_v, i) => {
+      // distinct URLs => distinct subscriptions; each needs its own verification slot
+      return rpc('events/subscribe', subParams({}, { url: `https://${HOST}/p${i}` }), 'bound-admin', env)
+    }))
+    const ok = results.filter((r) => !r.body.error).length
+    expect(subs().filter((r) => r.status === 'active').length).toBeLessThanOrEqual(MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT)
+    expect(ok).toBeLessThanOrEqual(2)
   })
 
   it('fails closed when secret storage (CONNECTOR_MASTER_KEY) is not configured: no fetch, no row', async () => {
@@ -555,17 +596,28 @@ describe('Standard Webhooks signing', () => {
 
 // ── delivery ─────────────────────────────────────────────────────────────────────
 
-function job(subscriptionId: string, over: Partial<DeliveryJob> = {}): DeliveryJob {
-  return {
-    subscription_id: subscriptionId,
-    event_id: 'evt_' + 'f'.repeat(32),
-    event_name: 'message.created',
-    timestamp: '2026-08-01T12:00:00.000Z',
-    data: { message_id: 'msg-1', seq: 42, read_after_seq: 41, kind: 'message', request_id: 'req-1' },
-    from_agent: 'agent-b',
-    attempt: 1,
-    ...over,
-  }
+/** Insert a real inbox row (the ONLY source of a delivery's facts). Idempotent per id. */
+function insertMsg(
+  mid: string,
+  o: { seq?: number; from?: string; to?: string; kind?: string; requestId?: string | null; createdAt?: string } = {},
+): void {
+  const exists = harness.sqlite.prepare('SELECT 1 AS x FROM agent_messages WHERE id = ?').get(mid)
+  if (exists) return
+  const seq = o.seq
+  harness.sqlite.prepare(
+    `INSERT INTO agent_messages (${seq !== undefined ? 'seq, ' : ''}id, tenant, to_agent, from_agent, from_member, kind, body, request_id, created_at)
+     VALUES (${seq !== undefined ? '?, ' : ''}?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    ...(seq !== undefined ? [seq] : []),
+    mid, TENANT, o.to ?? 'agent-a', o.from ?? 'agent-b', 'member-agent-b', o.kind ?? 'message',
+    'SECRET MESSAGE BODY MUST NEVER LEAVE', o.requestId ?? null, o.createdAt ?? '2026-08-01T12:00:00.000Z',
+  )
+}
+
+/** A job for message `mid` (row inserted on demand). */
+function msgJob(subscriptionId: string, mid = 'msg-1', o: Parameters<typeof insertMsg>[1] = {}): DeliveryJob {
+  insertMsg(mid, o)
+  return { subscription_id: subscriptionId, message_id: mid }
 }
 
 const eventReq = (): Sent[] => sent.filter((s) => (JSON.parse(s.body) as { type?: string }).type !== 'verification')
@@ -575,24 +627,27 @@ describe('delivery', () => {
   beforeEach(async () => {
     id = await subscribeOk()
     sent.length = 0
+    insertMsg('msg-1', { seq: 42, requestId: 'req-1' })
   })
 
-  it('POSTs one signed, body-free event and records ONE delivered receipt', async () => {
-    const out = await deliverSubscriptionEvent(makeEnv(), job(id))
+  it('POSTs one signed, body-free event built from the inbox row and records ONE delivered receipt', async () => {
+    const out = await deliverSubscriptionEvent(makeEnv(), msgJob(id))
     expect(out).toBe('delivered')
     expect(sent).toHaveLength(1)
     const req = sent[0]
+    const eid = await eventIdFor(id, 'msg-1')
     expect(req.url).toBe(URL_A)
     expect(req.redirect).toBe('manual')
     expect(JSON.parse(req.body)).toEqual({
-      eventId: 'evt_' + 'f'.repeat(32),
+      eventId: eid,
       name: 'message.created',
       timestamp: '2026-08-01T12:00:00.000Z',
       data: { message_id: 'msg-1', seq: 42, read_after_seq: 41, kind: 'message', request_id: 'req-1' },
       cursor: null,
     })
     expect(req.body).not.toContain('from_agent')
-    expect(req.headers['webhook-id']).toBe('evt_' + 'f'.repeat(32))
+    expect(req.body).not.toContain('SECRET MESSAGE BODY')
+    expect(req.headers['webhook-id']).toBe(eid)
     expect(req.headers['X-MCP-Subscription-Id']).toBe(id)
     expect(verifySw(SECRET_A, req.headers['webhook-id'], req.headers['webhook-timestamp'], req.body, req.headers['webhook-signature'])).toBe(true)
     const rc = receipts()
@@ -600,14 +655,19 @@ describe('delivery', () => {
     expect(rc[0]).toMatchObject({ outcome: 'delivered', attempt: 1, http_status: 200, subscription_id: id })
   })
 
+  it('a tz-less created_at (the column default) is normalised to ISO 8601 with a timezone', async () => {
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-notz', { seq: 50, createdAt: '2026-08-01 12:00:00' }))
+    expect((JSON.parse(sent[0].body) as { timestamp: string }).timestamp).toBe('2026-08-01T12:00:00.000Z')
+  })
+
   it('receipts hold metadata only: no body, no secret, no message content', async () => {
-    await deliverSubscriptionEvent(makeEnv(), job(id))
-    await deliverSubscriptionEvent(makeEnv(), job(id, { event_id: 'evt_2' }))
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id))
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-2'))
     const dump = JSON.stringify(receipts())
     expect(dump).not.toContain('whsec_')
     expect(dump).not.toContain(SECRET_A.slice(6))
     expect(dump).not.toContain('"data"')
-    expect(dump).not.toContain('msg-1')
+    expect(dump).not.toContain('SECRET MESSAGE BODY')
     expect(Object.keys(receipts()[0]).sort()).toEqual(
       ['attempt', 'created_at', 'error_class', 'event_id', 'http_status', 'id', 'outcome', 'signed_at', 'subscription_id'],
     )
@@ -620,38 +680,38 @@ describe('delivery', () => {
     expect(() => harness.sqlite.exec(`DELETE FROM event_delivery_receipts WHERE id = 'r1'`)).toThrow(/append-only/)
   })
 
-  it('retries transient failures with exponential backoff; eventId/webhook-id stable, signature fresh per attempt', async () => {
+  it('retries transient failures with exponential backoff; attempt state comes from receipts; eventId stable, signature fresh', async () => {
     installFetch(() => new Response('', { status: 503 }))
     const t0 = Date.now()
-    const o1 = await deliverSubscriptionEvent(makeEnv(), job(id), { nowMs: t0 })
-    expect(o1).toBe('retry')
-    expect(busSend).toHaveBeenCalledTimes(1)
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id), { nowMs: t0 })).toBe('retry')
     const [msg1, opts1] = busSend.mock.calls[0] as [BusEvent<DeliveryJob>, { delaySeconds: number }]
     expect(msg1.type).toBe('mcp.event.delivery')
-    expect(msg1.payload.attempt).toBe(2)
-    expect(msg1.payload.event_id).toBe('evt_' + 'f'.repeat(32))
+    expect(msg1.payload).toEqual({ subscription_id: id, message_id: 'msg-1' }) // nothing but identity
     expect(opts1.delaySeconds).toBe(10)
-
     await deliverSubscriptionEvent(makeEnv(), msg1.payload, { nowMs: t0 + 15_000 })
-    const [msg2, opts2] = busSend.mock.calls[1] as [BusEvent<DeliveryJob>, { delaySeconds: number }]
-    expect(msg2.payload.attempt).toBe(3)
+    const [, opts2] = busSend.mock.calls[1] as [BusEvent<DeliveryJob>, { delaySeconds: number }]
     expect(opts2.delaySeconds).toBe(20)
 
     expect(sent).toHaveLength(2)
     expect(sent[0].headers['webhook-id']).toBe(sent[1].headers['webhook-id'])
     expect(sent[0].headers['webhook-timestamp']).not.toBe(sent[1].headers['webhook-timestamp'])
     expect(sent[0].headers['webhook-signature']).not.toBe(sent[1].headers['webhook-signature'])
-    expect(sent[0].body).toBe(sent[1].body) // same event bytes
+    expect(sent[0].body).toBe(sent[1].body)
     for (const s of sent) expect(verifySw(SECRET_A, s.headers['webhook-id'], s.headers['webhook-timestamp'], s.body, s.headers['webhook-signature'])).toBe(true)
     expect(receipts().map((r) => [r.attempt, r.outcome])).toEqual([[1, 'retry'], [2, 'retry']])
   })
 
-  it('stops after the bounded attempt count', async () => {
+  it('stops after the bounded attempt count (counted from receipts)', async () => {
     installFetch(() => new Response('', { status: 500 }))
-    const out = await deliverSubscriptionEvent(makeEnv(), job(id, { attempt: MAX_DELIVERY_ATTEMPTS }))
-    expect(out).toBe('failed')
-    expect(busSend).not.toHaveBeenCalled()
-    expect(receipts()[0]).toMatchObject({ outcome: 'failed', error_class: 'retries_exhausted:http_500' })
+    const outs: string[] = []
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) outs.push(String(await deliverSubscriptionEvent(makeEnv(), msgJob(id))))
+    expect(outs).toEqual(['retry', 'retry', 'retry', 'retry', 'failed'])
+    expect(busSend).toHaveBeenCalledTimes(MAX_DELIVERY_ATTEMPTS - 1)
+    expect(receipts().at(-1)).toMatchObject({ outcome: 'failed', attempt: MAX_DELIVERY_ATTEMPTS, error_class: 'retries_exhausted:http_500' })
+    // finished: a further (duplicate/forged) job is dropped with no POST
+    const before = sent.length
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('skipped')
+    expect(sent).toHaveLength(before)
   })
 
   it.each([
@@ -660,7 +720,7 @@ describe('delivery', () => {
     ['network error', () => { throw new Error('reset') }],
   ] as [string, Handler][])('%s is transient', async (_n, h) => {
     installFetch(h)
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('retry')
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('retry')
     expect(busSend).toHaveBeenCalledTimes(1)
   })
 
@@ -669,7 +729,7 @@ describe('delivery', () => {
     installFetch((_r, init) => new Promise<Response>((_res, rej) => {
       init.signal?.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')))
     }))
-    const p = deliverSubscriptionEvent(makeEnv(), job(id))
+    const p = deliverSubscriptionEvent(makeEnv(), msgJob(id))
     await vi.waitFor(() => expect(sent).toHaveLength(1))
     await vi.advanceTimersByTimeAsync(10_001)
     expect(await p).toBe('retry')
@@ -678,18 +738,18 @@ describe('delivery', () => {
 
   it('410 revokes the subscription (gone) and later jobs are not delivered', async () => {
     installFetch(() => new Response('', { status: 410 }))
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('gone')
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('gone')
     expect(busSend).not.toHaveBeenCalled()
     expect(subs()[0]).toMatchObject({ status: 'revoked', revoke_reason: 'callback_gone' })
     installFetch()
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id, { event_id: 'evt_next' }))).toBe('refused')
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-next'))).toBe('refused')
     expect(sent).toHaveLength(0)
   })
 
   it('413 and other permanent 4xx are NOT retried', async () => {
     for (const status of [413, 400, 401, 404]) {
       installFetch(() => new Response('', { status }))
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id, { event_id: `evt_${status}` }))).toBe('failed')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, `msg-${status}`))).toBe('failed')
     }
     expect(busSend).not.toHaveBeenCalled()
     expect(receipts().find((r) => r.http_status === 413)).toMatchObject({ error_class: 'payload_too_large' })
@@ -697,7 +757,7 @@ describe('delivery', () => {
 
   it('a redirect response is a permanent failure and is never followed', async () => {
     installFetch(() => new Response(null, { status: 307, headers: { location: 'https://evil.example.net/x' } }))
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('failed')
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('failed')
     expect(sent).toHaveLength(1)
     expect(sent[0].redirect).toBe('manual')
     expect(busSend).not.toHaveBeenCalled()
@@ -705,7 +765,7 @@ describe('delivery', () => {
   })
 
   it('does not deliver for an expired subscription (and marks it expired)', async () => {
-    const out = await deliverSubscriptionEvent(makeEnv(), job(id), { nowMs: Date.now() + 3 * 3_600_000 })
+    const out = await deliverSubscriptionEvent(makeEnv(), msgJob(id), { nowMs: Date.now() + 3 * 3_600_000 })
     expect(out).toBe('refused')
     expect(sent).toHaveLength(0)
     expect(subs()[0].status).toBe('expired')
@@ -714,7 +774,7 @@ describe('delivery', () => {
 
   it('does not deliver for a revoked subscription', async () => {
     await rpc('events/unsubscribe', subParams())
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
     expect(sent).toHaveLength(0)
     expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'subscription_revoked' })
   })
@@ -722,36 +782,36 @@ describe('delivery', () => {
   describe('access is re-checked at delivery time', () => {
     it('revoked token stops delivery and revokes the subscription', async () => {
       harness.sqlite.exec(`UPDATE member_tokens SET revoked_at = '${T0}' WHERE id = 'tok-ba'`)
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
       expect(sent).toHaveLength(0)
       expect(subs()[0]).toMatchObject({ status: 'revoked', revoke_reason: 'access_token_not_live' })
     })
     it('expired token stops delivery', async () => {
       harness.sqlite.exec(`UPDATE member_tokens SET expires_at = '2020-01-01 00:00:00' WHERE id = 'tok-ba'`)
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
       expect(sent).toHaveLength(0)
     })
     it('deactivated agent stops delivery', async () => {
       harness.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'agent-a'`)
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
       expect(subs()[0].revoke_reason).toBe('access_agent_inactive')
       expect(sent).toHaveLength(0)
     })
     it('suspended member stops delivery', async () => {
       harness.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = 'member-agent-a'`)
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
       expect(sent).toHaveLength(0)
     })
     it('losing every capability stops delivery', async () => {
       harness.sqlite.exec(`DELETE FROM capabilities WHERE member_id = 'member-agent-a'`)
-      expect(await deliverSubscriptionEvent(makeEnv(), job(id))).toBe('refused')
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id))).toBe('refused')
       expect(subs()[0].revoke_reason).toBe('access_no_capability')
       expect(sent).toHaveLength(0)
     })
   })
 
-  it('never delivers an event for a message the subscribing agent sent itself', async () => {
-    expect(await deliverSubscriptionEvent(makeEnv(), job(id, { from_agent: 'agent-a' }))).toBe('refused')
+  it('never delivers an event for a message the subscribing agent sent itself (sender read from the row)', async () => {
+    expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-self', { from: 'agent-a' }))).toBe('refused')
     expect(sent).toHaveLength(0)
     expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'self_event' })
   })
@@ -759,28 +819,98 @@ describe('delivery', () => {
   it('caps new events per subscription per minute; the excess is refused with a receipt', async () => {
     const env = makeEnv()
     for (let i = 0; i < MAX_DELIVERIES_PER_MINUTE; i++) {
-      expect(await deliverSubscriptionEvent(env, job(id, { event_id: `evt_${i}` }))).toBe('delivered')
+      expect(await deliverSubscriptionEvent(env, msgJob(id, `msg-cap-${i}`))).toBe('delivered')
     }
-    expect(await deliverSubscriptionEvent(env, job(id, { event_id: 'evt_over' }))).toBe('refused')
+    expect(await deliverSubscriptionEvent(env, msgJob(id, 'msg-over'))).toBe('refused')
     expect(sent).toHaveLength(MAX_DELIVERIES_PER_MINUTE)
-    expect(receipts().at(-1)).toMatchObject({ outcome: 'refused', error_class: 'rate_limited', event_id: 'evt_over' })
-    // retries of an event already in flight are not counted against the cap
-    installFetch(() => new Response('', { status: 200 }))
-    expect(await deliverSubscriptionEvent(env, job(id, { event_id: 'evt_0', attempt: 2 }))).toBe('delivered')
+    expect(receipts().at(-1)).toMatchObject({ outcome: 'refused', error_class: 'rate_limited' })
   })
 
   it('signs with the old AND new secret during a rotation, and only until the window ends', async () => {
     await subscribeOk('bound-admin', subParams({}, { secret: SECRET_B }))
     sent.length = 0
-    await deliverSubscriptionEvent(makeEnv(), job(id))
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id))
     const s = sent[0]
     expect(s.headers['webhook-signature'].split(' ')).toHaveLength(2)
     expect(verifySw(SECRET_A, s.headers['webhook-id'], s.headers['webhook-timestamp'], s.body, s.headers['webhook-signature'])).toBe(true)
     expect(verifySw(SECRET_B, s.headers['webhook-id'], s.headers['webhook-timestamp'], s.body, s.headers['webhook-signature'])).toBe(true)
     sent.length = 0
     harness.sqlite.exec(`UPDATE event_subscriptions SET prev_secret_expires_at = '2020-01-01T00:00:00.000Z'`)
-    await deliverSubscriptionEvent(makeEnv(), job(id, { event_id: 'evt_after' }))
+    await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-after'))
     expect(sent[0].headers['webhook-signature'].split(' ')).toHaveLength(1)
+  })
+
+  describe('the callback allowlist is re-checked on EVERY attempt', () => {
+    it.each([['unset', null], ['changed to another host', 'other.example.org'], ['emptied', '']] as [string, string | null][])(
+      'host list %s => subscription revoked (callback_host_removed), receipt refused, no POST',
+      async (_n, hosts) => {
+        expect(await deliverSubscriptionEvent(makeEnv({ hosts }), msgJob(id))).toBe('refused')
+        expect(sent).toHaveLength(0)
+        expect(subs()[0]).toMatchObject({ status: 'revoked', revoke_reason: 'callback_host_removed' })
+        expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'callback_host_removed' })
+      },
+    )
+    it('still delivers while the host stays listed', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv({ hosts: `x.example.org, ${HOST}` }), msgJob(id))).toBe('delivered')
+    })
+  })
+
+  describe('queue jobs are NOT trusted: every fact is rebuilt from D1', () => {
+    it('a forged job for a message that does not exist => refused, no POST', async () => {
+      const out = await deliverSubscriptionEvent(makeEnv(), {
+        subscription_id: id, message_id: 'DOES-NOT-EXIST',
+        attempt: 2, data: { message_id: 'DOES-NOT-EXIST', seq: 999999, read_after_seq: 12345, kind: 'task_verdict', request_id: 'approve-x' },
+      })
+      expect(out).toBe('refused')
+      expect(sent).toHaveLength(0)
+      expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'message_not_found', attempt: 1 })
+    })
+
+    it('a job for a message addressed to ANOTHER agent => refused, no POST', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-foreign', { to: 'agent-c' }))).toBe('refused')
+      expect(sent).toHaveLength(0)
+      expect(receipts()[0]).toMatchObject({ error_class: 'message_not_addressed_to_subscriber' })
+    })
+
+    it('job-supplied attempt / data / seq / kind are ignored: the body carries the row\'s facts', async () => {
+      await deliverSubscriptionEvent(makeEnv(), {
+        subscription_id: id, message_id: 'msg-1', attempt: 4, from_agent: 'nobody', timestamp: '1999-01-01T00:00:00Z',
+        data: { message_id: 'msg-1', seq: 999999, read_after_seq: 7, kind: 'task_verdict', request_id: 'FORGED' },
+      })
+      expect(JSON.parse(sent[0].body)).toMatchObject({
+        timestamp: '2026-08-01T12:00:00.000Z',
+        data: { message_id: 'msg-1', seq: 42, read_after_seq: 41, kind: 'message', request_id: 'req-1' },
+      })
+      expect(receipts()[0]).toMatchObject({ attempt: 1 })
+    })
+
+    it.each([1.5, 2, 0, -1, 99, '3', null, Number.NaN])('forged attempt %s cannot bypass the rate cap or the attempt bound', async (attempt) => {
+      const env = makeEnv()
+      for (let i = 0; i < MAX_DELIVERIES_PER_MINUTE; i++) await deliverSubscriptionEvent(env, msgJob(id, `msg-r${i}`))
+      const before = sent.length
+      const out = await deliverSubscriptionEvent(env, { ...msgJob(id, 'msg-forged'), attempt })
+      expect(out).toBe('refused')
+      expect(sent).toHaveLength(before)
+    })
+
+    it('40 forged replays of one real job produce ONE POST and ONE receipt', async () => {
+      for (let i = 0; i < 40; i++) await deliverSubscriptionEvent(makeEnv(), { ...msgJob(id), attempt: 2 })
+      expect(sent).toHaveLength(1)
+      expect(receipts()).toHaveLength(1)
+    })
+
+    it('malformed jobs are dropped', async () => {
+      for (const bad of [null, 'x', 7, {}, { subscription_id: id }, { subscription_id: 5, message_id: 'm' }, { subscription_id: id, message_id: '' }]) {
+        expect(await deliverSubscriptionEvent(makeEnv(), bad)).toBe('skipped')
+      }
+      expect(sent).toHaveLength(0)
+    })
+
+    it('a row with a malformed seq (0) is refused, not coerced', async () => {
+      expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id, 'msg-seq0', { seq: 0 }))).toBe('refused')
+      expect(receipts()[0]).toMatchObject({ error_class: 'invalid_seq' })
+      expect(sent).toHaveLength(0)
+    })
   })
 })
 
@@ -816,24 +946,40 @@ async function runQueue(env: Env, ev: BusEvent) {
 }
 
 describe('queue wiring (message.created -> mcp.event.delivery)', () => {
-  it('enqueues one body-free job per active subscription of the RECIPIENT only', async () => {
+  it('enqueues one identity-only job per active subscription of the RECIPIENT only', async () => {
     const a = await subscribeOk('bound-admin')
     await subscribeOk('bound-c')
     const { ack } = await runQueue(makeEnv(), messageCreated())
     expect(ack).toHaveBeenCalled()
     const jobs = busSend.mock.calls.map((c) => (c[0] as BusEvent<DeliveryJob>).payload)
-    expect(jobs).toHaveLength(1)
-    expect(jobs[0].subscription_id).toBe(a)
+    expect(jobs).toEqual([{ subscription_id: a, message_id: 'msg-9' }])
     expect(JSON.stringify(busSend.mock.calls)).not.toContain('SECRET MESSAGE BODY')
-    expect(jobs[0].data).toEqual({ message_id: 'msg-9', seq: 9, read_after_seq: 8, kind: 'message', request_id: 'r-9' })
-    // eventId is deterministic per (subscription, message): a queue redelivery yields the same id
-    busSend.mockClear()
+  })
+
+  it('dedupes per (subscription, event): a retry of the whole message enqueues no second job', async () => {
+    await subscribeOk('bound-admin')
     await runQueue(makeEnv(), messageCreated())
-    expect((busSend.mock.calls[0][0] as BusEvent<DeliveryJob>).payload.event_id).toBe(jobs[0].event_id)
+    await runQueue(makeEnv(), messageCreated())
+    await runQueue(makeEnv(), messageCreated())
+    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(1)
+    // a different message is a different event
+    await runQueue(makeEnv(), messageCreated({ message_id: 'msg-10' }))
+    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2)
+  })
+
+  it('a failed queue send removes its marker so the message-level retry can enqueue it', async () => {
+    await subscribeOk('bound-admin')
+    busSend.mockRejectedValueOnce(new Error('queue down'))
+    await runQueue(makeEnv(), messageCreated())
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 0 })
+    await runQueue(makeEnv(), messageCreated())
+    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2) // failed attempt + the retry
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 1 })
   })
 
   it('end to end: a queued mcp.event.delivery job is signed and POSTed', async () => {
     await subscribeOk('bound-admin')
+    insertMsg('msg-9', { seq: 9, requestId: 'r-9' })
     sent.length = 0
     await runQueue(makeEnv(), messageCreated())
     const queued = busSend.mock.calls[0][0] as BusEvent
@@ -842,19 +988,21 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     expect(eventReq()[0].body).not.toContain('SECRET MESSAGE BODY')
   })
 
+  it('a FORGED message.created with no agent_messages row is enqueued but never delivered (receipt refused)', async () => {
+    await subscribeOk('bound-admin')
+    sent.length = 0
+    await runQueue(makeEnv(), messageCreated({ message_id: 'forged-1', seq: 999999 }))
+    const queued = busSend.mock.calls[0][0] as BusEvent
+    await runQueue(makeEnv(), queued)
+    expect(sent).toHaveLength(0)
+    expect(receipts()[0]).toMatchObject({ outcome: 'refused', error_class: 'message_not_found' })
+  })
+
   it('feedback-loop guard: a message the subscriber sent itself is never fanned out', async () => {
     await subscribeOk('bound-admin')
     await runQueue(makeEnv(), messageCreated({ from_agent: 'agent-a', to_agent: 'agent-a' }))
     expect(busSend).not.toHaveBeenCalled()
     expect(await enqueueMessageCreatedDeliveries(makeEnv(), messageCreated({ from_agent: 'agent-a', to_agent: 'agent-a' }))).toBe(0)
-  })
-
-  it('a malformed seq (0, negative, fractional, non-number) is dropped, never coerced into a wrong read_after_seq', async () => {
-    await subscribeOk('bound-admin')
-    for (const seq of [0, -3, 1.5, '7', null]) {
-      await runQueue(makeEnv(), messageCreated({ seq }))
-    }
-    expect(busSend).not.toHaveBeenCalled()
   })
 
   it('expired and revoked subscriptions are not enqueued', async () => {
@@ -876,10 +1024,9 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     const { ack } = await runQueue(off, messageCreated())
     expect(ack).toHaveBeenCalled()
     expect(busSend).not.toHaveBeenCalled()
-    expect(sqlLog.filter((s) => s.includes('event_subscriptions') || s.includes('event_delivery_receipts'))).toEqual([])
-    // and a delivery job that somehow reaches the consumer is dropped without a read or a POST
+    expect(sqlLog.filter((s) => s.includes('event_subscriptions') || s.includes('event_delivery_receipts') || s.includes('event_delivery_enqueued'))).toEqual([])
     sqlLog.length = 0
-    const queued = { ...messageCreated(), type: 'mcp.event.delivery', payload: job('sub_x') } as BusEvent
+    const queued = { ...messageCreated(), type: 'mcp.event.delivery', payload: { subscription_id: 'sub_x', message_id: 'm' } } as BusEvent
     await runQueue(off, queued)
     expect(sqlLog.filter((s) => s.includes('event_subscriptions'))).toEqual([])
     expect(sent).toHaveLength(0)
@@ -902,6 +1049,29 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
   })
 })
 
+describe('no producer can inject an mcp.event.delivery job', () => {
+  const FORGED = { subscription_id: 'sub_x', message_id: 'm' }
+
+  it('createBus().emit refuses it', async () => {
+    await expect(createBus(makeEnv()).emit({ type: 'mcp.event.delivery', tenant: TENANT, payload: FORGED, ts: T0 })).rejects.toThrow(/internal-only/)
+    expect(busSend).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['/publish', { type: 'mcp.event.delivery', payload: FORGED }],
+    ['/bridge', { event: { type: 'mcp.event.delivery', tenant: TENANT, payload: FORGED, ts: T0 } }],
+  ])('the sos addon %s refuses it (and still forwards a normal type)', async (path, body) => {
+    const env = { ...makeEnv(), SOS_SECRET: 'sos-secret' } as unknown as Env
+    const req = (b: unknown) => sosApp.request(path, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer sos-secret' }, body: JSON.stringify(b) }, env)
+    const res = await req(body)
+    expect(res.status).toBe(400)
+    expect(busSend).not.toHaveBeenCalled()
+    const ok = await req(path === '/publish' ? { type: 'task.created', payload: {} } : { event: { type: 'task.created', payload: {} } })
+    expect(ok.status).toBeLessThan(300)
+    expect(busSend).toHaveBeenCalledTimes(1)
+  })
+})
+
 // ── end to end: deliver -> payload -> the catalogue's own recovery read ──────────
 
 describe('recovery read described by the catalogue works on a real delivery', () => {
@@ -914,13 +1084,7 @@ describe('recovery read described by the catalogue works on a real delivery', ()
       SEND_AUTHZ,
     )
     expect(res.ok).toBe(true)
-    // the bus event sendAgentMessage emitted for it (real emitter, spied queue)
-    const ev = busSend.mock.calls.map((c) => c[0] as BusEvent).filter((e) => e.type === 'message.created').at(-1) as BusEvent
-    // HARNESS LIMITATION: the node:sqlite D1 double reports meta.last_row_id = 0 for
-    // INSERT ... SELECT (real D1 returns the rowid), so the emitted seq is 0 here. Take the real
-    // seq from the row the send just wrote and put it in the event, exactly as production emits it.
-    const row = harness.sqlite.prepare('SELECT seq FROM agent_messages WHERE id = ?').get((ev.payload as { message_id: string }).message_id) as { seq: number }
-    return { ...ev, payload: { ...(ev.payload as object), seq: row.seq } }
+    return busSend.mock.calls.map((c) => c[0] as BusEvent).filter((e) => e.type === 'message.created').at(-1) as BusEvent
   }
 
   /** queue: message.created -> delivery job -> POST; returns the delivered event body's `data`. */
@@ -956,23 +1120,20 @@ describe('recovery read described by the catalogue works on a real delivery', ()
   it('deliver -> take the payload -> inbox {peek, since_seq: read_after_seq, limit: 1} returns the triggering row and nothing foreign', async () => {
     await subscribeOk('bound-admin')
     const env = makeEnv()
-    // seq 1 -> agent-a (first ever row: read_after_seq must be 0, not -1)
     const ev1 = await sendReal(env, 'agent-a', 'FIRST-FOR-A')
     const d1 = await deliverThroughQueue(env, ev1)
     expect(d1.read_after_seq).toBe(0)
     expect((await inboxRead(d1.read_after_seq as number)).map((m) => m.body)).toEqual(['FIRST-FOR-A'])
-    // a foreign row (agent-c) sits between, then another row for agent-a
     await sendReal(env, 'agent-c', 'FOREIGN-FOR-C')
     const ev3 = await sendReal(env, 'agent-a', 'THIRD-FOR-A')
     const d3 = await deliverThroughQueue(env, ev3)
     expect(d3.seq).toBe(3)
     expect(d3.read_after_seq).toBe(2)
-    expect(JSON.stringify(eventReq()[0].body)).not.toContain('THIRD-FOR-A') // the event itself is body-free
+    expect(JSON.stringify(eventReq()[0].body)).not.toContain('THIRD-FOR-A')
     const got = await inboxRead(d3.read_after_seq as number)
     expect(got).toHaveLength(1)
     expect(got[0]).toMatchObject({ id: d3.message_id, body: 'THIRD-FOR-A', seq: 3 })
     expect(JSON.stringify(got)).not.toContain('FOREIGN-FOR-C')
-    // and the naive read the catalogue used to describe (since_seq = seq) would have SKIPPED it
     expect(await inboxRead(d3.seq as number)).toEqual([])
   })
 
@@ -988,5 +1149,179 @@ describe('recovery read described by the catalogue works on a real delivery', ()
     expect(schema.additionalProperties).toBe(false)
     expect(Object.keys(data).filter((k) => !(k in schema.properties))).toEqual([])
     expect(data.request_id).toBe('rid-schema')
+  })
+})
+
+// ── hardening round (gates A + B on 75d05143) ─────────────────────────────────────
+
+describe('the read-only profile door never serves events/*', () => {
+  async function profileRpc(method: string, params: unknown) {
+    const res = await mcpApp.request(
+      'https://pot.example/profile/needs-you',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer bound-admin' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      },
+      makeEnv(),
+    )
+    return { status: res.status, body: JSON.parse(await res.text()) as RpcBody }
+  }
+
+  it.each(['events/subscribe', 'events/unsubscribe', 'events/list', 'server/discover'])(
+    '%s through /profile/needs-you (flag ON) is method_not_found: no row, no fetch, no verification attempt',
+    async (m) => {
+      const r = await profileRpc(m, subParams())
+      expect(r.body.error).toMatchObject({ code: -32601, message: 'method_not_found' })
+      expect(sent).toHaveLength(0)
+      expect(subs()).toHaveLength(0)
+      expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_verification_attempts').get()).toEqual({ n: 0 })
+    },
+  )
+
+  it('the same call on the full door works (so the test above is not vacuous)', async () => {
+    expect((await rpc('events/subscribe', subParams())).body.error).toBeUndefined()
+  })
+})
+
+describe('callback verification is rate limited per agent (counted success or failure)', () => {
+  it('40 subscribes to a failing callback produce at most the cap of outbound POSTs', async () => {
+    installFetch(() => new Response('', { status: 500 }))
+    const reasons: (string | undefined)[] = []
+    for (let i = 0; i < 40; i++) {
+      const r = await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/fail${i}` }))
+      reasons.push(r.body.error?.data?.reason)
+    }
+    expect(sent).toHaveLength(MAX_VERIFICATION_ATTEMPTS)
+    expect(reasons.filter((x) => x === 'callback_http_error')).toHaveLength(MAX_VERIFICATION_ATTEMPTS)
+    expect(reasons.filter((x) => x === 'verification_rate_limited')).toHaveLength(40 - MAX_VERIFICATION_ATTEMPTS)
+  })
+
+  it('the same URL + same secret against a failing callback is limited too, and successes count as well', async () => {
+    for (let i = 0; i < 12; i++) await rpc('events/subscribe', subParams({}, { secret: i % 2 ? SECRET_A : SECRET_B }))
+    expect(sent).toHaveLength(MAX_VERIFICATION_ATTEMPTS) // each new-secret success consumed a slot
+  })
+
+  it('the limit is per agent, and the window expires', async () => {
+    installFetch(() => new Response('', { status: 500 }))
+    for (let i = 0; i < 8; i++) await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/a${i}` }))
+    const other = await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/c` }), 'bound-c')
+    expect(other.body.error?.data?.reason).toBe('callback_http_error') // agent-c still has its own budget
+    harness.sqlite.exec(`UPDATE event_verification_attempts SET attempted_at = '2020-01-01T00:00:00.000Z'`)
+    const again = await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/late` }))
+    expect(again.body.error?.data?.reason).toBe('callback_http_error')
+  })
+
+  it('a cached verification does not consume a slot', async () => {
+    await subscribeOk()
+    const n = () => (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_verification_attempts').get() as { n: number }).n
+    const before = n()
+    await subscribeOk()
+    expect(n()).toBe(before)
+  })
+})
+
+describe('the secret ciphertext is bound to its subscription and agent', () => {
+  it('a ciphertext copied from one row to another does not decrypt: delivery fails closed, no POST', async () => {
+    const idA = await subscribeOk('bound-admin')
+    const idC = await subscribeOk('bound-c', subParams({}, { secret: SECRET_B }))
+    const ctA = subs().find((r) => r.id === idA)!.secret_ciphertext
+    harness.sqlite.exec(`UPDATE event_subscriptions SET secret_ciphertext = '${ctA}' WHERE id = '${idC}'`)
+    sent.length = 0
+    insertMsg('msg-swap', { seq: 77, to: 'agent-c' })
+    const out = await deliverSubscriptionEvent(makeEnv(), { subscription_id: idC, message_id: 'msg-swap' })
+    expect(out).toBe('failed')
+    expect(sent).toHaveLength(0)
+    expect(receipts()[0]).toMatchObject({ outcome: 'failed', error_class: 'secret_unavailable' })
+  })
+
+  it('crypto level: the key salt (subscription id) and the AAD (agent + id) are each load-bearing', async () => {
+    const aad = subscriptionAad('agent-a', 'sub_1')
+    const ct = await encryptConnectorSecret(MASTER_KEY, 'sub_1', 'mcp_events', SECRET_A, aad)
+    expect(await decryptConnectorSecret(MASTER_KEY, 'sub_1', 'mcp_events', ct, aad)).toBe(SECRET_A)
+    // different salt, same AAD
+    await expect(decryptConnectorSecret(MASTER_KEY, 'sub_2', 'mcp_events', ct, aad)).rejects.toThrow()
+    // same salt, different AAD (other agent, other id, none)
+    await expect(decryptConnectorSecret(MASTER_KEY, 'sub_1', 'mcp_events', ct, subscriptionAad('agent-c', 'sub_1'))).rejects.toThrow()
+    await expect(decryptConnectorSecret(MASTER_KEY, 'sub_1', 'mcp_events', ct, subscriptionAad('agent-a', 'sub_2'))).rejects.toThrow()
+    await expect(decryptConnectorSecret(MASTER_KEY, 'sub_1', 'mcp_events', ct)).rejects.toThrow()
+    // a different vault domain does not decrypt it either
+    await expect(decryptConnectorSecret(MASTER_KEY, 'sub_1', 'custom', ct, aad)).rejects.toThrow()
+  })
+
+  it('connector callers that pass no AAD are unchanged', async () => {
+    const ct = await encryptConnectorSecret(MASTER_KEY, 'conn-1', 'custom', 'plain-secret')
+    expect(await decryptConnectorSecret(MASTER_KEY, 'conn-1', 'custom', ct)).toBe('plain-secret')
+  })
+})
+
+describe('further guards pinned', () => {
+  it('the challenge compare looks at every byte, not just the length', () => {
+    expect(timingSafeEqualStr('abcdef', 'abcdef')).toBe(true)
+    expect(timingSafeEqualStr('abcdef', 'abcdeg')).toBe(false) // same length, last byte differs
+    expect(timingSafeEqualStr('abcdef', 'abcde')).toBe(false)
+    expect(timingSafeEqualStr('', 'a')).toBe(false)
+  })
+
+  it('an echoed challenge of the right length with one wrong byte fails verification', async () => {
+    installFetch((req) => {
+      const c = (JSON.parse(req.body) as { challenge: string }).challenge
+      const flipped = c.slice(0, -1) + (c.endsWith('A') ? 'B' : 'A')
+      return new Response(JSON.stringify({ challenge: flipped }), { status: 200 })
+    })
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.body.error).toMatchObject({ data: { reason: 'challenge_failed' } })
+  })
+
+  it('the response read is capped at 8 KiB per BYTE (a 100 KiB single chunk is not accepted whole)', async () => {
+    installFetch((req) => {
+      const c = (JSON.parse(req.body) as { challenge: string }).challenge
+      // valid JSON with the right challenge FIRST, but far larger than the cap => truncated => unparseable
+      return new Response(`{"challenge":"${c}","pad":"${'x'.repeat(100_000)}"}`, { status: 200 })
+    })
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.body.error).toMatchObject({ data: { reason: 'challenge_failed' } })
+    // and a body just under the cap is fine
+    installFetch((req) => {
+      const c = (JSON.parse(req.body) as { challenge: string }).challenge
+      return new Response(`{"challenge":"${c}","pad":"${'x'.repeat(2000)}"}`, { status: 200 })
+    })
+    resetVerifyWindow()
+    expect((await rpc('events/subscribe', subParams({}, { url: `https://${HOST}/small` }))).body.error).toBeUndefined()
+  })
+
+  it('the verification cache only trusts ACTIVE rows: re-subscribing after unsubscribe verifies again', async () => {
+    await subscribeOk()
+    expect(sent).toHaveLength(1)
+    await rpc('events/unsubscribe', subParams())
+    await subscribeOk()
+    expect(sent).toHaveLength(2)
+  })
+
+  it('the upsert never overwrites a row owned by a different agent (ownership is in the statement)', async () => {
+    const id = await subscriptionId('agent-a', URL_A, 'message.created', {})
+    harness.sqlite.exec(`INSERT INTO event_subscriptions (id, tenant, agent_id, member_id, token_id, event_name, callback_url, secret_ciphertext, secret_fingerprint, status, refresh_before, created_at, last_refreshed_at)
+      VALUES ('${id}', '${TENANT}', 'agent-x', 'member-x', 'tok-x', 'message.created', '${URL_A}', 'untouched', 'deadbeef', 'active', '2099-01-01T00:00:00.000Z', '${T0}', '${T0}')`)
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.body.error).toBeDefined()
+    const row = subs().find((x) => x.id === id)!
+    expect(row).toMatchObject({ agent_id: 'agent-x', secret_ciphertext: 'untouched', token_id: 'tok-x' })
+  })
+
+  it('the expired-row sweep on subscribe touches only the CALLER\'s rows', async () => {
+    const other = await subscribeOk('bound-c')
+    harness.sqlite.exec(`UPDATE event_subscriptions SET refresh_before = '2020-01-01T00:00:00.000Z' WHERE id = '${other}'`)
+    await subscribeOk('bound-admin')
+    expect(subs().find((x) => x.id === other)?.status).toBe('active') // agent-c's row is agent-c's to expire
+  })
+
+  it('a malformed CONNECTOR_MASTER_KEY is a JSON-RPC refusal BEFORE any outbound request, never a 500 after one', async () => {
+    for (const masterKey of ['zz', 'ab'.repeat(16), 'xyz'.repeat(30)]) {
+      const r = await rpc('events/subscribe', subParams(), 'bound-admin', makeEnv({ masterKey }))
+      expect(r.status).toBe(503)
+      expect(r.body.error?.message).toBe('secret_storage_unavailable')
+      expect(sent).toHaveLength(0)
+      expect(subs()).toHaveLength(0)
+    }
   })
 })

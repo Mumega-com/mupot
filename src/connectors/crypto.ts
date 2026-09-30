@@ -155,18 +155,27 @@ async function deriveConnectorKey(
  * Encrypt a connector secret for storage.
  * Returns base64(iv || ciphertext || tag).
  * The plaintext MUST be discarded after this call.
+ *
+ * `aad` (optional): additional authenticated data bound into the GCM tag. A ciphertext written
+ * with an `aad` only decrypts with the SAME `aad` (mupot#1618: subscription id + agent id, so a
+ * ciphertext cannot be swapped between rows). Omitted = unchanged behaviour for every connector.
  */
 export async function encryptConnectorSecret(
   masterKeyHex: string,
   connectorId: string,
   type: VaultDomain,
   plaintext: string,
+  aad?: string,
 ): Promise<string> {
   if (!plaintext) throw new Error('connector-crypto: plaintext must be non-empty')
   const key = await deriveConnectorKey(masterKeyHex, connectorId, type)
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
   const ct = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(utf8(plaintext))),
+    await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: asBuf(iv), ...(aad !== undefined ? { additionalData: asBuf(utf8(aad)) } : {}) },
+      key,
+      asBuf(utf8(plaintext)),
+    ),
   )
   const out = new Uint8Array(iv.length + ct.length)
   out.set(iv, 0)
@@ -183,6 +192,7 @@ export async function decryptConnectorSecret(
   connectorId: string,
   type: VaultDomain,
   encryptedBase64: string,
+  aad?: string,
 ): Promise<string> {
   if (!encryptedBase64) {
     throw new Error('connector-crypto: ciphertext is empty (decrypt fail-closed)')
@@ -194,7 +204,11 @@ export async function decryptConnectorSecret(
   const iv = blob.slice(0, IV_BYTES)
   const ct = blob.slice(IV_BYTES)
   const key = await deriveConnectorKey(masterKeyHex, connectorId, type)
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: asBuf(iv) }, key, asBuf(ct))
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: asBuf(iv), ...(aad !== undefined ? { additionalData: asBuf(utf8(aad)) } : {}) },
+    key,
+    asBuf(ct),
+  )
   return new TextDecoder().decode(pt)
 }
 

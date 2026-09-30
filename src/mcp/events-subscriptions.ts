@@ -24,6 +24,13 @@ export const TTL_MAX_MS = 24 * 60 * 60_000
 export const VERIFICATION_CACHE_MS = 10 * 60_000
 export const SECRET_ROTATION_WINDOW_MS = 24 * 60 * 60_000
 export const MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT = 10
+export const MAX_VERIFICATION_ATTEMPTS = 5
+export const VERIFICATION_ATTEMPT_WINDOW_MS = 10 * 60_000
+
+/** AAD binding a stored secret ciphertext to its subscription + owning agent. */
+export function subscriptionAad(agentId: string, subscriptionId: string): string {
+  return `mcp-events-secret:v1\n${agentId}\n${subscriptionId}`
+}
 
 export interface SubscriptionRow {
   id: string
@@ -194,16 +201,29 @@ export async function eventsSubscribe(
   const now = new Date(nowMs).toISOString()
   const fingerprint = await secretFingerprint(secret)
 
-  // Opportunistic expiry sweep for this agent (no cron dependency).
+  // Encrypt BEFORE any outbound request: a malformed/unusable CONNECTOR_MASTER_KEY must be a clean
+  // JSON-RPC refusal, never a 500 after a verification POST already went out. The ciphertext is
+  // bound (AAD) to this agent + subscription id.
+  let ciphertext: string
+  try {
+    ciphertext = await encryptConnectorSecret(masterKey, id, 'mcp_events', secret, subscriptionAad(principal.agentId, id))
+  } catch {
+    return fail(-32000, 'secret_storage_unavailable', undefined, 503)
+  }
+
+  // Opportunistic expiry sweep for THIS agent only (no cron dependency).
   await env.DB.prepare(
     `UPDATE event_subscriptions SET status = 'expired', revoke_reason = 'expired'
       WHERE tenant = ?1 AND agent_id = ?2 AND status = 'active' AND refresh_before <= ?3`,
   ).bind(env.TENANT_SLUG, principal.agentId, now).run()
 
+  // Cheap pre-check (saves a pointless outbound verification when already at the cap). It is NOT
+  // the guard: the guarded INSERT below is. A row that is not currently ACTIVE (revoked/expired)
+  // counts as a new active subscription when re-subscribed.
   const existing = await env.DB.prepare(
-    `SELECT id, status FROM event_subscriptions WHERE id = ?1 AND agent_id = ?2`,
-  ).bind(id, principal.agentId).first<{ id: string; status: string }>()
-  if (!existing) {
+    `SELECT status FROM event_subscriptions WHERE id = ?1 AND agent_id = ?2`,
+  ).bind(id, principal.agentId).first<{ status: string }>()
+  if (existing?.status !== 'active') {
     const count = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM event_subscriptions WHERE tenant = ?1 AND agent_id = ?2 AND status = 'active'`,
     ).bind(env.TENANT_SLUG, principal.agentId).first<{ n: number }>()
@@ -214,7 +234,7 @@ export async function eventsSubscribe(
 
   // Verification cache: a SUCCESSFUL verification of the same principal + URL + secret within the
   // window is reused (spec permits a bounded cache). Scoped by secret fingerprint so a new secret
-  // is always re-proven.
+  // is always re-proven; only ACTIVE rows count.
   const cutoff = new Date(nowMs - VERIFICATION_CACHE_MS).toISOString()
   const cached = await env.DB.prepare(
     `SELECT verified_at FROM event_subscriptions
@@ -225,21 +245,42 @@ export async function eventsSubscribe(
 
   let verifiedAt = cached?.verified_at ?? null
   if (!verifiedAt) {
+    // Per-agent verification-attempt limit, counted whether the attempt later succeeds or fails.
+    // ONE atomic guarded INSERT (count-in-window < limit); changes = 0 means over the limit.
+    const windowStart = new Date(nowMs - VERIFICATION_ATTEMPT_WINDOW_MS).toISOString()
+    await env.DB.prepare(
+      `DELETE FROM event_verification_attempts WHERE tenant = ?1 AND agent_id = ?2 AND attempted_at <= ?3`,
+    ).bind(env.TENANT_SLUG, principal.agentId, windowStart).run()
+    const slot = await env.DB.prepare(
+      `INSERT INTO event_verification_attempts (id, tenant, agent_id, attempted_at)
+       SELECT ?1, ?2, ?3, ?4
+        WHERE (SELECT COUNT(*) FROM event_verification_attempts
+                WHERE tenant = ?2 AND agent_id = ?3 AND attempted_at > ?5) < ?6`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, principal.agentId, now, windowStart, MAX_VERIFICATION_ATTEMPTS).run()
+    if ((slot.meta?.changes ?? 0) === 0) {
+      return fail(-32015, 'CallbackEndpointError', { reason: 'verification_rate_limited' }, 429)
+    }
     const v = await verifyCallback(url, secret, id)
     if (!v.ok) return fail(-32015, 'CallbackEndpointError', { reason: v.reason })
     verifiedAt = now
   }
 
-  const ciphertext = await encryptConnectorSecret(masterKey, id, 'mcp_events', secret)
   const refreshBefore = new Date(nowMs + ttl).toISOString()
   const rotationExpiry = new Date(nowMs + SECRET_ROTATION_WINDOW_MS).toISOString()
 
-  await env.DB.prepare(
+  // ONE guarded statement: insert-or-refresh only if (a) this id is already ACTIVE (a plain
+  // refresh) or (b) the agent has fewer than the cap of ACTIVE subscriptions. Count and write are
+  // the same statement, so parallel subscribes cannot overshoot the cap. The DO UPDATE is itself
+  // guarded to the owning agent.
+  const res = await env.DB.prepare(
     `INSERT INTO event_subscriptions
        (id, tenant, agent_id, member_id, token_id, consented_by_member_id, event_name, arguments_json,
         callback_url, secret_ciphertext, secret_fingerprint, status, refresh_before, verified_at,
         created_at, last_refreshed_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?13, ?14, ?14)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?13, ?14, ?14
+      WHERE EXISTS (SELECT 1 FROM event_subscriptions WHERE id = ?1 AND agent_id = ?3 AND status = 'active')
+         OR (SELECT COUNT(*) FROM event_subscriptions
+              WHERE tenant = ?2 AND agent_id = ?3 AND status = 'active') < ?16
      ON CONFLICT(id) DO UPDATE SET
        member_id = excluded.member_id,
        token_id = excluded.token_id,
@@ -276,8 +317,14 @@ export async function eventsSubscribe(
       verifiedAt,
       now,
       rotationExpiry,
+      MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT,
     )
     .run()
+  if ((res.meta?.changes ?? 0) === 0) {
+    // Refused by the guard: over the cap (a concurrent subscribe won the last slot), or the id is
+    // held by a row that is not this agent's (never expected: the id embeds the agent id).
+    return fail(-32000, 'subscription_limit', { limit: MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT }, 429)
+  }
 
   // truthful: message.created is not replayable, so a supplied cursor's history is unavailable.
   const cursorSupplied = params.cursor !== undefined && params.cursor !== null && params.cursor !== ''
@@ -358,9 +405,10 @@ export async function subscriberAccessLive(env: Env, sub: SubscriptionRow): Prom
 export async function loadSigningSecrets(env: Env, sub: SubscriptionRow, nowMs: number): Promise<string[]> {
   const masterKey = env.CONNECTOR_MASTER_KEY
   if (!masterKey) throw new Error('secret_storage_unavailable')
-  const out = [await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.secret_ciphertext)]
+  const aad = subscriptionAad(sub.agent_id, sub.id)
+  const out = [await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.secret_ciphertext, aad)]
   if (sub.prev_secret_ciphertext && sub.prev_secret_expires_at && sub.prev_secret_expires_at > new Date(nowMs).toISOString()) {
-    out.push(await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.prev_secret_ciphertext))
+    out.push(await decryptConnectorSecret(masterKey, sub.id, 'mcp_events', sub.prev_secret_ciphertext, aad))
   }
   return out
 }

@@ -173,18 +173,17 @@ async function readBounded(res: Response): Promise<string> {
   const chunks: Uint8Array[] = []
   let total = 0
   try {
-    for (;;) {
+    while (total < MAX_RESPONSE_READ_BYTES) {
       const { done, value } = await reader.read()
       if (done) break
-      total += value.byteLength
-      chunks.push(value)
-      if (total >= MAX_RESPONSE_READ_BYTES) {
-        await reader.cancel()
-        break
-      }
+      // Cap per BYTE, not per chunk: never buffer more than the cap, however big one chunk is.
+      const take = value.subarray(0, MAX_RESPONSE_READ_BYTES - total)
+      chunks.push(take)
+      total += take.byteLength
     }
+    if (total >= MAX_RESPONSE_READ_BYTES) await reader.cancel()
   } catch {
-    // A truncated/aborted body is treated as an empty read; the caller decides by status.
+    // A truncated/aborted body is treated as what was read so far; the caller decides by status.
   }
   const buf = new Uint8Array(total)
   let off = 0
@@ -192,7 +191,7 @@ async function readBounded(res: Response): Promise<string> {
     buf.set(c, off)
     off += c.byteLength
   }
-  return new TextDecoder().decode(buf.subarray(0, MAX_RESPONSE_READ_BYTES))
+  return new TextDecoder().decode(buf)
 }
 
 /**

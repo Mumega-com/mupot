@@ -756,9 +756,12 @@ export type BusEventType =
                       // (result.meta.changes > 0), so a capped, fenced, or idempotent-
                       // duplicate send produces no event. See MessageCreatedPayload.
   | 'member.auto_enrolled'
-  // mupot#1618 PR 2: one MCP Events webhook delivery attempt (queue job produced by the
-  // message.created consumer leg and by its own retries). Deliberately NOT in the /bus/emit
-  // allowlist (src/bus/index.ts EVENT_TYPES): only the consumer can enqueue it.
+  // mupot#1618 PR 2: one MCP Events webhook delivery attempt (queue job {subscription_id,
+  // message_id} produced ONLY by the message.created consumer leg and by its own retries).
+  // Internal-only: createBus().emit, the sos addon's /publish and /bridge, and the /bus/emit
+  // allowlist all refuse it (src/bus/internal-events.ts), and the consumer rebuilds every fact of
+  // the delivery from D1 anyway, so a job that did get onto the queue can only trigger a delivery
+  // of a REAL inbox row to the subscription that owns it.
   | 'mcp.event.delivery'
   | 'billing.subscription.created'
   | 'billing.subscription.deleted'

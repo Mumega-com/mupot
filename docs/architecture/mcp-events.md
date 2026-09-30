@@ -52,12 +52,22 @@ supplied, because `message.created` is not replayable).
   non-numeric values are `-32602`.
 - **Secret**: must be `whsec_` + base64 decoding to 24–64 bytes. Stored **only** as AES-GCM ciphertext
   through the connector vault (`src/connectors/crypto.ts`, HKDF from `CONNECTOR_MASTER_KEY`, domain
-  `mcp_events`, salt = subscription id). If `CONNECTOR_MASTER_KEY` is unset, subscribe fails closed
+  `mcp_events`, salt = subscription id, plus AAD = agent id + subscription id so a ciphertext cannot be
+  swapped between rows). If `CONNECTOR_MASTER_KEY` is unset, subscribe fails closed
   (`secret_storage_unavailable`) before any outbound request. `secret_fingerprint` (8 hex chars of
   sha256) is a non-secret label. The plaintext never appears in a column, a receipt, a result, or a log.
 - **Rotation**: a refresh with a different secret keeps the previous ciphertext for 24 h; deliveries
   are signed with both (space-separated `v1,` signatures).
-- **Per-agent cap**: 10 active subscriptions (a refresh of an existing one still works at the cap).
+- **Per-agent cap**: 10 active subscriptions. Re-subscribing a revoked or expired row counts as a new
+  active subscription; a refresh of an already-active one does not. Count and write are ONE guarded
+  `INSERT ... SELECT ... WHERE (active count) < cap ... ON CONFLICT DO UPDATE WHERE agent_id = ...`
+  statement, so parallel subscribes cannot overshoot.
+- **Verification attempts** are limited per agent to 5 per 10 minutes, counted whether they succeed or
+  fail (`event_verification_attempts`, atomic guarded insert; over the limit is `-32015` with
+  `verification_rate_limited` and no request). A cache hit makes no request and consumes no slot. So an
+  onboarding burst of more than 5 distinct new URLs/secrets within 10 minutes waits for the window.
+- **Master key** is exercised (encrypting the secret) BEFORE the verification request: a malformed
+  `CONNECTOR_MASTER_KEY` is a JSON-RPC `secret_storage_unavailable` (503) with no outbound request.
 - **Expiry**: enforced on read at delivery and enqueue time, plus an opportunistic sweep of the
   caller's own expired rows on each subscribe. There is no cron.
 
@@ -98,10 +108,10 @@ one `mcp.event.delivery` job per **active, unexpired subscription of the recipie
 the catalogue `payloadSchema` exactly (asserted). The recovery read the catalogue describes,
 `inbox {peek:true, since_seq:<read_after_seq>, limit:1}`, is exercised end to end in the tests on a real
 `sendAgentMessage` row: it returns the triggering row and nothing foreign (and `since_seq = seq` would skip it).
-A `message.created` event with a malformed `seq` (not an integer >= 1) is dropped, not coerced.
+`seq` is read from the `agent_messages` row; one that is not an integer >= 1 is refused (`invalid_seq`), not coerced.
 
 Body-free (never the message text), one event per request, far below 256 KiB (checked anyway).
-`eventId` = `evt_` + hash(subscription id, message id): stable across retries and queue redelivery,
+`eventId` = `evt_` + hash(subscription id, message id), computed server-side: stable across retries and queue redelivery,
 also sent as `webhook-id`. Each **attempt** gets a fresh `webhook-timestamp` and signature; the body
 is serialised once and the exact string is signed and sent.
 
@@ -121,7 +131,25 @@ active, and the principal still holds an observer-or-better capability (director
 re-derive their clamped grants). If access is gone the subscription is marked `revoked`. Self-events
 (sender = the subscribing agent) are never fanned out, and refused again at delivery. Per-subscription
 cap of 30 new events per rolling minute; the excess is a `refused` receipt (`rate_limited`).
-`mcp.event.delivery` is deliberately not in the `/bus/emit` allowlist.
+
+### Queue jobs are not trusted
+
+The job is `{subscription_id, message_id}` and nothing else. At delivery the consumer re-derives
+everything: the event id (from subscription + message), the message's recipient/`seq`/`kind`/
+`request_id`/time from the `agent_messages` row (refused with a receipt if the row is missing, or is
+not addressed to the subscription's agent, or the sender is the subscriber, or `seq` is invalid), and
+the attempt number from the receipts table (a job-supplied `attempt` is ignored, so a fractional or
+forged value cannot bypass the cap). A finished `(subscription, event)` (any receipt other than
+`retry`) is never delivered again: duplicate, replayed or forged jobs are dropped without a POST or a
+new receipt. `mcp.event.delivery` is refused by every producer that forwards a caller-chosen type:
+`createBus().emit`, the sos addon `/publish` and `/bridge`, and the `/bus/emit` allowlist. Other
+producers can still put a `message.created` on the queue (org-admin `/bus/emit`, the shared-secret sos
+addon); that can only cause delivery of a real inbox row, never of attacker-chosen data.
+The enqueue is deduped per `(subscription, event)` in `event_delivery_enqueued`, so a retry of the whole
+`message.created` queue message (for example because the Hermes leg threw) does not create duplicate jobs.
+
+The callback URL is re-validated against the **current** `EVENTS_CALLBACK_HOSTS` on every attempt: a host
+removed from the list revokes the subscription (`callback_host_removed`) with a `refused` receipt.
 
 ## Not verified / known limits
 
@@ -132,14 +160,19 @@ cap of 30 new events per rolling minute; the excess is a `refused` receipt (`rat
 - **DNS rebinding cannot be pinned on Workers** (no way to fix the resolved IP for a `fetch`). The
   mitigation is layered, not a proof: operator-chosen exact hostnames, HTTPS, no redirects, no IP
   literals, no ports. An allowlisted hostname whose DNS an attacker controls is out of scope.
-- The per-minute rate cap and the per-agent subscription cap are best-effort under concurrency (read
-  then act), not atomic.
-- Repeated `events/subscribe` calls each cost the agent at most one verification request per
-  (URL, secret) per 10 min against an allowlisted host; there is no separate per-agent subscribe
-  rate limit.
-- The node:sqlite D1 double reports `meta.last_row_id = 0` for `INSERT ... SELECT`, so the end-to-end test
-  reads the real `seq` back from the row (production D1 returns the rowid; that path is not exercised here).
-- Receipts are never pruned (retention is a follow-up).
+- The per-minute delivery rate cap is best-effort under concurrency (it counts receipts written after
+  the POST). The subscription cap and the verification-attempt limit are atomic guarded statements.
+- Receipts, `event_delivery_enqueued` and `event_verification_attempts` (pruned per agent on each
+  verification) are otherwise never pruned; `event_delivery_receipts` cannot be deleted at all (trigger)
+  and, like any SQLite table, `INSERT OR REPLACE` bypasses its UPDATE trigger (no code path does it).
+- Egress from `events/subscribe` is bounded by the per-agent verification limit (5 per 10 min, failures
+  included) against operator-allowlisted hosts. The limit is per agent, not per host or per pot.
+- **Flag flipped ON to OFF mid-flight**: queued delivery jobs are acked with no POST, no receipt and no
+  retry; nothing replays them when the flag returns.
+- The allowlist is only as safe as its entries: every listed host must be one the operator controls (or a
+  vendor callback domain). Wildcard-DNS names, multi-tenant relays and the pot's own zone must not be
+  listed; the code cannot enforce that.
+- The profile door `/mcp/profile/needs-you` never serves `events/*` or `server/discover` (tested through the real route).
 - `events/subscribe`'s access-denied is `-32003`/403; the spec names no code for it.
 - Callback signature/replay defence (timestamp tolerance, dedup by `webhook-id`) is the callback's
   responsibility; we only guarantee stable `eventId` and a fresh signature per attempt.
