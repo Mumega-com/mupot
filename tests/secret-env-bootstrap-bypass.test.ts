@@ -212,3 +212,48 @@ describe('bindSecretEnv closes the TTL-boundary race at the write', () => {
     expect(oldReq.status).toBe('pending')
   })
 })
+
+describe('bindSecretEnv commit guards, each isolated', () => {
+  const okFetch = (during: () => void) => (async () => {
+    during()
+    return new Response(JSON.stringify({ success: true }), { status: 200 })
+  }) as unknown as typeof fetch
+  const state = (name: string) => harness.sqlite.prepare(
+    `SELECT b.status AS b, r.status AS r FROM secret_env_bindings b JOIN secret_env_requests r ON r.id = b.request_id WHERE b.binding_name = ?`,
+  ).get(name) as { b: string; r: string }
+
+  it('request expires during the CF round-trip (name NOT re-taken): nothing flips', async () => {
+    const first = await requestSecretEnv(env, { keys: [{ name: 'EXP_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-a' })
+    if (!first.ok) throw new Error('setup')
+    const res = await bindSecretEnv(env, {
+      requestId: first.request.id, values: { EXP_KEY: 'v' }, actorId: 'admin-1',
+      fetchImpl: okFetch(() => {
+        const expired = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 1_000).toISOString()
+        harness.sqlite.exec(`UPDATE secret_env_requests SET created_at = '${expired}'`)
+      }),
+    })
+    expect(res).toEqual({ ok: false, error: 'request_state_changed' })
+    expect(state('EXP_KEY')).toEqual({ b: 'pending', r: 'pending' })
+  })
+
+  it('binding re-taken during the round-trip while the request row is still fresh: nothing flips', async () => {
+    const first = await requestSecretEnv(env, { keys: [{ name: 'TAKE_KEY', purpose: 'p' }], reason: 'r', adapterHint: null, requestedBy: 'req-a' })
+    if (!first.ok) throw new Error('setup')
+    const res = await bindSecretEnv(env, {
+      requestId: first.request.id, values: { TAKE_KEY: 'v' }, actorId: 'admin-1',
+      fetchImpl: okFetch(() => {
+        // only the binding row ages out and is re-owned by another request
+        const expired = new Date(Date.now() - PENDING_REQUEST_TTL_MS - 1_000).toISOString()
+        harness.sqlite.exec(`UPDATE secret_env_bindings SET created_at = '${expired}' WHERE binding_name = 'TAKE_KEY'`)
+        harness.sqlite.exec(
+          `UPDATE secret_env_bindings SET request_id = 'other-req', requested_by = 'req-b', created_at = '${new Date().toISOString()}' WHERE binding_name = 'TAKE_KEY'`,
+        )
+      }),
+    })
+    expect(res).toEqual({ ok: false, error: 'request_state_changed' })
+    const b = harness.sqlite.prepare(`SELECT status, request_id FROM secret_env_bindings WHERE binding_name = 'TAKE_KEY'`).get() as { status: string; request_id: string }
+    expect(b).toEqual({ status: 'pending', request_id: 'other-req' })
+    const r = harness.sqlite.prepare(`SELECT status FROM secret_env_requests WHERE id = ?`).get(first.request.id) as { status: string }
+    expect(r.status).toBe('pending')
+  })
+})
