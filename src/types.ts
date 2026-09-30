@@ -333,6 +333,11 @@ export interface Env {
   // Explicit `action` never reads this. Secret via `wrangler secret put` if
   // a deployment wants the free-text path; this pilot does not deploy it.
   TYPESAFE_API_KEY?: string
+  // Decision port (src/decisions). Absent/unknown DECISION_ADAPTER => 'human' (defer to a
+  // human; no model call). DECISION_GATEWAY_ID optionally routes the Workers AI adapter
+  // through a Cloudflare AI Gateway.
+  DECISION_ADAPTER?: string
+  DECISION_GATEWAY_ID?: string
 }
 
 // ── Org domain (mirrors migrations/0001_init.sql + 0009_work_unit.sql) ──
