@@ -509,10 +509,47 @@ describe('elevation dashboard screens — integration through dashboardApp (real
 
   type Control = { tag: string; attrs: Record<string, string>; index: number }
 
+  // Attribute scanner without regexes: name, name="value" pairs separated by spaces.
   function parseAttrs(src: string): Record<string, string> {
     const attrs: Record<string, string> = {}
-    for (const m of src.matchAll(/([a-zA-Z_:][\w:.-]*)(?:="([^"]*)")?/g)) attrs[m[1]] = m[2] ?? ''
+    let i = 0
+    while (i < src.length) {
+      while (i < src.length && (src[i] === ' ' || src[i] === '\n' || src[i] === '\t' || src[i] === '/')) i++
+      let j = i
+      while (j < src.length && src[j] !== '=' && src[j] !== ' ' && src[j] !== '\n' && src[j] !== '\t') j++
+      const name = src.slice(i, j)
+      if (!name) break
+      if (src[j] === '=' && src[j + 1] === '"') {
+        const close = src.indexOf('"', j + 2)
+        attrs[name] = src.slice(j + 2, close)
+        i = close + 1
+      } else {
+        attrs[name] = ''
+        i = j
+      }
+    }
     return attrs
+  }
+
+  // Scan for '<' ... '>' tags and keep only input/select/textarea.
+  function scanControls(page: string): Control[] {
+    const controls: Control[] = []
+    let from = 0
+    for (;;) {
+      const lt = page.indexOf('<', from)
+      if (lt === -1) break
+      const gt = page.indexOf('>', lt)
+      if (gt === -1) break
+      const inner = page.slice(lt + 1, gt)
+      const spaces = [' ', '\n', '\t'].map((c) => inner.indexOf(c)).filter((n) => n !== -1)
+      const space = spaces.length ? Math.min(...spaces) : -1
+      const tag = (space === -1 ? inner : inner.slice(0, space)).toLowerCase()
+      if (tag === 'input' || tag === 'select' || tag === 'textarea') {
+        controls.push({ tag, attrs: parseAttrs(space === -1 ? '' : inner.slice(space + 1)), index: lt })
+      }
+      from = gt + 1
+    }
+    return controls
   }
 
   // Minimal HTML association rules (no DOM lib in this repo): a control belongs
@@ -521,11 +558,7 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     const formStart = page.indexOf('<form id="decide-form"')
     const formEnd = page.indexOf('</form>', formStart)
     expect(formStart).toBeGreaterThan(-1)
-    const controls: Control[] = []
-    for (const m of page.matchAll(/<(input|select|textarea)\b([^>]*)>/g)) {
-      controls.push({ tag: m[1], attrs: parseAttrs(m[2]), index: m.index ?? 0 })
-    }
-    const named = controls.filter((c) => 'name' in c.attrs)
+    const named = scanControls(page).filter((c) => 'name' in c.attrs)
     const belongs = (c: Control) =>
       (c.index > formStart && c.index < formEnd && (c.attrs.form ?? 'decide-form') === 'decide-form') ||
       c.attrs.form === 'decide-form'
@@ -554,7 +587,9 @@ describe('elevation dashboard screens — integration through dashboardApp (real
   it('running the real decideScript with every action ticked POSTs all actions, the duration and the note', async () => {
     const { page, request } = await renderApproval(['action:dispatch', 'action:manage_access'])
     const { named, belongs } = decisionControls(page)
-    const script = /<script>([\s\S]*?)<\/script>/.exec(page.slice(page.indexOf('<form id="decide-form"')))?.[1]
+    const afterForm = page.slice(page.indexOf('<form id="decide-form"'))
+    const scriptOpen = afterForm.indexOf('<script>')
+    const script = scriptOpen === -1 ? undefined : afterForm.slice(scriptOpen + '<script>'.length, afterForm.indexOf('</script>', scriptOpen))
     expect(script).toBeTruthy()
 
     // FormData(form) stand-in: only controls associated with the form, checkboxes only when checked.
