@@ -1,0 +1,46 @@
+{
+ "initialize:none": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mupot-digid\",\"version\":\"<version>\"},\"instructions\":\"<instructions>\"}}"
+ },
+ "initialize:2025-06-18": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mupot-digid\",\"version\":\"<version>\"},\"instructions\":\"<instructions>\"}}"
+ },
+ "initialize:2024-11-05": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mupot-digid\",\"version\":\"<version>\"},\"instructions\":\"<instructions>\"}}"
+ },
+ "initialize:garbage": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mupot-digid\",\"version\":\"<version>\"},\"instructions\":\"<instructions>\"}}"
+ },
+ "tools/call:status": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"ok\\\":true,\\\"tool\\\":\\\"status\\\",\\\"result\\\":{\\\"member_id\\\":\\\"member-1\\\",\\\"email\\\":null,\\\"channel\\\":\\\"workspace\\\",\\\"tenant\\\":\\\"digid\\\",\\\"role\\\":\\\"member\\\",\\\"bound_agent_id\\\":null,\\\"seat_name\\\":null,\\\"seats\\\":[],\\\"active_seat\\\":null,\\\"seat_roster\\\":[],\\\"capabilities\\\":[{\\\"member_id\\\":\\\"member-1\\\",\\\"scope_type\\\":\\\"org\\\",\\\"scope_id\\\":null,\\\"capability\\\":\\\"admin\\\"}]}}\"}],\"structuredContent\":{\"member_id\":\"member-1\",\"email\":null,\"channel\":\"workspace\",\"tenant\":\"digid\",\"role\":\"member\",\"bound_agent_id\":null,\"seat_name\":null,\"seats\":[],\"active_seat\":null,\"seat_roster\":[],\"capabilities\":[{\"member_id\":\"member-1\",\"scope_type\":\"org\",\"scope_id\":null,\"capability\":\"admin\"}]}}}"
+ },
+ "method_not_found": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method_not_found\",\"data\":\"nope/nothing\"}}"
+ },
+ "initialize:2026-07-28": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mupot-digid\",\"version\":\"<version>\"},\"instructions\":\"<instructions>\"}}"
+ },
+ "server/discover": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method_not_found\",\"data\":\"server/discover\"}}"
+ },
+ "events/list": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method_not_found\",\"data\":\"events/list\"}}"
+ },
+ "events/subscribe": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method_not_found\",\"data\":\"events/subscribe\"}}"
+ },
+ "events/unsubscribe": {
+  "status": 200,
+  "text": "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method_not_found\",\"data\":\"events/unsubscribe\"}}"
+ }
+}

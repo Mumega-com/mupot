@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { Env, BusEvent, BusEventType } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
+import { isInternalOnlyEventType } from '../bus/internal-events'
 
 export const sosApp = new Hono<{ Bindings: Env }>()
 
@@ -47,6 +48,11 @@ sosApp.post('/publish', async (c) => {
     return c.json({ error: 'invalid_payload', detail: 'type string is required' }, 400)
   }
 
+  // mupot#1618: this route forwards a caller-chosen type; internal-only job types are refused.
+  if (isInternalOnlyEventType(body.type)) {
+    return c.json({ error: 'invalid_type', detail: 'internal-only event type' }, 400)
+  }
+
   if (!c.env.BUS) {
     return c.json({ error: 'bus_unavailable', detail: 'BUS queue binding is missing' }, 500)
   }
@@ -84,6 +90,10 @@ sosApp.post('/bridge', async (c) => {
 
   if (!body.event || !body.event.type) {
     return c.json({ error: 'invalid_payload', detail: 'event with type is required' }, 400)
+  }
+
+  if (isInternalOnlyEventType(body.event.type)) {
+    return c.json({ error: 'invalid_type', detail: 'internal-only event type' }, 400)
   }
 
   if (!c.env.BUS) {
