@@ -6396,10 +6396,10 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
   if (method === 'initialize') {
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
-    if (negotiateProtocolVersion(body.params) === EVENTS_PROTOCOL_VERSION) {
+    if (negotiateProtocolVersion(body.params, isEventsEnabled(c.env)) === EVENTS_PROTOCOL_VERSION) {
       return rpcResult(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
-        capabilities: eventsProtocolCapabilities(isEventsEnabled(c.env)),
+        capabilities: eventsProtocolCapabilities(),
         serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
         instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
       })
@@ -6446,9 +6446,10 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     )
   }
 
-  // Bearerless like initialize: discloses only protocol versions + capability names.
-  if (method === 'server/discover') {
-    return rpcResult(id, serverDiscoverResult(isEventsEnabled(c.env)))
+  // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
+  // (default) falls through to method_not_found, exactly as on main.
+  if (method === 'server/discover' && isEventsEnabled(c.env)) {
+    return rpcResult(id, serverDiscoverResult())
   }
 
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
@@ -6467,8 +6468,13 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
       }
       const catalogue = eventCatalogue({
         bound: auth.boundAgentId != null,
-        // The same floor invokeTool enforces for needs_you_list (min: 'observer').
-        canReadNeedsYou: hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, 'observer'),
+        // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
+        // request time; unknown tool => not advertised).
+        mayCallTool: (toolName) => {
+          const spec = TOOL_BY_NAME.get(toolName)
+          if (!spec) return false
+          return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
+        },
       })
       return rpcResult(id, { events: catalogue })
     }

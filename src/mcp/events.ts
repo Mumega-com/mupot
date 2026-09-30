@@ -7,10 +7,10 @@
 //
 // Spec: https://developers.openai.com/plugins/build/mcp-events
 //
-// Everything is behind EVENTS_ENABLED (default OFF). With the flag off, `server/discover`
-// does not advertise `events` and every events/* method is method-not-found, so shipping this
-// changes nothing observable for the prod surface except the (additive) `server/discover`
-// method and 2026-07-28 negotiation for a client that explicitly asks for it.
+// EVERYTHING here is behind EVENTS_ENABLED (default OFF): version negotiation, `server/discover`,
+// and events/*. With the flag off, every request (including `initialize` asking for exactly
+// 2026-07-28, and `server/discover`) is byte-identical to origin/main, so merging changes
+// nothing for the live ChatGPT connector.
 
 import type { Env } from '../types'
 
@@ -33,29 +33,30 @@ export function isEventsEnabled(env: Pick<Env, 'EVENTS_ENABLED'>): boolean {
 }
 
 /**
- * Version negotiation. ONLY an exact request for 2026-07-28 gets 2026-07-28; anything else
- * (absent, non-string, unknown, 2025-06-18, older) gets the legacy version — the default is
- * deliberately NOT switched, so no existing client can be moved by this change.
+ * Version negotiation. Flag OFF: always the legacy version (the pre-change behaviour, whatever the
+ * client asked). Flag ON: ONLY an exact, case- and whitespace-sensitive request for 2026-07-28 gets
+ * 2026-07-28; anything else (absent, non-string, unknown, ' 2026-07-28', older) keeps the legacy
+ * version, so no existing client can be moved by this change.
  */
-export function negotiateProtocolVersion(params: unknown): string {
-  if (typeof params === 'object' && params !== null && !Array.isArray(params)) {
+export function negotiateProtocolVersion(params: unknown, enabled: boolean): string {
+  if (enabled && typeof params === 'object' && params !== null && !Array.isArray(params)) {
     const requested = (params as Record<string, unknown>).protocolVersion
     if (requested === EVENTS_PROTOCOL_VERSION) return EVENTS_PROTOCOL_VERSION
   }
   return LEGACY_PROTOCOL_VERSION
 }
 
-/** Capabilities for a NEW-protocol response. `events` only when the flag is on. */
-export function eventsProtocolCapabilities(enabled: boolean): Record<string, unknown> {
-  return enabled ? { tools: {}, events: {} } : { tools: {} }
+/** Capabilities for a 2026-07-28 response. Only ever called with the flag on. */
+export function eventsProtocolCapabilities(): Record<string, unknown> {
+  return { tools: {}, events: {} }
 }
 
-/** `server/discover` result (spec: resultType, supportedVersions, capabilities). */
-export function serverDiscoverResult(enabled: boolean): Record<string, unknown> {
+/** `server/discover` result (spec: resultType, supportedVersions, capabilities). Flag-on only. */
+export function serverDiscoverResult(): Record<string, unknown> {
   return {
     resultType: 'complete',
     supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-    capabilities: eventsProtocolCapabilities(enabled),
+    capabilities: eventsProtocolCapabilities(),
   }
 }
 
@@ -126,36 +127,24 @@ export function readAfterSeq(seq: number): number {
   return Math.max(0, seq - 1)
 }
 
-const NEEDS_YOU_CREATED: EventDefinition = {
-  name: 'needs_you.created',
-  description:
-    'A new item appeared in the needs-you (attention) queue visible to the authenticated principal. There are ' +
-    'no filter arguments; visibility follows the principal\'s existing access. The payload is a body-free ' +
-    'summary: read the item with the needs_you_list tool.',
-  delivery: ['webhook'],
-  inputSchema: noArgs(),
-  payloadSchema: {
-    type: 'object',
-    properties: {
-      item_id: { type: 'string', description: 'Needs-you item id.' },
-      project_id: { type: 'string', description: 'Owning project id, when the item belongs to one.' },
-      kind: { type: 'string', description: 'Item kind.' },
-    },
-    required: ['item_id', 'kind'],
-    additionalProperties: false,
-  },
-}
+/**
+ * v1 advertises ONLY message.created (the #1618 contract). To add an event later: add an entry here
+ * naming the tool a subscriber reads it with; the catalogue then lists it only for a principal who
+ * passes that tool's own floor.
+ */
+const CATALOGUE: readonly { def: EventDefinition; readTool: string }[] = [
+  { def: MESSAGE_CREATED, readTool: 'inbox' },
+]
 
 /**
- * The v1 catalogue for a principal.
+ * The catalogue for a principal.
  *  - `bound`: the session is bound to an agent (auth.boundAgentId). An unbound / zero-capability
  *    directory session has no inbox and gets an EMPTY catalogue (not a filtered full one).
- *  - `canReadNeedsYou`: the principal could already call needs_you_list (its floor). The catalogue
- *    never advertises an event whose read tool the principal could not call.
+ *  - `mayCallTool`: whether the principal passes the named read tool's OWN floor. The caller (index.ts)
+ *    derives it from the live tool registry entry, so the catalogue can never advertise an event whose
+ *    read tool the principal could not call, and cannot drift from the tool's declared minimum.
  */
-export function eventCatalogue(opts: { bound: boolean; canReadNeedsYou: boolean }): EventDefinition[] {
+export function eventCatalogue(opts: { bound: boolean; mayCallTool: (toolName: string) => boolean }): EventDefinition[] {
   if (!opts.bound) return []
-  const out: EventDefinition[] = [structuredClone(MESSAGE_CREATED)]
-  if (opts.canReadNeedsYou) out.push(structuredClone(NEEDS_YOU_CREATED))
-  return out
+  return CATALOGUE.filter((e) => opts.mayCallTool(e.readTool)).map((e) => structuredClone(e.def))
 }
