@@ -45,6 +45,7 @@ that release closes. See the
 [production runbook](./docs/production-runbook.md),
 [DME integration runbook](./docs/dme-integration-runbook.md),
 [DME integration release receipt](./docs/releases/dme-integration.md),
+[what mupot is today (code-cited status table)](./docs/architecture/mupot-today.md),
 [what running an agent on Mupot means](./docs/agent-running-on-mupot.md),
 [how to connect an MCP client](./docs/connect-mcp-client.md),
 [how to host a seat on your own machine](./docs/host-a-seat.md),
