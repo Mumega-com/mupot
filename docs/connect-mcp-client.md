@@ -141,7 +141,8 @@ discovery is split into two specs (mupot#1596):
   out for free. A tool at member-tier-or-below that a Custom GPT config
   already calls is unaffected; a new tool is private by default until someone
   adds its name to the allowlist.
-- **`GET /openapi.full.json`** — the full tool registry (all 144), gated the
+- **`GET /openapi.full.json`** — the full tool registry (all of it: 146 tools when counted on
+  `main`, and the count moves as tools land), gated the
   same way any other admin-tier read in this codebase is: `authenticateMember`
   + `hasWorkspaceAdmin` (org-admin bearer required). For internal tooling that
   legitimately needs the whole surface, not for a public Custom GPT config.

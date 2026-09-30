@@ -29,7 +29,7 @@ signed-in human holds elsewhere (`src/mcp/oauth-authorize.ts:1187-1199`). The
 session is therefore mostly mute; this is the designed floor, not a broken
 install. The `initialize` response says so to the client itself
 (`MUPOT_MCP_INITIALIZE_INSTRUCTIONS`, `src/mcp/instructions.ts:14`, returned at
-`src/mcp/index.ts:6392`).
+`src/mcp/index.ts:6448, 6455`).
 
 Requesting a squad grant for the human does not change this. The directory door
 discards standing grants by construction; the refusal text in `connect` says the
@@ -45,9 +45,9 @@ they are the *consenting human's* grants, not the agent's
 
 Three tools read them through `claimGrants = auth.latentCapabilities ?? grants`:
 
-- `fleet_agent_get` (`src/mcp/index.ts:5432`)
-- `orient` (`:5821`)
-- `connect` (`:5931`)
+- `fleet_agent_get` (`src/mcp/index.ts:5447`)
+- `orient` (`:5838`)
+- `connect` (`:5949`)
 
 I found no other reader of `latentCapabilities` in `src/mcp/index.ts`; a full
 repo-wide audit was not done (**not verified** outside that file).
@@ -127,7 +127,7 @@ A different agent needs a different consent (reconnect and choose again).
 A bound session's capabilities are computed by
 `resolveConsentedAgentCapabilities` (`:344-410`) on every request, both in
 `buildAuthContextFromPropsInner` and again on the internal-header hop
-(`src/mcp/index.ts:307-335`):
+(`src/mcp/index.ts:318-346`):
 
 - Agent must be `active` and have a binding, else `[]` (`:358-369`).
 - The consenting human must be an `active` member and still hold `admin` on the
@@ -138,7 +138,7 @@ A bound session's capabilities are computed by
   Ranks: observer 1, member 2, lead 3, admin 4, owner 5
   (`src/auth/capability.ts:188-194`).
 - If the result is empty, `bound_agent_id` is also nulled so the session cannot
-  keep draining the agent's inbox (`:1213-1214`; `src/mcp/index.ts:330`).
+  keep draining the agent's inbox (`:1213-1214`; `src/mcp/index.ts:341`).
 
 Deactivating the agent revokes the token too, via the existing
 `member_tokens.agent_id` sweep (`:171-175`).
@@ -156,18 +156,18 @@ Deactivating the agent revokes the token too, via the existing
 
 `connect { agent_name }` names an agent for the *current session*. For a
 consent-less (unbound) directory seat it authorizes against `latentCapabilities`
-(`src/mcp/index.ts:5931`) and returns `binding: 'session_local'` or
-`'durable'` (`:6049`). It tries to persist with
+(`src/mcp/index.ts:5949`) and returns `binding: 'session_local'` or
+`'durable'` (`:6067`). It tries to persist with
 `UPDATE member_tokens SET agent_id = ? WHERE id = ? AND agent_id IS NULL`
-(`:6032-6035`); when the migration-0071 trigger refuses (the token belongs to a
+(`:6050-6053`); when the migration-0071 trigger refuses (the token belongs to a
 human member, not the agent's own), the claim stays `session_local`
-(`:6038-6045`). It does not give the session the agent's capabilities. Bind at
+(`:6056-6063`). It does not give the session the agent's capabilities. Bind at
 consent (§5).
 
 ## 7. Verify what you actually got
 
 Call `boot_context` (no arguments). It returns `member_id`, `channel`,
-`capabilities`, and `bound_agent_id` (`src/mcp/index.ts:5751-5760`).
+`capabilities`, and `bound_agent_id` (`src/mcp/index.ts:5769-5777`).
 
 | You see | Meaning |
 |---|---|
@@ -189,7 +189,7 @@ Served by the OAuth provider wrapper, not by routes in this repo
 | Refresh | via `/token`; refresh TTL 30 days, access TTL 1 hour | `src/index.ts:258, 289-290` |
 | Scopes | `mcp:read`, `mcp:write` | `src/index.ts:286` |
 | Client ID Metadata Documents (CIMD) | Not configured in this repo; no reference to it under `src/`. Whether the pinned library (`@cloudflare/workers-oauth-provider ^0.4.0`, `package.json:74`) supports it: **not verified**. | grep of `src/`, `docs/`, `tests/` |
-| MCP `protocolVersion` | `'2025-06-18'` | `src/mcp/index.ts:6389` |
+| MCP `protocolVersion` | `'2025-06-18'` for every client, unless `EVENTS_ENABLED` is on and the client explicitly asks for `2026-07-28` (see §10) | `src/mcp/index.ts:6440-6457`; `src/mcp/events.ts:41-47` |
 
 `/mcp` is the only OAuth-protected route (`apiRoute: ['/mcp']`,
 `src/index.ts:269`).
@@ -206,3 +206,15 @@ Served by the OAuth provider wrapper, not by routes in this repo
 | `403 not_agent_bound` on `send`/`inbox` | Token is not agent-bound | Bind an agent at consent, or use an agent-bound token ([`host-a-seat.md`](./host-a-seat.md)) |
 | Provisioning tools return `operator_principal_required` | Session is bound to an agent (§3) | Use an unbound connection for administration |
 | Client complains about GET / SSE | `/mcp` is POST JSON-RPC | See [`connect-mcp-client.md`](./connect-mcp-client.md) |
+
+## 10. What else has landed on this door since this page was first written
+
+Each row is a fact about `main`'s code. None says anything about production
+unless it says so.
+
+| Item | What it is | Source |
+|---|---|---|
+| Curated read-only door | `POST /mcp/profile/needs-you` uses the same OAuth and the same per-tool authorization as `/mcp`, but `tools/list` returns only an allowlist (and only to an authenticated caller) and `tools/call` of anything else is refused `tool_not_in_profile` before the tool runs. Details: [`connect-chatgpt-needs-you-profile.md`](./connect-chatgpt-needs-you-profile.md). | `src/mcp/index.ts:6464-6471, 6485-6487`; `src/mcp/profile-needs-you.ts`; #1624 |
+| MCP Events (protocol 2026-07-28) | Server-to-client notification of inbox messages by signed webhook. **Default off**: it is enabled only when `EVENTS_ENABLED` is exactly `"true"`, and every callback URL is refused until `EVENTS_CALLBACK_HOSTS` names its host. With the flag off, `initialize` still answers `2025-06-18` and `events/*` and `server/discover` are `method_not_found`. The release operator reports it off in production; I could not confirm that from outside (**not verified**). **A real ChatGPT client completing the subscribe, verify, deliver loop has not been exercised** (**not proven**); see [`architecture/mcp-events.md`](./architecture/mcp-events.md) and open issues #1635 #1636. | `src/mcp/events.ts:30-33`; `src/mcp/index.ts:6438, 6440-6457, 6520`; `src/types.ts:325, 329`; #1629, #1633 |
+| Squad access for an agent | The consent rule in §2 needs the human to administer the agent's squad. An org admin can set an agent's squad access level from the agent page; the change is written with an append-only receipt. | `POST /agents/:id/access`, `src/dashboard/index.ts:1988`; `src/dashboard/agent-access-panel.ts`; `migrations/0187_agent_access_receipts.sql`; #1626 |
+| `tools/list` is still unfiltered | A JSON-RPC `tools/list` on `POST /mcp` returns the whole registry (146 tools, measured on `main`) to any valid token, including a bound directory seat with few grants. Open issue #1609. | `src/mcp/index.ts:6472` |
