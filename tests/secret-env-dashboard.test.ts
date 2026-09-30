@@ -231,7 +231,7 @@ describe('GET /approvals — secret-env section', () => {
     harness.sqlite.exec(`INSERT INTO members (id, email, display_name) VALUES ('mem-req-9', 'asker@example.test', 'Asker')`)
     const created = await requestSecretEnv(env, {
       keys: validKeys, reason: 'Need Notion access', adapterHint: null,
-      requestedBy: 'mem-req-9', requestedChannel: 'directory',
+      requestedBy: 'mem-req-9', requestedChannel: 'chan-probe-7',
     })
     if (!created.ok) throw new Error('setup: requestSecretEnv failed')
 
@@ -239,7 +239,7 @@ describe('GET /approvals — secret-env section', () => {
     const body = await res.text()
     expect(body).toContain('mem-req-9')
     expect(body).toContain('asker@example.test')
-    expect(body).toContain('directory')
+    expect(body).toContain('chan-probe-7')
   })
 
   it('non-admin never sees the secret-env section, even though a request is pending', async () => {
