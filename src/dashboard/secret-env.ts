@@ -44,6 +44,18 @@ export function secretEnvApprovalsSection(requests: PublicSecretEnvRequest[]) {
     ${raw(`<div id="secret-env-list">${cards}</div>`)}`
 }
 
+/** Who asked, fully escaped. For an agent requester: `agent X (owner: email / name)`. */
+function requesterLine(r: PublicSecretEnvRequest): string {
+  const via = `via ${esc(r.requester_channel ?? 'unknown channel')}`
+  if (r.requester_agent_name) {
+    const owners = (r.requester_owners ?? [])
+      .map((o) => `${esc(o.email ?? 'no email on file')} (${esc(o.display_name)}, <code>${esc(o.member_id)}</code>)`)
+      .join('; ')
+    return `Requested by agent <code>${esc(r.requester_agent_name)}</code> (owner: ${owners || 'unknown'}) · member <code>${esc(r.requested_by)}</code> · ${via}`
+  }
+  return `Requested by <code>${esc(r.requested_by)}</code> · ${esc(r.requester_email ?? 'no email on file')} · ${via}`
+}
+
 function secretEnvRequestCardHtml(r: PublicSecretEnvRequest): string {
   const keyInputs = r.keys
     .map((k) => (
@@ -62,7 +74,7 @@ function secretEnvRequestCardHtml(r: PublicSecretEnvRequest): string {
       <div class="appr-head">
         <div>
           <div class="appr-title">${adapterLabel}</div>
-          <div class="appr-meta">${esc(r.requested_by)} · ${when}</div>
+          <div class="appr-meta">${requesterLine(r)} · ${when}</div>
         </div>
       </div>
       <div class="appr-body">${esc(r.reason)}</div>

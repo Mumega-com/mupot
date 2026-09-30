@@ -3348,9 +3348,83 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0187_agent_access_receipts.sql",
+    sha256: "3bbfb1e509804c602d82db13eac62174b6f7dab574b63f2d149684c3453b9938",
+    statements: [
+      "-- 0187_agent_access_receipts.sql -- audit trail for the dashboard \"Access\" panel\n-- (POST /agents/:id/access): which human changed which agent's access level on\n-- which squad, from what, to what, and why.\n--\n-- WHY A RECEIPT TABLE: an agent's squad access is two rows (memberships +\n-- capabilities) written through setAgentSquadAccess / removeAgentSquadAccess in\n-- src/members/agent-access.ts. Neither records WHO asked or from WHAT prior level.\n-- The panel writes one receipt row in the SAME D1 batch as those two rows, and the\n-- receipt INSERT carries the authority guard, so a receipt exists if and only if\n-- the access rows changed (D1 rolls a batch back on a thrown error only, so the\n-- guard turns \"not authorized / stale\" into a NOT NULL violation on id).\n--\n-- CREATE-only on purpose: D1 runs one migration file as one transaction and a\n-- foreign key with ON DELETE RESTRICT is never deferred, so no parent table is\n-- touched here.\n--\n-- Append-only, in the style of oauth_consent_receipts (0091) and agent_audit (0086):\n-- no UPDATE and no DELETE, ever.\n\nCREATE TABLE IF NOT EXISTS agent_access_receipts (\n  id                TEXT PRIMARY KEY NOT NULL,\n  actor_member_id   TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,  -- the HUMAN who acted\n  agent_id          TEXT NOT NULL REFERENCES agents(id)  ON DELETE RESTRICT,\n  squad_id          TEXT NOT NULL REFERENCES squads(id)  ON DELETE RESTRICT,\n  prior_capability  TEXT CHECK (prior_capability IN ('observer','member','lead','admin')),  -- the capabilities row before, NULL = none\n  prior_membership  TEXT CHECK (prior_membership IN ('observer','member','lead','admin')),  -- the memberships row before, NULL = none\n  new_capability    TEXT CHECK (new_capability   IN ('observer','member','lead','admin')),\n  action            TEXT NOT NULL CHECK (action IN ('enroll','change','revoke')),\n  reason            TEXT CHECK (reason IS NULL OR length(reason) <= 500),\n  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  -- The action label must agree with the capability columns. The two tables can differ\n  -- (or hold only one row), so a receipt records BOTH priors: a change to either row is\n  -- never hidden behind the other. A 'change' must move at least one row to the new level.\n  CHECK (\n    (action = 'enroll' AND prior_capability IS NULL AND prior_membership IS NULL\n        AND new_capability IS NOT NULL)\n    OR (action = 'change' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)\n        AND new_capability IS NOT NULL\n        AND (prior_capability IS NOT new_capability OR prior_membership IS NOT new_capability))\n    OR (action = 'revoke' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)\n        AND new_capability IS NULL)\n  )\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_agent\n  ON agent_access_receipts(agent_id, created_at DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_squad\n  ON agent_access_receipts(squad_id, created_at DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_actor\n  ON agent_access_receipts(actor_member_id, created_at DESC);",
+      "\n\nCREATE TRIGGER agent_access_receipts_no_update\nBEFORE UPDATE ON agent_access_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'agent_access_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER agent_access_receipts_no_delete\nBEFORE DELETE ON agent_access_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'agent_access_receipts is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_access_receipts" },
+      { type: "index", name: "idx_agent_access_receipts_agent" },
+      { type: "index", name: "idx_agent_access_receipts_squad" },
+      { type: "index", name: "idx_agent_access_receipts_actor" },
+      { type: "trigger", name: "agent_access_receipts_no_update" },
+      { type: "trigger", name: "agent_access_receipts_no_delete" },
+    ],
+  },
+  {
+    file: "0188_mcp_event_subscriptions.sql",
+    sha256: "0a300055b1cdf0806083cafbb199bf609e9f22a254f405a314d0401ce1752072",
+    statements: [
+      "-- 0188_mcp_event_subscriptions.sql — MCP Events (protocol 2026-07-28) subscriptions + delivery\n-- receipts (mupot#1618, PR 2).\n--\n-- CREATE-only: no existing table is altered, rebuilt, or dropped (D1 runs a migration file as one\n-- transaction; FK RESTRICT is never deferred, so a parent-table rebuild is never safe). Numbering:\n-- 0186 = open PR #1622, 0187 = open PR #1626, 0188 is reserved for this PR.\n--\n-- event_subscriptions\n--   One row per (principal agent, callback URL, event name, canonical arguments): `id` is derived\n--   deterministically from exactly those four inputs in application code, so re-subscribing is an\n--   idempotent refresh (INSERT ... ON CONFLICT(id) DO UPDATE) and two concurrent identical\n--   subscribes yield ONE row.\n--   The `whsec_` signing secret is stored ONLY as an AES-GCM ciphertext (the connector-vault\n--   mechanism, src/connectors/crypto.ts) — a hash cannot sign an outgoing webhook. Nothing in\n--   this schema holds a plaintext secret. `secret_fingerprint` is the first 8 hex characters of\n--   sha256(secret): a non-secret label used to detect a rotation and to scope the callback\n--   verification cache. `prev_secret_ciphertext` keeps the previous secret for a bounded rotation\n--   window so deliveries can be signed with old AND new (space-separated signatures).\n--   `token_id` is the member_tokens row that created/refreshed the subscription: delivery stops\n--   when that credential (or the agent, or the member) is no longer live. `consented_by_member_id`\n--   is the consenting human of a directory-channel (OAuth consent-bound) session, or NULL: the\n--   delivery-time access re-check needs it to re-derive that session's clamped capabilities.\n--\n-- event_delivery_receipts\n--   One row per delivery ATTEMPT outcome. Metadata only: never the request body, never a secret,\n--   never response bytes. Append-only (no-UPDATE / no-DELETE triggers, same shape as\n--   oauth_consent_receipts, 0091).\n\nCREATE TABLE IF NOT EXISTS event_subscriptions (\n  id                     TEXT PRIMARY KEY,\n  tenant                 TEXT NOT NULL,\n  agent_id               TEXT NOT NULL,\n  member_id              TEXT NOT NULL,\n  token_id               TEXT NOT NULL,\n  consented_by_member_id TEXT,\n  event_name             TEXT NOT NULL,\n  arguments_json         TEXT NOT NULL DEFAULT '{}',\n  callback_url           TEXT NOT NULL,\n  secret_ciphertext      TEXT NOT NULL,\n  secret_fingerprint     TEXT NOT NULL CHECK (length(secret_fingerprint) = 8),\n  prev_secret_ciphertext TEXT,\n  prev_secret_expires_at TEXT,\n  status                 TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked','expired')),\n  refresh_before         TEXT NOT NULL,\n  verified_at            TEXT,\n  created_at             TEXT NOT NULL,\n  last_refreshed_at      TEXT NOT NULL,\n  revoked_at             TEXT,\n  revoke_reason          TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_event_subscriptions_delivery\n  ON event_subscriptions(tenant, agent_id, event_name, status);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_subscriptions_callback\n  ON event_subscriptions(agent_id, callback_url);",
+      "\n\nCREATE TABLE IF NOT EXISTS event_delivery_receipts (\n  id              TEXT PRIMARY KEY,\n  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE RESTRICT,\n  event_id        TEXT NOT NULL,\n  attempt         INTEGER NOT NULL CHECK (attempt >= 1),\n  outcome         TEXT NOT NULL CHECK (outcome IN ('delivered','retry','failed','gone','refused')),\n  http_status     INTEGER,\n  error_class     TEXT,\n  signed_at       TEXT,\n  created_at      TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_sub\n  ON event_delivery_receipts(subscription_id, created_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_event\n  ON event_delivery_receipts(subscription_id, event_id);",
+      "\n\n-- event_verification_attempts: one row per callback-verification attempt an agent STARTS (whether\n-- it later succeeds or fails). The per-agent rate limit is an atomic INSERT ... SELECT ... WHERE\n-- (count in window) < limit against this table.\nCREATE TABLE IF NOT EXISTS event_verification_attempts (\n  id           TEXT PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  agent_id     TEXT NOT NULL,\n  attempted_at TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_verification_attempts_agent\n  ON event_verification_attempts(tenant, agent_id, attempted_at);",
+      "\n\nCREATE TRIGGER event_delivery_receipts_no_update\nBEFORE UPDATE ON event_delivery_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'event_delivery_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER event_delivery_receipts_no_delete\nBEFORE DELETE ON event_delivery_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'event_delivery_receipts is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "event_subscriptions" },
+      { type: "index", name: "idx_event_subscriptions_delivery" },
+      { type: "index", name: "idx_event_subscriptions_callback" },
+      { type: "table", name: "event_delivery_receipts" },
+      { type: "index", name: "idx_event_delivery_receipts_sub" },
+      { type: "index", name: "idx_event_delivery_receipts_event" },
+      { type: "table", name: "event_verification_attempts" },
+      { type: "index", name: "idx_event_verification_attempts_agent" },
+      { type: "trigger", name: "event_delivery_receipts_no_update" },
+      { type: "trigger", name: "event_delivery_receipts_no_delete" },
+    ],
+  },
+  {
+    file: "0189_decision_receipts.sql",
+    sha256: "9175c75245533180fdbdb82a119f04deef772fa3b4b60166899d76c41dbf2243",
+    statements: [
+      "-- 0189_decision_receipts.sql — receipts for the decision-model port (src/decisions).\n--\n-- WHY: a decision model (TypeSafe Jev today; any small classifier/judge later) may RANK or\n-- PROPOSE, never AUTHORIZE. Every call through decide() writes exactly one receipt, success\n-- or failure, so the proposal, the exact model version that produced it, and what it was\n-- shown (as HASHES only) are auditable. The raw input text is never stored.\n--\n-- CREATE-only: no existing table is rebuilt (D1 runs a migration file as one transaction and\n-- FK RESTRICT is never deferred; nothing here touches an existing table's rows).\n--\n-- Append-only, same no_update/no_delete trigger pair as oauth_consent_receipts (0091) and\n-- agent_audit (0086). A human's later accept/override is a SEPARATE append-only row type\n-- (decision_outcomes), never an UPDATE of the receipt. This migration adds no writer for it.\n\nCREATE TABLE IF NOT EXISTS decision_receipts (\n  id             TEXT PRIMARY KEY,\n  tenant         TEXT,\n  use_case       TEXT NOT NULL,\n  data_class     TEXT NOT NULL,\n  adapter_id     TEXT NOT NULL,\n  model          TEXT,\n  model_version  TEXT,             -- exact id the provider RETURNED, not an alias\n  criteria_hash  TEXT NOT NULL,    -- sha256 hex of canonical {criteriaVersion, questions}\n  input_hash     TEXT NOT NULL,    -- sha256 hex of canonical {useCase, dataClass, fenced state}\n  answers_json   TEXT CHECK (answers_json IS NULL OR json_valid(answers_json)),\n  threshold_json TEXT NOT NULL,\n  outcome        TEXT NOT NULL CHECK (outcome IN ('proposed', 'declined_low_confidence', 'failed', 'deferred_to_human')),\n  reason         TEXT,\n  latency_ms     INTEGER NOT NULL,\n  input_tokens   INTEGER,\n  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_decision_receipts_use_case\n  ON decision_receipts(use_case, created_at DESC);",
+      "\n\nCREATE TRIGGER decision_receipts_no_update\nBEFORE UPDATE ON decision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'decision_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER decision_receipts_no_delete\nBEFORE DELETE ON decision_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'decision_receipts is append-only: DELETE is forbidden');\nEND;",
+      "\n\nCREATE TABLE IF NOT EXISTS decision_outcomes (\n  id               TEXT PRIMARY KEY,\n  receipt_id       TEXT NOT NULL REFERENCES decision_receipts(id) ON DELETE RESTRICT,\n  actor_member_id  TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  outcome          TEXT NOT NULL CHECK (outcome IN ('accepted', 'overridden')),\n  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_decision_outcomes_receipt\n  ON decision_outcomes(receipt_id, created_at DESC);",
+      "\n\n-- Only a receipt that actually carried a proposal can be accepted or overridden.\nCREATE TRIGGER decision_outcomes_only_proposed\nBEFORE INSERT ON decision_outcomes\nWHEN COALESCE((SELECT outcome FROM decision_receipts WHERE id = NEW.receipt_id), '') <> 'proposed'\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes: receipt is not a proposed decision');\nEND;",
+      "\n\nCREATE TRIGGER decision_outcomes_no_update\nBEFORE UPDATE ON decision_outcomes\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER decision_outcomes_no_delete\nBEFORE DELETE ON decision_outcomes\nBEGIN\n  SELECT RAISE(ABORT, 'decision_outcomes is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "decision_receipts" },
+      { type: "index", name: "idx_decision_receipts_use_case" },
+      { type: "trigger", name: "decision_receipts_no_update" },
+      { type: "trigger", name: "decision_receipts_no_delete" },
+      { type: "table", name: "decision_outcomes" },
+      { type: "index", name: "idx_decision_outcomes_receipt" },
+      { type: "trigger", name: "decision_outcomes_only_proposed" },
+      { type: "trigger", name: "decision_outcomes_no_update" },
+      { type: "trigger", name: "decision_outcomes_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "21b880ece72f00b755b663c81a35f3987715c6b03598aed66a45334df9aaf8e8"
+export const SCHEMA_CHAIN_DIGEST: string = "1734ba4237e4198d110cd9ed28ef56ef9eb16e1210fcf330e9a9040d4334a505"

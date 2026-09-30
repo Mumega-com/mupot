@@ -243,6 +243,27 @@ jobs:
       - name: Guard — public /openapi.json must stay an explicit, member-tier-or-below allowlist
         run: node scripts/check-openapi-public-allowlist.mjs
 
+  mcp-profile-needs-you:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The guard uses the TypeScript compiler API (already a devDependency) to read every
+      # ToolSpec declaration in src/mcp/*.ts — needs node_modules.
+      - run: npm ci
+      # Ratchet: POST /mcp/profile/needs-you is the curated, READ-ONLY tool profile offered to
+      # ChatGPT plugin/directory review (src/mcp/profile-needs-you.ts). It must stay explicit
+      # (every name a real tool), member-tier-or-below, not write-named, annotated
+      # readOnlyHint:true / destructiveHint:false / openWorldHint:false, and the tools/call
+      # allowlist refusal + filtered tools/list must stay wired in handleJsonRpc. Hard gate,
+      # not a baseline. Self-tests FIRST — same discipline as the sibling ratchets.
+      - name: Ratchet self-tests
+        run: node --test tests/check-mcp-profile-needs-you.test.mjs
+      - name: Guard — ChatGPT needs-you MCP profile must stay read-only, annotated and allowlist-enforced
+        run: node scripts/check-mcp-profile-needs-you.mjs
+
   bare-squad-id-authz:
     runs-on: ubuntu-latest
     steps:

@@ -1,3 +1,5 @@
+import { ENV_REVIEWED_BINDING_NAMES, RESERVED_BINDING_PREFIXES } from './env-reviewed-names'
+
 const BINDING_NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/
 
 export const RESERVED_BINDING_NAMES: ReadonlySet<string> = new Set([
@@ -30,11 +32,20 @@ export const RESERVED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'POSTHOG_PERSONAL_API_KEY',
 ])
 
+/** True when the worker owns/reads this name: hand-kept denylist OR any Env-declared key OR a reserved prefix. */
+export function isReservedBindingName(name: string): boolean {
+  return (
+    RESERVED_BINDING_NAMES.has(name)
+    || ENV_REVIEWED_BINDING_NAMES.has(name)
+    || RESERVED_BINDING_PREFIXES.some((prefix) => name.startsWith(prefix))
+  )
+}
+
 export function isValidBindingName(name: string): boolean {
   if (!BINDING_NAME_RE.test(name)) {
     return false
   }
-  if (RESERVED_BINDING_NAMES.has(name)) {
+  if (isReservedBindingName(name)) {
     return false
   }
   return true
@@ -44,7 +55,7 @@ export function assertBindingName(name: string): void {
   if (!BINDING_NAME_RE.test(name)) {
     throw new Error('invalid_binding_name')
   }
-  if (RESERVED_BINDING_NAMES.has(name)) {
+  if (isReservedBindingName(name)) {
     throw new Error('reserved_binding_name')
   }
 }
