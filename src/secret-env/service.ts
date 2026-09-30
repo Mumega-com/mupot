@@ -356,16 +356,47 @@ export async function listPendingSecretEnvRequests(env: Env): Promise<PublicSecr
        FROM secret_env_requests r
        LEFT JOIN members m ON m.id = r.requested_by
       WHERE r.tenant = ?1 AND r.status = 'pending' AND r.created_at >= ?2
-      ORDER BY r.created_at ASC`,
+      ORDER BY r.created_at ASC LIMIT 100`,
   )
     .bind(env.TENANT_SLUG, expiryCutoff)
     .all<SecretEnvRequestRow & { requester_email: string | null }>()
 
-  return (rows.results ?? []).map((row) => ({
-    ...toPublicRequest(row),
-    requester_email: row.requester_email ?? null,
-    requester_channel: parseRequestSchema(row.schema_json).requestedChannel ?? null,
-  }))
+  const out: PublicSecretEnvRequest[] = []
+  for (const row of rows.results ?? []) {
+    const base: PublicSecretEnvRequest = {
+      ...toPublicRequest(row),
+      requester_email: row.requester_email ?? null,
+      requester_channel: parseRequestSchema(row.schema_json).requestedChannel ?? null,
+    }
+    // If the requester is an AGENT's dedicated member (bootstrap_self / provisioned seats),
+    // its own members row has no email: name the agent and the HUMANS behind it — the
+    // agent's owner_member_id plus any human holding owner/admin on the agent's squad
+    // (bootstrap_self's founder grant) — so the approving admin sees a person.
+    const agent = await env.DB.prepare(
+      `SELECT a.id AS id, a.name AS name, a.squad_id AS squad_id, a.owner_member_id AS owner_member_id
+         FROM agent_member_bindings b JOIN agents a ON a.id = b.agent_id
+        WHERE b.tenant = ?1 AND b.member_id = ?2 LIMIT 1`,
+    ).bind(env.TENANT_SLUG, row.requested_by)
+      .first<{ id: string; name: string; squad_id: string; owner_member_id: string | null }>()
+    if (agent) {
+      const owners = await env.DB.prepare(
+        `SELECT DISTINCT m.id AS member_id, m.email AS email, m.display_name AS display_name
+           FROM members m
+          WHERE m.id != ?3 AND (
+                m.id = ?1
+             OR m.id IN (SELECT c.member_id FROM capabilities c
+                          WHERE c.scope_type = 'squad' AND c.scope_id = ?2 AND c.capability IN ('admin', 'owner')))
+          LIMIT 5`,
+      ).bind(agent.owner_member_id, agent.squad_id, row.requested_by)
+        .all<{ member_id: string; email: string | null; display_name: string }>()
+      base.requester_agent_name = agent.name
+      base.requester_owners = (owners.results ?? []).map((o) => ({
+        member_id: o.member_id, email: o.email ?? null, display_name: o.display_name,
+      }))
+    }
+    out.push(base)
+  }
+  return out
 }
 
 // ── getSecretEnvStatus ───────────────────────────────────────────────────────
@@ -474,18 +505,37 @@ export async function bindSecretEnv(
     return { ok: false, error: cfResult.error }
   }
 
-  const now = new Date().toISOString()
+  // ── commit point ─────────────────────────────────────────────────────────
+  // What CANNOT be atomic: putScriptSecrets (Cloudflare) has already succeeded and a D1
+  // batch cannot roll a CF write back. The window between the earlier status/expiry read
+  // and this batch (the CF round-trip) is therefore closed HERE, at the write, not by
+  // the read: the request flip is guarded on status='pending' AND not expired AND the
+  // request still owning EVERY binding it read (a re-taken expired name changes
+  // request_id, so the count drops), and each binding flip is keyed by request_id +
+  // status='pending' AND only fires if that request flip actually landed in this same
+  // transaction. If the guard refuses, nothing flips and the caller sees
+  // request_state_changed; the CF secret already written under that name stays on the
+  // worker (an idempotent re-PUT by whoever legitimately owns the name next overwrites it).
+  const nowMs = Date.now()
+  const now = new Date(nowMs).toISOString()
+  const expiryCutoff = new Date(nowMs - PENDING_REQUEST_TTL_MS).toISOString()
   const boundNames: string[] = []
   const statements = [
     env.DB.prepare(
-      `UPDATE secret_env_requests SET status = 'approved', decided_by = ?1, decided_at = ?2 WHERE id = ?3 AND tenant = ?4 AND status = 'pending'`,
-    ).bind(actorId, now, requestId, env.TENANT_SLUG),
+      `UPDATE secret_env_requests SET status = 'approved', decided_by = ?1, decided_at = ?2
+        WHERE id = ?3 AND tenant = ?4 AND status = 'pending' AND created_at >= ?5
+          AND (SELECT COUNT(*) FROM secret_env_bindings
+                WHERE tenant = ?4 AND request_id = ?3 AND status = 'pending') = ?6`,
+    ).bind(actorId, now, requestId, env.TENANT_SLUG, expiryCutoff, pendingBindings.length),
   ]
   for (const binding of pendingBindings) {
     statements.push(
       env.DB.prepare(
-        `UPDATE secret_env_bindings SET status = 'bound', bound_by = ?1, bound_at = ?2 WHERE id = ?3 AND tenant = ?4`,
-      ).bind(actorId, now, binding.id, env.TENANT_SLUG),
+        `UPDATE secret_env_bindings SET status = 'bound', bound_by = ?1, bound_at = ?2
+          WHERE id = ?3 AND tenant = ?4 AND request_id = ?5 AND status = 'pending'
+            AND EXISTS (SELECT 1 FROM secret_env_requests
+                         WHERE id = ?5 AND tenant = ?4 AND status = 'approved' AND decided_by = ?1 AND decided_at = ?2)`,
+      ).bind(actorId, now, binding.id, env.TENANT_SLUG, requestId),
     )
     boundNames.push(binding.binding_name)
   }

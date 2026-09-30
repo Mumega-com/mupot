@@ -14,6 +14,9 @@ const ORIGIN = 'https://pot.test'
 function makeDb() {
   const harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
+  // the real work squad the fixture members/agents hold grants on (the gate reads squads.kind)
+  harness.sqlite.exec(`INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept-1', 'D')`)
+  harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'squad-1', 'S')`)
   return {
     env: { DB: harness.db, TENANT_SLUG: TENANT } as Env,
     count: (table: string) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n,

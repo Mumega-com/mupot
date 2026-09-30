@@ -8,7 +8,8 @@
 // stranger/agent cannot squat it and an admin approval can never overwrite it.
 //
 // RATCHET: tests/secret-env-env-names-ratchet.test.ts parses src/types.ts (TypeScript
-// compiler API) and scans src/ for env.X reads; it FAILS when a new Env key or env.X read
+// compiler API), every `*Env`/`*Secrets` interface in src/, template-literal name prefixes,
+// and scans src/ for env.X / accessor(env).X / (env as T).X reads; it FAILS when a new Env key or env.X read
 // is not in this list. Adding a key here is the review step: a name is only ever removed
 // from the refusal set on purpose, never by omission.
 
@@ -33,6 +34,10 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'DEFAULT_CPU_MS',
   'DEFAULT_POT_HOST_SUFFIX',
   'DEFAULT_SUBREQUESTS',
+  'DISCORD_ADMIN_AGENT',
+  'DISCORD_ADMIN_BOT_TOKEN',
+  'DISCORD_BOT_TOKEN',
+  'DISCORD_PUBLIC_KEY',
   'DISPATCHER',
   'EMAIL_LOGIN_ENABLED',
   'EMAIL_PROVIDER',
@@ -51,10 +56,17 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'GITHUB_APP_ID',
   'GITHUB_APP_INSTALLATION_ID',
   'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_ENTERPRISE_FEATURES',
   'GITHUB_INBOUND_SQUAD_ID',
+  'GITHUB_LABEL_SQUAD_MAP',
+  'GITHUB_PLAN_TIER',
   'GITHUB_REPO',
+  'GITHUB_SYNC_PROJECT',
   'GITHUB_TOKEN',
   'GITHUB_WEBHOOK_SECRET',
+  'GOOGLE_CHAT_PROJECT_NUMBER',
+  'GOOGLE_CHAT_SA_KEY',
+  'GOOGLE_CHAT_VERIFY_TOKEN',
   'GOOGLE_CLIENT_ID',
   'GOOGLE_CLIENT_SECRET',
   'GOOGLE_WORKSPACE_DRIVE_ROOT',
@@ -117,5 +129,5 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'VEC',
 ])
 
-/** Dynamic-prefix names the worker derives at runtime (e.g. per-loop secrets). */
-export const RESERVED_BINDING_PREFIXES: readonly string[] = ['LOOP_SECRET_']
+/** Dynamic-prefix names the worker derives at runtime (per-loop secrets LOOP_SECRET_<REF>_HOST; per-agent DISCORD_BOT_TOKEN_<AGENT>). */
+export const RESERVED_BINDING_PREFIXES: readonly string[] = ['LOOP_SECRET_', 'DISCORD_BOT_TOKEN_']
