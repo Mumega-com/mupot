@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mcpApp, TOOLS } from '../src/mcp'
 import { sendAgentMessage } from '../src/agents/messages'
-import { readAfterSeq } from '../src/mcp/events'
+import { InvalidEventSeqError, readAfterSeq } from '../src/mcp/events'
 import { sha256Hex } from '../src/members/service'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -380,10 +380,10 @@ describe('events/subscribe + events/unsubscribe with the DEFAULT (empty) callbac
 describe('message.created read instruction is TRUE end to end (real SQL)', () => {
   const SYSTEM = { system: true, reason: 'test fixture' } as const
 
-  async function deliver(to: string, body: string): Promise<{ id: string; seq: number }> {
+  async function deliver(to: string, body: string, targetSeat?: string): Promise<{ id: string; seq: number }> {
     const r = await sendAgentMessage(
       makeEnv({}, []),
-      { fromAgent: 'agent-b', fromMember: 'member-agent-b', toAgent: to, body },
+      { fromAgent: 'agent-b', fromMember: 'member-agent-b', toAgent: to, body, ...(targetSeat ? { targetSeat } : {}) },
       SYSTEM,
     )
     if (!r.ok) throw new Error(`fixture send failed: ${r.reason}`)
@@ -413,14 +413,32 @@ describe('message.created read instruction is TRUE end to end (real SQL)', () =>
     expect(text).toContain('inbox {\\"peek\\":true,\\"since_seq\\":<read_after_seq>,\\"limit\\":1}')
     expect(text).toContain('read_after_seq')
     expect(text).not.toContain('message_get')
+    // verify-the-id instruction + the signed-reader caveat (Athena/adversarial r2)
+    expect(text).toContain("ALWAYS VERIFY that the returned message's id equals the event's message_id")
+    expect(def.description as string).toContain('no longer readable') // in the event description itself, not only the payload notes
+    expect((def.payloadSchema as { properties: { read_after_seq: { description: string } } }).properties.read_after_seq.description).toContain('no longer readable')
+    expect(text).toContain('consumer_fenced')
+    expect(text).not.toContain('first returned message is the triggering')
     expect(text).not.toMatch(/pass as since_seq to inbox\.? *$/)
   })
 
   it('readAfterSeq is seq-1 and never negative', () => {
     expect(readAfterSeq(5)).toBe(4)
     expect(readAfterSeq(1)).toBe(0)
-    expect(readAfterSeq(0)).toBe(0)
+    expect(readAfterSeq(Number.MAX_SAFE_INTEGER)).toBe(Number.MAX_SAFE_INTEGER - 1)
   })
+
+  it.each([NaN, Infinity, -Infinity, 1.5, -1, 0, -0, Number.MAX_SAFE_INTEGER + 2, '5', null, undefined, {}, 5n])(
+    'readAfterSeq refuses %p with a typed error',
+    (bad) => {
+      expect(() => readAfterSeq(bad)).toThrow(InvalidEventSeqError)
+      try {
+        readAfterSeq(bad)
+      } catch (e) {
+        expect((e as InvalidEventSeqError).code).toBe('invalid_event_seq')
+      }
+    },
+  )
 
   it("returns exactly the triggering message for the bound agent, with older and newer rows present", async () => {
     const older = await deliver('agent-a', 'older unread')
@@ -450,5 +468,106 @@ describe('message.created read instruction is TRUE end to end (real SQL)', () =>
     // and the mirror: agent-b's own token does see it, proving the row is really there
     const own = await inboxAsCatalogueSays(readAfterSeq(foreign.seq), 'bound-nogrants')
     expect(own.map((m) => m.id)).toEqual([foreign.id])
+  })
+})
+
+describe('message.created recovery-read edge cases (why the description says VERIFY the id)', () => {
+  const SYSTEM = { system: true, reason: 'test fixture' } as const
+
+  async function deliver(to: string, body: string, targetSeat?: string): Promise<{ id: string; seq: number }> {
+    const r = await sendAgentMessage(
+      makeEnv({}, []),
+      { fromAgent: 'agent-b', fromMember: 'member-agent-b', toAgent: to, body, ...(targetSeat ? { targetSeat } : {}) },
+      SYSTEM,
+    )
+    if (!r.ok) throw new Error(`fixture send failed: ${r.reason}`)
+    const row = harness.sqlite.prepare('SELECT seq FROM agent_messages WHERE id = ?').all(r.id)[0] as { seq: number }
+    return { id: r.id, seq: Number(row.seq) }
+  }
+
+  async function inboxCall(readAfter: number) {
+    const r = await rawRpc('tools/call', { name: 'inbox', arguments: { peek: true, since_seq: readAfter, limit: 1 } }, { bearer: 'bound-admin' }, true)
+    return { status: r.status, body: JSON.parse(r.text) as { result?: { structuredContent: { messages: { id: string }[] } }; error?: { message: string } } }
+  }
+
+  it('trigger already consumed: the NEXT newer message comes back, so a client must see the id mismatch', async () => {
+    const trigger = await deliver('agent-a', 'trigger')
+    const newer = await deliver('agent-a', 'newer')
+    harness.sqlite.prepare('UPDATE agent_messages SET read_at = ? WHERE id = ?').run(T0, trigger.id)
+    const got = (await inboxCall(readAfterSeq(trigger.seq))).body.result?.structuredContent.messages ?? []
+    expect(got.map((m) => m.id)).toEqual([newer.id])
+    expect(got[0].id).not.toBe(trigger.id) // the documented mismatch => "no longer readable"
+  })
+
+  it('trigger addressed to another seat: invisible to this reader, the next broadcast message returns', async () => {
+    const seated = await deliver('agent-a', 'for seat x only')
+    harness.sqlite.prepare("UPDATE agent_messages SET target_seat = 'seat-x' WHERE id = ?").run(seated.id) // send validates seats; set directly
+    const broadcast = await deliver('agent-a', 'broadcast')
+    const got = (await inboxCall(readAfterSeq(seated.seq))).body.result?.structuredContent.messages ?? []
+    expect(got.map((m) => m.id)).toEqual([broadcast.id])
+    expect(got.map((m) => m.id)).not.toContain(seated.id)
+  })
+
+  it('signed-reader-only inbox: the recovery read is refused 409 consumer_fenced', async () => {
+    const trigger = await deliver('agent-a', 'trigger')
+    harness.sqlite.exec(`INSERT INTO agent_inbox_fences (tenant, agent_id, mode, generation, key_fingerprint, updated_by_member_id, updated_at, reason)
+      VALUES ('${TENANT}', 'agent-a', 'signed_only', 1, '${'a'.repeat(64)}', 'member-1', '${T0}', 'test')`)
+    const r = await inboxCall(readAfterSeq(trigger.seq))
+    expect(r.body.error?.message).toBe('consumer_fenced')
+  })
+})
+
+// ── the curated profile door must not serve events at all (adversarial r2 P2-1) ───────────
+describe('POST /mcp/profile/needs-you is byte-identical with the flag ON and OFF', () => {
+  async function profileRpc(method: string, params: unknown, events: string | undefined, auth: boolean) {
+    const res = await mcpApp.request(
+      'https://pot.example/profile/needs-you',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(auth ? { authorization: 'Bearer bound-admin' } : {}) },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, ...(params === undefined ? {} : { params }) }),
+      },
+      makeEnv({ events }, []),
+    )
+    return { status: res.status, text: await res.text() }
+  }
+
+  const CASES: { key: string; method: string; params?: unknown; auth: boolean }[] = [
+    { key: 'initialize:2026-07-28', method: 'initialize', params: { protocolVersion: '2026-07-28' }, auth: false },
+    { key: 'initialize:none', method: 'initialize', auth: false },
+    { key: 'server/discover', method: 'server/discover', auth: false },
+    { key: 'server/discover:auth', method: 'server/discover', auth: true },
+    { key: 'events/list', method: 'events/list', params: {}, auth: true },
+    { key: 'events/list:unauth', method: 'events/list', params: {}, auth: false },
+    { key: 'events/subscribe', method: 'events/subscribe', params: {}, auth: true },
+    { key: 'events/unsubscribe', method: 'events/unsubscribe', params: {}, auth: true },
+    { key: 'tools/list', method: 'tools/list', auth: true },
+    { key: 'tools/call:inbox', method: 'tools/call', params: { name: 'inbox', arguments: {} }, auth: true },
+  ]
+
+  for (const c of CASES) {
+    it(`${c.key}: flag "true" == flag off`, async () => {
+      const off = await profileRpc(c.method, c.params, undefined, c.auth)
+      const on = await profileRpc(c.method, c.params, 'true', c.auth)
+      expect(on).toEqual(off)
+    })
+  }
+
+  it('on the profile door the events methods and discover are method_not_found and 2026-07-28 is not negotiated (flag ON)', async () => {
+    for (const m of ['server/discover', 'events/list', 'events/subscribe', 'events/unsubscribe']) {
+      const r = await profileRpc(m, {}, 'true', true)
+      expect(JSON.parse(r.text).error, m).toMatchObject({ code: -32601, message: 'method_not_found', data: m })
+    }
+    const init = JSON.parse((await profileRpc('initialize', { protocolVersion: '2026-07-28' }, 'true', false)).text) as { result: { protocolVersion: string; capabilities: unknown } }
+    expect(init.result.protocolVersion).toBe('2025-06-18')
+    expect(init.result.capabilities).toEqual({ tools: {} })
+    // and the profile still refuses the inbox read that the catalogue points at
+    const inbox = await profileRpc('tools/call', { name: 'inbox', arguments: {} }, 'true', true)
+    expect(inbox.status).toBe(403)
+  })
+
+  it('the full /mcp door still serves events with the flag ON (the profile fence is not a global off-switch)', async () => {
+    const r = await rawRpc('events/list', {}, { events: 'true', bearer: 'bound-admin' }, true)
+    expect((parse(r.text).result?.events as unknown[]).length).toBe(1)
   })
 })

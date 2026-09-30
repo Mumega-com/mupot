@@ -266,6 +266,10 @@ export async function buildOrient(
   mcpEndpoint: string,
   viewSensitive: boolean,
   nowMs: number,
+  // recordInduction:false = a strictly READ-ONLY orient (the curated ChatGPT profile): the
+  // agent_orientation induction/re-orient row is neither created nor bumped, and `induction`
+  // is reported false. Default true = every existing caller, unchanged.
+  opts: { recordInduction?: boolean } = {},
 ): Promise<OrientReadResult> {
   const agent = await env.DB.prepare(
     `SELECT id, slug, name, role, status, squad_id, okr, kpi_target, kpi_progress, effort, autonomy, budget_cap_cents, budget_window
@@ -317,15 +321,17 @@ export async function buildOrient(
   //    happens, RETURNING yields no row → induction = false (row already existed).
   // This removes the prior non-atomic SELECT-then-UPSERT race (cosmetic double
   // 'Welcome') AND caps write-amplification on the read path to one write per window.
-  const row = await env.DB.prepare(
-    `INSERT INTO agent_orientation (tenant, agent_id, first_inducted_at, last_oriented_at, orient_count)
-       VALUES (?1, ?2, ?3, ?3, 1)
-     ON CONFLICT(tenant, agent_id) DO UPDATE SET last_oriented_at = ?3, orient_count = orient_count + 1
-       WHERE last_oriented_at < ?4
-     RETURNING orient_count`,
-  )
-    .bind(env.TENANT_SLUG, agent.id, nowMs, nowMs - INDUCTION_RATE_MS)
-    .first<{ orient_count: number }>()
+  const row = opts.recordInduction === false
+    ? null
+    : await env.DB.prepare(
+        `INSERT INTO agent_orientation (tenant, agent_id, first_inducted_at, last_oriented_at, orient_count)
+           VALUES (?1, ?2, ?3, ?3, 1)
+         ON CONFLICT(tenant, agent_id) DO UPDATE SET last_oriented_at = ?3, orient_count = orient_count + 1
+           WHERE last_oriented_at < ?4
+         RETURNING orient_count`,
+      )
+        .bind(env.TENANT_SLUG, agent.id, nowMs, nowMs - INDUCTION_RATE_MS)
+        .first<{ orient_count: number }>()
   const induction = row?.orient_count === 1
 
   // Peer-exposure gate (#88): budget + field/trust are sensitive. Only the agent

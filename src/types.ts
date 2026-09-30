@@ -319,8 +319,9 @@ export interface Env {
   // /pricing renders its plan buttons disabled. Read via isPotSelfServeCheckoutEnabled().
   POT_SELF_SERVE_CHECKOUT_ENABLED?: string
   // mupot#1618 MCP Events (protocol 2026-07-28): OFF unless exactly the string "true". Off =>
-  // server/discover does not advertise `events` and events/* methods are method-not-found.
-  // Read via isEventsEnabled() in src/mcp/events.ts.
+  // every request is byte-identical to before: 2026-07-28 is not negotiated and server/discover
+  // and events/* are method_not_found. Served only on the full /mcp door, never on
+  // /mcp/profile/needs-you, whatever the value. Read via isEventsEnabled() in src/mcp/events.ts.
   EVENTS_ENABLED?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
   // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so

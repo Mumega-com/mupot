@@ -35,7 +35,8 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 # REALTIME_SEAT_EVENTS = "1"      # opt-in body-free seat-events channel (/api/fleet/events). Off by default.
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 # EVENTS_ENABLED = "true"          # mupot#1618: MCP Events (protocol 2026-07-28). ONLY the exact string "true" enables;
-                                  # off = negotiation/discover/events/* are as on main and the delivery hook never runs.
+                                  # off = byte-identical to before (server/discover + events/* are method_not_found) and the delivery hook never runs.
+                                  # Full /mcp door only (never the /mcp/profile/* doors).
 # EVENTS_CALLBACK_HOSTS = "hooks.example.com"  # exact-hostname allowlist (comma list) of webhook callback hosts. DEFAULT EMPTY =
                                   # every callback URL is refused. Needs the CONNECTOR_MASTER_KEY secret (signing secrets are stored encrypted).
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
