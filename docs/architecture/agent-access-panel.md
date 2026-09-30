@@ -60,15 +60,14 @@ in-batch guard (`guardSql`). Never a scalar compare.
 | 1 | Actor is org admin and admin on the target squad | `isOrgAdmin(auth)`, `actorRankOnScopeFor` | active-member leaf, org-admin leaf, squad-rank leaf (`currentMemberRankAtLeastSql`, which also reads the `users.role` bridge) |
 | 2 | Granted rank at most the actor's live rank; never owner | `isAgentAccessCapability` rejects owner; rank compared to `max(admin, new, prior)` | squad-rank leaf with the same required rank; table `CHECK` refuses `owner` |
 | 3 | Admin and above are human-only: any agent-bound session is refused | `auth.boundAgentId` set: refused for every level, before the agent is even looked up | actor must not be any agent-bound member |
-| 4 | No home or archived squads | squad `kind = 'home'`, the agent's home squad id, `status <> 'active'` | `squads.kind <> 'home' AND status = 'active'` leaf |
+| 4 | No home or archived squads | squad `kind = 'home'`, the agent's home squad id, `status <> 'active'` | `squads.kind <> 'home' AND status = 'active'` leaf, and the agent's current home squad must still equal the one the plan was computed against (so a home squad that moved between read and write rolls the batch back) |
 | 5 | An agent cannot change its own access | target's bound member equals actor; actor is any bound member | actor has no `agent_member_bindings` row |
-| 6 | No silent widening | the form carries the level the admin saw (`expected_prior`); no default level | compare-and-swap: `none` means neither row exists, otherwise the capability row has that level. A set to the level already held is answered `unchanged`, and the receipt `CHECK` (`prior <> new`) would refuse it anyway |
-| 7 | Org-scope-local actor rank; floor of admin for the target rank ceiling | `exceedsTargetRankCeiling` (org-scope-local actor vs the target's global rank) | the agent's member holds nothing above admin on any work scope (home-squad grants excluded, as `targetMaxRankAcrossScopes` does). This floor is stricter than the JS ceiling for an org owner acting on an agent that holds owner elsewhere: that is refused |
+| 6 | No silent widening | the form carries the level the admin saw (`expected_prior`); no default level; a squad where the membership and capability rows disagree is refused (`rows_disagree`), so a receipt can never hide a drop on one table | compare-and-swap in BOTH tables: `none` means neither row exists, otherwise the capability row AND the membership row have that level. A set to the level already held is answered `unchanged`, and the receipt `CHECK` (`prior <> new`) would refuse it anyway |
+| 7 | Org-scope-local actor rank; floor of admin for the target rank ceiling | `exceedsTargetRankCeiling` (org-scope-local actor vs the target's global rank) | the agent's member holds nothing above admin on any plane that ceiling reads: capability rows on any work scope, `channel_capability_grants` on a non-home squad, and the legacy role plane (`members.email` to `users.role`, case-insensitive). Home-squad grants are excluded, as `targetMaxRankAcrossScopes` does. The JS side has the same floor (`target_above_admin_floor`), so an org owner acting on an agent that holds owner elsewhere is refused with a specific message rather than a generic write-time one |
 | 8 | Receipt iff access changed | outcome read from the receipt row | receipt statement is in the same batch and carries the guard |
 
 Also in the batch: the target's welded identity must still be the member that was
-authorized, and an `owner` row in `memberships` blocks the change. An owner row in
-`capabilities` cannot pass the compare-and-swap.
+authorized. An owner row in either access table cannot pass the compare-and-swap.
 
 The squad-rank leaf is redundant today with the org-admin leaf plus the home refusal:
 an org admin's grant covers every non-home squad. It is kept so the rule stays true if

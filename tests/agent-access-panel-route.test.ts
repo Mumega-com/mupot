@@ -159,6 +159,23 @@ describe('POST /agents/:id/access', () => {
     expect(rows(harness).map((r) => (r as { action: string }).action)).toEqual(['enroll', 'revoke'])
   })
 
+  it('tells an org owner plainly when the agent holds owner elsewhere, not "changed underneath you"', async () => {
+    const { harness, env } = setup()
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('m-own', 'Owner', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
+        ('c-own', 'm-own', 'org', NULL, 'owner'),
+        ('c-rava-owner', 'm-rava', 'squad', 'sq-ops', 'owner');
+    `)
+    authState.current = { userId: 'm-own', email: null, role: 'member', tenant: TENANT, memberId: 'm-own', capabilities: [g('m-own', 'owner')] }
+    const res = await post(env, '/agents/rava/access', { squad_id: 'sq-core', capability: 'lead', expected_prior: 'observer', action: 'set' })
+    const body = await res.text()
+    expect(res.status).toBe(403)
+    expect(body).toContain('owner standing on another scope')
+    expect(body).not.toContain('changed underneath you')
+    expect(rows(harness)).toHaveLength(0)
+  })
+
   it('refuses a cross-origin POST (csrf) and changes nothing', async () => {
     const { harness, env } = setup()
     authState.current = asHadi()

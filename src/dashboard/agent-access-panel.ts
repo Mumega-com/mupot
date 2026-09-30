@@ -29,6 +29,7 @@ import {
   isOrgAdmin,
   RANK_SQL_CASE,
   sessionMemberId,
+  targetMaxRankAcrossScopes,
 } from '../auth/capability'
 import {
   commitAgentSquadAccess,
@@ -64,6 +65,8 @@ export type AccessRefusal =
   | 'invalid_reason'
   | 'insufficient_rank'
   | 'target_outranks_actor'
+  | 'target_above_admin_floor'
+  | 'rows_disagree'
   | 'owner_access_untouchable'
   | 'stale_state'
   | 'nothing_to_revoke'
@@ -129,6 +132,8 @@ export interface ReceiptPlan {
   action: 'enroll' | 'change' | 'revoke'
   reason: string | null
   requiredRank: number
+  /** The agent's home squad as read when the plan was made. Re-asserted at write time. */
+  homeSquadId: string
 }
 
 // Parameter map (every ?N is bound once, used many times):
@@ -136,6 +141,7 @@ export interface ReceiptPlan {
 //   ?5 prior level     ?6 new level      ?7 action       ?8 reason
 //   ?9 tenant          ?10 required squad rank           ?11 agent's member id
 //   ?12 org-admin floor / target-rank ceiling floor
+//   ?13 the agent's home squad as planned
 function guardSql(plan: ReceiptPlan): string {
   const orgAdmin = currentMemberRankAtLeastSql('org', {
     inviterIdParam: '?2',
@@ -155,7 +161,7 @@ function guardSql(plan: ReceiptPlan): string {
   // Compare-and-swap on what the admin saw. 'none' means neither row exists.
   const priorMatches = plan.prior === null
     ? `NOT ${capRow(null)} AND NOT ${memRow(null)}`
-    : capRow('?5')
+    : `${capRow('?5')} AND ${memRow('?5')}`
   return [
     // (1) the actor is a live member of this tenant
     `EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?2', '?9')})`,
@@ -173,11 +179,26 @@ function guardSql(plan: ReceiptPlan): string {
     // priorMatches below (it demands prior 'none' or a non-owner level), so only the
     // membership table needs its own leaf.
     `NOT ${memRow("'owner'")}`,
-    // (7) target rank ceiling, floor of admin: the agent's member holds nothing
-    // above admin on any WORK scope (home grants excluded, as targetMaxRankAcrossScopes does)
+    // (7) target rank ceiling, floor of admin: the agent's member holds nothing above
+    // admin on ANY plane exceedsTargetRankCeiling / targetMaxRankAcrossScopes reads:
+    //   - capability rows on any work scope (home-squad grants excluded, as there),
+    //   - channel_capability_grants on a non-home squad (resolveCapabilities' second
+    //     branch, same join and same home filter),
+    //   - the legacy role plane (members.email -> lower() -> users.role, the same
+    //     bridge as targetLegacyRoleRank / legacyRoleRankSql), which is global.
     `NOT EXISTS (SELECT 1 FROM capabilities t WHERE t.member_id = ?11 AND ${RANK_SQL_CASE('t.capability')} > ?12
         AND NOT (t.scope_type = 'squad' AND EXISTS (SELECT 1 FROM squads hs WHERE hs.id = t.scope_id AND hs.kind = 'home')))`,
-    // (6) the level the admin saw is still the level in the table. A set to the level
+    `NOT EXISTS (SELECT 1 FROM channel_capability_grants ccg JOIN squads cs ON cs.id = ccg.squad_id
+        WHERE ccg.member_id = ?11 AND cs.kind <> 'home' AND ${RANK_SQL_CASE('ccg.capability')} > ?12)`,
+    `NOT EXISTS (SELECT 1 FROM members rm JOIN users ru ON lower(ru.email) = lower(rm.email)
+        WHERE rm.id = ?11 AND ${RANK_SQL_CASE('ru.role')} > ?12)`,
+    // the agent's CURRENT home squad is the one this plan was computed against. The
+    // route refuses the agent's home squad as a target; if the home moved between that
+    // read and this write, the refusal was about a different squad. Equality here also
+    // makes the target squad (planned as not-home) still not-home.
+    `EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND squad_id = ?13)`,
+    // (6) the level the admin saw is still the level in BOTH tables (a disagreement
+    // between membership and capability rows is refused, never silently overwritten). A set to the level
     // already held cannot get past here as a receipt either: the table CHECK demands
     // prior <> new for 'change', and 'enroll' demands prior NULL.
     priorMatches,
@@ -204,6 +225,7 @@ export function receiptStatement(env: Env, plan: ReceiptPlan) {
     plan.requiredRank,
     plan.agentMemberId,
     ACTOR_RANK_FLOOR,
+    plan.homeSquadId,
   )
 }
 
@@ -213,6 +235,13 @@ async function resolveAgent(env: Env, ref: string): Promise<AgentRow | null> {
   return env.DB.prepare('SELECT id, name, squad_id FROM agents WHERE id = ? LIMIT 1')
     .bind(ref)
     .first<AgentRow>()
+}
+
+async function currentMembership(env: Env, agentId: string, squadId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    'SELECT capability FROM memberships WHERE agent_id = ? AND squad_id = ? LIMIT 1',
+  ).bind(agentId, squadId).first<CapabilityRow>()
+  return row?.capability ?? null
 }
 
 async function currentCapability(
@@ -288,7 +317,15 @@ export async function applyAgentAccessChange(
   }
 
   const live = await currentCapability(env, binding.memberId, squad.id)
-  if (live === 'owner') return fail('owner_access_untouchable', 403)
+  const liveMembership = await currentMembership(env, agent.id, squad.id)
+  if (live === 'owner' || liveMembership === 'owner') return fail('owner_access_untouchable', 403)
+  if (live !== liveMembership) return fail('rows_disagree', 409)
+  // Same agreement the SQL guard demands, in JS: the ceiling above is per-plane, this
+  // is the agent's own standing floor (admin) across every plane, so an org owner gets
+  // a specific refusal instead of a generic write-time one.
+  if ((await targetMaxRankAcrossScopes(env, binding.memberId)) > ACTOR_RANK_FLOOR) {
+    return fail('target_above_admin_floor', 403)
+  }
   if (input.action === 'revoke' && prior === null) return fail('nothing_to_revoke', 409)
   if ((live ?? 'none') !== (prior ?? 'none')) return fail('stale_state', 409)
   // A set to the level already held is a no-op: answered here, and refused again
@@ -307,6 +344,7 @@ export async function applyAgentAccessChange(
     action: input.action === 'revoke' ? 'revoke' : prior === null ? 'enroll' : 'change',
     reason: reason === '' ? null : reason,
     requiredRank,
+    homeSquadId: agent.squad_id,
   }
 
   let refusal: AccessRefusal | null = null
@@ -373,6 +411,8 @@ const REFUSAL_TEXT: Record<AccessRefusal, string> = {
   invalid_reason: `The reason is limited to ${REASON_MAX_LENGTH} characters.`,
   insufficient_rank: 'You need admin on that squad to set this level.',
   target_outranks_actor: 'This agent holds standing above yours elsewhere, so you cannot change it.',
+  target_above_admin_floor: 'This agent holds owner standing on another scope. Agent access is only changed for agents whose standing is admin or below, even for an org owner.',
+  rows_disagree: 'This agent\'s membership and capability rows for that squad disagree. An engineer needs to reconcile them before the level can be changed here.',
   owner_access_untouchable: 'Owner access is never changed from this panel.',
   stale_state: 'This agent\'s access changed since you loaded the page. Reload and try again.',
   nothing_to_revoke: 'There is no access on that squad to revoke.',

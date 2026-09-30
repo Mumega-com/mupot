@@ -9,6 +9,7 @@
 //
 // Full committed migration chain (tests/helpers/migrations.ts) — no hand-built schema.
 import { afterEach, describe, expect, it } from 'vitest'
+import { exceedsTargetRankCeiling } from '../src/auth/capability'
 import { applyAgentAccessChange, receiptStatement } from '../src/dashboard/agent-access-panel'
 import type { AccessChangeInput, ReceiptPlan } from '../src/dashboard/agent-access-panel'
 import { commitAgentSquadAccess, commitRemoveAgentSquadAccess } from '../src/members/agent-access'
@@ -271,11 +272,40 @@ describe('invariants at the route layer', () => {
     expect(receipts(harness)).toHaveLength(0)
   })
 
+  it('(6) membership and capability rows that disagree are refused, never overwritten under a receipt that hides it', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec(`
+      INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('ms-d', 'rava', 'sq-core', 'admin');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-d', 'm-rava', 'squad', 'sq-core', 'member');
+    `)
+    for (const expectedPrior of ['member', 'admin', 'none']) {
+      expect(await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedPrior }))).toMatchObject({ ok: false, error: 'rows_disagree', status: 409 })
+    }
+    expect(await applyAgentAccessChange(env, hadi(), change({ action: 'revoke', expectedPrior: 'member' }))).toMatchObject({ ok: false, error: 'rows_disagree' })
+    expect(rava(harness)).toEqual({ cap: 'member', mem: 'admin' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(6) a row present in only one table is a disagreement too', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-only', 'm-rava', 'squad', 'sq-core', 'member')")
+    expect(await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedPrior: 'member' }))).toMatchObject({ ok: false, error: 'rows_disagree' })
+    expect(rava(harness)).toEqual({ cap: 'member', mem: null })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
   it('(6) setting the level already held is refused and leaves no receipt', async () => {
     const { harness, env } = makeEnv()
     seedRava(harness, 'lead')
     expect(await applyAgentAccessChange(env, hadi(), change({ capability: 'lead', expectedPrior: 'lead' }))).toMatchObject({ ok: false, error: 'unchanged' })
     expect(receipts(harness)).toHaveLength(0)
+  })
+
+  it('(7) an org owner gets a specific refusal when the agent holds owner elsewhere (JS and SQL agree)', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec("INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-rava-owner','m-rava','squad','sq-ops','owner')")
+    expect(await applyAgentAccessChange(env, owner(), change())).toMatchObject({ ok: false, error: 'target_above_admin_floor', status: 403 })
+    expectUntouched(harness, { cap: null, mem: null })
   })
 
   it('(7) a target holding standing above the actor elsewhere is refused for an org admin', async () => {
@@ -329,6 +359,7 @@ function plan(overrides: Partial<ReceiptPlan> = {}): ReceiptPlan {
     action: 'enroll',
     reason: null,
     requiredRank: 4,
+    homeSquadId: 'sq-home',
     ...overrides,
   }
 }
@@ -447,11 +478,100 @@ describe('the guard re-asserted inside the batch', () => {
     expectUntouched(harness, { cap: null, mem: null })
   })
 
+  it('(6) in the batch: the membership row drifting from the capability row after the plan rolls back', async () => {
+    const { harness, env } = makeEnv()
+    seedRava(harness, 'member')
+    const p = plan({ prior: 'member', next: 'lead', action: 'change' })
+    harness.sqlite.exec("UPDATE memberships SET capability = 'admin' WHERE id = 'ms-sq-core'")
+    expect(await driveSet(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'member', mem: 'admin' })
+    expect(receipts(harness)).toHaveLength(0)
+  })
+
   it('(7) a home-squad owner grant on the target does not count toward its ceiling', async () => {
     const { harness, env } = makeEnv()
     harness.sqlite.exec("UPDATE capabilities SET capability = 'owner' WHERE id = 'cap-rava-home'")
     expect(await driveSet(env, plan())).toBe('committed')
     expect(rava(harness).cap).toBe('lead')
+  })
+
+  // Round 2 (Athena, P1 TOCTOU): the plan is computed FIRST, then the world changes,
+  // then the guarded batch runs. Each test asserts the whole batch rolled back.
+  it('(7) target becomes a legacy-role owner after the plan (users.role bridge, mixed-case email): rolled back', async () => {
+    const { harness, env } = makeEnv()
+    const p = plan()
+    harness.sqlite.exec(`
+      UPDATE members SET email = 'Rava@Example.test' WHERE id = 'm-rava';
+      INSERT INTO users (id, email, role) VALUES ('u-rava', 'rava@example.test', 'owner');
+    `)
+    expect(await exceedsTargetRankCeiling(env, hadi(), 'm-rava')).toBe(true) // the JS ceiling would refuse
+    expect(await driveSet(env, p)).toBe('threw')
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('(7) a legacy-role admin target does not trip the ceiling (control)', async () => {
+    const { harness, env } = makeEnv()
+    harness.sqlite.exec(`
+      UPDATE members SET email = 'rava@example.test' WHERE id = 'm-rava';
+      INSERT INTO users (id, email, role) VALUES ('u-rava', 'rava@example.test', 'admin');
+    `)
+    expect(await exceedsTargetRankCeiling(env, hadi(), 'm-rava')).toBe(false)
+    expect(await driveSet(env, plan())).toBe('committed')
+  })
+
+  function channelGrant(h: SqliteD1Harness, squad: string, capability: string): void {
+    h.sqlite.exec(`
+      INSERT INTO channel_bindings (id, platform, external_channel_id, squad_id) VALUES ('cb-1', 'discord', 'ch-1', '${squad}');
+      INSERT INTO channel_capability_grants (id, binding_id, member_id, squad_id, capability)
+        VALUES ('ccg-1', 'cb-1', 'm-rava', '${squad}', '${capability}');
+    `)
+  }
+
+  it('(7) target gains an owner channel grant on a work squad after the plan: rolled back', async () => {
+    const { harness, env } = makeEnv()
+    const p = plan()
+    channelGrant(harness, 'sq-ops', 'owner')
+    expect(await exceedsTargetRankCeiling(env, hadi(), 'm-rava')).toBe(true)
+    expect(await driveSet(env, p)).toBe('threw')
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('(7) channel grants that the ceiling ignores do not block: admin grant, and an owner grant on a home squad', async () => {
+    const a = makeEnv()
+    channelGrant(a.harness, 'sq-ops', 'admin')
+    expect(await exceedsTargetRankCeiling(a.env, hadi(), 'm-rava')).toBe(false)
+    expect(await driveSet(a.env, plan())).toBe('committed')
+    open?.close()
+    const b = makeEnv()
+    channelGrant(b.harness, 'sq-home2', 'owner')
+    expect(await exceedsTargetRankCeiling(b.env, hadi(), 'm-rava')).toBe(false)
+    expect(await driveSet(b.env, plan())).toBe('committed')
+  })
+
+  it('the agent home squad moves after the plan (to another squad): rolled back', async () => {
+    const { harness, env } = makeEnv()
+    const p = plan()
+    harness.sqlite.exec("UPDATE agents SET squad_id = 'sq-ops' WHERE id = 'rava'")
+    expect(await driveSet(env, p)).toBe('threw')
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('the agent home squad moves onto the target squad after the plan: rolled back', async () => {
+    const { harness, env } = makeEnv()
+    const p = plan()
+    harness.sqlite.exec("UPDATE agents SET squad_id = 'sq-core' WHERE id = 'rava'")
+    expect(await driveSet(env, p)).toBe('threw')
+    expectUntouched(harness, { cap: null, mem: null })
+  })
+
+  it('the home squad moving also blocks a revoke', async () => {
+    const { harness, env } = makeEnv()
+    seedRava(harness, 'lead')
+    const p = plan({ prior: 'lead', next: null, action: 'revoke' })
+    harness.sqlite.exec("UPDATE agents SET squad_id = 'sq-ops' WHERE id = 'rava'")
+    expect(await driveRevoke(env, p)).toBe('threw')
+    expect(rava(harness)).toEqual({ cap: 'lead', mem: 'lead' })
+    expect(receipts(harness)).toHaveLength(0)
   })
 
   it('(6) compare-and-swap: expected none but a row exists: rolled back', async () => {
@@ -494,11 +614,13 @@ describe('the guard re-asserted inside the batch', () => {
     const { harness, env } = makeEnv()
     seedRava(harness, 'lead')
     let sawServiceRead = false
+    let membershipReads = 0
     const racing = {
       prepare: (sql: string) => {
         // the service's own prior read of the membership row: by then the route's
         // pre-checks have passed. A concurrent revoke removes the rows just before it.
-        if (!sawServiceRead && sql.includes('FROM memberships') && sql.includes('LIMIT 1')) {
+        // (the route's own membership read is the first such prepare; the service's is the second)
+        if (!sawServiceRead && sql.includes('FROM memberships') && sql.includes('LIMIT 1') && ++membershipReads === 2) {
           sawServiceRead = true
           harness.sqlite.exec("DELETE FROM memberships WHERE id = 'ms-sq-core'; DELETE FROM capabilities WHERE id = 'cap-rava-sq-core'")
         }
@@ -570,6 +692,23 @@ describe('receipts', () => {
     expect(result).toMatchObject({ ok: false })
     expect(receipts(harness)).toHaveLength(0)
     expect(rava(harness)).toEqual({ cap: null, mem: null })
+  })
+
+  it('the outcome is read from the receipt row, not from the service return value', async () => {
+    const { harness, env } = makeEnv()
+    // The batch commits and the receipt exists; then the rows drift so the service's own
+    // read-back disagrees and it returns receipt_failed. The truth is the receipt.
+    const drifting = {
+      prepare: (sql: string) => env.DB.prepare(sql),
+      batch: async (statements: Parameters<Env['DB']['batch']>[0]) => {
+        const out = await env.DB.batch(statements)
+        harness.sqlite.exec("UPDATE memberships SET capability = 'member' WHERE agent_id = 'rava' AND squad_id = 'sq-core'")
+        return out
+      },
+    }
+    const result = await applyAgentAccessChange({ ...env, DB: drifting } as unknown as Env, hadi(), change({ capability: 'lead' }))
+    expect(receipts(harness)).toHaveLength(1)
+    expect(result).toMatchObject({ ok: true, receiptId: receipts(harness)[0].id })
   })
 
   it('receipts are append-only: UPDATE and DELETE are refused', async () => {
