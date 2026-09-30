@@ -96,23 +96,27 @@ const MESSAGE_CREATED: EventDefinition = {
     "A new message was delivered to the authenticated agent's own inbox. The inbox is implied by the " +
     'authenticated principal; there are no filter arguments. The payload is a body-free summary. To read ' +
     `the message, call the inbox tool exactly as ${MESSAGE_READ_INSTRUCTION} using the payload's ` +
-    'read_after_seq (since_seq is exclusive, so read_after_seq is seq - 1); the first returned message ' +
-    'is the one that triggered the event. inbox reads only your own inbox and, with peek, returns only ' +
-    'messages that are still unread, so a message already consumed by another reader is no longer returned. ' +
-    'Messages the agent sent itself do not produce this event.',
+    'read_after_seq (since_seq is exclusive, so read_after_seq is seq - 1). ALWAYS VERIFY that the returned ' +
+    "message's id equals the event's message_id; if it does not match, or nothing is returned, treat the " +
+    'triggering message as no longer readable (do not act on a different message). Common reasons: the ' +
+    'message was already consumed (inbox with peek returns only unread messages, so the next newer message ' +
+    'may come back instead), or it was addressed to a different seat than the reader token. inbox reads only ' +
+    'your own inbox. An agent whose inbox requires signed readers gets 409 consumer_fenced on this read and ' +
+    'must read through its signed reader instead. Messages the agent sent itself do not produce this event.',
   delivery: ['webhook'],
   inputSchema: noArgs(),
   payloadSchema: {
     type: 'object',
     properties: {
-      message_id: { type: 'string', description: 'Message id (identification only; not a read handle).' },
+      message_id: { type: 'string', description: 'Message id. After reading with inbox, verify the returned message id equals this.' },
       seq: { type: 'integer', minimum: 1, description: 'Inbox sequence number of the triggering message.' },
       read_after_seq: {
         type: 'integer',
         minimum: 0,
         description:
           'seq - 1 (never negative). Pass as since_seq to ' + MESSAGE_READ_INSTRUCTION +
-          ' (since_seq is exclusive); the first returned message is the triggering one.',
+          ' (since_seq is exclusive). Verify the returned message id equals message_id; a mismatch means ' +
+          'the triggering message is no longer readable.',
       },
       kind: { type: 'string', description: 'Message kind (e.g. message, task, request).' },
       request_id: { type: ['string', 'null'], description: 'Correlation id when the sender set one, else null.' },
@@ -122,9 +126,24 @@ const MESSAGE_CREATED: EventDefinition = {
   },
 }
 
-/** The `read_after_seq` a delivery must carry for a given inbox seq. PR 2's delivery MUST use this. */
-export function readAfterSeq(seq: number): number {
-  return Math.max(0, seq - 1)
+/** Thrown by readAfterSeq for a seq that cannot be an inbox sequence number. PR 2's delivery treats
+ *  this as a REFUSED event (never delivers a payload with a fabricated read_after_seq). */
+export class InvalidEventSeqError extends Error {
+  readonly code = 'invalid_event_seq'
+  constructor(seq: unknown) {
+    super(`invalid_event_seq: ${typeof seq === 'number' ? String(seq) : typeof seq}`)
+    this.name = 'InvalidEventSeqError'
+  }
+}
+
+/**
+ * The `read_after_seq` a delivery must carry for a given inbox seq: seq - 1, a safe integer >= 0.
+ * seq must itself be a safe integer >= 1 (inbox seqs start at 1); anything else (NaN, Infinity,
+ * non-integer, negative, zero, non-number) throws InvalidEventSeqError. PR 2's delivery MUST use this.
+ */
+export function readAfterSeq(seq: unknown): number {
+  if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 1) throw new InvalidEventSeqError(seq)
+  return seq - 1
 }
 
 /**

@@ -6430,11 +6430,16 @@ async function handleJsonRpc(
 ): Promise<Response> {
   const id = body.id ?? null
   const method = typeof body.method === 'string' ? body.method : ''
+  // MCP Events (mupot#1618) are served ONLY on the full /mcp door. The curated profile door
+  // (POST /mcp/profile/needs-you) refuses tools/call inbox (tool_not_in_profile), so advertising
+  // events there would point at a read path that cannot work; profile mode stays byte-identical
+  // to what #1624 shipped regardless of EVENTS_ENABLED.
+  const eventsOn = profile === undefined && isEventsEnabled(c.env)
 
   if (method === 'initialize') {
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
-    if (negotiateProtocolVersion(body.params, isEventsEnabled(c.env)) === EVENTS_PROTOCOL_VERSION) {
+    if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
       return rpcResult(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
@@ -6511,13 +6516,13 @@ async function handleJsonRpc(
 
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
   // (default) falls through to method_not_found, exactly as on main.
-  if (method === 'server/discover' && isEventsEnabled(c.env)) {
+  if (method === 'server/discover' && eventsOn) {
     return rpcResult(id, serverDiscoverResult())
   }
 
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
   // an unknown method, and no auth/DB work happens at all.
-  if (EVENTS_METHODS.has(method) && isEventsEnabled(c.env)) {
+  if (EVENTS_METHODS.has(method) && eventsOn) {
     const auth = await resolveAuth(c)
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)

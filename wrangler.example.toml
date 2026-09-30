@@ -35,7 +35,7 @@ FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via age
 # REALTIME_SEAT_EVENTS = "1"      # opt-in body-free seat-events channel (/api/fleet/events). Off by default.
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
 # EVENTS_ENABLED = "true"          # mupot#1618: MCP Events (protocol 2026-07-28) catalogue. ONLY the exact string "true" enables;
-                                  # off = server/discover omits `events` and events/* are method-not-found. PR 1: catalogue only, no delivery.
+                                  # off = byte-identical to before (server/discover + events/* are method_not_found). Full /mcp door only. PR 1: catalogue only, no delivery.
 POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
                                   # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
                                   # buttons. ONLY the exact string "true" enables; anything else = 503
