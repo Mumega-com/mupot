@@ -10,11 +10,44 @@
 import type { Env } from '../types'
 import { requestSecretEnv, getSecretEnvStatus } from '../secret-env/service'
 import type { SecretEnvKeySpec } from '../secret-env/types'
+import { holdsCapabilityFloor, loadSquadScope } from '../auth/capability'
+import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 const STRING_ARRAY_SCHEMA = { type: 'array', items: { type: 'string' } }
 const MAX_KEYS_PER_REQUEST = 20
+
+/**
+ * Caller gate for BOTH secret-env tools. `min: 'authenticated'` admits ANY verified
+ * Google account (directory signup is self-serve), and `bootstrap_self` +
+ * `reveal_credential_claim` then hand that stranger an agent-bound bearer AND
+ * squad:admin on a fresh `kind='home'` squad. Neither "agent-bound" nor "member on some
+ * scope" is therefore standing a stranger cannot mint. The required standing is:
+ *   - at least one grant that is NOT on a `kind='home'` squad — an org grant, a
+ *     department grant, or a grant on a `kind='work'` squad (home squads are written only
+ *     by bootstrap_self/createHomeForMember; nothing a stranger self-mints lands anywhere
+ *     else), at rank
+ *   - `observer` or better for an agent-bound seat (legitimate observer seats on real work
+ *     squads keep working), `member` or better for an unbound principal.
+ * An agent-bound token whose agent holds NO qualifying grant (stripped agent, home-only
+ * agent) is refused. Squad kind is read fresh from D1 via loadSquadScope (never trusted
+ * from the token). Legacy web principals (capabilities undefined) fall back to the org
+ * role floor via holdsCapabilityFloor. Not a registry `min`: min is scope-agnostic and
+ * cannot express "not a home squad".
+ */
+async function secretEnvCallerAllowed(auth: AuthContext, env: Env): Promise<boolean> {
+  const floor = auth.boundAgentId != null ? 'observer' : 'member'
+  if (auth.capabilities === undefined) return holdsCapabilityFloor(auth, 'member')
+  for (const grant of auth.capabilities) {
+    if (!holdsCapabilityFloor({ ...auth, capabilities: [grant] }, floor)) continue
+    if (grant.scope_type !== 'squad') return true
+    if (grant.scope_id == null) continue
+    const scope = await loadSquadScope(env, grant.scope_id)
+    if (scope !== null && scope.kind !== 'home') return true
+  }
+  return false
+}
 
 type ToolFailure = Extract<ReturnType<typeof fail>, { ok: false }>
 
@@ -44,7 +77,7 @@ function parseKeySpecs(raw: unknown): SecretEnvKeySpec[] | ToolFailure {
 
 const toolSecretEnvRequest: ToolSpec = {
   name: 'secret_env_request',
-  scope: 'org (any authenticated principal proposes an env schema — no values, ever)',
+  scope: 'org (agent-bound seat or member-on-some-scope proposes an env schema — no values, ever)',
   min: 'authenticated',
   args: '{ keys: [{ name: string, purpose: string }], reason: string, adapter_hint?: string }',
   inputSchema: {
@@ -60,6 +93,7 @@ const toolSecretEnvRequest: ToolSpec = {
   async run(auth, env, args) {
     // The actor is always resolved from auth, never trusted from args (same
     // pattern as every other tool — see index.ts comment on the tool surface).
+    if (!(await secretEnvCallerAllowed(auth, env as Env))) return fail(403, 'forbidden', { need: 'non_home_standing' })
     const requestedBy = auth.memberId ?? auth.userId
     if (!requestedBy) return fail(403, 'unauthenticated')
 
@@ -76,8 +110,9 @@ const toolSecretEnvRequest: ToolSpec = {
       reason,
       adapterHint,
       requestedBy,
+      requestedChannel: auth.channel ?? null,
     })
-    if (!result.ok) return fail(400, result.error)
+    if (!result.ok) return fail(result.error === 'too_many_pending_requests' || result.error === 'rate_limited' ? 409 : 400, result.error)
 
     return done({
       request_id: result.request.id,
@@ -88,7 +123,7 @@ const toolSecretEnvRequest: ToolSpec = {
 
 const toolSecretEnvStatus: ToolSpec = {
   name: 'secret_env_status',
-  scope: 'org (any authenticated principal reads binding state — statuses only, never values)',
+  scope: 'org (agent-bound seat or member-on-some-scope reads binding state — statuses only, never values)',
   min: 'authenticated',
   args: '{ names: string[] }',
   inputSchema: {
@@ -98,6 +133,7 @@ const toolSecretEnvStatus: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    if (!(await secretEnvCallerAllowed(auth, env as Env))) return fail(403, 'forbidden', { need: 'non_home_standing' })
     const requestedBy = auth.memberId ?? auth.userId
     if (!requestedBy) return fail(403, 'unauthenticated')
 
