@@ -3349,6 +3349,26 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     objects: [],
   },
   {
+    file: "0187_agent_access_receipts.sql",
+    sha256: "3bbfb1e509804c602d82db13eac62174b6f7dab574b63f2d149684c3453b9938",
+    statements: [
+      "-- 0187_agent_access_receipts.sql -- audit trail for the dashboard \"Access\" panel\n-- (POST /agents/:id/access): which human changed which agent's access level on\n-- which squad, from what, to what, and why.\n--\n-- WHY A RECEIPT TABLE: an agent's squad access is two rows (memberships +\n-- capabilities) written through setAgentSquadAccess / removeAgentSquadAccess in\n-- src/members/agent-access.ts. Neither records WHO asked or from WHAT prior level.\n-- The panel writes one receipt row in the SAME D1 batch as those two rows, and the\n-- receipt INSERT carries the authority guard, so a receipt exists if and only if\n-- the access rows changed (D1 rolls a batch back on a thrown error only, so the\n-- guard turns \"not authorized / stale\" into a NOT NULL violation on id).\n--\n-- CREATE-only on purpose: D1 runs one migration file as one transaction and a\n-- foreign key with ON DELETE RESTRICT is never deferred, so no parent table is\n-- touched here.\n--\n-- Append-only, in the style of oauth_consent_receipts (0091) and agent_audit (0086):\n-- no UPDATE and no DELETE, ever.\n\nCREATE TABLE IF NOT EXISTS agent_access_receipts (\n  id                TEXT PRIMARY KEY NOT NULL,\n  actor_member_id   TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,  -- the HUMAN who acted\n  agent_id          TEXT NOT NULL REFERENCES agents(id)  ON DELETE RESTRICT,\n  squad_id          TEXT NOT NULL REFERENCES squads(id)  ON DELETE RESTRICT,\n  prior_capability  TEXT CHECK (prior_capability IN ('observer','member','lead','admin')),  -- the capabilities row before, NULL = none\n  prior_membership  TEXT CHECK (prior_membership IN ('observer','member','lead','admin')),  -- the memberships row before, NULL = none\n  new_capability    TEXT CHECK (new_capability   IN ('observer','member','lead','admin')),\n  action            TEXT NOT NULL CHECK (action IN ('enroll','change','revoke')),\n  reason            TEXT CHECK (reason IS NULL OR length(reason) <= 500),\n  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  -- The action label must agree with the capability columns. The two tables can differ\n  -- (or hold only one row), so a receipt records BOTH priors: a change to either row is\n  -- never hidden behind the other. A 'change' must move at least one row to the new level.\n  CHECK (\n    (action = 'enroll' AND prior_capability IS NULL AND prior_membership IS NULL\n        AND new_capability IS NOT NULL)\n    OR (action = 'change' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)\n        AND new_capability IS NOT NULL\n        AND (prior_capability IS NOT new_capability OR prior_membership IS NOT new_capability))\n    OR (action = 'revoke' AND (prior_capability IS NOT NULL OR prior_membership IS NOT NULL)\n        AND new_capability IS NULL)\n  )\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_agent\n  ON agent_access_receipts(agent_id, created_at DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_squad\n  ON agent_access_receipts(squad_id, created_at DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_agent_access_receipts_actor\n  ON agent_access_receipts(actor_member_id, created_at DESC);",
+      "\n\nCREATE TRIGGER agent_access_receipts_no_update\nBEFORE UPDATE ON agent_access_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'agent_access_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER agent_access_receipts_no_delete\nBEFORE DELETE ON agent_access_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'agent_access_receipts is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_access_receipts" },
+      { type: "index", name: "idx_agent_access_receipts_agent" },
+      { type: "index", name: "idx_agent_access_receipts_squad" },
+      { type: "index", name: "idx_agent_access_receipts_actor" },
+      { type: "trigger", name: "agent_access_receipts_no_update" },
+      { type: "trigger", name: "agent_access_receipts_no_delete" },
+    ],
+  },
+  {
     file: "0188_mcp_event_subscriptions.sql",
     sha256: "b260aae9978d90ff52e8f19ac6905d800612c60f93cd79a39a10fccca78b8faa",
     statements: [
@@ -3383,4 +3403,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a67916f45bfb86e78de6268ae1596da694d564f0b47d0be14aa3175173b58735"
+export const SCHEMA_CHAIN_DIGEST: string = "7ddba25082e9a54207c17852fa10f61297dd3ae1ced2398ae09f325a90570ffd"
