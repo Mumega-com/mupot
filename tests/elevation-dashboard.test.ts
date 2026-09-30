@@ -501,4 +501,104 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     expect(bodyText).toContain('Squad Bravo')
     expect(bodyText).not.toContain('grant-b')
   })
+
+  // ── approval screen: every decision control must belong to #decide-form ──
+  // Regression: the action checkboxes sat outside <form id="decide-form"> with
+  // no form="decide-form" attribute, so FormData(form).getAll('actions') was
+  // always [] and "Approve narrowed access" could never succeed.
+
+  type Control = { tag: string; attrs: Record<string, string>; index: number }
+
+  function parseAttrs(src: string): Record<string, string> {
+    const attrs: Record<string, string> = {}
+    for (const m of src.matchAll(/([a-zA-Z_:][\w:.-]*)(?:="([^"]*)")?/g)) attrs[m[1]] = m[2] ?? ''
+    return attrs
+  }
+
+  // Minimal HTML association rules (no DOM lib in this repo): a control belongs
+  // to a form if it is nested inside it, or its form="<id>" attribute names it.
+  function decisionControls(page: string) {
+    const formStart = page.indexOf('<form id="decide-form"')
+    const formEnd = page.indexOf('</form>', formStart)
+    expect(formStart).toBeGreaterThan(-1)
+    const controls: Control[] = []
+    for (const m of page.matchAll(/<(input|select|textarea)\b([^>]*)>/g)) {
+      controls.push({ tag: m[1], attrs: parseAttrs(m[2]), index: m.index ?? 0 })
+    }
+    const named = controls.filter((c) => 'name' in c.attrs)
+    const belongs = (c: Control) =>
+      (c.index > formStart && c.index < formEnd && (c.attrs.form ?? 'decide-form') === 'decide-form') ||
+      c.attrs.form === 'decide-form'
+    return { named, belongs }
+  }
+
+  async function renderApproval(actions: string[]) {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const request = await seedPendingRequest(env, session.id, { actions })
+    const cookie = await devLogin(env)
+    const res = await dashboardApp.request(`/elevation/${request.id}`, { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    return { page: await res.text(), request }
+  }
+
+  it('every named input in the approval screen (actions, duration_minutes, note) is associated with #decide-form', async () => {
+    const { page } = await renderApproval(['action:dispatch', 'action:manage_access'])
+    const { named, belongs } = decisionControls(page)
+    const names = new Set(named.map((c) => c.attrs.name))
+    expect(names).toEqual(new Set(['actions', 'duration_minutes', 'note']))
+    const orphans = named.filter((c) => !belongs(c)).map((c) => `${c.tag}[name=${c.attrs.name}]`)
+    expect(orphans).toEqual([])
+  })
+
+  it('running the real decideScript with every action ticked POSTs all actions, the duration and the note', async () => {
+    const { page, request } = await renderApproval(['action:dispatch', 'action:manage_access'])
+    const { named, belongs } = decisionControls(page)
+    const script = /<script>([\s\S]*?)<\/script>/.exec(page.slice(page.indexOf('<form id="decide-form"')))?.[1]
+    expect(script).toBeTruthy()
+
+    // FormData(form) stand-in: only controls associated with the form, checkboxes only when checked.
+    const entries: Array<[string, string]> = []
+    for (const c of named.filter(belongs)) {
+      if (c.attrs.type === 'checkbox' && !('checked' in c.attrs)) continue
+      if (c.tag === 'select') entries.push([c.attrs.name, '30'])
+      else if (c.tag === 'textarea') entries.push([c.attrs.name, 'looks fine'])
+      else entries.push([c.attrs.name, c.attrs.value ?? ''])
+    }
+    class FakeFormData {
+      constructor(_form: unknown) {}
+      getAll(k: string) { return entries.filter(([n]) => n === k).map(([, v]) => v) }
+      get(k: string) { return entries.find(([n]) => n === k)?.[1] ?? null }
+    }
+    const posts: Array<{ url: string; body: Record<string, unknown> }> = []
+    const status = { textContent: '', innerHTML: '' }
+    const submitHandlers: Array<(e: { preventDefault(): void }) => void> = []
+    const form = {
+      querySelectorAll: () => [],
+      addEventListener: (ev: string, fn: (e: { preventDefault(): void }) => void) => { if (ev === 'submit') submitHandlers.push(fn) },
+    }
+    const doc = {
+      getElementById: (id: string) => (id === 'decide-form' ? form : id === 'decide-status' ? status : { addEventListener() {} }),
+    }
+    const fakeFetch = async (url: string, init: { body: string }) => {
+      posts.push({ url, body: JSON.parse(init.body) })
+      return { ok: true, json: async () => ({ ok: true }) }
+    }
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- executing the rendered page script against stubs is the test
+    new Function('document', 'FormData', 'fetch', 'window', 'setTimeout', script as string)(
+      doc, FakeFormData, fakeFetch, { location: { href: '' } }, () => 0,
+    )
+    submitHandlers[0]({ preventDefault() {} })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(status.textContent).not.toContain('Select at least one action')
+    expect(posts).toHaveLength(1)
+    expect(posts[0].url).toBe(`/auth/elevation/requests/${request.id}/decide`)
+    expect(posts[0].body).toEqual({
+      decision: 'approve',
+      actions: ['action:dispatch', 'action:manage_access'],
+      duration_minutes: 30,
+      note: 'looks fine',
+    })
+  })
 })
