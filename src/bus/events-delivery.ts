@@ -10,11 +10,11 @@
 //         (same mupot-events queue) -> handleQueue -> deliverSubscriptionEvent(): re-check
 //         everything, sign, POST, write ONE receipt, schedule a retry job with delaySeconds.
 //
-// BODY-FREE. The job and the request body carry {message_id, seq, kind, request_id} only — never
-// the message body. Receipts carry metadata only.
+// BODY-FREE. The job and the request body carry {message_id, seq, read_after_seq, kind,
+// request_id} only (the catalogue's payloadSchema) — never the message body. Receipts carry metadata only.
 
 import type { BusEvent, Env, MessageCreatedPayload } from '../types'
-import { isEventsEnabled } from '../mcp/events'
+import { isEventsEnabled, readAfterSeq } from '../mcp/events'
 import { MAX_EVENT_BODY_BYTES, postSigned, signedHeaders } from '../mcp/events-webhook'
 import { loadSigningSecrets, subscriberAccessLive, type SubscriptionRow } from '../mcp/events-subscriptions'
 
@@ -30,7 +30,7 @@ export interface DeliveryJob {
   event_name: 'message.created'
   /** ISO 8601 with timezone: when the event occurred (the message's created_at). */
   timestamp: string
-  data: { message_id: string; seq: number; kind: string; request_id: string | null }
+  data: { message_id: string; seq: number; read_after_seq: number; kind: string; request_id: string | null }
   /** Sender of the underlying message — used ONLY for the self-event guard; never sent out. */
   from_agent: string
   attempt: number
@@ -55,6 +55,9 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
   // subscription is always to the recipient's own inbox, so sender === recipient is the only
   // case where the subscriber is the sender.
   if (p.from_agent === p.to_agent) return 0
+  // seq is the inbox row id (>= 1 for a real row); a malformed one is dropped, not coerced.
+  const seq = p.seq
+  if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1) return 0
   const nowIso = new Date().toISOString()
   const subs = await env.DB.prepare(
     `SELECT id FROM event_subscriptions
@@ -70,7 +73,8 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
       timestamp: typeof p.created_at === 'string' ? p.created_at : event.ts,
       data: {
         message_id: p.message_id,
-        seq: typeof p.seq === 'number' ? p.seq : 0,
+        seq: seq,
+        read_after_seq: readAfterSeq(seq),
         kind: typeof p.kind === 'string' ? p.kind : 'message',
         request_id: typeof p.request_id === 'string' ? p.request_id : null,
       },

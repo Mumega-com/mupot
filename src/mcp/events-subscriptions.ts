@@ -17,8 +17,6 @@ import {
 } from './events-webhook'
 
 export const SUBSCRIBABLE_EVENTS: ReadonlySet<string> = new Set(['message.created'])
-/** In the catalogue but not subscribable yet. */
-export const CATALOGUE_ONLY_EVENTS: ReadonlySet<string> = new Set(['needs_you.created'])
 
 export const TTL_MIN_MS = 5 * 60_000
 export const TTL_DEFAULT_MS = 60 * 60_000
@@ -119,9 +117,6 @@ function parseTarget(
 ): { ok: true; t: ParsedTarget } | EventsFailure {
   const name = params.name
   if (typeof name !== 'string' || name.length === 0) return fail(-32602, 'invalid_params', { field: 'name' })
-  if (CATALOGUE_ONLY_EVENTS.has(name)) {
-    return fail(-32601, 'not_implemented', { method: 'events/subscribe', reason: 'event_not_implemented', name })
-  }
   if (!SUBSCRIBABLE_EVENTS.has(name)) return fail(-32602, 'unknown_event', { name })
   const rawArgs = params.arguments
   if (rawArgs !== undefined && rawArgs !== null) {
@@ -185,6 +180,15 @@ export async function eventsSubscribe(
 
   const masterKey = env.CONNECTOR_MASTER_KEY
   if (!masterKey) return fail(-32000, 'secret_storage_unavailable', undefined, 503)
+
+  // events/list offers message.created to any bound session, including one whose agent has since
+  // been deactivated: a subscription must never START for an inactive agent (delivery re-checks
+  // this for the subscription's whole life, see subscriberAccessLive).
+  const agent = await env.DB.prepare(`SELECT status FROM agents WHERE id = ?1`)
+    .bind(principal.agentId).first<{ status: string }>()
+  if (!agent || agent.status !== 'active') {
+    return fail(-32003, 'forbidden', { reason: 'agent_inactive' }, 403)
+  }
 
   const id = await subscriptionId(principal.agentId, url, name, args)
   const now = new Date(nowMs).toISOString()

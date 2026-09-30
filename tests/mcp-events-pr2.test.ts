@@ -3,6 +3,7 @@
 import { createHmac } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mcpApp } from '../src/mcp'
+import { sendAgentMessage } from '../src/agents/messages'
 import { handleQueue } from '../src/bus/consumer'
 import {
   MAX_DELIVERIES_PER_MINUTE,
@@ -312,14 +313,24 @@ describe('events/subscribe', () => {
     expect(sent).toHaveLength(0)
   })
 
-  it('needs_you.created stays in the catalogue but is not subscribable; unknown events and arguments are invalid', async () => {
+  it('only message.created is subscribable: every other event name (incl. needs_you.created) is unknown_event; arguments must be empty', async () => {
     const list = await rpc('events/list', {})
-    expect((list.body.result?.events as { name: string }[]).map((e) => e.name)).toContain('needs_you.created')
-    const ny = await rpc('events/subscribe', subParams({ name: 'needs_you.created' }))
-    expect(ny.body.error).toMatchObject({ code: -32601, message: 'not_implemented' })
-    expect((await rpc('events/subscribe', subParams({ name: 'nope.created' }))).body.error?.code).toBe(-32602)
+    expect((list.body.result?.events as { name: string }[]).map((e) => e.name)).toEqual(['message.created'])
+    for (const name of ['needs_you.created', 'nope.created', 'message.deleted', '']) {
+      const r = await rpc('events/subscribe', subParams({ name }))
+      expect(r.body.error?.code, name).toBe(-32602)
+    }
+    expect((await rpc('events/subscribe', subParams({ name: 'needs_you.created' }))).body.error?.message).toBe('unknown_event')
     expect((await rpc('events/subscribe', subParams({ arguments: { to_agent: 'agent-b' } }))).body.error?.code).toBe(-32602)
     expect((await rpc('events/subscribe', subParams({ arguments: [] }))).body.error?.code).toBe(-32602)
+    expect(sent).toHaveLength(0)
+    expect(subs()).toHaveLength(0)
+  })
+
+  it('refuses to START a subscription for an inactive agent (events/list still offers the event to it)', async () => {
+    harness.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = 'agent-a'`)
+    const r = await rpc('events/subscribe', subParams())
+    expect(r.body.error).toMatchObject({ code: -32003, data: { reason: 'agent_inactive' } })
     expect(sent).toHaveLength(0)
     expect(subs()).toHaveLength(0)
   })
@@ -550,7 +561,7 @@ function job(subscriptionId: string, over: Partial<DeliveryJob> = {}): DeliveryJ
     event_id: 'evt_' + 'f'.repeat(32),
     event_name: 'message.created',
     timestamp: '2026-08-01T12:00:00.000Z',
-    data: { message_id: 'msg-1', seq: 42, kind: 'message', request_id: 'req-1' },
+    data: { message_id: 'msg-1', seq: 42, read_after_seq: 41, kind: 'message', request_id: 'req-1' },
     from_agent: 'agent-b',
     attempt: 1,
     ...over,
@@ -577,7 +588,7 @@ describe('delivery', () => {
       eventId: 'evt_' + 'f'.repeat(32),
       name: 'message.created',
       timestamp: '2026-08-01T12:00:00.000Z',
-      data: { message_id: 'msg-1', seq: 42, kind: 'message', request_id: 'req-1' },
+      data: { message_id: 'msg-1', seq: 42, read_after_seq: 41, kind: 'message', request_id: 'req-1' },
       cursor: null,
     })
     expect(req.body).not.toContain('from_agent')
@@ -814,7 +825,7 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     expect(jobs).toHaveLength(1)
     expect(jobs[0].subscription_id).toBe(a)
     expect(JSON.stringify(busSend.mock.calls)).not.toContain('SECRET MESSAGE BODY')
-    expect(jobs[0].data).toEqual({ message_id: 'msg-9', seq: 9, kind: 'message', request_id: 'r-9' })
+    expect(jobs[0].data).toEqual({ message_id: 'msg-9', seq: 9, read_after_seq: 8, kind: 'message', request_id: 'r-9' })
     // eventId is deterministic per (subscription, message): a queue redelivery yields the same id
     busSend.mockClear()
     await runQueue(makeEnv(), messageCreated())
@@ -836,6 +847,14 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     await runQueue(makeEnv(), messageCreated({ from_agent: 'agent-a', to_agent: 'agent-a' }))
     expect(busSend).not.toHaveBeenCalled()
     expect(await enqueueMessageCreatedDeliveries(makeEnv(), messageCreated({ from_agent: 'agent-a', to_agent: 'agent-a' }))).toBe(0)
+  })
+
+  it('a malformed seq (0, negative, fractional, non-number) is dropped, never coerced into a wrong read_after_seq', async () => {
+    await subscribeOk('bound-admin')
+    for (const seq of [0, -3, 1.5, '7', null]) {
+      await runQueue(makeEnv(), messageCreated({ seq }))
+    }
+    expect(busSend).not.toHaveBeenCalled()
   })
 
   it('expired and revoked subscriptions are not enqueued', async () => {
@@ -880,5 +899,94 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     expect(r.body.error).toMatchObject({ code: -32601, message: 'method_not_found' })
     expect(sqlLog).toEqual([])
     expect(subs()).toHaveLength(0)
+  })
+})
+
+// ── end to end: deliver -> payload -> the catalogue's own recovery read ──────────
+
+describe('recovery read described by the catalogue works on a real delivery', () => {
+  const SEND_AUTHZ = { system: true, reason: 'test: exercises sendAgentMessage primitive directly' } as const
+
+  async function sendReal(env: Env, to: string, body: string, requestId?: string) {
+    const res = await sendAgentMessage(
+      env,
+      { fromAgent: 'agent-b', fromMember: 'member-agent-b', toAgent: to, body, kind: 'message', ...(requestId ? { requestId } : {}) },
+      SEND_AUTHZ,
+    )
+    expect(res.ok).toBe(true)
+    // the bus event sendAgentMessage emitted for it (real emitter, spied queue)
+    const ev = busSend.mock.calls.map((c) => c[0] as BusEvent).filter((e) => e.type === 'message.created').at(-1) as BusEvent
+    // HARNESS LIMITATION: the node:sqlite D1 double reports meta.last_row_id = 0 for
+    // INSERT ... SELECT (real D1 returns the rowid), so the emitted seq is 0 here. Take the real
+    // seq from the row the send just wrote and put it in the event, exactly as production emits it.
+    const row = harness.sqlite.prepare('SELECT seq FROM agent_messages WHERE id = ?').get((ev.payload as { message_id: string }).message_id) as { seq: number }
+    return { ...ev, payload: { ...(ev.payload as object), seq: row.seq } }
+  }
+
+  /** queue: message.created -> delivery job -> POST; returns the delivered event body's `data`. */
+  async function deliverThroughQueue(env: Env, ev: BusEvent): Promise<Record<string, unknown>> {
+    busSend.mockClear()
+    sent.length = 0
+    await runQueue(env, ev)
+    const queued = busSend.mock.calls.map((c) => c[0] as BusEvent).find((e) => e.type === 'mcp.event.delivery')
+    expect(queued).toBeDefined()
+    await runQueue(env, queued as BusEvent)
+    expect(eventReq()).toHaveLength(1)
+    return (JSON.parse(eventReq()[0].body) as { data: Record<string, unknown> }).data
+  }
+
+  async function inboxRead(sinceSeq: number) {
+    const r = await mcpApp.request(
+      'https://pot.example/',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer bound-admin' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'inbox', arguments: { peek: true, since_seq: sinceSeq, limit: 1 } },
+        }),
+      },
+      makeEnv(),
+    )
+    const j = JSON.parse(await r.text()) as { result?: { structuredContent?: { messages?: { id: string; body: string; seq: number }[] } }; error?: unknown }
+    expect(j.error).toBeUndefined()
+    return j.result?.structuredContent?.messages ?? []
+  }
+
+  it('deliver -> take the payload -> inbox {peek, since_seq: read_after_seq, limit: 1} returns the triggering row and nothing foreign', async () => {
+    await subscribeOk('bound-admin')
+    const env = makeEnv()
+    // seq 1 -> agent-a (first ever row: read_after_seq must be 0, not -1)
+    const ev1 = await sendReal(env, 'agent-a', 'FIRST-FOR-A')
+    const d1 = await deliverThroughQueue(env, ev1)
+    expect(d1.read_after_seq).toBe(0)
+    expect((await inboxRead(d1.read_after_seq as number)).map((m) => m.body)).toEqual(['FIRST-FOR-A'])
+    // a foreign row (agent-c) sits between, then another row for agent-a
+    await sendReal(env, 'agent-c', 'FOREIGN-FOR-C')
+    const ev3 = await sendReal(env, 'agent-a', 'THIRD-FOR-A')
+    const d3 = await deliverThroughQueue(env, ev3)
+    expect(d3.seq).toBe(3)
+    expect(d3.read_after_seq).toBe(2)
+    expect(JSON.stringify(eventReq()[0].body)).not.toContain('THIRD-FOR-A') // the event itself is body-free
+    const got = await inboxRead(d3.read_after_seq as number)
+    expect(got).toHaveLength(1)
+    expect(got[0]).toMatchObject({ id: d3.message_id, body: 'THIRD-FOR-A', seq: 3 })
+    expect(JSON.stringify(got)).not.toContain('FOREIGN-FOR-C')
+    // and the naive read the catalogue used to describe (since_seq = seq) would have SKIPPED it
+    expect(await inboxRead(d3.seq as number)).toEqual([])
+  })
+
+  it('the delivered data matches the catalogue payloadSchema exactly (required keys, no extras)', async () => {
+    await subscribeOk('bound-admin')
+    const env = makeEnv()
+    const list = await rpc('events/list', {})
+    const schema = (list.body.result?.events as { name: string; payloadSchema: { required: string[]; properties: Record<string, unknown>; additionalProperties: boolean } }[])
+      .find((e) => e.name === 'message.created')!.payloadSchema
+    const ev = await sendReal(env, 'agent-a', 'schema check', 'rid-schema')
+    const data = await deliverThroughQueue(env, ev)
+    for (const k of schema.required) expect(data, k).toHaveProperty(k)
+    expect(schema.additionalProperties).toBe(false)
+    expect(Object.keys(data).filter((k) => !(k in schema.properties))).toEqual([])
+    expect(data.request_id).toBe('rid-schema')
   })
 })
