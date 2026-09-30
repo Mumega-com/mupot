@@ -36,8 +36,18 @@ Both converge on the same handler with the same capabilities:
    the pot's tenant, `revoked_at IS NULL`). This is the door for Claude Code,
    Codex, Hermes, or any scripted client.
 2. **OAuth 2.1** (directory clients — ChatGPT/Claude connectors) — the standard
-   authorize/token flow. A directory-door seat gets **zero** capability grants by
-   default; a member who needs their real grants uses the member-key door.
+   authorize/token flow. An *unbound* directory seat gets **zero** capability
+   grants (the B1 ceiling, `src/mcp/oauth-authorize.ts:1194-1199`). A seat that
+   was bound to one agent at the consent screen instead carries that agent's
+   grants, clamped to the consenting human's live rank
+   (`resolveConsentedAgentCapabilities`, same file `:344`). The member's own
+   grants are parked in `latentCapabilities`, which only `connect`, `orient` and
+   `fleet_agent_get` read. Full walk-through, the exact consent rule and
+   troubleshooting: [`connect-from-chatgpt.md`](./connect-from-chatgpt.md). A
+   member who needs their real grants ambiently uses the member-key door.
+   *(Earlier wording here said directory seats always get zero grants; that
+   predates consent-time agent binding, mupot#903b, and is superseded by this
+   paragraph.)*
 
 Capabilities are re-resolved from D1 on **every** request — revoking a token
 takes effect immediately, never frozen into the token.
@@ -154,8 +164,10 @@ not a public listing: it returns `401` without a token and `404` with one.)
 | Client enters an OAuth/`/authorize` flow | `type:"sse"` issued a GET, followed the 401 challenge | Set transport to `http` |
 | `401 unauthenticated` | Missing/revoked/newline-wrapped token, or token minted on another pot | Re-mint on **this** pot; keep token on one line |
 | `413 payload_too_large` | Body over 64 KB | Trim the request |
+| OAuth connector connects but tools are refused (`directory_channel_zero_capability`) | Unbound directory seat | Reconnect and bind an agent at consent — see [`connect-from-chatgpt.md`](./connect-from-chatgpt.md) |
 
 ## See also
 
+- [connect-from-chatgpt.md](./connect-from-chatgpt.md) — the OAuth directory door, consent screen, agent binding.
 - [SELF-HOST.md](./SELF-HOST.md) — provision a pot on your own account.
 - [local-dev.md](./local-dev.md) — what works offline vs. needs a CF account.
