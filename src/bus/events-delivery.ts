@@ -32,6 +32,9 @@ export const MAX_DELIVERIES_PER_MINUTE = 30
 
 /** The ONLY thing a job carries. Every other fact is rebuilt from D1 at delivery time. */
 export interface DeliveryJob {
+  /** Stable id of this (subscription, message) job = the event id. Informational: delivery
+   *  re-derives the event id itself and ignores this value. */
+  job_id?: string
   subscription_id: string
   message_id: string
 }
@@ -62,22 +65,17 @@ export async function enqueueMessageCreatedDeliveries(env: Env, event: BusEvent)
   ).bind(event.tenant, p.to_agent, nowIso).all<{ id: string }>()
   let n = 0
   for (const s of subs.results ?? []) {
-    const eventId = await eventIdFor(s.id, p.message_id)
-    // Dedupe: a retry of the whole message.created queue message (another leg threw) must not
-    // enqueue a second job for the same (subscription, event).
-    const mark = await env.DB.prepare(
-      `INSERT OR IGNORE INTO event_delivery_enqueued (subscription_id, event_id, created_at) VALUES (?1, ?2, ?3)`,
-    ).bind(s.id, eventId, nowIso).run()
-    if ((mark.meta?.changes ?? 0) === 0) continue
-    const job: DeliveryJob = { subscription_id: s.id, message_id: p.message_id }
-    try {
-      await env.BUS.send({ type: 'mcp.event.delivery', tenant: event.tenant, agent_id: p.to_agent, payload: job, ts: nowIso })
-    } catch (err) {
-      // The job never left: drop its marker so the message-level retry can enqueue it.
-      await env.DB.prepare(`DELETE FROM event_delivery_enqueued WHERE subscription_id = ?1 AND event_id = ?2`)
-        .bind(s.id, eventId).run()
-      throw err
+    // NO pre-send marker, NO compensating write: nothing may suppress a retry. A failed send
+    // rejects out of here (the consumer then does not ack the source message). If the source is
+    // retried after some jobs were already accepted, those jobs are enqueued again; the consumer
+    // absorbs the duplicates (a finished (subscription, event) is never re-delivered, attempt state
+    // comes from receipts). Stable-id duplicate over loss.
+    const job: DeliveryJob = {
+      job_id: await eventIdFor(s.id, p.message_id), // stable per (subscription, message)
+      subscription_id: s.id,
+      message_id: p.message_id,
     }
+    await env.BUS.send({ type: 'mcp.event.delivery', tenant: event.tenant, agent_id: p.to_agent, payload: job, ts: nowIso })
     n++
   }
   return n
@@ -307,7 +305,7 @@ export async function deliverSubscriptionEvent(env: Env, payload: unknown, opts:
       type: 'mcp.event.delivery',
       tenant: env.TENANT_SLUG,
       agent_id: sub.agent_id,
-      payload: { subscription_id: sub.id, message_id: job.message_id } satisfies DeliveryJob,
+      payload: { job_id: eventId, subscription_id: sub.id, message_id: job.message_id } satisfies DeliveryJob,
       ts: nowIso,
     },
     { delaySeconds: backoffDelaySec(att.attempt) },

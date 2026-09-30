@@ -687,7 +687,7 @@ describe('delivery', () => {
     expect(await deliverSubscriptionEvent(makeEnv(), msgJob(id), { nowMs: t0 })).toBe('retry')
     const [msg1, opts1] = busSend.mock.calls[0] as [BusEvent<DeliveryJob>, { delaySeconds: number }]
     expect(msg1.type).toBe('mcp.event.delivery')
-    expect(msg1.payload).toEqual({ subscription_id: id, message_id: 'msg-1' }) // nothing but identity
+    expect(msg1.payload).toEqual({ job_id: await eventIdFor(id, 'msg-1'), subscription_id: id, message_id: 'msg-1' }) // identity only
     expect(opts1.delaySeconds).toBe(10)
     await deliverSubscriptionEvent(makeEnv(), msg1.payload, { nowMs: t0 + 15_000 })
     const [, opts2] = busSend.mock.calls[1] as [BusEvent<DeliveryJob>, { delaySeconds: number }]
@@ -953,37 +953,64 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     const { ack } = await runQueue(makeEnv(), messageCreated())
     expect(ack).toHaveBeenCalled()
     const jobs = busSend.mock.calls.map((c) => (c[0] as BusEvent<DeliveryJob>).payload)
-    expect(jobs).toEqual([{ subscription_id: a, message_id: 'msg-9' }])
+    expect(jobs).toEqual([{ job_id: await eventIdFor(a, 'msg-9'), subscription_id: a, message_id: 'msg-9' }])
     expect(JSON.stringify(busSend.mock.calls)).not.toContain('SECRET MESSAGE BODY')
   })
 
-  it('dedupes per (subscription, event): a retry of the whole message enqueues no second job', async () => {
-    await subscribeOk('bound-admin')
-    await runQueue(makeEnv(), messageCreated())
-    await runQueue(makeEnv(), messageCreated())
-    await runQueue(makeEnv(), messageCreated())
-    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(1)
-    // a different message is a different event
-    await runQueue(makeEnv(), messageCreated({ message_id: 'msg-10' }))
-    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2)
+  it('NO enqueue-side marker: a source retry enqueues the job again with the SAME stable job_id, and delivery absorbs the duplicates (exactly one POST)', async () => {
+    const id = await subscribeOk('bound-admin')
+    insertMsg('msg-9', { seq: 9, requestId: 'r-9' })
+    sent.length = 0
+    for (let i = 0; i < 3; i++) await runQueue(makeEnv(), messageCreated())
+    const jobs = busSend.mock.calls.map((c) => c[0] as BusEvent<DeliveryJob>).filter((e) => e.type === 'mcp.event.delivery')
+    expect(jobs).toHaveLength(3)
+    expect(new Set(jobs.map((j) => j.payload.job_id)).size).toBe(1)
+    expect(jobs[0].payload.job_id).toBe(await eventIdFor(id, 'msg-9'))
+    for (const j of jobs) await runQueue(makeEnv(), j)
+    expect(eventReq()).toHaveLength(1) // duplicates absorbed
+    expect(receipts()).toHaveLength(1)
+    expect(harness.sqlite.prepare("SELECT name FROM sqlite_master WHERE name = 'event_delivery_enqueued'").all()).toEqual([])
   })
 
-  it('EVENT LOSS guard: a failed delivery-job enqueue is NOT acked; the source message is retried and the job lands exactly once', async () => {
+  it('EVENT LOSS guard: BUS.send rejecting once, then twice => the source is retried every time, never acked without a job', async () => {
     await subscribeOk('bound-admin')
-    busSend.mockRejectedValueOnce(new Error('queue down'))
-    const first = await runQueue(makeEnv(), messageCreated())
-    expect(first.ack).not.toHaveBeenCalled()
-    expect(first.retry).toHaveBeenCalledTimes(1) // the queue will redeliver message.created
-    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 0 }) // marker rolled back
-    // the queue redelivers it: now it is accepted
-    const second = await runQueue(makeEnv(), messageCreated())
-    expect(second.ack).toHaveBeenCalled()
-    expect(second.retry).not.toHaveBeenCalled()
-    // ...and further redeliveries (e.g. the Hermes leg failing) never duplicate the job
-    await runQueue(makeEnv(), messageCreated())
-    // calls: 1 rejected (run 1) + 1 accepted (run 2) + 0 (run 3, deduped)
-    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2) // 1 rejected + 1 accepted
-    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 1 })
+    busSend.mockRejectedValueOnce(new Error('queue down')).mockRejectedValueOnce(new Error('queue down'))
+    const r1 = await runQueue(makeEnv(), messageCreated())
+    const r2 = await runQueue(makeEnv(), messageCreated())
+    for (const r of [r1, r2]) {
+      expect(r.ack).not.toHaveBeenCalled()
+      expect(r.retry).toHaveBeenCalledTimes(1)
+    }
+    const r3 = await runQueue(makeEnv(), messageCreated()) // the queue is back
+    expect(r3.ack).toHaveBeenCalled()
+    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(3) // 2 rejected + 1 accepted
+  })
+
+  it('EVENT LOSS guard: a failing bookkeeping read/write in the fan-out also retries the source (never swallowed)', async () => {
+    await subscribeOk('bound-admin')
+    const base = makeEnv()
+    const failing = {
+      ...base,
+      DB: { ...(base.DB as object), prepare: (sql: string) => { if (sql.includes('FROM event_subscriptions')) throw new Error('d1 down'); return (base.DB as { prepare: (q: string) => unknown }).prepare(sql) } },
+    } as unknown as Env
+    const r = await runQueue(failing, messageCreated())
+    expect(r.ack).not.toHaveBeenCalled()
+    expect(r.retry).toHaveBeenCalledTimes(1)
+    expect(busSend).not.toHaveBeenCalled()
+  })
+
+  it('a failing receipt write at delivery rejects the job (queue retries it), it is not acked as done', async () => {
+    const id = await subscribeOk('bound-admin')
+    insertMsg('msg-9', { seq: 9 })
+    const base = makeEnv()
+    const failing = {
+      ...base,
+      DB: { ...(base.DB as object), prepare: (sql: string) => { if (sql.includes('INSERT INTO event_delivery_receipts')) throw new Error('d1 down'); return (base.DB as { prepare: (q: string) => unknown }).prepare(sql) } },
+    } as unknown as Env
+    const job = { type: 'mcp.event.delivery', tenant: TENANT, payload: { subscription_id: id, message_id: 'msg-9' }, ts: T0 } as BusEvent
+    const r = await runQueue(failing, job)
+    expect(r.ack).not.toHaveBeenCalled()
+    expect(r.retry).toHaveBeenCalledTimes(1)
   })
 
   it('end to end: a queued mcp.event.delivery job is signed and POSTed', async () => {

@@ -598,8 +598,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // A failure here must NEVER be swallowed (that would ack the source event and lose every
       // affected subscriber's event with no receipt and no retry). It is recorded, the Hermes leg
       // still runs, and the message is then retried (throw below) until every delivery job has been
-      // accepted by the queue. Retries are safe: the (subscription, event) enqueue dedupe marker
-      // makes each job be enqueued exactly once; the cost is that a retry also re-runs the seat and
+      // accepted by the queue. Retries may enqueue a job twice; delivery absorbs duplicates (a
+      // finished (subscription, event) is never re-delivered), and a retry also re-runs the seat and
       // Hermes legs (both already at-least-once and deduped by id downstream).
       let eventsEnqueueError: unknown = null
       if (isEventsEnabled(env)) {

@@ -145,13 +145,16 @@ new receipt. `mcp.event.delivery` is refused by every producer that forwards a c
 `createBus().emit`, the sos addon `/publish` and `/bridge`, and the `/bus/emit` allowlist. Other
 producers can still put a `message.created` on the queue (org-admin `/bus/emit`, the shared-secret sos
 addon); that can only cause delivery of a real inbox row, never of attacker-chosen data.
-The enqueue is deduped per `(subscription, event)` in `event_delivery_enqueued`, so a retry of the whole
-`message.created` queue message (for example because the Hermes leg threw) does not create duplicate jobs.
+There is deliberately NO enqueue-side marker or compensating write (a stale marker could suppress a retry and
+lose the event). A retry of the whole `message.created` queue message (for example because the Hermes leg threw)
+may enqueue a job twice; the duplicate is absorbed at delivery, and each job carries a stable `job_id` (= the
+event id) derived from (subscription, message). Stable-id duplicate over loss. Two duplicate jobs processed
+at the same instant could both POST (same `eventId`/`webhook-id`; the receiver must dedupe).
 
 If enqueueing a delivery job fails, the source `message.created` is **not acked**: the consumer records the
 failure, still runs the seat and Hermes legs, then throws so the queue retries the source message (bounded by the
-queue's `max_retries`, then the DLQ). The per-`(subscription, event)` marker makes each job land exactly once
-across retries; the cost is that a retry also re-runs the seat/Hermes legs, which are already at-least-once.
+queue's `max_retries`, then the DLQ). Duplicate jobs from such retries are absorbed at
+delivery; the cost is that a retry also re-runs the seat/Hermes legs, which are already at-least-once.
 
 The callback URL is re-validated against the **current** `EVENTS_CALLBACK_HOSTS` on every attempt: a host
 removed from the list revokes the subscription (`callback_host_removed`) with a `refused` receipt.
@@ -167,7 +170,7 @@ removed from the list revokes the subscription (`callback_host_removed`) with a 
   literals, no ports. An allowlisted hostname whose DNS an attacker controls is out of scope.
 - The per-minute delivery rate cap is best-effort under concurrency (it counts receipts written after
   the POST). The subscription cap and the verification-attempt limit are atomic guarded statements.
-- Receipts, `event_delivery_enqueued` and `event_verification_attempts` (pruned per agent on each
+- Receipts and `event_verification_attempts` (pruned per agent on each
   verification) are otherwise never pruned; `event_delivery_receipts` cannot be deleted at all (trigger)
   and, like any SQLite table, `INSERT OR REPLACE` bypasses its UPDATE trigger (no code path does it).
 - Egress from `events/subscribe` is bounded by the per-agent verification limit (5 per 10 min, failures
