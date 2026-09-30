@@ -114,7 +114,7 @@ Design doc: [`decision-port.md`](./decision-port.md).
 | Default adapter is `human` (always `deferred_to_human`, sends nothing); `DECISION_ADAPTER` may select `workers-ai` or `typesafe`; an unknown value falls back to `human` | works | `selectAdapter`, `src/decisions/registry.ts:9-19`; `src/types.ts:336-339` |
 | One `decision_receipts` row per call, success or failure; raw input is never stored (hashes only); no-update and no-delete triggers | works | `migrations/0189_decision_receipts.sql:37-47`; `docs/architecture/decision-port.md` |
 | `decision_outcomes` (a human's later accept or override) exists as an append-only table; no code writes it yet | partial | `migrations/0189_decision_receipts.sql:49-74`; `docs/architecture/decision-port.md` |
-| Migration 0189 applied to production | **not verified** here | release operator's record |
+| Migration 0189 applied to production | **verified 2026-09-30** | remote D1 `sqlite_master` read: `decision_requests`, `decision_outcomes`, `decision_receipts`, `decision_request_resolutions` and their append-only/transition triggers exist |
 | Known gaps to close before the first caller or reader: `INSERT OR REPLACE` can rewrite a receipt, a `choice` answer is not required to match the top probability, `tenant` is nullable | partial | open issue #1635 |
 
 Because there is no caller, none of those gaps is reachable from production
@@ -157,7 +157,7 @@ confirm either from outside, because `/mcp` refuses an unauthenticated probe
 | The signing secret is stored only as vault ciphertext (domain `mcp_events`); subscribing fails closed if `CONNECTOR_MASTER_KEY` is unset | works | `src/mcp/events-subscriptions.ts`; `src/connectors/crypto.ts`; `docs/architecture/mcp-events.md` |
 | Delivery: the consumer's `message.created` case enqueues one `mcp.event.delivery` job per active subscription; the job carries only `{subscription_id, message_id}` and everything else is re-derived from D1 at delivery; up to 5 attempts with exponential backoff; one append-only receipt per attempt | works | `src/bus/events-delivery.ts:28-31, 54-92, 162`; `migrations/0188_mcp_event_subscriptions.sql:57, 86-92` |
 | Per-subscription cap of 30 new events per minute; the excess gets a terminal `refused` receipt | partial | `MAX_DELIVERIES_PER_MINUTE`, `src/bus/events-delivery.ts:31, 235`; open issue #1636 |
-| Migration 0188 applied to production | **not verified** here | release operator's record |
+| Migration 0188 applied to production | **verified 2026-09-30** | remote D1 `sqlite_master` read: `event_subscriptions`, `event_verification_attempts`, `event_delivery_receipts` and `event_delivery_receipts_no_update`/`_no_delete` triggers exist |
 | **A real ChatGPT client, or the Workers runtime, completing the subscribe, verify, deliver loop** | **not proven** | the tests use the node SQLite D1 harness and a stubbed `fetch`; `redirect: 'manual'` on `workerd` and DNS rebinding (the allowlist is the mitigation) are noted as unverified in `docs/architecture/mcp-events.md` |
 | Known gaps: flood-induced event loss, a swallowed marker-delete failure, `INSERT OR REPLACE` on the append-only receipts, unbounded table growth | partial | open issue #1636 |
 
