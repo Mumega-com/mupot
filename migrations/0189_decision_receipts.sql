@@ -1,4 +1,4 @@
--- 0186_decision_receipts.sql — receipts for the decision-model port (src/decisions).
+-- 0189_decision_receipts.sql — receipts for the decision-model port (src/decisions).
 --
 -- WHY: a decision model (TypeSafe Jev today; any small classifier/judge later) may RANK or
 -- PROPOSE, never AUTHORIZE. Every call through decide() writes exactly one receipt, success

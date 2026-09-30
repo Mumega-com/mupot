@@ -150,7 +150,7 @@ describe('the port grants nothing', () => {
     const port = readFileSync(join(__dirname, '..', 'src', 'decisions', 'port.ts'), 'utf8')
     const code = port.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
     expect(code).not.toMatch(/authori[sz]|permit|allowed:|approved/i)
-    const mig = readFileSync(join(__dirname, '..', 'migrations', '0186_decision_receipts.sql'), 'utf8')
+    const mig = readFileSync(join(__dirname, '..', 'migrations', '0189_decision_receipts.sql'), 'utf8')
     const ddl = mig.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n')
     expect(ddl).not.toMatch(/authori[sz]/i)
   })

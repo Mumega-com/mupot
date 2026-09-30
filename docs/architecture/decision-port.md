@@ -15,7 +15,7 @@ outcome, i.e. it goes to a human.
 
 Nothing calls `decide()` except tests. `src/mcp/agent-lifecycle.ts` is unchanged and
 still uses its own Jev call. The default adapter is `human`, so merging changes no
-behaviour. Migration 0186 is not applied by this PR; a human applies it.
+behaviour. Migration 0189 is not applied by this PR; a human applies it.
 
 ## Entry point
 

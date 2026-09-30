@@ -119,6 +119,13 @@ import {
 } from './enroll'
 import { loadControlCenterView, controlCenterPageBody } from './control-center'
 import { loadJoinPreview, confirmJoin, joinPreviewPageBody, joinConfirmedBody } from './join-agent'
+import {
+  accessChangeMessage,
+  accessRefusalMessage,
+  agentAccessPanel,
+  applyAgentAccessChange,
+  loadAgentAccessView,
+} from './agent-access-panel'
 import { mintAgentBoundToken, isAgentTokenCapability } from '../members/service'
 import { resolveAgentRef } from '../org/resolve'
 
@@ -1965,9 +1972,50 @@ dashboardApp.get('/agents/:id', async (c) => {
     withDeadline(loadWorkPanel(c.env, agent.id), undefined, 'Assigned work took too long to read.'),
     withDeadline(loadCollaborationPanel(c.env, agent.id), undefined, 'Collaboration history took too long to read.'),
   ])
+  // The Access panel is org-admin only; POST /agents/:id/access re-checks every rule.
+  const accessPanel = isOrgAdmin(auth) && !auth.boundAgentId
+    ? agentAccessPanel(agent, await loadAgentAccessView(c.env, agent.id), null)
+    : null
   return c.html(
-    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration)),
+    shell(c.env, `Agent · ${agent.name}`, agentConsoleBody(agent, squad, canWake, flights, work, collaboration, accessPanel)),
   )
+})
+
+// POST /agents/:id/access — the org-admin Access panel write. Every authority rule
+// lives in applyAgentAccessChange and is re-asserted inside the D1 batch (see
+// src/dashboard/agent-access-panel.ts). Same-origin form post: the csrf() Origin
+// check registered on dashboardApp applies, as for POST /squads/:id/agents/join.
+dashboardApp.post('/agents/:id/access', async (c) => {
+  const auth = c.get('auth')
+  // Refuse before resolving the agent so a non-admin cannot probe which agents exist.
+  if (auth.boundAgentId || !isOrgAdmin(auth)) {
+    const why = auth.boundAgentId ? 'agent_session_forbidden' : 'org_admin_required'
+    return c.html(shell(c.env, 'Agent access', errorBody(accessRefusalMessage(why))), 403)
+  }
+  const resolved = await resolveAgentRef(c.env, c.req.param('id'))
+  if (!resolved.ok) return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
+  const agent = await getById<Agent>(c.env, 'agents', resolved.value.id)
+  if (!agent) return c.html(shell(c.env, 'Agent', errorBody('Agent not found.')), 404)
+  const form = await c.req.parseBody()
+  const field = (name: string): string => (typeof form[name] === 'string' ? form[name].trim() : '')
+  const rawAction = field('action')
+  const result = await applyAgentAccessChange(c.env, auth, {
+    agentRef: agent.id,
+    squadId: field('squad_id'),
+    action: rawAction === 'revoke' ? 'revoke' : 'set',
+    capability: field('capability'),
+    expectedCapability: field('expected_capability'),
+    expectedMembership: field('expected_membership'),
+    reason: field('reason'),
+  })
+  const view = isOrgAdmin(auth) && !auth.boundAgentId ? await loadAgentAccessView(c.env, agent.id) : null
+  const page = (notice: string) => html`<p class="crumbs"><a href="/">Overview</a> / <a href="/agents/${agent.id}">${agent.name}</a> / Access</p>
+    ${view ? agentAccessPanel(agent, view, notice) : html`<p class="empty">${notice}</p>`}
+    <p><a href="/agents/${agent.id}">Back to ${agent.name}</a></p>`
+  if (!result.ok) {
+    return c.html(shell(c.env, `Access · ${agent.name}`, page(accessRefusalMessage(result.error))), result.status)
+  }
+  return c.html(shell(c.env, `Access · ${agent.name}`, page(accessChangeMessage(result))))
 })
 
 // ── members + divisions admin (humans as first-class network nodes) ───────────
@@ -5612,6 +5660,7 @@ function agentConsoleBody(
   flights: PanelResult<FlightSummary>,
   work: PanelResult<WorkSummary>,
   collaboration: PanelResult<CollaborationSummary>,
+  accessPanel: HtmlEscapedString | Promise<HtmlEscapedString> | null = null,
 ) {
   // The wake button calls the RBAC-gated agents endpoint. The fetch is same-origin
   // and credentialed (HttpOnly session cookie rides along automatically).
@@ -5665,6 +5714,7 @@ function agentConsoleBody(
         <dt>Created</dt><dd>${agent.created_at}</dd>
       </dl>
     </div>
+    ${accessPanel ?? ''}
     <h2>Flights</h2>
     ${renderPanel('flights', flights, (d) => html`
       <div class="card">

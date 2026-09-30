@@ -1007,13 +1007,29 @@ export async function currentMemberRankOnScope(
  *  expressed as a scalar SQL subquery so it can be compared inline. Shares
  *  `RANK.owner`/`RANK.admin`'s numeric VALUES (not a re-typed 5/4) — the
  *  ladder positions those two names occupy, wherever `RANK` is edited. */
+/** The members.email -> lower() -> users.role bridge, written ONCE. Both fragments
+ *  below are built from it, so the scalar rank (legacyRoleRankSql) and the EXISTS
+ *  ceiling (legacyRoleAboveSql) can never read two different definitions of the
+ *  role plane. Inputs are `?N` placeholders chosen by the caller, never values. */
+const legacyRoleBridgeSql = (memberIdParam: string): string =>
+  `FROM members m2
+        JOIN users u ON lower(u.email) = lower(m2.email)
+       WHERE m2.id = ${memberIdParam}`
+
 const legacyRoleRankSql = (memberIdParam: string): string =>
   `(CASE (
-      SELECT u.role FROM members m2
-        JOIN users u ON lower(u.email) = lower(m2.email)
-       WHERE m2.id = ${memberIdParam}
+      SELECT u.role ${legacyRoleBridgeSql(memberIdParam)}
        LIMIT 1
     ) WHEN 'owner' THEN ${RANK.owner} WHEN 'admin' THEN ${RANK.admin} ELSE 0 END)`
+
+/** EXISTS-shaped ceiling over the same bridge: true when ANY users row bridged to
+ *  the member has a legacy role ranking above `rankParam`. Unlike the LIMIT 1 scalar
+ *  above it cannot miss a second users row, and it is an EXISTS, so a NULL can only
+ *  make a NOT EXISTS guard pass when there truly is no such row. Used by the dashboard
+ *  Access panel's in-batch target ceiling (src/dashboard/agent-access-panel.ts). */
+export const legacyRoleAboveSql = (memberIdParam: string, rankParam: string): string =>
+  `EXISTS (SELECT 1 ${legacyRoleBridgeSql(memberIdParam)}
+         AND ${RANK_SQL_CASE('u.role')} > ${rankParam})`
 
 /**
  * mupot#1551 round 2 (Athena BLOCK, P0 on PR #1559): the SQL mirror of
