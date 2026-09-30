@@ -148,6 +148,11 @@ addon); that can only cause delivery of a real inbox row, never of attacker-chos
 The enqueue is deduped per `(subscription, event)` in `event_delivery_enqueued`, so a retry of the whole
 `message.created` queue message (for example because the Hermes leg threw) does not create duplicate jobs.
 
+If enqueueing a delivery job fails, the source `message.created` is **not acked**: the consumer records the
+failure, still runs the seat and Hermes legs, then throws so the queue retries the source message (bounded by the
+queue's `max_retries`, then the DLQ). The per-`(subscription, event)` marker makes each job land exactly once
+across retries; the cost is that a retry also re-runs the seat/Hermes legs, which are already at-least-once.
+
 The callback URL is re-validated against the **current** `EVENTS_CALLBACK_HOSTS` on every attempt: a host
 removed from the list revokes the subscription (`callback_host_removed`) with a `refused` receipt.
 
