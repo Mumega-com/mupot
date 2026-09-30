@@ -18,6 +18,7 @@ import { createTask } from '../tasks/service'
 import { runTaskExecution, resolveTaskId, resolveDispatchReceiptId } from './execute'
 import { runGoalCycle } from './loop'
 import { COOLDOWN_EXTENSION_MS } from './observer'
+import { emitEscalation } from './escalation'
 import { resolveAgentIdentity } from './identity'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
@@ -200,9 +201,8 @@ export class AgentDO extends DurableObject<Env> {
         // S2: consume observer signals from the goal cycle.
         // cooldown=true → extend the next alarm so the agent backs off instead of
         //   busy-looping on an identical situation every 15 min.
-        // escalate=true → TODO: emit a single operator notification via the
-        //   approval/notification seam (see loops/notifications or tasks gate_owner).
-        //   Left as a result field for now — the surface to wire it onto is S3 scope.
+        // escalate=true → emit an operator-facing task via createTask (the
+        //   obs?.escalate block below). Wired — see the delivery note there.
         const obs = goalResult.observer
         if (obs?.cooldown) {
           // Extend alarm by COOLDOWN_EXTENSION_MS on top of the standard interval.
@@ -211,27 +211,28 @@ export class AgentDO extends DurableObject<Env> {
         } else {
           await this.ensureAlarm()
         }
-        // obs?.escalate → emit ONE operator-facing task via the existing createTask
-        // seam (same path the cortex propose-cycle uses). The observer dedupes on
-        // ESCALATION_COOLDOWN_MS, so this fires at most once per stuck state —
-        // not once per tick. gate_owner marks it for operator attention.
+        // obs?.escalate → emit an operator-facing task via the existing createTask
+        // seam (same path the cortex propose-cycle uses). The observer rate-limits
+        // on ESCALATION_COOLDOWN_MS, so this fires at most once per HOUR, not once
+        // per 15-min tick — but it re-fires every hour while the agent stays stuck,
+        // and each emit also mirrors a GitHub issue (createTask does that unless
+        // skipMirror is set, which it is not here).
+        //
+        // DELIVERY, measured 2026-09-10: the gate_owner tag drives no wake. The
+        // gate-owner wake fires only on a transition INTO status 'review' and this
+        // task is created 'open', so it never runs — independently of the fact that
+        // 'gate:escalation' currently has zero grant holders. needs_you_list and the
+        // approvals queue also both filter to 'review'. What DOES reach a human is
+        // the GitHub issue mirror and the squad task list.
         if (obs?.escalate) {
-          try {
-            await createTask(
-              this.env,
-              {
-                squad_id: agent.squad_id,
-                title: `ESCALATION: agent ${agent.slug} stuck`,
-                body: `Agent ${agent.slug} (${agent.id}) crossed the stuck threshold.\nReason: ${obs.reason ?? 'unknown'}\nCycle: ${cycle}`,
-                done_when: '(operator resolves — set via task update)',
-                gate_owner: 'gate:escalation',
-              },
-              { actor: { kind: 'agent', id: agent.id }, allowDeferredPredicate: true },
-            )
-          } catch (emitErr) {
-            // A failed escalation emit must not kill the goal cycle — record and
-            // continue (the next tick re-emits after the cooldown).
-            this.recordCycle(cycle, `escalation-emit-failed: ${emitErr instanceof Error ? emitErr.message : 'err'}`)
+          // The emit itself lives in escalation.ts, which has no runtime-only
+          // imports and so can be tested; this file cannot be imported by the
+          // Node test pool at all. emitEscalation never throws — a failed emit
+          // must not kill the goal cycle, so it is recorded and the next tick
+          // re-emits after the observer's cooldown.
+          const emit = await emitEscalation(this.env, agent, obs.reason ?? null, cycle)
+          if (!emit.emitted) {
+            this.recordCycle(cycle, `escalation-emit-failed: ${emit.error}`)
           }
         }
 
