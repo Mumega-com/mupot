@@ -188,6 +188,15 @@ import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { ROUTINE_TOOLS } from './routines'
+import {
+  EVENTS_METHODS,
+  EVENTS_PROTOCOL_VERSION,
+  eventCatalogue,
+  eventsProtocolCapabilities,
+  isEventsEnabled,
+  negotiateProtocolVersion,
+  serverDiscoverResult,
+} from './events'
 import { RUNNER_TOOLS } from './runners'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
@@ -6421,8 +6430,23 @@ async function handleJsonRpc(
 ): Promise<Response> {
   const id = body.id ?? null
   const method = typeof body.method === 'string' ? body.method : ''
+  // MCP Events (mupot#1618) are served ONLY on the full /mcp door. The curated profile door
+  // (POST /mcp/profile/needs-you) refuses tools/call inbox (tool_not_in_profile), so advertising
+  // events there would point at a read path that cannot work; profile mode stays byte-identical
+  // to what #1624 shipped regardless of EVENTS_ENABLED.
+  const eventsOn = profile === undefined && isEventsEnabled(c.env)
 
   if (method === 'initialize') {
+    // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
+    // gets it. Every other request takes the untouched legacy branch below — byte-identical.
+    if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
+      return rpcResult(id, {
+        protocolVersion: EVENTS_PROTOCOL_VERSION,
+        capabilities: eventsProtocolCapabilities(),
+        serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
+        instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
+      })
+    }
     return rpcResult(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
@@ -6488,6 +6512,44 @@ async function handleJsonRpc(
       outcome.detail,
       outcome.status,
     )
+  }
+
+  // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
+  // (default) falls through to method_not_found, exactly as on main.
+  if (method === 'server/discover' && eventsOn) {
+    return rpcResult(id, serverDiscoverResult())
+  }
+
+  // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
+  // an unknown method, and no auth/DB work happens at all.
+  if (EVENTS_METHODS.has(method) && eventsOn) {
+    const auth = await resolveAuth(c)
+    if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
+      return rpcError(id, -32001, 'unauthenticated', undefined, 401)
+    }
+
+    if (method === 'events/list') {
+      const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+      // No cursor is ever issued (single page), so any non-empty cursor is not one of ours.
+      if (params.cursor !== undefined && params.cursor !== null && params.cursor !== '') {
+        return rpcError(id, -32602, 'invalid_cursor')
+      }
+      const catalogue = eventCatalogue({
+        bound: auth.boundAgentId != null,
+        // Same floor invokeTool enforces for that tool (spec.min read from the live registry entry at
+        // request time; unknown tool => not advertised).
+        mayCallTool: (toolName) => {
+          const spec = TOOL_BY_NAME.get(toolName)
+          if (!spec) return false
+          return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
+        },
+      })
+      return rpcResult(id, { events: catalogue })
+    }
+
+    // events/subscribe and events/unsubscribe: registered, but this build stores nothing and
+    // sends nothing (delivery is PR 2).
+    return rpcError(id, -32601, 'not_implemented', { method, reason: 'events_delivery_not_implemented_in_this_build' })
   }
 
   return rpcError(id, -32601, 'method_not_found', method)

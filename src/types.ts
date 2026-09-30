@@ -318,6 +318,11 @@ export interface Env {
   // or unset, returns 503 checkout_unavailable before any DB read or Stripe call, and
   // /pricing renders its plan buttons disabled. Read via isPotSelfServeCheckoutEnabled().
   POT_SELF_SERVE_CHECKOUT_ENABLED?: string
+  // mupot#1618 MCP Events (protocol 2026-07-28): OFF unless exactly the string "true". Off =>
+  // every request is byte-identical to before: 2026-07-28 is not negotiated and server/discover
+  // and events/* are method_not_found. Served only on the full /mcp door, never on
+  // /mcp/profile/needs-you, whatever the value. Read via isEventsEnabled() in src/mcp/events.ts.
+  EVENTS_ENABLED?: string
   SUPABASE_WEBHOOK_SECRET?: string
   // TypeSafe Jev (System One) — used only by the agent_lifecycle intent path.
   // Absent ⇒ that path returns classifier_unavailable (no guess, no execute).
