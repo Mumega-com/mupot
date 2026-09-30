@@ -245,7 +245,7 @@ describe('secret_env_request — reserved names via the real tool path', () => {
   it.each([
     'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'TELEGRAM_BOT_TOKEN', 'RESEND_API_KEY',
     'MEMBER_TOKEN_FINGERPRINT_SECRET', 'OAUTH_CLIENT_ID', 'PUBLIC_ORIGIN', 'IDP_PROVIDER',
-    'EMAIL_PROVIDER', 'LOCAL_TEST_AUTH', 'POT_SELF_SERVE_CHECKOUT_ENABLED', 'SOS_TOKEN', 'EVENTS_ENABLED',
+    'EMAIL_PROVIDER', 'LOCAL_TEST_AUTH', 'POT_SELF_SERVE_CHECKOUT_ENABLED', 'SOS_TOKEN', 'EVENTS_ENABLED', 'EVENTS_CALLBACK_HOSTS',
   ])('refuses %s', async (name) => {
     const db = makeDb()
     const out = await invokeTool(member, db.env, 'secret_env_request', REQ(name), ORIGIN)

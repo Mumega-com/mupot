@@ -14,6 +14,7 @@
 // docs/architecture/mcp-events.md as a limit, not a solved problem.
 
 import type { Env } from '../types'
+import { timingSafeEqual } from '../lib/crypto'
 
 export const CALLBACK_TIMEOUT_MS = 10_000
 /** Spec: maximum delivery payload. */
@@ -149,16 +150,6 @@ export async function standardWebhooksSignature(
   return parts.join(' ')
 }
 
-export function timingSafeEqualStr(a: string, b: string): boolean {
-  const ea = new TextEncoder().encode(a)
-  const eb = new TextEncoder().encode(b)
-  // Length is compared without early exit on content: pad the shorter to the longer.
-  const len = Math.max(ea.length, eb.length)
-  let diff = ea.length ^ eb.length
-  for (let i = 0; i < len; i++) diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0)
-  return diff === 0
-}
-
 // ── outbound POST ─────────────────────────────────────────────────────────────────
 
 export type PostOutcome =
@@ -281,7 +272,7 @@ export async function verifyCallback(
   } catch {
     return { ok: false, reason: 'challenge_failed' }
   }
-  if (typeof echoed !== 'string' || !timingSafeEqualStr(echoed, challenge)) {
+  if (typeof echoed !== 'string' || !timingSafeEqual(echoed, challenge)) {
     return { ok: false, reason: 'challenge_failed' }
   }
   return { ok: true }

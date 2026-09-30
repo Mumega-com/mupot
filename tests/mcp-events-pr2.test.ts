@@ -16,7 +16,8 @@ import {
   type DeliveryJob,
 } from '../src/bus/events-delivery'
 import { revokeSubscriptionForAgent, MAX_ACTIVE_SUBSCRIPTIONS_PER_AGENT, MAX_VERIFICATION_ATTEMPTS, subscriptionAad, subscriptionId } from '../src/mcp/events-subscriptions'
-import { standardWebhooksSignature, timingSafeEqualStr, validateCallbackUrl } from '../src/mcp/events-webhook'
+import { standardWebhooksSignature, validateCallbackUrl } from '../src/mcp/events-webhook'
+import { timingSafeEqual as timingSafeEqualStr } from '../src/lib/crypto'
 import { decryptConnectorSecret, encryptConnectorSecret } from '../src/connectors/crypto'
 import { sha256Hex } from '../src/members/service'
 import type { BusEvent, Env } from '../src/types'
@@ -967,13 +968,21 @@ describe('queue wiring (message.created -> mcp.event.delivery)', () => {
     expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2)
   })
 
-  it('a failed queue send removes its marker so the message-level retry can enqueue it', async () => {
+  it('EVENT LOSS guard: a failed delivery-job enqueue is NOT acked; the source message is retried and the job lands exactly once', async () => {
     await subscribeOk('bound-admin')
     busSend.mockRejectedValueOnce(new Error('queue down'))
+    const first = await runQueue(makeEnv(), messageCreated())
+    expect(first.ack).not.toHaveBeenCalled()
+    expect(first.retry).toHaveBeenCalledTimes(1) // the queue will redeliver message.created
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 0 }) // marker rolled back
+    // the queue redelivers it: now it is accepted
+    const second = await runQueue(makeEnv(), messageCreated())
+    expect(second.ack).toHaveBeenCalled()
+    expect(second.retry).not.toHaveBeenCalled()
+    // ...and further redeliveries (e.g. the Hermes leg failing) never duplicate the job
     await runQueue(makeEnv(), messageCreated())
-    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 0 })
-    await runQueue(makeEnv(), messageCreated())
-    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2) // failed attempt + the retry
+    // calls: 1 rejected (run 1) + 1 accepted (run 2) + 0 (run 3, deduped)
+    expect(busSend.mock.calls.filter((c) => (c[0] as BusEvent).type === 'mcp.event.delivery')).toHaveLength(2) // 1 rejected + 1 accepted
     expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM event_delivery_enqueued').get()).toEqual({ n: 1 })
   })
 
@@ -1123,7 +1132,9 @@ describe('recovery read described by the catalogue works on a real delivery', ()
     const ev1 = await sendReal(env, 'agent-a', 'FIRST-FOR-A')
     const d1 = await deliverThroughQueue(env, ev1)
     expect(d1.read_after_seq).toBe(0)
-    expect((await inboxRead(d1.read_after_seq as number)).map((m) => m.body)).toEqual(['FIRST-FOR-A'])
+    const got1 = await inboxRead(d1.read_after_seq as number)
+    expect(got1.map((m) => m.body)).toEqual(['FIRST-FOR-A'])
+    expect(got1[0].id).toBe(d1.message_id) // the returned row IS the triggering one (verify before acting)
     await sendReal(env, 'agent-c', 'FOREIGN-FOR-C')
     const ev3 = await sendReal(env, 'agent-a', 'THIRD-FOR-A')
     const d3 = await deliverThroughQueue(env, ev3)

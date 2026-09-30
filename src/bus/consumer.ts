@@ -595,12 +595,19 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       }
       // MCP Events leg (mupot#1618 PR 2, src/bus/events-delivery.ts): fan the SAME event out to
       // webhook subscriptions. Flag OFF => not called at all (no DB read, no queue message).
-      // Isolated like the seat leg above: a failure here is logged and never retries the Hermes leg.
+      // A failure here must NEVER be swallowed (that would ack the source event and lose every
+      // affected subscriber's event with no receipt and no retry). It is recorded, the Hermes leg
+      // still runs, and the message is then retried (throw below) until every delivery job has been
+      // accepted by the queue. Retries are safe: the (subscription, event) enqueue dedupe marker
+      // makes each job be enqueued exactly once; the cost is that a retry also re-runs the seat and
+      // Hermes legs (both already at-least-once and deduped by id downstream).
+      let eventsEnqueueError: unknown = null
       if (isEventsEnabled(env)) {
         try {
           await enqueueMessageCreatedDeliveries(env, event)
         } catch (err) {
-          console.error('bus: message.created — mcp events enqueue failed (isolated, not retried)', {
+          eventsEnqueueError = err
+          console.error('bus: message.created — mcp events enqueue failed (source message will be retried)', {
             tenant: event.tenant,
             message_id: p?.message_id,
             error: redactSecretPatterns(err instanceof Error ? err.message : String(err)),
@@ -626,10 +633,10 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // discipline as src/telegram-bridge/bus_notify.ts: log which knob is missing,
           // ack, move on.
           console.log('bus: message.created — delivery not configured', { ...logCtx, missing: outcome.missing })
-          return true
+          break
         case 'delivered':
           console.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
-          return true
+          break
         default:
           // unexpected_response | unauthorized | not_found | server_error | network_error:
           // all four are real, present-tense failures of a CONFIGURED delivery target.
@@ -639,6 +646,11 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           console.error('bus: message.created — delivery failed', { ...logCtx, outcome })
           throw new Error(`message.created delivery failed: ${outcome.kind}`)
       }
+      if (eventsEnqueueError !== null) {
+        // Not acked: handleQueue retries the source message (never a silent loss).
+        throw new Error('message.created mcp events fan-out failed; retrying the source message')
+      }
+      return true
     }
     case 'mcp.event.delivery': {
       // mupot#1618 PR 2: one signed webhook attempt. Retries are scheduled by the delivery module
