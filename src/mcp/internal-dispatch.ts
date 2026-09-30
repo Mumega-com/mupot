@@ -4,10 +4,14 @@
 
 import type { AuthContext } from '../types'
 import { AUTH_CONTEXT_HEADER } from './auth-header'
+import { NEEDS_YOU_PROFILE_PATH } from './profile-needs-you'
 
 export function mcpInternalRequest(request: Request, auth: AuthContext): Request {
   const url = new URL(request.url)
-  url.pathname = '/'
+  // Every /mcp* path re-roots to '/' EXCEPT the one curated profile door, whose sub-path must
+  // survive so mcpApp can route it to the read-only profile handler. Exact match only: a
+  // prefix/lookalike ('/mcp/profile/needs-you/x') still re-roots to '/', i.e. to the full /mcp.
+  url.pathname = url.pathname === NEEDS_YOU_PROFILE_PATH ? '/profile/needs-you' : '/'
 
   const headers = new Headers(request.headers)
   headers.set(AUTH_CONTEXT_HEADER, JSON.stringify(auth))

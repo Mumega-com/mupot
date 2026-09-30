@@ -237,6 +237,7 @@ import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
 import { selfReportAtBoot } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
+import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -6175,6 +6176,18 @@ function mcpTool(spec: ToolSpec): Record<string, unknown> {
   }
 }
 
+/** tools/list body for the curated needs-you profile: the profile allowlist only, each
+ *  entry = the normal mcpTool() shape + MCP `annotations`. Names come from the profile file
+ *  and are looked up in the registry; a name missing from TOOLS is skipped, never invented. */
+function profileToolList(): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = []
+  for (const entry of NEEDS_YOU_PROFILE) {
+    const spec = TOOL_BY_NAME.get(entry.name)
+    if (spec) out.push({ ...mcpTool(spec), annotations: { ...entry.annotations } })
+  }
+  return out
+}
+
 function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
   return {
     content: [{ type: 'text', text: JSON.stringify({ ok: true, tool, result }) }],
@@ -6380,7 +6393,13 @@ function safeWaitUntil(c: import('hono').Context<AppEnv>): ((p: Promise<unknown>
   }
 }
 
-async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcRequest): Promise<Response> {
+async function handleJsonRpc(
+  c: import('hono').Context<AppEnv>,
+  body: JsonRpcRequest,
+  // Curated-profile mode (POST /mcp/profile/needs-you). Undefined on /mcp — every branch
+  // below that reads it is a no-op there, so /mcp behavior is unchanged.
+  profile?: 'needs-you',
+): Promise<Response> {
   const id = body.id ?? null
   const method = typeof body.method === 'string' ? body.method : ''
 
@@ -6398,6 +6417,14 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
   }
 
   if (method === 'tools/list') {
+    if (profile === 'needs-you') {
+      // The profile never discloses the registry to an unauthenticated caller (mupot#1609).
+      const profileAuth = await resolveAuth(c)
+      if (!profileAuth || profileAuth.tenant !== c.env.TENANT_SLUG) {
+        return rpcError(id, -32001, 'unauthenticated', undefined, 401)
+      }
+      return rpcResult(id, { tools: profileToolList() })
+    }
     return rpcResult(id, { tools: TOOLS.map(mcpTool) })
   }
 
@@ -6408,6 +6435,12 @@ async function handleJsonRpc(c: import('hono').Context<AppEnv>, body: JsonRpcReq
     }
 
     const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+    // Profile allowlist: refuse BEFORE invokeTool, regardless of the caller's capabilities.
+    // Authentication above still comes first (401 for an anonymous caller, never a probe of
+    // which names are allowlisted).
+    if (profile === 'needs-you' && !profileEntry(params.name)) {
+      return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403)
+    }
     const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
       transport: 'mcp',
@@ -6450,6 +6483,22 @@ mcpApp.get('/tools', (c) =>
     })),
   }),
 )
+
+// POST /mcp/profile/needs-you — curated READ-ONLY tool profile for ChatGPT plugin/directory
+// use (src/mcp/profile-needs-you.ts). JSON-RPC only: the legacy {tool,args} shape is not
+// offered here. Same auth (resolveAuth) and same invokeTool authorization as POST /mcp.
+mcpApp.post('/profile/needs-you', async (c) => {
+  const len = Number(c.req.header('content-length') ?? '0')
+  if (Number.isFinite(len) && len > 64 * 1024) return c.json({ error: 'payload_too_large' }, 413)
+  let body: unknown
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+  if (!isJsonRpcRequest(body)) return c.json({ error: 'json_rpc_required' }, 400)
+  return handleJsonRpc(c, body, 'needs-you')
+})
 
 interface InvokeBody {
   tool?: unknown
