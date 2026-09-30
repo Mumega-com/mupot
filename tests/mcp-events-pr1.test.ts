@@ -1,5 +1,5 @@
 // mupot#1618 — MCP Events PR 1: protocol negotiation, server/discover, events/list catalogue.
-// No subscribe/delivery exists in this build; these tests also prove that.
+// (PR 2 adds subscribe/delivery: tests/mcp-events-pr2.test.ts.)
 // Real SQL: the schema is the whole committed migration chain (applyAllMigrations).
 import { readFileSync, writeFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -339,7 +339,10 @@ describe('events/list', () => {
   })
 })
 
-describe('events/subscribe + events/unsubscribe are not implemented and write nothing', () => {
+describe('events/subscribe + events/unsubscribe with the DEFAULT (empty) callback allowlist write nothing', () => {
+  // PR 2 replaced the PR 1 not_implemented stubs (full behaviour: tests/mcp-events-pr2.test.ts).
+  // What PR 1 pinned and still holds: with EVENTS_CALLBACK_HOSTS unset, a subscribe cannot reach
+  // any host and stores nothing.
   const subscribeParams = {
     name: 'message.created',
     arguments: {},
@@ -348,14 +351,21 @@ describe('events/subscribe + events/unsubscribe are not implemented and write no
     ttlMs: null,
   }
 
-  it.each(['events/subscribe', 'events/unsubscribe'])('%s refuses, with no writes and no fetch', async (m) => {
+  it('events/subscribe refuses every URL by default, with no writes and no fetch', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const before = dumpState()
-    const r = await rawRpc(m, subscribeParams, BOUND_ADMIN, true, [])
-    expect(parse(r.text).error).toMatchObject({ code: -32601, message: 'not_implemented' })
+    const r = await rawRpc('events/subscribe', subscribeParams, BOUND_ADMIN, true, [])
+    expect(parse(r.text).error).toMatchObject({ code: -32015, data: { reason: 'callback_host_not_allowed' } })
     expect(parse(r.text).result).toBeUndefined()
     expect(fetchSpy).not.toHaveBeenCalled()
-    expect(dumpState()).toBe(before) // no row anywhere changed
+    expect(dumpState()).toBe(before)
+  })
+
+  it('events/unsubscribe of a subscription that does not exist is an idempotent no-op', async () => {
+    const before = dumpState()
+    const r = await rawRpc('events/unsubscribe', subscribeParams, BOUND_ADMIN, true, [])
+    expect(parse(r.text).result).toEqual({})
+    expect(dumpState()).toBe(before)
   })
 
   it.each(['events/subscribe', 'events/unsubscribe'])('%s still requires authentication', async (m) => {

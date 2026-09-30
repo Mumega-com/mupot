@@ -3368,9 +3368,37 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_access_receipts_no_delete" },
     ],
   },
+  {
+    file: "0188_mcp_event_subscriptions.sql",
+    sha256: "0a300055b1cdf0806083cafbb199bf609e9f22a254f405a314d0401ce1752072",
+    statements: [
+      "-- 0188_mcp_event_subscriptions.sql — MCP Events (protocol 2026-07-28) subscriptions + delivery\n-- receipts (mupot#1618, PR 2).\n--\n-- CREATE-only: no existing table is altered, rebuilt, or dropped (D1 runs a migration file as one\n-- transaction; FK RESTRICT is never deferred, so a parent-table rebuild is never safe). Numbering:\n-- 0186 = open PR #1622, 0187 = open PR #1626, 0188 is reserved for this PR.\n--\n-- event_subscriptions\n--   One row per (principal agent, callback URL, event name, canonical arguments): `id` is derived\n--   deterministically from exactly those four inputs in application code, so re-subscribing is an\n--   idempotent refresh (INSERT ... ON CONFLICT(id) DO UPDATE) and two concurrent identical\n--   subscribes yield ONE row.\n--   The `whsec_` signing secret is stored ONLY as an AES-GCM ciphertext (the connector-vault\n--   mechanism, src/connectors/crypto.ts) — a hash cannot sign an outgoing webhook. Nothing in\n--   this schema holds a plaintext secret. `secret_fingerprint` is the first 8 hex characters of\n--   sha256(secret): a non-secret label used to detect a rotation and to scope the callback\n--   verification cache. `prev_secret_ciphertext` keeps the previous secret for a bounded rotation\n--   window so deliveries can be signed with old AND new (space-separated signatures).\n--   `token_id` is the member_tokens row that created/refreshed the subscription: delivery stops\n--   when that credential (or the agent, or the member) is no longer live. `consented_by_member_id`\n--   is the consenting human of a directory-channel (OAuth consent-bound) session, or NULL: the\n--   delivery-time access re-check needs it to re-derive that session's clamped capabilities.\n--\n-- event_delivery_receipts\n--   One row per delivery ATTEMPT outcome. Metadata only: never the request body, never a secret,\n--   never response bytes. Append-only (no-UPDATE / no-DELETE triggers, same shape as\n--   oauth_consent_receipts, 0091).\n\nCREATE TABLE IF NOT EXISTS event_subscriptions (\n  id                     TEXT PRIMARY KEY,\n  tenant                 TEXT NOT NULL,\n  agent_id               TEXT NOT NULL,\n  member_id              TEXT NOT NULL,\n  token_id               TEXT NOT NULL,\n  consented_by_member_id TEXT,\n  event_name             TEXT NOT NULL,\n  arguments_json         TEXT NOT NULL DEFAULT '{}',\n  callback_url           TEXT NOT NULL,\n  secret_ciphertext      TEXT NOT NULL,\n  secret_fingerprint     TEXT NOT NULL CHECK (length(secret_fingerprint) = 8),\n  prev_secret_ciphertext TEXT,\n  prev_secret_expires_at TEXT,\n  status                 TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked','expired')),\n  refresh_before         TEXT NOT NULL,\n  verified_at            TEXT,\n  created_at             TEXT NOT NULL,\n  last_refreshed_at      TEXT NOT NULL,\n  revoked_at             TEXT,\n  revoke_reason          TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_event_subscriptions_delivery\n  ON event_subscriptions(tenant, agent_id, event_name, status);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_subscriptions_callback\n  ON event_subscriptions(agent_id, callback_url);",
+      "\n\nCREATE TABLE IF NOT EXISTS event_delivery_receipts (\n  id              TEXT PRIMARY KEY,\n  subscription_id TEXT NOT NULL REFERENCES event_subscriptions(id) ON DELETE RESTRICT,\n  event_id        TEXT NOT NULL,\n  attempt         INTEGER NOT NULL CHECK (attempt >= 1),\n  outcome         TEXT NOT NULL CHECK (outcome IN ('delivered','retry','failed','gone','refused')),\n  http_status     INTEGER,\n  error_class     TEXT,\n  signed_at       TEXT,\n  created_at      TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_sub\n  ON event_delivery_receipts(subscription_id, created_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_delivery_receipts_event\n  ON event_delivery_receipts(subscription_id, event_id);",
+      "\n\n-- event_verification_attempts: one row per callback-verification attempt an agent STARTS (whether\n-- it later succeeds or fails). The per-agent rate limit is an atomic INSERT ... SELECT ... WHERE\n-- (count in window) < limit against this table.\nCREATE TABLE IF NOT EXISTS event_verification_attempts (\n  id           TEXT PRIMARY KEY,\n  tenant       TEXT NOT NULL,\n  agent_id     TEXT NOT NULL,\n  attempted_at TEXT NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_event_verification_attempts_agent\n  ON event_verification_attempts(tenant, agent_id, attempted_at);",
+      "\n\nCREATE TRIGGER event_delivery_receipts_no_update\nBEFORE UPDATE ON event_delivery_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'event_delivery_receipts is append-only: UPDATE is forbidden');\nEND;",
+      "\n\nCREATE TRIGGER event_delivery_receipts_no_delete\nBEFORE DELETE ON event_delivery_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'event_delivery_receipts is append-only: DELETE is forbidden');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "event_subscriptions" },
+      { type: "index", name: "idx_event_subscriptions_delivery" },
+      { type: "index", name: "idx_event_subscriptions_callback" },
+      { type: "table", name: "event_delivery_receipts" },
+      { type: "index", name: "idx_event_delivery_receipts_sub" },
+      { type: "index", name: "idx_event_delivery_receipts_event" },
+      { type: "table", name: "event_verification_attempts" },
+      { type: "index", name: "idx_event_verification_attempts_agent" },
+      { type: "trigger", name: "event_delivery_receipts_no_update" },
+      { type: "trigger", name: "event_delivery_receipts_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0081ed63ab87fc53e4f6027e583a55b7cd4027f8a4feea45db698e7dbfa784c5"
+export const SCHEMA_CHAIN_DIGEST: string = "8ec19920ea2fe662609c1dad089e805173376e8c023302a99275125002e0c2d0"
