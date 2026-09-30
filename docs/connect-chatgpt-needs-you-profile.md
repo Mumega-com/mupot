@@ -27,11 +27,18 @@ Each is listed with `readOnlyHint: true`, `destructiveHint: false`, `openWorldHi
 
 Approving or rejecting a task (`task_verdict`) needs a harness-attested human origin. ChatGPT does not supply one today, so approval stays in Telegram and the dashboard. v1 therefore has no `send`, `task_create`, `task_verdict`, `task_update`, `grant_*` or any other write tool.
 
-"Read-only" means no mutation of business data (tasks, projects, messages, grants). Two bookkeeping writes still happen, exactly as on `/mcp`: `invokeTool()` refreshes the caller's own presence after a successful call, and `boot_context` and `task_list` may refresh the caller's own presence/last-seen row and, for `boot_context` with a bound agent, the agent's self-reported runtime/model record. The registry has no per-tool read-only flag, so the hint means "does not change your work data", not "performs zero database writes".
+"Read-only" here is enforced, not just declared: a call on the profile runs in **profile mode = no session side effects** (`ToolCtx.sideEffectFree`, set only by the profile route). On `/mcp` the same tools still do their normal bookkeeping; on the profile they do not:
+
+- `invokeTool()` does not bump the caller's presence.
+- `task_list` does not refresh a poll-mode agent's `last_reported_at`.
+- `boot_context` does not touch presence and never reaches `selfReportAtBoot`. It also refuses `runtime` and `model` arguments (JSON-RPC `-32602`, `profile_args_not_allowed`, HTTP 400) and omits them from the profile schema. On `/mcp` those arguments set a bound agent's fleet row to `running` (even if an operator stopped it) and overwrite its runtime/model; that defect in `selfReportAtBoot` is tracked separately (#1625) and is not changed here.
+- `orient` does not create or bump the `agent_orientation` induction row (and reports `induction: false`).
+
+`tests/mcp-profile-needs-you-no-side-effects.test.ts` snapshots every table (real migration chain) and the KV before and after each of the 8 tools with a bound-agent session, and requires no change.
 
 ## CI ratchet
 
-`scripts/check-mcp-profile-needs-you.mjs` (CI job `mcp-profile-needs-you`) fails the build when a profile name is not a real tool, a profile tool's `min` is above `member`, a profile tool's name contains a write verb (`send`, `create`, `update`, `verdict`, `grant`, ...), annotations are missing or not exactly read-only, the list is unsorted or duplicated, or `handleJsonRpc` stops calling the allowlist refusal and the filtered listing. The name check is a mechanical backstop, not proof a tool is read-only: adding a tool is a reviewed change.
+`scripts/check-mcp-profile-needs-you.mjs` (CI job `mcp-profile-needs-you`) fails the build when a profile name is not a real tool, a profile tool's `min` is above `member`, a profile tool is not in the script's own explicit `REVIEWED_READ_ONLY` set, `boot_context` does not refuse `model` and `runtime`, annotations are missing or not exactly read-only, the list is unsorted or duplicated, or `handleJsonRpc` stops enforcing the allowlist refusal (`if (... !profileEntry(...))`) and the filtered listing. The gate is the reviewed set: a tool joins the profile only by being added there, with a reason, after its `run()` body was read. A secondary write-verb tripwire (names split on `.` and `_`) also runs but is not what the gate relies on.
 
 ## Loading it in ChatGPT developer mode
 
@@ -45,13 +52,12 @@ Exact ChatGPT UI labels change; these steps describe the protocol, not screensho
 ## Known limits
 
 - A directory-connector session that is not bound to an agent has zero capabilities (the B1 ceiling). It can call `boot_context` and `orient` (authenticated tier). The observer-tier tools (`needs_you_list`, `project_get`, `project_list`, `project_wiki`) and the member-tier tools (`task_board`, `task_list`) are refused at the capability floor until it is granted access. The profile does not widen this.
-- Only the exact path `/mcp/profile/needs-you` is the profile. Any other `/mcp/...` path (including `/mcp/profile/needs-you/`) is handled exactly as before, which means it is the full `/mcp` endpoint.
-- Tokens issued for the profile resource are audience-bound to the profile path, and the OAuth provider accepts them only on that path (it does not accept them on `/mcp`). A token issued for `/mcp` is accepted on the profile path, because the provider matches audiences by path prefix. It is still subject to the same tool authorization.
+- Only the exact path `/mcp/profile/needs-you` is the profile. `/mcp/profile` and every path under `/mcp/profile/` (including a trailing slash, `/x`, and `..%2F..`) answer 404; they are never routed to the full `/mcp`. Configure the connector with the exact URL, no trailing slash. Any other `/mcp...` path outside that namespace behaves exactly as before.
+- OAuth audience matching in the provider is by path prefix, and it is not the control that limits what a token can do. A token issued with the profile path as its resource is rejected by the provider on `/mcp` itself (audience mismatch), while a token issued for `/mcp` is accepted on the profile path. On every path a token is subject to the same per-tool authorization, and the profile allowlist only narrows what the profile path lists and calls.
 - No OpenAI submission requirements beyond the tool annotations (test cases, demo video, verification) are addressed by this change.
 
 ## What is NOT verified
 
-- No end-to-end run against a real ChatGPT client, and no real OAuth authorization flow, was performed. Verified instead: sub-app tests against the real registry, and a workerd test through the real `OAuthProvider` wrapper covering the unauthenticated `401` and `resource_metadata` pointer and the protected-resource document.
-- The audience-binding behavior in "Known limits" is read from the pinned `@cloudflare/workers-oauth-provider` source, not exercised with a minted token.
+- No end-to-end run against a real ChatGPT client, and no real OAuth authorization flow, was performed. Verified instead: sub-app tests against the real registry, a sqlite-backed test of the `boot_context` refusal against a stopped poll-mode row, and a workerd test (real Miniflare D1 carrying the migration chain) through the real `OAuthProvider` wrapper covering the unauthenticated `401`, the `resource_metadata` pointer, the protected-resource document, and tokens minted through the provider's own helpers (real code exchange).
 - Whether OpenAI's review accepts these annotations or wants additional fields (for example `idempotentHint`) is unknown.
 - Not deployed. Nothing here is live until a maintainer merges and deploys.

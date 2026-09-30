@@ -13,6 +13,10 @@ const good = (name) =>
   `{ name: '${name}', annotations: { title: 'T', readOnlyHint: true, destructiveHint: false, openWorldHint: false } }`
 const src = (...items) => `export const NEEDS_YOU_PROFILE: readonly ProfileToolEntry[] = [ ${items.join(',')} ]`
 const registry = new Map([
+  ['office.publish_post', { min: 'member', file: 'a.ts' }],
+  ['squad_message', { min: 'member', file: 'a.ts' }],
+  ['supabase_mutate', { min: 'member', file: 'a.ts' }],
+  ['project_list', { min: 'observer', file: 'a.ts' }],
   ['orient', { min: 'authenticated', file: 'a.ts' }],
   ['task_list', { min: 'member', file: 'a.ts' }],
   ['send', { min: 'member', file: 'a.ts' }],
@@ -24,10 +28,33 @@ const check = (source) => validateProfile(registry, extractProfileEntries(source
 test('a clean profile passes every check', () => {
   const v = check(src(good('orient'), good('task_list')))
   assert.deepEqual(
-    [v.unresolved, v.unknown, v.tooHigh, v.writeNamed, v.badAnnotations, v.duplicates],
-    [[], [], [], [], [], []],
+    [v.unresolved, v.unknown, v.tooHigh, v.notReviewed, v.writeNamed, v.badAnnotations, v.duplicates],
+    [[], [], [], [], [], [], []],
   )
   assert.equal(v.unsorted, false)
+})
+
+test('office.publish_post, squad_message, supabase_mutate are each rejected (not reviewed) even at member tier', () => {
+  for (const n of ['office.publish_post', 'squad_message', 'supabase_mutate']) {
+    const v = check(src(good(n)))
+    assert.deepEqual(v.notReviewed, [n], n)
+    assert.deepEqual(v.tooHigh, [], `${n} is member tier: only the reviewed set stops it`)
+  }
+})
+
+test('dotted names are tokenised by the secondary tripwire', () => {
+  assert.deepEqual(check(src(good('office.publish_post'))).writeNamed, ['office.publish_post'])
+})
+
+test('boot_context without rejectArgs model+runtime fails; with them passes', () => {
+  const r = new Map([...registry, ['boot_context', { min: 'authenticated', file: 'a.ts' }]])
+  const open = validateProfile(r, extractProfileEntries(src(good('boot_context'))))
+  assert.equal(open.bootSelfReportOpen, true)
+  const partial = validateProfile(r, extractProfileEntries(src(`{ name: 'boot_context', rejectArgs: ['model'], annotations: { title: 'T', readOnlyHint: true, destructiveHint: false, openWorldHint: false } }`)))
+  assert.equal(partial.bootSelfReportOpen, true)
+  const closed = validateProfile(r, extractProfileEntries(src(`{ name: 'boot_context', rejectArgs: ['model', 'runtime'], annotations: { title: 'T', readOnlyHint: true, destructiveHint: false, openWorldHint: false } }`)))
+  assert.equal(closed.bootSelfReportOpen, false)
+  assert.deepEqual(closed.notReviewed, [])
 })
 
 test('adding a write tool (send) fails: write-named', () => {
@@ -76,13 +103,15 @@ test('missing array returns null', () => {
 
 test('wiring: real src/mcp/index.ts passes', () => {
   const w = checkProfileWiring(readFileSync(new URL('../src/mcp/index.ts', import.meta.url), 'utf8'))
-  assert.deepEqual(w, { handlerFound: true, callsProfileEntry: true, callsProfileToolList: true, routeFound: true, routePassesMode: true })
+  assert.deepEqual(w, { handlerFound: true, callsProfileEntry: true, callsProfileToolList: true, setsSideEffectFree: true, routeFound: true, routePassesMode: true })
 })
 
 test('wiring: removing the allowlist refusal or the route mode is detected', () => {
   const real = readFileSync(new URL('../src/mcp/index.ts', import.meta.url), 'utf8')
   const noEntry = real.replace('!profileEntry(params.name)', 'false')
   assert.equal(checkProfileWiring(noEntry).callsProfileEntry, false)
+  const noSef = real.replace('sideEffectFree: true', 'sideEffectFree: false')
+  assert.equal(checkProfileWiring(noSef).setsSideEffectFree, false)
   const noMode = real.replace("handleJsonRpc(c, body, 'needs-you')", 'handleJsonRpc(c, body)')
   assert.equal(checkProfileWiring(noMode).routePassesMode, false)
 })

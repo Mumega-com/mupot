@@ -4,7 +4,9 @@
 // Drives the REAL mcpApp + REAL TOOLS registry through the same header seam the
 // OAuthProvider -> McpOAuthApiHandler hop uses (see tests/oauth-dual-auth.test.ts). The 401 +
 // resource_metadata contract lives in tests/composition/ (it needs the real wrapper).
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { mcpApp, TOOLS } from '../src/mcp'
 import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
@@ -14,31 +16,26 @@ import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 const TENANT = 'mumega'
 const ADMIN_MEMBER = 'mbr-admin'
 
+// Real SQL on the committed migration chain (tests/helpers/migrations.ts) — never a
+// hand-written prepare() double (scripts/check-test-schema-source.mjs).
+const harnesses: SqliteD1Harness[] = []
+afterEach(() => {
+  for (const h of harnesses.splice(0)) h.close()
+})
+
 function makeEnv(grants: CapabilityGrant[] = []): Env {
-  return {
-    TENANT_SLUG: TENANT,
-    BRAND: 'Mumega',
-    OAUTH_PROVIDER: 'google',
-    DB: {
-      prepare(sql: string) {
-        return {
-          bind() {
-            return {
-              async first() {
-                return null
-              },
-              async all() {
-                if (sql.includes('FROM capabilities') || sql.includes('FROM channel_capability_grants')) {
-                  return { results: grants }
-                }
-                return { results: [] }
-              },
-            }
-          },
-        }
-      },
-    },
-  } as unknown as Env
+  const harness = createSqliteD1()
+  harnesses.push(harness)
+  applyAllMigrations(harness.sqlite)
+  for (const id of new Set([ADMIN_MEMBER, 'mbr-dir', ...grants.map((g) => g.member_id)])) {
+    harness.sqlite.prepare(`INSERT INTO members (id, display_name, status, tenant) VALUES (?, ?, 'active', ?)`).run(id, id, TENANT)
+  }
+  for (const [i, g] of grants.entries()) {
+    harness.sqlite
+      .prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, ?, ?, ?)`)
+      .run(`cap-${i}`, g.member_id, g.scope_type, g.scope_id, g.capability)
+  }
+  return { TENANT_SLUG: TENANT, BRAND: 'Mumega', OAUTH_PROVIDER: 'google', DB: harness.db } as unknown as Env
 }
 
 const ADMIN_GRANTS: CapabilityGrant[] = [
@@ -205,9 +202,15 @@ describe('OAuthProvider -> mcpApp re-root (mcpInternalRequest)', () => {
     expect(rerooted(NEEDS_YOU_PROFILE_PATH)).toBe('/profile/needs-you')
   })
 
-  it('every other /mcp* path still re-roots to / (unchanged), including lookalikes', () => {
-    for (const p of ['/mcp', '/mcp/', '/mcp/tools', '/mcp/profile/needs-you/', '/mcp/profile/needs-you/x', '/mcp/profile', '/mcp/profile/other']) {
+  it('every other /mcp* path outside the profile namespace still re-roots to / (unchanged)', () => {
+    for (const p of ['/mcp', '/mcp/', '/mcp/tools', '/mcp/profiles', '/mcp/profile-x', '/mcp/x/profile/needs-you']) {
       expect(rerooted(p), p).toBe('/')
+    }
+  })
+
+  it('every other path in the reserved /mcp/profile namespace is re-rooted to a 404, NEVER to /', () => {
+    for (const p of ['/mcp/profile/needs-you/', '/mcp/profile/needs-you/x', '/mcp/profile', '/mcp/profile/', '/mcp/profile/other', '/mcp/profile/needs-you/..%2F..']) {
+      expect(rerooted(p), p).toBe('/profile/_not_found')
     }
   })
 })

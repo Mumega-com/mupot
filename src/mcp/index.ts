@@ -641,6 +641,10 @@ export type ToolCtx = {
   waitUntil?: (promise: Promise<unknown>) => void
   seat?: string
   source?: string
+  /** Set ONLY by the curated read-only profile (POST /mcp/profile/needs-you): the call must
+   *  leave NO session side effect — no presence bump, no poll-mode last-seen refresh, no fleet
+   *  self-report. Absent on every other door, where behavior is byte-for-byte unchanged. */
+  sideEffectFree?: boolean
 }
 
 export interface ToolSpec {
@@ -1002,7 +1006,7 @@ const toolTaskList: ToolSpec = {
     },
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const squadRes = await resolveTaskSquad(env, auth, args)
     if (!squadRes.ok) return squadRes
     const status = args.status
@@ -1123,7 +1127,7 @@ const toolTaskList: ToolSpec = {
     // mupot#1494 round 3 (P2-c) — touch AFTER every read/write above has succeeded, not
     // merely after the tool-layer 400/403/404 refusals: this is the LAST thing on the success
     // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
-    await touchPollFleetPresence(env, auth.boundAgentId)
+    if (!ctx?.sideEffectFree) await touchPollFleetPresence(env, auth.boundAgentId)
 
     return done({ squad_id: squadRes.squad.id, tasks: rankedTasks })
   },
@@ -5611,7 +5615,7 @@ const toolBootContext: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
-    if (auth.memberId) {
+    if (auth.memberId && !ctx?.sideEffectFree) {
       const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
       const bootTouch = (async () => {
         const id = await loadMemberIdentity(env, auth)
@@ -5644,7 +5648,9 @@ const toolBootContext: ToolSpec = {
     // to ask. Same reasoning as available_doors — the response that always succeeds is
     // where a fact has to be said, or it is not said at all.
     const selfReport = isMinted
-      ? await reportSelfAtBoot(env, auth.boundAgentId as string, { runtime: args.runtime, model: args.model })
+      // sideEffectFree (profile): never claim runtime/model — the profile refuses them, and
+      // this drops them even if a caller reaches here another way. An empty claim only READS.
+      ? await reportSelfAtBoot(env, auth.boundAgentId as string, ctx?.sideEffectFree ? {} : { runtime: args.runtime, model: args.model })
       : null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
@@ -5839,6 +5845,7 @@ const toolOrient: ToolSpec = {
       mcpEndpoint(canonicalOrigin(env, ctx.origin)),
       viewSensitive,
       Date.now(),
+      { recordInduction: !ctx.sideEffectFree },
     )
     if (notFound || !data) return fail(404, 'agent_not_found')
     return done({ packet: data, brief: renderBrief(data) })
@@ -6183,7 +6190,18 @@ function profileToolList(): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   for (const entry of NEEDS_YOU_PROFILE) {
     const spec = TOOL_BY_NAME.get(entry.name)
-    if (spec) out.push({ ...mcpTool(spec), annotations: { ...entry.annotations } })
+    if (!spec) continue
+    const base = mcpTool(spec)
+    if (entry.rejectArgs || entry.args !== undefined) {
+      const props = Object.fromEntries(
+        Object.entries(spec.inputSchema.properties).filter(([k]) => !entry.rejectArgs?.includes(k)),
+      )
+      base.inputSchema = { ...spec.inputSchema, properties: props }
+      if (entry.args !== undefined) {
+        base.description = `${spec.scope}; minimum capability: ${spec.min}. Args: ${entry.args}`
+      }
+    }
+    out.push({ ...base, annotations: { ...entry.annotations } })
   }
   return out
 }
@@ -6278,6 +6296,7 @@ export async function invokeTool(
         waitUntil: originOrCtx?.waitUntil,
         seat: originOrCtx?.seat,
         source: originOrCtx?.source,
+        sideEffectFree: originOrCtx?.sideEffectFree,
       }
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
@@ -6348,7 +6367,7 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)
@@ -6441,12 +6460,23 @@ async function handleJsonRpc(
     if (profile === 'needs-you' && !profileEntry(params.name)) {
       return rpcError(id, -32601, 'tool_not_in_profile', { profile }, 403)
     }
+    // Profile arg refusal (e.g. boot_context runtime/model, which would reach selfReportAtBoot
+    // and WRITE the fleet row). Refused, not stripped: a silent strip is a success-shaped no-op.
+    const rejectArgs = profile === 'needs-you' ? profileEntry(params.name)?.rejectArgs : undefined
+    if (rejectArgs && typeof params.arguments === 'object' && params.arguments !== null) {
+      const supplied = rejectArgs.filter((k) => Object.prototype.hasOwnProperty.call(params.arguments, k))
+      if (supplied.length > 0) {
+        return rpcError(id, -32602, 'profile_args_not_allowed', { tool: params.name, rejected: supplied }, 400)
+      }
+    }
     const ctx: ToolCtx = {
       origin: new URL(c.req.url).origin,
       transport: 'mcp',
       waitUntil: safeWaitUntil(c),
       seat: c.req.header('x-mupot-seat'),
       source: c.req.header('x-mupot-source'),
+      // Profile mode = no session side effects (see ToolCtx.sideEffectFree).
+      ...(profile === 'needs-you' ? { sideEffectFree: true } : {}),
     }
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
@@ -6499,6 +6529,9 @@ mcpApp.post('/profile/needs-you', async (c) => {
   if (!isJsonRpcRequest(body)) return c.json({ error: 'json_rpc_required' }, 400)
   return handleJsonRpc(c, body, 'needs-you')
 })
+// The reserved /mcp/profile namespace: anything that is not the exact route above is a 404
+// (registered AFTER the exact route so it never shadows it).
+mcpApp.all('/profile/*', (c) => c.json({ error: 'not_found' }, 404))
 
 interface InvokeBody {
   tool?: unknown

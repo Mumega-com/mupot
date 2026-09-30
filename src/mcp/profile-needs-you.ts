@@ -28,14 +28,25 @@
 // task_verdict, task_update, grant_* etc. here. scripts/check-mcp-profile-needs-you.mjs
 // fails CI if a tool above member capability, or one whose name reads as a write, is added.
 //
-// "READ-ONLY" HERE MEANS: no mutation of business data (tasks, projects, messages, grants).
-// The shared invokeTool()/boot_context/task_list bookkeeping still refreshes the CALLER'S OWN
-// presence/last-seen rows exactly as on /mcp; the registry has no per-tool readOnly metadata
-// to say otherwise.
+// "READ-ONLY" HERE IS ENFORCED: the profile route sets ToolCtx.sideEffectFree, under which
+// invokeTool does not bump presence, task_list does not refresh a poll agent's last-seen,
+// boot_context does not touch presence or self-report (and refuses runtime/model, rejectArgs
+// below), and orient does not record an induction row. tests/mcp-profile-needs-you-no-side-
+// effects.test.ts snapshots every table and the KV around each tool. If a tool cannot be made
+// side-effect-free, it does not belong in this list.
+//
+// PATH NAMESPACE: /mcp/profile and /mcp/profile/* are reserved. Only the exact
+// NEEDS_YOU_PROFILE_PATH is served; every other path in that namespace is a 404 (see
+// mcpInternalRequest), never the full /mcp.
 //
 // Keep this list sorted by name (a clean one-line diff per added tool).
 
 export const NEEDS_YOU_PROFILE_PATH = '/mcp/profile/needs-you'
+
+/** True for `/mcp/profile` and every `/mcp/profile/...` path (the reserved namespace). */
+export function inProfileNamespace(pathname: string): boolean {
+  return pathname === '/mcp/profile' || pathname.startsWith('/mcp/profile/')
+}
 
 export interface ProfileToolAnnotations {
   title: string
@@ -47,12 +58,24 @@ export interface ProfileToolAnnotations {
 export interface ProfileToolEntry {
   name: string
   annotations: ProfileToolAnnotations
+  /** Argument names the profile REFUSES (JSON-RPC -32602, HTTP 400) before invokeTool runs,
+   *  and omits from the profile's tools/list schema. */
+  rejectArgs?: readonly string[]
+  /** Replaces the tool's documented `Args:` text in the profile's tools/list description. */
+  args?: string
 }
 
 export const NEEDS_YOU_PROFILE: readonly ProfileToolEntry[] = [
   {
     name: 'boot_context',
     annotations: { title: 'Who am I and what can I do', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    // runtime/model make boot_context call selfReportAtBoot, which WRITES the caller's
+    // fleet_agents row (status -> 'running' even for an operator-stopped agent, runtime,
+    // model). That is a state change under a readOnlyHint, and ChatGPT calls read-only-hinted
+    // tools without confirmation — so the profile never forwards them (#1625 tracks the
+    // stopped-row defect in selfReportAtBoot itself).
+    rejectArgs: ['model', 'runtime'],
+    args: '{ source?: string, seat?: string, label?: string }',
   },
   {
     name: 'needs_you_list',

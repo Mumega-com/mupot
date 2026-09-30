@@ -7,10 +7,15 @@
 // Fails when:
 //   a. a profile name is not a real ToolSpec in src/mcp/*.ts (stale / typo);
 //   b. a profile tool's `min` is above 'member' (lead / admin / owner);
-//   c. a profile tool's NAME reads as a write (send, create, update, verdict, grant, mint,
-//      revoke, ...). The registry carries no per-tool readOnly flag, so this name check plus
-//      the min ceiling IS the mechanical read-only gate; adding a tool to the profile is a
-//      reviewed act, and this only stops the obvious mistakes;
+//   c. a profile tool is not in REVIEWED_READ_ONLY below — an explicit, human-reviewed set of
+//      names pinned IN THIS FILE (the registry carries no per-tool readOnly flag, and a name
+//      heuristic cannot tell `office.publish_post` or `squad_message` from a read). A tool is
+//      added to the profile only by adding it to that set, with a reason, in the same diff —
+//      that is the review act. A secondary token heuristic (split on '.' AND '_') still runs
+//      as a tripwire, but it is NOT the gate;
+//   c2. boot_context must refuse `model` and `runtime` (rejectArgs): they reach
+//      selfReportAtBoot, which writes the caller's fleet row (a state change under a
+//      readOnlyHint);
 //   d. annotations are missing, or are not exactly readOnlyHint:true, destructiveHint:false,
 //      openWorldHint:false, with a non-empty title;
 //   e. the list is unsorted or has duplicates;
@@ -37,6 +42,21 @@ const READ_TIERS = new Set(['authenticated', 'observer', 'member'])
 // Name tokens (split on '_') that mean a tool mutates or acts. A profile tool containing any
 // of these tokens fails. Deliberately broad: a false positive is a one-line review, a false
 // negative is a write tool in a ChatGPT-facing read-only profile.
+// Every name here was read (run body inspected) and judged to mutate no WORK data. Bookkeeping
+// (presence / poll last-seen bump by invokeTool and task_list) is accepted and documented in
+// docs/connect-chatgpt-needs-you-profile.md. boot_context is admitted ONLY with its
+// runtime/model self-report refused (check c2).
+export const REVIEWED_READ_ONLY = new Map([
+  ['boot_context', 'identity/onboarding read; runtime/model self-report refused on the profile'],
+  ['needs_you_list', 'attention-item read'],
+  ['orient', 'orientation read'],
+  ['project_get', 'project read'],
+  ['project_list', 'project list read'],
+  ['project_wiki', 'project wiki read'],
+  ['task_board', 'task board read'],
+  ['task_list', 'task list read (may refresh a poll agent last-seen; documented)'],
+])
+
 export const WRITE_TOKENS = new Set([
   'send', 'create', 'update', 'verdict', 'grant', 'mint', 'revoke', 'archive', 'unarchive',
   'remember', 'set', 'register', 'dispatch', 'deploy', 'delete', 'remove', 'write', 'submit',
@@ -45,6 +65,9 @@ export const WRITE_TOKENS = new Set([
   'disable', 'enable', 'configure', 'pause', 'cancel', 'run', 'answer', 'advance', 'land',
   'reap', 'end', 'bootstrap', 'connect', 'request', 'reveal', 'attest', 'reconcile', 'tick',
   'control', 'accept', 'recommit', 'reintake', 'authorize', 'expand', 'define', 'reverse',
+  'message', 'mutate', 'review', 'check', 'heartbeat', 'deregister', 'inbox', 'post', 'push',
+  'sync', 'upload', 'save', 'insert', 'patch', 'edit', 'apply', 'commit', 'merge', 'invite',
+  'kick', 'ban', 'stop', 'start', 'restart', 'kill', 'spawn', 'exec', 'call', 'invoke',
 ])
 
 function scriptKindFor(filePath) {
@@ -83,13 +106,16 @@ export function extractProfileEntries(source, filePath = 'source.ts') {
         if (!decl.initializer || !ts.isArrayLiteralExpression(decl.initializer)) continue
         const entries = []
         for (const el of decl.initializer.elements) {
-          const entry = { name: null, annotations: null, unresolved: false }
+          const entry = { name: null, annotations: null, rejectArgs: [], unresolved: false }
           if (!ts.isObjectLiteralExpression(el)) { entry.unresolved = true; entries.push(entry); continue }
           const props = objectProps(el)
           if (!props) { entry.unresolved = true; entries.push(entry); continue }
           const name = props.name ? literalValue(props.name) : UNRESOLVED_MIN
           if (typeof name !== 'string') entry.unresolved = true
           else entry.name = name
+          if (props.rejectArgs && ts.isArrayLiteralExpression(props.rejectArgs)) {
+            entry.rejectArgs = props.rejectArgs.elements.map((e) => literalValue(e))
+          }
           if (props.annotations && ts.isObjectLiteralExpression(props.annotations)) {
             const ap = objectProps(props.annotations)
             if (!ap) entry.unresolved = true
@@ -123,7 +149,13 @@ export function validateProfile(registry, entries) {
     .filter((n) => registry.has(n))
     .map((n) => ({ name: n, min: registry.get(n).min, file: registry.get(n).file }))
     .filter(({ min }) => !READ_TIERS.has(min))
-  const writeNamed = names.filter((n) => n.split('_').some((tok) => WRITE_TOKENS.has(tok)))
+  const notReviewed = names.filter((n) => !REVIEWED_READ_ONLY.has(n))
+  // Tripwire only (see header c): split on '.' AND '_' so dotted names are tokenised too.
+  const writeNamed = names.filter((n) => n.split(/[._]/).some((tok) => WRITE_TOKENS.has(tok)))
+  const bootEntry = named.find((e) => e.name === 'boot_context')
+  const bootSelfReportOpen = bootEntry
+    ? !(bootEntry.rejectArgs.includes('model') && bootEntry.rejectArgs.includes('runtime'))
+    : false
   const badAnnotations = named
     .filter((e) => {
       const a = e.annotations
@@ -140,7 +172,7 @@ export function validateProfile(registry, entries) {
   const sorted = [...names].sort()
   const unsorted = !names.every((n, i) => n === sorted[i])
   const duplicates = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
-  return { unresolved, unknown, tooHigh, writeNamed, badAnnotations, unsorted, duplicates }
+  return { unresolved, unknown, tooHigh, notReviewed, writeNamed, bootSelfReportOpen, badAnnotations, unsorted, duplicates }
 }
 
 /**
@@ -153,6 +185,7 @@ export function checkProfileWiring(source, filePath = 'index.ts') {
     handlerFound: false,
     callsProfileEntry: false,
     callsProfileToolList: false,
+    setsSideEffectFree: false,
     routeFound: false,
     routePassesMode: false,
   }
@@ -168,8 +201,28 @@ export function checkProfileWiring(source, filePath = 'index.ts') {
   function visit(node) {
     if (ts.isFunctionDeclaration(node) && node.name && node.name.text === 'handleJsonRpc' && node.body) {
       r.handlerFound = true
-      r.callsProfileEntry = callsIdent(node.body, 'profileEntry')
+      // The refusal must be an `if (... !profileEntry(x) ...)` — a bare call (e.g. only reading
+      // entry.rejectArgs) does not count.
+      let negated = false
+      ;(function inner(n) {
+        if (negated) return
+        if (
+          ts.isPrefixUnaryExpression(n) && n.operator === ts.SyntaxKind.ExclamationToken &&
+          ts.isCallExpression(n.operand) && ts.isIdentifier(n.operand.expression) &&
+          n.operand.expression.text === 'profileEntry'
+        ) { negated = true; return }
+        ts.forEachChild(n, inner)
+      })(node.body)
+      r.callsProfileEntry = negated
       r.callsProfileToolList = callsIdent(node.body, 'profileToolList')
+      // Profile mode must set ToolCtx.sideEffectFree (no presence bump / last-seen / self-report).
+      ;(function inner(n) {
+        if (
+          ts.isPropertyAssignment(n) && ts.isIdentifier(n.name) && n.name.text === 'sideEffectFree' &&
+          n.initializer.kind === ts.SyntaxKind.TrueKeyword
+        ) r.setsSideEffectFree = true
+        ts.forEachChild(n, inner)
+      })(node.body)
     }
     if (
       ts.isCallExpression(node) &&
@@ -223,6 +276,8 @@ function main() {
   if (v.unresolved.length) fail(`\nUNRESOLVED PROFILE ENTRY — ${PROFILE_REL} has ${v.unresolved.length} entry(ies) that are not plain { name: '<literal>', annotations: { literal booleans/strings } } objects.`)
   if (v.unknown.length) fail(`\nUNKNOWN TOOL IN PROFILE — not a ToolSpec in src/mcp/*.ts: ${v.unknown.join(', ')}`)
   for (const t of v.tooHigh) fail(`\nTOO-HIGH TOOL IN PROFILE — ${t.name} has min:'${t.min}' (${t.file}); the profile is read-only, member tier or below.`)
+  if (v.notReviewed.length) fail(`\nNOT IN THE REVIEWED READ-ONLY SET — ${v.notReviewed.join(', ')}. Read the tool's run() body, and only then add it to REVIEWED_READ_ONLY in this script (with a reason). v1 has no write tools.`)
+  if (v.bootSelfReportOpen) fail("\nboot_context is in the profile without rejectArgs ['model','runtime']: those args reach selfReportAtBoot and WRITE the caller's fleet row under a readOnlyHint.")
   if (v.writeNamed.length) fail(`\nWRITE-SHAPED TOOL IN READ-ONLY PROFILE — ${v.writeNamed.join(', ')}. v1 has no write tools (approvals need a harness-attested human origin).`)
   if (v.badAnnotations.length) fail(`\nBAD ANNOTATIONS — every profile tool needs readOnlyHint:true, destructiveHint:false, openWorldHint:false and a title: ${v.badAnnotations.join(', ')}`)
   if (v.unsorted) fail(`\n${PROFILE_REL}: NEEDS_YOU_PROFILE is not sorted by name.`)
@@ -232,6 +287,7 @@ function main() {
   if (!w.handlerFound) fail('\nCANNOT VERIFY — function handleJsonRpc not found in src/mcp/index.ts.')
   else {
     if (!w.callsProfileEntry) fail('\nBYPASS REGRESSION — handleJsonRpc no longer calls profileEntry(): tools/call on the profile would execute non-allowlisted tools.')
+    if (!w.setsSideEffectFree) fail('\nSIDE-EFFECT REGRESSION — handleJsonRpc no longer sets sideEffectFree: true for the profile: profile calls would bump presence / poll last-seen again under a readOnlyHint.')
     if (!w.callsProfileToolList) fail('\nBYPASS REGRESSION — handleJsonRpc no longer calls profileToolList(): the profile tools/list would not be the allowlist.')
   }
   if (!w.routeFound) fail("\nCANNOT VERIFY — mcpApp.post('/profile/needs-you', ...) not found in src/mcp/index.ts.")
