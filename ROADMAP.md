@@ -9,17 +9,16 @@ numbers.
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
-| Current production version | `0.31.0` | Last recorded deploy `d954c1ab` (2026-09-29); live `/health` reported `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
-| Last tagged stable release | `v0.31.0` | Deployed 2026-09-29 (#1604, code first as Cloudflare version `6d1d7c6c`, migration 0181 applied immediately after — 0 identity drift, 0 generation/binding split on the post-deploy check). **The annotated git tag itself is pending**: Kasra-core cuts `release/v0.31.0` and pushes `v0.31.0` against this commit range next — no tag object exists as of this commit, so read the tag, not a SHA copied in here, once it lands. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
+| Current production version | `0.31.0` | Last recorded deploy (2026-09-30, read from live `/health`): version `0.31.0`, commit `23cc5847`, `clean: true`. Live `/health` is the authoritative source; `main` and production move independently, so this row ages on the next deploy. |
+| Last tagged stable release | `v0.31.0` | Deployed 2026-09-29 (#1604, code first as Cloudflare version `6d1d7c6c`, migration 0181 applied immediately after — 0 identity drift, 0 generation/binding split on the post-deploy check). The annotated tag `v0.31.0` exists, with GitHub Release "v0.31.0 — Office" (`git for-each-ref refs/tags/v0.31.0`, `gh release list`); read the tag itself for the commit it points at. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
 | Next stable candidate | `v0.31.1` | P0 cherry-picks onto `release/v0.31.0` only, once cut — never a re-cut from wherever `main` happens to be. |
 | Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this release and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
 
-`0.31.0` is the version the source reports as of this commit, and (as of 2026-09-29) the
-version live in production too — the source version string and the deployed version
-agree for the first time since `v0.30.0`. `v0.30.0` remains the only version with a real
-git tag and release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) until
-`v0.31.0`'s annotated tag is cut. `main` continues past `d954c1ab` as preview; nothing on
-`main` after it is covered by whatever evidence bundle the `v0.31.0` tag ends up bound to.
+The source version string is whatever `package.json` says and the version production reports is
+whatever live `/health` says; both were `0.31.0` when this table was last edited. `v0.30.0` has release
+branch `release/v0.30.0` (at `09ea48f6`, 2026-09-26); `v0.31.0` is tagged and the tag is frozen at its own
+commit. Everything merged to `main` after the tag is preview and is not covered by the evidence the
+`v0.31.0` tag is bound to.
 
 ## Shipped — v0.31.0 "Office" (2026-09-29)
 
@@ -32,9 +31,7 @@ auth residuals (#1583), the seat-events channel for fleet hosts and its
 hardening (#1593, #1595 — a separate, concurrent Hadi-led effort that landed
 in the same window, not originally named in this flight), an SSRF/dependency
 security fix (#1601), and the v0.31.0 version bump + native-addon identity
-backfill (#1604). Office publishing remains inert (mupot#1592, PR #1602 in
-review) and the public `/openapi.json` still discloses admin tools (PR #1603
-in review) — see CHANGELOG.md "Known limitations" for both.
+backfill (#1604). At the tag, office publishing was inert and the public `/openapi.json` disclosed admin tools (CHANGELOG.md "Known limitations"). Since the tag these have merged to `main` (none is part of the `v0.31.0` tag; see CHANGELOG.md `[Unreleased]`): #1602 and #1614 (office approval binding and write bindings), #1603 (public OpenAPI allowlist), #1624 (read-only `needs-you` MCP profile), #1626 (agent Access panel), #1622 (decision port, which has no caller) and #1629 and #1633 (MCP Events, behind `EVENTS_ENABLED`). What is **not** proven: a first live office publish (#1617); MCP Events against a real ChatGPT client or the Workers runtime (#1618, #1636); the decision port has never run outside tests (#1635). Authenticated `tools/list` still lists every tool (#1609).
 
 Gate rule (Hadi, 2026-09-16): P0 blocks, P1 ships with a follow-up issue, two
 adversarial gate rounds maximum per artifact.

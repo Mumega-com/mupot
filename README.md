@@ -31,10 +31,8 @@ simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
 send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
-The version the code reports is `0.30.0`, but it is not yet a tagged stable release.
-The last tagged release is `v0.25.0 Project Routines and Needs You`; the next stable
-candidate is `v0.30.0 Stabilized Control Plane`, and `v0.31.0` work remains held until
-that release closes. See the
+The version the code reports is in `package.json`; the tags and GitHub Releases are the
+record of what has been published (`git tag -l`, `gh release list`). See the
 [version roadmap](./ROADMAP.md), the
 [next release flights](./docs/releases/next-flights.md), the
 [control-plane requirements](./docs/control-plane-roadmap.md), the

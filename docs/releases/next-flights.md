@@ -10,15 +10,21 @@ ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains 
 | Surface | Exact state |
 |---|---|
 | Current `main` | `0.31.0` — not pinned here; read `git rev-parse origin/main` |
-| Current production | `0.31.0` — read live `/health`; recorded deploy of the `v0.31.0` tag commit `52299bab`, `clean:true`, 2026-09-29 (migrations 0175–0181 applied). `main` and production move independently; this line ages on the next merge or deploy. |
+| Current production | `0.31.0` — read live `/health`. Last recorded deploy (2026-09-30, read from live `/health`): version `0.31.0`, commit `23cc5847`, `clean: true`. The earlier recorded deploy of the `v0.31.0` tag commit `52299bab` (2026-09-29, migrations 0175–0181 applied) is history. `main` and production move independently; this line ages on the next merge or deploy. |
 | Latest tagged stable release | `v0.31.0` — annotated tag at `52299bab` on `main`, 2026-09-29, with GitHub Release "v0.31.0 — Office" (see CHANGELOG.md `[0.31.0]`) |
-| Next stable candidate | `v0.31.1` — office publishing live (#1592 approval binding, T2b write bindings, #1610) |
+| Next stable candidate | `v0.31.1` — office publishing (#1592 approval binding, T2b write bindings, #1610): merged; a first live publish is not yet exercised (#1617), so "live" is not claimed |
 | Next development release | `v0.32.0` |
 
 The three states are intentionally different. Code on `main` is not necessarily
 deployed; deployed code is not necessarily stable; a stable claim requires the exact
 tag, GitHub Release, deployment, contract receipts, and final readiness verdict to
 agree.
+
+> **Superseded (v0.30.0 was tagged).** `v0.30.0` was tagged from `release/v0.30.0`
+> (option 2 in [ROADMAP.md](../../ROADMAP.md) "Why no version was tagged between
+> v0.25.0 and v0.30.0"; `git tag -l v0.30.0`). Rows A–D below and the "two ways
+> forward" paragraph after the table record the plan as it stood and are historical.
+> Row E was not re-checked when this note was written.
 
 ## Ordered flight queue
 
