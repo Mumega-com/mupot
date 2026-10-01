@@ -40,16 +40,17 @@ was not confirmed from outside because `/mcp` refuses an unauthenticated probe.
   and signed verification (`src/mcp/events-webhook.ts`; HTTPS only, hostname must
   exactly match `EVENTS_CALLBACK_HOSTS`, **default empty refuses every URL**,
   `redirect: 'manual'`), Standard Webhooks signed delivery through a queue job
-  that carries only `{subscription_id, message_id}` and re-derives the rest from
-  D1 (`src/bus/events-delivery.ts`, hooked from `src/bus/consumer.ts`), and an
+  that carries `{job_id?, subscription_id, message_id}` and re-derives every
+  authoritative fact from D1 (`job_id` is informational;
+  `src/bus/events-delivery.ts`, hooked from `src/bus/consumer.ts`), and an
   append-only receipt per attempt. Migration `0188_mcp_event_subscriptions.sql`.
   The only event is `message.created` (body-free). With the flag off `events/*`
   are `method_not_found` and the consumer never calls the fan-out hook. **Not
   proven:** a real ChatGPT client, or the Workers runtime, completing the
   subscribe, verify, deliver loop; the tests use the node SQLite D1 harness and a
-  stubbed `fetch`. Known gaps: flood-induced event loss, a swallowed
-  marker-delete failure, `INSERT OR REPLACE` on the append-only receipts,
-  unbounded table growth (#1636). The design doc states the callback-validation
+  stubbed `fetch`. Known gaps: flood-induced event loss, `INSERT OR REPLACE` on
+  the append-only receipts, unbounded table growth (#1636). The design doc states
+  the callback-validation
   design still needs Hadi's acceptance before the flag or
   `EVENTS_CALLBACK_HOSTS` is set anywhere: `docs/architecture/mcp-events.md`.
 - **#1626** — org-admin Access panel on the agent page: set which squad an agent
