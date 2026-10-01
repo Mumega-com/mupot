@@ -114,7 +114,8 @@ was not confirmed from outside because `/mcp` refuses an unauthenticated probe.
 
 - **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
   GPT Actions discovery) now serves an explicit, committed allowlist
-  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
+  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 141 tools
+  at the #1603 merge)
   instead of the whole registry, with a runtime min-capability floor. A new
   org-admin-gated `GET /openapi.full.json` serves the full registry. CI ratchet
   `scripts/check-openapi-public-allowlist.mjs`. **Not a full fix for admin-tool
