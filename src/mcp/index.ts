@@ -136,7 +136,7 @@ import { buildOrient, renderBrief } from '../orient/service'
 import { mcpEndpoint, canonicalOrigin, requiredCanonicalOrigin } from '../dashboard/connect'
 import { enrollUrl } from '../dashboard/enroll'
 import { classify, humanAge } from '../dashboard/fleet'
-import { resolveAgentRef } from '../org/resolve'
+import { resolveAgentRef, resolveSquadRef } from '../org/resolve'
 import {
   sendToRef, readAgentInbox, sendAgentMessage, getSenderMessage,
 } from '../agents/messages'
@@ -884,15 +884,21 @@ const toolTaskCreate: ToolSpec = {
   name: 'task_create',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id: string, project_id?: string|null, title: string, done_when: string, body?: string, assignee_agent_id?: string, assignee_member_id?: string, priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
+  args: '{ squad_id?: string (id|prefix|slug; defaults to the bound agent\'s own squad), project_id?: string|null, title: string, done_when: string, body?: string, description?: string (alias of body), assignee_agent_id?: string, assignee_member_id?: string, gate_owner?: string (bare slug is prefixed gate:; only when you are not the assignee), priority?: "P0"|"P1"|"P2"|"P3", parent_task_id?: string, external_source?: string }',
   inputSchema: {
     type: 'object',
     properties: {
-      squad_id: STRING_SCHEMA,
+      squad_id: { ...STRING_SCHEMA, description: 'Squad id, short id prefix, or slug. Omit on an agent-bound token to use the agent\'s own squad.' },
       project_id: NULLABLE_STRING_SCHEMA,
       title: STRING_SCHEMA,
       done_when: { ...STRING_SCHEMA, description: 'Verifiable success predicate — a checkable condition that proves the task is complete.' },
       body: STRING_SCHEMA,
+      description: { ...STRING_SCHEMA, description: 'Alias of body. Pass one or the other; if both are given they must be identical.' },
+      // mupot#1664 (onboard ergonomics): name the gate at create so the task need not be
+      // created, then re-patched, before it can enter review. Refused when the creator is
+      // also the assignee (a self-gated task is the self-close loop), and a bare slug is
+      // prefixed 'gate:' (O3) rather than refused. Same form guard task_update applies.
+      gate_owner: { ...STRING_SCHEMA, description: "Gate holder, 'gate:<owner>' (a bare slug is prefixed 'gate:'). Refused if you are also the assignee." },
       assignee_agent_id: STRING_SCHEMA,
       // migrations/0150. The point of this field is that work needing a PERSON —
       // a browser click, a credential decision, an approval — can be owned on the
@@ -918,20 +924,38 @@ const toolTaskCreate: ToolSpec = {
       // omitted) keeps the current wake behavior.
       dispatch: { type: 'boolean', description: 'false = backlog-only (no wake); true/omitted = wake the squad' },
     },
-    required: ['squad_id', 'title', 'done_when'],
+    required: ['title', 'done_when'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const squadId = str(args.squad_id)
     const title = str(args.title)
-    if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     if (!title) return fail(400, 'invalid_args', 'title required')
 
     // #142: done_when guard at the MCP boundary (before any DB work).
     const doneWhen = typeof args.done_when === 'string' ? args.done_when.trim() : ''
     if (!doneWhen) return fail(400, 'done_when_required', 'done_when must be a non-empty verifiable success predicate')
 
-    const squad = await loadSquad(env, squadId)
+    // mupot#1664: squad by id / short prefix (existing seam), else by SLUG through the
+    // shared org resolver; omitted -> the bound agent's own squad (as task_list does).
+    // Everything after this point — archive, member-on-squad — is unchanged and runs on
+    // the resolved row, so a slug can never reach a squad the caller could not name by id.
+    let squad: Squad | null = null
+    const squadRef = str(args.squad_id)
+    if (squadRef) {
+      squad = await loadSquad(env, squadRef)
+      if (!squad) {
+        const bySlug = await resolveSquadRef(env, squadRef)
+        if (!bySlug.ok && bySlug.reason === 'ambiguous') return fail(409, 'ambiguous_squad_id')
+        if (bySlug.ok) squad = await loadSquad(env, bySlug.value.id)
+      }
+    } else if (args.squad_id !== undefined && args.squad_id !== null) {
+      return fail(400, 'invalid_args', 'squad_id must be a non-empty string')
+    } else if (auth.boundAgentId) {
+      const own = await loadAgent(env, auth.boundAgentId)
+      squad = own ? await loadSquad(env, own.squad_id) : null
+    } else {
+      return fail(400, 'invalid_args', 'squad_id required unless the token is agent-bound')
+    }
     if (!squad) return fail(404, 'squad_not_found')
     // mupot#1496 Round 3 (Athena P0-1): archive state is an ACTION boundary —
     // a squad can neither be shown as live (Round 2) nor written into.
@@ -942,12 +966,18 @@ const toolTaskCreate: ToolSpec = {
       return fail(403, 'forbidden', { need: 'member', scope: 'squad' })
     }
 
-    const body =
-      args.body === undefined || args.body === null
-        ? ''
-        : typeof args.body === 'string'
-          ? args.body
-          : null
+    // `description` is an alias of `body` (mupot#1664). Both given and different is a
+    // 400, never a silent pick — one of them would be dropped.
+    if (args.description !== undefined && args.description !== null && typeof args.description !== 'string') {
+      return fail(400, 'invalid_args', 'description must be a string')
+    }
+    const bodyArg = args.body === undefined || args.body === null ? undefined : args.body
+    const descriptionArg = typeof args.description === 'string' ? args.description : undefined
+    if (bodyArg !== undefined && descriptionArg !== undefined && bodyArg !== descriptionArg) {
+      return fail(400, 'invalid_args', 'pass body or description, not both with different values')
+    }
+    const bodyRaw = bodyArg !== undefined ? bodyArg : descriptionArg
+    const body = bodyRaw === undefined ? '' : typeof bodyRaw === 'string' ? bodyRaw : null
     if (body === null) return fail(400, 'invalid_args', 'body must be a string')
 
     const assignee = await resolveTaskAssignee(env, args.assignee_agent_id, squad.id)
@@ -973,6 +1003,34 @@ const toolTaskCreate: ToolSpec = {
       if (trimmed.length === 0) return fail(400, 'invalid_args', 'external_source must not be blank')
       if (trimmed.length > 200) return fail(400, 'invalid_args', 'external_source must be at most 200 characters')
       externalSource = trimmed
+    }
+
+    // gate_owner at create (mupot#1664). Allowed ONLY when the creator is not the
+    // assignee: a creator who names itself both worker and gate-setter is the self-close
+    // shape no-self-review exists to stop. "Creator" is the acting identity — the bound
+    // agent for an agent token, else the member. A bare slug gains 'gate:' (O3); the
+    // result must still pass the SAME form guard task_update uses. The two machine gates
+    // with dedicated completion machinery are not settable by a plain task_create.
+    let gateOwner: string | null = null
+    if (args.gate_owner !== undefined && args.gate_owner !== null) {
+      if (typeof args.gate_owner !== 'string' || args.gate_owner.trim().length === 0) {
+        return fail(400, 'invalid_gate_owner')
+      }
+      const rawGate = args.gate_owner.trim()
+      const candidate = rawGate.startsWith('gate:') ? rawGate : `gate:${rawGate}`
+      if (!isValidGateOwnerForm(candidate)) {
+        return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
+      }
+      if (candidate === 'gate:office' || candidate === 'gate:routines') {
+        return fail(403, 'gate_owner_reserved', 'this gate is reserved for its own subsystem and cannot be set at task_create')
+      }
+      const creatorIsAssignee =
+        (assignee.value != null && assignee.value === auth.boundAgentId) ||
+        (assigneeMember.value != null && assigneeMember.value === auth.memberId)
+      if (creatorIsAssignee) {
+        return fail(403, 'gate_owner_creator_is_assignee', 'gate_owner at create is refused when you are also the assignee — a creator may not gate its own work')
+      }
+      gateOwner = candidate
     }
 
     const projectId = args.project_id == null ? null : str(args.project_id)
@@ -1010,6 +1068,7 @@ const toolTaskCreate: ToolSpec = {
           body,
           assignee_agent_id: assignee.value,
           assignee_member_id: assigneeMember.value,
+          gate_owner: gateOwner,
           priority,
           parent_task_id: parentTaskId,
         },
