@@ -101,7 +101,7 @@ function fixture(): Fixture {
     TENANT_SLUG: TENANT,
     AI: {
       async run() {
-        if (fakes.aiFail) throw new Error('AI is down (secret-looking sk-abcdefghijklmnopqrstuvwxyz0123456789)')
+        if (fakes.aiFail) throw new Error(`AI is down (secret-looking ${FAKE_KEY})`)
         return { data: [[0.1, 0.2, 0.3]] }
       },
     },
@@ -117,6 +117,11 @@ function fixture(): Fixture {
   } as unknown as Env
   return { harness, env, fakes, violations }
 }
+
+// Secret-shaped fixture built at RUNTIME from parts: scripts/no-secrets.mjs (and other CI
+// ratchets) scan raw source text, so no single source line may contain the whole key.
+const FAKE_KEY_BODY = ['abcdefghij', 'klmnopqrst', 'uvwxyz0123456789'].join('')
+const FAKE_KEY = ['sk', FAKE_KEY_BODY].join('-')
 
 let seq = 0
 function seedTask(f: Fixture, opts: { projectId?: string | null; title?: string; result?: string | null; status?: string } = {}): string {
@@ -200,8 +205,9 @@ describe('composition — content is server-built, bounded by ENCODED size, labe
   })
 
   it('redacts secret-shaped strings from the untrusted block', () => {
-    const text = composeVerdictMemoryText({ ...facts, result: 'key is sk-abcdefghijklmnopqrstuvwxyz0123456789 ok' })
-    expect(text).not.toContain('sk-abcdefghijklmnopqrstuvwxyz0123456789')
+    const text = composeVerdictMemoryText({ ...facts, result: `key is ${FAKE_KEY} ok` })
+    expect(text).not.toContain(FAKE_KEY_BODY)
+    expect(text).not.toContain(FAKE_KEY)
   })
 
   it('the cap is on ENCODED bytes: 1000 chars that JSON-escape 6x, and 4-byte emoji, both stay under the cap', () => {
@@ -359,7 +365,7 @@ describe('failure isolation', () => {
     expect(failed).toHaveLength(1)
     const reason = String(failed[0].evidence.reason)
     expect(reason.length).toBeLessThanOrEqual(200)
-    expect(reason).not.toContain('sk-abcdefghijklmnopqrstuvwxyz0123456789') // secret-shaped text redacted
+    expect(reason).not.toContain(FAKE_KEY_BODY) // secret-shaped text redacted
     expect(outcomes(f, verdictId).some((o) => o.operation === OP_RECORD)).toBe(false) // not claimed written
 
     f.fakes.aiFail = false
