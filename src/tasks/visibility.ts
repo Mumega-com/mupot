@@ -24,10 +24,6 @@ export const TASK_READ_MINIMUM: Capability = 'member'
 export interface VisibleTaskScope {
   /** Explicit, bounded, de-duplicated squad ids whose tasks the caller may read. Never null. */
   readonly squadIds: readonly string[]
-  /** True when the caller holds the org-wide plane (legacy role while capabilities are
-   *  unloaded, or an org-scope grant at member+). Informational: squadIds is already
-   *  materialized (non-home squads + the caller's exact grants). */
-  readonly orgWide: boolean
 }
 
 // The ONE definition of the legacy role plane: it counts ONLY while capabilities are
@@ -64,25 +60,24 @@ async function homeSquadIdsAmong(env: Env, ids: string[]): Promise<Set<string>> 
 export async function resolveVisibleTaskScope(env: Env, auth: AuthContext): Promise<VisibleTaskScope> {
   const grants = ambientGrants(auth)
   const rolePlane = rolePlaneActive(auth)
-  const orgGrantMember = hasCapability(grants, 'org', null, TASK_READ_MINIMUM)
-  const orgWide = rolePlane || orgGrantMember
   const exact = exactSquadGrantIds(grants)
 
   let inherited: string[]
-  if (orgWide) {
-    // Every NON-home squad. A home is reachable only through the caller's own exact grant.
+  if (rolePlane) {
+    // Legacy role plane (capabilities unloaded): every NON-home squad.
     inherited = await resolveAllSquadIds(env, { excludeHome: true })
   } else {
-    // Squad + department grants at member+. The department expansion can reach a home
-    // squad when a (legacy / poisoned) department grant names a home department, so homes
-    // are stripped from the INHERITED part below and re-admitted only via an exact grant.
+    // Org (every non-home squad), department and squad grants at member+. A department
+    // expansion can reach a home squad when a (legacy / poisoned) department grant names a
+    // home department, so homes are stripped from the INHERITED part below and re-admitted
+    // only through the caller's own exact squad grant.
     inherited = await resolveGrantedSquadIds(env, grants, TASK_READ_MINIMUM)
     const exactSet = new Set(exact)
     const candidates = inherited.filter((id) => !exactSet.has(id))
     const homes = await homeSquadIdsAmong(env, candidates)
     inherited = inherited.filter((id) => !homes.has(id))
   }
-  return { squadIds: [...new Set([...inherited, ...exact])], orgWide }
+  return { squadIds: [...new Set([...inherited, ...exact])] }
 }
 
 /** Can this caller read tasks on ONE squad? The single-squad twin of resolveVisibleTaskScope
