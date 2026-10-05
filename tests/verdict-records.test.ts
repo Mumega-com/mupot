@@ -200,23 +200,39 @@ describe('P0 regression: squad RBAC (squad-b reads project-shared but NOT squad-
     expect(ids(sectionA[0].records)).toEqual([a])
   })
 
-  it('orienting a PEER does not widen visibility: squad-b caller orienting agent-a (needs observer on squad-a) still sees only squad-b records', async () => {
+  it('orienting a PEER does not widen visibility: observer on squad-a is NOT enough (task_list needs member), member on squad-a is', async () => {
     const f = make()
     seedTwoSquads(f)
     seedTask(f, { squad: SQUAD_A, status: 'open', assignee: AGENT_A })
-    const callerWithBothObserver: AuthContext = {
+    const withA = (capability: string): AuthContext => ({
       ...authB(),
       capabilities: [
         { member_id: MEMBER_B, scope_type: 'squad', scope_id: SQUAD_B, capability: 'member' },
-        { member_id: MEMBER_B, scope_type: 'squad', scope_id: SQUAD_A, capability: 'observer' },
+        { member_id: MEMBER_B, scope_type: 'squad', scope_id: SQUAD_A, capability },
       ],
+    } as unknown as AuthContext)
+    const observer = await orient(f, withA('observer'), AGENT_A) // may orient (observer), may NOT read squad-a task results
+    expect(observer.ok).toBe(true)
+    expect(JSON.stringify(observer.result)).not.toContain('SQUAD-A-PRIVATE')
+    const member = await orient(f, withA('member'), AGENT_A)
+    expect(JSON.stringify(member.result)).toContain('SQUAD-A-PRIVATE-TITLE')
+    // ...and the squad-b-only caller cannot orient agent-a at all.
+    expect((await orient(f, authB(), AGENT_A)).ok).toBe(false)
+  })
+
+  it('orient never consults latentCapabilities: a seat with zero ambient grants and a latent squad-a member grant gets no section', async () => {
+    const f = make()
+    seedTwoSquads(f)
+    seedTask(f, { squad: SQUAD_A, status: 'open', assignee: AGENT_A })
+    const latentOnly = {
+      ...authA(), capabilities: [],
+      latentCapabilities: [{ member_id: MEMBER_A, scope_type: 'squad', scope_id: SQUAD_A, capability: 'member' }],
     } as unknown as AuthContext
-    // observer on squad-a is a READ grant on squad-a, so this caller legitimately reads squad-a too.
-    const widened = await orient(f, callerWithBothObserver, AGENT_A)
-    expect(JSON.stringify(widened.result)).toContain('SQUAD-A-PRIVATE-TITLE')
-    // ...but the squad-b-only caller cannot orient agent-a at all.
-    const denied = await orient(f, authB(), AGENT_A)
-    expect(denied.ok).toBe(false)
+    const res = await orient(f, latentOnly, AGENT_A)
+    expect(res.ok).toBe(true) // orient authorizes the NAMED read from latent grants (#712) ...
+    expect(res.result.packet.recent_project_verdicts).toBeUndefined() // ...the verdict section does not
+    expect(JSON.stringify(res.result)).not.toContain('SQUAD-A-PRIVATE')
+    expect(await listProjectVerdictRecords(f.env, latentOnly, P_SHARED)).toEqual([])
   })
 
   it('the unreadable-squad filter is what hides it: an org admin sees both (no oracle in the other direction)', async () => {
@@ -224,6 +240,107 @@ describe('P0 regression: squad RBAC (squad-b reads project-shared but NOT squad-
     const { a, b } = seedTwoSquads(f)
     const records = await listProjectVerdictRecords(f.env, authOwner(), P_SHARED)
     expect(new Set(ids(records))).toEqual(new Set([a, b]))
+  })
+})
+
+describe('SEAM: the projection never shows more than task_list shows the same caller', () => {
+  const PROJ = 'project-seam'
+  const HOME = 'squad-home-x'
+  const mk = (id: string, cap: string, scope: 'org' | 'squad', scopeId: string | null): string =>
+    `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-${id}', '${id}', '${scope}', ${scopeId === null ? 'NULL' : `'${scopeId}'`}, '${cap}');`
+
+  async function build(): Promise<{ f: Fixture; tA: string; tB: string; tH: string }> {
+    const f = make()
+    f.harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('${HOME}', 'dept-a', 'home-x', 'Home X', 'home');
+      INSERT INTO projects (id, slug, name, status) VALUES ('${PROJ}', 'seam', 'Seam', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
+        ('${PROJ}', '${SQUAD_A}', 'write'), ('${PROJ}', '${SQUAD_B}', 'write'), ('${PROJ}', '${HOME}', 'write');
+      INSERT INTO members (id, display_name, status, tenant) VALUES
+        ('m-orgadmin','a','active','${TENANT}'),('m-orgmember','b','active','${TENANT}'),('m-orgobs','c','active','${TENANT}'),
+        ('m-legacy','d','active','${TENANT}'),('m-sqa','e','active','${TENANT}'),('m-sqbobs','f','active','${TENANT}'),
+        ('m-none','g','active','${TENANT}'),('m-latent','h','active','${TENANT}'),('m-revoked','i','active','${TENANT}'),
+        ('m-homeowner','j','active','${TENANT}');
+      ${mk('m-orgadmin', 'admin', 'org', null)}
+      ${mk('m-orgmember', 'member', 'org', null)}
+      ${mk('m-orgobs', 'observer', 'org', null)}
+      ${mk('m-sqa', 'member', 'squad', SQUAD_A)}
+      ${mk('m-sqbobs', 'observer', 'squad', SQUAD_B)}
+      ${mk('m-revoked', 'member', 'squad', SQUAD_A)}
+      ${mk('m-homeowner', 'admin', 'squad', HOME)}
+    `)
+    const tA = seedTask(f, { squad: SQUAD_A, project: PROJ, title: 'A-title', result: 'A-result' })
+    const tB = seedTask(f, { squad: SQUAD_B, project: PROJ, title: 'B-title', result: 'B-result' })
+    const tH = seedTask(f, { squad: HOME, project: PROJ, title: 'HOME-title', result: 'HOME-result' })
+    for (const t of [tA, tB, tH]) seedVerdict(f, t)
+    f.harness.sqlite.exec("DELETE FROM capabilities WHERE member_id = 'm-revoked'") // the grant is revoked (the table has no expiry column)
+    return { f, tA, tB, tH }
+  }
+
+  async function loaded(f: Fixture, memberId: string): Promise<AuthContext> {
+    const { resolveCapabilities } = await import('../src/auth/capability')
+    return {
+      userId: memberId, memberId, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: null,
+      capabilities: await resolveCapabilities(f.env, memberId),
+    } as unknown as AuthContext
+  }
+
+  async function taskListIds(f: Fixture, auth: AuthContext): Promise<Set<string>> {
+    const out = new Set<string>()
+    for (const squad of [SQUAD_A, SQUAD_B, HOME]) {
+      const res = await invokeTool(auth, f.env, 'task_list', { squad_id: squad, project_id: PROJ, status: 'approved' }, 'https://pot.example')
+      if (res.ok) for (const t of (res.result as { tasks: Array<{ id: string }> }).tasks) out.add(t.id)
+    }
+    return out
+  }
+
+  it('matrix: projection === expected exact set, and is always a subset of what task_list returns that caller', async () => {
+    const { f, tA, tB, tH } = await build()
+    const callers: Array<[string, AuthContext, string[]]> = [
+      ['org admin', await loaded(f, 'm-orgadmin'), [tA, tB]],
+      ['org member', await loaded(f, 'm-orgmember'), [tA, tB]],
+      ['org observer', await loaded(f, 'm-orgobs'), []],
+      ['legacy role admin, capabilities not loaded', { userId: 'u', memberId: 'm-legacy', email: null, role: 'admin', tenant: TENANT, channel: 'workspace', boundAgentId: null, capabilities: undefined } as unknown as AuthContext, [tA, tB]],
+      ['squad-A member', await loaded(f, 'm-sqa'), [tA]],
+      ['squad-B OBSERVER', await loaded(f, 'm-sqbobs'), []],
+      ['no grants', await loaded(f, 'm-none'), []],
+      ['agent-bound token with latentCapabilities only', { ...(await loaded(f, 'm-latent')), boundAgentId: AGENT_A, capabilities: [], latentCapabilities: [{ member_id: 'm-latent', scope_type: 'org', scope_id: null, capability: 'admin' }] } as unknown as AuthContext, []],
+      ['revoked capability', await loaded(f, 'm-revoked'), []],
+      ['home owner (exact grant on its own home)', await loaded(f, 'm-homeowner'), [tH]],
+    ]
+    for (const [name, auth, expected] of callers) {
+      const shown = new Set(ids(await listProjectVerdictRecords(f.env, auth, PROJ)))
+      const listed = await taskListIds(f, auth)
+      for (const id of shown) expect(listed.has(id), `${name}: projection showed ${id} that task_list does not`).toBe(true)
+      expect([...shown].sort(), name).toEqual([...expected].sort())
+    }
+  })
+
+  it('no org-wide caller ever sees the home squad task (title, result or decided_by) in either surface', async () => {
+    const { f } = await build()
+    for (const member of ['m-orgadmin', 'm-orgmember']) {
+      const auth = await loaded(f, member)
+      const ctx = await invokeTool(auth, f.env, 'project_context', { project_id: PROJ }, 'https://pot.example')
+      expect(JSON.stringify(ctx.result)).not.toContain('HOME-result')
+      expect(JSON.stringify(ctx.result)).not.toContain('HOME-title')
+    }
+  })
+
+  it('an archived task is hidden exactly as task_list hides it', async () => {
+    const { f, tA } = await build()
+    const auth = await loaded(f, 'm-sqa')
+    expect(ids(await listProjectVerdictRecords(f.env, auth, PROJ))).toEqual([tA])
+    f.harness.sqlite.prepare('INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status) VALUES (?, ?, ?, ?, ?)').run(tA, '2026-10-05T00:00:00Z', 'test', 'm-orgadmin', 'approved')
+    expect(await listProjectVerdictRecords(f.env, auth, PROJ)).toEqual([])
+    expect((await taskListIds(f, auth)).has(tA)).toBe(false)
+  })
+
+  it('a non-admin needs the squad\'s own project edge, as task_list does', async () => {
+    const { f, tA } = await build()
+    const auth = await loaded(f, 'm-sqa')
+    f.harness.sqlite.exec(`DELETE FROM project_squad_access WHERE project_id = '${PROJ}' AND squad_id = '${SQUAD_A}'`)
+    expect(await listProjectVerdictRecords(f.env, auth, PROJ)).toEqual([])
+    expect((await taskListIds(f, auth)).has(tA)).toBe(false)
   })
 })
 
@@ -456,6 +573,34 @@ describe('redaction runs on the FULL text BEFORE the cut; every pattern the gate
     const result = 'y'.repeat(950) + j('-----BEGIN OPENSSH PRIVATE ', 'KEY-----\n') + BODY.repeat(200)
     const out = buildUntrusted('t', result)
     expect(out.result_excerpt).not.toContain(BODY.slice(0, 12))
+  })
+
+  it('zero-width / soft-hyphen / bidi characters INSIDE a token cannot defeat the redactor (strip first, then redact)', () => {
+    const live = j('sk', '_live_', 'abcd')
+    for (const invisible of ['\u200b', '\u00ad', '\u202e', '\ufeff', '\u2060']) {
+      const out = buildUntrusted(`${live}${invisible}EFGH12345678`, `key ${live}${invisible}EFGH12345678 end`)
+      expect(JSON.stringify(out), JSON.stringify(invisible)).not.toContain('EFGH1234')
+      expect(JSON.stringify(out)).not.toContain('abcdEFGH')
+    }
+  })
+
+  const extra: Array<[string, string, string]> = [
+    ['lowercase pem', j('-----begin private ', 'key-----\n', BODY, '\n-----end private ', 'key-----'), BODY],
+    ['4-dash RSA pem', j('----BEGIN RSA PRIVATE ', 'KEY----\n', BODY, '\n----END RSA PRIVATE ', 'KEY----'), BODY],
+    ['redis empty username', j('redis', '://:', 'hunter2hunter2', '@cache.internal:6379/0'), 'hunter2hunter2'],
+    ['base64 pem', j('LS0tLS1C', 'RUdJTiBQUklWQVRFIEtFWS0tLS0t', 'Zm9vYmFyQkFaUVVY'), 'Zm9vYmFyQkFaUVVY'],
+  ]
+  for (const [name, secret, needle] of extra) {
+    it(`${name}: redacted`, () => {
+      const json = JSON.stringify(buildUntrusted(`t ${secret}`, `before ${secret} after`))
+      expect(json).not.toContain(needle)
+      expect(json).toContain('[redacted]')
+    })
+  }
+
+  it('the TITLE is stripped of control/bidi/zero-width characters and newlines', () => {
+    const out = buildUntrusted('ti\u0007tle\u202e\u200b one\ntwo', 'r')
+    expect(out.title).toBe('ti tle one two')
   })
 
   it('redactEvidenceText leaves ordinary prose and URLs without credentials alone', () => {
