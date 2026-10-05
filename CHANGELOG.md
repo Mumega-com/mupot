@@ -2,16 +2,127 @@
 
 ## [Unreleased] — main since v0.31.0
 
+**Recorded deploy (2026-09-30, read from live `/health`):** production reported
+version `0.31.0`, commit `23cc5847dab6314b80df0d86ad4fca9b0f70297d`,
+`clean: true`, built `2026-09-30T14:29:59Z`. Live `/health` is the authoritative
+source; this record ages on the next deploy, and anything merged after that commit
+is not in it. Every entry below is merged on `main`; "merged" is not "proven":
+where an entry says a path is unexercised, it is.
+
+Migrations since the `v0.31.0` tag are 0182 through 0185, 0187, 0188 and 0189;
+there is no 0186 file. Per the release operator, 0188 and 0189 were applied to
+production. For 0182, 0183, 0184, 0185 and 0187 the application state is **not
+stated here and not verified** (0184 and 0185 must be applied **before** the code
+that reads them, see their DEPLOY ORDER headers). Per the release operator
+`EVENTS_ENABLED` is off in production and `EVENTS_CALLBACK_HOSTS` is unset; that
+was not confirmed from outside because `/mcp` refuses an unauthenticated probe.
+
+- **#1622** (decision-model port) — `src/decisions/`, a microkernel that lets a
+  small classifier or judge be swapped behind one entry point,
+  `decide(env, request, config)` (`src/decisions/decide.ts:211`). A model output
+  is data, never a permission: no port type or receipt column carries an
+  authorize field. The default adapter is `human` (always `deferred_to_human`,
+  sends nothing); `DECISION_ADAPTER` may select `workers-ai` or `typesafe`, an
+  unknown value selects `human` (`src/decisions/registry.ts`). Migration
+  `0189_decision_receipts.sql` adds append-only `decision_receipts` (one row per
+  call, hashes only, never the raw input) and `decision_outcomes`. **No code
+  outside `src/decisions/` calls `decide()`; only tests do**, so nothing in
+  production exercises it. The gate recorded P2/P3 gaps that must land before the
+  first caller or reader: `INSERT OR REPLACE` can rewrite a receipt, a `choice`
+  answer is not required to match the top probability, `tenant` is nullable
+  (#1635). Design: `docs/architecture/decision-port.md`.
+- **#1633** (mupot#1618 PR 2) and **#1629** (PR 1) — MCP Events (protocol
+  2026-07-28), behind `EVENTS_ENABLED`, on only for the exact string `"true"`
+  (`src/mcp/events.ts:30-33`). PR 1: dual-version negotiation (only an explicit
+  `2026-07-28` request gets it; everyone else still gets `2025-06-18`),
+  `server/discover`, `events/list`. PR 2: `events/subscribe` and
+  `events/unsubscribe` (`src/mcp/events-subscriptions.ts`), callback URL policy
+  and signed verification (`src/mcp/events-webhook.ts`; HTTPS only, hostname must
+  exactly match `EVENTS_CALLBACK_HOSTS`, **default empty refuses every URL**,
+  `redirect: 'manual'`), Standard Webhooks signed delivery through a queue job
+  that carries `{job_id?, subscription_id, message_id}` and re-derives every
+  authoritative fact from D1 (`job_id` is informational;
+  `src/bus/events-delivery.ts`, hooked from `src/bus/consumer.ts`), and an
+  append-only receipt per attempt. Migration `0188_mcp_event_subscriptions.sql`.
+  The only event is `message.created` (body-free). With the flag off `events/*`
+  are `method_not_found` and the consumer never calls the fan-out hook. **Not
+  proven:** a real ChatGPT client, or the Workers runtime, completing the
+  subscribe, verify, deliver loop; the tests use the node SQLite D1 harness and a
+  stubbed `fetch`. Known gaps: flood-induced event loss, `INSERT OR REPLACE` on
+  the append-only receipts, unbounded table growth (#1636). The design doc states
+  the callback-validation
+  design still needs Hadi's acceptance before the flag or
+  `EVENTS_CALLBACK_HOSTS` is set anywhere: `docs/architecture/mcp-events.md`.
+- **#1626** — org-admin Access panel on the agent page: set which squad an agent
+  sits on and at which level (`observer`, `member`, `lead`, `admin`; never
+  `owner`), or revoke it, via `POST /agents/:id/access`
+  (`src/dashboard/index.ts:1988`, `src/dashboard/agent-access-panel.ts`). The
+  write reuses `setAgentSquadAccess` / `removeAgentSquadAccess`; one receipt
+  `INSERT` in the same D1 batch carries the authority guards, so a receipt exists
+  if and only if the access rows changed. Migration
+  `0187_agent_access_receipts.sql` (append-only). One test in this area orders
+  receipts by `created_at` and is timing-dependent (#1634).
+- **#1624** — curated read-only MCP door `POST /mcp/profile/needs-you` for
+  ChatGPT: same OAuth and per-tool authorization as `/mcp`, `tools/list` returns
+  only an allowlist, `tools/call` outside it is refused `tool_not_in_profile`
+  (`docs/connect-chatgpt-needs-you-profile.md`).
+- **#1627** (`fix(secret-env)`: P1 authz gate, Env-name reservation, request
+  cap and rate limit, requester visibility), **#1628** (`fix(elevation)`: action
+  checkboxes outside `#decide-form` made approval always refused), **#1631**
+  (fast-uri advisories) and **#1623** (undici override `7.29.0` to `7.29.1`,
+  the first patched version for GHSA-rfgv-xxqx-mfg5 and GHSA-w293-vg96-wgc3) —
+  listed from their merged PR titles and #1623's commit message; not audited
+  for this entry. #1623 and #1631 cleared dependency advisories that were blocking
+  the audit gate.
+- **#1614** (mupot#1580, #1610 — T2b) — write-capable connector bindings, and
+  the idempotency and reconcile semantics office publishing depends on.
+  - Migration `0184_addon_connector_bindings_write_capability.sql` adds
+    `addon_connector_bindings.capability_v2` (`'read' | 'write'`); the legacy
+    `capability` column stays frozen at `'read'`. `preflightAddonBindings`
+    honours a `'write'` connector requirement only when
+    `installationMayHoldWriteCapabilityBinding` holds: `external_mcp` manifest,
+    `external_isolated` trust class on both manifest and live installation, and
+    no external-isolation violation, re-proved at every call
+    (`src/addons/bindings.ts`). `mcpwp-office`'s `wordpress_site` slot is the
+    only write requirement in the repo.
+  - Migration `0185_office_publish_freeze_idempotency_key.sql` adds
+    `office_publish_freezes.idempotency_key`. The one-shot publish claim stamps
+    it (`COALESCE`, never overwritten) and it is written into the WordPress
+    post `slug` (`src/addons/office/service.ts`).
+  - Publish outcomes are classified `delivered` / `definite_failure` /
+    `ambiguous`. Only a definite failure may record `outcome='failed'`; an
+    ambiguous outcome leaves `outcome` NULL, the claim stays unreconciled, and a
+    rework loop cannot mint a fresh unclaimed freeze.
+  - `office.reconcile_stalled_publish` checks WordPress by the idempotency slug
+    before clearing the double-post guard and never treats a failed or empty
+    lookup as proof of absence: any candidate evidence is
+    `reconcile_candidate_found` (not overridable); no answer is
+    `reconcile_check_unavailable` (the only case an audited human override may
+    accept, after a retry).
+  - Not yet done: the first live publish end to end (#1617), MCPWP API-key auth
+    and post-meta idempotency marker (#1616), reconcile evidence persistence
+    (#1615), freeze-lock cleanup (#1612).
+- **#1602** (mupot#1592) — approval binding for office publishing. The payload
+  is frozen when a `gate:office` task enters `review`
+  (`freezeOfficeTaskOnReviewEntry`); `office.review_approval` requires the
+  caller to echo `expected_payload_sha256`; the freeze is bound to the approving
+  verdict in the same D1 batch; the verdict write re-checks the freeze and the
+  live task content inside the write; `task_update` and `PATCH /api/tasks/:id`
+  refuse title/body edits while such a task is in review; the generic verdict
+  surfaces refuse `gate:office` tasks (`DedicatedGatePredicateRequiredError`).
+  Migration `0182_office_publish_freeze_verdict_binding.sql`.
+
 - **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
   GPT Actions discovery) now serves an explicit, committed allowlist
-  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
+  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 141 tools
+  at the #1603 merge)
   instead of the whole registry, with a runtime min-capability floor. A new
   org-admin-gated `GET /openapi.full.json` serves the full registry. CI ratchet
   `scripts/check-openapi-public-allowlist.mjs`. **Not a full fix for admin-tool
   disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
   to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
   `/openapi.full.json` (#1608). #1596 stays open.
-- **mupot#1586** (`kasra/task-result-path-1586`) — new `task_submit_result`
+- **#1600** (mupot#1586) — new `task_submit_result`
   MCP tool: the agent ASSIGNEE of a hand-worked (never-dispatched) task can
   now report its completion evidence and enter `review` in one atomic step,
   closing the board deadlock where such a task (`task_update` refuses an
@@ -47,8 +158,7 @@
   for the v0.31.0 release PR and mupot#1592. `task_submit_result` is
   member-tier and deliberately left out of #1603's public `/openapi.json`
   allowlist (private by default; add it only if a Custom GPT facade needs
-  it). Not merged; state it as merged only once `gh pr view` on this PR
-  reports `MERGED`.
+  it). Merged as #1600 (`294a6dbf`).
 
 ## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
 
@@ -212,6 +322,11 @@ Follow-ups filed: #1571, #1575, #1576, #1578, #1579, #1581, #1584. Designs:
   including admin-only tools, to any unauthenticated caller. Fix in
   progress under PR #1603 (in review as of this writing): an explicit
   public/internal allowlist.
+
+*Superseded after the tag:* both limitations above described the tagged release.
+On `main` since, #1602 and #1614 address the first (see `[Unreleased]`; first
+live publish still unverified, #1617) and #1603 addresses the unauthenticated
+half of the second (authenticated `tools/list` disclosure remains, #1609).
 
 Known follow-ups still open: #1587 (slice-1 gate follow-ups — its fixes
 shipped in #1588, though the issue itself is still open on GitHub), #1591
