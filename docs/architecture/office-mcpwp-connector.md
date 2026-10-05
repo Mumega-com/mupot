@@ -126,11 +126,24 @@ task left `approved` anyway, nothing is written, the claim stays open, and the r
 is `publish_unreconciled` with the post id and link. A freeze that says `done` while
 its task is not `done` also blocks a fresh freeze.
 
-Writers that can move an office task out of `approved`: the verdict reversal (guarded
-as above) and the generic `approved -> done` task update and the gate-execute
-`approved -> done` (dashboard) — those two cannot double-post, because the freeze
-stays claimed with no outcome and still blocks a refreeze until reconciled. Reject
-only applies from `review`, where no claim can exist.
+The invariant now lives in the shared generic task UPDATE (`buildTaskUpdateStatement`,
+`src/tasks/service.ts`): for an APPROVED gate:office task it carries
+`NOT EXISTS (unresolved publish claim)` in its own WHERE, so a claim that lands after
+any pre-check (a claim does not touch `updated_at`) still refuses the write
+atomically. Writers: MCP `task_update`, REST PATCH, routine actions
+(`persistTaskUpdate`), `task_verdict_reverse` and the reversal step 2 all go through
+that statement and inherit it; the reversal also keeps its own guard on the verdict
+stamp; the dashboard gate-execute `approved -> done` uses
+`markApprovedTaskDoneFromGate` with the same guard. A refused write surfaces as
+`office_publish_unresolved` with the reconcile hint (MCP error, REST 409, dashboard
+409), never a generic invalid transition. Every other task runs the UNCHANGED statement
+(two variants chosen by the gate_owner already read in the request), so non-office tasks
+never reference `office_publish_freezes`, and a schema without that table cannot make a
+non-office update throw. Reject only applies from `review`, where no claim can exist.
+
+The runbook warning "do not mark an office task done while a claim is open" is
+therefore enforced by the system, not only by the runbook. This is code-only: no
+migration (`office_publish_freezes` is core migration 0179, in every pot schema chain).
 
 ## First real publish: pre-flight
 

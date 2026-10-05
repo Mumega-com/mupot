@@ -1131,7 +1131,7 @@ tasksApp.patch('/:id', async (c) => {
     if (error instanceof TaskIntakeContractError) {
       return c.json({ error: error.code, detail: error.message }, 400)
     }
-    if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code }, 409)
+    if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code, ...(error.detail ? { detail: error.detail } : {}) }, 409)
     throw error
   }
 

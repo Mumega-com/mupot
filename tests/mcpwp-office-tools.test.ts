@@ -22,6 +22,17 @@
 // workaround is never silently forgotten.
 
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
+
+// REST PATCH is driven through the real tasks router with auth injected (mupot#1616 gate r3).
+const restAuth = vi.hoisted(() => ({ current: null as unknown }))
+vi.mock('../src/auth', async (original) => ({
+  ...(await original<typeof import('../src/auth')>()),
+  requireAuth: async (c: { set: (k: string, v: unknown) => void }, next: () => Promise<void>) => {
+    c.set('auth', restAuth.current)
+    await next()
+  },
+}))
+const { tasksApp } = await import('../src/tasks')
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { checkMcpwpOfficeHealth } from '../src/addons/office/health'
@@ -36,6 +47,7 @@ import { createTask } from '../src/tasks/service'
 import * as bindingsModule from '../src/addons/bindings'
 import { publishOfficePost, OFFICE_IDEMPOTENCY_META_KEY, OFFICE_PAYLOAD_HASH_META_KEY } from '../src/addons/office/service'
 import { resolveActiveOfficeInstallationId, buildOfficePublishFreeze, unreconciledPriorFreezeExists } from '../src/addons/office/freeze'
+import { markApprovedTaskDoneFromGate, persistTaskUpdate, TaskUpdateConflictError, OFFICE_PUBLISH_UNRESOLVED_MESSAGE } from '../src/tasks/service'
 import { manifestSha256 } from '../src/addons/contract'
 import { McpwpOfficeAddon } from '../src/addons/office/manifest'
 import type { Task } from '../src/types'
@@ -3639,5 +3651,223 @@ describe('mupot#1616 gate r2: no reversal over an unresolved publish; all-or-not
     expect((await reverse(c)).ok).toBe(true) // never claimed
     expect(taskStatus(c)).toBe('review')
     c.harness.close()
+  })
+})
+
+
+// ── mupot#1616 gate round 3: the invariant lives in the SHARED generic UPDATE ──────
+// An approved gate:office task with an unresolved publish claim cannot leave
+// 'approved' through ANY writer: the guard is in the statement's own WHERE.
+describe('mupot#1616 gate r3: generic writers x claim state', () => {
+  const runtimeKey = (): string => ['mcpwp', 'r3key', crypto.randomUUID().replaceAll('-', '')].join('_')
+
+  /** Strict bind-count wrapper (mupot#1642) around every statement. */
+  function strictEnv(testEnv: Env, violations: string[], onPrepare?: (sql: string) => void): Env {
+    const realDb = testEnv.DB
+    const check = (sql: string, values: unknown[]): void => {
+      const indexes = [...sql.matchAll(/\?(\d+)/g)].map((m) => Number(m[1]))
+      const anonymous = [...sql.matchAll(/\?(?!\d)/g)].length
+      const declared = indexes.length > 0 ? Math.max(...indexes) : anonymous
+      if (values.length !== declared) violations.push(`bound ${values.length}, SQL declares ${declared}: ${sql.replace(/\s+/g, ' ').slice(0, 100)}`)
+    }
+    const wrap = (sql: string) => {
+      onPrepare?.(sql)
+      const stmt = realDb.prepare(sql)
+      return new Proxy(stmt, {
+        get(target, prop) {
+          if (prop === 'bind') return (...values: unknown[]) => { check(sql, values); return target.bind(...values) }
+          const value = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    }
+    return { ...testEnv, DB: { prepare: wrap, batch: (st: D1PreparedStatement[]) => realDb.batch(st) } as unknown as D1Database } as Env
+  }
+
+  async function base() {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const apiKey = runtimeKey()
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', apiKey)
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    return { harness, testEnv, apiKey, connectorId, departmentId, squadId }
+  }
+  type Base = Awaited<ReturnType<typeof base>>
+  type Ctx = Base & { taskId: string }
+
+  async function officeApproved(b: Base): Promise<Ctx> {
+    const taskId = await makeOfficeTask(b.testEnv, b.squadId)
+    await approveOfficeTask(b.testEnv, taskId)
+    return { ...b, taskId }
+  }
+  async function bareApproved(b: Base, gateOwner: string): Promise<Ctx> {
+    const task = await createTask(b.testEnv, { squad_id: b.squadId, title: 'Bare approved', done_when: 'post is live', gate_owner: gateOwner }, { skipMirror: true, skipEvent: true })
+    b.harness.sqlite.prepare(`UPDATE tasks SET status = 'approved' WHERE id = ?`).run(task.id)
+    return { ...b, taskId: task.id }
+  }
+  const stall = async (c: Ctx) => {
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    await invokeTool(officeLead(c.departmentId), c.testEnv, 'office.publish_post', { task_id: c.taskId }, ORIGIN)
+    return wp
+  }
+  type State = 'unresolved' | 'resolved' | 'nofreeze' | 'nonoffice'
+  async function inState(state: State): Promise<{ c: Ctx; wp: ReturnType<typeof createFakeMcpwp> | null }> {
+    const b = await base()
+    if (state === 'unresolved') { const c = await officeApproved(b); return { c, wp: await stall(c) } }
+    if (state === 'resolved') {
+      const c = await officeApproved(b)
+      c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_by = 'x', claimed_at = ?, outcome = 'failed', outcome_detail = 'r', completed_at = ? WHERE task_id = ?`)
+        .run(new Date().toISOString(), new Date().toISOString(), c.taskId)
+      return { c, wp: null }
+    }
+    if (state === 'nofreeze') return { c: await bareApproved(b, 'gate:office'), wp: null }
+    return { c: await bareApproved(b, 'gate:loops'), wp: null }
+  }
+
+  const mcpDone = (c: Ctx, e: Env = c.testEnv) => {
+    const member = auth('owner-1', [{ member_id: 'owner-1', scope_type: 'squad', scope_id: c.squadId, capability: 'member' } as CapabilityGrant], 'member')
+    return invokeTool(member, e, 'task_update', { task_id: c.taskId, status: 'done' }, ORIGIN)
+  }
+  const restDone = async (c: Ctx, e: Env = c.testEnv) => {
+    restAuth.current = { ...orgOwnerAuth(), capabilities: undefined, channel: 'dashboard' }
+    const response = await tasksApp.fetch(new Request(`${ORIGIN}/${c.taskId}`, { method: 'PATCH', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ status: 'done' }) }), e)
+    return { status: response.status, body: await response.json() as { error?: string; detail?: string } }
+  }
+  const gateDone = (c: Ctx, e: Env = c.testEnv) => markApprovedTaskDoneFromGate(e, c.taskId, 'receipt', new Date().toISOString())
+  const verdictReverse = (c: Ctx, e: Env = c.testEnv) =>
+    invokeTool(orgOwnerAuth(), e, 'task_verdict_reverse', { task_id: c.taskId, reversal_reason: 'matrix' }, ORIGIN)
+  const status = (c: Ctx) => (c.harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(c.taskId) as { status: string }).status
+  const posts = (wp: { requests: { method: string }[] } | null) => wp ? wp.requests.filter((r) => r.method === 'POST').length : 0
+
+  const writers = {
+    'MCP task_update done (member)': async (c: Ctx, e: Env) => { const r = await mcpDone(c, e); return r.ok ? { refused: null } : { refused: r.error, detail: JSON.stringify(r) } },
+    'REST PATCH done (unloaded-caps owner)': async (c: Ctx, e: Env) => { const r = await restDone(c, e); return r.status === 200 ? { refused: null } : { refused: r.body.error ?? `http_${r.status}`, detail: JSON.stringify(r.body) } },
+    'dashboard gate-execute approved->done': async (c: Ctx, e: Env) => { const r = await gateDone(c, e); return r === 'office_publish_unresolved' ? { refused: r, detail: OFFICE_PUBLISH_UNRESOLVED_MESSAGE } : { refused: null } },
+    'task_verdict_reverse': async (c: Ctx, e: Env) => { const r = await verdictReverse(c, e); return r.ok ? { refused: null } : { refused: r.error, detail: JSON.stringify(r) } },
+  } as const
+  const expectedFor = (state: State, writer: string): { leaves: 'done' | 'review' | null } =>
+    state === 'unresolved' ? { leaves: null } : { leaves: writer === 'task_verdict_reverse' ? 'review' : 'done' }
+
+  for (const [name, run] of Object.entries(writers)) {
+    for (const state of ['unresolved', 'resolved', 'nofreeze', 'nonoffice'] as const) {
+      it(`${name} x ${state}: ${state === 'unresolved' ? 'REFUSED (office_publish_unresolved + hint), task stays approved' : 'allowed, unchanged behaviour'}; strict binds`, async () => {
+        const { c, wp } = await inState(state)
+        const violations: string[] = []
+        const outcome = await run(c, strictEnv(c.testEnv, violations))
+        if (state === 'unresolved') {
+          expect(outcome.refused).toBe('office_publish_unresolved')
+          expect('detail' in outcome ? outcome.detail : '').toContain('office.reconcile_stalled_publish')
+          expect(status(c)).toBe('approved')
+          expect(posts(wp)).toBe(1)
+        } else if (name === 'task_verdict_reverse' && (state === 'nofreeze' || state === 'nonoffice')) {
+          // a task approved by raw SQL has no verdict to reverse: the ordinary, unchanged answer
+          expect(outcome.refused).toBe('no_verdict_to_reverse')
+          expect(status(c)).toBe('approved')
+        } else {
+          expect(outcome.refused).toBeNull()
+          expect(status(c)).toBe(expectedFor(state, name).leaves)
+        }
+        expect(violations).toEqual([])
+        c.harness.close()
+      })
+    }
+  }
+
+  it('ATHENA REPRO end to end: ambiguous publish -> generic done REFUSED (MCP and REST) -> reconcile adopts -> task done, exactly one POST', async () => {
+    const { c, wp } = await inState('unresolved')
+    expect((await mcpDone(c)).ok).toBe(false)
+    expect((await restDone(c)).status).toBe(409)
+    expect(status(c)).toBe('approved')
+    c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`).run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+    const adopted = await invokeTool(orgOwnerAuth(), c.testEnv, 'office.reconcile_stalled_publish', { task_id: c.taskId, outcome: 'failed' }, ORIGIN)
+    expect(adopted.ok).toBe(true)
+    expect(status(c)).toBe('done')
+    expect(posts(wp)).toBe(1)
+    c.harness.close()
+  })
+
+  it('CLAIM BETWEEN PRECHECK AND WRITE: a claim that lands after the caller read the task (it does not touch updated_at) still refuses the generic update atomically', async () => {
+    const b = await base()
+    const c = await officeApproved(b)
+    let fired = false
+    const racing = strictEnv(c.testEnv, [], (sql) => {
+      if (!fired && sql.includes('SET title = ?, body = ?')) {
+        fired = true
+        c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_by = 'racer', claimed_at = ? WHERE task_id = ?`).run(new Date().toISOString(), c.taskId)
+      }
+    })
+    const result = await mcpDone(c, racing)
+    expect(fired).toBe(true)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('office_publish_unresolved')
+    expect(status(c)).toBe('approved')
+    c.harness.close()
+  })
+
+  it('RACE: generic done vs publish claim — exactly one wins; a post never exists without a path to a receipt', async () => {
+    for (let round = 0; round < 6; round++) {
+      const c = await officeApproved(await base())
+      const wp = createFakeMcpwp({ apiKey: c.apiKey })
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return wp.f(input, init)
+      }) as unknown as typeof fetch)
+      const [pub, generic] = await Promise.all([
+        invokeTool(officeLead(c.departmentId), c.testEnv, 'office.publish_post', { task_id: c.taskId }, ORIGIN),
+        mcpDone(c),
+      ])
+      if (generic.ok) {
+        expect(pub.ok).toBe(false)
+        expect(posts(wp)).toBe(0)
+      } else {
+        expect(pub.ok).toBe(true)
+        expect(posts(wp)).toBe(1)
+      }
+      expect(status(c)).toBe('done')
+      c.harness.close()
+    }
+  })
+
+  it('RACE: generic done vs reconcile commit on a stalled claim — the task ends done with one POST, never stranded', async () => {
+    const { c, wp } = await inState('unresolved')
+    c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`).run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+    const [generic, rec] = await Promise.all([
+      mcpDone(c),
+      invokeTool(orgOwnerAuth(), c.testEnv, 'office.reconcile_stalled_publish', { task_id: c.taskId, outcome: 'failed' }, ORIGIN),
+    ])
+    expect(generic.ok).toBe(false) // either refused by the guard, or the reconcile finished first (done is terminal)
+    expect(rec.ok).toBe(true)
+    expect(status(c)).toBe('done')
+    expect((c.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { outcome: string }).outcome).toBe('done')
+    expect(posts(wp)).toBe(1)
+    c.harness.close()
+  })
+
+  it('the guard covers ANY generic update of an approved office task with an unresolved claim, not only a done target (e.g. a field/gate change that would strip the guard)', async () => {
+    const { c } = await inState('unresolved')
+    const row = await c.testEnv.DB.prepare(`SELECT * FROM tasks WHERE id = ?`).bind(c.taskId).first<Task>()
+    if (!row) throw new Error('fixture')
+    const next: Task = { ...row, priority: 'P2', gate_owner: 'gate:loops', updated_at: new Date().toISOString() }
+    let caught: unknown
+    try { await persistTaskUpdate(c.testEnv, row, next) } catch (error) { caught = error }
+    expect(caught).toBeInstanceOf(TaskUpdateConflictError)
+    expect((caught as TaskUpdateConflictError).code).toBe('office_publish_unresolved')
+    expect((c.harness.sqlite.prepare(`SELECT gate_owner FROM tasks WHERE id = ?`).get(c.taskId) as { gate_owner: string }).gate_owner).toBe('gate:office')
+    c.harness.close()
+  })
+
+  it('a pot whose schema lacks office_publish_freezes: a NON-office task update and reversal never throw (the guard is scoped by gate_owner)', async () => {
+    const b = await base()
+    const c = await bareApproved(b, 'gate:loops')
+    b.harness.sqlite.exec('DROP TABLE office_publish_freezes')
+    expect((await mcpDone(c)).ok).toBe(true)
+    expect(status(c)).toBe('done')
+    const d = await bareApproved(b, 'gate:loops')
+    const reversal = await verdictReverse(d) // unchanged path: no throw, ordinary answer
+    if (!reversal.ok) expect(reversal.error).toBe('no_verdict_to_reverse')
+    expect((await restDone(d)).status).toBe(200)
+    b.harness.close()
   })
 })

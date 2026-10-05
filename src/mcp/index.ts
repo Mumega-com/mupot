@@ -1746,7 +1746,7 @@ const toolTaskUpdate: ToolSpec = {
       }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
-      if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
+      if (error instanceof TaskUpdateConflictError) return fail(409, error.code, error.detail)
       throw error
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
