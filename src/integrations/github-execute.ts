@@ -13,6 +13,10 @@ import type { Env } from '../types'
 import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIdentity } from './github-pr'
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
+import { officePublishUnresolvedSql } from '../tasks/service'
+
+/** Statuses execute-task may move to 'review' (work in flight). Never approved/done/review/etc. */
+const EXECUTABLE_FROM_STATUSES = ['open', 'in_progress'] as const
 
 /** Domain for an agent-authored commit's email local part (`slug@<this>`), baked into the
  *  CUSTOMER's git history. `env.AGENT_COMMIT_EMAIL_DOMAIN` overrides it; unset ⇒ this default,
@@ -76,10 +80,18 @@ export async function executeTaskAsPR(
   if (!(await githubCan(env, 'repo_file_write'))) return { ok: false, error: 'capability_disabled', stage: 'capability' }
 
   // ── task must exist (this pot's D1) ───────────────────────────────────────────
-  const task = await env.DB.prepare(`SELECT id, status, assignee_agent_id FROM tasks WHERE id = ?1 LIMIT 1`)
+  const task = await env.DB.prepare(
+    `SELECT id, status, assignee_agent_id, ${officePublishUnresolvedSql('tasks.id')} AS unresolved FROM tasks WHERE id = ?1 LIMIT 1`,
+  )
     .bind(taskId)
-    .first<{ id: string; status: string; assignee_agent_id: string | null }>()
+    .first<{ id: string; status: string; assignee_agent_id: string | null; unresolved?: number }>()
   if (!task) return { ok: false, error: 'task_not_found', stage: 'task' }
+  // Fail BEFORE any GitHub side effect (branch/PR). The final UPDATE's WHERE re-enforces both
+  // (this read can go stale) — the writer's WHERE is the invariant, this is the early refusal.
+  if (task.unresolved) return { ok: false, error: 'office_publish_unresolved', stage: 'task' }
+  if (!(EXECUTABLE_FROM_STATUSES as readonly string[]).includes(task.status)) {
+    return { ok: false, error: 'invalid_transition', stage: 'task' }
+  }
 
   // Per-agent authorship (#21): the task's assigned agent authors the commits as itself.
   // Falls back to the App identity if the task has no agent or it can't be resolved.
@@ -114,11 +126,23 @@ export async function executeTaskAsPR(
 
   // ── link the PR to the task: status → review (awaiting human/gate merge) ───────
   const now = new Date().toISOString()
-  await env.DB.prepare(
-    `UPDATE tasks SET status = 'review', github_issue_url = ?1, updated_at = ?2 WHERE id = ?3`,
+  const upd = await env.DB.prepare(
+    `UPDATE tasks SET status = 'review', github_issue_url = ?1, updated_at = ?2
+      WHERE id = ?3 AND status IN ('open', 'in_progress')
+        AND NOT ${officePublishUnresolvedSql('tasks.id')}`,
   )
     .bind(pr.url, now, taskId)
     .run()
+  // 0 rows = the task moved (or an office publish claim landed) after the early check; the PR
+  // already exists, so say so rather than reporting a link that did not happen.
+  if ((upd.meta?.changes ?? 0) === 0) {
+    const now2 = await env.DB.prepare(
+      `SELECT status, ${officePublishUnresolvedSql('tasks.id')} AS unresolved FROM tasks WHERE id = ?1 LIMIT 1`,
+    )
+      .bind(taskId)
+      .first<{ status: string; unresolved: number }>()
+    return { ok: false, error: now2?.unresolved ? 'office_publish_unresolved' : 'invalid_transition', stage: 'task' }
+  }
 
   return { ok: true, prNumber: pr.number, prUrl: pr.url, filesWritten: written }
 }
