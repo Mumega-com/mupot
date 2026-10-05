@@ -497,10 +497,13 @@ export async function decideElevationRequest(
   // scope_type is not known statically here, and — per G-FP1b — a squad-scope
   // check must load a real SquadScope (kind included) rather than a bare id +
   // a separately-resolved department id, so an approver's org/department/role
-  // authority correctly answers false for a home squad. Deliberate exception:
-  // `decidedByIsOrgAdmin === true` still authorizes approving a home-scoped
-  // REQUEST — that is the intended "human decides, time-boxed, receipted"
-  // door (G-FP1b point 4), not a standing bypass of the home's own reads.
+  // authority correctly answers false for a home squad. The org-admin flag
+  // (`decidedByIsOrgAdmin`) is NOT an exception for home squads: it is gated by
+  // planeCoversScope('org', scope) (decidedByOrgAdminCoversScope), so an org
+  // admin with no grant on a member's home can neither approve nor deny a
+  // request scoped to it — INCLUDING `action:home_access`. The only durable
+  // approver for a home-scoped request is the home's own exact squad-scope
+  // admin grant (tests/home-access-elevation.test.ts).
   const decidedByHasAuthority = await decidedByHasElevationAuthority(
     env,
     input.decidedByIsOrgAdmin,

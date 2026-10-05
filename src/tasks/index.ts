@@ -31,7 +31,7 @@ import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskArtifactShape } from './artifact-verification'
-import { hasIndependentRuntimeGate, listTaskDispatchReceiptTimeline } from './runtime-receipts'
+import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -1477,6 +1477,25 @@ export async function evaluateVerdictGates(
   // which already required the caller to BE that assignee to reach this point).
   const isSelfVerdict = principal.id === task.assignee_agent_id
   if (isSelfVerdict && !isSelfCompletionGate) {
+    return { allowed: false, code: 'self_verdict', principal }
+  }
+
+  // mupot#1663 P2: a MEMBER who is the assignee agent's owner (or another member
+  // row of that owner, or the agent's own bound identity) is not independent of
+  // the work — task_verdict's harness-attested human_origin (#1425) writes the
+  // verdict AS the owner, so a gate GRANT held by the owner must not let them
+  // decide their own agent's task. Same predicate review entry uses
+  // (memberAffiliatedWithAssigneeSql). An org owner/admin (legacyOwnerAdmin) is
+  // exempt: they pass every gate by role already and are the existing
+  // supervisory path — this closes the grant-only route, not the admin role.
+  // Owner-less agents (owner_member_id NULL) fall back to the old rule.
+  if (
+    !isSelfCompletionGate
+    && principal.type === 'member'
+    && task.assignee_agent_id
+    && !legacyOwnerAdmin(auth)
+    && (await isMemberAffiliatedWithAssigneeAgent(env, principal.id, task.assignee_agent_id))
+  ) {
     return { allowed: false, code: 'self_verdict', principal }
   }
 

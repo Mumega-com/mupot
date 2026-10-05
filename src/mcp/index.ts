@@ -2828,6 +2828,15 @@ const toolTaskSubmitResult: ToolSpec = {
     const actor = { kind: 'agent' as const, id: callerAgentId }
     await emitTaskEvent(env, 'task.updated', next, actor)
 
+    // mupot#1663 P1: the SAME entering-review freeze task_update performs for a
+    // gate:office task (the approval tool refuses payload_not_frozen without
+    // it). Same function, same post-write best-effort ordering as task_update
+    // above — the status flip is already committed, and a failed freeze leaves
+    // the task reviewable-by-rejection exactly like the task_update path.
+    if (next.gate_owner === OFFICE_GATE_OWNER) {
+      await freezeOfficeTaskOnReviewEntry(env, next, auth.memberId as string)
+    }
+
     // Same review-wake every other entering-review path fires (task_update),
     // so a gate owner learns about a hand-worked completion the same way it
     // learns about a dispatched one.
