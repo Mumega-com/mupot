@@ -67,6 +67,93 @@ export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
  */
 export class InboxFullError extends Error {}
 
+/** Max length (UTF-16 code units, after trim) of each task-text field copied into the envelope. */
+export const DISPATCH_ENVELOPE_TEXT_MAX = 2000
+
+/** Optional additive keys the v1 body may carry beyond the six required ones. The receipt
+ *  validator (src/tasks/runtime-receipts.ts) accepts exactly the required six plus any subset of
+ *  these, so older in-flight ids-only envelopes and new self-describing ones both settle. */
+export const DISPATCH_ENVELOPE_OPTIONAL_KEYS = ['title', 'done_when', 'truncated', 'settle'] as const
+
+function boundText(value: unknown): { text: string; truncated: boolean } {
+  const raw = typeof value === 'string' ? value : ''
+  if (raw.length <= DISPATCH_ENVELOPE_TEXT_MAX) return { text: raw, truncated: false }
+  let cut = raw.slice(0, DISPATCH_ENVELOPE_TEXT_MAX)
+  // Do not leave half of a surrogate pair at the cut.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1)
+  return { text: cut, truncated: true }
+}
+
+/**
+ * Read the task's title and done_when for the envelope. The tasks table is per-tenant (no
+ * tenant column; env.DB is the tenant boundary), so the only selector is the task id the
+ * consumer already derived from the persisted dispatch receipt.
+ *
+ * Failure policy (chosen deliberately):
+ *  - row ABSENT -> return null: send the ids-only fields WITH the `settle` object. The settle
+ *    path is the load-bearing part (a seat that cannot settle strands the task); title/done_when
+ *    are convenience, and the receipt validator independently re-checks the real task row.
+ *  - DB read THROWS -> propagate. The consumer treats any throw as a retryable delivery failure
+ *    (request_id is idempotent, so a retry is safe). Swallowing it would permanently commit a
+ *    degraded envelope, because a redelivery after the row is written is a no-op.
+ */
+async function readTaskText(
+  env: Env,
+  taskId: string,
+): Promise<{ title: string; done_when: string; truncated?: true } | null> {
+  const row = await env.DB.prepare('SELECT title, done_when FROM tasks WHERE id = ?1 LIMIT 1')
+    .bind(taskId)
+    .first<{ title: unknown; done_when: unknown }>()
+  if (!row) return null
+  const title = boundText(row.title)
+  const doneWhen = boundText(row.done_when)
+  return {
+    title: title.text,
+    done_when: doneWhen.text,
+    ...(title.truncated || doneWhen.truncated ? { truncated: true as const } : {}),
+  }
+}
+
+/** The settlement path, self-described. Built ONLY from the two opaque ids plus constants. */
+function buildSettleHint(taskId: string, receiptId: string) {
+  return {
+    note: 'A bus ack, inbox_ack or any chat reply does NOT settle this task. Only task_dispatch_runtime_receipt moves it to in_progress and review.',
+    tool: 'task_dispatch_runtime_receipt',
+    args: { task_id: taskId, dispatch_receipt_id: receiptId },
+    attempt: 'Pass this inbox message\'s delivery_attempts value (1 on first delivery).',
+    runtime_receipt_hash: 'Required on every call: lowercase hex SHA-256 of your own consumption/completion receipt.',
+    stages: [
+      { stage: 'runtime_consumed', when: 'once you have taken the task and are starting work' },
+      {
+        stage: 'completed',
+        when: 'work finished; pass result, and artifact_refs plus artifact_sha256 if done_when names an Artifact: or SHA256: requirement',
+      },
+      { stage: 'failed', when: 'work cannot be completed; pass reason' },
+    ],
+  }
+}
+
+async function buildEnvelopeBody(env: Env, input: DispatchBridgeInput): Promise<string> {
+  const text = await readTaskText(env, input.taskId)
+  return JSON.stringify({
+    version: 'runtime.dispatch/v1',
+    type: 'task_dispatch',
+    task_id: input.taskId,
+    dispatch_receipt_id: input.receiptId,
+    squad_id: input.squadId,
+    // The consumer already resolved agentId from the persisted fleet route. Do
+    // not accept a second caller-controlled address that could diverge from the
+    // actual durable inbox target.
+    runtime_address: input.agentId,
+    // Additive, self-describing fields. `title`/`done_when` are DATA authored by
+    // members/agents: bounded, and only ever placed as JSON string values here,
+    // never concatenated into `settle` or any instruction text. `settle` is built
+    // from the two opaque ids and constants only.
+    ...(text ?? {}),
+    settle: buildSettleHint(input.taskId, input.receiptId),
+  })
+}
+
 /**
  * deliverDispatchToInbox — write the task_dispatch as an inbox message for `input.agentId`, via
  * the existing sendAgentMessage. Idempotent: request_id is derived from `receiptId`
@@ -84,17 +171,18 @@ export class InboxFullError extends Error {}
  * dispatch" surfaces as a retried, visible failure instead of a silently-dropped write.
  */
 export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInput): Promise<BridgeResult> {
-  const body = JSON.stringify({
-    version: 'runtime.dispatch/v1',
-    type: 'task_dispatch',
-    task_id: input.taskId,
-    dispatch_receipt_id: input.receiptId,
-    squad_id: input.squadId,
-    // The consumer already resolved agentId from the persisted fleet route. Do
-    // not accept a second caller-controlled address that could diverge from the
-    // actual durable inbox target.
-    runtime_address: input.agentId,
-  })
+  // Redelivery must be body-independent. sendAgentMessage treats a same-request_id send as an
+  // idempotent no-op ONLY if the body is byte-identical, else request_id_conflict. The envelope
+  // now embeds mutable task text, so if the task was edited between the first write and a
+  // Queue redelivery, rebuilding the body would conflict forever. When an envelope for this
+  // dispatch already exists, resend ITS stored body (identical by construction); sendAgentMessage
+  // still re-checks recipient/kind/project.
+  const stored = await env.DB.prepare(
+    `SELECT body FROM agent_messages WHERE tenant = ?1 AND from_agent = ?2 AND request_id = ?3 LIMIT 1`,
+  )
+    .bind(env.TENANT_SLUG, DISPATCH_BRIDGE_SENDER, dispatchInboxRequestId(input.receiptId))
+    .first<{ body: string }>()
+  const body = stored ? stored.body : await buildEnvelopeBody(env, input)
 
   const res = await sendAgentMessage(env, {
     fromAgent: DISPATCH_BRIDGE_SENDER,

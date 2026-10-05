@@ -460,8 +460,11 @@ the task-scoped wake. Emission or wake failure leaves an attempt count and bound
 error for operator diagnosis.
 
 For a live external runtime, the durable inbox body is `runtime.dispatch/v1` and
-includes only task, dispatch, squad, and the public route address selected by
-Mupot. The authenticated outer inbox row remains authoritative for sender,
+includes task, dispatch, squad, and the public route address selected by
+Mupot, plus optional informational fields (`title`, `done_when`, `truncated`, and
+a `settle` object naming `task_dispatch_runtime_receipt` and its stages). The
+version is still v1; see the envelope section of the operations doc for the
+versioning decision and the untrusted-text rules. The authenticated outer inbox row remains authoritative for sender,
 recipient, project, message sequence, lease, and delivery attempt. Queue delivery
 is transport evidence only.
 

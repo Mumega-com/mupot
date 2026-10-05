@@ -475,6 +475,8 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     }
 
     function first(sql: string, b: unknown[]) {
+      // deliverDispatchToInbox reads the task text for the envelope; this mock models no task text.
+      if (sql.includes('FROM tasks WHERE id = ?1 LIMIT 1') && sql.includes('title')) return null
       if (sql.includes('FROM task_dispatch_receipts')) {
         return {
           consumed_at: receipt.consumedAt,
