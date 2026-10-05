@@ -513,6 +513,16 @@ describe('sweep', () => {
   })
 })
 
+describe('direct reconcile callers are capped too', () => {
+  it(`repeated queue redelivery with AI down leaves at most ${MAX_ATTEMPTS} failed rows, never an unbounded log`, async () => {
+    const f = make()
+    const verdictId = seedVerdict(f, seedTask(f))
+    f.fakes.aiFail = true
+    for (let i = 0; i < MAX_ATTEMPTS + 4; i += 1) await reconcileVerdictMemory(f.env, verdictId, 'worker_callback')
+    expect(outcomes(f, verdictId).filter((o) => o.operation === OP_RECORD_FAILED)).toHaveLength(MAX_ATTEMPTS)
+  })
+})
+
 describe('boot-visible read: project_context shows the records without being told', () => {
   const auth = (): AuthContext => ({
     userId: MEMBER_ID, memberId: MEMBER_ID, email: null, role: 'member', tenant: TENANT, channel: 'workspace',
