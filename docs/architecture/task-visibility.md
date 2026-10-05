@@ -1,5 +1,6 @@
 # Task visibility — one chokepoint (mupot#1647, #1645)
 
+Scope: PARTIAL for #1645 — situation slices fixed on all four surfaces; see "Not migrated".
 Status: implemented in `src/tasks/visibility.ts`. Seam test: `tests/task-visibility-seam.test.ts`.
 File:line references below are against `origin/main` at `418bcf0b` (the base of this change) unless
 marked "now".
@@ -39,7 +40,7 @@ Legend: **A** applied, **M** missing, **D** different (explained below the table
 | `project_squad_access` edge for a `project_id` filter | A, per squad (`canReadProjectForSquad` 773) | n/a | n/a (project view lists all accessible squads' tasks of a project) | **D** edge to ANY readable squad (`canReadProjectForTaskList` 231) | n/a | project selected by `readableProject` (project-level visibility); rows by squad list |
 | legacy role plane (`auth.role` owner/admin) | **only while `capabilities === undefined`** (`hasWorkspaceAdmin` 756) | same | **D** `isOrgAdmin`: always | **D** `legacyOwnerAdmin` 94: always | **D** always (`canActOnSquad` 172) | n/a (callers pass lists) |
 | ambient `auth.capabilities`, never `latentCapabilities` | A (`auth.capabilities ?? []`) | A | A (`resolveAccessibleSquadIds`) | A | A | A |
-| grants unloaded + `memberId` set | `[]` (fail closed) | `[]` | resolves from DB | resolves from DB | resolves from DB | n/a |
+| grants unloaded + `memberId` set (REST owner/admin cookie session) | `[]` (MCP sessions always carry capabilities, so unreachable) | `[]` | resolves from DB | resolves from DB | resolves from DB | n/a |
 | revoked grant | capability rows are deleted on revoke; no grant row => no standing (all readers) | | | | | |
 | `result` field exposure | full row (`TASK_SELECT_COLUMNS` incl. `result`), no extra rule | full | full (`t.result`) | full | full | `result` excerpt in blockers; title in activity/needs-you |
 | assignee-only / gate-owner privacy | none for reads (only `dispatch_receipt_id` is attached to the assignee's own rows) | same | none | none | none | none |
@@ -71,7 +72,11 @@ A caller may read a task iff **all** hold:
 1. **Squad plane.** The task's squad is in the caller's readable squad set at rank **member**:
    - legacy role plane (`auth.role` owner/admin) **only while `auth.capabilities === undefined`**:
      every squad with `kind != 'home'`;
-   - otherwise ambient grants only (`auth.capabilities`, never `latentCapabilities`): an org-scope grant
+   - grants = `auth.capabilities` when loaded; when unloaded and `memberId` is set (a REST owner/admin
+     cookie session) the member's rows are loaded from D1 (the old `canActOnSquad` behavior, so the
+     owner's exact grant on their OWN home still resolves); no `memberId` -> no grants. Never
+     `latentCapabilities`;
+   - otherwise ambient grants only: an org-scope grant
      at member+ covers every non-home squad; a department-scope grant covers that department's non-home
      squads; an exact squad-scope grant at member+ covers its own squad — **including a home squad**
      (that is the home's owner, not inheritance);
