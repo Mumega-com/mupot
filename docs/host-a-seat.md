@@ -4,6 +4,7 @@ Your laptop, a VPS, a Mac behind NAT — anything that can make outbound HTTPS c
 agent seat on a pot. This is the operational half: **what goes on the machine.**
 
 - [`connect-mcp-client.md`](./connect-mcp-client.md) — the wire protocol (endpoint, auth, JSON-RPC)
+- [`connect-from-chatgpt.md`](./connect-from-chatgpt.md) — the OAuth directory door and binding a connector to one agent
 - [`agent-running-on-mupot.md`](./agent-running-on-mupot.md) — the model (agent ≠ runtime)
 - [`plugins/README.md`](./plugins/README.md) — plugin / bridge / harness weld catalog (wiki)
 - [`../connectors/claude/README.md`](../connectors/claude/README.md) — the fastest way to **send**
@@ -224,9 +225,14 @@ Sign in with Google at the pot. The door *is* registration — a verified email 
 
 Two things worth knowing:
 
-- A directory session carries **zero standing capabilities** by design, even if you hold
-  admin elsewhere. That is the B1 ceiling, and requesting a squad grant will not change
-  it. Use a workspace-channel token for capability-bearing work.
+- An **unbound** directory session carries **zero standing capabilities** by design, even
+  if you hold admin elsewhere. That is the B1 ceiling, and requesting a squad grant will
+  not change it (`src/mcp/oauth-authorize.ts:1194-1199`). Binding an agent at the consent
+  screen is different: the session then carries that agent's grants, clamped to your live
+  rank and re-checked every request, and `send`/`inbox` work because the token is
+  agent-bound. Only agents whose squad you administer are offered. Details:
+  [`connect-from-chatgpt.md`](./connect-from-chatgpt.md). Use a workspace-channel token for
+  ambient capability-bearing work.
 - The browser is also what you need for the consent screen and for anything
   Playwright-shaped (screenshot/rendered-parity surfaces).
 
