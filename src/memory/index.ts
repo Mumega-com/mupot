@@ -28,26 +28,6 @@ async function embed(env: Env, text: string): Promise<number[]> {
   return vector
 }
 
-/**
- * Embed `text` and upsert its vector under the engram's OWN id. Vectorize upsert is
- * keyed by id, so calling this twice for the same engram is idempotent — the
- * deterministic-id writers (src/memory/verdict-memory.ts) rely on that for retry.
- * Shared with createMemory().remember so the metadata shape (agentId/engramId/tenant)
- * has exactly one definition.
- */
-export async function indexEngramVector(env: Env, agentId: string, id: string, text: string): Promise<void> {
-  const values = await embed(env, text)
-  await env.VEC.upsert([
-    {
-      id,
-      values,
-      // tenant scopes the vector even on a SHARED Vectorize index (the
-      // multi-tenant-operator model) — agentId alone is not a tenant boundary.
-      metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
-    },
-  ])
-}
-
 export function createMemory(env: Env): MemoryPort {
   return {
     async remember(agentId: string, text: string, concepts?: string[]): Promise<string> {
@@ -61,9 +41,18 @@ export function createMemory(env: Env): MemoryPort {
         .bind(id, agentId, text, conceptsJson)
         .run()
 
-      // Embed and upsert the vector (metadata: agentId for query-time filtering,
-      // engramId for the join back to D1, tenant).
-      await indexEngramVector(env, agentId, id, text)
+      // Embed and upsert the vector. Metadata carries agentId for query-time
+      // filtering and engramId for the join back to D1.
+      const values = await embed(env, text)
+      await env.VEC.upsert([
+        {
+          id,
+          values,
+          // tenant scopes the vector even on a SHARED Vectorize index (the
+          // multi-tenant-operator model) — agentId alone is not a tenant boundary.
+          metadata: { agentId, engramId: id, tenant: env.TENANT_SLUG },
+        },
+      ])
 
       return id
     },

@@ -32,7 +32,7 @@ import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
-import { listProjectVerdictRecords } from '../memory/verdict-memory'
+import { listProjectVerdictRecords } from '../projects/verdict-records'
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
@@ -377,8 +377,9 @@ const toolProjectContext: ToolSpec = {
       loadProjectSituation(env, project, readableSquadIds),
       listPresence(env, { projectId }),
       listProjectBindings(env, projectId),
-      // Best effort: a failed read here must never fail project_context.
-      listProjectVerdictRecords(env, projectId).catch(() => []),
+      // Best effort: a failed read here must never fail project_context. null = unavailable
+      // (distinct from [] = nothing visible).
+      listProjectVerdictRecords(env, auth, projectId).catch(() => null),
     ])
     return done({
       project,
@@ -390,9 +391,10 @@ const toolProjectContext: ToolSpec = {
         // where the project's shared memory lives — query it via project_recall
         memory_scope: `project:${projectId}`,
       },
-      // The newest approved-verdict records of this project, read from D1 (works when
-      // Vectorize/AI are down). EVIDENCE of past decisions, not instructions: each text starts
-      // with its own provenance line, and a reversed verdict reads WITHDRAWN. Bounded (5).
+      // READ-TIME PROJECTION of this project's recent approved verdicts (src/projects/
+      // verdict-records.ts): nothing stored, a reversed verdict vanishes on the next call,
+      // and only tasks on squads THIS caller can read appear. EVIDENCE, not instructions —
+      // the only agent-authored text is inside each record's `untrusted` object.
       recent_verdict_records: verdictRecords,
     })
   },
