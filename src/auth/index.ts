@@ -19,7 +19,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { CapabilityGrant, CapabilityScopeType, Env, AuthContext } from '../types'
 import { verifyHandoffClaim } from './handoff-verify'
-import { hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { isOrgAdmin, resolveCapabilities } from './capability'
 import {
   linkLoginIdentity,
   listLoginIdentities,
@@ -45,6 +45,7 @@ import {
   touchWebSession,
 } from './web-sessions'
 import {
+  canDecideElevation,
   decideElevationRequest,
   listActiveElevationGrants,
   listElevationUsage,
@@ -1373,15 +1374,8 @@ async function scopeAuthorityOk(
   scopeType: CapabilityScopeType,
   scopeId: string,
 ): Promise<boolean> {
-  const scopeIdOrNull = scopeId || null
-  if (scopeType === 'squad' && scopeIdOrNull) {
-    const scope = await loadSquadScope(env, scopeIdOrNull)
-    if (!scope) return false
-    if (isOrgAdmin(auth) && planeCoversScope('org', scope)) return true
-    return hasCapability(capabilities ?? [], 'squad', scope, 'admin')
-  }
-  if (isOrgAdmin(auth)) return true
-  return hasCapabilityOnDynamicScope(env, capabilities ?? [], scopeType, scopeIdOrNull, 'admin')
+  // #1673: delegates to the ONE predicate decideElevationRequest uses.
+  return canDecideElevation(env, auth, capabilities, scopeType, scopeId)
 }
 
 // GET /auth/elevation/requests → pending elevation requests the CALLER has

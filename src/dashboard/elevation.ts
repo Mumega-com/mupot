@@ -78,8 +78,9 @@ import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, resolveCapabilities } from '../auth/capability'
+import { resolveCapabilities } from '../auth/capability'
 import {
+  canDecideElevation,
   listPendingElevationRequests,
   loadElevationRequestById,
   listActiveElevationGrants,
@@ -166,11 +167,14 @@ async function loadOperatorContext(env: Env, auth: AuthContext): Promise<Operato
 
 async function operatorIsAdminOnScope(
   env: Env,
+  auth: AuthContext,
   capabilities: CapabilityGrant[],
   scopeType: CapabilityScopeType,
   scopeId: string,
 ): Promise<boolean> {
-  return hasCapabilityOnDynamicScope(env, capabilities, scopeType, scopeId || null, 'admin')
+  // #1673: the same predicate decideElevationRequest enforces (org-admin
+  // plane incl. the home-squad exclusion, OR an admin grant on the scope).
+  return canDecideElevation(env, auth, capabilities, scopeType, scopeId)
 }
 
 function notBridgedBody(): Html {
@@ -257,6 +261,7 @@ function outOfScopePanel(items: OutOfScopeGroup[], kind: string): Html {
 
 async function splitByOperatorScope<T>(
   env: Env,
+  auth: AuthContext,
   ctx: OperatorContext,
   rows: T[],
   scopeOf: (row: T) => { scopeType: CapabilityScopeType; scopeId: string },
@@ -266,7 +271,7 @@ async function splitByOperatorScope<T>(
   const indexByKey = new Map<string, number>()
   for (const row of rows) {
     const { scopeType, scopeId } = scopeOf(row)
-    const ok = ctx.memberId ? await operatorIsAdminOnScope(env, ctx.capabilities, scopeType, scopeId) : false
+    const ok = ctx.memberId ? await operatorIsAdminOnScope(env, auth, ctx.capabilities, scopeType, scopeId) : false
     if (ok) {
       visible.push(row)
       continue
@@ -323,7 +328,7 @@ export async function pendingRequestsBody(env: Env, auth: AuthContext): Promise<
   if (!ctx.memberId) return notBridgedBody()
 
   const all = await listPendingElevationRequests(env, env.TENANT_SLUG)
-  const { visible, outOfScope } = await splitByOperatorScope(env, ctx, all, (r) => ({
+  const { visible, outOfScope } = await splitByOperatorScope(env, auth, ctx, all, (r) => ({
     scopeType: r.requested_scope_type,
     scopeId: r.requested_scope_id,
   }))
@@ -458,7 +463,7 @@ export async function approvalBody(env: Env, auth: AuthContext, requestId: strin
       <p><a href="/elevation">← Back to pending requests</a></p>`
   }
 
-  const eligible = await operatorIsAdminOnScope(env, ctx.capabilities, request.requested_scope_type, request.requested_scope_id)
+  const eligible = await operatorIsAdminOnScope(env, auth, ctx.capabilities, request.requested_scope_type, request.requested_scope_id)
   const scopeLabel = await loadScopeLabel(env, request.requested_scope_type, request.requested_scope_id)
 
   if (!eligible) {
@@ -673,7 +678,7 @@ export async function activeGrantsBody(env: Env, auth: AuthContext): Promise<Htm
   if (!ctx.memberId) return notBridgedBody()
 
   const all = await listActiveElevationGrants(env, env.TENANT_SLUG)
-  const { visible, outOfScope } = await splitByOperatorScope(env, ctx, all, (g) => ({
+  const { visible, outOfScope } = await splitByOperatorScope(env, auth, ctx, all, (g) => ({
     scopeType: g.scope_type,
     scopeId: g.scope_id,
   }))

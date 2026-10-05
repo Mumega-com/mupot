@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -402,6 +402,41 @@ async function decidedByOrgAdminCoversScope(
   return planeCoversScope('org', scope)
 }
 
+/** decidedByHasElevationAuthority — the ONE authority predicate for deciding an
+ *  elevation request on a scope: org-admin plane (home squads excluded via
+ *  decidedByOrgAdminCoversScope) OR an admin capability grant on the scope.
+ *  Takes the already-resolved org-admin boolean so decideElevationRequest
+ *  (whose input carries `decidedByIsOrgAdmin`, not an AuthContext) and
+ *  canDecideElevation below share one body and cannot drift. */
+async function decidedByHasElevationAuthority(
+  env: Env,
+  decidedByIsOrgAdmin: boolean | undefined,
+  capabilities: CapabilityGrant[],
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<boolean> {
+  return (
+    (await decidedByOrgAdminCoversScope(env, decidedByIsOrgAdmin, scopeType, scopeId)) ||
+    (await hasCapabilityOnDynamicScope(env, capabilities, scopeType, scopeId, 'admin'))
+  )
+}
+
+/** canDecideElevation (#1673) — may this caller decide (approve/deny) an
+ *  elevation request on this scope? Every list/visibility surface (API
+ *  pending + active lists, dashboard list + "Outside your authority" panel,
+ *  dashboard decision page) and the decide transaction itself go through this
+ *  predicate, so "listed" and "decidable" are the same fact (Security
+ *  Invariant 12: UI visibility follows effective authorization). */
+export async function canDecideElevation(
+  env: Env,
+  auth: AuthContext | null | undefined,
+  capabilities: CapabilityGrant[] | undefined,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null | undefined,
+): Promise<boolean> {
+  return decidedByHasElevationAuthority(env, isOrgAdmin(auth), capabilities ?? [], scopeType, scopeId || null)
+}
+
 /**
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
@@ -466,20 +501,13 @@ export async function decideElevationRequest(
   // `decidedByIsOrgAdmin === true` still authorizes approving a home-scoped
   // REQUEST — that is the intended "human decides, time-boxed, receipted"
   // door (G-FP1b point 4), not a standing bypass of the home's own reads.
-  const decidedByHasAuthority =
-    (await decidedByOrgAdminCoversScope(
-      env,
-      input.decidedByIsOrgAdmin,
-      request.requested_scope_type as CapabilityScopeType,
-      request.requested_scope_id || null,
-    )) ||
-    (await hasCapabilityOnDynamicScope(
-      env,
-      input.decidedByCapabilities,
-      request.requested_scope_type as CapabilityScopeType,
-      request.requested_scope_id || null,
-      'admin',
-    ))
+  const decidedByHasAuthority = await decidedByHasElevationAuthority(
+    env,
+    input.decidedByIsOrgAdmin,
+    input.decidedByCapabilities,
+    request.requested_scope_type as CapabilityScopeType,
+    request.requested_scope_id || null,
+  )
   if (!decidedByHasAuthority) {
     return {
       ok: false,
@@ -538,10 +566,7 @@ export async function decideElevationRequest(
   // above, so this re-check is over the same scope the hoisted gate cleared. It
   // stays as defence in depth and must honour the SAME two planes, or an owner
   // clears the first gate and is refused by the second.
-  if (
-    !(await decidedByOrgAdminCoversScope(env, input.decidedByIsOrgAdmin, scopeType, scopeId || null)) &&
-    !(await hasCapabilityOnDynamicScope(env, input.decidedByCapabilities, scopeType, scopeId || null, 'admin'))
-  ) {
+  if (!(await decidedByHasElevationAuthority(env, input.decidedByIsOrgAdmin, input.decidedByCapabilities, scopeType, scopeId || null))) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
 
