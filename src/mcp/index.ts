@@ -1738,7 +1738,7 @@ const toolTaskUpdate: ToolSpec = {
           existing, next, tenant: env.TENANT_SLUG, reason: reversalReason,
           actorId: auth.memberId as string, actorType: 'member',
         })
-        if (!outcome.ok) return fail(409, outcome.error)
+        if (!outcome.ok) return fail(409, outcome.error, 'detail' in outcome ? outcome.detail : undefined)
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
       } else {

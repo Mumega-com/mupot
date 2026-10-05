@@ -35,7 +35,7 @@ import { activateAddon, configureAddon, installAddon } from '../src/addons/servi
 import { createTask } from '../src/tasks/service'
 import * as bindingsModule from '../src/addons/bindings'
 import { publishOfficePost, OFFICE_IDEMPOTENCY_META_KEY, OFFICE_PAYLOAD_HASH_META_KEY } from '../src/addons/office/service'
-import { resolveActiveOfficeInstallationId, buildOfficePublishFreeze } from '../src/addons/office/freeze'
+import { resolveActiveOfficeInstallationId, buildOfficePublishFreeze, unreconciledPriorFreezeExists } from '../src/addons/office/freeze'
 import { manifestSha256 } from '../src/addons/contract'
 import { McpwpOfficeAddon } from '../src/addons/office/manifest'
 import type { Task } from '../src/types'
@@ -2488,23 +2488,29 @@ describe('mupot#1592 reconcile-before-reapprove', () => {
       // fetch; this simulates one old enough to be genuinely stalled.
     ).run(new Date(Date.now() - 60_000).toISOString(), taskId)
 
-    // Org admin reverses the (never-actually-executed) approval to get the task
-    // back into review — the review-entry hook fires but must NOT mint a fresh
-    // freeze over the unreconciled one.
+    // mupot#1616 gate r2: reversing the approval while the claim is unresolved is
+    // REFUSED, atomically — it used to be allowed and opened a rework loop that
+    // could double-post. Nothing moves: the task stays approved, the freeze stays
+    // claimed and untouched.
     const owner = orgOwnerAuth()
     const reversal = await invokeTool(
       owner, testEnv, 'task_update',
       { task_id: taskId, status: 'review', reversal_reason: 'publish outcome unknown, need to check WordPress by hand' },
       ORIGIN,
     )
-    if (!reversal.ok) throw new Error(`fixture error: reversal failed: ${JSON.stringify(reversal)}`)
-
+    expect(reversal.ok).toBe(false)
+    if (!reversal.ok) {
+      expect(reversal.error).toBe('office_publish_unresolved')
+      expect(JSON.stringify(reversal)).toContain('office.reconcile_stalled_publish')
+    }
     const afterReversal = harness.sqlite.prepare(
-      `SELECT frozen_at, claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?`,
-    ).get(taskId) as { frozen_at: string; claimed_at: string | null; outcome: string | null }
-    expect(afterReversal.frozen_at).toBe(before.frozen_at) // untouched — no silent refreeze
+      `SELECT frozen_at, claimed_at, outcome, voided_at FROM office_publish_freezes WHERE task_id = ?`,
+    ).get(taskId) as { frozen_at: string; claimed_at: string | null; outcome: string | null; voided_at: string | null }
+    expect(afterReversal.frozen_at).toBe(before.frozen_at)
     expect(afterReversal.claimed_at).not.toBeNull()
     expect(afterReversal.outcome).toBeNull()
+    expect(afterReversal.voided_at).toBeNull()
+    expect((harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }).status).toBe('approved')
 
     // A non-admin cannot reconcile it.
     const nonAdmin = auth('m5', [grant('department', 'dept-office-1', 'lead')])
@@ -2538,16 +2544,14 @@ describe('mupot#1592 reconcile-before-reapprove', () => {
     expect(secondReconcile.ok).toBe(false)
     if (!secondReconcile.ok) expect(secondReconcile.error).toBe('already_reconciled')
 
-    // NOW a fresh review-entry mints a real, unclaimed freeze again. review's only
-    // outbound transitions are approved/rejected (TRANSITIONS, src/tasks/
-    // service.ts) — reject first (the voided freeze needs no hash), then the
-    // ordinary rejected -> in_progress -> review rework loop.
-    const reject = await invokeTool(owner, testEnv, 'office.review_approval', { task_id: taskId, verdict: 'rejected' }, ORIGIN)
-    if (!reject.ok) throw new Error(`fixture error: could not reject: ${JSON.stringify(reject)}`)
-    const toInProgress = await invokeTool(owner, testEnv, 'task_update', { task_id: taskId, status: 'in_progress' }, ORIGIN)
-    if (!toInProgress.ok) throw new Error(`fixture error: could not move to in_progress: ${JSON.stringify(toInProgress)}`)
-    const backToReview = await invokeTool(owner, testEnv, 'task_update', { task_id: taskId, status: 'review' }, ORIGIN)
-    if (!backToReview.ok) throw new Error(`fixture error: could not re-enter review: ${JSON.stringify(backToReview)}`)
+    // NOW (the claim is resolved) the reversal is allowed, and its review-entry mints
+    // a real, unclaimed freeze again.
+    const reversalAfter = await invokeTool(
+      owner, testEnv, 'task_update',
+      { task_id: taskId, status: 'review', reversal_reason: 'WordPress confirmed to have no post' },
+      ORIGIN,
+    )
+    if (!reversalAfter.ok) throw new Error(`fixture error: reversal after reconcile failed: ${JSON.stringify(reversalAfter)}`)
 
     const freshFreeze = harness.sqlite.prepare(
       `SELECT frozen_at, claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?`,
@@ -3462,6 +3466,178 @@ describe('mupot#1616 gate r1: atomic receipts, key scope, duplicates, redirects,
     const result = await reconcile(c)
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.error).toBe('reconcile_check_unavailable')
+    c.harness.close()
+  })
+})
+
+
+// ── mupot#1616 gate round 2: one narrow invariant ────────────────────────────────
+// A task must not leave 'approved' while its publish is claimed-but-unresolved, and
+// a 'done' receipt is all-or-nothing in both directions: the double-post path was
+// "freeze says done, task never did, the rework loop reopens over a live post".
+describe('mupot#1616 gate r2: no reversal over an unresolved publish; all-or-nothing done receipt', () => {
+  const runtimeKey = (): string => ['mcpwp', 'r2key', crypto.randomUUID().replaceAll('-', '')].join('_')
+
+  async function approvedTask() {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const apiKey = runtimeKey()
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', apiKey)
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    return { harness, testEnv, apiKey, connectorId, departmentId, taskId }
+  }
+  type Ctx = Awaited<ReturnType<typeof approvedTask>>
+  const publish = (c: Ctx) => invokeTool(officeLead(c.departmentId), c.testEnv, 'office.publish_post', { task_id: c.taskId }, ORIGIN)
+  const reconcile = (c: Ctx, args: Record<string, unknown> = {}) =>
+    invokeTool(orgOwnerAuth(), c.testEnv, 'office.reconcile_stalled_publish', { task_id: c.taskId, outcome: 'failed', ...args }, ORIGIN)
+  const reverse = (c: Ctx) =>
+    invokeTool(orgOwnerAuth(), c.testEnv, 'task_update', { task_id: c.taskId, status: 'review', reversal_reason: 'operator reversal' }, ORIGIN)
+  const backdate = (c: Ctx) => c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`)
+    .run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+  const taskStatus = (c: Ctx) => (c.harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(c.taskId) as { status: string }).status
+  const freezeRow = (c: Ctx) => c.harness.sqlite.prepare(`SELECT outcome, claimed_at, voided_at FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { outcome: string | null; claimed_at: string | null; voided_at: string | null }
+  const posts = (wp: { requests: { method: string }[] }) => wp.requests.filter((r) => r.method === 'POST').length
+
+  it('REPRO A: ambiguous publish -> operator reversal is REFUSED -> reconcile adopts -> exactly one POST, task done, no rework path opens', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false) // WordPress stored it, the connection aborted
+
+    const reversal = await reverse(c)
+    expect(reversal.ok).toBe(false)
+    if (!reversal.ok) {
+      expect(reversal.error).toBe('office_publish_unresolved')
+      expect(JSON.stringify(reversal)).toContain('office.reconcile_stalled_publish')
+    }
+    expect(taskStatus(c)).toBe('approved')
+    expect(freezeRow(c).voided_at).toBeNull()
+
+    backdate(c)
+    expect((await reconcile(c)).ok).toBe(true)
+    expect(taskStatus(c)).toBe('done')
+    expect(freezeRow(c).outcome).toBe('done')
+    expect(posts(wp)).toBe(1)
+    expect(wp.posts).toHaveLength(1)
+    c.harness.close()
+  })
+
+  it('REPRO B: a reversal that lands DURING the POST is refused; the publish completes; one POST', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey })
+    let during: Awaited<ReturnType<typeof reverse>> | null = null
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') during = await reverse(c)
+      return wp.f(input, init)
+    }) as unknown as typeof fetch)
+
+    const result = await publish(c)
+
+    expect(result.ok).toBe(true)
+    expect(during).not.toBeNull()
+    expect(during === null ? true : during.ok).toBe(false)
+    expect(taskStatus(c)).toBe('done')
+    expect(posts(wp)).toBe(1)
+    c.harness.close()
+  })
+
+  it('RACE: concurrent reversal and publish-claim — exactly one wins, never both, never a second POST', async () => {
+    for (let round = 0; round < 6; round++) {
+      const c = await approvedTask()
+      const wp = createFakeMcpwp({ apiKey: c.apiKey })
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        return wp.f(input, init)
+      }) as unknown as typeof fetch)
+
+      const [pub, rev] = await Promise.all([publish(c), reverse(c)])
+
+      if (rev.ok) {
+        expect(pub.ok).toBe(false) // the reversal won the verdict: the claim was refused, no POST
+        expect(posts(wp)).toBe(0)
+        expect(taskStatus(c)).toBe('review')
+      } else {
+        expect(pub.ok).toBe(true) // the claim won: the reversal was refused
+        expect(posts(wp)).toBe(1)
+        expect(taskStatus(c)).toBe('done')
+      }
+      c.harness.close()
+    }
+  })
+
+  it('BELT (freeze half): the task leaves approved during the POST -> BOTH writes refused, claim stays OPEN, and the result says a post EXISTS (id + link), not a bare verdict_race', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') c.harness.sqlite.prepare(`UPDATE tasks SET status = 'review' WHERE id = ?`).run(c.taskId) // raw: bypasses the reversal guard
+      return wp.f(input, init)
+    }) as unknown as typeof fetch)
+
+    const result = await publish(c)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('publish_unreconciled')
+    const shown = JSON.stringify(result)
+    expect(shown).toContain(`id ${wp.posts[0]?.id}`)
+    expect(shown).toContain('https://wordpress.example.com/?p=')
+    expect(freezeRow(c).outcome).toBeNull() // claim stays open — NOT a half commit
+    expect(taskStatus(c)).toBe('review')
+    // and the rework loop cannot open over it
+    expect(await unreconciledPriorFreezeExists(c.testEnv, c.taskId)).toBe(true)
+    c.harness.close()
+  })
+
+  it('BELT (reconcile): adopting while the task is no longer approved leaves both unchanged and says a post exists', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false)
+    c.harness.sqlite.prepare(`UPDATE tasks SET status = 'review' WHERE id = ?`).run(c.taskId)
+    backdate(c)
+
+    const result = await reconcile(c)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('publish_unreconciled')
+    expect(JSON.stringify(result)).toContain(`id ${wp.posts[0]?.id}`)
+    expect(freezeRow(c).outcome).toBeNull()
+    expect(taskStatus(c)).toBe('review')
+    c.harness.close()
+  })
+
+  it('BELT (task half + outcome guard): a claim resolved by someone else during the POST is never overwritten and the task is not flipped', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET outcome = 'failed', outcome_detail = 'other', completed_at = ? WHERE task_id = ?`).run(new Date().toISOString(), c.taskId)
+      return wp.f(input, init)
+    }) as unknown as typeof fetch)
+
+    const result = await publish(c)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('already_reconciled')
+    expect(freezeRow(c).outcome).toBe('failed') // the other writer's outcome survives
+    expect(taskStatus(c)).toBe('approved') // the task half did NOT land alone
+    c.harness.close()
+  })
+
+  it('REFREEZE: a prior freeze that says done while its task is NOT done blocks a fresh freeze (a live post with no receipt)', async () => {
+    const c = await approvedTask()
+    c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ?, outcome = 'done' WHERE task_id = ?`).run(new Date().toISOString(), c.taskId)
+    expect(await unreconciledPriorFreezeExists(c.testEnv, c.taskId)).toBe(true)
+    c.harness.sqlite.prepare(`UPDATE tasks SET status = 'done' WHERE id = ?`).run(c.taskId)
+    expect(await unreconciledPriorFreezeExists(c.testEnv, c.taskId)).toBe(false)
+    c.harness.close()
+  })
+
+  it('a reversal of a task whose claim is RESOLVED still works (the guard is only for an unresolved claim), and an unclaimed approval reverses normally', async () => {
+    const c = await approvedTask()
+    expect((await reverse(c)).ok).toBe(true) // never claimed
+    expect(taskStatus(c)).toBe('review')
     c.harness.close()
   })
 })

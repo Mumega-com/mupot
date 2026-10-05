@@ -1121,7 +1121,7 @@ tasksApp.patch('/:id', async (c) => {
       const outcome = await reverseTaskVerdict(c.env, {
         existing, next, tenant: c.env.TENANT_SLUG, reason: reversalReason, actorId, actorType,
       })
-      if (!outcome.ok) return c.json({ error: outcome.error }, 409)
+      if (!outcome.ok) return c.json({ error: outcome.error, ...('detail' in outcome ? { detail: outcome.detail } : {}) }, 409)
       next.status = outcome.task.status
       next.updated_at = outcome.task.updated_at
     } else {

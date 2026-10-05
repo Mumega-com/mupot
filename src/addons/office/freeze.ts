@@ -81,6 +81,9 @@ export type OfficeRefusalReason =
   // meta) but a different payload hash than the human approved — never adopted,
   // never overwritten, never overridable.
   | 'reconcile_conflict'
+  // mupot#1616: a post EXISTS on WordPress, the task left 'approved', the claim is
+  // still open (no receipt written). Never read as "nothing happened".
+  | 'publish_unreconciled'
   // mupot#1616: the connector's site URL has a path (a subdirectory install);
   // office calls address <origin>/wp-json and would hit a different application.
   | 'unsupported_site_path'
@@ -105,8 +108,9 @@ export type OfficeRefusalReason =
 
 export type OfficeResult<T> =
   | { ok: true; value: T }
-  // `hint`: an optional human-readable explanation of the refusal. Never carries
-  // a credential, a response body, or any site-supplied text.
+  // `hint`: an optional human-readable explanation of the refusal. Never carries a
+  // credential or response body; the only site-derived values are a created post's
+  // id and link.
   | { ok: false; reason: OfficeRefusalReason; hint?: string }
 
 // P3-2 (kasra-review adversarial round 1, PR #1588): the ORIGINAL version of this
@@ -262,10 +266,17 @@ interface PriorOfficeFreezeRow {
 // entry AND rework re-entry) goes through, until an operator manually confirms the
 // real outcome via office.reconcile_stalled_publish.
 export async function unreconciledPriorFreezeExists(env: Env, taskId: string): Promise<boolean> {
+  // Blocks while the claim is unresolved (outcome NULL) AND when a freeze says
+  // 'done' but its task never reached 'done' (a live post with no receipt):
+  // the rework loop must never open over either.
   const row = await env.DB.prepare(
-    `SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?1`,
-  ).bind(taskId).first<PriorOfficeFreezeRow>()
-  return row !== null && row.claimed_at !== null && row.outcome === null
+    `SELECT f.claimed_at AS claimed_at, f.outcome AS outcome, t.status AS task_status
+       FROM office_publish_freezes f LEFT JOIN tasks t ON t.id = f.task_id
+      WHERE f.task_id = ?1`,
+  ).bind(taskId).first<PriorOfficeFreezeRow & { task_status: string | null }>()
+  if (row === null || row.claimed_at === null) return false
+  if (row.outcome === null) return true
+  return row.outcome === 'done' && row.task_status !== 'done'
 }
 
 // mupot#1592 NEW-1 (r2 adversarial follow-up on PR #1588): computes the EXACT

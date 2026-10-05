@@ -52,6 +52,7 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'freeze_not_found':
     case 'already_reconciled':
     case 'reconcile_conflict':
+    case 'publish_unreconciled':
     case 'unsupported_site_path':
     case 'reconcile_candidate_found':
     case 'reconcile_check_unavailable':
@@ -233,7 +234,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
       articleUrl,
       overrideReason,
     })
-    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
     return done({ task: result.value.task })
   },
 }

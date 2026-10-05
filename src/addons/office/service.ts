@@ -946,26 +946,36 @@ async function lookupWordpressPostByMeta(
  * 'approved' when the second failed, which reconcile refuses as already_reconciled:
  * a live post with no receipt and no way back (mupot#1616, publish AND reconcile).
  *
- * The task UPDATE is conditional on THIS batch's freeze UPDATE having landed
- * (EXISTS on the done row stamped with this call's own completed_at): a batch does
- * not roll back on a zero-row UPDATE, so without that a lost freeze race would
- * still flip the task.
+ * All-or-nothing in BOTH directions (a D1 batch does not roll back on a zero-row
+ * UPDATE, so each half is conditional on the other's precondition): the freeze
+ * UPDATE needs the task still 'approved', and the task UPDATE needs the freeze
+ * UPDATE to have landed. A zero-row on either side leaves BOTH unchanged and the
+ * claim open.
  *  - 'already_reconciled': the freeze row was not open (someone else resolved it).
- *  - 'verdict_race': the freeze landed but the task was no longer 'approved'.
+ *  - 'task_not_approved': a post EXISTS on WordPress, the claim is still open, and
+ *    the task is no longer 'approved'. Callers must say so plainly.
  * Throws if the batch itself fails; callers map that to a refusal that leaves the
  * claim open.
  */
+/** What an operator must be told when 'task_not_approved' happens: a bare
+ *  "verdict_race" reads as "nothing happened", but a post exists. */
+function postExistsUnreconciledHint(post: { postId: number; articleUrl: string }): string {
+  return `A post EXISTS on WordPress (id ${post.postId}, ${post.articleUrl}) but the task is no longer approved, so no receipt was written and the claim stays open. `
+    + 'Do NOT re-approve or republish. Resolve it with office.reconcile_stalled_publish (it adopts the post by its stamp).'
+}
+
 async function commitOfficeDoneReceipt(
   env: Env,
   taskId: string,
   freezeOutcomeDetail: string,
   result: { postId: number; articleUrl: string; note?: string },
-): Promise<'ok' | 'already_reconciled' | 'verdict_race'> {
+): Promise<'ok' | 'already_reconciled' | 'task_not_approved'> {
   const now = new Date().toISOString()
   const [freezeUpdate, taskUpdate] = await env.DB.batch([
     env.DB.prepare(
       `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2
-        WHERE task_id = ?3 AND outcome IS NULL AND claimed_at IS NOT NULL`,
+        WHERE task_id = ?3 AND outcome IS NULL AND claimed_at IS NOT NULL
+          AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')`,
     ).bind(freezeOutcomeDetail, now, taskId),
     env.DB.prepare(
       `UPDATE tasks SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
@@ -973,8 +983,18 @@ async function commitOfficeDoneReceipt(
           AND EXISTS (SELECT 1 FROM office_publish_freezes WHERE task_id = ?3 AND outcome = 'done' AND completed_at = ?2)`,
     ).bind(JSON.stringify(result), now, taskId),
   ])
-  if ((freezeUpdate?.meta?.changes ?? 0) === 0) return 'already_reconciled'
-  if ((taskUpdate?.meta?.changes ?? 0) === 0) return 'verdict_race'
+  if ((freezeUpdate?.meta?.changes ?? 0) === 0) {
+    // Neither half landed (the task UPDATE is conditional on the freeze one). Tell
+    // "someone already resolved this claim" from "the task left 'approved' while a
+    // post exists": the latter leaves the claim OPEN, never a half commit.
+    const open = await env.DB.prepare(
+      `SELECT 1 AS open FROM office_publish_freezes WHERE task_id = ?1 AND outcome IS NULL AND claimed_at IS NOT NULL`,
+    ).bind(taskId).first<{ open: number }>()
+    return open ? 'task_not_approved' : 'already_reconciled'
+  }
+  // Both statements ran in one transaction and the task one is conditional on the
+  // freeze one, so the freeze landing and the task not is not a reachable state.
+  if ((taskUpdate?.meta?.changes ?? 0) === 0) throw new Error('office_receipt_half_commit')
   return 'ok'
 }
 
@@ -1156,7 +1176,8 @@ export async function publishOfficePost(
   } catch {
     return { ok: false, reason: 'publish_outcome_unknown' }
   }
-  if (committed !== 'ok') return { ok: false, reason: 'verdict_race' }
+  if (committed === 'task_not_approved') return { ok: false, reason: 'publish_unreconciled', hint: postExistsUnreconciledHint(published.value) }
+  if (committed === 'already_reconciled') return { ok: false, reason: 'already_reconciled' }
 
   return { ok: true, value: published.value }
 }
@@ -1416,7 +1437,7 @@ async function applyReconcileOutcome(
       return { ok: false, reason: 'write_failed' }
     }
     if (committed === 'already_reconciled') return { ok: false, reason: 'already_reconciled' }
-    if (committed === 'verdict_race') return { ok: false, reason: 'verdict_race' }
+    if (committed === 'task_not_approved') return { ok: false, reason: 'publish_unreconciled', hint: postExistsUnreconciledHint({ postId, articleUrl }) }
     return { ok: true, value: { task } }
   }
 

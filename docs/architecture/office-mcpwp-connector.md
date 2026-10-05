@@ -111,3 +111,39 @@ body): use `publish_status: "draft"` with a write key, or an admin key.
   defence in the addon. Workers egress is the backstop.
 - The lookup reads at most 20 candidates' meta and treats a truncated list as
   unverifiable (a candidate), never as nothing found.
+
+## Approval state and the double-post invariant
+
+A task cannot leave `approved` through a verdict reversal while its publish claim is
+unresolved (`claimed_at IS NOT NULL AND outcome IS NULL`): the stamp of
+`reversed_at` carries `NOT EXISTS (unresolved claim)` in the same statement, and a
+publish claim itself requires the verdict to be unreversed, so exactly one of
+{reversal, claim} wins any race. The refusal is `office_publish_unresolved`
+("a publish is in flight or unresolved; run office.reconcile_stalled_publish first").
+The 'done' receipt is all-or-nothing in both directions: the freeze UPDATE needs the
+task still `approved`, the task UPDATE needs the freeze UPDATE to have landed. If the
+task left `approved` anyway, nothing is written, the claim stays open, and the result
+is `publish_unreconciled` with the post id and link. A freeze that says `done` while
+its task is not `done` also blocks a fresh freeze.
+
+Writers that can move an office task out of `approved`: the verdict reversal (guarded
+as above) and the generic `approved -> done` task update and the gate-execute
+`approved -> done` (dashboard) — those two cannot double-post, because the freeze
+stays claimed with no outcome and still blocks a refreeze until reconciled. Reject
+only applies from `review`, where no claim can exist.
+
+## First real publish: pre-flight
+
+1. Use a WRITE-scope MCPWP key (not admin).
+2. Connector meta exactly `{"siteUrl":"https://digid.ca","publish_status":"draft"}` with
+   the literal lowercase key `publish_status` (any other spelling or value publishes
+   PUBLICLY).
+3. `siteUrl` is a bare https site root (no path, query or fragment).
+4. Confirm the plugin version (3.13.0+ has the scope gate; the latest tag is 3.14.10).
+5. Confirm permalinks resolve `/wp-json`.
+6. Give the task a distinctive title (the lookup searches by title).
+7. Run the addon health check and expect ok.
+8. Approve the exact payload hash, then publish ONCE.
+9. Check the draft in wp-admin.
+10. If the result is `publish_outcome_unknown`, do NOT reverse the task: wait out the
+    staleness window, then run `office.reconcile_stalled_publish`.
