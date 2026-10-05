@@ -487,3 +487,106 @@ describe('task_submit_result (mupot#1586)', () => {
     expect(res).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
   })
 })
+
+// mupot#1663 — a gate lane held by an independent HUMAN member (gate:office,
+// decided by humans via office_review_approval) counts as independent, never
+// the assignee agent's owner (whose attested human_origin verdict would reopen
+// the self-close loop), and never an agent identity masquerading as a member.
+describe('task_submit_result — member-held gate lanes (mupot#1663)', () => {
+  const OFFICE = 'gate:office'
+  const HOLDER = 'mem-x'
+  const OWNER = 'mem-y'
+
+  function seedMemberGate(
+    harness: SqliteD1Harness,
+    o: { holder?: string | null; ownerEmail?: string; holderEmail?: string; holderStatus?: string } = {},
+  ): void {
+    seed(harness.sqlite, { gateOwner: OFFICE, independentGateHolder: false })
+    const ownerEmail = o.ownerEmail ? `'${o.ownerEmail}'` : 'NULL'
+    const holderEmail = o.holderEmail ? `'${o.holderEmail}'` : 'NULL'
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant, email) VALUES ('${OWNER}', 'Owner Y', 'active', '${TENANT}', ${ownerEmail});
+      INSERT INTO members (id, display_name, status, tenant, email) VALUES ('${HOLDER}', 'Holder X', '${o.holderStatus ?? 'active'}', '${TENANT}', ${holderEmail});
+      UPDATE agents SET owner_member_id = '${OWNER}' WHERE id = '${ASSIGNEE_ID}';
+    `)
+    if (o.holder !== null) {
+      harness.sqlite.exec(`
+        INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+          VALUES ('gg-office', '${OFFICE}', 'member', '${o.holder ?? HOLDER}', '${MEMBER_ID}', '${T0}');
+      `)
+    }
+  }
+
+  async function submit(env: Env) {
+    return invokeTool(assigneeAuth(), env, 'task_submit_result', { task_id: TASK_ID, result: VALID_RESULT }, URL)
+  }
+
+  it('gate:office held by independent member mem-x (assignee owned by mem-y) -> review', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness)
+    const res = await submit(env)
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    expect(taskRow(harness).status).toBe('review')
+    expect(submissionRows(harness)).toHaveLength(1)
+  })
+
+  it('gate held ONLY by the assignee agent\'s owner -> independent_gate_required', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness, { holder: OWNER })
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+    expect(taskRow(harness).status).toBe('in_progress')
+  })
+
+  it('gate held by another member row of the same person as the owner (same email) -> refused', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness, { ownerEmail: 'Hadi@X.test', holderEmail: 'hadi@x.test' })
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+  })
+
+  it('gate held by nobody -> refused', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness, { holder: null })
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+  })
+
+  it('gate held by a suspended member -> refused', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness, { holderStatus: 'suspended' })
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+  })
+
+  it('gate held (as a "member" grant) by an agent-bound member row -> refused (agents use the live-credential rule)', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness, { holder: GATE_MEMBER_ID })
+    harness.sqlite.exec(`
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+        VALUES ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '${T0}');
+    `)
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+  })
+
+  it('gate:agent-self-completion is still refused even if a member holds a grant for it', async () => {
+    const { harness, env } = freshEnv()
+    seed(harness.sqlite, { gateOwner: 'gate:agent-self-completion', independentGateHolder: false })
+    harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('${HOLDER}', 'Holder X', 'active', '${TENANT}');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gg-sc', 'gate:agent-self-completion', 'member', '${HOLDER}', '${MEMBER_ID}', '${T0}');
+    `)
+    const res = await submit(env)
+    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+  })
+
+  it('the runtime-receipt predicate keeps its agent-only rule (member holders are opt-in)', async () => {
+    const { harness, env } = freshEnv()
+    seedMemberGate(harness)
+    const { hasIndependentRuntimeGate } = await import('../src/tasks/runtime-receipts')
+    expect(await hasIndependentRuntimeGate(env, OFFICE, ASSIGNEE_ID, SQUAD_ID)).toBe(false)
+    expect(await hasIndependentRuntimeGate(env, OFFICE, ASSIGNEE_ID, SQUAD_ID, { allowMemberHolders: true })).toBe(true)
+  })
+})

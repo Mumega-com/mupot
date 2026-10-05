@@ -286,11 +286,13 @@ export function independentGateHolderExistsSql(p: {
   squadIdExpr: string
   tenantParam: string
   nowParam: string
+  /** mupot#1663 — also count a gate held by an independent HUMAN member (see
+   *  humanGateHolderExistsSql). Default false: the runtime-receipt `completed`
+   *  path and the dispatch pre-check keep the agent-holder-only rule; only the
+   *  hand-worked review entry (task_submit_result) opts in. */
+  allowMemberHolders?: boolean
 }): string {
-  return `(
-    ${p.gateOwnerExpr} IS NOT NULL
-    AND ${p.gateOwnerExpr} <> 'gate:agent-self-completion'
-    AND EXISTS (
+  const agentHolder = `EXISTS (
       SELECT 1
         FROM gate_grants grant_row
         JOIN agents gate_agent
@@ -333,8 +335,71 @@ export function independentGateHolderExistsSql(p: {
                 )
               )
          )
+    )`
+  const memberHolder = p.allowMemberHolders ? `
+    OR ${humanGateHolderExistsSql(p)}` : ''
+  return `(
+    ${p.gateOwnerExpr} IS NOT NULL
+    AND ${p.gateOwnerExpr} <> 'gate:agent-self-completion'
+    AND (
+      ${agentHolder}${memberHolder}
     )
   )`
+}
+
+/**
+ * humanGateHolderExistsSql — mupot#1663. True iff the gate lane is held (a
+ * gate_grants row, principal_type='member', migrations/0008) by an ACTIVE human
+ * member who is INDEPENDENT of the assignee. This is how a human-decided lane
+ * (gate:office, decided via office_review_approval) can be a legitimate review
+ * gate for an agent-built task, which the agent-only holder rule refused.
+ *
+ * Independence — each exclusion closes a self-close route (the loop documented
+ * at task_submit_result in src/mcp/index.ts: the party being graded must never
+ * be able to decide its own review):
+ *   - the assignee agent's OWNER (agents.owner_member_id). task_verdict accepts
+ *     a harness-attested human_origin and writes the verdict AS the owner
+ *     (mupot#1425), so an owner-held gate would let the assignee submit and
+ *     then have its own owner's identity approve it. Also excluded: any member
+ *     row sharing the owner's email (one human routinely has several member
+ *     rows), so the exclusion is of the person, not just one row id.
+ *   - any member that is bound to an agent (agent_member_bindings) — that row
+ *     is an AGENT identity, not a human; agent holders are judged by the
+ *     stricter live-credential rule above, never admitted here as a "member".
+ * The holder must be status='active' (same liveness hasActiveGateGrant uses).
+ */
+function humanGateHolderExistsSql(p: {
+  gateOwnerExpr: string
+  assigneeIdExpr: string
+  tenantParam: string
+}): string {
+  return `EXISTS (
+      SELECT 1
+        FROM gate_grants member_grant
+        JOIN members gate_human
+          ON member_grant.principal_type = 'member'
+         AND gate_human.id = member_grant.principal_id
+         AND gate_human.status = 'active'
+         AND gate_human.tenant = ${p.tenantParam}
+       WHERE member_grant.capability = ${p.gateOwnerExpr}
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_member_bindings bound WHERE bound.member_id = gate_human.id
+         )
+         AND NOT EXISTS (
+           SELECT 1
+             FROM agents assignee_agent
+             LEFT JOIN members owner_member ON owner_member.id = assignee_agent.owner_member_id
+            WHERE assignee_agent.id = ${p.assigneeIdExpr}
+              AND (
+                assignee_agent.owner_member_id = gate_human.id
+                OR (
+                  owner_member.email IS NOT NULL
+                  AND gate_human.email IS NOT NULL
+                  AND lower(owner_member.email) = lower(gate_human.email)
+                )
+              )
+         )
+    )`
 }
 
 export async function hasIndependentRuntimeGate(
@@ -342,6 +407,7 @@ export async function hasIndependentRuntimeGate(
   gateOwner: string | null | undefined,
   assigneeAgentId: string,
   taskSquadId: string,
+  opts: { allowMemberHolders?: boolean } = {},
 ): Promise<boolean> {
   if (
     gateOwner === null || gateOwner === undefined
@@ -351,6 +417,7 @@ export async function hasIndependentRuntimeGate(
   const row = await env.DB.prepare(`
     SELECT 1 WHERE ${independentGateHolderExistsSql({
       gateOwnerExpr: '?1', assigneeIdExpr: '?2', tenantParam: '?3', squadIdExpr: '?4', nowParam: '?5',
+      allowMemberHolders: opts.allowMemberHolders,
     })}
   `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
     .first<{ 1: number }>()
