@@ -62,7 +62,7 @@ import {
   type AddonActor,
   type AddonMutationResult,
 } from '../addons/service'
-import { validateBindingInputs } from '../addons/bindings'
+import { listAddonBindings, validateBindingInputs } from '../addons/bindings'
 import { OFFICE_ADDON_KEY, probeOfficeHealth } from '../addons/office/service'
 import { hasCapability } from '../auth/capability'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
@@ -331,12 +331,32 @@ const toolAddonSetup: ToolSpec = {
     if (!installed.ok) return stop('install', installed)
     steps.push({ step: 'install', outcome: installed.created ? 'created' : 'idempotent' })
 
-    // configureAddon refuses an already-active installation, and re-running it with no
-    // bindings on an already-configured one would only restamp it; both are skipped so a
-    // repeat call converges. Bindings supplied against an ACTIVE installation are not
-    // applied (disable -> addon_setup is the reconfigure path) and the output says so.
+    // configureAddon refuses an already-active installation, so a repeat call converges by
+    // skipping it. Skipped likewise when configured/disabled and no bindings were supplied
+    // (the existing bindings stand; re-running would only restamp). Bindings supplied against
+    // an ACTIVE installation are never silently dropped (wrong-tenant credential risk): equal
+    // to the current binding -> idempotent; anything else -> 409, nothing changed, and the
+    // currently bound connector is named. Rebinding is disable -> addon_setup.
     const state = installed.state
-    const skipConfigure = state === 'active' || (state === 'configured' && validated.bindings.length === 0)
+    let skipConfigure = false
+    if (state === 'active' && validated.bindings.length > 0) {
+      const current = (await listAddonBindings(env, installed.installation.id)).filter((row) => !row.revokedAt)
+      const same = validated.bindings.every((wanted) => current.some((row) =>
+        row.slot === wanted.slot
+        && row.adapter === wanted.adapter
+        && row.bindingKind === wanted.bindingKind
+        && (row.connectorId ?? null) === (wanted.connectorId ?? null)))
+      if (!same) {
+        return fail(409, 'already_active_disable_to_rebind', {
+          failed_step: 'configure',
+          completed_steps: steps,
+          bound_connector_ids: current.flatMap((row) => (row.connectorId ? [row.connectorId] : [])),
+        })
+      }
+      skipConfigure = true
+    } else if (state === 'active' || ((state === 'configured' || state === 'disabled') && validated.bindings.length === 0)) {
+      skipConfigure = true
+    }
     if (skipConfigure) {
       steps.push({ step: 'configure', outcome: 'skipped' })
     } else {
@@ -349,19 +369,13 @@ const toolAddonSetup: ToolSpec = {
     if (!activated.ok) return stop('activate', activated)
     steps.push({ step: 'activate', outcome: activated.idempotent ? 'idempotent' : 'applied' })
 
-    const bindingsIgnored = state === 'active' && validated.bindings.length > 0
-    const base = {
-      key,
-      state: activated.state,
-      steps,
-      ...(bindingsIgnored ? { bindings_applied: false } : {}),
-    }
+    const base = { key, state: activated.state, steps }
     if (key !== OFFICE_ADDON_KEY) return done(base)
 
     // Activation never depends on health; the probe only reports (mupot#1662).
     const probe = await probeOfficeHealth(env)
     const health = probe.ok
-      ? probe.value
+      ? (({ installation_id: _installationId, ...report }) => report)(probe.value)
       : { status: 'unavailable' as const, reason: probe.reason }
     return done({ ...base, health })
   },

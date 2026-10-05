@@ -101,11 +101,11 @@ afterEach(() => {
 
 describe('office.health', () => {
   it.each([
-    [200, { status: 'available' }],
-    [401, { status: 'failed', reason: 'key_invalid' }],
-    [403, { status: 'failed', reason: 'key_invalid' }],
-    [500, { status: 'failed', reason: 'unreachable' }],
-    [302, { status: 'failed', reason: 'unreachable' }],
+    [200, { status: 'available', connector_id: 'connector-wp' }],
+    [401, { status: 'failed', reason: 'key_invalid', connector_id: 'connector-wp' }],
+    [403, { status: 'failed', reason: 'key_invalid', connector_id: 'connector-wp' }],
+    [500, { status: 'failed', reason: 'unreachable', connector_id: 'connector-wp' }],
+    [302, { status: 'failed', reason: 'unreachable', connector_id: 'connector-wp' }],
   ])('maps a %s from the site to %j', async (status, expected) => {
     const { harness, deptId } = await activeOffice()
     const spy = stubSite(() => new Response(`secret body ${SECRET}`, { status }))
@@ -121,14 +121,14 @@ describe('office.health', () => {
     const { harness, deptId } = await activeOffice()
     stubSite(() => { throw new TypeError('network down') })
     const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
-    expect(out).toMatchObject({ ok: true, result: { status: 'failed', reason: 'unreachable' } })
+    expect(out).toMatchObject({ ok: true, result: { status: 'failed', reason: 'unreachable', connector_id: 'connector-wp' } })
   })
 
   it('keeps the SSRF guard: a private-host connector is never fetched', async () => {
     const { harness, deptId } = await activeOffice('https://10.0.0.5')
     const spy = stubSite(ok200)
     const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
-    expect(out).toMatchObject({ ok: true, result: { status: 'unavailable', reason: 'invalid_site_url' } })
+    expect(out).toMatchObject({ ok: true, result: { status: 'unavailable', reason: 'invalid_site_url', connector_id: 'connector-wp' } })
     expect(spy).not.toHaveBeenCalled()
   })
 
@@ -157,6 +157,95 @@ describe('office.health', () => {
   })
 })
 
+describe('addon_setup — rebind and disabled paths', () => {
+  it('refuses 409 to rebind an ACTIVE install to a different connector: nothing changes, new connector never probed', async () => {
+    const { harness } = await activeOffice()
+    const other = await seedConnector(harness, 'https://other-tenant.example.com', 'connector-other')
+    const before = receipts(harness)
+    const spy = stubSite(ok200)
+    const out = await invokeTool(orgOwner, env(harness), 'addon_setup', { key: KEY, bindings: bindings(other) }, ORIGIN)
+    expect(out.ok).toBe(false)
+    if (!out.ok) {
+      expect(out.status).toBe(409)
+      expect(out.error).toBe('already_active_disable_to_rebind')
+      expect(out.detail).toMatchObject({ failed_step: 'configure', bound_connector_ids: ['connector-wp'] })
+    }
+    expect(spy).not.toHaveBeenCalled()
+    expect(receipts(harness)).toEqual(before)
+    expect(installationState(harness)).toBe('active')
+    const bound = harness.sqlite.prepare(
+      `SELECT connector_id FROM addon_connector_bindings WHERE revoked_at IS NULL`,
+    ).all() as Array<{ connector_id: string }>
+    expect(bound.map((r) => r.connector_id)).toEqual(['connector-wp'])
+  })
+
+  it('a disabled install with no bindings skips configure and just re-activates', async () => {
+    const { harness } = await activeOffice()
+    const disabled = await invokeTool(orgOwner, env(harness), 'addon_disable', { key: KEY }, ORIGIN)
+    expect(disabled.ok).toBe(true)
+    expect(installationState(harness)).toBe('disabled')
+    stubSite(ok200)
+    const out = await invokeTool(orgOwner, env(harness), 'addon_setup', { key: KEY }, ORIGIN)
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    if (out.ok) {
+      expect((out.result as { steps: unknown }).steps).toEqual([
+        { step: 'install', outcome: 'idempotent' },
+        { step: 'configure', outcome: 'skipped' },
+        { step: 'activate', outcome: 'applied' },
+      ])
+    }
+    expect(installationState(harness)).toBe('active')
+  })
+})
+
+describe('office.health — cooldown and eligibility', () => {
+  it('allows one outbound probe per 60s per installation; inside the window returns the cached result', async () => {
+    const { harness, deptId } = await activeOffice()
+    const member = auth('m', [grant('department', deptId, 'member')])
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-06-01T00:00:00.000Z'))
+      const spy = stubSite(() => new Response('', { status: 401 }))
+      const first = await invokeTool(member, env(harness), 'office.health', {}, ORIGIN)
+      expect(first).toMatchObject({ ok: true, result: { status: 'failed', reason: 'key_invalid', connector_id: 'connector-wp' } })
+      if (first.ok) expect((first.result as { cached?: boolean }).cached).toBeUndefined()
+
+      vi.setSystemTime(new Date('2026-06-01T00:00:30.000Z'))
+      stubSite(ok200) // would read healthy if it were probed again
+      const second = await invokeTool(member, env(harness), 'office.health', {}, ORIGIN)
+      expect(second).toMatchObject({
+        ok: true,
+        result: { status: 'failed', reason: 'key_invalid', cached: true, checked_at: '2026-06-01T00:00:00.000Z' },
+      })
+      expect(spy).toHaveBeenCalledTimes(1)
+
+      vi.setSystemTime(new Date('2026-06-01T00:01:01.000Z'))
+      const third = await invokeTool(member, env(harness), 'office.health', {}, ORIGIN)
+      expect(third).toMatchObject({ ok: true, result: { status: 'available' } })
+      if (third.ok) expect((third.result as { cached?: boolean }).cached).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a drifted manifest digest never sends the key (same eligibility resolver as publish)', async () => {
+    const { harness, deptId } = await activeOffice()
+    // The schema forbids this drift on a live row; drop only the identity trigger to simulate
+    // an installation row that no longer matches the registered manifest.
+    const triggers = harness.sqlite.prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%identity is immutable%'`,
+    ).all() as Array<{ name: string }>
+    expect(triggers.length).toBeGreaterThan(0)
+    for (const t of triggers) harness.sqlite.exec(`DROP TRIGGER "${t.name}"`)
+    harness.sqlite.prepare(`UPDATE addon_installations SET manifest_sha256 = '${'0'.repeat(64)}' WHERE addon_key = ?`).run(KEY)
+    const spy = stubSite(ok200)
+    const out = await invokeTool(auth('m', [grant('department', deptId, 'member')]), env(harness), 'office.health', {}, ORIGIN)
+    expect(out.ok).toBe(false)
+    if (!out.ok) expect(out.error).toBe('addon_inactive')
+    expect(spy).not.toHaveBeenCalled()
+  })
+})
+
 describe('addon_setup', () => {
   it('happy path: install -> configure -> activate, with the health probe reported', async () => {
     const harness = makeHarness()
@@ -173,7 +262,7 @@ describe('addon_setup', () => {
           { step: 'configure', outcome: 'applied' },
           { step: 'activate', outcome: 'applied' },
         ],
-        health: { status: 'available' },
+        health: { status: 'available', connector_id: 'connector-wp' },
       },
     })
     expect(installationState(harness)).toBe('active')
@@ -216,21 +305,20 @@ describe('addon_setup', () => {
     expect(receipts(harness).map((r) => r.action)).toEqual(['install', 'configure', 'activate'])
   })
 
-  it('is idempotent when re-run on an active installation (no new receipts, bindings flagged not applied)', async () => {
+  it('is idempotent when re-run on an active installation with the SAME binding (no new receipts)', async () => {
     const { harness, connectorId } = await activeOffice()
     const before = receipts(harness).length
     stubSite(ok200)
     const out = await invokeTool(orgOwner, env(harness), 'addon_setup', { key: KEY, bindings: bindings(connectorId) }, ORIGIN)
     expect(out.ok).toBe(true)
     if (out.ok) {
-      const result = out.result as { state: string; steps: unknown; bindings_applied?: boolean }
+      const result = out.result as { state: string; steps: unknown }
       expect(result.state).toBe('active')
       expect(result.steps).toEqual([
         { step: 'install', outcome: 'idempotent' },
         { step: 'configure', outcome: 'skipped' },
         { step: 'activate', outcome: 'idempotent' },
       ])
-      expect(result.bindings_applied).toBe(false)
     }
     expect(receipts(harness).length).toBe(before)
   })
@@ -267,7 +355,7 @@ describe('addon_setup', () => {
     expect(out.ok).toBe(true)
     if (out.ok) {
       expect((out.result as { state: string }).state).toBe('active')
-      expect((out.result as { health: unknown }).health).toEqual({ status: 'failed', reason: 'key_invalid' })
+      expect((out.result as { health: unknown }).health).toEqual({ status: 'failed', reason: 'key_invalid', connector_id: 'connector-wp' })
     }
     expect(installationState(harness)).toBe('active')
   })

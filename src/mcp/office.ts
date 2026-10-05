@@ -138,7 +138,7 @@ const toolOfficeHealth: ToolSpec = {
   async run(auth: AuthContext, env) {
     const result = await getOfficeHealth(env, auth)
     if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
-    return done({ status: result.value.status, ...(result.value.reason ? { reason: result.value.reason } : {}) })
+    return done(result.value)
   },
 }
 
