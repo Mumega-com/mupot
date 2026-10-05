@@ -133,6 +133,7 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'task_create',
   'task_dispatch',
   'task_dispatch_runtime_receipt',
+  'task_get',
   'task_intake_audit',
   'task_list',
   'task_update',

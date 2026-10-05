@@ -92,6 +92,7 @@ import {
   detectVerdictReversalRequest,
   reverseTaskVerdict,
   DedicatedGatePredicateRequiredError,
+  findLatestVerdict,
 } from '../tasks/service'
 // mupot#1586 — the same completion-size ceiling execute.ts's own finishTask
 // enforces on the in-Worker path (~16KB), reused here rather than a second
@@ -107,6 +108,9 @@ import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
   loadLatestDispatchReceiptsForTasks,
+  loadDispatchStatus,
+  resolveDecidedByDisplay,
+  type LatestDispatchStatus,
   adminResetDispatchLease,
   hasInFlightDispatchReceipt,
   hasIndependentRuntimeGate,
@@ -178,7 +182,7 @@ import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
-import { canReadProjectForTasks, canReadSquadTasks, visibleTaskClause } from '../tasks/visibility'
+import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -1224,6 +1228,66 @@ const toolTaskBoard: ToolSpec = {
       ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
     ) as Record<TaskStatus, number>
     return done({ squad_id: squadRes.squad.id, counts, columns })
+  },
+}
+
+// task_get — read ONE task by id (plus its latest verdict and latest dispatch receipt).
+// VISIBILITY: the row gate is canReadTask from the shared task-visibility chokepoint
+// (src/tasks/visibility.ts, mupot#1647) — the single-row twin of task_list's gate and row
+// predicate, archived tasks EXCLUDED exactly as task_list excludes them. This tool never
+// re-derives rank / plane / home / archive rules. A task the caller cannot read answers with
+// the SAME 404 task_not_found as an id that does not exist (no existence oracle).
+const TASK_GET_FIELDS = [
+  'id', 'squad_id', 'project_id', 'title', 'body', 'done_when', 'status', 'assignee_agent_id',
+  'assignee_member_id', 'gate_owner', 'result', 'execution_receipt_id', 'completed_at',
+  'created_at', 'updated_at',
+] as const
+
+const toolTaskGet: ToolSpec = {
+  name: 'task_get',
+  scope: 'squad',
+  min: 'member',
+  args: '{ task_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { task_id: STRING_SCHEMA },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    // Shared projection (tasks/ranking.ts) + execution_receipt_id; the response is then narrowed
+    // to TASK_GET_FIELDS so a column added to the shared projection never widens this reader.
+    const full = await env.DB.prepare(
+      `SELECT ${TASK_SELECT_COLUMNS}, execution_receipt_id FROM tasks WHERE id = ?1 LIMIT 1`,
+    ).bind(taskId).first<Record<string, unknown> & { id: string; squad_id: string }>()
+    if (!full || !(await canReadTask(env, auth, { id: full.id, squad_id: full.squad_id }))) {
+      return fail(404, 'task_not_found')
+    }
+    // Assignee-only, exactly like task_list/task_board: a non-assignee reader gets no dispatch
+    // or execution receipt id (Athena gate on #1665: execution_receipt_id leaked via the row).
+    const isAssignee = !!auth.boundAgentId && full.assignee_agent_id === auth.boundAgentId
+    const row: Record<string, unknown> = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
+    if (!isAssignee) row.execution_receipt_id = null
+    // Canonical latest-verdict reader (tasks/service.ts) - carries reversed_at; same ordering
+    // every reversal path trusts. decided_by is shown in the REST timeline's display form.
+    const v = await findLatestVerdict(env, full.id)
+    const latestVerdict = v
+      ? {
+          verdict: v.verdict,
+          decided_by: await resolveDecidedByDisplay(env, v.decided_by),
+          decided_at: v.decided_at,
+          reversed: v.reversed_at != null,
+          reversed_at: v.reversed_at ?? null,
+        }
+      : null
+    let latestDispatch: LatestDispatchStatus | null = null
+    if (isAssignee) {
+      const info = (await loadLatestDispatchReceiptsForTasks(env, [full.id])).get(full.id)
+      latestDispatch = info ? await loadDispatchStatus(env, info.dispatch_receipt_id) : null
+    }
+    return done({ task: row, latest_verdict: latestVerdict, latest_dispatch_receipt: latestDispatch })
   },
 }
 
@@ -6109,6 +6173,7 @@ export const TOOLS: ToolSpec[] = [
   toolFlightReapStalled,
   toolTaskCreate,
   toolTaskList,
+  toolTaskGet,
   toolTaskBoard,
   toolKanbanBoard,
   toolTaskUpdate,
