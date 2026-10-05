@@ -390,7 +390,11 @@ export async function listPresence(
   const statement = env.DB.prepare(`${PRESENCE_SELECT}${scopeClause}${homeClause} ORDER BY last_seen_at DESC LIMIT 200`)
   const bound = idsJson === null ? statement.bind(env.TENANT_SLUG) : statement.bind(env.TENANT_SLUG, idsJson)
   const res = await bound.all<PresenceRow>()
-  const rows = (res.results ?? []).map((r) => {
+  return hydratePresenceRows(env, res.results ?? [], nowMs)
+}
+
+async function hydratePresenceRows(env: Env, results: PresenceRow[], nowMs: number): Promise<PresenceView[]> {
+  const rows = results.map((r) => {
     const ms = sqliteUtcToMs(r.last_seen_at)
     return {
       ...r,
@@ -408,6 +412,18 @@ export async function listPresence(
   // resting session agent reads "sleeping · next 14:00" instead of a false "dead".
   const states = scheduleStates(await listFlights(env))
   return attachSchedule(rows, states)
+}
+
+/**
+ * listOwnAgentPresence — the check-in seat rows of ONE bound agent (mupot#1664 self-read).
+ * The agent id comes from the caller's authenticated credential, never from a request
+ * field; the WHERE pins tenant AND agent_id, so no other agent's row can be returned.
+ */
+export async function listOwnAgentPresence(env: Env, nowMs: number, agentId: string): Promise<PresenceView[]> {
+  const res = await env.DB.prepare(`${PRESENCE_SELECT} AND agent_id = ?2 ORDER BY last_seen_at DESC LIMIT 50`)
+    .bind(env.TENANT_SLUG, agentId)
+    .all<PresenceRow>()
+  return hydratePresenceRows(env, res.results ?? [], nowMs)
 }
 
 // Count currently-present agents (active within the stale window) for a quick stat.

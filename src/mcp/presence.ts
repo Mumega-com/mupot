@@ -64,6 +64,8 @@ import {
   type ActivityReport,
 } from '../registry/service'
 import { publishRosterPush } from '../registry/realtime'
+import { holdsCapabilityFloor } from '../auth/capability'
+import { listOwnAgentPresence } from '../fleet/presence'
 import { readAccess, readableProject } from './projects'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
@@ -271,15 +273,34 @@ const toolPresenceDeregister: ToolSpec = {
 
 const toolPresenceList: ToolSpec = {
   name: 'presence_list',
-  scope: 'project roster (any member who can read the project) — omit project_id for the org-admin tenant-wide view',
-  min: 'observer',
-  args: '{ project_id?: string|null }',
+  scope: 'project roster (any member who can read the project) — omit project_id for the org-admin tenant-wide view; self:true for the caller\'s own rows',
+  min: 'authenticated',
+  args: '{ project_id?: string|null, self?: boolean (own registrations + own check-in seats; agent-bound token) }',
   inputSchema: {
     type: 'object',
-    properties: { project_id: NULLABLE_STRING_SCHEMA },
+    properties: {
+      project_id: NULLABLE_STRING_SCHEMA,
+      self: { type: 'boolean', description: 'Return only the calling agent\'s own presence (registrations and check-in seats). Needs an agent-bound token; no grant required.' },
+    },
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // mupot#1664 self-read. The identity is auth.boundAgentId — never an argument — so
+    // this path structurally cannot return another agent's row. It is reached BEFORE the
+    // observer floor because a freshly onboarded agent holds no grant at all, and "can I
+    // see that I am online" must not depend on one.
+    if (args.self === true) {
+      if (args.project_id !== undefined) return fail(400, 'invalid_args', 'self cannot be combined with project_id')
+      if (!auth.boundAgentId) return fail(403, 'not_agent_session', 'self needs an agent-bound token')
+      const own = auth.boundAgentId
+      const modules = (await listPresence(env, {})).filter((m) => m.identity === own)
+      const seats = await listOwnAgentPresence(env, Date.now(), own)
+      return done({ self: true, agent_id: own, modules, seats })
+    }
+    // Non-self: the observer floor the dispatcher applied when spec.min was 'observer'.
+    if (!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'observer')) {
+      return fail(403, 'forbidden', { need: 'observer' })
+    }
     if (args.project_id === undefined) {
       // Unscoped roster — every registration this tenant has, across every project.
       // Wider disclosure than a single project's roster, so it requires the org
