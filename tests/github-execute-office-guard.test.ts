@@ -96,4 +96,16 @@ describe('executeTaskAsPR office/status guard (#1660)', () => {
     expect(res).toEqual({ ok: false, error: 'office_publish_unresolved', stage: 'task' })
     expect(row()).toEqual({ status: 'in_progress', github_issue_url: null })
   })
+
+  it('writer WHERE holds when the task is approved AFTER the early check (status race): row unchanged', async () => {
+    seed('in_progress', null, false)
+    const f = happyFetch()
+    const racing = (async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith('/pulls')) harness.sqlite.exec(`UPDATE tasks SET status='approved' WHERE id='T1'`)
+      return f.impl(url, init)
+    }) as unknown as typeof fetch
+    const res = await executeTaskAsPR(env(), params, { fetchImpl: racing })
+    expect(res).toEqual({ ok: false, error: 'invalid_transition', stage: 'task' })
+    expect(row()).toEqual({ status: 'approved', github_issue_url: null })
+  })
 })
