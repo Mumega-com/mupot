@@ -16,6 +16,7 @@ import {
   listOrientProjectVerdicts,
   listProjectVerdictRecords,
   redactEvidenceText,
+  visibleSquadIds,
   type VerdictRecord,
 } from '../src/projects/verdict-records'
 import type { AuthContext, Env } from '../src/types'
@@ -269,6 +270,12 @@ describe('SEAM: the projection never shows more than task_list shows the same ca
       ${mk('m-revoked', 'member', 'squad', SQUAD_A)}
       ${mk('m-homeowner', 'admin', 'squad', HOME)}
     `)
+    f.harness.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('m-sqab','k','active','${TENANT}'),('m-roleadmin','l','active','${TENANT}');
+      ${mk('m-sqab', 'member', 'squad', SQUAD_A)}
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-m-sqab-b', 'm-sqab', 'squad', '${SQUAD_B}', 'member');
+      ${mk('m-roleadmin', 'member', 'squad', SQUAD_A)}
+    `)
     const tA = seedTask(f, { squad: SQUAD_A, project: PROJ, title: 'A-title', result: 'A-result' })
     const tB = seedTask(f, { squad: SQUAD_B, project: PROJ, title: 'B-title', result: 'B-result' })
     const tH = seedTask(f, { squad: HOME, project: PROJ, title: 'HOME-title', result: 'HOME-result' })
@@ -307,6 +314,7 @@ describe('SEAM: the projection never shows more than task_list shows the same ca
       ['agent-bound token with latentCapabilities only', { ...(await loaded(f, 'm-latent')), boundAgentId: AGENT_A, capabilities: [], latentCapabilities: [{ member_id: 'm-latent', scope_type: 'org', scope_id: null, capability: 'admin' }] } as unknown as AuthContext, []],
       ['revoked capability', await loaded(f, 'm-revoked'), []],
       ['home owner (exact grant on its own home)', await loaded(f, 'm-homeowner'), [tH]],
+      ['role=admin but capabilities LOADED (squad-A member only): the role plane does not apply', { ...(await loaded(f, 'm-roleadmin')), role: 'admin' } as unknown as AuthContext, [tA]],
     ]
     for (const [name, auth, expected] of callers) {
       const shown = new Set(ids(await listProjectVerdictRecords(f.env, auth, PROJ)))
@@ -335,12 +343,32 @@ describe('SEAM: the projection never shows more than task_list shows the same ca
     expect((await taskListIds(f, auth)).has(tA)).toBe(false)
   })
 
-  it('a non-admin needs the squad\'s own project edge, as task_list does', async () => {
-    const { f, tA } = await build()
-    const auth = await loaded(f, 'm-sqa')
+  it('a non-admin needs the TASK SQUAD\'s own project edge, as task_list does (project stays visible through another squad)', async () => {
+    const { f, tA, tB } = await build()
+    const auth = await loaded(f, 'm-sqab') // member of A and B
+    expect(new Set(ids(await listProjectVerdictRecords(f.env, auth, PROJ)))).toEqual(new Set([tA, tB]))
     f.harness.sqlite.exec(`DELETE FROM project_squad_access WHERE project_id = '${PROJ}' AND squad_id = '${SQUAD_A}'`)
-    expect(await listProjectVerdictRecords(f.env, auth, PROJ)).toEqual([])
-    expect((await taskListIds(f, auth)).has(tA)).toBe(false)
+    expect(ids(await listProjectVerdictRecords(f.env, auth, PROJ))).toEqual([tB])
+    const listed = await taskListIds(f, auth)
+    expect(listed.has(tA)).toBe(false)
+    expect(listed.has(tB)).toBe(true)
+  })
+
+  it('a workspace admin does NOT need the squad edge (task_list only requires the project to exist) and still never reaches home', async () => {
+    const { f, tA, tB } = await build()
+    const auth = await loaded(f, 'm-orgadmin')
+    f.harness.sqlite.exec(`DELETE FROM project_squad_access WHERE project_id = '${PROJ}' AND squad_id = '${SQUAD_A}'`)
+    expect(new Set(ids(await listProjectVerdictRecords(f.env, auth, PROJ)))).toEqual(new Set([tA, tB]))
+    expect((await taskListIds(f, auth)).has(tA)).toBe(true)
+  })
+
+  it('visibleSquadIds consults ambient capabilities only: a latent-only seat resolves to no squads, an org admin resolves to every NON-home squad', async () => {
+    const { f } = await build()
+    const latent = { userId: 'u', memberId: 'm-latent', email: null, role: 'member', tenant: TENANT, channel: 'directory', boundAgentId: null, capabilities: [], latentCapabilities: [{ member_id: 'm-latent', scope_type: 'org', scope_id: null, capability: 'admin' }] } as unknown as AuthContext
+    expect(await visibleSquadIds(f.env, latent)).toEqual([])
+    const admin = await visibleSquadIds(f.env, await loaded(f, 'm-orgadmin'))
+    expect(new Set(admin)).toEqual(new Set([SQUAD_A, SQUAD_B]))
+    expect(admin).not.toContain(HOME)
   })
 })
 
