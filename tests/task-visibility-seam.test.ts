@@ -331,32 +331,34 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
         }
       })
 
-      it('project_context situation (#1645) shows only canonical tasks: counts + review/blocked ids', async () => {
-        const auth = await make.auth()
-        const res = await invokeTool(auth, strict.env, 'project_context', { project_id: P1 }, ORIGIN)
-        const status = new Map(TASKS.map(([id, , , st]) => [id, st] as const))
-        status.set('t-home-owner-org', 'open')
-        const want = (st: string) => make.p1.filter((id) => status.get(id) === st).sort()
-        if (!res.ok) {
-          // project not even readable for this caller -> they see no tasks at all
-          expect(make.p1).toEqual([])
-          return
-        }
-        const situation = (res.result as { situation: {
-          task_counts: Record<string, number>
-          blockers: Array<{ id: string }>
-          pending_reviews: Array<{ id: string }>
-          needs_you: { count: number }
-        } }).situation
-        expect(situation.task_counts.open).toBe(want('open').length)
-        expect(situation.task_counts.review).toBe(want('review').length)
-        expect(situation.task_counts.blocked).toBe(want('blocked').length)
-        expect(situation.task_counts.in_progress).toBe(want('in_progress').length)
-        expect(ids(situation.pending_reviews)).toEqual(want('review'))
-        expect(ids(situation.blockers)).toEqual(want('blocked'))
-        // needs-you rows are task-derived too (gate_owner'd review + unassigned blocked tasks)
-        expect(situation.needs_you.count).toBe(want('review').length + want('blocked').length)
-      })
+      for (const tool of ['project_context', 'project_get'] as const) {
+        it(`${tool} situation (#1645) shows only canonical tasks: counts + review/blocked ids`, async () => {
+          const auth = await make.auth()
+          const res = await invokeTool(auth, strict.env, tool, { project_id: P1 }, ORIGIN)
+          const status = new Map(TASKS.map(([id, , , st]) => [id, st] as const))
+          status.set('t-home-owner-org', 'open')
+          const want = (st: string) => make.p1.filter((id) => status.get(id) === st).sort()
+          if (!res.ok) {
+            // project not even readable for this caller -> they see no tasks at all
+            expect(make.p1).toEqual([])
+            return
+          }
+          const situation = (res.result as { situation: {
+            task_counts: Record<string, number>
+            blockers: Array<{ id: string }>
+            pending_reviews: Array<{ id: string }>
+            needs_you: { count: number }
+          } }).situation
+          expect(situation.task_counts.open).toBe(want('open').length)
+          expect(situation.task_counts.review).toBe(want('review').length)
+          expect(situation.task_counts.blocked).toBe(want('blocked').length)
+          expect(situation.task_counts.in_progress).toBe(want('in_progress').length)
+          expect(ids(situation.pending_reviews)).toEqual(want('review'))
+          expect(ids(situation.blockers)).toEqual(want('blocked'))
+          // needs-you rows are task-derived too (gate_owner'd review + unassigned blocked tasks)
+          expect(situation.needs_you.count).toBe(want('review').length + want('blocked').length)
+        })
+      }
 
       it('activity task rows carry exactly the canonical project tasks', async () => {
         const auth = await make.auth()
