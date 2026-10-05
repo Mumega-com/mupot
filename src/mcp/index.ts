@@ -6315,6 +6315,17 @@ function mcpCallResult(tool: string, result: unknown): Record<string, unknown> {
   }
 }
 
+/** MCP tool execution error result (mupot#1667). `status` is the HTTP status REST would have used,
+ *  kept in the body so agents can still tell 403/404/409 apart; `need` is lifted to the top level
+ *  when the refusal detail carries one. */
+function mcpToolRefusalResult(tool: string, status: number, error: string, detail: unknown): Record<string, unknown> {
+  const need = typeof detail === 'object' && detail !== null && 'need' in detail
+    ? (detail as { need?: unknown }).need // narrowed by the 'in' check above
+    : undefined
+  const body = { ok: false, tool, error, status, ...(need !== undefined ? { need } : {}), detail }
+  return { isError: true, content: [{ type: 'text', text: JSON.stringify(body) }], structuredContent: body }
+}
+
 // ── runtime schema enforcement (defense-in-depth at the seam) ─────────────────
 // The per-tool inputSchema was previously DECORATIVE — only documentation. Every
 // security-relevant field is still hand-validated inside each tool, but a future
@@ -6598,13 +6609,12 @@ async function handleJsonRpc(
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
     if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
 
-    return rpcError(
-      id,
-      jsonRpcCodeForToolFailure(outcome.status, outcome.error),
-      outcome.error,
-      outcome.detail,
-      outcome.status,
-    )
+    // mupot#1667: a tool-level refusal is an EXECUTION error, not a transport/protocol error. Per the
+    // MCP spec it travels as HTTP 200 with result.isError=true so connector harnesses (claude.ai,
+    // ChatGPT) show the model the real reason instead of replacing a 4xx body with "blocked by a
+    // firewall / mcp_request_blocked". Same refusal, same floor; only the envelope changes. The REST
+    // /actions path keeps its HTTP statuses, and 401 (above) stays a real 401 for OAuth discovery.
+    return rpcResult(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
   }
 
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
