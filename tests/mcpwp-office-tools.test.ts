@@ -264,10 +264,15 @@ function readOfficeDepartmentAndSquad(harness: SqliteD1Harness): { departmentId:
   return { departmentId: department.id, squadId: squad.id }
 }
 
-async function seedWordpressConnector(harness: SqliteD1Harness, siteUrl: string, secret: string): Promise<string> {
+async function seedWordpressConnector(
+  harness: SqliteD1Harness,
+  siteUrl: string,
+  secret: string,
+  metaExtra: Record<string, unknown> = {},
+): Promise<string> {
   const id = 'connector-office-wordpress'
   const encrypted = await encryptConnectorSecret(MASTER_KEY, id, 'mcpwp', secret)
-  const meta = JSON.stringify({ siteUrl, username: 'office-agent' })
+  const meta = JSON.stringify({ siteUrl, username: 'office-agent', ...metaExtra })
   harness.sqlite.prepare(
     `INSERT INTO connectors (id, tenant, type, label, encrypted_secret, meta, scope_type, scope_id, created_by, created_at)
      VALUES (?, ?, 'mcpwp', 'Office WordPress site', ?, ?, 'pot', NULL, 'test-setup', '2026-01-01T00:00:00Z')`,
@@ -2883,5 +2888,291 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     expect(freeze.outcome).toBeNull() // guard NOT cleared
     expect(freeze.claimed_at).not.toBeNull()
     harness.close()
+  })
+})
+
+
+// ── mupot#1616: authenticate with the vaulted MCPWP API key, publish idempotently ──
+//
+// Everything below runs against the faithful MCPWP fake (tests/helpers/fake-mcpwp.ts,
+// which 401s anything but X-API-Key) with the real vault, real D1 schema, and the
+// strict bind-count wrapper (mupot#1642: the shared test D1 silently drops surplus
+// binds that real D1 rejects). The API key is built at runtime — never a literal.
+describe('mupot#1616: MCPWP API-key auth and post-meta idempotency', () => {
+  const runtimeKey = (): string => ['mcpwp', 'testkey', crypto.randomUUID().replaceAll('-', '')].join('_')
+
+  /** mupot#1642: D1 rejects a bind count that differs from the SQL's highest ?N;
+   *  the node:sqlite harness drops the surplus. Violations are collected, not thrown. */
+  function strictEnv(testEnv: Env, violations: string[]): Env {
+    const realDb = testEnv.DB
+    const check = (sql: string, values: unknown[]): void => {
+      const indexes = [...sql.matchAll(/\?(\d+)/g)].map((m) => Number(m[1]))
+      const declared = indexes.length === 0 ? 0 : Math.max(...indexes)
+      if (values.length !== declared) violations.push(`bound ${values.length}, SQL declares ${declared}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+    }
+    const wrap = (sql: string) => {
+      const stmt = realDb.prepare(sql)
+      return new Proxy(stmt, {
+        get(target, prop) {
+          if (prop === 'bind') return (...values: unknown[]) => { check(sql, values); return target.bind(...values) }
+          const value = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    }
+    const db = { prepare: wrap, batch: (statements: D1PreparedStatement[]) => realDb.batch(statements) } as unknown as D1Database
+    return { ...testEnv, DB: db } as Env
+  }
+
+  async function approvedOfficeTask(metaExtra: Record<string, unknown> = {}, siteUrl = 'https://wordpress.example.com') {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const apiKey = runtimeKey()
+    const connectorId = await seedWordpressConnector(harness, siteUrl, apiKey, metaExtra)
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    const frozen = harness.sqlite.prepare(`SELECT payload_sha256 FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { payload_sha256: string }
+    return { harness, testEnv, apiKey, connectorId, departmentId, taskId, payloadSha256: frozen.payload_sha256 }
+  }
+
+  const publish = (ctx: { testEnv: Env; departmentId: string; taskId: string }) =>
+    invokeTool(officeLead(ctx.departmentId), ctx.testEnv, 'office.publish_post', { task_id: ctx.taskId }, ORIGIN)
+  const reconcile = (ctx: { testEnv: Env; taskId: string }, args: Record<string, unknown> = {}) =>
+    invokeTool(orgOwnerAuth(), ctx.testEnv, 'office.reconcile_stalled_publish', { task_id: ctx.taskId, outcome: 'failed', ...args }, ORIGIN)
+  const backdateClaim = (harness: SqliteD1Harness, taskId: string) =>
+    harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`)
+      .run(new Date(Date.now() - 60_000).toISOString(), taskId)
+
+  it('AUTH: creates through MCPWP /mcpwp/v1/posts with X-API-Key (never Authorization), even for a connector whose meta still carries a legacy username', async () => {
+    const ctx = await approvedOfficeTask() // seed meta carries username 'office-agent' (legacy Basic inference)
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey })
+    vi.stubGlobal('fetch', wp.f)
+
+    const result = await publish(ctx)
+
+    expect(result.ok).toBe(true)
+    expect(wp.requests).toHaveLength(1)
+    const [req] = wp.requests
+    expect(req?.method).toBe('POST')
+    expect(req?.path).toBe('/wp-json/mcpwp/v1/posts')
+    expect(req?.headers.get('x-api-key')).toBe(ctx.apiKey)
+    expect(req?.headers.get('authorization')).toBeNull()
+    expect(wp.posts).toHaveLength(1)
+    ctx.harness.close()
+  })
+
+  it('AUTH: a wrong key is refused by the site (401) and nothing is created; the outcome is ambiguous, so the guard stays set', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: runtimeKey() }) // the site holds a DIFFERENT key
+    vi.stubGlobal('fetch', wp.f)
+
+    const result = await publish(ctx)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('publish_outcome_unknown')
+    expect(wp.posts).toHaveLength(0)
+    const freeze = ctx.harness.sqlite.prepare(`SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { claimed_at: string | null; outcome: string | null }
+    expect(freeze.claimed_at).not.toBeNull()
+    expect(freeze.outcome).toBeNull()
+    ctx.harness.close()
+  })
+
+  it('IDEMPOTENCY META: the create call stamps the idempotency key and the PREFIXED payload hash as post meta (a bare 64-hex digest reads back masked as ***)', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey })
+    vi.stubGlobal('fetch', wp.f)
+
+    expect((await publish(ctx)).ok).toBe(true)
+
+    const freeze = ctx.harness.sqlite.prepare(`SELECT idempotency_key FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { idempotency_key: string }
+    const body = wp.requests[0]?.body as { meta: Record<string, string>; slug: string }
+    expect(body.meta[OFFICE_IDEMPOTENCY_META_KEY]).toBe(freeze.idempotency_key)
+    expect(body.meta[OFFICE_PAYLOAD_HASH_META_KEY]).toBe(`sha256-${ctx.payloadSha256}`)
+    expect(body.slug).toBe(`mupot-office-${freeze.idempotency_key}`) // slug is a hint, the meta is the identity
+    ctx.harness.close()
+  })
+
+  it('DRAFT: a connector with publish_status "draft" creates status=draft and the receipt says it is not public; the default (no setting) is unchanged', async () => {
+    const draftCtx = await approvedOfficeTask({ publish_status: 'draft' })
+    const draftWp = createFakeMcpwp({ apiKey: draftCtx.apiKey })
+    vi.stubGlobal('fetch', draftWp.f)
+    expect((await publish(draftCtx)).ok).toBe(true)
+    expect((draftWp.requests[0]?.body as { status: string }).status).toBe('draft')
+    expect(draftWp.posts[0]?.status).toBe('draft')
+    const row = draftCtx.harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(draftCtx.taskId) as { status: string; result: string }
+    expect(row.status).toBe('done')
+    expect((JSON.parse(row.result) as { note: string }).note).toContain('not public')
+    draftCtx.harness.close()
+
+    const defaultCtx = await approvedOfficeTask()
+    const defaultWp = createFakeMcpwp({ apiKey: defaultCtx.apiKey })
+    vi.stubGlobal('fetch', defaultWp.f)
+    expect((await publish(defaultCtx)).ok).toBe(true)
+    expect((defaultWp.requests[0]?.body as { status: string }).status).toBe('publish')
+    defaultCtx.harness.close()
+  })
+
+  it('REDACTION: the key never appears in any result, receipt, error, log line or request URL — including when a hostile site echoes it back', async () => {
+    const ctx = await approvedOfficeTask()
+    const logs: string[] = []
+    for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+      vi.spyOn(console, level).mockImplementation((...args: unknown[]) => { logs.push(args.map((a) => String(a)).join(' ')) })
+    }
+    const wp = createFakeMcpwp({
+      apiKey: ctx.apiKey,
+      // The site echoes the credential it was sent in an error body (a debugging
+      // plugin or reverse proxy would): it must still never reach a receipt.
+      intercept: (req) => (req.method === 'POST' ? new Response(`internal error for key ${req.headers.get('x-api-key')}`, { status: 500 }) : undefined),
+    })
+    vi.stubGlobal('fetch', wp.f)
+
+    const first = await publish(ctx)
+    backdateClaim(ctx.harness, ctx.taskId)
+    const recon = await reconcile(ctx, { detail: 'stalled' })
+
+    const seen = JSON.stringify([
+      first, recon, logs,
+      ctx.harness.sqlite.prepare(`SELECT * FROM office_publish_freezes WHERE task_id = ?`).all(ctx.taskId),
+      ctx.harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).all(ctx.taskId),
+      wp.requests.map((r) => `${r.path}${r.search}`),
+    ])
+    expect(first.ok).toBe(false)
+    expect(seen).not.toContain(ctx.apiKey)
+    ctx.harness.close()
+  })
+
+  it('RETRY after success-but-receipt-failure: the post exists, the receipt write fails, reconcile ADOPTS it by meta — exactly one post, never a second', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey })
+    vi.stubGlobal('fetch', wp.f)
+    // The receipt batch fails (D1 hiccup) AFTER WordPress accepted the post.
+    const realDb = ctx.testEnv.DB
+    const failingEnv = { ...ctx.testEnv, DB: { prepare: (sql: string) => realDb.prepare(sql), batch: async () => { throw new Error('D1 unavailable') } } as unknown as D1Database } as Env
+
+    const first = await invokeTool(officeLead(ctx.departmentId), failingEnv, 'office.publish_post', { task_id: ctx.taskId }, ORIGIN)
+    expect(first.ok).toBe(false)
+    if (!first.ok) expect(first.error).toBe('publish_outcome_unknown')
+    expect(wp.posts).toHaveLength(1) // WordPress has it
+    const stuck = ctx.harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(ctx.taskId) as { status: string }
+    expect(stuck.status).toBe('approved') // no receipt
+    const open = ctx.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { outcome: string | null }
+    expect(open.outcome).toBeNull() // the claim is open: reconcile can still resolve it
+
+    // A blind retry is refused (one-shot claim) and performs no fetch.
+    const callsBefore = wp.requests.length
+    const retry = await publish(ctx)
+    expect(retry.ok).toBe(false)
+    expect(wp.requests.length).toBe(callsBefore)
+
+    // Reconcile finds the post BY ITS META and adopts it.
+    backdateClaim(ctx.harness, ctx.taskId)
+    const adopted = await reconcile(ctx, { outcome: 'failed', detail: 'receipt write failed' })
+    expect(adopted.ok).toBe(true)
+    const done = ctx.harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(ctx.taskId) as { status: string; result: string }
+    expect(done.status).toBe('done')
+    expect(JSON.parse(done.result)).toMatchObject({ postId: wp.posts[0]?.id })
+    expect(wp.posts).toHaveLength(1)
+    expect(wp.requests.filter((r) => r.method === 'POST')).toHaveLength(1)
+    ctx.harness.close()
+  })
+
+  it('CONFLICT: a post under this claim\'s idempotency key with DIFFERENT content refuses (reconcile_conflict) — never adopted, never overwritten, not overridable', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(ctx)).ok).toBe(false) // ambiguous: the response was lost
+    expect(wp.posts).toHaveLength(1)
+    // Someone edited the content out from under the key: its stored hash no longer matches.
+    const post = wp.posts[0]
+    if (!post) throw new Error('fixture: post missing')
+    post.meta[OFFICE_PAYLOAD_HASH_META_KEY] = `sha256-${'0'.repeat(64)}`
+
+    backdateClaim(ctx.harness, ctx.taskId)
+    const refused = await reconcile(ctx)
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_conflict')
+
+    seedPriorReconcileAttempt(ctx.harness, ctx.taskId)
+    const override = await reconcile(ctx, { override_reason: 'I looked and it is fine' })
+    expect(override.ok).toBe(false)
+    if (!override.ok) expect(override.error).toBe('reconcile_conflict')
+    const freeze = ctx.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { outcome: string | null }
+    expect(freeze.outcome).toBeNull() // guard stays set
+    expect(wp.requests.filter((r) => r.method !== 'GET')).toHaveLength(1) // only the original create; reconcile never writes
+    expect(post.content).toBe('') // untouched
+    ctx.harness.close()
+  })
+
+  it('NO MATCH: a candidate that carries no mupot meta is never adopted (a stranger\'s post with our slug), and the guard stays set', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(ctx)).ok).toBe(false)
+    const post = wp.posts[0]
+    if (!post) throw new Error('fixture: post missing')
+    post.meta = {} // meta stripped: the post can no longer be proven ours
+
+    backdateClaim(ctx.harness, ctx.taskId)
+    const refused = await reconcile(ctx)
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_candidate_found')
+    const freeze = ctx.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { outcome: string | null }
+    expect(freeze.outcome).toBeNull()
+    ctx.harness.close()
+  })
+
+  it('NETWORK ERROR / TIMEOUT / WAF 403 / 302 after the create all leave the double-post guard set, and a retry creates no second post', async () => {
+    for (const postMode of ['throwAfterInsert', '403AfterInsert', '302AfterInsert', '400AfterInsert'] as const) {
+      const ctx = await approvedOfficeTask()
+      const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode })
+      vi.stubGlobal('fetch', wp.f)
+
+      const first = await publish(ctx)
+      expect(first.ok).toBe(false)
+      if (!first.ok) expect(first.error).toBe('publish_outcome_unknown')
+      const retry = await publish(ctx)
+      expect(retry.ok).toBe(false)
+      if (!retry.ok) expect(retry.error).toBe('publish_claimed')
+      expect(wp.posts).toHaveLength(1)
+      const freeze = ctx.harness.sqlite.prepare(`SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?`).get(ctx.taskId) as { claimed_at: string | null; outcome: string | null }
+      expect(freeze.claimed_at).not.toBeNull()
+      expect(freeze.outcome).toBeNull()
+      // every request asked the site for exactly the redirect-refusing behaviour
+      for (const call of (wp.f as unknown as { mock: { calls: [unknown, RequestInit | undefined][] } }).mock.calls) {
+        expect(call[1]?.redirect).toBe('manual')
+      }
+      ctx.harness.close()
+    }
+  })
+
+  it('SSRF: a private or non-https site URL is refused before any fetch — the key is never sent', async () => {
+    for (const siteUrl of ['https://127.0.0.1', 'https://169.254.169.254', 'http://wordpress.example.com']) {
+      const ctx = await approvedOfficeTask({}, siteUrl).catch(() => null)
+      // Some SSRF-shaped URLs are already refused at connector bind time; those never reach publish.
+      if (!ctx) continue
+      const wp = createFakeMcpwp({ apiKey: ctx.apiKey })
+      vi.stubGlobal('fetch', wp.f)
+      const result = await publish(ctx)
+      expect(result.ok).toBe(false)
+      expect(wp.requests).toHaveLength(0)
+      ctx.harness.close()
+    }
+  })
+
+  it('STRICT BINDS: publish and reconcile bind exactly the parameters their SQL declares (mupot#1642)', async () => {
+    const ctx = await approvedOfficeTask()
+    const violations: string[] = []
+    const strict = strictEnv(ctx.testEnv, violations)
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+
+    await invokeTool(officeLead(ctx.departmentId), strict, 'office.publish_post', { task_id: ctx.taskId }, ORIGIN)
+    backdateClaim(ctx.harness, ctx.taskId)
+    const recon = await invokeTool(orgOwnerAuth(), strict, 'office.reconcile_stalled_publish', { task_id: ctx.taskId, outcome: 'failed' }, ORIGIN)
+    expect(recon.ok).toBe(true) // adopted by meta
+    expect(violations).toEqual([])
+    ctx.harness.close()
   })
 })
