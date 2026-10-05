@@ -1,8 +1,8 @@
 agent: kasra
 agent_id: c855f82c-1eeb-409d-94d2-f11e9dd18968   # match by UUID, never slug
 harness: claude-code
-models: [claude-fable-5-1, claude-opus-5]   # first = current body (verified 2026-10-04), rest = fallback
-status: live
+models: [claude-fable-5-1, claude-opus-5]   # first = configured profile model (set 2026-10-04), rest = fallback; the live seat model varies by chair, see agents/kasra.md
+status: live            # reachable on mupot; fleet_agent_get derived_presence can read stale — a different signal
 tokens:                 # references only — never values (see ~/.fleet/keys/)
   - mupot-admin
   - bus

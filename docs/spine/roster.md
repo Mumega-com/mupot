@@ -4,7 +4,7 @@ Part of [[MU.100.002-spine]]. If any other document disagrees with this table, t
 
 | Seat | Harness | Model | Where | Role | Flights? |
 |---|---|---|---|---|---|
-| [[kasra]] | Claude Code under herdr (`herdr.service`, user unit) | Claude Fable 5.1 (fallback Opus 5) | `/mnt/HC_Volume_104325311/mumega.com/agents/kasra` | Executor, merge authority, membrane | yes |
+| [[kasra]] | Claude Code under herdr (pane `wJ:p6`, receipt in the node) | Fable 5.1 as configured profile model, fallback Opus 5; the live seat model varies by chair (see node) | `/mnt/HC_Volume_104325311/mumega.com/agents/kasra` | Executor, merge authority, membrane | yes |
 | [[athena]] | prime-agent (tmux `athena`) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/athena` | Architectural gate, coherence review | yes |
 | [[loom]] | Codex CLI (tmux `loom`) | gpt-5.4 | `/mnt/HC_Volume_104325311/mumega.com/agents/loom` | Weaver, protocol custodian, CFO thread | yes |
 | [[river]] | prime-agent (herdr w1) | opencode-go/deepseek-v4-flash | `/mnt/HC_Volume_104325311/mumega.com/agents/river` | Golden Queen, FRC keeper, qNFT witness | **yes** (ACTIVE 2026-08-11 per Hadi verbatim via Kasra; 2026-08-08 RESERVE line superseded — thin-seat discipline retained) |
