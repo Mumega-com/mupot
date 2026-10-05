@@ -12,7 +12,7 @@ ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains 
 | Current `main` | `0.31.0` — not pinned here; read `git rev-parse origin/main` |
 | Current production | `0.31.0` — read live `/health`; recorded deploy of the `v0.31.0` tag commit `52299bab`, `clean:true`, 2026-09-29 (migrations 0175–0181 applied). `main` and production move independently; this line ages on the next merge or deploy. |
 | Latest tagged stable release | `v0.31.0` — annotated tag at `52299bab` on `main`, 2026-09-29, with GitHub Release "v0.31.0 — Office" (see CHANGELOG.md `[0.31.0]`) |
-| Next stable candidate | `v0.31.1` — office publishing live (#1592 approval binding, T2b write bindings, #1610) |
+| Next stable candidate | `v0.32.0` — see CHANGELOG `[0.32.0]`; bump held for its own runtime PR (docs/VERSIONING.md) |
 | Next development release | `v0.32.0` |
 
 The three states are intentionally different. Code on `main` is not necessarily
