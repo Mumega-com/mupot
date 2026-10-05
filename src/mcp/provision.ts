@@ -1144,7 +1144,7 @@ const toolListAgentSessions: ToolSpec = {
   async run(auth, env, args, _ctx) {
     const agentArg = str(args.agent)
     if (args.agent !== undefined && args.agent !== null && !agentArg) return fail(400, 'invalid_args', 'agent must be a non-empty string')
-    const wantsSelf = args.self === true || (!agentArg && auth.boundAgentId != null)
+    const wantsSelf = args.self === true || (args.self === undefined && !agentArg && auth.boundAgentId != null)
     if (wantsSelf) {
       if (agentArg) return fail(400, 'invalid_args', 'self and agent are mutually exclusive')
       if (!auth.boundAgentId) return fail(403, 'not_agent_session', 'self needs an agent-bound token')

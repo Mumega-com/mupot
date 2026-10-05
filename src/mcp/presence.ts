@@ -56,6 +56,7 @@ import {
   heartbeatModule,
   deregisterModule,
   listPresence,
+  listOwnModules,
   getModule,
   isModuleKind,
   isActivityState,
@@ -293,7 +294,7 @@ const toolPresenceList: ToolSpec = {
       if (args.project_id !== undefined) return fail(400, 'invalid_args', 'self cannot be combined with project_id')
       if (!auth.boundAgentId) return fail(403, 'not_agent_session', 'self needs an agent-bound token')
       const own = auth.boundAgentId
-      const modules = (await listPresence(env, {})).filter((m) => m.identity === own)
+      const modules = await listOwnModules(env, own)
       const seats = await listOwnAgentPresence(env, Date.now(), own)
       return done({ self: true, agent_id: own, modules, seats })
     }

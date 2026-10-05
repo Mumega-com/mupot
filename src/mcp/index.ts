@@ -1022,7 +1022,7 @@ const toolTaskCreate: ToolSpec = {
       if (!isValidGateOwnerForm(candidate)) {
         return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
       }
-      if (candidate === 'gate:office' || candidate === 'gate:routines') {
+      if (candidate === 'gate:office' || candidate === 'gate:routines' || candidate === 'gate:agent-self-completion' || candidate.startsWith('gate:self-')) {
         return fail(403, 'gate_owner_reserved', 'this gate is reserved for its own subsystem and cannot be set at task_create')
       }
       const creatorIsAssignee =
@@ -6549,7 +6549,13 @@ export async function invokeTool(
         // mupot#1664: touchPresence only refreshes the row for THIS call's seat label; an
         // agent checked in under another seat name otherwise expires mid-work. Also slide
         // the agent's own check-in row(s) forward (self-rate-limited in the UPDATE itself).
-        if (auth.boundAgentId) await refreshOwnAgentPresence(env, id.memberId, auth.boundAgentId)
+        if (auth.boundAgentId) {
+          const sc = resolveAgentSessionContext(auth)
+          const live = sc.ok
+            ? await loadLiveAgentSessionByCredential(env, env.TENANT_SLUG, sc.context.authKind, sc.context.credentialId)
+            : null
+          await refreshOwnAgentPresence(env, id.memberId, auth.boundAgentId, live?.seat ?? null)
+        }
       }
     })().catch(() => {})
 

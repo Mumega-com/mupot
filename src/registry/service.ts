@@ -489,6 +489,21 @@ export async function listPresence(
   return out
 }
 
+/** listOwnModules — every registration of ONE identity, scoped in SQL (never a filtered tenant-wide LIMITed list). */
+export async function listOwnModules(env: Env, identity: string, now: Date = new Date()): Promise<ModulePresence[]> {
+  const rows = await env.DB.prepare(
+    `SELECT ${SELECT_COLUMNS} FROM module_registry WHERE tenant = ?1 AND identity = ?2 ORDER BY last_heartbeat DESC LIMIT 50`,
+  )
+    .bind(env.TENANT_SLUG, identity)
+    .all<ModuleRegistryRow>()
+  const out: ModulePresence[] = []
+  for (const row of rows.results ?? []) {
+    const hydrated = hydrate(row, now.getTime())
+    if (hydrated) out.push(hydrated)
+  }
+  return out
+}
+
 /** getModule — tenant-scoped fetch of ONE caller's own registration (self-lookup). */
 export async function getModule(
   env: Env,

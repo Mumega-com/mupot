@@ -294,25 +294,31 @@ export async function touchPresence(
 }
 
 /**
- * refreshOwnAgentPresence — slide last_seen_at forward on the check-in row(s) a bound agent
- * already owns, from ANY authenticated call (mupot#1664). touchPresence keys on the
- * per-call seat label (header, else the token's label), so an agent that checked in under
- * a different seat name watched its own row expire 10 minutes later while it worked.
+ * refreshOwnAgentPresence — slide last_seen_at forward on the ONE check-in row this
+ * credential's own session declared (mupot#1664). touchPresence keys on the per-call seat
+ * label (header, else the token's label), so an agent that checked in under a different
+ * seat name watched its own row expire 10 minutes later while it worked.
  *
- * Scoped to (tenant, member_id, agent_id): only rows this very credential holder wrote for
- * this very agent, never another member's seat of the same agent, so a dead sibling seat is
- * not resurrected. Rate limit is the WHERE itself (`last_seen_at` older than 60s), which is
- * one conditional UPDATE and a no-op inside the window: no KV, no read-then-write race.
- * It only ever UPDATEs an existing row — it cannot mint presence for an agent that never
- * checked in. Returns the number of rows refreshed.
+ * `seat` is the seat of the caller's live agent_session (credential-keyed, set by check_in),
+ * so only the row THIS credential checked in under is refreshed. Sibling seats of the same
+ * agent (other machines/tokens) are never touched: a dead seat must stay dead, or peers'
+ * ordering by last_seen_at would report an arbitrary one. A caller with no declared seat
+ * refreshes nothing. Rate limit is the WHERE itself (older than 60s): one conditional
+ * UPDATE, no KV, no read-then-write race; UPDATE-only, so it cannot create presence.
  */
-export async function refreshOwnAgentPresence(env: Env, memberId: string, agentId: string): Promise<number> {
+export async function refreshOwnAgentPresence(
+  env: Env,
+  memberId: string,
+  agentId: string,
+  seat: string | null,
+): Promise<number> {
+  if (!seat) return 0
   const res = await env.DB.prepare(
     `UPDATE presence SET last_seen_at = datetime('now')
-      WHERE tenant = ?1 AND member_id = ?2 AND agent_id = ?3
+      WHERE tenant = ?1 AND member_id = ?2 AND agent_id = ?3 AND label = ?4
         AND last_seen_at < datetime('now', '-60 seconds')`,
   )
-    .bind(env.TENANT_SLUG, memberId, agentId)
+    .bind(env.TENANT_SLUG, memberId, agentId, seat)
     .run()
   return res.meta?.changes ?? 0
 }

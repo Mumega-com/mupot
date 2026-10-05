@@ -185,7 +185,7 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
       if (!bad.ok) expect(bad.error).toBe('invalid_gate_owner')
       const blank = await create(agentAuth(), { gate_owner: '   ' })
       expect(blank.ok).toBe(false)
-      for (const reserved of ['office', 'gate:routines']) {
+      for (const reserved of ['office', 'gate:routines', 'agent-self-completion', 'self-anything']) {
         const r = await create(agentAuth(), { gate_owner: reserved })
         expect(r.ok).toBe(false)
         if (!r.ok) expect(r.error).toBe('gate_owner_reserved')
@@ -206,34 +206,41 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
     const ageSeconds = (member: string, label: string) =>
       (Date.now() - Date.parse(seen(member, label).replace(' ', 'T') + 'Z')) / 1000
 
-    it('a non-check_in call refreshes the agent\'s check-in row even under a DIFFERENT seat name', async () => {
-      await seed(MEM_A, AGENT_A, 'mupot-mac', 500) // checked in as seat "mupot-mac"; token label is "claude-ai"
+    // Production shape: the agent's dedicated member holds several seats of the SAME agent
+    // (other machines/tokens). The credential's session records which seat IT checked in as.
+    async function checkInAs(seat: string, ageSec: number) {
+      await invokeTool(agentAuth(), env, 'check_in', { seat }, ORIGIN)
+      await run(`UPDATE presence SET last_seen_at = datetime('now', ?1) WHERE member_id = ?2 AND label = ?3`, `-${ageSec} seconds`, MEM_A, seat)
+    }
+
+    it('a non-check_in call refreshes the seat THIS credential checked in under (not the token label), and no sibling seat', async () => {
+      await checkInAs('mupot-mac', 500) // token label is "claude-ai"
+      await seed(MEM_A, AGENT_A, 'dead-sibling', 300000) // same agent, same member, dead 3 days
       expect(ageSeconds(MEM_A, 'mupot-mac')).toBeGreaterThan(400)
       const res = await invokeTool(agentAuth(), env, 'task_list', {}, ORIGIN)
       expect(res.ok, JSON.stringify(res)).toBe(true)
       expect(ageSeconds(MEM_A, 'mupot-mac')).toBeLessThan(30)
+      expect(ageSeconds(MEM_A, 'dead-sibling')).toBeGreaterThan(290000)
     })
 
     it('is rate-limited: a row seen <60s ago is not rewritten', async () => {
-      await seed(MEM_A, AGENT_A, 'mupot-mac', 20)
+      await checkInAs('mupot-mac', 20)
       const before = seen(MEM_A, 'mupot-mac')
       await invokeTool(agentAuth(), env, 'task_list', {}, ORIGIN)
       expect(seen(MEM_A, 'mupot-mac')).toBe(before)
     })
 
-    it('never touches another agent\'s row, nor a different member\'s seat of the same agent', async () => {
+    it('never touches another agent\'s row', async () => {
+      await checkInAs('mupot-mac', 500)
       await seed(MEM_B, AGENT_B, 'b-laptop', 500)
-      await seed(MEM_B, AGENT_A, 'a-on-other-member', 500)
       await invokeTool(agentAuth(), env, 'task_list', {}, ORIGIN)
       expect(ageSeconds(MEM_B, 'b-laptop')).toBeGreaterThan(400)
-      expect(ageSeconds(MEM_B, 'a-on-other-member')).toBeGreaterThan(400)
     })
 
-    it('cannot mint presence for an agent that never checked in (UPDATE only)', async () => {
+    it('a credential with no declared seat refreshes no seat row', async () => {
+      await seed(MEM_A, AGENT_A, 'orphan-seat', 500)
       await invokeTool(agentAuth(), env, 'task_list', {}, ORIGIN)
-      const rows = harness.sqlite.prepare('SELECT label FROM presence WHERE agent_id = ?').all(AGENT_A) as Array<{ label: string }>
-      // the pre-existing zero-touch writes its own seat row; the refresh adds nothing else
-      expect(rows.length).toBeLessThanOrEqual(1)
+      expect(ageSeconds(MEM_A, 'orphan-seat')).toBeGreaterThan(400)
     })
   })
 
@@ -321,6 +328,12 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
       const named = await invokeTool(adminAgent, env, 'list_agent_sessions', { agent: AGENT_B }, ORIGIN)
       expect(named.ok).toBe(false)
       if (!named.ok) expect(named.error).toBe('operator_principal_required')
+    })
+
+    it('self:false is honoured: no implicit self on a bound token, falls to the admin path', async () => {
+      const res = await invokeTool(noGrants('a'), env, 'list_agent_sessions', { self: false }, ORIGIN)
+      expect(res.ok).toBe(false)
+      if (!res.ok) expect(res.error).toBe('forbidden')
     })
 
     it('list_agent_sessions: an admin operator still lists any agent, and a non-self call without agent is a 400', async () => {
