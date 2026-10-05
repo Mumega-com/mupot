@@ -469,29 +469,31 @@ tasksApp.get('/audit', async (c) => {
 // ── GET /:id — single task read (for the /send poller) ───────────────────────
 // member+ on the task's squad. Includes result + completed_at so the dashboard
 // can render the live status and the finished output.
-tasksApp.get('/:id', async (c) => {
-  const id = c.req.param('id')
-  const task = await c.env.DB.prepare(
+tasksApp.get('/:id', async (c) => readTaskForAuth(c.env, c.get('auth'), c.req.param('id')))
+
+// GET /:id — single-row reader with an explicit AuthContext (see listTasksForAuth).
+export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): Promise<Response> {
+  const task = await env.DB.prepare(
     `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
     .first<Task>()
-  if (!task) return c.json({ error: 'task_not_found' }, 404)
+  if (!task) return jsonResponse({ error: 'task_not_found' }, 404)
 
   // RBAC: reading a task requires member+ on its squad. (A token scoped to this
   // tenant but holding no grant on the squad must not read its work.)
   // mupot#1647: single-row reader of the shared chokepoint. An explicit id lookup is a
   // history read, so an archived task stays readable here (includeArchived) — listings
   // never are.
-  if (!(await canReadTask(c.env, c.get('auth'), task, { includeArchived: true }))) {
-    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  if (!(await canReadTask(env, auth, task, { includeArchived: true }))) {
+    return jsonResponse({ error: 'forbidden', need: 'member' }, 403)
   }
 
-  const [visibleTask] = await loadGateWakeNotices(c.env, [task])
-  const dispatchTimeline = await listTaskDispatchReceiptTimeline(c.env, task.id)
-  return c.json({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
-})
+  const [visibleTask] = await loadGateWakeNotices(env, [task])
+  const dispatchTimeline = await listTaskDispatchReceiptTimeline(env, task.id)
+  return jsonResponse({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
+}
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────
 

@@ -15,7 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createHomeForMember } from '../src/org/service'
 import { invokeTool } from '../src/mcp'
 import { resolveCapabilities } from '../src/auth/capability'
-import { listTasksForAuth } from '../src/tasks'
+import { listTasksForAuth, readTaskForAuth } from '../src/tasks'
 import { listProjectActivity } from '../src/projects/projections'
 import {
   canReadSquadTasks,
@@ -241,6 +241,8 @@ beforeAll(async () => {
   runSql(`DELETE FROM project_squad_access WHERE project_id = '${P2}' AND squad_id = '${SQ_A}'`)
   harness.sqlite.prepare("UPDATE tasks SET squad_id = ?, project_id = ? WHERE id = 't-moved'").run(SQ_A, P1)
   harness.sqlite.prepare("UPDATE tasks SET squad_id = ?, project_id = ? WHERE id = 't-moved'").run(SQ_B, P2)
+  // every review/blocked task is gated, so the situation's needs-you slice sees it
+  harness.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:seam' WHERE status IN ('review', 'blocked')").run()
   harness.sqlite.prepare(
     `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
      VALUES ('t-a-archived', datetime('now'), 'seam fixture', 'm-archiver', 'review')`,
@@ -297,6 +299,18 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
         expect(bySquad[P2]!.sort()).toEqual([...make.p2].sort())
       })
 
+      it('GET /tasks/:id reads exactly the canonical set, plus the archived task as a history read', async () => {
+        const auth = await make.auth()
+        const all = await strict.env.DB.prepare('SELECT id FROM tasks').all<{ id: string }>()
+        const readable: string[] = []
+        for (const t of all.results ?? []) {
+          if ((await readTaskForAuth(strict.env, auth, t.id)).status === 200) readable.push(t.id)
+        }
+        // an explicit id lookup is archived-inclusive: whoever reads the squad reads its archived task
+        const history = expected.includes('t-a-open') ? ['t-a-archived'] : []
+        expect(readable.sort()).toEqual([...expected, ...history].sort())
+      })
+
       it('task_list over every squad returns exactly the set (and 403s elsewhere)', async () => {
         const auth = await make.auth()
         const squads = await strict.env.DB.prepare('SELECT id FROM squads').all<{ id: string }>()
@@ -332,6 +346,7 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
           task_counts: Record<string, number>
           blockers: Array<{ id: string }>
           pending_reviews: Array<{ id: string }>
+          needs_you: { count: number }
         } }).situation
         expect(situation.task_counts.open).toBe(want('open').length)
         expect(situation.task_counts.review).toBe(want('review').length)
@@ -339,6 +354,8 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
         expect(situation.task_counts.in_progress).toBe(want('in_progress').length)
         expect(ids(situation.pending_reviews)).toEqual(want('review'))
         expect(ids(situation.blockers)).toEqual(want('blocked'))
+        // needs-you rows are task-derived too (gate_owner'd review + unassigned blocked tasks)
+        expect(situation.needs_you.count).toBe(want('review').length + want('blocked').length)
       })
 
       it('activity task rows carry exactly the canonical project tasks', async () => {
