@@ -178,6 +178,7 @@ import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
+import { canReadProjectForTasks, canReadSquadTasks, visibleTaskClause } from '../tasks/visibility'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -749,6 +750,29 @@ async function resolveTaskSquad(
   )
 }
 
+// task_list's squad resolution — the READ gate comes from the shared task-visibility
+// chokepoint (src/tasks/visibility.ts, mupot#1647), not from resolveScopedSquad's own
+// copy of the rank/plane/home rules. Same squad-resolution rules (arg, else the bound
+// agent's squad), same 400/404/403 outcomes.
+async function resolveReadableTaskSquad(
+  env: Env,
+  auth: AuthContext,
+  args: Record<string, unknown>,
+): Promise<{ ok: true; squad: Squad } | Extract<ToolOutcome, { ok: false }>> {
+  let squadId = str(args.squad_id)
+  if (!squadId && auth.boundAgentId) {
+    const agent = await loadAgent(env, auth.boundAgentId)
+    squadId = agent?.squad_id ?? null
+  }
+  if (!squadId) return failOnly(400, 'invalid_args', 'squad_id required unless the token is agent-bound')
+  const squadRes = await getSquad(env, squadId)
+  if (!squadRes.ok) return squadRes
+  if (!(await canReadSquadTasks(env, auth, squadRes.squad.id))) {
+    return failOnly(403, 'forbidden', { need: 'member', scope: 'squad' })
+  }
+  return { ok: true, squad: squadRes.squad }
+}
+
 // Exported so sibling tool modules (src/mcp/addons.ts, provision.ts) share this ONE
 // org-admin check instead of re-deriving it — the MCP-side equivalent of
 // src/auth/capability.ts#isOrgAdmin (dashboard route gate), translated from coarse
@@ -1017,7 +1041,7 @@ const toolTaskList: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
-    const squadRes = await resolveTaskSquad(env, auth, args)
+    const squadRes = await resolveReadableTaskSquad(env, auth, args)
     if (!squadRes.ok) return squadRes
     const status = args.status
     if (status !== undefined && status !== null && !isTaskStatus(status)) {
@@ -1030,13 +1054,16 @@ const toolTaskList: ToolSpec = {
     const limit = readLimit(args.limit, 25, 100)
     if (typeof limit !== 'number') return limit
 
-    const baseClauses = ['squad_id = ?1', TASK_NOT_ARCHIVED_SQL()]
-    const baseBinds: unknown[] = [squadRes.squad.id]
+    // The squad was admitted by canReadSquadTasks above; the row predicate (squad + not
+    // archived) comes from the same chokepoint module as every other task reader.
+    const visible = visibleTaskClause({ squadIds: [squadRes.squad.id] }, 1)
+    const baseClauses = [visible.sql]
+    const baseBinds: unknown[] = [...visible.binds]
     const parsedProjectId = args.project_id == null ? undefined : str(args.project_id)
     if (args.project_id != null && !parsedProjectId) return fail(400, 'invalid_project_id')
     const projectId = parsedProjectId ?? undefined
     if (projectId) {
-      if (!(await canReadProjectForSquad(env, auth, projectId, squadRes.squad.id))) {
+      if (!(await canReadProjectForTasks(env, auth, projectId, [squadRes.squad.id]))) {
         return fail(404, 'project_not_found')
       }
       baseClauses.push(`project_id = ?${baseBinds.length + 1}`)

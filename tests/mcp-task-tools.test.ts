@@ -167,8 +167,11 @@ function makeEnv(
                   return { results: grants.get(args[0] as string) ?? [] }
                 }
                 if (sql.includes('FROM tasks')) {
-                  const squadId = args[0] as string
-                  let result = rows.filter((r) => r.squad_id === squadId)
+                  // mupot#1647: task_list's row predicate is the shared chokepoint's
+                  // `squad_id IN (json_each(?1))`; older tool queries still bind one id.
+                  const scope = String(args[0])
+                  const squadIds: string[] = scope.startsWith('[') ? JSON.parse(scope) : [scope]
+                  let result = rows.filter((r) => squadIds.includes(r.squad_id))
                   if (sql.includes('status = ?2')) result = result.filter((r) => r.status === args[1])
                   if (sql.includes('assignee_agent_id')) {
                     const assignee = args.find((a) => typeof a === 'string' && String(a).startsWith('agent-'))

@@ -28,6 +28,7 @@ import {
 } from '../projects/access'
 import { resolveReadableSquadIds } from '../projects/readable-squads'
 import { loadProjectSituation } from '../projects/situation'
+import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
@@ -341,7 +342,8 @@ const toolProjectGet: ToolSpec = {
     const project = await readableProject(env, projectId, access)
     if (!project) return fail(404, 'project_not_found')
     const readableSquadIds = await projectionReadableSquads(env, access)
-    const situation = await loadProjectSituation(env, project, readableSquadIds)
+    const taskScope = await resolveVisibleTaskScope(env, auth)
+    const situation = await loadProjectSituation(env, project, readableSquadIds, { taskScope })
     return done({ project, situation })
   },
 }
@@ -372,8 +374,9 @@ const toolProjectContext: ToolSpec = {
     const project = await readableProject(env, projectId, access)
     if (!project) return fail(404, 'project_not_found')
     const readableSquadIds = await projectionReadableSquads(env, access)
+    const taskScope = await resolveVisibleTaskScope(env, auth)
     const [situation, roster, boardBindings] = await Promise.all([
-      loadProjectSituation(env, project, readableSquadIds),
+      loadProjectSituation(env, project, readableSquadIds, { taskScope }),
       listPresence(env, { projectId }),
       listProjectBindings(env, projectId),
     ])

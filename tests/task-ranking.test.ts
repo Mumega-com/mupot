@@ -257,6 +257,9 @@ describe('GET /api/tasks — ranked output, wired end-to-end', () => {
                     }
                     return { results: filtered } as { results: T[] }
                   }
+                  // mupot#1647: the owner's visible-squad list (resolveAllSquadIds) —
+                  // every fixture task lives on 'squad-1'.
+                  if (sql.includes('FROM squads')) return { results: [{ id: 'squad-1' }] } as { results: T[] }
                   // Agent runtime-state radar query (dashboard/observatory.ts
                   // loadAgentRuntimeStates): agent-dead is attached but its
                   // heartbeat reads 'stopped' (offline); agent-live is
@@ -424,8 +427,10 @@ describe('P1 regression (2026-07-16) — terminal volume never starves actionabl
                     if (sql.includes('FROM capabilities') && sql.includes('UNION ALL')) return { results: [] } as { results: T[] }
                     if (sql.includes('SELECT DISTINCT t.member_id')) return { results: [] } as { results: T[] }
                     if (sql.includes('FROM tasks')) {
-                      const squadId = args[0] as string
-                      let result = rows.filter((r) => r.squad_id === squadId)
+                      // mupot#1647: the row predicate is `squad_id IN (json_each(?1))`.
+                      const scope = String(args[0])
+                      const squadIds: string[] = scope.startsWith('[') ? JSON.parse(scope) : [scope]
+                      let result = rows.filter((r) => squadIds.includes(r.squad_id))
                       result = filterByStatusClause(result, sql, args)
                       result = applyOrderAndLimit(result, sql)
                       return { results: result } as { results: T[] }
@@ -488,6 +493,8 @@ describe('P1 regression (2026-07-16) — terminal volume never starves actionabl
                     return null as T
                   },
                   async all<T>() {
+                    // mupot#1647: the owner's visible-squad list (resolveAllSquadIds).
+                    if (sql.includes('FROM squads')) return { results: [{ id: 'squad-starve-dashboard' }] } as { results: T[] }
                     if (sql.includes('FROM tasks')) {
                       let result = filterByStatusClause(rows, sql, _args)
                       result = applyOrderAndLimit(result, sql)

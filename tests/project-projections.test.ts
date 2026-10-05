@@ -20,6 +20,10 @@ function harness(options: { includeKeysetMigration?: boolean } = {}) {
     .sort()) {
     fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
+  // mupot#1647: the activity task rows now exclude archived tasks (tasks_archive_state, 0173,
+  // applied long before this simulated pre-0059 window). Stand in an empty table so this
+  // fixture still isolates the keyset-index rollout, not the archive substrate.
+  if (!includeKeysetMigration) fixture.sqlite.exec('CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY)')
   // Projection fixtures insert historical rows directly; authorization-trigger behavior is
   // covered by the project-link service tests.
   fixture.sqlite.exec('DROP TRIGGER trg_project_link_receipt_authorized')

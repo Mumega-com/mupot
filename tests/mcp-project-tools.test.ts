@@ -781,7 +781,7 @@ describe('MCP project lifecycle control', () => {
     `)
     const departmentReader = auth({
       capabilities: [
-        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'dept-a', capability: 'observer' },
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'dept-a', capability: 'member' },
       ],
     })
 
@@ -819,7 +819,7 @@ describe('MCP project lifecycle control', () => {
     `)
     const reader = auth({
       capabilities: [
-        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'bulk-dept', capability: 'observer' },
+        { member_id: MEMBER_ID, scope_type: 'department', scope_id: 'bulk-dept', capability: 'member' },
       ],
     })
 
