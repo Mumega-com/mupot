@@ -3147,18 +3147,55 @@ describe('mupot#1616: MCPWP API-key auth and post-meta idempotency', () => {
     }
   })
 
-  it('SSRF: a private or non-https site URL is refused before any fetch — the key is never sent', async () => {
-    for (const siteUrl of ['https://127.0.0.1', 'https://169.254.169.254', 'http://wordpress.example.com']) {
-      const ctx = await approvedOfficeTask({}, siteUrl).catch(() => null)
-      // Some SSRF-shaped URLs are already refused at connector bind time; those never reach publish.
-      if (!ctx) continue
+  it('SSRF: if the connector\'s site URL is repointed at a private host after approval, publish refuses before any fetch — the key is never sent', async () => {
+    for (const hostile of ['https://127.0.0.1', 'https://169.254.169.254/latest', 'http://wordpress.example.com']) {
+      const ctx = await approvedOfficeTask()
       const wp = createFakeMcpwp({ apiKey: ctx.apiKey })
       vi.stubGlobal('fetch', wp.f)
+      ctx.harness.sqlite.prepare(`UPDATE connectors SET meta = ? WHERE id = ?`)
+        .run(JSON.stringify({ siteUrl: hostile, username: 'office-agent' }), ctx.connectorId)
+
       const result = await publish(ctx)
+
       expect(result.ok).toBe(false)
       expect(wp.requests).toHaveLength(0)
       ctx.harness.close()
     }
+  })
+
+  it('SSRF: reconcile against a connector repointed at a private host performs no fetch (origin drift = check unavailable)', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(ctx)).ok).toBe(false)
+    const before = wp.requests.length
+    ctx.harness.sqlite.prepare(`UPDATE connectors SET meta = ? WHERE id = ?`)
+      .run(JSON.stringify({ siteUrl: 'https://127.0.0.1', username: 'office-agent' }), ctx.connectorId)
+    backdateClaim(ctx.harness, ctx.taskId)
+
+    const result = await reconcile(ctx)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('reconcile_check_unavailable')
+    expect(wp.requests.length).toBe(before)
+    ctx.harness.close()
+  })
+
+  it('CONFLICT outranks a find: two posts under the same key, one with the approved hash and one without, refuse rather than adopt', async () => {
+    const ctx = await approvedOfficeTask()
+    const wp = createFakeMcpwp({ apiKey: ctx.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(ctx)).ok).toBe(false)
+    const original = wp.posts[0]
+    if (!original) throw new Error('fixture: post missing')
+    wp.posts.push({ ...original, id: 9001, meta: { ...original.meta, [OFFICE_PAYLOAD_HASH_META_KEY]: `sha256-${'1'.repeat(64)}` } })
+    backdateClaim(ctx.harness, ctx.taskId)
+
+    const refused = await reconcile(ctx)
+
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_conflict')
+    ctx.harness.close()
   })
 
   it('STRICT BINDS: publish and reconcile bind exactly the parameters their SQL declares (mupot#1642)', async () => {
