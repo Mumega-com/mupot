@@ -1055,7 +1055,13 @@ const RECEIPT_TEXT_MAX_LENGTH = 200
  * vector. Applied here, at the render site, rather than at mint time, so it
  * covers every existing row regardless of when it was written.
  */
-function sanitizeReceiptText(value: string): string {
+/**
+ * Strip control characters, bidi/zero-width/soft-hyphen characters and collapse
+ * whitespace, WITHOUT any length cap. Exported so other render sites (e.g.
+ * src/memory/verdict-memory.ts) share this ONE definition of "unsafe text" instead of
+ * keeping a second copy that drifts. Callers apply their own (byte-aware) bound.
+ */
+export function stripUnsafeText(value: string): string {
   const stripped = value
     // eslint-disable-next-line no-control-regex -- deliberately stripping C0/C1 control chars, incl. newlines/tabs.
     .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
@@ -1067,7 +1073,11 @@ function sanitizeReceiptText(value: string): string {
     // strips.
     .replace(/[\u200B-\u200F\u2060\uFEFF\u00AD\u202A-\u202E\u2066-\u2069]/g, '')
     .trim()
-  const collapsed = stripped.replace(/\s+/g, ' ')
+  return stripped.replace(/\s+/g, ' ')
+}
+
+function sanitizeReceiptText(value: string): string {
+  const collapsed = stripUnsafeText(value)
   return collapsed.length > RECEIPT_TEXT_MAX_LENGTH
     ? collapsed.slice(0, RECEIPT_TEXT_MAX_LENGTH)
     : collapsed

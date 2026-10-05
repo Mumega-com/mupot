@@ -24,6 +24,7 @@ import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { isEventsEnabled } from '../mcp/events'
 import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './events-delivery'
 import { redactSecretPatterns } from '../lib/redact'
+import { reconcileVerdictMemoryForTask } from '../memory/verdict-memory'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -481,9 +482,23 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       }
       return true
     }
+    case 'task.verdict': {
+      // Verdict -> project memory (evidence). Runs AFTER the verdict is durable, inside the
+      // queue consumer, never in the verdict write. reconcileVerdictMemoryForTask never throws;
+      // it re-reads everything from D1 and only takes task_id from the event. A miss or failure
+      // is recorded as an outcome row and retried by the maintenance sweep.
+      const payload = event.payload as { task_id?: unknown; verdict?: unknown }
+      if (typeof payload?.task_id === 'string' && payload.verdict === 'approved') {
+        await reconcileVerdictMemoryForTask(env, payload.task_id, 'worker_callback')
+      }
+      console.log(`bus: ${event.type}`, {
+        tenant: event.tenant,
+        squad_id: event.squad_id,
+      })
+      return true
+    }
     case 'task.updated':
     case 'task.completed':
-    case 'task.verdict':
     case 'fleet.control.requested':
     case 'brain.directive.updated':
     case 'org.provisioned':

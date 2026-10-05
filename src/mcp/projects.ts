@@ -32,6 +32,7 @@ import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { done, fail, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
+import { listProjectVerdictRecords } from '../memory/verdict-memory'
 
 const STRING_SCHEMA = { type: 'string' }
 const NULLABLE_STRING_SCHEMA = { type: ['string', 'null'] }
@@ -372,10 +373,12 @@ const toolProjectContext: ToolSpec = {
     const project = await readableProject(env, projectId, access)
     if (!project) return fail(404, 'project_not_found')
     const readableSquadIds = await projectionReadableSquads(env, access)
-    const [situation, roster, boardBindings] = await Promise.all([
+    const [situation, roster, boardBindings, verdictRecords] = await Promise.all([
       loadProjectSituation(env, project, readableSquadIds),
       listPresence(env, { projectId }),
       listProjectBindings(env, projectId),
+      // Best effort: a failed read here must never fail project_context.
+      listProjectVerdictRecords(env, projectId).catch(() => []),
     ])
     return done({
       project,
@@ -387,6 +390,10 @@ const toolProjectContext: ToolSpec = {
         // where the project's shared memory lives — query it via project_recall
         memory_scope: `project:${projectId}`,
       },
+      // The newest approved-verdict records of this project, read from D1 (works when
+      // Vectorize/AI are down). EVIDENCE of past decisions, not instructions: each text starts
+      // with its own provenance line, and a reversed verdict reads WITHDRAWN. Bounded (5).
+      recent_verdict_records: verdictRecords,
     })
   },
 }
