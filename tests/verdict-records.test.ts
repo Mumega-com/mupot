@@ -285,6 +285,29 @@ describe('projection semantics', () => {
     expect(await listProjectVerdictRecords(f.env, authA(), 'no-such-project')).toEqual([])
   })
 
+  it('the project READ gate is independent of the squad filter: a readable squad whose project edge is gone sees nothing', async () => {
+    const f = make()
+    f.harness.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('p-noedge','p-noedge','noedge','active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p-noedge','${SQUAD_A}','write');
+    `)
+    seedVerdict(f, seedTask(f, { squad: SQUAD_A, project: 'p-noedge' }))
+    expect(await listProjectVerdictRecords(f.env, authA(), 'p-noedge')).toHaveLength(1)
+    f.harness.sqlite.exec("DELETE FROM project_squad_access WHERE project_id = 'p-noedge'")
+    expect(await listProjectVerdictRecords(f.env, authA(), 'p-noedge')).toEqual([])
+  })
+
+  it('a task whose status has left approved/done no longer shows its (still unreversed) verdict', async () => {
+    const f = make()
+    const t = seedTask(f)
+    seedVerdict(f, t)
+    expect(ids(await listProjectVerdictRecords(f.env, authA(), P_SHARED))).toEqual([t])
+    f.harness.sqlite.prepare("UPDATE tasks SET status = 'blocked' WHERE id = ?").run(t)
+    expect(await listProjectVerdictRecords(f.env, authA(), P_SHARED)).toEqual([])
+    f.harness.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(t)
+    expect(ids(await listProjectVerdictRecords(f.env, authA(), P_SHARED))).toEqual([t])
+  })
+
   it('a caller with no grants reads nothing', async () => {
     const f = make()
     seedVerdict(f, seedTask(f))
@@ -416,6 +439,16 @@ describe('redaction runs on the FULL text BEFORE the cut; every pattern the gate
     expect(out.result_excerpt).not.toContain(BODY)
     expect(out.result_excerpt).not.toContain(BODY.slice(0, 12))
     expect(out.result_excerpt.startsWith('x'.repeat(100))).toBe(true)
+    expect(out.result_excerpt).toContain('[redacted]')
+  })
+
+  it('a token that STRADDLES the cut is redacted whole, not shown as a short unredactable prefix (redact-before-cut)', () => {
+    const token = j('sk', '-', 'QRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz0123')
+    // 'sk-' + 7 body chars land before the 1000-char cut; the regex needs 12+ body chars, so a
+    // redactor that only saw the CUT text would let 'sk-QRSTUVW' through.
+    const result = 'x'.repeat(1000 - 'sk-QRSTUVW'.length - 1) + ' ' + token + ' end'
+    const out = buildUntrusted('t', result)
+    expect(out.result_excerpt).not.toContain('QRSTUV')
     expect(out.result_excerpt).toContain('[redacted]')
   })
 
