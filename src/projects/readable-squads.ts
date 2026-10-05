@@ -7,6 +7,9 @@ function jsonIds(ids: string[]): string {
   return JSON.stringify([...new Set(ids)])
 }
 
+// resolveReadableSquadIds — squads named by EXACT id (squadIds) plus every squad inside the
+// given departments. mupot#1646: department expansion excludes kind='home' squads (an
+// exact id still returns one — that is the home owner's own grant).
 export async function resolveReadableSquadIds(
   env: Env,
   squadIds: string[],
@@ -21,7 +24,10 @@ export async function resolveReadableSquadIds(
     const result = await env.DB.prepare(
       `SELECT id FROM squads
         WHERE (id IN (SELECT CAST(value AS TEXT) FROM json_each(?1))
-           OR department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2)))
+           OR (department_id IN (SELECT CAST(value AS TEXT) FROM json_each(?2))
+               -- mupot#1646: department expansion never covers a home squad
+               -- (planeCoversScope); only an EXACT squad id (direct list) does.
+               AND kind != 'home'))
           AND id > ?3
         ORDER BY id
         LIMIT ?4`,

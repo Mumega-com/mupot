@@ -368,6 +368,18 @@ export async function acceptInvite(
       return { ok: false, error: 'home_scope_not_invitable' }
     }
   }
+  // mupot#1646: same refusal for a DEPARTMENT-scope invite onto a home
+  // department. Pre-authorization ages: an invite created before the
+  // creation-time refusal existed (or inserted by any other producer) must
+  // not redeem into a department grant over someone's home squad.
+  if (scopeType === 'department' && scopeId) {
+    const dept = await env.DB.prepare('SELECT kind FROM departments WHERE id = ? LIMIT 1')
+      .bind(scopeId)
+      .first<{ kind: string }>()
+    if (dept?.kind === 'home') {
+      return { ok: false, error: 'home_scope_not_invitable' }
+    }
+  }
 
   // mupot#1551 slice 1 — re-check the INVITER at redemption, mirroring
   // redeemTelegramProjectInvite's own minter re-check (project-invites.ts
@@ -483,6 +495,9 @@ export async function acceptInvite(
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
           WHERE NOT EXISTS (SELECT 1 FROM members WHERE lower(email) = lower(?2))
             AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?8', '?7')})
+            -- mupot#1646: same home-department refusal as the capabilities INSERT
+            -- below, so a blocked grant never orphans a member row.
+            AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?9 AND kind = 'home')
             AND ${currentMemberRankAtLeastSql(scopeType, {
               inviterIdParam: '?8',
               scopeIdParam: '?9',
@@ -536,6 +551,7 @@ export async function acceptInvite(
          SELECT ?1, ?2, ?3, ?4, ?5
           WHERE EXISTS (SELECT 1 FROM members WHERE id = ?2)
             AND EXISTS (SELECT 1 FROM members WHERE ${INVITER_ACTIVE_MEMBER_SQL('?6', '?7')})
+            AND NOT EXISTS (SELECT 1 FROM departments WHERE id = ?4 AND ?3 = 'department' AND kind = 'home')
             AND ${currentMemberRankAtLeastSql(scopeType, {
               inviterIdParam: '?6',
               scopeIdParam: '?4',
@@ -878,10 +894,15 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
       return c.json({ error: 'invalid_department_id' }, 400)
     }
     departmentId = body.department_id.trim()
-    const dept = await c.env.DB.prepare('SELECT id FROM departments WHERE id = ? LIMIT 1')
+    const dept = await c.env.DB.prepare('SELECT id, kind FROM departments WHERE id = ? LIMIT 1')
       .bind(departmentId)
-      .first<{ id: string }>()
+      .first<{ id: string; kind: string }>()
     if (!dept) return c.json({ error: 'department_not_found' }, 404)
+    // mupot#1646: a member's home department holds their private home squad.
+    // Org/department/role authority never covers a home squad (planeCoversScope),
+    // and readers that expand department grants assume no such grant can be
+    // written. Refuse here (creation); acceptInvite re-checks at redemption.
+    if (dept.kind === 'home') return c.json({ error: 'home_scope_not_invitable' }, 403)
   }
 
   c.set('inviteBody', {
