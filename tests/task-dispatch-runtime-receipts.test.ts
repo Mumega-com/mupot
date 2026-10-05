@@ -288,6 +288,21 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
     })
 
+    it('refuses a mistyped optional key (title not a string)', async () => {
+      await expect(settleAgainst((body) => ({ ...body, title: 42 })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it.each([false, 'true', 1, null])('refuses truncated = %j (only boolean true is allowed)', async (value) => {
+      await expect(settleAgainst((body) => ({ ...body, truncated: value })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it('accepts truncated = true', async () => {
+      const { result } = await settleAgainst((body) => ({ ...body, truncated: true }))
+      expect(result.task_status).toBe('in_progress')
+    })
+
     it('refuses a mistyped optional key (done_when not a string)', async () => {
       await expect(settleAgainst((body) => ({ ...body, done_when: { evil: true } })))
         .rejects.toMatchObject({ code: 'runtime_delivery_stale' })

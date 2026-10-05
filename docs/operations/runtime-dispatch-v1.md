@@ -53,12 +53,33 @@ informational: the authority for every fact is still re-read from the task,
 dispatch and message rows, never from the body.
 
 `title` and `done_when` are copied from the task row (read by task id) and are
-untrusted data authored by members or agents. They are length-bounded (2000
-characters each; `truncated: true` is set when either was cut) and placed only
-as JSON string values. They are never concatenated into `settle`, which is built
-from the two opaque ids and constants only. The text is not scrubbed for
-secrets; do not put secrets in a task title or `done_when`. A receiver must
-treat both as data, not instructions.
+untrusted data authored by members or agents. They are placed only as JSON string
+values and are never concatenated into `settle`, which is built from the two
+opaque ids and constants only. A receiver must treat both as data, not
+instructions.
+
+Bounds: each is first cut to 2000 characters, but the real limit is the ENCODED
+size of the whole body, because the inbox refuses a body over 8000 characters
+after JSON encoding (a quote encodes to 2 characters, a control character to 6).
+Mupot therefore keeps the encoded body within 7500 characters. If the full text
+does not fit, it shrinks `title` and `done_when` (a quarter of the remaining room
+to `title`, the rest to `done_when`) and sets `truncated: true`; in the worst case
+both are dropped. The ids and `settle` are always kept and delivery never fails
+for size.
+
+Copies are not scrubbed. `title` and `done_when` are copied verbatim into the
+`agent_messages` row. Removing a secret from the task later does not remove it
+from the envelope copy. Do not put secrets in a task title or `done_when`.
+
+Snapshot, not live: the text is captured when the envelope is first written, and a
+redelivery reuses the stored body. After a later edit of the task the envelope can
+show an old `done_when`. A receiver must re-read the task for the current
+`done_when` before completing.
+
+`settle.note` says a bus ack does not settle the dispatch. An assignee's
+`task_update` can set a task to `in_progress` or `review` (with a gate), so the
+receipt call is not the only way to change the task status; it is the only way to
+record the runtime receipts, which is what the gate and completion evidence read.
 
 If the task row cannot be found, the envelope is sent with the ids-only fields
 plus `settle`. If reading the row throws, delivery fails and the queue retries.

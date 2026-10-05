@@ -24,7 +24,7 @@ import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
-const MAX_BODY_CHARS = 8000
+export const MAX_BODY_CHARS = 8000
 const MAX_REF_CHARS = 128 // agent ids / member ids
 const DEFAULT_INBOX_LIMIT = 20
 const MAX_INBOX_LIMIT = 100

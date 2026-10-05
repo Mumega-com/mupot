@@ -191,6 +191,64 @@ describe('deliverDispatchToInbox', () => {
       expect(body.truncated).toBe(true)
     })
 
+    describe('encoded-size cap (sendAgentMessage refuses bodies over 8000 encoded chars)', () => {
+      async function deliverOk(title: string, doneWhen: string) {
+        const db = makeDb({ tasks: [{ id: 'task-1', title, done_when: doneWhen }] })
+        const res = await deliverDispatchToInbox(envWith(db), baseInput) // must not throw
+        expect(res.delivered).toBe(true)
+        expect(db._messages).toHaveLength(1)
+        const raw = db._messages[0].body
+        expect(raw.length).toBeLessThanOrEqual(8000)
+        expect(db._messages[0].request_id).toBe('dispatch-inbox:receipt-1')
+        const body = JSON.parse(raw) as Record<string, unknown> & { settle: unknown }
+        const baseline = await deliver(makeDb({ tasks: [] }))
+        expect(body.settle).toEqual(baseline.settle)
+        expect(body.task_id).toBe('task-1')
+        expect(body.dispatch_receipt_id).toBe('receipt-1')
+        return body
+      }
+
+      it('probe (a): 1400 control chars in done_when (encoded 6x) still delivers', async () => {
+        const body = await deliverOk('T', '\u0001'.repeat(1400))
+        expect(body.truncated).toBe(true)
+        expect((body.done_when as string).length).toBeGreaterThan(0)
+        expect((body.done_when as string).length).toBeLessThan(1400)
+      })
+
+      it('probe (b): title and done_when of 2000 quotes each (encoded 2x) still delivers', async () => {
+        const q = '"'.repeat(2000)
+        const body = await deliverOk(q, q)
+        expect(body.truncated).toBe(true)
+        expect(/^"*$/.test(body.title as string)).toBe(true)
+      })
+
+      it('worst case: control chars in BOTH fields still delivers', async () => {
+        const c = '\u0001'.repeat(2000)
+        const body = await deliverOk(c, c)
+        expect(body.truncated).toBe(true)
+      })
+
+      it('multi-byte / surrogate text stays well-formed after shrinking', async () => {
+        const mixed = ('\u{1F600}"\u0001é').repeat(700)
+        const body = await deliverOk(mixed, mixed)
+        expect(body.truncated).toBe(true)
+        expect((body.title as string).isWellFormed()).toBe(true)
+        expect((body.done_when as string).isWellFormed()).toBe(true)
+      })
+
+      it('text that fits encoded is not shrunk and not flagged', async () => {
+        const body = await deliverOk('plain title', 'plain done when')
+        expect(body.truncated).toBeUndefined()
+        expect(body.done_when).toBe('plain done when')
+      })
+
+      it('settle.note says the text is a snapshot and the dispatch (not the task status) is what only the receipt settles', async () => {
+        const body = await deliver(makeDb({ tasks: [] }))
+        expect(body.settle.note).toMatch(/re-read the task/)
+        expect(body.settle.note).toMatch(/task_update/)
+      })
+    })
+
     it('task row absent -> ids-only fields WITH the settle object (delivery is not blocked)', async () => {
       const body = await deliver(makeDb({ tasks: [] }))
       expect(body.title).toBeUndefined()

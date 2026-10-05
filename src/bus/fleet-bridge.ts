@@ -19,7 +19,7 @@
 // 'agent.wake' case for the full reasoning, and issue #353 for the design doc.
 
 import type { Env } from '../types'
-import { sendAgentMessage } from '../agents/messages'
+import { sendAgentMessage, MAX_BODY_CHARS } from '../agents/messages'
 
 // Sender identity for a bridged dispatch message. This is NOT a welded agent — task_dispatch is
 // invoked by a human member through the mupot tool surface, not by an agent acting as sender, so
@@ -100,7 +100,7 @@ function boundText(value: unknown): { text: string; truncated: boolean } {
 async function readTaskText(
   env: Env,
   taskId: string,
-): Promise<{ title: string; done_when: string; truncated?: true } | null> {
+): Promise<{ title: string; done_when: string; truncated: boolean } | null> {
   const row = await env.DB.prepare('SELECT title, done_when FROM tasks WHERE id = ?1 LIMIT 1')
     .bind(taskId)
     .first<{ title: unknown; done_when: unknown }>()
@@ -110,14 +110,14 @@ async function readTaskText(
   return {
     title: title.text,
     done_when: doneWhen.text,
-    ...(title.truncated || doneWhen.truncated ? { truncated: true as const } : {}),
+    truncated: title.truncated || doneWhen.truncated,
   }
 }
 
 /** The settlement path, self-described. Built ONLY from the two opaque ids plus constants. */
 function buildSettleHint(taskId: string, receiptId: string) {
   return {
-    note: 'A bus ack, inbox_ack or any chat reply does NOT settle this task. Only task_dispatch_runtime_receipt moves it to in_progress and review.',
+    note: 'A bus ack, inbox_ack or any chat reply does NOT settle this dispatch: only task_dispatch_runtime_receipt records the runtime receipts (task_update can set a task status but records none). title/done_when are a snapshot taken at dispatch time; re-read the task for the current done_when before completing.',
     tool: 'task_dispatch_runtime_receipt',
     args: { task_id: taskId, dispatch_receipt_id: receiptId },
     attempt: 'Pass this inbox message\'s delivery_attempts value (1 on first delivery).',
@@ -133,9 +133,44 @@ function buildSettleHint(taskId: string, receiptId: string) {
   }
 }
 
+/** Encoded-size budget for the whole envelope body. sendAgentMessage refuses `body.length >
+ *  MAX_BODY_CHARS` (UTF-16 code units of the ENCODED string, i.e. exactly what `.length` of the
+ *  JSON.stringify output gives), so the budget is measured the same way, with headroom. */
+export const DISPATCH_ENVELOPE_BODY_BUDGET = MAX_BODY_CHARS - 500
+
+/** Encoded cost of `value` as a JSON string value (the two quotes excluded). */
+function encodedLen(value: string): number {
+  return JSON.stringify(value).length - 2
+}
+
+/** Longest prefix of `value` whose ENCODED length is <= maxEncoded, never splitting a surrogate
+ *  pair. Encoded length is monotonic in prefix length, so a binary search is exact. */
+function fitEncoded(value: string, maxEncoded: number): string {
+  if (maxEncoded <= 0) return ''
+  if (encodedLen(value) <= maxEncoded) return value
+  let lo = 0
+  let hi = value.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (encodedLen(value.slice(0, mid)) <= maxEncoded) lo = mid
+    else hi = mid - 1
+  }
+  let cut = value.slice(0, lo)
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1)
+  return cut
+}
+
+/**
+ * Build the envelope body. A raw-length cap is not an encoded-size cap (`"` encodes to 2 chars,
+ * a control char to 6), and sendAgentMessage refuses an oversized body PERMANENTLY (the retry
+ * rebuilds the same body from the same task row). So size is enforced on the ENCODED output and
+ * degrades deterministically instead of ever throwing: shrink title/done_when to fit
+ * (`truncated: true`), and in the worst case drop them; the ids and the `settle` object are
+ * always kept, and that ids-only+settle form always fits.
+ */
 async function buildEnvelopeBody(env: Env, input: DispatchBridgeInput): Promise<string> {
   const text = await readTaskText(env, input.taskId)
-  return JSON.stringify({
+  const base = {
     version: 'runtime.dispatch/v1',
     type: 'task_dispatch',
     task_id: input.taskId,
@@ -145,13 +180,34 @@ async function buildEnvelopeBody(env: Env, input: DispatchBridgeInput): Promise<
     // not accept a second caller-controlled address that could diverge from the
     // actual durable inbox target.
     runtime_address: input.agentId,
-    // Additive, self-describing fields. `title`/`done_when` are DATA authored by
-    // members/agents: bounded, and only ever placed as JSON string values here,
-    // never concatenated into `settle` or any instruction text. `settle` is built
-    // from the two opaque ids and constants only.
-    ...(text ?? {}),
-    settle: buildSettleHint(input.taskId, input.receiptId),
-  })
+  }
+  const settle = buildSettleHint(input.taskId, input.receiptId)
+  // `title`/`done_when` are DATA authored by members/agents: only ever JSON string values here,
+  // never concatenated into `settle` or any instruction text. `settle` is built from the two
+  // opaque ids and constants only.
+  const assemble = (t: { title: string; done_when: string; truncated: boolean } | null): string =>
+    JSON.stringify({
+      ...base,
+      ...(t ? { title: t.title, done_when: t.done_when, ...(t.truncated ? { truncated: true } : {}) } : {}),
+      settle,
+    })
+
+  if (!text) return assemble(null)
+  let candidate = { title: text.title, done_when: text.done_when, truncated: text.truncated }
+  let out = assemble(candidate)
+  if (out.length <= DISPATCH_ENVELOPE_BODY_BUDGET) return out
+
+  // Over budget: spend what is left after the fixed part (ids + settle + the truncated flag),
+  // a quarter to the title and the rest to done_when.
+  const fixed = assemble({ title: '', done_when: '', truncated: true }).length
+  const room = Math.max(0, DISPATCH_ENVELOPE_BODY_BUDGET - fixed)
+  const title = fitEncoded(text.title, Math.floor(room / 4))
+  const doneWhen = fitEncoded(text.done_when, room - encodedLen(title))
+  candidate = { title, done_when: doneWhen, truncated: true }
+  out = assemble(candidate)
+  if (out.length <= DISPATCH_ENVELOPE_BODY_BUDGET) return out
+  // Unreachable by construction; last resort keeps delivery working rather than throwing.
+  return assemble(null)
 }
 
 /**
