@@ -60,6 +60,7 @@ import {
   loadLiveElevationGrantsForSession,
   evaluateElevationGrant,
   boundAgentHasAnyLiveElevationGrant,
+  elevationHint,
 } from '../auth/elevation'
 import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, REQUESTABLE_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
 import { createBus } from '../bus'
@@ -6381,6 +6382,9 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'grant_agent_capability',
   'create_squad',
   'project_create',
+  // mupot#1674: project_squad_set consults action:manage_access (scoped to the
+  // target squad) inside run(); unreachable without membership here.
+  'project_squad_set',
 ])
 
 export async function invokeTool(
@@ -6446,7 +6450,8 @@ export async function invokeTool(
       ELEVATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
       (await boundAgentHasAnyLiveElevationGrant(env, auth))
     if (!mayBeElevated) {
-      return { ...fail(403, 'forbidden', { need: spec.min }), tool: spec.name }
+      const hint = elevationHint(spec.name)
+      return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }
   }
 

@@ -117,7 +117,7 @@ export interface CreateElevationRequestInput {
 
 export type CreateElevationRequestResult =
   | { ok: true; request: ElevationRequestRecord }
-  | { ok: false; reason: 'invalid_elevation_request'; detail: string }
+  | { ok: false; reason: 'invalid_elevation_request' | 'invalid_scope'; detail: string }
 
 /**
  * createElevationRequest — the agent-facing half. Every identity field
@@ -166,6 +166,24 @@ export async function createElevationRequest(
       ok: false,
       reason: 'invalid_elevation_request',
       detail: 'action:home_access must name an exact squad scope, never org or department',
+    }
+  }
+  // mupot#1674: an unknown scope id is refused at REQUEST time. Otherwise a
+  // human approves a grant naming a slug / typo / wrong-tenant id that can never
+  // match a real scope — a silent no-op approval. Ids only (slugs are refused
+  // with a hint, not resolved: the grant row must carry the canonical id the
+  // matcher compares against). org scope carries no id.
+  if (input.scopeType === 'department' || input.scopeType === 'squad') {
+    const table = input.scopeType === 'department' ? 'departments' : 'squads'
+    const exists = input.scopeId
+      ? await env.DB.prepare(`SELECT 1 AS ok FROM ${table} WHERE id = ?1 LIMIT 1`).bind(input.scopeId).first()
+      : null
+    if (!exists) {
+      return {
+        ok: false,
+        reason: 'invalid_scope',
+        detail: `${input.scopeType} scope_id must be the id of an existing ${input.scopeType} (a slug is not accepted here)`,
+      }
     }
   }
   if (!isValidElevationDuration(input.durationMinutes)) {
@@ -1021,6 +1039,25 @@ const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
   no_matching_grant: 'no live elevation grant covers this action and scope for this exact session — ask an org/department/squad admin to approve request_elevation for it',
   approver_authority_lost: 'the human who approved this grant no longer holds the required capability on this scope — ask a current admin to approve a fresh elevation',
   approver_session_ended: 'the human who approved this grant is no longer signed in — ask a current admin to approve a fresh elevation',
+}
+
+/** Tools that consult an elevation action, and the action key each consults.
+ *  Text-only: used to name the door in a plain `need=<cap>` refusal. It grants
+ *  nothing and is not consulted by any authorization decision. */
+const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze({
+  project_create: 'action:workspace_project',
+  project_squad_set: 'action:manage_access',
+  grant_agent_capability: 'action:manage_access',
+  mint_agent_token: 'action:mint_token',
+  create_squad: 'action:project_lifecycle',
+})
+
+/** elevationHint — the refusal hint naming request_elevation + the action key
+ *  for a tool that has an elevation door, or undefined for one that has none. */
+export function elevationHint(toolName: string): string | undefined {
+  const action = ELEVATION_ACTION_BY_TOOL[toolName]
+  if (!action) return undefined
+  return `an admin can approve a time-boxed elevation instead: call request_elevation with actions ["${action}"]`
 }
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {
