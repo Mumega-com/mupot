@@ -28,6 +28,7 @@ import { html, raw } from 'hono/html'
 import { getCookie } from 'hono/cookie'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import { TASK_SELECT_COLUMNS, actionableStatusOrderSql, priorityOrderSql } from '../tasks/ranking'
+import { markApprovedTaskDoneFromGate, OFFICE_PUBLISH_UNRESOLVED_MESSAGE } from '../tasks/service'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import type {
   Env,
@@ -1416,12 +1417,12 @@ dashboardApp.post('/admin/departments/:dept/execute/:gateId', async (c) => {
       const receiptResult = outcome.diff
         ? `Applied ${outcome.diff.changeType} via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''} — ${outcome.diff.field}: ${JSON.stringify(outcome.diff.before)} -> ${JSON.stringify(outcome.diff.after)}`
         : `Published via ${outcome.adapter ?? 'unknown'}${outcome.artifactUrl ? `: ${outcome.artifactUrl}` : ''}`
-      await c.env.DB.prepare(
-        `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
-           WHERE id = ? AND status = 'approved'`,
-      )
-        .bind(receiptResult, now, now, gateId)
-        .run()
+      // mupot#1616: an approved gate:office task with an unresolved publish claim
+      // must not be marked done here (see markApprovedTaskDoneFromGate).
+      const closed = await markApprovedTaskDoneFromGate(c.env, gateId, receiptResult, now)
+      if (closed === 'office_publish_unresolved') {
+        return c.json({ ...outcome, error: 'office_publish_unresolved', detail: OFFICE_PUBLISH_UNRESOLVED_MESSAGE }, 409)
+      }
     }
     return c.json(outcome, outcome.executed ? 200 : 422)
   } catch (e) {

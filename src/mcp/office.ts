@@ -51,6 +51,9 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'unreconciled_prior_publish':
     case 'freeze_not_found':
     case 'already_reconciled':
+    case 'reconcile_conflict':
+    case 'publish_unreconciled':
+    case 'unsupported_site_path':
     case 'reconcile_candidate_found':
     case 'reconcile_check_unavailable':
     case 'reconcile_retry_required':
@@ -97,7 +100,7 @@ const toolOfficePublishPost: ToolSpec = {
     const taskRes = await getTask(env, taskRef)
     if (!taskRes.ok) return taskRes
     const result = await publishOfficePost(env, auth, { task: taskRes.task })
-    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
     return done({ post_id: result.value.postId, article_url: result.value.articleUrl })
   },
 }
@@ -177,10 +180,13 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
     ' override_reason?: string }' +
     ' -- this tool queries the live WordPress site by the claim\'s idempotency key BEFORE' +
     ' accepting any outcome; the requested outcome/post_id/article_url are NEVER trusted' +
-    ' on their own. Three results only: (1) the post is POSITIVELY found (an exact' +
-    ' idempotency-slug match, parsed, with a real id and link) -> marked done with the' +
+    ' on their own. Four results only: (1) the post is POSITIVELY found (a post whose' +
+    ' mupot-owned post meta carries this claim\'s idempotency key AND the approved payload' +
+    ' hash, read back through MCPWP) -> marked done with the' +
     ' discovered post, always, regardless of what was requested here; a trashed match is' +
-    ' recorded as found-but-not-live, never as a false "live" receipt. (2) SOME evidence' +
+    ' recorded as found-but-not-live, never as a false "live" receipt. (1b) a post carries' +
+    ' the idempotency key but a DIFFERENT payload hash -> refused as reconcile_conflict,' +
+    ' never adopted, never overridable. (2) SOME evidence' +
     ' exists that is not a clean match (a malformed exact-slug match, or any title/time' +
     ' search hit) -> refused as reconcile_candidate_found; this is NEVER overridable —' +
     ' resolve the actual post by hand (accept it as done, or delete it) before retrying.' +
@@ -228,7 +234,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
       articleUrl,
       overrideReason,
     })
-    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
     return done({ task: result.value.task })
   },
 }

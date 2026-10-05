@@ -39,7 +39,7 @@ import { getRegisteredAddon } from '../registry'
 import { manifestSha256 } from '../contract'
 import { resolveConnectorByIdWithMeta } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
-import { parseSiteConnectorConfig } from './health'
+import { parseSiteConnectorConfig, isRootSiteUrl } from './health'
 import { canonicalJson, sha256Hex } from '../../lib/canonical-json'
 import { claimTimestamp } from '../../lib/claim-timestamp'
 
@@ -77,6 +77,16 @@ export type OfficeRefusalReason =
   //     TLS failure, a revoked connector, origin drift, OR every lookup came
   //     back genuinely, cleanly empty. THE ONLY reason the human override may
   //     ever accept, and only once retried (see reconcile_retry_required).
+  // mupot#1616: a post carries THIS claim's idempotency key (mupot-owned post
+  // meta) but a different payload hash than the human approved — never adopted,
+  // never overwritten, never overridable.
+  | 'reconcile_conflict'
+  // mupot#1616: a post EXISTS on WordPress, the task left 'approved', the claim is
+  // still open (no receipt written). Never read as "nothing happened".
+  | 'publish_unreconciled'
+  // mupot#1616: the connector's site URL has a path (a subdirectory install);
+  // office calls address <origin>/wp-json and would hit a different application.
+  | 'unsupported_site_path'
   | 'reconcile_candidate_found'
   | 'reconcile_check_unavailable'
   | 'reconcile_retry_required'
@@ -98,7 +108,10 @@ export type OfficeRefusalReason =
 
 export type OfficeResult<T> =
   | { ok: true; value: T }
-  | { ok: false; reason: OfficeRefusalReason }
+  // `hint`: an optional human-readable explanation of the refusal. Never carries a
+  // credential or response body; the only site-derived values are a created post's
+  // id and link.
+  | { ok: false; reason: OfficeRefusalReason; hint?: string }
 
 // P3-2 (kasra-review adversarial round 1, PR #1588): the ORIGINAL version of this
 // function did `.find(row => row.addonKey === OFFICE_ADDON_KEY)` THEN checked
@@ -191,9 +204,27 @@ export async function resolveOfficeSiteOrigin(env: Env, connectorId: string): Pr
   const config = parseSiteConnectorConfig(connector.meta)
   if (!config) return null
   try {
-    return assertPublicHttpsUrl(config.siteUrl).origin
+    const url = assertPublicHttpsUrl(config.siteUrl)
+    // mupot#1616: publish and lookup address `<origin>/wp-json/...`, so a WordPress
+    // installed under a subdirectory (https://x/blog) would be written to the WRONG
+    // application at https://x/wp-json. Fail closed rather than guess.
+    return isRootSiteUrl(url) ? url.origin : null
   } catch {
     return null
+  }
+}
+
+/** Distinguishes the typed reason when resolveOfficeSiteOrigin returned null: the
+ *  site URL is public https but not a site root (a subdirectory install). */
+export async function officeSiteUrlIsSubdirectory(env: Env, connectorId: string): Promise<boolean> {
+  const connector = await resolveConnectorByIdWithMeta(env, connectorId)
+  if (!connector) return false
+  const config = parseSiteConnectorConfig(connector.meta)
+  if (!config) return false
+  try {
+    return !isRootSiteUrl(assertPublicHttpsUrl(config.siteUrl))
+  } catch {
+    return false
   }
 }
 
@@ -235,10 +266,17 @@ interface PriorOfficeFreezeRow {
 // entry AND rework re-entry) goes through, until an operator manually confirms the
 // real outcome via office.reconcile_stalled_publish.
 export async function unreconciledPriorFreezeExists(env: Env, taskId: string): Promise<boolean> {
+  // Blocks while the claim is unresolved (outcome NULL) AND when a freeze says
+  // 'done' but its task never reached 'done' (a live post with no receipt):
+  // the rework loop must never open over either.
   const row = await env.DB.prepare(
-    `SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?1`,
-  ).bind(taskId).first<PriorOfficeFreezeRow>()
-  return row !== null && row.claimed_at !== null && row.outcome === null
+    `SELECT f.claimed_at AS claimed_at, f.outcome AS outcome, t.status AS task_status
+       FROM office_publish_freezes f LEFT JOIN tasks t ON t.id = f.task_id
+      WHERE f.task_id = ?1`,
+  ).bind(taskId).first<PriorOfficeFreezeRow & { task_status: string | null }>()
+  if (row === null || row.claimed_at === null) return false
+  if (row.outcome === null) return true
+  return row.outcome === 'done' && row.task_status !== 'done'
 }
 
 // mupot#1592 NEW-1 (r2 adversarial follow-up on PR #1588): computes the EXACT
@@ -259,7 +297,9 @@ export async function buildOfficePublishFreeze(env: Env, task: Task): Promise<Of
   if (!bindingResult.ok) return bindingResult
 
   const siteOrigin = await resolveOfficeSiteOrigin(env, bindingResult.value.connectorId)
-  if (!siteOrigin) return { ok: false, reason: 'invalid_site_config' }
+  if (!siteOrigin) {
+    return { ok: false, reason: (await officeSiteUrlIsSubdirectory(env, bindingResult.value.connectorId)) ? 'unsupported_site_path' : 'invalid_site_config' }
+  }
 
   const payload = {
     task_id: task.id,

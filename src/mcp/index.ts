@@ -1738,7 +1738,7 @@ const toolTaskUpdate: ToolSpec = {
           existing, next, tenant: env.TENANT_SLUG, reason: reversalReason,
           actorId: auth.memberId as string, actorType: 'member',
         })
-        if (!outcome.ok) return fail(409, outcome.error)
+        if (!outcome.ok) return fail(409, outcome.error, 'detail' in outcome ? outcome.detail : undefined)
         next.status = outcome.task.status
         next.updated_at = outcome.task.updated_at
       } else {
@@ -1746,7 +1746,7 @@ const toolTaskUpdate: ToolSpec = {
       }
     } catch (error) {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
-      if (error instanceof TaskUpdateConflictError) return fail(409, error.code)
+      if (error instanceof TaskUpdateConflictError) return fail(409, error.code, error.detail)
       throw error
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {

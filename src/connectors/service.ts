@@ -559,6 +559,44 @@ function safeImmediateResult<T extends ImmediateConnectorResult>(value: T, secre
   }) as T
 }
 
+/**
+ * How an `mcpwp` connector authenticates to the WordPress site (mupot#1616).
+ *   - 'api_key': the MCPWP API key, sent as `X-API-Key` (the header MCPWP's own
+ *     REST layer reads first: mcpwp/includes/traits/trait-mcpwp-api-auth.php
+ *     `get_api_key_from_request`). Accepted only on `/wp-json/mcpwp/v1/*`.
+ *   - 'basic': a WordPress application password (`Authorization: Basic user:pass`),
+ *     accepted only on WordPress core routes (`/wp-json/wp/v2/*`).
+ * An MCPWP key sent as a Basic password is a 401 (observed live, mupot#1616).
+ */
+export type McpwpAuthMode = 'api_key' | 'basic'
+
+export interface UseConnectorOptions {
+  /** Caller-pinned auth mode for an `mcpwp` connector. Wins over the connector's
+   *  own meta: a caller that only talks to `/mcpwp/v1/*` must never be steered
+   *  into sending a Basic credential (or the reverse) by editable meta. */
+  readonly mcpwpAuthMode?: McpwpAuthMode
+}
+
+/** Meta `auth_mode` is honoured only for the two known values. Absent: a
+ *  connector that carries a `username` is a pre-#1616 application-password
+ *  connector and stays Basic (the marketing adapter and the content executor
+ *  still call core `/wp/v2` routes with it); one without is an API-key
+ *  connector. */
+function mcpwpAuthModeFromMeta(meta: string | null): McpwpAuthMode {
+  if (meta) {
+    try {
+      const value = JSON.parse(meta) as unknown
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const mode = (value as Record<string, unknown>).auth_mode
+        if (mode === 'api_key' || mode === 'basic') return mode
+      }
+    } catch {
+      // fall through to legacy inference
+    }
+  }
+  return basicAuthUsername(meta) ? 'basic' : 'api_key'
+}
+
 function basicAuthUsername(meta: string | null): string | null {
   if (!meta) return null
   try {
@@ -589,6 +627,7 @@ export async function useConnectorById<T extends ImmediateConnectorResult>(
   connectorId: string,
   type: ConnectorType,
   use: (connector: ImmediateConnectorUse) => T | Promise<T>,
+  options: UseConnectorOptions = {},
 ): Promise<T | null> {
   if (!connectorId || !isConnectorType(type) || typeof use !== 'function') return null
   const masterKey = env.CONNECTOR_MASTER_KEY
@@ -631,9 +670,18 @@ export async function useConnectorById<T extends ImmediateConnectorResult>(
         if (row.type === 'posthog' || row.type === 'inkwell') {
           headers.set('authorization', `Bearer ${secret}`)
         } else if (row.type === 'mcpwp') {
-          const username = basicAuthUsername(row.meta)
-          if (!username) throw new Error('invalid connector auth config')
-          headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+          const mode = options.mcpwpAuthMode ?? mcpwpAuthModeFromMeta(row.meta)
+          if (mode === 'api_key') {
+            // The vault owns auth-header construction: a caller-supplied
+            // Authorization/X-API-Key is dropped, never forwarded alongside.
+            headers.delete('authorization')
+            headers.set('x-api-key', secret)
+          } else {
+            const username = basicAuthUsername(row.meta)
+            if (!username) throw new Error('invalid connector auth config')
+            headers.delete('x-api-key')
+            headers.set('authorization', `Basic ${btoa(`${username}:${secret}`)}`)
+          }
         } else if (row.type === 'linear') {
           // Linear's GraphQL API takes the personal/workspace API key verbatim in
           // the Authorization header — no "Bearer " prefix (unlike posthog/inkwell).

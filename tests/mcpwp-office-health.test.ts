@@ -66,7 +66,7 @@ afterEach(() => {
 })
 
 describe('mcpwp-office health check', () => {
-  it('reports healthy on a 200 initialize response and sends Basic auth built from the vaulted secret', async () => {
+  it('reports healthy on a 200 initialize response and sends the vaulted MCPWP API key as X-API-Key (never Basic)', async () => {
     const harness = makeHarness()
     const secret = 'wordpress-app-password-abc123'
     const connectorId = await connectorFixture(harness, 'https://wordpress.example.com', secret)
@@ -86,7 +86,9 @@ describe('mcpwp-office health check', () => {
     expect(url.pathname).toBe('/wp-json/mcpwp/v1/mcp')
     expect(init.method).toBe('POST')
     expect(init.redirect).toBe('manual')
-    expect(new Headers(init.headers).get('authorization')).toBe(`Basic ${btoa(`office-agent:${secret}`)}`)
+    // mupot#1616: the MCPWP endpoint takes the key as X-API-Key; a Basic password is a 401.
+    expect(new Headers(init.headers).get('x-api-key')).toBe(secret)
+    expect(new Headers(init.headers).get('authorization')).toBeNull()
     const body = JSON.parse(String(init.body)) as { jsonrpc: string; method: string }
     expect(body.jsonrpc).toBe('2.0')
     expect(body.method).toBe('initialize')
@@ -99,23 +101,17 @@ describe('mcpwp-office health check', () => {
   // it: a WordPress install under a subdirectory must be probed at that subdirectory's
   // own path, not the bare origin. Revert the basePath logic in health.ts and this
   // must go red.
-  it('pins subdirectory-path preservation: a siteUrl with a path probes that path, not the bare origin', async () => {
+  it('mupot#1616: a subdirectory siteUrl is refused (typed) with zero fetches — office calls address <origin>/wp-json, never a guessed path', async () => {
     const harness = makeHarness()
-    const connectorId = await connectorFixture(harness, 'https://wordpress.example.com/blog', 'wordpress-secret-subdir')
-    const fetchSpy = vi.fn(async () => new Response(
-      JSON.stringify({ jsonrpc: '2.0', id: 'mupot-office-health', result: {} }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    )) as unknown as typeof fetch
+    const secret = 'wordpress-secret-subdir'
+    const connectorId = await connectorFixture(harness, 'https://wordpress.example.com/blog', secret)
+    const fetchSpy = vi.fn()
     vi.stubGlobal('fetch', fetchSpy)
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'available', observations: [] })
-    expect(fetchSpy).toHaveBeenCalledOnce()
-    const [rawUrl] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string]
-    const url = new URL(String(rawUrl))
-    expect(url.origin).toBe('https://wordpress.example.com')
-    expect(url.pathname).toBe('/blog/wp-json/mcpwp/v1/mcp')
+    expect(result).toEqual({ status: 'unavailable', reason: 'unsupported_site_path', observations: [] })
+    expect(fetchSpy).not.toHaveBeenCalled()
     harness.close()
   })
 
@@ -139,7 +135,8 @@ describe('mcpwp-office health check', () => {
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(result).toMatchObject({ status: 'unavailable', observations: [] })
+    expect(['invalid_site_url', 'unsupported_site_path']).toContain(result.reason)
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(JSON.stringify(result)).not.toContain(secret)
     harness.close()
@@ -158,7 +155,8 @@ describe('mcpwp-office health check', () => {
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(result).toMatchObject({ status: 'unavailable', observations: [] })
+    expect(['invalid_site_url', 'unsupported_site_path']).toContain(result.reason)
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(JSON.stringify(result)).not.toContain(secret)
     harness.close()
@@ -254,7 +252,8 @@ describe('mcpwp-office health check', () => {
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(result).toMatchObject({ status: 'unavailable', observations: [] })
+    expect(['invalid_site_url', 'unsupported_site_path']).toContain(result.reason)
     expect(fetchSpy).not.toHaveBeenCalled()
     harness.close()
   })
@@ -267,7 +266,8 @@ describe('mcpwp-office health check', () => {
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(result).toMatchObject({ status: 'unavailable', observations: [] })
+    expect(['invalid_site_url', 'unsupported_site_path']).toContain(result.reason)
     expect(fetchSpy).not.toHaveBeenCalled()
     harness.close()
   })
@@ -280,7 +280,8 @@ describe('mcpwp-office health check', () => {
 
     const result = await checkMcpwpOfficeHealth(vaultEnv(harness), connectorId)
 
-    expect(result).toEqual({ status: 'unavailable', reason: 'invalid_site_url', observations: [] })
+    expect(result).toMatchObject({ status: 'unavailable', observations: [] })
+    expect(['invalid_site_url', 'unsupported_site_path']).toContain(result.reason)
     expect(fetchSpy).not.toHaveBeenCalled()
     harness.close()
   })

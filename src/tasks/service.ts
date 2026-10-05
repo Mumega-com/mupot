@@ -309,10 +309,10 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked' | 'detach_locked_result_present'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved'
 
 export class TaskUpdateConflictError extends Error {
-  constructor(readonly code: TaskUpdateConflictCode) {
+  constructor(readonly code: TaskUpdateConflictCode, readonly detail?: string) {
     super(code)
     this.name = 'TaskUpdateConflictError'
   }
@@ -468,11 +468,42 @@ function mapTaskProjectUpdateError(error: unknown): never {
 // projectSquadAccessStatements pattern already used elsewhere in this file
 // and in src/projects/service.ts for exactly this "extract the pure
 // statement, let a bigger batch include it" shape.
+/** True when `existing` is an approved gate:office task: the only rows whose
+ *  generic updates must carry the unresolved-publish-claim guard. */
+export function officeUpdateGuarded(existing: Pick<Task, 'gate_owner' | 'status'>): boolean {
+  return existing.gate_owner === 'gate:office' && existing.status === 'approved'
+}
+
+/** A generic task UPDATE matched 0 rows. For an office task whose claim is
+ *  unresolved that is the typed, actionable refusal; otherwise the ordinary
+ *  optimistic-concurrency conflict. */
+async function throwTaskUpdateConflict(env: Env, existing: Task): Promise<never> {
+  if (officeUpdateGuarded(existing)) {
+    const unresolved = await env.DB.prepare(`SELECT ${officePublishUnresolvedSql('?1')} AS unresolved`)
+      .bind(existing.id).first<{ unresolved: number }>()
+    if (unresolved?.unresolved) throw new TaskUpdateConflictError('office_publish_unresolved', OFFICE_PUBLISH_UNRESOLVED_MESSAGE)
+  }
+  throw new TaskUpdateConflictError('task_update_conflict')
+}
+
 function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
+  // mupot#1616: the ONE shared status/field UPDATE every generic writer reaches
+  // (MCP task_update, REST PATCH, routine actions, reversal step 2). For an
+  // APPROVED gate:office task it carries NOT EXISTS (unresolved publish claim) in
+  // its own WHERE, so a claim that lands between any pre-check and this write (a
+  // claim does not touch tasks.updated_at) still wins atomically: the task cannot
+  // leave 'approved' (or have its gate/fields changed) while a post may exist with
+  // no path to a receipt. Two variants, chosen by the gate_owner already read for
+  // this request: every other task runs the UNCHANGED statement and never
+  // references office_publish_freezes, so a schema without that table cannot make
+  // a non-office update throw.
+  const officeGuard = officeUpdateGuarded(existing)
+    ? ` AND NOT ${officePublishUnresolvedSql('tasks.id')}`
+    : ''
   return env.DB.prepare(
     `UPDATE tasks
         SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
-      WHERE id = ? AND updated_at = ? AND project_id IS ?`,
+      WHERE id = ? AND updated_at = ? AND project_id IS ?${officeGuard}`,
   ).bind(
     next.title,
     next.body,
@@ -510,7 +541,7 @@ export async function persistTaskUpdate(
   } catch (error) {
     mapTaskProjectUpdateError(error)
   }
-  if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
+  if (!result.meta?.changes) await throwTaskUpdateConflict(env, existing)
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -561,6 +592,10 @@ export interface VerdictReversalInput {
 export type VerdictReversalOutcome =
   | { ok: true; task: Task }
   | { ok: false; error: 'no_verdict_to_reverse' }
+  // mupot#1616: an office publish is in flight or unresolved (claimed, no outcome).
+  // Reversing now would let the rework loop mint a second freeze while a post may
+  // already exist on WordPress.
+  | { ok: false; error: 'office_publish_unresolved'; detail: string }
 
 // reverseTaskVerdict — FP-01 Slice 2 v2 round 2 (P0, kasra-review adversarial
 // gate on PR #1490 + Athena's binding ordering rider): the ONE function both
@@ -606,14 +641,71 @@ export type VerdictReversalOutcome =
 //      INSERT of the identical row is refused by its own UNIQUE(id)
 //      constraint, caught here, and treated as "already recorded", never a
 //      second receipt or a caller-visible error.
+/** An office publish was claimed (one WordPress create committed to) and has no
+ *  outcome yet: in flight, or ambiguous. `taskIdExpr` is a SQL expression for the
+ *  task id (a bind placeholder or a column), so every writer that can move an
+ *  office task out of 'approved' embeds the SAME predicate in its own statement. */
+export function officePublishUnresolvedSql(taskIdExpr: string): string {
+  return `EXISTS (SELECT 1 FROM office_publish_freezes WHERE task_id = ${taskIdExpr} AND claimed_at IS NOT NULL AND outcome IS NULL)`
+}
+
+export const OFFICE_PUBLISH_UNRESOLVED_MESSAGE =
+  'a publish is in flight or unresolved; run office.reconcile_stalled_publish first (do not reverse or edit the task)'
+
+/**
+ * The dashboard gate-execute "close the loop" write: an APPROVED task whose id is
+ * the executed gate's id becomes done with the receipt. Two statement variants
+ * chosen by the task's gate_owner: an approved gate:office task carries the
+ * unresolved-publish-claim guard in its own WHERE (atomic), every other task runs
+ * the unchanged statement and never references office_publish_freezes.
+ */
+export async function markApprovedTaskDoneFromGate(
+  env: Env,
+  taskId: string,
+  receiptResult: string,
+  now: string,
+): Promise<'done' | 'none' | 'office_publish_unresolved'> {
+  const row = await env.DB.prepare(`SELECT gate_owner FROM tasks WHERE id = ?1`).bind(taskId).first<{ gate_owner: string | null }>()
+  const guarded = row?.gate_owner === 'gate:office'
+  const result = await env.DB.prepare(
+    `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'approved'${guarded ? ` AND NOT ${officePublishUnresolvedSql('tasks.id')}` : ''}`,
+  ).bind(receiptResult, now, now, taskId).run()
+  if ((result.meta?.changes ?? 0) > 0) return 'done'
+  if (guarded) {
+    const unresolved = await env.DB.prepare(`SELECT ${officePublishUnresolvedSql('?1')} AS unresolved`).bind(taskId).first<{ unresolved: number }>()
+    if (unresolved?.unresolved) return 'office_publish_unresolved'
+  }
+  return 'none'
+}
+
 export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput): Promise<VerdictReversalOutcome> {
   const { existing, next, tenant, reason, actorId, actorType } = input
   const verdict = await findLatestVerdict(env, existing.id)
   if (!verdict) return { ok: false, error: 'no_verdict_to_reverse' }
   const fromStatus = existing.status
 
-  // Step 1 — CLOSE THE GATE FIRST, unconditionally, before anything else.
-  await markVerdictReversed(env, existing.id, next.updated_at)
+  // Step 1 — CLOSE THE GATE FIRST, before anything else. For an office task the
+  // stamp carries ONE extra condition IN THE SAME STATEMENT (never a read then a
+  // write): no unresolved publish claim. A publish claim itself requires this
+  // verdict to be unreversed, so exactly one of {reversal, claim} wins any race.
+  if (existing.gate_owner === 'gate:office') {
+    const stamped = await env.DB.prepare(
+      `UPDATE task_verdicts SET reversed_at = ?1
+        WHERE id = (
+          SELECT id FROM task_verdicts WHERE task_id = ?2 AND reversed_at IS NULL
+           ORDER BY decided_at DESC, id DESC LIMIT 1
+        )
+        AND NOT ${officePublishUnresolvedSql('?2')}`,
+    ).bind(next.updated_at, existing.id).run()
+    if ((stamped.meta?.changes ?? 0) === 0) {
+      // 0 rows is either "already reversed" (idempotent retry) or the guard.
+      const unresolved = await env.DB.prepare(`SELECT ${officePublishUnresolvedSql('?1')} AS unresolved`).bind(existing.id).first<{ unresolved: number }>()
+      if (unresolved?.unresolved) return { ok: false, error: 'office_publish_unresolved', detail: OFFICE_PUBLISH_UNRESOLVED_MESSAGE }
+    }
+  } else {
+    await markVerdictReversed(env, existing.id, next.updated_at)
+  }
 
   // Step 1b (mupot#1592 NEW-2) — office.publish_post's frozen-payload binding must
   // die with the verdict it was bound to. Idempotent (WHERE voided_at IS NULL, like
@@ -655,7 +747,7 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
     } catch (error) {
       mapTaskProjectUpdateError(error)
     }
-    if (!result.meta?.changes) throw new TaskUpdateConflictError('task_update_conflict')
+    if (!result.meta?.changes) await throwTaskUpdateConflict(env, existing)
     landed = next
   }
 
