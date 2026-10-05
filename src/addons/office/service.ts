@@ -62,7 +62,7 @@ import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../type
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
-import { parseSiteConnectorConfig, MCPWP_API_KEY_AUTH } from './health'
+import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH } from './health'
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
@@ -78,6 +78,7 @@ import {
   resolveEligibleActiveOfficeInstallationId,
   resolveOfficeConnectorBinding,
   resolveOfficeSiteOrigin,
+  officeSiteUrlIsSubdirectory,
   officeConnectorSatisfiesRequirement,
   resolveOfficePublishRequiredCapability,
   type OfficeResult,
@@ -599,7 +600,7 @@ interface WpPublishConnectorResult {
 export type WordpressPublishResult =
   | { readonly kind: 'delivered'; readonly value: OfficePublishPostOutcome; readonly createdStatus: string }
   | { readonly kind: 'definite_failure'; readonly reason: OfficeRefusalReason }
-  | { readonly kind: 'ambiguous' }
+  | { readonly kind: 'ambiguous'; readonly hint?: string }
 
 function officePayloadHashMetaValue(payloadSha256: string): string {
   return `${OFFICE_PAYLOAD_HASH_META_PREFIX}${payloadSha256}`
@@ -626,6 +627,8 @@ async function wordpressPublish(
       // Pre-send failure: the SSRF guard refused before any fetch — definite.
       return { status: 'unavailable', reason: 'invalid_site_url', observations: [] }
     }
+    // Subdirectory installs are refused (see isRootSiteUrl): pre-send, definite.
+    if (!isRootSiteUrl(base)) return { status: 'unavailable', reason: 'invalid_site_url', observations: [] }
 
     const endpoint = new URL(MCPWP_POSTS_PATH, base.origin)
     const controller = new AbortController()
@@ -669,7 +672,8 @@ async function wordpressPublish(
       // The request reached the network (and very possibly WordPress's own
       // insert logic); the status code alone cannot prove it did not.
       if (!response.ok) {
-        return { status: 'failed', reason: 'ambiguous_response', observations: [] }
+        // The status code only picks the HINT; it never makes the outcome definite.
+        return { status: 'failed', reason: `ambiguous_response_${response.status}`, observations: [] }
       }
       const body = (await response.json().catch(() => null)) as { id?: unknown; url?: unknown; status?: unknown } | null
       if (!body || typeof body.id !== 'number' || typeof body.url !== 'string' || !body.url) {
@@ -707,7 +711,21 @@ async function wordpressPublish(
   if (reason === 'invalid_site_config' || reason === 'invalid_site_url') {
     return { kind: 'definite_failure', reason }
   }
-  return { kind: 'ambiguous' }
+  return { kind: 'ambiguous', ...(publishRefusalHint(reason) ? { hint: publishRefusalHint(reason) } : {}) }
+}
+
+/** A plain-language reason for the two statuses an operator can actually act on.
+ *  Fixed strings only: nothing from the response body or the credential is echoed. */
+function publishRefusalHint(reason: string): string | undefined {
+  if (reason === 'ambiguous_response_403') {
+    return 'WordPress/MCPWP answered 403 to the create. The outcome is treated as unknown, so the claim stays locked and a retry cannot double-post. '
+      + 'MCPWP 3.13.0+ requires an ADMIN-scope key to create a post with status publish, private or future: '
+      + 'use connector meta publish_status:"draft" with a write-scope key, or use an admin-scope key. Check WordPress for a post before reconciling.'
+  }
+  if (reason === 'ambiguous_response_401') {
+    return 'WordPress/MCPWP did not accept the connector key (401). The outcome is treated as unknown and the claim stays locked. Check the MCPWP API key in the connector, then check WordPress for a post before reconciling.'
+  }
+  return undefined
 }
 
 // mupot#1610, r3 (kasra-review adversarial gate ROUND 2 on #1614 — the SECOND
@@ -784,6 +802,7 @@ async function wpReconcileGet(
     } catch {
       return { status: 'unavailable', observations: [] }
     }
+    if (!isRootSiteUrl(base)) return { status: 'unavailable', observations: [] }
     const endpoint = buildEndpoint(base)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WP_PUBLISH_TIMEOUT_MS)
@@ -879,6 +898,7 @@ async function lookupWordpressPostByMeta(
 
   const expectedHash = officePayloadHashMetaValue(payloadSha256)
   let found: WpCandidate | null = null
+  let matches = 0
   let conflict = false
   let unverified = unreadable > 0 || incomplete
   let checked = 0
@@ -900,48 +920,62 @@ async function lookupWordpressPostByMeta(
     }
     if (idem !== idempotencyKey) continue // not ours (absent, or another claim's key)
     const hash = readMcpwpMetaValue(metaRead.body, OFFICE_PAYLOAD_HASH_META_KEY)
-    if (hash === expectedHash) found = found ?? candidate
-    else conflict = true
+    if (hash === expectedHash) {
+      matches += 1
+      found = found ?? candidate
+    } else conflict = true
   }
   // A conflict outranks a find: a post under our key with different content means
   // the identity is ambiguous, and ambiguity must refuse, not adopt.
-  if (conflict) return { status: 'conflict' }
+  // Two or more posts carrying the same key AND hash is also a conflict: a WordPress
+  // author can copy custom fields onto their own post, so "first match wins" would
+  // let a copy be adopted as ours.
+  if (conflict || matches > 1) return { status: 'conflict' }
   if (found) return { status: 'found', ...found }
   if (byId.size > 0 || unverified) return { status: 'candidate' }
   return { status: 'unavailable' }
 }
 
 /**
- * Marks the task done with the WordPress write's result — the "execution receipt"
- * (Task.result/completed_at are the existing, generic fields for this; see the file
- * header for why no new receipts table was built). Guarded atomically on
- * `status = 'approved'`: a concurrent second publish attempt (or a task that somehow
- * left 'approved' between the verdict check and here) gets zero rows changed, which
- * the caller treats as a race/already-executed refusal rather than a silent
- * double-write.
+ * The ONE place a 'done' outcome is committed: the freeze row's outcome and the
+ * task's done receipt (Task.result/completed_at are the existing generic fields;
+ * see the file header for why no receipts table was built) land in ONE D1 batch
+ * (a transaction). If either statement throws, neither lands, `outcome` stays NULL
+ * and the claim stays open, so office.reconcile_stalled_publish can still adopt
+ * the post. Writing them as two statements left `outcome = 'done'` on a task still
+ * 'approved' when the second failed, which reconcile refuses as already_reconciled:
+ * a live post with no receipt and no way back (mupot#1616, publish AND reconcile).
+ *
+ * The task UPDATE is conditional on THIS batch's freeze UPDATE having landed
+ * (EXISTS on the done row stamped with this call's own completed_at): a batch does
+ * not roll back on a zero-row UPDATE, so without that a lost freeze race would
+ * still flip the task.
+ *  - 'already_reconciled': the freeze row was not open (someone else resolved it).
+ *  - 'verdict_race': the freeze landed but the task was no longer 'approved'.
+ * Throws if the batch itself fails; callers map that to a refusal that leaves the
+ * claim open.
  */
-async function markOfficeTaskPublished(
+async function commitOfficeDoneReceipt(
   env: Env,
   taskId: string,
-  outcome: OfficePublishPostOutcome,
-  // r3 P3-1 (kasra-review r2 adversarial gate): an explicit, honest note for
-  // when the found post is NOT actually live (e.g. `wpStatus: 'trash'`) — the
-  // postId/articleUrl WordPress assigned are still factually true regardless
-  // of status, but the receipt must never let a reader assume "live" by
-  // omission.
-  note?: string,
-): Promise<boolean> {
+  freezeOutcomeDetail: string,
+  result: { postId: number; articleUrl: string; note?: string },
+): Promise<'ok' | 'already_reconciled' | 'verdict_race'> {
   const now = new Date().toISOString()
-  const result = await env.DB.prepare(`
-    UPDATE tasks
-       SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
-     WHERE id = ?3 AND status = 'approved'
-  `).bind(
-    JSON.stringify({ postId: outcome.postId, articleUrl: outcome.articleUrl, ...(note ? { note } : {}) }),
-    now,
-    taskId,
-  ).run()
-  return (result.meta?.changes ?? 0) > 0
+  const [freezeUpdate, taskUpdate] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2
+        WHERE task_id = ?3 AND outcome IS NULL AND claimed_at IS NOT NULL`,
+    ).bind(freezeOutcomeDetail, now, taskId),
+    env.DB.prepare(
+      `UPDATE tasks SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
+        WHERE id = ?3 AND status = 'approved'
+          AND EXISTS (SELECT 1 FROM office_publish_freezes WHERE task_id = ?3 AND outcome = 'done' AND completed_at = ?2)`,
+    ).bind(JSON.stringify(result), now, taskId),
+  ])
+  if ((freezeUpdate?.meta?.changes ?? 0) === 0) return 'already_reconciled'
+  if ((taskUpdate?.meta?.changes ?? 0) === 0) return 'verdict_race'
+  return 'ok'
 }
 
 interface OfficeFreezeRoutingRow {
@@ -1003,7 +1037,9 @@ export async function publishOfficePost(
   const bindingResult = await resolveOfficeConnectorBinding(env, installationId)
   if (!bindingResult.ok) return bindingResult
   const siteOrigin = await resolveOfficeSiteOrigin(env, bindingResult.value.connectorId)
-  if (!siteOrigin) return { ok: false, reason: 'invalid_site_config' }
+  if (!siteOrigin) {
+    return { ok: false, reason: (await officeSiteUrlIsSubdirectory(env, bindingResult.value.connectorId)) ? 'unsupported_site_path' : 'invalid_site_config' }
+  }
   if (
     installationId !== freezeRow.installation_id ||
     bindingResult.value.connectorId !== freezeRow.connector_id ||
@@ -1099,7 +1135,7 @@ export async function publishOfficePost(
   // for the full reasoning. The row stays claimed forever until an operator
   // reconciles it; there is no automatic retry.
   if (published.kind === 'ambiguous') {
-    return { ok: false, reason: 'publish_outcome_unknown' }
+    return { ok: false, reason: 'publish_outcome_unknown', ...(published.hint ? { hint: published.hint } : {}) }
   }
 
   if (published.kind === 'definite_failure') {
@@ -1109,33 +1145,18 @@ export async function publishOfficePost(
     return { ok: false, reason: published.reason }
   }
 
-  // The post EXISTS on WordPress from here on. The two receipt writes (the freeze
-  // row's outcome and the task's done receipt) land in ONE batch (a D1 batch is a
-  // transaction): if either statement throws, neither lands, `outcome` stays NULL
-  // and the claim stays open — office.reconcile_stalled_publish then finds the
-  // post by its meta and adopts it. Previously the freeze outcome was written
-  // first and a failure of the task write left `outcome = 'done'` on a task still
-  // 'approved', which reconcile refuses as already_reconciled: a live post with
-  // no receipt and no way back.
+  // The post EXISTS on WordPress from here on: both receipt writes in one batch
+  // (see commitOfficeDoneReceipt). A failure leaves the claim open for reconcile.
   // A draft (or any non-public status the SITE reports) is recorded as such so a
   // reader never assumes "live" by omission.
-  const note = published.createdStatus === 'publish' ? null : `created on WordPress with status "${published.createdStatus}" — not public`
-  const resultJson = JSON.stringify({ postId: published.value.postId, articleUrl: published.value.articleUrl, ...(note ? { note } : {}) })
-  let taskChanges: number
+  const note = published.createdStatus === 'publish' ? undefined : `created on WordPress with status "${published.createdStatus}" — not public`
+  let committed: Awaited<ReturnType<typeof commitOfficeDoneReceipt>>
   try {
-    const [, taskUpdate] = await env.DB.batch([
-      env.DB.prepare(
-        `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2 WHERE task_id = ?3`,
-      ).bind(JSON.stringify(published.value), now, task.id),
-      env.DB.prepare(
-        `UPDATE tasks SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2 WHERE id = ?3 AND status = 'approved'`,
-      ).bind(resultJson, now, task.id),
-    ])
-    taskChanges = taskUpdate.meta?.changes ?? 0
+    committed = await commitOfficeDoneReceipt(env, task.id, JSON.stringify(published.value), { ...published.value, ...(note ? { note } : {}) })
   } catch {
     return { ok: false, reason: 'publish_outcome_unknown' }
   }
-  if (taskChanges === 0) return { ok: false, reason: 'verdict_race' }
+  if (committed !== 'ok') return { ok: false, reason: 'verdict_race' }
 
   return { ok: true, value: published.value }
 }
@@ -1304,11 +1325,16 @@ export async function reconcileStalledOfficePublish(
     // NEVER overridable — live evidence wins outright regardless of what the
     // operator asked for or attested. A trashed find is recorded honestly.
     const isLive = lookup.wpStatus === 'publish'
+    // What adoption proves: the post carries THIS claim's idempotency key and the
+    // approved payload hash, stamped at create. It does NOT prove the post's
+    // CURRENT content still matches (it could have been edited since), so the
+    // receipt says "stamp verified", never "content verified".
     return applyReconcileOutcome(env, task, auth, 'done', lookup.postId, lookup.articleUrl, detail, {
       adoptedByPostMeta: true,
-      verifiedLiveOnWordpress: isLive,
-      ...(isLive ? {} : { wordpressStatus: lookup.wpStatus }),
-    }, isLive ? undefined : `found in WordPress with status "${lookup.wpStatus}" — not currently live`)
+      postMetaStampVerified: true,
+      contentReverified: false,
+      wordpressStatus: lookup.wpStatus,
+    }, `adopted: the post carries this claim's idempotency stamp and approved-payload hash (stamp verified; its current content was NOT re-verified)${isLive ? '' : `; found with status "${lookup.wpStatus}" — not currently live`}`)
   }
 
   if (lookup.status === 'conflict') {
@@ -1354,7 +1380,7 @@ export async function reconcileStalledOfficePublish(
 /** The single write path for a terminal reconcile outcome ('done' or
  *  'failed') — shared by the no-idempotency-key fallback, the `found` branch,
  *  and the retry-eligible override branch, so the TOCTOU-safe UPDATE and the
- *  markOfficeTaskPublished call are never duplicated. */
+ *  commitOfficeDoneReceipt call are never duplicated. */
 async function applyReconcileOutcome(
   env: Env,
   task: Task,
@@ -1380,16 +1406,25 @@ async function applyReconcileOutcome(
   // the earlier SELECT) — closes the TOCTOU between that read and this UPDATE
   // (two concurrent reconcile calls, or this exact publish's own outcome
   // write landing in between).
+  if (outcome === 'done' && postId !== null && articleUrl !== null) {
+    // Adoption is the main recovery path, so it gets the same all-or-nothing
+    // receipt as the publish itself: a throw leaves the claim open to retry.
+    let committed: Awaited<ReturnType<typeof commitOfficeDoneReceipt>>
+    try {
+      committed = await commitOfficeDoneReceipt(env, task.id, outcomeDetail, { postId, articleUrl, ...(doneNote ? { note: doneNote } : {}) })
+    } catch {
+      return { ok: false, reason: 'write_failed' }
+    }
+    if (committed === 'already_reconciled') return { ok: false, reason: 'already_reconciled' }
+    if (committed === 'verdict_race') return { ok: false, reason: 'verdict_race' }
+    return { ok: true, value: { task } }
+  }
+
   const reconciled = await env.DB.prepare(
     `UPDATE office_publish_freezes SET outcome = ?1, outcome_detail = ?2, completed_at = ?3
       WHERE task_id = ?4 AND outcome IS NULL AND claimed_at IS NOT NULL`,
   ).bind(outcome, outcomeDetail, now, task.id).run()
   if ((reconciled.meta?.changes ?? 0) === 0) return { ok: false, reason: 'already_reconciled' }
-
-  if (outcome === 'done' && postId !== null && articleUrl !== null) {
-    const marked = await markOfficeTaskPublished(env, task.id, { postId, articleUrl }, doneNote)
-    if (!marked) return { ok: false, reason: 'verdict_race' }
-  }
 
   return { ok: true, value: { task } }
 }

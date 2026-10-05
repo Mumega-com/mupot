@@ -24,6 +24,8 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { checkMcpwpOfficeHealth } from '../src/addons/office/health'
+import { getTask } from '../src/mcp/index'
 import { createFakeMcpwp, type FakeMcpwpPost, type FakeMcpwpPostMode } from './helpers/fake-mcpwp'
 import { applyAllMigrations } from './helpers/migrations'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
@@ -1003,7 +1005,10 @@ describe('office.publish_post', () => {
     const connectorId = await seedWordpressConnector(harness, 'https://blog.example.com//169.254.169.254/x', secret)
     seedActiveOfficeInstallation(harness, connectorId)
     const taskId = await makeOfficeTask(testEnv, squadId)
-    await approveOfficeTask(testEnv, taskId)
+    // mupot#1616: a site URL with a path is refused already at freeze time, so the
+    // approval cannot even bind a payload; publish therefore refuses too.
+    const approval = await invokeTool(orgOwnerAuth(), testEnv, 'office.review_approval', { task_id: taskId, verdict: 'approved' }, ORIGIN)
+    expect(approval.ok).toBe(false)
 
     const fetchSpy = vi.fn()
     vi.stubGlobal('fetch', fetchSpy)
@@ -1013,16 +1018,8 @@ describe('office.publish_post', () => {
       { task_id: taskId }, ORIGIN,
     )
 
-    // The stored siteUrl's HOST ('blog.example.com') is itself public/https, so
-    // assertPublicHttpsUrl(config.siteUrl) passes — but the write only ever uses
-    // base.origin (a plain string) to build the endpoint, never the hostile pathname,
-    // so no host-confusion is possible and no fetch is refused for THAT reason. This
-    // test pins that guarantee structurally: whatever the outcome, fetch is never
-    // called against the metadata host.
-    if (fetchSpy.mock.calls.length > 0) {
-      const [rawUrl] = fetchSpy.mock.calls[0] as [string]
-      expect(new URL(String(rawUrl)).hostname).toBe('blog.example.com')
-    }
+    expect(result.ok).toBe(false)
+    expect(fetchSpy).not.toHaveBeenCalled()
     expect(JSON.stringify(result)).not.toContain(secret)
     harness.close()
   })
@@ -2687,7 +2684,8 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
       postId: 777,
       articleUrl: 'https://wordpress.example.com/?p=777',
       adoptedByPostMeta: true,
-      verifiedLiveOnWordpress: true,
+      postMetaStampVerified: true,
+      contentReverified: false,
     })
     harness.close()
   })
@@ -3217,5 +3215,253 @@ describe('mupot#1616: MCPWP API-key auth and post-meta idempotency', () => {
     expect(recon.ok).toBe(true) // adopted by meta
     expect(violations).toEqual([])
     ctx.harness.close()
+  })
+})
+
+
+// ── mupot#1616 gate round 1 ────────────────────────────────────────────────────
+describe('mupot#1616 gate r1: atomic receipts, key scope, duplicates, redirects, caps, subdirectories', () => {
+  const runtimeKey = (): string => ['mcpwp', 'gatekey', crypto.randomUUID().replaceAll('-', '')].join('_')
+
+  async function approvedTask(metaExtra: Record<string, unknown> = {}) {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const apiKey = runtimeKey()
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', apiKey, metaExtra)
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    return { harness, testEnv, apiKey, connectorId, departmentId, taskId }
+  }
+  type Ctx = Awaited<ReturnType<typeof approvedTask>>
+  const publish = (c: Ctx) => invokeTool(officeLead(c.departmentId), c.testEnv, 'office.publish_post', { task_id: c.taskId }, ORIGIN)
+  const reconcile = (c: Ctx, args: Record<string, unknown> = {}, e: Env = c.testEnv) =>
+    invokeTool(orgOwnerAuth(), e, 'office.reconcile_stalled_publish', { task_id: c.taskId, outcome: 'failed', ...args }, ORIGIN)
+  const backdate = (c: Ctx) => c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_at = ? WHERE task_id = ? AND outcome IS NULL`)
+    .run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+
+  /** A DB whose done-receipt TASK statement is invalid SQL: the REAL transactional
+   *  batch then fails as a whole, so whether the freeze UPDATE survives is decided by
+   *  the production code's batching, not by this double. */
+  function envWithBrokenTaskReceipt(c: Ctx): Env {
+    const realDb = c.testEnv.DB
+    const db = {
+      prepare: (sql: string) => realDb.prepare(sql.includes("UPDATE tasks SET status = 'done'") ? 'UPDATE tasks SET no_such_column = 1' : sql),
+      batch: (statements: D1PreparedStatement[]) => realDb.batch(statements),
+    } as unknown as D1Database
+    return { ...c.testEnv, DB: db } as Env
+  }
+
+  it('P1-1: a failing task receipt during RECONCILE adoption rolls back the freeze outcome — the claim stays open and a later reconcile adopts (never already_reconciled with an approved task)', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false)
+    backdate(c)
+
+    const broken = await reconcile(c, {}, envWithBrokenTaskReceipt(c))
+    expect(broken.ok).toBe(false)
+    const open = c.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { outcome: string | null }
+    expect(open.outcome).toBeNull()
+    expect((c.harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(c.taskId) as { status: string }).status).toBe('approved')
+
+    const adopted = await reconcile(c)
+    expect(adopted.ok).toBe(true)
+    expect((c.harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(c.taskId) as { status: string }).status).toBe('done')
+    expect(wp.posts).toHaveLength(1)
+    c.harness.close()
+  })
+
+  it('P1-1: the same holds for the PUBLISH receipt (failing task statement -> claim open, reconcile adopts, one post)', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey })
+    vi.stubGlobal('fetch', wp.f)
+    const first = await invokeTool(officeLead(c.departmentId), envWithBrokenTaskReceipt(c), 'office.publish_post', { task_id: c.taskId }, ORIGIN)
+    expect(first.ok).toBe(false)
+    expect((c.harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { outcome: string | null }).outcome).toBeNull()
+    backdate(c)
+    expect((await reconcile(c)).ok).toBe(true)
+    expect(wp.posts).toHaveLength(1)
+    c.harness.close()
+  })
+
+  it('P1-2: a WRITE-scope key creating a DRAFT works (MCPWP 3.13.0: only publish/private/future need admin)', async () => {
+    const c = await approvedTask({ publish_status: 'draft' })
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, scope: 'write' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(true)
+    expect(wp.posts[0]?.status).toBe('draft')
+    c.harness.close()
+  })
+
+  it('P1-2: a WRITE-scope key with the default publish status gets 403 -> publish_outcome_unknown with a plain-language hint (no key), claim stays locked, no double post', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, scope: 'write' })
+    vi.stubGlobal('fetch', wp.f)
+
+    const first = await publish(c)
+
+    expect(first.ok).toBe(false)
+    if (!first.ok) expect(first.error).toBe('publish_outcome_unknown')
+    const shown = JSON.stringify(first)
+    expect(shown).toContain('ADMIN-scope')
+    expect(shown).toContain('publish_status')
+    expect(shown).not.toContain(c.apiKey)
+    expect(wp.posts).toHaveLength(0)
+    const retry = await publish(c)
+    if (!retry.ok) expect(retry.error).toBe('publish_claimed')
+    expect(wp.requests.filter((r) => r.method === 'POST')).toHaveLength(1)
+    const freeze = c.harness.sqlite.prepare(`SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { claimed_at: string | null; outcome: string | null }
+    expect(freeze.claimed_at).not.toBeNull()
+    expect(freeze.outcome).toBeNull()
+    c.harness.close()
+  })
+
+  it('P1-2: an ADMIN-scope key may publish', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, scope: 'admin' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(true)
+    expect(wp.posts[0]?.status).toBe('publish')
+    c.harness.close()
+  })
+
+  it('P2-a: two posts carrying the same key AND hash (a copied custom field) is a conflict, never adopted', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false)
+    const original = wp.posts[0]
+    if (!original) throw new Error('fixture')
+    wp.posts.push({ ...original, id: 9100, meta: { ...original.meta } })
+    backdate(c)
+    const refused = await reconcile(c)
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_conflict')
+    c.harness.close()
+  })
+
+  it('P2-b: adoption of a post defaced after creation (stamp intact) says "stamp verified", never "content verified"', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert' })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false)
+    const post = wp.posts[0]
+    if (!post) throw new Error('fixture')
+    post.content = 'DEFACED'
+    backdate(c)
+    expect((await reconcile(c)).ok).toBe(true)
+    const freeze = c.harness.sqlite.prepare(`SELECT outcome_detail FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { outcome_detail: string }
+    const detail = JSON.parse(freeze.outcome_detail) as Record<string, unknown>
+    expect(detail.postMetaStampVerified).toBe(true)
+    expect(detail.contentReverified).toBe(false)
+    expect(detail).not.toHaveProperty('verifiedLiveOnWordpress')
+    const task = c.harness.sqlite.prepare(`SELECT result FROM tasks WHERE id = ?`).get(c.taskId) as { result: string }
+    expect(task.result).toContain('NOT re-verified')
+    c.harness.close()
+  })
+
+  it('P2-c: publish, lookup AND health all refuse redirects (redirect:"manual") — a 302 to another host never receives the key', async () => {
+    const c = await approvedTask()
+    const evil: { headers: Headers }[] = []
+    // A runtime that FOLLOWS unless told 'manual' (and, like fetch, would carry
+    // X-API-Key across origins): the second host records what it was sent.
+    const stub = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.host === 'evil.example.net') {
+        evil.push({ headers: new Headers(init?.headers) })
+        return new Response('{}', { status: 200 })
+      }
+      const redirect = new Response(null, { status: 302, headers: { location: 'https://evil.example.net/steal' } })
+      if (init?.redirect !== 'manual') {
+        evil.push({ headers: new Headers(init?.headers) })
+        return new Response('{}', { status: 200 })
+      }
+      return redirect
+    }) as unknown as typeof fetch
+    vi.stubGlobal('fetch', stub)
+
+    const published = await publish(c) // 302 on create -> ambiguous
+    expect(published.ok).toBe(false)
+    backdate(c)
+    const recon = await reconcile(c) // 302 on every lookup GET -> unavailable
+    expect(recon.ok).toBe(false)
+    const health = await checkMcpwpOfficeHealth(c.testEnv, c.connectorId)
+    expect(health.status).toBe('failed')
+
+    expect(evil).toHaveLength(0)
+    for (const call of (stub as unknown as { mock: { calls: [unknown, RequestInit | undefined][] } }).mock.calls) {
+      expect(call[1]?.redirect).toBe('manual')
+    }
+    c.harness.close()
+  })
+
+  it('P2-d: the lookup reads at most 20 candidates\' meta — a matching post beyond the cap is NOT adopted (candidate), and the cap is pinned', async () => {
+    const c = await approvedTask()
+    const seed: FakeMcpwpPost[] = []
+    // 25 posts whose title matches the task title, none carrying our stamp except the last.
+    for (let i = 0; i < 25; i++) seed.push({ id: 500 + i, slug: `other-${i}`, status: 'draft', title: 'Publish: Q4 recap', content: '', type: 'post', meta: {} })
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, seed })
+    vi.stubGlobal('fetch', wp.f)
+    // claim by hand with a known key, then stamp the LAST seeded post as ours
+    c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_by = 'ghost', claimed_at = ?, idempotency_key = 'idem-cap' WHERE task_id = ?`)
+      .run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+    const hash = (c.harness.sqlite.prepare(`SELECT payload_sha256 FROM office_publish_freezes WHERE task_id = ?`).get(c.taskId) as { payload_sha256: string }).payload_sha256
+    const last = wp.posts[24]
+    if (!last) throw new Error('fixture')
+    last.meta = { [OFFICE_IDEMPOTENCY_META_KEY]: 'idem-cap', [OFFICE_PAYLOAD_HASH_META_KEY]: `sha256-${hash}` }
+
+    const refused = await reconcile(c)
+
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_candidate_found')
+    expect(wp.requests.filter((r) => r.path.startsWith('/wp-json/mcpwp/v1/post-meta/'))).toHaveLength(20)
+    c.harness.close()
+  })
+
+  it('P2-d: a truncated list (total > returned) with no readable post is a candidate, never "nothing found"', async () => {
+    const c = await approvedTask()
+    c.harness.sqlite.prepare(`UPDATE office_publish_freezes SET claimed_by = 'ghost', claimed_at = ?, idempotency_key = 'idem-trunc' WHERE task_id = ?`)
+      .run(new Date(Date.now() - 60_000).toISOString(), c.taskId)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ posts: [], total: 3 }), { status: 200 })) as unknown as typeof fetch)
+    const refused = await reconcile(c)
+    expect(refused.ok).toBe(false)
+    if (!refused.ok) expect(refused.error).toBe('reconcile_candidate_found')
+    c.harness.close()
+  })
+
+  it('P2-e: a subdirectory site URL is refused with a typed reason before any fetch (freeze, and publish after a repoint)', async () => {
+    const c = await approvedTask()
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    c.harness.sqlite.prepare(`UPDATE connectors SET meta = ? WHERE id = ?`)
+      .run(JSON.stringify({ siteUrl: 'https://wordpress.example.com/blog' }), c.connectorId)
+
+    const task = await getTask(c.testEnv, c.taskId)
+    if (!task.ok) throw new Error('fixture')
+    const frozen = await buildOfficePublishFreeze(c.testEnv, task.task)
+    expect(frozen).toEqual({ ok: false, reason: 'unsupported_site_path' })
+
+    const result = await publish(c)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('unsupported_site_path')
+    expect(fetchSpy).not.toHaveBeenCalled()
+    c.harness.close()
+  })
+
+  it('P2-f: a search plugin that disables Mcpwp_Slug_Search leaves only the title search; if that misses too the result is "unavailable", never absence', async () => {
+    const c = await approvedTask()
+    const wp = createFakeMcpwp({ apiKey: c.apiKey, postMode: 'throwAfterInsert', slugSearch: false })
+    vi.stubGlobal('fetch', wp.f)
+    expect((await publish(c)).ok).toBe(false)
+    const post = wp.posts[0]
+    if (!post) throw new Error('fixture')
+    post.title = 'A completely different title' // retitled: neither search can see it
+    backdate(c)
+    const result = await reconcile(c)
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('reconcile_check_unavailable')
+    c.harness.close()
   })
 })

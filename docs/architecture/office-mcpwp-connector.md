@@ -58,9 +58,11 @@ candidate's `GET /mcpwp/v1/post-meta/{id}` and compare. The hash is stored behin
 | candidates exist but none can be proven ours | `reconcile_candidate_found`: refused, not overridable |
 | nothing found, or the check failed | `reconcile_check_unavailable`: only the audited, retried human override proceeds |
 
-A conflict outranks a find. A retried `publish_post` never reaches WordPress: the
+A conflict outranks a find, and so do two or more posts carrying the same key and hash (a WordPress author can copy custom fields onto their own post, so "first match wins" is not acceptable). A retried `publish_post` never reaches WordPress: the
 one-shot claim refuses it (`publish_claimed`). Retry after "post created, receipt
 write failed" goes through `office.reconcile_stalled_publish`, which adopts the post.
+
+Adoption proves the post carries this claim's idempotency stamp (key plus approved-payload hash, written at create). It does NOT prove the post's current content still matches; the receipt says `postMetaStampVerified: true, contentReverified: false`.
 
 Absence cannot be proven: the plugin cannot list trashed or custom-status posts,
 and search is not a meta query. The existing "no inferred-absence" posture from
@@ -72,3 +74,40 @@ Connector meta `publish_status: "draft"` creates the post with `status=draft`; t
 receipt notes it is not public. The default (no setting) is still `publish`, so
 approval semantics are unchanged. There is no separate "go public" tool: making a
 draft public is a manual step in WordPress today.
+
+## Key scope (MCPWP 3.13.0)
+
+Verified in the plugin source (`git show v3.13.0:mcpwp/includes/traits/trait-mcpwp-api-auth.php`,
+`publish_gated_routes` at line 1739 and the loop at 1812): `POST /mcpwp/v1/posts`
+needs an ADMIN-scope key when the body status is `publish`, `private` or `future`;
+a write-scope key may create drafts. 3.11.1 had no such gate. A read-scope key
+sees published posts only, so it cannot run the lookup for drafts.
+
+The office does not change its default status (`publish`, approval semantics). A
+write-scope key with the default therefore gets a 403 on the create. The 403 is
+treated as an unknown outcome (the claim stays locked, a retry cannot double-post)
+and `office.publish_post` returns a fixed, human-readable hint (no key, no response
+body): use `publish_status: "draft"` with a write key, or an admin key.
+
+## Runbook for a connector's first run
+
+1. Connector meta: `{"siteUrl": "https://example.com", "publish_status": "draft"}`; the
+   secret is a write-scope MCPWP key. Site URL must be a site ROOT.
+2. Publish once; confirm the draft in WordPress; make it public by hand.
+3. Only then consider an admin-scope key and `publish_status: "publish"`.
+4. Before using `override_reason` on a reconcile, check WordPress by hand for the post
+   by its title and by the `mupot_office_idem` custom field. The lookup can miss a post
+   (trashed, retitled and re-slugged, or a search plugin that disabled slug matching),
+   and an override after such a miss can produce a second post.
+
+## Other limits
+
+- Subdirectory installs (`https://example.com/blog`) are refused with
+  `unsupported_site_path` (publish, lookup, health): office calls address
+  `<origin>/wp-json`, which would hit a different application.
+- Redirects are never followed (`redirect: "manual"`) on publish, lookup and health:
+  `X-API-Key` is not stripped by fetch on a cross-origin redirect.
+- The SSRF check is lexical (`assertPublicHttpsUrl`); there is no DNS-rebinding
+  defence in the addon. Workers egress is the backstop.
+- The lookup reads at most 20 candidates' meta and treats a truncated list as
+  unverifiable (a candidate), never as nothing found.

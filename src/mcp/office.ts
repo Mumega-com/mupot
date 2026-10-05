@@ -52,6 +52,7 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'freeze_not_found':
     case 'already_reconciled':
     case 'reconcile_conflict':
+    case 'unsupported_site_path':
     case 'reconcile_candidate_found':
     case 'reconcile_check_unavailable':
     case 'reconcile_retry_required':
@@ -98,7 +99,7 @@ const toolOfficePublishPost: ToolSpec = {
     const taskRes = await getTask(env, taskRef)
     if (!taskRes.ok) return taskRes
     const result = await publishOfficePost(env, auth, { task: taskRes.task })
-    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason, result.hint)
     return done({ post_id: result.value.postId, article_url: result.value.articleUrl })
   },
 }

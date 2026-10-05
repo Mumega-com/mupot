@@ -43,6 +43,7 @@ export type McpwpOfficeHealthReason =
   | 'connector_unavailable'
   | 'invalid_site_config'
   | 'invalid_site_url'
+  | 'unsupported_site_path'
   | 'unreachable'
   | 'key_invalid'
 
@@ -79,6 +80,11 @@ export type OfficePublishStatus = 'draft' | 'publish'
  *  API key (X-API-Key) — pinned here, never inferred from editable connector meta
  *  (mupot#1616: publish and health must use the same auth). */
 export const MCPWP_API_KEY_AUTH = { mcpwpAuthMode: 'api_key' } as const satisfies UseConnectorOptions
+
+/** True when the URL addresses a site root (no path, query or fragment). */
+export function isRootSiteUrl(url: URL): boolean {
+  return (url.pathname === '/' || url.pathname === '') && url.search === '' && url.hash === ''
+}
 
 export interface SiteConnectorConfig {
   readonly siteUrl: string
@@ -131,38 +137,11 @@ export async function checkMcpwpOfficeHealth(
       return unavailable('invalid_site_url')
     }
 
-    // Resolve against the FULL stored URL, not just its origin — a WordPress site
-    // installed under a subdirectory (e.g. https://example.com/blog) must probe
-    // https://example.com/blog/wp-json/mcpwp/v1/mcp, not the bare-origin path (P3
-    // fix: `new URL(MCPWP_MCP_PATH, base.origin)` silently dropped `base.pathname`
-    // and always probed the wrong endpoint for any non-root install).
-    const basePath = base.pathname.endsWith('/') ? base.pathname.slice(0, -1) : base.pathname
-    const endpoint = new URL(`${basePath}${MCPWP_MCP_PATH}`, base.origin)
-
-    // mupot#1587 P1-A (round-2 gate on #1582): assertPublicHttpsUrl above only ever
-    // validated `config.siteUrl` (i.e. `base`) — but `endpoint` is then REBUILT by
-    // concatenating `basePath` (attacker/operator-controlled: it comes straight from
-    // the stored siteUrl's own pathname) into a new URL string and re-parsing it. The
-    // WHATWG URL parser treats a string beginning `//` as SCHEME-RELATIVE — it takes
-    // everything after the slashes as a NEW AUTHORITY (host), not a path segment — so
-    // a stored siteUrl of `https://blog.example.com//169.254.169.254/x` yields
-    // `basePath = '//169.254.169.254/x'`, and `new URL(basePath + MCPWP_MCP_PATH,
-    // base.origin)` silently resolves to `https://169.254.169.254/x/wp-json/...` —an
-    // entirely different, private/metadata host — with the vaulted Basic credential
-    // still attached by authenticatedFetch below. A leading `\\` reaches the same
-    // outcome (the URL parser normalizes backslashes to forward slashes for special
-    // schemes before this same scheme-relative rule applies). Re-validating `endpoint`
-    // from scratch (assertPublicHttpsUrl again, not just re-checking the host inline)
-    // AND requiring its origin to be BYTE-IDENTICAL to `base`'s origin closes this:
-    // any string that caused the rebuild to change host, port, or scheme is refused
-    // here, before authenticatedFetch is ever called — zero fetches, credential never
-    // sent. This must run on every request; it is not a one-time check on `siteUrl`.
-    try {
-      assertPublicHttpsUrl(endpoint.href)
-    } catch {
-      return unavailable('invalid_site_url')
-    }
-    if (endpoint.origin !== base.origin) return unavailable('invalid_site_url')
+    // mupot#1616: a subdirectory install (https://x/blog) is refused, for consistency
+    // with publish and lookup, which address <origin>/wp-json only. Guessing the
+    // path would probe (and send the key to) a different application.
+    if (!isRootSiteUrl(base)) return unavailable('unsupported_site_path')
+    const endpoint = new URL(MCPWP_MCP_PATH, base.origin)
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), MCPWP_OFFICE_HEALTH_TIMEOUT_MS)

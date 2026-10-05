@@ -41,8 +41,21 @@ export interface FakeMcpwpRequest {
   readonly body: unknown
 }
 
+export type FakeMcpwpScope = 'read' | 'write' | 'admin'
+
 export interface FakeMcpwpOptions {
   readonly apiKey: string
+  /** Scope of the key. Default 'admin' (so older tests are unchanged). Modelled from
+   *  MCPWP v3.13.0 (git show v3.13.0:mcpwp/includes/traits/trait-mcpwp-api-auth.php,
+   *  get_required_scope_for_request + request_targets_publish_status +
+   *  key_has_scope): POST /mcpwp/v1/posts needs 'write', and 'admin' when the body
+   *  status is publish|private|future; a read key sees published posts only. */
+  readonly scope?: FakeMcpwpScope
+  /** MCPWP 3.11.1 had no publish gate: set false to model it. Default true (3.13.0). */
+  readonly publishNeedsAdmin?: boolean
+  /** Mcpwp_Slug_Search opts a single-token search into slug matching; a search
+   *  plugin that touches the clause disables it (plain title/content search only). */
+  readonly slugSearch?: boolean
   readonly postMode?: FakeMcpwpPostMode
   readonly seed?: readonly FakeMcpwpPost[]
   /** Mutates the stored post right after the insert (a workflow plugin changing
@@ -100,9 +113,14 @@ export function createFakeMcpwp(options: FakeMcpwpOptions) {
     if (!presented || presented !== options.apiKey) return json({ code: 'missing_api_key' }, 401)
     const route = url.pathname.slice(prefix.length)
 
+    const scope = options.scope ?? 'admin'
     if (route === 'posts' && method === 'POST') {
       const data = body as { title: string; content: string; slug?: string; status?: string; meta?: Record<string, string> }
       const status = data.status ?? 'draft'
+      const targetsPublish = ['publish', 'private', 'future'].includes(status)
+      if (scope === 'read' || (scope === 'write' && targetsPublish && (options.publishNeedsAdmin ?? true))) {
+        return json({ code: 'insufficient_scope', required_scope: targetsPublish ? 'admin' : 'write' }, 403)
+      }
       let slug = data.slug ?? ''
       if (status === 'publish') {
         let n = 2
@@ -127,10 +145,11 @@ export function createFakeMcpwp(options: FakeMcpwpOptions) {
       const perPage = Number(url.searchParams.get('per_page') ?? '10')
       let matches = posts.filter((p) => p.type === 'post')
       matches = matches.filter((p) => (statusParam === 'any' ? p.status !== 'trash' : statusParam.split(',').includes(p.status)))
+      if (scope === 'read') matches = matches.filter((p) => p.status === 'publish') // non-public content needs write scope
       if (search !== null) {
         const hay = (p: FakeMcpwpPost) => `${p.title} ${p.content}`.toLowerCase()
         // Slug search is opt-in for a single token (Mcpwp_Slug_Search::should_match_slug).
-        const single = !/[\s",+]/.test(search)
+        const single = (options.slugSearch ?? true) && !/[\s",+]/.test(search)
         matches = matches.filter((p) => hay(p).includes(search.toLowerCase()) || (single && p.slug === search))
       }
       const page = matches.slice(0, perPage)
@@ -143,7 +162,7 @@ export function createFakeMcpwp(options: FakeMcpwpOptions) {
     const metaMatch = /^post-meta\/(\d+)$/.exec(route)
     if (metaMatch && method === 'GET') {
       const post = posts.find((p) => p.id === Number(metaMatch[1]))
-      if (!post) return json({ code: 'not_found' }, 404)
+      if (!post || (scope === 'read' && post.status !== 'publish')) return json({ code: 'not_found' }, 404)
       const entries = Object.entries(post.meta)
       if (entries.length === 0) return json({ id: post.id, meta: [] })
       return json({ id: post.id, meta: Object.fromEntries(entries.map(([k, v]) => [k, looksLikeCredential(v) ? '***' : v])) })
