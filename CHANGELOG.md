@@ -2,6 +2,14 @@
 
 ## [Unreleased] — main since v0.31.0
 
+- **task_get** (`kasra/task-get-read-tool`) - new member-tier MCP read tool
+  `task_get { task_id }`: one task row plus its latest `task_verdicts` row and latest
+  dispatch receipt (id + derived status). Row gate is `canReadTask` from the shared
+  task-visibility chokepoint (`src/tasks/visibility.ts`, mupot#1647), archived tasks
+  excluded exactly as `task_list` excludes them; an invisible task returns the same
+  `404 task_not_found` as a nonexistent id. Added to the public OpenAPI allowlist
+  (member tier). Pinned by `tests/mcp-task-get.test.ts` (agreement with `task_list`
+  across a real-grant caller matrix, strict bind-count wrapper).
 - **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
   GPT Actions discovery) now serves an explicit, committed allowlist
   (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)

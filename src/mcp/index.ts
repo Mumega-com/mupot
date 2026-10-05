@@ -178,7 +178,7 @@ import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
-import { canReadProjectForTasks, canReadSquadTasks, visibleTaskClause } from '../tasks/visibility'
+import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -1224,6 +1224,67 @@ const toolTaskBoard: ToolSpec = {
       ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
     ) as Record<TaskStatus, number>
     return done({ squad_id: squadRes.squad.id, counts, columns })
+  },
+}
+
+// task_get — read ONE task by id (plus its latest verdict and latest dispatch receipt).
+// VISIBILITY: the row gate is canReadTask from the shared task-visibility chokepoint
+// (src/tasks/visibility.ts, mupot#1647) — the single-row twin of task_list's gate and row
+// predicate, archived tasks EXCLUDED exactly as task_list excludes them. This tool never
+// re-derives rank / plane / home / archive rules. A task the caller cannot read answers with
+// the SAME 404 task_not_found as an id that does not exist (no existence oracle).
+const TASK_GET_FIELDS = [
+  'id', 'squad_id', 'project_id', 'title', 'body', 'done_when', 'status', 'assignee_agent_id',
+  'assignee_member_id', 'gate_owner', 'result', 'execution_receipt_id', 'completed_at',
+  'created_at', 'updated_at',
+] as const
+
+const toolTaskGet: ToolSpec = {
+  name: 'task_get',
+  scope: 'squad',
+  min: 'member',
+  args: '{ task_id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { task_id: STRING_SCHEMA },
+    required: ['task_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const taskId = str(args.task_id)
+    if (!taskId) return fail(400, 'invalid_args', 'task_id required')
+    // Shared projection (tasks/ranking.ts) + execution_receipt_id; the response is then narrowed
+    // to TASK_GET_FIELDS so a column added to the shared projection never widens this reader.
+    const full = await env.DB.prepare(
+      `SELECT ${TASK_SELECT_COLUMNS}, execution_receipt_id FROM tasks WHERE id = ?1 LIMIT 1`,
+    ).bind(taskId).first<Record<string, unknown> & { id: string; squad_id: string }>()
+    if (!full || !(await canReadTask(env, auth, { id: full.id, squad_id: full.squad_id }))) {
+      return fail(404, 'task_not_found')
+    }
+    const row = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
+    const verdict = await env.DB.prepare(
+      `SELECT verdict, decided_by, decided_at FROM task_verdicts
+        WHERE task_id = ?1 ORDER BY decided_at DESC, rowid DESC LIMIT 1`,
+    ).bind(full.id).first<{ verdict: string; decided_by: string; decided_at: string }>()
+    const dispatch = await env.DB.prepare(
+      `SELECT id, claimed_at, consumed_at, last_error FROM task_dispatch_receipts
+        WHERE tenant = ?1 AND task_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    ).bind(env.TENANT_SLUG, full.id).first<{
+      id: string
+      claimed_at: string | null
+      consumed_at: string | null
+      last_error: string | null
+    }>()
+    return done({
+      task: row,
+      latest_verdict: verdict ?? null,
+      latest_dispatch_receipt: dispatch
+        ? {
+            id: dispatch.id,
+            status: dispatch.consumed_at ? 'consumed' : dispatch.claimed_at ? 'claimed' : dispatch.last_error ? 'failed' : 'pending',
+          }
+        : null,
+    })
   },
 }
 
@@ -6109,6 +6170,7 @@ export const TOOLS: ToolSpec[] = [
   toolFlightReapStalled,
   toolTaskCreate,
   toolTaskList,
+  toolTaskGet,
   toolTaskBoard,
   toolKanbanBoard,
   toolTaskUpdate,
