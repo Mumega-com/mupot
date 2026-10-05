@@ -324,8 +324,18 @@ export async function createProject(
     // One batch = one transaction: the project row and its creator-squad edge
     // land together or not at all (statements built by the shared access
     // writer, never hand-rolled SQL).
+    // The edge is INSERT..SELECT guarded on the squad's CURRENT state (not
+    // archived, not home), so a squad archived between the caller's check and
+    // this batch silently gets no edge rather than a stale one (the project is
+    // still created; the caller reports whether the edge landed). A 'write'
+    // edge never needs the provider-binding invalidation the shared writer
+    // appends for downgrades, so this single statement is equivalent for it.
     const statements = opts.attachSquadId
-      ? [insertStmt, ...projectSquadAccessStatements(env, project.id, opts.attachSquadId, 'write', now)]
+      ? [insertStmt, env.DB.prepare(
+          `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+           SELECT ?1, id, 'write', ?3 FROM squads
+            WHERE id = ?2 AND status != 'archived' AND kind != 'home'`,
+        ).bind(project.id, opts.attachSquadId, now)]
       : [insertStmt]
     const results = statements.length > 1 ? await env.DB.batch(statements) : [await insertStmt.run()]
     if (!wrote(results[0])) return { ok: false, error: 'receipt_failed' }

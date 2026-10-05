@@ -1046,7 +1046,6 @@ const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
  *  nothing and is not consulted by any authorization decision. */
 const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze({
   project_create: 'action:workspace_project',
-  project_squad_set: 'action:manage_access',
   grant_agent_capability: 'action:manage_access',
   mint_agent_token: 'action:mint_token',
   create_squad: 'action:project_lifecycle',

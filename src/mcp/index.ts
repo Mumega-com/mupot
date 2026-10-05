@@ -6382,9 +6382,6 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'grant_agent_capability',
   'create_squad',
   'project_create',
-  // mupot#1674: project_squad_set consults action:manage_access (scoped to the
-  // target squad) inside run(); unreachable without membership here.
-  'project_squad_set',
 ])
 
 export async function invokeTool(

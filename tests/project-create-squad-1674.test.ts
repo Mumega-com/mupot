@@ -5,6 +5,7 @@ import { invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { ELEVATION_ACTIONS } from '../src/auth/elevation-actions'
 import { createElevationRequest, decideElevationRequest } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
 import { resolveCapabilities } from '../src/auth/capability'
@@ -260,7 +261,7 @@ describe('#1674 (1) project_create attaches the creator squad', () => {
   })
 })
 
-describe('#1674 (2) project_squad_set honours action:manage_access, scoped to the target squad', () => {
+describe('#1674 (2, cut) project_squad_set stays standing-org-admin only: no elevation opens it', () => {
   let projectId: string
   beforeEach(async () => {
     seedExtra()
@@ -268,44 +269,36 @@ describe('#1674 (2) project_squad_set honours action:manage_access, scoped to th
     projectId = (res.result as { project: { id: string } }).project.id
   })
 
-  it('no grant at all: plain refusal that names request_elevation + the action key', async () => {
-    const res = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: LEAD_SQUAD_ID, access_level: 'write' }, ORIGIN)
-    expect(res.ok).toBe(false)
-    expect(JSON.stringify(res)).toContain('request_elevation')
-    expect(JSON.stringify(res)).toContain('action:manage_access')
+  it.each([
+    ['squad', LEAD_SQUAD_ID],
+    ['org', ''],
+  ] as const)('a live manage_access grant (%s scope) does not let an agent attach any squad', async (scopeType, scopeId) => {
+    await elevate(['action:manage_access'], scopeType, scopeId)
+    for (const level of ['write', 'admin']) {
+      const res = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: LEAD_SQUAD_ID, access_level: level }, ORIGIN)
+      expect(res.ok).toBe(false)
+    }
     expect(edges(projectId)).toEqual([])
   })
 
-  it('squad-scoped grant: may attach THAT squad, not another', async () => {
-    await elevate(['action:manage_access'], 'squad', LEAD_SQUAD_ID)
-    const ok = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: LEAD_SQUAD_ID, access_level: 'write' }, ORIGIN)
-    expect(ok.ok, JSON.stringify(ok)).toBe(true)
-    expect(edges(projectId)).toEqual([{ squad_id: LEAD_SQUAD_ID, access_level: 'write' }])
-    const cross = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: OTHER_SQUAD_ID, access_level: 'write' }, ORIGIN)
-    expect(cross.ok).toBe(false)
-    expect(JSON.stringify(cross)).toContain('no_matching_grant')
-    expect(edges(projectId)).toEqual([{ squad_id: LEAD_SQUAD_ID, access_level: 'write' }])
-  })
-
-  it('a grant for a DIFFERENT action does not open it', async () => {
-    await elevate(['action:mint_token'], 'squad', LEAD_SQUAD_ID)
+  it('the plain refusal does not advertise request_elevation', async () => {
     const res = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: LEAD_SQUAD_ID, access_level: 'write' }, ORIGIN)
     expect(res.ok).toBe(false)
+    expect(JSON.stringify(res)).not.toContain('request_elevation')
   })
 
-  it('even an org-scoped grant never reaches a home squad', async () => {
-    await elevate(['action:manage_access'], 'org', '')
-    const res = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: HOME_SQUAD_ID, access_level: 'write' }, ORIGIN)
-    expect(res.ok).toBe(false)
-    expect(edges(projectId)).toEqual([])
+  it('the catalog does not claim project access edits', () => {
+    expect(ELEVATION_ACTIONS['action:manage_access'].description).toContain('Does NOT cover project')
   })
+})
 
-  it('an expired grant does not open it', async () => {
-    await elevate(['action:manage_access'], 'squad', LEAD_SQUAD_ID)
-    vi.useFakeTimers()
-    vi.setSystemTime(Date.now() + 61 * 60 * 1000)
-    const res = await invokeTool(leadAuth(), env, 'project_squad_set', { project_id: projectId, squad_id: LEAD_SQUAD_ID, access_level: 'write' }, ORIGIN)
-    expect(res.ok).toBe(false)
+describe('#1674 (1b) the creator-squad edge is guarded on the squad current state', () => {
+  it('a squad archived after the caller check but before the write gets no edge', async () => {
+    const { createProject } = await import('../src/projects/service')
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${LEAD_SQUAD_ID}'`)
+    const res = await createProject(env, { slug: 'race', name: 'Race' }, { attachSquadId: LEAD_SQUAD_ID })
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(edges(res.value.id)).toEqual([])
   })
 })
 

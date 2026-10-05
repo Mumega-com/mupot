@@ -1,11 +1,9 @@
 import type { AuthContext, BusEvent, Env, Project, ProjectSquadAccess, ProjectStatus } from '../types'
 import { hasCapability } from '../auth/capability'
 import {
-  boundAgentHasAnyLiveGrantForAction,
   elevationHint,
   elevationRemedyMessage,
   hasElevatedAction,
-  resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
 } from '../auth/elevation'
 import { resolveSquadRef } from '../org/resolve'
 import { createBus } from '../bus'
@@ -263,12 +261,13 @@ const toolProjectCreate: ToolSpec = {
     })
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'created', result.value.id)
-    return done({
-      project: result.value,
-      squad_access: creatorSquad.squadId
-        ? { squad_id: creatorSquad.squadId, access_level: 'write' }
-        : null,
-    })
+    // Report what actually landed: the edge is guarded in SQL on the squad's
+    // current state, so it can be absent if the squad was archived mid-call.
+    const edge = creatorSquad.squadId
+      ? await env.DB.prepare('SELECT squad_id, access_level FROM project_squad_access WHERE project_id = ? AND squad_id = ?')
+          .bind(result.value.id, creatorSquad.squadId).first<{ squad_id: string; access_level: string }>()
+      : null
+    return done({ project: result.value, squad_access: edge ?? null })
   },
 }
 
@@ -635,20 +634,8 @@ const toolProjectSquadSet: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Standing workspace admin, OR a live action:manage_access elevation for
-    // THIS exact agent session, scope-matched to the TARGET SQUAD (elevations
-    // have no project scope, so the squad is the narrowest honest scope; an
-    // org-scoped grant covers any non-home squad, a squad/department grant only
-    // its own). mupot#1674: the catalog claimed this coverage without the
-    // enforcement; this is the enforcement.
-    const standing = workspaceAdmin(auth)
-    let mayBeElevated = false
-    if (!standing) {
-      // Same collapse as grant_agent_capability: zero live grants for the
-      // action = the plain uniform refusal, before anything is resolved.
-      mayBeElevated = auth.boundAgentId != null && (await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:manage_access'))
-      if (!mayBeElevated) return requireWorkspaceAdmin(auth, 'project_squad_set') as ToolOutcome
-    }
+    const denied = requireWorkspaceAdmin(auth)
+    if (denied) return denied
     const projectId = str(args.project_id)
     const squadId = str(args.squad_id)
     if (!projectId) return fail(400, 'invalid_project_id')
@@ -656,36 +643,9 @@ const toolProjectSquadSet: ToolSpec = {
     // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
     // repopulated by granting it project access.
     if (await isSquadArchived(env, squadId)) return fail(409, 'squad_archived')
-    let elevationGrantId: string | undefined
-    if (!standing) {
-      const target = await resolveSquadRef(env, squadId)
-      // Unknown target: plain 404 only after the caller proved a live grant for
-      // the action exists (the probe above), never for a stranger.
-      if (!target.ok) return fail(404, 'squad_not_found')
-      // A home squad is never reachable through this elevation (its own door is
-      // action:home_access, exact-squad, owner-approved).
-      if (target.value.kind === 'home') return fail(403, 'home_scope_not_grantable')
-      const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', target.value.id, {
-        squadDepartmentId: await resolveElevationSquadDepartmentId(env, 'squad', target.value.id),
-        toolName: 'project_squad_set',
-        detail: { project_id: projectId, squad_id: target.value.id, access_level: args.access_level },
-      })
-      if (!elevated.granted) {
-        return fail(403, 'forbidden', {
-          need: 'admin',
-          scope: 'org',
-          elevation_denied: elevated.reason,
-          remedy: elevationRemedyMessage(elevated.reason),
-        })
-      }
-      elevationGrantId = elevated.grant.id
-    }
     const result = await upsertProjectSquadAccess(env, projectId, squadId, args.access_level)
     if (!result.ok) return mutationFailure(result.error)
-    await emitProjectMutation(env, auth.memberId as string, 'squad_access_set', projectId, {
-      squad_id: squadId,
-      ...(elevationGrantId ? { via_elevation_grant: elevationGrantId } : {}),
-    })
+    await emitProjectMutation(env, auth.memberId as string, 'squad_access_set', projectId, { squad_id: squadId })
     return done({ squad: result.value })
   },
 }
