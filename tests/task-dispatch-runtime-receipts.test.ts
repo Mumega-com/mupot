@@ -13,6 +13,7 @@ import {
 import { invokeTool, mcpActionsApp } from '../src/mcp'
 import { leaseAgentInbox } from '../src/agents/messages'
 import { deliverDispatchToInbox } from '../src/bus/fleet-bridge'
+import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'tenant-runtime-receipt'
@@ -2686,4 +2687,61 @@ describe('adminResetDispatchLease sanitizes `reason` before it is ever persisted
       fixture.harness.close()
     }
   })
+})
+
+// Real D1 (workerd) refuses a statement whose bound-value count differs from its parameter
+// count ("Wrong number of parameter bindings for SQL query"). The node:sqlite harness remaps
+// bindings by ?N index and silently drops any value no placeholder references, so a surplus
+// bind is invisible to every other test in this file. This wrapper enforces the D1 rule.
+function strictBindingEnv(env: Env): { env: Env; violations: string[] } {
+  const violations: string[] = []
+  const realDb = env.DB
+  const check = (sql: string, values: unknown[]): void => {
+    const indexes = [...sql.matchAll(/\?(\d+)/g)].map((m) => Number(m[1]))
+    const count = indexes.length === 0 ? 0 : Math.max(...indexes)
+    if (values.length !== count) {
+      violations.push(`bound ${values.length} values, SQL declares ${count}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+    }
+  }
+  const db = {
+    prepare(sql: string) {
+      const stmt = realDb.prepare(sql)
+      return new Proxy(stmt, {
+        get(target, prop) {
+          if (prop === 'bind') {
+            return (...values: unknown[]) => { check(sql, values); return target.bind(...values) }
+          }
+          const value = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    },
+    batch: (statements: D1PreparedStatement[]) => realDb.batch(statements),
+  } as unknown as D1Database
+  return { env: { ...env, DB: db } as Env, violations }
+}
+
+describe('D1 strict parameter-binding parity (prod internal_error repro)', () => {
+  // The loop only closes if the WHOLE settle path survives real D1: consumed first, then a
+  // terminal stage. Drive each terminal stage after a consumed stage under the strict wrapper.
+  for (const terminal of ['completed', 'failed'] as const) {
+    it(`runtime_consumed then ${terminal}: every statement binds exactly the parameters it declares`, async () => {
+      const fixture = runtimeFixture()
+      try {
+        const strict = strictBindingEnv(fixture.env)
+        await recordTaskDispatchRuntimeReceipt(strict.env, fixture.auth, {
+          taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+          stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+        })
+        await recordTaskDispatchRuntimeReceipt(strict.env, fixture.auth, {
+          taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
+          stage: terminal, runtimeReceiptHash: 'd'.repeat(64), attempt: 1,
+          ...(terminal === 'completed' ? { result: 'Implemented and tested.' } : { reason: 'runtime reported failure' }),
+        })
+        expect(strict.violations).toEqual([])
+      } finally {
+        fixture.harness.close()
+      }
+    })
+  }
 })

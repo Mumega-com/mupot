@@ -649,7 +649,11 @@ async function loadDelivery(
       AND dispatch.squad_id = task.squad_id
     LIMIT 1
   `).bind(messageId, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, now,
-    input.attempt, callerAgentId)
+    input.attempt,
+    // ?7 (agentId) is referenced ONLY by envelopeHoldsSql's custody branch (completed/failed).
+    // Real D1 refuses a statement whose bound-value count differs from its parameter count
+    // ("Wrong number of parameter bindings"), so runtime_consumed must not bind it.
+    ...(input.stage === 'completed' || input.stage === 'failed' ? [callerAgentId] : []))
     .first<DeliveryRow>()
   if (!row) throw new TaskDispatchRuntimeReceiptError('runtime_delivery_not_found')
   return row
