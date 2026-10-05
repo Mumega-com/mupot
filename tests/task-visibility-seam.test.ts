@@ -217,6 +217,9 @@ function callers(): Caller[] {
     { name: 'REST admin session: role admin, capabilities unloaded, memberId set, has a home',
       auth: async () => authFor('m-home-owner', undefined, { role: 'admin' }),
       visible: [...ORG_WIDE, 't-home-owner'], p1: ['t-a-open', 't-a-review', 't-b-blocked', 't-home-owner'], p2: ['t-c-open', 't-moved', 't-a-p2'] },
+    { name: 'role member, capabilities unloaded, no memberId, latentCapabilities org admin (never ambient)',
+      auth: async () => authFor('m-latent', undefined, { memberId: undefined, latentCapabilities: [grant('m-latent', 'org', null, 'admin')] }),
+      visible: [], p1: [], p2: [] },
     { name: 'no grants', auth: async () => authFor('m-none', []), visible: [], p1: [], p2: [] },
     { name: 'agent-bound with latentCapabilities only (directory B1 ceiling)',
       auth: async () => authFor('m-latent', [], { boundAgentId: 'agent-latent', latentCapabilities: [grant('m-latent', 'org', null, 'admin')] }),
@@ -285,10 +288,15 @@ beforeAll(async () => {
   harness.sqlite.prepare("UPDATE tasks SET squad_id = ?, project_id = ? WHERE id = 't-moved'").run(SQ_B, P2)
   // every review/blocked task is gated, so the situation's needs-you slice sees it
   harness.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:seam' WHERE status IN ('review', 'blocked')").run()
-  harness.sqlite.prepare(
-    `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
-     VALUES ('t-a-archived', datetime('now'), 'seam fixture', 'm-archiver', 'review')`,
-  ).run()
+  // an archived approved gate:content task with a result: the needs-you "publishable output" slice
+  runSql(`INSERT INTO tasks (id, squad_id, title, status, project_id, gate_owner, result)
+          VALUES ('t-a-archived-pub', '${SQ_A}', 'title t-a-archived-pub', 'approved', '${P1}', 'gate:content', 'published body')`)
+  for (const archivedId of ['t-a-archived', 't-a-archived-pub']) {
+    harness.sqlite.prepare(
+      `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
+       VALUES (?, datetime('now'), 'seam fixture', 'm-archiver', 'review')`,
+    ).run(archivedId)
+  }
 })
 
 afterAll(() => harness.close())
@@ -349,7 +357,7 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
           if ((await readTaskForAuth(strict.env, auth, t.id)).status === 200) readable.push(t.id)
         }
         // an explicit id lookup is archived-inclusive: whoever reads the squad reads its archived task
-        const history = expected.includes('t-a-open') ? ['t-a-archived'] : []
+        const history = expected.includes('t-a-open') ? ['t-a-archived', 't-a-archived-pub'] : []
         expect(readable.sort()).toEqual([...expected, ...history].sort())
       })
 
