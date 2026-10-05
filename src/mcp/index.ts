@@ -153,6 +153,7 @@ import { resolveBoundSeat, resolveBoundSeatStrict, resolveInboxSeatArg } from '.
 import {
   recordCheckin,
   touchPresence,
+  refreshOwnAgentPresence,
   sqliteUtcToMs,
   normalizeSevenAxis,
   SEVEN_AXIS_HARNESSES,
@@ -6545,11 +6546,18 @@ export async function invokeTool(
           }
         }
         await touchPresence(env, id, { source: ctx.source, label: seat })
+        // mupot#1664: touchPresence only refreshes the row for THIS call's seat label; an
+        // agent checked in under another seat name otherwise expires mid-work. Also slide
+        // the agent's own check-in row(s) forward (self-rate-limited in the UPDATE itself).
+        if (auth.boundAgentId) await refreshOwnAgentPresence(env, id.memberId, auth.boundAgentId)
       }
     })().catch(() => {})
 
+    // Without a waitUntil the write would race the response being torn down; await it.
     if (ctx.waitUntil) {
       ctx.waitUntil(touchPromise)
+    } else {
+      await touchPromise
     }
   }
 
