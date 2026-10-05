@@ -12,6 +12,7 @@ import {
 } from '../src/tasks/runtime-receipts'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
 import { leaseAgentInbox } from '../src/agents/messages'
+import { deliverDispatchToInbox } from '../src/bus/fleet-bridge'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'tenant-runtime-receipt'
@@ -232,6 +233,80 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     } finally {
       fixture.harness.close()
     }
+  })
+
+  describe('self-describing envelope bodies (runtime.dispatch/v1 optional keys)', () => {
+    async function settleAgainst(mutateBody?: (body: Record<string, unknown>) => Record<string, unknown>) {
+      const fixture = runtimeFixture()
+      try {
+        // Replace the seeded ids-only message with the REAL producer output.
+        const sqlite = fixture.harness.sqlite
+        sqlite.prepare('DELETE FROM agent_messages WHERE id = ?').run(MESSAGE_ID)
+        await deliverDispatchToInbox(fixture.env, {
+          agentId: RUNTIME_ADDRESS, squadId: SQUAD_ID, taskId: TASK_ID,
+          receiptId: DISPATCH_ID, dispatchedByMemberId: MEMBER_ID,
+        })
+        const row = sqlite.prepare('SELECT id, body FROM agent_messages WHERE request_id = ?')
+          .get(`dispatch-inbox:${DISPATCH_ID}`) as { id: string; body: string }
+        const produced = JSON.parse(row.body) as Record<string, unknown>
+        if (mutateBody) {
+          sqlite.prepare('UPDATE agent_messages SET body = ? WHERE id = ?')
+            .run(JSON.stringify(mutateBody(produced)), row.id)
+        }
+        sqlite.prepare(
+          "UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?",
+        ).run(row.id)
+        return {
+          produced,
+          result: await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+            taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: row.id,
+            stage: 'runtime_consumed', runtimeReceiptHash: RUNTIME_HASH, attempt: 1,
+          }),
+        }
+      } finally {
+        fixture.harness.close()
+      }
+    }
+
+    it('settles against the real self-describing envelope the producer writes', async () => {
+      const { produced, result } = await settleAgainst()
+      expect(produced.title).toBe('Runtime receipt task')
+      expect(produced.done_when).toBe('The exact runtime consumption is receipted.')
+      expect(produced.settle).toBeTruthy()
+      expect(result.task_status).toBe('in_progress')
+    })
+
+    it('still refuses an unknown extra key in the envelope body', async () => {
+      await expect(settleAgainst((body) => ({ ...body, approve_everything: true })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it('still refuses an envelope missing a required key', async () => {
+      await expect(settleAgainst((body) => {
+        const { squad_id: _squad, ...rest } = body
+        return rest
+      })).rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it('refuses a mistyped optional key (title not a string)', async () => {
+      await expect(settleAgainst((body) => ({ ...body, title: 42 })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it.each([false, 'true', 1, null])('refuses truncated = %j (only boolean true is allowed)', async (value) => {
+      await expect(settleAgainst((body) => ({ ...body, truncated: value })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
+
+    it('accepts truncated = true', async () => {
+      const { result } = await settleAgainst((body) => ({ ...body, truncated: true }))
+      expect(result.task_status).toBe('in_progress')
+    })
+
+    it('refuses a mistyped optional key (done_when not a string)', async () => {
+      await expect(settleAgainst((body) => ({ ...body, done_when: { evil: true } })))
+        .rejects.toMatchObject({ code: 'runtime_delivery_stale' })
+    })
   })
 
   it('returns one idempotent receipt and rejects changed content under the same stage attempt', async () => {

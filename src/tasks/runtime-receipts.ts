@@ -2,7 +2,7 @@ import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
 import type { AuthContext, Env } from '../types'
-import { DISPATCH_BRIDGE_SENDER, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
+import { DISPATCH_BRIDGE_SENDER, DISPATCH_ENVELOPE_OPTIONAL_KEYS, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
@@ -655,6 +655,28 @@ async function loadDelivery(
   return row
 }
 
+const REQUIRED_ENVELOPE_KEYS = ['dispatch_receipt_id', 'runtime_address', 'squad_id', 'task_id', 'type', 'version']
+const OPTIONAL_ENVELOPE_KEYS: ReadonlySet<string> = new Set(DISPATCH_ENVELOPE_OPTIONAL_KEYS)
+
+// runtime.dispatch/v1 stays v1: the six required keys are unchanged and the self-describing
+// fields (title, done_when, truncated, settle) are OPTIONAL and informational only. They carry no
+// authority — every authoritative fact is still re-read from the task/dispatch/message rows — so
+// they are not compared to anything here; only their presence and basic type are allowed. Any
+// other key is still refused (an unknown key may not smuggle meaning into a settle).
+function hasAllowedEnvelopeKeys(body: Record<string, unknown>): boolean {
+  const keys = Object.keys(body)
+  if (!REQUIRED_ENVELOPE_KEYS.every((key) => keys.includes(key))) return false
+  for (const key of keys) {
+    if (REQUIRED_ENVELOPE_KEYS.includes(key)) continue
+    if (!OPTIONAL_ENVELOPE_KEYS.has(key)) return false
+    const value = body[key]
+    if ((key === 'title' || key === 'done_when') && typeof value !== 'string') return false
+    if (key === 'truncated' && value !== true) return false
+    if (key === 'settle' && (typeof value !== 'object' || value === null || Array.isArray(value))) return false
+  }
+  return true
+}
+
 function validateEnvelope(
   row: DeliveryRow,
   input: RecordTaskDispatchRuntimeReceiptInput,
@@ -693,7 +715,7 @@ function validateEnvelope(
   }
   const body = parsed as Record<string, unknown>
   if (
-    Object.keys(body).sort().join('\n') !== 'dispatch_receipt_id\nruntime_address\nsquad_id\ntask_id\ntype\nversion'
+    !hasAllowedEnvelopeKeys(body)
     || body.version !== 'runtime.dispatch/v1'
     || body.type !== 'task_dispatch'
     || body.task_id !== input.taskId
