@@ -11,9 +11,10 @@
 // migrated reader (task_list, GET /tasks, project_context, the activity task rows) plus the
 // chokepoint's own three faces (scope list, SQL clause, canReadTask) must return exactly it.
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createHomeForMember } from '../src/org/service'
 import { invokeTool } from '../src/mcp'
+import { loadProjectDetail } from '../src/dashboard/projects'
 import { resolveCapabilities } from '../src/auth/capability'
 import { listTasksForAuth, readTaskForAuth } from '../src/tasks'
 import { listProjectActivity } from '../src/projects/projections'
@@ -26,6 +27,21 @@ import {
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+// REST project routes read the session through requireAuth; inject the matrix caller.
+const authState: { current: AuthContext | null } = { current: null }
+vi.mock('../src/auth', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/auth')>()),
+  requireAuth: async (
+    c: { set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+const { projectsApp } = await import('../src/projects')
 
 const TENANT = 'mumega'
 const ORIGIN = 'https://pot.test'
@@ -60,6 +76,23 @@ function strictBindingEnv(env: Env): { env: Env; violations: string[] } {
     batch: (statements: D1PreparedStatement[]) => realDb.batch(statements),
   } as unknown as D1Database
   return { env: { ...env, DB: db } as Env, violations }
+}
+
+// Same DB, but the routine-schema probe answers "tables absent": drives the rolling-deploy
+// (routines-not-ready) needs-you branch of loadProjectSituation.
+function withoutRoutineTables(env: Env): Env {
+  const realDb = env.DB
+  const db = {
+    prepare(sql: string) {
+      if (sql.includes('sqlite_master') && sql.includes('routine_runs')) {
+        const stub = { bind: () => stub, all: async () => ({ results: [{ count: 0 }] }) }
+        return stub as unknown as D1PreparedStatement
+      }
+      return realDb.prepare(sql)
+    },
+    batch: (statements: D1PreparedStatement[]) => realDb.batch(statements),
+  } as unknown as D1Database
+  return { ...env, DB: db } as Env
 }
 
 let harness: SqliteD1Harness
@@ -175,6 +208,15 @@ function callers(): Caller[] {
     { name: 'home owner who is ALSO an org member', auth: real('m-home-owner-org'),
       visible: [...ORG_WIDE, 't-home-owner-org'], p1: ['t-a-open', 't-a-review', 't-b-blocked', 't-home-owner-org'], p2: ['t-c-open', 't-moved'],
       p2Any: ['t-c-open', 't-moved', 't-a-p2'] },
+    // The REST owner/admin cookie session: role owner/admin, capabilities NOT loaded (auth/index.ts
+    // loads them only for role 'member') but memberId set. The role plane still skips homes; the
+    // owner's exact admin grant on their OWN home must still resolve from D1 (old canActOnSquad).
+    { name: 'REST owner session: role owner, capabilities unloaded, memberId set, has a home',
+      auth: async () => authFor('m-home-owner', undefined, { role: 'owner' }),
+      visible: [...ORG_WIDE, 't-home-owner'], p1: ['t-a-open', 't-a-review', 't-b-blocked', 't-home-owner'], p2: ['t-c-open', 't-moved', 't-a-p2'] },
+    { name: 'REST admin session: role admin, capabilities unloaded, memberId set, has a home',
+      auth: async () => authFor('m-home-owner', undefined, { role: 'admin' }),
+      visible: [...ORG_WIDE, 't-home-owner'], p1: ['t-a-open', 't-a-review', 't-b-blocked', 't-home-owner'], p2: ['t-c-open', 't-moved', 't-a-p2'] },
     { name: 'no grants', auth: async () => authFor('m-none', []), visible: [], p1: [], p2: [] },
     { name: 'agent-bound with latentCapabilities only (directory B1 ceiling)',
       auth: async () => authFor('m-latent', [], { boundAgentId: 'agent-latent', latentCapabilities: [grant('m-latent', 'org', null, 'admin')] }),
@@ -331,34 +373,66 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
         }
       })
 
+      const wantStatus = (st: string) => {
+        const status = new Map(TASKS.map(([id, , , x]) => [id, x] as const))
+        status.set('t-home-owner-org', 'open')
+        return make.p1Any ?? make.p1.filter((id) => status.get(id) === st).sort()
+      }
+      type Situation = {
+        task_counts: Record<string, number>
+        blockers: Array<{ id: string }>
+        pending_reviews: Array<{ id: string }>
+        needs_you: { count: number }
+      }
+      const checkSituation = (situation: Situation) => {
+        const want = wantStatus
+        expect(situation.task_counts.open).toBe(want('open').length)
+        expect(situation.task_counts.review).toBe(want('review').length)
+        expect(situation.task_counts.blocked).toBe(want('blocked').length)
+        expect(situation.task_counts.in_progress).toBe(want('in_progress').length)
+        expect(ids(situation.pending_reviews)).toEqual(want('review'))
+        expect(ids(situation.blockers)).toEqual(want('blocked'))
+        // needs-you rows are task-derived too (gate_owner'd review + unassigned blocked tasks)
+        expect(situation.needs_you.count).toBe(want('review').length + want('blocked').length)
+      }
+      const wantActivity = () => {
+        const w = TASKS.filter(([id, , p]) => p === P1 && expected.includes(id)).map(([id]) => id)
+        if (expected.includes('t-home-owner-org')) w.push('t-home-owner-org')
+        return w.sort()
+      }
+
       for (const tool of ['project_context', 'project_get'] as const) {
         it(`${tool} situation (#1645) shows only canonical tasks: counts + review/blocked ids`, async () => {
-          const auth = await make.auth()
-          const res = await invokeTool(auth, strict.env, tool, { project_id: P1 }, ORIGIN)
-          const status = new Map(TASKS.map(([id, , , st]) => [id, st] as const))
-          status.set('t-home-owner-org', 'open')
-          const want = (st: string) => make.p1.filter((id) => status.get(id) === st).sort()
-          if (!res.ok) {
-            // project not even readable for this caller -> they see no tasks at all
-            expect(make.p1).toEqual([])
-            return
-          }
-          const situation = (res.result as { situation: {
-            task_counts: Record<string, number>
-            blockers: Array<{ id: string }>
-            pending_reviews: Array<{ id: string }>
-            needs_you: { count: number }
-          } }).situation
-          expect(situation.task_counts.open).toBe(want('open').length)
-          expect(situation.task_counts.review).toBe(want('review').length)
-          expect(situation.task_counts.blocked).toBe(want('blocked').length)
-          expect(situation.task_counts.in_progress).toBe(want('in_progress').length)
-          expect(ids(situation.pending_reviews)).toEqual(want('review'))
-          expect(ids(situation.blockers)).toEqual(want('blocked'))
-          // needs-you rows are task-derived too (gate_owner'd review + unassigned blocked tasks)
-          expect(situation.needs_you.count).toBe(want('review').length + want('blocked').length)
+          const res = await invokeTool(await make.auth(), strict.env, tool, { project_id: P1 }, ORIGIN)
+          if (!res.ok) { expect(make.p1).toEqual([]); return }
+          checkSituation((res.result as { situation: Situation }).situation)
         })
       }
+
+      it('project_context on a pot whose routine tables are not yet applied (needs-you not-ready branch)', async () => {
+        const res = await invokeTool(await make.auth(), withoutRoutineTables(strict.env), 'project_context', { project_id: P1 }, ORIGIN)
+        if (!res.ok) { expect(make.p1).toEqual([]); return }
+        checkSituation((res.result as { situation: Situation }).situation)
+      })
+
+      it('dashboard loadProjectDetail: situation and activity task rows are canonical', async () => {
+        const view = await loadProjectDetail(strict.env, await make.auth(), P1)
+        if (!view) { expect(make.p1).toEqual([]); return }
+        checkSituation(view.situation)
+        expect(view.activity.rows.filter((r) => r.source_type === 'task').map((r) => r.source_id).sort()).toEqual(wantActivity())
+      })
+
+      it('REST GET /projects/:id and /projects/:id/activity are canonical', async () => {
+        authState.current = await make.auth()
+        const rest = (path: string) => projectsApp.fetch(new Request(`https://pot.test${path}`), strict.env)
+        const detail = await rest(`/${P1}`)
+        if (detail.status !== 200) { expect(make.p1).toEqual([]); return }
+        checkSituation(((await detail.json()) as { situation: Situation }).situation)
+        const activity = await rest(`/${P1}/activity?limit=100`)
+        expect(activity.status).toBe(200)
+        const rows = ((await activity.json()) as { rows: Array<{ source_type: string; source_id: string }> }).rows
+        expect(rows.filter((r) => r.source_type === 'task').map((r) => r.source_id).sort()).toEqual(wantActivity())
+      })
 
       it('activity task rows carry exactly the canonical project tasks', async () => {
         const auth = await make.auth()

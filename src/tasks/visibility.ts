@@ -14,6 +14,7 @@ import {
   hasCapability,
   loadSquadScope,
   planeCoversScope,
+  resolveCapabilities,
 } from '../auth/capability'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { resolveAllSquadIds, resolveGrantedSquadIds } from '../projects/readable-squads'
@@ -35,8 +36,13 @@ function rolePlaneActive(auth: AuthContext): boolean {
 
 // Ambient grants only. NEVER auth.latentCapabilities (a directory-channel session parks the
 // member's real grants there precisely so they are NOT ambient authority).
-function ambientGrants(auth: AuthContext): CapabilityGrant[] {
-  return auth.capabilities ?? []
+// When the session carries none (a REST owner/admin cookie session: src/auth/index.ts loads
+// capabilities only for role 'member') but names a member, load that member's rows from D1 —
+// the old canActOnSquad semantics, so the owner's exact admin grant on their OWN home squad
+// still resolves. No memberId -> no grants.
+async function ambientGrants(env: Env, auth: AuthContext): Promise<CapabilityGrant[]> {
+  if (auth.capabilities !== undefined) return auth.capabilities
+  return auth.memberId ? resolveCapabilities(env, auth.memberId) : []
 }
 
 function exactSquadGrantIds(grants: CapabilityGrant[]): string[] {
@@ -58,7 +64,7 @@ async function homeSquadIdsAmong(env: Env, ids: string[]): Promise<Set<string>> 
 }
 
 export async function resolveVisibleTaskScope(env: Env, auth: AuthContext): Promise<VisibleTaskScope> {
-  const grants = ambientGrants(auth)
+  const grants = await ambientGrants(env, auth)
   const rolePlane = rolePlaneActive(auth)
   const exact = exactSquadGrantIds(grants)
 
@@ -86,7 +92,7 @@ export async function canReadSquadTasks(env: Env, auth: AuthContext, squadId: st
   const scope = await loadSquadScope(env, squadId)
   if (!scope) return false
   if (rolePlaneActive(auth) && planeCoversScope('role', scope)) return true
-  return hasCapability(ambientGrants(auth), 'squad', scope, TASK_READ_MINIMUM)
+  return hasCapability(await ambientGrants(env, auth), 'squad', scope, TASK_READ_MINIMUM)
 }
 
 /** Single-row reader. `includeArchived` is for an explicit history read (GET /tasks/:id);
@@ -122,8 +128,8 @@ export function visibleTaskClause(
 
 /** True when the caller may read ANY project regardless of project_squad_access edges:
  *  the legacy role plane (capabilities unloaded) or an org-scope admin grant. */
-export function hasProjectEdgeBypass(auth: AuthContext): boolean {
-  return rolePlaneActive(auth) || hasCapability(ambientGrants(auth), 'org', null, 'admin')
+export async function hasProjectEdgeBypass(env: Env, auth: AuthContext): Promise<boolean> {
+  return rolePlaneActive(auth) || hasCapability(await ambientGrants(env, auth), 'org', null, 'admin')
 }
 
 /** Project selection precondition for a task listing filtered by project_id: the bypass
@@ -135,7 +141,7 @@ export async function canReadProjectForTasks(
   projectId: string,
   candidateSquadIds: readonly string[],
 ): Promise<boolean> {
-  if (hasProjectEdgeBypass(auth)) {
+  if (await hasProjectEdgeBypass(env, auth)) {
     return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?1').bind(projectId).first()) !== null
   }
   if (candidateSquadIds.length === 0) return false
