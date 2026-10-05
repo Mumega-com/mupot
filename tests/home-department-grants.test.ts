@@ -11,6 +11,7 @@
 // Real migration chain via createSqliteD1 + applyAllMigrations; every Env.DB is wrapped in
 // strictBindingEnv (the shared double silently drops surplus binds, mupot#1642).
 
+import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { acceptInvite, membersApp } from '../src/members'
 import { createHomeForMember } from '../src/org/service'
@@ -298,6 +299,19 @@ describe('mupot#1646 — home department grants', () => {
       const res = await post('/invites', { email: 'x@example.com', squad_id: homeSquadId, capability: 'member' })
       expect(res.status).toBe(403)
       await expect(res.json()).resolves.toMatchObject({ error: 'home_scope_not_invitable' })
+    })
+  })
+
+  describe('detection SQL (scripts/detect-home-department-grants.sql)', () => {
+    it('runs on the real schema, finds a poisoned grant and a stale invite, finds nothing on clean data', () => {
+      const statements = readFileSync('scripts/detect-home-department-grants.sql', 'utf8')
+        .split('\n').filter((l) => !l.trim().startsWith('--')).join('\n')
+        .split(';').map((x) => x.trim()).filter(Boolean)
+      const run = (): number[] => statements.map((q) => harness.sqlite.prepare(q).all().length)
+      expect(run()).toEqual([0, 0, 0, 0, 0])
+      harness.sqlite.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('bad', 'member-other', 'department', ?, 'member')`).run(homeDeptId)
+      harness.sqlite.prepare(`INSERT INTO invites (id, email, department_id, capability, invited_by) VALUES ('stale', 's@example.com', ?, 'member', 'member-admin')`).run(homeDeptId)
+      expect(run()).toEqual([1, 0, 0, 1, 0])
     })
   })
 })
