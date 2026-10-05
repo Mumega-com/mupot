@@ -211,24 +211,66 @@ describe('task_get — payload', () => {
     expect(r.latest_dispatch_receipt).toBeNull()
   })
 
-  it('returns the LATEST verdict and the latest dispatch receipt id/status', async () => {
+  const HASH = 'a'.repeat(64)
+  const bound = async (): Promise<AuthContext> =>
+    authFor('m-squad-a', await resolveCapabilities(strict.env, 'm-squad-a'), { boundAgentId: 'ag-1' })
+
+  function seedRuntimeReceipt(id: string, dispatchId: string, stage: string, createdAt: string): void {
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.exec(`
+      INSERT INTO task_dispatch_runtime_receipts (id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id,
+        stage, attempt, runtime_address, runtime_receipt_hash, request_digest, result, reason, audit_entry_id, created_at)
+      VALUES ('${id}', '${TENANT}', '${dispatchId}', 't-a-review', 'ag-1', 'msg-1', 'm-gate', 'tok-1', '${stage}', 1, 'rt', '${HASH}', '${HASH}',
+        ${stage === 'completed' ? "'done'" : 'NULL'}, ${stage === 'failed' ? "'boom'" : 'NULL'}, 'audit-${id}', '${createdAt}')`)
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+  }
+
+  it('returns the LATEST verdict (canonical order, display name) and, for the assignee, the latest dispatch receipt', async () => {
+    harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-1', '${SQ_A}', 'ag1', 'Agent One', 'inactive')`)
+    harness.sqlite.exec(`UPDATE tasks SET assignee_agent_id = 'ag-1' WHERE id = 't-a-review'`)
     harness.sqlite.exec(`
       INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at) VALUES
         ('v-old', 't-a-review', 'rejected', 'm-gate', '2026-01-01T00:00:00Z'),
-        ('v-new', 't-a-review', 'approved', 'm-gate', '2026-02-01T00:00:00Z');
+        ('v-new', 't-a-review', 'approved', 'ag-1', '2026-02-01T00:00:00Z');
     `)
-    harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-1', '${SQ_A}', 'ag1', 'Ag1', 'inactive')`)
     harness.sqlite.exec(`
       INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, claimed_at, consumed_at) VALUES
         ('d-old', '${TENANT}', 't-a-review', '${SQ_A}', 'ag-1', 'member', 'm-gate', '2026-01-01T00:00:00Z', NULL, NULL),
         ('d-new', '${TENANT}', 't-a-review', '${SQ_A}', 'ag-1', 'member', 'm-gate', '2026-02-01T00:00:00Z', '2026-02-01T00:00:01Z', '2026-02-01T00:00:02Z');
     `)
-    const a = await callers()[0]!.auth()
-    const res = await get(a, 't-a-review')
+    const res = await get(await bound(), 't-a-review')
     const r = (res as { result: { latest_verdict: unknown; latest_dispatch_receipt: unknown } }).result
-    expect(r.latest_verdict).toEqual({ verdict: 'approved', decided_by: 'm-gate', decided_at: '2026-02-01T00:00:00Z' })
-    expect(r.latest_dispatch_receipt).toEqual({ id: 'd-new', status: 'consumed' })
+    expect(r.latest_verdict).toEqual({ verdict: 'approved', decided_by: 'Agent One', decided_at: '2026-02-01T00:00:00Z', reversed: false, reversed_at: null })
+    expect(r.latest_dispatch_receipt).toEqual({ id: 'd-new', status: 'consumed', last_error: null })
     expect(strict.violations).toEqual([])
+  })
+
+  it('a human-reversed verdict is reported as reversed, never as a live approval', async () => {
+    harness.sqlite.exec(`UPDATE task_verdicts SET reversed_at = '2026-03-01T00:00:00Z' WHERE id = 'v-new'`)
+    const res = await get(await bound(), 't-a-review')
+    const v = (res as { result: { latest_verdict: { verdict: string; reversed: boolean; reversed_at: string } } }).result.latest_verdict
+    expect(v.reversed).toBe(true)
+    expect(v.reversed_at).toBe('2026-03-01T00:00:00Z')
+  })
+
+  it('a non-assignee squad reader gets latest_dispatch_receipt null (task_list parity)', async () => {
+    const a = await callers().find((c) => c.name === 'squad-A member')!.auth() // not agent-bound
+    const r = (await get(a, 't-a-review') as { result: { latest_dispatch_receipt: unknown } }).result
+    expect(r.latest_dispatch_receipt).toBeNull()
+    const otherAgent = authFor('m-squad-a', await resolveCapabilities(strict.env, 'm-squad-a'), { boundAgentId: 'ag-other' })
+    expect(((await get(otherAgent, 't-a-review')) as { result: { latest_dispatch_receipt: unknown } }).result.latest_dispatch_receipt).toBeNull()
+  })
+
+  it('dispatch status reflects runtime terminal state, and last_error is not hidden when claimed', async () => {
+    harness.sqlite.exec(`UPDATE task_dispatch_receipts SET last_error = 'transport hiccup', consumed_at = NULL WHERE id = 'd-new'`)
+    let r = (await get(await bound(), 't-a-review') as { result: { latest_dispatch_receipt: unknown } }).result
+    expect(r.latest_dispatch_receipt).toEqual({ id: 'd-new', status: 'claimed', last_error: 'transport hiccup' })
+    seedRuntimeReceipt('rt-1', 'd-new', 'runtime_consumed', '2026-02-01T00:00:03Z')
+    r = (await get(await bound(), 't-a-review') as { result: { latest_dispatch_receipt: unknown } }).result
+    expect(r.latest_dispatch_receipt).toEqual({ id: 'd-new', status: 'runtime_consumed', last_error: 'transport hiccup' })
+    seedRuntimeReceipt('rt-2', 'd-new', 'failed', '2026-02-01T00:00:04Z')
+    r = (await get(await bound(), 't-a-review') as { result: { latest_dispatch_receipt: unknown } }).result
+    expect((r.latest_dispatch_receipt as { status: string }).status).toBe('failed')
   })
 
   it('a task in a squad the caller cannot read never exposes its verdict or receipt', async () => {

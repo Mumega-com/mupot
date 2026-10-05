@@ -92,6 +92,7 @@ import {
   detectVerdictReversalRequest,
   reverseTaskVerdict,
   DedicatedGatePredicateRequiredError,
+  findLatestVerdict,
 } from '../tasks/service'
 // mupot#1586 — the same completion-size ceiling execute.ts's own finishTask
 // enforces on the in-Worker path (~16KB), reused here rather than a second
@@ -107,6 +108,9 @@ import {
   recordTaskDispatchRuntimeReceipt,
   TaskDispatchRuntimeReceiptError,
   loadLatestDispatchReceiptsForTasks,
+  loadDispatchStatus,
+  resolveDecidedByDisplay,
+  type LatestDispatchStatus,
   adminResetDispatchLease,
   hasInFlightDispatchReceipt,
   hasIndependentRuntimeGate,
@@ -1262,29 +1266,25 @@ const toolTaskGet: ToolSpec = {
       return fail(404, 'task_not_found')
     }
     const row = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
-    const verdict = await env.DB.prepare(
-      `SELECT verdict, decided_by, decided_at FROM task_verdicts
-        WHERE task_id = ?1 ORDER BY decided_at DESC, rowid DESC LIMIT 1`,
-    ).bind(full.id).first<{ verdict: string; decided_by: string; decided_at: string }>()
-    const dispatch = await env.DB.prepare(
-      `SELECT id, claimed_at, consumed_at, last_error FROM task_dispatch_receipts
-        WHERE tenant = ?1 AND task_id = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-    ).bind(env.TENANT_SLUG, full.id).first<{
-      id: string
-      claimed_at: string | null
-      consumed_at: string | null
-      last_error: string | null
-    }>()
-    return done({
-      task: row,
-      latest_verdict: verdict ?? null,
-      latest_dispatch_receipt: dispatch
-        ? {
-            id: dispatch.id,
-            status: dispatch.consumed_at ? 'consumed' : dispatch.claimed_at ? 'claimed' : dispatch.last_error ? 'failed' : 'pending',
-          }
-        : null,
-    })
+    // Canonical latest-verdict reader (tasks/service.ts) - carries reversed_at; same ordering
+    // every reversal path trusts. decided_by is shown in the REST timeline's display form.
+    const v = await findLatestVerdict(env, full.id)
+    const latestVerdict = v
+      ? {
+          verdict: v.verdict,
+          decided_by: await resolveDecidedByDisplay(env, v.decided_by),
+          decided_at: v.decided_at,
+          reversed: v.reversed_at != null,
+          reversed_at: v.reversed_at ?? null,
+        }
+      : null
+    // Assignee-only, exactly like task_list/task_board: a non-assignee reader gets null.
+    let latestDispatch: LatestDispatchStatus | null = null
+    if (auth.boundAgentId && full.assignee_agent_id === auth.boundAgentId) {
+      const info = (await loadLatestDispatchReceiptsForTasks(env, [full.id])).get(full.id)
+      latestDispatch = info ? await loadDispatchStatus(env, info.dispatch_receipt_id) : null
+    }
+    return done({ task: row, latest_verdict: latestVerdict, latest_dispatch_receipt: latestDispatch })
   },
 }
 

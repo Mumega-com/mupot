@@ -1055,7 +1055,7 @@ const RECEIPT_TEXT_MAX_LENGTH = 200
  * vector. Applied here, at the render site, rather than at mint time, so it
  * covers every existing row regardless of when it was written.
  */
-function sanitizeReceiptText(value: string): string {
+export function sanitizeReceiptText(value: string): string {
   const stripped = value
     // eslint-disable-next-line no-control-regex -- deliberately stripping C0/C1 control chars, incl. newlines/tabs.
     .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
@@ -1100,6 +1100,47 @@ export interface TaskDispatchReceiptTimeline {
   task_status: string
 }
 
+// The ONE definition of how a verdict's decided_by id is shown to readers (joins `agent` and
+// `member` aliases on verdict.decided_by). Shared by the REST timeline and task_get.
+const DECIDED_BY_DISPLAY_SQL = `COALESCE(NULLIF(agent.name, ''), NULLIF(member.display_name, ''), 'Independent gate')`
+
+export async function resolveDecidedByDisplay(env: Env, decidedBy: string): Promise<string> {
+  const row = await env.DB.prepare(`
+    SELECT ${DECIDED_BY_DISPLAY_SQL} AS display
+      FROM (SELECT ?1 AS id) verdict
+      LEFT JOIN agents agent ON agent.id = verdict.id
+      LEFT JOIN members member ON member.id = verdict.id
+  `).bind(decidedBy).first<{ display: string }>()
+  return sanitizeReceiptText(row?.display ?? 'Independent gate')
+}
+
+export interface LatestDispatchStatus {
+  id: string
+  /** Runtime terminal state wins (completed / failed / reset_terminated); then runtime_consumed;
+   *  then transport state (consumed / claimed / pending). */
+  status: 'completed' | 'failed' | 'reset_terminated' | 'runtime_consumed' | 'consumed' | 'claimed' | 'pending'
+  last_error: string | null
+}
+
+export async function loadDispatchStatus(env: Env, dispatchReceiptId: string): Promise<LatestDispatchStatus | null> {
+  const d = await env.DB.prepare(
+    `SELECT id, claimed_at, consumed_at, last_error FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2`,
+  ).bind(env.TENANT_SLUG, dispatchReceiptId).first<{
+    id: string; claimed_at: string | null; consumed_at: string | null; last_error: string | null
+  }>()
+  if (!d) return null
+  const rt = await env.DB.prepare(
+    `SELECT stage FROM task_dispatch_runtime_receipts
+      WHERE tenant = ?1 AND dispatch_receipt_id = ?2
+      ORDER BY CASE WHEN stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL}) THEN 0 ELSE 1 END, created_at DESC, id DESC
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, dispatchReceiptId).first<{ stage: string }>()
+  let status: LatestDispatchStatus['status']
+  if (rt?.stage === 'completed' || rt?.stage === 'failed' || rt?.stage === 'reset_terminated' || rt?.stage === 'runtime_consumed') status = rt.stage
+  else status = d.consumed_at ? 'consumed' : d.claimed_at ? 'claimed' : 'pending'
+  return { id: d.id, status, last_error: d.last_error === null ? null : sanitizeReceiptText(d.last_error) }
+}
+
 export async function listTaskDispatchReceiptTimeline(
   env: Env,
   taskId: string,
@@ -1134,7 +1175,7 @@ export async function listTaskDispatchReceiptTimeline(
   `).bind(env.TENANT_SLUG, taskId, boundedLimit).all<ReceiptRow>()
   const gate = await env.DB.prepare(`
     SELECT verdict.verdict, verdict.note,
-           COALESCE(NULLIF(agent.name, ''), NULLIF(member.display_name, ''), 'Independent gate')
+           ${DECIDED_BY_DISPLAY_SQL}
              AS decided_by_display,
            verdict.decided_at,
            verdict.decided_via,
