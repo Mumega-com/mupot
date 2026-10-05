@@ -6614,6 +6614,12 @@ async function handleJsonRpc(
     // ChatGPT) show the model the real reason instead of replacing a 4xx body with "blocked by a
     // firewall / mcp_request_blocked". Same refusal, same floor; only the envelope changes. The REST
     // /actions path keeps its HTTP statuses, and 401 (above) stays a real 401 for OAuth discovery.
+    // Protocol-level failures stay JSON-RPC errors (HTTP 200 at the transport; only auth is a 4xx):
+    // unknown tool, malformed request and inputSchema/args validation are -32602 Invalid params per
+    // the MCP spec. Only authorization/business refusals from the tool pipeline become isError.
+    if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
+      return rpcError(id, -32602, outcome.error, outcome.detail)
+    }
     return rpcResult(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
   }
 

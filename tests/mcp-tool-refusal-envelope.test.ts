@@ -85,4 +85,20 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
     expect(body).toMatchObject({ ok: false, error: 'forbidden' })
     expect(body.detail?.need).toBe('admin')
   })
+
+  it('unknown tool is a JSON-RPC -32602 error at HTTP 200, not isError', async () => {
+    const res = await call(mcpApp, 'https://pot.example/', { ...rpcCall, params: { name: 'no_such_tool', arguments: {} } })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { error?: { code: number; message: string }; result?: unknown }
+    expect(body.result).toBeUndefined()
+    expect(body.error).toMatchObject({ code: -32602, message: 'unknown_tool' })
+  })
+
+  it('schema-invalid args are a JSON-RPC -32602 error at HTTP 200, not isError', async () => {
+    const res = await call(mcpApp, 'https://pot.example/', { ...rpcCall, params: { name: 'status', arguments: { bogus: 1 } } })
+    expect(res.status).toBe(200)
+    const body = await res.json() as { error?: { code: number; message: string }; result?: unknown }
+    expect(body.result).toBeUndefined()
+    expect(body.error).toMatchObject({ code: -32602, message: 'invalid_args' })
+  })
 })
