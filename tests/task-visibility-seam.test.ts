@@ -291,7 +291,10 @@ beforeAll(async () => {
   // an archived approved gate:content task with a result: the needs-you "publishable output" slice
   runSql(`INSERT INTO tasks (id, squad_id, title, status, project_id, gate_owner, result)
           VALUES ('t-a-archived-pub', '${SQ_A}', 'title t-a-archived-pub', 'approved', '${P1}', 'gate:content', 'published body')`)
-  for (const archivedId of ['t-a-archived', 't-a-archived-pub']) {
+  // ...and an archived gated unassigned blocked task: the "blocked_task" needs-you slice
+  runSql(`INSERT INTO tasks (id, squad_id, title, status, project_id, gate_owner)
+          VALUES ('t-b-archived-blocked', '${SQ_B}', 'title t-b-archived-blocked', 'blocked', '${P1}', 'gate:seam')`)
+  for (const archivedId of ['t-a-archived', 't-a-archived-pub', 't-b-archived-blocked']) {
     harness.sqlite.prepare(
       `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
        VALUES (?, datetime('now'), 'seam fixture', 'm-archiver', 'review')`,
@@ -357,7 +360,10 @@ describe('task-visibility seam matrix (every migrated reader == the canonical se
           if ((await readTaskForAuth(strict.env, auth, t.id)).status === 200) readable.push(t.id)
         }
         // an explicit id lookup is archived-inclusive: whoever reads the squad reads its archived task
-        const history = expected.includes('t-a-open') ? ['t-a-archived', 't-a-archived-pub'] : []
+        const history = [
+          ...(expected.includes('t-a-open') ? ['t-a-archived', 't-a-archived-pub'] : []),
+          ...(expected.includes('t-b-blocked') ? ['t-b-archived-blocked'] : []),
+        ]
         expect(readable.sort()).toEqual([...expected, ...history].sort())
       })
 
