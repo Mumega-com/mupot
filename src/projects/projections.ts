@@ -1,3 +1,4 @@
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { Env } from '../types'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import {
@@ -62,6 +63,9 @@ export interface ProjectProjectionCursor {
 export interface ProjectProjectionInput {
   projectId: string
   readableSquadIds: string[] | null
+  /** Visible-task scope from the shared chokepoint (src/tasks/visibility.ts, mupot#1647). When
+   *  given, the TASK rows of the activity feed read only these squads (never unrestricted). */
+  taskSquadIds?: readonly string[]
   excludeRoutineEvents?: boolean
   limit?: number
   offset?: number
@@ -313,6 +317,8 @@ export async function listProjectActivity(
   const sourceLimit = offset + limit + 1
   const ids = readableIds(input)
   const isAdmin = adminFlag(input)
+  const taskIds = input.taskSquadIds ? JSON.stringify([...new Set(input.taskSquadIds)]) : ids
+  const taskAdmin = input.taskSquadIds ? 0 : isAdmin
   const taskAfter = afterClause(input, epochMs('t.created_at'), 't.id', 'task', 4)
   const messageAfter = afterClause(input, epochMs('m.created_at'), 'm.id', 'message', 7)
   const flightAfter = afterClause(input, 'f.created_at', 'f.id', 'flight', 5)
@@ -329,9 +335,10 @@ export async function listProjectActivity(
          FROM tasks t JOIN squads s ON s.id = t.squad_id
         WHERE t.project_id = ?1
           AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+          AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ${taskAfter.sql}
         ORDER BY ${epochMs('t.created_at')} DESC, t.id ASC LIMIT ?${taskAfter.nextParam}`,
-    ).bind(input.projectId, isAdmin, ids, ...taskAfter.binds, sourceLimit).all<{
+    ).bind(input.projectId, taskAdmin, taskIds, ...taskAfter.binds, sourceLimit).all<{
       id: string; title: string; status: string; assignee_agent_id: string | null; created_at: string; squad_name: string
     }>(),
     env.DB.prepare(

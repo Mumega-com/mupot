@@ -13,6 +13,7 @@ import {
 } from './access'
 import { resolveReadableSquadIds } from './readable-squads'
 import { loadProjectSituation } from './situation'
+import { resolveVisibleTaskScope } from '../tasks/visibility'
 import {
   createProject,
   getProject,
@@ -391,9 +392,10 @@ projectsApp.get('/:id', async (c) => {
   const project = await readableProject(c.env, c.req.param('id'), access)
   if (!project) return c.json({ error: 'project_not_found' }, 404)
   const readableSquadIds = await projectionReadableSquads(c.env, access)
+  const taskScope = await resolveVisibleTaskScope(c.env, c.get('auth'))
   const [aggregates, situation, parent] = await Promise.all([
     projectAggregates(c.env, project.id, access),
-    loadProjectSituation(c.env, project, readableSquadIds),
+    loadProjectSituation(c.env, project, readableSquadIds, { taskScope }),
     project.parent_project_id ? getProject(c.env, project.parent_project_id) : null,
   ])
   return c.json({
@@ -413,6 +415,7 @@ projectsApp.get('/:id/activity', async (c) => {
   const rows = await listProjectActivity(c.env, {
     projectId: project.id,
     readableSquadIds: await projectionReadableSquads(c.env, access),
+    taskSquadIds: (await resolveVisibleTaskScope(c.env, c.get('auth'))).squadIds,
     limit: page.limit,
     offset: page.offset,
     after: page.after,

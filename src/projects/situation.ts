@@ -1,3 +1,4 @@
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { projectLinkTimestampMsSql } from '../addons/project-link/timestamps'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { routineTablesReady } from '../routines/schema-ready'
@@ -158,6 +159,14 @@ export interface ProjectSituation {
 }
 
 export interface ProjectSituationOptions {
+  /**
+   * The caller's visible-task scope from the shared chokepoint (src/tasks/visibility.ts,
+   * mupot#1647). When present, EVERY task-derived slice (counts, blockers, reviews, needs-you
+   * task rows, latest_activity task rows) reads only these squads, home squads and member rank
+   * included. Absent = internal caller (routine scheduler) whose `readableSquadIds` is already
+   * an explicit server-chosen list. Archived tasks are excluded in both cases.
+   */
+  taskScope?: { readonly squadIds: readonly string[] }
   excludeTaskIds?: string[]
   excludeFlightIds?: string[]
   excludeMessageIds?: string[]
@@ -456,6 +465,9 @@ export async function loadProjectSituation(
 ): Promise<ProjectSituation> {
   const ids = jsonIds(readableSquadIds)
   const unrestricted = readableFlag(readableSquadIds)
+  // Task-derived slices use the chokepoint scope when given (never unrestricted).
+  const taskIds = options.taskScope ? jsonIds([...options.taskScope.squadIds]) : ids
+  const taskUnrestricted = options.taskScope ? 0 : unrestricted
   const excludedTaskIds = jsonIds(options.excludeTaskIds ?? [])
   const excludedFlightIds = jsonIds(options.excludeFlightIds ?? [])
   const excludedActivity = new Set([
@@ -472,6 +484,9 @@ export async function loadProjectSituation(
   // Rolling deploy: Worker may ship before D1 applies 0073. Skip Routine SQL until tables exist.
   const routinesReady = controlSnapshot ? false : await routineTablesReady(env)
   const skipRoutineSlices = controlSnapshot || !routinesReady
+  // needs-you binds the task scope as its own trailing params (its routine slices keep ?2/?3).
+  const tFlag = routinesReady ? '?6' : '?5'
+  const tIds = routinesReady ? '?7' : '?6'
 
   const [taskResult, flightResult, routineResult, nextRoutineResult, activeRunResult, terminalRunResult, needsYouResult, activity, linkHealthResult] = await Promise.all([
     env.DB.prepare(
@@ -482,6 +497,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'blocked'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
@@ -491,6 +507,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'review'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
@@ -500,6 +517,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'in_progress'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
@@ -509,6 +527,7 @@ export async function loadProjectSituation(
            FROM tasks t
           WHERE t.project_id = ?1 AND t.status = 'open'
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
           ORDER BY t.updated_at, t.id LIMIT ?4
        )
@@ -518,7 +537,7 @@ export async function loadProjectSituation(
        UNION ALL SELECT * FROM open_rows
        ORDER BY status_order, updated_at, id
        LIMIT ?5`,
-    ).bind(project.id, unrestricted, ids, snapshotLimit, snapshotLimit * 4, excludedTaskIds).all<SituationTaskRow>(),
+    ).bind(project.id, taskUnrestricted, taskIds, snapshotLimit, snapshotLimit * 4, excludedTaskIds).all<SituationTaskRow>(),
     env.DB.prepare(
       `SELECT f.id, f.agent, f.goal, f.status, f.created_at
          FROM flights f
@@ -597,7 +616,7 @@ export async function loadProjectSituation(
                 0 AS urgency_rank, t.gate_owner AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'review' AND t.gate_owner IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        routine_waits AS (
@@ -624,7 +643,7 @@ export async function loadProjectSituation(
                 2 AS urgency_rank, t.gate_owner AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'blocked' AND t.assignee_agent_id IS NULL AND t.gate_owner IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        publishable_outputs AS (
@@ -633,7 +652,7 @@ export async function loadProjectSituation(
                 3 AS urgency_rank, 'workspace_admin' AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'approved' AND t.gate_owner = 'gate:content' AND t.result IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        )
        SELECT * FROM (
@@ -649,7 +668,7 @@ export async function loadProjectSituation(
                 0 AS urgency_rank, t.gate_owner AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'review' AND t.gate_owner IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        blocked_tasks AS (
@@ -658,7 +677,7 @@ export async function loadProjectSituation(
                 2 AS urgency_rank, t.gate_owner AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'blocked' AND t.assignee_agent_id IS NULL AND t.gate_owner IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        ),
        publishable_outputs AS (
@@ -667,7 +686,7 @@ export async function loadProjectSituation(
                 3 AS urgency_rank, 'workspace_admin' AS responsible, t.created_at, p.target_date AS deadline_at
            FROM tasks t JOIN projects p ON p.id = t.project_id
           WHERE t.project_id = ?1 AND t.status = 'approved' AND t.gate_owner = 'gate:content' AND t.result IS NOT NULL
-            AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
+            AND (${tFlag} = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(${tIds}))) AND ${TASK_NOT_ARCHIVED_SQL('t')}
           ORDER BY COALESCE(p.target_date, '9999-12-31T23:59:59.999Z'), t.created_at DESC, 'task', t.id LIMIT ?4
        )
        SELECT * FROM (
@@ -678,12 +697,13 @@ export async function loadProjectSituation(
        LIMIT ?4`,
       ).bind(
         ...(routinesReady
-          ? [project.id, unrestricted, ids, snapshotLimit, env.TENANT_SLUG]
-          : [project.id, unrestricted, ids, snapshotLimit]),
+          ? [project.id, unrestricted, ids, snapshotLimit, env.TENANT_SLUG, taskUnrestricted, taskIds]
+          : [project.id, unrestricted, ids, snapshotLimit, taskUnrestricted, taskIds]),
       ).all<SituationNeedsYouRow>(),
     listProjectActivity(env, {
       projectId: project.id,
       readableSquadIds,
+      taskSquadIds: options.taskScope?.squadIds,
       excludeRoutineEvents: skipRoutineSlices,
       limit: Math.min(100, excludedActivity.size + 1),
     }),

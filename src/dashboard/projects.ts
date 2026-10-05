@@ -28,6 +28,7 @@ import {
 } from '../projects/access'
 import { listProjectActivity, listProjectEvidence } from '../projects/projections'
 import { loadProjectSituation } from '../projects/situation'
+import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { resolveGrantedSquadIds } from '../projects/readable-squads'
 import type {
   ProjectActivitySource,
@@ -767,13 +768,14 @@ export async function loadProjectDetail(
   const { project, access } = readable
 
   const squads = await loadReadableSquads(env, project.id, access)
+  const taskScope = await resolveVisibleTaskScope(env, auth)
   const [aggregates, tasks, members, parent, situation, activity, evidence, boards, canManageBoards, worker] = await Promise.all([
     loadProjectAggregates(env, project.id, access),
     loadReadableTasks(env, project.id, access),
     loadReadableProjectMembers(env, squads.rows),
     project.parent_project_id ? getProject(env, project.parent_project_id) : Promise.resolve(null),
-    loadProjectSituation(env, project, access.readableSquadIds),
-    listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
+    loadProjectSituation(env, project, access.readableSquadIds, { taskScope }),
+    listProjectActivity(env, { projectId: project.id, readableSquadIds: access.readableSquadIds, taskSquadIds: taskScope.squadIds }),
     listProjectEvidence(env, { projectId: project.id, readableSquadIds: access.readableSquadIds }),
     listProjectBindings(env, project.id),
     projectManageAccessContextFor(env, access, project.id).then((ctx) => ctx.authorized),

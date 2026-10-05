@@ -23,7 +23,8 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
-import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, capabilityRank, planeCoversScope, brandSquadScope } from '../auth/capability'
+import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
+import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError } from './service'
 import type { TaskStatus } from './service'
@@ -175,92 +176,8 @@ export async function canActOnSquad(
   return hasCapability(grants, 'squad', scope, min)
 }
 
-// `null` = unrestricted (legacy owner/admin, or an org-scope grant holder) —
-// the caller adds NO `squad_id IN (...)` clause at all, same zero-extra-query
-// cost as before G-FP1b. That is exactly why this alone is NOT enough to
-// exclude home squads: a materialized "every non-home squad id" list would
-// change this from "no filter" to "an enumerated filter" for the common
-// admin case, which is both a real cost regression AND breaks the "an
-// unrestricted read costs the same query shape as always" property
-// tests/tasks-list-rbac.test.ts asserts directly. Home exclusion for the
-// `null` case is instead pushed into the CALLER's SQL as a `NOT EXISTS`
-// clause (see the `readable === null` branch in the GET / handler below) —
-// this function's contract is otherwise UNCHANGED from before this PR.
-async function readableSquadIds(env: Env, auth: AuthContext): Promise<string[] | null> {
-  if (legacyOwnerAdmin(auth)) return null
-  if (!auth.memberId) return []
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, 'member')) return null
-
-  const squadIds = new Set<string>()
-  const deptIds = new Set<string>()
-  for (const grant of grants) {
-    // Self-referential check (this grant, on its OWN scope) — exact-scope
-    // squad grants always cover their own squad regardless of kind, and a
-    // department-scope grant never legitimately names a home department
-    // after this PR's C-surface refusals, so no SquadScope/kind lookup is
-    // needed here either.
-    if (grant.scope_type === 'squad' && grant.scope_id && capabilityRank(grant.capability) >= capabilityRank('member')) {
-      squadIds.add(grant.scope_id)
-    }
-    if (grant.scope_type === 'department' && grant.scope_id && capabilityRank(grant.capability) >= capabilityRank('member')) {
-      deptIds.add(grant.scope_id)
-    }
-  }
-
-  if (deptIds.size > 0) {
-    // Defense in depth: a department-scope grant should never legitimately
-    // name a home department after this PR's writer refusals, but the
-    // exclusion costs nothing to assert here directly too.
-    const rows = await env.DB.prepare(
-      `SELECT id
-         FROM squads
-        WHERE department_id IN (
-          SELECT CAST(value AS TEXT) FROM json_each(?)
-        )
-        AND kind != 'home'`,
-    )
-      .bind(JSON.stringify([...deptIds]))
-      .all<{ id: string }>()
-    for (const row of rows.results ?? []) squadIds.add(row.id)
-  }
-
-  return [...squadIds]
-}
-
-async function canReadProjectForTaskList(
-  env: Env,
-  auth: AuthContext,
-  projectId: string,
-  readableSquads: string[] | null,
-  explicitSquadId?: string,
-): Promise<boolean> {
-  if (legacyOwnerAdmin(auth)) {
-    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?').bind(projectId).first()) !== null
-  }
-  if (!auth.memberId) return false
-  const grants = auth.capabilities ?? (await resolveCapabilities(env, auth.memberId))
-  if (hasCapability(grants, 'org', null, 'admin')) {
-    return (await env.DB.prepare('SELECT 1 FROM projects WHERE id = ?').bind(projectId).first()) !== null
-  }
-
-  const squadIds = explicitSquadId ? [explicitSquadId] : readableSquads
-  if (squadIds !== null && squadIds.length === 0) return false
-  const squadClause = squadIds === null
-    ? ''
-    : ` AND psa.squad_id IN (
-          SELECT CAST(value AS TEXT) FROM json_each(?)
-        )`
-  return (await env.DB.prepare(
-    `SELECT 1
-       FROM projects p
-      WHERE p.id = ?
-        AND EXISTS (
-          SELECT 1 FROM project_squad_access psa
-           WHERE psa.project_id = p.id${squadClause}
-        )`,
-  ).bind(projectId, ...(squadIds === null ? [] : [JSON.stringify(squadIds)])).first()) !== null
-}
+// mupot#1647: readableSquadIds / canReadProjectForTaskList were this router's private copies of the
+// read-visibility rules; they now live in the shared chokepoint (./visibility).
 
 function taskProjectErrorResponse(error: TaskProjectError): { body: { error: string; need?: string }; status: 400 | 403 | 404 | 409 } {
   if (error.code === 'project_not_found') return { body: { error: error.code }, status: 404 }
@@ -313,57 +230,70 @@ tasksApp.use('*', async (c, next) => {
 
 // ── GET / — list tasks ───────────────────────────────────────────────────────
 
-tasksApp.get('/', async (c) => {
-  const squadId = c.req.query('squad_id')
-  const status = c.req.query('status')
-  const projectId = c.req.query('project_id')
-  const auth = c.get('auth')
+tasksApp.get('/', async (c) =>
+  listTasksForAuth(c.env, c.get('auth'), {
+    squadId: c.req.query('squad_id'),
+    status: c.req.query('status'),
+    projectId: c.req.query('project_id'),
+  }),
+)
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return Response.json(body, { status })
+}
+
+// GET / — the list reader, callable with an explicit AuthContext (the route above is a thin
+// wrapper) so the task-visibility seam test (tests/task-visibility-seam.test.ts) can drive it
+// with every caller shape. Row visibility comes from the shared chokepoint (./visibility).
+export async function listTasksForAuth(
+  env: Env,
+  auth: AuthContext,
+  q: { squadId?: string; status?: string; projectId?: string },
+): Promise<Response> {
+  const squadId = q.squadId
+  const status = q.status
+  const projectId = q.projectId
+  
   if (status !== undefined && !isTaskStatus(status)) {
-    return c.json({ error: 'invalid_status' }, 400)
+    return jsonResponse({ error: 'invalid_status' }, 400)
   }
   if (projectId !== undefined && !isNonEmptyString(projectId)) {
-    return c.json({ error: 'invalid_project_id' }, 400)
+    return jsonResponse({ error: 'invalid_project_id' }, 400)
   }
 
-  // Build the filter with bound params only — never interpolate caller input.
+  // Build the filter with bound params only — never interpolate caller input. Placeholders
+  // are NUMBERED (?N): D1 rejects a bind count that differs from the placeholder count.
   const clauses: string[] = []
   const binds: string[] = []
-  let readable: string[] | null = null
+  const bindParam = (value: string): string => {
+    binds.push(value)
+    return `?${binds.length}`
+  }
+  // mupot#1647: who may read which tasks is decided by the shared chokepoint
+  // (src/tasks/visibility.ts) — squad plane/rank/home fence and the archive predicate.
+  let candidateSquadIds: readonly string[]
   if (squadId !== undefined) {
-    if (!(await canActOnSquad(c.env, auth, squadId))) {
-      return c.json({ error: 'forbidden', need: 'member' }, 403)
+    if (!(await canReadSquadTasks(env, auth, squadId))) {
+      return jsonResponse({ error: 'forbidden', need: 'member' }, 403)
     }
-    clauses.push('squad_id = ?')
-    binds.push(squadId)
+    const visible = visibleTaskClause({ squadIds: [squadId] }, 1)
+    binds.push(...(visible.binds as string[]))
+    clauses.push(visible.sql)
+    candidateSquadIds = [squadId]
   } else {
-    readable = await readableSquadIds(c.env, auth)
-    if (readable !== null) {
-      if (readable.length > 0) {
-        clauses.push(`squad_id IN (
-          SELECT CAST(value AS TEXT) FROM json_each(?)
-        )`)
-        binds.push(JSON.stringify(readable))
-      }
-    } else {
-      // G-FP1b point 2/3: `readable === null` means "unrestricted" (legacy
-      // owner/admin, or an org-scope grant holder) — no `squad_id IN (...)`
-      // enumeration, by design (see readableSquadIds's doc comment). That
-      // must not include a member's home squad, so the exclusion is pushed
-      // into the query itself instead of into a materialized id list.
-      clauses.push(`NOT EXISTS (
-        SELECT 1 FROM squads s WHERE s.id = tasks.squad_id AND s.kind = 'home'
-      )`)
-    }
+    const scope = await resolveVisibleTaskScope(env, auth)
+    if (scope.squadIds.length === 0) return jsonResponse({ tasks: [] })
+    const visible = visibleTaskClause(scope, 1)
+    binds.push(...(visible.binds as string[]))
+    clauses.push(visible.sql)
+    candidateSquadIds = scope.squadIds
   }
   if (projectId !== undefined) {
-    if (!(await canReadProjectForTaskList(c.env, auth, projectId, readable, squadId))) {
-      return c.json({ error: 'project_not_found' }, 404)
+    if (!(await canReadProjectForTasks(env, auth, projectId, candidateSquadIds))) {
+      return jsonResponse({ error: 'project_not_found' }, 404)
     }
-    clauses.push('project_id = ?')
-    binds.push(projectId)
+    clauses.push(`project_id = ${bindParam(projectId)}`)
   }
-  if (squadId === undefined && readable !== null && readable.length === 0) return c.json({ tasks: [] })
   // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED at
   // the SQL layer, not just reordered in JS after an unbounded read — see
   // ranking.ts's "SQL fetch-boundary helpers" section for the full P1
@@ -381,10 +311,10 @@ tasksApp.get('/', async (c) => {
     // completed/gated" view is what a caller filtering to done/review/etc.
     // actually wants).
     const isActionable = !excludeFromRanking(status)
-    const statusClauses = [...clauses, 'status = ?']
+    const statusClauses = [...clauses, `status = ?${binds.length + 1}`]
     const statusBinds = [...binds, status]
     const cap = isActionable ? ACTIONABLE_FETCH_CAP : PASSTHROUGH_FETCH_CAP
-    const rows = await c.env.DB.prepare(
+    const rows = await env.DB.prepare(
       `SELECT ${TASK_SELECT_COLUMNS}
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
@@ -410,7 +340,7 @@ tasksApp.get('/', async (c) => {
       : `WHERE ${terminalStatusInSql()}`
 
     const [actionableRows, terminalRows] = await Promise.all([
-      c.env.DB.prepare(
+      env.DB.prepare(
         `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${actionableWhere}
            ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
@@ -418,7 +348,7 @@ tasksApp.get('/', async (c) => {
       )
         .bind(...binds)
         .all<Task>(),
-      c.env.DB.prepare(
+      env.DB.prepare(
         `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${terminalWhere}
            ORDER BY ${priorityOrderSql()}, created_at DESC
@@ -436,10 +366,10 @@ tasksApp.get('/', async (c) => {
   // Skipped entirely when there are no rows to rank — no reason to pay for it
   // on an empty result.
   const agentStates: ReadonlyMap<string, AgentRuntimeState> =
-    taskRows.length > 0 ? await loadAgentRuntimeStates(c.env) : new Map()
+    taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
-  return c.json({ tasks: rankTasks(taskRows, agentStates) })
-})
+  return jsonResponse({ tasks: rankTasks(taskRows, agentStates) })
+}
 
 // ── GET /audit — audit task intake compliance across squad/tenant (Issue #1040 Phase 3) ──
 tasksApp.get('/audit', async (c) => {
@@ -539,26 +469,31 @@ tasksApp.get('/audit', async (c) => {
 // ── GET /:id — single task read (for the /send poller) ───────────────────────
 // member+ on the task's squad. Includes result + completed_at so the dashboard
 // can render the live status and the finished output.
-tasksApp.get('/:id', async (c) => {
-  const id = c.req.param('id')
-  const task = await c.env.DB.prepare(
+tasksApp.get('/:id', async (c) => readTaskForAuth(c.env, c.get('auth'), c.req.param('id')))
+
+// GET /:id — single-row reader with an explicit AuthContext (see listTasksForAuth).
+export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): Promise<Response> {
+  const task = await env.DB.prepare(
     `SELECT ${TASK_SELECT_COLUMNS}
        FROM tasks WHERE id = ? LIMIT 1`,
   )
     .bind(id)
     .first<Task>()
-  if (!task) return c.json({ error: 'task_not_found' }, 404)
+  if (!task) return jsonResponse({ error: 'task_not_found' }, 404)
 
   // RBAC: reading a task requires member+ on its squad. (A token scoped to this
   // tenant but holding no grant on the squad must not read its work.)
-  if (!(await canActOnSquad(c.env, c.get('auth'), task.squad_id))) {
-    return c.json({ error: 'forbidden', need: 'member' }, 403)
+  // mupot#1647: single-row reader of the shared chokepoint. An explicit id lookup is a
+  // history read, so an archived task stays readable here (includeArchived) — listings
+  // never are.
+  if (!(await canReadTask(env, auth, task, { includeArchived: true }))) {
+    return jsonResponse({ error: 'forbidden', need: 'member' }, 403)
   }
 
-  const [visibleTask] = await loadGateWakeNotices(c.env, [task])
-  const dispatchTimeline = await listTaskDispatchReceiptTimeline(c.env, task.id)
-  return c.json({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
-})
+  const [visibleTask] = await loadGateWakeNotices(env, [task])
+  const dispatchTimeline = await listTaskDispatchReceiptTimeline(env, task.id)
+  return jsonResponse({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
+}
 
 // ── POST / — create a task (optionally dispatch it for execution) ─────────────
 

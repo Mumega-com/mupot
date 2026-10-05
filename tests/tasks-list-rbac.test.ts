@@ -143,7 +143,9 @@ describe('GET /api/tasks RBAC', () => {
     // #22 v1 ATC ranking (P1 fix): no explicit ?status filter, so this is now
     // TWO bounded queries (actionable + terminal), never one unbounded fetch.
     expect(taskQueries).toHaveLength(2)
-    expect(taskQueries.every((q) => !q.sql.includes('squad_id IN'))).toBe(true)
+    // mupot#1647: the unrestricted owner now reads through the shared chokepoint, which
+    // materializes the explicit non-home squad list (never an unbounded/unfiltered read).
+    expect(taskQueries.every((q) => q.sql.includes('squad_id IN'))).toBe(true)
   })
 
   it('member session without a resolved member id cannot list every squad by omission', async () => {

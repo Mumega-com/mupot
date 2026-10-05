@@ -121,7 +121,10 @@ it('the task-listing queries THIS ROUND fixed still carry TASK_NOT_ARCHIVED_SQL 
   // Direct proof for the array-composed case the literal scan above cannot
   // see: baseClauses itself must contain the fragment's call.
   const mcpIndexSrc = readFileSync(join(SRC_DIR, 'mcp', 'index.ts'), 'utf8')
-  expect(mcpIndexSrc).toMatch(/const baseClauses = \['squad_id = \?1', TASK_NOT_ARCHIVED_SQL\(\)\]/)
+  // mupot#1647: task_list's row predicate (squad + not archived) comes from the shared
+  // task-visibility chokepoint, which itself carries TASK_NOT_ARCHIVED_SQL.
+  expect(mcpIndexSrc).toMatch(/const baseClauses = \[visible\.sql\]/)
+  expect(readFileSync(join(SRC_DIR, 'tasks', 'visibility.ts'), 'utf8')).toMatch(/TASK_NOT_ARCHIVED_SQL\(alias\)/)
 })
 
 // ── functional proof ─────────────────────────────────────────────────────────

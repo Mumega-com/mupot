@@ -14,7 +14,9 @@ function harness(options: { includeKeysetMigration?: boolean } = {}) {
     .filter((name) => {
       if (!name.endsWith('.sql')) return false
       // Pre-keyset path: skip 0059+ (project_id attribution columns + later rebuilds).
-      if (!includeKeysetMigration && name >= '0059_') return false
+      // mupot#1647: 0173 (tasks_archive_state) stays in — the activity task rows now exclude
+      // archived tasks and that migration shipped long before this simulated window.
+      if (!includeKeysetMigration && name >= '0059_' && !name.startsWith('0173_')) return false
       return true
     })
     .sort()) {

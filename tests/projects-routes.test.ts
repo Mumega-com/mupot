@@ -160,7 +160,7 @@ describe('projectsApp', () => {
     seedProjects(harness)
     as(actor({
       memberId: 'member-a',
-      capabilities: [{ member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'observer' }],
+      capabilities: [{ member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'member' }],
     }))
 
     const detail = await fetch(harness, '/visible-child')
@@ -241,7 +241,7 @@ describe('projectsApp', () => {
     seedProjects(harness)
     as(actor({
       memberId: 'member-a',
-      capabilities: [{ member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'observer' }],
+      capabilities: [{ member_id: 'member-a', scope_type: 'department', scope_id: 'dept-a', capability: 'member' }],
     }))
 
     const list = await fetch(harness, '/')
@@ -284,13 +284,13 @@ describe('projectsApp', () => {
         member_id: 'member-many',
         scope_type: 'squad' as const,
         scope_id: index === 159 ? 'squad-a' : `unused-squad-${index}`,
-        capability: 'observer' as const,
+        capability: 'member' as const,
       })),
       ...Array.from({ length: 160 }, (_, index) => ({
         member_id: 'member-many',
         scope_type: 'department' as const,
         scope_id: index === 159 ? 'dept-a' : `unused-department-${index}`,
-        capability: 'observer' as const,
+        capability: 'member' as const,
       })),
     ]
     as(actor({ memberId: 'member-many', capabilities }))
@@ -324,7 +324,7 @@ describe('projectsApp', () => {
     as(actor({
       memberId: 'bulk-reader',
       capabilities: [
-        { member_id: 'bulk-reader', scope_type: 'department', scope_id: 'bulk-dept', capability: 'observer' },
+        { member_id: 'bulk-reader', scope_type: 'department', scope_id: 'bulk-dept', capability: 'member' },
       ],
     }))
 
@@ -370,7 +370,7 @@ describe('projectsApp', () => {
 
     as(actor({
       memberId: 'member-a',
-      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'observer' }],
+      capabilities: [{ member_id: 'member-a', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
     }))
     await expect((await fetch(harness, '/visible-child')).json()).resolves.toMatchObject({
       aggregates: { direct_tasks: 1, direct_squads: 1, direct_flights: 1 },
