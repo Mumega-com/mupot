@@ -261,6 +261,17 @@ describe('task_get — payload', () => {
     expect(((await get(otherAgent, 't-a-review')) as { result: { latest_dispatch_receipt: unknown } }).result.latest_dispatch_receipt).toBeNull()
   })
 
+  it('execution_receipt_id is assignee-only too: a non-assignee reader gets null, the assignee sees it', async () => {
+    harness.sqlite.exec(`UPDATE tasks SET execution_receipt_id = 'd-new' WHERE id = 't-a-review'`)
+    type R = { result: { task: { execution_receipt_id: unknown } } }
+    const a = await callers().find((c) => c.name === 'squad-A member')!.auth() // not agent-bound
+    expect(((await get(a, 't-a-review')) as R).result.task.execution_receipt_id).toBeNull()
+    const otherAgent = authFor('m-squad-a', await resolveCapabilities(strict.env, 'm-squad-a'), { boundAgentId: 'ag-other' })
+    expect(((await get(otherAgent, 't-a-review')) as R).result.task.execution_receipt_id).toBeNull()
+    expect(((await get(await bound(), 't-a-review')) as R).result.task.execution_receipt_id).toBe('d-new')
+    harness.sqlite.exec(`UPDATE tasks SET execution_receipt_id = NULL WHERE id = 't-a-review'`)
+  })
+
   it('dispatch status reflects runtime terminal state, and last_error is not hidden when claimed', async () => {
     harness.sqlite.exec(`UPDATE task_dispatch_receipts SET last_error = 'transport hiccup', consumed_at = NULL WHERE id = 'd-new'`)
     let r = (await get(await bound(), 't-a-review') as { result: { latest_dispatch_receipt: unknown } }).result

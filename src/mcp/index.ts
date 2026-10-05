@@ -1265,7 +1265,11 @@ const toolTaskGet: ToolSpec = {
     if (!full || !(await canReadTask(env, auth, { id: full.id, squad_id: full.squad_id }))) {
       return fail(404, 'task_not_found')
     }
-    const row = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
+    // Assignee-only, exactly like task_list/task_board: a non-assignee reader gets no dispatch
+    // or execution receipt id (Athena gate on #1665: execution_receipt_id leaked via the row).
+    const isAssignee = !!auth.boundAgentId && full.assignee_agent_id === auth.boundAgentId
+    const row: Record<string, unknown> = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
+    if (!isAssignee) row.execution_receipt_id = null
     // Canonical latest-verdict reader (tasks/service.ts) - carries reversed_at; same ordering
     // every reversal path trusts. decided_by is shown in the REST timeline's display form.
     const v = await findLatestVerdict(env, full.id)
@@ -1278,9 +1282,8 @@ const toolTaskGet: ToolSpec = {
           reversed_at: v.reversed_at ?? null,
         }
       : null
-    // Assignee-only, exactly like task_list/task_board: a non-assignee reader gets null.
     let latestDispatch: LatestDispatchStatus | null = null
-    if (auth.boundAgentId && full.assignee_agent_id === auth.boundAgentId) {
+    if (isAssignee) {
       const info = (await loadLatestDispatchReceiptsForTasks(env, [full.id])).get(full.id)
       latestDispatch = info ? await loadDispatchStatus(env, info.dispatch_receipt_id) : null
     }
