@@ -24,6 +24,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { createFakeMcpwp, type FakeMcpwpPost, type FakeMcpwpPostMode } from './helpers/fake-mcpwp'
 import { applyAllMigrations } from './helpers/migrations'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
 import { invokeTool } from '../src/mcp/index'
@@ -31,7 +32,7 @@ import '../src/mcp/office'
 import { activateAddon, configureAddon, installAddon } from '../src/addons/service'
 import { createTask } from '../src/tasks/service'
 import * as bindingsModule from '../src/addons/bindings'
-import { publishOfficePost } from '../src/addons/office/service'
+import { publishOfficePost, OFFICE_IDEMPOTENCY_META_KEY, OFFICE_PAYLOAD_HASH_META_KEY } from '../src/addons/office/service'
 import { resolveActiveOfficeInstallationId, buildOfficePublishFreeze } from '../src/addons/office/freeze'
 import { manifestSha256 } from '../src/addons/contract'
 import { McpwpOfficeAddon } from '../src/addons/office/manifest'
@@ -506,7 +507,7 @@ describe('T2b: the real write-capable binding lifecycle', () => {
     await approveOfficeTask(testEnv, taskId)
 
     const fetchSpy = vi.fn(async () => new Response(
-      JSON.stringify({ id: 5150, link: 'https://wordpress.example.com/?p=5150' }),
+      JSON.stringify({ id: 5150, url: 'https://wordpress.example.com/?p=5150' }),
       { status: 201, headers: { 'content-type': 'application/json' } },
     )) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
@@ -548,7 +549,7 @@ describe('T2b: the real write-capable binding lifecycle', () => {
       calls += 1
       const mine = calls
       await new Promise((resolve) => setTimeout(resolve, 15))
-      return new Response(JSON.stringify({ id: 2000 + mine, link: `https://wordpress.example.com/?p=${2000 + mine}` }), { status: 201 })
+      return new Response(JSON.stringify({ id: 2000 + mine, url: `https://wordpress.example.com/?p=${2000 + mine}` }), { status: 201 })
     }) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
 
@@ -654,7 +655,7 @@ describe('office.publish_post', () => {
     // The frozen payload was computed from task.title/task.body at APPROVAL time —
     // office.publish_post no longer accepts title/content from its caller at all.
     const fetchSpy = vi.fn(async () => new Response(
-      JSON.stringify({ id: 4242, link: 'https://wordpress.example.com/?p=4242' }),
+      JSON.stringify({ id: 4242, url: 'https://wordpress.example.com/?p=4242' }),
       { status: 201, headers: { 'content-type': 'application/json' } },
     )) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
@@ -667,7 +668,7 @@ describe('office.publish_post', () => {
     const [rawUrl, init] = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     const url = new URL(String(rawUrl))
     expect(url.origin).toBe('https://wordpress.example.com')
-    expect(url.pathname).toBe('/wp-json/wp/v2/posts')
+    expect(url.pathname).toBe('/wp-json/mcpwp/v1/posts')
     const body = JSON.parse(String(init.body)) as { title: string; content: string; status: string; slug: string }
     // task.title is 'Publish: Q4 recap' (makeOfficeTask) and task.body defaults to
     // '' (createTask's body is optional) — the point of this assertion is that the
@@ -746,7 +747,7 @@ describe('office.publish_post', () => {
       calls += 1
       const mine = calls
       await new Promise((resolve) => setTimeout(resolve, 15))
-      return new Response(JSON.stringify({ id: 1000 + mine, link: `https://wordpress.example.com/?p=${1000 + mine}` }), { status: 201 })
+      return new Response(JSON.stringify({ id: 1000 + mine, url: `https://wordpress.example.com/?p=${1000 + mine}` }), { status: 201 })
     }) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
 
@@ -1111,7 +1112,7 @@ describe('r2 P1-1: an ambiguous publish outcome never clears the double-post gua
     const fetchSpy = vi.fn(async () => {
       calls += 1
       if (calls === 1) throw new DOMException('The operation was aborted.', 'AbortError')
-      return new Response(JSON.stringify({ id: 900 + calls, link: `https://wordpress.example.com/?p=${900 + calls}` }), { status: 201 })
+      return new Response(JSON.stringify({ id: 900 + calls, url: `https://wordpress.example.com/?p=${900 + calls}` }), { status: 201 })
     }) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
 
@@ -1187,7 +1188,7 @@ describe('r2 P2-1: idempotency_key is generation-scoped, never reused across a r
 
     const fetchSpy2 = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as { slug: string }
-      return new Response(JSON.stringify({ id: 1234, link: 'https://wordpress.example.com/?p=1234', slug: body.slug }), { status: 201 })
+      return new Response(JSON.stringify({ id: 1234, url: 'https://wordpress.example.com/?p=1234', slug: body.slug }), { status: 201 })
     }) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy2)
     await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
@@ -1312,74 +1313,30 @@ describe('r3 P3-1/P2-1: an audited, retried human override unblocks a reconcile 
 // semantics: a `-term` is an EXCLUSION), run through the real fetch path.
 // Every scenario below must end with AT MOST ONE post in the fake site's
 // store, whether or not an operator ever calls reconcile at all.
-interface FakeWpPostR3 { id: number; slug: string; status: string; title: string; content: string; type: string; date: number }
-type PostSendMode = 'ok' | 'throwAfterInsert' | '403AfterInsert' | '302AfterInsert' | '400AfterInsert'
+type PostSendMode = Exclude<FakeMcpwpPostMode, 'ok'>
 
-/** WordPress's own `search=` semantics, simplified to the one rule that
- *  matters here: a `-term` is an EXCLUSION (`NOT LIKE`), so a title that
- *  contains a hyphen-prefixed number (e.g. "-3%") excludes itself from its
- *  own search — the exact WordPress behavior r2's title/time fallback search
- *  silently assumed away. */
-function wpSearchMatchesR3(post: FakeWpPostR3, search: string): boolean {
-  const terms = search.split(/\s+/).filter(Boolean)
-  const hay = `${post.title} ${post.content}`.toLowerCase()
-  return terms.every((term) => (
-    term.startsWith('-') && term.length > 1
-      ? !hay.includes(term.slice(1).toLowerCase())
-      : hay.includes(term.toLowerCase())
-  ))
-}
-
+/** The r3 scenarios on the faithful MCPWP fake (tests/helpers/fake-mcpwp.ts):
+ *  what the site does to the post behind the addon's back (a custom editorial
+ *  status, a slug/title rewrite, a post-type switch) and how the create response
+ *  is lost (abort, WAF 403, 302, 400). The addon's identity is the post META,
+ *  which none of those rewrites touch. */
 function fakeWordpressR3(opts: {
   postMode?: PostSendMode
   forceStatus?: string
   forceType?: string
   rewriteSlugAndTitle?: (post: { slug: string; title: string }) => { slug: string; title: string }
-  clockSkewMs?: number
+  apiKey: string
 }) {
-  const posts: FakeWpPostR3[] = []
-  const requests: string[] = []
-  let nextId = 100
-  const f = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = new URL(String(input))
-    const method = init?.method ?? 'GET'
-    requests.push(`${method} ${url.pathname}${decodeURIComponent(url.search)}`)
-    if (method === 'POST') {
-      const body = JSON.parse(String(init?.body)) as { title: string; content: string; slug: string; status: string }
-      const rewritten = opts.rewriteSlugAndTitle?.({ slug: body.slug, title: body.title }) ?? { slug: body.slug, title: body.title }
-      let slug = rewritten.slug
-      let n = 2
-      while (posts.some((p) => p.slug === slug)) slug = `${rewritten.slug}-${n++}`
-      const post: FakeWpPostR3 = {
-        id: nextId++, slug, title: rewritten.title, content: body.content,
-        status: opts.forceStatus ?? body.status, type: opts.forceType ?? 'post',
-        date: Date.now() + (opts.clockSkewMs ?? 0),
-      }
-      posts.push(post)
-      switch (opts.postMode) {
-        case 'throwAfterInsert': throw new DOMException('The operation was aborted.', 'AbortError')
-        case '403AfterInsert': return new Response('<html>403 Forbidden (WAF)</html>', { status: 403 })
-        case '302AfterInsert': return new Response(null, { status: 302, headers: { location: `https://${url.host}/wp-admin/` } })
-        case '400AfterInsert': return new Response('{"code":"plugin_validation"}', { status: 400 })
-        default: return new Response(JSON.stringify({ id: post.id, link: `https://${url.host}/?p=${post.id}`, slug }), { status: 201 })
-      }
-    }
-    // GET — only ever returns post_type=post, exactly like the real /wp/v2/posts endpoint.
-    let matches = posts.filter((p) => p.type === 'post')
-    const slug = url.searchParams.get('slug')
-    if (slug !== null) matches = matches.filter((p) => p.slug === slug)
-    const statuses = url.searchParams.get('status')?.split(',')
-    if (statuses) matches = matches.filter((p) => statuses.includes(p.status))
-    const search = url.searchParams.get('search')
-    if (search !== null) matches = matches.filter((p) => wpSearchMatchesR3(p, search))
-    const after = url.searchParams.get('after')
-    if (after !== null) matches = matches.filter((p) => p.date > Date.parse(after))
-    return new Response(
-      JSON.stringify(matches.map((p) => ({ id: p.id, link: `https://${url.host}/?p=${p.id}`, slug: p.slug, status: p.status }))),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    )
-  }) as unknown as typeof fetch
-  return { f, posts, requests }
+  const fake = createFakeMcpwp({
+    apiKey: opts.apiKey,
+    ...(opts.postMode ? { postMode: opts.postMode } : {}),
+    afterInsert: (post: FakeMcpwpPost) => {
+      if (opts.rewriteSlugAndTitle) Object.assign(post, opts.rewriteSlugAndTitle({ slug: post.slug, title: post.title }))
+      if (opts.forceStatus) post.status = opts.forceStatus
+      if (opts.forceType) post.type = opts.forceType
+    },
+  })
+  return { f: fake.f, posts: fake.posts, requests: fake.requests }
 }
 
 async function reverseAndReapproveR3(testEnv: Env, taskId: string): Promise<boolean> {
@@ -1399,7 +1356,7 @@ describe('r3: THE CLASS — every "looks absent but might not be" scenario ends 
     ['N2 slug AND title both edited between the ambiguous publish and reconcile', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: () => ({ slug: 'q4-recap-final', title: 'Q4 recap (updated)' }) } as const],
     ['N3 slug rewritten + a "-term" in the title (WordPress search treats it as an exclusion)', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: (p: { slug: string; title: string }) => ({ slug: `${p.slug}-en`, title: p.title }) } as const],
     ['N4 post type switched to page (Post Type Switcher)', { postMode: 'throwAfterInsert', forceType: 'page' } as const],
-    ['N5 slug rewritten + WordPress clock 20 minutes behind', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: (p: { slug: string; title: string }) => ({ slug: `${p.slug}-x`, title: p.title }), clockSkewMs: -20 * 60_000 } as const],
+    ['N5 slug rewritten (the lookup no longer depends on a clock window at all)', { postMode: 'throwAfterInsert', rewriteSlugAndTitle: (p: { slug: string; title: string }) => ({ slug: `${p.slug}-x`, title: p.title }) } as const],
     ['N6 403 after insert (a response-phase WAF, e.g. ModSecurity leakage rule)', { postMode: '403AfterInsert' } as const],
     ['N7 302 after insert (a plugin redirecting in save_post)', { postMode: '302AfterInsert' } as const],
     ['N8 400 after insert (a plugin erroring in rest_after_insert_post)', { postMode: '400AfterInsert' } as const],
@@ -1418,7 +1375,7 @@ describe('r3: THE CLASS — every "looks absent but might not be" scenario ends 
     const taskId = task.id
     await approveOfficeTask(testEnv, taskId)
 
-    const wp = fakeWordpressR3(wpOpts)
+    const wp = fakeWordpressR3({ ...wpOpts, apiKey: 'secret-r3-scenario' })
     vi.stubGlobal('fetch', wp.f)
     const publish1 = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
     expect(publish1.ok).toBe(false) // every scenario here is ambiguous or a post-send WAF/redirect/4xx — never a clean 2xx
@@ -2221,7 +2178,7 @@ describe('mupot#1592 freeze/verdict binding', () => {
     let capturedBody: { title?: string; content?: string } | null = null
     const fetchSpy = vi.fn(async (_url: string, init: RequestInit) => {
       capturedBody = JSON.parse(init.body as string)
-      return new Response(JSON.stringify({ id: 42, link: 'https://wordpress.example.com/?p=42' }), { status: 201 })
+      return new Response(JSON.stringify({ id: 42, url: 'https://wordpress.example.com/?p=42' }), { status: 201 })
     })
     vi.stubGlobal('fetch', fetchSpy)
 
@@ -2667,43 +2624,33 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     return taskId
   }
 
-  /** r2 P1-2: a minimal fake WordPress GET-only server — filters `?slug=` (exact,
-   *  status-scoped by the `?status=` CSV) the same way real WordPress does, and
-   *  `?search=` as a plain substring-on-title match. Used ONLY by the reconcile
-   *  tests below, which hand-seed a `posts` array directly rather than going
-   *  through a real publish. */
-  interface FakeWpPost { readonly id: number; readonly slug: string; readonly status: string; readonly title: string; readonly link: string }
-  function fakeWordpressReconcileServer(posts: readonly FakeWpPost[]) {
-    const requests: string[] = []
-    const f = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input))
-      requests.push(`${url.pathname}${url.search}`)
-      const slug = url.searchParams.get('slug')
-      const search = url.searchParams.get('search')
-      const statuses = (url.searchParams.get('status') ?? 'publish').split(',')
-      const matches = slug !== null
-        ? posts.filter((p) => p.slug === slug && statuses.includes(p.status))
-        : search !== null
-          ? posts.filter((p) => p.title.includes(search) && statuses.includes(p.status))
-          : []
-      return new Response(
-        JSON.stringify(matches.map((p) => ({ id: p.id, link: p.link, slug: p.slug, status: p.status }))),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      )
-    }) as unknown as typeof fetch
-    return { f, requests }
+  /** The faithful MCPWP fake (tests/helpers/fake-mcpwp.ts) seeded with posts that
+   *  the addon "published before the timeout" — each carrying the mupot-owned meta
+   *  the real create call would have stamped. The apiKey is the connector's own
+   *  secret (every test seeds its connector with the secret it passes here). */
+  function mcpwpReconcileServer(apiKey: string, posts: readonly FakeMcpwpPost[]) {
+    const fake = createFakeMcpwp({ apiKey, seed: posts })
+    return { f: fake.f, fake, get requests() { return fake.requests.map((r) => `${r.path}${decodeURIComponent(r.search)}`) } }
   }
 
-  it('the post WAS live on WordPress (a timeout after WordPress accepted it) — reconcile discovers it, forces outcome "done" with the real URL, and never accepts the operator\'s "failed" guess', async () => {
+  /** The meta the addon's real create call stamps for a claim (idempotency key +
+   *  prefixed payload hash) — read from the freeze row, never recomputed. */
+  function stampedMeta(harness: SqliteD1Harness, taskId: string, idempotencyKey: string): Record<string, string> {
+    const row = harness.sqlite.prepare(`SELECT payload_sha256 FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { payload_sha256: string }
+    return { [OFFICE_IDEMPOTENCY_META_KEY]: idempotencyKey, [OFFICE_PAYLOAD_HASH_META_KEY]: `sha256-${row.payload_sha256}` }
+  }
+
+  it('the post WAS live on WordPress (a timeout after WordPress accepted it) — reconcile finds it BY ITS META, forces outcome "done" with the real URL, and never accepts the operator\'s "failed" guess', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
-    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-found')
+    const secret = 'secret-1610-found'
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', secret)
     const idempotencyKey = 'idem-1610-found'
     const taskId = await setupStalledClaim(testEnv, harness, connectorId, idempotencyKey)
 
-    const wp = fakeWordpressReconcileServer([{
-      id: 777, slug: `mupot-office-${idempotencyKey}`, status: 'publish',
-      title: 'Publish: Q4 recap', link: 'https://wordpress.example.com/?p=777',
+    const wp = mcpwpReconcileServer(secret, [{
+      id: 777, slug: `mupot-office-${idempotencyKey}`, status: 'publish', type: 'post',
+      title: 'Publish: Q4 recap', content: '', meta: stampedMeta(harness, taskId, idempotencyKey),
     }])
     vi.stubGlobal('fetch', wp.f)
 
@@ -2718,10 +2665,10 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     )
 
     expect(reconciled.ok).toBe(true)
-    // Found on the FIRST query (the un-trashed slug, matching a live 'publish'
-    // status) — the trashed-slug and fallback-search queries never run.
-    expect(wp.f).toHaveBeenCalledOnce()
-    expect(wp.requests[0]).toContain(`slug=mupot-office-${idempotencyKey}`)
+    // slug search, title search, then ONE post-meta read of the single candidate.
+    expect(wp.requests[0]).toContain(`search=mupot-office-${idempotencyKey}`)
+    expect(wp.requests.some((r) => r.startsWith('/wp-json/mcpwp/v1/post-meta/777'))).toBe(true)
+    expect(wp.fake.posts.length).toBe(1) // reconcile never writes to WordPress
 
     const row = harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(taskId) as { status: string; result: string }
     expect(row.status).toBe('done')
@@ -2734,12 +2681,9 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     expect(JSON.parse(freeze.outcome_detail)).toMatchObject({
       postId: 777,
       articleUrl: 'https://wordpress.example.com/?p=777',
+      adoptedByPostMeta: true,
       verifiedLiveOnWordpress: true,
     })
-
-    // No second WordPress WRITE is even possible from here — the guard is
-    // cleared as 'done' (a terminal outcome), and a fresh review-entry would
-    // mint a brand-new freeze rather than ever re-touch this one.
     harness.close()
   })
 
@@ -2748,13 +2692,14 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     async (status) => {
       const harness = makeHarness()
       const testEnv = env(harness)
-      const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', `secret-1610-${status}`)
+      const secret = `secret-1610-${status}`
+      const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', secret)
       const idempotencyKey = `idem-1610-${status}`
       const taskId = await setupStalledClaim(testEnv, harness, connectorId, idempotencyKey)
 
-      const wp = fakeWordpressReconcileServer([{
-        id: 555, slug: `mupot-office-${idempotencyKey}`, status,
-        title: 'Publish: Q4 recap', link: 'https://wordpress.example.com/?p=555',
+      const wp = mcpwpReconcileServer(secret, [{
+        id: 555, slug: `mupot-office-${idempotencyKey}`, status, type: 'post',
+        title: 'Publish: Q4 recap', content: '', meta: stampedMeta(harness, taskId, idempotencyKey),
       }])
       vi.stubGlobal('fetch', wp.f)
 
@@ -2768,80 +2713,65 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
       expect(reconciled.ok).toBe(true)
       const row = harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(taskId) as { status: string; result: string }
       expect(row.status).toBe('done') // found -> forced done, never the operator's 'failed'
-      expect(JSON.parse(row.result)).toMatchObject({ postId: 555 })
+      const result = JSON.parse(row.result) as { postId: number; note?: string }
+      expect(result.postId).toBe(555)
+      expect(result.note).toContain(status) // not live: the receipt says so
       harness.close()
     },
   )
 
-  it('a TRASHED post (WordPress renamed its slug to <slug>__trashed) is still FOUND via the second query, never read as absent', async () => {
+  it('a TRASHED post is invisible to the plugin\'s list (status=any excludes trash) — reconcile can NOT find it and says so (unavailable), never "absent" (documented limitation of the plugin\'s surface)', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
-    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-trashed')
+    const secret = 'secret-1610-trashed'
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', secret)
     const idempotencyKey = 'idem-1610-trashed'
     const taskId = await setupStalledClaim(testEnv, harness, connectorId, idempotencyKey)
 
-    const wp = fakeWordpressReconcileServer([{
-      id: 666, slug: `mupot-office-${idempotencyKey}__trashed`, status: 'trash',
-      title: 'Publish: Q4 recap', link: 'https://wordpress.example.com/?p=666',
+    const wp = mcpwpReconcileServer(secret, [{
+      id: 666, slug: `mupot-office-${idempotencyKey}__trashed`, status: 'trash', type: 'post',
+      title: 'Publish: Q4 recap', content: '', meta: stampedMeta(harness, taskId, idempotencyKey),
     }])
     vi.stubGlobal('fetch', wp.f)
 
     const owner = orgOwnerAuth()
-    const reconciled = await invokeTool(
-      owner, testEnv, 'office.reconcile_stalled_publish',
-      { task_id: taskId, outcome: 'failed' },
-      ORIGIN,
-    )
+    const reconciled = await invokeTool(owner, testEnv, 'office.reconcile_stalled_publish', { task_id: taskId, outcome: 'failed' }, ORIGIN)
 
-    expect(reconciled.ok).toBe(true)
-    expect(wp.f).toHaveBeenCalledTimes(2) // un-trashed slug (miss), then __trashed (hit)
-    const row = harness.sqlite.prepare(`SELECT status, result FROM tasks WHERE id = ?`).get(taskId) as { status: string; result: string }
-    expect(row.status).toBe('done')
-    expect(JSON.parse(row.result)).toMatchObject({ postId: 666 })
+    expect(reconciled.ok).toBe(false)
+    if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_check_unavailable')
+    const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
+    expect(freeze.outcome).toBeNull() // guard NOT cleared
     harness.close()
   })
 
-  it('a matched element with an id but no link is reconcile_candidate_found — NEVER read as absent, NEVER overridable (the exact P1-2/P1-3 bug)', async () => {
+  it('a matched element the addon cannot read as a post (no url) is reconcile_candidate_found — NEVER read as absent, NEVER overridable', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
-    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-malformed')
+    const secret = 'secret-1610-malformed'
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', secret)
     const idempotencyKey = 'idem-1610-malformed'
     const taskId = await setupStalledClaim(testEnv, harness, connectorId, idempotencyKey)
 
-    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input))
-      const slug = url.searchParams.get('slug')
-      if (slug === `mupot-office-${idempotencyKey}`) {
-        // A real match exists, but WordPress/a plugin stripped `link` from the
-        // response shape — this must never be silently treated the same as
-        // "no element matched at all".
-        return new Response(JSON.stringify([{ id: 999 }]), { status: 200, headers: { 'content-type': 'application/json' } })
-      }
-      return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } })
-    }) as unknown as typeof fetch
+    const fetchSpy = vi.fn(async () => (
+      // A real match exists, but a plugin stripped `url` from the list element —
+      // this must never be silently treated the same as "no element matched".
+      new Response(JSON.stringify({ posts: [{ id: 999 }], total: 1 }), { status: 200, headers: { 'content-type': 'application/json' } })
+    )) as unknown as typeof fetch
     vi.stubGlobal('fetch', fetchSpy)
 
     const owner = orgOwnerAuth()
-    const reconciled = await invokeTool(
-      owner, testEnv, 'office.reconcile_stalled_publish',
-      { task_id: taskId, outcome: 'failed' },
-      ORIGIN,
-    )
+    const reconciled = await invokeTool(owner, testEnv, 'office.reconcile_stalled_publish', { task_id: taskId, outcome: 'failed' }, ORIGIN)
 
     expect(reconciled.ok).toBe(false)
     if (!reconciled.ok) expect(reconciled.error).toBe('reconcile_candidate_found')
-    // Short-circuits on the malformed match — the trashed-slug and fallback
-    // search queries never even run.
-    expect(fetchSpy).toHaveBeenCalledOnce()
     const freeze = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
     expect(freeze.outcome).toBeNull()
 
-    // r3 P1-3: a candidate is NEVER overridable, even with a reason and even
-    // after a prior attempt is on record.
+    // A candidate is NEVER overridable, even with a reason and a prior attempt on record.
     seedPriorReconcileAttempt(harness, taskId)
     const overrideAttempt = await invokeTool(
       owner, testEnv, 'office.reconcile_stalled_publish',
-      { task_id: taskId, outcome: 'failed', override_reason: 'id-only element, assume broken' },
+      { task_id: taskId, outcome: 'failed', override_reason: 'unreadable element, assume broken' },
       ORIGIN,
     )
     expect(overrideAttempt.ok).toBe(false)
@@ -2875,14 +2805,14 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     harness.close()
   })
 
-  it('the post genuinely never reached WordPress — reconcile checks every avenue (slug, trashed slug, title search), but a clean-empty result is STILL NOT proof of absence: it refuses (reconcile_check_unavailable), and only a retried, audited override can clear it', async () => {
+  it('the post genuinely never reached WordPress — reconcile checks every avenue (slug search, title search), but a clean-empty result is STILL NOT proof of absence: it refuses (reconcile_check_unavailable), and only a retried, audited override can clear it', async () => {
     const harness = makeHarness()
     const testEnv = env(harness)
     const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1610-absent')
     const idempotencyKey = 'idem-1610-absent'
     const taskId = await setupStalledClaim(testEnv, harness, connectorId, idempotencyKey)
 
-    const wp = fakeWordpressReconcileServer([]) // genuinely nothing anywhere
+    const wp = mcpwpReconcileServer('secret-1610-absent', []) // genuinely nothing anywhere
     vi.stubGlobal('fetch', wp.f)
 
     const owner = orgOwnerAuth()
@@ -2897,12 +2827,11 @@ describe('mupot#1610: reconcile verifies WordPress before clearing the double-po
     )
     expect(firstAttempt.ok).toBe(false)
     if (!firstAttempt.ok) expect(firstAttempt.error).toBe('reconcile_check_unavailable')
-    // r2 P1-2: slug, then `<slug>__trashed`, then the title/window fallback
-    // search — all three ran before this refusal.
-    expect(wp.f).toHaveBeenCalledTimes(3)
-    expect(wp.requests[0]).toContain(`slug=mupot-office-${idempotencyKey}`)
-    expect(wp.requests[1]).toContain(`slug=mupot-office-${idempotencyKey}__trashed`)
-    expect(wp.requests[2]).toContain('search=')
+    // The slug search, then the title search — both ran (and found nothing)
+    // before this refusal.
+    expect(wp.f).toHaveBeenCalledTimes(2)
+    expect(wp.requests[0]).toContain(`search=mupot-office-${idempotencyKey}`)
+    expect(wp.requests[1]).toContain('search=Publish')
     const stillOpen = harness.sqlite.prepare(`SELECT outcome FROM office_publish_freezes WHERE task_id = ?`).get(taskId) as { outcome: string | null }
     expect(stillOpen.outcome).toBeNull() // guard NOT cleared by the plain 'failed' claim
 

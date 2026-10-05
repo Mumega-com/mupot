@@ -62,7 +62,7 @@ import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../type
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
-import { parseSiteConnectorConfig } from './health'
+import { parseSiteConnectorConfig, MCPWP_API_KEY_AUTH } from './health'
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
@@ -88,14 +88,35 @@ export type { OfficeResult, OfficeRefusalReason } from './freeze'
 export { OFFICE_ADDON_KEY, OFFICE_GATE_OWNER, OFFICE_WORDPRESS_SLOT } from './freeze'
 
 const OFFICE_DEPARTMENT_SLUG = 'office'
+// mupot#1616: the office talks ONLY to MCPWP's own REST layer, authenticated
+// with the MCPWP API key (X-API-Key). Contract source (read-only, plugin 3.11.1
+// in /home/mumega/mcpwp; the live site ran 3.13.0 per the issue):
+//   POST /wp-json/mcpwp/v1/posts            create — body {title, content, status,
+//                                           slug, meta:{...}}; 201 + {id, url, status, ...}
+//   GET  /wp-json/mcpwp/v1/posts            list — query search|status(any)|per_page;
+//                                           200 + {posts:[{id,slug,status,url}], total}
+//   GET  /wp-json/mcpwp/v1/post-meta/{id}   200 + {id, meta:{<key>: <value>}}
+// There is NO query-by-meta route anywhere in the plugin, so "look the post up by
+// meta" is: collect candidates by slug/title search, then read each candidate's
+// post meta and compare. See lookupWordpressPostByMeta.
+const MCPWP_POSTS_PATH = '/wp-json/mcpwp/v1/posts'
+const MCPWP_POST_META_PATH = '/wp-json/mcpwp/v1/post-meta/'
+// mupot-owned post meta. Lowercase on purpose (the plugin's single-key read path
+// runs sanitize_key, which lowercases), no leading underscore (a post write's
+// `meta` field refuses protected keys) and no credential-shaped stem (the plugin
+// refuses those too).
+export const OFFICE_IDEMPOTENCY_META_KEY = 'mupot_office_idem'
+export const OFFICE_PAYLOAD_HASH_META_KEY = 'mupot_office_payload'
+// The plugin masks any read-back value that "looks like a credential" to `***`,
+// and a bare 64-char hex digest does (Mcpwp_Option_Access::looks_like_credential:
+// >=32 chars, [A-Za-z0-9+/=_-], has a digit and a letter). A dash-structured value
+// is explicitly exempted, so the digest is stored behind this prefix.
+const OFFICE_PAYLOAD_HASH_META_PREFIX = 'sha256-'
+// Reconcile never reads more than this many candidate posts' meta; a site with
+// more matching posts than this is "can't verify all" = a candidate, never absence.
+const WP_LOOKUP_MAX_CANDIDATES = 20
+const WP_LOOKUP_PER_PAGE = 100
 const WP_PUBLISH_TIMEOUT_MS = 8_000
-const WP_POSTS_PATH = '/wp-json/wp/v2/posts'
-// mupot#1610: every claim mints (or, on a fixture predating this feature,
-// leaves NULL) a random idempotency key, stamped into the WordPress post's own
-// `slug` field at publish time — WordPress has no native idempotency concept,
-// so this is what lets office.reconcile_stalled_publish look a post up by a
-// stable identifier after a timeout/crash leaves the outcome unknown, with zero
-// durable local record of whether the fetch itself landed.
 const OFFICE_SLUG_PREFIX = 'mupot-office-'
 // mupot#1602 r1 P3-3: a publish can legitimately still be in flight for up to
 // WP_PUBLISH_TIMEOUT_MS — reconciling a claim as 'failed'/'done' mid-flight would
@@ -532,9 +553,15 @@ function isRedirect(response: Response): boolean {
 // is exactly how an ambiguous outcome was able to masquerade as a definite
 // 'failed' before the r2 fix, and the r2 fix ITSELF still over-claimed
 // "definite" for 401/403/3xx/4xx (this round's actual finding — see below).
+interface WpPublishObservation extends OfficePublishPostOutcome {
+  /** The status the SITE reports the post was created with (its own word, not
+   *  what we asked for). */
+  readonly createdStatus: string
+}
+
 interface WpPublishConnectorResult {
   readonly status: 'available' | 'unavailable' | 'failed'
-  readonly observations: readonly [OfficePublishPostOutcome] | readonly []
+  readonly observations: readonly [WpPublishObservation] | readonly []
   readonly reason?: string
 }
 
@@ -570,9 +597,13 @@ interface WpPublishConnectorResult {
 // list to maintain or re-litigate — "not a parsed delivered 2xx" IS the
 // definition of ambiguous.
 export type WordpressPublishResult =
-  | { readonly kind: 'delivered'; readonly value: OfficePublishPostOutcome }
+  | { readonly kind: 'delivered'; readonly value: OfficePublishPostOutcome; readonly createdStatus: string }
   | { readonly kind: 'definite_failure'; readonly reason: OfficeRefusalReason }
   | { readonly kind: 'ambiguous' }
+
+function officePayloadHashMetaValue(payloadSha256: string): string {
+  return `${OFFICE_PAYLOAD_HASH_META_PREFIX}${payloadSha256}`
+}
 
 async function wordpressPublish(
   env: Env,
@@ -580,6 +611,8 @@ async function wordpressPublish(
   title: string,
   content: string,
   slug: string,
+  idempotencyKey: string,
+  payloadSha256: string,
 ): Promise<WordpressPublishResult> {
   const result = await useConnectorById<WpPublishConnectorResult>(env, connectorId, 'mcpwp', async (connector: ImmediateConnectorUse) => {
     const config = parseSiteConnectorConfig(connector.meta)
@@ -594,7 +627,7 @@ async function wordpressPublish(
       return { status: 'unavailable', reason: 'invalid_site_url', observations: [] }
     }
 
-    const endpoint = new URL(WP_POSTS_PATH, base.origin)
+    const endpoint = new URL(MCPWP_POSTS_PATH, base.origin)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), WP_PUBLISH_TIMEOUT_MS)
     try {
@@ -610,7 +643,20 @@ async function wordpressPublish(
           // time) — WordPress assigns it as the post's own slug, which is what lets
           // reconcileStalledOfficePublish find this exact post later by a stable,
           // pre-agreed identifier rather than trusting a human's unverified say-so.
-          body: JSON.stringify({ title, content, status: 'publish', slug }),
+          // `meta` is applied by the plugin in the SAME create call (no second
+          // request that could fail between "post exists" and "post is findable").
+          // The mupot-owned meta, not the slug, is the identity: WordPress does not
+          // make draft slugs unique (mupot#1616, observed live).
+          body: JSON.stringify({
+            title,
+            content,
+            status: config.publishStatus,
+            slug,
+            meta: {
+              [OFFICE_IDEMPOTENCY_META_KEY]: idempotencyKey,
+              [OFFICE_PAYLOAD_HASH_META_KEY]: officePayloadHashMetaValue(payloadSha256),
+            },
+          }),
         })
       } catch {
         // The request was SENT (dispatched over the network) and something broke
@@ -625,24 +671,34 @@ async function wordpressPublish(
       if (!response.ok) {
         return { status: 'failed', reason: 'ambiguous_response', observations: [] }
       }
-      const body = (await response.json().catch(() => null)) as { id?: number; link?: string } | null
-      if (!body || typeof body.id !== 'number' || typeof body.link !== 'string' || !body.link) {
+      const body = (await response.json().catch(() => null)) as { id?: unknown; url?: unknown; status?: unknown } | null
+      if (!body || typeof body.id !== 'number' || typeof body.url !== 'string' || !body.url) {
         // A 2xx with a body we cannot parse as a real post (a PHP
         // notice/warning prepended ahead of the JSON is the textbook case) means
         // the HTTP layer says success but we cannot read back what was created —
         // we cannot rule out that WordPress actually created the post. AMBIGUOUS.
         return { status: 'failed', reason: 'unparseable_response', observations: [] }
       }
-      return { status: 'available', observations: [{ postId: body.id, articleUrl: body.link }] }
+      return {
+        status: 'available',
+        observations: [{
+          postId: body.id,
+          articleUrl: body.url,
+          createdStatus: typeof body.status === 'string' ? body.status : config.publishStatus,
+        }],
+      }
     } finally {
       clearTimeout(timer)
     }
-  })
+  }, MCPWP_API_KEY_AUTH)
   // Connector resolution itself failed (row missing/revoked, master key
   // absent, decrypt failed) — this happens entirely INSIDE useConnectorById,
   // BEFORE the callback (and so before any fetch) ever runs. Pre-send, definite.
   if (!result) return { kind: 'definite_failure', reason: 'connector_not_bound' }
-  if (result.status === 'available' && result.observations[0]) return { kind: 'delivered', value: result.observations[0] }
+  const delivered = result.status === 'available' ? result.observations[0] : undefined
+  if (delivered) {
+    return { kind: 'delivered', value: { postId: delivered.postId, articleUrl: delivered.articleUrl }, createdStatus: delivered.createdStatus }
+  }
   // r3: an ALLOWLIST of definite (pre-send) reasons, not a denylist of
   // ambiguous ones — the safe default for any reason this function does not
   // explicitly recognize is AMBIGUOUS, never definite. Only the two pre-send
@@ -685,22 +741,25 @@ async function wordpressPublish(
 //     once (see RECONCILE_RETRY_MIN_INTERVAL_MS below).
 // The title/time fallback search still runs — but ONLY to detect a candidate
 // worth refusing over, NEVER as a basis for declaring absence.
-type WordpressSlugLookupResult =
+// mupot#1616: the lookup is by the mupot-owned POST META, not the slug. Outcomes:
+//   - `found`     — a candidate's meta carries THIS claim's idempotency key AND the
+//                   frozen payload's hash: this exact post exists (adopt it).
+//   - `conflict`  — a post carries this claim's idempotency key but a DIFFERENT
+//                   (or unreadable) payload hash: never adopted, never overwritten.
+//   - `candidate` — some post matched the slug/title search but none could be
+//                   proven to be ours (no meta, meta unreadable, or more matches
+//                   than could be verified). Never overridable.
+//   - `unavailable` — nothing found or the check itself failed. "Nothing found"
+//                   is NOT proof of absence: the plugin has no query-by-meta, the
+//                   search can't see trashed or custom-status posts, and the
+//                   claim's own slug can be rewritten. Same epistemic state as a
+//                   network failure; only the audited, retried human override
+//                   may proceed from here.
+type WordpressPostLookupResult =
   | { status: 'found'; postId: number; articleUrl: string; wpStatus: string }
+  | { status: 'conflict' }
   | { status: 'candidate' }
   | { status: 'unavailable' }
-
-// Every WordPress post status this addon's own connector user might plausibly
-// be able to see via `context=edit` — publish is included so a race with a
-// genuinely-published post (found by the primary path anyway) is harmless.
-const WP_ALL_STATUSES = 'publish,future,draft,pending,private,trash'
-const WP_RECONCILE_SEARCH_MARGIN_MS = 15 * 60 * 1000
-
-interface WpRawPost {
-  readonly id?: unknown
-  readonly link?: unknown
-  readonly status?: unknown
-}
 
 interface WpLookupConnectorResult {
   readonly status: 'available' | 'unavailable' | 'failed'
@@ -709,8 +768,8 @@ interface WpLookupConnectorResult {
 
 /** One GET request through the vaulted connector, returning the raw parsed JSON
  *  body. Exactly one `authenticatedFetch` call per `useConnectorById` use (the
- *  vault's own one-shot-per-access contract) — lookupWordpressPostBySlug below
- *  calls this multiple times, each a fresh, independent vault access. */
+ *  vault's own one-shot-per-access contract) — the lookup below calls this
+ *  repeatedly, each a fresh, independent vault access. */
 async function wpReconcileGet(
   env: Env,
   connectorId: string,
@@ -744,70 +803,111 @@ async function wpReconcileGet(
     } finally {
       clearTimeout(timer)
     }
-  })
+  }, MCPWP_API_KEY_AUTH)
   if (!result || result.status !== 'available') return { ok: false }
   const body = result.observations[0]
   return body === undefined ? { ok: false } : { ok: true, body }
 }
 
-/** Validates one candidate element strictly. `undefined` = genuinely no match at
- *  this slug (element absent from the array); `null` = a match exists but is
- *  malformed — a CANDIDATE (this addon's own post, almost certainly), never
- *  "absent". */
-function firstValidWpPost(body: unknown): { postId: number; articleUrl: string; wpStatus: string } | null | undefined {
-  if (!Array.isArray(body)) return null
-  if (body.length === 0) return undefined
-  const match = body[0] as WpRawPost
-  if (typeof match !== 'object' || match === null) return null
-  if (typeof match.id !== 'number' || typeof match.link !== 'string' || !match.link) return null
-  return { postId: match.id, articleUrl: match.link, wpStatus: typeof match.status === 'string' ? match.status : 'unknown' }
+interface WpCandidate {
+  readonly postId: number
+  readonly articleUrl: string
+  readonly wpStatus: string
 }
 
-async function lookupWordpressPostBySlug(
+/** Parses MCPWP's list envelope `{posts:[...], total}`. `null` = unreadable.
+ *  `unreadable` counts elements that could not be read as a post (an element we
+ *  cannot identify is a candidate we cannot verify, never "nothing"). */
+function parseMcpwpPostList(body: unknown): { candidates: WpCandidate[]; unreadable: number; incomplete: boolean } | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  const envelope = body as { posts?: unknown; total?: unknown }
+  if (!Array.isArray(envelope.posts)) return null
+  const candidates: WpCandidate[] = []
+  let unreadable = 0
+  for (const raw of envelope.posts) {
+    const post = typeof raw === 'object' && raw !== null ? (raw as { id?: unknown; url?: unknown; status?: unknown }) : null
+    if (!post || typeof post.id !== 'number' || typeof post.url !== 'string' || !post.url) {
+      unreadable += 1
+      continue
+    }
+    candidates.push({ postId: post.id, articleUrl: post.url, wpStatus: typeof post.status === 'string' ? post.status : 'unknown' })
+  }
+  const incomplete = typeof envelope.total === 'number' && envelope.total > envelope.posts.length
+  return { candidates, unreadable, incomplete }
+}
+
+/** Reads one meta value out of MCPWP's `{id, meta:{key: value}}` envelope.
+ *  `undefined` = key absent; `null` = envelope unreadable. A multi-valued key
+ *  reads as an array, which is never equal to the expected string. */
+function readMcpwpMetaValue(body: unknown, key: string): string | undefined | null {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return null
+  const meta = (body as { meta?: unknown }).meta
+  // PHP serialises an empty array as `[]` — a post with no meta at all.
+  if (Array.isArray(meta) && meta.length === 0) return undefined
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return null
+  if (!(key in meta)) return undefined
+  const value = (meta as Record<string, unknown>)[key]
+  return typeof value === 'string' ? value : ''
+}
+
+async function lookupWordpressPostByMeta(
   env: Env,
   connectorId: string,
+  idempotencyKey: string,
+  payloadSha256: string,
   slug: string,
   title: string,
-  claimedAtIso: string,
-): Promise<WordpressSlugLookupResult> {
-  for (const slugCandidate of [slug, `${slug}__trashed`]) {
-    const fetched = await wpReconcileGet(env, connectorId, (base) => {
-      const endpoint = new URL(WP_POSTS_PATH, base.origin)
-      endpoint.searchParams.set('slug', slugCandidate)
-      endpoint.searchParams.set('status', WP_ALL_STATUSES)
-      endpoint.searchParams.set('context', 'edit')
+): Promise<WordpressPostLookupResult> {
+  const byId = new Map<number, WpCandidate>()
+  let unreadable = 0
+  let incomplete = false
+  for (const term of [slug, title]) {
+    const listed = await wpReconcileGet(env, connectorId, (base) => {
+      const endpoint = new URL(MCPWP_POSTS_PATH, base.origin)
+      endpoint.searchParams.set('search', term)
+      endpoint.searchParams.set('status', 'any')
+      endpoint.searchParams.set('per_page', String(WP_LOOKUP_PER_PAGE))
       return endpoint
     })
-    if (!fetched.ok) return { status: 'unavailable' }
-    const match = firstValidWpPost(fetched.body)
-    if (match === null) return { status: 'candidate' } // malformed exact match — this IS our post
-    if (match !== undefined) return { status: 'found', postId: match.postId, articleUrl: match.articleUrl, wpStatus: match.wpStatus }
+    if (!listed.ok) return { status: 'unavailable' }
+    const parsed = parseMcpwpPostList(listed.body)
+    if (!parsed) return { status: 'unavailable' }
+    unreadable += parsed.unreadable
+    incomplete = incomplete || parsed.incomplete
+    for (const candidate of parsed.candidates) byId.set(candidate.postId, candidate)
   }
 
-  // Both exact-slug variants came back genuinely empty (never malformed) — the
-  // slug could still have been rewritten out from under this idempotency key.
-  // This search is ONLY ever used to detect a CANDIDATE worth refusing over —
-  // never, under any result, as grounds to call the post absent.
-  const claimedAtMs = Date.parse(claimedAtIso)
-  const windowStart = Number.isNaN(claimedAtMs)
-    ? undefined
-    : new Date(claimedAtMs - WP_RECONCILE_SEARCH_MARGIN_MS).toISOString()
-  const searched = await wpReconcileGet(env, connectorId, (base) => {
-    const endpoint = new URL(WP_POSTS_PATH, base.origin)
-    endpoint.searchParams.set('search', title)
-    endpoint.searchParams.set('status', WP_ALL_STATUSES)
-    endpoint.searchParams.set('context', 'edit')
-    if (windowStart) endpoint.searchParams.set('after', windowStart)
-    return endpoint
-  })
-  if (!searched.ok) return { status: 'unavailable' }
-  if (!Array.isArray(searched.body)) return { status: 'unavailable' }
-  if (searched.body.length > 0) return { status: 'candidate' } // ANY hit — even unconfirmed — is a candidate, never absence
-  // Checked every avenue this addon knows how to query and found genuinely
-  // nothing. THE CLASS still applies: this is NOT proof of absence (see the
-  // header — custom statuses, switched post types, etc. are all invisible to
-  // this query) — it is the SAME "could not obtain a positive answer" state a
-  // network failure produces, handled identically by the caller.
+  const expectedHash = officePayloadHashMetaValue(payloadSha256)
+  let found: WpCandidate | null = null
+  let conflict = false
+  let unverified = unreadable > 0 || incomplete
+  let checked = 0
+  for (const candidate of byId.values()) {
+    if (checked >= WP_LOOKUP_MAX_CANDIDATES) {
+      unverified = true
+      break
+    }
+    checked += 1
+    const metaRead = await wpReconcileGet(env, connectorId, (base) => new URL(`${MCPWP_POST_META_PATH}${candidate.postId}`, base.origin))
+    if (!metaRead.ok) {
+      unverified = true
+      continue
+    }
+    const idem = readMcpwpMetaValue(metaRead.body, OFFICE_IDEMPOTENCY_META_KEY)
+    if (idem === null) {
+      unverified = true
+      continue
+    }
+    if (idem !== idempotencyKey) continue // not ours (absent, or another claim's key)
+    const hash = readMcpwpMetaValue(metaRead.body, OFFICE_PAYLOAD_HASH_META_KEY)
+    if (hash === expectedHash) found = found ?? candidate
+    else conflict = true
+  }
+  // A conflict outranks a find: a post under our key with different content means
+  // the identity is ambiguous, and ambiguity must refuse, not adopt.
+  if (conflict) return { status: 'conflict' }
+  if (found) return { status: 'found', ...found }
+  if (byId.size > 0 || unverified) return { status: 'candidate' }
   return { status: 'unavailable' }
 }
 
@@ -977,14 +1077,16 @@ export async function publishOfficePost(
           ORDER BY decided_at DESC, id DESC LIMIT 1
        )
        AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')
-    RETURNING payload_json, idempotency_key
+    RETURNING payload_json, payload_sha256, idempotency_key
   `).bind(claimant, claimTimestamp(), task.id, freezeRow.frozen_at, idempotencyKeyCandidate)
-    .first<{ payload_json: string; idempotency_key: string }>()
+    .first<{ payload_json: string; payload_sha256: string; idempotency_key: string }>()
   if (!claimed) return { ok: false, reason: 'publish_claimed' }
 
   const frozenPayload = JSON.parse(claimed.payload_json) as { title: string; content: string }
   const slug = `${OFFICE_SLUG_PREFIX}${claimed.idempotency_key}`
-  const published = await wordpressPublish(env, bindingResult.value.connectorId, frozenPayload.title, frozenPayload.content, slug)
+  const published = await wordpressPublish(
+    env, bindingResult.value.connectorId, frozenPayload.title, frozenPayload.content, slug, claimed.idempotency_key, claimed.payload_sha256,
+  )
   const now = new Date().toISOString()
 
   // r2 P1-1: an AMBIGUOUS outcome writes NOTHING to office_publish_freezes —
@@ -1007,12 +1109,33 @@ export async function publishOfficePost(
     return { ok: false, reason: published.reason }
   }
 
-  await env.DB.prepare(
-    `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2 WHERE task_id = ?3`,
-  ).bind(JSON.stringify(published.value), now, task.id).run()
-
-  const marked = await markOfficeTaskPublished(env, task.id, published.value)
-  if (!marked) return { ok: false, reason: 'verdict_race' }
+  // The post EXISTS on WordPress from here on. The two receipt writes (the freeze
+  // row's outcome and the task's done receipt) land in ONE batch (a D1 batch is a
+  // transaction): if either statement throws, neither lands, `outcome` stays NULL
+  // and the claim stays open — office.reconcile_stalled_publish then finds the
+  // post by its meta and adopts it. Previously the freeze outcome was written
+  // first and a failure of the task write left `outcome = 'done'` on a task still
+  // 'approved', which reconcile refuses as already_reconciled: a live post with
+  // no receipt and no way back.
+  // A draft (or any non-public status the SITE reports) is recorded as such so a
+  // reader never assumes "live" by omission.
+  const note = published.createdStatus === 'publish' ? null : `created on WordPress with status "${published.createdStatus}" — not public`
+  const resultJson = JSON.stringify({ postId: published.value.postId, articleUrl: published.value.articleUrl, ...(note ? { note } : {}) })
+  let taskChanges: number
+  try {
+    const [, taskUpdate] = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2 WHERE task_id = ?3`,
+      ).bind(JSON.stringify(published.value), now, task.id),
+      env.DB.prepare(
+        `UPDATE tasks SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2 WHERE id = ?3 AND status = 'approved'`,
+      ).bind(resultJson, now, task.id),
+    ])
+    taskChanges = taskUpdate.meta?.changes ?? 0
+  } catch {
+    return { ok: false, reason: 'publish_outcome_unknown' }
+  }
+  if (taskChanges === 0) return { ok: false, reason: 'verdict_race' }
 
   return { ok: true, value: published.value }
 }
@@ -1097,6 +1220,7 @@ interface OfficeFreezeReconcileRow {
   idempotency_key: string | null
   site_origin: string
   payload_json: string
+  payload_sha256: string
 }
 
 // r3 P2-1 (kasra-review r2 adversarial gate): a SINGLE transient lookup blip
@@ -1142,7 +1266,7 @@ export async function reconcileStalledOfficePublish(
   }
 
   const row = await env.DB.prepare(
-    `SELECT claimed_at, outcome, outcome_detail, connector_id, idempotency_key, site_origin, payload_json FROM office_publish_freezes WHERE task_id = ?1`,
+    `SELECT claimed_at, outcome, outcome_detail, connector_id, idempotency_key, site_origin, payload_json, payload_sha256 FROM office_publish_freezes WHERE task_id = ?1`,
   ).bind(task.id).first<OfficeFreezeReconcileRow>()
   if (!row) return { ok: false, reason: 'freeze_not_found' }
   if (row.claimed_at === null || row.outcome !== null) return { ok: false, reason: 'already_reconciled' }
@@ -1174,16 +1298,23 @@ export async function reconcileStalledOfficePublish(
   const slug = `${OFFICE_SLUG_PREFIX}${row.idempotency_key}`
   const lookup = originDrifted
     ? ({ status: 'unavailable' } as const)
-    : await lookupWordpressPostBySlug(env, row.connector_id, slug, frozen.title, row.claimed_at)
+    : await lookupWordpressPostByMeta(env, row.connector_id, row.idempotency_key, row.payload_sha256, slug, frozen.title)
 
   if (lookup.status === 'found') {
     // NEVER overridable — live evidence wins outright regardless of what the
     // operator asked for or attested. A trashed find is recorded honestly.
     const isLive = lookup.wpStatus === 'publish'
     return applyReconcileOutcome(env, task, auth, 'done', lookup.postId, lookup.articleUrl, detail, {
+      adoptedByPostMeta: true,
       verifiedLiveOnWordpress: isLive,
       ...(isLive ? {} : { wordpressStatus: lookup.wpStatus }),
     }, isLive ? undefined : `found in WordPress with status "${lookup.wpStatus}" — not currently live`)
+  }
+
+  if (lookup.status === 'conflict') {
+    // NEVER overridable, never adopted, never overwritten: a post carries this
+    // claim's idempotency key with different content than the human approved.
+    return { ok: false, reason: 'reconcile_conflict' }
   }
 
   if (lookup.status === 'candidate') {

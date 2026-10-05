@@ -77,6 +77,10 @@ export type OfficeRefusalReason =
   //     TLS failure, a revoked connector, origin drift, OR every lookup came
   //     back genuinely, cleanly empty. THE ONLY reason the human override may
   //     ever accept, and only once retried (see reconcile_retry_required).
+  // mupot#1616: a post carries THIS claim's idempotency key (mupot-owned post
+  // meta) but a different payload hash than the human approved — never adopted,
+  // never overwritten, never overridable.
+  | 'reconcile_conflict'
   | 'reconcile_candidate_found'
   | 'reconcile_check_unavailable'
   | 'reconcile_retry_required'

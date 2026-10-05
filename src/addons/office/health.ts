@@ -32,7 +32,7 @@
 // contains the raw secret, so a future edit to this file that accidentally
 // echoed it back would fail loudly rather than leak silently.
 
-import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
+import { useConnectorById, type ImmediateConnectorUse, type UseConnectorOptions } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
 import type { Env } from '../../types'
 
@@ -69,8 +69,20 @@ function isRedirect(response: Response): boolean {
     || (response.status >= 300 && response.status < 400)
 }
 
+/** The status a published post is created with. 'draft' (not publicly visible)
+ *  is the safe first-publish choice; 'publish' is the long-standing default and
+ *  is NOT changed by mupot#1616 (approval semantics are untouched). It is set by
+ *  the org admin in the connector's own meta, never by a caller of the tool. */
+export type OfficePublishStatus = 'draft' | 'publish'
+
+/** Every office call goes to `/wp-json/mcpwp/v1/*`, which accepts only an MCPWP
+ *  API key (X-API-Key) — pinned here, never inferred from editable connector meta
+ *  (mupot#1616: publish and health must use the same auth). */
+export const MCPWP_API_KEY_AUTH = { mcpwpAuthMode: 'api_key' } as const satisfies UseConnectorOptions
+
 export interface SiteConnectorConfig {
   readonly siteUrl: string
+  readonly publishStatus: OfficePublishStatus
 }
 
 export function parseSiteConnectorConfig(meta: string | null): SiteConnectorConfig | null {
@@ -80,7 +92,8 @@ export function parseSiteConnectorConfig(meta: string | null): SiteConnectorConf
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null
     const record = value as Record<string, unknown>
     if (typeof record.siteUrl !== 'string' || !record.siteUrl.trim()) return null
-    return { siteUrl: record.siteUrl.trim() }
+    // Anything other than the literal 'draft' keeps the existing default.
+    return { siteUrl: record.siteUrl.trim(), publishStatus: record.publish_status === 'draft' ? 'draft' : 'publish' }
   } catch {
     return null
   }
@@ -169,7 +182,7 @@ export async function checkMcpwpOfficeHealth(
     } finally {
       clearTimeout(timer)
     }
-  })
+  }, MCPWP_API_KEY_AUTH)
 
   return result ?? unavailable('connector_unavailable')
 }

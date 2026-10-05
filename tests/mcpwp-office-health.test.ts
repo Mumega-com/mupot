@@ -66,7 +66,7 @@ afterEach(() => {
 })
 
 describe('mcpwp-office health check', () => {
-  it('reports healthy on a 200 initialize response and sends Basic auth built from the vaulted secret', async () => {
+  it('reports healthy on a 200 initialize response and sends the vaulted MCPWP API key as X-API-Key (never Basic)', async () => {
     const harness = makeHarness()
     const secret = 'wordpress-app-password-abc123'
     const connectorId = await connectorFixture(harness, 'https://wordpress.example.com', secret)
@@ -86,7 +86,9 @@ describe('mcpwp-office health check', () => {
     expect(url.pathname).toBe('/wp-json/mcpwp/v1/mcp')
     expect(init.method).toBe('POST')
     expect(init.redirect).toBe('manual')
-    expect(new Headers(init.headers).get('authorization')).toBe(`Basic ${btoa(`office-agent:${secret}`)}`)
+    // mupot#1616: the MCPWP endpoint takes the key as X-API-Key; a Basic password is a 401.
+    expect(new Headers(init.headers).get('x-api-key')).toBe(secret)
+    expect(new Headers(init.headers).get('authorization')).toBeNull()
     const body = JSON.parse(String(init.body)) as { jsonrpc: string; method: string }
     expect(body.jsonrpc).toBe('2.0')
     expect(body.method).toBe('initialize')
