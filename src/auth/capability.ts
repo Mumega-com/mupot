@@ -131,7 +131,14 @@ export async function loadSquadScope(env: Env, squadId: string): Promise<SquadSc
  *                                removeSquadMember (home_squad_immutable),
  *                                src/members/project-invites.ts's createProjectInvite
  *                                (home_scope_not_invitable), src/onboarding/doors.ts's
- *                                selfGrant (home_scope_not_grantable). The ONLY writer that
+ *                                selfGrant (home_scope_not_grantable), and — mupot#1646, which
+ *                                found this inventory's claim FALSE for the plain department
+ *                                invite door — src/members/index.ts's POST /invites
+ *                                (parseInvite) and acceptInvite for DEPARTMENT scope
+ *                                (home_scope_not_invitable, at creation AND redemption, plus an
+ *                                SQL guard on both redemption INSERTs). Reader belt:
+ *                                resolveReadableSquadIds drops kind='home' squads from
+ *                                department expansion. The ONLY writer that
  *                                MAY target a home is org/service.ts's createHomeForMember
  *                                (the member's own exact-match admin row).
  *   channel_capability_grants — a SECOND capabilities-shaped table, unioned into
