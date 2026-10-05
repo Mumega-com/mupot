@@ -3154,6 +3154,10 @@ describe('mupot#1616: MCPWP API-key auth and post-meta idempotency', () => {
       vi.stubGlobal('fetch', wp.f)
       ctx.harness.sqlite.prepare(`UPDATE connectors SET meta = ? WHERE id = ?`)
         .run(JSON.stringify({ siteUrl: hostile, username: 'office-agent' }), ctx.connectorId)
+      // Make the frozen origin match too, so the drift check (binding_changed) cannot be
+      // what refuses: only the SSRF guards stand between this config and a fetch.
+      ctx.harness.sqlite.prepare(`UPDATE office_publish_freezes SET site_origin = ? WHERE task_id = ?`)
+        .run(new URL(hostile).origin, ctx.taskId)
 
       const result = await publish(ctx)
 
@@ -3171,6 +3175,8 @@ describe('mupot#1616: MCPWP API-key auth and post-meta idempotency', () => {
     const before = wp.requests.length
     ctx.harness.sqlite.prepare(`UPDATE connectors SET meta = ? WHERE id = ?`)
       .run(JSON.stringify({ siteUrl: 'https://127.0.0.1', username: 'office-agent' }), ctx.connectorId)
+    ctx.harness.sqlite.prepare(`UPDATE office_publish_freezes SET site_origin = ? WHERE task_id = ?`)
+      .run('https://127.0.0.1', ctx.taskId) // frozen origin matches: no drift refusal, only the SSRF guards
     backdateClaim(ctx.harness, ctx.taskId)
 
     const result = await reconcile(ctx)
