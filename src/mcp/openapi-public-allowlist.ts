@@ -83,6 +83,7 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'needs_you_list',
   'objective_accept',
   'objective_get',
+  'office.health',
   'office.list_pending_approvals',
   'office.publish_post',
   'office.review_approval',

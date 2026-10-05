@@ -62,7 +62,7 @@ import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../type
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
-import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH } from './health'
+import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH, checkMcpwpOfficeHealth, type McpwpOfficeHealthResult } from './health'
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
@@ -75,6 +75,7 @@ import {
 import { claimTimestamp } from '../../lib/claim-timestamp'
 import {
   OFFICE_GATE_OWNER,
+  resolveActiveOfficeInstallationId,
   resolveEligibleActiveOfficeInstallationId,
   resolveOfficeConnectorBinding,
   resolveOfficeSiteOrigin,
@@ -145,6 +146,32 @@ export async function hasOfficeCapability(
   const departmentId = await resolveOfficeDepartmentId(env)
   if (!departmentId) return false
   return hasCapability(auth.capabilities ?? [], 'department', departmentId, min)
+}
+
+// ── office.health (mupot#1662) ──────────────────────────────────────────────────
+
+/** The only fields an office health probe ever exposes: a status and a closed-set
+ *  reason code. Never a response body, URL, header or credential. */
+export interface OfficeHealthReport {
+  readonly status: McpwpOfficeHealthResult['status']
+  readonly reason?: NonNullable<McpwpOfficeHealthResult['reason']>
+}
+
+/** Probes the active installation's bound WordPress connector. No authority check:
+ *  callers (office.health, addon_setup) gate it themselves. Refuses with a typed
+ *  reason when there is no active installation or no bound connector. */
+export async function probeOfficeHealth(env: Env): Promise<OfficeResult<OfficeHealthReport>> {
+  const installationId = await resolveActiveOfficeInstallationId(env)
+  if (!installationId) return { ok: false, reason: 'addon_inactive' }
+  const binding = await resolveOfficeConnectorBinding(env, installationId)
+  if (!binding.ok) return binding
+  const result = await checkMcpwpOfficeHealth(env, binding.value.connectorId)
+  return { ok: true, value: result.reason ? { status: result.status, reason: result.reason } : { status: result.status } }
+}
+
+export async function getOfficeHealth(env: Env, auth: AuthContext): Promise<OfficeResult<OfficeHealthReport>> {
+  if (!(await hasOfficeCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
+  return probeOfficeHealth(env)
 }
 
 // ── office.list_pending_approvals ───────────────────────────────────────────────

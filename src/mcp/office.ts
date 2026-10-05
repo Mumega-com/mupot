@@ -21,6 +21,7 @@ import { getTask, type ToolSpec, fail, done, str } from './index'
 import type { AuthContext } from '../types'
 import {
   listOfficePendingApprovals,
+  getOfficeHealth,
   publishOfficePost,
   reviewOfficeApproval,
   reconcileStalledOfficePublish,
@@ -121,6 +122,23 @@ const toolOfficeListPendingApprovals: ToolSpec = {
     const result = await listOfficePendingApprovals(env, auth, limit)
     if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
     return done({ tasks: result.value })
+  },
+}
+
+// mupot#1662: operator-visible probe of the bound WordPress connector, so a newly
+// bound key can be verified before the first real publish. Read-only; returns a status
+// and a closed-set reason only (src/addons/office/health.ts keeps the SSRF guard and
+// never lets the credential or a response body leave the connector vault call).
+const toolOfficeHealth: ToolSpec = {
+  name: 'office.health',
+  scope: 'department:office (member) — read-only probe of the bound WordPress connector',
+  min: 'member',
+  args: '{}',
+  inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
+  async run(auth: AuthContext, env) {
+    const result = await getOfficeHealth(env, auth)
+    if (!result.ok) return fail(officeFailureStatus(result.reason), result.reason)
+    return done({ status: result.value.status, ...(result.value.reason ? { reason: result.value.reason } : {}) })
   },
 }
 
@@ -242,6 +260,7 @@ const toolOfficeReconcileStalledPublish: ToolSpec = {
 export const OFFICE_TOOLS: ToolSpec[] = [
   toolOfficePublishPost,
   toolOfficeListPendingApprovals,
+  toolOfficeHealth,
   toolOfficeReviewApproval,
   toolOfficeReconcileStalledPublish,
 ]

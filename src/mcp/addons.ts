@@ -47,6 +47,8 @@
 //                       installation — see addon-loop-instantiation.test.ts / PR #439)
 //   addon_disable    — org:admin — disableAddon
 //   addon_archive    — org:admin — archiveAddon
+//   addon_setup      — org:admin — install -> configure -> activate in one call, through the
+//                       SAME three service functions (mupot#1662)
 
 import type { AuthContext } from '../types'
 import { getRegisteredAddon, type AddonCatalogEntry } from '../addons/registry'
@@ -61,6 +63,7 @@ import {
   type AddonMutationResult,
 } from '../addons/service'
 import { validateBindingInputs } from '../addons/bindings'
+import { OFFICE_ADDON_KEY, probeOfficeHealth } from '../addons/office/service'
 import { hasCapability } from '../auth/capability'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
@@ -291,10 +294,84 @@ const toolAddonArchive: ToolSpec = {
   },
 }
 
+type SetupStepName = 'install' | 'configure' | 'activate'
+type SetupStepOutcome = 'created' | 'applied' | 'idempotent' | 'skipped'
+
+const toolAddonSetup: ToolSpec = {
+  name: 'addon_setup',
+  scope: 'org (org-admin installs, configures and activates an addon in one call)',
+  min: 'admin',
+  args: '{ key: string, bindings?: Array<{ slot: string, adapter: string, bindingKind: "internal_adapter"|"vault_connector", connectorId?: string }> }',
+  inputSchema: toolAddonConfigure.inputSchema,
+  async run(auth, env, args) {
+    const resolved = await resolveAdminEntry(auth, args)
+    if (!resolved.ok) return resolved.outcome
+
+    const rawBindings = args.bindings === undefined ? [] : args.bindings
+    if (!Array.isArray(rawBindings)) return fail(400, 'invalid_args', 'bindings must be an array')
+    const validated = validateBindingInputs(rawBindings, resolved.entry.manifest.connectorRequirements.length)
+    if (!validated.ok) return fail(400, 'invalid_args', 'invalid bindings')
+
+    const { key, actor } = resolved
+    const steps: Array<{ step: SetupStepName, outcome: SetupStepOutcome }> = []
+    // Stops at the first refusal. Each step is the SAME service function the individual
+    // addon_* tool calls, so receipts/audit rows are identical to the three-call path and
+    // no authority is added here; a refusal reports which step failed and what already ran.
+    const stop = (step: SetupStepName, result: MutationFailure) => {
+      const outcome = mutationOutcome(result)
+      const detail = !outcome.ok && typeof outcome.detail === 'object' && outcome.detail !== null ? outcome.detail : {}
+      return fail(outcome.ok ? 409 : outcome.status, outcome.ok ? result.reason : outcome.error, {
+        ...detail,
+        failed_step: step,
+        completed_steps: steps,
+      })
+    }
+
+    const installed = await installAddon(env, actor, key)
+    if (!installed.ok) return stop('install', installed)
+    steps.push({ step: 'install', outcome: installed.created ? 'created' : 'idempotent' })
+
+    // configureAddon refuses an already-active installation, and re-running it with no
+    // bindings on an already-configured one would only restamp it; both are skipped so a
+    // repeat call converges. Bindings supplied against an ACTIVE installation are not
+    // applied (disable -> addon_setup is the reconfigure path) and the output says so.
+    const state = installed.state
+    const skipConfigure = state === 'active' || (state === 'configured' && validated.bindings.length === 0)
+    if (skipConfigure) {
+      steps.push({ step: 'configure', outcome: 'skipped' })
+    } else {
+      const configured = await configureAddon(env, actor, key, { bindings: validated.bindings })
+      if (!configured.ok) return stop('configure', configured)
+      steps.push({ step: 'configure', outcome: 'applied' })
+    }
+
+    const activated = await activateAddon(env, actor, key)
+    if (!activated.ok) return stop('activate', activated)
+    steps.push({ step: 'activate', outcome: activated.idempotent ? 'idempotent' : 'applied' })
+
+    const bindingsIgnored = state === 'active' && validated.bindings.length > 0
+    const base = {
+      key,
+      state: activated.state,
+      steps,
+      ...(bindingsIgnored ? { bindings_applied: false } : {}),
+    }
+    if (key !== OFFICE_ADDON_KEY) return done(base)
+
+    // Activation never depends on health; the probe only reports (mupot#1662).
+    const probe = await probeOfficeHealth(env)
+    const health = probe.ok
+      ? probe.value
+      : { status: 'unavailable' as const, reason: probe.reason }
+    return done({ ...base, health })
+  },
+}
+
 export const ADDON_TOOLS: ToolSpec[] = [
   toolAddonInstall,
   toolAddonConfigure,
   toolAddonActivate,
   toolAddonDisable,
   toolAddonArchive,
+  toolAddonSetup,
 ]
