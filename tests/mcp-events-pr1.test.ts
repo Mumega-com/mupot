@@ -380,6 +380,39 @@ describe('events/subscribe + events/unsubscribe with the DEFAULT (empty) callbac
     expect(dumpState()).toBe(before)
   })
 
+  it('a refused subscribe logs the callback HOSTNAME only — never path, query, userinfo or secret (mupot#1709)', async () => {
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      const params = {
+        ...subscribeParams,
+        delivery: {
+          ...subscribeParams.delivery,
+          url: 'https://user:pw-SECRET@Hooks.Client.Example/cb/PATH-SECRET?token=QUERY-SECRET',
+        },
+      }
+      const r = await rawRpc('events/subscribe', params, BOUND_ADMIN, true, [])
+      expect(parse(r.text).error).toMatchObject({ code: -32015 })
+      const lines = spy.mock.calls.filter((c) => c[0] === '[mcp:events/subscribe] callback refused').map((c) => c[1])
+      expect(lines).toEqual([{ reason: 'callback_credentials_not_allowed', host: 'hooks.client.example' }])
+      const logged = JSON.stringify(spy.mock.calls)
+      for (const s of ['pw-SECRET', 'PATH-SECRET', 'QUERY-SECRET', 'whsec_']) expect(logged).not.toContain(s)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('a refused subscribe with an unparseable callback URL logs host null', async () => {
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      const params = { ...subscribeParams, delivery: { ...subscribeParams.delivery, url: 'not a url' } }
+      await rawRpc('events/subscribe', params, BOUND_ADMIN, true, [])
+      const lines = spy.mock.calls.filter((c) => c[0] === '[mcp:events/subscribe] callback refused').map((c) => c[1])
+      expect(lines).toEqual([{ reason: 'callback_url_invalid', host: null }])
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('events/unsubscribe of a subscription that does not exist is an idempotent no-op', async () => {
     const before = dumpState()
     const r = await rawRpc('events/unsubscribe', subscribeParams, BOUND_ADMIN, true, [])

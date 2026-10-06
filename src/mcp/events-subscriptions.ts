@@ -115,6 +115,16 @@ interface ParsedTarget {
   url: string
 }
 
+/** Hostname only (lowercased, capped) of a callback URL, or null when it is not a parseable URL. */
+function refusedCallbackHost(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  try {
+    return new URL(raw).hostname.toLowerCase().slice(0, 253)
+  } catch {
+    return null
+  }
+}
+
 /** Shared parse for subscribe/unsubscribe identity fields. `requireHostAllowed` is false for
  *  unsubscribe (tearing down must not depend on the current allowlist). */
 function parseTarget(
@@ -137,7 +147,15 @@ function parseTarget(
   let url: string
   if (requireHostAllowed) {
     const check = validateCallbackUrl(delivery.url, env)
-    if (!check.ok) return fail(-32015, 'CallbackEndpointError', { reason: check.reason })
+    if (!check.ok) {
+      // mupot#1709: EVENTS_CALLBACK_HOSTS may only name a host a real client was OBSERVED sending, so
+      // log the refused hostname — never the path/query/userinfo, which can carry a client's secret.
+      console.info('[mcp:events/subscribe] callback refused', {
+        reason: check.reason,
+        host: refusedCallbackHost(delivery.url),
+      })
+      return fail(-32015, 'CallbackEndpointError', { reason: check.reason })
+    }
     url = check.url
   } else {
     if (typeof delivery.url !== 'string') return fail(-32602, 'invalid_params', { field: 'delivery.url' })
