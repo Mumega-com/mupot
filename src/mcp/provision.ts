@@ -115,6 +115,7 @@ import {
   boundAgentHasAnyLiveGrantForAction,
   resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
   elevationRemedyMessage,
+  elevationHint,
   recordElevationUsage,
   type ElevationGrantRecord,
 } from '../auth/elevation'
@@ -691,7 +692,7 @@ export const toolMintAgentToken: ToolSpec = {
     // authority question only: a principal who fails it still falls through to
     // the elevation limb below, unchanged.
     if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
-      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('mint_agent_token') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
       const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
         squadDepartmentId,
@@ -1431,7 +1432,7 @@ export const toolGrantAgentCapability: ToolSpec = {
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, squad, 'admin'))) {
-      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('grant_agent_capability') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
         squadDepartmentId,
