@@ -6777,6 +6777,13 @@ async function handleJsonRpc(
           return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
         },
       })
+      // mupot#1709: what a client was actually shown, so a client canary observes the catalogue instead
+      // of inferring it. Shape only — never a token, principal id, or message body.
+      console.info('[mcp:events/list]', {
+        bound: auth.boundAgentId != null,
+        count: catalogue.length,
+        names: catalogue.map((e) => e.name),
+      })
       return ok(id, { events: catalogue })
     }
 
