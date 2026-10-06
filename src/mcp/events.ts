@@ -46,6 +46,41 @@ export function negotiateProtocolVersion(params: unknown, enabled: boolean): str
   return LEGACY_PROTOCOL_VERSION
 }
 
+/** `_meta` key a modern (2026-07-28) request carries its protocol version under (spec: Versioning). */
+export const PROTOCOL_VERSION_META_KEY = 'io.modelcontextprotocol/protocolVersion'
+
+/**
+ * Is this request a modern (2026-07-28) request? Spec (basic/versioning, transports/streamable-http):
+ * there is no handshake state on the wire; every POST carries `MCP-Protocol-Version` and the request
+ * `_meta[io.modelcontextprotocol/protocolVersion]`. mupot is stateless HTTP, so the version of a
+ * non-initialize request is read from those two carriers (either one naming 2026-07-28 is enough,
+ * exact match only). Always false when `enabled` is false (flag OFF => legacy bytes).
+ */
+export function isModernProtocolRequest(enabled: boolean, headerValue: string | null | undefined, params: unknown): boolean {
+  if (!enabled) return false
+  if (headerValue === EVENTS_PROTOCOL_VERSION) return true
+  if (typeof params === 'object' && params !== null && !Array.isArray(params)) {
+    const meta = (params as Record<string, unknown>)._meta
+    if (typeof meta === 'object' && meta !== null && !Array.isArray(meta)) {
+      return (meta as Record<string, unknown>)[PROTOCOL_VERSION_META_KEY] === EVENTS_PROTOCOL_VERSION
+    }
+  }
+  return false
+}
+
+/**
+ * 2026-07-28 (SEP-2322): "All results now carry a required `resultType` field: "complete" for ordinary
+ * results and "input_required" for multi round-trip request interim results." Every result this server
+ * returns is final, so it is always "complete" (mupot never returns InputRequiredResult). An existing
+ * resultType is preserved. Non-object results are returned untouched (none exist today).
+ */
+export function withResultType(result: unknown): unknown {
+  if (typeof result !== 'object' || result === null || Array.isArray(result)) return result
+  const r = result as Record<string, unknown>
+  if (typeof r.resultType === 'string') return r
+  return { resultType: 'complete', ...r }
+}
+
 /** Capabilities for a 2026-07-28 response. Only ever called with the flag on. */
 export function eventsProtocolCapabilities(): Record<string, unknown> {
   return { tools: {}, events: {} }
