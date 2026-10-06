@@ -349,7 +349,9 @@ describe('authenticated Telegram receipts and human controls', () => {
       VALUES ('task-visible', 'squad-1', 'project-1', 'Public decision', 'done', 'review', 'gate:human'),
              ('task-hidden', 'squad-2', 'project-2', 'Private secret', 'done', 'review', 'gate:human');`)
     const observer = (await (await post(envelope('/needs'))).json() as { reply: string }).reply
-    expect(observer).toContain('Public decision')
+    // mupot#1688: an observer cannot decide anything, so nothing is listed for them (it used
+    // to list view-only rows).
+    expect(observer).not.toContain('Public decision')
     expect(observer).not.toContain('Private secret')
     expect(observer).not.toContain('/approve')
     expect(observer).not.toContain('/reject')
@@ -366,7 +368,9 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('keeps Needs You deliverable as one Telegram message and signals omitted items', async () => {
-    await member('observer')
+    await member()
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('human-gate', 'gate:human', 'member', 'human-1', 'test', datetime('now'))`)
     for (let index = 0; index < 10; index++) {
       harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
         VALUES (?, 'squad-1', 'project-1', ?, 'done', 'review', 'gate:human')`)

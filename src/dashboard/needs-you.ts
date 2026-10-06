@@ -37,7 +37,7 @@ export async function loadNeedsYouDashboard(
   auth: AuthContext,
   options: { limit?: number; after?: string } = {},
 ): Promise<NeedsYouDashboardView> {
-  const page = await listNeedsYou(env, routinePrincipal(auth), options)
+  const page = await listNeedsYou(env, routinePrincipal(auth), { ...options, auth })
   return { items: page.items, nextCursor: page.next_cursor, truncated: page.truncated, truncatedSources: page.truncated_sources }
 }
 

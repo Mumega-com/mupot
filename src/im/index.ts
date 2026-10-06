@@ -427,8 +427,9 @@ export function memberAuth(env: Env, member: Member, grants: CapabilityGrant[]):
 }
 
 async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], projectId: string | null): Promise<string> {
-  const principal = routinePrincipal(memberAuth(env, member, grants))
-  const page = await listNeedsYou(env, principal, { ...(projectId ? { project_id: projectId } : {}), limit: 10 })
+  const auth = memberAuth(env, member, grants)
+  const principal = routinePrincipal(auth)
+  const page = await listNeedsYou(env, principal, { ...(projectId ? { project_id: projectId } : {}), limit: 10, auth })
   if (!page.items.length) return 'Nothing needs your attention in your accessible projects.'
   const lines: string[] = []
   let omitted = Boolean(page.next_cursor || page.truncated)

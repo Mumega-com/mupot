@@ -26,8 +26,12 @@ export const attentionApp = new Hono<AppEnv>()
 attentionApp.get('/needs-you', routineEndpoint, async (c) => {
   const options = pagination(c)
   if (!options) return c.json({ error: 'invalid_pagination' }, 400)
+  const view = c.req.query('view')
+  if (view !== undefined && view !== 'inbox' && view !== 'stuck') return c.json({ error: 'invalid_view' }, 400)
   try {
-    return c.json(await listNeedsYou(c.env, routinePrincipal(c.get('auth')), options))
+    return c.json(await listNeedsYou(c.env, routinePrincipal(c.get('auth')), {
+      ...options, ...(view === undefined ? {} : { view }), auth: c.get('auth'),
+    }))
   } catch {
     return c.json({ error: 'invalid_pagination' }, 400)
   }
@@ -40,7 +44,7 @@ attentionApp.get('/projects/:projectId/needs-you', routineEndpoint, async (c) =>
   const principal = routinePrincipal(c.get('auth'))
   if (!await principalCanReadProject(c.env, principal, projectId)) return c.json({ error: 'project_not_found' }, 404)
   try {
-    return c.json(await listNeedsYou(c.env, principal, { ...options, project_id: projectId }))
+    return c.json(await listNeedsYou(c.env, principal, { ...options, project_id: projectId, auth: c.get('auth') }))
   } catch {
     return c.json({ error: 'invalid_pagination' }, 400)
   }

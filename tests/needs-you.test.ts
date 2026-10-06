@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { CapabilityGrant, Env } from '../src/types'
 import { listNeedsYou } from '../src/attention/service'
@@ -62,6 +62,18 @@ function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): Sqli
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES
       ('project-a', 'squad-a', 'write'),
       ('project-b', 'squad-b', 'write');
+    -- An independent HUMAN who holds the human-decided gate lanes (mupot#1688: a gate wait
+    -- with no independent human holder is an agent-gate wait, not an owner-inbox item).
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('holder-human', 'holder@example.test', 'Holder', 'active', 'tenant-a'),
+      ('member-a', 'member-a@example.test', 'Member A', 'active', 'tenant-a'),
+      ('observer-a', 'observer-a@example.test', 'Observer A', 'active', 'tenant-a'),
+      ('fine-admin', 'fine-admin@example.test', 'Fine Admin', 'active', 'tenant-a');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+      VALUES ('cap-holder', 'holder-human', 'org', NULL, 'member');
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES
+      ('holder-content', 'gate:content', 'member', 'holder-human', 'owner-a', '2026-07-01T00:00:00.000Z'),
+      ('holder-loops', 'gate:loops', 'member', 'holder-human', 'owner-a', '2026-07-01T00:00:00.000Z');
   `)
   return harness
 }
@@ -134,6 +146,11 @@ function itemActions(page: Awaited<ReturnType<typeof listNeedsYou>>, sourceId: s
   return item.allowed_actions
 }
 
+// mupot#1688: an item the viewer cannot act on is not listed at all (it used to be a view-only row).
+function absent(page: Awaited<ReturnType<typeof listNeedsYou>>, sourceId: string) {
+  return !page.items.some(candidate => candidate.source_id === sourceId)
+}
+
 function insertTask(harness: SqliteD1Harness, values: {
   id: string
   projectId?: string
@@ -141,6 +158,7 @@ function insertTask(harness: SqliteD1Harness, values: {
   title?: string
   assignee?: string | null
   gateOwner?: string | null
+  priority?: 'P0' | 'P1' | 'P2' | 'P3' | null
   result?: string | null
   createdAt?: string
   updatedAt?: string
@@ -152,11 +170,11 @@ function insertTask(harness: SqliteD1Harness, values: {
   harness.sqlite.prepare(
     `INSERT INTO tasks (
        id, squad_id, project_id, title, body, done_when, status, assignee_agent_id,
-       gate_owner, result, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, '', 'A durable outcome.', ?, ?, ?, ?, ?, ?)`,
+       gate_owner, priority, result, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, '', 'A durable outcome.', ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     values.id, squadId, projectId, values.title ?? values.id, values.status,
-    values.assignee ?? null, values.gateOwner ?? null, values.result ?? null, createdAt, updatedAt,
+    values.assignee ?? null, values.gateOwner ?? null, values.priority ?? null, values.result ?? null, createdAt, updatedAt,
   )
 }
 
@@ -198,7 +216,15 @@ function insertWaitingRun(harness: SqliteD1Harness, values: {
 describe('Needs You projection', () => {
   let harness: SqliteD1Harness | undefined
 
+  // The fixtures are dated 2026-07-19; pin "now" a few hours later so age / stale rules
+  // (mupot#1688) see fresh rows exactly as the pre-#1688 assertions assumed.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-19T13:00:00.000Z'))
+  })
+
   afterEach(() => {
+    vi.useRealTimers()
     harness?.close()
     harness = undefined
   })
@@ -257,11 +283,9 @@ describe('Needs You projection', () => {
     })
     const env = envFor(harness)
 
+    // A member who cannot decide it has nothing to do here: not listed (was: a view-only row).
     const visible = await listNeedsYou(env, member(), { project_id: 'project-a' })
-    expect(visible.items).toEqual([expect.objectContaining({
-      kind: 'approval', source_type: 'task', source_id: 'approval-output',
-      allowed_actions: ['view'], safe_url: '/projects/project-a#work',
-    })])
+    expect(visible.items).toEqual([])
 
     harness.sqlite.prepare(
       `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
@@ -269,7 +293,8 @@ describe('Needs You projection', () => {
     ).run()
     const decidable = await listNeedsYou(env, member(), { project_id: 'project-a' })
     expect(decidable.items).toEqual([expect.objectContaining({
-      source_id: 'approval-output', allowed_actions: ['view', 'approve', 'reject'],
+      kind: 'approval', source_type: 'task', source_id: 'approval-output',
+      allowed_actions: ['view', 'approve', 'reject'], safe_url: '/projects/project-a#work',
     })])
   })
 
@@ -313,10 +338,10 @@ describe('Needs You projection', () => {
       id: 'blocked-later', status: 'blocked', gateOwner: 'role:delivery', createdAt: '2026-07-19T15:00:00.000Z',
     })
     insertTask(harness, {
-      id: 'approval-z', status: 'review', gateOwner: 'gate:content', createdAt: '2026-07-19T10:00:00.000Z',
+      id: 'approval-z', status: 'review', gateOwner: 'gate:content', priority: 'P0', createdAt: '2026-07-19T10:00:00.000Z',
     })
     insertTask(harness, {
-      id: 'approval-a', status: 'review', gateOwner: 'gate:content', createdAt: '2026-07-19T10:00:00.000Z',
+      id: 'approval-a', status: 'review', gateOwner: 'gate:content', priority: 'P0', createdAt: '2026-07-19T10:00:00.000Z',
     })
     const page = await listNeedsYou(envFor(harness), owner(), {})
 
@@ -376,14 +401,12 @@ describe('Needs You projection', () => {
     })
 
     const observerPage = await listNeedsYou(env, observer, {})
-    expect(itemActions(observerPage, 'routine-agent')).toEqual(['view'])
-    expect(itemActions(observerPage, 'routine-answer')).toEqual(['view'])
-    expect(itemActions(observerPage, 'routine-budget')).toEqual(['view'])
+    expect(observerPage.items).toEqual([])
 
     const memberPage = await listNeedsYou(env, member(), {})
-    expect(itemActions(memberPage, 'routine-agent')).toEqual(['view'])
+    expect(absent(memberPage, 'routine-agent')).toBe(true)
     expect(itemActions(memberPage, 'routine-answer')).toEqual(['view', 'answer'])
-    expect(itemActions(memberPage, 'routine-budget')).toEqual(['view'])
+    expect(absent(memberPage, 'routine-budget')).toBe(true)
 
     const adminPage = await listNeedsYou(env, administrator, {})
     expect(itemActions(adminPage, 'routine-agent')).toEqual(['view', 'assign_agent', 'cancel'])
@@ -391,9 +414,7 @@ describe('Needs You projection', () => {
     expect(itemActions(adminPage, 'routine-budget')).toEqual(['view', 'change_budget', 'cancel'])
 
     const agentPage = await listNeedsYou(env, agent, {})
-    expect(itemActions(agentPage, 'routine-agent')).toEqual(['view'])
-    expect(itemActions(agentPage, 'routine-answer')).toEqual(['view'])
-    expect(itemActions(agentPage, 'routine-budget')).toEqual(['view'])
+    expect(agentPage.items).toEqual([])
   })
 
   it('requires writable responsible-squad Project access before advertising answer', async () => {
@@ -408,7 +429,7 @@ describe('Needs You projection', () => {
     }
 
     setAccess('read')
-    expect(itemActions(await listNeedsYou(env, member(), {}), 'access-answer')).toEqual(['view'])
+    expect(absent(await listNeedsYou(env, member(), {}), 'access-answer')).toBe(true)
 
     setAccess('write')
     expect(itemActions(await listNeedsYou(env, member(), {}), 'access-answer')).toEqual(['view', 'answer'])
@@ -443,10 +464,10 @@ describe('Needs You projection', () => {
     })
     const selfAgent = principal({ actor_type: 'agent', actor_id: 'agent-a' })
 
-    expect(itemActions(await listNeedsYou(env, observer, {}), 'standard-gate')).toEqual(['view'])
-    expect(itemActions(await listNeedsYou(env, noGateFineGrainedAdmin, {}), 'standard-gate')).toEqual(['view'])
+    expect(absent(await listNeedsYou(env, observer, {}), 'standard-gate')).toBe(true)
+    expect(absent(await listNeedsYou(env, noGateFineGrainedAdmin, {}), 'standard-gate')).toBe(true)
     expect(itemActions(await listNeedsYou(env, member(), {}), 'standard-gate')).toEqual(['view', 'approve', 'reject'])
-    expect(itemActions(await listNeedsYou(env, selfAgent, {}), 'self-gate')).toEqual(['view'])
+    expect(absent(await listNeedsYou(env, selfAgent, {}), 'self-gate')).toBe(true)
     expect(itemActions(await listNeedsYou(env, member(), {}), 'loops-gate')).toEqual(['view', 'reject'])
 
     harness.sqlite.prepare(

@@ -284,9 +284,9 @@ describe('Needs You — project_recommit_due source', () => {
     harness = makeHarness()
     insertProject(harness, { id: 'proj-a-due', cycleBoundaryAt: isoPlusHours(10), squadId: 'squad-a' })
     const page = await listNeedsYou(envFor(harness), member(['squad-a']), {}, NOW)
-    const item = findItem(page, 'proj-a-due')
-    expect(item).toBeDefined()
-    expect(item?.allowed_actions).toEqual(['view'])
+    // mupot#1688: a recommit warning the viewer cannot act on (no workspace-admin authority)
+    // is not in their inbox at all — it used to be a view-only row.
+    expect(findItem(page, 'proj-a-due')).toBeUndefined()
   })
 })
 
