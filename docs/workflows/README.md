@@ -47,7 +47,7 @@ own coverage is honest about what exists vs. what is only proposed.
 ## Cross-cutting notes
 
 - Workflows 3, 7, and 9 share the same `task_verdict` / `task_verdicts` machinery
-  (`src/mcp/index.ts:1886`) — a proposal (3) is decided through the same verdict call a
+  (`name: 'task_verdict'` in `src/mcp/index.ts`) — a proposal (3) is decided through the same verdict call a
   human can reach via a harness-attested Telegram origin (7), and a wrongly-decided
   verdict is corrected through the same table's reversal path (9). Read them together.
 - Workflow 2's actual capability-granting step is workflow 3 — first-person intake only

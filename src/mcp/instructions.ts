@@ -37,7 +37,8 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - 403 forbidden need=<cap>: Server-side authorization floor. Your session lacks the required capability for this tool. Grant capability or reconnect with bound agent.
    - Client Error 'mcp_request_blocked' / "blocked by a firewall or security service": Third-party MCP client connectors (e.g. ChatGPT / OpenAI) frequently label ANY upstream 403 as one of these. This is an authorization floor issue, NOT a network/firewall block. Re-check the same call over REST before blaming networks.
    - 401 unauthenticated / dead credential: Bearer token expired, revoked, or invalid. Mint a new token.
-   - 400 invalid_args: Authentication and authorization passed; check input argument schema.
+   - Tool refusals (403/404/409 and other 4xx) over MCP arrive as a normal result with isError:true and a JSON body { ok:false, tool, error, status, need?, detail }. Read 'need' (the missing capability) and 'status' there; there is no HTTP 4xx to inspect.
+   - 400 invalid_args (REST /actions) or JSON-RPC -32602 (MCP; also unknown tool): Authentication and authorization passed; check the tool name and input argument schema.
    - 429 rate_limited: Budget ceiling or rate limit reached.
 
 7. SYNTHETIC COUNCIL BUS & ACK PROTOCOL
@@ -50,7 +51,11 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
    - (Note: this applies to fleet bus messages, not MCP JSON-RPC tool result envelopes).
    - Critical handoffs require ACK within 30s; routine within 60s.
 
-8. 7-AXIS SEAT DECLARATION (TURN 1)
+8. TASKS: READ ONE, CLOSE ONE
+   - Read a single task with 'task_get' { task_id }; a task you cannot read answers task_not_found.
+   - A task you worked by hand (never dispatched) is closed by its assignee with 'task_submit_result' { task_id, result }; result must state "Artifact: <path>" and "SHA256: <64-hex>", and the task moves to review.
+
+9. 7-AXIS SEAT DECLARATION (TURN 1)
    - On your first turn after boot_context/orient, invoke 'check_in' with your full 7-axis identity so the pot can distinguish this seat from sibling harnesses on the same member token.
    - Required axes:
        check_in({

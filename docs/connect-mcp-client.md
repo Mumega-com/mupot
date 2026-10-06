@@ -11,7 +11,7 @@ implemented but never spelled out.
 | Endpoint | `POST https://<your-pot>/mcp` |
 | Protocol | JSON-RPC 2.0 over **streamable-HTTP** (transport `http`, **not** `sse`) |
 | Auth | `Authorization: Bearer <MEMBER_TOKEN>` — a `mupot_…` member API key |
-| Methods | `initialize`, `notifications/initialized`, `tools/list`, `tools/call` |
+| Methods | `initialize`, `notifications/initialized`, `tools/list`, `tools/call` (plus `server/discover` and `events/*` only when the pot sets `EVENTS_ENABLED=true`; off by default) |
 | Get a token | Dashboard → **Connect** card (show-once), or the `mint_agent_token` tool |
 
 A `GET` is not the MCP door — MCP here is **POST JSON-RPC**. `/mcp` sits inside
@@ -112,6 +112,24 @@ curl -sS https://<your-pot>/mcp \
 Request bodies are capped at 64 KB. `tools/call` runs as the authenticated
 member — the pot never reads an identity field from the arguments.
 
+### How a call fails
+
+| Failure | What you receive |
+|---|---|
+| Tool refusal (missing capability, not found, conflict: any 4xx from the tool) | HTTP `200`, `result.isError: true`, body `{ ok:false, tool, error, status, need?, detail }` (also in `structuredContent`). `status` is the HTTP status REST would have used; `need` is the missing capability when there is one. |
+| Unknown tool, malformed request, input schema violation | JSON-RPC error `-32602` (`unknown_tool`, `invalid_args`, `invalid_request`) |
+| Server fault (5xx) | JSON-RPC error carrying the HTTP status |
+| `401` (missing/revoked token) | a real HTTP `401`, unchanged (OAuth discovery depends on it) |
+
+REST `POST /actions/:tool` keeps plain HTTP statuses. Do not treat a `200` from `tools/call`
+as success: check `result.isError`.
+
+### MCP events (off by default)
+
+`server/discover` and `events/list|subscribe|unsubscribe` (protocol `2026-07-28`) are served
+only when the pot sets `EVENTS_ENABLED=true`. The flag is currently off, so a normal pot
+answers `method_not_found` for them. Do not build against them yet.
+
 ## Custom GPT / OpenAPI Actions
 
 For a Custom GPT that speaks OpenAPI instead of MCP, tools are exposed as REST
@@ -123,7 +141,7 @@ discovery is split into two specs (mupot#1596):
   Lists only the tools at member capability or below (`authenticated` /
   `observer` / `member`), from the explicit, committed allowlist in
   `src/mcp/openapi-public-allowlist.ts`. This used to list the entire tool
-  registry — 144 tools including the whole admin surface (`mint_agent_token`,
+  registry — the full tool registry, including the whole admin surface (`mint_agent_token`,
   `grant_agent_capability`, `revoke_*`, `archive_row`/`unarchive_row`,
   `addon_archive`, and more) by name and input schema. Every tool already
   enforced its own authz, so that was disclosure rather than an access break,
@@ -131,7 +149,7 @@ discovery is split into two specs (mupot#1596):
   out for free. A tool at member-tier-or-below that a Custom GPT config
   already calls is unaffected; a new tool is private by default until someone
   adds its name to the allowlist.
-- **`GET /openapi.full.json`** — the full tool registry (all 144), gated the
+- **`GET /openapi.full.json`** — the full tool registry (every registered tool), gated the
   same way any other admin-tier read in this codebase is: `authenticateMember`
   + `hasWorkspaceAdmin` (org-admin bearer required). For internal tooling that
   legitimately needs the whole surface, not for a public Custom GPT config.
@@ -152,6 +170,7 @@ not a public listing: it returns `401` without a token and `404` with one.)
 | GET `/mcp` (or `/mcp/tools`) → `401` Bearer challenge | GET hits the OAuth layer; MCP is POST JSON-RPC | POST `/mcp` with `tools/list` |
 | GET `/mcp` with a valid token → `404` | GET re-roots to `/`, which has no handler | POST JSON-RPC, transport `http` |
 | Client enters an OAuth/`/authorize` flow | `type:"sse"` issued a GET, followed the 401 challenge | Set transport to `http` |
+| `200` with `isError: true` and `need` | The tool refused you; `need` names the capability | Grant it or bind an agent with it; not a network problem |
 | `401 unauthenticated` | Missing/revoked/newline-wrapped token, or token minted on another pot | Re-mint on **this** pot; keep token on one line |
 | `413 payload_too_large` | Body over 64 KB | Trim the request |
 

@@ -28,7 +28,7 @@ The proposing agent, a deciding human, and the mupot backend.
    `waitForHuman('review')` gate every proposal kind uses (`src/routines/actions.ts:1033` —
    `approvedGate` flips the control task's `gate_status` from `pending`→`approved`/`rejected`
    generically).
-4. A human casts `task_verdict` (`src/mcp/index.ts:1886`) on the control task —
+4. A human casts `task_verdict` (`name: 'task_verdict'` in `src/mcp/index.ts`) on the control task —
    `approved`/`rejected`, optionally with `human_origin` (see the "human decision channel"
    workflow doc for that mechanism in full; this flow simply requires the verdict to satisfy
    `verdictIsHuman`, below).

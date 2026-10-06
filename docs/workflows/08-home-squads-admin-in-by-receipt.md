@@ -19,16 +19,16 @@ session is refused before any scope check runs, see Known gaps), the **home squa
 
 ## Tool/route sequence
 
-1. `request_elevation` (MCP tool, `src/mcp/index.ts:4469`) — the agent asks for
+1. `request_elevation` (MCP tool, `name: 'request_elevation'` in `src/mcp/index.ts`) — the agent asks for
    `actions: ['action:home_access']`, `scope_type: 'squad'`, `scope_id: <home squad id>`,
    `duration_minutes`, `reason`. Identity (`agentSessionId`/`agentId`/`memberId`) is derived
    from the authenticated session via `resolveAgentSessionContext(auth)`, never from request
    args — an agent cannot name a different session or another agent's request
-   (`src/mcp/index.ts:4462-4469` comment; enforced by `resolveAgentSessionContext`).
+   (comment on that tool in `src/mcp/index.ts`; enforced by `resolveAgentSessionContext`).
    Writes a row via `createElevationRequest` (`src/auth/elevation.ts`) into
    `elevation_requests`. Response: `{ request: {...}, note: 'Pending human approval. No
    authority is granted yet — poll elevation_status or wait for it to be reflected on your
-   next call.' }` (`src/mcp/index.ts:4536`).
+   next call.' }` (that tool's `run()`).
 2. `GET /auth/elevation/requests` (`src/auth/index.ts:1011`) — the home owner's dashboard
    session lists pending requests it has authority to decide (a request on a scope the
    operator cannot admin is not even listed — "Security Invariant 12").
@@ -37,7 +37,7 @@ session is refused before any scope check runs, see Known gaps), the **home squa
    actions?, duration_minutes?, note? }` — `actions`/`duration_minutes` may only narrow the
    request, never widen it.
 4. On approval, a row is written to `elevation_grants` inside the same decision transaction.
-5. `elevation_status` (MCP tool, `src/mcp/index.ts:4542`) — the agent polls its session's live
+5. `elevation_status` (MCP tool, `name: 'elevation_status'` in `src/mcp/index.ts`) — the agent polls its session's live
    grants; each is re-evaluated live via `evaluateElevationGrant`.
 6. On use, `canOnSquadAuth` (`src/auth/capability.ts:545-547`) checks, for a `kind==='home'`
    scope and a bound-agent caller: `hasElevatedAction(env, auth, 'action:home_access', 'squad',
@@ -95,7 +95,7 @@ session is refused before any scope check runs, see Known gaps), the **home squa
   `reversible`, effect note `"Read-only and scoped to a single squad; the access itself
   leaves no lasting effect once the grant expires."` (`src/auth/elevation-actions.ts:159-166`).
 - Agent, on `elevation_status`: `{ session_id, request, active_elevations: [{ id, action,
-  label, scope_type, scope_id, effect, expires_at, live }] }` (`src/mcp/index.ts:4542`).
+  label, scope_type, scope_id, effect, expires_at, live }] }` (that tool's `run()`).
 - No notice is sent to the home-squad owner when someone *else* triggers the flow — the owner
   only sees it because they themselves are the required approver.
 

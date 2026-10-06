@@ -31,10 +31,10 @@ simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
 send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
-The version the code reports is `0.30.0`, but it is not yet a tagged stable release.
-The last tagged release is `v0.25.0 Project Routines and Needs You`; the next stable
-candidate is `v0.30.0 Stabilized Control Plane`, and `v0.31.0` work remains held until
-that release closes. See the
+Do not read a version from this README. The running version is whatever the pot's
+`/health` reports (source: `src/version.ts`), the released versions are the git tags
+(`git tag --list 'v*'`), and the next release candidate and its scope live only in
+[`ROADMAP.md`](./ROADMAP.md) and [`CHANGELOG.md`](./CHANGELOG.md). See the
 [version roadmap](./ROADMAP.md), the
 [next release flights](./docs/releases/next-flights.md), the
 [control-plane requirements](./docs/control-plane-roadmap.md), the
