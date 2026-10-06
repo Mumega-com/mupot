@@ -330,6 +330,15 @@ describe('onboard ergonomics (#1664 ceremony slice)', () => {
       if (!named.ok) expect(named.error).toBe('operator_principal_required')
     })
 
+    it('a bound agent holding org admin: agent=<other> and self:false both still get operator_principal_required', async () => {
+      const adminAgent = agentAuth('a', [{ member_id: MEM_A, scope_type: 'org', scope_id: null, capability: 'admin' } as CapabilityGrant])
+      for (const args of [{ agent: AGENT_B }, { self: false }, { self: false, agent: AGENT_B }]) {
+        const res = await invokeTool(adminAgent, env, 'list_agent_sessions', args, ORIGIN)
+        expect(res.ok).toBe(false)
+        if (!res.ok) expect(res.error).toBe('operator_principal_required')
+      }
+    })
+
     it('self:false is honoured: no implicit self on a bound token, falls to the admin path', async () => {
       const res = await invokeTool(noGrants('a'), env, 'list_agent_sessions', { self: false }, ORIGIN)
       expect(res.ok).toBe(false)
