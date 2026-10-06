@@ -437,9 +437,10 @@ async function sourceRows(
       'approval' AS kind, 'task' AS source_type, t.id AS source_id,
       p.id AS project_id, p.name AS project_name, t.title,
       'Approval required by ' || t.gate_owner || COALESCE((
-        SELECT ' (no verdict after ' || g.rewake_count || ' gate re-wake' || CASE WHEN g.rewake_count = 1 THEN '' ELSE 's' END || ')'
+        -- Requires migration 0191 applied before deploy. Shows DELIVERED re-wakes only (never attempts).
+        SELECT ' (no verdict after ' || g.delivered_count || ' gate re-wake' || CASE WHEN g.delivered_count = 1 THEN '' ELSE 's' END || ')'
           FROM gate_stall_rewakes g
-         WHERE g.task_id = t.id AND g.review_since = t.updated_at AND g.rewake_count > 0), '') AS reason,
+         WHERE g.task_id = t.id AND g.review_since = t.updated_at AND g.delivered_count > 0), '') AS reason,
       ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,

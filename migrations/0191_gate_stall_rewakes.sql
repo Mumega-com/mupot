@@ -10,13 +10,17 @@
 -- episode with a fresh budget. The claim is a single atomic UPSERT…WHERE (never read-compare-write),
 -- so concurrent sweeps cannot both win.
 --
+-- DEPLOY ORDER: apply this migration BEFORE deploying the code — the Needs You approvals query
+-- (src/attention/service.ts) reads this table.
+--
 -- CREATE-only; touches no existing table. No FK: the row is a bookkeeping ledger and must never
 -- block a task delete or be cascaded by one.
 
 CREATE TABLE IF NOT EXISTS gate_stall_rewakes (
   task_id        TEXT NOT NULL PRIMARY KEY,
   review_since   TEXT NOT NULL,                 -- tasks.updated_at observed at claim time
-  rewake_count   INTEGER NOT NULL DEFAULT 0,
+  rewake_count   INTEGER NOT NULL DEFAULT 0,      -- claims (attempts) this episode; bounds the cap
+  delivered_count INTEGER NOT NULL DEFAULT 0,     -- re-wakes that actually reached a holder (delivered|partial); the only count shown to humans
   last_rewake_at TEXT NOT NULL,                 -- ISO-8601
   last_outcome   TEXT                           -- GateWakeOutcome.status of the last re-wake
 );

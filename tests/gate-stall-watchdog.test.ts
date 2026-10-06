@@ -183,4 +183,46 @@ describe('gate-stall watchdog', () => {
     expect(await reasons()).toEqual(['Approval required by gate:athena (no verdict after 1 gate re-wake)'])
     harness.close()
   })
+
+  it('never counts or shows a re-wake that reached no holder (no_live_holder lane)', async () => {
+    const { env, sqlite, harness } = setup()
+    sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('p1', 'p1', 'P', 'active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p1', '${SQUAD_ID}', 'write');`)
+    seedReviewTask(sqlite, 't1', { gateOwner: 'gate:nobody' })
+    sqlite.exec(`UPDATE tasks SET project_id = 'p1' WHERE id = 't1'`)
+    let rewoken = 0
+    let undelivered = 0
+    for (let i = 0; i < 4; i += 1) {
+      const r = await sweepStalledGateReviews(env, minutes(i * 31))
+      rewoken += r.rewoken
+      undelivered += r.undelivered
+    }
+    expect(rewoken).toBe(0)
+    expect(undelivered).toBe(3)
+    expect(wakeCount(sqlite, 't1')).toBe(0)
+    const row = sqlite.prepare(`SELECT rewake_count, delivered_count, last_outcome FROM gate_stall_rewakes WHERE task_id='t1'`).get() as Record<string, unknown>
+    expect(row).toMatchObject({ rewake_count: 3, delivered_count: 0, last_outcome: 'no_live_holder' })
+    const auth: AuthContext = { userId: 'o', memberId: 'o', email: null, role: 'owner', tenant: TENANT, channel: 'workspace', boundAgentId: null }
+    const reasons = (await listNeedsYou(env, routinePrincipal(auth), { view: 'stuck', auth }, minutes(200).toISOString())).items.map((i) => i.reason)
+    expect(reasons.every((r) => !r.includes('re-wake'))).toBe(true)
+    harness.close()
+  })
+
+  it('a task that re-enters review gets a fresh budget, even past the cap with an old verdict', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 't1')
+    for (let i = 0; i < 4; i += 1) await sweepStalledGateReviews(env, minutes(i * 31))
+    expect(wakeCount(sqlite, 't1')).toBe(3)
+    // Old round's verdict (unreversed, decided before re-entry) must not suppress the new round.
+    sqlite.exec(`INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at)
+                 VALUES ('v-old', 't1', 'rejected', 'x', '2026-10-06T09:00:00.000Z')`)
+    const reentered = minutes(150).toISOString()
+    sqlite.exec(`UPDATE tasks SET updated_at = '${reentered}' WHERE id = 't1'`)
+    await sweepStalledGateReviews(env, minutes(190))
+    expect(wakeCount(sqlite, 't1')).toBe(4)
+    const row = sqlite.prepare(`SELECT rewake_count, delivered_count, review_since FROM gate_stall_rewakes WHERE task_id='t1'`).get() as Record<string, unknown>
+    expect(row).toMatchObject({ rewake_count: 1, delivered_count: 1, review_since: reentered })
+    harness.close()
+  })
 })

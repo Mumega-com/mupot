@@ -24,6 +24,7 @@ const WATCHDOG_ID = 'mupot-gate-stall-watchdog'
 export interface GateStallSweepResult {
   scanned: number
   rewoken: number
+  undelivered: number
   skipped_claimed: number
   errors: number
 }
@@ -38,7 +39,7 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
   const maxRewakes = positiveInt(env.GATE_STALL_MAX_REWAKES, DEFAULT_GATE_STALL_MAX_REWAKES)
   const nowIso = now.toISOString()
   const cutoffIso = new Date(now.getTime() - thresholdMin * 60_000).toISOString()
-  const result: GateStallSweepResult = { scanned: 0, rewoken: 0, skipped_claimed: 0, errors: 0 }
+  const result: GateStallSweepResult = { scanned: 0, rewoken: 0, undelivered: 0, skipped_claimed: 0, errors: 0 }
 
   // Candidates: review + gate_owner + older than the threshold + no LIVE verdict since entering
   // review (reversed verdicts do not count; datetime() normalises 'YYYY-MM-DD HH:MM:SS' vs ISO).
@@ -72,6 +73,8 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
          ON CONFLICT(task_id) DO UPDATE SET
            rewake_count = CASE WHEN gate_stall_rewakes.review_since <> excluded.review_since
                                THEN 1 ELSE gate_stall_rewakes.rewake_count + 1 END,
+           delivered_count = CASE WHEN gate_stall_rewakes.review_since <> excluded.review_since
+                                  THEN 0 ELSE gate_stall_rewakes.delivered_count END,
            review_since = excluded.review_since,
            last_rewake_at = excluded.last_rewake_at
          WHERE gate_stall_rewakes.review_since <> excluded.review_since
@@ -88,10 +91,20 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
         { kind: 'agent', id: WATCHDOG_ID },
         WATCHDOG_ID,
       )
-      await env.DB.prepare(`UPDATE gate_stall_rewakes SET last_outcome = ?1 WHERE task_id = ?2`)
-        .bind(outcome.status, task.id)
+      // Only a wake that reached a holder counts as a re-wake. requires_human / no_live_holder /
+      // ambiguous / delivery_failed spend the attempt budget but are never reported as re-wakes —
+      // a counter shown to humans must count deliveries, not attempts (#1706 adversarial P1).
+      const delivered = outcome.status === 'delivered' || outcome.status === 'partial'
+      await env.DB.prepare(
+        `UPDATE gate_stall_rewakes
+            SET last_outcome = ?1,
+                delivered_count = delivered_count + ?3
+          WHERE task_id = ?2`,
+      )
+        .bind(outcome.status, task.id, delivered ? 1 : 0)
         .run()
-      result.rewoken += 1
+      if (delivered) result.rewoken += 1
+      else result.undelivered += 1
     } catch {
       result.errors += 1
     }
