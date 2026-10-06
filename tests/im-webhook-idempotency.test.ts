@@ -349,7 +349,9 @@ describe('authenticated Telegram receipts and human controls', () => {
       VALUES ('task-visible', 'squad-1', 'project-1', 'Public decision', 'done', 'review', 'gate:human'),
              ('task-hidden', 'squad-2', 'project-2', 'Private secret', 'done', 'review', 'gate:human');`)
     const observer = (await (await post(envelope('/needs'))).json() as { reply: string }).reply
-    expect(observer).toContain('Public decision')
+    // mupot#1688: an observer cannot decide anything, so nothing is listed for them (it used
+    // to list view-only rows).
+    expect(observer).not.toContain('Public decision')
     expect(observer).not.toContain('Private secret')
     expect(observer).not.toContain('/approve')
     expect(observer).not.toContain('/reject')
@@ -366,7 +368,9 @@ describe('authenticated Telegram receipts and human controls', () => {
   })
 
   it('keeps Needs You deliverable as one Telegram message and signals omitted items', async () => {
-    await member('observer')
+    await member()
+    harness.sqlite.exec(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+      VALUES ('human-gate', 'gate:human', 'member', 'human-1', 'test', datetime('now'))`)
     for (let index = 0; index < 10; index++) {
       harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
         VALUES (?, 'squad-1', 'project-1', ?, 'done', 'review', 'gate:human')`)
@@ -376,6 +380,25 @@ describe('authenticated Telegram receipts and human controls', () => {
     const reply = (await response.json() as { reply: string }).reply
     expect(reply.length).toBeLessThanOrEqual(4096)
     expect(reply).toMatch(/more.*dashboard/i)
+  })
+
+  it('never says "nothing" when a capped scan ended with rows still unscanned (#1688)', async () => {
+    await member()
+    // listNeedsYou stores its continuation cursor server-side; give the harness env a minimal KV.
+    env = { ...env, SESSIONS: { put: async () => undefined } } as unknown as Env
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('lane-holder', 'lane@example.com', 'Lane', 'active', 'telegram-test');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lane', 'lane-holder', 'org', NULL, 'member');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('lane-grant', 'gate:lane', 'member', 'lane-holder', 'test', datetime('now'))`)
+    // 520 approvals on a human lane this member does not hold: every scanned row is filtered out.
+    for (let index = 0; index < 520; index++) {
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
+        VALUES (?, 'squad-1', 'project-1', 'Not yours', 'done', 'review', 'gate:lane')`).run(`noise-${index}`)
+    }
+    const reply = (await (await post(envelope('/needs'))).json() as { reply: string }).reply
+    expect(reply).not.toMatch(/^Nothing needs/)
+    expect(reply).toMatch(/More may be waiting/)
   })
 
   it.each(['suspended', 'revoked'])('refuses task effects for %s membership', async status => {

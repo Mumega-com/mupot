@@ -537,8 +537,8 @@ const reportRunUsage: ToolSpec = {
 
 const needsYouList: ToolSpec = {
   name: 'needs_you_list', scope: 'visible project and workspace attention items', min: 'observer',
-  args: '{ project_id?: string, limit?: 1..100, cursor?: string }',
-  inputSchema: { type: 'object', properties: { project_id: id(), limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: NEEDS_YOU_CURSOR, maxLength: 200 } }, additionalProperties: false },
+  args: '{ project_id?: string, limit?: 1..100, cursor?: string, view?: "inbox" | "stuck" }',
+  inputSchema: { type: 'object', properties: { project_id: id(), limit: { type: 'integer', minimum: 1, maximum: 100 }, cursor: { type: 'string', pattern: NEEDS_YOU_CURSOR, maxLength: 200 }, view: { type: 'string', enum: ['inbox', 'stuck'] } }, additionalProperties: false },
   async run(auth, env, args) {
     if (args.project_id !== undefined && !validId(args.project_id)) return fail(404, 'project_not_found')
     if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 100)) return fail(400, 'invalid_pagination')
@@ -550,6 +550,8 @@ const needsYouList: ToolSpec = {
         ...(args.project_id ? { project_id: args.project_id } : {}),
         ...(args.limit === undefined ? {} : { limit: Number(args.limit) }),
         ...(args.cursor === undefined ? {} : { after: args.cursor }),
+        ...(args.view === 'stuck' ? { view: 'stuck' as const } : {}),
+        auth,
       }))
     } catch {
       return fail(400, 'invalid_pagination')

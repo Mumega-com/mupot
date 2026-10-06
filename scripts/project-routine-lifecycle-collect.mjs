@@ -263,7 +263,7 @@ function validateDependencies(deps) {
     ]],
     ['browser', [
       'assertOwnerSession', 'createRoutine', 'enableRoutine', 'captureRoutine',
-      'manualFire', 'approveTask', 'readRun', 'readProjectSituation',
+      'manualFire', 'approveTask', 'readNeedsYou', 'readRun', 'readProjectSituation',
       'readActivityEvidence', 'close',
     ]],
   ]) {
@@ -514,17 +514,25 @@ async function collectLifecycle(config, deps, secretValues) {
   ).run
   const controlTaskId = required(waitingRun?.task_id, 'routine control task id')
 
-  const attention = assertActionOk(
+  // #1688: Needs You is the viewer's INBOX. The control task is an approval only the OWNER
+  // can decide (the dashboard owner session that approves below — an MCP member token is not
+  // offered owner-role approvals); the assigned agent cannot approve its own work, so its inbox
+  // must OMIT it.
+  const attention = await deps.browser.readNeedsYou({ projectId: config.projectId })
+  const need = attentionItem(attention.items ?? [], controlTaskId)
+  if (!need) throw new CollectorError('Needs You did not expose the control task', attention, secretValues)
+  const agentAttention = assertActionOk(
     await deps.api.invokeAction({
       token: assignedToken,
       tool: 'needs_you_list',
       input: { project_id: config.projectId, limit: 100 },
     }),
-    'Needs You read',
+    'assigned agent Needs You read',
     secretValues,
   )
-  const need = attentionItem(attention.items ?? [], controlTaskId)
-  if (!need) throw new CollectorError('Needs You did not expose the control task', attention, secretValues)
+  if (attentionItem(agentAttention.items ?? [], controlTaskId)) {
+    throw new CollectorError('assigned agent Needs You exposed its own control task', agentAttention, secretValues)
+  }
 
   const approval = await deps.browser.approveTask({ taskId: controlTaskId, runId })
   if (approval?.verdict !== 'approved') {

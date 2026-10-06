@@ -728,6 +728,21 @@ export async function createCollectorDependencies(config) {
       return { taskId, runId, verdict: 'approved' }
     },
 
+    // #1688: the OWNER's Needs You inbox, read through the same dashboard session that approves.
+    async readNeedsYou() {
+      const active = await ensureBrowser()
+      await active.page.goto(`${baseUrl}/needs-you?limit=100`, { waitUntil: 'networkidle', timeout: 20_000 })
+      const sources = await active.page.locator('[data-needs-you-source]').evaluateAll(
+        nodes => nodes.map(node => node.getAttribute('data-needs-you-source')),
+      )
+      return {
+        items: sources.filter(Boolean).map(value => {
+          const separator = value.indexOf(':')
+          return { source_type: value.slice(0, separator), source_id: value.slice(separator + 1) }
+        }),
+      }
+    },
+
     async readRun({ runId, projectId, expected }) {
       const active = await ensureBrowser()
       await active.page.goto(

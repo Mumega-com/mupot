@@ -185,17 +185,8 @@ function dependencies(overrides: Record<string, unknown> = {}) {
         return { ok: true, status: 200, result: { run: { ...terminalRun, situation_digest: 'a'.repeat(64) } } }
       }
       if (tool === 'needs_you_list') {
-        return {
-          ok: true,
-          status: 200,
-          result: {
-            items: [{
-              source_type: 'task',
-              source_id: 'control-task',
-              project_id: 'project-main',
-            }],
-          },
-        }
+        // #1688: an agent's inbox omits its own control task (it cannot approve it).
+        return { ok: true, status: 200, result: { items: [] } }
       }
       if (tool !== 'routine_proposal_submit') {
         throw new Error(`unexpected tool ${tool}`)
@@ -266,6 +257,7 @@ function dependencies(overrides: Record<string, unknown> = {}) {
     })),
     manualFire: vi.fn(async () => ({ accepted: true, routineId: 'routine-1' })),
     approveTask: vi.fn(async () => ({ taskId: 'control-task', verdict: 'approved' })),
+    readNeedsYou: vi.fn(async () => ({ items: [{ source_type: 'task', source_id: 'control-task' }] })),
     readRun: vi.fn(async () => terminalRun),
     readProjectSituation: vi.fn(async () => situation),
     readActivityEvidence: vi.fn(async () => ({ activity, evidence })),
@@ -591,9 +583,7 @@ describe('collector CLI', () => {
               if (tool === 'project_get') return {
                 ok: true, result: { project: { id: config.projectId, status: 'active' }, situation }
               }
-              if (tool === 'needs_you_list') return {
-                ok: true, result: { items: [{ source_type: 'task', source_id: 'task-cli' }] }
-              }
+              if (tool === 'needs_you_list') return { ok: true, result: { items: [] } }
               if (token === 'wrong-cli-secret') return {
                 ok: false, status: 403, error: 'assigned_agent_mismatch'
               }
@@ -635,6 +625,7 @@ describe('collector CLI', () => {
             }),
             manualFire: async () => ({ accepted: true }),
             approveTask: async () => ({ taskId: 'task-cli', verdict: 'approved' }),
+            readNeedsYou: async () => ({ items: [{ source_type: 'task', source_id: 'task-cli' }] }),
             readRun: async () => run,
             readProjectSituation: async () => situation,
             readActivityEvidence: async () => ({

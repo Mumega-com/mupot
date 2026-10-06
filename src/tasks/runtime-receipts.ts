@@ -432,7 +432,7 @@ export function independentGateHolderExistsSql(p: {
  * hold member-or-better standing on the task's squad (memberStandingOnSquadSql —
  * the same standing the agent branch demands, mupot#1663 P3).
  */
-function humanGateHolderExistsSql(p: {
+export function humanGateHolderExistsSql(p: {
   gateOwnerExpr: string
   assigneeIdExpr: string
   squadIdExpr: string

@@ -1,6 +1,6 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -49,10 +49,16 @@ function makeHarness(): SqliteD1Harness {
       ('blocked-a', 'squad-a', 'project-a', 'Unblock launch', '', 'Unblocked', 'blocked', 'role:delivery', NULL, '2026-07-19T10:00:00.000Z', '2026-07-19T10:00:00.000Z'),
       ('publish-a', 'squad-a', 'project-a', 'Publish release', '', 'Published', 'approved', 'gate:content', 'ready', '2026-07-19T09:00:00.000Z', '2026-07-19T09:00:00.000Z'),
       ('hidden-a', 'squad-b', 'project-b', 'Hidden approval', '', 'Approved', 'review', 'gate:content', NULL, '2026-07-19T11:00:00.000Z', '2026-07-19T11:00:00.000Z');
+    UPDATE tasks SET priority = 'P0' WHERE id = 'approval-a';
+    -- member-a is the independent HUMAN holder of gate:content (mupot#1688: only human-decidable
+    -- gate waits the viewer can act on are listed).
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES ('member-a', 'member-a@example.test', 'Member A', 'active', 'tenant-a');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-member-a', 'member-a', 'squad', 'squad-a', 'member');
+    INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('grant-a', 'gate:content', 'member', 'member-a', 'owner-a', '2026-07-01T00:00:00.000Z');
     INSERT INTO routines (id, tenant, project_id, name, objective, status, trigger_kind, timezone, overlap_policy, execution_mode, responsible_squad_id, budget_micro_usd, max_attempts, retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at)
       VALUES ('routine-a', 'tenant-a', 'project-a', 'Routine wait', 'Wait for review', 'enabled', 'manual', 'UTC', 'skip', 'propose', 'squad-a', 0, 3, 300, 1, 'member-a', '2026-07-19T08:00:00.000Z', 'member-a', '2026-07-19T08:00:00.000Z', '2026-07-19T08:00:00.000Z');
     INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key, trigger_kind, status, waiting_reason, created_at, updated_at)
-      VALUES ('routine-wait', 'tenant-a', 'project-a', 'routine-a', 1, '{}', 'manual:wait', 'manual', 'waiting', 'review', '2026-07-19T12:00:00.000Z', '2026-07-19T12:00:00.000Z');
+      VALUES ('routine-wait', 'tenant-a', 'project-a', 'routine-a', 1, '{}', 'manual:wait', 'manual', 'waiting', 'answer', '2026-07-19T12:00:00.000Z', '2026-07-19T12:00:00.000Z');
   `)
   return harness
 }
@@ -71,7 +77,14 @@ function member(): AuthContext {
 describe('Needs You dashboard', () => {
   let harness: SqliteD1Harness | undefined
 
+  beforeEach(() => {
+    // Fixtures are dated 2026-07-19; pin Date so the age / stale rules (mupot#1688) see them fresh.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-07-19T13:00:00.000Z'))
+  })
+
   afterEach(() => {
+    vi.useRealTimers()
     authState.current = null
     harness?.close()
     harness = undefined
@@ -80,7 +93,7 @@ describe('Needs You dashboard', () => {
   it('renders source-specific safe action links, exact urgency labels, continuation, and no generic resolution mutation', async () => {
     harness = makeHarness()
     authState.current = member()
-    const response = await dashboardApp.fetch(new Request('https://pot.test/needs-you?limit=1'), envFor(harness))
+    const response = await dashboardApp.fetch(new Request('https://pot.test/needs-you?limit=2'), envFor(harness))
     const body = await response.text()
 
     expect(response.status).toBe(200)

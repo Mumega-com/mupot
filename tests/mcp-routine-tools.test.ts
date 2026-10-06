@@ -217,7 +217,7 @@ describe('routine MCP tools', () => {
       routine_run_answer: { required: ['run_id', 'answer'], properties: ['run_id', 'answer'] },
       routine_run_cancel: { required: ['run_id'], properties: ['run_id'] },
       routine_proposal_submit: { required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], properties: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'] },
-      needs_you_list: { properties: ['project_id', 'limit', 'cursor'] },
+      needs_you_list: { properties: ['project_id', 'limit', 'cursor', 'view'] },
     }
     for (const tool of routines) {
       expect(tool.inputSchema).toMatchObject({ type: 'object', additionalProperties: false })

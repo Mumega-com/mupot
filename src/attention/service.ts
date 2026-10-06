@@ -1,4 +1,4 @@
-import type { Env, OrgKind } from '../types'
+import type { AuthContext, Env, OrgKind } from '../types'
 import { brandSquadScope, hasCapability, planeCoversScope } from '../auth/capability'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
 import { projectVisibilityClause } from '../projects/access'
@@ -14,6 +14,9 @@ import {
 import type { RoutinePrincipal } from '../routines/access'
 import { routineTablesReady } from '../routines/schema-ready'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { createVerdictGateCache, evaluateVerdictGates, type VerdictGateCache } from '../tasks/index'
+import { canReadSquadTasks } from '../tasks/visibility'
+import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -46,6 +49,30 @@ const RECOMMIT_URGENT_WINDOW_MS = 24 * 60 * 60 * 1000
  * though projects.stalled is still 0 and cycle_boundary_at may be weeks out.
  */
 const STALL_WARNING_LEAD_DAYS = 2
+
+/**
+ * Needs You urgency + staleness rule (mupot#1688). ONE rule for every task-
+ * backed source (approvals, blocked work, publishable output), computed in SQL
+ * so the keyset cursor orders by exactly what is displayed:
+ *
+ *   base    task.priority  P0 -> urgent(0), P1 -> high(1), P2 / unset -> normal(2), P3 -> low(3)
+ *   bump    one level up (never past urgent) for each of:
+ *             - waiting >= NEEDS_YOU_AGE_BUMP_DAYS[0] days (3)   -> +1
+ *             - waiting >= NEEDS_YOU_AGE_BUMP_DAYS[1] days (7)   -> +2 (replaces the +1)
+ *             - the project target_date is within NEEDS_YOU_DUE_BUMP_DAYS (2) of now or past -> +1
+ *           total bump is capped at 2 levels, so a low-priority old item reads 'high' at most.
+ *   stale   waiting >= NEEDS_YOU_STALE_DAYS (14): the age bump no longer applies (it is no
+ *           longer 'getting worse', it is old) and the item sorts AFTER every non-stale item
+ *           (sort rank + NEEDS_YOU_STALE_RANK_OFFSET) and reports stale:true — the UI groups
+ *           it as 'older'. Nothing is auto-dismissed or hidden.
+ *
+ * Routine waits keep their own wait-reason rank (0 for approval/review/budget, 1 for
+ * agent/answer) and only gain the stale grouping. Recommit-due keeps its deadline-driven rank.
+ */
+export const NEEDS_YOU_STALE_DAYS = 14
+export const NEEDS_YOU_AGE_BUMP_DAYS = [3, 7] as const
+export const NEEDS_YOU_DUE_BUMP_DAYS = 2
+const NEEDS_YOU_STALE_RANK_OFFSET = 10
 
 export type NeedsYouKind =
   | 'approval'
@@ -84,12 +111,24 @@ export interface NeedsYouItem {
   deadline_at: string | null
   safe_url: string
   allowed_actions: NeedsYouAction[]
+  /** Waiting >= NEEDS_YOU_STALE_DAYS: render under 'older', never mixed into the live list. */
+  stale: boolean
 }
 
 export interface NeedsYouOptions {
   project_id?: string
   limit?: number
   after?: string
+  /**
+   * 'inbox' (default): only items the viewer can ACT on, human gates only.
+   * 'stuck': workspace admins only — approvals waiting on a gate that NO
+   * independent human holds (agent-only lanes, gate:agent-self-completion).
+   * They never appear in the owner inbox.
+   */
+  view?: 'inbox' | 'stuck'
+  /** The caller's real AuthContext. Every caller has one; when omitted (principal-only
+   *  callers, tests) it is rebuilt from the principal. Never client-supplied. */
+  auth?: AuthContext
 }
 
 export interface NeedsYouPage {
@@ -121,8 +160,6 @@ interface SourceRow {
   project_access_level: 'read' | 'write' | 'admin' | null
   assignee_agent_id: string | null
   gate_owner: string | null
-  has_gate_grant: number
-  has_surface_grant: number
   sort_deadline: string
   sort_timestamp: string
 }
@@ -151,7 +188,12 @@ function safePath(segment: string): string {
   return encodeURIComponent(segment)
 }
 
-function urgency(rank: number): NeedsYouItem['urgency'] {
+function isStaleRank(rank: number): boolean {
+  return rank >= NEEDS_YOU_STALE_RANK_OFFSET
+}
+
+function urgency(sortRank: number): NeedsYouItem['urgency'] {
+  const rank = sortRank % NEEDS_YOU_STALE_RANK_OFFSET
   if (rank === 0) return 'urgent'
   if (rank === 1) return 'high'
   if (rank === 2) return 'normal'
@@ -188,18 +230,23 @@ function principalCanAnswerRoutine(row: SourceRow, principal: RoutinePrincipal):
     && principalCanActOnSquad(row, principal)
 }
 
-function actionsFor(row: SourceRow, principal: RoutinePrincipal): NeedsYouAction[] {
+interface TaskDecision {
+  approve: boolean
+  reject: boolean
+}
+
+function actionsFor(row: SourceRow, principal: RoutinePrincipal, decision?: TaskDecision): NeedsYouAction[] {
   if (row.source_type === 'task') {
     if (row.kind === 'approval') {
-      if (
-        row.assignee_agent_id === principal.actor_id
-        || !principalCanActOnSquad(row, principal)
-        || !(principal.legacy_owner_admin || row.has_gate_grant)
-      ) return ['view']
-      if (row.gate_owner === 'gate:loops' && !(principal.legacy_owner_admin || row.has_surface_grant)) {
-        return ['view', 'reject']
-      }
-      return ['view', 'approve', 'reject']
+      // The RBAC half (gate ownership, gate:loops surface cap, self-verdict,
+      // owner-affiliation) is evaluateVerdictGates' answer, resolved by the caller
+      // (resolveTaskDecisions) — the SAME predicate task_verdict / POST /verdict run,
+      // never re-derived here. Only the squad-scope half is local.
+      if (!decision || !principalCanActOnSquad(row, principal)) return ['view']
+      const actions: NeedsYouAction[] = ['view']
+      if (decision.approve) actions.push('approve')
+      if (decision.reject) actions.push('reject')
+      return actions
     }
     if (row.kind === 'publishable_output') {
       return principal.actor_type === 'member' && principal.workspace_admin ? ['view', 'publish'] : ['view']
@@ -240,7 +287,18 @@ function actionsFor(row: SourceRow, principal: RoutinePrincipal): NeedsYouAction
   return actions
 }
 
-function itemFrom(row: SourceRow, principal: RoutinePrincipal): NeedsYouItem {
+/**
+ * Is this row the viewer's to act on? Any verb beyond 'view' qualifies. The one
+ * exception is blocked work: the list has no resolve verb for it (unblocking happens
+ * on the task itself), so being the human squad member who can act on its squad IS
+ * the actionability — its gate lane was already required to be human-held in SQL.
+ */
+function isActionable(row: SourceRow, principal: RoutinePrincipal, actions: NeedsYouAction[]): boolean {
+  if (actions.some(action => action !== 'view')) return true
+  return row.kind === 'blocked_task' && principal.actor_type === 'member' && principalCanActOnSquad(row, principal)
+}
+
+function itemFrom(row: SourceRow, principal: RoutinePrincipal, decision?: TaskDecision): NeedsYouItem {
   return {
     kind: row.kind,
     source_type: row.source_type,
@@ -259,7 +317,8 @@ function itemFrom(row: SourceRow, principal: RoutinePrincipal): NeedsYouItem {
       : row.source_type === 'project'
         ? `/projects/${safePath(row.project_id)}`
         : `/projects/${safePath(row.project_id)}/routines?run_id=${safePath(row.source_id)}`,
-    allowed_actions: actionsFor(row, principal),
+    allowed_actions: actionsFor(row, principal, decision),
+    stale: isStaleRank(row.urgency_rank),
   }
 }
 
@@ -315,8 +374,30 @@ async function querySource(
   return { name, rows: rows.slice(0, SOURCE_SCAN_CAP), truncated: rows.length > SOURCE_SCAN_CAP }
 }
 
-function principalGateBinds(principal: RoutinePrincipal): unknown[] {
-  return [principal.actor_type, principal.actor_id, principal.actor_type, principal.actor_id]
+const ISO_NOW = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
+
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
+/** Age in days of a created_at column, against the (validated, server-minted) now. */
+function ageDaysSql(createdExpr: string, nowIso: string): string {
+  return `(julianday('${nowIso}') - julianday(${createdExpr}))`
+}
+
+/**
+ * Sort rank for a task-backed row — the rule documented at NEEDS_YOU_STALE_DAYS.
+ * `projectAlias` carries target_date (the due signal). Stale rows get the offset.
+ */
+function taskRankSql(taskAlias: string, projectAlias: string, nowIso: string): string {
+  const age = ageDaysSql(`${taskAlias}.created_at`, nowIso)
+  const [soon, week] = NEEDS_YOU_AGE_BUMP_DAYS
+  const base = `CASE ${taskAlias}.priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P3' THEN 3 ELSE 2 END`
+  const ageBump = `CASE WHEN ${age} >= ${NEEDS_YOU_STALE_DAYS} THEN 0 WHEN ${age} >= ${week} THEN 2 WHEN ${age} >= ${soon} THEN 1 ELSE 0 END`
+  const dueBump = `CASE WHEN ${projectAlias}.target_date IS NOT NULL
+    AND julianday(${projectAlias}.target_date) - julianday('${nowIso}') <= ${NEEDS_YOU_DUE_BUMP_DAYS} THEN 1 ELSE 0 END`
+  return `(CASE WHEN ${age} >= ${NEEDS_YOU_STALE_DAYS} THEN ${NEEDS_YOU_STALE_RANK_OFFSET} ELSE 0 END
+    + MAX(0, (${base}) - MIN(2, (${ageBump}) + (${dueBump}))))`
 }
 
 async function sourceRows(
@@ -329,7 +410,26 @@ async function sourceRows(
   const visibility = projectVisibilityClause(principal.project_read)
   const projectClause = options.project_id ? ' AND p.id = ?' : ''
   const projectBinds = options.project_id ? [options.project_id] : []
-  const gateBinds = principalGateBinds(principal)
+  if (!ISO_NOW.test(nowIso)) throw new Error('invalid_needs_you_now')
+  const stuckView = options.view === 'stuck'
+  // Archived projects drop out of every source (a task/routine under an archived project is
+  // not live work). Task-level archive is TASK_NOT_ARCHIVED_SQL (canonical, hygiene/filters).
+  const projectLive = `p.status != 'archived'`
+  // A gate wait belongs to the human inbox when an independent HUMAN holds the lane
+  // (humanGateHolderExistsSql, the predicate that admits a human review gate) OR the lane has
+  // no agent holder at all (org owner/admin decide it by role, e.g. gate:routines). A lane held
+  // by an AGENT with no independent human holder, and gate:agent-self-completion (no human
+  // lane by design), are agent-gate waits: a stuck-agent signal for an admin, not the owner's inbox.
+  const humanHolder = `(t.gate_owner <> 'gate:agent-self-completion' AND (${humanGateHolderExistsSql({
+    gateOwnerExpr: 't.gate_owner',
+    assigneeIdExpr: 't.assignee_agent_id',
+    squadIdExpr: 't.squad_id',
+    tenantParam: sqlQuote(env.TENANT_SLUG),
+  })} OR NOT EXISTS (
+    SELECT 1 FROM gate_grants agent_lane
+     WHERE agent_lane.capability = t.gate_owner AND agent_lane.principal_type = 'agent'
+  )))`
+  const holderClause = stuckView ? `AND NOT ${humanHolder}` : `AND ${humanHolder}`
   const projectScope = [...projectBinds, ...visibility.binds]
 
   const approvals = querySource(env, 'approvals', `
@@ -337,30 +437,22 @@ async function sourceRows(
       'approval' AS kind, 'task' AS source_type, t.id AS source_id,
       p.id AS project_id, p.name AS project_name, t.title,
       'Approval required by ' || t.gate_owner AS reason,
-      0 AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
+      ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
       t.assignee_agent_id, t.gate_owner,
-      CASE WHEN EXISTS (
-        SELECT 1 FROM gate_grants g
-         WHERE g.capability = t.gate_owner
-           AND g.principal_type = ?
-           AND g.principal_id = ?
-      ) THEN 1 ELSE 0 END AS has_gate_grant,
-      CASE WHEN EXISTS (
-        SELECT 1 FROM gate_grants g
-         WHERE g.capability = 'outreach:send-gated'
-           AND g.principal_type = ?
-           AND g.principal_id = ?
-      ) THEN 1 ELSE 0 END AS has_surface_grant,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'review' AND t.gate_owner IS NOT NULL${projectClause}
+      AND ${projectLive} ${holderClause}
       AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
-  `, [...gateBinds, ...projectScope], cursor)
+  `, projectScope, cursor)
+
+  // The admin 'stuck' view is approvals only — never start the other sources for it.
+  if (stuckView) return [await approvals]
 
   // Rolling deploy: Worker may ship before D1 applies 0073. Skip Routine waits until tables exist.
   const routinesReady = await routineTablesReady(env)
@@ -377,12 +469,13 @@ async function sourceRows(
       'routine_run' AS source_type, rr.id AS source_id,
       p.id AS project_id, p.name AS project_name, r.name AS title,
       'Routine is waiting for ' || rr.waiting_reason AS reason,
-      CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END AS urgency_rank,
+      (CASE WHEN rr.waiting_reason IN ('approval', 'review', 'budget') THEN 0 ELSE 1 END
+        + CASE WHEN ${ageDaysSql('rr.created_at', nowIso)} >= ${NEEDS_YOU_STALE_DAYS} THEN ${NEEDS_YOU_STALE_RANK_OFFSET} ELSE 0 END) AS urgency_rank,
       r.responsible_squad_id AS responsible, r.created_by AS requested_by,
       rr.created_at, rr.scheduled_for AS deadline_at,
       r.responsible_squad_id AS squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind,
       psa.access_level AS project_access_level,
-      NULL AS assignee_agent_id, NULL AS gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
+      NULL AS assignee_agent_id, NULL AS gate_owner,
       COALESCE(rr.scheduled_for, '${DEADLINE_SENTINEL}') AS sort_deadline,
       rr.created_at AS sort_timestamp
     FROM routine_runs rr
@@ -393,6 +486,7 @@ async function sourceRows(
       ON psa.project_id = rr.project_id AND psa.squad_id = r.responsible_squad_id
     WHERE rr.tenant = ? AND rr.status = 'waiting' AND rr.waiting_reason IS NOT NULL
       AND NOT (rr.waiting_reason = 'review' AND rr.task_id IS NOT NULL)${projectClause}
+      AND ${projectLive}
       AND ${visibility.sql}
   `, [env.TENANT_SLUG, ...projectScope], cursor)
     : Promise.resolve({ name: 'routine_waits', rows: [], truncated: false })
@@ -402,15 +496,17 @@ async function sourceRows(
       'blocked_task' AS kind, 'task' AS source_type, t.id AS source_id,
       p.id AS project_id, p.name AS project_name, t.title,
       'Blocked work requires ' || t.gate_owner AS reason,
-      2 AS urgency_rank, t.gate_owner AS responsible, NULL AS requested_by,
+      ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, t.gate_owner AS responsible, NULL AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
-      NULL AS assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
+      NULL AS assignee_agent_id, t.gate_owner,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'blocked' AND t.assignee_agent_id IS NULL AND t.gate_owner IS NOT NULL${projectClause}
+      AND ${projectLive}
+      AND (t.gate_owner NOT LIKE 'gate:%' OR ${humanHolder})
       AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
   `, projectScope, cursor)
@@ -420,15 +516,16 @@ async function sourceRows(
       'publishable_output' AS kind, 'task' AS source_type, t.id AS source_id,
       p.id AS project_id, p.name AS project_name, t.title,
       'Approved output awaits publication' AS reason,
-      3 AS urgency_rank, 'workspace_admin' AS responsible, t.assignee_agent_id AS requested_by,
+      ${taskRankSql('t', 'p', nowIso)} AS urgency_rank, 'workspace_admin' AS responsible, t.assignee_agent_id AS requested_by,
       t.created_at, p.target_date AS deadline_at,
       t.squad_id, s.department_id AS squad_department_id, s.kind AS squad_kind, NULL AS project_access_level,
-      t.assignee_agent_id, t.gate_owner, 0 AS has_gate_grant, 0 AS has_surface_grant,
+      t.assignee_agent_id, t.gate_owner,
       COALESCE(p.target_date, '${DEADLINE_SENTINEL}') AS sort_deadline,
       t.created_at AS sort_timestamp
     FROM tasks t JOIN projects p ON p.id = t.project_id
     JOIN squads s ON s.id = t.squad_id
     WHERE t.status = 'approved' AND t.gate_owner = ? AND t.result IS NOT NULL${projectClause}
+      AND ${projectLive}
       AND ${TASK_NOT_ARCHIVED_SQL('t')}
       AND ${visibility.sql}
   `, [CONTENT_GATE_OWNER, ...projectScope], cursor)
@@ -581,7 +678,7 @@ async function recommitDueSource(
       created_at: candidate.created_at,
       deadline_at: candidate.cycle_boundary_at,
       squad_id: null, squad_department_id: null, squad_kind: null, project_access_level: null,
-      assignee_agent_id: null, gate_owner: null, has_gate_grant: 0, has_surface_grant: 0,
+      assignee_agent_id: null, gate_owner: null,
       sort_deadline: candidate.cycle_boundary_at,
       sort_timestamp: candidate.created_at,
     }
@@ -646,15 +743,13 @@ async function resolveCursor(
   return cursor
 }
 
-async function issueCursor(
+function cursorFor(
   env: Env,
   principal: RoutinePrincipal,
   projectId: string | undefined,
   row: SourceRow,
-): Promise<string> {
-  const token = crypto.randomUUID()
-  const digest = await digestToken(token)
-  const cursor: NeedsYouCursor = {
+): NeedsYouCursor {
+  return {
     tenant: env.TENANT_SLUG,
     actor_type: principal.actor_type,
     actor_id: principal.actor_id,
@@ -665,12 +760,92 @@ async function issueCursor(
     type: row.source_type,
     id: row.source_id,
   }
+}
+
+async function issueCursor(env: Env, cursor: NeedsYouCursor): Promise<string> {
+  const token = crypto.randomUUID()
+  const digest = await digestToken(token)
   await env.SESSIONS.put(`needs-you-cursor:${digest}`, JSON.stringify(cursor), { expirationTtl: CURSOR_TTL_SECONDS })
   return token
 }
 
+function compareRows(left: SourceRow, right: SourceRow): number {
+  return left.urgency_rank - right.urgency_rank
+    || left.sort_deadline.localeCompare(right.sort_deadline)
+    || right.sort_timestamp.localeCompare(left.sort_timestamp)
+    || left.source_type.localeCompare(right.source_type)
+    || left.source_id.localeCompare(right.source_id)
+}
+
+/** Hard bound on source pages scanned for ONE response (each page <= SOURCE_SCAN_CAP rows/source). */
+const MAX_SCAN_PAGES = 5
+
+// Principal-only callers (tests, internal) carry no AuthContext: rebuild the one
+// routinePrincipal() was derived from. A legacy owner/admin with no loaded grants keeps
+// `capabilities` undefined (the role plane), exactly as the real session does.
+function authForPrincipal(principal: RoutinePrincipal): AuthContext {
+  const legacy = principal.legacy_owner_admin === true
+  return {
+    userId: principal.actor_id,
+    email: null,
+    role: principal.org_owner === true ? 'owner' : legacy ? 'admin' : 'member',
+    tenant: principal.tenant,
+    ...(principal.actor_type === 'member' ? { memberId: principal.actor_id } : {}),
+    boundAgentId: principal.actor_type === 'agent' ? principal.actor_id : null,
+    ...(legacy && principal.grants.length === 0 ? {} : { capabilities: principal.grants }),
+  }
+}
+
 /**
- * Read-only bounded projection over authoritative Task and RoutineRun records.
+ * The viewer-specific half of "can this person act on it", resolved with the SAME
+ * predicates the write paths run — never a second copy:
+ *   - visibility: canReadSquadTasks (src/tasks/visibility.ts, the task-visibility
+ *     chokepoint) — a task row of a squad the viewer cannot read never appears;
+ *   - approvals: evaluateVerdictGates for 'approved' and 'rejected' (gate ownership incl.
+ *     liveness, gate:loops surface cap, self-verdict, owner-affiliation #1663, the
+ *     gate:agent-self-completion assignee rule), one cache per request.
+ * Returns the rows the viewer may see plus the per-approval decision.
+ */
+async function resolveTaskDecisions(
+  env: Env,
+  auth: AuthContext,
+  rows: SourceRow[],
+  cache: VerdictGateCache,
+  decisions: Map<string, TaskDecision>,
+  visible: Map<string, Promise<boolean>>,
+  informationOnly: boolean,
+): Promise<SourceRow[]> {
+  const kept = await Promise.all(rows.map(async (row) => {
+    if (row.source_type !== 'task') return true
+    if (row.squad_id === null) return false
+    let canRead = visible.get(row.squad_id)
+    if (!canRead) {
+      canRead = canReadSquadTasks(env, auth, row.squad_id)
+      visible.set(row.squad_id, canRead)
+    }
+    if (!(await canRead)) return false
+    // The admin 'stuck' view is information only: no verb is offered, so no verdict predicate runs.
+    if (informationOnly || row.kind !== 'approval' || row.gate_owner === null) return true
+    const task = { squad_id: row.squad_id, gate_owner: row.gate_owner, assignee_agent_id: row.assignee_agent_id }
+    const [approve, reject] = await Promise.all([
+      evaluateVerdictGates(env, auth, task, 'approved', cache),
+      evaluateVerdictGates(env, auth, task, 'rejected', cache),
+    ])
+    decisions.set(row.source_id, { approve: approve.allowed, reject: reject.allowed })
+    return true
+  }))
+  return rows.filter((_, index) => kept[index])
+}
+
+/**
+ * Bounded projection over authoritative Task and RoutineRun records (mupot#1688: the
+ * viewer's INBOX, not a wall). ONE function feeds the MCP needs_you_list tool, REST
+ * /needs-you, the dashboard /needs-you page and Telegram /needs.
+ *
+ * An item is listed only when the viewer can ACT on it (allowed_actions beyond 'view'),
+ * can read its squad's tasks, its project and task are not archived, and — for gate
+ * waits — an independent HUMAN holds the gate. Agent-gate waits are the admin
+ * `view: 'stuck'` list. Urgency/staleness: see NEEDS_YOU_STALE_DAYS.
  * Cursor state is held server-side; no Need You row is persisted or resolved here.
  */
 export async function listNeedsYou(
@@ -682,28 +857,59 @@ export async function listNeedsYou(
   // shape). Mirrors the nowIso param every project-loop function takes.
   nowIso: string = new Date().toISOString(),
 ): Promise<NeedsYouPage> {
-  if (principal.tenant !== env.TENANT_SLUG) {
-    return { items: [], next_cursor: null, truncated: false, truncated_sources: [] }
-  }
+  const empty: NeedsYouPage = { items: [], next_cursor: null, truncated: false, truncated_sources: [] }
+  if (principal.tenant !== env.TENANT_SLUG) return empty
+  if (options.view === 'stuck' && !principal.workspace_admin) return empty
   const limit = options.limit ?? DEFAULT_LIMIT
   if (!validLimit(limit)) throw new Error('invalid_needs_you_pagination')
   const cursor = await resolveCursor(env, principal, options)
-  const sources = await sourceRows(env, principal, options, cursor, nowIso)
-  const rows = sources.flatMap(source => source.rows).sort((left, right) => (
-    left.urgency_rank - right.urgency_rank
-    || left.sort_deadline.localeCompare(right.sort_deadline)
-    || right.sort_timestamp.localeCompare(left.sort_timestamp)
-    || left.source_type.localeCompare(right.source_type)
-    || left.source_id.localeCompare(right.source_id)
-  ))
-  const items = rows.slice(0, limit)
+  const auth = options.auth ?? authForPrincipal(principal)
+  const stuckView = options.view === 'stuck'
+  const decisions = new Map<string, TaskDecision>()
+  const gateCache = createVerdictGateCache()
+  const visible = new Map<string, Promise<boolean>>()
+  const kept: SourceRow[] = []
+  // The viewer filter runs AFTER the capped SQL fetch, so a page of rows the viewer cannot
+  // act on must never hide the ones they can: keep scanning source pages (bounded) until
+  // enough kept rows exist or the sources are exhausted, and hand back a cursor from the last
+  // SCANNED row when the bound is hit.
+  let scanCursor = cursor
+  let frontierCursor: NeedsYouCursor | null = null
+  let exhausted = false
+  let unscannable: string[] = []
+  let pendingSources: string[] = []
+  for (let page = 0; page < MAX_SCAN_PAGES; page++) {
+    const sources = await sourceRows(env, principal, options, scanCursor, nowIso);
+    const all = sources.flatMap(source => source.rows).sort(compareRows)
+    // recommit_due is JS-ranked (not keyset-pageable), so it cannot bound the frontier.
+    const pageable = sources.filter(source => source.truncated && source.name !== 'recommit_due')
+    pendingSources = pageable.map(source => source.name)
+    unscannable = sources.filter(source => source.truncated && source.name === 'recommit_due').map(source => source.name)
+    const frontierRow = pageable
+      .map(source => source.rows.at(-1))
+      .filter((row): row is SourceRow => row !== undefined)
+      .sort(compareRows)[0] ?? null
+    const consider = frontierRow ? all.filter(row => compareRows(row, frontierRow) <= 0) : all
+    const visibleRows = await resolveTaskDecisions(env, auth, consider, gateCache, decisions, visible, stuckView)
+    kept.push(...visibleRows.filter(row => stuckView
+      || isActionable(row, principal, actionsFor(row, principal, decisions.get(row.source_id)))))
+    if (!frontierRow) { exhausted = true; frontierCursor = null; break }
+    frontierCursor = cursorFor(env, principal, options.project_id, frontierRow)
+    scanCursor = frontierCursor
+    if (kept.length > limit) break
+  }
+  const items = kept.slice(0, limit)
   const last = items.at(-1)
-  const truncatedSources = sources.filter(source => source.truncated).map(source => source.name)
-  const hasMore = rows.length > limit || truncatedSources.length > 0
+  const moreKept = kept.length > limit
+  // Scan bound hit with rows still unscanned: not exhausted and not already paging on kept rows.
+  const scanIncomplete = !exhausted && !moreKept
+  let nextCursor: string | null = null
+  if (moreKept && last) nextCursor = await issueCursor(env, cursorFor(env, principal, options.project_id, last))
+  else if (scanIncomplete && frontierCursor) nextCursor = await issueCursor(env, frontierCursor)
   return {
-    items: items.map(row => itemFrom(row, principal)),
-    next_cursor: hasMore && last ? await issueCursor(env, principal, options.project_id, last) : null,
-    truncated: truncatedSources.length > 0,
-    truncated_sources: truncatedSources,
+    items: items.map(row => itemFrom(row, principal, decisions.get(row.source_id))),
+    next_cursor: nextCursor,
+    truncated: scanIncomplete || unscannable.length > 0,
+    truncated_sources: [...(scanIncomplete ? pendingSources : []), ...unscannable],
   }
 }

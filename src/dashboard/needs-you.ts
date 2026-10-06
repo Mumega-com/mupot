@@ -37,7 +37,7 @@ export async function loadNeedsYouDashboard(
   auth: AuthContext,
   options: { limit?: number; after?: string } = {},
 ): Promise<NeedsYouDashboardView> {
-  const page = await listNeedsYou(env, routinePrincipal(auth), options)
+  const page = await listNeedsYou(env, routinePrincipal(auth), { ...options, auth })
   return { items: page.items, nextCursor: page.next_cursor, truncated: page.truncated, truncatedSources: page.truncated_sources }
 }
 
@@ -153,7 +153,7 @@ export function needsYouBody(view: NeedsYouDashboardView): Html {
   const hasRecommit = view.items.some(item => item.allowed_actions.includes('recommit'))
   const rows = view.items.map(item => [
     pill(title(item.urgency), urgencyTone(item.urgency)),
-    html`<span style="display:grid;gap:3px;"><strong>${item.title}</strong><span class="ui-panel-sub">${item.kind.replaceAll('_', ' ')}</span></span>`,
+    html`<span data-needs-you-source="${item.source_type}:${item.source_id}" style="display:grid;gap:3px;"><strong>${item.title}</strong><span class="ui-panel-sub">${item.kind.replaceAll('_', ' ')}</span></span>`,
     html`<a class="ui-link" href="/projects/${encodeURIComponent(item.project_id)}">${item.project_name}</a>`,
     html`<span>${item.responsible ?? 'Unassigned'}<span class="ui-panel-sub">Requested by ${item.requested_by ?? 'system'}</span></span>`,
     html`<span>${item.reason}<span class="ui-panel-sub">${item.deadline_at ?? item.created_at}</span></span>`,
