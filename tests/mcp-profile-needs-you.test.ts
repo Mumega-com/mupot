@@ -110,14 +110,14 @@ describe('profile tools/list', () => {
 })
 
 describe('/mcp is unchanged (regression guard)', () => {
-  it('tools/list on /mcp returns the FULL registry with no annotations', async () => {
+  it('tools/list on /mcp returns the FULL registry; annotations are the full-table hints (#1709), not the profile ones', async () => {
     const { json } = await rpc('/', 'tools/list', undefined, {}, makeEnv())
     const tools = json!.result.tools as Array<{ name: string; annotations?: unknown }>
     expect(tools.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name))
     expect(tools.length).toBeGreaterThan(NEEDS_YOU_PROFILE.length * 5)
-    expect(tools.some((t) => 'annotations' in t)).toBe(false)
-    // Keys of every /mcp entry are exactly the pre-profile shape.
-    for (const t of tools) expect(Object.keys(t).sort()).toEqual(['description', 'inputSchema', 'name'])
+    // mupot#1709: every /mcp entry now ALSO carries `annotations` (tests/mcp-tool-annotations.test.ts pins
+    // their values). Deliberate update: the pre-#1709 shape had none. Everything else is unchanged.
+    for (const t of tools) expect(Object.keys(t).sort()).toEqual(['annotations', 'description', 'inputSchema', 'name'])
   })
 
   it('/mcp tools/call still reaches non-profile tools (a floor refusal, not tool_not_in_profile)', async () => {
