@@ -3,6 +3,7 @@ import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
 import { resolveAgentTokenExpiry } from '../src/auth/token-lifecycle'
 import { discardCredentialClaim } from '../src/auth/credential-claim'
+import { mcpRequest } from './helpers/mcp-call'
 
 // mupot#682 — list_agent_tokens / revoke_agent_token.
 //
@@ -189,7 +190,7 @@ function makeEnv(opts: Opts = {}): Env {
 }
 
 async function call(name: string, args: Record<string, unknown>, env: Env) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://mupot.mumega.com/',
     {
       method: 'POST',
@@ -202,7 +203,7 @@ async function call(name: string, args: Record<string, unknown>, env: Env) {
 
 describe('token lifecycle — the tools exist at all (mupot#682)', () => {
   it('mint has counterparts: list and revoke are advertised', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mupot.mumega.com/',
       {
         method: 'POST',

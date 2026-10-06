@@ -6620,6 +6620,11 @@ async function handleJsonRpc(
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       return rpcError(id, -32602, outcome.error, outcome.detail)
     }
+    // 5xx (internal_error, receipt_failed, 503s) stay JSON-RPC errors carrying their HTTP status so
+    // server-fault monitoring keeps working; only 4xx authz/business refusals become isError.
+    if (outcome.status >= 500) {
+      return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, outcome.detail, outcome.status)
+    }
     return rpcResult(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
   }
 

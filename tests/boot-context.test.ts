@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 // boot_context MCP tool — #126 identity_status signal for coherent first-run onboarding.
 //
@@ -57,7 +58,7 @@ function makeEnv(opts: Opts = {}): Env {
 }
 
 async function bootContext(env: Env, auth = true) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://agents.digid.ca/',
     {
       method: 'POST',
@@ -78,7 +79,7 @@ async function bootContext(env: Env, auth = true) {
 
 describe('boot_context MCP tool (#126)', () => {
   it('is advertised in tools/list', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',
@@ -143,7 +144,7 @@ describe('boot_context MCP tool (#126)', () => {
   })
 
   it('rejects extra args (additionalProperties: false)', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',

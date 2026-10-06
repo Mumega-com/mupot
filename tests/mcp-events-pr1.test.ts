@@ -10,6 +10,7 @@ import { sha256Hex } from '../src/members/service'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { mcpRequest } from './helpers/mcp-call'
 
 const SNAPSHOT_PATH = new URL('./fixtures/mcp-legacy-snapshots.json', import.meta.url)
 const TENANT = 'digid'
@@ -98,7 +99,7 @@ function dumpState(): string {
 }
 
 async function rawRpc(method: string, params: unknown, opts: EnvOpts = {}, auth = false, sqlLog: string[] = []) {
-  const res = await mcpApp.request(
+  const res = await mcpRequest(
     'https://pot.example/',
     {
       method: 'POST',
@@ -268,7 +269,7 @@ describe('events/list', () => {
 
   it('rejects a principal from another tenant (tenant check in the events branch)', async () => {
     const forged = { userId: 'member-1', email: null, role: 'member', tenant: 'othertenant', channel: 'workspace' }
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://pot.example/',
       {
         method: 'POST',
@@ -520,7 +521,7 @@ describe('message.created recovery-read edge cases (why the description says VER
 // ── the curated profile door must not serve events at all (adversarial r2 P2-1) ───────────
 describe('POST /mcp/profile/needs-you is byte-identical with the flag ON and OFF', () => {
   async function profileRpc(method: string, params: unknown, events: string | undefined, auth: boolean) {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://pot.example/profile/needs-you',
       {
         method: 'POST',

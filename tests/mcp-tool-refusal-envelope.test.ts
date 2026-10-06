@@ -1,52 +1,44 @@
-import { describe, expect, it } from 'vitest'
-import { mcpActionsApp, mcpApp } from '../src/mcp'
-import type { CapabilityGrant, Env } from '../src/types'
-
 // mupot#1667: tool-level refusals must reach connector harnesses as HTTP 200 + result.isError,
 // not as a 4xx the harness replaces with "blocked by a firewall / mcp_request_blocked".
-function makeEnv(grants: CapabilityGrant[]): Env {
-  const memberId = 'member-1'
-  return {
-    TENANT_SLUG: 'digid',
-    BRAND: 'Digid',
-    OAUTH_PROVIDER: 'google',
-    DB: {
-      prepare(sql: string) {
-        return {
-          bind() {
-            return {
-              async first() {
-                if (sql.includes('FROM member_tokens')) {
-                  return {
-                    member_id: memberId, email: null, display_name: 'm', telegram_chat_id: null,
-                    status: 'active', created_at: '2026-06-09 00:00:00', channel: 'workspace',
-                  }
-                }
-                return null
-              },
-              async all() {
-                if (sql.includes('FROM capabilities')) return { results: grants }
-                return { results: [] }
-              },
-            }
-          },
-        }
-      },
-    },
-  } as unknown as Env // minimal D1 stub: only the auth + capability reads these paths issue
-}
+// Real SQL: the schema is the whole committed migration chain (applyAllMigrations).
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mcpActionsApp, mcpApp } from '../src/mcp'
+import { sha256Hex } from '../src/members/service'
+import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { callToolOutcome } from './helpers/mcp-call'
 
-const MEMBER: CapabilityGrant[] = []
+const TENANT = 'digid'
+const T0 = '2026-08-01T00:00:00.000Z'
+let harness: SqliteD1Harness
+
+beforeEach(async () => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  const hash = await sha256Hex('member-tok')
+  harness.sqlite.exec(`
+    INSERT INTO members (id, email, display_name, status, created_at, tenant) VALUES ('member-1', NULL, 'Plain member', 'active', '${T0}', '${TENANT}');
+    INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+      VALUES ('tok-1', 'member-1', '${hash}', 't', 'workspace', '${T0}', NULL, '${TENANT}');
+  `)
+})
+
+afterEach(() => harness.close())
+
+function makeEnv(): Env {
+  return { TENANT_SLUG: TENANT, BRAND: 'Digid', OAUTH_PROVIDER: 'google', DB: harness.db } as unknown as Env // harness D1 adapter satisfies the bindings these paths read
+}
 
 function call(app: typeof mcpApp, url: string, payload: unknown, bearer = true) {
   return app.request(
     url,
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...(bearer ? { authorization: 'Bearer t' } : {}) },
+      headers: { 'content-type': 'application/json', ...(bearer ? { authorization: 'Bearer member-tok' } : {}) },
       body: JSON.stringify(payload),
     },
-    makeEnv(MEMBER),
+    makeEnv(),
   )
 }
 
@@ -56,6 +48,7 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
   it('member calling an admin-only tool: HTTP 200 + isError + refusal fields', async () => {
     const res = await call(mcpApp, 'https://pot.example/', rpcCall)
     expect(res.status).toBe(200)
+    const outcome = await callToolOutcome(res.clone())
     const body = await res.json() as {
       id: number
       error?: unknown
@@ -68,6 +61,7 @@ describe('MCP tool refusals are JSON-RPC isError results (#1667)', () => {
     expect(parsed).toMatchObject({ ok: false, tool: 'pot_list', error: 'forbidden', status: 403 })
     expect(parsed.need).toBe('admin')
     expect(body.result.structuredContent).toEqual(parsed)
+    expect(outcome).toMatchObject({ status: 403, error: 'forbidden', isToolRefusal: true })
   })
 
   it('unauthenticated tools/call stays HTTP 401 with a JSON-RPC error', async () => {
