@@ -84,6 +84,10 @@ export interface Env {
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
   BRAND: string
+  // Gate-stall watchdog (mupot#1705): minutes a task may sit in review with no verdict before the
+  // gate wake is re-sent (default 30), and the max re-wakes per review episode (default 3).
+  GATE_STALL_THRESHOLD_MINUTES?: string
+  GATE_STALL_MAX_REWAKES?: string
   // Which IdP the human web-login door uses. NAMED `IDP_PROVIDER`, NOT `OAUTH_PROVIDER` —
   // @cloudflare/workers-oauth-provider RESERVES the binding name `OAUTH_PROVIDER` and
   // injects its own OAuthHelpersImpl instance there at runtime. Declaring that name as a

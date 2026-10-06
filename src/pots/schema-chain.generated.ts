@@ -3442,9 +3442,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "addon_connector_bindings_revoke_only" },
     ],
   },
+  {
+    file: "0191_gate_stall_rewakes.sql",
+    sha256: "3c6b2a826d6bcb5e49a9b8cf65ddb5402e019c52dc66be74376eb27ffa3bddaf",
+    statements: [
+      "-- 0191_gate_stall_rewakes.sql — durable claim ledger for the gate-stall watchdog (mupot#1705).\n--\n-- WHY: a task parked in 'review' with a live gate_owner and no verdict was never re-woken; the\n-- unattended loop stalled silently (task d9f6b672, ~7.5h). The maintenance sweep\n-- (src/gates/stall-watchdog.ts) re-sends the gate wake, at most once per threshold window and at\n-- most N times per review episode. This table is that bound, recorded durably.\n--\n-- One row per task. review_since is the tasks.updated_at the claim was made against: a task that\n-- re-enters review (or is otherwise touched) carries a different updated_at, which starts a new\n-- episode with a fresh budget. The claim is a single atomic UPSERT…WHERE (never read-compare-write),\n-- so concurrent sweeps cannot both win.\n--\n-- DEPLOY ORDER: apply this migration BEFORE deploying the code — the Needs You approvals query\n-- (src/attention/service.ts) reads this table.\n--\n-- CREATE-only; touches no existing table. No FK: the row is a bookkeeping ledger and must never\n-- block a task delete or be cascaded by one.\n\nCREATE TABLE IF NOT EXISTS gate_stall_rewakes (\n  task_id        TEXT NOT NULL PRIMARY KEY,\n  review_since   TEXT NOT NULL,                 -- tasks.updated_at observed at claim time\n  rewake_count   INTEGER NOT NULL DEFAULT 0,      -- claims (attempts) this episode; bounds the cap\n  delivered_count INTEGER NOT NULL DEFAULT 0,     -- re-wakes that actually reached a holder (delivered|partial); the only count shown to humans\n  last_rewake_at TEXT NOT NULL,                 -- ISO-8601\n  last_outcome   TEXT                           -- GateWakeOutcome.status of the last re-wake\n);",
+    ],
+    objects: [
+      { type: "table", name: "gate_stall_rewakes" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "313429d5c741f9bb34c97fdbc345b55bb5f2b825bb715c13a363a8c523f9e093"
+export const SCHEMA_CHAIN_DIGEST: string = "93e2c93e9a569086ed55c8f1995194205df43fcf2873666f98e8fe50900fd49e"
