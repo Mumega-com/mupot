@@ -88,8 +88,8 @@ describe('mcp JSON-RPC compatibility', () => {
     expect(body.result.tools.map((t) => t.name)).toContain('status')
     expect(body.result.tools.find((t) => t.name === 'task_create')?.inputSchema).toMatchObject({
       type: 'object',
-      // #142 capsule keystone: done_when is now required alongside squad_id + title.
-      required: ['squad_id', 'title', 'done_when'],
+      // #142 capsule keystone: done_when is required alongside title; squad_id became optional in #1664 (slug, or the bound agent's own squad).
+      required: ['title', 'done_when'],
     })
     expect(body.result.tools.find((t) => t.name === 'inbox')?.inputSchema).toMatchObject({
       type: 'object',
