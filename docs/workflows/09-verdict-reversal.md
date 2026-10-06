@@ -20,10 +20,10 @@ Org owner or admin only (`isOrgOwnerAdmin(auth)`) — never a plain member, neve
 
 ## Tool/route sequence
 
-1. `task_verdict_reverse` (`src/mcp/index.ts:2098`) — thin wrapper: requires a non-empty
+1. `task_verdict_reverse` (tool `name: 'task_verdict_reverse'` in `src/mcp/index.ts`) — thin wrapper: requires a non-empty
    `reversal_reason` (falls back to `reason`), then calls `toolTaskUpdate.run(...)` with
-   `status: 'review'` (`src/mcp/index.ts:2125-2131`).
-2. `task_update` (MCP) / `PATCH /api/tasks/:id` (HTTP, `src/tasks/index.ts:836`) — both call
+   `status: 'review'` (the `run()` of that tool).
+2. `task_update` (MCP) / `PATCH /api/tasks/:id` (HTTP, the PATCH handler in `src/tasks/index.ts`) — both call
    `detectVerdictReversalRequest` (`src/tasks/service.ts:656`) to classify the request as
    `'fresh'`, `'retry_completion'`, or `'none'`.
    - `'fresh'`: `approved`/`rejected` → `review`.
@@ -31,10 +31,10 @@ Org owner or admin only (`isOrgOwnerAdmin(auth)`) — never a plain member, neve
      **and** its latest verdict's `reversed_at` is already set — i.e. a retry of a reversal
      whose gate-closing step landed but a later step didn't. Any other `review → review`
      request is ordinary and untouched by this path.
-3. On `reversalKind !== 'none'` (`src/mcp/index.ts:1275-1298` / `src/tasks/index.ts:~836`):
+3. On `reversalKind !== 'none'` (the `reversalKind !== 'none'` branch of `toolTaskUpdate` in `src/mcp/index.ts` / the PATCH handler in `src/tasks/index.ts`):
    `isOrgOwnerAdmin(auth)` gate, mandatory non-empty reversal reason, then
    `reverseTaskVerdict` (`src/tasks/service.ts:585`, shared by both write surfaces) —
-   called from `src/mcp/index.ts:1589` and `src/tasks/index.ts:1168`.
+   called from `toolTaskUpdate` (`src/mcp/index.ts`) and the PATCH handler (`src/tasks/index.ts`).
 4. `reverseTaskVerdict` runs three steps, **in this order, non-negotiably**:
    1. `markVerdictReversed` — stamps `task_verdicts.reversed_at` on the latest verdict row.
       This is the gate-closing write: `executeRoutineAction`'s `resolveProposalVerdict`
@@ -48,7 +48,7 @@ Org owner or admin only (`isOrgOwnerAdmin(auth)`) — never a plain member, neve
 
 ## Human gate
 
-`isOrgOwnerAdmin(auth)` (`src/mcp/index.ts:1284`) — org owner or admin capability only.
+`isOrgOwnerAdmin(auth)` (`src/mcp/index.ts`) — org owner or admin capability only.
 A non-empty `reversal_reason` (or `reason`) is mandatory; missing it is
 `400 verdict_reversal_reason_required`. There is no agent-authority path here at all —
 unlike `task_verdict`'s `human_origin` fallback, reversal has no non-human branch.
@@ -103,12 +103,12 @@ task requires org owner/admin authority' }`.
   `reverseTaskVerdict` skips `buildTaskUpdateStatement` entirely and returns
   `landed = existing` (`src/tasks/service.ts:604-625`) — nothing about a bundled field
   change (e.g. a new `gate_owner`) is persisted to `tasks`. But back in the caller
-  (`src/mcp/index.ts:1589-1592`), only `next.status`/`next.updated_at` are reset from that
+  (`toolTaskUpdate` in `src/mcp/index.ts`, after `reverseTaskVerdict` returns), only `next.status`/`next.updated_at` are reset from that
   outcome — `next.gate_owner` and other fields keep the caller's requested-but-never-written
   values, and `reassignsGatedReview` (computed independently of `reversesVerdict`,
-  `src/mcp/index.ts:1502`) is not gated on whether the task row actually changed. The result:
+  `toolTaskUpdate` in `src/mcp/index.ts`) is not gated on whether the task row actually changed. The result:
   a second `task_verdict_reverse` call that also asks for a `gate_owner` change writes a real
-  `gate_owner_reassignments` receipt and wakes the new "owner" (`src/mcp/index.ts:1629-1657`)
+  `gate_owner_reassignments` receipt and wakes the new "owner" (the `gate_owner_reassignments` block of `toolTaskUpdate`)
   for a reassignment that never landed in the `tasks` table. `tests/task-verdict-reversal.test.ts`'s
   idempotent-replay test only re-sends the same plain reversal reason, so this compound path
   has no test coverage. Confirmed unfixed on `origin/main` at `3c706069`.

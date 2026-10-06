@@ -26,8 +26,11 @@ file, not the site repo.
   `applyAllMigrations()` (`tests/helpers/sqlite-d1.ts`, `tests/helpers/migrations.ts`).
 - A hand-written `CREATE TABLE` fails CI (#711). A hand-rolled `env.DB` mock that string-matches
   SQL also fails CI (#721).
-- **Never add a migration numbered ≤ 0079.** Production's applied head is 0079; anything at or
-  below merges green and silently never runs (#729). Hand out ≥ 0080.
+- **Never add a migration numbered at or below production's applied head.** Anything at or below
+  merges green and silently never runs (#729). Do not trust a number written in a doc: read the
+  applied head with `npx wrangler d1 migrations list DB --remote` (the highest applied file) and
+  number above both it and the highest file in `migrations/`; `scripts/check-migration-numbering.mjs`
+  enforces this in CI.
 
 ## Ops state (current)
 

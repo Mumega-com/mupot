@@ -21,12 +21,12 @@ relaying a message the human sent it over Telegram.
 
 ## Tool/route sequence
 
-1. `task_verdict` (`src/mcp/index.ts:1886`) with `human_origin: { channel: "telegram",
-   user_id, chat_id, message_id, message_at, text }` (schema `src/mcp/index.ts:1856-1877`).
+1. `task_verdict` (`name: 'task_verdict'` in `src/mcp/index.ts`) with `human_origin: { channel: "telegram",
+   user_id, chat_id, message_id, message_at, text }` (the `human_origin` property of that tool's input schema).
    `message_at` and `text` are both **required** — `text` must name the target task id
    (full, or an 8+ hex-char prefix) or the stamp is refused (`task_not_named`).
 2. `resolveHarnessAttestedOrigin` (`src/im/origin-verdict.ts:667`), called from
-   `src/mcp/index.ts:1970`, only when `auth.boundAgentId` is set (non-agent-bound callers
+   the `task_verdict` `run()` in `src/mcp/index.ts`, only when `auth.boundAgentId` is set (non-agent-bound callers
    supplying `human_origin` get a hard `400 human_origin_not_applicable`).
 3. `dryRunAuthorize` — **read-only**, checks every conjunct in order (agent owned by a
    member; owner active; origin is well-formed, private-chat-shaped

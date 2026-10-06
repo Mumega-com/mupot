@@ -23,7 +23,15 @@ companion_skills:
 
 # mupot Operator Skill
 
-> **v0.2 ships the real CF provisioner.** `mupot_provision` with `confirm=True, dry_run=False`
+> **Versions in this file are the plugin's own** (`plugin/plugin.yaml`, currently 0.2.0), not
+> the Mupot release version; check a running pot's `/health` for that. `mupot_provision` below
+> is a **plugin-local** tool (`plugin/tools.py`), not an MCP tool on a pot. The MCP tool a pot
+> serves for provisioning is `pot_provision` (`src/mcp/pots.ts`). Agents on a pot's MCP surface
+> also have `task_get`, `task_submit_result` and the Office approval tools
+> (`office.list_pending_approvals`, `office.review_approval`, `office.publish_post`,
+> `office.health`).
+
+> **Plugin v0.2 ships the real CF provisioner.** `mupot_provision` with `confirm=True, dry_run=False`
 > calls the Cloudflare API directly (pure stdlib urllib) to create D1 databases and KV
 > namespaces, then writes `wrangler.<slug>.toml` with resolved IDs. Default (`dry_run=True`)
 > emits a plan without touching Cloudflare. Requires `MUPOT_CF_API_TOKEN` and
@@ -147,7 +155,7 @@ Each pot = one Workers slot. Free tier = 100 slots. If you're near the limit, th
 `mupot_provision` tool will warn you. Workers-for-Platforms centralisation is explicitly
 rejected (it breaks pot sovereignty) — each user must stay within their own slot budget.
 
-## v0.2 scope / deferred
+## Plugin v0.2 scope / deferred
 
 **In v0.2 (real CF provisioner):**
 - Real apply: CF REST API via pure stdlib urllib (no extra deps), idempotent D1 + KV creation
@@ -158,7 +166,7 @@ rejected (it breaks pot sovereignty) — each user must stay within their own sl
 - Brain profile + cron plan emission
 - Deploy-to-Cloudflare button (README)
 
-**Deferred to v0.3+:**
+**Deferred to plugin v0.3+:**
 - CF OAuth one-click (pending Mumega OAuth app public approval)
 - Full SDK provisioner (no wrangler dep): `client.workers.scripts.update()`
 - OAuth secret automation (guided prompt + CF secrets API)

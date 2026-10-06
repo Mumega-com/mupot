@@ -32,6 +32,26 @@ after a successful `connect` can return `"MCP server session expired"`. This is 
 identity being revoked; it's transport, not authorization. **Just call `connect` again
 immediately before the call that failed**, in the same turn. Don't burn a turn diagnosing it.
 
+## Closing and reading tasks: `task_get`, `task_submit_result`
+
+- `mcp__mupot__task_get { task_id }` reads one task through the same visibility rules as
+  `task_list`; an unreadable id and a missing id both answer `task_not_found`.
+- A task you worked by hand (never dispatched) is closed with
+  `mcp__mupot__task_submit_result { task_id, result }`. You must be the agent assignee, the task
+  must already carry an independent `gate_owner`, and `result` must state `Artifact: <path>` and
+  `SHA256: <64-hex>`. It moves the task to `review`; it does not approve it.
+- A refused MCP call is **not** an HTTP error. It returns `isError: true` with a JSON body
+  `{ ok:false, tool, error, status, need?, detail }`; branch on `need` (e.g. `gate:X`) and
+  `status`. Unknown tool or bad arguments are JSON-RPC `-32602`.
+
+## Office approvals
+
+When the Office department is installed: `office.list_pending_approvals` (read-only),
+`office.review_approval` (the `gate:office` decision), `office.publish_post`,
+`office.health` (probe the bound WordPress connector), and `office.reconcile_stalled_publish`
+(org owner/admin recovery of a claimed-but-unconfirmed publish). Clients may show these with an
+underscore (`office_review_approval`). Design: `docs/architecture/office-mcpwp-connector.md`.
+
 ## The two gate mechanisms — do not conflate them
 
 mupot has two independent adjudication systems. See `docs/gate-protocol.md` in this repo for

@@ -58,6 +58,16 @@ describe('MUPOT_MCP_INITIALIZE_INSTRUCTIONS', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('429 rate_limited')
   })
 
+  it('documents isError refusals with a need field, task_get and task_submit_result', () => {
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('isError:true')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('need?')
+    expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('-32602')
+    for (const name of ['task_get', 'task_submit_result']) {
+      expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain(name)
+      expect(TOOLS.some((t) => t.name === name)).toBe(true)
+    }
+  })
+
   it('documents the Synthetic Council bus request/response ACK protocol', () => {
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('[request_id:<uuid>]')
     expect(MUPOT_MCP_INITIALIZE_INSTRUCTIONS).toContain('{ack_for: <uuid>, ok: true}')

@@ -86,7 +86,20 @@ Discover the live surface any time (no token needed):
 curl "$MUPOT_URL/mcp/tools"
 ```
 
-Full tools: `task_create`, `remember`, `recall`, `wake_agent`, `squad_message`,
-`status`. This skill wraps the everyday three (task / status / recall) plus
-`remember`; `wake_agent` and `squad_message` are available via the raw MCP client
-for `lead`+ members.
+Full tools: `task_create`, `task_get`, `task_submit_result`, `remember`, `recall`,
+`wake_agent`, `squad_message`, `status`. This skill wraps the everyday three
+(task / status / recall) plus `remember`; `wake_agent` and `squad_message` are available
+via the raw MCP client for `lead`+ members.
+
+- `task_get { task_id }` reads one task. A task you cannot read answers the same
+  `task_not_found` as an id that does not exist.
+- `task_submit_result { task_id, result }` is the exit for a hand-worked task: only the
+  agent assignee may call it, `result` must state `Artifact: <path>` and `SHA256: <64-hex>`,
+  and the task moves to `review` for its (independent) gate owner.
+- Office approvals (an Office department is installed): `office.list_pending_approvals`,
+  `office.review_approval`, `office.publish_post`, `office.health`. Some clients display the
+  dot as an underscore (`office_review_approval`).
+
+Over MCP a refused call comes back as a normal result with `isError: true` and a body
+`{ ok:false, tool, error, status, need?, detail }` (not an HTTP 4xx). Read `need` for the
+missing capability. Over REST `/actions/<tool>` the HTTP status is unchanged.

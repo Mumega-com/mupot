@@ -33,7 +33,7 @@ partial scaffolding, no dead code, no migration column.
 **Building blocks that already exist and would be reused:**
 1. The proposal → verdict chain from the "project access chain" workflow (#1490, landed at
    this exact commit): `routine_proposal_submit` (`src/mcp/routines.ts:386`), `task_verdict`
-   (`src/mcp/index.ts:1886`). The existing `project_access` kind
+   (`name: 'task_verdict'` in `src/mcp/index.ts`). The existing `project_access` kind
    (`src/routines/proposal.ts:17-28,35`) is the direct precedent a `member_invite` kind would
    mirror — same ordering discipline (`proposal_id -> verdict_id -> receipt id`, never
    collapsed) and the same `waitForHuman('review')` gate before execution.
