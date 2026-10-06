@@ -1193,6 +1193,11 @@ export function sanitizeReceiptText(value: string): string {
     : collapsed
 }
 
+/** mupot#1702 - a runtime timeline entry as shown to the assignee / gate holder / org admin
+ *  (task_get): the public entry plus the receipt ids a gate needs to compare against D1.
+ *  Still never credential_id, member_id or request_digest. */
+export type PrivilegedTimelineReceipt = PublicTaskDispatchRuntimeReceipt & { id: string; dispatch_receipt_id: string }
+
 export interface TaskDispatchReceiptTimeline {
   transport: Array<{
     agent_slug: string
@@ -1200,7 +1205,7 @@ export interface TaskDispatchReceiptTimeline {
     dispatched_at: string
     transport_delivered_at: string | null
   }>
-  runtime: PublicTaskDispatchRuntimeReceipt[]
+  runtime: Array<PublicTaskDispatchRuntimeReceipt | PrivilegedTimelineReceipt>
   gate: Array<{
     verdict: 'approved' | 'rejected'
     note: string | null
@@ -1265,6 +1270,7 @@ export async function listTaskDispatchReceiptTimeline(
   env: Env,
   taskId: string,
   limit = 20,
+  opts: { withReceiptIds?: boolean } = {},
 ): Promise<TaskDispatchReceiptTimeline> {
   const boundedLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 100)) : 20
   const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1 LIMIT 1')
@@ -1317,7 +1323,11 @@ export async function listTaskDispatchReceiptTimeline(
   }>()
   return {
     transport: transport.results ?? [],
-    runtime: (runtime.results ?? []).map(publicTimelineReceipt),
+    runtime: (runtime.results ?? []).map((row) => (
+      opts.withReceiptIds
+        ? { ...publicTimelineReceipt(row), id: row.id, dispatch_receipt_id: row.dispatch_receipt_id }
+        : publicTimelineReceipt(row)
+    )),
     gate: (gate.results ?? []).map((row) => ({
       ...row,
       note: row.note === null ? null : sanitizeReceiptText(row.note),
