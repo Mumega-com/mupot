@@ -12,6 +12,7 @@ import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { NEEDS_YOU_PROFILE, NEEDS_YOU_PROFILE_PATH, profileEntry } from '../src/mcp/profile-needs-you'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 const TENANT = 'mumega'
 const ADMIN_MEMBER = 'mbr-admin'
@@ -60,7 +61,7 @@ function header(overrides: Partial<AuthContext> = {}): Record<string, string> {
 const DIRECTORY_UNBOUND = header({ userId: 'mbr-dir', memberId: 'mbr-dir', channel: 'directory' })
 
 async function rpc(path: string, method: string, params: unknown, headers: Record<string, string>, env: Env) {
-  const res = await mcpApp.request(
+  const res = await mcpRequest(
     `https://pot.example${path}`,
     {
       method: 'POST',
@@ -99,7 +100,7 @@ describe('profile tools/list', () => {
   })
 
   it('rejects a non-JSON-RPC body (no legacy {tool,args} shape on the profile)', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       `https://pot.example${PROFILE}`,
       { method: 'POST', headers: { 'content-type': 'application/json', ...header() }, body: JSON.stringify({ tool: 'status', args: {} }) },
       makeEnv(),

@@ -20,6 +20,7 @@ import {
 } from '../src/dashboard/enroll'
 import { mintAgentBoundToken } from '../src/members/service'
 import type { Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 const TENANT = 'pot-a'
 const ORIGIN = 'https://pot.test'
@@ -140,7 +141,7 @@ async function callTool(
   args: Record<string, unknown> = {},
   headers: Record<string, string> = {},
 ) {
-  return mcpApp.request(
+  return mcpRequest(
     `${ORIGIN}/`,
     {
       method: 'POST',

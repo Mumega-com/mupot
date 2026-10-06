@@ -4,6 +4,7 @@ import { mcpApp } from '../src/mcp'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { mcpRequest } from './helpers/mcp-call'
 
 // Issue #1192: Stateless Connect Persistence & Security Invariant Test Suite
 //
@@ -100,7 +101,7 @@ function seedFixture(
 }
 
 async function callTool(env: Env, toolName: string, args: Record<string, unknown> = {}) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://mupot.mumega.com/',
     {
       method: 'POST',
