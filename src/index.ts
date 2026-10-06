@@ -31,6 +31,9 @@ import { projectsApp } from './projects'
 import { busApp } from './bus'
 import { membersApp } from './members'
 import { mcpActionsApp, mcpApp } from './mcp'
+// Static (not await import): the watchdog imports ../mcp, and a dynamic edge into that graph makes
+// esbuild lazy-wrap it and emit `await init_*()` inside a sync initializer — Worker fails to start.
+import { sweepStalledGateReviews } from './gates/stall-watchdog'
 import { imApp } from './im'
 import { dashboardApp } from './dashboard'
 import { inviteApp } from './dashboard/invite'
@@ -477,7 +480,6 @@ export default {
     // 13. Gate-stall watchdog (mupot#1705) — re-send the gate wake for a review task whose gate
     //     seat has not recorded a verdict past the threshold. Bounded + recorded durably; never
     //     changes status or verdicts. Requires migration 0191 (gate_stall_rewakes).
-    const { sweepStalledGateReviews } = await import('./gates/stall-watchdog')
     const maintenance: ReadonlyArray<readonly [string, () => Promise<unknown>]> = [
       ['membership', () => reconcileMembership(env)],
       ['metabolism', () => runMetabolism(env)],

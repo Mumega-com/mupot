@@ -15,6 +15,9 @@
 //    (src/attention/service.ts reads gate_stall_rewakes).
 
 import type { Env, Task } from '../types'
+// Static import: a dynamic import('../mcp') here made esbuild lazy-wrap the module graph and emit a
+// top-level await inside a sync initializer ("Unexpected reserved word" at Worker startup).
+import { wakeGateOwnerOnReview } from '../mcp'
 
 export const DEFAULT_GATE_STALL_THRESHOLD_MINUTES = 30
 export const DEFAULT_GATE_STALL_MAX_REWAKES = 3
@@ -61,7 +64,6 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
       LIMIT ?3`,
   ).bind(cutoffIso, maxRewakes, SWEEP_LIMIT).all<Task>()
 
-  const { wakeGateOwnerOnReview } = await import('../mcp')
   for (const task of rows.results ?? []) {
     result.scanned += 1
     try {
