@@ -415,15 +415,20 @@ async function sourceRows(
   // Archived projects drop out of every source (a task/routine under an archived project is
   // not live work). Task-level archive is TASK_NOT_ARCHIVED_SQL (canonical, hygiene/filters).
   const projectLive = `p.status != 'archived'`
-  // Gate lanes with an independent HUMAN holder (same predicate that admits a human review
-  // gate at task_submit_result). Agent-only lanes and gate:agent-self-completion have none:
-  // they are a stuck-agent signal for an admin, not the owner's inbox.
-  const humanHolder = `(t.gate_owner <> 'gate:agent-self-completion' AND ${humanGateHolderExistsSql({
+  // A gate wait belongs to the human inbox when an independent HUMAN holds the lane
+  // (humanGateHolderExistsSql, the predicate that admits a human review gate) OR the lane has
+  // no agent holder at all (org owner/admin decide it by role, e.g. gate:routines). A lane held
+  // by an AGENT with no independent human holder, and gate:agent-self-completion (no human
+  // lane by design), are agent-gate waits: a stuck-agent signal for an admin, not the owner's inbox.
+  const humanHolder = `(t.gate_owner <> 'gate:agent-self-completion' AND (${humanGateHolderExistsSql({
     gateOwnerExpr: 't.gate_owner',
     assigneeIdExpr: 't.assignee_agent_id',
     squadIdExpr: 't.squad_id',
     tenantParam: sqlQuote(env.TENANT_SLUG),
-  })})`
+  })} OR NOT EXISTS (
+    SELECT 1 FROM gate_grants agent_lane
+     WHERE agent_lane.capability = t.gate_owner AND agent_lane.principal_type = 'agent'
+  )))`
   const holderClause = stuckView ? `AND NOT ${humanHolder}` : `AND ${humanHolder}`
   const projectScope = [...projectBinds, ...visibility.binds]
 

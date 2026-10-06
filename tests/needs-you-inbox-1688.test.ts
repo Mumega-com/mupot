@@ -277,6 +277,14 @@ describe('Needs You inbox (#1688)', () => {
     expect((await inbox(harness, viewerAuth(), { view: 'stuck' })).items).toEqual([])
   })
 
+  it('a lane nobody holds (decided by org owner role, e.g. gate:routines) stays in the owner inbox, not the viewer\'s', async () => {
+    harness = makeHarness()
+    insertTask(harness, { id: 'ownerless-lane', gate: 'gate:routines' })
+    expect((await inbox(harness, ownerAuth())).items.map(item => item.source_id)).toEqual(['ownerless-lane'])
+    expect((await inbox(harness, ownerAuth(), { view: 'stuck' })).items).toEqual([])
+    expect((await inbox(harness, viewerAuth())).items).toEqual([])
+  })
+
   it('MCP, REST, dashboard and Telegram all read through the one listNeedsYou', async () => {
     for (const file of ['mcp/routines.ts', 'attention/routes.ts', 'dashboard/needs-you.ts', 'im/index.ts']) {
       const source = readFileSync(join(SRC_DIR, file), 'utf8')
