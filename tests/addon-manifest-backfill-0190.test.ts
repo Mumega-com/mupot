@@ -87,6 +87,8 @@ function seededDb() {
     seedGeneration('gen-office', 'inst-office', 'mumega', OFFICE_OLD),
     // Native control with a PRE-EXISTING split generation: must NOT be healed here.
     seedGeneration('gen-cro-split', 'inst-cro', 'mumega', NATIVE_DIGESTS['marketing-cro-monitor']),
+    // Unexpected-digest office parent with its own generation (split below to the OLD digest).
+    seedGeneration('gen-office-odd', 'inst-office-odd', 'tenant-odd', '7'.repeat(64)),
   ].join('\n'))
   // Archive the control row. The lifecycle triggers (rightly) forbid a raw
   // archive without receipts, so lift every addon_installations trigger except
@@ -102,7 +104,9 @@ function seededDb() {
   // edit, so lift those two on this throwaway DB; the migration recreates them.
   h.sqlite.exec(`DROP TRIGGER addon_binding_generations_revoke_only; DROP TRIGGER addon_connector_bindings_revoke_only;
     UPDATE addon_binding_generations SET manifest_sha256='${'8'.repeat(64)}' WHERE id='gen-cro-split';
-    UPDATE addon_connector_bindings SET manifest_sha256='${'8'.repeat(64)}' WHERE id='bind-gen-cro-split';`)
+    UPDATE addon_connector_bindings SET manifest_sha256='${'8'.repeat(64)}' WHERE id='bind-gen-cro-split';
+    UPDATE addon_binding_generations SET manifest_sha256='${OFFICE_OLD}' WHERE id='gen-office-odd';
+    UPDATE addon_connector_bindings SET manifest_sha256='${OFFICE_OLD}' WHERE id='bind-gen-office-odd';`)
   return h
 }
 
@@ -153,6 +157,20 @@ describe('0190 office identity backfill', () => {
       expect(bind('bind-gen-office')).toBe(OFFICE_NEW)
       expect(gen('gen-cro-split')).toBe('8'.repeat(64))
       expect(bind('bind-gen-cro-split')).toBe('8'.repeat(64))
+    } finally { close() }
+  })
+
+  it('Athena gate: an unexpected-digest office parent keeps its split children untouched', () => {
+    const { sqlite, close } = seededDb()
+    try {
+      applyInTransaction(sqlite, MIGRATION_SQL)
+      const gen = (id: string) => (sqlite.prepare('SELECT manifest_sha256 AS d FROM addon_binding_generations WHERE id = ?').get(id) as { d: string }).d
+      const bind = (id: string) => (sqlite.prepare('SELECT manifest_sha256 AS d FROM addon_connector_bindings WHERE id = ?').get(id) as { d: string }).d
+      // Parent left at its unexpected digest by the installation UPDATE …
+      expect(installs(sqlite)['inst-office-odd'].manifest_sha256).toBe('7'.repeat(64))
+      // … so its OLD-digest children must NOT be rewritten (to NEW or to the unexpected value).
+      expect(gen('gen-office-odd')).toBe(OFFICE_OLD)
+      expect(bind('bind-gen-office-odd')).toBe(OFFICE_OLD)
     } finally { close() }
   })
 
@@ -211,8 +229,9 @@ describe('0190 office identity backfill', () => {
       const first = sqlite.prepare(statements[0]).all() as Array<{ id: string; old_digest_match: number }>
       expect(first.find((r) => r.id === 'inst-office')?.old_digest_match).toBe(1)
       expect(first.find((r) => r.id === 'inst-office-odd')?.old_digest_match).toBe(0)
-      expect(sqlite.prepare(statements[1]).all().length).toBe(1)
-      expect(sqlite.prepare(statements[2]).all().length).toBe(1)
+      // Live office generations / bindings: the healthy parent's plus the unexpected parent's split child.
+      expect(sqlite.prepare(statements[1]).all().length).toBe(2)
+      expect(sqlite.prepare(statements[2]).all().length).toBe(2)
     } finally { close() }
   })
 })

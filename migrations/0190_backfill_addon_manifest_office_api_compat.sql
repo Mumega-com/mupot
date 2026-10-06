@@ -19,7 +19,12 @@
 --
 -- Idempotent: the installation UPDATE is guarded by addon_key + the exact OLD
 -- digest + compat + state <> 'archived' (second run matches zero rows); the heal
--- UPDATEs match only rows whose digest differs from their installation's.
+-- UPDATEs are exact-pair: a live child row moves OLD -> NEW only when it still
+-- holds the exact OLD digest AND its parent installation now holds the exact
+-- NEW digest. A parent with any other (unexpected) digest — deliberately left
+-- untouched by the installation UPDATE — never has its children rewritten
+-- (Athena gate on #1694: the migration's own WHERE is the safety boundary,
+-- not the pre-apply probe).
 --
 -- Triggers: the three identity/revoke-only triggers are dropped for the repair
 -- and recreated byte-for-byte (current bodies: identity + generations from
@@ -42,13 +47,9 @@ UPDATE addon_installations
    AND state <> 'archived';
 
 UPDATE addon_binding_generations
-   SET manifest_sha256 = (
-     SELECT installation.manifest_sha256
-       FROM addon_installations AS installation
-      WHERE installation.id = addon_binding_generations.installation_id
-        AND installation.tenant = addon_binding_generations.tenant
-   )
+   SET manifest_sha256 = '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2'
  WHERE revoked_at IS NULL
+   AND manifest_sha256 = '9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f'
    AND EXISTS (
      SELECT 1
        FROM addon_installations AS installation
@@ -56,17 +57,13 @@ UPDATE addon_binding_generations
         AND installation.tenant = addon_binding_generations.tenant
         AND installation.addon_key = 'mcpwp-office'
         AND installation.state <> 'archived'
-        AND installation.manifest_sha256 <> addon_binding_generations.manifest_sha256
+        AND installation.manifest_sha256 = '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2'
    );
 
 UPDATE addon_connector_bindings
-   SET manifest_sha256 = (
-     SELECT installation.manifest_sha256
-       FROM addon_installations AS installation
-      WHERE installation.id = addon_connector_bindings.installation_id
-        AND installation.tenant = addon_connector_bindings.tenant
-   )
+   SET manifest_sha256 = '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2'
  WHERE revoked_at IS NULL
+   AND manifest_sha256 = '9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f'
    AND EXISTS (
      SELECT 1
        FROM addon_installations AS installation
@@ -74,7 +71,7 @@ UPDATE addon_connector_bindings
         AND installation.tenant = addon_connector_bindings.tenant
         AND installation.addon_key = 'mcpwp-office'
         AND installation.state <> 'archived'
-        AND installation.manifest_sha256 <> addon_connector_bindings.manifest_sha256
+        AND installation.manifest_sha256 = '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2'
    );
 
 CREATE TRIGGER addon_installations_identity_is_immutable
