@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { ADDON_API_VERSION } from '../src/addons/api-version'
 import { canonicalManifestJson, manifestSha256, validateAddonManifest } from '../src/addons/contract'
-import { createAddonRegistry, listRegisteredAddons } from '../src/addons/registry'
+import { assertAddonRuntimeContract, createAddonRegistry, listRegisteredAddons } from '../src/addons/registry'
 import { FixtureAddon } from '../src/addons/modules/fixture'
 import '../src/addons/modules/index'
 import '../src/addons/modules/fixture-with-loop'
@@ -9,9 +9,9 @@ import '../src/addons/project-link/manifest'
 import '../src/addons/workflow-circuits/manifest'
 import '../src/addons/office/manifest'
 
-// Digests of every registered addon as computed on main BEFORE ADDON_API_VERSION
-// existed (e07f938d). Decoupling addon compatibility from the product version
-// must not move any of them — a moved digest drifts live addon_installations
+// Digests of every registered addon. The five native digests are as computed on
+// main BEFORE ADDON_API_VERSION existed (e07f938d): decoupling must not move
+// them — a moved digest drifts live addon_installations
 // rows and needs a backfill migration like 0181. If this test goes red you
 // changed digest-bound manifest content; that is a migration, not a refactor.
 const PINNED_DIGESTS: Record<string, string> = {
@@ -20,7 +20,9 @@ const PINNED_DIGESTS: Record<string, string> = {
   'marketing-cro-monitor': '7c6081a3debd40846c4c724110917c1c2685ebe315f081e9d73b2ad258225c6a',
   'project-link': '139f17b91d4ce39b23f510c4006826d3ddfa95e11c13d30ba528bcb36e8dd629',
   'workflow-circuits': '3e7e7084eb77f6cc8f27f93d3370294c1ed6d399a674acc1a8d272053f0dd661',
-  'mcpwp-office': '9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f',
+  // External manifests hash addonApiCompatibility, so this moved from
+  // 9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f (migration 0190).
+  'mcpwp-office': '7d66a75e95732366e71c87f34b5d5586b5bb005ddea6e3369d8725fa09a91ad2',
 }
 
 const externalVariant = {
@@ -82,7 +84,23 @@ describe('digest-bound identity is independent of the addon API pin', () => {
     expect(actual).toEqual(PINNED_DIGESTS)
   })
 
-  it('declaring or re-pinning addonApiCompatibility does not change the digest', async () => {
+  it('external: addonApiCompatibility is REQUIRED — absence is refused at validation and at registration', async () => {
+    const { addonApiCompatibility: _field, ...noField } = externalVariant
+    expect(validateAddonManifest(noField)).toMatchObject({ ok: false, reason: 'missing_field', path: 'addonApiCompatibility' })
+    await expect(createAddonRegistry().register(noField)).rejects.toThrow('addon_manifest_invalid:missing_field')
+    // Defense in depth: even bypassing validation there is no legacy fallback.
+    expect(() => assertAddonRuntimeContract(noField)).toThrow('addon_api_incompatible')
+  })
+
+  it('external: widening, narrowing or changing addonApiCompatibility changes the digest', async () => {
+    const base = await manifestSha256({ ...externalVariant, addonApiCompatibility: '^1.0.0' })
+    for (const range of ['^1.1.0', '^1.0.1', '^2.0.0', '^0.9.0', '>=1.0.0']) {
+      expect(await manifestSha256({ ...externalVariant, addonApiCompatibility: range })).not.toBe(base)
+    }
+    expect(canonicalManifestJson({ ...externalVariant, addonApiCompatibility: '^1.0.0' })).toContain('addonApiCompatibility')
+  })
+
+  it('native: declaring or re-pinning addonApiCompatibility does not change the digest', async () => {
     const { addonApiCompatibility: _declared, ...legacy } = FixtureAddon
     const base = await manifestSha256(legacy)
     expect(await manifestSha256({ ...legacy, addonApiCompatibility: '^1.0.0' })).toBe(base)

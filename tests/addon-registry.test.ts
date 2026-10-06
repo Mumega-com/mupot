@@ -75,7 +75,7 @@ describe('addon registry', () => {
     })
   })
 
-  it('does not extend the additive native bridge to external addons', async () => {
+  it('external addons get no legacy fallback: a manifest without addonApiCompatibility is refused', async () => {
     const registry = createAddonRegistry()
 
     await expect(registry.register({
@@ -87,7 +87,7 @@ describe('addon registry', () => {
       departments: [],
       metrics: [],
       consoleSections: [],
-    })).rejects.toThrow('addon_mupot_incompatible')
+    })).rejects.toThrow('addon_manifest_invalid:missing_field')
   })
 
   it('rejects unknown department references', async () => {

@@ -718,7 +718,7 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
     // six files falling out of coverage — 109 > 103.5 passed while 7 real objects were droppable
     // without ground truth noticing. A file may legitimately contribute no probe only when a LATER
     // migration drops or renames every object it creates, and that later file is probed instead.
-    // Today that is exactly two files, so the shortfall is pinned at 2 rather than a percentage:
+    // Today that is exactly four files, so the shortfall is pinned at 4 rather than a percentage:
     // any new exclusion has to be justified here deliberately, not absorbed by a slack window.
     //
     // mupot#1587 P1-B added the second exclusion: migrations/0089_backfill_addon_manifest_v0_29
@@ -729,14 +729,24 @@ describe('applySchemaChain — ROUND 4: selectGroundTruthProbes probes every obj
     // header), so 0178 is the file ground truth probes for that object going forward, and 0089's
     // one-and-only object is superseded — the exact "a later migration drops or renames every
     // object it creates" case this comment already documented, now instantiated a second time.
+    //
+    // mupot#1694 (migration 0190) added the third and fourth: 0190 DROP+CREATEs all three
+    // addon identity/revoke-only triggers (addon_installations_identity_is_immutable,
+    // addon_binding_generations_revoke_only, addon_connector_bindings_revoke_only) to heal the
+    // mcpwp-office digest. That supersedes the ONLY objects of 0181 (the same three triggers) and
+    // of 0184 (its only surviving object is addon_connector_bindings_revoke_only; the ADD COLUMN
+    // creates no probeable object) — same "later migration redefines every object it creates"
+    // class, 0190 is now the file probed for them.
     const unprobed = SCHEMA_CHAIN.filter(
       (entry) => entry.objects.length > 0 && !new Set(probes.map((p) => p.file)).has(entry.file),
     ).map((entry) => entry.file)
     expect(unprobed).toEqual([
       '0061_task_project_access_on_attribution.sql',
       '0089_backfill_addon_manifest_v0_29.sql',
+      '0181_backfill_addon_manifest_v0_31.sql',
+      '0184_addon_connector_bindings_write_capability.sql',
     ])
-    expect(probes.length).toBe(withSurvivingObject - 2)
+    expect(probes.length).toBe(withSurvivingObject - 4)
 
     // Every probed file must be distinct (one probe per file, not per object).
     expect(new Set(probes.map((p) => p.file)).size).toBe(probes.length)

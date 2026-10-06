@@ -21,7 +21,7 @@ export const FixtureAddonWithLoop: AddonManifestV1 = {
   publisher: 'mumega',
   trustClass: 'native_reviewed',
   mupotCompatibility: '^0.30.0',
-  addonApiCompatibility: '^1.0.0', // addon contract (src/addons/api-version.ts); mupotCompatibility above is a frozen digest-bound legacy pin — never bump it on a product release
+  addonApiCompatibility: '^1.0.0', // addon contract (src/addons/api-version.ts); mupotCompatibility above is a frozen digest-bound legacy pin; native-only claim, excluded from the digest — never bump mupotCompatibility on a product release
   kind: 'native',
   description: 'Lifecycle fixture with a declared loop, no authority.',
   departments: [{ moduleKey: FixtureModule.key, required: true }],

@@ -15,11 +15,16 @@ export interface AddonManifestV1 {
   // release.
   mupotCompatibility: string
   // Compatibility range against ADDON_API_VERSION (src/addons/api-version.ts),
-  // the addon contract version — NOT the product version. Optional so legacy
-  // manifests (checked against the product version as before) still register;
-  // every in-repo manifest declares it. Excluded from manifestSha256 (see
-  // canonicalManifestJson): it is a runtime gate on the in-code manifest, not
-  // installed identity, so declaring or re-pinning it never drifts a digest.
+  // the addon contract version — NOT the product version.
+  //   native_reviewed  : optional (legacy manifests fall back to the product-
+  //                      version check). EXCLUDED from manifestSha256: native
+  //                      manifests are compiled with the host, so the claim is
+  //                      code-coupled and re-pinning it never drifts a digest.
+  //   external_isolated: REQUIRED and INCLUDED in manifestSha256. An external
+  //                      manifest is the trust anchor for code the host did
+  //                      not compile, so its API claim is part of the reviewed
+  //                      identity — widening, narrowing or removing it changes
+  //                      the digest, and there is no legacy fallback.
   addonApiCompatibility?: string
   kind: 'native' | 'external_mcp'
   description: string
@@ -414,13 +419,16 @@ export function validateAddonManifest(value: unknown): AddonValidationResult {
     for (const field of ['name', 'publisher', 'mupotCompatibility', 'description'] as const) {
       if (!isNonEmptyString(value[field])) return fail('invalid_string', field)
     }
-    if (value.addonApiCompatibility !== undefined && !isNonEmptyString(value.addonApiCompatibility)) {
-      return fail('invalid_string', 'addonApiCompatibility')
-    }
     if (typeof value.version !== 'string' || !SEMVER_PATTERN.test(value.version)) return fail('invalid_version', 'version')
     if (value.trustClass !== 'native_reviewed' && value.trustClass !== 'external_isolated') return fail('invalid_trust_class', 'trustClass')
     if (value.kind !== 'native' && value.kind !== 'external_mcp') return fail('invalid_kind', 'kind')
     if ((value.kind === 'native') !== (value.trustClass === 'native_reviewed')) return fail('trust_kind_mismatch')
+    if (value.addonApiCompatibility !== undefined && !isNonEmptyString(value.addonApiCompatibility)) {
+      return fail('invalid_string', 'addonApiCompatibility')
+    }
+    if (value.trustClass === 'external_isolated' && value.addonApiCompatibility === undefined) {
+      return fail('missing_field', 'addonApiCompatibility')
+    }
 
     const validators: Array<[unknown, (entry: unknown) => AddonValidationResult | null]> = [
       [value.departments, validateDepartments],
@@ -496,12 +504,14 @@ function sortValue(value: unknown): unknown {
 }
 
 // Fields that are runtime gates on the in-code manifest and deliberately NOT
-// part of its digest-bound identity. Keep this list tiny and justified.
-const DIGEST_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['addonApiCompatibility'])
+// part of its digest-bound identity — NATIVE (host-compiled) manifests only.
+// External manifests hash every field. Keep this list tiny and justified.
+const NATIVE_DIGEST_EXCLUDED_KEYS: ReadonlySet<string> = new Set(['addonApiCompatibility'])
 
 export function canonicalManifestJson(manifest: AddonManifestV1): string {
+  const excluded = manifest.trustClass === 'native_reviewed' ? NATIVE_DIGEST_EXCLUDED_KEYS : new Set<string>()
   const identity = Object.fromEntries(
-    Object.entries(manifest).filter(([key]) => !DIGEST_EXCLUDED_KEYS.has(key)),
+    Object.entries(manifest).filter(([key]) => !excluded.has(key)),
   )
   return JSON.stringify(sortValue(identity))
 }

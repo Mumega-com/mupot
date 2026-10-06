@@ -89,11 +89,15 @@ export function assertAddonRuntimeContract(manifest: AddonManifestV1): void {
     if (!supportsMupotVersion(manifest.addonApiCompatibility, ADDON_API_VERSION)) {
       throw new Error('addon_api_incompatible')
     }
+  } else if (manifest.trustClass === 'external_isolated') {
+    // External manifests must declare the addon API they were reviewed for;
+    // they never fall back to the legacy product-version predicate.
+    throw new Error('addon_api_incompatible')
   } else if (
-    // Legacy path for manifests that predate addonApiCompatibility. Native
-    // addons are compiled and reviewed with the host: permit one additive
-    // pre-1.0 minor without rewriting their digest-bound lifecycle identity.
-    // External addons remain on strict semver compatibility.
+    // Legacy path for NATIVE manifests that predate addonApiCompatibility.
+    // Native addons are compiled and reviewed with the host: permit one
+    // additive pre-1.0 minor without rewriting their digest-bound lifecycle
+    // identity.
     !supportsMupotVersion(manifest.mupotCompatibility, MUPOT_PUBLIC_API_VERSION) &&
     !supportsAdditiveNativePreviousMinor(manifest, MUPOT_PUBLIC_API_VERSION)
   ) {

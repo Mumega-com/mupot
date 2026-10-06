@@ -49,7 +49,7 @@ export const McpwpOfficeAddon: AddonManifestV1 = {
   // live compatibility gate is addonApiCompatibility below, checked against
   // ADDON_API_VERSION (src/addons/api-version.ts), never the product version.
   mupotCompatibility: '^0.31.0',
-  addonApiCompatibility: '^1.0.0', // addon contract (src/addons/api-version.ts); mupotCompatibility above is a frozen digest-bound legacy pin — never bump it on a product release
+  addonApiCompatibility: '^1.0.0', // REQUIRED + digest-bound for external_isolated (src/addons/api-version.ts); changing it moves this manifest's digest and needs a backfill migration (see 0190)
   kind: 'external_mcp',
   description: 'WordPress as each pot’s office — publish and review content through the mcpwp MCP endpoint under gate.',
   departments: [{ moduleKey: 'office', required: true }],
