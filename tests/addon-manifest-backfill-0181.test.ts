@@ -9,7 +9,7 @@ import { createSqliteD1 } from './helpers/sqlite-d1'
 // (observed 5s-40s for the identical operation across runs, not a hang).
 // Raise the file's timeout rather than each `it` individually.
 vi.setConfig({ testTimeout: 60_000 })
-import { manifestSha256 } from '../src/addons/contract'
+import { manifestSha256, type AddonManifestV1 } from '../src/addons/contract'
 import { getRegisteredAddon } from '../src/addons/registry'
 import {
   activateAddon,
@@ -133,6 +133,15 @@ const ADDONS: AddonFixture[] = [
     newDigest: '9ee9eb05c9a5a469e67e88e98aca68b0654448f539dcb3744eb48c090139c84f',
   },
 ]
+
+// 0190 (mupot#1694) made addonApiCompatibility digest-bound for external
+// manifests, moving mcpwp-office's CURRENT digest. 0181 is immutable history
+// that targeted the manifest shape as of v0.31.0, i.e. WITHOUT that field, so
+// this suite evaluates the registered manifests in that historical shape.
+function asOf0181(manifest: AddonManifestV1): AddonManifestV1 {
+  const { addonApiCompatibility: _later, ...historical } = manifest
+  return historical
+}
 
 function priorMigrations(upTo?: string): string[] {
   return readdirSync(MIGRATIONS_DIR)
@@ -282,7 +291,7 @@ describe('0181_backfill_addon_manifest_v0_31 — digest constants (load-bearing)
       const entry = getRegisteredAddon(key)
       if (!entry) throw new Error(`expected addon not registered: ${key}`)
       expect(entry.manifest.mupotCompatibility).toBe(newCompat)
-      expect(await manifestSha256(entry.manifest)).toBe(newDigest)
+      expect(await manifestSha256(asOf0181(entry.manifest))).toBe(newDigest)
       expect(MIGRATION_SQL).toContain(`'${newDigest}'`)
     }
   })
@@ -294,7 +303,7 @@ describe('0181_backfill_addon_manifest_v0_31 — digest constants (load-bearing)
       // Every field besides mupotCompatibility is unchanged since the prior
       // version — this test would fail loudly the moment that stops being
       // true, same discipline as addon-manifest-backfill-0089's asOfV0290.
-      const asOfOld = { ...entry.manifest, mupotCompatibility: oldCompat }
+      const asOfOld = { ...asOf0181(entry.manifest), mupotCompatibility: oldCompat }
       expect(await manifestSha256(asOfOld)).toBe(oldDigest)
       expect(MIGRATION_SQL).toContain(`'${oldDigest}'`)
     }
@@ -443,7 +452,11 @@ describe('0181_backfill_addon_manifest_v0_31 — the actual goal: freeze is lift
   it('matchesRegisteredIdentity() is false before the migration and true after, for every affected installation including mcpwp-office', () => {
     const { sqlite, close } = buildSeededDb()
     try {
-      const entries = new Map(ADDONS.map(({ key }) => [key, getRegisteredAddon(key)]))
+      const entries = new Map(ADDONS.map(({ key, newDigest }) => {
+        const live = getRegisteredAddon(key)
+        // Historical catalog entry as of 0181 (see asOf0181).
+        return [key, live && { manifest: asOf0181(live.manifest), manifestSha256: newDigest }] as const
+      }))
       for (const [key, entry] of entries) {
         if (!entry) throw new Error(`expected addon not registered: ${key}`)
       }
