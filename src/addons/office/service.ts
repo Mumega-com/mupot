@@ -62,7 +62,7 @@ import type { Env, AuthContext, Task, Capability, TaskVerdict } from '../../type
 import { hasCapability, isOrgAdmin } from '../../auth/capability'
 import { useConnectorById, type ImmediateConnectorUse } from '../../connectors/service'
 import { assertPublicHttpsUrl } from '../../lib/ssrf'
-import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH } from './health'
+import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH, checkMcpwpOfficeHealth, type McpwpOfficeHealthResult } from './health'
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
@@ -145,6 +145,93 @@ export async function hasOfficeCapability(
   const departmentId = await resolveOfficeDepartmentId(env)
   if (!departmentId) return false
   return hasCapability(auth.capabilities ?? [], 'department', departmentId, min)
+}
+
+// ── office.health (mupot#1662) ──────────────────────────────────────────────────
+
+/** The only fields an office health probe ever exposes: a status, a closed-set reason
+ *  code and the id of the connector actually probed (the operator must be able to see
+ *  WHICH credential was exercised). Never a response body, URL, header or secret. */
+export interface OfficeHealthReport {
+  readonly status: McpwpOfficeHealthResult['status']
+  readonly reason?: NonNullable<McpwpOfficeHealthResult['reason']> | 'probe_in_flight'
+  readonly connector_id: string
+  readonly cached?: true
+  readonly checked_at?: string
+}
+
+export const OFFICE_HEALTH_COOLDOWN_MS = 60_000
+
+/** Probes the active installation's bound WordPress connector. No authority check:
+ *  callers gate it themselves. Uses the SAME eligibility resolver publish uses
+ *  (digest + isolation re-verified), so a drifted manifest never sends the key.
+ *  Not rate-limited — see getOfficeHealth for the member-reachable, cooled-down path. */
+export async function probeOfficeHealth(env: Env): Promise<OfficeResult<OfficeHealthReport & { installation_id: string }>> {
+  const eligible = await resolveEligibleActiveOfficeInstallationId(env)
+  if (!eligible.ok) return eligible
+  const installationId = eligible.value
+  const binding = await resolveOfficeConnectorBinding(env, installationId)
+  if (!binding.ok) return binding
+  const connectorId = binding.value.connectorId
+  const result = await checkMcpwpOfficeHealth(env, connectorId)
+  return {
+    ok: true,
+    value: {
+      status: result.status,
+      ...(result.reason ? { reason: result.reason } : {}),
+      connector_id: connectorId,
+      installation_id: installationId,
+    },
+  }
+}
+
+interface CachedHealth { checked_at: number; report: OfficeHealthReport | null }
+
+function parseCachedHealth(value: string | null | undefined): CachedHealth | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as { checked_at?: unknown; report?: unknown }
+    if (typeof parsed.checked_at !== 'number') return null
+    return { checked_at: parsed.checked_at, report: (parsed.report ?? null) as OfficeHealthReport | null }
+  } catch {
+    return null
+  }
+}
+
+/** Member-reachable probe: at most one outbound probe per OFFICE_HEALTH_COOLDOWN_MS per
+ *  installation. The slot is claimed with ONE atomic upsert (org_settings, keyed by the
+ *  installation id) whose WHERE only lets a claim through when the stored checked_at is
+ *  older than the window, so concurrent callers cannot both probe. Inside the window the
+ *  last stored result is returned with cached:true. */
+export async function getOfficeHealth(env: Env, auth: AuthContext): Promise<OfficeResult<OfficeHealthReport>> {
+  if (!(await hasOfficeCapability(env, auth, 'member'))) return { ok: false, reason: 'not_authorized' }
+  const eligible = await resolveEligibleActiveOfficeInstallationId(env)
+  if (!eligible.ok) return eligible
+  const key = `office_health_probe:${eligible.value}`
+  const now = Date.now()
+  const claim = await env.DB.prepare(`
+    INSERT INTO org_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+     WHERE CAST(json_extract(org_settings.value, '$.checked_at') AS INTEGER) <= ?4
+  `).bind(key, JSON.stringify({ checked_at: now, report: null }), new Date(now).toISOString(), now - OFFICE_HEALTH_COOLDOWN_MS).run()
+  if ((claim.meta?.changes ?? 0) < 1) {
+    const row = await env.DB.prepare(`SELECT value FROM org_settings WHERE key = ?1`).bind(key).first<{ value: string }>()
+    const cached = parseCachedHealth(row?.value)
+    const checkedAt = cached ? new Date(cached.checked_at).toISOString() : undefined
+    if (cached?.report) return { ok: true, value: { ...cached.report, cached: true, ...(checkedAt ? { checked_at: checkedAt } : {}) } }
+    // Another caller holds the window and has not stored its result yet.
+    return { ok: true, value: { status: 'unavailable', reason: 'probe_in_flight', connector_id: '', cached: true, ...(checkedAt ? { checked_at: checkedAt } : {}) } }
+  }
+  const probe = await probeOfficeHealth(env)
+  if (!probe.ok) {
+    // Nothing was probed; release the window so a fixed binding can be re-checked at once.
+    await env.DB.prepare(`DELETE FROM org_settings WHERE key = ?1`).bind(key).run()
+    return probe
+  }
+  const { installation_id: _installationId, ...report } = probe.value
+  await env.DB.prepare(`UPDATE org_settings SET value = ?2, updated_at = ?3 WHERE key = ?1`)
+    .bind(key, JSON.stringify({ checked_at: now, report }), new Date().toISOString()).run()
+  return { ok: true, value: { ...report, checked_at: new Date(now).toISOString() } }
 }
 
 // ── office.list_pending_approvals ───────────────────────────────────────────────
