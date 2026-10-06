@@ -201,6 +201,29 @@ describe('Needs You inbox (#1688)', () => {
     expect(page.items.find(item => item.source_id === 'due-soon')?.urgency).toBe('high')
   })
 
+  it('never lists a task whose squad the viewer cannot read, even when they hold a verb on it', async () => {
+    harness = makeHarness()
+    // A workspace admin (org admin grant) may 'publish' an approved output, but a task in someone's
+    // HOME squad is private: the task-visibility chokepoint (canReadSquadTasks) keeps it out.
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('squad-home', 'dept-1', 'home-viewer', 'Home', 'home');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-live', 'squad-home', 'write');
+    `)
+    harness.sqlite.prepare(
+      `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, gate_owner, result, created_at, updated_at)
+       VALUES ('home-publishable', 'squad-home', 'project-live', 'Home output', '', 'Done', 'approved', 'gate:content', 'ready', ?, ?)`,
+    ).run(daysAgo(0.1), daysAgo(0.1))
+    insertTask(harness, { id: 'shared-publishable', status: 'approved' })
+    harness.sqlite.exec("UPDATE tasks SET result = 'ready' WHERE id = 'shared-publishable'")
+    const admin: AuthContext = {
+      userId: 'holder', memberId: 'holder', email: null, role: 'member', tenant: 'tenant-a', channel: 'workspace',
+      boundAgentId: null,
+      capabilities: [{ member_id: 'holder', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const page = await inbox(harness, admin)
+    expect(page.items.map(item => item.source_id)).toEqual(['shared-publishable'])
+  })
+
   it('MCP, REST, dashboard and Telegram all read through the one listNeedsYou', async () => {
     for (const file of ['mcp/routines.ts', 'attention/routes.ts', 'dashboard/needs-you.ts', 'im/index.ts']) {
       const source = readFileSync(join(SRC_DIR, file), 'utf8')
