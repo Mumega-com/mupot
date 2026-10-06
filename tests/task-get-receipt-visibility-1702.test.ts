@@ -6,6 +6,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
 import { resolveCapabilities } from '../src/auth/capability'
+import { readTaskForAuth } from '../src/tasks/index'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -87,6 +88,36 @@ beforeAll(async () => {
 afterAll(() => harness.close())
 
 const assignee = (): Promise<AuthContext> => real('m-squad', { boundAgentId: 'ag-assignee' })
+
+// mupot#1704: the REST single-task read (GET /tasks/:id → readTaskForAuth) goes through the SAME
+// chokepoint. Declared before the MCP block, whose last tests revoke the grants they rely on.
+describe('REST GET /tasks/:id receipt visibility (#1704)', () => {
+  type RestBody = { task: { id: string }; dispatch_timeline: { runtime: Array<Record<string, unknown>> } | null }
+  const rest = async (a: AuthContext): Promise<{ status: number; body: RestBody; raw: string }> => {
+    const res = await readTaskForAuth(env, a, TASK)
+    const raw = await res.text()
+    return { status: res.status, body: JSON.parse(raw) as RestBody, raw }
+  }
+
+  it('a plain squad member and another squad agent read the task but get dispatch_timeline: null', async () => {
+    for (const a of [await real('m-squad'), await real('m-squad', { boundAgentId: 'ag-peer' })]) {
+      const r = await rest(a)
+      expect(r.status).toBe(200)
+      expect(r.body.task.id).toBe(TASK)
+      expect(r.body.dispatch_timeline).toBeNull()
+      for (const leak of ['rt-1', HASH]) expect(r.raw).not.toContain(leak)
+    }
+  })
+
+  it('the assignee, a live gate-holding agent and member, and an org admin get the timeline', async () => {
+    for (const a of [await assignee(), await real('m-squad', { boundAgentId: 'ag-gate' }), await real('m-gate-human'), await real('m-admin')]) {
+      const r = await rest(a)
+      expect(r.status).toBe(200)
+      // REST keeps its pre-#1704 shape for permitted readers (no receipt ids — that widening is MCP-only, #1703).
+      expect(r.body.dispatch_timeline?.runtime).toEqual([expect.objectContaining({ stage: 'completed', runtime_receipt_hash: HASH })])
+    }
+  })
+})
 
 describe('task_get receipt visibility (#1702)', () => {
   it('the assignee view is unchanged: execution_receipt_id, latest dispatch, plus the timeline', async () => {

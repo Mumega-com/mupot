@@ -491,7 +491,12 @@ export async function readTaskForAuth(env: Env, auth: AuthContext, id: string): 
   }
 
   const [visibleTask] = await loadGateWakeNotices(env, [task])
-  const dispatchTimeline = await listTaskDispatchReceiptTimeline(env, task.id)
+  // mupot#1704: the runtime receipt timeline (receipt hashes, artifact sha256/refs, stages) goes
+  // through the SAME chokepoint as MCP task_get (#1702/#1703): assignee, org admin, or a live
+  // gate-lane holder. Any other squad reader gets null, never a narrower re-derived rule.
+  const dispatchTimeline = (await canViewTaskReceipts(env, auth, task))
+    ? await listTaskDispatchReceiptTimeline(env, task.id)
+    : null
   return jsonResponse({ task: visibleTask ?? task, dispatch_timeline: dispatchTimeline })
 }
 
