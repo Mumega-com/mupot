@@ -514,9 +514,12 @@ async function collectLifecycle(config, deps, secretValues) {
   ).run
   const controlTaskId = required(waitingRun?.task_id, 'routine control task id')
 
+  // #1688: Needs You is the viewer's INBOX. The control task is an approval only the OWNER
+  // can decide (the same principal that approves below); the assigned agent cannot approve its
+  // own work, so its inbox must OMIT it.
   const attention = assertActionOk(
     await deps.api.invokeAction({
-      token: assignedToken,
+      token: config.ownerToken,
       tool: 'needs_you_list',
       input: { project_id: config.projectId, limit: 100 },
     }),
@@ -525,6 +528,18 @@ async function collectLifecycle(config, deps, secretValues) {
   )
   const need = attentionItem(attention.items ?? [], controlTaskId)
   if (!need) throw new CollectorError('Needs You did not expose the control task', attention, secretValues)
+  const agentAttention = assertActionOk(
+    await deps.api.invokeAction({
+      token: assignedToken,
+      tool: 'needs_you_list',
+      input: { project_id: config.projectId, limit: 100 },
+    }),
+    'assigned agent Needs You read',
+    secretValues,
+  )
+  if (attentionItem(agentAttention.items ?? [], controlTaskId)) {
+    throw new CollectorError('assigned agent Needs You exposed its own control task', agentAttention, secretValues)
+  }
 
   const approval = await deps.browser.approveTask({ taskId: controlTaskId, runId })
   if (approval?.verdict !== 'approved') {

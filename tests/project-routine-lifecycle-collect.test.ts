@@ -185,6 +185,8 @@ function dependencies(overrides: Record<string, unknown> = {}) {
         return { ok: true, status: 200, result: { run: { ...terminalRun, situation_digest: 'a'.repeat(64) } } }
       }
       if (tool === 'needs_you_list') {
+        // #1688: only the owner (who can approve) is offered the control task, never the agent.
+        if (token !== OWNER_TOKEN) return { ok: true, status: 200, result: { items: [] } }
         return {
           ok: true,
           status: 200,
@@ -592,7 +594,7 @@ describe('collector CLI', () => {
                 ok: true, result: { project: { id: config.projectId, status: 'active' }, situation }
               }
               if (tool === 'needs_you_list') return {
-                ok: true, result: { items: [{ source_type: 'task', source_id: 'task-cli' }] }
+                ok: true, result: { items: token === config.ownerToken ? [{ source_type: 'task', source_id: 'task-cli' }] : [] }
               }
               if (token === 'wrong-cli-secret') return {
                 ok: false, status: 403, error: 'assigned_agent_mismatch'
