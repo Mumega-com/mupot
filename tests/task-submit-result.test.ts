@@ -545,11 +545,11 @@ describe('task_submit_result — member-held gate lanes (mupot#1663)', () => {
     expect(taskRow(harness).status).toBe('in_progress')
   })
 
-  it('gate held by another member row of the same person as the owner (same email) -> refused', async () => {
+  it('email is NOT an affiliation key: a same-email member row with no owner/binding/key link counts as a distinct holder (documented residual)', async () => {
     const { harness, env } = freshEnv()
     seedMemberGate(harness, { ownerEmail: 'Hadi@X.test', holderEmail: 'hadi@x.test' })
     const res = await submit(env)
-    expect(res).toMatchObject({ ok: false, error: 'independent_gate_required' })
+    expect(res.ok).toBe(true)
   })
 
   it('gate held by nobody -> refused', async () => {

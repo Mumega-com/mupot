@@ -296,9 +296,7 @@ function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): stri
 
 /**
  * memberAffiliatedWithAssigneeSql (mupot#1663 P2) — TRUE iff the member is the
- * ASSIGNEE AGENT's owner (agents.owner_member_id), another member row of that
- * owner (same email, case-insensitive — one human routinely has several
- * member rows), or bound to the assignee agent (agent_member_bindings: the
+ * ASSIGNEE AGENT's owner (agents.owner_member_id), or bound to the assignee agent (agent_member_bindings: the
  * agent's own identity), or the member an assignee-agent key authenticates
  * as (agent_keys.member_id — the same signal memberOwnsAssigneeAgent /
  * hasConflictOfInterest use on the IM path). Such a member is not independent of the work: a
@@ -308,21 +306,23 @@ function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): stri
  * also runs) call it; semantics mirror hasConflictOfInterest in
  * src/im/origin-verdict.ts. An agent with NO owner_member_id has nothing to
  * match on the owner side (falls back to the pre-existing rule).
+ *
+ * Deliberately NO email leg: an earlier draft also excluded "another member
+ * row with the owner's email". That is a raw members.email authority match,
+ * which the member-email-authority-lookup ratchet forbids outside the
+ * canonical identity resolver, and the identity model (0143) binds a human to
+ * a provider subject, never to an email. Known residual: one human holding two
+ * member rows that share no owner/binding/key link is not excluded — tracked
+ * on the follow-up issue, to be closed by a canonical same-human relation, not
+ * by email.
  */
 export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigneeIdExpr: string }): string {
   return `EXISTS (
       SELECT 1
         FROM agents assignee_agent
-        LEFT JOIN members owner_member ON owner_member.id = assignee_agent.owner_member_id
-        LEFT JOIN members affiliated_candidate ON affiliated_candidate.id = ${p.memberExpr}
        WHERE assignee_agent.id = ${p.assigneeIdExpr}
          AND (
            assignee_agent.owner_member_id = ${p.memberExpr}
-           OR (
-             owner_member.email IS NOT NULL
-             AND affiliated_candidate.email IS NOT NULL
-             AND lower(owner_member.email) = lower(affiliated_candidate.email)
-           )
            OR EXISTS (
              SELECT 1 FROM agent_member_bindings assignee_binding
               WHERE assignee_binding.agent_id = assignee_agent.id AND assignee_binding.member_id = ${p.memberExpr}
@@ -423,9 +423,8 @@ export function independentGateHolderExistsSql(p: {
  *   - the assignee agent's OWNER (agents.owner_member_id). task_verdict accepts
  *     a harness-attested human_origin and writes the verdict AS the owner
  *     (mupot#1425), so an owner-held gate would let the assignee submit and
- *     then have its own owner's identity approve it. Also excluded: any member
- *     row sharing the owner's email (one human routinely has several member
- *     rows), so the exclusion is of the person, not just one row id.
+ *     then have its own owner's identity approve it. (No same-email leg — see
+ *     memberAffiliatedWithAssigneeSql: email is not an authority key.)
  *   - any member that is bound to an agent (agent_member_bindings) — that row
  *     is an AGENT identity, not a human; agent holders are judged by the
  *     stricter live-credential rule above, never admitted here as a "member".
