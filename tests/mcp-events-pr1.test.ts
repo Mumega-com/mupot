@@ -313,6 +313,24 @@ describe('events/list', () => {
     expect(parse(r.text).result).toEqual({ events: [] })
   })
 
+  it('logs what was shown — bound flag, count, names — and never the bearer or a principal id (mupot#1709)', async () => {
+    const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
+    try {
+      await rawRpc('events/list', {}, BOUND_ADMIN, true)
+      await rawRpc('events/list', {}, { events: 'true', bearer: 'unbound-admin' }, true)
+      const lines = spy.mock.calls.filter((c) => c[0] === '[mcp:events/list]').map((c) => c[1])
+      expect(lines).toEqual([
+        { bound: true, count: 1, names: ['message.created'] },
+        { bound: false, count: 0, names: [] },
+      ])
+      const logged = JSON.stringify(spy.mock.calls)
+      expect(logged).not.toContain('bound-admin')
+      expect(logged).not.toContain('unbound-admin')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('a zero-capability directory session (weld nulled) gets an EMPTY catalogue', async () => {
     const r = await rawRpc('events/list', {}, { events: 'true', bearer: 'dir-zero' }, true)
     expect(parse(r.text).result).toEqual({ events: [] })
