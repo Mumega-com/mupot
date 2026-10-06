@@ -2321,7 +2321,7 @@ const toolTaskVerdict: ToolSpec = {
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {
         return fail(409, 'self_verdict', {
-          reason: 'decider is the task assignee; self-approval is forbidden',
+          reason: 'decider is the task assignee or is affiliated with the assignee agent (owner, same-email member, bound member, or key minter); self-approval is forbidden',
         })
       }
       const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
@@ -2689,7 +2689,10 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
 //     is for the runtime-receipt path itself.
 //   - requires the task's gate_owner to be an INDEPENDENT, live,
 //     credentialed gate (hasIndependentRuntimeGate — the SAME predicate the
-//     runtime-receipt path's `completed` stage requires), re-asserted inside
+//     runtime-receipt path's `completed` stage requires, PLUS (mupot#1663)
+//     a gate lane held by an independent active HUMAN member — never the
+//     assignee agent's owner, whose attested human_origin verdict would
+//     reopen the self-close loop — see humanGateHolderExistsSql), re-asserted inside
 //     the UPDATE's own WHERE clause, not only in JS (kasra-review round 1
 //     P0: an assignee holding only member+ could set gate_owner to
 //     'gate:agent-self-completion' via task_update while in_progress, submit
@@ -2731,7 +2734,8 @@ const toolTaskSubmitResult: ToolSpec = {
     ' other review-entry path enforces — a shape check only, not a verified hash match).' +
     ' The task must already carry an INDEPENDENT gate_owner (set by its creator or an admin via' +
     ' task_update, never by this tool — the assignee cannot choose its own reviewer): live,' +
-    ' credentialed, held by some agent other than the assignee, and never' +
+    ' credentialed, held by some agent other than the assignee (or by an active human member who is' +
+    ' neither the assignee nor the assignee agent\'s owner, e.g. gate:office), and never' +
     ' "gate:agent-self-completion". A dispatched task (live execution_receipt_id, or an' +
     ' in-flight unconsumed dispatch) is refused — use task_dispatch_runtime_receipt instead.',
   inputSchema: {
@@ -2807,11 +2811,11 @@ const toolTaskSubmitResult: ToolSpec = {
     // task_update) before a completion can be submitted at all. Covers both
     // the no-gate case and 'gate:agent-self-completion' (hasIndependentRuntimeGate
     // returns false for both, and for a gate no live independent agent holds).
-    if (!(await hasIndependentRuntimeGate(env, existing.gate_owner, callerAgentId, existing.squad_id))) {
+    if (!(await hasIndependentRuntimeGate(env, existing.gate_owner, callerAgentId, existing.squad_id, { allowMemberHolders: true }))) {
       return fail(409, 'independent_gate_required', {
         gate_owner: existing.gate_owner,
         detail: existing.gate_owner
-          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
+          ? 'the task\'s gate_owner must be held by a live, independently-credentialed agent other than the assignee, or by an active human member who is neither the assignee nor the assignee agent\'s owner (never "gate:agent-self-completion") — ask an admin to grant it, or have the gate reassigned via task_update'
           : 'a task can only enter review through task_submit_result once it carries an independent gate_owner — ask the task\'s creator or an admin to set one via task_update; this tool never accepts gate_owner itself, so the assignee cannot choose its own reviewer',
       })
     }
@@ -2860,6 +2864,7 @@ const toolTaskSubmitResult: ToolSpec = {
           AND ${independentGateHolderExistsSql({
             gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
             squadIdExpr: 'tasks.squad_id', tenantParam: '?7', nowParam: '?8',
+            allowMemberHolders: true,
           })}`,
     ).bind(
       next.result, next.updated_at, next.id, existing.updated_at, existing.project_id,
@@ -2883,6 +2888,15 @@ const toolTaskSubmitResult: ToolSpec = {
 
     const actor = { kind: 'agent' as const, id: callerAgentId }
     await emitTaskEvent(env, 'task.updated', next, actor)
+
+    // mupot#1663 P1: the SAME entering-review freeze task_update performs for a
+    // gate:office task (the approval tool refuses payload_not_frozen without
+    // it). Same function, same post-write best-effort ordering as task_update
+    // above — the status flip is already committed, and a failed freeze leaves
+    // the task reviewable-by-rejection exactly like the task_update path.
+    if (next.gate_owner === OFFICE_GATE_OWNER) {
+      await freezeOfficeTaskOnReviewEntry(env, next, auth.memberId as string)
+    }
 
     // Same review-wake every other entering-review path fires (task_update),
     // so a gate owner learns about a hand-worked completion the same way it

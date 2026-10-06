@@ -261,6 +261,93 @@ const SHA256_RE = /^[0-9a-f]{64}$/
 const STAGES = new Set<TaskDispatchRuntimeStage>(['runtime_consumed', 'completed', 'failed'])
 
 /**
+ * memberStandingOnSquadSql — member-or-better standing on a task's squad (own
+ * squad grant, its department, org, or a channel grant). ONE copy, shared by
+ * the agent-holder branch and the human-holder branch (mupot#1663 P3) so an
+ * independent gate holder of either kind needs the same standing.
+ */
+function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): string {
+  return `(
+    EXISTS (
+      SELECT 1
+        FROM capabilities capability
+       WHERE capability.member_id = ${memberExpr}
+         AND capability.capability IN ('member', 'lead', 'admin', 'owner')
+         AND (
+           capability.scope_type = 'org'
+           OR (capability.scope_type = 'squad' AND capability.scope_id = ${squadIdExpr})
+           OR (
+             capability.scope_type = 'department'
+             AND capability.scope_id = (
+               SELECT task_squad.department_id FROM squads task_squad WHERE task_squad.id = ${squadIdExpr}
+             )
+           )
+         )
+    )
+    OR EXISTS (
+      SELECT 1
+        FROM channel_capability_grants channel_grant
+       WHERE channel_grant.member_id = ${memberExpr}
+         AND channel_grant.squad_id = ${squadIdExpr}
+         AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
+    )
+  )`
+}
+
+/**
+ * memberAffiliatedWithAssigneeSql (mupot#1663 P2) — TRUE iff the member is the
+ * ASSIGNEE AGENT's owner (agents.owner_member_id), or bound to the assignee agent (agent_member_bindings: the
+ * agent's own identity), or the member an assignee-agent key authenticates
+ * as (agent_keys.member_id — the same signal memberOwnsAssigneeAgent /
+ * hasConflictOfInterest use on the IM path). Such a member is not independent of the work: a
+ * harness-attested human_origin verdict (mupot#1425) writes the verdict AS the
+ * owner. This is THE exclusion — review entry (humanGateHolderExistsSql) and
+ * every verdict writer (evaluateVerdictGates, which office_review_approval
+ * also runs) call it; semantics mirror hasConflictOfInterest in
+ * src/im/origin-verdict.ts. An agent with NO owner_member_id has nothing to
+ * match on the owner side (falls back to the pre-existing rule).
+ *
+ * Deliberately NO email leg: an earlier draft also excluded "another member
+ * row with the owner's email". That is a raw members.email authority match,
+ * which the member-email-authority-lookup ratchet forbids outside the
+ * canonical identity resolver, and the identity model (0143) binds a human to
+ * a provider subject, never to an email. Known residual: one human holding two
+ * member rows that share no owner/binding/key link is not excluded — tracked
+ * on the follow-up issue, to be closed by a canonical same-human relation, not
+ * by email.
+ */
+export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigneeIdExpr: string }): string {
+  return `EXISTS (
+      SELECT 1
+        FROM agents assignee_agent
+       WHERE assignee_agent.id = ${p.assigneeIdExpr}
+         AND (
+           assignee_agent.owner_member_id = ${p.memberExpr}
+           OR EXISTS (
+             SELECT 1 FROM agent_member_bindings assignee_binding
+              WHERE assignee_binding.agent_id = assignee_agent.id AND assignee_binding.member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_keys assignee_key
+              WHERE assignee_key.agent_id = assignee_agent.id AND assignee_key.member_id = ${p.memberExpr}
+           )
+         )
+    )`
+}
+
+/** JS form of the SAME fragment, for verdict writers (one predicate, two call shapes). */
+export async function isMemberAffiliatedWithAssigneeAgent(
+  env: Env,
+  memberId: string,
+  assigneeAgentId: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 WHERE ${memberAffiliatedWithAssigneeSql({ memberExpr: '?1', assigneeIdExpr: '?2' })}`,
+  ).bind(memberId, assigneeAgentId).first<{ 1: number }>()
+  return row !== null
+}
+
+/**
  * independentGateHolderExistsSql — the boolean SQL fragment proving a task's
  * gate_owner is a LIVE, INDEPENDENT (not-the-assignee) credentialed gate —
  * never null, never `gate:agent-self-completion`, and actually held by some
@@ -286,11 +373,13 @@ export function independentGateHolderExistsSql(p: {
   squadIdExpr: string
   tenantParam: string
   nowParam: string
+  /** mupot#1663 — also count a gate held by an independent HUMAN member (see
+   *  humanGateHolderExistsSql). Default false: the runtime-receipt `completed`
+   *  path and the dispatch pre-check keep the agent-holder-only rule; only the
+   *  hand-worked review entry (task_submit_result) opts in. */
+  allowMemberHolders?: boolean
 }): string {
-  return `(
-    ${p.gateOwnerExpr} IS NOT NULL
-    AND ${p.gateOwnerExpr} <> 'gate:agent-self-completion'
-    AND EXISTS (
+  const agentHolder = `EXISTS (
       SELECT 1
         FROM gate_grants grant_row
         JOIN agents gate_agent
@@ -307,34 +396,63 @@ export function independentGateHolderExistsSql(p: {
             WHERE t.agent_id = gate_agent.id
               AND t.tenant = ${p.tenantParam}
               AND ${TOKEN_LIVE_PREDICATE(p.nowParam)}
-              AND (
-                EXISTS (
-                  SELECT 1
-                    FROM capabilities capability
-                   WHERE capability.member_id = t.member_id
-                     AND capability.capability IN ('member', 'lead', 'admin', 'owner')
-                     AND (
-                       capability.scope_type = 'org'
-                       OR (capability.scope_type = 'squad' AND capability.scope_id = ${p.squadIdExpr})
-                       OR (
-                         capability.scope_type = 'department'
-                         AND capability.scope_id = (
-                           SELECT task_squad.department_id FROM squads task_squad WHERE task_squad.id = ${p.squadIdExpr}
-                         )
-                       )
-                     )
-                )
-                OR EXISTS (
-                  SELECT 1
-                    FROM channel_capability_grants channel_grant
-                   WHERE channel_grant.member_id = t.member_id
-                     AND channel_grant.squad_id = ${p.squadIdExpr}
-                     AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
-                )
-              )
+              AND ${memberStandingOnSquadSql('t.member_id', p.squadIdExpr)}
          )
+    )`
+  const memberHolder = p.allowMemberHolders ? `
+    OR ${humanGateHolderExistsSql(p)}` : ''
+  return `(
+    ${p.gateOwnerExpr} IS NOT NULL
+    AND ${p.gateOwnerExpr} <> 'gate:agent-self-completion'
+    AND (
+      ${agentHolder}${memberHolder}
     )
   )`
+}
+
+/**
+ * humanGateHolderExistsSql — mupot#1663. True iff the gate lane is held (a
+ * gate_grants row, principal_type='member', migrations/0008) by an ACTIVE human
+ * member who is INDEPENDENT of the assignee. This is how a human-decided lane
+ * (gate:office, decided via office_review_approval) can be a legitimate review
+ * gate for an agent-built task, which the agent-only holder rule refused.
+ *
+ * Independence — each exclusion closes a self-close route (the loop documented
+ * at task_submit_result in src/mcp/index.ts: the party being graded must never
+ * be able to decide its own review):
+ *   - the assignee agent's OWNER (agents.owner_member_id). task_verdict accepts
+ *     a harness-attested human_origin and writes the verdict AS the owner
+ *     (mupot#1425), so an owner-held gate would let the assignee submit and
+ *     then have its own owner's identity approve it. (No same-email leg — see
+ *     memberAffiliatedWithAssigneeSql: email is not an authority key.)
+ *   - any member that is bound to an agent (agent_member_bindings) — that row
+ *     is an AGENT identity, not a human; agent holders are judged by the
+ *     stricter live-credential rule above, never admitted here as a "member".
+ * The holder must be status='active' (same liveness hasActiveGateGrant uses) and
+ * hold member-or-better standing on the task's squad (memberStandingOnSquadSql —
+ * the same standing the agent branch demands, mupot#1663 P3).
+ */
+function humanGateHolderExistsSql(p: {
+  gateOwnerExpr: string
+  assigneeIdExpr: string
+  squadIdExpr: string
+  tenantParam: string
+}): string {
+  return `EXISTS (
+      SELECT 1
+        FROM gate_grants member_grant
+        JOIN members gate_human
+          ON member_grant.principal_type = 'member'
+         AND gate_human.id = member_grant.principal_id
+         AND gate_human.status = 'active'
+         AND gate_human.tenant = ${p.tenantParam}
+       WHERE member_grant.capability = ${p.gateOwnerExpr}
+         AND NOT EXISTS (
+           SELECT 1 FROM agent_member_bindings bound WHERE bound.member_id = gate_human.id
+         )
+         AND NOT ${memberAffiliatedWithAssigneeSql({ memberExpr: 'gate_human.id', assigneeIdExpr: p.assigneeIdExpr })}
+         AND ${memberStandingOnSquadSql('gate_human.id', p.squadIdExpr)}
+    )`
 }
 
 export async function hasIndependentRuntimeGate(
@@ -342,6 +460,7 @@ export async function hasIndependentRuntimeGate(
   gateOwner: string | null | undefined,
   assigneeAgentId: string,
   taskSquadId: string,
+  opts: { allowMemberHolders?: boolean } = {},
 ): Promise<boolean> {
   if (
     gateOwner === null || gateOwner === undefined
@@ -351,6 +470,7 @@ export async function hasIndependentRuntimeGate(
   const row = await env.DB.prepare(`
     SELECT 1 WHERE ${independentGateHolderExistsSql({
       gateOwnerExpr: '?1', assigneeIdExpr: '?2', tenantParam: '?3', squadIdExpr: '?4', nowParam: '?5',
+      allowMemberHolders: opts.allowMemberHolders,
     })}
   `).bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, taskSquadId, nowSqlUtc())
     .first<{ 1: number }>()

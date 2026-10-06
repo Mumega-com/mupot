@@ -696,10 +696,10 @@ async function verdictReply(
       return `You don't have permission to approve "${task.title}" (need outreach:send-gated).`
     }
     if (gateResult.code === 'self_verdict') {
-      // Unreachable in practice today: this function's principal is always a
-      // member id, which can never equal an agent assignee_agent_id. Kept as
-      // a defensive, sensible message rather than an unhandled branch.
-      return `You can't decide "${task.title}" because you are the assignee.`
+      // Reachable since mupot#1663: evaluateVerdictGates refuses a member
+      // affiliated with the assignee agent (its owner, a same-email member row,
+      // a bound member, or the member who minted its key).
+      return `You can't decide "${task.title}" because you own or operate the agent assigned to it — someone independent has to approve it.`
     }
     const need = gateOwner === 'gate:agent-self-completion' ? 'assignee_or_org_admin' : gateOwner
     return `You don't have permission to decide "${task.title}" (need ${need}).`
