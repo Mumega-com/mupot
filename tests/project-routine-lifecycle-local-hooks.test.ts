@@ -198,7 +198,7 @@ describe('Project Routine local lifecycle hooks', () => {
     }
     for (const callback of [
       'assertOwnerSession', 'createRoutine', 'enableRoutine', 'captureRoutine',
-      'manualFire', 'approveTask', 'readRun', 'readProjectSituation',
+      'manualFire', 'approveTask', 'readNeedsYou', 'readRun', 'readProjectSituation',
       'readActivityEvidence', 'close',
     ]) {
       expect(dependencies.browser[callback]).toBeTypeOf('function')
