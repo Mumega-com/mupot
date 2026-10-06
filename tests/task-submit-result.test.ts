@@ -642,5 +642,24 @@ describe('task_submit_result — member-held gate lanes (mupot#1663)', () => {
     )
     expect(byBound.ok).toBe(false)
   })
+
+  it('Athena P1: the member an assignee-agent KEY authenticates as is affiliated — not an independent holder, cannot verdict', async () => {
+    const { harness, env } = freshEnv()
+    const GATE = 'gate:reviewer-human'
+    seedMemberGate(harness, { gate: GATE })
+    harness.sqlite.exec(`
+      INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES ('${TENANT}', '${ASSIGNEE_ID}', 'pk-test', '${MEMBER_ID}', 1);
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gg-keyed', '${GATE}', 'member', '${MEMBER_ID}', '${MEMBER_ID}', '${T0}');
+    `)
+    // An independent holder (HOLDER) exists, so submit enters review; the keyed member must still be refused at verdict.
+    expect((await submit(env)).ok).toBe(true)
+    const byKeyed = await invokeTool(
+      { userId: MEMBER_ID, memberId: MEMBER_ID, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: null,
+        capabilities: [{ member_id: MEMBER_ID, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'admin' }] } as AuthContext,
+      env, 'task_verdict', { task_id: TASK_ID, verdict: 'approved' }, URL,
+    )
+    expect(byKeyed.ok).toBe(false)
+  })
 })
 

@@ -2260,7 +2260,7 @@ const toolTaskVerdict: ToolSpec = {
       const overrideRequested = args.override_self_verdict === true
       if (!isOrgOwner || !overrideRequested) {
         return fail(409, 'self_verdict', {
-          reason: 'decider is the task assignee; self-approval is forbidden',
+          reason: 'decider is the task assignee or is affiliated with the assignee agent (owner, same-email member, bound member, or key minter); self-approval is forbidden',
         })
       }
       const overrideNote = `[self_verdict_override by org owner ${principal.id}]`

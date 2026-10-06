@@ -299,7 +299,9 @@ function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): stri
  * ASSIGNEE AGENT's owner (agents.owner_member_id), another member row of that
  * owner (same email, case-insensitive — one human routinely has several
  * member rows), or bound to the assignee agent (agent_member_bindings: the
- * agent's own identity). Such a member is not independent of the work: a
+ * agent's own identity), or the member an assignee-agent key authenticates
+ * as (agent_keys.member_id — the same signal memberOwnsAssigneeAgent /
+ * hasConflictOfInterest use on the IM path). Such a member is not independent of the work: a
  * harness-attested human_origin verdict (mupot#1425) writes the verdict AS the
  * owner. This is THE exclusion — review entry (humanGateHolderExistsSql) and
  * every verdict writer (evaluateVerdictGates, which office_review_approval
@@ -324,6 +326,10 @@ export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigne
            OR EXISTS (
              SELECT 1 FROM agent_member_bindings assignee_binding
               WHERE assignee_binding.agent_id = assignee_agent.id AND assignee_binding.member_id = ${p.memberExpr}
+           )
+           OR EXISTS (
+             SELECT 1 FROM agent_keys assignee_key
+              WHERE assignee_key.agent_id = assignee_agent.id AND assignee_key.member_id = ${p.memberExpr}
            )
          )
     )`
