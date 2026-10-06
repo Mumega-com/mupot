@@ -10,6 +10,7 @@ import {
 import { revealCredentialClaim } from '../src/auth/credential-claim'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { mcpRequest } from './helpers/mcp-call'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'tenant-a'
@@ -100,7 +101,7 @@ describe('verify_agent_connection MCP callback', () => {
     rawToken: string,
     args: Record<string, unknown>,
   ): Promise<{ response: Response; body: Record<string, unknown> }> {
-    const response = await mcpApp.request(
+    const response = await mcpRequest(
       'https://attacker-host.invalid/',
       {
         method: 'POST',
@@ -124,7 +125,7 @@ describe('verify_agent_connection MCP callback', () => {
   }
 
   it('is advertised with only receipt_id and challenge arguments', async () => {
-    const response = await mcpApp.request(
+    const response = await mcpRequest(
       'https://pot.example/',
       {
         method: 'POST',

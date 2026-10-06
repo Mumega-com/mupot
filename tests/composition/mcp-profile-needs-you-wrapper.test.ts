@@ -64,6 +64,22 @@ describe('/mcp/profile/needs-you through the OAuthProvider wrapper', () => {
     )
   })
 
+  it('unauthenticated /mcp tools/call is 401 WITH WWW-Authenticate resource_metadata (#1667: OAuth discovery must not regress)', async () => {
+    const res = await worker.fetch(
+      new Request('https://pot.test/mcp', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } }),
+      }),
+      env(),
+      ctx,
+    )
+    expect(res.status).toBe(401)
+    expect(res.headers.get('www-authenticate') ?? '').toContain(
+      'resource_metadata="https://pot.test/.well-known/oauth-protected-resource/mcp"',
+    )
+  })
+
   it('an invalid bearer is 401 with the same pointer, never a tool list', async () => {
     const res = await worker.fetch(
       new Request(PROFILE_URL, {

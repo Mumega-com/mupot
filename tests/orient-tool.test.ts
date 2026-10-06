@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 // orient is the basin-drop MCP tool. These tests drive it through the JSON-RPC seam
 // (tools/call) the same way a real agent harness would. The DB is a hand-rolled mock
@@ -107,7 +108,7 @@ function makeEnv(opts: Opts = {}): Env {
 }
 
 async function orient(args: Record<string, unknown>, env: Env, auth = true) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://agents.digid.ca/',
     {
       method: 'POST',
@@ -123,7 +124,7 @@ async function orient(args: Record<string, unknown>, env: Env, auth = true) {
 
 describe('orient MCP tool', () => {
   it('is advertised in tools/list', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',

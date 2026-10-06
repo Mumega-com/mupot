@@ -123,6 +123,15 @@ describe('resolveResource — mcp', () => {
     await expect(r.act('x', {})).rejects.toThrow('mcp_error: bad tool')
   })
 
+  it('treats a tools/call result.isError (mupot#1667 refusal envelope) as a failure, not a success', async () => {
+    const { fn } = fakeFetch({
+      result: { isError: true, content: [{ type: 'text', text: '{}' }], structuredContent: { ok: false, status: 403, error: 'forbidden', detail: { need: 'admin' } } },
+    })
+    const r = resolveResource(ENV, { kind: 'mcp', url: 'https://x/mcp' }, { fetchFn: fn })
+    await expect(r.act('x', {})).rejects.toThrow('mcp_tool_error_403: forbidden')
+    await expect(r.read('q')).rejects.toThrow('mcp_tool_error_403: forbidden')
+  })
+
   it('falls back to text content blocks when there is no structuredContent', async () => {
     const { fn } = fakeFetch({
       result: { content: [{ type: 'text', text: 'hello' }, { type: 'image' }] },

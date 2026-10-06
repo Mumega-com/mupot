@@ -3,6 +3,7 @@ import { done, mcpApp } from '../src/mcp'
 import type { ToolCtx, ToolSpec } from '../src/mcp'
 import { callerCanGrantAgentCapability, PROVISION_TOOLS } from '../src/mcp/provision'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 // The provision tools (create_squad / create_agent / mint_agent_token) are the in-band
 // org-builder surface. These tests drive them through the JSON-RPC seam (tools/call) the
@@ -243,7 +244,7 @@ async function call(
   auth = true,
   requestOrigin = 'https://agents.digid.ca',
 ) {
-  return mcpApp.request(
+  return mcpRequest(
     `${requestOrigin}/`,
     {
       method: 'POST',
@@ -259,7 +260,7 @@ async function call(
 
 describe('provision tools — advertised', () => {
   it('all provision tools appear in tools/list', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',
@@ -286,7 +287,7 @@ describe('provision tools — advertised', () => {
   })
 
   it('advertises grant_agent_capability with its exact schema', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',
