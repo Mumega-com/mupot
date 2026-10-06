@@ -1412,10 +1412,29 @@ export interface VerdictGateCache {
   // there and awaits the SAME promise.
   readonly gateCapability: Map<string, Promise<boolean>>
   readonly surfaceCapability: Map<string, Promise<boolean>>
+  // mupot#1688 P3: memberAffiliatedWithAssignee is also verdict-independent — one D1 read per
+  // (member, assignee agent) per request, shared by every row and both verdicts.
+  readonly affiliation: Map<string, Promise<boolean>>
 }
 
 export function createVerdictGateCache(): VerdictGateCache {
-  return { gateCapability: new Map(), surfaceCapability: new Map() }
+  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map() }
+}
+
+function memberAffiliated(
+  env: Env,
+  memberId: string,
+  assigneeAgentId: string,
+  cache: VerdictGateCache | undefined,
+): Promise<boolean> {
+  if (!cache) return isMemberAffiliatedWithAssigneeAgent(env, memberId, assigneeAgentId)
+  const key = `${memberId}:${assigneeAgentId}`
+  let hit = cache.affiliation.get(key)
+  if (!hit) {
+    hit = isMemberAffiliatedWithAssigneeAgent(env, memberId, assigneeAgentId)
+    cache.affiliation.set(key, hit)
+  }
+  return hit
 }
 
 export async function evaluateVerdictGates(
@@ -1494,7 +1513,7 @@ export async function evaluateVerdictGates(
     && principal.type === 'member'
     && task.assignee_agent_id
     && !legacyOwnerAdmin(auth)
-    && (await isMemberAffiliatedWithAssigneeAgent(env, principal.id, task.assignee_agent_id))
+    && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache))
   ) {
     return { allowed: false, code: 'self_verdict', principal }
   }

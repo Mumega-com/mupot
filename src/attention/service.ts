@@ -738,15 +738,13 @@ async function resolveCursor(
   return cursor
 }
 
-async function issueCursor(
+function cursorFor(
   env: Env,
   principal: RoutinePrincipal,
   projectId: string | undefined,
   row: SourceRow,
-): Promise<string> {
-  const token = crypto.randomUUID()
-  const digest = await digestToken(token)
-  const cursor: NeedsYouCursor = {
+): NeedsYouCursor {
+  return {
     tenant: env.TENANT_SLUG,
     actor_type: principal.actor_type,
     actor_id: principal.actor_id,
@@ -757,9 +755,25 @@ async function issueCursor(
     type: row.source_type,
     id: row.source_id,
   }
+}
+
+async function issueCursor(env: Env, cursor: NeedsYouCursor): Promise<string> {
+  const token = crypto.randomUUID()
+  const digest = await digestToken(token)
   await env.SESSIONS.put(`needs-you-cursor:${digest}`, JSON.stringify(cursor), { expirationTtl: CURSOR_TTL_SECONDS })
   return token
 }
+
+function compareRows(left: SourceRow, right: SourceRow): number {
+  return left.urgency_rank - right.urgency_rank
+    || left.sort_deadline.localeCompare(right.sort_deadline)
+    || right.sort_timestamp.localeCompare(left.sort_timestamp)
+    || left.source_type.localeCompare(right.source_type)
+    || left.source_id.localeCompare(right.source_id)
+}
+
+/** Hard bound on source pages scanned for ONE response (each page <= SOURCE_SCAN_CAP rows/source). */
+const MAX_SCAN_PAGES = 5
 
 // Principal-only callers (tests, internal) carry no AuthContext: rebuild the one
 // routinePrincipal() was derived from. A legacy owner/admin with no loaded grants keeps
@@ -791,10 +805,11 @@ async function resolveTaskDecisions(
   env: Env,
   auth: AuthContext,
   rows: SourceRow[],
-): Promise<{ rows: SourceRow[]; decisions: Map<string, TaskDecision> }> {
-  const visible = new Map<string, Promise<boolean>>()
-  const cache: VerdictGateCache = createVerdictGateCache()
-  const decisions = new Map<string, TaskDecision>()
+  cache: VerdictGateCache,
+  decisions: Map<string, TaskDecision>,
+  visible: Map<string, Promise<boolean>>,
+  informationOnly: boolean,
+): Promise<SourceRow[]> {
   const kept = await Promise.all(rows.map(async (row) => {
     if (row.source_type !== 'task') return true
     if (row.squad_id === null) return false
@@ -804,7 +819,8 @@ async function resolveTaskDecisions(
       visible.set(row.squad_id, canRead)
     }
     if (!(await canRead)) return false
-    if (row.kind !== 'approval' || row.gate_owner === null) return true
+    // The admin 'stuck' view is information only: no verb is offered, so no verdict predicate runs.
+    if (informationOnly || row.kind !== 'approval' || row.gate_owner === null) return true
     const task = { squad_id: row.squad_id, gate_owner: row.gate_owner, assignee_agent_id: row.assignee_agent_id }
     const [approve, reject] = await Promise.all([
       evaluateVerdictGates(env, auth, task, 'approved', cache),
@@ -813,7 +829,7 @@ async function resolveTaskDecisions(
     decisions.set(row.source_id, { approve: approve.allowed, reject: reject.allowed })
     return true
   }))
-  return { rows: rows.filter((_, index) => kept[index]), decisions }
+  return rows.filter((_, index) => kept[index])
 }
 
 /**
@@ -842,26 +858,53 @@ export async function listNeedsYou(
   const limit = options.limit ?? DEFAULT_LIMIT
   if (!validLimit(limit)) throw new Error('invalid_needs_you_pagination')
   const cursor = await resolveCursor(env, principal, options)
-  const sources = await sourceRows(env, principal, options, cursor, nowIso)
   const auth = options.auth ?? authForPrincipal(principal)
-  const resolved = await resolveTaskDecisions(env, auth, sources.flatMap(source => source.rows))
-  const rows = resolved.rows
-    .filter(row => isActionable(row, principal, actionsFor(row, principal, resolved.decisions.get(row.source_id))))
-    .sort((left, right) => (
-      left.urgency_rank - right.urgency_rank
-      || left.sort_deadline.localeCompare(right.sort_deadline)
-      || right.sort_timestamp.localeCompare(left.sort_timestamp)
-      || left.source_type.localeCompare(right.source_type)
-      || left.source_id.localeCompare(right.source_id)
-    ))
-  const items = rows.slice(0, limit)
+  const stuckView = options.view === 'stuck'
+  const decisions = new Map<string, TaskDecision>()
+  const gateCache = createVerdictGateCache()
+  const visible = new Map<string, Promise<boolean>>()
+  const kept: SourceRow[] = []
+  // The viewer filter runs AFTER the capped SQL fetch, so a page of rows the viewer cannot
+  // act on must never hide the ones they can: keep scanning source pages (bounded) until
+  // enough kept rows exist or the sources are exhausted, and hand back a cursor from the last
+  // SCANNED row when the bound is hit.
+  let scanCursor = cursor
+  let frontierCursor: NeedsYouCursor | null = null
+  let exhausted = false
+  let unscannable: string[] = []
+  let pendingSources: string[] = []
+  for (let page = 0; page < MAX_SCAN_PAGES; page++) {
+    const sources = await sourceRows(env, principal, options, scanCursor, nowIso);
+    const all = sources.flatMap(source => source.rows).sort(compareRows)
+    // recommit_due is JS-ranked (not keyset-pageable), so it cannot bound the frontier.
+    const pageable = sources.filter(source => source.truncated && source.name !== 'recommit_due')
+    pendingSources = pageable.map(source => source.name)
+    unscannable = sources.filter(source => source.truncated && source.name === 'recommit_due').map(source => source.name)
+    const frontierRow = pageable
+      .map(source => source.rows.at(-1))
+      .filter((row): row is SourceRow => row !== undefined)
+      .sort(compareRows)[0] ?? null
+    const consider = frontierRow ? all.filter(row => compareRows(row, frontierRow) <= 0) : all
+    const visibleRows = await resolveTaskDecisions(env, auth, consider, gateCache, decisions, visible, stuckView)
+    kept.push(...visibleRows.filter(row => stuckView
+      || isActionable(row, principal, actionsFor(row, principal, decisions.get(row.source_id)))))
+    if (!frontierRow) { exhausted = true; frontierCursor = null; break }
+    frontierCursor = cursorFor(env, principal, options.project_id, frontierRow)
+    scanCursor = frontierCursor
+    if (kept.length > limit) break
+  }
+  const items = kept.slice(0, limit)
   const last = items.at(-1)
-  const truncatedSources = sources.filter(source => source.truncated).map(source => source.name)
-  const hasMore = rows.length > limit || truncatedSources.length > 0
+  const moreKept = kept.length > limit
+  // Scan bound hit with rows still unscanned: not exhausted and not already paging on kept rows.
+  const scanIncomplete = !exhausted && !moreKept
+  let nextCursor: string | null = null
+  if (moreKept && last) nextCursor = await issueCursor(env, cursorFor(env, principal, options.project_id, last))
+  else if (scanIncomplete && frontierCursor) nextCursor = await issueCursor(env, frontierCursor)
   return {
-    items: items.map(row => itemFrom(row, principal, resolved.decisions.get(row.source_id))),
-    next_cursor: hasMore && last ? await issueCursor(env, principal, options.project_id, last) : null,
-    truncated: truncatedSources.length > 0,
-    truncated_sources: truncatedSources,
+    items: items.map(row => itemFrom(row, principal, decisions.get(row.source_id))),
+    next_cursor: nextCursor,
+    truncated: scanIncomplete || unscannable.length > 0,
+    truncated_sources: [...(scanIncomplete ? pendingSources : []), ...unscannable],
   }
 }

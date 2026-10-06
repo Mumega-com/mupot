@@ -430,7 +430,11 @@ async function needsReply(env: Env, member: Member, grants: CapabilityGrant[], p
   const auth = memberAuth(env, member, grants)
   const principal = routinePrincipal(auth)
   const page = await listNeedsYou(env, principal, { ...(projectId ? { project_id: projectId } : {}), limit: 10, auth })
-  if (!page.items.length) return 'Nothing needs your attention in your accessible projects.'
+  if (!page.items.length) {
+    // A capped scan can end with no kept row yet more unscanned: never claim "nothing".
+    if (page.next_cursor || page.truncated) return 'More may be waiting for you. Open the dashboard Needs You inbox to see it.'
+    return 'Nothing needs your attention in your accessible projects.'
+  }
   const lines: string[] = []
   let omitted = Boolean(page.next_cursor || page.truncated)
   for (const item of page.items) {

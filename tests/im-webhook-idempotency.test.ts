@@ -382,6 +382,25 @@ describe('authenticated Telegram receipts and human controls', () => {
     expect(reply).toMatch(/more.*dashboard/i)
   })
 
+  it('never says "nothing" when a capped scan ended with rows still unscanned (#1688)', async () => {
+    await member()
+    // listNeedsYou stores its continuation cursor server-side; give the harness env a minimal KV.
+    env = { ...env, SESSIONS: { put: async () => undefined } } as unknown as Env
+    harness.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('lane-holder', 'lane@example.com', 'Lane', 'active', 'telegram-test');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-lane', 'lane-holder', 'org', NULL, 'member');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('lane-grant', 'gate:lane', 'member', 'lane-holder', 'test', datetime('now'))`)
+    // 520 approvals on a human lane this member does not hold: every scanned row is filtered out.
+    for (let index = 0; index < 520; index++) {
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, gate_owner)
+        VALUES (?, 'squad-1', 'project-1', 'Not yours', 'done', 'review', 'gate:lane')`).run(`noise-${index}`)
+    }
+    const reply = (await (await post(envelope('/needs'))).json() as { reply: string }).reply
+    expect(reply).not.toMatch(/^Nothing needs/)
+    expect(reply).toMatch(/More may be waiting/)
+  })
+
   it.each(['suspended', 'revoked'])('refuses task effects for %s membership', async status => {
     await member()
     if (status === 'suspended') harness.sqlite.exec("UPDATE members SET status = 'suspended'")

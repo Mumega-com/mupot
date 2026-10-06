@@ -224,6 +224,59 @@ describe('Needs You inbox (#1688)', () => {
     expect(page.items.map(item => item.source_id)).toEqual(['shared-publishable'])
   })
 
+  // P1 (gate on #1696): the viewer filter runs after a capped SQL fetch — rows the viewer
+  // cannot act on must never hide the ones they can.
+  function seedNoise(h: SqliteD1Harness, count: number) {
+    // 'holder' owns the assignee agent (affiliated, so not an independent holder): use a third human.
+    h.sqlite.exec(`
+      INSERT INTO members (id, email, display_name, status, tenant) VALUES ('holder-x', 'hx@example.test', 'Lane X holder', 'active', 'tenant-a');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-holder-x', 'holder-x', 'org', NULL, 'member');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-lane-x', 'gate:lane-x', 'member', 'holder-x', 'owner-admin', '2026-07-01T00:00:00.000Z')`)
+    for (let index = 0; index < count; index++) {
+      insertTask(h, { id: `noise-${String(index).padStart(4, '0')}`, gate: 'gate:lane-x', priority: 'P0' })
+    }
+  }
+
+  it('101 non-actionable P0 approvals do not hide the one the viewer can act on', async () => {
+    harness = makeHarness()
+    seedNoise(harness, 101)
+    insertTask(harness, { id: 'the-real-one', priority: 'P3' })
+    const page = await inbox(harness, viewerAuth())
+    expect(page.items.map(item => item.source_id)).toEqual(['the-real-one'])
+    expect(page.truncated).toBe(false)
+  })
+
+  it('past the scan bound the actionable item is reachable via the cursor, never silently lost', async () => {
+    harness = makeHarness()
+    seedNoise(harness, 520)
+    insertTask(harness, { id: 'the-real-one', priority: 'P3' })
+    const env = envFor(harness)
+    const auth = viewerAuth()
+    const first = await listNeedsYou(env, routinePrincipal(auth), { auth }, NOW)
+    expect(first.items).toEqual([])
+    expect(first.next_cursor).toEqual(expect.any(String))
+    expect(first.truncated).toBe(true)
+    const second = await listNeedsYou(env, routinePrincipal(auth), { auth, after: first.next_cursor as string }, NOW)
+    expect(second.items.map(item => item.source_id)).toEqual(['the-real-one'])
+    expect(second.next_cursor).toBeNull()
+  })
+
+  it('stuck view is information only: a role-member org admin sees agent-gate rows, a plain member none', async () => {
+    harness = makeHarness()
+    insertTask(harness, { id: 'agent-gate', gate: 'gate:kasra-core' })
+    insertTask(harness, { id: 'agent-selfcomp', gate: 'gate:agent-self-completion' })
+    insertTask(harness, { id: 'act-human' })
+    const orgAdmin: AuthContext = {
+      userId: 'holder', memberId: 'holder', email: null, role: 'member', tenant: 'tenant-a', channel: 'workspace',
+      boundAgentId: null,
+      capabilities: [{ member_id: 'holder', scope_type: 'org', scope_id: null, capability: 'admin' }],
+    }
+    const stuck = await inbox(harness, orgAdmin, { view: 'stuck' })
+    expect(stuck.items.map(item => item.source_id).sort()).toEqual(['agent-gate', 'agent-selfcomp'])
+    expect(stuck.items.every(item => item.allowed_actions.length === 1 && item.allowed_actions[0] === 'view')).toBe(true)
+    expect((await inbox(harness, viewerAuth(), { view: 'stuck' })).items).toEqual([])
+  })
+
   it('MCP, REST, dashboard and Telegram all read through the one listNeedsYou', async () => {
     for (const file of ['mcp/routines.ts', 'attention/routes.ts', 'dashboard/needs-you.ts', 'im/index.ts']) {
       const source = readFileSync(join(SRC_DIR, file), 'utf8')

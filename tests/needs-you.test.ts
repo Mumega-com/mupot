@@ -375,10 +375,11 @@ describe('Needs You projection', () => {
     }
     const page = await listNeedsYou(envFor(harness), owner(), { limit: 100 })
 
+    // #1688: the scan keeps going to fill the page, so the 101st row is read and reachable via
+    // the cursor; 'truncated' is reserved for a scan that hit its bound with rows unscanned.
     expect(page.items).toHaveLength(100)
     expect(page.next_cursor).toEqual(expect.any(String))
-    expect(page.truncated).toBe(true)
-    expect(page.truncated_sources).toContain('blocked_tasks')
+    expect(page.truncated).toBe(false)
   })
 
   it('advertises Routine lifecycle and answer actions only to the authorized human principal', async () => {
