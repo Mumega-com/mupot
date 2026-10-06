@@ -9,6 +9,7 @@ export const ProjectLinkAddon = Object.freeze<AddonManifestV1>({
   publisher: 'mumega',
   trustClass: 'native_reviewed',
   mupotCompatibility: '^0.30.0',
+  addonApiCompatibility: '^1.0.0', // addon contract (src/addons/api-version.ts); mupotCompatibility above is a frozen digest-bound legacy pin — never bump it on a product release
   kind: 'native',
   description: 'Signed, bounded collaboration between sovereign Mupot projects.',
   departments: [],

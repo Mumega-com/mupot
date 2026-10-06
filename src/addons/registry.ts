@@ -4,6 +4,7 @@ import {
   type AddonManifestV1,
 } from './contract'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
+import { ADDON_API_VERSION } from './api-version'
 import { composeDeptMetricDescriptors } from '../departments/channels/compose'
 import { getRegistered as getRegisteredDepartment } from '../departments/registry'
 import { getAddonConsoleRenderer } from './console-registry'
@@ -82,10 +83,17 @@ function supportsAdditiveNativePreviousMinor(
 }
 
 export function assertAddonRuntimeContract(manifest: AddonManifestV1): void {
-  // Native addons are compiled and reviewed with the host. Permit one additive
-  // pre-1.0 minor without rewriting their digest-bound lifecycle identity.
-  // External addons remain on strict semver compatibility.
-  if (
+  if (manifest.addonApiCompatibility !== undefined) {
+    // Current contract: strict semver against the ADDON API version, never the
+    // product version. A product release cannot invalidate a registered addon.
+    if (!supportsMupotVersion(manifest.addonApiCompatibility, ADDON_API_VERSION)) {
+      throw new Error('addon_api_incompatible')
+    }
+  } else if (
+    // Legacy path for manifests that predate addonApiCompatibility. Native
+    // addons are compiled and reviewed with the host: permit one additive
+    // pre-1.0 minor without rewriting their digest-bound lifecycle identity.
+    // External addons remain on strict semver compatibility.
     !supportsMupotVersion(manifest.mupotCompatibility, MUPOT_PUBLIC_API_VERSION) &&
     !supportsAdditiveNativePreviousMinor(manifest, MUPOT_PUBLIC_API_VERSION)
   ) {

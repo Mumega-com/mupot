@@ -44,15 +44,12 @@ export const McpwpOfficeAddon: AddonManifestV1 = {
   version: '1.0.0',
   publisher: 'mumega',
   trustClass: 'external_isolated',
-  // Pinned as a literal, like the native addons' mupotCompatibility — NOT
-  // derived from MUPOT_PUBLIC_API_VERSION. An external_isolated addon gets
-  // no one-minor grace band (supportsAdditiveNativePreviousMinor is native-
-  // only by design: "external addons remain on strict semver compatibility"),
-  // so a derived value meant every version bump, patches included, would
-  // drift every live installation's identity and need its own backfill
-  // migration (found in mupot#1604's adversarial gate). Bump this by hand
-  // alongside the native manifests' compat strings at each release.
+  // FROZEN legacy identity pin — persisted in addon_installations and hashed
+  // into the manifest digest, so it must not move on a product release. The
+  // live compatibility gate is addonApiCompatibility below, checked against
+  // ADDON_API_VERSION (src/addons/api-version.ts), never the product version.
   mupotCompatibility: '^0.31.0',
+  addonApiCompatibility: '^1.0.0', // addon contract (src/addons/api-version.ts); mupotCompatibility above is a frozen digest-bound legacy pin — never bump it on a product release
   kind: 'external_mcp',
   description: 'WordPress as each pot’s office — publish and review content through the mcpwp MCP endpoint under gate.',
   departments: [{ moduleKey: 'office', required: true }],

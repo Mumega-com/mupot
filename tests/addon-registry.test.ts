@@ -3,6 +3,10 @@ import { createAddonRegistry } from '../src/addons/registry'
 import { FixtureAddon } from '../src/addons/modules/fixture'
 import { MarketingCroMonitorAddon } from '../src/addons/modules/marketing-cro-monitor'
 
+// Legacy-path fixtures: manifests that predate addonApiCompatibility are still
+// checked against the product version (see assertAddonRuntimeContract).
+const { addonApiCompatibility: _declaredApi, ...LegacyFixtureAddon } = FixtureAddon
+
 describe('addon registry', () => {
   it('registers a deep-frozen clone', async () => {
     const registry = createAddonRegistry()
@@ -34,10 +38,20 @@ describe('addon registry', () => {
     const registry = createAddonRegistry()
 
     await expect(registry.register({
-      ...FixtureAddon,
+      ...LegacyFixtureAddon,
       key: 'incompatible-addon',
       mupotCompatibility: '^0.23.0',
     })).rejects.toThrow('addon_mupot_incompatible')
+  })
+
+  it('rejects a manifest incompatible with the addon API', async () => {
+    const registry = createAddonRegistry()
+
+    await expect(registry.register({
+      ...FixtureAddon,
+      key: 'incompatible-addon-api',
+      addonApiCompatibility: '^2.0.0',
+    })).rejects.toThrow('addon_api_incompatible')
   })
 
   it('preserves an additive previous-minor lifecycle identity for compiled native addons', async () => {
@@ -47,7 +61,7 @@ describe('addon registry', () => {
     // addons. Bump alongside every future API-version bump, same as the
     // real native manifests in src/addons/ (see migrations/0181's header).
     const manifest = {
-      ...FixtureAddon,
+      ...LegacyFixtureAddon,
       key: 'previous-minor-native-addon',
       version: '1.0.0',
       mupotCompatibility: '^0.30.0',
@@ -65,7 +79,7 @@ describe('addon registry', () => {
     const registry = createAddonRegistry()
 
     await expect(registry.register({
-      ...FixtureAddon,
+      ...LegacyFixtureAddon,
       key: 'previous-minor-external-addon',
       trustClass: 'external_isolated',
       kind: 'external_mcp',
