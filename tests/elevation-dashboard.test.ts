@@ -101,6 +101,14 @@ describe('elevation dashboard screens — integration through dashboardApp (real
     )
       .bind(TOKEN_ID, AGENT_MEMBER, TENANT, AGENT_ID)
       .run()
+    // admin@x.test must NOT be an org owner/admin: dev-login would otherwise make the
+    // first user the bootstrap owner, and (mupot#1673) an org admin is — correctly —
+    // listed AND able to decide every work-squad request. Pre-seed the users row as
+    // a plain member so this fixture really is "admin on squad-a ONLY".
+    // (The unlinked-login test keeps its bootstrap-owner dev user: it needs a 200 page.)
+    if (env.LOCAL_TEST_AUTH_EMAIL === 'admin@x.test') {
+      await env.DB.prepare(`INSERT INTO users (id, email, role) VALUES ('user-admin-x', 'admin@x.test', 'member')`).run()
+    }
     // admin@x.test: admin capability on squad-a ONLY (never squad-b).
     await env.DB.prepare(
       `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?1, ?2, 'squad', ?3, 'admin')`,

@@ -3871,3 +3871,82 @@ describe('mupot#1616 gate r3: generic writers x claim state', () => {
     b.harness.close()
   })
 })
+
+// mupot#1663 — an agent-built gate:office task reaches review through
+// task_submit_result, gets FROZEN exactly like the task_update path, and is
+// decided by an independent human holder (never the assignee agent's owner).
+describe('gate:office via task_submit_result (mupot#1663)', () => {
+  const AGENT = 'agent-office-builder'
+  const AGENT_MEMBER = 'member-office-builder'
+  const OWNER = 'mem-owner-y'
+  const HOLDER = 'mem-holder-z'
+  const SHA256 = 'b'.repeat(64)
+
+  async function setup() {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { departmentId, squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-1663')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const q = harness.sqlite
+    for (const [id, email] of [[OWNER, 'owner-y@x.t'], [HOLDER, 'holder-z@x.t'], [AGENT_MEMBER, null]] as const) {
+      q.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES (?, ?, ?, 'active', ?)`).run(id, email, id, TENANT)
+    }
+    q.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id) VALUES (?, ?, 'office-builder', 'Office Builder', 'worker', 'x', 'active', ?)`).run(AGENT, squadId, OWNER)
+    q.prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, ?, ?, datetime('now'))`).run(TENANT, AGENT, AGENT_MEMBER)
+    for (const m of [OWNER, HOLDER]) {
+      q.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES (?, ?, 'squad', ?, 'member')`).run(`cap-${m}`, m, squadId)
+      q.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES (?, 'gate:office', 'member', ?, 'test', datetime('now'))`).run(`gg-${m}`, m)
+    }
+    const task = await createTask(
+      testEnv,
+      { squad_id: squadId, title: 'Publish: agent built', body: 'draft body', done_when: 'post is live', gate_owner: 'gate:office', assignee_agent_id: AGENT },
+      { skipMirror: true, skipEvent: true },
+    )
+    q.prepare(`UPDATE tasks SET status = 'in_progress' WHERE id = ?`).run(task.id)
+    const agentAuth: AuthContext = {
+      ...auth(AGENT_MEMBER, [grant('squad', squadId, 'member')]), boundAgentId: AGENT,
+    }
+    const humanAuth = (memberId: string) => auth(memberId, [grant('squad', squadId, 'member'), grant('department', departmentId, 'lead')])
+    return { harness, testEnv, taskId: task.id, agentAuth, humanAuth }
+  }
+
+  it('agent submits -> payload frozen -> independent holder lists it, approves with the frozen sha -> approved', async () => {
+    const { harness, testEnv, taskId, agentAuth, humanAuth } = await setup()
+    const submitted = await invokeTool(agentAuth, testEnv, 'task_submit_result', {
+      task_id: taskId, result: `Draft ready\nArtifact: /tmp/draft.md\nSHA256: ${SHA256}`,
+    }, ORIGIN)
+    expect(submitted.ok, JSON.stringify(submitted)).toBe(true)
+
+    const listed = await invokeTool(humanAuth(HOLDER), testEnv, 'office.list_pending_approvals', {}, ORIGIN)
+    expect(listed.ok).toBe(true)
+    const row = listed.ok
+      ? (listed.result as { tasks: Array<{ id: string; payload_sha256: string | null }> }).tasks.find((t) => t.id === taskId)
+      : undefined
+    expect(row?.payload_sha256).toMatch(/^[0-9a-f]{64}$/)
+
+    const approved = await invokeTool(humanAuth(HOLDER), testEnv, 'office.review_approval', {
+      task_id: taskId, verdict: 'approved', expected_payload_sha256: row?.payload_sha256,
+    }, ORIGIN)
+    expect(approved.ok, JSON.stringify(approved)).toBe(true)
+    const status = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(status.status).toBe('approved')
+    harness.close()
+  })
+
+  it('the assignee agent\'s OWNER (also a gate:office holder) cannot approve via office.review_approval', async () => {
+    const { harness, testEnv, taskId, agentAuth, humanAuth } = await setup()
+    await invokeTool(agentAuth, testEnv, 'task_submit_result', {
+      task_id: taskId, result: `Draft ready\nArtifact: /tmp/draft.md\nSHA256: ${SHA256}`,
+    }, ORIGIN)
+    const sha = await officeFreezeHash(testEnv, taskId)
+    expect(sha).not.toBeNull()
+    const refused = await invokeTool(humanAuth(OWNER), testEnv, 'office.review_approval', {
+      task_id: taskId, verdict: 'approved', expected_payload_sha256: sha ?? undefined,
+    }, ORIGIN)
+    expect(refused.ok).toBe(false)
+    const status = harness.sqlite.prepare(`SELECT status FROM tasks WHERE id = ?`).get(taskId) as { status: string }
+    expect(status.status).toBe('review')
+    harness.close()
+  })
+})

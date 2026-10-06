@@ -115,6 +115,7 @@ import {
   boundAgentHasAnyLiveGrantForAction,
   resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
   elevationRemedyMessage,
+  elevationHint,
   recordElevationUsage,
   type ElevationGrantRecord,
 } from '../auth/elevation'
@@ -691,7 +692,7 @@ export const toolMintAgentToken: ToolSpec = {
     // authority question only: a principal who fails it still falls through to
     // the elevation limb below, unchanged.
     if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
-      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('mint_agent_token') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', agent.squad_id)
       const elevated = await hasElevatedAction(env, auth, 'action:mint_token', 'squad', agent.squad_id, {
         squadDepartmentId,
@@ -1107,20 +1108,65 @@ const toolRevokeAgentToken: ToolSpec = {
 // and can only ever target its own exact current session, never one it
 // names), so the two surfaces never overlap in what they can reach.
 
+// mupot#1664 (onboard ergonomics): an agent-bound caller may read ITS OWN sessions
+// (`self: true`, or `agent` omitted on a bound token) without admin. The spec floor is
+// therefore 'authenticated' and the admin floor the dispatcher used to apply is
+// re-applied INLINE for every non-self call, byte-for-byte the same refusal. The self
+// path derives the agent from auth.boundAgentId only — there is no argument that can
+// name another agent on it, so it cannot reach a row the caller does not own.
+function sessionView(row: Awaited<ReturnType<typeof listAgentSessions>>[number]) {
+  return {
+    id: row.id,
+    auth_kind: row.auth_kind,
+    seat: row.seat,
+    created_at: row.created_at,
+    last_seen_at: row.last_seen_at,
+    idle_expires_at: row.idle_expires_at,
+    absolute_expires_at: row.absolute_expires_at,
+    revoked_at: row.revoked_at,
+    revoke_reason: row.revoke_reason,
+    live: evaluateAgentSession(row).ok,
+  }
+}
+
 const toolListAgentSessions: ToolSpec = {
   name: 'list_agent_sessions',
-  scope: "agent's squad",
-  min: 'admin',
-  args: '{ agent: string (id|slug) }',
+  scope: "self (own sessions, agent-bound) or agent's squad (admin)",
+  min: 'authenticated',
+  args: '{ agent?: string (id|slug; admin only), self?: boolean (own sessions; implied when agent is omitted on an agent-bound token) }',
   inputSchema: {
     type: 'object',
-    properties: { agent: STRING_SCHEMA },
-    required: ['agent'],
+    properties: {
+      agent: STRING_SCHEMA,
+      self: { type: 'boolean', description: 'List only the calling agent\'s own sessions. Needs an agent-bound token.' },
+    },
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
+    const agentArg = str(args.agent)
+    if (args.agent !== undefined && args.agent !== null && !agentArg) return fail(400, 'invalid_args', 'agent must be a non-empty string')
+    const wantsSelf = args.self === true || (args.self === undefined && !agentArg && auth.boundAgentId != null)
+    if (wantsSelf) {
+      if (agentArg) return fail(400, 'invalid_args', 'self and agent are mutually exclusive')
+      if (!auth.boundAgentId) return fail(403, 'not_agent_session', 'self needs an agent-bound token')
+      const own = await resolveAgentRef(env, auth.boundAgentId)
+      if (!own.ok) return fail(404, 'agent_not_found')
+      const ownRows = await listAgentSessions(env, env.TENANT_SLUG, own.value.id)
+      const ownSessions = ownRows.map(sessionView)
+      return done({
+        agent: { id: own.value.id, slug: own.value.slug, name: own.value.name },
+        sessions: ownSessions,
+        live_count: ownSessions.filter((s) => s.live).length,
+        self: true,
+      })
+    }
+
+    // Non-self: the admin floor the dispatcher applied when spec.min was 'admin'.
+    if (!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')) {
+      return fail(403, 'forbidden', { need: 'admin' })
+    }
     if (auth.boundAgentId) return fail(403, 'operator_principal_required')
-    const agentRef = str(args.agent)
+    const agentRef = agentArg
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
     const agentResult = await resolveAgentRef(env, agentRef)
@@ -1133,18 +1179,7 @@ const toolListAgentSessions: ToolSpec = {
     }
 
     const rows = await listAgentSessions(env, env.TENANT_SLUG, agent.id)
-    const sessions = rows.map((row) => ({
-      id: row.id,
-      auth_kind: row.auth_kind,
-      seat: row.seat,
-      created_at: row.created_at,
-      last_seen_at: row.last_seen_at,
-      idle_expires_at: row.idle_expires_at,
-      absolute_expires_at: row.absolute_expires_at,
-      revoked_at: row.revoked_at,
-      revoke_reason: row.revoke_reason,
-      live: evaluateAgentSession(row).ok,
-    }))
+    const sessions = rows.map(sessionView)
     return done({
       agent: { id: agent.id, slug: agent.slug, name: agent.name },
       sessions,
@@ -1431,7 +1466,7 @@ export const toolGrantAgentCapability: ToolSpec = {
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
     if (!(await memberCanOnSquad(env, grants, squad, 'admin'))) {
-      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('grant_agent_capability') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
         squadDepartmentId,

@@ -26,7 +26,7 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -117,7 +117,7 @@ export interface CreateElevationRequestInput {
 
 export type CreateElevationRequestResult =
   | { ok: true; request: ElevationRequestRecord }
-  | { ok: false; reason: 'invalid_elevation_request'; detail: string }
+  | { ok: false; reason: 'invalid_elevation_request' | 'invalid_scope'; detail: string }
 
 /**
  * createElevationRequest — the agent-facing half. Every identity field
@@ -166,6 +166,24 @@ export async function createElevationRequest(
       ok: false,
       reason: 'invalid_elevation_request',
       detail: 'action:home_access must name an exact squad scope, never org or department',
+    }
+  }
+  // mupot#1674: an unknown scope id is refused at REQUEST time. Otherwise a
+  // human approves a grant naming a slug / typo / wrong-tenant id that can never
+  // match a real scope — a silent no-op approval. Ids only (slugs are refused
+  // with a hint, not resolved: the grant row must carry the canonical id the
+  // matcher compares against). org scope carries no id.
+  if (input.scopeType === 'department' || input.scopeType === 'squad') {
+    const table = input.scopeType === 'department' ? 'departments' : 'squads'
+    const exists = input.scopeId
+      ? await env.DB.prepare(`SELECT 1 AS ok FROM ${table} WHERE id = ?1 LIMIT 1`).bind(input.scopeId).first()
+      : null
+    if (!exists) {
+      return {
+        ok: false,
+        reason: 'invalid_scope',
+        detail: `${input.scopeType} scope_id must be the id of an existing ${input.scopeType} (a slug is not accepted here)`,
+      }
     }
   }
   if (!isValidElevationDuration(input.durationMinutes)) {
@@ -402,6 +420,41 @@ async function decidedByOrgAdminCoversScope(
   return planeCoversScope('org', scope)
 }
 
+/** decidedByHasElevationAuthority — the ONE authority predicate for deciding an
+ *  elevation request on a scope: org-admin plane (home squads excluded via
+ *  decidedByOrgAdminCoversScope) OR an admin capability grant on the scope.
+ *  Takes the already-resolved org-admin boolean so decideElevationRequest
+ *  (whose input carries `decidedByIsOrgAdmin`, not an AuthContext) and
+ *  canDecideElevation below share one body and cannot drift. */
+async function decidedByHasElevationAuthority(
+  env: Env,
+  decidedByIsOrgAdmin: boolean | undefined,
+  capabilities: CapabilityGrant[],
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+): Promise<boolean> {
+  return (
+    (await decidedByOrgAdminCoversScope(env, decidedByIsOrgAdmin, scopeType, scopeId)) ||
+    (await hasCapabilityOnDynamicScope(env, capabilities, scopeType, scopeId, 'admin'))
+  )
+}
+
+/** canDecideElevation (#1673) — may this caller decide (approve/deny) an
+ *  elevation request on this scope? Every list/visibility surface (API
+ *  pending + active lists, dashboard list + "Outside your authority" panel,
+ *  dashboard decision page) and the decide transaction itself go through this
+ *  predicate, so "listed" and "decidable" are the same fact (Security
+ *  Invariant 12: UI visibility follows effective authorization). */
+export async function canDecideElevation(
+  env: Env,
+  auth: AuthContext | null | undefined,
+  capabilities: CapabilityGrant[] | undefined,
+  scopeType: CapabilityScopeType,
+  scopeId: string | null | undefined,
+): Promise<boolean> {
+  return decidedByHasElevationAuthority(env, isOrgAdmin(auth), capabilities ?? [], scopeType, scopeId || null)
+}
+
 /**
  * decideElevationRequest — THE single-decision transaction. Security
  * Invariant 6 ("Approval is single-decision and atomic. Concurrent
@@ -462,24 +515,20 @@ export async function decideElevationRequest(
   // scope_type is not known statically here, and — per G-FP1b — a squad-scope
   // check must load a real SquadScope (kind included) rather than a bare id +
   // a separately-resolved department id, so an approver's org/department/role
-  // authority correctly answers false for a home squad. Deliberate exception:
-  // `decidedByIsOrgAdmin === true` still authorizes approving a home-scoped
-  // REQUEST — that is the intended "human decides, time-boxed, receipted"
-  // door (G-FP1b point 4), not a standing bypass of the home's own reads.
-  const decidedByHasAuthority =
-    (await decidedByOrgAdminCoversScope(
-      env,
-      input.decidedByIsOrgAdmin,
-      request.requested_scope_type as CapabilityScopeType,
-      request.requested_scope_id || null,
-    )) ||
-    (await hasCapabilityOnDynamicScope(
-      env,
-      input.decidedByCapabilities,
-      request.requested_scope_type as CapabilityScopeType,
-      request.requested_scope_id || null,
-      'admin',
-    ))
+  // authority correctly answers false for a home squad. The org-admin flag
+  // (`decidedByIsOrgAdmin`) is NOT an exception for home squads: it is gated by
+  // planeCoversScope('org', scope) (decidedByOrgAdminCoversScope), so an org
+  // admin with no grant on a member's home can neither approve nor deny a
+  // request scoped to it — INCLUDING `action:home_access`. The only durable
+  // approver for a home-scoped request is the home's own exact squad-scope
+  // admin grant (tests/home-access-elevation.test.ts).
+  const decidedByHasAuthority = await decidedByHasElevationAuthority(
+    env,
+    input.decidedByIsOrgAdmin,
+    input.decidedByCapabilities,
+    request.requested_scope_type as CapabilityScopeType,
+    request.requested_scope_id || null,
+  )
   if (!decidedByHasAuthority) {
     return {
       ok: false,
@@ -538,10 +587,7 @@ export async function decideElevationRequest(
   // above, so this re-check is over the same scope the hoisted gate cleared. It
   // stays as defence in depth and must honour the SAME two planes, or an owner
   // clears the first gate and is refused by the second.
-  if (
-    !(await decidedByOrgAdminCoversScope(env, input.decidedByIsOrgAdmin, scopeType, scopeId || null)) &&
-    !(await hasCapabilityOnDynamicScope(env, input.decidedByCapabilities, scopeType, scopeId || null, 'admin'))
-  ) {
+  if (!(await decidedByHasElevationAuthority(env, input.decidedByIsOrgAdmin, input.decidedByCapabilities, scopeType, scopeId || null))) {
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
 
@@ -1021,6 +1067,24 @@ const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
   no_matching_grant: 'no live elevation grant covers this action and scope for this exact session — ask an org/department/squad admin to approve request_elevation for it',
   approver_authority_lost: 'the human who approved this grant no longer holds the required capability on this scope — ask a current admin to approve a fresh elevation',
   approver_session_ended: 'the human who approved this grant is no longer signed in — ask a current admin to approve a fresh elevation',
+}
+
+/** Tools that consult an elevation action, and the action key each consults.
+ *  Text-only: used to name the door in a plain `need=<cap>` refusal. It grants
+ *  nothing and is not consulted by any authorization decision. */
+const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze({
+  project_create: 'action:workspace_project',
+  grant_agent_capability: 'action:manage_access',
+  mint_agent_token: 'action:mint_token',
+  create_squad: 'action:project_lifecycle',
+})
+
+/** elevationHint — the refusal hint naming request_elevation + the action key
+ *  for a tool that has an elevation door, or undefined for one that has none. */
+export function elevationHint(toolName: string): string | undefined {
+  const action = ELEVATION_ACTION_BY_TOOL[toolName]
+  if (!action) return undefined
+  return `an admin can approve a time-boxed elevation instead: call request_elevation with actions ["${action}"]`
 }
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {

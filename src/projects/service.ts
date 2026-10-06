@@ -58,6 +58,11 @@ export interface CreateProjectOpts {
   /** elevation_grants.id, when this create ran under a bounded action:*
    *  elevation rather than standing capability (migration 0166). */
   createdViaElevationGrant?: string
+  /** mupot#1674: attach this squad to the new project with `write` access in
+   *  the SAME D1 batch as the project INSERT (no orphan window). Like the two
+   *  fields above it is a TypeScript-reference-only opt, never request input:
+   *  the CALLER must already have verified the creator belongs to the squad. */
+  attachSquadId?: string
 }
 
 export interface UpdateProjectInput {
@@ -302,7 +307,7 @@ export async function createProject(
   }
 
   try {
-    const result = await env.DB.prepare(
+    const insertStmt = env.DB.prepare(
       `INSERT INTO projects
        (id, slug, name, description, goal, status, parent_project_id, target_date,
         cycle_boundary_at, stalled, stall_threshold_days, completion_proposed_by,
@@ -315,8 +320,25 @@ export async function createProject(
       project.cycle_boundary_at, project.stalled, project.stall_threshold_days, project.completion_proposed_by,
       project.repo_url, project.worker_name, project.live_url, project.assigned_squad_id, project.deploy_status,
       project.created_by_member_id, project.created_via_elevation_grant, project.created_at, project.updated_at,
-    ).run()
-    if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
+    )
+    // One batch = one transaction: the project row and its creator-squad edge
+    // land together or not at all (statements built by the shared access
+    // writer, never hand-rolled SQL).
+    // The edge is INSERT..SELECT guarded on the squad's CURRENT state (not
+    // archived, not home), so a squad archived between the caller's check and
+    // this batch silently gets no edge rather than a stale one (the project is
+    // still created; the caller reports whether the edge landed). A 'write'
+    // edge never needs the provider-binding invalidation the shared writer
+    // appends for downgrades, so this single statement is equivalent for it.
+    const statements = opts.attachSquadId
+      ? [insertStmt, env.DB.prepare(
+          `INSERT INTO project_squad_access (project_id, squad_id, access_level, granted_at)
+           SELECT ?1, id, 'write', ?3 FROM squads
+            WHERE id = ?2 AND status != 'archived' AND kind != 'home'`,
+        ).bind(project.id, opts.attachSquadId, now)]
+      : [insertStmt]
+    const results = statements.length > 1 ? await env.DB.batch(statements) : [await insertStmt.run()]
+    if (!wrote(results[0])) return { ok: false, error: 'receipt_failed' }
   } catch (error) {
     if (isUniqueViolation(error)) return { ok: false, error: 'slug_taken' }
     if (isForeignKeyViolation(error)) return { ok: false, error: 'parent_not_found' }

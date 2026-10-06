@@ -76,7 +76,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     key: 'action:manage_access',
     enforced: true,
     label: 'Manage access',
-    description: 'Grant/revoke capabilities, add/remove squad members, edit project↔squad access.',
+    description: 'Grant agent capabilities on a squad you have been granted. Does NOT cover project↔squad access edits (project_squad_set is standing org admin only).',
     effect: 'reversible',
     effectNote: 'Access edges and capability grants can be edited or removed by standing authority after expiry.',
   },

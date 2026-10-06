@@ -2772,7 +2772,8 @@ dashboardApp.post('/admin/github/execute-task', async (c) => {
     title: typeof body.title === 'string' ? body.title : '',
     body: typeof body.bodyText === 'string' ? body.bodyText : undefined,
   })
-  return c.json(result, result.ok ? 200 : 400)
+  const refused = !result.ok && (result.error === 'office_publish_unresolved' || result.error === 'invalid_transition')
+  return c.json(result, result.ok ? 200 : refused ? 409 : 400)
 })
 
 // POST /admin/github/import-project — Projects v2 ↔ pot bridge: import board items assigned to

@@ -1362,11 +1362,13 @@ describe('team_bootstrap successor (mupot#1498 P0/P1/P2/P3, PR #1510 round-2 gat
     // never even attempted once the project limb refused, so no orphan squad.
     const squad = await env.DB.prepare("SELECT 1 FROM squads WHERE slug = 'leadproj-sqd'").first()
     expect(squad).toBeNull()
-    // No edge, no receipt claiming this project as team_bootstrap's own.
-    const edge = await env.DB.prepare('SELECT COUNT(*) AS n FROM project_squad_access WHERE project_id = ?')
+    // No edge, no receipt claiming this project as team_bootstrap's own. The
+    // ONLY edge is the planter's own squad, attached by project_create itself
+    // (mupot#1674: a creator's own squad is attached in the same write).
+    const edges = await env.DB.prepare('SELECT squad_id, access_level FROM project_squad_access WHERE project_id = ?')
       .bind(plantedProject.project.id)
-      .first<{ n: number }>()
-    expect(edge?.n).toBe(0)
+      .all<{ squad_id: string; access_level: string }>()
+    expect(edges.results).toEqual([{ squad_id: LEAD_SQUAD_ID, access_level: 'write' }])
   })
 
   it('P0(b): a squad planted by a squad lead under a department-scoped elevation is EMPTY (zero agents, zero capabilities) yet still refused — provenance replaced emptiness as the adoption ground', async () => {

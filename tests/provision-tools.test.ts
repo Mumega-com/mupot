@@ -1006,6 +1006,14 @@ describe('provision tools — operator-principal invariant is exhaustive', () =>
     // (member-grant self-caller reaching the lane through invokeTool) — lives
     // in tests/agent-self-update.test.ts, not here.
     'update_agent',
+    // mupot#1664: list_agent_sessions grew a SELF path (`self: true`, or `agent` omitted
+    // on a bound token) that returns only auth.boundAgentId's own sessions, so with the
+    // empty args this loop sends it classifies as self and cannot be the literal first
+    // refusal. Every NON-self path is unchanged: the admin floor is re-applied inline and
+    // a bound caller naming an agent (or passing self:false) still gets
+    // operator_principal_required. Covered in tests/onboard-ergonomics.test.ts and
+    // tests/agent-sessions-mcp-integration.test.ts.
+    'list_agent_sessions',
   ])
 
   const boundAgentAuth: AuthContext = {
