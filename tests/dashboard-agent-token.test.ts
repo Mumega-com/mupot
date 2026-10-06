@@ -32,6 +32,7 @@ import type { Env } from '../src/types'
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
+import { mcpRequest } from './helpers/mcp-call'
 
 // ── test fixtures ─────────────────────────────────────────────────────────────
 
@@ -438,7 +439,7 @@ async function callReplacementMint(
   priorTokenId: string,
   overrides: Record<string, unknown> = {},
 ): Promise<Response> {
-  return mcpApp.request('https://mupot.mumega.com/', {
+  return mcpRequest('https://mupot.mumega.com/', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: 'Bearer replacement-surface-operator-token' },
     body: JSON.stringify({

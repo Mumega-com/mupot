@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 // connect MCP tool — #128 self-name-to-bind (cold→hot path).
 //
@@ -156,7 +157,7 @@ function makeEnv(opts: Opts = {}): Env {
 }
 
 async function callConnect(env: Env, agentName: string, auth = true) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://mcp.acme-example.co/',
     {
       method: 'POST',
@@ -181,7 +182,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
   // ── happy path ──────────────────────────────────────────────────────────────
 
   it('advertised in tools/list', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -286,7 +287,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
   })
 
   it('agent_name required — missing field rejected', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -341,7 +342,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
   })
 
   it('rejects extra fields (additionalProperties: false)', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -364,7 +365,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
 
   it('QA-1: boot_context unminted next_step mentions connect as the immediate path', async () => {
     const env = makeEnv({ boundAgentId: null })
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -395,7 +396,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
 
   it('QA-1: orient without agent arg on unbound token → refusal includes connect instruction', async () => {
     const env = makeEnv({ boundAgentId: null })
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -421,7 +422,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
   it('QA-2 regression: boot_context always reports identity_status (unminted or minted)', async () => {
     // unminted
     const unmintedEnv = makeEnv({ boundAgentId: null })
-    const r1 = await mcpApp.request(
+    const r1 = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -440,7 +441,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
 
     // minted
     const mintedEnv = makeEnv({ boundAgentId: 'agent-x' })
-    const r2 = await mcpApp.request(
+    const r2 = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',
@@ -461,7 +462,7 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
   // ── QA finding 3: no real tenant slugs in any tool description ───────────────
 
   it('QA-3: tools/list descriptions contain no real tenant slugs (viamar, gaf, digid)', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://mcp.acme-example.co/',
       {
         method: 'POST',

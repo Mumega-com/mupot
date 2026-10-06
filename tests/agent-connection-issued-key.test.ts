@@ -7,6 +7,7 @@ import { dashboardApp } from '../src/dashboard'
 import { mcpApp } from '../src/mcp'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { mcpRequest } from './helpers/mcp-call'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'tenant-a'
@@ -126,7 +127,7 @@ describe('issued agent connection key end-to-end', () => {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ response: Response; body: RpcSuccess<T> }> {
-    const response = await mcpApp.request(
+    const response = await mcpRequest(
       'https://malicious-request-host.invalid/',
       {
         method: 'POST',

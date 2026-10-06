@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mcpApp } from '../src/mcp'
 import type { CapabilityGrant, Env } from '../src/types'
+import { mcpRequest } from './helpers/mcp-call'
 
 // deactivate_agent is the inverse of create_agent: a gated, auditable way to retire a
 // dead/junk agent (or a duplicate identity) without a raw-D1 hand-edit. These tests
@@ -136,7 +137,7 @@ function makeEnv(opts: Opts = {}, captured: Captured[] = []): Env {
 }
 
 async function call(name: string, args: Record<string, unknown>, env: Env, auth = true) {
-  return mcpApp.request(
+  return mcpRequest(
     'https://agents.digid.ca/',
     {
       method: 'POST',
@@ -152,7 +153,7 @@ async function call(name: string, args: Record<string, unknown>, env: Env, auth 
 
 describe('deactivate_agent — advertised', () => {
   it('appears in tools/list', async () => {
-    const res = await mcpApp.request(
+    const res = await mcpRequest(
       'https://agents.digid.ca/',
       {
         method: 'POST',

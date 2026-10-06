@@ -149,7 +149,16 @@ async function mcpRpc(
   if (text.length > MCP_MAX_RESPONSE_BYTES) throw new Error('mcp_response_too_large')
   const json = JSON.parse(text) as { result?: unknown; error?: { message?: string } }
   if (json.error) throw new Error(`mcp_error: ${json.error.message ?? 'unknown'}`)
-  return json.result
+  // MCP tool execution errors ride a 200 with result.isError=true (mupot#1667): a refusal is a
+  // failure, never a success-shaped result for act()/read().
+  const r = json.result
+  if (r && typeof r === 'object' && (r as { isError?: unknown }).isError === true) { // narrowed by the typeof/isError checks
+    const sc = (r as { structuredContent?: { status?: unknown; error?: unknown } }).structuredContent
+    const status = typeof sc?.status === 'number' ? sc.status : 'unknown'
+    const error = typeof sc?.error === 'string' ? sc.error : 'tool_error'
+    throw new Error(`mcp_tool_error_${status}: ${error}`)
+  }
+  return r
 }
 
 /** Coerce an MCP tools/call result into ResourceItem[] (ChatGPT search shape first). */
