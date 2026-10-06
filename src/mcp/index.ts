@@ -201,6 +201,8 @@ import {
   eventCatalogue,
   eventsProtocolCapabilities,
   isEventsEnabled,
+  isModernProtocolRequest,
+  withResultType,
   negotiateProtocolVersion,
   serverDiscoverResult,
 } from './events'
@@ -6628,19 +6630,26 @@ async function handleJsonRpc(
   // events there would point at a read path that cannot work; profile mode stays byte-identical
   // to what #1624 shipped regardless of EVENTS_ENABLED.
   const eventsOn = profile === undefined && isEventsEnabled(c.env)
+  // 2026-07-28 (SEP-2322): every result carries resultType. ONE place: all result returns below go
+  // through `ok`, which stamps it when this request is modern (initialize asking for 2026-07-28, or any
+  // request carrying MCP-Protocol-Version / _meta protocolVersion 2026-07-28). Legacy requests and
+  // flag-off requests are byte-identical. JSON-RPC errors are not results and carry no resultType.
+  const modern = isModernProtocolRequest(eventsOn, c.req.header('mcp-protocol-version'), body.params) ||
+    (method === 'initialize' && negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION)
+  const ok = (rid: unknown, result: unknown): Response => rpcResult(rid, modern ? withResultType(result) : result)
 
   if (method === 'initialize') {
     // Dual-version negotiation (mupot#1618): ONLY a client that explicitly asks for 2026-07-28
     // gets it. Every other request takes the untouched legacy branch below — byte-identical.
     if (negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION) {
-      return rpcResult(id, {
+      return ok(id, {
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
         serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
         instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
       })
     }
-    return rpcResult(id, {
+    return ok(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
@@ -6659,9 +6668,11 @@ async function handleJsonRpc(
       if (!profileAuth || profileAuth.tenant !== c.env.TENANT_SLUG) {
         return rpcError(id, -32001, 'unauthenticated', undefined, 401)
       }
-      return rpcResult(id, { tools: profileToolList() })
+      return ok(id, { tools: profileToolList() })
     }
-    return rpcResult(id, { tools: TOOLS.map(mcpTool) })
+    // 2026-07-28 (SEP-2549): tools/list is a CacheableResult — ttlMs + cacheScope REQUIRED. 0/private =
+    // "do not reuse", the conservative value (no freshness claim is made for the registry).
+    return ok(id, { tools: TOOLS.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
   }
 
   if (method === 'tools/call') {
@@ -6696,7 +6707,7 @@ async function handleJsonRpc(
       ...(profile === 'needs-you' ? { sideEffectFree: true } : {}),
     }
     const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
-    if (outcome.ok) return rpcResult(id, mcpCallResult(outcome.tool as string, outcome.result))
+    if (outcome.ok) return ok(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     // mupot#1667: a tool-level refusal is an EXECUTION error, not a transport/protocol error. Per the
     // MCP spec it travels as HTTP 200 with result.isError=true so connector harnesses (claude.ai,
@@ -6714,13 +6725,13 @@ async function handleJsonRpc(
     if (outcome.status >= 500) {
       return rpcError(id, jsonRpcCodeForToolFailure(outcome.status, outcome.error), outcome.error, outcome.detail, outcome.status)
     }
-    return rpcResult(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
+    return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
   }
 
   // Bearerless like initialize: discloses only protocol versions + capability names. Flag OFF
   // (default) falls through to method_not_found, exactly as on main.
   if (method === 'server/discover' && eventsOn) {
-    return rpcResult(id, serverDiscoverResult())
+    return ok(id, serverDiscoverResult())
   }
 
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
@@ -6747,7 +6758,7 @@ async function handleJsonRpc(
           return spec.min === 'authenticated' || hasWorkspaceAdmin(auth) || holdsCapabilityFloor(auth, spec.min)
         },
       })
-      return rpcResult(id, { events: catalogue })
+      return ok(id, { events: catalogue })
     }
 
     // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on, on the
@@ -6757,7 +6768,7 @@ async function handleJsonRpc(
     const out = method === 'events/subscribe'
       ? await eventsSubscribe(c.env, auth, floorOk, body.params)
       : await eventsUnsubscribe(c.env, auth, floorOk, body.params)
-    return out.ok ? rpcResult(id, out.result) : rpcError(id, out.code, out.message, out.data, out.status)
+    return out.ok ? ok(id, out.result) : rpcError(id, out.code, out.message, out.data, out.status)
   }
 
   return rpcError(id, -32601, 'method_not_found', method)
