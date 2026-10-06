@@ -20,6 +20,8 @@ TENANT_SLUG = "mumega"          # your org slug
                                  # only ever used on behalf of the owning tenant, never a
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
+# GATE_STALL_THRESHOLD_MINUTES = "30"  # re-send the gate wake for a review task with no verdict after this long (mupot#1705)
+# GATE_STALL_MAX_REWAKES = "3"         # re-wakes per review episode, then the stall is only surfaced in Needs You (stuck)
 IDP_PROVIDER = "google"           # google | telegram
                                   # NOT `OAUTH_PROVIDER` — that binding name is RESERVED by
                                   # @cloudflare/workers-oauth-provider, which injects its helpers
