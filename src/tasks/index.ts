@@ -1437,6 +1437,58 @@ function memberAffiliated(
   return hit
 }
 
+// mupot#1702 — the ONE definition of "does this caller hold the task's gate_owner lane live".
+// Extracted verbatim from evaluateVerdictGates (which now calls it), so the verdict write path
+// and the receipt-visibility read path (canViewTaskReceipts) can never drift apart.
+//   - gate:agent-self-completion: ONLY the assignee or an org owner/admin (a grant is NOT
+//     authority for it - BLOCK-1, kasra-review 2026-08-13).
+//   - every other gate_owner: callerHoldsGateCapability (live grant JOIN active principal,
+//     plus the legacy owner/admin escape).
+// It deliberately excludes the surface-cap and self-verdict rules: those are about WRITING a
+// verdict, not about holding the lane.
+async function holdsTaskGateLane(
+  env: Env,
+  auth: AuthContext,
+  task: VerdictGateTask,
+  cache?: VerdictGateCache,
+): Promise<boolean> {
+  const principal = verdictPrincipal(auth)
+  if (task.gate_owner === 'gate:agent-self-completion') {
+    return principal.id === task.assignee_agent_id || legacyOwnerAdmin(auth)
+  }
+  const gateCacheKey = cache ? `${principal.type}:${principal.id}:${task.gate_owner}` : null
+  const cachedGate = gateCacheKey !== null ? cache?.gateCapability.get(gateCacheKey) : undefined
+  if (cachedGate) return cachedGate
+  const hasGatePromise = callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner)
+  if (cache && gateCacheKey !== null) cache.gateCapability.set(gateCacheKey, hasGatePromise)
+  return hasGatePromise
+}
+
+/**
+ * mupot#1702 - the ONE chokepoint that decides who may read a task's dispatch + runtime
+ * receipt timeline (task_get). Three principals, nobody else (keeps #1665's narrowing):
+ *   (a) the assignee agent (token-bound),
+ *   (b) a principal holding the task's gate_owner lane LIVE (holdsTaskGateLane - the same
+ *       predicate evaluateVerdictGates uses; a revoked grant or a paused/suspended holder fails),
+ *   (c) org admins (isOrgAdmin: legacy owner/admin or an org-scope admin grant).
+ * Callers must already have passed the row-visibility gate (canReadTask); this is an additional
+ * narrowing on top of it, never a substitute.
+ */
+export async function canViewTaskReceipts(
+  env: Env,
+  auth: AuthContext,
+  task: { squad_id: string; gate_owner: string | null; assignee_agent_id: string | null },
+): Promise<boolean> {
+  if (auth.boundAgentId && task.assignee_agent_id === auth.boundAgentId) return true
+  if (isOrgAdmin(auth)) return true
+  if (!task.gate_owner) return false
+  return holdsTaskGateLane(env, auth, {
+    squad_id: task.squad_id,
+    gate_owner: task.gate_owner,
+    assignee_agent_id: task.assignee_agent_id,
+  })
+}
+
 export async function evaluateVerdictGates(
   env: Env,
   auth: AuthContext,
@@ -1447,27 +1499,8 @@ export async function evaluateVerdictGates(
   const principal = verdictPrincipal(auth)
   const isSelfCompletionGate = task.gate_owner === 'gate:agent-self-completion'
 
-  // BLOCK-1 fix (kasra-review 2026-08-13, proof-of-exploit): gate:agent-self-completion
-  // is closeable ONLY by the completing agent (the assignee) or an org owner/admin —
-  // the gate grant is explicitly NOT authority for this one gate (the D2 universal
-  // mint grant would otherwise let any agent approve any other agent's task).
-  if (isSelfCompletionGate) {
-    if (principal.id !== task.assignee_agent_id && !legacyOwnerAdmin(auth)) {
-      return { allowed: false, code: 'no_gate_capability', principal }
-    }
-  } else {
-    const gateCacheKey = cache ? `${principal.type}:${principal.id}:${task.gate_owner}` : null
-    let hasGatePromise: Promise<boolean>
-    const cachedGate = gateCacheKey !== null ? cache?.gateCapability.get(gateCacheKey) : undefined
-    if (cachedGate) {
-      hasGatePromise = cachedGate
-    } else {
-      hasGatePromise = callerHoldsGateCapability(env, auth, task.squad_id, task.gate_owner)
-      if (cache && gateCacheKey !== null) cache.gateCapability.set(gateCacheKey, hasGatePromise)
-    }
-    if (!(await hasGatePromise)) {
-      return { allowed: false, code: 'no_gate_capability', principal }
-    }
+  if (!(await holdsTaskGateLane(env, auth, task, cache))) {
+    return { allowed: false, code: 'no_gate_capability', principal }
   }
 
   // Surface-cap gate (#106): approving a gate:loops task (outreach queue) requires

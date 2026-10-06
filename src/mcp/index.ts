@@ -36,7 +36,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
-import { evaluateVerdictGates } from '../tasks/index'
+import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
 import {
   persistGateWakeNotice,
@@ -110,6 +110,8 @@ import {
   TaskDispatchRuntimeReceiptError,
   loadLatestDispatchReceiptsForTasks,
   loadDispatchStatus,
+  listTaskDispatchReceiptTimeline,
+  type TaskDispatchReceiptTimeline,
   resolveDecidedByDisplay,
   type LatestDispatchStatus,
   adminResetDispatchLease,
@@ -1332,7 +1334,7 @@ const toolTaskGet: ToolSpec = {
     // or execution receipt id (Athena gate on #1665: execution_receipt_id leaked via the row).
     const isAssignee = !!auth.boundAgentId && full.assignee_agent_id === auth.boundAgentId
     const row: Record<string, unknown> = Object.fromEntries(TASK_GET_FIELDS.map((f) => [f, full[f] ?? null]))
-    if (!isAssignee) row.execution_receipt_id = null
+    row.execution_receipt_id = null // restored below only for a principal canViewTaskReceipts admits
     // Canonical latest-verdict reader (tasks/service.ts) - carries reversed_at; same ordering
     // every reversal path trusts. decided_by is shown in the REST timeline's display form.
     const v = await findLatestVerdict(env, full.id)
@@ -1345,12 +1347,29 @@ const toolTaskGet: ToolSpec = {
           reversed_at: v.reversed_at ?? null,
         }
       : null
+    // mupot#1702: receipt visibility has ONE chokepoint (canViewTaskReceipts) - the assignee,
+    // a live holder of the task's gate_owner lane, or an org admin. A gate can't verify what it
+    // can't see. Non-assignee viewers get the same sanitised timeline (never credential_id,
+    // member_id or request_digest - those are not in the timeline projection at all).
+    const canViewReceipts = isAssignee || await canViewTaskReceipts(env, auth, {
+      squad_id: full.squad_id,
+      gate_owner: typeof full.gate_owner === 'string' ? full.gate_owner : null,
+      assignee_agent_id: typeof full.assignee_agent_id === 'string' ? full.assignee_agent_id : null,
+    })
     let latestDispatch: LatestDispatchStatus | null = null
-    if (isAssignee) {
+    let dispatchTimeline: TaskDispatchReceiptTimeline | null = null
+    if (canViewReceipts) {
+      row.execution_receipt_id = full.execution_receipt_id ?? null
       const info = (await loadLatestDispatchReceiptsForTasks(env, [full.id])).get(full.id)
       latestDispatch = info ? await loadDispatchStatus(env, info.dispatch_receipt_id) : null
+      dispatchTimeline = await listTaskDispatchReceiptTimeline(env, full.id, 20, { withReceiptIds: true })
     }
-    return done({ task: row, latest_verdict: latestVerdict, latest_dispatch_receipt: latestDispatch })
+    return done({
+      task: row,
+      latest_verdict: latestVerdict,
+      latest_dispatch_receipt: latestDispatch,
+      dispatch_timeline: dispatchTimeline,
+    })
   },
 }
 
