@@ -78,7 +78,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
     'send', 'broadcast', 'squad_message', 'wake_agent', 'task_create', 'task_list', 'task_update', 'task_verdict',
     'task_verdict_reverse', 'task_dispatch', 'task_submit_result', 'remember', 'squad_remember', 'project_remember',
     'presence_register', 'presence_heartbeat', 'presence_deregister', 'check_in', 'mint_agent_token', 'revoke_agent_token',
-    'archive_row', 'unarchive_row', 'flight_dispatch', 'flight_land', 'flight_list', 'office.health', 'office.publish_post',
+    'archive_row', 'unarchive_row', 'flight_dispatch', 'flight_land', 'office.health', 'office.publish_post',
     'secret_env_request', 'supabase_mutate', 'create_agent', 'deactivate_agent', 'routine_create', 'routine_run_now',
     'request_elevation', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
   ]
@@ -100,7 +100,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
   const KNOWN_EXTERNAL = [
     'task_create', 'task_update', 'task_submit_result', 'project_wiki', 'office.publish_post', 'office.health', 'cursor_dispatch',
     'cursor_run_status', 'pot_provision', 'pot_list', 'supabase_connect', 'supabase_schema', 'supabase_query', 'supabase_mutate',
-    'agent_lifecycle', 'addon_setup',
+    'agent_lifecycle', 'addon_setup', 'wake_agent',
   ]
   it.each(KNOWN_EXTERNAL)('%s is openWorld', (name) => {
     expect(TOOL_ANNOTATION_ROWS[name]?.openWorldHint, name).toBe(true)
@@ -117,6 +117,52 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
   it.each(KNOWN_PURE_READS)('%s is readOnly and closed-world', (name) => {
     expect(TOOL_ANNOTATION_ROWS[name]?.readOnlyHint, name).toBe(true)
     expect(TOOL_ANNOTATION_ROWS[name]?.openWorldHint, name).toBe(false)
+  })
+})
+
+// mupot#1718 Athena P1-2: pin the WHOLE table, not hand-picked samples. Any relabel of any tool, in
+// any direction, must change this list in the same diff (a reviewer then sees it). Lists generated
+// from the classified table and reviewed row by row against the evidence strings.
+describe('full-table pin: every readOnly / destructive / openWorld label is explicit', () => {
+  const ALL_READ_ONLY = [
+    'archive_plan_expand', 'athena_review_pr', 'cursor_run_status', 'elevation_status',
+    'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
+    'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'inbox_consumer_status',
+    'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
+    'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
+    'presence_list', 'project_context', 'project_get', 'project_list', 'project_recall', 'project_squad_list',
+    'project_wiki', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
+    'routine_run_list', 'runner_list', 'secret_env_status', 'squad_member_list', 'squad_recall', 'status',
+    'supabase_query', 'supabase_schema', 'task_board', 'task_get', 'task_intake_audit',
+  ]
+  const ALL_DESTRUCTIVE = [
+    'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
+    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_land',
+    'flight_reap_stalled', 'grant_agent_capability', 'loop_control', 'loop_set_status', 'mint_agent_token',
+    'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
+    'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
+    'project_update', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
+    'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
+    'routine_update', 'runner_record', 'secret_env_request', 'set_agent_inbox_consumer',
+    'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
+    'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
+    'update_agent', 'update_squad',
+  ]
+  const ALL_OPEN_WORLD = [
+    'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'office.health',
+    'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki',
+    'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
+    'task_submit_result', 'task_update', 'wake_agent',
+  ]
+  const names = Object.keys(TOOL_ANNOTATION_ROWS)
+  const pick = (k: 'readOnlyHint' | 'destructiveHint' | 'openWorldHint') =>
+    names.filter((n) => TOOL_ANNOTATION_ROWS[n][k]).sort()
+
+  it('the readOnly set is exactly the pinned list', () => expect(pick('readOnlyHint')).toEqual([...ALL_READ_ONLY].sort()))
+  it('the destructive set is exactly the pinned list', () => expect(pick('destructiveHint')).toEqual([...ALL_DESTRUCTIVE].sort()))
+  it('the openWorld set is exactly the pinned list', () => expect(pick('openWorldHint')).toEqual([...ALL_OPEN_WORLD].sort()))
+  it('readOnly and destructive never overlap', () => {
+    for (const n of ALL_READ_ONLY) expect(ALL_DESTRUCTIVE, n).not.toContain(n)
   })
 })
 

@@ -19,14 +19,25 @@
 //                 successful /mcp call of every tool, so it cannot distinguish tools and is not
 //                 counted; a tool is judged on what its OWN handler writes. (The needs-you
 //                 profile runs with ToolCtx.sideEffectFree and suppresses even that bump.)
+//                 SECOND carve-out (Athena #1718 P1-1, one rule for every reader): an
+//                 ephemeral, caller-bound PAGINATION CURSOR stored with a TTL (KV
+//                 SESSIONS.put of the next-page position, readable only by the same caller)
+//                 is not counted. It changes no state any other caller can observe; it is
+//                 the server-side half of returning a page. Applies identically to
+//                 flight_list and needs_you_list.
 //  destructiveHint true if the tool can delete, revoke, archive, deactivate, reset, kill, or
 //                 overwrite existing state (updates to an existing row's content/config/
 //                 verdict, status moves that end something, secret/credential replacement).
 //                 Additive INSERTs and the caller's own liveness/identity self-reports are not.
+//                 An upsert that can overwrite an existing row's user-visible content (ON
+//                 CONFLICT DO UPDATE of status/evidence/config) IS destructive; a recomputed
+//                 accounting rollup (cost totals derived from reported usage) is not.
 //  openWorldHint  true if the handler reaches a system outside this pot's own D1/KV/R2/DO/
 //                 Vectorize/Workers-AI bindings: Cloudflare API, GitHub, Inkwell/WordPress,
-//                 Supabase, Cursor, Jev. Asynchronous bus delivery to other agents is NOT
-//                 counted as open-world (the handler itself makes no external call).
+//                 Supabase, Cursor, Jev, or a model provider via the AI Gateway — including
+//                 a SYNCHRONOUS call made by a Durable Object the handler awaits (wake_agent).
+//                 Asynchronous bus delivery to other agents is NOT counted as open-world (the
+//                 handler itself makes no external call and does not wait on one).
 //
 // A test (tests/mcp-tool-annotations.test.ts) fails if a registered tool has no row here, if a
 // row names no registered tool, or if a known-writing tool is marked readOnly.
@@ -61,7 +72,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // ── flights ────────────────────────────────────────────────────────────────────────────────
   flight_dispatch: ADD('dispatchFlight INSERTs flights + sendAgentMessage INSERT agent_messages (messages.ts:426)'),
   flight_get: RO('getFlight SELECT only (index.ts:3509)'),
-  flight_list: ADD('issueFlightCursor SESSIONS.put pagination cursor when more pages (index.ts:3110); ephemeral but a KV write, so not readOnly'),
+  flight_list: RO('SELECTs; the only write is the TTL\'d caller-bound pagination cursor (issueFlightCursor, index.ts:3110), covered by the cursor carve-out'),
   flight_land: MUT('landGovernedFlight UPDATE flights status=landed + INSERT flight_event_outbox (flight/service.ts:418,543)'),
   flight_reap_stalled: MUT('reapStalledFlight UPDATE flights / routine_runs + INSERT reap receipt (flight/watchdog.ts:403,413,476)'),
 
@@ -88,7 +99,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   project_recall: RO('createMemory.recall read path (memory/index.ts:60)'),
 
   // ── wake / routing / messaging ─────────────────────────────────────────────────────────────
-  wake_agent: ADD('routeAgentWake POSTs AgentDO /wake, advancing the agent DO cycle/alarm (agents/wake-routing.ts:123)'),
+  wake_agent: ADDX('routeAgentWake POSTs AgentDO /wake (agents/wake-routing.ts:123); the DO runs one cortex cycle synchronously via createModel (agents/agent-do.ts:16,136) which calls the model provider through the AI Gateway, and advances the DO cycle/alarm'),
   router_tick: MUT('runRouterTick UPDATE tasks (claims/assigns) + bus emit; dry_run skips only some writes (router/engine.ts:123,197)'),
   execution_meter_status: RO('getAuthorizedMeterStatus SELECT only (agents/meter.ts:287)'),
   squad_message: ADD('createBus().emit queue send (index.ts:4148)'),
@@ -113,7 +124,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   end_agent_session: MUT('revokeAgentSessionByCredential revokes the caller session (index.ts:5313)'),
   request_elevation: ADD('createElevationRequest INSERT elevation_requests (auth/elevation.ts:202)'),
   elevation_status: RO('SELECT elevation requests/grants only (index.ts:5421)'),
-  status: RO('SELECTs + AgentDO /status read of storage only (index.ts:5588; agents/agent-do.ts:417)'),
+  status: RO('SELECTs + AgentDO /status read of storage only (index.ts:5588; agents/agent-do.ts:417); opening the DO runs an idempotent CREATE TABLE IF NOT EXISTS schema init (agent-do.ts:95), not state'),
   fleet_agent_get: RO('readFleetAgentRow SELECT only (index.ts:5612; fleet/registry.ts:625)'),
   // boot_context on the FULL /mcp writes: touchPresence (index.ts:5820) and, with runtime/model
   // args, reportSelfAtBoot UPDATE fleet_agents (index.ts:5850). On the needs-you profile it runs
@@ -134,7 +145,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   project_squad_list: RO('SELECT only (mcp/projects.ts:567)'),
   project_squad_set: MUT('upsertProjectSquadAccess overwrites access_level (mcp/projects.ts:626)'),
   project_squad_remove: MUT('removeProjectSquadAccess DELETE (mcp/projects.ts:654)'),
-  project_deploy: ADD('deployProject recordProjectDeployment INSERT receipt only; no external call in deploy.ts (projects/deploy.ts:196)'),
+  project_deploy: ADD('deployProject: UPDATE projects.deploy_status (projects/deploy.ts:95), createTask (:120), createFlight (:141), recordProjectDeployment INSERT receipt (:196); no external call in deploy.ts'),
 
   // ── org / agents / tokens ──────────────────────────────────────────────────────────────────
   create_department: ADD('INSERT departments (org/service.ts:141)'),
@@ -220,12 +231,12 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   routine_run_answer: ADD('answerRoutineRun UPDATE routine_run_actions/runs + INSERT event (routines/actions.ts:1880-1906); records an answer'),
   routine_run_cancel: MUT('cancelRoutineRun terminates the run (routines/actions.ts:2070-2084)'),
   routine_proposal_submit: ADD('submitRoutineProposal records a proposal (routines/actions.ts:2127)'),
-  report_run_usage: ADD('UPDATE flights.cost_micro_usd + routine_runs cost + outbox payload (mcp/routines.ts:414); accounting rollup'),
-  needs_you_list: RO('listNeedsYou SELECT only (attention/service.ts:855)'),
+  report_run_usage: ADD('UPDATE flights.cost_micro_usd + routine_runs cost + outbox payload (mcp/routines.ts:414,498): a recomputed accounting rollup from reported usage, not an overwrite of user content, so additive by rule'),
+  needs_you_list: RO('listNeedsYou SELECTs (attention/service.ts:855); the only write is the TTL\'d caller-bound pagination cursor (issueCursor, attention/service.ts:772) when more pages exist, covered by the cursor carve-out'),
   project_access_reintake_authorize: ADD('INSERT project_access_grant_receipts (mcp/routines.ts:582)'),
 
   // ── runners / flight spine ─────────────────────────────────────────────────────────────────
-  runner_record: ADD('recordRunner INSERT runner_receipts ON CONFLICT(id) DO UPDATE, idempotent (runners/service.ts:98-103)'),
+  runner_record: MUT('recordRunner INSERT runner_receipts ON CONFLICT(id) DO UPDATE SET status, ended_at, evidence_summary, verdict_line, log_url: overwrites an existing receipt row (runners/service.ts:103-109)'),
   runner_list: RO('listRunners SELECT only (runners/service.ts:145)'),
   objective_accept: ADD('acceptObjective INSERT objectives + acceptance keys + audit (flight-spine/objectives.ts:469,605)'),
   objective_get: RO('visibleObjective SELECT only (mcp/flight-spine.ts:210)'),
