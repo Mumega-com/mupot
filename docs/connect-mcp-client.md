@@ -48,8 +48,15 @@ Show-once, never re-fetchable — copy it when it's shown.
 
 - **Dashboard:** open your pot → **Connect** card → mint. It prints the raw token
   once plus a ready-to-paste config snippet for your client.
-- **Programmatically:** call the `mint_agent_token` tool (requires admin on the
-  target squad). It returns the raw token exactly once and the `mcp_endpoint`.
+- **Programmatically (two legs):** call the `mint_agent_token` tool (requires admin on the
+  target squad). It does **not** return the raw token (mupot#987); it returns a short-lived,
+  single-use `credential_claim` (`claim_id`) and the `mcp_endpoint`. The **same member** then
+  calls `reveal_credential_claim { claim_id }` within 10 minutes
+  (`CLAIM_TTL_SECONDS = 600`, `src/auth/credential-claim.ts:52`) to receive the raw token
+  exactly once. After the reveal, or after the claim expires, the token cannot be fetched
+  again; mint a new one. Another caller, a second reveal and an expired claim all get the
+  same refusal. `bootstrap_self` and `provision_agent_connection` use the same claim flow
+  (`src/mcp/credential-claim.ts`).
 
 A minted agent token is **hard-capped at `member`** on its own squad — it can
 never mint further tokens or escalate. That cap is the sovereign default.

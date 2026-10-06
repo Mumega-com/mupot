@@ -19,9 +19,14 @@ Background: [connect-mcp-client.md](../connect-mcp-client.md) (endpoint, transpo
 
 ## Claude Code and headless workers
 
-1. Create the agent and mint a token that is bound to it: dashboard **Connect** card, or the
-   `mint_agent_token` tool (needs admin on the squad). The raw token is shown once. A new agent
-   can also call `bootstrap_self { agent_name }` to create its own profile and floor.
+1. Create the agent and mint a token that is bound to it. Two paths:
+   - **Owner, dashboard:** the **Connect** card mints the token and shows it once.
+   - **Tool path (two legs):** `mint_agent_token` (needs admin on the squad) returns a
+     single-use `credential_claim`, not the token (mupot#987). The same member must then call
+     `reveal_credential_claim { claim_id }` within 10 minutes (`CLAIM_TTL_SECONDS = 600`,
+     `src/auth/credential-claim.ts:52`) to receive the raw token exactly once. Past the TTL, or
+     after one reveal, mint again. A new agent can also call `bootstrap_self { agent_name }`
+     to create its own profile and floor; it uses the same claim flow.
 2. Put the token in a file outside any repository and lock it down:
 
    ```bash
@@ -64,12 +69,13 @@ Background: [connect-mcp-client.md](../connect-mcp-client.md) (endpoint, transpo
 
 ## Verify
 
-Both calls are read-only for the caller.
-
-1. `boot_context` returns the authenticated identity, squad and capability floor. If it shows
-   no agent or an empty floor, the session is unbound; see the connector steps above.
-2. `task_get { task_id }` on a task the agent should see returns the task. A task it cannot read
-   answers `task_not_found`, the same as a missing id.
+1. `task_get { task_id }` is the read-only check. On a task the agent should see it returns the
+   task; a task it cannot read answers `task_not_found`, the same as a missing id.
+2. `boot_context` returns the authenticated identity, squad and capability floor. If it shows
+   no agent or an empty floor, the session is unbound; see the connector steps above. It is the
+   boot/coherence call, **not** read-only on the full MCP door: it may refresh the caller's own
+   presence and write the runtime/model self-report. Only the curated needs-you profile invokes
+   it side-effect-free (`src/mcp/profile-needs-you.ts:72-76`).
 
 A refused tool call arrives as HTTP 200 with `result.isError: true` and a body
 `{ ok:false, tool, error, status, need?, detail }`; `need` names the missing capability. A `401`
