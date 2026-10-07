@@ -9,6 +9,7 @@ import {
   listTaskDispatchReceiptTimeline,
   recordTaskDispatchRuntimeReceipt,
   adminResetDispatchLease,
+  hasInFlightDispatchReceipt,
   pointerAvailableForSql,
 } from '../src/tasks/runtime-receipts'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
@@ -2961,6 +2962,92 @@ describe('rework re-dispatch takes over a terminal execution pointer (mupot#1727
       await expect(stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed'))
         .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
       expect(pointer(f)).toBe(D2)
+    } finally { f.harness.close() }
+  })
+
+  // mupot#1736 P2 — the `AND execution_receipt_id = ?5` pin on the completed UPDATE.
+  // D1 consumed -> D1 failed -> D2 consumed (takes the pointer, running) -> D1 sends completed.
+  // Every earlier guard PASSES for D1 (its envelope still holds via its own consumed custody
+  // receipt, assignee/gate/capability unchanged, nothing forbids completed after failed), so the
+  // pin is the ONLY thing refusing it: it is load-bearing, not defence in depth.
+  it('a failed dispatch D1 cannot complete the task while D2 holds the pointer (pins execution_receipt_id on completed)', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'failed', { reason: 'boom-D1' })
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+      expect(pointer(f)).toBe(D2)
+
+      await expect(stage(f, DISPATCH_ID, MESSAGE_ID, 'completed', { result: 'late D1 result' }))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+
+      expect(f.harness.sqlite.prepare('SELECT status, result, execution_receipt_id AS p FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress', result: 'boom-D1', p: D2 })
+      // the refused completed left no receipt behind (batch rolled back)
+      expect(f.harness.sqlite.prepare(
+        `SELECT COUNT(*) AS c FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? AND stage = 'completed'`,
+      ).get(DISPATCH_ID)).toEqual({ c: 0 })
+
+      // D2 is unaffected and can still complete
+      await expect(stage(f, D2, M2, 'completed', { result: 'D2 result' }))
+        .resolves.toMatchObject({ task_status: 'review' })
+      expect(f.harness.sqlite.prepare('SELECT result AS r FROM tasks WHERE id = ?').get(TASK_ID)).toEqual({ r: 'D2 result' })
+    } finally { f.harness.close() }
+  })
+
+  // mupot#1736 P3 — behavioural (not source-string): a dispatch that belongs to ANOTHER task is
+  // never "available" to take over this task's terminal pointer, even if it is newer.
+  it('a newer dispatch belonging to ANOTHER task cannot take over this task\'s terminal pointer', async () => {
+    const f = runtimeFixture()
+    try {
+      f.harness.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner, created_at, updated_at)
+          VALUES ('task-other', '${SQUAD_ID}', 'other', 'b', 'd', 'open', '${AGENT_ID}', 'gate:independent', '${T0}', '${T0}');
+        UPDATE task_dispatch_receipts SET settled_at = 1, settled_stage = 'completed' WHERE id = '${DISPATCH_ID}';
+        UPDATE tasks SET status = 'rejected', execution_receipt_id = '${DISPATCH_ID}' WHERE id = '${TASK_ID}';
+        INSERT INTO task_dispatch_receipts (
+          id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,
+          created_at, claimed_at, consumed_at, attempts, last_error
+        ) VALUES ('dispatch-other', '${TENANT}', 'task-other', '${SQUAD_ID}', '${AGENT_ID}',
+          'member', '${MEMBER_ID}', '${T1}', '${T1}', '${T1}', 1, NULL);`)
+      seedRedispatch(f)
+      const available = (receipt: string): unknown => f.harness.sqlite.prepare(
+        `SELECT 1 AS ok FROM tasks WHERE id = ? AND ${pointerAvailableForSql({ tenantParam: '?2', newReceiptParam: '?3' })}`,
+      ).get(TASK_ID, TENANT, receipt)
+      expect(available('dispatch-other')).toBeUndefined()
+      expect(available(D2)).toEqual({ ok: 1 })
+    } finally { f.harness.close() }
+  })
+
+  // mupot#1736 P3 — failed(B) -> B no longer in flight -> C takes over via runtime_consumed.
+  it('failed(B) without a consume frees the task: not in flight, and C takes over via runtime_consumed', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'completed', { result: 'first pass' })
+      await invokeTool(f.gateAuth, f.env, 'task_verdict',
+        { task_id: TASK_ID, verdict: 'rejected', note: 'rework' }, 'https://pot.test')
+      seedRedispatch(f) // B = D2
+      await stage(f, D2, M2, 'failed', { reason: 'boom-B' })
+      expect(pointer(f)).toBe(D2)
+      expect(await hasInFlightDispatchReceipt(f.env, TASK_ID)).toBe(false)
+
+      const C = 'dispatch-runtime-3'
+      const M3 = 'message-runtime-3'
+      seedDispatchRow(f, C, '2026-08-30T20:00:00.000Z')
+      f.harness.sqlite.exec(`
+        INSERT INTO agent_messages (
+          id, tenant, to_agent, from_agent, from_member, kind, body, request_id,
+          created_at, delivery_attempts, lease_expires_at
+        ) VALUES (
+          '${M3}', '${TENANT}', '${RUNTIME_ADDRESS}', 'mupot-dispatch', '${MEMBER_ID}', 'request',
+          '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"${TASK_ID}","dispatch_receipt_id":"${C}","squad_id":"${SQUAD_ID}","runtime_address":"${RUNTIME_ADDRESS}"}',
+          'dispatch-inbox:${C}', '2026-08-30T20:00:00.000Z', 1, '2099-01-01T00:00:00.000Z'
+        );`)
+      await expect(stage(f, C, M3, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+      expect(pointer(f)).toBe(C)
+      await expect(stage(f, C, M3, 'completed', { result: 'C result' })).resolves.toMatchObject({ task_status: 'review' })
     } finally { f.harness.close() }
   })
 })
