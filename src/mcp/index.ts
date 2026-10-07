@@ -236,6 +236,7 @@ import {
   validateFlightProjectTarget,
   validateFlightTaskProjectConsistency,
   type FlightRow,
+  withCostSemantics,
 } from '../flight/service'
 import {
   findFinishedWorkConflict,
@@ -3160,8 +3161,8 @@ function memberCanAccessFlight(
   return true
 }
 
-function flightWithParsedMeta(flight: FlightRow, meta: FlightMetaV1): Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 } {
-  return { ...flight, meta }
+function flightWithParsedMeta(flight: FlightRow, meta: FlightMetaV1): Omit<FlightRow, 'meta' | 'cost_micro_usd' | 'cost_metered'> & { meta: FlightMetaV1; cost_micro_usd: number | null; cost_metered: boolean } {
+  return { ...withCostSemantics(flight), meta }
 }
 
 const toolFlightDispatch: ToolSpec = {
@@ -3563,17 +3564,18 @@ const toolFlightLand: ToolSpec = {
   name: 'flight_land',
   scope: 'self (bound agent own flight)',
   min: 'member',
-  args: '{ flight_id: string, cost_micro_usd: number, score?: number, note?: string, reason?: string }',
+  args: '{ flight_id: string, cost_micro_usd?: number (required unless cost_metered=false), cost_metered?: boolean (false = executor has no spend meter; omit cost, budget check skipped, reported as unmetered), score?: number, note?: string, reason?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       flight_id: STRING_SCHEMA,
       cost_micro_usd: OPTIONAL_NUMBER_SCHEMA,
+      cost_metered: { type: 'boolean' },
       score: OPTIONAL_NUMBER_SCHEMA,
       note: STRING_SCHEMA,
       reason: STRING_SCHEMA,
     },
-    required: ['flight_id', 'cost_micro_usd'],
+    required: ['flight_id'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -3583,8 +3585,15 @@ const toolFlightLand: ToolSpec = {
     if (boundAgent.status !== 'active') return fail(409, 'agent_binding_inactive')
 
     const flightRef = str(args.flight_id)
-    const costMicroUsd = args.cost_micro_usd
     const score = args.score
+    if (args.cost_metered !== undefined && typeof args.cost_metered !== 'boolean') return fail(400, 'invalid_args')
+    const unmetered = args.cost_metered === false
+    // #1732: unmetered = cost must be absent (no mixing a fabricated number with the flag);
+    // metered (default) = today's contract, cost required.
+    const costMicroUsd = unmetered ? 0 : args.cost_micro_usd
+    if (unmetered && args.cost_micro_usd !== undefined && args.cost_micro_usd !== null) {
+      return fail(400, 'invalid_args', { reason: 'cost_micro_usd must be omitted when cost_metered=false' })
+    }
     if (!flightRef || !Number.isSafeInteger(costMicroUsd) || (costMicroUsd as number) < 0) {
       return fail(400, 'invalid_args')
     }
@@ -3616,12 +3625,13 @@ const toolFlightLand: ToolSpec = {
     if (!Number.isSafeInteger(flight.budget_micro_usd) || (flight.budget_micro_usd as number) < 0) {
       return fail(409, 'flight_budget_policy_missing')
     }
-    if ((costMicroUsd as number) > (flight.budget_micro_usd as number)) {
+    if (!unmetered && (costMicroUsd as number) > (flight.budget_micro_usd as number)) {
       return fail(409, 'flight_budget_exceeded', { budget_micro_usd: flight.budget_micro_usd })
     }
 
     const landing = await landGovernedFlight(env, flight.id, {
       cost_micro_usd: costMicroUsd as number,
+      cost_metered: !unmetered,
       score: score as number | undefined,
       expected_agent: auth.boundAgentId,
       agent_id: flight.agent,
@@ -3764,7 +3774,7 @@ const toolFlightList: ToolSpec = {
     let before = await resolveFlightCursor(env, auth, squad.id, projectId, args.cursor)
     if (before === null) return fail(400, 'invalid_flight_cursor')
 
-    const visible: Array<Omit<FlightRow, 'meta'> & { meta: FlightMetaV1 }> = []
+    const visible: Array<ReturnType<typeof flightWithParsedMeta>> = []
     const squadCache = new Map<string, Squad | null>([[squad.id, squad]])
     const pageSize = 50
     let pages = 0

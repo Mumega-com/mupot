@@ -214,7 +214,7 @@ function makeEnv(
                   const scoreIndex = governed ? 4 : 3
                   const endedIndex = governed ? 5 : 4
                   const governedBudgetValid = !governed || (
-                    typeof row?.budget_micro_usd === 'number' && (args[costIndex] as number) <= row.budget_micro_usd
+                    typeof row?.budget_micro_usd === 'number' && (args[6] === 0 || (args[costIndex] as number) <= row.budget_micro_usd)
                   )
                   if (
                     row && row.tenant === args[1]
@@ -224,6 +224,7 @@ function makeEnv(
                   ) {
                     row.status = 'landed'
                     row.cost_micro_usd = args[costIndex] as number
+                    if (governed) (row as { cost_metered?: number }).cost_metered = args[6] as number
                     row.score = (args[scoreIndex] as number | null) ?? row.score
                     row.ended_at = args[endedIndex] as number
                     changes = 1
@@ -1101,6 +1102,64 @@ describe('MCP flight tools', () => {
     expect(out).toMatchObject({ ok: false, status: 409, error: 'flight_budget_exceeded' })
   })
 
+  describe('#1732 unmetered landing', () => {
+    async function ready() {
+      const h = makeEnv()
+      const dispatched = await invokeTool(auth(), h.env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
+      const id = (dispatched.result as { flight: FlightRow }).flight.id
+      h.tasks.get('task-m000')!.status = 'done'
+      h.verdicts.set('task-m000', 'approved')
+      return { ...h, id }
+    }
+
+    it('lands unmetered: cost omitted, reported null + cost_metered false, receipt says unknown', async () => {
+      const { env, id, rows, events } = await ready()
+      const out = await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_metered: false }, 'https://pot.example')
+      expect(out.ok, JSON.stringify(out)).toBe(true)
+      expect((out.result as { flight: Record<string, unknown> }).flight).toMatchObject({ status: 'landed', cost_micro_usd: null, cost_metered: false })
+      expect((rows.get(id) as { cost_metered?: number }).cost_metered).toBe(0)
+      expect(events.length).toBeGreaterThan(0)
+    })
+
+    it('refuses cost_metered:false mixed with a cost (even 0)', async () => {
+      const { env, id } = await ready()
+      for (const cost of [0, 5]) {
+        const out = await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_metered: false, cost_micro_usd: cost }, 'https://pot.example')
+        expect(out).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+      }
+    })
+
+    it('default path unchanged: cost still required and over-budget still refused', async () => {
+      const { env, id } = await ready()
+      expect(await invokeTool(auth(), env, 'flight_land', { flight_id: id }, 'https://pot.example'))
+        .toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
+      expect(await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_metered: true, cost_micro_usd: 1 }, 'https://pot.example'))
+        .toMatchObject({ ok: false, status: 409, error: 'flight_budget_exceeded' })
+    })
+
+    it('unmetered still refuses incomplete tasks, wrong agent, and not-in-air', async () => {
+      const a = await ready()
+      a.tasks.get('task-m000')!.status = 'in_progress'
+      expect(await invokeTool(auth(), a.env, 'flight_land', { flight_id: a.id, cost_metered: false }, 'https://pot.example'))
+        .toMatchObject({ ok: false, status: 409, error: 'flight_tasks_incomplete' })
+      const b = await ready()
+      b.rows.get(b.id)!.agent = 'someone-else'
+      expect(await invokeTool(auth(), b.env, 'flight_land', { flight_id: b.id, cost_metered: false }, 'https://pot.example'))
+        .toMatchObject({ ok: false, status: 404 })
+      const c = await ready()
+      c.rows.get(c.id)!.status = 'landed'
+      expect(await invokeTool(auth(), c.env, 'flight_land', { flight_id: c.id, cost_metered: false }, 'https://pot.example'))
+        .toMatchObject({ ok: false, status: 409, error: 'flight_not_in_air' })
+    })
+
+    it('flight_get shows an unmetered flight as cost null, never 0', async () => {
+      const { env, id } = await ready()
+      await invokeTool(auth(), env, 'flight_land', { flight_id: id, cost_metered: false }, 'https://pot.example')
+      const got = await invokeTool(auth(), env, 'flight_get', { flight_id: id }, 'https://pot.example')
+      expect((got.result as { flight: Record<string, unknown> }).flight).toMatchObject({ cost_micro_usd: null, cost_metered: false })
+    })
+  })
+
   it('refuses landing a flight outside an in-air state', async () => {
     const { env, rows, tasks, verdicts } = makeEnv()
     const dispatched = await invokeTool(auth(), env, 'flight_dispatch', dispatchArgs, 'https://pot.example')
@@ -1276,7 +1335,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           dispatched_by_agent_id TEXT NOT NULL DEFAULT '', goal TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
           gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
-          cost_micro_usd INTEGER NOT NULL DEFAULT 0, next_run_at INTEGER,
+          cost_micro_usd INTEGER NOT NULL DEFAULT 0, cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1)), next_run_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
           ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
         );

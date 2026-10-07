@@ -121,7 +121,7 @@ export interface FlightSummary {
  * the most interesting failure mode on this deployment.
  */
 export function summariseFlights(
-  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; created_at: string }[],
+  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; created_at: string }[],
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
@@ -138,6 +138,8 @@ export function summariseFlights(
     else if (r.status === 'failed') summary.failed += 1
     else if (r.status === 'held') summary.held += 1
     else if (r.status === 'running') summary.running += 1
+    // #1732: an unmetered flight has no known cost; skip it rather than add a fabricated 0.
+    if (r.cost_metered === 0) continue
     const cost = Number(r.cost_micro_usd)
     if (Number.isFinite(cost)) summary.costMicroUsd += cost
   }
@@ -153,13 +155,13 @@ export function summariseFlights(
 export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelResult<FlightSummary>> {
   try {
     const res = await env.DB.prepare(
-      `SELECT id, goal, status, cost_micro_usd, created_at
+      `SELECT id, goal, status, cost_micro_usd, cost_metered, created_at
          FROM flights
         WHERE tenant = ?1 AND agent = ?2
         ORDER BY created_at DESC
         LIMIT ${PANEL_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{
-      id: string; goal: string; status: string; cost_micro_usd: number | null; created_at: string
+      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; created_at: string
     }>()
     const rows = res.results ?? []
     if (rows.length === 0) return empty()
