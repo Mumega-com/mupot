@@ -23,6 +23,8 @@ function safeAlias(alias: string): string {
  */
 export function cancelledFlightSql(alias = 'f'): string {
   const a = safeAlias(alias)
+  // Legacy-receipt note (#1748 P2): the self_cancel payload key has been present since migration 0194's first
+  // writer, and prod has 0 flight_cancel_receipts rows, so no receipt lacks it; COALESCE only covers hand-built rows.
   return `EXISTS (SELECT 1 FROM flight_cancel_receipts fcr WHERE fcr.tenant = ${a}.tenant AND fcr.flight_id = ${a}.id AND COALESCE(json_extract(fcr.payload, '$.self_cancel'), 0) <> 1)`
 }
 
@@ -47,4 +49,24 @@ export function isCancelledFlight(row: { status: string; cancelled: number | boo
 /** The outcome a reader should DISPLAY/COUNT: 'cancelled' replaces 'failed' for cancels only. */
 export function flightOutcome<S extends string>(row: { status: S; cancelled: number | boolean | null | undefined }): S | 'cancelled' {
   return isCancelledFlight(row) ? 'cancelled' : row.status
+}
+
+/**
+ * SQL boolean fragment for an outcome-feed filter (mupot#1748 r3): rows whose DISPLAYED outcome
+ * (flightOutcome) is one of `outcomes`. Pushed into WHERE so it applies BEFORE any LIMIT; filtering in JS
+ * after a row cap hides older matches from a cursor consumer. 'cancelled' = failed + non-self receipt,
+ * 'failed' = failed with no such receipt, any other value is a stored status. Values are validated
+ * (interpolated, never bound) and built only from the shared predicate above.
+ */
+export function outcomeFilterSql(outcomes: readonly string[], alias = 'f'): string {
+  const a = safeAlias(alias)
+  if (outcomes.length === 0) return '1=1'
+  const parts = new Set<string>()
+  for (const o of outcomes) {
+    if (!/^[a-z_]+$/.test(o)) throw new Error('invalid_outcome')
+    if (o === 'cancelled') parts.add(`(${a}.status = 'failed' AND ${cancelledFlightSql(a)})`)
+    else if (o === 'failed') parts.add(genuinelyFailedFlightSql(a))
+    else parts.add(`${a}.status = '${o}'`)
+  }
+  return `(${[...parts].join(' OR ')})`
 }

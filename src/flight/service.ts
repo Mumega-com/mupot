@@ -12,7 +12,7 @@ import type { FlightMetaV1 } from './meta'
 import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
 import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { cancelledColumnSql } from './cancelled'
+import { cancelledColumnSql, outcomeFilterSql } from './cancelled'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -825,6 +825,66 @@ export async function listFlights(env: Env, limit = 100, projectId?: string): Pr
   const res = await statement
     .all<FlightRow>()
   return res.results ?? []
+}
+
+/**
+ * Outcome-feed read (mupot#1748 r3). The outcome filter and the `since` cursor are applied in SQL, BEFORE the
+ * row cap, so a rare outcome (cancelled) older than 500 newer non-matching flights is still reachable.
+ *
+ * Ordering: without `sinceMs` newest-first (back-compat, unchanged). With `sinceMs` the window is the OLDEST
+ * `limit` rows past the cursor (ordered by the same key the cursor tracks, COALESCE(ended_at, created_at), then
+ * id), so a consumer advancing to the max key it saw does not skip a match that was already committed;
+ * rows are returned newest-first. A late commit with key <= the cursor can still be skipped (#1754).
+ * `more` is true when matching rows may remain past the returned window. In cursor mode the window is widened to
+ * the whole group of rows sharing its last key (up to TIE_GROUP_CAP), so a committed tie group is not split
+ * unless it exceeds the cap.
+ */
+const TIE_GROUP_CAP = 1000
+
+export async function listFlightOutcomes(
+  env: Env,
+  opts: { limit: number; projectId?: string; outcomes?: readonly string[] | null; sinceMs?: number | null },
+): Promise<{ rows: FlightRow[]; more: boolean }> {
+  const limit = Math.min(Math.max(opts.limit, 1), 500)
+  const key = 'COALESCE(f.ended_at, f.created_at)'
+  const binds: unknown[] = [env.TENANT_SLUG]
+  const where: string[] = ['f.tenant = ?1']
+  if (opts.projectId !== undefined) {
+    binds.push(opts.projectId)
+    where.push(`f.project_id = ?${binds.length}`)
+  }
+  if (opts.outcomes && opts.outcomes.length > 0) where.push(outcomeFilterSql(opts.outcomes, 'f'))
+  const since = opts.sinceMs ?? null
+  if (since !== null) {
+    binds.push(since)
+    where.push(`${key} > ?${binds.length}`)
+  }
+  const order = since === null ? 'f.created_at DESC, f.id DESC' : `${key} ASC, f.id ASC`
+  const select = `SELECT f.*, ${cancelledColumnSql('f')}, ${key} AS feed_key, a.name AS agent_name, s.name AS squad_name
+       FROM flights f
+       LEFT JOIN agents a ON a.id = f.agent
+       LEFT JOIN squads s ON s.id = a.squad_id`
+  const read = async (extraWhere: string, extraBinds: unknown[], max: number) => {
+    const all = [...binds, ...extraBinds, max]
+    const res = await env.DB.prepare(
+      `${select}
+      WHERE ${where.join(' AND ')}${extraWhere}
+      ORDER BY ${order} LIMIT ?${all.length}`,
+    )
+      .bind(...all)
+      .all<FlightRow & { feed_key: number }>()
+    return res.results ?? []
+  }
+  const fetched = await read('', [], limit + 1)
+  const more = fetched.length > limit
+  let window = fetched.slice(0, limit)
+  // Cursor mode: the consumer advances to the max key it saw, so every row sharing the window's last key must be in
+  // the window (a tie split across polls would be skipped). Widen to the whole tie group, bounded by TIE_GROUP_CAP.
+  if (since !== null && more && fetched[limit].feed_key === window[limit - 1].feed_key) {
+    window = await read(` AND ${key} <= ?${binds.length + 1}`, [window[limit - 1].feed_key], TIE_GROUP_CAP)
+  }
+  const rows = since === null ? window : [...window].reverse()
+  return { rows, more }
 }
 
 export async function listFlightsForSquad(

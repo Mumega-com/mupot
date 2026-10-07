@@ -314,12 +314,12 @@ describe('flight project attribution', () => {
     expect((await filtered.json() as { flights: FlightRow[] }).flights).toEqual([
       expect.objectContaining({ id: 'flight-a', project_id: 'project-a' }),
     ])
-    expect(filteredQueries.some((sql) => sql.includes('project_id=?2') && sql.includes('LIMIT ?3'))).toBe(true)
+    expect(filteredQueries.some((sql) => sql.includes('f.project_id = ?2') && sql.includes('LIMIT ?3'))).toBe(true)
 
     const legacyQueries: string[] = []
     const legacy = await list(harness, '', legacyQueries)
     expect((await legacy.json() as { flights: FlightRow[] }).flights.map((flight) => flight.id)).toEqual(['flight-a', 'flight-b', 'flight-null'])
-    expect(legacyQueries.some((sql) => sql.includes('FROM flights f') && sql.includes('LEFT JOIN agents') && sql.includes('LEFT JOIN squads') && sql.includes('WHERE f.tenant=?1'))).toBe(true)
+    expect(legacyQueries.some((sql) => sql.includes('FROM flights f') && sql.includes('LEFT JOIN agents') && sql.includes('LEFT JOIN squads') && sql.includes('WHERE f.tenant = ?1'))).toBe(true)
   })
 
   it('maps final project trigger failures to stable service errors', async () => {

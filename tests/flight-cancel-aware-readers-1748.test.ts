@@ -12,6 +12,7 @@ import { deriveFlightDeckKpis, flightFilterGroup, flightsBody } from '../src/das
 import { loadFlightPanel } from '../src/dashboard/agent-profile'
 import { loadProjectFlights, type ProjectWorkContext } from '../src/dashboard/projects'
 import { parseFlightMetaV1 } from '../src/flight/meta'
+import { hashMemberToken } from '../src/auth/member-bearer'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import type { AuthContext, Env } from '../src/types'
@@ -59,30 +60,28 @@ function fixture() {
   const env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
   return { h, env }
 }
+async function feedFixture() {
+  const f = fixture()
+  await seedFeedAdmin(f.h)
+  return f
+}
 const cancel = (env: Env, who: AuthContext, id = 'f-cancel') =>
   invokeTool(who, env, 'flight_cancel', { flight_id: id, reason: 'Hadi directed close' }, 'https://pot.test')
 
-/** Real DB, with only the org-admin bearer lookups stubbed (member_tokens / capabilities). */
-function feedEnv(env: Env): Env {
-  const real = env.DB
-  const db = {
-    prepare(sql: string) {
-      if (sql.includes('FROM member_tokens')) {
-        return { bind: () => ({ first: async () => ({ member_id: 'admin-1', display_name: 'A', email: null, status: 'active', bound_agent_id: null }) }) }
-      }
-      if (sql.includes('FROM capabilities')) {
-        return { bind: () => ({ all: async () => ({ results: [{ member_id: 'admin-1', scope_type: 'org', scope_id: null, capability: 'admin' }] }) }) }
-      }
-      return real.prepare(sql)
-    },
-    batch: real.batch.bind(real),
-  }
-  return { ...env, DB: db } as unknown as Env
+/** Real auth rows: an active member + live token + org-admin grant, so resolveOrgAdmin runs its real queries. */
+const FEED_TOKEN = 'feed-admin-token'
+async function seedFeedAdmin(h: ReturnType<typeof createSqliteD1>): Promise<void> {
+  const hash = await hashMemberToken(FEED_TOKEN)
+  h.sqlite.exec(`
+    INSERT INTO members (id, display_name, status, tenant) VALUES ('admin-1','Admin','active','${TENANT}');
+    INSERT INTO member_tokens (id, member_id, token_hash, revoked_at, agent_id, tenant) VALUES ('tok-admin-1','admin-1','${hash}',NULL,NULL,'${TENANT}');
+    INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-admin-1','admin-1','org',NULL,'admin');
+  `)
 }
 async function feed(env: Env, qs = '') {
-  const res = await flightsApp.request(`https://pot.example/${qs}`, { headers: { authorization: 'Bearer t' } }, feedEnv(env))
+  const res = await flightsApp.request(`https://pot.example/${qs}`, { headers: { authorization: `Bearer ${FEED_TOKEN}` } }, env)
   expect(res.status).toBe(200)
-  return (await res.json()) as { flights: Array<{ id: string; status: string; outcome: string; cancelled: boolean }> }
+  return (await res.json()) as { flights: Array<{ id: string; status: string; outcome: string; cancelled: boolean; cost_micro_usd: number | null }>; cursor: number; has_more: boolean }
 }
 const ids = (r: { flights: Array<{ id: string }> }) => r.flights.map((f) => f.id).sort()
 
@@ -103,7 +102,7 @@ describe('#1748 shared predicate', () => {
 
 describe('#1748 readers on a real schema', () => {
   async function seeded() {
-    const f = fixture()
+    const f = await feedFixture()
     const r = await cancel(f.env, lead())
     expect(r, JSON.stringify(r)).toMatchObject({ ok: true, result: { cancelled: true } })
     return f
@@ -175,7 +174,7 @@ describe('#1748 r2 project-scoped deck (loadProjectFlights seam)', () => {
 
 describe('#1748 r2 self-cancel still counts as a failure', () => {
   it('self-cancel (executor) is NOT cancelled for counting; a lead cancelling someone else IS', async () => {
-    const a = fixture()
+    const a = await feedFixture()
     expect(await cancel(a.env, lead('agent-1'))).toMatchObject({ ok: true })
     const ka = deriveFlightDeckKpis(buildBoard(await listFlights(a.env), NOW))
     expect(ka).toMatchObject({ failed: 2, cancelled: 0 })
@@ -227,5 +226,75 @@ describe('#1748 P2 self-cancel flag', () => {
     expect(other.gate_reason).toBe('cancelled_by_lead: Hadi directed close')
     const pb = b.h.sqlite.prepare("SELECT payload FROM flight_cancel_receipts WHERE flight_id='f-cancel'").get() as { payload: string }
     expect(JSON.parse(pb.payload).self_cancel).toBe(false)
+  })
+})
+
+describe('#1748 r3 outcome filter applies BEFORE the row cap (real engine)', () => {
+  /** 520 newer landed flights bury the older cancel + the older genuine failure beyond listFlights' 500 cap. */
+  async function buried() {
+    const f = await feedFixture()
+    expect(await cancel(f.env, lead())).toMatchObject({ ok: true })
+    f.h.sqlite.exec("UPDATE flights SET cost_micro_usd = 4242, cost_metered = 1 WHERE id = 'f-cancel'")
+    const ins = f.h.sqlite.prepare(
+      `INSERT INTO flights (id, tenant, agent, goal, status, gate_reason, budget_micro_usd, meta, created_at, started_at, ended_at, project_id)
+       VALUES (?, ?, 'agent-1', 'bulk', 'landed', '', 100, ?, ?, ?, ?, 'p1')`,
+    )
+    f.h.sqlite.exec('BEGIN')
+    for (let i = 0; i < 520; i += 1) ins.run(`bulk-${String(i).padStart(4, '0')}`, TENANT, meta(), NOW + 1000 + i, NOW + 1000 + i, NOW + 1000 + i)
+    f.h.sqlite.exec('COMMIT')
+    return f
+  }
+
+  it('the legacy 500-row cap really does bury the cancel (premise of the test)', async () => {
+    const { env } = await buried()
+    expect((await listFlights(env, 500)).some((r) => r.id === 'f-cancel')).toBe(false)
+  })
+
+  it('?status=cancelled still returns the buried cancel, with its cost', async () => {
+    const { env } = await buried()
+    const r = await feed(env, '?status=cancelled')
+    expect(ids(r)).toEqual(['f-cancel'])
+    expect(r.flights[0]).toMatchObject({ outcome: 'cancelled', cancelled: true, cost_micro_usd: 4242 })
+  })
+
+  it('?status=failed returns the buried genuine failure and not the cancel; project scope too', async () => {
+    const { env } = await buried()
+    expect(ids(await feed(env, '?status=failed'))).toEqual(['f-failed'])
+    expect(ids(await feed(env, '?status=cancelled&project_id=p1'))).toEqual(['f-cancel'])
+    expect(ids(await feed(env, '?status=cancelled&project_id=nope'))).toEqual([])
+  })
+
+  it('a cursor consumer filtering landed pages through ALL matches in order with no skip, no dup', async () => {
+    const { env } = await buried()
+    const seen: string[] = []
+    let since = 1
+    for (let guard = 0; guard < 20; guard += 1) {
+      const r = await feed(env, `?status=landed&since=${since}&limit=200`)
+      seen.push(...r.flights.map((f) => f.id))
+      if (!r.has_more) break
+      expect(r.cursor).toBeGreaterThan(since)
+      since = r.cursor
+    }
+    expect(new Set(seen).size).toBe(seen.length)
+    expect(seen.filter((x) => x.startsWith('bulk-'))).toHaveLength(520)
+    expect(seen).toContain('f-landed')
+  })
+
+  it('a same-millisecond tie group straddling the page limit is delivered whole, never skipped', async () => {
+    const f = await feedFixture()
+    const ins = f.h.sqlite.prepare(
+      `INSERT INTO flights (id, tenant, agent, goal, status, gate_reason, budget_micro_usd, meta, created_at, started_at, ended_at)
+       VALUES (?, ?, 'agent-1', 'tie', 'landed', '', 100, ?, ?, ?, ?)`,
+    )
+    for (let i = 0; i < 5; i += 1) ins.run(`tie-${i}`, TENANT, meta(), NOW + 9000, NOW + 9000, NOW + 9000)
+    const seen = new Set<string>()
+    let since = NOW + 8000
+    for (let guard = 0; guard < 10; guard += 1) {
+      const r = await feed(f.env, `?status=landed&since=${since}&limit=3`)
+      for (const x of r.flights) seen.add(x.id)
+      if (!r.has_more) break
+      since = r.cursor
+    }
+    expect([...seen].filter((x) => x.startsWith('tie-')).sort()).toEqual(['tie-0', 'tie-1', 'tie-2', 'tie-3', 'tie-4'])
   })
 })
