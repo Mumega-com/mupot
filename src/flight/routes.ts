@@ -29,7 +29,7 @@ import {
   // ../service and covered by tests/flight-service.test.ts, but nothing in production
   // calls it now; removing it outright is a follow-up, not part of this fix.
   landGovernedFlight,
-  listFlights,
+  listLiveFlights,
   listFlightOutcomes,
   listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
@@ -578,12 +578,13 @@ flightsApp.get('/', async (c) => {
 })
 
 // Collisions — the ATC tower's current cross-flight HOLD/WARN view (read-only,
-// tenant-scoped via listFlights, same auth as the other flight reads).
+// tenant-scoped via listLiveFlights, same auth as the other flight reads).
 flightsApp.get('/collisions', async (c) => {
   const auth = await requireOrgAdmin(c.env, c.req.header('authorization'))
   if (!auth.ok) return c.json({ error: auth.status === 401 ? 'unauthorized' : 'forbidden' }, auth.status)
 
-  const flights = await listFlights(c.env, 500)
-  const { holds, warns } = deriveActiveCollisions(flights)
-  return c.json({ holds, warns })
+  // Full live set in SQL (#1755), not the newest 500.
+  const live = await listLiveFlights(c.env)
+  const { holds, warns } = deriveActiveCollisions(live.rows)
+  return c.json({ holds, warns, live_set_truncated: live.truncated })
 })
