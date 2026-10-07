@@ -1,6 +1,7 @@
 import { createBus } from '../bus'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
-import { hasIndependentRuntimeGate } from '../tasks/runtime-receipts'
+import { nowSqlUtc } from '../auth/token-lifecycle'
+import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import type { BusEvent, Env } from '../types'
 
 export interface RouterTickInput {
@@ -84,9 +85,21 @@ export async function runRouterTick(
       WHERE t.squad_id = ?1
         AND t.status = 'open'
         AND t.assignee_agent_id IS NULL
+        -- mupot#1733 — a held task stays open+unassigned forever, so it must not occupy the
+        -- bounded scan window (starvation). A real gate:* task is only scanned if SOME
+        -- independent holder exists (assignee '' matches no agent: coarse, member+agent mode);
+        -- the per-candidate hasIndependentRuntimeGate below is the precise test.
+        AND (
+          t.gate_owner IS NULL
+          OR t.gate_owner = 'gate:agent-self-completion'
+          OR ${independentGateHolderExistsSql({
+            gateOwnerExpr: 't.gate_owner', assigneeIdExpr: "''", squadIdExpr: 't.squad_id',
+            tenantParam: '?3', nowParam: '?4', allowMemberHolders: true,
+          })}
+        )
       ORDER BY t.created_at ASC, t.id ASC
       LIMIT ?2`,
-  ).bind(squadId, limit).all<RouterTaskRow>()
+  ).bind(squadId, limit, decision.tenant, nowSqlUtc()).all<RouterTaskRow>()
 
   const decisions: RouterTickResult['decisions'] = []
   let assigned = 0
@@ -99,7 +112,11 @@ export async function runRouterTick(
       continue
     }
 
-    const candidate = await env.DB.prepare(
+    // mupot#1733 — pick the FIRST live agent (existing id order) that is independent of the
+    // gate's holders; a gate held only by the lowest-id agent must not strand the task when
+    // another live agent could take it. Hold only if none passes. null / self-completion
+    // gates claim no independent holder, so the first live agent is taken as before.
+    const candidates = await env.DB.prepare(
       `SELECT DISTINCT a.id
          FROM agents a
          JOIN presence p
@@ -109,32 +126,29 @@ export async function runRouterTick(
           AND a.status = 'active'
           AND p.last_seen_at >= datetime('now', '-10 minutes')
         ORDER BY a.id ASC
-        LIMIT 1`,
-    ).bind(decision.tenant, squadId).first<RouterAgentRow>()
+        LIMIT 50`,
+    ).bind(decision.tenant, squadId).all<RouterAgentRow>()
+    const live = candidates.results ?? []
 
-    if (!candidate) {
+    if (live.length === 0) {
       unrouted += 1
       decisions.push({ task_id: task.id, outcome: 'unrouted', agent_id: null })
       continue
     }
 
-    // mupot#1733 — same gate-holder predicate task_dispatch uses (hasIndependentRuntimeGate,
-    // normal-dispatch mode: an independent agent OR human-member holder). Without it this
-    // wake starts execute-mode work on a task whose review can never be cleared. HOLD the
-    // task (it stays open and unassigned, so a later tick re-evaluates once a holder is
-    // granted) and log why. null / 'gate:agent-self-completion' claim no independent holder
-    // and settle through the self-completion flow, so they are NOT held. Evaluated against the
-    // candidate, so a gate held only by the candidate itself is (correctly) not independent.
-    // Also applies to dry runs, so would_assign never promises a wake the real tick refuses.
-    // The claim UPDATE below does not re-assert this (a grant revoked between the check and
-    // the claim is a TOCTOU the task_dispatch settle paths still catch); documented, not closed.
-    if (
-      task.gate_owner !== null
-      && task.gate_owner !== 'gate:agent-self-completion'
-      && !(await hasIndependentRuntimeGate(env, task.gate_owner, candidate.id, squadId, { allowMemberHolders: true }))
-    ) {
+    // Same predicate task_dispatch uses (normal mode: independent agent OR human holder).
+    // The claim UPDATE below does not re-assert it (TOCTOU on a revoked grant; documented).
+    const gated = task.gate_owner !== null && task.gate_owner !== 'gate:agent-self-completion'
+    let candidate: RouterAgentRow | undefined
+    for (const agent of live) {
+      if (
+        !gated
+        || await hasIndependentRuntimeGate(env, task.gate_owner, agent.id, squadId, { allowMemberHolders: true })
+      ) { candidate = agent; break }
+    }
+    if (!candidate) {
       unrouted += 1
-      decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner })
+      decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner ?? undefined })
       console.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
       continue
     }

@@ -2601,6 +2601,25 @@ const toolTaskDispatch: ToolSpec = {
       ) gateMemberOnlyInbox = true
     }
 
+    // #1739 contract: `warning` stays receiver_stale (full object) whenever it applies; the
+    // `warnings` array lists EVERY applicable warning (receiver_stale first, then #1733's).
+    const warnings: Array<Record<string, unknown>> = []
+    if (receiverVerdict.stale_poll) {
+      warnings.push({
+        code: 'receiver_stale',
+        agent_id: task.assignee_agent_id,
+        last_reported_at: receiverVerdict.last_reported_at,
+        presence_ttl_sec: receiverVerdict.presence_ttl_sec,
+      })
+    }
+    if (gateMemberOnlyInbox) {
+      warnings.push({
+        code: 'gate_member_only_inbox',
+        gate_owner: task.gate_owner,
+        detail: 'gate is held only by human members and this dispatch routes to the inbox; the completed runtime receipt cannot settle it. Complete via task_submit_result, then a human verdict.',
+      })
+    }
+
     const memberId = auth.memberId as string
     const receiptId = crypto.randomUUID()
     const dispatchedAt = new Date().toISOString()
@@ -2666,21 +2685,7 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
       ...(deliveryForcedPredicted ? { delivery_forced_predicted: deliveryForcedPredicted } : {}),
-      ...(gateMemberOnlyInbox ? {
-        warning: {
-          code: 'gate_member_only_inbox',
-          gate_owner: task.gate_owner,
-          detail: 'gate is held only by human members and this dispatch routes to the inbox; the completed runtime receipt cannot settle it. Complete via task_submit_result, then a human verdict.',
-        },
-        ...(receiverVerdict.stale_poll ? { receiver_stale_warning: { code: 'receiver_stale', agent_id: task.assignee_agent_id } } : {}),
-      } : receiverVerdict.stale_poll ? {
-        warning: {
-          code: 'receiver_stale',
-          agent_id: task.assignee_agent_id,
-          last_reported_at: receiverVerdict.last_reported_at,
-          presence_ttl_sec: receiverVerdict.presence_ttl_sec,
-        },
-      } : {}),
+      ...(warnings.length > 0 ? { warning: warnings[0], warnings } : {}),
     })
   },
 }
