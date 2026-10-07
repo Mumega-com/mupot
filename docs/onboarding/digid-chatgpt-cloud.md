@@ -76,13 +76,13 @@ limitations below.
 | Project/module presence | October 7 session reported online during the turn, then offline afterward. | Fleet registration or dispatch eligibility. |
 | Seat check-in | The seat remained active at the later readback. | A still-running worker; this signal differed from project presence. |
 | Fleet runtime | Initial plain check-in left fleet readback empty, with null runtime/report timestamp and `live: false`. Later poll-mode check-in produced `presence_mode: poll`, `status: running`, `live: true`, verified by the cloud session and Kasra. | Perpetual liveness, autonomous wake or actual task consumption. The later state is a time-bounded readback. |
-| Original dispatch | The synchronous dispatch response reported `delivery_forced_predicted: no_delivery_mode`: the requested forced inbox route was not accepted because no delivery surface was registered. The dispatch itself still proceeded; this was a prediction before the queue consumer selected the actual route. A later read showed a consumed dispatch with `delivered_via: null`. [#1721](https://github.com/Mumega-com/mupot/issues/1721) records Kasra's diagnosis: the built-in AgentDO `in_worker` path ran; there was no external consumer. | Consumption by this exact cloud runtime. The missing delivery-mode stamp is the tracked observability defect. |
+| Original dispatch | The synchronous dispatch response reported `delivery_forced_predicted: no_delivery_mode`: the requested forced inbox route was not accepted because no delivery surface was registered. The dispatch itself still proceeded; this was a prediction before the queue consumer selected the actual route. A later read showed a consumed dispatch with `delivered_via: null`. [#1721](https://github.com/Mumega-com/mupot/issues/1721) records Kasra's diagnosis: the built-in AgentDO `in_worker` path ran; there was no external consumer. | Consumption by this exact cloud runtime. The historical receipt's null delivery mode is tracked on #1721; in-Worker settles since #1725 stamp `in_worker`. |
 | Task/artifact | The task showed `artifact_verification_failed:no_artifact_claimed`. #1721 attributes this to the built-in AgentDO execution cycle; the cloud worker reported no task mutations. | A valid artifact claim or completion by the external cloud worker. Do not describe this as no execution anywhere. |
 | Execution and gate receipts | External runtime/gate timelines were empty. An `execution_receipt_get` lookup used a dispatch-receipt ID and returned `404 receipt_not_found`. These are different receipt kinds; the 404 was a lookup mismatch, not a second observability defect. | A correlated external runtime-consumed/completed receipt or independent verdict. |
-| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. Process evidence at the latest checkpoint confirmed the receiver stopped, despite persisted poll/live fleet state. This did not deregister its inbox route; TTL expiry alone would not do so either. | Delivery in either window, unattended receiving, or an ongoing receiver. Fleet state is not a process check. |
-| Recovery and flight | An initial flight was held at readiness `0.418` against threshold `0.5`. A later replacement flight was reported preflight-go at `0.942`. [#1723](https://github.com/Mumega-com/mupot/issues/1723) records that task redispatch still failed with `task_not_dispatchable`: the original consumed in-worker dispatch receipt was unsettled, and its no-message shape also blocked lease-reset repair. | External cloud task delivery/execution, artifact completion, verdict or departure proved by runtime receipts. Preflight-go is not execution evidence or permission to bypass recovery gates. |
-| Governed cycle (refresh, 11:10 UTC) | Task `02471acf` (flight `083f3f72`, preflight GO `0.869`) was dispatched by inbox (`81f08d8a`, 03:08:15Z). Server runtime receipts recorded consumption and an accepted `completed` stage; the artifact digest matched on independent readback. The independent gate (`gate:kasra-core`) first **rejected** it for rework (`6401f627`), then, after an inbox redispatch (`0c99a08e`), **approved** it (`4a72645c`, 04:06:35Z). Task done; the flight landed honestly as **unmetered** at 04:33:46Z (#1737). Redispatch after a completed run depended on #1734. | Autonomous cloud wake (the cycle was started by an active session), a fresh-instance replay, or metered external cost. Executor-local receipts named in the verdict are agent-reported. |
-| Budget and cost | Session report at the earlier checkpoint: initial flight budget allocation `500000 microUSD` ($0.50); original built-in in-worker cost `30720 microUSD` ($0.03072). | External cloud flight cost, total reconciled spend or cost efficiency. Allocation is not spend, and the original built-in cost is not this held flight's consumption. |
+| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. Process evidence at the pre-cycle checkpoint confirmed that receiver stopped, despite persisted poll/live fleet state. This did not deregister its inbox route; TTL expiry alone would not do so either. | Delivery in either window, unattended receiving, or an ongoing receiver. Fleet state is not a process check. |
+| Recovery and flight | An initial flight was held at readiness `0.418` against threshold `0.5`. A later replacement flight was reported preflight-go at `0.942`. [#1723](https://github.com/Mumega-com/mupot/issues/1723) records that task redispatch still failed with `task_not_dispatchable`: the original consumed in-worker dispatch receipt was unsettled, and its no-message shape also blocked lease-reset repair (historical; fixed by #1725, issue #1723 closed). | External cloud task delivery/execution, artifact completion, verdict or departure proved by runtime receipts. Preflight-go is not execution evidence or permission to bypass recovery gates. |
+| Governed cycle (refresh, 11:10 UTC) | On the **mumega** pot under the Digid project; no separate Digid tenant was used. Task `02471acf` (flight `083f3f72`, preflight GO `0.869`) was dispatched by inbox (`81f08d8a`, 03:08:15Z). Agent-submitted runtime receipts for intake and an accepted `completed` stage were recorded by the server; the artifact digest matched on independent readback. The independent gate (`gate:kasra-core`) first **rejected** it for rework (`6401f627`), then, after an inbox redispatch (`0c99a08e`), **approved** it (`4a72645c`, 04:06:35Z). Task done; the flight landed honestly as **unmetered** at 04:33:46Z (#1737). Redispatch after a completed run depended on #1727 (PR #1734). | Autonomous cloud wake (the cycle was started by an active session), a fresh-instance replay, or metered external cost. Executor-local receipts named in the verdict are agent-reported. |
+| Budget and cost | Session report at the earlier checkpoint: initial flight budget allocation `500000 microUSD` ($0.50); original built-in in-worker cost `30720 microUSD` ($0.03072). | External cloud flight cost, total reconciled spend or cost efficiency. Allocation is not spend, and the original built-in cost is not this held flight's consumption. Execution later occurred: flight `083f3f72` landed with `cost_metered: false`, so no external cost figure exists. |
 
 **Evidence provenance:** the October 6 messaging/wake summary is published in
 #1715. October 7 presence/runtime observations are Rava's operating-session
@@ -150,7 +150,7 @@ transport consumption, and the author's own assessment do not complete that gate
 
 ## Shutdown limitations: process, route and work are separate
 
-Source-checked at `cd2d4060`; these are existing control semantics, not a
+Source-checked at `bf68e83c`; these are existing control semantics, not a
 verified end-to-end shutdown recipe:
 
 - Stopping the local receiver or waiting out its TTL leaves an active poll
@@ -163,15 +163,17 @@ verified end-to-end shutdown recipe:
 - The authenticated [detach routes](../../src/fleet/attach-routes.ts) mark the
   owned fleet row `stopped` and clear poll mode/TTL; they do not stop the host
   process themselves. A later poll check-in does not resurrect a stopped row.
-- Since #1739 and #1743 (source at `bf68e83c`), a **stopped** fleet row is a
-  dispatch fence. Dispatch to a stopped receiver is refused `receiver_not_live`.
-  The same stopped-row check sits inside the inbox envelope INSERT and the
-  in-Worker claim UPDATE, so a concurrent detach cannot slip work through. The
-  refused receipt settles `failed` / `receiver_not_live`. A merely stale poll
-  registration (not stopped) warns and keeps the mailbox; that policy is
-  pending. This is source- and test-level evidence, not a verified end-to-end
-  stop/restart run.
-- Without a stopped row, neither control is a general no-execution fence. With no eligible external
+- Since #1739 and #1743 (deployed; prod `/health` `bf68e83c`), a **stopped**
+  fleet row is a dispatch fence. Dispatch to a stopped receiver is refused with
+  409 `receiver_not_live` before any receipt is minted. For queue-dispatched
+  work, the same stopped-row check also sits inside the inbox envelope INSERT
+  and the in-Worker claim UPDATE, so a detach that commits before delivery or
+  claim refuses it, and the existing receipt settles `failed` /
+  `receiver_not_live`. Direct in-Worker callers are unfenced, and a detach after
+  the claim does not stop an in-flight run. A merely stale poll registration
+  (not stopped) warns and keeps the mailbox; that policy is pending (#1740). No
+  end-to-end stop/restart run has verified this.
+- A resident check-in alone (no stopped row) is not a no-execution fence. With no eligible external
   surface, normal dispatch can fall back to `in_worker`. If a nonempty runtime
   remains, a forced inbox request can still pass the registered-surface test
   even while that row is not live. Existing inbox deliveries and in-flight work
@@ -190,16 +192,16 @@ process stop distinct from a secure system-wide stop.
 ## Remaining setup checklist
 
 - [ ] Attach sanitized external-runtime consumption evidence; retain #1721's in-worker attribution.
-- [x] Demonstrate the intended runtime consuming one authorized task (task `02471acf`, inbox route).
+- [x] Demonstrate the agent's own token consuming one authorized task over the inbox route (task `02471acf`); the carrying runtime is session-reported.
 - [x] Retain artifact/digest, completion receipt and independent verdict (`4a72645c`).
 - [ ] Verify restart/replay and disable/removal behavior within approved scope.
 - [ ] Verify autonomous cloud wake separately if that capability is implemented.
-- [x] Verify #1723's recovery repair before retrying task dispatch (fixed; redispatch `0c99a08e` completed).
-- [x] Confirm receiver stopped from process evidence; retain the finite-window limit.
+- [ ] Verify #1723's recovery on its original task. Fixed in source (#1725), but the original `08d5f457` recovery was not retried; redispatch `0c99a08e` of a different task exercised #1734.
+- [x] Confirm receiver stopped from process evidence (pre-cycle checkpoint; read current process state fresh); retain the finite-window limit.
 - [ ] Verify routing cleanup and a dispatch hold across stop/restart; process stop
       and TTL expiry are not completion of this step.
 - [ ] Attach the held flight/budget and original built-in cost evidence separately;
-      record external flight cost only if execution occurs.
+      external cost is unmetered (flight `083f3f72` landed `cost_metered: false`); attach a metered figure only if one becomes available.
 - [ ] Re-run the documented setup in a fresh instance and pin runtime/version.
 
 These are evidence gaps, not instructions to execute the actions now.
