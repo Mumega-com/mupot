@@ -424,7 +424,7 @@ describe('REST governed flight landing parity', () => {
     const response = await flightsApp.request('https://pot.example/flight-m000/land', {
       method: 'POST',
       headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
-      body: JSON.stringify({ score: 0.97 }),
+      body: JSON.stringify({ score: 0.97, cost_micro_usd: 0 }),
     }, env)
 
     expect(response.status).toBe(200)
@@ -459,5 +459,36 @@ describe('REST governed flight landing parity', () => {
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toEqual({ error: 'flight_budget_exceeded', budget_micro_usd: 0 })
     expect(flight.status).toBe('running')
+  })
+
+  // mupot#1738: a missing cost is not a metered 0 (mirrors flight_land).
+  const land = (env: Env, body: unknown) => flightsApp.request('https://pot.example/flight-m000/land', {
+    method: 'POST',
+    headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }, env)
+
+  it('#1738 refuses a land with no cost and no cost_metered:false (no fabricated metered 0)', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await land(env, { score: 0.9 })
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toMatchObject({ error: 'invalid_flight_cost' })
+    expect(flight.status).toBe('running')
+  })
+
+  it('#1738 refuses cost_metered:false combined with a cost, and a non-boolean flag', async () => {
+    const a = makeGovernedLandEnv('done', 'approved')
+    expect((await land(a.env, { cost_metered: false, cost_micro_usd: 0 })).status).toBe(400)
+    const b = makeGovernedLandEnv('done', 'approved')
+    expect((await land(b.env, { cost_metered: 'no' })).status).toBe(400)
+    expect(a.flight.status).toBe('running')
+    expect(b.flight.status).toBe('running')
+  })
+
+  it('#1738 accepts an explicit cost_metered:false land (unmetered, budget compare skipped)', async () => {
+    const { env, flight } = makeGovernedLandEnv('done', 'approved')
+    const response = await land(env, { cost_metered: false })
+    expect(response.status).toBe(200)
+    expect(flight.status).toBe('landed')
   })
 })

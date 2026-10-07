@@ -244,6 +244,26 @@ describe('routine runtime-neutral dispatch', () => {
     expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 0 })
   })
 
+  // #1738 round 2 regression: ask_human -> answer lands the control flight and re-queues the
+  // run with flight_id NULL, the old flight still in routine_run_refs. Re-dispatch must proceed.
+  it('re-dispatches a run re-queued after ask_human was answered (landed control flight in refs)', async () => {
+    harness = makeHarness()
+    harness.sqlite.prepare(
+      `INSERT INTO flights (id, tenant, project_id, agent, goal, status, budget_micro_usd,
+         cost_micro_usd, created_at, started_at, meta)
+       VALUES ('old-control', 'tenant-a', 'project-1', 'agent-preferred', 'g', 'landed', 100000, 0, 1, 1, '{}')`,
+    ).run()
+    harness.sqlite.prepare(
+      `INSERT INTO routine_run_refs (id, tenant, project_id, run_id, ref_type, ref_id, relation, created_at)
+       VALUES ('ref-old', 'tenant-a', 'project-1', 'run-1', 'flight', 'old-control', 'dispatch_flight', '${NOW.toISOString()}')`,
+    ).run()
+    harness.sqlite.prepare("UPDATE routine_runs SET flight_id = NULL, task_id = NULL WHERE id = 'run-1'").run()
+
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+
+    expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-preferred' })
+  })
+
   it('keeps the reserved executor stable across a failed delivery retry', async () => {
     harness = makeHarness()
     const env = envFor(harness)

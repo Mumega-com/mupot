@@ -392,7 +392,19 @@ flightsApp.post('/:id/land', async (c) => {
     return c.json({ error: 'flight_meta_incompatible' }, 409)
   }
   if (governedMeta) {
-    const cost = b.cost_micro_usd == null ? 0 : b.cost_micro_usd
+    // #1738: mirror flight_land. A missing cost is NOT a metered 0; the caller must either
+    // supply a measured cost or explicitly declare cost_metered:false (executor has no meter).
+    if (b.cost_metered !== undefined && typeof b.cost_metered !== 'boolean') {
+      return c.json({ error: 'invalid_flight_cost' }, 400)
+    }
+    const unmetered = b.cost_metered === false
+    if (unmetered && b.cost_micro_usd != null) {
+      return c.json({ error: 'invalid_flight_cost', reason: 'cost_micro_usd must be omitted when cost_metered=false' }, 400)
+    }
+    if (!unmetered && b.cost_micro_usd == null) {
+      return c.json({ error: 'invalid_flight_cost', reason: 'cost_micro_usd required unless cost_metered=false' }, 400)
+    }
+    const cost = unmetered ? 0 : b.cost_micro_usd
     const score = b.score
     if (!Number.isSafeInteger(cost) || (cost as number) < 0) {
       return c.json({ error: 'invalid_flight_cost' }, 400)
@@ -406,11 +418,12 @@ flightsApp.post('/:id/land', async (c) => {
     if (!Number.isSafeInteger(existing.budget_micro_usd) || (existing.budget_micro_usd as number) < 0) {
       return c.json({ error: 'flight_budget_policy_missing' }, 409)
     }
-    if ((cost as number) > (existing.budget_micro_usd as number)) {
+    if (!unmetered && (cost as number) > (existing.budget_micro_usd as number)) {
       return c.json({ error: 'flight_budget_exceeded', budget_micro_usd: existing.budget_micro_usd }, 409)
     }
     const landing = await landGovernedFlight(c.env, id, {
       cost_micro_usd: cost as number,
+      ...(unmetered ? { cost_metered: false } : {}),
       score: score as number | undefined,
       agent_id: existing.agent,
       meta: governedMeta,

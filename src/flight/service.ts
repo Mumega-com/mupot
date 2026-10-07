@@ -421,7 +421,13 @@ export async function landGovernedFlight(
        )`
     : ''
   const transition = env.DB.prepare(
-    `UPDATE flights SET status='landed', cost_micro_usd=?4, cost_metered=?7, score=COALESCE(?5, score), ended_at=?6
+    `UPDATE flights SET status='landed',
+            -- #1738: a landing that claims no cost (0 / unmetered) must not erase usage already
+            -- reported onto this flight by report_run_usage (metered, cost > 0). An explicit
+            -- non-zero landing cost still wins.
+            cost_micro_usd = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN cost_micro_usd ELSE ?4 END,
+            cost_metered = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN 1 ELSE ?7 END,
+            score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')
@@ -446,7 +452,7 @@ export async function landGovernedFlight(
                ), '') <> 'approved'
              )
        )${routineWitnessSql}
-     RETURNING score, cost_micro_usd`,
+     RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd`,
   )
     .bind(
       id,
@@ -508,7 +514,9 @@ export async function landGovernedFlight(
   // Row count is derived from the statement's own output, and it is this codebase's
   // established idiom for conditional-UPDATE-with-RETURNING: see the fence write at
   // src/mcp/index.ts:2652 and consumeAgentInbox in src/agents/messages.ts.
-  const transitionResult = await transition.all<{ score: number | null; cost_micro_usd: number }>()
+  const transitionResult = await transition.all<{
+    score: number | null; cost_micro_usd: number; cost_metered: number; budget_micro_usd: number | null
+  }>()
   const landedRows = transitionResult.results ?? []
   if (landedRows.length !== 1) return { transitioned: false, receipt: false }
 
@@ -523,10 +531,20 @@ export async function landGovernedFlight(
   // one statement observing another's write.
   const landedRow = landedRows[0]
 
+  // #1738 gate: the receipt states what the ROW holds, not what the caller claimed. The
+  // landing can preserve an already-reported metered cost (see the CASE above), so a claim
+  // of 0 / unmetered may leave the row metered with a real cost — possibly over budget.
+  const storedMetered = landedRow ? landedRow.cost_metered === 1 : opts.cost_metered !== false
+  const storedCost = landedRow?.cost_micro_usd ?? opts.cost_micro_usd
+  const storedBudget = landedRow?.budget_micro_usd ?? null
   const receiptPayload = JSON.stringify({
     ...JSON.parse(payload) as Record<string, unknown>,
     score: landedRow?.score ?? opts.score ?? null,
-    cost_micro_usd: opts.cost_metered === false ? null : (landedRow?.cost_micro_usd ?? opts.cost_micro_usd),
+    cost_micro_usd: storedMetered ? storedCost : null,
+    cost_metered: storedMetered,
+    budget_compliance: !storedMetered
+      ? 'unknown'
+      : storedBudget !== null && storedCost > storedBudget ? 'over_budget' : 'within_budget',
   })
 
   let receipt = false

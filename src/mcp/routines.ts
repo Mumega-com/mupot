@@ -495,7 +495,7 @@ const reportRunUsage: ToolSpec = {
       // for work that never ran — is not addressed by a status check; it lives in the report
       // path, and is tracked separately.
       env.DB.prepare(
-        `UPDATE flights SET cost_micro_usd = ?3 WHERE id = ?1 AND tenant = ?2`,
+        `UPDATE flights SET cost_micro_usd = ?3, cost_metered = 1 WHERE id = ?1 AND tenant = ?2`,
       ).bind(run.flight_id, env.TENANT_SLUG, priced),
 
       // Keep the run consistent with its flights. routine_runs.cost_micro_usd is defined
@@ -525,7 +525,7 @@ const reportRunUsage: ToolSpec = {
       // be rewritten. Those stay wrong, and that is correct: you cannot un-send a receipt.
       env.DB.prepare(
         `UPDATE flight_event_outbox
-            SET payload = json_set(payload, '$.cost_micro_usd', ?3)
+            SET payload = json_set(payload, '$.cost_micro_usd', ?3, '$.cost_metered', json('true'))
           WHERE tenant = ?2 AND flight_id = ?1
             AND event_type = 'flight.landed' AND delivered_at IS NULL`,
       ).bind(run.flight_id, env.TENANT_SLUG, priced),
