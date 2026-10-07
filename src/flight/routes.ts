@@ -42,7 +42,7 @@ import {
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
-import { flightOutcome, isCancelledFlight } from './cancelled'
+import { flightOutcome, isCancelledFlight, isCancelUnconfirmed } from './cancelled'
 import {
   findFinishedWorkConflict,
   findFlightByClientRequestId,
@@ -564,6 +564,8 @@ flightsApp.get('/', async (c) => {
       status: f.status,
       outcome: flightOutcome(f),
       cancelled: isCancelledFlight(f),
+      // #1756: cancelled (never a failure) but the routine effect was not fenced; label it, do not count it.
+      cancel_unconfirmed: isCancelUnconfirmed(f),
       score: f.score,
       cost_micro_usd: f.cost_metered === 0 ? null : f.cost_micro_usd,
       cost_metered: f.cost_metered !== 0,

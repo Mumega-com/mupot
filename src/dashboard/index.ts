@@ -5724,7 +5724,7 @@ function agentConsoleBody(
           <dt>Flown</dt><dd>${d.truncated ? html`at least ${d.total}` : html`${d.total}`}</dd>
           <dt>Landed</dt><dd>${d.landed}</dd>
           <dt>Failed</dt><dd>${d.failed}</dd>
-          <dt>Cancelled</dt><dd>${d.cancelled}</dd>
+          <dt>Cancelled</dt><dd>${d.cancelled}${d.cancelUnconfirmed > 0 ? html` (${d.cancelUnconfirmed} effect unconfirmed)` : ''}</dd>
           <dt>Held</dt><dd>${d.held}</dd>
           <dt>Running</dt><dd>${d.running}</dd>
           <dt>Spend</dt><dd>${formatCost(d.costMicroUsd)}</dd>

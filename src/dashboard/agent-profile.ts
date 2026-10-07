@@ -1,5 +1,5 @@
 import type { Env } from '../types'
-import { cancelledColumnSql, flightOutcome, isCancelledFlight } from '../flight/cancelled'
+import { cancelledColumnSql, flightOutcome, isCancelledFlight, isCancelUnconfirmed } from '../flight/cancelled'
 
 /**
  * Agent profile panels.
@@ -110,11 +110,13 @@ export interface FlightSummary {
   failed: number
   /** #1748: lead/admin cancels, stored as 'failed'; NOT counted in `failed`. */
   cancelled: number
+  /** #1756: of `cancelled`, how many did not fence the routine effect. Still NOT counted as failed. */
+  cancelUnconfirmed: number
   held: number
   running: number
   /** Total spend in micro-USD across every flight this agent flew. */
   costMicroUsd: number
-  recent: { id: string; goal: string; status: string; created_at: string }[]
+  recent: { id: string; goal: string; status: string; cancel_unconfirmed?: boolean; created_at: string }[]
 }
 
 /**
@@ -124,7 +126,7 @@ export interface FlightSummary {
  * the most interesting failure mode on this deployment.
  */
 export function summariseFlights(
-  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; created_at: string }[],
+  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; cancel_unconfirmed?: number; created_at: string }[],
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
@@ -132,6 +134,7 @@ export function summariseFlights(
     landed: 0,
     failed: 0,
     cancelled: 0,
+    cancelUnconfirmed: 0,
     held: 0,
     running: 0,
     costMicroUsd: 0,
@@ -139,7 +142,10 @@ export function summariseFlights(
   }
   for (const r of rows) {
     if (r.status === 'landed') summary.landed += 1
-    else if (isCancelledFlight(r)) summary.cancelled += 1
+    else if (isCancelledFlight(r)) {
+      summary.cancelled += 1
+      if (isCancelUnconfirmed(r)) summary.cancelUnconfirmed += 1
+    }
     else if (r.status === 'failed') summary.failed += 1
     else if (r.status === 'held') summary.held += 1
     else if (r.status === 'running') summary.running += 1
@@ -152,6 +158,7 @@ export function summariseFlights(
     id: r.id,
     goal: r.goal,
     status: flightOutcome(r),
+    ...(isCancelUnconfirmed(r) ? { cancel_unconfirmed: true } : {}),
     created_at: r.created_at,
   }))
   return summary
@@ -166,7 +173,7 @@ export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelR
         ORDER BY created_at DESC
         LIMIT ${PANEL_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{
-      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; cancelled: number; created_at: string
+      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; cancelled: number; cancel_unconfirmed: number; created_at: string
     }>()
     const rows = res.results ?? []
     if (rows.length === 0) return empty()

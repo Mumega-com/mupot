@@ -3856,13 +3856,13 @@ const toolFlightCancel: ToolSpec = {
       console.error('flight cancelled without a receipt', { flight_id: result.flight_id })
     }
     // flight_closed = terminal bookkeeping (the flight row left its live states). cancelled = the stronger
-    // guarantee that no effect commits afterwards. They differ only when a routine action was already running.
+    // guarantee that no effect commits afterwards. They differ only when a routine action was already running or its control message was already delivered.
     const effectUnfenced = result.routine_outcome === 'unconfirmed'
     return done({
       cancelled: !effectUnfenced,
       flight_closed: true,
       ...(effectUnfenced
-        ? { cancellation: 'unconfirmed', reason: 'routine_action_running_effect_may_still_commit' }
+        ? { cancellation: 'unconfirmed', reason: 'routine_effect_may_be_in_flight' }
         : {}),
       flight_id: result.flight_id,
       previous_status: result.previous_status,

@@ -75,7 +75,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   flight_list: RO('SELECTs; the only write is the TTL\'d caller-bound pagination cursor (issueFlightCursor, index.ts:3110), covered by the cursor carve-out'),
   flight_land: MUT('landGovernedFlight UPDATE flights status=landed + INSERT flight_event_outbox (flight/service.ts:418,543)'),
   flight_reap_stalled: MUT('reapStalledFlight UPDATE flights / routine_runs + INSERT reap receipt (flight/watchdog.ts:403,413,476)'),
-  flight_cancel: MUT('cancelFlight UPDATE flights status=failed (+ routine_runs) + INSERT flight_cancel_receipts (flight/watchdog.ts cancelFlight)'),
+  flight_cancel: MUT('cancelFlight UPDATE flights status=failed + UPDATE routine_runs (cancelled or failed/cancellation_unconfirmed) + UPDATE routine_run_actions (unconfirmed branch only) + INSERT routine_run_events (cancellation_unconfirmed) + INSERT flight_cancel_receipts with routine_outcome (flight/watchdog.ts cancelFlight)'),
 
   // ── tasks ──────────────────────────────────────────────────────────────────────────────────
   task_create: ADDX('createTask INSERT tasks (tasks/service.ts:1414) + mirrorTaskCreate GitHub issue POST (service.ts:1470,853)'),

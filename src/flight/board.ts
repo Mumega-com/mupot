@@ -8,7 +8,7 @@
 import type { FlightRow, FlightStatus } from './service'
 import { detectFlightCollisions } from './clearance'
 import type { FlightCollision } from './clearance'
-import { isCancelledFlight } from './cancelled'
+import { isCancelledFlight, isCancelUnconfirmed } from './cancelled'
 
 // The board metaphor (plain mupot language): running=flying, waiting=holding (at a
 // human gate), sleeping=between flights. preflight/held/landed/failed keep their names.
@@ -47,6 +47,8 @@ export interface FlightCard {
   goal: string
   status: FlightStatus
   phase: FlightPhase
+  /** #1756: phase 'cancelled' but the routine effect was NOT fenced (closed by a human, work may still commit). */
+  cancel_unconfirmed: boolean
   live: boolean
   cost_usd: string
   budget_usd: string | null
@@ -129,6 +131,7 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       goal: row.goal,
       status: row.status,
       phase,
+      cancel_unconfirmed: isCancelUnconfirmed(row),
       live: LIVE_PHASES.has(phase),
       cost_usd: row.cost_metered === 0 ? 'unmetered' : (formatUsd(row.cost_micro_usd) ?? '$0.0000'),
       budget_usd: formatUsd(row.budget_micro_usd),
