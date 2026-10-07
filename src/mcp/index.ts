@@ -166,6 +166,7 @@ import {
 import {
   readFleetAgentRow,
   getFleetAgentLiveness,
+  evaluateReceiverLiveness,
   derivePresence,
   resolveFleetPresenceTtlSec,
   clampPollIntervalSec,
@@ -2539,6 +2540,21 @@ const toolTaskDispatch: ToolSpec = {
     // settle) clears this the same way it clears the reassignment guard.
     if (await hasInFlightDispatchReceipt(env, task.id)) {
       return fail(409, 'task_not_dispatchable')
+    }
+
+    // mupot#1729 — never dispatch to an external receiver that is not currently live (a stopped
+    // or TTL-expired poll seat would dead-letter in an unread inbox; falling back to in-Worker
+    // would run the work somewhere the owner did not choose). Same liveness derivation as
+    // fleet_agent_get. Agents with no fleet surface are untouched.
+    const receiverVerdict = await evaluateReceiverLiveness(env, task.assignee_agent_id, forceInboxDelivery)
+    if (!receiverVerdict.ok) {
+      return fail(409, 'receiver_not_live', {
+        agent_id: task.assignee_agent_id,
+        presence_mode: receiverVerdict.presence_mode,
+        status: receiverVerdict.status,
+        live: receiverVerdict.live,
+        reason: receiverVerdict.reason,
+      })
     }
 
     // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` must not strand a task in an inbox

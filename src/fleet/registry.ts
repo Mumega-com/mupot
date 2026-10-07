@@ -939,6 +939,50 @@ export async function getFleetAgentLiveness(
   return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
 }
 
+export type ReceiverNotLiveReason = 'poll_stopped' | 'poll_stale' | 'stopped_forced_inbox'
+
+export interface ReceiverLivenessVerdict {
+  /** False iff dispatching to this agent's external receiver must be refused (mupot#1729). */
+  ok: boolean
+  agent_id: string
+  presence_mode: string
+  status: string
+  live: boolean
+  reason?: ReceiverNotLiveReason
+}
+
+/**
+ * evaluateReceiverLiveness — mupot#1729. THE dispatch-time fence: work goes to an external
+ * receiver ONLY when that receiver is currently live. Routing state (presence_mode='poll',
+ * a kept runtime) outlives the process, so a stopped/expired receiver must be refused rather
+ * than handed an inbox dead letter or silently run in-Worker. Reads the RAW row (not
+ * getFleetAgentLiveness, which hides a stopped row's poll mode) and the SAME derivePresence +
+ * resolveFleetPresenceTtlSec that fleet_agent_get's derived_presence uses.
+ *
+ * Refuses when: poll + stopped; poll + not live (TTL expired); stopped + forced inbox against a
+ * row with a registered surface (runtime kept after detach). No row / no poll / no runtime =
+ * no fleet surface -> ok (in-Worker behaviour unchanged). Unforced resident rows unchanged.
+ */
+export async function evaluateReceiverLiveness(
+  env: Env,
+  agentId: string,
+  forceInbox: boolean,
+  nowMs = Date.now(),
+): Promise<ReceiverLivenessVerdict> {
+  const row = await readFleetAgentRow(env, agentId)
+  if (!row) return { ok: true, agent_id: '', presence_mode: '', status: 'unknown', live: false }
+  const presenceMode = row.presence_mode ? String(row.presence_mode) : ''
+  const runtime = row.runtime ? String(row.runtime) : ''
+  const status = String(row.status ?? 'unknown')
+  const live = derivePresence(status, String(row.last_reported_at ?? ''), resolveFleetPresenceTtlSec(env, row), nowMs) === 'live'
+  const base = { agent_id: String(row.agent_id), presence_mode: presenceMode, status, live }
+  let reason: ReceiverNotLiveReason | undefined
+  if (presenceMode === 'poll' && status === 'stopped') reason = 'poll_stopped'
+  else if (presenceMode === 'poll' && !live) reason = 'poll_stale'
+  else if (status === 'stopped' && forceInbox && (presenceMode === 'poll' || runtime !== '')) reason = 'stopped_forced_inbox'
+  return reason ? { ok: false, ...base, reason } : { ok: true, ...base }
+}
+
 /**
  * listSquadMemberIds — sorted, deduped agent_ids currently reporting squadId in their
  * `squads[]` (the SAME self-reported column groupBySquad/squadControlPanel already group by —

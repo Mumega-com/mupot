@@ -97,7 +97,22 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
   })
 
-  it('IS honored against a poll-registered agent (presence_mode=poll), regardless of its own TTL state', async () => {
+  it('IS honored against a LIVE poll-registered agent (presence_mode=poll)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, presence_mode, presence_ttl_sec, last_reported_at, updated_at)
+      VALUES ('${AGENT_ID}', '${TENANT}', 'Target', '', '[]', 'on_demand', 'running', '${AGENT_ID}', 'generic', 'poll', 300,
+              '${sqliteStamp(Date.now())}', '${sqliteStamp(Date.now())}');
+    `)
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
+    expect(res.result).not.toHaveProperty('delivery_forced_predicted')
+    expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
+  })
+
+  // mupot#1729: a STALE poll agent is now refused at dispatch (was: honored into a dead inbox).
+  it('is REFUSED (409 receiver_not_live) against a STALE poll-registered agent', async () => {
     harness.sqlite.exec(`
       INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, presence_mode, presence_ttl_sec, last_reported_at, updated_at)
       VALUES ('${AGENT_ID}', '${TENANT}', 'Target', '', '[]', 'on_demand', 'running', '${AGENT_ID}', 'generic', 'poll', 300,
@@ -106,9 +121,8 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
 
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
-    expect(res.ok).toBe(true)
-    expect(res.result).not.toHaveProperty('delivery_forced_predicted')
-    expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'receiver_not_live' })
+    expect(events).toHaveLength(0)
   })
 
   it('is IGNORED against a presence_mode=resident row with no runtime (cleared/de-registered)', async () => {

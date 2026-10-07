@@ -453,6 +453,22 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // `resolveDispatchDeliveryMode` is pure and independently unit-tested; this call site only
       // supplies the two inputs it needs and acts on (and durably records — never silently) what
       // it returns.
+      // mupot#1729 — natural poll routing is not liveness-gated; if the poll receiver is no
+      // longer live at consume time (dispatch-time fence passed, then it stopped/expired),
+      // refuse here instead of dead-lettering into an unread inbox or running in-Worker.
+      // Terminal disposition: settle the receipt failed (reason receiver_not_live, delivered_via
+      // stays NULL, no envelope written) and consume it, so it never wedges or retries. The
+      // task is untouched (still dispatchable once the receiver is live again).
+      if (route.presenceMode === 'poll' && !route.live) {
+        await settleInWorkerDispatchReceipt(env, {
+          dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id,
+          stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
+        })
+        if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {
+          throw new Error('receiver_not_live dispatch receipt consume failed')
+        }
+        return true
+      }
       const deliveryMode = resolveDispatchDeliveryMode(route, forcedInboxDelivery(event))
       try {
         if (deliveryMode === 'inbox') {

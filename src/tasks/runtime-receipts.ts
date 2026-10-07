@@ -249,21 +249,26 @@ const NO_INBOX_ENVELOPE_SQL = (tenantParam: string, receiptParam: string): strin
  */
 export async function settleInWorkerDispatchReceipt(
   env: Env,
-  input: { dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string },
+  input: {
+    dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string
+    /** mupot#1729: 'none' = refused before any delivery (delivered_via stays NULL). Default in_worker. */
+    deliveredVia?: 'in_worker' | 'none'
+  },
 ): Promise<boolean> {
   const now = new Date().toISOString()
+  const deliveredVia = input.deliveredVia === 'none' ? null : 'in_worker'
   const reason = sanitizeReceiptText(text(input.reason, 500))
   const auditId = crypto.randomUUID()
   const evidence = canonicalJson({
     dispatch_receipt_id: input.dispatchReceiptId,
     stage: input.stage,
     reason,
-    delivered_via: 'in_worker',
+    delivered_via: deliveredVia,
   })
   const results = await env.DB.batch([
     env.DB.prepare(`
       UPDATE task_dispatch_receipts
-         SET settled_stage = ?1, settled_at = ?2, settled_reason = ?3, delivered_via = 'in_worker'
+         SET settled_stage = ?1, settled_at = ?2, settled_reason = ?3, delivered_via = ${deliveredVia ? "'in_worker'" : 'NULL'}
        WHERE tenant = ?4 AND id = ?5 AND task_id = ?6 AND agent_id = ?7
          AND settled_at IS NULL
          AND (delivered_via IS NULL OR delivered_via = 'in_worker')
