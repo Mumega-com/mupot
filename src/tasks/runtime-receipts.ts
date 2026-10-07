@@ -209,7 +209,9 @@ export function pointerAvailableForSql(p: { tenantParam: string; newReceiptParam
          AND EXISTS (
            SELECT 1 FROM task_dispatch_receipts nd
             WHERE nd.tenant = ${p.tenantParam} AND nd.id = ${p.newReceiptParam}
-                            AND (nd.created_at > pd.created_at
+              -- mupot#1736 — pin the incoming dispatch to THIS task in SQL (no reliance on the JS lookup)
+              AND nd.task_id = tasks.id
+              AND (nd.created_at > pd.created_at
                    OR (nd.created_at = pd.created_at AND nd.rowid > pd.rowid))
          )
          AND (pd.settled_at IS NOT NULL OR EXISTS (
@@ -1258,7 +1260,10 @@ export async function recordTaskDispatchRuntimeReceipt(
           `).bind(result, now, input.taskId, agentId, input.dispatchReceiptId,
             env.TENANT_SLUG, input.attempt, nowSqlUtc(), messageId)
         : env.DB.prepare(`
-            UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2
+            -- mupot#1736 — a failed takeover moves the pointer to THIS dispatch in the same UPDATE
+            -- (same pointerAvailableForSql guard), so result and pointer never name different runs.
+            UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2,
+              execution_receipt_id = ?5
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status IN ('open', 'in_progress', 'blocked', 'rejected')
                AND ${pointerAvailableForSql({ tenantParam: '?6', newReceiptParam: '?5' })}
