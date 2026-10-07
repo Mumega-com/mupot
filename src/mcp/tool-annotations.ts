@@ -97,6 +97,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   squad_recall: RO('createMemory.recall read path (memory/index.ts:60)'),
   project_remember: ADD('createMemory.remember INSERT engrams + Vectorize upsert (memory/index.ts:39,47)'),
   project_recall: RO('createMemory.recall read path (memory/index.ts:60)'),
+  project_memory_get: RO('SELECT engrams WHERE id AND agent_id=project:<id> behind readableProject (index.ts toolProjectMemoryGet); pure SHA-256 over stored text'),
 
   // ── wake / routing / messaging ─────────────────────────────────────────────────────────────
   wake_agent: ADDX('routeAgentWake POSTs AgentDO /wake (agents/wake-routing.ts:123); the DO runs one cortex cycle synchronously via createModel (agents/agent-do.ts:16,136) which calls the model provider through the AI Gateway, and advances the DO cycle/alarm'),
