@@ -421,7 +421,13 @@ export async function landGovernedFlight(
        )`
     : ''
   const transition = env.DB.prepare(
-    `UPDATE flights SET status='landed', cost_micro_usd=?4, cost_metered=?7, score=COALESCE(?5, score), ended_at=?6
+    `UPDATE flights SET status='landed',
+            -- #1738: a landing that claims no cost (0 / unmetered) must not erase usage already
+            -- reported onto this flight by report_run_usage (metered, cost > 0). An explicit
+            -- non-zero landing cost still wins.
+            cost_micro_usd = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN cost_micro_usd ELSE ?4 END,
+            cost_metered = CASE WHEN ?4 = 0 AND cost_metered = 1 AND cost_micro_usd > 0 THEN 1 ELSE ?7 END,
+            score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')

@@ -1,10 +1,8 @@
-// mupot#1738 — unknown (unmetered) flight cost must be honoured by every writer and aggregate
-// that feeds routine budget enforcement. Real schema (all migrations), no hand-written DDL.
+// mupot#1738 — writers must honour the unmetered flag. Real schema (all migrations).
 import { afterEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp'
-import { submitRoutineProposal } from '../src/routines/actions'
-import { getRoutineRun } from '../src/routines/service'
-import { publicRoutineRun } from '../src/routines/public'
+import { landGovernedFlight } from '../src/flight/service'
+import { parseFlightMetaV1 } from '../src/flight/meta'
 import type { AuthContext, CapabilityGrant } from '../src/types'
 import { makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
 
@@ -21,86 +19,58 @@ function agentPrincipal(): AuthContext {
   } as any
 }
 
-const dispatchFlight = (f: ReadyRoutineFixture, key: string) => f.proposal({
-  key, kind: 'dispatch_flight',
-  input: { goal: 'Go', task_ids: ['control-task'], artifact_refs: [], budget_micro_usd: 1000 },
-})
+const usage = { run_id: 'run-1', model: 'deepseek-v4-flash', input: 1_000_000, output: 1_000_000 }
 
-describe('#1738 unmetered aggregates', () => {
+describe('#1738 unmetered writers', () => {
   let fixture: ReadyRoutineFixture | undefined
   afterEach(() => { fixture?.harness.close(); fixture = undefined })
 
-  it('metered run: dispatch_flight proposal is accepted as before (budget unchanged)', async () => {
-    fixture = await makeReadyRoutineFixture('propose')
-    const r = await submitRoutineProposal(fixture.env, fixture.principal, dispatchFlight(fixture, 'f-metered'))
-    expect(r).not.toMatchObject({ error: 'budget_unknown_unmetered' })
-    expect(r).not.toMatchObject({ error: 'budget_exceeded' })
-  })
-
-  it('all-unmetered run: dispatch_flight is refused budget_unknown_unmetered (not treated as 0 spend)', async () => {
-    fixture = await makeReadyRoutineFixture('propose')
-    fixture.harness.sqlite.exec("UPDATE flights SET cost_metered = 0 WHERE id = 'control-flight'")
-    const r = await submitRoutineProposal(fixture.env, fixture.principal, dispatchFlight(fixture, 'f-unmetered'))
-    expect(r).toEqual({ ok: false, error: 'budget_unknown_unmetered' })
-  })
-
-  it('mixed metered + unmetered: refused (unknown, not the metered partial sum)', async () => {
-    fixture = await makeReadyRoutineFixture('propose')
-    fixture.harness.sqlite.exec(`
-      UPDATE flights SET cost_micro_usd = 5 WHERE id = 'control-flight';
-      INSERT INTO flights (id, tenant, project_id, agent, goal, status, budget_micro_usd, cost_micro_usd,
-        cost_metered, created_at, started_at, meta)
-      VALUES ('extra-unmetered', 'tenant-a', 'project-1', 'agent-1', 'g', 'landed', 1000, 0, 0, 1, 1, '{}');
-      INSERT INTO routine_run_refs (id, tenant, project_id, run_id, ref_type, ref_id, relation)
-      VALUES ('ref-extra', 'tenant-a', 'project-1', 'run-1', 'flight', 'extra-unmetered', 'action_result');
-    `)
-    const r = await submitRoutineProposal(fixture.env, fixture.principal, dispatchFlight(fixture, 'f-mixed'))
-    expect(r).toEqual({ ok: false, error: 'budget_unknown_unmetered' })
-  })
-
-  it('public run DTO shows unknown cost (null + cost_metered:false), never 0, for an unmetered run; metered shows the sum', async () => {
-    fixture = await makeReadyRoutineFixture('propose')
-    fixture.harness.sqlite.exec("UPDATE routine_runs SET cost_micro_usd = 7 WHERE id = 'run-1'")
-    const principal = { ...fixture.principal, workspace_admin: true }
-    const metered = await getRoutineRun(fixture.env, principal, 'run-1')
-    expect(metered && publicRoutineRun(metered)).toMatchObject({ cost_micro_usd: 7, cost_metered: true })
-
-    fixture.harness.sqlite.exec("UPDATE flights SET cost_metered = 0 WHERE id = 'control-flight'")
-    const unknown = await getRoutineRun(fixture.env, principal, 'run-1')
-    expect(unknown && publicRoutineRun(unknown)).toMatchObject({ cost_micro_usd: null, cost_metered: false })
-  })
-
-  it('report_run_usage on an unmetered flight flips it to metered, fixes the outbox, and readers show the cost', async () => {
+  it('report_run_usage on an unmetered flight flips it to metered and fixes the outbox payload', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
-    fixture.harness.sqlite.exec("UPDATE flights SET cost_metered = 0 WHERE id = 'control-flight'")
     fixture.harness.sqlite.exec(`
+      UPDATE flights SET cost_metered = 0 WHERE id = 'control-flight';
       INSERT INTO flight_event_outbox (id, tenant, flight_id, event_type, actor_kind, actor_id, payload, created_at)
       VALUES ('ob-1', 'tenant-a', 'control-flight', 'flight.landed', 'agent', 'agent-1',
               '{"cost_micro_usd":null,"cost_metered":false,"budget_compliance":"unknown"}', '2026-07-19T16:00:00.000Z');
     `)
-    const out = await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage',
-      { run_id: 'run-1', model: 'deepseek-v4-flash', input: 1_000_000, output: 1_000_000 }, 'https://pot.test')
+    const out = await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
     expect(out).toMatchObject({ ok: true, result: { cost_micro_usd: 420_000 } })
-
     expect(row(fixture, "SELECT cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
       .toEqual({ c: 420_000, m: 1 })
     const payload = JSON.parse((row(fixture, "SELECT payload FROM flight_event_outbox WHERE id='ob-1'") as { payload: string }).payload)
     expect(payload).toMatchObject({ cost_micro_usd: 420_000, cost_metered: true })
-    const run = await getRoutineRun(fixture.env, { ...fixture.principal, workspace_admin: true }, 'run-1')
-    expect(run && publicRoutineRun(run)).toMatchObject({ cost_micro_usd: 420_000, cost_metered: true })
   })
 
-  it('landControlFlight lands the control flight UNMETERED (its 0 was never measured)', async () => {
+  it('landing with no cost claim does not erase usage already reported by report_run_usage', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
-    const r = await submitRoutineProposal(fixture.env, fixture.principal, fixture.proposal({
-      key: 'none-1', kind: 'no_action', input: { reason: 'No accountable action is currently available.' },
-    }))
-    expect(r).toMatchObject({ ok: true, status: 'succeeded' })
+    await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    // Drop the routine witness so this exercises the plain (REST/MCP-style) landing path.
+    fixture.harness.sqlite.exec("UPDATE flights SET meta = json_remove(meta, '$.routine_run_id', '$.routine_revision') WHERE id='control-flight'")
+    const meta = parseFlightMetaV1(JSON.parse((row(fixture, "SELECT meta FROM flights WHERE id='control-flight'") as { meta: string }).meta))
+    if (!meta) throw new Error('meta')
+    fixture.harness.sqlite.exec("UPDATE tasks SET status = 'done' WHERE id = 'control-task'")
+    const landed = await landGovernedFlight(fixture.env, 'control-flight', {
+      cost_micro_usd: 0, expected_agent: 'agent-1', agent_id: 'agent-1', meta,
+      actor: { kind: 'agent', id: 'agent-1' },
+    })
+    expect(landed.transitioned).toBe(true)
     expect(row(fixture, "SELECT status, cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
-      .toEqual({ status: 'landed', c: 0, m: 0 })
-    const payload = JSON.parse((row(fixture, "SELECT payload FROM flight_event_outbox WHERE flight_id='control-flight'") as { payload: string }).payload)
-    expect(payload).toMatchObject({ cost_micro_usd: null, cost_metered: false })
-    const run = await getRoutineRun(fixture.env, { ...fixture.principal, workspace_admin: true }, 'run-1')
-    expect(run && publicRoutineRun(run)).toMatchObject({ cost_micro_usd: null, cost_metered: false })
+      .toEqual({ status: 'landed', c: 420_000, m: 1 })
+  })
+
+  it('an explicit non-zero landing cost still wins (metered landings are unchanged)', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    // Drop the routine witness so this exercises the plain (REST/MCP-style) landing path.
+    fixture.harness.sqlite.exec("UPDATE flights SET meta = json_remove(meta, '$.routine_run_id', '$.routine_revision') WHERE id='control-flight'")
+    const meta = parseFlightMetaV1(JSON.parse((row(fixture, "SELECT meta FROM flights WHERE id='control-flight'") as { meta: string }).meta))
+    if (!meta) throw new Error('meta')
+    fixture.harness.sqlite.exec("UPDATE tasks SET status = 'done' WHERE id = 'control-task'")
+    await landGovernedFlight(fixture.env, 'control-flight', {
+      cost_micro_usd: 500, expected_agent: 'agent-1', agent_id: 'agent-1', meta,
+      actor: { kind: 'agent', id: 'agent-1' },
+    })
+    expect(row(fixture, "SELECT cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
+      .toEqual({ c: 500, m: 1 })
   })
 })

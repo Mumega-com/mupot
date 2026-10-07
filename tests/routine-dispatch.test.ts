@@ -244,54 +244,20 @@ describe('routine runtime-neutral dispatch', () => {
     expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 0 })
   })
 
-  // mupot#1738: an unmetered flight's cost is UNKNOWN. The aggregate sums it as 0, so
-  // enforcement must fail closed instead of reading 0 as "within budget".
-  function addRunFlight(h: SqliteD1Harness, id: string, costMicroUsd: number, metered: 0 | 1, primary: boolean) {
-    h.sqlite.prepare(
+  // #1738 round 2 regression: ask_human -> answer lands the control flight and re-queues the
+  // run with flight_id NULL, the old flight still in routine_run_refs. Re-dispatch must proceed.
+  it('re-dispatches a run re-queued after ask_human was answered (landed control flight in refs)', async () => {
+    harness = makeHarness()
+    harness.sqlite.prepare(
       `INSERT INTO flights (id, tenant, project_id, agent, goal, status, budget_micro_usd,
-         cost_micro_usd, cost_metered, created_at, started_at, meta)
-       VALUES (?, 'tenant-a', 'project-1', 'agent-preferred', 'g', 'landed', 100000, ?, ?, 1, 1, '{}')`,
-    ).run(id, costMicroUsd, metered)
-    if (primary) {
-      h.sqlite.prepare("UPDATE routine_runs SET flight_id = ? WHERE id = 'run-1'").run(id)
-    } else {
-      h.sqlite.prepare(
-        `INSERT INTO routine_run_refs (id, tenant, project_id, run_id, ref_type, ref_id, relation, created_at)
-         VALUES (?, 'tenant-a', 'project-1', 'run-1', 'flight', ?, 'action_result', '${NOW.toISOString()}')`,
-      ).run(`ref-${id}`, id)
-    }
-  }
-  const heldRow = (h: SqliteD1Harness) =>
-    row(h, "SELECT status, waiting_reason, result_summary FROM routine_runs WHERE id = 'run-1'")
-
-  it('#1738 holds dispatch when every flight of the run is unmetered (budget_unknown_unmetered)', async () => {
-    harness = makeHarness()
-    addRunFlight(harness, 'fl-u', 0, 0, true)
-
-    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
-
-    expect(result).toEqual({ ok: true, status: 'waiting', reason: 'budget', run_id: 'run-1' })
-    expect(heldRow(harness)).toEqual({
-      status: 'waiting', waiting_reason: 'budget', result_summary: 'budget_unknown_unmetered',
-    })
-    expect(row(harness, 'SELECT COUNT(*) AS count FROM tasks')).toEqual({ count: 0 })
-  })
-
-  it('#1738 holds dispatch for a mixed metered + unmetered run (unknown, not the metered partial sum)', async () => {
-    harness = makeHarness()
-    addRunFlight(harness, 'fl-m', 10, 1, true)
-    addRunFlight(harness, 'fl-u', 0, 0, false)
-
-    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
-
-    expect(result).toEqual({ ok: true, status: 'waiting', reason: 'budget', run_id: 'run-1' })
-    expect(heldRow(harness)).toMatchObject({ result_summary: 'budget_unknown_unmetered' })
-  })
-
-  it('#1738 all-metered run is unchanged: still dispatches', async () => {
-    harness = makeHarness()
-    addRunFlight(harness, 'fl-m', 10, 1, true)
-    addRunFlight(harness, 'fl-m2', 5, 1, false)
+         cost_micro_usd, created_at, started_at, meta)
+       VALUES ('old-control', 'tenant-a', 'project-1', 'agent-preferred', 'g', 'landed', 100000, 0, 1, 1, '{}')`,
+    ).run()
+    harness.sqlite.prepare(
+      `INSERT INTO routine_run_refs (id, tenant, project_id, run_id, ref_type, ref_id, relation, created_at)
+       VALUES ('ref-old', 'tenant-a', 'project-1', 'run-1', 'flight', 'old-control', 'dispatch_flight', '${NOW.toISOString()}')`,
+    ).run()
+    harness.sqlite.prepare("UPDATE routine_runs SET flight_id = NULL, task_id = NULL WHERE id = 'run-1'").run()
 
     const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
 

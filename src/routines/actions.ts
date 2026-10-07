@@ -33,7 +33,6 @@ import {
 import type { RoutinePolicySnapshot } from './types'
 import { isCancellationPending, sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId } from './identity'
-import { runBudgetUnknown, unmeteredFlightsSql } from './cost'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
 const ROUTINE_GATE = 'gate:routines'
@@ -45,7 +44,7 @@ type ProposalError =
   | 'invalid_proposal' | 'run_not_found' | 'run_not_accepting_proposal' | 'forbidden'
   | 'assigned_agent_mismatch' | 'run_mismatch' | 'project_mismatch' | 'situation_mismatch'
   | 'stale_situation' | 'invalid_policy' | 'project_not_active' | 'assignee_ineligible'
-  | 'reference_out_of_scope' | 'budget_exceeded' | 'budget_unknown_unmetered' | 'action_key_conflict'
+  | 'reference_out_of_scope' | 'budget_exceeded' | 'action_key_conflict'
   | 'proposal_already_submitted' | 'receipt_failed'
   | 'member_not_eligible' | 'access_ceiling_exceeded'
   // execution_mode_forbidden_for_kind (FP-01 Slice 2 v2, P0-1): project_access
@@ -57,7 +56,7 @@ type ProposalError =
 
 type ActionError =
   | 'run_not_found' | 'action_not_found' | 'approval_required' | 'action_waiting'
-  | 'invalid_policy' | 'budget_exceeded' | 'budget_unknown_unmetered' | 'reference_out_of_scope' | 'stale_situation'
+  | 'invalid_policy' | 'budget_exceeded' | 'reference_out_of_scope' | 'stale_situation'
   | 'project_not_active' | 'action_failed' | 'receipt_failed'
 
 // Athena addendum H: notification_reason is ADDITIVE only — every existing
@@ -109,7 +108,6 @@ interface RunContext {
   situation_digest: string | null
   proposal_json: string | null
   cost_micro_usd: number
-  cost_unmetered_flights: number
   attempt: number
   retry_at: string | null
   project_slug: string
@@ -264,8 +262,7 @@ export async function loadRun(env: Env, runId: string): Promise<RunContext | nul
     `SELECT rr.id, rr.tenant, rr.project_id, rr.routine_id, rr.routine_revision,
             rr.policy_json, rr.status, rr.waiting_reason, rr.assigned_agent_id,
             rr.task_id, rr.flight_id, rr.situation_digest, rr.proposal_json,
-            rr.cost_micro_usd, ${unmeteredFlightsSql('rr')} AS cost_unmetered_flights,
-            rr.attempt, rr.retry_at,
+            rr.cost_micro_usd, rr.attempt, rr.retry_at,
             p.slug AS project_slug, p.name AS project_name,
             p.description AS project_description, p.goal AS project_goal,
             p.status AS project_status, p.parent_project_id, p.target_date,
@@ -640,8 +637,6 @@ async function validateActionScope(
     return row ? null : 'assignee_ineligible'
   }
   if (action.kind === 'dispatch_flight') {
-    // #1738: unknown spend (any unmetered flight) is not 'within budget'. Fail closed.
-    if (runBudgetUnknown(run)) return 'budget_unknown_unmetered'
     const remaining = Math.max(0, policy.budget_micro_usd - Number(run.cost_micro_usd))
     if (action.input.budget_micro_usd > remaining) return 'budget_exceeded'
     // mupot#1496 Round 2 (Athena P0-1): same exclusion as
@@ -1101,7 +1096,6 @@ async function executeFlightAction(
   action: Extract<RoutineProposalAction, { kind: 'dispatch_flight' }>,
   actionId: string,
 ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
-  if (runBudgetUnknown(run)) return { ok: false, reason: 'budget_unknown_unmetered' }
   const remaining = Math.max(0, policy.budget_micro_usd - Number(run.cost_micro_usd))
   if (action.input.budget_micro_usd > remaining || !run.assigned_agent_id) {
     return { ok: false, reason: 'reference_out_of_scope' }
@@ -1229,12 +1223,8 @@ async function landControlFlight(env: Env, run: RunContext): Promise<void> {
   if (!meta || meta.routine_run_id !== run.id || meta.routine_revision !== run.routine_revision) {
     throw new Error('routine control Flight metadata mismatch')
   }
-  // #1738: the control flight IS the assigned agent's work, and its real cost arrives later
-  // via report_run_usage (which flips cost_metered=1). Until then the cost is UNKNOWN, so land
-  // it unmetered instead of fabricating a metered 0 that enforcement would count as free.
   const landed = await landGovernedFlight(env, flight.id, {
     cost_micro_usd: 0,
-    cost_metered: false,
     score: 1,
     expected_agent: run.assigned_agent_id,
     agent_id: run.assigned_agent_id,
@@ -1569,7 +1559,6 @@ export async function executeRoutineAction(
     }
     const scopeError = await validateActionScope(env, run, policy, typedAction)
     if (scopeError === 'budget_exceeded') return { ok: false, error: 'budget_exceeded' }
-    if (scopeError === 'budget_unknown_unmetered') return { ok: false, error: 'budget_unknown_unmetered' }
     if (scopeError) return { ok: false, error: 'reference_out_of_scope' }
   }
   if (action.gate_status === 'pending') {

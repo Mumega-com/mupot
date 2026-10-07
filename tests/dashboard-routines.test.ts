@@ -244,7 +244,6 @@ describe('Project Routines dashboard', () => {
       flight_id: null,
       result_summary: null,
       cost_micro_usd: 1200,
-      cost_metered: true,
       started_at: null,
       finished_at: null,
       created_at: '2026-07-19T11:00:00.000Z',

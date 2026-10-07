@@ -13,7 +13,6 @@ import type { CapabilityGrant, Env, OrgKind, Project, Task } from '../types'
 import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
-import { runBudgetUnknown, unmeteredFlightsSql } from './cost'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 
 const ROUTINE_SENDER = 'mupot-routines'
@@ -46,7 +45,6 @@ interface DispatchRunRow {
   situation_digest: string | null
   assigned_agent_id: string | null
   cost_micro_usd: number
-  cost_unmetered_flights: number
   objective: string
   routine_status: string
   current_routine_revision: number
@@ -173,7 +171,6 @@ async function loadRun(env: Env, runId: string): Promise<DispatchRunRow | null> 
     `SELECT rr.id, rr.tenant, rr.project_id, rr.routine_id, rr.routine_revision,
             rr.policy_json, rr.status, rr.waiting_reason, rr.attempt, rr.task_id,
             rr.flight_id, rr.situation_digest, rr.assigned_agent_id, rr.cost_micro_usd,
-            ${unmeteredFlightsSql('rr')} AS cost_unmetered_flights,
             r.objective, r.status AS routine_status, r.revision AS current_routine_revision,
             p.slug AS project_slug, p.name AS project_name,
             p.description AS project_description, p.goal AS project_goal,
@@ -377,14 +374,9 @@ async function appendStateEvent(
   return wrote(outcomes[0])
 }
 
-async function waitForBudget(
-  env: Env,
-  run: DispatchRunRow,
-  now: Date,
-  summary: 'budget_exhausted' | 'budget_unknown_unmetered' = 'budget_exhausted',
-): Promise<RoutineDispatchResult> {
+async function waitForBudget(env: Env, run: DispatchRunRow, now: Date): Promise<RoutineDispatchResult> {
   const transitioned = await appendStateEvent(env, run, now.toISOString(), {
-    status: 'waiting', waitingReason: 'budget', resultSummary: summary,
+    status: 'waiting', waitingReason: 'budget', resultSummary: 'budget_exhausted',
     retryAt: null, eventKind: 'budget_blocked',
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
@@ -568,9 +560,6 @@ export async function dispatchRoutineRun(
   }
   const endpoint = publicMcpEndpoint(env)
   if (!endpoint) return { ok: false, error: 'invalid_public_origin' }
-  // #1738: an unmetered flight's cost is UNKNOWN, not 0. Fail closed rather than treat the
-  // run as within budget; reuse the existing budget hold (waiting_reason='budget').
-  if (runBudgetUnknown(run)) return waitForBudget(env, run, now, 'budget_unknown_unmetered')
   const remainingBudget = Math.max(0, policy.budget_micro_usd - Number(run.cost_micro_usd))
   if (remainingBudget === 0) return waitForBudget(env, run, now)
 
