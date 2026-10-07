@@ -44,6 +44,8 @@ export interface FlightRow {
   score: number | null
   budget_micro_usd: number | null
   cost_micro_usd: number
+  /** 0 = executor had no spend meter; cost_micro_usd is NOT a measurement (0193, #1732). Optional: hand-built rows omit it. */
+  cost_metered?: number
   next_run_at: number | null
   created_at: number
   started_at: number | null
@@ -368,6 +370,8 @@ export async function landGovernedFlight(
   id: string,
   opts: {
     cost_micro_usd: number
+    /** false = unmetered land (#1732): cost_micro_usd must be 0, budget comparison is skipped. Default true. */
+    cost_metered?: boolean
     score?: number
     expected_agent?: string
     agent_id: string
@@ -384,7 +388,9 @@ export async function landGovernedFlight(
     agent_id: opts.agent_id,
     squad_ids: opts.meta.squad_ids,
     task_ids: opts.meta.task_ids,
-    cost_micro_usd: opts.cost_micro_usd,
+    cost_micro_usd: opts.cost_metered === false ? null : opts.cost_micro_usd,
+    cost_metered: opts.cost_metered !== false,
+    budget_compliance: opts.cost_metered === false ? 'unknown' : 'within_budget',
     score: opts.score ?? null,
   })
   // Witness SQL is only attached when this flight claims a routine_run_id.
@@ -415,11 +421,11 @@ export async function landGovernedFlight(
        )`
     : ''
   const transition = env.DB.prepare(
-    `UPDATE flights SET status='landed', cost_micro_usd=?4, score=COALESCE(?5, score), ended_at=?6
+    `UPDATE flights SET status='landed', cost_micro_usd=?4, cost_metered=?7, score=COALESCE(?5, score), ended_at=?6
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')
-       AND budget_micro_usd IS NOT NULL AND ?4 <= budget_micro_usd
+       AND budget_micro_usd IS NOT NULL AND (?7 = 0 OR ?4 <= budget_micro_usd)
        AND json_valid(meta)
        AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1'
        AND NOT EXISTS (
@@ -449,6 +455,7 @@ export async function landGovernedFlight(
       opts.cost_micro_usd,
       opts.score ?? null,
       endedAt,
+      opts.cost_metered === false ? 0 : 1,
     )
   // SEQUENTIAL, NOT BATCHED (#916). The previous version put the transition and this
   // INSERT in one env.DB.batch(), and the INSERT read back the row the transition had
@@ -519,7 +526,7 @@ export async function landGovernedFlight(
   const receiptPayload = JSON.stringify({
     ...JSON.parse(payload) as Record<string, unknown>,
     score: landedRow?.score ?? opts.score ?? null,
-    cost_micro_usd: landedRow?.cost_micro_usd ?? opts.cost_micro_usd,
+    cost_micro_usd: opts.cost_metered === false ? null : (landedRow?.cost_micro_usd ?? opts.cost_micro_usd),
   })
 
   let receipt = false
@@ -843,4 +850,15 @@ export async function listFlightsForSquad(
     ).bind(env.TENANT_SLUG, projectId, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
   const res = await statement.all<FlightRow>()
   return res.results ?? []
+}
+
+/**
+ * Read-side normalisation for #1732: an unmetered flight (cost_metered=0) has no known
+ * cost, so it is reported as cost_micro_usd:null + cost_metered:false, never as 0.
+ */
+export function withCostSemantics<T extends { cost_micro_usd: number; cost_metered?: number }>(
+  row: T,
+): Omit<T, 'cost_micro_usd' | 'cost_metered'> & { cost_micro_usd: number | null; cost_metered: boolean } {
+  const metered = row.cost_metered !== 0
+  return { ...row, cost_micro_usd: metered ? row.cost_micro_usd : null, cost_metered: metered }
 }

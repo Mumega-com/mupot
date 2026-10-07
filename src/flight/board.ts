@@ -103,7 +103,7 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
   return rows.map((row, i) => {
     const phase = PHASE[row.status]
     const over =
-      row.budget_micro_usd != null && Number.isFinite(row.budget_micro_usd) && row.cost_micro_usd > row.budget_micro_usd
+      row.cost_metered !== 0 && row.budget_micro_usd != null && Number.isFinite(row.budget_micro_usd) && row.cost_micro_usd > row.budget_micro_usd
 
     let trend: Trend | null = null
     if (row.score != null && Number.isFinite(row.score)) {
@@ -128,7 +128,7 @@ export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
       status: row.status,
       phase,
       live: LIVE_PHASES.has(phase),
-      cost_usd: formatUsd(row.cost_micro_usd) ?? '$0.0000',
+      cost_usd: row.cost_metered === 0 ? 'unmetered' : (formatUsd(row.cost_micro_usd) ?? '$0.0000'),
       budget_usd: formatUsd(row.budget_micro_usd),
       over_budget: over,
       score: row.score,

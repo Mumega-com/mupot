@@ -545,7 +545,8 @@ flightsApp.get('/', async (c) => {
       goal: f.goal,
       status: f.status,
       score: f.score,
-      cost_micro_usd: f.cost_micro_usd,
+      cost_micro_usd: f.cost_metered === 0 ? null : f.cost_micro_usd,
+      cost_metered: f.cost_metered !== 0,
       created_at: f.created_at,
       ended_at: f.ended_at,
     }))

@@ -3462,9 +3462,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0193_flights_cost_metered.sql",
+    sha256: "63a155082b92810f52710621676541088a2329e8e12e6b11b5c595a19c534455",
+    statements: [
+      "-- 0193_flights_cost_metered.sql — mupot#1732. A flight whose executor has no spend meter\n-- (e.g. a Codex cloud agent) must land honestly: cost_metered=0 means \"never measured\",\n-- distinct from a measured cost of 0. cost_micro_usd stays 0 on such rows (NOT NULL\n-- column); readers must treat cost_metered=0 as cost unknown, not zero.\n-- Additive, no backfill: every existing row is metered (DEFAULT 1).\nALTER TABLE flights ADD COLUMN cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1));",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "aa41c0e15a1dfd11d9344703196f4e1735ac41a538ed5cb466938e61f8e3fea7"
+export const SCHEMA_CHAIN_DIGEST: string = "0383b04657dff850e7e73cf318d7ef5a0b8b3fab1de5db9592a49e741674375e"
