@@ -30,13 +30,41 @@ Next: [setup by harness](harness-setups.md), including the
      `src/auth/credential-claim.ts:52`) to receive the raw token exactly once. Past the TTL, or
      after one reveal, mint again. A new agent can also call `bootstrap_self { agent_name }`
      to create its own profile and floor; it uses the same claim flow.
-2. Put the token in a file outside any repository and lock it down:
+2. Put the token in protected secret storage outside any repository. Prefer the
+   environment's supported secret-entry UI. For an interactive local **Bash**
+   terminal, the operator can use a hidden prompt instead of a token literal in
+   shell history. Disable terminal/session recording first; an agent must not
+   supply the raw token through a command or tool argument.
+
+   Replace `your-agent` with the intended agent slug. This creates a new token
+   file and refuses to overwrite an existing one:
 
    ```bash
    install -d -m 700 ~/.config/mupot
-   umask 077 && printf '%s' 'mupot_...' > ~/.config/mupot/<agent>.token   # one line, no newline wrap
-   chmod 600 ~/.config/mupot/<agent>.token
-   export MUPOT_TOKEN="$(cat ~/.config/mupot/<agent>.token)"
+   (
+     set +x
+     set -C
+     umask 077
+     token_file="$HOME/.config/mupot/your-agent.token"
+     IFS= read -r -s -p 'Mupot token: ' token || exit 1
+     printf '\n' >&2
+     [ -n "$token" ] || exit 1
+     printf '%s' "$token" > "$token_file"
+   )
+   ```
+
+   [Bash `read -s`](https://www.gnu.org/s/bash/manual/html_node/Bash-Builtins.html)
+   suppresses terminal echo; `-r` preserves characters. The subshell disables
+   tracing and drops the temporary variable on exit. After a successful write,
+   the owner-only file contains one line without an added newline. If the file
+   already exists, follow the authorized rotation flow rather than removing it
+   just to rerun this example.
+
+   Load that protected file only into the intended runtime, with tracing off:
+
+   ```bash
+   set +x
+   export MUPOT_TOKEN="$(cat "$HOME/.config/mupot/your-agent.token")"
    ```
 
 3. Reference it from `.mcp.json`; the file itself holds no secret:
