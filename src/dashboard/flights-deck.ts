@@ -270,9 +270,10 @@ function renderArtifactButtons(artifacts: FlightArtifacts): string {
     : `<span class="fd-arts-empty">No artifacts yet</span>`
 }
 
-function renderBadge(kind: FlightDeckBadge): string {
+function renderBadge(kind: FlightDeckBadge, unconfirmed = false): string {
+  // #1756: a cancel whose routine effect was not fenced says so; the badge kind (and every count) stays 'cancelled'.
   const label =
-    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : kind === 'cancelled' ? 'Cancelled' : 'Failed'
+    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : kind === 'cancelled' ? (unconfirmed ? 'Cancelled (effect unconfirmed)' : 'Cancelled') : 'Failed'
   return `<span class="fd-badge fd-badge-${kind}">${kind === 'flying' ? '<span class="fd-pulse" aria-hidden="true"></span>' : ''}${escHtml(label)}</span>`
 }
 
@@ -304,7 +305,7 @@ function renderRow(card: FlightCard, nowMs: number): string {
       </td>
       <td class="fd-cell-pipe">${renderPipeline(stage)}</td>
       <td class="fd-cell-art">${renderArtifactButtons(artifacts)}</td>
-      <td class="fd-cell-status">${renderBadge(badge)}</td>
+      <td class="fd-cell-status">${renderBadge(badge, card.cancel_unconfirmed)}</td>
       <td class="fd-cell-time">
         <div><span class="fd-time-label">Started</span> ${escHtml(started)}</div>
         <div><span class="fd-time-label">Duration</span> ${escHtml(duration)}</div>

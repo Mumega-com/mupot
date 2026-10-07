@@ -1,4 +1,4 @@
-import { runningActionExistsSql } from './running-action'
+import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql, runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage } from '../agents/messages'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
@@ -37,7 +37,6 @@ import { routineControlId } from './identity'
 import { resolveSoleGateOwnerAgent } from '../gates/grants'
 
 const ROUTINE_GATE = 'gate:routines'
-const ROUTINE_ACTOR = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
 const HUMAN_WAIT_BODY_LIMIT = 8000
 
@@ -2052,14 +2051,8 @@ export async function cancelRoutineRun(
     `SELECT 1 WHERE ${runningActionExistsSql('?', '?')}`,
   ).bind(live.id, live.tenant).first()
   const deliveredMessage = await env.DB.prepare(
-    `SELECT 1 FROM agent_messages
-      WHERE tenant = ? AND project_id = ? AND from_agent = ?
-        AND (request_id = ? OR instr(request_id, ? || ':attempt:') = 1)
-      LIMIT 1`,
-  ).bind(
-    live.tenant, live.project_id, ROUTINE_ACTOR,
-    `routine-run:${live.id}`, `routine-run:${live.id}`,
-  ).first()
+    `SELECT 1 WHERE ${routineMessageDeliveredExistsSql('?1', '?2', '?3')}`,
+  ).bind(live.id, live.tenant, live.project_id).first()
   const taskConfirmed = await cancelControlTask(env, children)
   const flightCancel = await cancelControlFlight(env, children)
   // A delivered inbox request is external work unless the runtime supplies an acknowledgement.

@@ -64,6 +64,8 @@ export interface FlightRow {
   escalated_at?: number | null
   /** 1 when a flight_cancel_receipts row exists (mupot#1748; read via cancelledColumnSql). Optional: hand-built rows omit it. */
   cancelled: number | undefined
+  /** 1 when the cancel receipt records routine_outcome='unconfirmed' (#1756): closed, but the effect was not fenced. */
+  cancel_unconfirmed?: number
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null

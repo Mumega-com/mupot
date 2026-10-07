@@ -28,9 +28,24 @@ export function cancelledFlightSql(alias = 'f'): string {
   return `EXISTS (SELECT 1 FROM flight_cancel_receipts fcr WHERE fcr.tenant = ${a}.tenant AND fcr.flight_id = ${a}.id AND COALESCE(json_extract(fcr.payload, '$.self_cancel'), 0) <> 1)`
 }
 
-/** SELECT-list column `cancelled` (0/1) so the JS side can ask isCancelledFlight(row). */
+/**
+ * SQL boolean fragment (#1756): the flight was cancelled but its routine run's effect could NOT be fenced
+ * (receipt payload routine_outcome = 'unconfirmed'). A missing key (receipts written before #1756) reads as 'none'.
+ * This is a LABEL concern only: such a flight still counts as cancelled, never as a failure (#1748).
+ */
+export function cancelUnconfirmedFlightSql(alias = 'f'): string {
+  const a = safeAlias(alias)
+  return `EXISTS (SELECT 1 FROM flight_cancel_receipts fcr WHERE fcr.tenant = ${a}.tenant AND fcr.flight_id = ${a}.id AND COALESCE(json_extract(fcr.payload, '$.self_cancel'), 0) <> 1 AND COALESCE(json_extract(fcr.payload, '$.routine_outcome'), 'none') = 'unconfirmed')`
+}
+
+/** SELECT-list columns `cancelled` (0/1) and `cancel_unconfirmed` (0/1); JS side: isCancelledFlight / isCancelUnconfirmed. */
 export function cancelledColumnSql(alias = 'f'): string {
-  return `CASE WHEN ${cancelledFlightSql(alias)} THEN 1 ELSE 0 END AS cancelled`
+  return `CASE WHEN ${cancelledFlightSql(alias)} THEN 1 ELSE 0 END AS cancelled, CASE WHEN ${cancelUnconfirmedFlightSql(alias)} THEN 1 ELSE 0 END AS cancel_unconfirmed`
+}
+
+/** JS side of cancelUnconfirmedFlightSql. Absent key (hand-built rows, older queries) = not unconfirmed. */
+export function isCancelUnconfirmed(row: { status: string; cancel_unconfirmed?: number | boolean | null }): boolean {
+  return row.status === 'failed' && (row.cancel_unconfirmed === 1 || row.cancel_unconfirmed === true)
 }
 
 /** SQL fragment: a genuinely failed flight (status failed AND no cancel receipt). */

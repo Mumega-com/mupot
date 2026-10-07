@@ -25,7 +25,7 @@
 //      would be broadcast as a successful landing (mupot#1132 / #1147).
 
 import type { Env } from '../types'
-import { runningActionExistsSql } from '../routines/running-action'
+import { routineEffectInFlightSql } from '../routines/running-action'
 import type { FlightRow, FlightStatus } from './service'
 import { getFlight } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
@@ -609,28 +609,28 @@ export async function cancelFlight(
         WHERE id = ?1 AND tenant = ?2 AND status = ?5
         RETURNING id, status`,
     ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, previousStatus),
-    // Confirmed branch: no action running. The in-flight check is INSIDE the WHERE (shared predicate).
+    // Confirmed branch: no action running AND no delivered message (#1756). The in-flight check is INSIDE the WHERE (shared predicate).
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
               result_summary = ?1, finished_at = ?2, updated_at = ?2
         WHERE tenant = ?3 AND flight_id = ?4
           AND status IN ('queued','leased','observing','waiting','running')
-          AND NOT ${runningActionExistsSql('routine_runs.id', 'routine_runs.tenant')}
+          AND NOT ${routineEffectInFlightSql('routine_runs.id', 'routine_runs.tenant', 'routine_runs.project_id')}
           AND EXISTS (
             SELECT 1 FROM flights
              WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5 AND gate_reason = ?6
           )
         RETURNING id`,
     ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs, gateReason),
-    // Unconfirmed branch: an action is running; its effect cannot be fenced. Mirrors cancelRoutineRun.
+    // Unconfirmed branch: an action is running or a control message was delivered; its effect cannot be fenced. Mirrors cancelRoutineRun.
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'failed', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
               retry_at = NULL, result_summary = 'cancellation_unconfirmed', finished_at = ?1, updated_at = ?1
         WHERE tenant = ?2 AND flight_id = ?3
           AND status IN ('queued','leased','observing','waiting','running')
-          AND ${runningActionExistsSql('routine_runs.id', 'routine_runs.tenant')}
+          AND ${routineEffectInFlightSql('routine_runs.id', 'routine_runs.tenant', 'routine_runs.project_id')}
           AND EXISTS (
             SELECT 1 FROM flights
              WHERE id = ?3 AND tenant = ?2 AND status = 'failed' AND ended_at = ?4 AND gate_reason = ?5
@@ -667,7 +667,15 @@ export async function cancelFlight(
     env.DB.prepare(
       `INSERT INTO flight_cancel_receipts
          (id, tenant, flight_id, previous_status, actor_kind, actor_id, cancel_reason, cost_metered, payload, created_at)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+              -- #1756: routine outcome decided in SQL from the run rows THIS batch wrote (same finished_at stamp).
+              json_set(?9, '$.routine_outcome', CASE
+                WHEN EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.tenant = ?2 AND rr.flight_id = ?3 AND rr.status = 'failed'
+                               AND rr.result_summary = 'cancellation_unconfirmed' AND rr.finished_at = ?10) THEN 'unconfirmed'
+                WHEN EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.tenant = ?2 AND rr.flight_id = ?3 AND rr.status = 'cancelled'
+                               AND rr.finished_at = ?10) THEN 'confirmed'
+                ELSE 'none' END),
+              ?10
         WHERE EXISTS (
           SELECT 1 FROM flights
            WHERE id = ?3 AND tenant = ?2 AND status = 'failed' AND ended_at = ?11 AND gate_reason = ?12

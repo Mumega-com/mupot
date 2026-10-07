@@ -108,6 +108,26 @@ the brain": the brain is ground crew (perceives cheap, decides whether to fly, t
 flight); the pot records + readies the expensive prefrontal burst. Open: whether the pot's
 layer becomes the CF-native PORT of `coherence.py` or defers to a forked brain beside it.
 
+## flight_cancel — response contract (mupot#1730, #1746, #1756)
+
+`flight_cancel` (lead/admin only) ends a live flight early. The flight is stored as `failed` (the status CHECK is not widened) with a `flight_cancel_receipts` row written in the same batch; readers treat receipt = "cancelled, not failed" (`src/flight/cancelled.ts`).
+
+Response fields:
+
+| Field | Meaning |
+|---|---|
+| `flight_closed` | Always `true` on success: the flight row left its live states. Bookkeeping only. |
+| `cancelled` | The stronger claim: no routine effect commits afterwards. `false` when the flight's routine run has a running action OR an already-delivered control message in the agent inbox. |
+| `cancellation` | Present only when `cancelled` is `false`: `'unconfirmed'`. |
+| `reason` | Present only when `cancelled` is `false`: `'routine_effect_may_be_in_flight'`. |
+| `receipt` | Whether the receipt row landed. |
+
+The unconfirmed case mirrors `cancelRoutineRun` (run `failed` / `cancellation_unconfirmed`, open actions cancelled, a `cancellation_unconfirmed` event). Both surfaces share ONE predicate, `routineEffectInFlightSql` in `src/routines/running-action.ts`, evaluated inside the guarded UPDATE, not in a pre-read.
+
+The receipt payload carries `routine_outcome` (`confirmed` | `unconfirmed` | `none`, `none` = no live routine run; a missing key reads as `none`). The deck badge, the outcome feed (`cancel_unconfirmed`) and the agent profile use it to label a cancel whose effect was not fenced; counting is unchanged (still cancelled, never a failure).
+
+Known gap: `cancelRoutineRun` also requires its control TASK to be confirmed cancelled (`taskConfirmed`). That is a multi-step write with task events, not expressible in the flight_cancel batch, so a flight cancel does not check it.
+
 ## Vocabulary (adopted)
 
 `loop` (the think→act→observe cycle) · `routine` (a saved config + trigger that fires
