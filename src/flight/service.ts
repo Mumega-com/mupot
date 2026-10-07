@@ -240,6 +240,12 @@ function mapFlightProjectInsertError(error: unknown): never {
 export async function createFlight(env: Env, f: NewFlight, options: CreateFlightOptions = {}): Promise<string> {
   await validateFlightProjectAttribution(env, f)
   const id = options.id ?? crypto.randomUUID()
+  // #1762: the INSERT branches below are mutually exclusive and only the last-but-one names the bookkeeping column.
+  // A bookkeeping caller that also passed a fence / client_request_id / redispatch receipt would silently get
+  // bookkeeping=0 (a HOLD-able phantom). Refuse the combination instead of dropping the flag.
+  if (options.bookkeeping === true && (options.routineRunFence || f.client_request_id !== undefined || options.redispatchReceipt)) {
+    throw new Error('flight_bookkeeping_option_conflict')
+  }
   let result
   try {
     const fence = options.routineRunFence

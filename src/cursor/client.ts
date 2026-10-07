@@ -280,6 +280,44 @@ export async function createCursorAgent(
   return parseAgentResult(body)
 }
 
+/**
+ * #1762: launch outcome as a tri-state, decided at the source (where we know whether a request left the process).
+ *  - launched: Cursor returned a parseable agent; a real agent exists.
+ *  - not_launched: we KNOW no agent was created: the request was never sent (no/blank token, invalid args) or Cursor
+ *    returned a clean 4xx refusal (408 excluded: a timeout says nothing about whether the create was applied).
+ *  - maybe_launched: the POST may have reached Cursor (5xx, connection reset/timeout, 2xx with an unparseable body, any
+ *    unclassified error). A real agent may be running on the repo; callers must treat it as live work.
+ */
+export type CursorLaunchOutcome =
+  | { state: 'launched'; result: CursorAgentResult }
+  | { state: 'not_launched'; error: unknown }
+  | { state: 'maybe_launched'; error: unknown }
+
+/** A clean refusal: a real HTTP 4xx response from Cursor (not 408, not our synthetic 503/502 codes). */
+function isCleanCursorRefusal(error: unknown): boolean {
+  return error instanceof CursorApiError && error.status >= 400 && error.status < 500 && error.status !== 408
+}
+
+export async function launchCursorAgent(
+  token: string,
+  options: CreateCursorAgentOptions,
+): Promise<CursorLaunchOutcome> {
+  // Pre-flight checks that run before any fetch: a failure here means nothing was sent.
+  const name = options.name.trim()
+  const repoUrl = options.repoUrl.trim()
+  const prompt = options.prompt.trim()
+  if (!token.trim() || !name || !repoUrl || !prompt) {
+    return { state: 'not_launched', error: new CursorApiError(400, 'invalid_args', 'token, name, repoUrl and prompt are required') }
+  }
+  try {
+    return { state: 'launched', result: await createCursorAgent(token, options) }
+  } catch (error) {
+    return isCleanCursorRefusal(error)
+      ? { state: 'not_launched', error }
+      : { state: 'maybe_launched', error }
+  }
+}
+
 export async function dispatchCursorRun(
   token: string,
   agentId: string,
