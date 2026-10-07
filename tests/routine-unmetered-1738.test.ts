@@ -19,6 +19,12 @@ function agentPrincipal(): AuthContext {
   } as any
 }
 
+function receipt(f: ReadyRoutineFixture): Record<string, unknown> {
+  const r = f.harness.sqlite.prepare("SELECT payload FROM flight_event_outbox WHERE flight_id='control-flight' AND event_type='flight.landed'").get() as { payload: string } | undefined
+  if (!r) throw new Error('no landing receipt')
+  return JSON.parse(r.payload) as Record<string, unknown>
+}
+
 const usage = { run_id: 'run-1', model: 'deepseek-v4-flash', input: 1_000_000, output: 1_000_000 }
 
 describe('#1738 unmetered writers', () => {
@@ -56,6 +62,8 @@ describe('#1738 unmetered writers', () => {
     expect(landed.transitioned).toBe(true)
     expect(row(fixture, "SELECT status, cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
       .toEqual({ status: 'landed', c: 420_000, m: 1 })
+    // #1738 gate: the receipt states the stored row, not the 0 the caller claimed.
+    expect(receipt(fixture)).toMatchObject({ cost_micro_usd: 420_000, cost_metered: true, budget_compliance: 'over_budget' })
   })
 
   it('an unmetered landing claim does not mark an already-reported (metered) cost unmetered', async () => {
@@ -71,6 +79,23 @@ describe('#1738 unmetered writers', () => {
     })
     expect(row(fixture, "SELECT cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
       .toEqual({ c: 420_000, m: 1 })
+    // #1738 gate: an unmetered CLAIM over a metered row must not produce an "unmetered/unknown" receipt.
+    expect(receipt(fixture)).toMatchObject({ cost_micro_usd: 420_000, cost_metered: true, budget_compliance: 'over_budget' })
+  })
+
+  it('a preserved reported cost above budget is receipted over_budget, not within_budget', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    fixture.harness.sqlite.exec("UPDATE flights SET budget_micro_usd = 100000, meta = json_remove(meta, '$.routine_run_id', '$.routine_revision') WHERE id='control-flight'")
+    const meta = parseFlightMetaV1(JSON.parse((row(fixture, "SELECT meta FROM flights WHERE id='control-flight'") as { meta: string }).meta))
+    if (!meta) throw new Error('meta')
+    fixture.harness.sqlite.exec("UPDATE tasks SET status = 'done' WHERE id = 'control-task'")
+    const landed = await landGovernedFlight(fixture.env, 'control-flight', {
+      cost_micro_usd: 0, expected_agent: 'agent-1', agent_id: 'agent-1', meta,
+      actor: { kind: 'agent', id: 'agent-1' },
+    })
+    expect(landed.transitioned).toBe(true)
+    expect(receipt(fixture)).toMatchObject({ cost_micro_usd: 420_000, cost_metered: true, budget_compliance: 'over_budget' })
   })
 
   it('an explicit non-zero landing cost still wins (metered landings are unchanged)', async () => {
