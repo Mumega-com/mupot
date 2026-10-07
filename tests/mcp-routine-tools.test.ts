@@ -77,7 +77,7 @@ const policy = {
 const PUBLIC_RUN_KEYS = [
   'id', 'project_id', 'routine_id', 'routine_revision', 'trigger_kind', 'scheduled_for', 'status',
   'waiting_reason', 'attempt', 'assigned_agent_id', 'task_id', 'flight_id', 'result_summary',
-  'cost_micro_usd', 'started_at', 'finished_at', 'created_at', 'updated_at',
+  'cost_metered', 'cost_micro_usd', 'started_at', 'finished_at', 'created_at', 'updated_at',
 ].sort()
 
 function assertSafe(value: unknown): void {

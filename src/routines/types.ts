@@ -76,6 +76,8 @@ export interface RoutineRun {
   proposal_json: string | null
   result_summary: string | null
   cost_micro_usd: number
+  /** #1738: count of this run's flights with unknown (unmetered) cost; >0 => spend is unknown. */
+  cost_unmetered_flights: number
   started_at: string | null
   finished_at: string | null
   created_at: string

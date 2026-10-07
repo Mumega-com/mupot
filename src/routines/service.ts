@@ -18,6 +18,7 @@ import {
   type RoutinePrincipal,
 } from './access'
 import { brandSquadScope, hasCapability } from '../auth/capability'
+import { unmeteredFlightsSql } from './cost'
 
 export type RoutineMutationError =
   | 'forbidden' | 'project_not_found' | 'project_not_active' | 'archived_project'
@@ -123,11 +124,15 @@ const ROUTINE_SELECT = `id, tenant, project_id, name, objective, status, trigger
   retry_backoff_seconds, max_occurrences, stop_at, revision, enabled_by, enabled_at,
   created_by, created_at, updated_at`
 
-const RUN_SELECT = `id, tenant, project_id, routine_id, routine_revision, policy_json,
+const RUN_COLUMNS = `id, tenant, project_id, routine_id, routine_revision, policy_json,
   occurrence_key, trigger_kind, scheduled_for, status, waiting_reason, lease_owner,
   lease_expires_at, attempt, retry_at, assigned_agent_id, task_id, flight_id,
   situation_digest, proposal_json, result_summary, cost_micro_usd, started_at,
   finished_at, created_at, updated_at`
+
+// #1738: unknown-cost signal rides every run read (computed, not stored).
+const RUN_SELECT = `${RUN_COLUMNS}, ${unmeteredFlightsSql('routine_runs')} AS cost_unmetered_flights`
+const RUN_SELECT_ALIASED = `${RUN_COLUMNS.split(',').map(column => `rr.${column.trim()}`).join(', ')}, ${unmeteredFlightsSql('rr')} AS cost_unmetered_flights`
 
 function wrote(result: D1Result<unknown>): boolean {
   return Number(result.meta?.changes ?? 0) > 0
@@ -559,7 +564,7 @@ export async function createManualRoutineRun(
     trigger_kind: 'manual', scheduled_for: null, status: 'queued', waiting_reason: null,
     lease_owner: null, lease_expires_at: null, attempt: 0, retry_at: null,
     assigned_agent_id: null, task_id: null, flight_id: null, situation_digest: null,
-    proposal_json: null, result_summary: null, cost_micro_usd: 0,
+    proposal_json: null, result_summary: null, cost_micro_usd: 0, cost_unmetered_flights: 0,
     started_at: null, finished_at: null, created_at: now.toISOString(), updated_at: now.toISOString(),
   }
   try {
@@ -610,7 +615,7 @@ export async function getRoutineRun(
   if (principal.tenant !== env.TENANT_SLUG) return null
   const visibility = projectVisibilityClause(principal.project_read)
   return env.DB.prepare(
-    `SELECT ${RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')}
+    `SELECT ${RUN_SELECT_ALIASED}
        FROM routine_runs rr JOIN projects p ON p.id = rr.project_id
       WHERE rr.id = ? AND rr.tenant = ? AND ${visibility.sql}`,
   ).bind(id, env.TENANT_SLUG, ...visibility.binds).first<RoutineRun>()
@@ -631,7 +636,7 @@ export async function listLatestRoutineRuns(
     return { ok: false, error: 'project_not_found' }
   }
   if (ids.length === 0) return { ok: true, items: [], next_cursor: null }
-  const select = RUN_SELECT.split(',').map(column => `rr.${column.trim()}`).join(', ')
+  const select = RUN_SELECT_ALIASED
   const result = await env.DB.prepare(
     `SELECT ${select}
        FROM routine_runs rr
