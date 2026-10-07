@@ -239,10 +239,10 @@ export async function dispatchStudioFlight(
     { skipEvent: true, skipMirror: true, actor: { kind: 'member', id: auth.memberId ?? auth.userId } },
   )
 
-  // #1758: EXEMPT from flight clearance, deliberately — an unexecuted bookkeeping flight with no lifecycle (stays in
-  // 'preflight', NULL budget, never landed, reaped only by the watchdog after 60-84 min). Gating it on the shared
-  // repo artifact_ref would self-block Deploy -> Studio (deploy creates the same-repo flight first). Real fix: give
-  // it a lifecycle (tracked separately).
+  // #1758/#1762: an unexecuted bookkeeping flight with no lifecycle (stays in 'preflight', NULL budget, never
+  // landed; closed only by the watchdog after 60-84 min, cancelFlight or flight_reap_stalled). Marked `bookkeeping`
+  // (server-set via the createFlight option, never request/meta input) so a member-supplied repoUrl cannot plant a
+  // clearance HOLD on someone's repo; not itself clearance-gated (would self-block Deploy -> Studio).
   const flightId = await createFlight(env, {
     agent: home.agentId,
     dispatched_by: auth.boundAgentId ?? home.agentId,
@@ -264,7 +264,7 @@ export async function dispatchStudioFlight(
       publication_target: 'none',
       parent_flight_id: null,
     },
-  }, { id: reservedFlightId })
+  }, { id: reservedFlightId, bookkeeping: true })
 
   return {
     ok: true,

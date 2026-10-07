@@ -201,7 +201,9 @@ export function detectFlightCollisions(flights: FlightRow[]): FlightCollision[] 
       const a = parsed[i]
       const b = parsed[j]
       const collision = compareMeta(a.row.id, a.row.tenant, a.meta, b.row.id, b.row.tenant, b.meta)
-      if (collision) collisions.push(collision)
+      if (!collision) continue
+      // #1762: radar view stays consistent with checkFlightClearance: a pair involving a bookkeeping flight is WARN at most.
+      collisions.push(a.row.bookkeeping === 1 || b.row.bookkeeping === 1 ? { ...collision, severity: 'warn' } : collision)
     }
   }
   return collisions
@@ -235,7 +237,10 @@ export function checkFlightClearance(
     const tenant = opts.tenant ?? row.tenant
     const collision = compareMeta(proposedId, tenant, proposed, row.id, row.tenant, meta)
     if (!collision) continue
-    if (collision.severity === 'hold') holds.push(collision)
+    // #1762: a bookkeeping flight (deploy/studio, server-marked) never executes, so it can never HOLD. Mirrors the
+    // `f.bookkeeping = 0` predicate on the HOLD read in listIntersectingLiveFlights; it may still WARN.
+    if (collision.severity === 'hold' && row.bookkeeping !== 1) holds.push(collision)
+    else if (collision.severity === 'hold') warns.push({ ...collision, severity: 'warn' })
     else warns.push(collision)
   }
 

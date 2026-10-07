@@ -3480,9 +3480,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "flight_cancel_receipts" },
     ],
   },
+  {
+    file: "0195_flights_bookkeeping.sql",
+    sha256: "71dda79328d715ff5b8c0ec9dc8c9bde1ad5398efe2f92b2ad33ac7a5fba58b7",
+    statements: [
+      "-- 0195_flights_bookkeeping.sql — mupot#1762. Deploy (projects/deploy.ts) and Studio (dashboard/studio.ts)\n-- create unexecuted bookkeeping flights: they sit in 'preflight' with a NULL budget, have no lifecycle, and\n-- are only ever closed by the watchdog / cancelFlight / flight_reap_stalled. bookkeeping=1 marks them so the\n-- flight-clearance HOLD read (listIntersectingLiveFlights) cannot be blocked by a flight that will never\n-- execute. SERVER-SET ONLY: createFlight writes it solely from its internal CreateFlightOptions (never from\n-- NewFlight / meta / REST / MCP input), and no UPDATE path touches it. Additive, no backfill: DEFAULT 0 keeps\n-- every existing flight a real, HOLD-able flight.\nALTER TABLE flights ADD COLUMN bookkeeping INTEGER NOT NULL DEFAULT 0 CHECK (bookkeeping IN (0,1));",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "3bad715eec7c698533bf5f1e3525519afb3aed3c54dd2de9d02625859c367d45"
+export const SCHEMA_CHAIN_DIGEST: string = "5c1e5737f507c1261954968d67323f018038a1cc9f08ddf55f7d36752a4f0b8d"
