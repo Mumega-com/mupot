@@ -3803,6 +3803,68 @@ const toolFlightReapStalled: ToolSpec = {
   },
 }
 
+const toolFlightCancel: ToolSpec = {
+  name: 'flight_cancel',
+  scope: 'squad:lead / org:admin',
+  min: 'member',
+  args: '{ flight_id: string, reason: string (1-500 chars) }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      flight_id: STRING_SCHEMA,
+      reason: { type: 'string', minLength: 1, maxLength: 500 },
+    },
+    required: ['flight_id', 'reason'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const flightRef = str(args.flight_id)
+    const reason = str(args.reason)
+    if (!flightRef || !reason || reason.length > 500) return fail(400, 'invalid_args')
+
+    const { resolveFlightEntity } = await import('../lib/entity-resolver')
+    const flightRes = await resolveFlightEntity(env, flightRef)
+    if (!flightRes.ok) {
+      if (flightRes.reason === 'ambiguous') {
+        return fail(409, 'ambiguous_flight_id', { candidates: flightRes.candidates })
+      }
+      return fail(404, 'flight_not_found')
+    }
+
+    const { cancelFlight } = await import('../flight/watchdog')
+    // Same principal derivation as flight_reap_stalled; cancelFlight then applies the narrower
+    // lead/admin-only rule (no flight-agent/dispatcher allowance).
+    const grants = auth.capabilities ?? []
+    const isOrgAdmin = hasCapability(grants, 'org', null, 'admin')
+    const leadSquadIds = grants
+      .filter((c) => c.scope_type === 'squad' && (c.capability === 'lead' || c.capability === 'admin') && typeof c.scope_id === 'string')
+      .map((c) => c.scope_id as string)
+    const actorId = auth.boundAgentId ?? auth.memberId ?? auth.userId ?? 'unknown-actor'
+    const actor = auth.boundAgentId
+      ? { kind: 'agent' as const, id: actorId }
+      : { kind: 'member' as const, id: actorId }
+
+    const result = await cancelFlight(env, flightRes.entity.id, { actor, isOrgAdmin, leadSquadIds }, reason)
+    if (!result.transitioned) {
+      if (result.error === 'forbidden_insufficient_cancel_capability') {
+        return fail(403, 'forbidden', { need: 'squad:lead or org:admin', scope: 'flight' })
+      }
+      if (result.error === 'flight_not_found') return fail(404, 'flight_not_found')
+      return fail(409, result.error ?? 'flight_cancel_failed')
+    }
+    if (!result.receipt) {
+      console.error('flight cancelled without a receipt', { flight_id: result.flight_id })
+    }
+    return done({
+      cancelled: true,
+      flight_id: result.flight_id,
+      previous_status: result.previous_status,
+      cost_metered: result.cost_metered,
+      receipt: result.receipt,
+    })
+  },
+}
+
 const toolFlightList: ToolSpec = {
   name: 'flight_list',
   scope: 'squad',
@@ -6422,6 +6484,7 @@ export const TOOLS: ToolSpec[] = [
   toolFlightList,
   toolFlightLand,
   toolFlightReapStalled,
+  toolFlightCancel,
   toolTaskCreate,
   toolTaskList,
   toolTaskGet,
