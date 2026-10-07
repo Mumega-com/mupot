@@ -2759,3 +2759,118 @@ describe('D1 strict parameter-binding parity (prod internal_error repro)', () =>
     })
   }
 })
+
+// mupot#1727 — a pointer to a FINISHED run must not block the successor dispatch.
+describe('rework re-dispatch takes over a terminal execution pointer (mupot#1727)', () => {
+  const D2 = 'dispatch-runtime-2'
+  const M2 = 'message-runtime-2'
+  const T1 = '2026-08-30T19:00:00.000Z'
+
+  function seedRedispatch(fixture: ReturnType<typeof runtimeFixture>): void {
+    fixture.harness.sqlite.exec(`
+      INSERT INTO task_dispatch_receipts (
+        id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,
+        created_at, claimed_at, consumed_at, attempts, last_error
+      ) VALUES (
+        '${D2}', '${TENANT}', '${TASK_ID}', '${SQUAD_ID}', '${AGENT_ID}',
+        'member', '${MEMBER_ID}', '${T1}', '${T1}', '${T1}', 1, NULL
+      );
+      INSERT INTO agent_messages (
+        id, tenant, to_agent, from_agent, from_member, kind, body, request_id,
+        created_at, delivery_attempts, lease_expires_at
+      ) VALUES (
+        '${M2}', '${TENANT}', '${RUNTIME_ADDRESS}', 'mupot-dispatch', '${MEMBER_ID}', 'request',
+        '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"${TASK_ID}","dispatch_receipt_id":"${D2}","squad_id":"${SQUAD_ID}","runtime_address":"${RUNTIME_ADDRESS}"}',
+        'dispatch-inbox:${D2}', '${T1}', 1, '2099-01-01T00:00:00.000Z'
+      );
+    `)
+  }
+  const stage = (fixture: ReturnType<typeof runtimeFixture>, dispatch: string, message: string,
+    s: 'runtime_consumed' | 'completed' | 'failed', extra: Record<string, unknown> = {}) =>
+    recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+      taskId: TASK_ID, dispatchReceiptId: dispatch, messageId: message, stage: s,
+      runtimeReceiptHash: 'b'.repeat(64), attempt: 1, ...extra,
+    })
+  const pointer = (fixture: ReturnType<typeof runtimeFixture>) =>
+    (fixture.harness.sqlite.prepare('SELECT execution_receipt_id AS p FROM tasks WHERE id = ?').get(TASK_ID) as { p: string | null }).p
+
+  it('completed -> rejected verdict -> inbox re-dispatch -> runtime_consumed -> completed', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'completed', { result: 'first pass' })
+      const verdict = await invokeTool(f.gateAuth, f.env, 'task_verdict',
+        { task_id: TASK_ID, verdict: 'rejected', note: 'rework please' }, 'https://pot.test')
+      expect(verdict).toMatchObject({ ok: true })
+      expect(pointer(f)).toBe(DISPATCH_ID)
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+      expect(pointer(f)).toBe(D2)
+      await expect(stage(f, D2, M2, 'completed', { result: 'second pass' }))
+        .resolves.toMatchObject({ task_status: 'review' })
+      // history retained: old dispatch + its runtime receipts are untouched
+      expect(f.harness.sqlite.prepare(
+        `SELECT stage FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ? ORDER BY created_at, id`,
+      ).all(DISPATCH_ID).map((r) => (r as { stage: string }).stage).sort()).toEqual(['completed', 'runtime_consumed'])
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS c FROM task_dispatch_receipts').get()).toEqual({ c: 2 })
+    } finally { f.harness.close() }
+  })
+
+  it('failed -> inbox re-dispatch -> runtime_consumed OK; a failed settle also takes over', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'failed', { reason: 'boom' })
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+      expect(pointer(f)).toBe(D2)
+    } finally { f.harness.close() }
+  })
+
+  it('failed stage on the new dispatch takes over a terminal pointer without a consume', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'failed', { reason: 'boom' })
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'failed', { reason: 'boom2' })).resolves.toMatchObject({ task_status: 'blocked' })
+    } finally { f.harness.close() }
+  })
+
+  it('an in-worker-style settled pointed dispatch (settled_at, no runtime receipt) is terminal', async () => {
+    const f = runtimeFixture()
+    try {
+      f.harness.sqlite.exec(`
+        UPDATE task_dispatch_receipts SET settled_at = 1, settled_stage = 'completed' WHERE id = '${DISPATCH_ID}';
+        UPDATE tasks SET status = 'rejected', execution_receipt_id = '${DISPATCH_ID}' WHERE id = '${TASK_ID}';`)
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+    } finally { f.harness.close() }
+  })
+
+  it('a LIVE unsettled pointed receipt still blocks the successor (consumed and failed)', async () => {
+    const f = runtimeFixture()
+    try {
+      f.harness.sqlite.exec(`UPDATE tasks SET status = 'blocked', execution_receipt_id = '${DISPATCH_ID}' WHERE id = '${TASK_ID}';`)
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'runtime_consumed'))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      await expect(stage(f, D2, M2, 'failed', { reason: 'x' }))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(pointer(f)).toBe(DISPATCH_ID)
+    } finally { f.harness.close() }
+  })
+
+  it('an OLDER dispatch cannot take over the pointer of a newer terminal run', async () => {
+    const f = runtimeFixture()
+    try {
+      seedRedispatch(f)
+      await stage(f, D2, M2, 'runtime_consumed')
+      await stage(f, D2, M2, 'completed', { result: 'newer done' })
+      f.harness.sqlite.exec(`UPDATE tasks SET status = 'rejected' WHERE id = '${TASK_ID}';`)
+      await expect(stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed'))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(pointer(f)).toBe(D2)
+    } finally { f.harness.close() }
+  })
+})

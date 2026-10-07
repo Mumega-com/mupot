@@ -190,6 +190,36 @@ export function inFlightDispatchReceiptExistsSql(p: { tenantParam: string; taskI
   )`
 }
 
+/**
+ * pointerAvailableForSql — mupot#1727. The ONE predicate for "this task's execution pointer may
+ * be written for dispatch ?newReceipt": the pointer is empty, already this receipt, OR points at a
+ * FINISHED run (its dispatch row is settled, or it has a terminal runtime receipt — the same
+ * TERMINAL_RUNTIME_RECEIPT_STAGES set the in-flight check uses). A completed run deliberately
+ * keeps tasks.execution_receipt_id (projections' correlation id), so after a gate rejection the
+ * rework dispatch must be able to take the pointer over; a live or unsettled pointed run must
+ * still block. The old receipt stays in task_dispatch_receipts / runtime receipts / verdicts.
+ * `tasks` columns are referenced unqualified (inside UPDATE tasks ... WHERE).
+ */
+export function pointerAvailableForSql(p: { tenantParam: string; newReceiptParam: string }): string {
+  return `(execution_receipt_id IS NULL OR execution_receipt_id = ${p.newReceiptParam}
+    OR EXISTS (
+      SELECT 1 FROM task_dispatch_receipts pd
+       WHERE pd.tenant = ${p.tenantParam} AND pd.id = tasks.execution_receipt_id
+         -- the incoming dispatch must be a NEWER dispatch (task + assignee already pinned by the UPDATE's id/assignee WHERE and the delivery lookup)
+         AND EXISTS (
+           SELECT 1 FROM task_dispatch_receipts nd
+            WHERE nd.tenant = ${p.tenantParam} AND nd.id = ${p.newReceiptParam}
+                            AND (nd.created_at > pd.created_at
+                   OR (nd.created_at = pd.created_at AND nd.rowid > pd.rowid))
+         )
+         AND (pd.settled_at IS NOT NULL OR EXISTS (
+           SELECT 1 FROM task_dispatch_runtime_receipts pr
+            WHERE pr.tenant = ${p.tenantParam} AND pr.dispatch_receipt_id = pd.id
+              AND pr.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+         ))
+    ))`
+}
+
 export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Promise<boolean> {
   const row = await env.DB.prepare(`
     SELECT 1 WHERE ${inFlightDispatchReceiptExistsSql({ tenantParam: '?1', taskIdExpr: '?2' })}
@@ -1184,7 +1214,7 @@ export async function recordTaskDispatchRuntimeReceipt(
             execution_claim_expires_at = NULL, updated_at = ?2
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
-             AND (execution_receipt_id IS NULL OR execution_receipt_id = ?1)
+             AND ${pointerAvailableForSql({ tenantParam: '?5', newReceiptParam: '?1' })}
              AND NOT EXISTS (
                SELECT 1 FROM task_dispatch_runtime_receipts failed
                 WHERE failed.tenant = ?5
@@ -1226,7 +1256,7 @@ export async function recordTaskDispatchRuntimeReceipt(
             UPDATE tasks SET status = 'blocked', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status IN ('open', 'in_progress', 'blocked', 'rejected')
-               AND (execution_receipt_id IS NULL OR execution_receipt_id = ?5)
+               AND ${pointerAvailableForSql({ tenantParam: '?6', newReceiptParam: '?5' })}
                -- mupot#1539 round 2 (P0-1 / P2-b) — same envelope fence as consume/complete:
                -- live lease or this caller's consumed receipt at this attempt, re-asserted at
                -- write time.
