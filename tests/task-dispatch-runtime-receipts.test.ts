@@ -9,6 +9,7 @@ import {
   listTaskDispatchReceiptTimeline,
   recordTaskDispatchRuntimeReceipt,
   adminResetDispatchLease,
+  pointerAvailableForSql,
 } from '../src/tasks/runtime-receipts'
 import { invokeTool, mcpActionsApp } from '../src/mcp'
 import { leaseAgentInbox } from '../src/agents/messages'
@@ -2835,6 +2836,95 @@ describe('rework re-dispatch takes over a terminal execution pointer (mupot#1727
       seedRedispatch(f)
       await expect(stage(f, D2, M2, 'failed', { reason: 'boom2' })).resolves.toMatchObject({ task_status: 'blocked' })
     } finally { f.harness.close() }
+  })
+
+  // mupot#1736 P2 — A completed -> rejected -> B re-dispatched -> failed(B) with NO consume.
+  it('failed(B) without a consume moves the pointer to B, result = B reason, A history retained', async () => {
+    const f = runtimeFixture()
+    try {
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed')
+      await stage(f, DISPATCH_ID, MESSAGE_ID, 'completed', { result: 'first pass' })
+      await invokeTool(f.gateAuth, f.env, 'task_verdict',
+        { task_id: TASK_ID, verdict: 'rejected', note: 'rework please' }, 'https://pot.test')
+      seedRedispatch(f)
+      await expect(stage(f, D2, M2, 'failed', { reason: 'boom-B' })).resolves.toMatchObject({ task_status: 'blocked' })
+      expect(pointer(f)).toBe(D2)
+      expect(f.harness.sqlite.prepare('SELECT result AS r FROM tasks WHERE id = ?').get(TASK_ID)).toEqual({ r: 'boom-B' })
+      expect(f.harness.sqlite.prepare(
+        `SELECT stage FROM task_dispatch_runtime_receipts WHERE dispatch_receipt_id = ?`,
+      ).all(DISPATCH_ID).map((r) => (r as { stage: string }).stage).sort()).toEqual(['completed', 'runtime_consumed'])
+      expect(f.harness.sqlite.prepare('SELECT COUNT(*) AS c FROM task_dispatch_receipts').get()).toEqual({ c: 2 })
+    } finally { f.harness.close() }
+  })
+
+  function seedDispatchRow(f: ReturnType<typeof runtimeFixture>, id: string, createdAt: string): void {
+    f.harness.sqlite.exec(`
+      INSERT INTO task_dispatch_receipts (
+        id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id,
+        created_at, claimed_at, consumed_at, attempts, last_error
+      ) VALUES (
+        '${id}', '${TENANT}', '${TASK_ID}', '${SQUAD_ID}', '${AGENT_ID}',
+        'member', '${MEMBER_ID}', '${createdAt}', '${createdAt}', '${createdAt}', 1, NULL
+      );`)
+  }
+
+  // mupot#1736 P2 — 3 rows (old, pointed, newest): a stale dispatch must not take over just
+  // because SOME newer row exists. Kills the `nd.id = incoming` pin mutant.
+  it('a STALE dispatch cannot take over when a newer third row exists (old, pointed, newest)', async () => {
+    const f = runtimeFixture()
+    try {
+      // DISPATCH_ID (T0) = old; D2 (T1) = pointed + completed; D3 (T2) = newest, unrelated.
+      seedRedispatch(f)
+      await stage(f, D2, M2, 'runtime_consumed')
+      await stage(f, D2, M2, 'completed', { result: 'pointed done' })
+      seedDispatchRow(f, 'dispatch-runtime-3', '2026-08-30T20:00:00.000Z')
+      f.harness.sqlite.exec(`UPDATE tasks SET status = 'rejected' WHERE id = '${TASK_ID}';`)
+      await expect(stage(f, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed'))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      await expect(stage(f, DISPATCH_ID, MESSAGE_ID, 'failed', { reason: 'stale' }))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(pointer(f)).toBe(D2)
+    } finally { f.harness.close() }
+  })
+
+  // mupot#1736 P2 — equal created_at: only the rowid orders the two. Kills the rowid tie-break
+  // removal (newer cannot take over) and `>` -> `>=` (older CAN take over) mutants.
+  it('same created_at tie: higher rowid takes over, lower rowid cannot', async () => {
+    const seedTie = (pointerId: string): ReturnType<typeof runtimeFixture> => {
+      const f = runtimeFixture()
+      // D2 shares DISPATCH_ID's created_at (T0) and has the higher rowid.
+      seedDispatchRow(f, D2, T0)
+      f.harness.sqlite.exec(`
+        INSERT INTO agent_messages (
+          id, tenant, to_agent, from_agent, from_member, kind, body, request_id,
+          created_at, delivery_attempts, lease_expires_at
+        ) VALUES (
+          '${M2}', '${TENANT}', '${RUNTIME_ADDRESS}', 'mupot-dispatch', '${MEMBER_ID}', 'request',
+          '{"version":"runtime.dispatch/v1","type":"task_dispatch","task_id":"${TASK_ID}","dispatch_receipt_id":"${D2}","squad_id":"${SQUAD_ID}","runtime_address":"${RUNTIME_ADDRESS}"}',
+          'dispatch-inbox:${D2}', '${T0}', 1, '2099-01-01T00:00:00.000Z'
+        );
+        UPDATE task_dispatch_receipts SET settled_at = 1, settled_stage = 'completed' WHERE id = '${pointerId}';
+        UPDATE tasks SET status = 'rejected', execution_receipt_id = '${pointerId}' WHERE id = '${TASK_ID}';`)
+      return f
+    }
+    // pointer on the LOWER rowid, same timestamp: the higher-rowid dispatch is newer -> takes over
+    const up = seedTie(DISPATCH_ID)
+    try {
+      await expect(stage(up, D2, M2, 'runtime_consumed')).resolves.toMatchObject({ task_status: 'in_progress' })
+      expect(pointer(up)).toBe(D2)
+    } finally { up.harness.close() }
+    // pointer on the HIGHER rowid, same timestamp: the lower-rowid dispatch is not newer -> refused
+    const down = seedTie(D2)
+    try {
+      await expect(stage(down, DISPATCH_ID, MESSAGE_ID, 'runtime_consumed'))
+        .rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(pointer(down)).toBe(D2)
+    } finally { down.harness.close() }
+  })
+
+  // mupot#1736 P3 — the incoming dispatch is pinned to THIS task inside the SQL predicate.
+  it('SQL predicate pins the incoming dispatch to the task (nd.task_id = tasks.id)', () => {
+    expect(pointerAvailableForSql({ tenantParam: '?1', newReceiptParam: '?2' })).toContain('nd.task_id = tasks.id')
   })
 
   it('an in-worker-style settled pointed dispatch (settled_at, no runtime receipt) is terminal', async () => {
