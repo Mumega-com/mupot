@@ -833,9 +833,11 @@ export async function listFlights(env: Env, limit = 100, projectId?: string): Pr
  *
  * Ordering: without `sinceMs` newest-first (back-compat, unchanged). With `sinceMs` the window is the OLDEST
  * `limit` rows past the cursor (ordered by the same key the cursor tracks, COALESCE(ended_at, created_at), then
- * id), so a consumer that advances to the max key it saw never skips a match; rows are returned newest-first.
+ * id), so a consumer advancing to the max key it saw does not skip a match that was already committed;
+ * rows are returned newest-first. A late commit with key <= the cursor can still be skipped (#1754).
  * `more` is true when matching rows may remain past the returned window. In cursor mode the window is widened to
- * the whole group of rows sharing its last key (up to TIE_GROUP_CAP), so advancing to the max key never skips a tie.
+ * the whole group of rows sharing its last key (up to TIE_GROUP_CAP), so a committed tie group is not split
+ * unless it exceeds the cap.
  */
 const TIE_GROUP_CAP = 1000
 

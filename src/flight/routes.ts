@@ -571,7 +571,8 @@ flightsApp.get('/', async (c) => {
       ended_at: f.ended_at,
     }))
   // cursor = max ended_at/created_at seen, so the brain can poll incrementally. With `since` the page is the OLDEST
-  // matches past the cursor (whole same-ms tie groups included), so advancing never skips one.
+  // matches past the cursor (same-ms tie groups included up to TIE_GROUP_CAP). The key is a wall
+  // clock, so a row that commits after a poll with a key <= the cursor can still be skipped (#1754).
   const cursor = flights.reduce((m, f) => Math.max(m, f.ended_at ?? f.created_at), q.sinceMs ?? 0)
   return c.json({ flights, cursor, has_more: page.more })
 })
