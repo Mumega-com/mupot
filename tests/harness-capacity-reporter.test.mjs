@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { assertAllowedOrcaCommand, buildPayload, summarize, ORCA_READ_ALLOWLIST } from '../scripts/harness-capacity-reporter.mjs'
 
-const SECRET = 'sk-live-SECRET-TOKEN-1234'
+const SECRET = 'CANARY_TERMINAL_TEXT_7f3a9c'  // must never appear in a payload
 const NOW = 1_800_000_000_000
 const raw = {
   terminals: { ok: true, result: { terminals: [
