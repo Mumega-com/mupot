@@ -1,0 +1,11 @@
+# User unit (files only; NOT installed by the repo). mupot#1765.
+# Needs ~/.config/mupot/harness-capacity.env with MUPOT_TOKEN_FILE=<path to bearer token file>.
+[Unit]
+Description=mupot harness capacity reporter (read-only, counts only)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/mupot/harness-capacity.env
+ExecStart=/usr/bin/node %h/mupot/scripts/harness-capacity-reporter.mjs --host-key hadi-mac
+NoNewPrivileges=true
+PrivateTmp=true

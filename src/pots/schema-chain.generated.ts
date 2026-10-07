@@ -3488,9 +3488,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0196_harness_capacity_snapshots.sql",
+    sha256: "41af0af1e500074d0f827ba413e423301f65b711756c9427f788388f5e84559d",
+    statements: [
+      "-- 0196_harness_capacity_snapshots.sql — mupot#1765 (epic #1590): read-only harness capacity.\n--\n-- ONE latest row per (tenant, harness, host_key, reporter_agent_id), upserted by the\n-- harness_capacity_report MCP tool. COUNTS ONLY: no terminal text, titles, paths or branch\n-- names ever land here. Distinct from runner_receipts (0105), which is per-run history.\n-- A snapshot older than the freshness window is UNKNOWN load, never zero (enforced at read).\n\nCREATE TABLE IF NOT EXISTS harness_capacity_snapshots (\n  id                       TEXT PRIMARY KEY,\n  tenant                   TEXT NOT NULL,\n  harness                  TEXT NOT NULL CHECK (harness IN ('orca', 'herdr')),\n  host_key                 TEXT NOT NULL CHECK (length(host_key) BETWEEN 1 AND 48),\n  reporter_agent_id        TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  observed_at              INTEGER NOT NULL CHECK (observed_at >= 0),\n  received_at              INTEGER NOT NULL CHECK (received_at >= 0),\n  live_terminals           INTEGER NOT NULL CHECK (live_terminals >= 0),\n  agent_sessions           INTEGER NOT NULL CHECK (agent_sessions >= 0),\n  busy_recent              INTEGER NOT NULL CHECK (busy_recent >= 0),\n  orphaned_terminals       INTEGER NOT NULL CHECK (orphaned_terminals >= 0),\n  workers_active           INTEGER NOT NULL CHECK (workers_active >= 0),\n  workers_release_unknown  INTEGER NOT NULL CHECK (workers_release_unknown >= 0),\n  worktrees_with_live      INTEGER NOT NULL CHECK (worktrees_with_live >= 0),\n  max_agents               INTEGER CHECK (max_agents IS NULL OR max_agents >= 0),\n  summary_json             TEXT NOT NULL DEFAULT '{}' CHECK (length(summary_json) <= 4096)\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_harness_capacity_latest\n  ON harness_capacity_snapshots(tenant, harness, host_key, reporter_agent_id);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harness_capacity_received\n  ON harness_capacity_snapshots(tenant, received_at DESC);",
+    ],
+    objects: [
+      { type: "table", name: "harness_capacity_snapshots" },
+      { type: "index", name: "idx_harness_capacity_latest" },
+      { type: "index", name: "idx_harness_capacity_received" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "5c1e5737f507c1261954968d67323f018038a1cc9f08ddf55f7d36752a4f0b8d"
+export const SCHEMA_CHAIN_DIGEST: string = "17ffe63dd913466209d320be408c404c5ba25fbc54fa8675a4dd0e12c181f31d"

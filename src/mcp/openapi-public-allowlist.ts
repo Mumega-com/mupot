@@ -72,6 +72,8 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'flight_reap_stalled',
   'get_agent_profile',
   'get_circuit_state',
+  'harness_capacity_list',
+  'harness_capacity_report',
   'inbox',
   'inbox_ack',
   'inbox_consumer_status',

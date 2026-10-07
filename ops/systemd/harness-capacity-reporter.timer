@@ -1,0 +1,11 @@
+# User timer (files only; NOT installed by the repo). mupot#1765.
+[Unit]
+Description=Run the mupot harness capacity reporter every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
