@@ -53,6 +53,7 @@ import { asData, untrustedContentGuard } from '../lib/prompt-safety'
 // existing tests import it from this module.
 import { isExternallySourced, externalMarker } from '../tasks/provenance'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
+import { receiverNotStoppedSql } from '../fleet/registry'
 export { isExternallySourced, externalMarker }
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
@@ -132,10 +133,17 @@ export async function runTaskExecution(
   // Claim + mark working before spending the model budget.
   const startedAt = new Date().toISOString()
   const executionClaimExpiresAt = now + EXECUTION_CLAIM_LEASE_MS
+  // mupot#1740 — a queue-dispatched run (deps.executionReceiptId = the dispatch receipt id)
+  // carries the stopped-seat fence INSIDE the claim UPDATE, so a detach that commits after the
+  // consumer's liveness check can never start an execution. Direct callers are unfenced.
+  const fenceStoppedReceiver = deps.executionReceiptId !== undefined
   const claimed = await claimTaskProgress(
-    env, task, agent, startedAt, executionReceiptId, executionClaimExpiresAt,
+    env, task, agent, startedAt, executionReceiptId, executionClaimExpiresAt, fenceStoppedReceiver,
   )
   if (!claimed) {
+    if (fenceStoppedReceiver && await receiverIsStopped(env, agent.id)) {
+      return { ok: false, task_id: task.id, decided: '', error: 'receiver_not_live' }
+    }
     return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
   }
   const claimedTask = await loadTaskById(env, task.id)
@@ -484,6 +492,13 @@ async function loadSquadCharter(env: Env, squadId: string): Promise<string | nul
   return row?.charter ?? null
 }
 
+async function receiverIsStopped(env: Env, agentId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok WHERE NOT ${receiverNotStoppedSql('?1', '?2')}`,
+  ).bind(env.TENANT_SLUG, agentId).first()
+  return row !== null
+}
+
 async function claimTaskProgress(
   env: Env,
   task: Task,
@@ -491,32 +506,39 @@ async function claimTaskProgress(
   updatedAt: string,
   executionReceiptId: string,
   executionClaimExpiresAt: number,
+  fenceStoppedReceiver = false,
 ): Promise<boolean> {
   const isResume = task.status === 'in_progress'
   const executionCondition = isResume ? ' AND execution_receipt_id IS NULL' : ''
+  // mupot#1740 — numbered params throughout: the stopped-seat fence reuses ?8 (tenant) / ?9 (the
+  // agents.id its fleet row resolves from), which anonymous `?` cannot express.
+  const stoppedFenceSql = fenceStoppedReceiver ? `AND ${receiverNotStoppedSql('?8', '?9')}` : ''
+  const fenceBinds: unknown[] = fenceStoppedReceiver ? [env.TENANT_SLUG, agent.id] : []
   const result = task.assignee_agent_id === null
     ? await env.DB.prepare(
       `UPDATE tasks
-          SET status = 'in_progress', assignee_agent_id = ?, updated_at = ?,
-              execution_receipt_id = ?, execution_claim_expires_at = ?
-        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id IS NULL
+          SET status = 'in_progress', assignee_agent_id = ?1, updated_at = ?2,
+              execution_receipt_id = ?3, execution_claim_expires_at = ?4
+        WHERE id = ?5 AND squad_id = ?6 AND status = ?7 AND assignee_agent_id IS NULL
           AND assignee_member_id IS NULL
           ${executionCondition}
-          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND status = 'active')
+          ${stoppedFenceSql}`,
     ).bind(
       agent.id, updatedAt, executionReceiptId, executionClaimExpiresAt,
-      task.id, agent.squad_id, task.status, agent.id,
+      task.id, agent.squad_id, task.status, ...fenceBinds,
     ).run()
     : await env.DB.prepare(
       `UPDATE tasks
-          SET status = 'in_progress', updated_at = ?, execution_receipt_id = ?,
-              execution_claim_expires_at = ?
-        WHERE id = ? AND squad_id = ? AND status = ? AND assignee_agent_id = ?
+          SET status = 'in_progress', updated_at = ?1, execution_receipt_id = ?2,
+              execution_claim_expires_at = ?3
+        WHERE id = ?4 AND squad_id = ?5 AND status = ?6 AND assignee_agent_id = ?7
           ${executionCondition}
-          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'active')`,
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ?7 AND status = 'active')
+          ${stoppedFenceSql}`,
     ).bind(
       updatedAt, executionReceiptId, executionClaimExpiresAt,
-      task.id, task.squad_id, task.status, agent.id, agent.id,
+      task.id, task.squad_id, task.status, agent.id, ...fenceBinds,
     ).run()
   return result.meta?.changes === 1
 }
@@ -917,7 +939,18 @@ export async function runDispatchedTaskExecution(
   deps: ExecuteDeps = {},
 ): Promise<ExecuteResult> {
   const r = await runTaskExecution(env, agent, taskId, { ...deps, executionReceiptId })
-  if (executionReceiptId) {
+  if (executionReceiptId && r.error === 'receiver_not_live') {
+    // mupot#1740 — the claim UPDATE's stopped-seat fence refused: nothing executed, no pointer
+    // set. Same terminal disposition as the consumer's pre-check (delivered_via stays NULL).
+    try {
+      await settleInWorkerDispatchReceipt(env, {
+        dispatchReceiptId: executionReceiptId, taskId: r.task_id, agentId: agent.id,
+        stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
+      })
+    } catch (settleErr) {
+      console.error('execute: receiver_not_live settle failed', settleErr)
+    }
+  } else if (executionReceiptId) {
     const stage = inWorkerSettleStage(r)
     if (stage) {
       try {

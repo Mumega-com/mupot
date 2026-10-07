@@ -17,7 +17,7 @@ import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
 import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
-import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
+import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
@@ -48,7 +48,7 @@ class RetryAfterError extends Error {
   }
 }
 
-async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<void> {
+async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<'ok' | 'receiver_not_live'> {
   const id = env.AGENT.idFromName(agentId)
   const stub = env.AGENT.get(id)
   const res = await stub.fetch(`${DO_ORIGIN}/wake`, {
@@ -57,8 +57,15 @@ async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<vo
     body: JSON.stringify(event),
   })
   if (!res.ok) {
+    // mupot#1740 — the DO's claim UPDATE refused a stopped seat (no execution started, the DO
+    // already settled the dispatch receipt failed). A terminal refusal, not a retryable failure.
+    if (res.status === 409) {
+      const body = await res.json().catch(() => null) as { error?: unknown } | null
+      if (body?.error === 'receiver_not_live') return 'receiver_not_live'
+    }
     throw new Error(`AgentDO ${agentId} wake failed: ${res.status}`)
   }
+  return 'ok'
 }
 
 type TaskDispatchPayload = { task_id?: unknown; dispatch_receipt_id?: unknown; delivery?: unknown }
@@ -459,13 +466,18 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // delivered_via NULL) and consume it. If the settle did not land, do NOT consume
       // silently: release the lease and throw so the queue retries. A stale (not stopped)
       // poll seat is delivered to its inbox as before (mailbox preserved).
-      const receiverVerdict = await evaluateReceiverLiveness(env, event.agent_id)
-      if (!receiverVerdict.ok) {
+      // mupot#1740 — settle + consume the refusal. Shared by the fast-fail pre-check below and
+      // by the in-write fences (envelope INSERT / in-Worker claim) that close the TOCTOU window.
+      const refuseReceiverNotLive = async (): Promise<true> => {
         const settled = await settleInWorkerDispatchReceipt(env, {
-          dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id,
+          dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id as string,
           stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
         })
-        if (!settled) {
+        // The in-Worker route's DO settles first; an already-settled-failed receipt is landed.
+        const alreadySettled = !settled && (await env.DB.prepare(
+          `SELECT settled_reason FROM task_dispatch_receipts WHERE tenant = ? AND id = ? AND settled_stage = 'failed' LIMIT 1`,
+        ).bind(event.tenant, identity.receiptId).first<{ settled_reason: string | null }>())?.settled_reason === 'receiver_not_live'
+        if (!settled && !alreadySettled) {
           const err = new Error('receiver_not_live settle did not land')
           await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, err)
           throw err
@@ -475,6 +487,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         }
         return true
       }
+      const receiverVerdict = await evaluateReceiverLiveness(env, event.agent_id)
+      if (!receiverVerdict.ok) return refuseReceiverNotLive()
       const deliveryMode = resolveDispatchDeliveryMode(route, forcedInboxDelivery(event))
       try {
         if (deliveryMode === 'inbox') {
@@ -494,6 +508,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             receiptId: identity.receiptId,
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
+            receiverFenceAgentId: event.agent_id,
           })
         } else {
           // IN-WORKER route: reached whenever `resolveDispatchDeliveryMode` returns
@@ -511,9 +526,13 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // as `delivery_forced_predicted: 'no_delivery_mode'`, never silently dropped here).
           // This remains the only path that executes in-Worker: exactly one route is chosen
           // and acted on per lease-holder (BLOCK-2 fix, unchanged).
-          await wakeAgent(env, event.agent_id, event)
+          if (await wakeAgent(env, event.agent_id, event) === 'receiver_not_live') {
+            return refuseReceiverNotLive()
+          }
         }
       } catch (error) {
+        // mupot#1740 — the envelope INSERT's own fence refused: no envelope landed.
+        if (error instanceof ReceiverNotLiveError) return refuseReceiverNotLive()
         await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, error)
         if (error instanceof InboxFullError) {
           throw new RetryAfterError(error.message, INBOX_FULL_RETRY_DELAY_SEC)
