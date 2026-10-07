@@ -26,6 +26,7 @@ function auth(member: string, caps: AuthContext['capabilities'], boundAgentId: s
   return { userId: member, memberId: member, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId, capabilities: caps }
 }
 const lead = () => auth('m-lead', [{ member_id: 'm-lead', scope_type: 'squad', scope_id: 'squad-core', capability: 'lead' }])
+const admin = () => auth('m-admin', [{ member_id: 'm-admin', scope_type: 'org', scope_id: null, capability: 'admin' }])
 const plain = () => auth('m-plain', [{ member_id: 'm-plain', scope_type: 'squad', scope_id: 'squad-core', capability: 'member' }], 'agent-other')
 
 function fixture(status = 'running', metered = 1) {
@@ -108,5 +109,75 @@ describe('#1730 flight_cancel', () => {
     const rs = await Promise.all([cancelFlight(env, 'f1', principal, 'a'), cancelFlight(env, 'f1', principal, 'b')])
     expect(rs.filter((x) => x.transitioned)).toHaveLength(1)
     expect(h.sqlite.prepare('SELECT count(*) AS n FROM flight_cancel_receipts').get()).toEqual({ n: 1 })
+  })
+
+  it('org admin cancels with the cancelled_by_admin label', async () => {
+    const { h, env } = fixture()
+    expect(await cancel(env, admin())).toMatchObject({ ok: true, result: { cancelled: true } })
+    expect(row(h)).toMatchObject({ status: 'failed', gate_reason: 'cancelled_by_admin: Hadi directed close' })
+  })
+
+  it('the flight\'s own flying agent gets 403 (no escape hatch), even holding member on the squad', async () => {
+    const { h, env } = fixture()
+    const own = auth('m-exec', [{ member_id: 'm-exec', scope_type: 'squad', scope_id: 'squad-core', capability: 'member' }], 'agent-1')
+    expect(await cancel(env, own)).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(JSON.stringify(await cancel(env, own))).toContain('squad:lead or org:admin')
+    expect(row(h)).toMatchObject({ status: 'running' })
+    expect(h.sqlite.prepare('SELECT count(*) AS n FROM flight_cancel_receipts').get()).toEqual({ n: 0 })
+  })
+
+  it('the dispatcher agent gets 403', async () => {
+    const { h, env } = fixture()
+    h.sqlite.exec("UPDATE flights SET dispatched_by_agent_id = 'agent-other' WHERE id = 'f1'")
+    expect(await cancel(env, plain())).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
+    expect(row(h)).toMatchObject({ status: 'running' })
+  })
+
+  it('a lead of a DIFFERENT squad gets 403', async () => {
+    const { env } = fixture()
+    const other = auth('m-x', [{ member_id: 'm-x', scope_type: 'squad', scope_id: 'squad-zzz', capability: 'lead' }])
+    expect(await cancel(env, other)).toMatchObject({ ok: false, status: 403 })
+  })
+
+  function routineFixture(h: ReturnType<typeof fixture>['h']) {
+    const t = '2026-01-01T00:00:00.000Z'
+    h.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-r','project-r','R','active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-r','squad-core','write');
+      INSERT INTO routines (id, tenant, project_id, name, objective, status, trigger_kind, run_once_at,
+        cron_expression, timezone, next_run_at, overlap_policy, execution_mode, responsible_squad_id,
+        budget_micro_usd, max_attempts, retry_backoff_seconds, max_occurrences, revision, enabled_by,
+        enabled_at, created_by, created_at, updated_at)
+      VALUES ('routine-r','${TENANT}','project-r','routine-r','o','enabled','cron',NULL,'* * * * *','UTC','${t}',
+        'skip','propose','squad-core',100000,3,300,NULL,1,'o','${t}','o','${t}','${t}');
+      INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, scheduled_for, status, attempt, flight_id, created_at, updated_at)
+      VALUES ('run-r','${TENANT}','project-r','routine-r',1,'{}','manual:run-r','cron','${t}','running',1,'f1','${t}','${t}');
+    `)
+  }
+  const runRow = (h: ReturnType<typeof fixture>['h']) =>
+    h.sqlite.prepare("SELECT status, result_summary, finished_at FROM routine_runs WHERE id='run-r'").get() as { status: string; result_summary: string; finished_at: string | null }
+
+  it('cancelling a routine control flight moves its run to cancelled (terminal, not failed)', async () => {
+    const { h, env } = fixture()
+    routineFixture(h)
+    expect(await cancel(env, lead())).toMatchObject({ ok: true })
+    const r = runRow(h)
+    expect(r.status).toBe('cancelled')
+    expect(r.result_summary).toBe('cancelled_by_lead: Hadi directed close')
+    expect(r.finished_at).not.toBeNull()
+  })
+
+  it('stale read: flight moved after the read -> no transition, no receipt, routine run untouched, no false previous_status', async () => {
+    const { h, env } = fixture('running')
+    routineFixture(h)
+    const principal = { actor: { kind: 'member' as const, id: 'm-lead' }, isOrgAdmin: true }
+    const p = cancelFlight(env, 'f1', principal, 'stale')
+    h.sqlite.exec("UPDATE flights SET status = 'sleeping' WHERE id = 'f1'")
+    const res = await p
+    expect(res.transitioned).toBe(false)
+    expect(row(h)).toMatchObject({ status: 'sleeping' })
+    expect(h.sqlite.prepare('SELECT count(*) AS n FROM flight_cancel_receipts').get()).toEqual({ n: 0 })
+    expect(runRow(h).status).toBe('running')
   })
 })

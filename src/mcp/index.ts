@@ -3801,7 +3801,7 @@ const toolFlightReapStalled: ToolSpec = {
 
 const toolFlightCancel: ToolSpec = {
   name: 'flight_cancel',
-  scope: 'squad:lead / org:admin / flight:agent',
+  scope: 'squad:lead / org:admin',
   min: 'member',
   args: '{ flight_id: string, reason: string (1-500 chars) }',
   inputSchema: {
@@ -3828,7 +3828,8 @@ const toolFlightCancel: ToolSpec = {
     }
 
     const { cancelFlight } = await import('../flight/watchdog')
-    // Same principal derivation as flight_reap_stalled, so authz cannot drift between them.
+    // Same principal derivation as flight_reap_stalled; cancelFlight then applies the narrower
+    // lead/admin-only rule (no flight-agent/dispatcher allowance).
     const grants = auth.capabilities ?? []
     const isOrgAdmin = hasCapability(grants, 'org', null, 'admin')
     const leadSquadIds = grants

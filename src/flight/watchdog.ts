@@ -284,6 +284,33 @@ export interface ReapPrincipalContext {
   leadSquadIds?: string[]
 }
 
+/** Squad lead (or squad admin) on one of the flight's squads, per meta.squad_ids. */
+function leadsFlightSquad(flight: FlightRow, ctx: ReapPrincipalContext): boolean {
+  if (!ctx.leadSquadIds || ctx.leadSquadIds.length === 0) return false
+  try {
+    if (typeof flight.meta === 'string' && flight.meta.trim().startsWith('{')) {
+      const parsed = JSON.parse(flight.meta) as { squad_ids?: unknown }
+      if (Array.isArray(parsed.squad_ids)) {
+        return parsed.squad_ids.some((sqId) => typeof sqId === 'string' && ctx.leadSquadIds?.includes(sqId))
+      }
+    }
+  } catch {
+    // ignore JSON error
+  }
+  return false
+}
+
+/**
+ * Who may CANCEL a flight: org admin or a squad lead on a flight squad ONLY. Deliberately
+ * narrower than canReapFlight: the flight's own agent and its dispatcher are excluded, because
+ * cancel has no stalled predicate, and an executor must not be able to erase its own flight
+ * (e.g. after flight_land refuses it) under a label that reads as a lead decision.
+ */
+export function cancelAuthority(flight: FlightRow, ctx: ReapPrincipalContext): 'admin' | 'lead' | null {
+  if (ctx.isOrgAdmin) return 'admin'
+  return leadsFlightSquad(flight, ctx) ? 'lead' : null
+}
+
 /**
  * Verify whether caller holds authority to force-reap a stalled flight.
  * Zero hardcoded name literals; column matching and capability checks only.
@@ -313,21 +340,7 @@ export function canReapFlight(
   }
 
   // 5. Squad Lead of flight squads
-  if (ctx.leadSquadIds && ctx.leadSquadIds.length > 0) {
-    try {
-      if (typeof flight.meta === 'string' && flight.meta.trim().startsWith('{')) {
-        const parsed = JSON.parse(flight.meta) as { squad_ids?: unknown }
-        if (Array.isArray(parsed.squad_ids)) {
-          const matching = parsed.squad_ids.some((sqId) =>
-            typeof sqId === 'string' && ctx.leadSquadIds?.includes(sqId),
-          )
-          if (matching) return true
-        }
-      }
-    } catch {
-      // ignore JSON error
-    }
-  }
+  if (leadsFlightSquad(flight, ctx)) return true
 
   return false
 }
@@ -528,9 +541,9 @@ export interface FlightCancelResult {
 }
 
 /**
- * Governed early close of a flight by a lead/admin (mupot#1730). Same authz helper as the
- * reap (canReapFlight). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
- * (the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
+ * Governed early close of a flight by a lead/admin (mupot#1730). Authz: cancelAuthority (lead/admin only,
+ * NOT the reap's agent/dispatcher allowance). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
+ * (label cancelled_by_lead|cancelled_by_admin; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
  * receipt is inserted in the SAME batch as the transition, guarded on that exact transition
  * having landed, so a cancelled flight cannot lack its receipt.
  */
@@ -545,7 +558,8 @@ export async function cancelFlight(
   if (!flight) return { transitioned: false, flight_id: flightId, error: 'flight_not_found' }
 
   // Authorize before revealing lifecycle state.
-  if (!canReapFlight(flight, principal)) {
+  const authority = cancelAuthority(flight, principal)
+  if (!authority) {
     return { transitioned: false, flight_id: flightId, error: 'forbidden_insufficient_cancel_capability' }
   }
 
@@ -558,8 +572,9 @@ export async function cancelFlight(
   }
 
   const costMetered = flight.cost_metered === 0 ? 0 : 1
-  const gateReason = `cancelled_by_lead: ${reason.slice(0, 400)}`
-  const runReason = `cancelled_by_lead: ${reason.slice(0, 200)}`
+  const label = authority === 'admin' ? 'cancelled_by_admin' : 'cancelled_by_lead'
+  const gateReason = `${label}: ${reason.slice(0, 400)}`
+  const runReason = `${label}: ${reason.slice(0, 200)}`
   const nowIso = new Date(nowMs).toISOString()
   const payload = JSON.stringify({
     flight_id: flightId,
@@ -582,7 +597,7 @@ export async function cancelFlight(
     ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, previousStatus),
     env.DB.prepare(
       `UPDATE routine_runs
-          SET status = 'failed', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+          SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
               result_summary = ?1, finished_at = ?2, updated_at = ?2
         WHERE tenant = ?3 AND flight_id = ?4
           AND status IN ('queued','leased','observing','waiting','running')
