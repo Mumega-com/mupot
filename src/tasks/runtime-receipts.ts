@@ -614,7 +614,10 @@ export async function diagnoseGateHolderFailure(
                WHERE g.capability = ?1 AND g.principal_type = 'agent'
                  AND g.principal_id <> ?2) AS any_holder,
       EXISTS (SELECT 1 FROM gate_grants g
-               WHERE g.capability = ?1 AND g.principal_type = 'member') AS member_holder,
+                JOIN members gh ON gh.id = g.principal_id AND gh.status = 'active' AND gh.tenant = ?3
+               WHERE g.capability = ?1 AND g.principal_type = 'member'
+                 AND NOT EXISTS (SELECT 1 FROM agent_member_bindings bound WHERE bound.member_id = gh.id)
+                 AND NOT ${memberAffiliatedWithAssigneeSql({ memberExpr: 'gh.id', assigneeIdExpr: '?2' })}) AS member_holder,
       EXISTS (SELECT 1 FROM gate_grants g JOIN agents a ON a.id = g.principal_id AND a.status = 'active'
                WHERE g.capability = ?1 AND g.principal_type = 'agent'
                  AND a.id <> ?2) AS active_holder,

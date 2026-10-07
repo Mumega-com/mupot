@@ -1,5 +1,6 @@
 import { createBus } from '../bus'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
+import { hasIndependentRuntimeGate } from '../tasks/runtime-receipts'
 import type { BusEvent, Env } from '../types'
 
 export interface RouterTickInput {
@@ -16,8 +17,10 @@ export interface RouterTickResult {
   unrouted: number
   decisions: Array<{
     task_id: string
-    outcome: 'would_assign' | 'assigned' | 'unrouted' | 'lost_claim'
+    outcome: 'would_assign' | 'assigned' | 'unrouted' | 'lost_claim' | 'held_no_gate_holder'
     agent_id: string | null
+    /** Set only for held_no_gate_holder: the gate_owner no independent holder can clear. */
+    gate_owner?: string
   }>
 }
 
@@ -31,6 +34,7 @@ interface RouterTaskRow {
   id: string
   project_id: string | null
   project_routable: number
+  gate_owner: string | null
 }
 
 interface RouterAgentRow {
@@ -63,6 +67,7 @@ export async function runRouterTick(
   const tasks = await env.DB.prepare(
     `SELECT t.id,
             t.project_id,
+            t.gate_owner,
             CASE WHEN t.project_id IS NULL THEN 1
                  WHEN EXISTS (
                    SELECT 1
@@ -110,6 +115,27 @@ export async function runRouterTick(
     if (!candidate) {
       unrouted += 1
       decisions.push({ task_id: task.id, outcome: 'unrouted', agent_id: null })
+      continue
+    }
+
+    // mupot#1733 — same gate-holder predicate task_dispatch uses (hasIndependentRuntimeGate,
+    // normal-dispatch mode: an independent agent OR human-member holder). Without it this
+    // wake starts execute-mode work on a task whose review can never be cleared. HOLD the
+    // task (it stays open and unassigned, so a later tick re-evaluates once a holder is
+    // granted) and log why. null / 'gate:agent-self-completion' claim no independent holder
+    // and settle through the self-completion flow, so they are NOT held. Evaluated against the
+    // candidate, so a gate held only by the candidate itself is (correctly) not independent.
+    // Also applies to dry runs, so would_assign never promises a wake the real tick refuses.
+    // The claim UPDATE below does not re-assert this (a grant revoked between the check and
+    // the claim is a TOCTOU the task_dispatch settle paths still catch); documented, not closed.
+    if (
+      task.gate_owner !== null
+      && task.gate_owner !== 'gate:agent-self-completion'
+      && !(await hasIndependentRuntimeGate(env, task.gate_owner, candidate.id, squadId, { allowMemberHolders: true }))
+    ) {
+      unrouted += 1
+      decisions.push({ task_id: task.id, outcome: 'held_no_gate_holder', agent_id: null, gate_owner: task.gate_owner })
+      console.error('router_tick: held, no eligible gate holder', { task_id: task.id, gate_owner: task.gate_owner })
       continue
     }
 
