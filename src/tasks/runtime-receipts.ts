@@ -249,21 +249,26 @@ const NO_INBOX_ENVELOPE_SQL = (tenantParam: string, receiptParam: string): strin
  */
 export async function settleInWorkerDispatchReceipt(
   env: Env,
-  input: { dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string },
+  input: {
+    dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string
+    /** mupot#1729: 'none' = refused before any delivery (delivered_via stays NULL). Default in_worker. */
+    deliveredVia?: 'in_worker' | 'none'
+  },
 ): Promise<boolean> {
   const now = new Date().toISOString()
+  const deliveredVia = input.deliveredVia === 'none' ? null : 'in_worker'
   const reason = sanitizeReceiptText(text(input.reason, 500))
   const auditId = crypto.randomUUID()
   const evidence = canonicalJson({
     dispatch_receipt_id: input.dispatchReceiptId,
     stage: input.stage,
     reason,
-    delivered_via: 'in_worker',
+    delivered_via: deliveredVia,
   })
   const results = await env.DB.batch([
     env.DB.prepare(`
       UPDATE task_dispatch_receipts
-         SET settled_stage = ?1, settled_at = ?2, settled_reason = ?3, delivered_via = 'in_worker'
+         SET settled_stage = ?1, settled_at = ?2, settled_reason = ?3, delivered_via = ${deliveredVia ? "'in_worker'" : 'NULL'}
        WHERE tenant = ?4 AND id = ?5 AND task_id = ?6 AND agent_id = ?7
          AND settled_at IS NULL
          AND (delivered_via IS NULL OR delivered_via = 'in_worker')
@@ -280,8 +285,8 @@ export async function settleInWorkerDispatchReceipt(
         credential_id, origin, handler, operation, target_kind, target_id,
         task_id, request_id, idempotency_key, evidence_json, recorded_at
       )
-      SELECT ?1, ?2, 'system', 'in_worker_execute', NULL, ?3,
-             NULL, 'worker_callback', 'in_worker_dispatch_settle', ?4, 'dispatch_receipt', ?5,
+      SELECT ?1, ?2, 'system', ${deliveredVia ? "'in_worker_execute'" : "'dispatch_receiver_fence'"}, NULL, ?3,
+             NULL, 'worker_callback', ${deliveredVia ? "'in_worker_dispatch_settle'" : "'receiver_not_live_settle'"}, ?4, 'dispatch_receipt', ?5,
              ?6, ?7, ?7, ?8, ?9
        WHERE changes() = 1
     `).bind(

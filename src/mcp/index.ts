@@ -166,6 +166,7 @@ import {
 import {
   readFleetAgentRow,
   getFleetAgentLiveness,
+  evaluateReceiverLiveness,
   derivePresence,
   resolveFleetPresenceTtlSec,
   clampPollIntervalSec,
@@ -2541,6 +2542,20 @@ const toolTaskDispatch: ToolSpec = {
       return fail(409, 'task_not_dispatchable')
     }
 
+    // mupot#1729 — a STOPPED (detached) fleet row is the fence: refuse, forced or not (same
+    // predicate the bus consumer re-checks at consume time). A stale-but-not-stopped poll seat
+    // is NOT refused (its inbox is a store-and-forward mailbox); the dispatcher gets a warning.
+    const receiverVerdict = await evaluateReceiverLiveness(env, task.assignee_agent_id)
+    if (!receiverVerdict.ok) {
+      return fail(409, 'receiver_not_live', {
+        agent_id: task.assignee_agent_id,
+        presence_mode: receiverVerdict.presence_mode,
+        status: receiverVerdict.status,
+        live: receiverVerdict.live,
+        reason: receiverVerdict.reason,
+      })
+    }
+
     // mupot#1494 round 2 (P1-e) — `delivery:'inbox'` must not strand a task in an inbox
     // nothing is known to poll. Run the SAME eligibility check consumer.ts's
     // resolveDispatchDeliveryMode will run asynchronously, synchronously, here, so an
@@ -2627,6 +2642,14 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
       ...(deliveryForcedPredicted ? { delivery_forced_predicted: deliveryForcedPredicted } : {}),
+      ...(receiverVerdict.stale_poll ? {
+        warning: {
+          code: 'receiver_stale',
+          agent_id: task.assignee_agent_id,
+          last_reported_at: receiverVerdict.last_reported_at,
+          presence_ttl_sec: receiverVerdict.presence_ttl_sec,
+        },
+      } : {}),
     })
   },
 }

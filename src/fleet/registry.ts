@@ -939,6 +939,52 @@ export async function getFleetAgentLiveness(
   return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
 }
 
+export interface ReceiverLivenessVerdict {
+  /** False iff dispatching to this agent must be refused: the fleet row is 'stopped' (mupot#1729). */
+  ok: boolean
+  reason?: 'stopped'
+  agent_id: string
+  presence_mode: string
+  status: string
+  live: boolean
+  /** True iff the row is poll-mode, not stopped, and its per-row TTL has lapsed. NOT a refusal:
+   *  a poll inbox is a store-and-forward mailbox, so this only drives a dispatcher warning. */
+  stale_poll: boolean
+  last_reported_at: string
+  presence_ttl_sec: number
+}
+
+/**
+ * evaluateReceiverLiveness — mupot#1729. THE ONE fence, used at dispatch time (task_dispatch)
+ * AND consume time (bus consumer). A fleet row with status 'stopped' (operator detach,
+ * markStopped) is refused whatever its presence_mode/runtime: detach writes status 'stopped'
+ * AND presence_mode '', so keying on the poll mode would miss a freshly detached seat. A stale
+ * but not stopped poll seat is NOT refused (mailbox preserved) — reported via stale_poll.
+ * Reads the RAW row and the same derivePresence/resolveFleetPresenceTtlSec as fleet_agent_get.
+ * No row = no fleet surface = ok (in-Worker behaviour unchanged).
+ */
+export async function evaluateReceiverLiveness(
+  env: Env,
+  agentId: string,
+  nowMs = Date.now(),
+): Promise<ReceiverLivenessVerdict> {
+  const row = await readFleetAgentRow(env, agentId)
+  if (!row) {
+    return { ok: true, agent_id: '', presence_mode: '', status: 'unknown', live: false, stale_poll: false, last_reported_at: '', presence_ttl_sec: 0 }
+  }
+  const presenceMode = row.presence_mode ? String(row.presence_mode) : ''
+  const status = String(row.status ?? 'unknown')
+  const lastReportedAt = String(row.last_reported_at ?? '')
+  const ttlSec = resolveFleetPresenceTtlSec(env, row)
+  const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
+  const base = {
+    agent_id: String(row.agent_id), presence_mode: presenceMode, status, live,
+    last_reported_at: lastReportedAt, presence_ttl_sec: ttlSec,
+  }
+  if (status === 'stopped') return { ok: false, reason: 'stopped', stale_poll: false, ...base }
+  return { ok: true, stale_poll: presenceMode === 'poll' && !live, ...base }
+}
+
 /**
  * listSquadMemberIds — sorted, deduped agent_ids currently reporting squadId in their
  * `squads[]` (the SAME self-reported column groupBySquad/squadControlPanel already group by —

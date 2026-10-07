@@ -16,7 +16,7 @@
 import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
-import { getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
+import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
 import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
@@ -453,6 +453,28 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // `resolveDispatchDeliveryMode` is pure and independently unit-tested; this call site only
       // supplies the two inputs it needs and acts on (and durably records — never silently) what
       // it returns.
+      // mupot#1729 — re-run the dispatch-time fence at consume time: a seat that was detached
+      // (status 'stopped') between dispatch and consume must not get an inbox envelope or an
+      // in-Worker run. Terminal disposition: settle the receipt failed (receiver_not_live,
+      // delivered_via NULL) and consume it. If the settle did not land, do NOT consume
+      // silently: release the lease and throw so the queue retries. A stale (not stopped)
+      // poll seat is delivered to its inbox as before (mailbox preserved).
+      const receiverVerdict = await evaluateReceiverLiveness(env, event.agent_id)
+      if (!receiverVerdict.ok) {
+        const settled = await settleInWorkerDispatchReceipt(env, {
+          dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id,
+          stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
+        })
+        if (!settled) {
+          const err = new Error('receiver_not_live settle did not land')
+          await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, err)
+          throw err
+        }
+        if (!(await consumeTaskDispatchReceipt(env, event, leaseExpiresAt))) {
+          throw new Error('receiver_not_live dispatch receipt consume failed')
+        }
+        return true
+      }
       const deliveryMode = resolveDispatchDeliveryMode(route, forcedInboxDelivery(event))
       try {
         if (deliveryMode === 'inbox') {
