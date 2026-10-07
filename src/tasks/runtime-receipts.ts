@@ -298,7 +298,11 @@ export type TaskDispatchRuntimeReceiptErrorCode =
 export class TaskDispatchRuntimeReceiptError extends Error {
   readonly name = 'TaskDispatchRuntimeReceiptError'
 
-  constructor(readonly code: TaskDispatchRuntimeReceiptErrorCode) {
+  constructor(
+    readonly code: TaskDispatchRuntimeReceiptErrorCode,
+    /** mupot#1730 — non-secret reason (runtime_gate_required only). */
+    readonly reason?: GateHolderFailure,
+  ) {
     super(code)
   }
 }
@@ -536,6 +540,61 @@ export function humanGateHolderExistsSql(p: {
          AND NOT ${memberAffiliatedWithAssigneeSql({ memberExpr: 'gate_human.id', assigneeIdExpr: p.assigneeIdExpr })}
          AND ${memberStandingOnSquadSql('gate_human.id', p.squadIdExpr)}
     )`
+}
+
+/** mupot#1730 — which condition of independentGateHolderExistsSql failed. */
+export type GateHolderFailure =
+  | 'no_holder'
+  | 'holder_unavailable' // inactive agent OR no live credential — collapsed so a squad member cannot probe another agent's credential state
+  | 'no_squad_standing'
+  | 'gate_owner_not_independent'
+
+/**
+ * diagnoseGateHolderFailure — names the first failing condition of the agent-holder
+ * branch of independentGateHolderExistsSql, for a NON-SECRET refusal reason only.
+ * It never decides eligibility (hasIndependentRuntimeGate does, via the same
+ * fragment); it reuses TOKEN_LIVE_PREDICATE + memberStandingOnSquadSql so the
+ * stages cannot drift from the predicate. Returns no ids.
+ */
+export async function diagnoseGateHolderFailure(
+  env: Env,
+  gateOwner: string | null | undefined,
+  assigneeAgentId: string,
+  opts: { allowMemberHolders?: boolean } = {},
+): Promise<GateHolderFailure> {
+  if (
+    gateOwner === null || gateOwner === undefined
+    || gateOwner === 'gate:agent-self-completion'
+    || !isValidGateOwnerForm(gateOwner)
+  ) return 'gate_owner_not_independent'
+  const live = `AND EXISTS (
+        SELECT 1 FROM member_tokens t
+          JOIN members gm ON gm.id = t.member_id AND gm.status = 'active'
+         WHERE t.agent_id = a.id AND t.tenant = ?3 AND ${TOKEN_LIVE_PREDICATE('?4')}`
+  const row = await env.DB.prepare(`
+    SELECT
+      EXISTS (SELECT 1 FROM gate_grants g
+               WHERE g.capability = ?1 AND g.principal_type = 'agent'
+                 AND g.principal_id <> ?2) AS any_holder,
+      EXISTS (SELECT 1 FROM gate_grants g
+               WHERE g.capability = ?1 AND g.principal_type = 'member') AS member_holder,
+      EXISTS (SELECT 1 FROM gate_grants g JOIN agents a ON a.id = g.principal_id AND a.status = 'active'
+               WHERE g.capability = ?1 AND g.principal_type = 'agent'
+                 AND a.id <> ?2) AS active_holder,
+      EXISTS (SELECT 1 FROM gate_grants g JOIN agents a ON a.id = g.principal_id AND a.status = 'active'
+               WHERE g.capability = ?1 AND g.principal_type = 'agent' AND a.id <> ?2
+                 ${live})) AS live_token
+  `)
+    .bind(gateOwner, assigneeAgentId, env.TENANT_SLUG, nowSqlUtc())
+    .first<{ any_holder: number; member_holder: number; active_holder: number; live_token: number }>()
+  // Member-allowed mode: a human holder is still a holder, so the boolean being false
+  // means that human fails independence/standing, never "no holder" (must not disagree
+  // with hasIndependentRuntimeGate in the same mode).
+  const memberHolder = opts.allowMemberHolders === true && row?.member_holder
+  if (!row || (!row.any_holder && !memberHolder)) return 'no_holder'
+  if (!row.any_holder) return 'no_squad_standing'
+  if (!row.active_holder || !row.live_token) return 'holder_unavailable'
+  return 'no_squad_standing'
 }
 
 export async function hasIndependentRuntimeGate(
@@ -1080,7 +1139,10 @@ export async function recordTaskDispatchRuntimeReceipt(
     agentId,
     delivery.task_squad_id,
   ))) {
-    throw new TaskDispatchRuntimeReceiptError('runtime_gate_required')
+    throw new TaskDispatchRuntimeReceiptError(
+      'runtime_gate_required',
+      await diagnoseGateHolderFailure(env, delivery.task_gate_owner, agentId),
+    )
   }
   if (
     input.stage === 'completed'
