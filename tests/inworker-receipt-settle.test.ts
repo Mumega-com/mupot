@@ -439,9 +439,12 @@ describe('in_worker dispatch receipts settle (mupot#1723, #1721)', () => {
       expect(r.decided).toMatch(/^no_op:/)
       expect(dispatchRow(receiptId).settled_at).toBeNull()
     })
-    it('task_not_found settles nothing', async () => {
+    it('task_not_found (task reassigned away) settles nothing', async () => {
       const { receiptId } = await dispatchOnce()
-      const r = await runDispatchedTaskExecution(env, agentRow(), 'no-such-task', receiptId, deps(goodModel))
+      harness.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status, created_at)
+        VALUES ('agent-other', '${SQUAD_ID}', 'other-agent', 'Other', 'active', '${T0}');
+        UPDATE tasks SET assignee_agent_id = 'agent-other' WHERE id = '${TASK_ID}'`)
+      const r = await runDispatchedTaskExecution(env, agentRow(), TASK_ID, receiptId, deps(goodModel))
       expect(r.error).toBe('task_not_found')
       expect(dispatchRow(receiptId).settled_at).toBeNull()
     })
