@@ -2792,11 +2792,14 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
 //     flight — is task_dispatch_runtime_receipt's job, which carries its own
 //     far stronger independent-gate check; this tool must never become a
 //     second, weaker door onto the same row). KNOWN LIMITATION (kasra-review
-//     round 1 P3, accepted as-is): a runtime `failed` settle leaves
-//     execution_receipt_id set permanently, so a task whose dispatch failed
-//     can never use this tool afterward either — the only way back is an
-//     operator's `task_dispatch_lease_reset`/redispatch, same as it already
-//     is for the runtime-receipt path itself.
+//     round 1 P3, accepted as-is; widened by mupot#1736): a runtime `failed`
+//     settle leaves execution_receipt_id set permanently, and since #1736 it
+//     sets it to the failing dispatch even when that dispatch was never
+//     consumed. So a task whose dispatch failed — before OR after consume —
+//     gets 409 task_dispatched from this tool until a re-dispatch takes the
+//     pointer over (the next dispatch's runtime_consumed/failed, via
+//     pointerAvailableForSql) or an operator's `task_dispatch_lease_reset`,
+//     same as it already is for the runtime-receipt path itself.
 //   - requires the task's gate_owner to be an INDEPENDENT, live,
 //     credentialed gate (hasIndependentRuntimeGate — the SAME predicate the
 //     runtime-receipt path's `completed` stage requires, PLUS (mupot#1663)
