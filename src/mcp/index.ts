@@ -4010,6 +4010,101 @@ const toolProjectRecall: ToolSpec = {
   },
 }
 
+// project_memory_get — deterministic, FULL, hash-verifiable readback of ONE project memory
+// record by id. project_recall is semantic-only over <=512-token embeddings, so a large
+// record can never be retrieved whole through it. Gate = the SAME readableProject chokepoint
+// project_recall uses. Scope fence: the row's agent_id must be EXACTLY project:<project_id>
+// (enforced in the SQL WHERE, not after the fetch). Missing row, wrong project, another
+// scope (agent-private/squad) and no project access all return the identical 404 not_found
+// — no existence oracle. engrams has no author/tenant column (one D1 per tenant pot), so
+// author is null and tenant isolation is the database boundary.
+async function utf8Sha256(text: string): Promise<{ bytes: number; sha256: string }> {
+  const data = new TextEncoder().encode(text)
+  return { bytes: data.byteLength, sha256: await sha256Hex(text) }
+}
+
+const toolProjectMemoryGet: ToolSpec = {
+  name: 'project_memory_get',
+  scope: 'project memory',
+  min: 'observer',
+  args: '{ project_id: string, id: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA, id: STRING_SCHEMA },
+    required: ['project_id', 'id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
+    const id = str(args.id)
+    if (!id) return fail(400, 'invalid_args', 'id required')
+
+    const project = await readableProject(env, projectId, readAccess(auth))
+    if (!project) return fail(404, 'not_found')
+
+    const row = await env.DB.prepare(
+      'SELECT id, text, created_at FROM engrams WHERE id = ? AND agent_id = ?',
+    )
+      .bind(id, projectMemoryScope(projectId))
+      .first<{ id: string; text: string; created_at: string }>()
+    if (!row) return fail(404, 'not_found')
+
+    const h = await utf8Sha256(row.text)
+    return done({
+      id: row.id,
+      project_id: projectId,
+      text: row.text,
+      created_at: row.created_at,
+      author_agent_id: null,
+      utf8_bytes: h.bytes,
+      sha256: h.sha256,
+    })
+  },
+}
+
+// project_memory_list — newest-first index of a project's memory records (id, created_at,
+// utf8_bytes, 200-char preview). Same gate + scope fence as project_memory_get.
+const toolProjectMemoryList: ToolSpec = {
+  name: 'project_memory_list',
+  scope: 'project memory',
+  min: 'observer',
+  args: '{ project_id: string, limit?: number, before?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { project_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, before: STRING_SCHEMA },
+    required: ['project_id'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const projectId = str(args.project_id)
+    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
+    const limit = readLimit(args.limit, 20, 50)
+    if (typeof limit !== 'number') return limit
+    const before = str(args.before)
+
+    const project = await readableProject(env, projectId, readAccess(auth))
+    if (!project) return fail(404, 'not_found')
+
+    const scope = projectMemoryScope(projectId)
+    const stmt = before
+      ? env.DB.prepare(
+          'SELECT id, text, created_at FROM engrams WHERE agent_id = ? AND created_at < ? ORDER BY created_at DESC, id DESC LIMIT ?',
+        ).bind(scope, before, limit)
+      : env.DB.prepare(
+          'SELECT id, text, created_at FROM engrams WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
+        ).bind(scope, limit)
+    const rows = await stmt.all<{ id: string; text: string; created_at: string }>()
+    const items = (rows.results ?? []).map((r) => ({
+      id: r.id,
+      created_at: r.created_at,
+      utf8_bytes: new TextEncoder().encode(r.text).byteLength,
+      preview: Array.from(r.text).slice(0, 200).join(''),
+    }))
+    return done({ project_id: projectId, items })
+  },
+}
+
 // wake_agent — drive one cortex cycle of an agent. cap: lead+ on the AGENT's squad.
 const toolWakeAgent: ToolSpec = {
   name: 'wake_agent',
@@ -6314,6 +6409,8 @@ export const TOOLS: ToolSpec[] = [
   toolSquadRecall,
   toolProjectRemember,
   toolProjectRecall,
+  toolProjectMemoryGet,
+  toolProjectMemoryList,
   toolWakeAgent,
   toolRouterTick,
   toolExecutionMeterStatus,
