@@ -13,6 +13,7 @@ import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
 import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { cancelledColumnSql, outcomeFilterSql } from './cancelled'
+import { LIVE_FLIGHT_STATUSES } from './clearance'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -803,6 +804,38 @@ export async function getFlight(env: Env, id: string): Promise<FlightRow | null>
       .bind(id, env.TENANT_SLUG)
       .first<FlightRow>()) ?? null
   )
+}
+
+/**
+ * Live-set read (mupot#1755). Selects live flights directly in SQL (no created_at window), so a waiting or
+ * sleeping flight older than any number of newer terminal flights is still returned. The live-status list is the
+ * single definition in clearance.ts. Capped at LIVE_SET_CAP; `truncated` is true when the cap was hit, and every
+ * SAFETY caller must then fail closed (the set may be incomplete).
+ */
+export const LIVE_SET_CAP = 2000
+export async function listLiveFlights(
+  env: Env,
+  cap = LIVE_SET_CAP,
+): Promise<{ rows: FlightRow[]; truncated: boolean }> {
+  const marks = LIVE_FLIGHT_STATUSES.map((_, i) => `?${i + 3}`).join(',')
+  const res = await env.DB.prepare(
+    `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
+       FROM flights f
+       LEFT JOIN agents a ON a.id = f.agent
+       LEFT JOIN squads s ON s.id = a.squad_id
+      WHERE f.tenant=?1 AND f.status IN (${marks}) ORDER BY f.created_at DESC LIMIT ?2`,
+  )
+    .bind(env.TENANT_SLUG, cap + 1, ...LIVE_FLIGHT_STATUSES)
+    .all<FlightRow>()
+  const all = res.results ?? []
+  return { rows: all.slice(0, cap), truncated: all.length > cap }
+}
+
+/** Newest `limit` flights PLUS the full live set (deduped, created_at DESC) — display readers that derive live state. */
+export async function listFlightsWithLive(env: Env, limit = 100): Promise<FlightRow[]> {
+  const [recent, live] = await Promise.all([listFlights(env, limit), listLiveFlights(env)])
+  const seen = new Set(recent.map((r) => r.id))
+  return [...recent, ...live.rows.filter((r) => !seen.has(r.id))].sort((a, b) => b.created_at - a.created_at)
 }
 
 export async function listFlights(env: Env, limit = 100, projectId?: string): Promise<FlightRow[]> {

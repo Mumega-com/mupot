@@ -36,7 +36,7 @@ import {
   DEFAULT_PRESENCE_TTL_SEC,
   type FleetAgentRuntimeView,
 } from '../fleet/registry'
-import { listFlights, type FlightRow, type FlightStatus } from '../flight/service'
+import { listFlightsWithLive, type FlightRow, type FlightStatus } from '../flight/service'
 import { buildBoard, type FlightCard } from '../flight/board'
 
 // ── shapes ───────────────────────────────────────────────────────────────────
@@ -389,7 +389,7 @@ export async function loadFleetRadar(
       listFleetAgentRuntimeView(env, nowMs, squadIds),
       listPresence(env, nowMs, squadIds, true),
       loadRecentTasks(env),
-      listFlights(env, 500),
+      listFlightsWithLive(env, 500),
     ])
 
   // Unconditional — never gated behind `isFiltered`/`accessibleSet`, the same

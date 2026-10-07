@@ -19,7 +19,7 @@
 import type { Env } from '../types'
 import { preflightCheck } from './preflight'
 import type { FlightSignals, PreflightOptions, PreflightResult } from './preflight'
-import { createFlight, applyPreflight, listFlights } from './service'
+import { createFlight, applyPreflight, listLiveFlights } from './service'
 import type { NewFlight } from './service'
 import { checkFlightClearance } from './clearance'
 import type { ClearanceResult } from './clearance'
@@ -47,7 +47,8 @@ export interface DispatchResult {
 }
 
 function clearanceReasonTags(clearance: ClearanceResult): string[] {
-  return clearance.holds.flatMap((hold) => hold.reasons.map((reason) => `clearance_${reason}:${hold.flight_b_id}`))
+  const truncated = clearance.live_set_truncated ? ['flight_clearance_live_set_truncated'] : []
+  return truncated.concat(clearance.holds.flatMap((hold) => hold.reasons.map((reason) => `clearance_${reason}:${hold.flight_b_id}`)))
 }
 
 export async function dispatchFlight(
@@ -61,10 +62,11 @@ export async function dispatchFlight(
 
   let clearance: ClearanceResult | undefined
   if (flight.meta) {
-    // Thin DB read (mirrors board.ts's philosophy) — recent flights for this tenant,
-    // then checkFlightClearance filters to live statuses internally.
-    const active = await listFlights(env, 500)
-    clearance = checkFlightClearance(flight.meta, active, {
+    // The FULL live set, selected in SQL (#1755) — never the newest-N window. If the read hit its cap the
+    // set may be incomplete, so clearance fails closed.
+    const active = await listLiveFlights(env)
+    clearance = checkFlightClearance(flight.meta, active.rows, {
+      liveSetTruncated: active.truncated,
       tenant: env.TENANT_SLUG,
       ignoreFlightIds: extra.allowCollisionWith,
     })

@@ -85,6 +85,8 @@ export interface FlightCollision {
 
 export interface ClearanceResult {
   cleared: boolean
+  /** True when the live-set read hit its cap: the set may be incomplete, so clearance FAILS CLOSED (#1755). */
+  live_set_truncated?: boolean
   holds: FlightCollision[]
   warns: FlightCollision[]
 }
@@ -94,7 +96,8 @@ export interface ClearanceResult {
 // an independent literal set here to avoid a board.ts↔clearance.ts import cycle;
 // board.ts imports FROM clearance.ts for deriveActiveCollisions, not the reverse).
 // Terminal flights (landed/failed/held) cannot collide — they are not doing anything.
-const LIVE_STATUSES: ReadonlySet<FlightStatus> = new Set<FlightStatus>(['preflight', 'running', 'waiting', 'sleeping'])
+export const LIVE_FLIGHT_STATUSES: readonly FlightStatus[] = ['preflight', 'running', 'waiting', 'sleeping']
+const LIVE_STATUSES: ReadonlySet<FlightStatus> = new Set<FlightStatus>(LIVE_FLIGHT_STATUSES)
 
 function intersect(a: readonly string[], b: readonly string[]): string[] {
   const setB = new Set(b)
@@ -216,7 +219,7 @@ export function detectFlightCollisions(flights: FlightRow[]): FlightCollision[] 
 export function checkFlightClearance(
   proposed: FlightMetaV1,
   activeFlights: FlightRow[],
-  opts: { tenant?: string; ignoreFlightIds?: string[] } = {},
+  opts: { tenant?: string; ignoreFlightIds?: string[]; liveSetTruncated?: boolean } = {},
 ): ClearanceResult {
   const ignore = new Set(opts.ignoreFlightIds ?? [])
   const proposedId = '__proposed__'
@@ -236,5 +239,7 @@ export function checkFlightClearance(
     else warns.push(collision)
   }
 
+  // Fail closed (#1755): an incomplete live set cannot prove the absence of a collision.
+  if (opts.liveSetTruncated) return { cleared: false, live_set_truncated: true, holds, warns }
   return { cleared: holds.length === 0, holds, warns }
 }
