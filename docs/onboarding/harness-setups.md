@@ -74,7 +74,7 @@ Keep the record short, with one answer and evidence state for each field:
 | Check-in / presence | Declared seat axes and optional genuine flight ID; project/module presence, seat presence and fleet state individually; real polling cadence only when a poller exists. |
 | Dispatch / wake | Receive mechanism, active-turn/idle behavior, one designated consumer, public route and independently observed wake evidence. |
 | Flight / task receipts | Identify the applicable protocol. Record delivery, exact runtime consumption, completion/artifact hash and independent verdict separately. Record flight/cost evidence only when available. |
-| Recovery / removal | Durable intake/cursor/dedupe, replay behavior, pause/stop handling, disable/revoke path, and who is authorized to perform repair. |
+| Recovery / removal | Durable intake/cursor/dedupe, replay behavior, process stop and routing cleanup separately, queued-work disposition, disable/revoke path, and who is authorized to repair. Poll TTL expiry does not withdraw an inbox route; deregistration/detach can change fallback routing and are not a complete execution stop. |
 | Review | Independent gate, exact artifact/commit, test evidence, and current verdict. An author or transport ACK cannot supply the independent verdict. |
 | Known gaps | Exact error, unsupported feature or unknown value; last checked date; existing issue/owner for the next step. |
 
@@ -96,7 +96,10 @@ Keep the record short, with one answer and evidence state for each field:
 6. Keep Flight-3 separate: its assignment, seat generation, encrypted ingress,
    signing authority and signed evidence are additional requirements. Do not
    manufacture them for an ordinary task or messaging test.
-7. Test restart/replay and removal only within the approved scope. Record skipped
+7. Test restart/replay and removal only within the approved scope. Verify both
+   process state and routing/work disposition; do not treat TTL expiry or a
+   stopped receiver as poll deregistration. See the Digid example's shutdown
+   limitations before prescribing `resident` mode or detach. Record skipped
    stages as untested, then update this existing row instead of creating a
    parallel support matrix.
 
