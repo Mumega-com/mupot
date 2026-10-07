@@ -117,6 +117,7 @@ import {
   adminResetDispatchLease,
   hasInFlightDispatchReceipt,
   hasIndependentRuntimeGate,
+  diagnoseGateHolderFailure,
   independentGateHolderExistsSql,
   inFlightDispatchReceiptExistsSql,
   type TaskDispatchRuntimeStage,
@@ -2501,6 +2502,30 @@ const toolTaskDispatch: ToolSpec = {
       return fail(409, 'task_not_dispatchable')
     }
 
+    // mupot#1730 — refuse at dispatch a task whose gate can never settle, using the SAME
+    // predicate (hasIndependentRuntimeGate) the settle paths use. The delivery route is only
+    // decided later (bus/consumer.ts resolveDispatchDeliveryMode):
+    //   - in-worker route lands `review` with no holder check and a HUMAN holder can give
+    //     the verdict (Telegram/dashboard/office_review_approval) -> a normal dispatch
+    //     accepts agent OR independent-member holders (allowMemberHolders: true).
+    //   - inbox route can only settle through the completed runtime receipt, which is
+    //     agent-holders-only -> a FORCED delivery:'inbox' requires an AGENT holder.
+    // RESIDUAL: a normal dispatch whose gate is held only by a human can still be routed to
+    // inbox by the natural poll route; that task cannot complete via the receipt.
+    // null / 'gate:agent-self-completion' are not refused (they claim no independent holder
+    // and settle through the self-completion verdict flow). The router_tick wake
+    // (src/router/engine.ts) has no gate check; that predates this and is a follow-up.
+    if (task.gate_owner !== null && task.gate_owner !== 'gate:agent-self-completion') {
+      const gateOpts = { allowMemberHolders: !forceInboxDelivery }
+      if (!(await hasIndependentRuntimeGate(env, task.gate_owner, task.assignee_agent_id, task.squad_id, gateOpts))) {
+        return fail(409, 'no_eligible_gate_holder', {
+          gate_owner: task.gate_owner,
+          squad_id: task.squad_id,
+          reason: await diagnoseGateHolderFailure(env, task.gate_owner, task.assignee_agent_id, gateOpts),
+        })
+      }
+    }
+
     // mupot#1494 v4 (P1-a, adversarial round 2) — hasInFlightDispatchReceipt's OWN doc
     // comment already claimed this task's reassignment guard "see toolTaskDispatch's own
     // task_not_dispatchable gate" — a gate that did not actually exist here. PROVED: a
@@ -2611,11 +2636,14 @@ function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutc
     return fail(403, error.code)
   }
   if (error.code === 'runtime_delivery_not_found') return fail(404, error.code)
+  // mupot#1730 — name WHICH gate-holder condition failed (non-secret enum, no ids).
+  if (error.code === 'runtime_gate_required') {
+    return fail(409, error.code, error.reason ? { reason: error.reason } : undefined)
+  }
   if (
     error.code === 'runtime_delivery_stale'
     || error.code === 'runtime_receipt_conflict'
     || error.code === 'runtime_artifact_required'
-    || error.code === 'runtime_gate_required'
     || error.code === 'runtime_receipt_transition_conflict'
     || error.code === 'dispatch_terminated'
   ) return fail(409, error.code)

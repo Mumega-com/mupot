@@ -455,12 +455,14 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
   it.each([
     {
       name: 'nonexistent gate grant',
+      reason: 'no_holder',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:missing' WHERE id = ?").run(TASK_ID)
       },
     },
     {
       name: 'gate held only by the assignee',
+      reason: 'no_holder',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.exec(`
           DELETE FROM gate_grants;
@@ -472,6 +474,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     },
     {
       name: 'self-completion gate',
+      reason: 'gate_owner_not_independent',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.prepare(
           "UPDATE tasks SET gate_owner = 'gate:agent-self-completion' WHERE id = ?",
@@ -480,6 +483,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     },
     {
       name: 'revoked gate credential',
+      reason: 'holder_unavailable',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.prepare('UPDATE member_tokens SET revoked_at = ? WHERE id = ?')
           .run(T0, GATE_TOKEN_ID)
@@ -487,6 +491,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     },
     {
       name: 'inactive gate agent',
+      reason: 'holder_unavailable',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.prepare("UPDATE agents SET status = 'paused' WHERE id = ?")
           .run(GATE_AGENT_ID)
@@ -494,6 +499,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     },
     {
       name: 'cross-squad gate without task-squad member authority',
+      reason: 'no_squad_standing',
       mutate: (fixture: ReturnType<typeof runtimeFixture>) => {
         fixture.harness.sqlite.exec(`
           INSERT INTO squads (id, department_id, slug, name)
@@ -505,7 +511,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         `)
       },
     },
-  ])('refuses completion for $name', async ({ mutate }) => {
+  ])('refuses completion for $name', async ({ mutate, reason }) => {
     const fixture = runtimeFixture()
     try {
       mutate(fixture)
@@ -517,7 +523,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID,
         stage: 'completed', runtimeReceiptHash: 'b'.repeat(64), attempt: 1,
         result: 'Must not enter zombie review.',
-      })).rejects.toMatchObject({ code: 'runtime_gate_required' })
+      })).rejects.toMatchObject({ code: 'runtime_gate_required', reason })
       expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
         .toEqual({ status: 'in_progress' })
     } finally {
@@ -848,7 +854,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       const mcp = await invokeTool(
         mcpFixture.auth, mcpFixture.env, 'task_dispatch_runtime_receipt', args, 'https://pot.test',
       )
-      expect(mcp).toMatchObject({ ok: false, status: 409, error: 'runtime_gate_required' })
+      expect(mcp).toMatchObject({ ok: false, status: 409, error: 'runtime_gate_required', detail: { reason: 'no_holder' } })
 
       const response = await mcpActionsApp.request(
         'https://pot.test/actions/task_dispatch_runtime_receipt',
@@ -2067,6 +2073,14 @@ describe('adminResetDispatchLease terminate:true — the wedge now has an exit (
       // again first, and assignee resolved via GATE_AGENT_ID which the fixture's own squad
       // capability already covers).
       fixture.harness.sqlite.prepare(`UPDATE tasks SET status = 'open' WHERE id = ?`).run(TASK_ID)
+      // mupot#1730 — GATE_AGENT_ID is the SOLE holder of gate:independent, so reassigning the
+      // task to it leaves no independent gate holder; dispatch now refuses that up front.
+      const selfGated = await invokeTool(fixture.gateAuth, fixture.env, 'task_dispatch', {
+        task_id: TASK_ID,
+      }, 'https://pot.test')
+      expect(selfGated).toMatchObject({ ok: false, status: 409, error: 'no_eligible_gate_holder' })
+      // This test is about recovery, not gating: move to the self-completion lane (not refused).
+      fixture.harness.sqlite.prepare(`UPDATE tasks SET gate_owner = 'gate:agent-self-completion' WHERE id = ?`).run(TASK_ID)
       const freshDispatch = await invokeTool(fixture.gateAuth, fixture.env, 'task_dispatch', {
         task_id: TASK_ID,
       }, 'https://pot.test') as { ok: boolean; result?: { dispatched?: boolean; receipt?: { id: string } } }
