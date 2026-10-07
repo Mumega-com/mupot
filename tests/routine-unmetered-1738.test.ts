@@ -58,6 +58,21 @@ describe('#1738 unmetered writers', () => {
       .toEqual({ status: 'landed', c: 420_000, m: 1 })
   })
 
+  it('an unmetered landing claim does not mark an already-reported (metered) cost unmetered', async () => {
+    fixture = await makeReadyRoutineFixture('execute_internal')
+    await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
+    fixture.harness.sqlite.exec("UPDATE flights SET meta = json_remove(meta, '$.routine_run_id', '$.routine_revision') WHERE id='control-flight'")
+    const meta = parseFlightMetaV1(JSON.parse((row(fixture, "SELECT meta FROM flights WHERE id='control-flight'") as { meta: string }).meta))
+    if (!meta) throw new Error('meta')
+    fixture.harness.sqlite.exec("UPDATE tasks SET status = 'done' WHERE id = 'control-task'")
+    await landGovernedFlight(fixture.env, 'control-flight', {
+      cost_micro_usd: 0, cost_metered: false, expected_agent: 'agent-1', agent_id: 'agent-1', meta,
+      actor: { kind: 'agent', id: 'agent-1' },
+    })
+    expect(row(fixture, "SELECT cost_micro_usd AS c, cost_metered AS m FROM flights WHERE id='control-flight'"))
+      .toEqual({ c: 420_000, m: 1 })
+  })
+
   it('an explicit non-zero landing cost still wins (metered landings are unchanged)', async () => {
     fixture = await makeReadyRoutineFixture('execute_internal')
     await invokeTool(agentPrincipal(), fixture.env, 'report_run_usage', usage, 'https://pot.test')
