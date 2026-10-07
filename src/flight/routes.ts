@@ -30,6 +30,7 @@ import {
   // calls it now; removing it outright is a follow-up, not part of this fix.
   landGovernedFlight,
   listFlights,
+  listFlightOutcomes,
   listFlightProjectMismatchTaskIds,
   listIncompleteFlightTaskIds,
   routineControlLandLacksWitness,
@@ -550,13 +551,10 @@ flightsApp.get('/', async (c) => {
   const rawProjectId = params.get('project_id')
   const projectId = rawProjectId === null ? undefined : rawProjectId.trim()
   if (projectId !== undefined && (projectId.length === 0 || projectId.length > 200)) return c.json({ error: 'invalid_project_id' }, 400)
-  const all = await listFlights(c.env, 500, projectId)
-  const statusSet = q.statuses ? new Set<OutcomeFilter>(q.statuses) : null
-  const flights = all
-    // flightOutcome: a cancel matches 'cancelled' only, never 'failed' (#1748).
-    .filter((f) => (statusSet ? statusSet.has(flightOutcome(f)) : true))
-    .filter((f) => (q.sinceMs == null ? true : (f.ended_at ?? f.created_at) > q.sinceMs))
-    .slice(0, q.limit)
+  // Outcome filter + `since` are pushed into SQL (before the row cap): filtering in JS after a 500-row cap hid older
+  // matches from a cursor consumer (#1748 r3). The outcome predicate is the shared one in flight/cancelled.
+  const page = await listFlightOutcomes(c.env, { limit: q.limit, projectId, outcomes: q.statuses, sinceMs: q.sinceMs })
+  const flights = page.rows
     .map((f) => ({
       id: f.id,
       project_id: f.project_id,
@@ -572,9 +570,10 @@ flightsApp.get('/', async (c) => {
       created_at: f.created_at,
       ended_at: f.ended_at,
     }))
-  // cursor = max ended_at/created_at seen, so the brain can poll incrementally.
+  // cursor = max ended_at/created_at seen, so the brain can poll incrementally. With `since` the page is the OLDEST
+  // matches past the cursor (whole same-ms tie groups included), so advancing never skips one.
   const cursor = flights.reduce((m, f) => Math.max(m, f.ended_at ?? f.created_at), q.sinceMs ?? 0)
-  return c.json({ flights, cursor })
+  return c.json({ flights, cursor, has_more: page.more })
 })
 
 // Collisions — the ATC tower's current cross-flight HOLD/WARN view (read-only,
