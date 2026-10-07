@@ -48,6 +48,8 @@ export interface FlightRow {
   cost_micro_usd: number
   /** 0 = executor had no spend meter; cost_micro_usd is NOT a measurement (0193, #1732). Optional: hand-built rows omit it. */
   cost_metered?: number
+  /** 1 = server-marked bookkeeping flight (deploy/studio; 0195, #1762): never executes, never HOLDs clearance. Optional: hand-built rows omit it. */
+  bookkeeping?: number
   next_run_at: number | null
   created_at: number
   started_at: number | null
@@ -102,6 +104,12 @@ export interface CreateFlightOptions {
    * batch as the flight INSERT (see src/flight/rebooking.ts).
    */
   redispatchReceipt?: RedispatchReceiptInput
+  /**
+   * mupot#1762: mark this flight as an unexecuted bookkeeping flight (deploy/studio). INTERNAL ONLY — this option
+   * is passed by exactly two server-side writers and is deliberately NOT a field of NewFlight or flight meta, so no
+   * flight_dispatch / REST / MCP caller can set it. Such a flight never HOLDs clearance (it may still WARN).
+   */
+  bookkeeping?: boolean
 }
 
 export class FlightCreateFenceError extends Error {
@@ -277,6 +285,13 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       } else {
         result = await insert.run()
       }
+    } else if (options.bookkeeping === true) {
+      // Only the bookkeeping writers name the 0195 column on INSERT. This is NOT deploy-order safe overall: the
+      // clearance HOLD read always names f.bookkeeping, so migration 0195 must be applied before this code ships.
+      result = await env.DB.prepare(
+        `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, bookkeeping)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, 1)`,
+      ).bind(...values).run()
     } else {
       // No key → the pre-0172 statement, byte for byte. Deploy-order safety: until an
       // operator applies 0172, flights has no client_request_id column, and naming it on
@@ -837,12 +852,15 @@ export async function listLiveFlights(
  * #1758 P1-2: the clearance read, scoped in SQL to live flights whose meta INTERSECTS the proposed meta on a key
  * `checkFlightClearance` compares — so unrelated live flights can never truncate it.
  *  - HOLD keys (`task_ids`, `artifact_refs`): capped at `cap`; if THIS set overflows, `truncated` is true and the
- *    caller must fail closed (the colliding set may be incomplete).
- *  - WARN keys (`objective_id`, `goal_id`, `squad_ids`): advisory only (never block), read separately with their own
- *    cap and merged in; their overflow never sets `truncated`. Kept separate because squad overlap is near-universal
- *    and must not be able to make the HOLD set look truncated.
- * A proposed meta with no comparable keys skips the read entirely. Rows with unparseable meta are excluded in SQL
- * (clearance treats them as opaque anyway).
+ *    caller must fail closed (the colliding set may be incomplete). This read is skipped when the proposed meta
+ *    declares neither key. It EXCLUDES bookkeeping flights (`f.bookkeeping = 0`, #1762): an unexecuted deploy/studio
+ *    flight can neither HOLD nor count toward truncation. `bookkeeping` is server-set only (see CreateFlightOptions).
+ *  - WARN keys (`objective_id`, `goal_id`, `squad_ids`): advisory only (never block), ALWAYS read (separately, with
+ *    their own cap) and merged in; their overflow never sets `truncated`. Kept separate because squad overlap is
+ *    near-universal and must not be able to make the HOLD set look truncated. Bookkeeping flights may appear here,
+ *    and `checkFlightClearance` caps any collision with them at WARN.
+ * Rows whose meta is not valid JSON are excluded in SQL (`json_valid`); valid-JSON rows that fail FlightMetaV1
+ * validation are returned and treated as opaque by clearance (skipped, logged).
  */
 export async function listIntersectingLiveFlights(
   env: Env,
@@ -869,7 +887,7 @@ export async function listIntersectingLiveFlights(
     holdBinds.push(JSON.stringify(meta.artifact_refs))
   }
   if (holdClauses.length > 0) {
-    const res = await env.DB.prepare(`${base} AND (${holdClauses.join(' OR ')}) ORDER BY f.created_at DESC LIMIT ?2`)
+    const res = await env.DB.prepare(`${base} AND f.bookkeeping = 0 AND (${holdClauses.join(' OR ')}) ORDER BY f.created_at DESC LIMIT ?2`)
       .bind(env.TENANT_SLUG, cap + 1, ...LIVE_FLIGHT_STATUSES, ...holdBinds)
       .all<FlightRow>()
     const all = res.results ?? []

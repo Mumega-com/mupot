@@ -162,11 +162,15 @@ Two presence sources, by agent tier:
   (surfaces, never blocks) on shared objective/goal/squad only (normal co-work). Read-only
   view: `GET /api/flights/collisions`.
 - **Exempt writers (#1758).** Only `dispatchFlight` runs clearance. `projects/deploy.ts`, `dashboard/studio.ts`
-  and `routines/dispatch.ts` create flights directly and are deliberately exempt: deploy/Studio flights are
-  unexecuted bookkeeping flights with no lifecycle (they stay in `preflight`, budget NULL, never landed, reaped by
-  the watchdog after 60-84 min), so gating them on the shared repo `artifact_ref` would self-block the product's own
-  Deploy -> Studio flow for about an hour. Giving them a lifecycle is the real fix (tracked separately). Routine
-  control flights carry only their own attempt's task id and no `artifact_refs`, so clearance would be vacuous.
+  and `routines/dispatch.ts` create flights directly and are deliberately exempt: gating deploy/Studio flights on the
+  shared repo `artifact_ref` would self-block the product's own Deploy -> Studio flow. Routine control flights carry
+  only their own attempt's task id and no `artifact_refs`.
+- **Bookkeeping flights (#1762, migration 0195).** Deploy flights, and Studio flights that did NOT launch a Cursor
+  agent, are unexecuted (they stay in `preflight`, budget NULL, never landed; closed by the watchdog after ~60-84 min,
+  `flight_cancel` or `flight_reap_stalled`). They are stored with `flights.bookkeeping = 1`, set only by those writers
+  through an internal `createFlight` option (never from request or meta input). Bookkeeping flights never HOLD and never
+  count toward the HOLD cap; they may still WARN. A Studio flight that DID launch a Cursor agent is real work on the
+  repo and stays HOLD-able. Giving these flights a real lifecycle remains open (#1762).
 - The clearance read is scoped in SQL to live flights whose meta intersects the proposed meta (`task_ids`,
   `artifact_refs` for HOLD; `objective_id`, `goal_id`, `squad_ids` for WARN), so unrelated live flights cannot
   truncate it; only an overflowing intersecting HOLD set fails closed.

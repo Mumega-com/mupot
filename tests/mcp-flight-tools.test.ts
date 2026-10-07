@@ -1335,7 +1335,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           dispatched_by_agent_id TEXT NOT NULL DEFAULT '', goal TEXT NOT NULL,
           status TEXT NOT NULL DEFAULT 'preflight', trigger_source TEXT NOT NULL DEFAULT 'manual',
           gate_verdict TEXT, gate_reason TEXT NOT NULL DEFAULT '', score REAL, budget_micro_usd INTEGER,
-          cost_micro_usd INTEGER NOT NULL DEFAULT 0, cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1)), next_run_at INTEGER,
+          cost_micro_usd INTEGER NOT NULL DEFAULT 0, cost_metered INTEGER NOT NULL DEFAULT 1 CHECK (cost_metered IN (0,1)),
+          bookkeeping INTEGER NOT NULL DEFAULT 0 CHECK (bookkeeping IN (0,1)), next_run_at INTEGER,
           created_at INTEGER NOT NULL DEFAULT (unixepoch('now') * 1000), started_at INTEGER,
           ended_at INTEGER, meta TEXT NOT NULL DEFAULT '{}'
         );

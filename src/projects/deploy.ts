@@ -138,10 +138,11 @@ async function dispatchDeployFlight(
     { skipEvent: true, skipMirror: true, actor: { kind: 'member', id: actorId(auth) } },
   )
 
-  // #1758: EXEMPT from flight clearance, deliberately. This is an unexecuted bookkeeping flight with no lifecycle:
-  // it stays in 'preflight' (nothing calls applyPreflight), budget is NULL, landFlight refuses it, and only the
-  // watchdog reaps it (60-84 min). Gating it on the shared repo artifact_ref would self-block the product's own
-  // Deploy -> Studio flow for about an hour. The real fix is giving it a lifecycle (tracked separately).
+  // #1758/#1762: an unexecuted bookkeeping flight with no lifecycle: it stays in 'preflight' (nothing calls
+  // applyPreflight), budget is NULL, landFlight refuses it, and it is closed only by the watchdog (60-84 min),
+  // cancelFlight or flight_reap_stalled. It is therefore marked `bookkeeping` (server-set via the createFlight
+  // option, never caller meta) so it cannot HOLD flight clearance on its repo artifact_ref, and it is not itself
+  // clearance-gated (that would self-block Deploy -> Studio).
   return createFlight(env, {
     agent: agentId,
     dispatched_by: auth.boundAgentId ?? agentId,
@@ -161,7 +162,7 @@ async function dispatchDeployFlight(
       publication_target: 'none',
       parent_flight_id: null,
     },
-  })
+  }, { bookkeeping: true })
 }
 
 export async function deployProject(
