@@ -197,6 +197,15 @@ export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Prom
   return row !== null
 }
 
+/** SQL fragment: no inbox envelope exists for this dispatch receipt. Makes "an in_worker
+ *  settle/terminate never touches an inbox-delivered dispatch" hold by construction (mupot#1723),
+ *  not by the delivered_via annotation alone. `receiptParam` is a bound-parameter placeholder. */
+const NO_INBOX_ENVELOPE_SQL = (tenantParam: string, receiptParam: string): string => `NOT EXISTS (
+  SELECT 1 FROM agent_messages m
+   WHERE m.tenant = ${tenantParam} AND m.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+     AND m.request_id = '${DISPATCH_INBOX_PREFIX}' || ${receiptParam}
+)`
+
 /**
  * settleInWorkerDispatchReceipt — mupot#1723 / #1721. Terminal disposition for a dispatch that
  * routed 'in_worker' (no agent_messages row, no runtime credential, so the message-backed
@@ -228,6 +237,7 @@ export async function settleInWorkerDispatchReceipt(
        WHERE tenant = ?4 AND id = ?5 AND task_id = ?6 AND agent_id = ?7
          AND settled_at IS NULL
          AND (delivered_via IS NULL OR delivered_via = 'in_worker')
+         AND ${NO_INBOX_ENVELOPE_SQL('?4', '?5')}
          AND NOT EXISTS (
            SELECT 1 FROM task_dispatch_runtime_receipts r
             WHERE r.tenant = ?4 AND r.dispatch_receipt_id = ?5
@@ -248,9 +258,25 @@ export async function settleInWorkerDispatchReceipt(
       auditId, env.TENANT_SLUG, input.agentId, `settle_${input.stage}`, input.dispatchReceiptId,
       input.taskId, `in-worker-settle:${input.dispatchReceiptId}:${input.stage}`, evidence, now,
     ),
+    // Clear the dead run's execution pointer (failed settles only) so the next dispatch, inbox
+    // or in-Worker, can claim the task: runtime_consumed requires execution_receipt_id IS NULL
+    // OR = the new receipt. Guarded on the pointer value, on this exact settle having landed
+    // (settled_at = now for this receipt), and on the task not being mid-run. A 'completed'
+    // settle keeps the pointer (projections use it as the correlation id of a reviewed task).
+    env.DB.prepare(clearExecutionPointerSql).bind(
+      input.taskId, input.dispatchReceiptId, env.TENANT_SLUG, now, input.stage === 'failed' ? 1 : 0,
+    ),
   ])
   return (results[0].meta as { changes?: number }).changes === 1
 }
+
+const clearExecutionPointerSql = `
+  UPDATE tasks SET execution_receipt_id = NULL, execution_claim_expires_at = NULL
+   WHERE id = ?1 AND execution_receipt_id = ?2 AND status <> 'in_progress' AND ?5 = 1
+     AND EXISTS (
+       SELECT 1 FROM task_dispatch_receipts d
+        WHERE d.tenant = ?3 AND d.id = ?2 AND d.settled_at = ?4
+     )`
 
 export type TaskDispatchRuntimeReceiptErrorCode =
   | 'agent_bound_workspace_credential_required'
@@ -1581,9 +1607,10 @@ export async function adminResetDispatchLease(
   // Also fetches `agent_id` now — needed only for `terminate: true`'s receipt row, but
   // cheap to carry from this same SELECT rather than a second round trip later.
   const dispatch = await env.DB.prepare(
-    `SELECT task_id, agent_id, delivered_via, settled_at FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 LIMIT 1`,
+    `SELECT task_id, agent_id, delivered_via, settled_at, settled_stage FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 LIMIT 1`,
   ).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{
     task_id: string; agent_id: string; delivered_via: string | null; settled_at: string | null
+    settled_stage: string | null
   }>()
   if (!dispatch) {
     await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
@@ -1685,20 +1712,38 @@ export async function adminResetDispatchLease(
   const message = await loadMessage()
   if (!message) {
     // mupot#1723 — an in_worker dispatch never had an agent_messages row. Terminate it on the
-    // dispatch row alone. Narrow: only when the receipt is provably in-Worker (delivered_via
-    // 'in_worker', or the task's execution_receipt_id points at it — the pre-#1721 shape where
-    // delivered_via was never stamped) AND the caller asked to terminate. Everything else is
-    // still not-found, exactly as before. Operator/org-admin/reason/credential guards already
-    // ran above (and in toolTaskDispatchLeaseReset).
-    const inWorker = terminate && (dispatch.delivered_via === 'in_worker' || (await env.DB.prepare(
-      `SELECT 1 FROM tasks WHERE id = ?1 AND execution_receipt_id = ?2 LIMIT 1`,
-    ).bind(input.taskId, input.dispatchReceiptId).first<{ 1: number }>()) !== null)
+    // dispatch row alone. Only when the caller asked to terminate and the receipt LOOKS
+    // in-Worker (delivered_via 'in_worker', or the task's execution pointer names it — the
+    // pre-#1721 shape where delivered_via was never stamped). The pointer is also set by an
+    // inbox runtime_consumed, so it is a hint, not proof: the real fences are the UPDATE's own
+    // guards below (unsettled, delivered_via not inbox, no inbox envelope, no terminal runtime
+    // receipt). Operator/org-admin/reason/credential guards already ran above.
+    const taskRow = terminate ? await env.DB.prepare(
+      `SELECT status, execution_receipt_id, execution_claim_expires_at FROM tasks WHERE id = ?1 LIMIT 1`,
+    ).bind(input.taskId).first<{ status: string; execution_receipt_id: string | null; execution_claim_expires_at: number | null }>() : null
+    const inWorker = terminate && (dispatch.delivered_via === 'in_worker' || taskRow?.execution_receipt_id === input.dispatchReceiptId)
     if (inWorker) {
       if (dispatch.settled_at !== null) {
         await writeAudit('reset_refused_already_terminal', 'dispatch_receipt', input.dispatchReceiptId, evidence())
         return {
           reset: false, code: 'reset_refused_already_terminal', message_id: null, audit_id: auditId,
-          overrode: false, terminated: true,
+          // Only an operator termination reports terminated:true; a naturally settled
+          // (completed/failed) receipt is terminal but was not terminated by this call.
+          overrode: false, terminated: dispatch.settled_stage === 'reset_terminated',
+        }
+      }
+      // A LIVE in-Worker run (task in_progress under an unexpired execution claim) is not a
+      // wedge; mirror the message path's reset_refused_lease_live unless override.
+      const claimExpires = taskRow?.execution_claim_expires_at ?? null
+      const live = taskRow?.status === 'in_progress' && claimExpires !== null && claimExpires > Date.now()
+      if (live && !override) {
+        await writeAudit('reset_refused_lease_live', 'dispatch_receipt', input.dispatchReceiptId, evidence({
+          holder: dispatch.agent_id, lease_expires_at: new Date(claimExpires).toISOString(), in_worker: true,
+        }))
+        return {
+          reset: false, code: 'reset_refused_lease_live', message_id: null, audit_id: auditId,
+          overrode: false, terminated: false,
+          lease_live: { holder: dispatch.agent_id, lease_expires_at: new Date(claimExpires).toISOString(), delivery_attempts: 0 },
         }
       }
       const reason = sanitizeReceiptText(text(input.reason, 500))
@@ -1708,6 +1753,7 @@ export async function adminResetDispatchLease(
              SET settled_stage = 'reset_terminated', settled_at = ?3, settled_reason = ?4, delivered_via = 'in_worker'
            WHERE tenant = ?1 AND id = ?2 AND settled_at IS NULL
              AND (delivered_via IS NULL OR delivered_via = 'in_worker')
+             AND ${NO_INBOX_ENVELOPE_SQL('?1', '?2')}
              AND NOT EXISTS (
                SELECT 1 FROM task_dispatch_runtime_receipts r
                 WHERE r.tenant = ?1 AND r.dispatch_receipt_id = ?2
@@ -1730,13 +1776,16 @@ export async function adminResetDispatchLease(
           auditId, env.TENANT_SLUG,
           agentId ? 'agent' : 'member', agentId ?? memberId, memberId, agentId,
           credentialId, input.dispatchReceiptId,
-          input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence({ in_worker: true }), now,
+          input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`,
+          evidence({ in_worker: true, ...(live ? { override_of_live_run: true } : {}) }), now,
         ),
+        // Clear the dead run's pointer so a re-dispatch (inbox or in-Worker) can claim the task.
+        env.DB.prepare(clearExecutionPointerSql).bind(input.taskId, input.dispatchReceiptId, env.TENANT_SLUG, now, 1),
       ])
       const done = (batch[0].meta as { changes?: number }).changes === 1
       return {
         reset: done, code: done ? 'reset' : 'reset_refused_terminal', message_id: null, audit_id: auditId,
-        overrode: false, terminated: done,
+        overrode: done && live, terminated: done,
       }
     }
     await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
