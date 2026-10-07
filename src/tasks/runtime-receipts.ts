@@ -285,8 +285,8 @@ export async function settleInWorkerDispatchReceipt(
         credential_id, origin, handler, operation, target_kind, target_id,
         task_id, request_id, idempotency_key, evidence_json, recorded_at
       )
-      SELECT ?1, ?2, 'system', 'in_worker_execute', NULL, ?3,
-             NULL, 'worker_callback', 'in_worker_dispatch_settle', ?4, 'dispatch_receipt', ?5,
+      SELECT ?1, ?2, 'system', ${deliveredVia ? "'in_worker_execute'" : "'dispatch_receiver_fence'"}, NULL, ?3,
+             NULL, 'worker_callback', ${deliveredVia ? "'in_worker_dispatch_settle'" : "'receiver_not_live_settle'"}, ?4, 'dispatch_receipt', ?5,
              ?6, ?7, ?7, ?8, ?9
        WHERE changes() = 1
     `).bind(

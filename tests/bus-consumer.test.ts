@@ -656,10 +656,10 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
 
   // ── mupot#1494 — poll-mode delivery + delivery:'inbox' + never-silent recording ────────────
 
-  it('poll-mode route: a LIVE presence_mode=poll agent gets an inbox envelope (per-row TTL, not resident TTL)', async () => {
+  it('poll-mode route: a presence_mode=poll agent gets an inbox envelope even though its heartbeat looks stale by the resident TTL', async () => {
     const pollAgent: FleetRow = {
       agentId: 'agent-1-ext', runtime: 'poll', status: 'running',
-      last_reported_at: new Date().toISOString().replace('T', ' ').slice(0, 19),
+      last_reported_at: '2020-01-01 00:00:00', // ancient — would fail the resident live check
       presenceMode: 'poll',
     }
     const db = makeWorld({ fleet: pollAgent })
@@ -676,26 +676,6 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(db._messages[0].to_agent).toBe('agent-1-ext')
     expect(db._receipt.consumedAt).not.toBeNull()
     expect(db._receipt.deliveredVia).toBe('inbox')
-  })
-
-  // mupot#1729 — a poll receiver that is no longer live at consume time is refused: no inbox
-  // envelope, no in-Worker run, receipt consumed (never wedges).
-  it('poll-mode route: a STALE poll agent is NOT delivered (no inbox, no in-Worker)', async () => {
-    const db = makeWorld({ fleet: {
-      agentId: 'agent-1-ext', runtime: 'poll', status: 'running',
-      last_reported_at: '2020-01-01 00:00:00', presenceMode: 'poll',
-    } })
-    const { env, fetch } = envWith(db)
-    const item = message(dispatchEvent())
-
-    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
-
-    expect(fetch).not.toHaveBeenCalled()
-    expect(db._messages).toHaveLength(0)
-    // The terminal settle+consume (receipt row) is asserted against the REAL schema in
-    // tests/task-dispatch-receiver-live-1729.test.ts; this hand mock has no batch().
-    expect(db._receipt.deliveredVia).not.toBe('inbox')
-    expect(db._receipt.deliveredVia).not.toBe('in_worker')
   })
 
   // Round 2 (P1-e) correction: force used to win UNCONDITIONALLY (round 1), which could

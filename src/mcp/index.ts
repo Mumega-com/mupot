@@ -2542,11 +2542,10 @@ const toolTaskDispatch: ToolSpec = {
       return fail(409, 'task_not_dispatchable')
     }
 
-    // mupot#1729 — never dispatch to an external receiver that is not currently live (a stopped
-    // or TTL-expired poll seat would dead-letter in an unread inbox; falling back to in-Worker
-    // would run the work somewhere the owner did not choose). Same liveness derivation as
-    // fleet_agent_get. Agents with no fleet surface are untouched.
-    const receiverVerdict = await evaluateReceiverLiveness(env, task.assignee_agent_id, forceInboxDelivery)
+    // mupot#1729 — a STOPPED (detached) fleet row is the fence: refuse, forced or not (same
+    // predicate the bus consumer re-checks at consume time). A stale-but-not-stopped poll seat
+    // is NOT refused (its inbox is a store-and-forward mailbox); the dispatcher gets a warning.
+    const receiverVerdict = await evaluateReceiverLiveness(env, task.assignee_agent_id)
     if (!receiverVerdict.ok) {
       return fail(409, 'receiver_not_live', {
         agent_id: task.assignee_agent_id,
@@ -2643,6 +2642,14 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
       ...(deliveryForcedPredicted ? { delivery_forced_predicted: deliveryForcedPredicted } : {}),
+      ...(receiverVerdict.stale_poll ? {
+        warning: {
+          code: 'receiver_stale',
+          agent_id: task.assignee_agent_id,
+          last_reported_at: receiverVerdict.last_reported_at,
+          presence_ttl_sec: receiverVerdict.presence_ttl_sec,
+        },
+      } : {}),
     })
   },
 }

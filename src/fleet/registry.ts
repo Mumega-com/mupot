@@ -939,48 +939,50 @@ export async function getFleetAgentLiveness(
   return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
 }
 
-export type ReceiverNotLiveReason = 'poll_stopped' | 'poll_stale' | 'stopped_forced_inbox'
-
 export interface ReceiverLivenessVerdict {
-  /** False iff dispatching to this agent's external receiver must be refused (mupot#1729). */
+  /** False iff dispatching to this agent must be refused: the fleet row is 'stopped' (mupot#1729). */
   ok: boolean
+  reason?: 'stopped'
   agent_id: string
   presence_mode: string
   status: string
   live: boolean
-  reason?: ReceiverNotLiveReason
+  /** True iff the row is poll-mode, not stopped, and its per-row TTL has lapsed. NOT a refusal:
+   *  a poll inbox is a store-and-forward mailbox, so this only drives a dispatcher warning. */
+  stale_poll: boolean
+  last_reported_at: string
+  presence_ttl_sec: number
 }
 
 /**
- * evaluateReceiverLiveness — mupot#1729. THE dispatch-time fence: work goes to an external
- * receiver ONLY when that receiver is currently live. Routing state (presence_mode='poll',
- * a kept runtime) outlives the process, so a stopped/expired receiver must be refused rather
- * than handed an inbox dead letter or silently run in-Worker. Reads the RAW row (not
- * getFleetAgentLiveness, which hides a stopped row's poll mode) and the SAME derivePresence +
- * resolveFleetPresenceTtlSec that fleet_agent_get's derived_presence uses.
- *
- * Refuses when: poll + stopped; poll + not live (TTL expired); stopped + forced inbox against a
- * row with a registered surface (runtime kept after detach). No row / no poll / no runtime =
- * no fleet surface -> ok (in-Worker behaviour unchanged). Unforced resident rows unchanged.
+ * evaluateReceiverLiveness — mupot#1729. THE ONE fence, used at dispatch time (task_dispatch)
+ * AND consume time (bus consumer). A fleet row with status 'stopped' (operator detach,
+ * markStopped) is refused whatever its presence_mode/runtime: detach writes status 'stopped'
+ * AND presence_mode '', so keying on the poll mode would miss a freshly detached seat. A stale
+ * but not stopped poll seat is NOT refused (mailbox preserved) — reported via stale_poll.
+ * Reads the RAW row and the same derivePresence/resolveFleetPresenceTtlSec as fleet_agent_get.
+ * No row = no fleet surface = ok (in-Worker behaviour unchanged).
  */
 export async function evaluateReceiverLiveness(
   env: Env,
   agentId: string,
-  forceInbox: boolean,
   nowMs = Date.now(),
 ): Promise<ReceiverLivenessVerdict> {
   const row = await readFleetAgentRow(env, agentId)
-  if (!row) return { ok: true, agent_id: '', presence_mode: '', status: 'unknown', live: false }
+  if (!row) {
+    return { ok: true, agent_id: '', presence_mode: '', status: 'unknown', live: false, stale_poll: false, last_reported_at: '', presence_ttl_sec: 0 }
+  }
   const presenceMode = row.presence_mode ? String(row.presence_mode) : ''
-  const runtime = row.runtime ? String(row.runtime) : ''
   const status = String(row.status ?? 'unknown')
-  const live = derivePresence(status, String(row.last_reported_at ?? ''), resolveFleetPresenceTtlSec(env, row), nowMs) === 'live'
-  const base = { agent_id: String(row.agent_id), presence_mode: presenceMode, status, live }
-  let reason: ReceiverNotLiveReason | undefined
-  if (presenceMode === 'poll' && status === 'stopped') reason = 'poll_stopped'
-  else if (presenceMode === 'poll' && !live) reason = 'poll_stale'
-  else if (status === 'stopped' && forceInbox && (presenceMode === 'poll' || runtime !== '')) reason = 'stopped_forced_inbox'
-  return reason ? { ok: false, ...base, reason } : { ok: true, ...base }
+  const lastReportedAt = String(row.last_reported_at ?? '')
+  const ttlSec = resolveFleetPresenceTtlSec(env, row)
+  const live = derivePresence(status, lastReportedAt, ttlSec, nowMs) === 'live'
+  const base = {
+    agent_id: String(row.agent_id), presence_mode: presenceMode, status, live,
+    last_reported_at: lastReportedAt, presence_ttl_sec: ttlSec,
+  }
+  if (status === 'stopped') return { ok: false, reason: 'stopped', stale_poll: false, ...base }
+  return { ok: true, stale_poll: presenceMode === 'poll' && !live, ...base }
 }
 
 /**

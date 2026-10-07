@@ -1,6 +1,7 @@
 // mupot#1729 — routing state outlives the process. task_dispatch must refuse (409
 // receiver_not_live) to hand work to an external receiver that is not currently live, and the
-// bus consumer must not deliver a poll-routed dispatch to a no-longer-live receiver.
+// bus consumer must not deliver to a seat stopped between dispatch and consume. STOPPED is the
+// fence; a stale (not stopped) poll seat keeps its mailbox and only yields a warning.
 // Real-schema harness (applyAllMigrations); no hand-written DDL.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MessageBatch } from '@cloudflare/workers-types'
@@ -57,81 +58,76 @@ beforeEach(() => {
 })
 afterEach(() => h.close())
 
-describe('task_dispatch receiver liveness fence (#1729)', () => {
-  it('poll + live -> dispatch OK', async () => {
+const detach = (runtime = '') => h.sqlite.exec(
+  `UPDATE fleet_agents SET status='stopped', presence_mode='', presence_ttl_sec=NULL, runtime='${runtime}', last_reported_at=datetime('now')`)
+
+describe('task_dispatch receiver fence (#1729)', () => {
+  it('live poll -> OK, no warning', async () => {
     fleet({ mode: 'poll', at: FRESH() })
     const r = await dispatch()
     expect(r.ok).toBe(true)
+    expect(r.result).not.toHaveProperty('warning')
     expect(events).toHaveLength(1)
   })
 
-  it('poll + stale -> 409 receiver_not_live, nothing emitted, no receipt row', async () => {
+  it('stale poll -> OK with receiver_stale warning (mailbox preserved)', async () => {
     fleet({ mode: 'poll', at: STALE })
     const r = await dispatch()
+    expect(r.ok).toBe(true)
+    expect(r.result).toMatchObject({ warning: { code: 'receiver_stale', agent_id: AGENT, last_reported_at: STALE, presence_ttl_sec: 300 } })
+    expect(events).toHaveLength(1)
+  })
+
+  it('REAL detach shape (stopped, mode empty, runtime empty) -> 409 unforced and forced', async () => {
+    fleet({ mode: 'poll', at: FRESH() })
+    detach('')
+    const r = await dispatch()
     expect(r).toMatchObject({ ok: false, status: 409, error: 'receiver_not_live' })
-    expect(r.detail).toMatchObject({ agent_id: AGENT, presence_mode: 'poll', status: 'running', live: false, reason: 'poll_stale' })
+    expect(r.detail).toMatchObject({ agent_id: AGENT, presence_mode: '', status: 'stopped', live: false, reason: 'stopped' })
+    expect(await dispatch({ delivery: 'inbox' })).toMatchObject({ status: 409, error: 'receiver_not_live' })
     expect(events).toHaveLength(0)
     expect(h.sqlite.prepare('SELECT COUNT(*) n FROM task_dispatch_receipts').get()).toMatchObject({ n: 0 })
   })
 
-  it('poll + stale + forced inbox -> 409 too', async () => {
-    fleet({ mode: 'poll', at: STALE })
+  it('REAL detach shape with runtime kept -> 409 unforced and forced', async () => {
+    fleet({ runtime: 'claude-code', mode: 'poll', at: FRESH() })
+    detach('claude-code')
+    expect(await dispatch()).toMatchObject({ status: 409, error: 'receiver_not_live' })
     expect(await dispatch({ delivery: 'inbox' })).toMatchObject({ status: 409, error: 'receiver_not_live' })
-  })
-
-  it('stopped + forced inbox (runtime kept) -> 409', async () => {
-    fleet({ runtime: 'claude-code', status: 'stopped', at: FRESH() })
-    const r = await dispatch({ delivery: 'inbox' })
-    expect(r).toMatchObject({ status: 409, error: 'receiver_not_live' })
-    expect(r.detail).toMatchObject({ status: 'stopped', reason: 'stopped_forced_inbox' })
-  })
-
-  it('detached poll row (stopped, poll + runtime kept) -> 409 even unforced', async () => {
-    fleet({ runtime: 'claude-code', mode: 'poll', status: 'stopped', at: FRESH() })
-    const r = await dispatch()
-    expect(r).toMatchObject({ status: 409, error: 'receiver_not_live' })
-    expect(r.detail).toMatchObject({ reason: 'poll_stopped', live: false })
   })
 
   it('no fleet surface -> in-worker route unchanged', async () => {
     const r = await dispatch()
     expect(r.ok).toBe(true)
+    expect(r.result).not.toHaveProperty('warning')
     expect(events).toHaveLength(1)
   })
 
-  it('live resident runtime -> unchanged (also with forced inbox)', async () => {
+  it('live resident runtime -> unchanged', async () => {
     fleet({ runtime: 'claude-code', at: FRESH() })
     expect((await dispatch()).ok).toBe(true)
-    h.sqlite.exec(`UPDATE task_dispatch_receipts SET settled_at='${T0}', settled_stage='failed'`)
-    expect((await dispatch({ delivery: 'inbox' })).ok).toBe(true)
   })
 
-  it('stale resident (no poll), unforced -> unchanged (not in scope)', async () => {
-    fleet({ runtime: 'claude-code', at: STALE })
-    expect((await dispatch()).ok).toBe(true)
-  })
-
-  it('after check_in poll refresh the receiver is live again -> dispatch OK', async () => {
-    fleet({ mode: 'poll', at: STALE })
+  it('re-dispatch after the seat reattaches and is live -> OK', async () => {
+    fleet({ mode: 'poll', at: FRESH() })
+    detach('')
     expect((await dispatch()).status).toBe(409)
-    const ci = await invokeTool(auth(AGENT), env, 'check_in', { presence_mode: 'poll', poll_interval_sec: 300 }, 'https://pot.example')
-    expect(ci.ok).toBe(true)
+    h.sqlite.prepare(`UPDATE fleet_agents SET status='running', last_reported_at=?`).run(FRESH())
     expect((await dispatch()).ok).toBe(true)
   })
 })
 
-describe('bus consumer: poll receiver not live at consume time (#1729)', () => {
+describe('bus consumer (#1729)', () => {
   const deliver = async (event: BusEvent) => {
     const item = { id: 'm1', attempts: 1, body: event, ack: vi.fn(), retry: vi.fn() }
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
     return item
   }
 
-  it('settles the receipt failed/receiver_not_live, writes no inbox envelope, does not wedge', async () => {
+  it('seat stopped between dispatch and consume -> failed settle, no envelope, no in-Worker run', async () => {
     fleet({ mode: 'poll', at: FRESH() })
     expect((await dispatch()).ok).toBe(true)
-    // receiver stops/expires between dispatch and consume
-    h.sqlite.prepare(`UPDATE fleet_agents SET last_reported_at = ?`).run(STALE)
+    detach('')
     const item = await deliver(events[0])
     expect(item.ack).toHaveBeenCalled()
     expect(item.retry).not.toHaveBeenCalled()
@@ -139,16 +135,38 @@ describe('bus consumer: poll receiver not live at consume time (#1729)', () => {
     expect(row).toMatchObject({ settled_stage: 'failed', settled_reason: 'receiver_not_live', delivered_via: null })
     expect(row.consumed_at).not.toBeNull()
     expect(h.sqlite.prepare('SELECT COUNT(*) n FROM agent_messages').get()).toMatchObject({ n: 0 })
-    // task stays dispatchable once the receiver is live again
-    h.sqlite.prepare(`UPDATE fleet_agents SET last_reported_at = ?`).run(FRESH())
+    expect(h.sqlite.prepare('SELECT execution_receipt_id e FROM tasks').get()).toMatchObject({ e: null })
+    const audit = h.sqlite.prepare(`SELECT principal_id, handler FROM mutation_audit_entries WHERE target_id = ?`).get(row.id) as Record<string, unknown>
+    expect(audit).toMatchObject({ principal_id: 'dispatch_receiver_fence', handler: 'receiver_not_live_settle' })
+    h.sqlite.prepare(`UPDATE fleet_agents SET status='running', last_reported_at=?`).run(FRESH())
     expect((await dispatch()).ok).toBe(true)
   })
 
-  it('live poll receiver still gets the inbox envelope', async () => {
+  it('settle that does not land is retried, not silently consumed', async () => {
     fleet({ mode: 'poll', at: FRESH() })
+    await dispatch()
+    detach('')
+    // pre-settle the row out from under the consumer is covered by idempotence; force a no-land
+    // by marking a conflicting delivered_via so the settle UPDATE matches nothing.
+    h.sqlite.exec(`UPDATE task_dispatch_receipts SET delivered_via = 'inbox'`)
+    const item = await deliver(events[0])
+    const row = h.sqlite.prepare('SELECT consumed_at c FROM task_dispatch_receipts').get() as Record<string, unknown>
+    expect(row.c).toBeNull()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('stale (not stopped) poll seat still gets the inbox envelope', async () => {
+    fleet({ mode: 'poll', at: STALE })
     await dispatch()
     await deliver(events[0])
     expect(h.sqlite.prepare('SELECT COUNT(*) n FROM agent_messages').get()).toMatchObject({ n: 1 })
     expect(h.sqlite.prepare('SELECT delivered_via v FROM task_dispatch_receipts').get()).toMatchObject({ v: 'inbox' })
+  })
+
+  it('live poll seat gets the inbox envelope', async () => {
+    fleet({ mode: 'poll', at: FRESH() })
+    await dispatch()
+    await deliver(events[0])
+    expect(h.sqlite.prepare('SELECT COUNT(*) n FROM agent_messages').get()).toMatchObject({ n: 1 })
   })
 })
