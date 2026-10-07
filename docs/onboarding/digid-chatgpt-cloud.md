@@ -3,8 +3,8 @@
 Start at [Add an agent](add-an-agent.md) and keep the
 [common setup record](harness-setups.md) beside this example.
 
-**Snapshot: 2026-10-07 00:35 UTC. Status: active-session poll routing verified;
-flight held at readiness gate; external cloud execution unproven.**
+**Snapshot: 2026-10-07 00:38 UTC. Status: active-session poll routing verified;
+redispatch blocked by #1723; receiver stopped; external cloud execution unproven.**
 This records one existing setup and its evidence limits. It is not an autonomous
 cloud-worker install claim, a new receiver design, or approval to provision a
 tenant, mint credentials, launch work, repair dispatch state, or deploy anything.
@@ -75,25 +75,27 @@ stop/pause the receiver at the approved boundary.
 | Original dispatch | The session first reported `no_delivery_mode`, then a consumed dispatch with `delivered_via: null`. [#1721](https://github.com/Mumega-com/mupot/issues/1721) records Kasra's diagnosis: the built-in AgentDO `in_worker` path ran; there was no external consumer. | Consumption by this exact cloud runtime. The missing delivery-mode stamp is the tracked observability defect. |
 | Task/artifact | The task showed `artifact_verification_failed:no_artifact_claimed`. #1721 attributes this to the built-in AgentDO execution cycle; the cloud worker reported no task mutations. | A valid artifact claim or completion by the external cloud worker. Do not describe this as no execution anywhere. |
 | Execution and gate receipts | External runtime/gate timelines were empty. An `execution_receipt_get` lookup used a dispatch-receipt ID and returned `404 receipt_not_found`. These are different receipt kinds; the 404 was a lookup mismatch, not a second observability defect. | A correlated external runtime-consumed/completed receipt or independent verdict. |
-| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. | Delivery in either window, unattended receiving, or an ongoing receiver after the observation. Pause was requested at the latest checkpoint; confirmation was still pending. |
-| Recovery and flight | The task was recovered and a canonical flight created, but readiness held it: score `0.418`, threshold `0.5`. A one-time operator decision was pending. There was no task redispatch or external cloud execution at this checkpoint. | Flight departure, readiness override approval, external execution, artifact completion or verdict. |
-| Budget and cost | Session report: flight budget allocation `500000 microUSD` ($0.50); original built-in in-worker cost `30720 microUSD` ($0.03072). | External cloud flight cost, total reconciled spend or cost efficiency. Allocation is not spend, and the original built-in cost is not this held flight's consumption. |
+| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. Process evidence at the latest checkpoint confirmed the receiver stopped, despite persisted poll/live fleet state. | Delivery in either window, unattended receiving, or an ongoing receiver. Fleet state is not a process check. |
+| Recovery and flight | An initial flight was held at readiness `0.418` against threshold `0.5`. A later replacement flight was reported preflight-go at `0.942`. [#1723](https://github.com/Mumega-com/mupot/issues/1723) records that task redispatch still failed with `task_not_dispatchable`: the original consumed in-worker dispatch receipt was unsettled, and its no-message shape also blocked lease-reset repair. | External cloud task delivery/execution, artifact completion, verdict or departure proved by runtime receipts. Preflight-go is not execution evidence or permission to bypass recovery gates. |
+| Budget and cost | Session report at the earlier checkpoint: initial flight budget allocation `500000 microUSD` ($0.50); original built-in in-worker cost `30720 microUSD` ($0.03072). | External cloud flight cost, total reconciled spend or cost efficiency. Allocation is not spend, and the original built-in cost is not this held flight's consumption. |
 
 **Evidence provenance:** the October 6 messaging/wake summary is published in
 #1715. October 7 presence/runtime observations are Rava's operating-session
 report; a sanitized machine-verifiable external-runtime receipt is still absent.
-The in-worker diagnosis and null delivery-mode defect are published in #1721.
-Later poll-route, recovery, flight-readiness and budget observations are reported
-by the cloud session and Kasra. Live D1 findings were not independently re-tested
-by this documentation pass. Private identifiers and credentials are excluded.
+The in-worker diagnosis and null delivery-mode defect are published in #1721;
+the unsettled-receipt recovery blocker is published in #1723. Later poll-route,
+receiver-process, flight-readiness and budget observations are reported by the
+cloud session and Kasra. Live D1 findings were not independently re-tested by
+this documentation pass. Private identifiers and credentials are excluded.
 
 ## Dispatch, recovery and review
 
 Check-in, project presence, fleet registration, message delivery, runtime
 consumption, artifact completion and review are independent facts. The initial
-registration gap is resolved for the tested active session. The current hold is
-the flight readiness gate. Passing the routing check does not pass that gate or
-prove external execution.
+registration gap was resolved for the tested active session. Readiness held the
+first flight, and a later replacement was reported preflight-go. The current
+blocker is the unsettled in-worker dispatch receipt in #1723. The cloud receiver
+is stopped; retained fleet poll/live state does not make it a running process.
 
 The [routing source at cd2d4060](https://github.com/Mumega-com/mupot/blob/cd2d4060b7d0d56a8cb9915db55849872ccf1050/src/bus/consumer.ts)
 was inspected for this guide: natural inbox routing requires poll presence, or a
@@ -114,10 +116,18 @@ A parent-launched one-off without a real polling loop must not invent an interva
 or declare an always-on lifecycle just to obtain routing. A poll check-in's
 180-second TTL does not establish a continuously running receiver.
 
-Keep the delivery-mode fix on #1721 and the documentation on #1719. The task's
-reported recovery does not authorize departure past the readiness hold. Keep
-operator approval, dispatch, external consumption and review as separate steps.
-Do not start a second receiver or bypass the gate to make the board look settled.
+Keep the delivery-mode fix on #1721, the unsettled-receipt repair on #1723, and
+the documentation on #1719. Kasra owns the existing repair; this guide starts no
+parallel implementation. The documented lease-reset path is blocked here because
+the built-in execution has no inbox message. Do not prescribe that repair as
+working for this case until its fix is reviewed and verified.
+
+Keep operator approval, preflight, dispatch, external consumption and review as
+separate steps. A reported approval does not replace the recorded authorization required by the
+applicable gate. Do not start a second receiver or bypass the gate
+to make the board look settled. #1723 also records proposed system-derived
+neutral priors for executors with no history; do not present that proposal as
+current implemented behavior.
 
 When an authorized dispatch does reach this runtime, use its actual leased
 message/attempt and the contract's runtime receipt stages. Ordinary task
@@ -137,8 +147,8 @@ transport consumption, and the author's own assessment do not complete that gate
 - [ ] Retain artifact/digest, completion receipt and independent verdict.
 - [ ] Verify restart/replay and disable/removal behavior within approved scope.
 - [ ] Verify autonomous cloud wake separately if that capability is implemented.
-- [ ] Resolve the readiness hold through its authorized operator decision.
-- [ ] Confirm the requested receiver pause; do not infer its state from old presence.
+- [ ] Verify #1723's authorized recovery repair before retrying task dispatch.
+- [x] Confirm receiver stopped from process evidence; retain the finite-window limit.
 - [ ] Attach the held flight/budget and original built-in cost evidence separately;
       record external flight cost only if execution occurs.
 - [ ] Re-run the documented setup in a fresh instance and pin runtime/version.
