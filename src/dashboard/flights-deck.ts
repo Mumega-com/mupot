@@ -14,8 +14,8 @@ import { pageHeader, kpiRow } from './ui'
 export const FLIGHT_DECK_POLL_MS = 12_000
 export const FLIGHT_PIPELINE_STAGES = ['Plan', 'Sandbox', 'Tests', 'Gate', 'PR', 'Deploy'] as const
 export type FlightPipelineStage = (typeof FLIGHT_PIPELINE_STAGES)[number]
-export type FlightDeckFilter = 'all' | 'flying' | 'landed' | 'held' | 'failed'
-export type FlightDeckBadge = 'flying' | 'landed' | 'held' | 'failed'
+export type FlightDeckFilter = 'all' | 'flying' | 'landed' | 'held' | 'failed' | 'cancelled'
+export type FlightDeckBadge = 'flying' | 'landed' | 'held' | 'failed' | 'cancelled'
 
 export interface FlightPersona {
   emoji: string
@@ -36,6 +36,8 @@ export interface FlightDeckKpis {
   active: number
   landed: number
   failed: number
+  /** #1748: lead/admin cancels. Not failures, and not counted as a closed outcome. */
+  cancelled: number
   withPr: number
   prLandingRate: number | null
   prLandingLabel: string
@@ -156,6 +158,7 @@ export function extractFlightArtifacts(meta: string): FlightArtifacts {
 export function flightFilterGroup(phase: FlightPhase): Exclude<FlightDeckFilter, 'all'> {
   if (phase === 'landed') return 'landed'
   if (phase === 'failed') return 'failed'
+  if (phase === 'cancelled') return 'cancelled'
   if (phase === 'held' || phase === 'holding') return 'held'
   return 'flying'
 }
@@ -177,6 +180,7 @@ export function pipelineStageIndex(phase: FlightPhase, artifacts: FlightArtifact
     case 'landed':
       return artifacts.prUrl ? 4 : 3
     case 'failed':
+    case 'cancelled':
       return artifacts.prUrl ? 4 : 2
     default:
       return 0
@@ -201,6 +205,7 @@ export function deriveFlightDeckKpis(cards: FlightCard[]): FlightDeckKpis {
   const active = cards.filter((card) => card.live).length
   const landed = cards.filter((card) => card.phase === 'landed').length
   const failed = cards.filter((card) => card.phase === 'failed').length
+  const cancelled = cards.filter((card) => card.phase === 'cancelled').length
   const withPr = cards.filter((card) => card.phase === 'landed' && extractFlightArtifacts(card.meta).prUrl).length
   const closed = landed + failed
   const prLandingRate = closed === 0 ? null : Math.round((100 * (withPr > 0 ? withPr : landed)) / closed)
@@ -209,6 +214,7 @@ export function deriveFlightDeckKpis(cards: FlightCard[]): FlightDeckKpis {
     active,
     landed,
     failed,
+    cancelled,
     withPr,
     prLandingRate,
     prLandingLabel: prLandingRate === null ? '—' : `${prLandingRate}%`,
@@ -266,7 +272,7 @@ function renderArtifactButtons(artifacts: FlightArtifacts): string {
 
 function renderBadge(kind: FlightDeckBadge): string {
   const label =
-    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : 'Failed'
+    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : kind === 'cancelled' ? 'Cancelled' : 'Failed'
   return `<span class="fd-badge fd-badge-${kind}">${kind === 'flying' ? '<span class="fd-pulse" aria-hidden="true"></span>' : ''}${escHtml(label)}</span>`
 }
 
@@ -314,6 +320,7 @@ function filterCounts(cards: FlightCard[]): Record<FlightDeckFilter, number> {
     landed: 0,
     held: 0,
     failed: 0,
+    cancelled: 0,
   }
   for (const card of cards) counts[flightFilterGroup(card.phase)] += 1
   return counts
@@ -396,6 +403,7 @@ const DECK_CSS = `
   .fd-badge-landed { color: var(--fd-teal); background: color-mix(in srgb, var(--fd-teal) 12%, transparent); border-color: color-mix(in srgb, var(--fd-teal) 35%, var(--border)); }
   .fd-badge-held { color: var(--fd-amber); background: color-mix(in srgb, var(--fd-amber) 12%, transparent); border-color: color-mix(in srgb, var(--fd-amber) 35%, var(--border)); }
   .fd-badge-failed { color: var(--fd-red); background: color-mix(in srgb, var(--fd-red) 12%, transparent); border-color: color-mix(in srgb, var(--fd-red) 35%, var(--border)); }
+  .fd-badge-cancelled { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); border-color: color-mix(in srgb, var(--muted) 35%, var(--border)); }
   .fd-pulse {
     width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
     animation: fd-radar 1.6s ease-out infinite;
@@ -632,6 +640,7 @@ export function flightsBody(
       data-fd-count-landed="${String(counts.landed)}"
       data-fd-count-held="${String(counts.held)}"
       data-fd-count-failed="${String(counts.failed)}"
+      data-fd-count-cancelled="${String(counts.cancelled)}"
     >
       ${pageHeader({
         crumbs: project ? `Projects / ${project.name} / Flights` : 'Overview / Flights',
@@ -687,6 +696,7 @@ export function flightsBody(
           <button type="button" class="fd-tab" role="tab" aria-selected="false" data-fd-tab="landed">🏁 Landed / Merged <span class="fd-tab-count">${counts.landed}</span></button>
           <button type="button" class="fd-tab" role="tab" aria-selected="false" data-fd-tab="held">⏸️ Held <span class="fd-tab-count">${counts.held}</span></button>
           <button type="button" class="fd-tab" role="tab" aria-selected="false" data-fd-tab="failed">❌ Failed <span class="fd-tab-count">${counts.failed}</span></button>
+          <button type="button" class="fd-tab" role="tab" aria-selected="false" data-fd-tab="cancelled">🚫 Cancelled <span class="fd-tab-count">${counts.cancelled}</span></button>
         </div>
         ${kpis.active > 0
           ? html`<span class="fd-live-hint" id="fd-live-hint">Live board · polling every 12s</span>`

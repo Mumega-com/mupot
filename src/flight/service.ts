@@ -12,6 +12,7 @@ import type { FlightMetaV1 } from './meta'
 import { ROUTINE_PROPOSAL_RECEIPT_PREFIX } from '../routines/proposal'
 import { redispatchReceiptStatement, type RedispatchReceiptInput } from './rebooking'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { cancelledColumnSql } from './cancelled'
 
 const D1_TASK_ID_QUERY_CHUNK_SIZE = 90
 
@@ -60,6 +61,8 @@ export interface FlightRow {
   client_request_id?: string | null
   /** Unix ms the watchdog escalated the current wait (once per wait); NULL otherwise. */
   escalated_at?: number | null
+  /** 1 when a flight_cancel_receipts row exists (mupot#1748; read via cancelledColumnSql). Optional: hand-built rows omit it. */
+  cancelled?: number
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null
@@ -806,14 +809,14 @@ export async function listFlights(env: Env, limit = 100, projectId?: string): Pr
   const boundedLimit = Math.min(Math.max(limit, 1), 500)
   const statement = projectId === undefined
     ? env.DB.prepare(
-        `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+        `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
            FROM flights f
            LEFT JOIN agents a ON a.id = f.agent
            LEFT JOIN squads s ON s.id = a.squad_id
           WHERE f.tenant=?1 ORDER BY f.created_at DESC LIMIT ?2`,
       ).bind(env.TENANT_SLUG, boundedLimit)
     : env.DB.prepare(
-        `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+        `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
            FROM flights f
            LEFT JOIN agents a ON a.id = f.agent
            LEFT JOIN squads s ON s.id = a.squad_id
@@ -836,7 +839,7 @@ export async function listFlightsForSquad(
   const beforeId = before?.id ?? '\uffff'
   const statement = projectId === undefined
     ? env.DB.prepare(
-      `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+      `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
         FROM flights f
         LEFT JOIN agents a ON a.id = f.agent
         LEFT JOIN squads s ON s.id = a.squad_id
@@ -851,7 +854,7 @@ export async function listFlightsForSquad(
       LIMIT ?6`,
     ).bind(env.TENANT_SLUG, squadId, beforeCreatedAt, beforeCreatedAt, beforeId, boundedLimit)
     : env.DB.prepare(
-      `SELECT f.*, a.name AS agent_name, s.name AS squad_name
+      `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
         FROM flights f
         LEFT JOIN agents a ON a.id = f.agent
         LEFT JOIN squads s ON s.id = a.squad_id
