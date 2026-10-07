@@ -10,6 +10,7 @@ import { flightsApp } from '../src/flight/routes'
 import { cancelledFlightSql, flightOutcome, isCancelledFlight } from '../src/flight/cancelled'
 import { deriveFlightDeckKpis, flightFilterGroup, flightsBody } from '../src/dashboard/flights-deck'
 import { loadFlightPanel } from '../src/dashboard/agent-profile'
+import { loadProjectFlights, type ProjectWorkContext } from '../src/dashboard/projects'
 import { parseFlightMetaV1 } from '../src/flight/meta'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
@@ -40,6 +41,7 @@ function fixture() {
     INSERT INTO departments (id, slug, name) VALUES ('dept-a','dept-a','A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-core','dept-a','squad-core','Core');
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-1','squad-core','agent-1','One','operator','test','active');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-d','squad-core','agent-d','Disp','operator','test','active');
     INSERT INTO tasks (id, squad_id, title, status) VALUES ('t1','squad-core','t','done');
   `)
   const ins = h.sqlite.prepare(
@@ -50,6 +52,10 @@ function fixture() {
   ins.run('f-landed', TENANT, 'ok', 'landed', '', meta(), NOW - 4000, NOW - 4000, NOW - 3500)
   ins.run('f-failed', TENANT, 'bad', 'failed', 'cancelled_by_lead: forged by executor', meta(), NOW - 3000, NOW - 3000, NOW - 2500)
   ins.run('f-cancel', TENANT, 'stop', 'running', '', meta(), NOW - 2000, NOW - 2000, null)
+  h.sqlite.exec(`INSERT INTO projects (id, slug, name, description, goal, status) VALUES ('p1','p1','P1','d','g','active');
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p1','squad-core','write');
+    UPDATE tasks SET project_id = 'p1';
+    UPDATE flights SET project_id = 'p1'`)
   const env = { DB: h.db, TENANT_SLUG: TENANT } as unknown as Env
   return { h, env }
 }
@@ -150,6 +156,59 @@ describe('#1748 readers on a real schema', () => {
     const { h } = await seeded()
     const src = h.sqlite.prepare("SELECT sql FROM sqlite_master WHERE name='routine_runs'").get() as { sql: string }
     expect(src.sql).toContain("'cancelled'")
+  })
+})
+
+const projectCtx = (readableSquadIds: string[] | null): ProjectWorkContext =>
+  ({ project: { id: 'p1' }, readableSquadIds, taskableSquadIds: [], taskableSquadIdsTruncated: false }) as unknown as ProjectWorkContext
+
+describe('#1748 r2 project-scoped deck (loadProjectFlights seam)', () => {
+  it.each([['admin (unrestricted)', null], ['squad-restricted', ['squad-core']]])('%s: cancel is cancelled, genuine failure is failed', async (_n, readable) => {
+    const f = fixture()
+    expect(await cancel(f.env, lead())).toMatchObject({ ok: true })
+    const { rows } = await loadProjectFlights(f.env, projectCtx(readable as string[] | null))
+    const kpis = deriveFlightDeckKpis(buildBoard(rows, NOW))
+    expect(kpis).toMatchObject({ failed: 1, cancelled: 1, landed: 1 })
+    expect(kpis.prLandingRate).toBe(50)
+  })
+})
+
+describe('#1748 r2 self-cancel still counts as a failure', () => {
+  it('self-cancel (executor) is NOT cancelled for counting; a lead cancelling someone else IS', async () => {
+    const a = fixture()
+    expect(await cancel(a.env, lead('agent-1'))).toMatchObject({ ok: true })
+    const ka = deriveFlightDeckKpis(buildBoard(await listFlights(a.env), NOW))
+    expect(ka).toMatchObject({ failed: 2, cancelled: 0 })
+    const panel = await loadFlightPanel(a.env, 'agent-1')
+    if (panel.state !== 'ready') throw new Error('panel')
+    expect(panel.data).toMatchObject({ failed: 2, cancelled: 0 })
+    expect(ids(await feed(a.env, '?status=failed'))).toEqual(['f-cancel', 'f-failed'])
+    expect(ids(await feed(a.env, '?status=cancelled'))).toEqual([])
+
+    const b = fixture()
+    expect(await cancel(b.env, lead('agent-other-lead'))).toMatchObject({ ok: true })
+    expect(deriveFlightDeckKpis(buildBoard(await listFlights(b.env), NOW))).toMatchObject({ failed: 1, cancelled: 1 })
+  })
+
+  it('the DISPATCHER branch of self-cancel is flagged and counts as failed', async () => {
+    const f = fixture()
+    f.h.sqlite.exec("UPDATE flights SET dispatched_by_agent_id = 'agent-d' WHERE id = 'f-cancel'")
+    expect(await cancel(f.env, lead('agent-d'))).toMatchObject({ ok: true })
+    const g = f.h.sqlite.prepare("SELECT gate_reason FROM flights WHERE id='f-cancel'").get() as { gate_reason: string }
+    expect(g.gate_reason).toBe('cancelled_by_lead(self): Hadi directed close')
+    expect(deriveFlightDeckKpis(buildBoard(await listFlights(f.env), NOW))).toMatchObject({ failed: 2, cancelled: 0 })
+  })
+})
+
+describe('#1748 r2 tenant conjunct', () => {
+  it("another tenant's receipt for the same flight id never marks this tenant's flight cancelled", async () => {
+    const f = fixture()
+    f.h.sqlite.prepare(
+      `INSERT INTO flight_cancel_receipts (id, tenant, flight_id, previous_status, actor_kind, actor_id, cancel_reason, cost_metered, payload, created_at)
+       VALUES ('r-x', 'other-tenant', 'f-failed', 'running', 'member', 'm', 'x', 1, '{}', 'now')`,
+    ).run()
+    const kpis = deriveFlightDeckKpis(buildBoard(await listFlights(f.env), NOW))
+    expect(kpis).toMatchObject({ failed: 1, cancelled: 0 })
   })
 })
 

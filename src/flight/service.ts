@@ -62,7 +62,7 @@ export interface FlightRow {
   /** Unix ms the watchdog escalated the current wait (once per wait); NULL otherwise. */
   escalated_at?: number | null
   /** 1 when a flight_cancel_receipts row exists (mupot#1748; read via cancelledColumnSql). Optional: hand-built rows omit it. */
-  cancelled?: number
+  cancelled: number | undefined
   // Server-joined canonical names (Flight-006 Slice 2). Absent on hand-built
   // rows / when the agent has since been deleted; callers fall back to `agent`.
   agent_name?: string | null

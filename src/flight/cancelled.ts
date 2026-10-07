@@ -15,10 +15,15 @@ function safeAlias(alias: string): string {
   return alias
 }
 
-/** SQL boolean fragment: the flight aliased `alias` has a cancel receipt. */
+/**
+ * SQL boolean fragment: the flight aliased `alias` was CANCELLED for counting purposes: it has a cancel
+ * receipt AND that receipt is not a self-cancel. A self-cancel (executor/dispatcher through a lead grant it
+ * also holds, receipt payload self_cancel=true) still counts as a failure, otherwise an executor could drop
+ * its own failing flight out of the failed count (#1748 r2).
+ */
 export function cancelledFlightSql(alias = 'f'): string {
   const a = safeAlias(alias)
-  return `EXISTS (SELECT 1 FROM flight_cancel_receipts fcr WHERE fcr.tenant = ${a}.tenant AND fcr.flight_id = ${a}.id)`
+  return `EXISTS (SELECT 1 FROM flight_cancel_receipts fcr WHERE fcr.tenant = ${a}.tenant AND fcr.flight_id = ${a}.id AND COALESCE(json_extract(fcr.payload, '$.self_cancel'), 0) <> 1)`
 }
 
 /** SELECT-list column `cancelled` (0/1) so the JS side can ask isCancelledFlight(row). */
@@ -33,11 +38,13 @@ export function genuinelyFailedFlightSql(alias = 'f'): string {
 }
 
 /** JS side of the predicate, over a row read with cancelledColumnSql(). */
-export function isCancelledFlight(row: { status: string; cancelled?: number | boolean | null }): boolean {
+// `cancelled` is a REQUIRED key (value may be undefined only for hand-built rows): a reader whose row type
+// lacks it fails to compile instead of silently counting cancels as failures (#1748 r2).
+export function isCancelledFlight(row: { status: string; cancelled: number | boolean | null | undefined }): boolean {
   return row.status === 'failed' && (row.cancelled === 1 || row.cancelled === true)
 }
 
 /** The outcome a reader should DISPLAY/COUNT: 'cancelled' replaces 'failed' for cancels only. */
-export function flightOutcome<S extends string>(row: { status: S; cancelled?: number | boolean | null }): S | 'cancelled' {
+export function flightOutcome<S extends string>(row: { status: S; cancelled: number | boolean | null | undefined }): S | 'cancelled' {
   return isCancelledFlight(row) ? 'cancelled' : row.status
 }

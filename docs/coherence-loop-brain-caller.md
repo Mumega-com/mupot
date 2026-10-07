@@ -78,12 +78,16 @@ Refusals are all `409` on flight state, never `400` on your body: `flight_not_in
 ### `POST /api/flights/:id/fail` — failed outcome
 Body `{ "reason": "tool X unreachable after 3 tries" }`. → `{ok, id, status}`.
 
-### `GET /api/flights?status=landed,failed&since=<cursor_ms>&limit=200` — outcome feed
-→ `{ flights: [{id, agent, goal, status, score, cost_micro_usd, created_at, ended_at}], cursor }`.
+### `GET /api/flights?status=landed,failed,cancelled&since=<cursor_ms>&limit=200` — outcome feed
+→ `{ flights: [{id, agent, goal, status, outcome, cancelled, score, cost_micro_usd, created_at, ended_at}], cursor }`.
 Poll with `since = <last cursor>`; fold each new outcome into C(t):
 - `landed` with `score` → a success sample (weight by `score` if you want graded EMA).
-- `failed` → a failure sample.
-- `cost_micro_usd` → feed the budget/energy accounting.
+- `failed` → a failure sample. `?status=failed` EXCLUDES lead/admin cancels (mupot#1748); a cancel is stored as
+  `failed` but reported with `outcome: "cancelled"`, `cancelled: true`. A self-cancel (executor cancelling its own
+  flight) stays `failed`.
+- `cancelled` → NOT a failure sample (a human closed it early). Use `?status=cancelled` or `outcome`.
+- `cost_micro_usd` → feed the budget/energy accounting. A caller polling only `landed,failed` will NOT see the cost
+  of cancelled flights: add `cancelled` to the filter if you account for cost.
 
 ## Brain-side rules (DO / DON'T)
 

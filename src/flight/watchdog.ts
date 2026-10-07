@@ -543,7 +543,8 @@ export interface FlightCancelResult {
 /**
  * Governed early close of a flight by a lead/admin (mupot#1730). Authz: cancelAuthority (lead/admin only,
  * NOT the reap's agent/dispatcher allowance). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
- * (label cancelled_by_lead|cancelled_by_admin; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
+ * (label cancelled_by_lead|cancelled_by_admin, with a '(self)' suffix when the executor/dispatcher cancels its own
+ * flight; a self-cancel is recorded in the receipt payload and still COUNTS AS A FAILURE for readers; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
  * receipt is inserted in the SAME batch as the transition, guarded on that exact transition
  * having landed, so a cancelled flight cannot lack its receipt.
  */

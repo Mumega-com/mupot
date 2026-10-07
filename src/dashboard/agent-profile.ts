@@ -124,7 +124,7 @@ export interface FlightSummary {
  * the most interesting failure mode on this deployment.
  */
 export function summariseFlights(
-  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled?: number; created_at: string }[],
+  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; created_at: string }[],
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
