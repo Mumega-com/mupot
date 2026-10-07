@@ -3,10 +3,10 @@
 Start at [Add an agent](add-an-agent.md) and keep the
 [common setup record](harness-setups.md) beside this example.
 
-**Snapshot: 2026-10-07. Status: one task executed by the existing cloud agent
-was approved by an independent gate at 04:06 UTC and is done; its flight landed
+**Snapshot: 2026-10-07. Status: one task completed using the existing cloud
+agent's own token was approved by an independent gate at 04:06 UTC and is done; its flight landed
 at 04:33:46 UTC with `cost_metered: false` (cost unknown, not zero). The full
-46,157-byte UTF-8 project-memory record was read back 7/7 with SHA256
+46,157-byte UTF-8 project-memory record was reported read back 7/7 with SHA256
 `e75bcf23cbb894bf5d8ee99898fe5f3e9c08fb65c56aa222634b7829ad8a3e5e`. The
 navigation change remains a stored proposal, not merged. See "Current evidence"
 below; the 00:38 UTC troubleshooting table is kept as history.**
@@ -74,9 +74,9 @@ limitations below.
 
 | Stage | Observation | What this does not establish |
 |---|---|---|
-| Bounded external execution | On the **mumega** pot under the Digid project (no separate Digid tenant). The existing cloud agent, using its own token, received one authorized task over the inbox route, submitted runtime receipts that the server recorded (intake and an accepted `completed`), and delivered an artifact whose digest matched on independent readback. | Autonomous cloud wake (the cycle was started by an active session), a fresh-instance replay, or the exact runtime version (session-reported). |
+| Bounded external execution | On the **mumega** pot under the Digid project (no separate Digid tenant). The existing cloud agent, using its own token, received one authorized task over the inbox route, submitted runtime receipts that the server recorded (intake and an accepted `completed`), and delivered an artifact whose digest matched on independent readback. | Autonomous cloud wake (the cycle was started by an active session), a fresh-instance replay, or which runtime carried the work: receipts are agent-submitted, so the carrying runtime is agent/session-reported. |
 | Review and rework | The independent gate first rejected the artifact for rework, because required items existed only in the executor workspace. After an inbox redispatch it approved the task at 04:06 UTC; the task is done. | That any other task or the original #1723 task was re-verified. |
-| Memory readback | The full 46,157-byte UTF-8 project-memory record was read back 7/7 by id with SHA256 `e75bcf23cbb894bf5d8ee99898fe5f3e9c08fb65c56aa222634b7829ad8a3e5e`. | Semantic recall of large records, which embeds only a prefix. |
+| Memory readback | The full 46,157-byte UTF-8 project-memory record was reported read back 7/7 by id (operating-session report; bytes and hash recomputed independently) with SHA256 `e75bcf23cbb894bf5d8ee99898fe5f3e9c08fb65c56aa222634b7829ad8a3e5e`. | Semantic recall of large records, which embeds only a prefix. |
 | Flight and cost | The flight landed at 04:33:46 UTC with `cost_metered: false` and cost `null`. | Any cost figure: unmetered means unknown, not zero. |
 | Navigation | The navigation change is stored as a proposed integration package. | A merged navigation change. |
 
@@ -150,8 +150,9 @@ lease-reset path described for #1723 is historical; use the current runtime
 dispatch contract for recovery. Current recovery semantics:
 
 - [#1734](https://github.com/Mumega-com/mupot/pull/1734): a newer dispatch may
-  take over an old execution pointer only when that pointer is terminal, never
-  while it is live or unsettled.
+  take over an old execution pointer only when the pointed run is finished
+  (dispatch settled, or a terminal runtime receipt recorded) and the incoming
+  dispatch is newer; a live run with no terminal receipt still blocks.
 - [#1735](https://github.com/Mumega-com/mupot/pull/1735): `project_memory_get`
   returns a record's full text, byte length and hash, under project-scope access.
 - [#1737](https://github.com/Mumega-com/mupot/pull/1737): a flight may land
@@ -225,9 +226,10 @@ process stop distinct from a secure system-wide stop.
 
 - [x] Bounded external execution: the existing cloud agent's own token received,
       completed and passed independent review on one authorized task (receipts in
-      the project evidence record; exact runtime version session-reported).
+      the project evidence record; carrying runtime agent/session-reported).
+- [ ] Attach sanitized evidence of which runtime carried the work; retain #1721's in-worker attribution.
 - [x] Retain artifact digest, completion receipt and independent verdict.
-- [x] Read back the full project-memory record by id (7/7, hash above).
+- [x] Read back the full project-memory record by id (reported 7/7; bytes and hash recomputed).
 - [x] Confirm receiver stopped from process evidence (pre-cycle checkpoint; read current process state fresh); retain the finite-window limit.
 - [ ] Run a second end-to-end task.
 - [ ] Verify cold wake (a stopped agent starting on its own) separately if implemented.
