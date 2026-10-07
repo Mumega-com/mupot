@@ -239,10 +239,12 @@ export async function dispatchStudioFlight(
     { skipEvent: true, skipMirror: true, actor: { kind: 'member', id: auth.memberId ?? auth.userId } },
   )
 
-  // #1758/#1762: an unexecuted bookkeeping flight with no lifecycle (stays in 'preflight', NULL budget, never
-  // landed; closed only by the watchdog after 60-84 min, cancelFlight or flight_reap_stalled). Marked `bookkeeping`
-  // (server-set via the createFlight option, never request/meta input) so a member-supplied repoUrl cannot plant a
-  // clearance HOLD on someone's repo; not itself clearance-gated (would self-block Deploy -> Studio).
+  // #1758/#1762: without a launched Cursor agent this is an unexecuted bookkeeping flight with no lifecycle (stays in
+  // 'preflight', NULL budget, never landed; closed by the watchdog after 60-84 min, cancelFlight or flight_reap_stalled).
+  // It is then marked `bookkeeping` (server-set via the createFlight option, never request/meta input) so a
+  // member-supplied repoUrl cannot plant a clearance HOLD on someone's repo. When a Cursor cloud agent WAS launched
+  // against repoUrl, the flight is the only row for real work on that repo, so it stays HOLD-able (bookkeeping=false).
+  // Not itself clearance-gated either way (would self-block Deploy -> Studio).
   const flightId = await createFlight(env, {
     agent: home.agentId,
     dispatched_by: auth.boundAgentId ?? home.agentId,
@@ -264,7 +266,7 @@ export async function dispatchStudioFlight(
       publication_target: 'none',
       parent_flight_id: null,
     },
-  }, { id: reservedFlightId, bookkeeping: true })
+  }, { id: reservedFlightId, bookkeeping: cursor === null })
 
   return {
     ok: true,

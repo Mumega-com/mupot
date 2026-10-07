@@ -286,7 +286,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
         result = await insert.run()
       }
     } else if (options.bookkeeping === true) {
-      // Only the two bookkeeping writers name the 0195 column (same deploy-order safety as client_request_id above).
+      // Only the bookkeeping writers name the 0195 column on INSERT. This is NOT deploy-order safe overall: the
+      // clearance HOLD read always names f.bookkeeping, so migration 0195 must be applied before this code ships.
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, bookkeeping)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, 1)`,

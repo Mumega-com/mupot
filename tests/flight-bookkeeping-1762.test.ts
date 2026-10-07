@@ -1,5 +1,5 @@
 // #1762 — unexecuted deploy/studio bookkeeping flights must never HOLD flight clearance. Real schema + real engine.
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -7,7 +7,8 @@ import { createProject } from '../src/projects/service'
 import { deployProject } from '../src/projects/deploy'
 import { dispatchStudioFlight } from '../src/dashboard/studio'
 import { clearFlightMeta, dispatchFlight } from '../src/flight/dispatch'
-import { createFlight, listIntersectingLiveFlights } from '../src/flight/service'
+import { createFlight, listFlights, listIntersectingLiveFlights } from '../src/flight/service'
+import { detectFlightCollisions } from '../src/flight/clearance'
 import { parseFlightMetaV1, type FlightMetaV1 } from '../src/flight/meta'
 import type { FlightSignals } from '../src/flight/preflight'
 
@@ -27,7 +28,7 @@ function meta(over: Partial<FlightMetaV1> = {}): FlightMetaV1 {
 }
 
 let harness: SqliteD1Harness | undefined
-afterEach(() => { harness?.close(); harness = undefined })
+afterEach(() => { harness?.close(); harness = undefined; vi.unstubAllGlobals() })
 
 function podHarness(): { h: SqliteD1Harness; env: Env } {
   const h = createSqliteD1()
@@ -189,5 +190,55 @@ describe('#1762 / #1761 P3: read cap boundaries', () => {
     const over = await listIntersectingLiveFlights(env, proposed)
     expect(over.rows).toHaveLength(2000)
     expect(over.truncated).toBe(true)
+  })
+})
+
+describe('#1763 gate P2: a Studio flight that launched a real Cursor agent is real work and stays HOLD-able', () => {
+  function stubCursorLaunch(): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      agent: { id: 'bc-1', name: 'n', status: 'ACTIVE', url: 'https://cursor.com/agents/bc-1', createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z', latestRunId: 'run-1', repos: [{ url: REPO }] },
+      run: { id: 'run-1', agentId: 'bc-1', status: 'CREATING', createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('Cursor launched -> bookkeeping=0 and a later real dispatch on the same repo is HELD', async () => {
+    const { h, env } = podHarness()
+    const fetchMock = stubCursorLaunch()
+    const s = await dispatchStudioFlight({ ...env, CURSOR_API_TOKEN: 'tok' } as Env, auth, { prompt: 'real work', repoUrl: REPO, model: 'cursor-cloud' })
+    expect(s.ok).toBe(true)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    if (s.ok) expect(s.result.cursor_launched).toBe(true)
+    const row = h.sqlite.prepare('SELECT bookkeeping FROM flights').get() as { bookkeeping: number }
+    expect(row.bookkeeping).toBe(0)
+    const r = await clearFlightMeta(env, real)
+    expect(r.cleared).toBe(false)
+    expect(r.reasons.some((x) => x.startsWith('clearance_shared_artifact_ref:'))).toBe(true)
+  })
+
+  it('Cursor launch failed -> bookkeeping=1 and the real dispatch clears', async () => {
+    const { h, env } = podHarness()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
+    const s = await dispatchStudioFlight({ ...env, CURSOR_API_TOKEN: 'tok' } as Env, auth, { prompt: 'no launch', repoUrl: REPO, model: 'cursor-cloud' })
+    expect(s.ok).toBe(true)
+    if (s.ok) expect(s.result.cursor_launched).toBe(false)
+    expect((h.sqlite.prepare('SELECT bookkeeping FROM flights').get() as { bookkeeping: number }).bookkeeping).toBe(1)
+    expect((await clearFlightMeta(env, real)).cleared).toBe(true)
+  })
+})
+
+describe('#1763 gate P3: radar (detectFlightCollisions) caps bookkeeping pairs at WARN', () => {
+  it('a live bookkeeping flight sharing a repo with a live real flight is reported as warn, not hold', async () => {
+    const { h, env } = podHarness()
+    seed(h, 1, 'bk', () => meta({ task_ids: ['b'], artifact_refs: [REPO] }), 'preflight', 1)
+    seed(h, 1, 'rl', () => meta({ task_ids: ['r'], artifact_refs: [REPO] }), 'running', 0)
+    seed(h, 1, 'r2', () => meta({ task_ids: ['r2'], artifact_refs: [REPO] }), 'running', 0)
+    const collisions = detectFlightCollisions(await listFlights(env, 10))
+    const bkPairs = collisions.filter((c) => [c.flight_a_id, c.flight_b_id].includes('bk-0'))
+    expect(bkPairs).toHaveLength(2)
+    for (const c of bkPairs) expect(c.severity).toBe('warn')
+    const realPair = collisions.find((c) => [c.flight_a_id, c.flight_b_id].includes('rl-0') && [c.flight_a_id, c.flight_b_id].includes('r2-0'))
+    expect(realPair?.severity).toBe('hold')
   })
 })
