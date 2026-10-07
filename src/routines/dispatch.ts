@@ -494,6 +494,9 @@ async function ensureFlight(
     routine_run_id: run.id,
     routine_revision: run.routine_revision,
   }
+  // #1758: EXEMPT from flight clearance, deliberately. A routine control flight carries only its own attempt's
+  // deterministic task id and no artifact_refs, so the clearance would be vacuous here (nothing else can share
+  // that task id), and it would cost an extra D1 statement against the scheduler invocation budget.
   return createFlight(env, {
     agent: agentId,
     goal: run.objective,

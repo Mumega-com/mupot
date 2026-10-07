@@ -85,11 +85,11 @@ describe('#1755 clearance reads the full live set', () => {
     expect(capped.truncated).toBe(true)
   })
 
-  it('fails CLOSED when the live-set read hits its cap, even with no visible collision', async () => {
+  it('fails CLOSED when the INTERSECTING live set hits its cap (#1758: unrelated flights no longer count)', async () => {
     const { env, h } = fixture('waiting', 0)
     h.sqlite.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ${LIVE_SET_CAP + 1})
       INSERT INTO flights (id, tenant, agent, goal, status, gate_reason, budget_micro_usd, meta, created_at)
-      SELECT 'bulk-' || i, '${TENANT}', 'agent-1', 'g', 'running', '', 1, '{}', ${NOW} + i FROM n`)
+      SELECT 'bulk-' || i, '${TENANT}', 'agent-1', 'g', 'running', '', 1, '${JSON.stringify(metaFor('unrelated-task'))}', ${NOW} + i FROM n`)
     const r = await dispatchFlight(env, flight('unrelated-task'), SIGNALS)
     expect(r.go).toBe(false)
     expect(r.status).toBe('held')

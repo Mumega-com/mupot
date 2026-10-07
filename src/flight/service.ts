@@ -833,6 +833,64 @@ export async function listLiveFlights(
   return { rows: all.slice(0, cap), truncated: all.length > cap }
 }
 
+/**
+ * #1758 P1-2: the clearance read, scoped in SQL to live flights whose meta INTERSECTS the proposed meta on a key
+ * `checkFlightClearance` compares — so unrelated live flights can never truncate it.
+ *  - HOLD keys (`task_ids`, `artifact_refs`): capped at `cap`; if THIS set overflows, `truncated` is true and the
+ *    caller must fail closed (the colliding set may be incomplete).
+ *  - WARN keys (`objective_id`, `goal_id`, `squad_ids`): advisory only (never block), read separately with their own
+ *    cap and merged in; their overflow never sets `truncated`. Kept separate because squad overlap is near-universal
+ *    and must not be able to make the HOLD set look truncated.
+ * A proposed meta with no comparable keys skips the read entirely. Rows with unparseable meta are excluded in SQL
+ * (clearance treats them as opaque anyway).
+ */
+export async function listIntersectingLiveFlights(
+  env: Env,
+  meta: { task_ids: string[]; artifact_refs: string[]; objective_id: string; goal_id: string; squad_ids: string[] },
+  cap = LIVE_SET_CAP,
+): Promise<{ rows: FlightRow[]; truncated: boolean }> {
+  const statusMarks = LIVE_FLIGHT_STATUSES.map((_, i) => `?${i + 3}`).join(',')
+  const base = `SELECT f.*, ${cancelledColumnSql('f')}, a.name AS agent_name, s.name AS squad_name
+       FROM flights f
+       LEFT JOIN agents a ON a.id = f.agent
+       LEFT JOIN squads s ON s.id = a.squad_id
+      WHERE f.tenant=?1 AND f.status IN (${statusMarks}) AND json_valid(f.meta)`
+  const overlap = (path: string, param: string): string =>
+    `EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '${path}') je
+              WHERE je.value IN (SELECT value FROM json_each(${param})))`
+  const rows = new Map<string, FlightRow>()
+  let truncated = false
+
+  const holdClauses: string[] = []
+  const holdBinds: unknown[] = []
+  if (meta.task_ids.length > 0) { holdClauses.push(overlap('$.task_ids', `?${LIVE_FLIGHT_STATUSES.length + 3}`)); holdBinds.push(JSON.stringify(meta.task_ids)) }
+  if (meta.artifact_refs.length > 0) {
+    holdClauses.push(overlap('$.artifact_refs', `?${LIVE_FLIGHT_STATUSES.length + 3 + holdBinds.length}`))
+    holdBinds.push(JSON.stringify(meta.artifact_refs))
+  }
+  if (holdClauses.length > 0) {
+    const res = await env.DB.prepare(`${base} AND (${holdClauses.join(' OR ')}) ORDER BY f.created_at DESC LIMIT ?2`)
+      .bind(env.TENANT_SLUG, cap + 1, ...LIVE_FLIGHT_STATUSES, ...holdBinds)
+      .all<FlightRow>()
+    const all = res.results ?? []
+    truncated = all.length > cap
+    for (const r of all.slice(0, cap)) rows.set(r.id, r)
+  }
+
+  const warnClauses: string[] = []
+  const warnBinds: unknown[] = []
+  const warnParam = (): string => `?${LIVE_FLIGHT_STATUSES.length + 3 + warnBinds.length}`
+  warnClauses.push(`json_extract(f.meta,'$.objective_id') = ${warnParam()}`); warnBinds.push(meta.objective_id)
+  warnClauses.push(`json_extract(f.meta,'$.goal_id') = ${warnParam()}`); warnBinds.push(meta.goal_id)
+  if (meta.squad_ids.length > 0) { warnClauses.push(overlap('$.squad_ids', warnParam())); warnBinds.push(JSON.stringify(meta.squad_ids)) }
+  const warnRes = await env.DB.prepare(`${base} AND (${warnClauses.join(' OR ')}) ORDER BY f.created_at DESC LIMIT ?2`)
+    .bind(env.TENANT_SLUG, cap, ...LIVE_FLIGHT_STATUSES, ...warnBinds)
+    .all<FlightRow>()
+  for (const r of warnRes.results ?? []) if (!rows.has(r.id)) rows.set(r.id, r)
+
+  return { rows: [...rows.values()], truncated }
+}
+
 /** Newest `limit` flights PLUS the full live set (deduped, created_at DESC) — display readers that derive live state. */
 export async function listFlightsWithLive(env: Env, limit = 100): Promise<FlightRow[]> {
   const [recent, live] = await Promise.all([listFlights(env, limit), listLiveFlights(env)])
