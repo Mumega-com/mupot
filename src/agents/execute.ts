@@ -52,6 +52,7 @@ import { asData, untrustedContentGuard } from '../lib/prompt-safety'
 // use the SAME predicate without importing the execution path. Re-exported here because
 // existing tests import it from this module.
 import { isExternallySourced, externalMarker } from '../tasks/provenance'
+import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 export { isExternallySourced, externalMarker }
 
 // Hard ceiling on a persisted result (chars). Keeps a runaway model answer from
@@ -887,4 +888,50 @@ export function resolveDispatchReceiptId(input: { payload?: unknown }): string |
     if (typeof value === 'string' && value.length > 0) return value
   }
   return null
+}
+
+/**
+ * inWorkerSettleStage — mupot#1723. Maps an in-Worker execution outcome to the terminal stage
+ * its dispatch receipt should settle to, or null when the run did not reach a terminal outcome
+ * of its own (claim lost / task not found / no-op wake) and so must leave the receipt alone.
+ */
+function inWorkerSettleStage(r: ExecuteResult): 'completed' | 'failed' | null {
+  if (r.error === 'task_claim_lost' || r.error === 'task_not_found') return null
+  if (r.decided.startsWith('no_op:')) return null
+  if (r.task_status === 'blocked') return 'failed'
+  if (r.ok && (r.task_status === 'review' || r.task_status === 'done')) return 'completed'
+  return null
+}
+
+/**
+ * runDispatchedTaskExecution — the AgentDO execute-mode entry (mupot#1723). Runs the task, then,
+ * when the wake was a task_dispatch (executionReceiptId is the dispatch receipt id), settles the
+ * in-Worker dispatch receipt to the run's terminal outcome. Settle failure never changes the
+ * run's result; the queue consumer's recovery branch retries the same idempotent settle.
+ */
+export async function runDispatchedTaskExecution(
+  env: Env,
+  agent: Agent,
+  taskId: string,
+  executionReceiptId: string | undefined,
+  deps: ExecuteDeps = {},
+): Promise<ExecuteResult> {
+  const r = await runTaskExecution(env, agent, taskId, { ...deps, executionReceiptId })
+  if (executionReceiptId) {
+    const stage = inWorkerSettleStage(r)
+    if (stage) {
+      try {
+        await settleInWorkerDispatchReceipt(env, {
+          dispatchReceiptId: executionReceiptId,
+          taskId: r.task_id,
+          agentId: agent.id,
+          stage,
+          reason: stage === 'failed' ? (r.error ?? (r.decided || 'execution_failed')) : (r.decided || 'completed'),
+        })
+      } catch (settleErr) {
+        console.error('execute: in_worker receipt settle failed', settleErr)
+      }
+    }
+  }
+  return r
 }

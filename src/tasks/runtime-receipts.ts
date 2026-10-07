@@ -174,6 +174,8 @@ export function inFlightDispatchReceiptExistsSql(p: { tenantParam: string; taskI
     SELECT 1
       FROM task_dispatch_receipts d
      WHERE d.tenant = ${p.tenantParam} AND d.task_id = ${p.taskIdExpr}
+       -- mupot#1723 — an in-Worker dispatch has no runtime receipt; it settles on its own row.
+       AND d.settled_at IS NULL
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_receipts newer
           WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
@@ -193,6 +195,61 @@ export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Prom
     SELECT 1 WHERE ${inFlightDispatchReceiptExistsSql({ tenantParam: '?1', taskIdExpr: '?2' })}
   `).bind(env.TENANT_SLUG, taskId).first<{ 1: number }>()
   return row !== null
+}
+
+/**
+ * settleInWorkerDispatchReceipt — mupot#1723 / #1721. Terminal disposition for a dispatch that
+ * routed 'in_worker' (no agent_messages row, no runtime credential, so the message-backed
+ * recordTaskDispatchRuntimeReceipt cannot be used: its row needs NOT NULL message_id and
+ * credential_id). Settles on the dispatch row itself and stamps delivered_via='in_worker'.
+ *
+ * Idempotent and fenced: touches only a not-yet-settled receipt of this exact (task, agent)
+ * that has no terminal runtime receipt and was not delivered via the inbox; the audit row is
+ * written in the same batch only if the UPDATE actually changed the row. Returns true iff this
+ * call performed the settle.
+ */
+export async function settleInWorkerDispatchReceipt(
+  env: Env,
+  input: { dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string },
+): Promise<boolean> {
+  const now = new Date().toISOString()
+  const reason = sanitizeReceiptText(text(input.reason, 500))
+  const auditId = crypto.randomUUID()
+  const evidence = canonicalJson({
+    dispatch_receipt_id: input.dispatchReceiptId,
+    stage: input.stage,
+    reason,
+    delivered_via: 'in_worker',
+  })
+  const results = await env.DB.batch([
+    env.DB.prepare(`
+      UPDATE task_dispatch_receipts
+         SET settled_stage = ?1, settled_at = ?2, settled_reason = ?3, delivered_via = 'in_worker'
+       WHERE tenant = ?4 AND id = ?5 AND task_id = ?6 AND agent_id = ?7
+         AND settled_at IS NULL
+         AND (delivered_via IS NULL OR delivered_via = 'in_worker')
+         AND NOT EXISTS (
+           SELECT 1 FROM task_dispatch_runtime_receipts r
+            WHERE r.tenant = ?4 AND r.dispatch_receipt_id = ?5
+              AND r.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+         )
+    `).bind(input.stage, now, reason, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, input.agentId),
+    env.DB.prepare(`
+      INSERT INTO mutation_audit_entries (
+        id, tenant, principal_kind, principal_id, member_id, agent_id,
+        credential_id, origin, handler, operation, target_kind, target_id,
+        task_id, request_id, idempotency_key, evidence_json, recorded_at
+      )
+      SELECT ?1, ?2, 'system', 'in_worker_execute', NULL, ?3,
+             NULL, 'worker_callback', 'in_worker_dispatch_settle', ?4, 'dispatch_receipt', ?5,
+             ?6, ?7, ?7, ?8, ?9
+       WHERE changes() = 1
+    `).bind(
+      auditId, env.TENANT_SLUG, input.agentId, `settle_${input.stage}`, input.dispatchReceiptId,
+      input.taskId, `in-worker-settle:${input.dispatchReceiptId}:${input.stage}`, evidence, now,
+    ),
+  ])
+  return (results[0].meta as { changes?: number }).changes === 1
 }
 
 export type TaskDispatchRuntimeReceiptErrorCode =
@@ -1524,8 +1581,10 @@ export async function adminResetDispatchLease(
   // Also fetches `agent_id` now — needed only for `terminate: true`'s receipt row, but
   // cheap to carry from this same SELECT rather than a second round trip later.
   const dispatch = await env.DB.prepare(
-    `SELECT task_id, agent_id FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 LIMIT 1`,
-  ).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{ task_id: string; agent_id: string }>()
+    `SELECT task_id, agent_id, delivered_via, settled_at FROM task_dispatch_receipts WHERE tenant = ?1 AND id = ?2 LIMIT 1`,
+  ).bind(env.TENANT_SLUG, input.dispatchReceiptId).first<{
+    task_id: string; agent_id: string; delivered_via: string | null; settled_at: string | null
+  }>()
   if (!dispatch) {
     await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
     return { reset: false, code: 'reset_not_found', message_id: null, audit_id: auditId, overrode: false, terminated: false }
@@ -1625,6 +1684,61 @@ export async function adminResetDispatchLease(
 
   const message = await loadMessage()
   if (!message) {
+    // mupot#1723 — an in_worker dispatch never had an agent_messages row. Terminate it on the
+    // dispatch row alone. Narrow: only when the receipt is provably in-Worker (delivered_via
+    // 'in_worker', or the task's execution_receipt_id points at it — the pre-#1721 shape where
+    // delivered_via was never stamped) AND the caller asked to terminate. Everything else is
+    // still not-found, exactly as before. Operator/org-admin/reason/credential guards already
+    // ran above (and in toolTaskDispatchLeaseReset).
+    const inWorker = terminate && (dispatch.delivered_via === 'in_worker' || (await env.DB.prepare(
+      `SELECT 1 FROM tasks WHERE id = ?1 AND execution_receipt_id = ?2 LIMIT 1`,
+    ).bind(input.taskId, input.dispatchReceiptId).first<{ 1: number }>()) !== null)
+    if (inWorker) {
+      if (dispatch.settled_at !== null) {
+        await writeAudit('reset_refused_already_terminal', 'dispatch_receipt', input.dispatchReceiptId, evidence())
+        return {
+          reset: false, code: 'reset_refused_already_terminal', message_id: null, audit_id: auditId,
+          overrode: false, terminated: true,
+        }
+      }
+      const reason = sanitizeReceiptText(text(input.reason, 500))
+      const batch = await env.DB.batch([
+        env.DB.prepare(`
+          UPDATE task_dispatch_receipts
+             SET settled_stage = 'reset_terminated', settled_at = ?3, settled_reason = ?4, delivered_via = 'in_worker'
+           WHERE tenant = ?1 AND id = ?2 AND settled_at IS NULL
+             AND (delivered_via IS NULL OR delivered_via = 'in_worker')
+             AND NOT EXISTS (
+               SELECT 1 FROM task_dispatch_runtime_receipts r
+                WHERE r.tenant = ?1 AND r.dispatch_receipt_id = ?2
+                  AND r.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+             )
+        `).bind(env.TENANT_SLUG, input.dispatchReceiptId, now, reason),
+        env.DB.prepare(`
+          INSERT INTO mutation_audit_entries (
+            id, tenant, principal_kind, principal_id, member_id, agent_id,
+            credential_id, origin, handler, operation, target_kind, target_id,
+            task_id, request_id, idempotency_key, evidence_json, recorded_at
+          ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            ?7, 'mcp', 'task_dispatch_lease_reset',
+            CASE WHEN changes() = 1 THEN 'reset_terminate_in_worker' ELSE 'reset_refused_terminal' END,
+            'dispatch_receipt', ?8,
+            ?9, ?10, ?10, ?11, ?12
+          )
+        `).bind(
+          auditId, env.TENANT_SLUG,
+          agentId ? 'agent' : 'member', agentId ?? memberId, memberId, agentId,
+          credentialId, input.dispatchReceiptId,
+          input.taskId, `lease-reset:${input.dispatchReceiptId}:${auditId}`, evidence({ in_worker: true }), now,
+        ),
+      ])
+      const done = (batch[0].meta as { changes?: number }).changes === 1
+      return {
+        reset: done, code: done ? 'reset' : 'reset_refused_terminal', message_id: null, audit_id: auditId,
+        overrode: false, terminated: done,
+      }
+    }
     await writeAudit('reset_not_found', 'dispatch_receipt', input.dispatchReceiptId, evidence())
     return { reset: false, code: 'reset_not_found', message_id: null, audit_id: auditId, overrode: false, terminated: false }
   }

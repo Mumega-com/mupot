@@ -3452,9 +3452,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "gate_stall_rewakes" },
     ],
   },
+  {
+    file: "0192_task_dispatch_receipts_settled.sql",
+    sha256: "3455e2ae5351bfcd3fab6e65ef63a046354ced474e249e00a05fdb55211b0e70",
+    statements: [
+      "-- mupot#1723 / #1721 — in-Worker dispatch receipts need their own terminal disposition.\n--\n-- A task_dispatch that routes 'in_worker' (src/bus/consumer.ts, resolveDispatchDeliveryMode)\n-- never creates an agent_messages row and never has a runtime credential, so it can never\n-- write a task_dispatch_runtime_receipts row (message_id / credential_id are NOT NULL, FK'd).\n-- Before this column set, such a receipt was consumed but NEVER settled: when the in-Worker\n-- run ended without a verified artifact (task blocked) the dispatch stayed \"in flight\" forever,\n-- task_dispatch refused task_not_dispatchable, and the operator repair\n-- task_dispatch_lease_reset(terminate:true) refused too (no message to load).\n--\n-- Additive, nullable, no backfill: NULL = not settled on the dispatch row (either still in\n-- flight, or message-backed and settled through task_dispatch_runtime_receipts as before).\n-- hasInFlightDispatchReceipt / inFlightDispatchReceiptExistsSql treat settled_at IS NOT NULL\n-- as terminal alongside a terminal runtime receipt.\nALTER TABLE task_dispatch_receipts ADD COLUMN settled_stage TEXT\n  CHECK (settled_stage IS NULL OR settled_stage IN ('completed', 'failed', 'reset_terminated'));",
+      "\nALTER TABLE task_dispatch_receipts ADD COLUMN settled_at TEXT;",
+      "\nALTER TABLE task_dispatch_receipts ADD COLUMN settled_reason TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "93e2c93e9a569086ed55c8f1995194205df43fcf2873666f98e8fe50900fd49e"
+export const SCHEMA_CHAIN_DIGEST: string = "aa41c0e15a1dfd11d9344703196f4e1735ac41a538ed5cb466938e61f8e3fea7"
