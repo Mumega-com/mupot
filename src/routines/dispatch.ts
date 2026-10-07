@@ -4,7 +4,6 @@ import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { brandSquadScope, hasCapability } from '../auth/capability'
 import { mcpEndpoint } from '../dashboard/connect'
-import { clearFlightMeta } from '../flight/dispatch'
 import { applyPreflight, createFlight, failFlight, FlightCreateFenceError } from '../flight/service'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, type FlightMetaV1 } from '../flight/meta'
 import { getFleetAgentRuntimeStates } from '../fleet/registry'
@@ -94,7 +93,7 @@ export type RoutineDispatchResult =
   | {
       ok: true
       status: 'retry_scheduled'
-      reason: 'agent_offline' | 'inbox_full' | 'delivery_failed' | 'flight_clearance_hold'
+      reason: 'agent_offline' | 'inbox_full' | 'delivery_failed'
       run_id: string
     }
   | { ok: false; error: 'run_not_found' | 'run_not_dispatchable' | 'invalid_policy' | 'invalid_public_origin' }
@@ -401,7 +400,7 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
     retryAt, eventKind: 'retry_scheduled',
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
-  const publicReason = reason === 'agent_offline' || reason === 'inbox_full' || reason === 'flight_clearance_hold'
+  const publicReason = reason === 'agent_offline' || reason === 'inbox_full'
     ? reason
     : 'delivery_failed'
   return { ok: true, status: 'retry_scheduled', reason: publicReason, run_id: run.id }
@@ -450,9 +449,6 @@ async function ensureTask(
   }
 }
 
-/** ensureFlight outcome when another live flight holds this task's airspace (#1758); the run retries, never bricks. */
-const FLIGHT_CLEARANCE_HELD = 'flight_clearance_held' as const
-
 async function ensureFlight(
   env: Env,
   run: DispatchRunRow,
@@ -460,7 +456,7 @@ async function ensureFlight(
   agentId: string,
   task: Task,
   budgetMicroUsd: number,
-): Promise<string | typeof FLIGHT_CLEARANCE_HELD | null> {
+): Promise<string | null> {
   const id = await routineControlId('flight', `${run.id}:${run.attempt}`)
   type ExistingFlight = { id: string; project_id: string | null; agent: string; status: string; budget_micro_usd: number | null; meta: string }
   const loadExisting = () => env.DB.prepare(
@@ -498,15 +494,9 @@ async function ensureFlight(
     routine_run_id: run.id,
     routine_revision: run.routine_revision,
   }
-  // #1758: the control flight runs the same clearance as every other meta-bearing writer. It must never collide
-  // with ITSELF or this run's own earlier attempts (every attempt's control flight is deterministic per
-  // `${run.id}:${n}`), so those ids are ignored; a REAL collision with another live flight holds the run
-  // recoverably (caller -> retry_scheduled / waiting) rather than failing it terminally.
-  const ownAttemptIds = await Promise.all(
-    Array.from({ length: Number(run.attempt) + 1 }, (_, n) => routineControlId('flight', `${run.id}:${n}`)),
-  )
-  const clearance = await clearFlightMeta(env, meta, { ignoreFlightIds: [id, ...ownAttemptIds] })
-  if (!clearance.cleared) return FLIGHT_CLEARANCE_HELD
+  // #1758: EXEMPT from flight clearance, deliberately. A routine control flight carries only its own attempt's
+  // deterministic task id and no artifact_refs, so the clearance would be vacuous here (nothing else can share
+  // that task id), and it would cost an extra D1 statement against the scheduler invocation budget.
   return createFlight(env, {
     agent: agentId,
     goal: run.objective,
@@ -617,7 +607,6 @@ export async function dispatchRoutineRun(
   const task = await ensureTask(env, run, policy, selected.agentId)
   if (!task) return { ok: false, error: 'run_not_dispatchable' }
   const flightId = await ensureFlight(env, run, policy, selected.agentId, task, remainingBudget)
-  if (flightId === FLIGHT_CLEARANCE_HELD) return waitForAgent(env, run, now, 'flight_clearance_hold')
   if (!flightId) return { ok: false, error: 'run_not_dispatchable' }
   const situation = await loadProjectSituation(env, projectFrom(run), [policy.responsible_squad_id], {
     excludeTaskIds: [task.id],

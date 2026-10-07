@@ -161,6 +161,15 @@ Two presence sources, by agent tier:
 - HOLD (blocks) on shared `task_ids` or `artifact_refs` (same work / same file). WARN
   (surfaces, never blocks) on shared objective/goal/squad only (normal co-work). Read-only
   view: `GET /api/flights/collisions`.
+- **Exempt writers (#1758).** Only `dispatchFlight` runs clearance. `projects/deploy.ts`, `dashboard/studio.ts`
+  and `routines/dispatch.ts` create flights directly and are deliberately exempt: deploy/Studio flights are
+  unexecuted bookkeeping flights with no lifecycle (they stay in `preflight`, budget NULL, never landed, reaped by
+  the watchdog after 60-84 min), so gating them on the shared repo `artifact_ref` would self-block the product's own
+  Deploy -> Studio flow for about an hour. Giving them a lifecycle is the real fix (tracked separately). Routine
+  control flights carry only their own attempt's task id and no `artifact_refs`, so clearance would be vacuous.
+- The clearance read is scoped in SQL to live flights whose meta intersects the proposed meta (`task_ids`,
+  `artifact_refs` for HOLD; `objective_id`, `goal_id`, `squad_ids` for WARN), so unrelated live flights cannot
+  truncate it; only an overflowing intersecting HOLD set fails closed.
 - **This is an ADVISORY tower, NOT an authoritative atomic anti-double-work lock.** Known
   v1 limits (see `src/flight/clearance.ts` header): (a) TOCTOU — read-then-insert with no
   DB transaction, so sub-second concurrent dispatches can both CLEAR (safe for the

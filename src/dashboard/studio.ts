@@ -23,8 +23,6 @@ import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
-import { clearFlightMeta } from '../flight/dispatch'
-import type { FlightMetaV1 } from '../flight/meta'
 import { createTask } from '../tasks/service'
 import { peekSessionAuth } from '../auth'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
@@ -180,22 +178,6 @@ export function studioBranchLabel(env: Env): string {
   return 'main'
 }
 
-function studioFlightMeta(squadId: string, taskIds: string[], artifactRefs: string[], goalId: string): FlightMetaV1 {
-  return {
-    schema: 'mupot.flight.meta/v1',
-    goal_id: goalId,
-    objective_id: 'studio-canvas',
-    squad_ids: [squadId],
-    task_ids: taskIds,
-    done_when: ['Studio canvas shows a reviewable preview and the flight can land.'],
-    artifact_refs: artifactRefs,
-    receipt_refs: [],
-    confidentiality: 'internal',
-    publication_target: 'none',
-    parent_flight_id: null,
-  }
-}
-
 export async function dispatchStudioFlight(
   env: Env,
   auth: AuthContext,
@@ -212,14 +194,6 @@ export async function dispatchStudioFlight(
   const model = normalizeStudioModel(input.model)
   const home = await resolveStudioHome(env, auth)
   if (!home) return { ok: false, status: 409, error: 'no_squad' }
-
-  // #1758: Studio flights claim the repo as an artifact_ref, so a live flight on the same repo is a HOLD-level
-  // collision. Decision: REFUSE (409 flight_clearance_hold) — and do it BEFORE the Cursor Cloud agent launch and
-  // the task insert, which are external/durable side effects we must not leave behind for a flight that never
-  // departs. The cursor agent_url and the new task id are unique to this dispatch, so they cannot collide and the
-  // pre-check meta omits them.
-  const clearance = await clearFlightMeta(env, studioFlightMeta(home.squadId, [], repoUrl ? [repoUrl] : [], 'studio:pending'))
-  if (!clearance.cleared) return { ok: false, status: 409, error: 'flight_clearance_hold' }
 
   const title = prompt.length > 80 ? `${prompt.slice(0, 77)}…` : prompt
   const reservedFlightId = crypto.randomUUID()
@@ -265,17 +239,31 @@ export async function dispatchStudioFlight(
     { skipEvent: true, skipMirror: true, actor: { kind: 'member', id: auth.memberId ?? auth.userId } },
   )
 
+  // #1758: EXEMPT from flight clearance, deliberately — an unexecuted bookkeeping flight with no lifecycle (stays in
+  // 'preflight', NULL budget, never landed, reaped only by the watchdog after 60-84 min). Gating it on the shared
+  // repo artifact_ref would self-block Deploy -> Studio (deploy creates the same-repo flight first). Real fix: give
+  // it a lifecycle (tracked separately).
   const flightId = await createFlight(env, {
     agent: home.agentId,
     dispatched_by: auth.boundAgentId ?? home.agentId,
     goal: prompt,
     trigger_source: 'api',
-    meta: studioFlightMeta(
-      home.squadId,
-      [task.id],
-      [...(repoUrl ? [repoUrl] : []), ...(cursor ? [cursor.agent_url] : [])],
-      `studio:${task.id}`,
-    ),
+    meta: {
+      schema: 'mupot.flight.meta/v1',
+      goal_id: `studio:${task.id}`,
+      objective_id: 'studio-canvas',
+      squad_ids: [home.squadId],
+      task_ids: [task.id],
+      done_when: ['Studio canvas shows a reviewable preview and the flight can land.'],
+      artifact_refs: [
+        ...(repoUrl ? [repoUrl] : []),
+        ...(cursor ? [cursor.agent_url] : []),
+      ],
+      receipt_refs: [],
+      confidentiality: 'internal',
+      publication_target: 'none',
+      parent_flight_id: null,
+    },
   }, { id: reservedFlightId })
 
   return {

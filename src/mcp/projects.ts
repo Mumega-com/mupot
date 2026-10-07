@@ -705,7 +705,7 @@ const toolProjectDeploy: ToolSpec = {
       prompt: args.prompt,
     })
     if (!result.ok) {
-      const code = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' || result.error === 'flight_clearance_hold' ? 409 : 400
+      const code = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
       return fail(code, result.error)
     }
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.project.id, {

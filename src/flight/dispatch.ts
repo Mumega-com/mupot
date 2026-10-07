@@ -19,7 +19,7 @@
 import type { Env } from '../types'
 import { preflightCheck } from './preflight'
 import type { FlightSignals, PreflightOptions, PreflightResult } from './preflight'
-import { createFlight, applyPreflight, listLiveFlights } from './service'
+import { createFlight, applyPreflight, listIntersectingLiveFlights } from './service'
 import type { NewFlight } from './service'
 import { checkFlightClearance } from './clearance'
 import type { ClearanceResult } from './clearance'
@@ -62,18 +62,18 @@ export interface FlightMetaClearance {
 }
 
 /**
- * THE chokepoint (#1758): every flight writer that carries `task_ids` / `artifact_refs` meta runs the
- * ATC clearance through this one function — dispatchFlight, project deploy, Studio dispatch, Routine
- * control flights. Reads the FULL live set in SQL (never the newest-N window) and fails closed on truncation.
- * `ignoreFlightIds` names flights the proposed flight may knowingly share airspace with (co-work override,
- * or a routine run's own earlier attempts).
+ * The clearance chokepoint. Reads only live flights whose meta INTERSECTS the proposed meta (SQL-scoped, so
+ * unrelated live flights cannot truncate it — #1758) and fails closed when the intersecting HOLD set overflows.
+ * `ignoreFlightIds` names flights the proposed flight may knowingly share airspace with (co-work override).
+ * Used by dispatchFlight only: the other meta-bearing createFlight writers are deliberately exempt (see the
+ * comments at each and docs/flight-operations.md).
  */
 export async function clearFlightMeta(
   env: Env,
   meta: FlightMetaV1,
   opts: { ignoreFlightIds?: string[] } = {},
 ): Promise<FlightMetaClearance> {
-  const active = await listLiveFlights(env)
+  const active = await listIntersectingLiveFlights(env, meta)
   const clearance = checkFlightClearance(meta, active.rows, {
     liveSetTruncated: active.truncated,
     tenant: env.TENANT_SLUG,
