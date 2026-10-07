@@ -61,7 +61,9 @@ measurements. Retain the actual engine/version if the platform exposes it later.
 The actual launch observed so far was parent-initiated. A finite, explicitly
 started receive window was subsequently tested; this does not install a daemon
 or establish autonomous cloud wake. Use the actual server-returned cadence and
-stop/pause the receiver at the approved boundary.
+handle both process shutdown and routing registration at the approved boundary.
+Stopping the process alone does not withdraw the poll route; see the shutdown
+limitations below.
 
 ## Evidence by stage
 
@@ -72,10 +74,10 @@ stop/pause the receiver at the approved boundary.
 | Project/module presence | October 7 session reported online during the turn, then offline afterward. | Fleet registration or dispatch eligibility. |
 | Seat check-in | The seat remained active at the later readback. | A still-running worker; this signal differed from project presence. |
 | Fleet runtime | Initial plain check-in left fleet readback empty, with null runtime/report timestamp and `live: false`. Later poll-mode check-in produced `presence_mode: poll`, `status: running`, `live: true`, verified by the cloud session and Kasra. | Perpetual liveness, autonomous wake or actual task consumption. The later state is a time-bounded readback. |
-| Original dispatch | The session first reported `no_delivery_mode`, then a consumed dispatch with `delivered_via: null`. [#1721](https://github.com/Mumega-com/mupot/issues/1721) records Kasra's diagnosis: the built-in AgentDO `in_worker` path ran; there was no external consumer. | Consumption by this exact cloud runtime. The missing delivery-mode stamp is the tracked observability defect. |
+| Original dispatch | The synchronous dispatch response reported `delivery_forced_predicted: no_delivery_mode`: the requested forced inbox route was not accepted because no delivery surface was registered. The dispatch itself still proceeded; this was a prediction before the queue consumer selected the actual route. A later read showed a consumed dispatch with `delivered_via: null`. [#1721](https://github.com/Mumega-com/mupot/issues/1721) records Kasra's diagnosis: the built-in AgentDO `in_worker` path ran; there was no external consumer. | Consumption by this exact cloud runtime. The missing delivery-mode stamp is the tracked observability defect. |
 | Task/artifact | The task showed `artifact_verification_failed:no_artifact_claimed`. #1721 attributes this to the built-in AgentDO execution cycle; the cloud worker reported no task mutations. | A valid artifact claim or completion by the external cloud worker. Do not describe this as no execution anywhere. |
 | Execution and gate receipts | External runtime/gate timelines were empty. An `execution_receipt_get` lookup used a dispatch-receipt ID and returned `404 receipt_not_found`. These are different receipt kinds; the 404 was a lookup mismatch, not a second observability defect. | A correlated external runtime-consumed/completed receipt or independent verdict. |
-| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. Process evidence at the latest checkpoint confirmed the receiver stopped, despite persisted poll/live fleet state. | Delivery in either window, unattended receiving, or an ongoing receiver. Fleet state is not a process check. |
+| Finite receive test | A requested 30-second interval was returned by the server as 60 seconds, with TTL 180 seconds. The first window made five peeks at 30-second spacing over two minutes and found no delivery because the task was blocked; that receiver then stopped. A later recovery window used the actual 60-second cadence. Process evidence at the latest checkpoint confirmed the receiver stopped, despite persisted poll/live fleet state. This did not deregister its inbox route; TTL expiry alone would not do so either. | Delivery in either window, unattended receiving, or an ongoing receiver. Fleet state is not a process check. |
 | Recovery and flight | An initial flight was held at readiness `0.418` against threshold `0.5`. A later replacement flight was reported preflight-go at `0.942`. [#1723](https://github.com/Mumega-com/mupot/issues/1723) records that task redispatch still failed with `task_not_dispatchable`: the original consumed in-worker dispatch receipt was unsettled, and its no-message shape also blocked lease-reset repair. | External cloud task delivery/execution, artifact completion, verdict or departure proved by runtime receipts. Preflight-go is not execution evidence or permission to bypass recovery gates. |
 | Budget and cost | Session report at the earlier checkpoint: initial flight budget allocation `500000 microUSD` ($0.50); original built-in in-worker cost `30720 microUSD` ($0.03072). | External cloud flight cost, total reconciled spend or cost efficiency. Allocation is not spend, and the original built-in cost is not this held flight's consumption. |
 
@@ -107,14 +109,16 @@ For an actual scheduled/polling non-resident worker, the existing
 [runner playbook](../playbooks/runner-onboarding.md) uses
 `check_in({ presence_mode: "poll", poll_interval_sec: <actual cadence> })`.
 The [poll upsert](https://github.com/Mumega-com/mupot/blob/cd2d4060b7d0d56a8cb9915db55849872ccf1050/src/fleet/registry.ts)
-writes the caller's own fleet row with `presence_mode: "poll"` and an on-demand
-lifecycle; runtime may remain empty. Read that fleet value back to verify the
+inserts the caller's own fleet row with `presence_mode: "poll"`, an empty runtime
+and `lifecycle: "on_demand"`. On conflict, it refreshes poll fields but preserves
+the existing runtime and lifecycle; it does not normalize an older lifecycle. Read that fleet value back to verify the
 registration. This step was performed in the finite receive test above. Use the
 server-returned 60-second cadence for this observed configuration, not the
 initial requested 30 seconds; read back the actual values again in a new setup.
 A parent-launched one-off without a real polling loop must not invent an interval
 or declare an always-on lifecycle just to obtain routing. A poll check-in's
-180-second TTL does not establish a continuously running receiver.
+180-second TTL governs displayed liveness, not poll-route removal. The consumer
+selects inbox for an active poll registration even when `live` is false.
 
 Keep the delivery-mode fix on #1721, the unsettled-receipt repair on #1723, and
 the documentation on #1719. Kasra owns the existing repair; this guide starts no
@@ -140,6 +144,36 @@ describing any unattended receiver as conformant.
 An independent gate reviews the exact artifact and digest. Messaging success,
 transport consumption, and the author's own assessment do not complete that gate.
 
+## Shutdown limitations: process, route and work are separate
+
+Source-checked at `cd2d4060`; these are existing control semantics, not a
+verified end-to-end shutdown recipe:
+
+- Stopping the local receiver or waiting out its TTL leaves an active poll
+  registration eligible for inbox routing. New work can accumulate unread.
+- The caller's `check_in({ presence_mode: "resident" })` is an explicit poll
+  deregistration path. [The handler](../../src/mcp/index.ts) calls
+  `clearPollFleetPresence` and returns `poll_registration_cleared: true`.
+  [The update](../../src/fleet/registry.ts) clears mode/TTL but leaves
+  status, runtime and lifecycle unchanged. It does not start a resident process.
+- The authenticated [detach routes](../../src/fleet/attach-routes.ts) mark the
+  owned fleet row `stopped` and clear poll mode/TTL; they do not stop the host
+  process themselves. A later poll check-in does not resurrect a stopped row.
+- Neither control is a general no-execution fence. With no eligible external
+  surface, normal dispatch can fall back to `in_worker`. If a nonempty runtime
+  remains, a forced inbox request can still pass the registered-surface test
+  even while that row is not live. Existing inbox deliveries and in-flight work
+  are not canceled by these presence changes.
+
+An authorized operator must account for new dispatches, queued/in-flight work,
+local process state and the post-change route before using either control as
+part of shutdown. Read back mode, status, runtime and route separately.
+**Unresolved:** this example has no verified quiesce/dispatch-hold procedure that
+prevents both unread inbox accumulation and unintended in-worker execution
+through the whole stop/restart boundary. Do not run deregistration or detach as
+an automatic "safe stop" based on this guide. Keep the receiver's observed
+process stop distinct from a secure system-wide stop.
+
 ## Remaining setup checklist
 
 - [ ] Attach sanitized external-runtime consumption evidence; retain #1721's in-worker attribution.
@@ -149,6 +183,8 @@ transport consumption, and the author's own assessment do not complete that gate
 - [ ] Verify autonomous cloud wake separately if that capability is implemented.
 - [ ] Verify #1723's authorized recovery repair before retrying task dispatch.
 - [x] Confirm receiver stopped from process evidence; retain the finite-window limit.
+- [ ] Verify routing cleanup and a dispatch hold across stop/restart; process stop
+      and TTL expiry are not completion of this step.
 - [ ] Attach the held flight/budget and original built-in cost evidence separately;
       record external flight cost only if execution occurs.
 - [ ] Re-run the documented setup in a fresh instance and pin runtime/version.
