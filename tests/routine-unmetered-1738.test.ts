@@ -4,11 +4,9 @@ import { invokeTool } from '../src/mcp'
 import { landGovernedFlight } from '../src/flight/service'
 import { parseFlightMetaV1 } from '../src/flight/meta'
 import type { AuthContext, CapabilityGrant } from '../src/types'
-import { makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
+import { fixtureRow, makeReadyRoutineFixture, type ReadyRoutineFixture } from './helpers/routine-actions'
 
-function row(f: ReadyRoutineFixture, sql: string): unknown {
-  return f.harness.sqlite.prepare(sql).get()
-}
+const row = fixtureRow
 
 function agentPrincipal(): AuthContext {
   const grant: CapabilityGrant = { member_id: 'member-1', scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }
@@ -20,7 +18,7 @@ function agentPrincipal(): AuthContext {
 }
 
 function receipt(f: ReadyRoutineFixture): Record<string, unknown> {
-  const r = f.harness.sqlite.prepare("SELECT payload FROM flight_event_outbox WHERE flight_id='control-flight' AND event_type='flight.landed'").get() as { payload: string } | undefined
+  const r = fixtureRow(f, "SELECT payload FROM flight_event_outbox WHERE flight_id='control-flight' AND event_type='flight.landed'") as { payload: string } | undefined
   if (!r) throw new Error('no landing receipt')
   return JSON.parse(r.payload) as Record<string, unknown>
 }

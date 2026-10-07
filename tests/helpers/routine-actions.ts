@@ -145,3 +145,8 @@ export async function makeReadyRoutineFixture(
     },
   }
 }
+
+/** Read one row from the fixture's REAL sqlite engine (schema = full migration chain). */
+export function fixtureRow(f: ReadyRoutineFixture, sql: string): unknown {
+  return f.harness.sqlite.prepare(sql).get()
+}
