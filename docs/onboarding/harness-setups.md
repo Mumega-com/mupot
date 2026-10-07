@@ -5,7 +5,7 @@ Then use the matching row below to configure the carrying runtime and record wha
 has actually been verified. The first worked example is
 [Digid in a saved ChatGPT cloud environment](digid-chatgpt-cloud.md).
 
-**Snapshot: 2026-10-07 00:38 UTC.** This is documentation within
+**Snapshot: 2026-10-07 00:38 UTC, Digid row refreshed 11:10 UTC.** This is documentation within
 [#1719](https://github.com/Mumega-com/mupot/issues/1719). It does not introduce a
 provisioner, receiver, or identity system. The portable adapter direction remains
 [#1590](https://github.com/Mumega-com/mupot/issues/1590); its proposed automatic
@@ -48,7 +48,7 @@ integrations remain explicitly marked.
 
 | Harness / delivery surface | Setup source | Current evidence and boundary |
 |---|---|---|
-| Saved ChatGPT cloud worker, Digid example | [Worked example](digid-chatgpt-cloud.md) | Own-token messaging round trip reported in [#1715](https://github.com/Mumega-com/mupot/issues/1715). Later session reports verify active-session poll registration/routing; an earlier plain check-in left fleet state empty. A replacement flight later passed preflight, but task redispatch is blocked by the unsettled in-worker receipt in [#1723](https://github.com/Mumega-com/mupot/issues/1723). The receiver is stopped. Autonomous cloud wake and external execution receipts remain unproven. |
+| Saved ChatGPT cloud worker, Digid example | [Worked example](digid-chatgpt-cloud.md) | Own-token messaging round trip reported in [#1715](https://github.com/Mumega-com/mupot/issues/1715). Later session reports verify active-session poll registration/routing; an earlier plain check-in left fleet state empty. The #1723 redispatch blocker is fixed. One governed cycle then landed through the inbox route: task `02471acf` was rejected once, redispatched, approved by an independent gate (`4a72645c`), and its flight landed unmetered. Stopped-seat dispatch fences exist since #1739/#1743. Autonomous cloud wake and a fresh-instance replay remain unproven. |
 | ChatGPT connector, Rava example | [OAuth onboarding](add-an-agent.md), [#1715](https://github.com/Mumega-com/mupot/issues/1715) | Native MCP Events wake reported tested on 2026-10-06. This is a separate receiving surface from the cloud worker. Notification does not authorize execution, reply or ACK. |
 | Claude Code | [Plugin](../plugins/mupot-claude-plugin.md), [host/receive guide](../host-a-seat.md) | Published integration; Stop-hook receive is documented at turn boundaries. An idle session is not proved wakeable by that hook. Reconcile older [flock pack](../../packs/claude-code/flock-agent/README.md) instructions through #1719. |
 | Hermes | [Plugin](../plugins/mupot-hermes-plugin.md), [harness contract](../architecture/agent-harness-contract.md) | Published plugin; native-receive and adversarial-review evidence is pinned in the contract. Catalog watcher instructions and installed runtime revision require reconciliation. Keep operator, provisioner and manager profiles distinct. |
