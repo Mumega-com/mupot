@@ -1394,6 +1394,10 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         -- dispatches a flight with meta.task_ids set -- same "purely-additive table a
         -- shared surface now unconditionally reads" failure as the squads.status
         -- column above. Always empty here; no task in this fixture is archived.
+        -- mupot#1748: listFlights/listFlightsForSquad now read flight_cancel_receipts (0194)
+        -- through the shared cancelled predicate (src/flight/cancelled.ts). Same hand-written-subset
+        -- class: a purely-additive table a shared surface unconditionally reads. Always empty here.
+        CREATE TABLE flight_cancel_receipts (tenant TEXT NOT NULL, flight_id TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE tasks_archive_state (
           task_id TEXT PRIMARY KEY, archived_at TEXT NOT NULL, archived_reason TEXT NOT NULL,
           archived_by_member_id TEXT NOT NULL, prior_status TEXT NOT NULL, created_at TEXT NOT NULL

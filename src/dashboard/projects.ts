@@ -42,6 +42,7 @@ import { listProjectBindings } from '../projects/providers/bindings'
 import type { ProjectProviderBinding } from '../projects/providers/port'
 import { emptyState, pageHeader, pill, sectionPanel } from './ui'
 import type { Html } from './ui'
+import { cancelledColumnSql } from '../flight/cancelled'
 import { projectLivePreviewSplitHtml } from '../platform/routes'
 import {
   DEFAULT_PROJECT_WORKER_SQUAD,
@@ -981,7 +982,7 @@ export async function loadProjectFlights(
 ): Promise<ProjectFlightsResult> {
   if (context.readableSquadIds === null) {
     const result = await env.DB.prepare(
-      `SELECT *
+      `SELECT *, ${cancelledColumnSql('flights')}
          FROM flights
         WHERE tenant = ?1 AND project_id = ?2
         ORDER BY created_at DESC, id DESC
@@ -994,7 +995,7 @@ export async function loadProjectFlights(
   const maxCandidates = MAX_FLIGHT_SCAN_PAGES * 100
 
   const result: { results?: FlightRow[] } = await env.DB.prepare(
-    `SELECT *
+    `SELECT *, ${cancelledColumnSql('f')}
        FROM flights f
       WHERE f.tenant = ?1 AND f.project_id = ?2
         ${readableFlightSql('f', '?3')}

@@ -543,7 +543,8 @@ export interface FlightCancelResult {
 /**
  * Governed early close of a flight by a lead/admin (mupot#1730). Authz: cancelAuthority (lead/admin only,
  * NOT the reap's agent/dispatcher allowance). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
- * (label cancelled_by_lead|cancelled_by_admin; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
+ * (label cancelled_by_lead|cancelled_by_admin, with a '(self)' suffix when the executor/dispatcher cancels its own
+ * flight; a self-cancel is recorded in the receipt payload and still COUNTS AS A FAILURE for readers; the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
  * receipt is inserted in the SAME batch as the transition, guarded on that exact transition
  * having landed, so a cancelled flight cannot lack its receipt.
  */
@@ -572,7 +573,11 @@ export async function cancelFlight(
   }
 
   const costMetered = flight.cost_metered === 0 ? 0 : 1
-  const label = authority === 'admin' ? 'cancelled_by_admin' : 'cancelled_by_lead'
+  // #1748 P2: the executor (or dispatcher) of this very flight cancelled it through a lead/admin grant it also holds.
+  // Flag it (receipt payload + gate_reason) so a self-cancel is distinguishable from a third-party cancel.
+  const selfCancel = principal.actor.kind === 'agent' &&
+    (principal.actor.id === flight.agent || principal.actor.id === flight.dispatched_by_agent_id)
+  const label = `${authority === 'admin' ? 'cancelled_by_admin' : 'cancelled_by_lead'}${selfCancel ? '(self)' : ''}`
   const gateReason = `${label}: ${reason.slice(0, 400)}`
   const runReason = `${label}: ${reason.slice(0, 200)}`
   const nowIso = new Date(nowMs).toISOString()
@@ -584,6 +589,7 @@ export async function cancelFlight(
     cost_metered: costMetered === 1,
     cancelled_at: nowIso,
     actor: principal.actor,
+    self_cancel: selfCancel,
   })
 
   // The status guard pins the exact status we recorded as previous_status, so the receipt's

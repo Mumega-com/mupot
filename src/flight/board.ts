@@ -8,10 +8,11 @@
 import type { FlightRow, FlightStatus } from './service'
 import { detectFlightCollisions } from './clearance'
 import type { FlightCollision } from './clearance'
+import { isCancelledFlight } from './cancelled'
 
 // The board metaphor (plain mupot language): running=flying, waiting=holding (at a
 // human gate), sleeping=between flights. preflight/held/landed/failed keep their names.
-export type FlightPhase = 'preflight' | 'flying' | 'holding' | 'sleeping' | 'held' | 'landed' | 'failed'
+export type FlightPhase = 'preflight' | 'flying' | 'holding' | 'sleeping' | 'held' | 'landed' | 'failed' | 'cancelled'
 
 const PHASE: Record<FlightStatus, FlightPhase> = {
   preflight: 'preflight',
@@ -101,7 +102,8 @@ function nextDeparture(row: FlightRow, nowMs: number): string | null {
  */
 export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
   return rows.map((row, i) => {
-    const phase = PHASE[row.status]
+    // #1748: a cancelled flight is stored as 'failed' but is its own phase, never a failure.
+    const phase: FlightPhase = isCancelledFlight(row) ? 'cancelled' : PHASE[row.status]
     const over =
       row.cost_metered !== 0 && row.budget_micro_usd != null && Number.isFinite(row.budget_micro_usd) && row.cost_micro_usd > row.budget_micro_usd
 

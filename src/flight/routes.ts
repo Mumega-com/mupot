@@ -41,6 +41,7 @@ import {
 import type { FlightSignals, PreflightOptions } from './preflight'
 import { FLIGHT_META_V1_SCHEMA, parseFlightMetaV1, validateFlightMetaReferences, type FlightMetaV1 } from './meta'
 import { deriveActiveCollisions } from './board'
+import { flightOutcome, isCancelledFlight } from './cancelled'
 import {
   findFinishedWorkConflict,
   findFlightByClientRequestId,
@@ -54,6 +55,8 @@ import {
 
 const TRIGGERS: ReadonlySet<string> = new Set(['manual', 'schedule', 'api', 'event', 'cron'])
 const STATUSES: ReadonlySet<string> = new Set(['preflight', 'held', 'running', 'waiting', 'sleeping', 'landed', 'failed'])
+// #1748: 'cancelled' is an outcome filter, not a stored status (a cancel is stored as 'failed' + a receipt).
+const OUTCOME_FILTERS: ReadonlySet<string> = new Set([...STATUSES, 'cancelled'])
 
 function asBool(v: unknown): boolean {
   return v === true
@@ -223,17 +226,19 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   }
 }
 
+export type OutcomeFilter = FlightStatus | 'cancelled'
+
 export interface OutcomeQuery {
-  statuses: FlightStatus[] | null // null = all
+  statuses: OutcomeFilter[] | null // null = all
   sinceMs: number | null
   limit: number
 }
 
-/** Parse the outcome-feed query (?status=landed,failed&since=<ms>&limit=N). */
+/** Parse the outcome-feed query (?status=landed,failed,cancelled&since=<ms>&limit=N). 'failed' excludes cancels (#1748). */
 export function parseOutcomeQuery(q: URLSearchParams): OutcomeQuery {
   const statusRaw = q.get('status')
   const statuses = statusRaw
-    ? (statusRaw.split(',').map((x) => x.trim()).filter((x) => STATUSES.has(x)) as FlightStatus[])
+    ? (statusRaw.split(',').map((x) => x.trim()).filter((x) => OUTCOME_FILTERS.has(x)) as OutcomeFilter[])
     : null
   const sinceRaw = q.get('since')
   const sinceN = sinceRaw == null ? NaN : Number(sinceRaw)
@@ -546,9 +551,10 @@ flightsApp.get('/', async (c) => {
   const projectId = rawProjectId === null ? undefined : rawProjectId.trim()
   if (projectId !== undefined && (projectId.length === 0 || projectId.length > 200)) return c.json({ error: 'invalid_project_id' }, 400)
   const all = await listFlights(c.env, 500, projectId)
-  const statusSet = q.statuses ? new Set<FlightStatus>(q.statuses) : null
+  const statusSet = q.statuses ? new Set<OutcomeFilter>(q.statuses) : null
   const flights = all
-    .filter((f) => (statusSet ? statusSet.has(f.status) : true))
+    // flightOutcome: a cancel matches 'cancelled' only, never 'failed' (#1748).
+    .filter((f) => (statusSet ? statusSet.has(flightOutcome(f)) : true))
     .filter((f) => (q.sinceMs == null ? true : (f.ended_at ?? f.created_at) > q.sinceMs))
     .slice(0, q.limit)
     .map((f) => ({
@@ -556,7 +562,10 @@ flightsApp.get('/', async (c) => {
       project_id: f.project_id,
       agent: f.agent,
       goal: f.goal,
+      // Raw stored status (back-compat); a cancel still reads 'failed' here, so consumers MUST use `outcome`/`cancelled`.
       status: f.status,
+      outcome: flightOutcome(f),
+      cancelled: isCancelledFlight(f),
       score: f.score,
       cost_micro_usd: f.cost_metered === 0 ? null : f.cost_micro_usd,
       cost_metered: f.cost_metered !== 0,

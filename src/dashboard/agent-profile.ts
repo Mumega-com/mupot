@@ -1,4 +1,5 @@
 import type { Env } from '../types'
+import { cancelledColumnSql, flightOutcome, isCancelledFlight } from '../flight/cancelled'
 
 /**
  * Agent profile panels.
@@ -107,6 +108,8 @@ export interface FlightSummary {
   truncated: boolean
   landed: number
   failed: number
+  /** #1748: lead/admin cancels, stored as 'failed'; NOT counted in `failed`. */
+  cancelled: number
   held: number
   running: number
   /** Total spend in micro-USD across every flight this agent flew. */
@@ -121,13 +124,14 @@ export interface FlightSummary {
  * the most interesting failure mode on this deployment.
  */
 export function summariseFlights(
-  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; created_at: string }[],
+  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; created_at: string }[],
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
     truncated: rows.length >= PANEL_ROW_CAP,
     landed: 0,
     failed: 0,
+    cancelled: 0,
     held: 0,
     running: 0,
     costMicroUsd: 0,
@@ -135,6 +139,7 @@ export function summariseFlights(
   }
   for (const r of rows) {
     if (r.status === 'landed') summary.landed += 1
+    else if (isCancelledFlight(r)) summary.cancelled += 1
     else if (r.status === 'failed') summary.failed += 1
     else if (r.status === 'held') summary.held += 1
     else if (r.status === 'running') summary.running += 1
@@ -146,7 +151,7 @@ export function summariseFlights(
   summary.recent = rows.slice(0, 5).map((r) => ({
     id: r.id,
     goal: r.goal,
-    status: r.status,
+    status: flightOutcome(r),
     created_at: r.created_at,
   }))
   return summary
@@ -155,13 +160,13 @@ export function summariseFlights(
 export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelResult<FlightSummary>> {
   try {
     const res = await env.DB.prepare(
-      `SELECT id, goal, status, cost_micro_usd, cost_metered, created_at
+      `SELECT id, goal, status, cost_micro_usd, cost_metered, created_at, ${cancelledColumnSql('flights')}
          FROM flights
         WHERE tenant = ?1 AND agent = ?2
         ORDER BY created_at DESC
         LIMIT ${PANEL_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{
-      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; created_at: string
+      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; cancelled: number; created_at: string
     }>()
     const rows = res.results ?? []
     if (rows.length === 0) return empty()
