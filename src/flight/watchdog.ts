@@ -540,7 +540,8 @@ export interface FlightCancelResult {
   cost_metered?: boolean
   /**
    * Fate of the routine run bound to this flight, decided by the guarded write (RETURNING), not a pre-read.
-   * 'confirmed' = run cancelled, no action was running. 'unconfirmed' = a routine action was already running
+   * 'confirmed' = run cancelled, no action was running and no control message delivered. 'unconfirmed' = a routine
+   * action was already running OR the run's control message was already delivered to the agent inbox
    * (its effect may still commit): run recorded failed/cancellation_unconfirmed, same as cancelRoutineRun.
    * undefined = the flight has no live routine run.
    */

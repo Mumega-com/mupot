@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
-import { leaseAgentInbox } from '../src/agents/messages'
+import { leaseAgentInbox, sendAgentMessage } from '../src/agents/messages'
+import { cancelFlight } from '../src/flight/watchdog'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
 import { cancelRoutineRun } from '../src/routines/actions'
 import type { RoutinePrincipal } from '../src/routines/access'
@@ -604,5 +605,70 @@ describe('routine runtime-neutral dispatch', () => {
 
       expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-member-only' })
     })
+  })
+})
+
+
+// #1756 r2: flight_cancel in the create-before-observe window must fail closed (no message, sane run state).
+describe('#1756 control flight cancelled before the run observes it', () => {
+  function envCancellingAtObserve(harness: SqliteD1Harness): { env: Env; cancelled: () => boolean } {
+    const base = envFor(harness)
+    let armed = false
+    let done = false
+    const db = harness.db
+    return {
+      cancelled: () => done,
+      env: {
+        ...base,
+        DB: {
+          prepare(sql: string) {
+            if (!done && /SET status = 'observing', assigned_agent_id = \?, task_id = \?/.test(sql)) armed = true
+            return db.prepare(sql)
+          },
+          async batch(statements: D1PreparedStatement[]) {
+            if (armed && !done) {
+              done = true
+              // The control flight exists (preflight) but routine_runs.flight_id is still NULL: the cancel matches no run.
+              const row = harness.sqlite.prepare("SELECT id FROM flights WHERE status = 'preflight'").get() as { id: string }
+              const res = await cancelFlight(base, row.id, { actor: { kind: 'member', id: 'm-admin' }, isOrgAdmin: true }, 'stop')
+              expect(res).toMatchObject({ transitioned: true })
+            }
+            return db.batch(statements)
+          },
+        } as unknown as D1Database,
+      } as Env,
+    }
+  }
+  const delivered = (h: SqliteD1Harness) =>
+    (h.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'mupot-routines'").get() as { n: number }).n
+
+  it('cancel in the window: no message delivered, run ends terminal with a reason', async () => {
+    const harness = makeHarness()
+    const { env, cancelled } = envCancellingAtObserve(harness)
+    const result = await dispatchRoutineRun(env, 'run-1', NOW)
+    expect(cancelled()).toBe(true)
+    expect(result).toEqual({ ok: false, error: 'run_not_dispatchable' })
+    expect(delivered(harness)).toBe(0)
+    expect(harness.sqlite.prepare("SELECT status, result_summary, finished_at IS NOT NULL AS fin, flight_id FROM routine_runs WHERE id='run-1'").get())
+      .toMatchObject({ status: 'cancelled', result_summary: 'control_flight_cancelled_before_dispatch', fin: 1, flight_id: null })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'observed'").get()).toEqual({ n: 0 })
+  })
+
+  it('the routine send fence refuses a non-live control flight on its own (dispatch_fenced)', async () => {
+    const harness = makeHarness()
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, cost_metered, created_at, project_id)
+        VALUES ('cf-1', 'tenant-a', 'agent-preferred', 'g', 'failed', 100, '{}', 1, 1, 'project-1');
+      UPDATE routine_runs SET status = 'observing', flight_id = 'cf-1' WHERE id = 'run-1';
+    `)
+    const send = () => sendAgentMessage(envFor(harness), {
+      fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
+      requestId: 'routine-run:run-1', projectId: 'project-1',
+    }, { system: true, reason: 'test' }, { systemProjectAttribution: true, routineRunFence: { runId: 'run-1', projectId: 'project-1' } })
+    expect(await send()).toEqual({ ok: false, reason: 'dispatch_fenced' })
+    expect(delivered(harness)).toBe(0)
+    harness.sqlite.exec("UPDATE flights SET status = 'running' WHERE id = 'cf-1'")
+    expect(await send()).toMatchObject({ ok: true })
+    expect(delivered(harness)).toBe(1)
   })
 })

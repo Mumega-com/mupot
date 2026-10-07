@@ -44,8 +44,10 @@ export function cancelledColumnSql(alias = 'f'): string {
 }
 
 /** JS side of cancelUnconfirmedFlightSql. Absent key (hand-built rows, older queries) = not unconfirmed. */
-export function isCancelUnconfirmed(row: { status: string; cancel_unconfirmed?: number | boolean | null }): boolean {
-  return row.status === 'failed' && (row.cancel_unconfirmed === 1 || row.cancel_unconfirmed === true)
+export function isCancelUnconfirmed(
+  row: { status: string; cancelled: number | boolean | null | undefined; cancel_unconfirmed?: number | boolean | null },
+): boolean {
+  return isCancelledFlight(row) && (row.cancel_unconfirmed === 1 || row.cancel_unconfirmed === true)
 }
 
 /** SQL fragment: a genuinely failed flight (status failed AND no cancel receipt). */

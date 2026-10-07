@@ -1,4 +1,5 @@
 import type { D1Result } from '@cloudflare/workers-types'
+import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql } from './running-action'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { sendAgentMessage as sendMessage } from '../agents/messages'
 import { brandSquadScope, hasCapability } from '../auth/capability'
@@ -15,7 +16,6 @@ import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 
-const ROUTINE_SENDER = 'mupot-routines'
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
 // squad (ordered by ascending uuid) the rest were invisible to dispatch with no
@@ -365,7 +365,7 @@ async function appendStateEvent(
               AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?
          )`,
     ).bind(
-      crypto.randomUUID(), input.eventKind, ROUTINE_SENDER, now,
+      crypto.randomUUID(), input.eventKind, ROUTINE_ACTOR, now,
       JSON.stringify({ reason: input.resultSummary, retry_at: input.retryAt, attempt: run.attempt }),
       run.id, run.tenant, input.status, input.waitingReason, input.waitingReason,
       input.resultSummary, now, input.eventKind, run.attempt,
@@ -509,6 +509,31 @@ async function ensureFlight(
   })
 }
 
+/**
+ * #1756: when the run's control flight left its live states before any message was delivered (flight_cancel in the
+ * create-before-observe window), end the run terminally instead of leaving it leased/observing. Guarded in SQL:
+ * only while the run is still pre-dispatch AND the flight is not live AND no control message exists for the run.
+ */
+async function closeRunIfControlFlightCancelled(
+  env: Env,
+  run: DispatchRunRow,
+  flightId: string,
+  nowIso: string,
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE routine_runs
+        SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+            retry_at = NULL, result_summary = 'control_flight_cancelled_before_dispatch',
+            finished_at = ?1, updated_at = ?1
+      WHERE id = ?2 AND tenant = ?3 AND status IN ('leased','observing')
+        AND NOT EXISTS (
+          SELECT 1 FROM flights cf
+           WHERE cf.id = ?4 AND cf.tenant = ?3 AND cf.status IN ('preflight','running')
+        )
+        AND NOT ${routineMessageDeliveredExistsSql('?2', '?3', '?5')}`,
+  ).bind(nowIso, run.id, run.tenant, flightId, run.project_id).run()
+}
+
 function proposalSchema(): Record<string, unknown> {
   return {
     version: 'routine.proposal/v1',
@@ -592,10 +617,14 @@ export async function dispatchRoutineRun(
               flight_id = ?, situation_digest = ?, updated_at = ?
         WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
           AND assigned_agent_id = ?
-          AND ${sqlNotCancellationPending('routine_runs')}`,
+          AND ${sqlNotCancellationPending('routine_runs')}
+          AND EXISTS (
+            SELECT 1 FROM flights cf
+             WHERE cf.id = ? AND cf.tenant = routine_runs.tenant AND cf.status IN ('preflight','running')
+          )`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
-      run.id, run.tenant, selected.agentId,
+      run.id, run.tenant, selected.agentId, flightId,
     ),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
@@ -612,13 +641,17 @@ export async function dispatchRoutineRun(
          SELECT 1 FROM routine_run_events WHERE run_id = ? AND kind = 'observed'
        )`,
     ).bind(
-      crypto.randomUUID(), run.tenant, run.project_id, run.id, ROUTINE_SENDER, nowIso,
+      crypto.randomUUID(), run.tenant, run.project_id, run.id, ROUTINE_ACTOR, nowIso,
       JSON.stringify({ situation_digest: situationDigest }), run.id,
       run.id, run.tenant, selected.agentId, task.id, flightId, situationDigest, nowIso,
       run.id,
     ),
   ])
-  if (!wrote(observed[0])) return { ok: false, error: 'run_not_dispatchable' }
+  if (!wrote(observed[0])) {
+    // #1756: the control flight was cancelled in the create-before-observe window. Fail closed: no message goes out.
+    await closeRunIfControlFlightCancelled(env, run, flightId, nowIso)
+    return { ok: false, error: 'run_not_dispatchable' }
+  }
 
   const response = humanResponse(run)
   const body = JSON.stringify({
@@ -634,7 +667,7 @@ export async function dispatchRoutineRun(
   })
   const send = deps.sendAgentMessage ?? sendMessage
   const delivery = await send(env, {
-    fromAgent: ROUTINE_SENDER,
+    fromAgent: ROUTINE_ACTOR,
     fromMember: ROUTINE_MEMBER,
     toAgent: selected.inboxAgentId,
     body,
@@ -649,7 +682,10 @@ export async function dispatchRoutineRun(
     routineRunFence: { runId: run.id, projectId: run.project_id },
   })
   if (!delivery.ok) {
-    if (delivery.reason === 'dispatch_fenced') return { ok: false, error: 'run_not_dispatchable' }
+    if (delivery.reason === 'dispatch_fenced') {
+      await closeRunIfControlFlightCancelled(env, run, flightId, nowIso)
+      return { ok: false, error: 'run_not_dispatchable' }
+    }
     return waitForAgent(env, run, now, delivery.reason === 'inbox_full' ? 'inbox_full' : 'delivery_failed')
   }
 
@@ -718,7 +754,7 @@ export async function dispatchRoutineRun(
          AND assigned_agent_id = ? AND task_id = ? AND flight_id = ?
          AND situation_digest = ? AND updated_at = ?`,
     ).bind(
-      crypto.randomUUID(), ROUTINE_SENDER, nowIso,
+      crypto.randomUUID(), ROUTINE_ACTOR, nowIso,
       JSON.stringify({ agent_id: selected.agentId, task_id: task.id, flight_id: flightId, message_id: delivery.id }),
       run.id, run.tenant, selected.agentId, task.id, flightId, situationDigest, nowIso,
     ),

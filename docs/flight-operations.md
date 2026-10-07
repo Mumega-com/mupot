@@ -122,9 +122,11 @@ Response fields:
 | `reason` | Present only when `cancelled` is `false`: `'routine_effect_may_be_in_flight'`. |
 | `receipt` | Whether the receipt row landed. |
 
-The unconfirmed case mirrors `cancelRoutineRun` (run `failed` / `cancellation_unconfirmed`, open actions cancelled, a `cancellation_unconfirmed` event). Both surfaces share ONE predicate, `routineEffectInFlightSql` in `src/routines/running-action.ts`, evaluated inside the guarded UPDATE, not in a pre-read.
+The unconfirmed case mirrors `cancelRoutineRun` (run `failed` / `cancellation_unconfirmed`, open actions cancelled, a `cancellation_unconfirmed` event). Both surfaces share the component predicates in `src/routines/running-action.ts` (`runningActionExistsSql`, `routineMessageDeliveredExistsSql`, combined as `routineEffectInFlightSql`). `flight_cancel` evaluates them inside the guarded UPDATE; `cancelRoutineRun` pre-reads them. `cancelRoutineRun` is also stricter: a live control flight gives `confirmable:false` (unconfirmed), which `flight_cancel` cannot say because it is the thing closing that flight.
 
-The receipt payload carries `routine_outcome` (`confirmed` | `unconfirmed` | `none`, `none` = no live routine run; a missing key reads as `none`). The deck badge, the outcome feed (`cancel_unconfirmed`) and the agent profile use it to label a cancel whose effect was not fenced; counting is unchanged (still cancelled, never a failure).
+Create-before-observe window: the control flight is created (`preflight`) before the run's `flight_id` is set. A cancel in that window matches no run (`routine_outcome` `none`), so dispatch fails closed instead: the `observed` update and the routine send fence both require the control flight to still be `preflight`/`running`, and the run ends `cancelled` / `control_flight_cancelled_before_dispatch` with no message delivered.
+
+The receipt payload carries `routine_outcome` (`confirmed` | `unconfirmed` | `none`, `none` = this cancel batch wrote no run row: no routine run is linked to the flight yet, or it was already terminal; a missing key reads as `none`). The deck badge, the outcome feed (`cancel_unconfirmed`) and the agent profile use it to label a cancel whose effect was not fenced; counting is unchanged (still cancelled, never a failure).
 
 Known gap: `cancelRoutineRun` also requires its control TASK to be confirmed cancelled (`taskConfirmed`). That is a multi-step write with task events, not expressible in the flight_cancel batch, so a flight cancel does not check it.
 

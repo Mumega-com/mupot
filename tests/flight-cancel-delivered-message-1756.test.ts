@@ -90,7 +90,7 @@ describe('#1756 flight_cancel vs a delivered inbox message', () => {
       const r = await cancel(env)
       expect(r, JSON.stringify(r)).toMatchObject({
         ok: true,
-        result: { cancelled: false, flight_closed: true, cancellation: 'unconfirmed', receipt: true },
+        result: { cancelled: false, flight_closed: true, cancellation: 'unconfirmed', reason: 'routine_effect_may_be_in_flight', receipt: true },
       })
       const got = snap(h)
 
@@ -115,6 +115,10 @@ describe('#1756 flight_cancel vs a delivered inbox message', () => {
     h.sqlite.prepare(
       `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, project_id)
        VALUES ('msg-2', ?, 'agent-1', 'mupot-routines', 'system:routines', 'request', 'x', 'routine-run:run-r', 'project-o')`,
+    ).run(TENANT)
+    h.sqlite.prepare(
+      `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, project_id)
+       VALUES ('msg-3', ?, 'agent-1', 'someone-else', 'm', 'request', 'x', 'routine-run:run-r', 'project-r')`,
     ).run(TENANT)
     const r = await cancel(env)
     expect(r).toMatchObject({ ok: true, result: { cancelled: true, flight_closed: true } })
@@ -154,6 +158,10 @@ describe('#1756 flight_cancel vs a delivered inbox message', () => {
     // legacy receipt without the key reads as 'none'
     c.h.sqlite.exec("UPDATE flight_cancel_receipts SET payload = json_remove(payload, '$.routine_outcome')")
     expect(isCancelUnconfirmed(read(c.h))).toBe(false)
+    // a self-cancel is a failure, never "cancelled", so it is never labelled cancel-unconfirmed either
+    u.h.sqlite.exec("UPDATE flight_cancel_receipts SET payload = json_set(payload, '$.self_cancel', json('true'))")
+    expect(isCancelUnconfirmed(read(u.h))).toBe(false)
+    u.h.sqlite.exec("UPDATE flight_cancel_receipts SET payload = json_set(payload, '$.self_cancel', json('false'))")
     // not a failure: the genuinely-failed predicate excludes it
     const failed = u.h.sqlite.prepare(`SELECT COUNT(*) AS n FROM flights f WHERE ${genuinelyFailedFlightSql('f')}`).get() as { n: number }
     expect(failed.n).toBe(0)

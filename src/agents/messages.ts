@@ -221,6 +221,10 @@ async function routineDispatchAllowed(
   const row = await env.DB.prepare(
     `SELECT 1 FROM routine_runs rr
       WHERE rr.id = ? AND rr.tenant = ? AND rr.project_id = ? AND rr.status = 'observing'
+        AND EXISTS (
+          SELECT 1 FROM flights cf
+           WHERE cf.id = rr.flight_id AND cf.tenant = rr.tenant AND cf.status IN ('preflight','running')
+        )
         AND NOT EXISTS (
           SELECT 1 FROM routine_run_events requested
            WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
@@ -456,6 +460,10 @@ export async function sendAgentMessage(
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
                       AND rr.status = 'observing'
+                      AND EXISTS (
+                        SELECT 1 FROM flights cf
+                         WHERE cf.id = rr.flight_id AND cf.tenant = rr.tenant AND cf.status IN ('preflight','running')
+                      )
                       AND NOT EXISTS (
                         SELECT 1 FROM routine_run_events requested
                          WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
