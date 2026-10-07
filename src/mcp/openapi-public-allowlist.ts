@@ -64,6 +64,7 @@ export const PUBLIC_TOOL_ALLOWLIST: readonly string[] = [
   'execution_meter_status',
   'execution_receipt_get',
   'fleet_agent_get',
+  'flight_cancel',
   'flight_dispatch',
   'flight_get',
   'flight_land',

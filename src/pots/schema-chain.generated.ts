@@ -3470,9 +3470,19 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0194_flight_cancel_receipts.sql",
+    sha256: "c90368322312780442e03d2c0600af7ee75dc2b89623cb9495244e7c15b59fdc",
+    statements: [
+      "-- 0194_flight_cancel_receipts.sql — mupot#1730: lead/admin early close of a flight (flight_cancel).\n--\n-- WHY A NEW TABLE, AND WHY NO NEW flights.status VALUE\n--\n-- flights.status carries CHECK (status IN ('preflight','held','running','waiting','sleeping',\n-- 'landed','failed')) (0017, rebuilt by 0172). Widening it means create-copy-drop-rename on a table\n-- with project triggers (0055/0069/0059), 0172's waiting triggers and many dependents: a\n-- \"never blind-apply\" rebuild. flight_cancel therefore ends the flight as 'failed' with\n-- gate_reason 'cancelled_by_lead: <reason>' (distinct from watchdog_reap:), and the authoritative,\n-- machine-readable record that it was a CANCEL lives here.\n--\n-- flight_reap_receipts (0109) cannot hold it: its previous_status CHECK excludes 'waiting', and\n-- a cancel is legal from waiting. flight_event_outbox is a landing delivery queue (0109 explains\n-- why a non-landing row there would be announced as a landing).\n--\n-- Additive only: CREATE TABLE / INDEX IF NOT EXISTS. No cost column is invented: cost_metered is\n-- recorded as read from the flight, and flights.cost_micro_usd is never touched by a cancel.\nCREATE TABLE IF NOT EXISTS flight_cancel_receipts (\n  id              TEXT PRIMARY KEY,\n  tenant          TEXT NOT NULL,\n  flight_id       TEXT NOT NULL,\n  previous_status TEXT NOT NULL CHECK (previous_status IN ('preflight', 'running', 'waiting', 'sleeping')),\n  actor_kind      TEXT NOT NULL CHECK (actor_kind IN ('member', 'agent')),\n  actor_id        TEXT NOT NULL,\n  cancel_reason   TEXT NOT NULL,\n  cost_metered    INTEGER NOT NULL CHECK (cost_metered IN (0, 1)),\n  payload         TEXT NOT NULL CHECK (json_valid(payload)),\n  created_at      TEXT NOT NULL,\n  -- A flight leaves its non-terminal states once, so one cancel receipt per flight.\n  UNIQUE (tenant, flight_id)\n);",
+    ],
+    objects: [
+      { type: "table", name: "flight_cancel_receipts" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "0383b04657dff850e7e73cf318d7ef5a0b8b3fab1de5db9592a49e741674375e"
+export const SCHEMA_CHAIN_DIGEST: string = "3bad715eec7c698533bf5f1e3525519afb3aed3c54dd2de9d02625859c367d45"

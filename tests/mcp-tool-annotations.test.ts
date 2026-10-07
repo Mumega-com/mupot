@@ -137,7 +137,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   ]
   const ALL_DESTRUCTIVE = [
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
-    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_land',
+    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
     'flight_reap_stalled', 'grant_agent_capability', 'loop_control', 'loop_set_status', 'mint_agent_token',
     'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
     'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',

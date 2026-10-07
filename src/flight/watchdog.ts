@@ -518,6 +518,108 @@ export async function reapStalledFlight(
   }
 }
 
+export interface FlightCancelResult {
+  transitioned: boolean
+  flight_id: string
+  previous_status?: FlightStatus
+  receipt?: boolean
+  cost_metered?: boolean
+  error?: string
+}
+
+/**
+ * Governed early close of a flight by a lead/admin (mupot#1730). Same authz helper as the
+ * reap (canReapFlight). Ends the flight as 'failed' with gate_reason 'cancelled_by_lead: ...'
+ * (the status CHECK is not widened; see migrations/0194). Never touches cost or tasks. The
+ * receipt is inserted in the SAME batch as the transition, guarded on that exact transition
+ * having landed, so a cancelled flight cannot lack its receipt.
+ */
+export async function cancelFlight(
+  env: Env,
+  flightId: string,
+  principal: ReapPrincipalContext,
+  reason: string,
+  nowMs: number = Date.now(),
+): Promise<FlightCancelResult> {
+  const flight = await getFlight(env, flightId)
+  if (!flight) return { transitioned: false, flight_id: flightId, error: 'flight_not_found' }
+
+  // Authorize before revealing lifecycle state.
+  if (!canReapFlight(flight, principal)) {
+    return { transitioned: false, flight_id: flightId, error: 'forbidden_insufficient_cancel_capability' }
+  }
+
+  const previousStatus = flight.status
+  if (
+    previousStatus !== 'preflight' && previousStatus !== 'running' &&
+    previousStatus !== 'waiting' && previousStatus !== 'sleeping'
+  ) {
+    return { transitioned: false, flight_id: flightId, previous_status: previousStatus, error: 'flight_already_terminal' }
+  }
+
+  const costMetered = flight.cost_metered === 0 ? 0 : 1
+  const gateReason = `cancelled_by_lead: ${reason.slice(0, 400)}`
+  const runReason = `cancelled_by_lead: ${reason.slice(0, 200)}`
+  const nowIso = new Date(nowMs).toISOString()
+  const payload = JSON.stringify({
+    flight_id: flightId,
+    previous_status: previousStatus,
+    target_status: 'failed',
+    cancel_reason: reason,
+    cost_metered: costMetered === 1,
+    cancelled_at: nowIso,
+    actor: principal.actor,
+  })
+
+  // The status guard pins the exact status we recorded as previous_status, so the receipt's
+  // previous_status is true even if the flight moved between the read and this write.
+  const batch = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE flights
+          SET status = 'failed', gate_reason = ?3, ended_at = ?4
+        WHERE id = ?1 AND tenant = ?2 AND status = ?5
+        RETURNING id, status`,
+    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, previousStatus),
+    env.DB.prepare(
+      `UPDATE routine_runs
+          SET status = 'failed', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+              result_summary = ?1, finished_at = ?2, updated_at = ?2
+        WHERE tenant = ?3 AND flight_id = ?4
+          AND status IN ('queued','leased','observing','waiting','running')
+          AND EXISTS (
+            SELECT 1 FROM flights
+             WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5 AND gate_reason = ?6
+          )`,
+    ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs, gateReason),
+    env.DB.prepare(
+      `INSERT INTO flight_cancel_receipts
+         (id, tenant, flight_id, previous_status, actor_kind, actor_id, cancel_reason, cost_metered, payload, created_at)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+        WHERE EXISTS (
+          SELECT 1 FROM flights
+           WHERE id = ?3 AND tenant = ?2 AND status = 'failed' AND ended_at = ?11 AND gate_reason = ?12
+        )
+       ON CONFLICT (tenant, flight_id) DO NOTHING
+       RETURNING id`,
+    ).bind(
+      crypto.randomUUID(), env.TENANT_SLUG, flightId, previousStatus, principal.actor.kind,
+      principal.actor.id, reason, costMetered, payload, nowIso, nowMs, gateReason,
+    ),
+  ])
+
+  // Decide from RETURNING rows, never meta.changes.
+  if ((batch[0]?.results ?? []).length === 0) {
+    return { transitioned: false, flight_id: flightId, previous_status: previousStatus, error: 'transition_race_or_already_terminal' }
+  }
+  return {
+    transitioned: true,
+    flight_id: flightId,
+    previous_status: previousStatus,
+    receipt: (batch[2]?.results ?? []).length > 0,
+    cost_metered: costMetered === 1,
+  }
+}
+
 /**
  * Finished parked flights past the grace window (mupot#1540 r2 P1-A): waiting, not yet
  * escalated, every task done. Its own window and LIMIT, like the other two — and a row
