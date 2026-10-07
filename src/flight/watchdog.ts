@@ -25,6 +25,7 @@
 //      would be broadcast as a successful landing (mupot#1132 / #1147).
 
 import type { Env } from '../types'
+import { runningActionExistsSql } from '../routines/running-action'
 import type { FlightRow, FlightStatus } from './service'
 import { getFlight } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
@@ -537,6 +538,13 @@ export interface FlightCancelResult {
   previous_status?: FlightStatus
   receipt?: boolean
   cost_metered?: boolean
+  /**
+   * Fate of the routine run bound to this flight, decided by the guarded write (RETURNING), not a pre-read.
+   * 'confirmed' = run cancelled, no action was running. 'unconfirmed' = a routine action was already running
+   * (its effect may still commit): run recorded failed/cancellation_unconfirmed, same as cancelRoutineRun.
+   * undefined = the flight has no live routine run.
+   */
+  routine_outcome?: 'confirmed' | 'unconfirmed'
   error?: string
 }
 
@@ -601,17 +609,61 @@ export async function cancelFlight(
         WHERE id = ?1 AND tenant = ?2 AND status = ?5
         RETURNING id, status`,
     ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, previousStatus),
+    // Confirmed branch: no action running. The in-flight check is INSIDE the WHERE (shared predicate).
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'cancelled', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
               result_summary = ?1, finished_at = ?2, updated_at = ?2
         WHERE tenant = ?3 AND flight_id = ?4
           AND status IN ('queued','leased','observing','waiting','running')
+          AND NOT ${runningActionExistsSql('routine_runs.id', 'routine_runs.tenant')}
           AND EXISTS (
             SELECT 1 FROM flights
              WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5 AND gate_reason = ?6
-          )`,
+          )
+        RETURNING id`,
     ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs, gateReason),
+    // Unconfirmed branch: an action is running; its effect cannot be fenced. Mirrors cancelRoutineRun.
+    env.DB.prepare(
+      `UPDATE routine_runs
+          SET status = 'failed', waiting_reason = NULL, lease_owner = NULL, lease_expires_at = NULL,
+              retry_at = NULL, result_summary = 'cancellation_unconfirmed', finished_at = ?1, updated_at = ?1
+        WHERE tenant = ?2 AND flight_id = ?3
+          AND status IN ('queued','leased','observing','waiting','running')
+          AND ${runningActionExistsSql('routine_runs.id', 'routine_runs.tenant')}
+          AND EXISTS (
+            SELECT 1 FROM flights
+             WHERE id = ?3 AND tenant = ?2 AND status = 'failed' AND ended_at = ?4 AND gate_reason = ?5
+          )
+        RETURNING id`,
+    ).bind(nowIso, env.TENANT_SLUG, flightId, nowMs, gateReason),
+    env.DB.prepare(
+      `UPDATE routine_run_actions
+          SET status = 'cancelled', updated_at = ?1
+        WHERE tenant = ?2 AND status IN ('pending','waiting','running')
+          AND run_id IN (
+            SELECT id FROM routine_runs
+             WHERE tenant = ?2 AND flight_id = ?3 AND status = 'failed'
+               AND result_summary = 'cancellation_unconfirmed' AND finished_at = ?1
+          )`,
+    ).bind(nowIso, env.TENANT_SLUG, flightId),
+    env.DB.prepare(
+      `INSERT INTO routine_run_events (
+         id, tenant, project_id, run_id, kind, actor_type, actor_id, occurred_at, metadata_json, correlation_id
+       ) SELECT ?1, tenant, project_id, id, 'cancellation_unconfirmed', ?2, ?3, ?4, ?5, id
+           FROM routine_runs
+          WHERE tenant = ?6 AND flight_id = ?7 AND status = 'failed'
+            AND result_summary = 'cancellation_unconfirmed' AND finished_at = ?4
+            AND NOT EXISTS (
+              SELECT 1 FROM routine_run_events e
+               WHERE e.run_id = routine_runs.id AND e.tenant = routine_runs.tenant
+                 AND e.kind IN ('cancellation_confirmed','cancellation_unconfirmed')
+            )`,
+    ).bind(
+      crypto.randomUUID(), principal.actor.kind, principal.actor.id, nowIso,
+      JSON.stringify({ reason: 'flight_cancelled', action_claimed: true, flight_stopped: true }),
+      env.TENANT_SLUG, flightId,
+    ),
     env.DB.prepare(
       `INSERT INTO flight_cancel_receipts
          (id, tenant, flight_id, previous_status, actor_kind, actor_id, cancel_reason, cost_metered, payload, created_at)
@@ -636,8 +688,13 @@ export async function cancelFlight(
     transitioned: true,
     flight_id: flightId,
     previous_status: previousStatus,
-    receipt: (batch[2]?.results ?? []).length > 0,
+    receipt: (batch[5]?.results ?? []).length > 0,
     cost_metered: costMetered === 1,
+    ...((batch[2]?.results ?? []).length > 0
+      ? { routine_outcome: 'unconfirmed' as const }
+      : (batch[1]?.results ?? []).length > 0
+        ? { routine_outcome: 'confirmed' as const }
+        : {}),
   }
 }
 
