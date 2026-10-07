@@ -217,14 +217,85 @@ describe('#1763 gate P2: a Studio flight that launched a real Cursor agent is re
     expect(r.reasons.some((x) => x.startsWith('clearance_shared_artifact_ref:'))).toBe(true)
   })
 
-  it('Cursor launch failed -> bookkeeping=1 and the real dispatch clears', async () => {
+  async function studioWith(fetchImpl: (() => Promise<Response>) | null, token: string | null = 'tok') {
     const { h, env } = podHarness()
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('boom', { status: 500 })))
-    const s = await dispatchStudioFlight({ ...env, CURSOR_API_TOKEN: 'tok' } as Env, auth, { prompt: 'no launch', repoUrl: REPO, model: 'cursor-cloud' })
+    const fetchMock = vi.fn(fetchImpl ?? (async () => new Response('unused', { status: 200 })))
+    vi.stubGlobal('fetch', fetchMock)
+    const e = (token ? { ...env, CURSOR_API_TOKEN: token } : env) as Env
+    const s = await dispatchStudioFlight(e, auth, { prompt: 'work', repoUrl: REPO, model: 'cursor-cloud' })
     expect(s.ok).toBe(true)
     if (s.ok) expect(s.result.cursor_launched).toBe(false)
-    expect((h.sqlite.prepare('SELECT bookkeeping FROM flights').get() as { bookkeeping: number }).bookkeeping).toBe(1)
+    const bk = (h.sqlite.prepare('SELECT bookkeeping FROM flights').get() as { bookkeeping: number }).bookkeeping
+    return { env, bk, fetchMock }
+  }
+
+  it('clean 4xx refusal (nothing launched) -> bookkeeping=1 and the real dispatch clears', async () => {
+    const { env, bk, fetchMock } = await studioWith(async () => new Response(JSON.stringify({ error: 'bad_repo' }), { status: 422 }))
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(bk).toBe(1)
     expect((await clearFlightMeta(env, real)).cleared).toBe(true)
+  })
+
+  it('no CURSOR_API_TOKEN (no request sent) -> bookkeeping=1', async () => {
+    const { env, bk, fetchMock } = await studioWith(null, null)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(bk).toBe(1)
+    expect((await clearFlightMeta(env, real)).cleared).toBe(true)
+  })
+
+  it('500 (maybe launched) -> bookkeeping=0 and a later real dispatch on the repo is HELD', async () => {
+    const { env, bk } = await studioWith(async () => new Response('boom', { status: 500 }))
+    expect(bk).toBe(0)
+    const r = await clearFlightMeta(env, real)
+    expect(r.cleared).toBe(false)
+    expect(r.reasons.some((x) => x.startsWith('clearance_shared_artifact_ref:'))).toBe(true)
+  })
+
+  it('fetch throws after send (connection reset) -> bookkeeping=0 HELD', async () => {
+    const { env, bk } = await studioWith(async () => { throw new TypeError('connection reset') })
+    expect(bk).toBe(0)
+    expect((await clearFlightMeta(env, real)).cleared).toBe(false)
+  })
+
+  it('2xx with a malformed body -> bookkeeping=0 HELD', async () => {
+    const { env, bk } = await studioWith(async () => new Response('<html>ok</html>', { status: 200 }))
+    expect(bk).toBe(0)
+    expect((await clearFlightMeta(env, real)).cleared).toBe(false)
+  })
+
+  it('408 timeout is not a clean refusal -> bookkeeping=0 HELD', async () => {
+    const { bk } = await studioWith(async () => new Response('timeout', { status: 408 }))
+    expect(bk).toBe(0)
+  })
+})
+
+describe('#1762 launchCursorAgent tri-state', () => {
+  it('classifies each outcome at the source', async () => {
+    const { launchCursorAgent } = await import('../src/cursor/client')
+    const o = { name: 'n', repoUrl: REPO, prompt: 'p' }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: 403 })))
+    expect((await launchCursorAgent('tok', o)).state).toBe('not_launched')
+    expect((await launchCursorAgent('  ', o)).state).toBe('not_launched')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('x', { status: 502 })))
+    expect((await launchCursorAgent('tok', o)).state).toBe('maybe_launched')
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('reset') }))
+    expect((await launchCursorAgent('tok', o)).state).toBe('maybe_launched')
+  })
+})
+
+describe('#1762 createFlight option precedence cannot silently drop bookkeeping', () => {
+  const nf = { agent: 'agent-a', goal: 'g', meta: real }
+  it('bookkeeping + client_request_id / redispatchReceipt / fence is refused, not silently written as 0', async () => {
+    const { h, env } = podHarness()
+    await expect(createFlight(env, { ...nf, client_request_id: 'req-1' }, { bookkeeping: true })).rejects.toThrow('flight_bookkeeping_option_conflict')
+    await expect(createFlight(env, nf, { bookkeeping: true, routineRunFence: { runId: 'r', tenant: 'pot-a' } })).rejects.toThrow('flight_bookkeeping_option_conflict')
+    await expect(createFlight(env, nf, { bookkeeping: true, redispatchReceipt: {} as never })).rejects.toThrow('flight_bookkeeping_option_conflict')
+    expect((h.sqlite.prepare('SELECT COUNT(*) AS n FROM flights').get() as { n: number }).n).toBe(0)
+  })
+  it('bookkeeping alone is honored', async () => {
+    const { h, env } = podHarness()
+    const id = await createFlight(env, nf, { bookkeeping: true })
+    expect((h.sqlite.prepare('SELECT bookkeeping FROM flights WHERE id = ?').get(id) as { bookkeeping: number }).bookkeeping).toBe(1)
   })
 })
 

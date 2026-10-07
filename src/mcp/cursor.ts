@@ -3,7 +3,7 @@
 // cursor_dispatch launches a Cursor Cloud agent (POST /v1/agents), then writes
 // the matching mupot task + flight. cursor_run_status polls a run.
 
-import { createCursorAgent, CursorApiError, getCursorRun, resolveCursorApiToken } from '../cursor/client'
+import { CursorApiError, launchCursorAgent, getCursorRun, resolveCursorApiToken } from '../cursor/client'
 import { recordCursorCloudWork } from '../cursor/dispatch'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Capability, Env } from '../types'
@@ -81,12 +81,14 @@ export const toolCursorDispatch: ToolSpec = {
     const reservedFlightId = crypto.randomUUID()
     const launchedPrompt = injectSevenAxisSeatDeclaration(prompt, reservedFlightId)
 
-    let launched
-    try {
-      launched = await createCursorAgent(token, { name, repoUrl, prompt: launchedPrompt, model })
-    } catch (error) {
-      return cursorFailure(error)
+    const outcome = await launchCursorAgent(token, { name, repoUrl, prompt: launchedPrompt, model })
+    if (outcome.state === 'not_launched') return cursorFailure(outcome.error)
+    if (outcome.state === 'maybe_launched') {
+      // #1762: the create POST may have been applied. Do not present this as a clean failure a caller can blindly
+      // retry; surface that an agent may exist. (No row is recorded here: that gap is tracked on #1762.)
+      return fail(503, 'cursor_launch_unconfirmed', { launch: 'maybe_launched' })
     }
+    const launched = outcome.result
 
     const actor = auth.memberId
       ? { kind: 'member' as const, id: auth.memberId }

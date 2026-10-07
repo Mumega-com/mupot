@@ -171,6 +171,13 @@ Two presence sources, by agent tier:
   through an internal `createFlight` option (never from request or meta input). Bookkeeping flights never HOLD and never
   count toward the HOLD cap; they may still WARN. A Studio flight that DID launch a Cursor agent is real work on the
   repo and stays HOLD-able. Giving these flights a real lifecycle remains open (#1762).
+  **Tri-state rule.** `launchCursorAgent` (`src/cursor/client.ts`) returns `launched | not_launched | maybe_launched`.
+  `bookkeeping = 1` is allowed ONLY for `not_launched`: no request was sent (no/blank token, launch skipped, invalid
+  args) or Cursor returned a clean 4xx refusal (408 excluded). Everything else is `maybe_launched` (5xx, connection
+  reset or timeout after send, 2xx with an unparseable body, unclassified error) and the flight is `bookkeeping = 0`,
+  so it HOLDs like real work: a real agent may be running on that repo. `createFlight` refuses `bookkeeping: true`
+  combined with `routineRunFence`, `client_request_id` or `redispatchReceipt` (`flight_bookkeeping_option_conflict`)
+  rather than silently writing 0. Every caller of the launch path consumes the tri-state (Studio, `cursor_dispatch`).
 - The clearance read is scoped in SQL to live flights whose meta intersects the proposed meta (`task_ids`,
   `artifact_refs` for HOLD; `objective_id`, `goal_id`, `squad_ids` for WARN), so unrelated live flights cannot
   truncate it; only an overflowing intersecting HOLD set fails closed.

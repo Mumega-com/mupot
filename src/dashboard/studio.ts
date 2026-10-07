@@ -19,7 +19,7 @@ import type { Context } from 'hono'
 import { resolveCapabilities, holdsCapabilityFloor, isOrgAdmin } from '../auth/capability'
 import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import { csrf } from 'hono/csrf'
-import { createCursorAgent, resolveCursorApiToken } from '../cursor/client'
+import { launchCursorAgent, resolveCursorApiToken } from '../cursor/client'
 import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
@@ -199,17 +199,20 @@ export async function dispatchStudioFlight(
   const reservedFlightId = crypto.randomUUID()
   const launchedPrompt = model === 'cursor-cloud' ? injectSevenAxisSeatDeclaration(prompt, reservedFlightId) : prompt
   let cursor: { agent_id: string; run_id: string; agent_url: string } | null = null
+  let cursorMaybeLaunched = false
   const token = model === 'cursor-cloud' ? resolveCursorApiToken(env) : null
   if (token && repoUrl) {
-    try {
-      const launched = await createCursorAgent(token, { name: title, repoUrl, prompt: launchedPrompt })
+    const outcome = await launchCursorAgent(token, { name: title, repoUrl, prompt: launchedPrompt })
+    if (outcome.state === 'launched') {
       cursor = {
-        agent_id: launched.agent.id,
-        run_id: launched.run.id,
-        agent_url: launched.agent.url,
+        agent_id: outcome.result.agent.id,
+        run_id: outcome.result.run.id,
+        agent_url: outcome.result.agent.url,
       }
-    } catch {
-      cursor = null
+    } else if (outcome.state === 'maybe_launched') {
+      // #1762: the POST may have reached Cursor (5xx / reset / timeout / bad 2xx body): a real agent may be running on
+      // this repo. Not a bookkeeping flight; it HOLDs like real work.
+      cursorMaybeLaunched = true
     }
   }
 
@@ -243,7 +246,7 @@ export async function dispatchStudioFlight(
   // 'preflight', NULL budget, never landed; closed by the watchdog after 60-84 min, cancelFlight or flight_reap_stalled).
   // It is then marked `bookkeeping` (server-set via the createFlight option, never request/meta input) so a
   // member-supplied repoUrl cannot plant a clearance HOLD on someone's repo. When a Cursor cloud agent WAS launched
-  // against repoUrl, the flight is the only row for real work on that repo, so it stays HOLD-able (bookkeeping=false).
+  // (or MAY have been: tri-state launchCursorAgent, only no-request / clean-4xx count as not launched) against repoUrl, the flight is the only row for real work on that repo, so it stays HOLD-able (bookkeeping=false).
   // Not itself clearance-gated either way (would self-block Deploy -> Studio).
   const flightId = await createFlight(env, {
     agent: home.agentId,
@@ -266,7 +269,7 @@ export async function dispatchStudioFlight(
       publication_target: 'none',
       parent_flight_id: null,
     },
-  }, { id: reservedFlightId, bookkeeping: cursor === null })
+  }, { id: reservedFlightId, bookkeeping: cursor === null && !cursorMaybeLaunched })
 
   return {
     ok: true,
