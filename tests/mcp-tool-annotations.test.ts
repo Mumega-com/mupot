@@ -127,7 +127,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   const ALL_READ_ONLY = [
     'archive_plan_expand', 'athena_review_pr', 'cursor_run_status', 'elevation_status',
     'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
-    'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'inbox_consumer_status',
+    'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
     'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
@@ -138,7 +138,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   const ALL_DESTRUCTIVE = [
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
     'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
-    'flight_reap_stalled', 'grant_agent_capability', 'loop_control', 'loop_set_status', 'mint_agent_token',
+    'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'loop_control', 'loop_set_status', 'mint_agent_token',
     'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
     'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
     'project_update', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',

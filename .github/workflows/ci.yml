@@ -214,6 +214,8 @@ jobs:
         run: node --test tests/check-mcp-tool-seam.test.mjs
       - name: Guard — MCP tool tests must enter through invokeTool
         run: node scripts/check-mcp-tool-seam.mjs
+      - name: Harness capacity reporter self-tests (allowlist + counts-only)
+        run: node --test tests/harness-capacity-reporter.test.mjs
 
   openapi-public-allowlist:
     runs-on: ubuntu-latest

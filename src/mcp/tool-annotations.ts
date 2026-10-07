@@ -239,6 +239,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
 
   // ── runners / flight spine ─────────────────────────────────────────────────────────────────
   runner_record: MUT('recordRunner INSERT runner_receipts ON CONFLICT(id) DO UPDATE SET status, ended_at, evidence_summary, verdict_line, log_url: overwrites an existing receipt row (runners/service.ts:103-109)'),
+  harness_capacity_report: MUT('upsertCapacity INSERT ... ON CONFLICT DO UPDATE harness_capacity_snapshots (harness/capacity.ts): overwrites the caller\'s own latest snapshot row'),
+  harness_capacity_list: RO('listCapacity SELECT only (harness/capacity.ts)'),
   runner_list: RO('listRunners SELECT only (runners/service.ts:145)'),
   objective_accept: ADD('acceptObjective INSERT objectives + acceptance keys + audit (flight-spine/objectives.ts:469,605)'),
   objective_get: RO('visibleObjective SELECT only (mcp/flight-spine.ts:210)'),

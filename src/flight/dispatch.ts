@@ -25,6 +25,7 @@ import { checkFlightClearance } from './clearance'
 import type { ClearanceResult } from './clearance'
 import type { RedispatchReceiptInput } from './rebooking'
 import type { FlightMetaV1 } from './meta'
+import { saturatedHarnessAdvisories } from '../harness/capacity'
 
 export interface DispatchExtra {
   // The override mechanism: an intentional co-work flight that already knows about and
@@ -45,6 +46,8 @@ export interface DispatchResult {
   reasons: string[]
   score: number
   clearance?: ClearanceResult
+  /** mupot#1765: WARN-class, NON-blocking (e.g. `harness_capacity_saturated:orca:hadi-mac`). Absent when empty. */
+  advisories?: string[]
 }
 
 function clearanceReasonTags(clearance: ClearanceResult): string[] {
@@ -116,6 +119,8 @@ export async function dispatchFlight(
     ...(extra.redispatchReceipt ? { redispatchReceipt: extra.redispatchReceipt } : {}),
   })
   const status = await applyPreflight(env, id, combined)
+  // mupot#1765: advisory only — never changes go/reasons/status. One bounded read, never throws.
+  const advisories = await saturatedHarnessAdvisories(env)
   return {
     id,
     go: combined.go,
@@ -123,5 +128,6 @@ export async function dispatchFlight(
     reasons: combined.reasons,
     score: combined.score,
     clearance,
+    ...(advisories.length > 0 ? { advisories } : {}),
   }
 }

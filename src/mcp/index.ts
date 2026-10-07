@@ -212,6 +212,7 @@ import {
 } from './events'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { RUNNER_TOOLS } from './runners'
+import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
 import { FLIGHT_SPINE_TOOLS } from './flight-spine'
 import { CURSOR_TOOLS } from './cursor'
 import { ATHENA_TOOLS } from './athena'
@@ -6555,6 +6556,7 @@ export const TOOLS: ToolSpec[] = [
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
   ...RUNNER_TOOLS,
+  ...HARNESS_CAPACITY_TOOLS,
   ...FLIGHT_SPINE_TOOLS,
   ...CURSOR_TOOLS,
   ...ATHENA_TOOLS,
