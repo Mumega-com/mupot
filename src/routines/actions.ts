@@ -1,3 +1,4 @@
+import { runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage } from '../agents/messages'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
@@ -2048,7 +2049,7 @@ export async function cancelRoutineRun(
   const children = { project_id: live.project_id, task_id: taskId, flight_id: flightId }
 
   const runningAction = await env.DB.prepare(
-    "SELECT 1 FROM routine_run_actions WHERE run_id = ? AND tenant = ? AND status = 'running' LIMIT 1",
+    `SELECT 1 WHERE ${runningActionExistsSql('?', '?')}`,
   ).bind(live.id, live.tenant).first()
   const deliveredMessage = await env.DB.prepare(
     `SELECT 1 FROM agent_messages
