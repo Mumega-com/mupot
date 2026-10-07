@@ -177,7 +177,7 @@ import {
   POLL_PRESENCE_MODE,
   RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
-import { hasRegisteredDeliverySurface } from '../bus/consumer'
+import { hasRegisteredDeliverySurface, resolveDispatchDeliveryMode } from '../bus/consumer'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { toolAgentLifecycle } from './agent-lifecycle'
@@ -2512,8 +2512,19 @@ const toolTaskDispatch: ToolSpec = {
     //     accepts agent OR independent-member holders (allowMemberHolders: true).
     //   - inbox route can only settle through the completed runtime receipt, which is
     //     agent-holders-only -> a FORCED delivery:'inbox' requires an AGENT holder.
-    // RESIDUAL: a normal dispatch whose gate is held only by a human can still be routed to
-    // inbox by the natural poll route; that task cannot complete via the receipt.
+    // RESIDUAL (mupot#1733): a normal dispatch whose gate is held only by a human can still be
+    // routed to inbox by the natural poll route; that task cannot complete via the receipt.
+    // Not refused (the human-verdict path is legitimate): the route is predicted below with the
+    // consumer's own resolveDispatchDeliveryMode and surfaced as warning gate_member_only_inbox.
+    // STRICTNESS vs the verdict path (mupot#1733): this preflight demands a credentialed AGENT
+    // holder or an independent, standing, non-affiliated MEMBER holder. evaluateVerdictGates
+    // (src/tasks/index.ts) lets an org owner/admin give a verdict with NO gate grant and NO
+    // squad-standing check, and exempts them from assignee affiliation. So dispatch can refuse a
+    // gate that only such a principal could clear; deliberate (dispatch must not start work
+    // nobody-by-grant can approve), not a bug. No behaviour change here.
+    // REST vs MCP (mupot#1733): REST POST /tasks dispatch:true refuses null and
+    // 'gate:agent-self-completion' gates (src/tasks/index.ts); this MCP tool exempts them.
+    // Known divergence, documented only.
     // null / 'gate:agent-self-completion' are not refused (they claim no independent holder
     // and settle through the self-completion verdict flow). The router_tick wake
     // (src/router/engine.ts) has no gate check; that predates this and is a follow-up.
@@ -2576,6 +2587,38 @@ const toolTaskDispatch: ToolSpec = {
       if (!hasRegisteredDeliverySurface(route)) deliveryForcedPredicted = 'no_delivery_mode'
     }
     const effectiveForceDelivery = forceInboxDelivery && !deliveryForcedPredicted
+
+    // mupot#1733 — predict the route with the consumer's own decision function. If it is the
+    // inbox and the gate has only HUMAN holders (no agent holder), the agent-only `completed`
+    // receipt can never settle: completion must go through task_submit_result + a human verdict.
+    // Warn, never refuse. A prediction (the fleet row can change before the consumer runs).
+    let gateMemberOnlyInbox = false
+    if (task.gate_owner !== null && task.gate_owner !== 'gate:agent-self-completion') {
+      const route = await getFleetAgentLiveness(env, task.assignee_agent_id)
+      if (
+        resolveDispatchDeliveryMode(route, effectiveForceDelivery) === 'inbox'
+        && !(await hasIndependentRuntimeGate(env, task.gate_owner, task.assignee_agent_id, task.squad_id, { allowMemberHolders: false }))
+      ) gateMemberOnlyInbox = true
+    }
+
+    // #1739 contract: `warning` stays receiver_stale (full object) whenever it applies; the
+    // `warnings` array lists EVERY applicable warning (receiver_stale first, then #1733's).
+    const warnings: Array<Record<string, unknown>> = []
+    if (receiverVerdict.stale_poll) {
+      warnings.push({
+        code: 'receiver_stale',
+        agent_id: task.assignee_agent_id,
+        last_reported_at: receiverVerdict.last_reported_at,
+        presence_ttl_sec: receiverVerdict.presence_ttl_sec,
+      })
+    }
+    if (gateMemberOnlyInbox) {
+      warnings.push({
+        code: 'gate_member_only_inbox',
+        gate_owner: task.gate_owner,
+        detail: 'gate is held only by human members and this dispatch routes to the inbox; the completed runtime receipt cannot settle it. Complete via task_submit_result, then a human verdict.',
+      })
+    }
 
     const memberId = auth.memberId as string
     const receiptId = crypto.randomUUID()
@@ -2642,14 +2685,7 @@ const toolTaskDispatch: ToolSpec = {
         dispatched_at: dispatchedAt,
       },
       ...(deliveryForcedPredicted ? { delivery_forced_predicted: deliveryForcedPredicted } : {}),
-      ...(receiverVerdict.stale_poll ? {
-        warning: {
-          code: 'receiver_stale',
-          agent_id: task.assignee_agent_id,
-          last_reported_at: receiverVerdict.last_reported_at,
-          presence_ttl_sec: receiverVerdict.presence_ttl_sec,
-        },
-      } : {}),
+      ...(warnings.length > 0 ? { warning: warnings[0], warnings } : {}),
     })
   },
 }
