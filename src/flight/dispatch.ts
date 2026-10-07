@@ -24,6 +24,7 @@ import type { NewFlight } from './service'
 import { checkFlightClearance } from './clearance'
 import type { ClearanceResult } from './clearance'
 import type { RedispatchReceiptInput } from './rebooking'
+import type { FlightMetaV1 } from './meta'
 
 export interface DispatchExtra {
   // The override mechanism: an intentional co-work flight that already knows about and
@@ -51,6 +52,41 @@ function clearanceReasonTags(clearance: ClearanceResult): string[] {
   return truncated.concat(clearance.holds.flatMap((hold) => hold.reasons.map((reason) => `clearance_${reason}:${hold.flight_b_id}`)))
 }
 
+export interface FlightMetaClearance {
+  cleared: boolean
+  /** True when the live-set read hit its cap: the set may be incomplete, so clearance fails closed (#1755). */
+  truncated: boolean
+  /** Tags such as `clearance_shared_artifact_ref:<flight id>`; empty when cleared. */
+  reasons: string[]
+  clearance: ClearanceResult
+}
+
+/**
+ * THE chokepoint (#1758): every flight writer that carries `task_ids` / `artifact_refs` meta runs the
+ * ATC clearance through this one function — dispatchFlight, project deploy, Studio dispatch, Routine
+ * control flights. Reads the FULL live set in SQL (never the newest-N window) and fails closed on truncation.
+ * `ignoreFlightIds` names flights the proposed flight may knowingly share airspace with (co-work override,
+ * or a routine run's own earlier attempts).
+ */
+export async function clearFlightMeta(
+  env: Env,
+  meta: FlightMetaV1,
+  opts: { ignoreFlightIds?: string[] } = {},
+): Promise<FlightMetaClearance> {
+  const active = await listLiveFlights(env)
+  const clearance = checkFlightClearance(meta, active.rows, {
+    liveSetTruncated: active.truncated,
+    tenant: env.TENANT_SLUG,
+    ignoreFlightIds: opts.ignoreFlightIds,
+  })
+  return {
+    cleared: clearance.cleared,
+    truncated: active.truncated,
+    reasons: clearance.cleared ? [] : clearanceReasonTags(clearance),
+    clearance,
+  }
+}
+
 export async function dispatchFlight(
   env: Env,
   flight: NewFlight,
@@ -62,14 +98,7 @@ export async function dispatchFlight(
 
   let clearance: ClearanceResult | undefined
   if (flight.meta) {
-    // The FULL live set, selected in SQL (#1755) — never the newest-N window. If the read hit its cap the
-    // set may be incomplete, so clearance fails closed.
-    const active = await listLiveFlights(env)
-    clearance = checkFlightClearance(flight.meta, active.rows, {
-      liveSetTruncated: active.truncated,
-      tenant: env.TENANT_SLUG,
-      ignoreFlightIds: extra.allowCollisionWith,
-    })
+    clearance = (await clearFlightMeta(env, flight.meta, { ignoreFlightIds: extra.allowCollisionWith })).clearance
   }
 
   const cleared = clearance ? clearance.cleared : true

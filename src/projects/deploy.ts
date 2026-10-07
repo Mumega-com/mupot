@@ -1,5 +1,7 @@
 import type { AuthContext, Env, Project, ProjectDeployment, ProjectDeployStatus } from '../types'
 import { createFlight } from '../flight/service'
+import { clearFlightMeta } from '../flight/dispatch'
+import type { FlightMetaV1 } from '../flight/meta'
 import { createTask } from '../tasks/service'
 import { getProject } from './service'
 import { githubRepoSlug, studioDispatchPath } from './urls'
@@ -13,6 +15,8 @@ export type ProjectDeployError =
   | 'repo_required'
   | 'invalid_commit_sha'
   | 'receipt_failed'
+  // #1758: another live flight already holds this repo (shared artifact_ref) — refused before any task/flight/receipt.
+  | 'flight_clearance_hold'
 
 export type ProjectDeployResult =
   | {
@@ -96,6 +100,36 @@ async function markProjectDeployStatus(
   ).bind(status, new Date().toISOString(), projectId).run()
 }
 
+function deployFlightMeta(project: Project, squadId: string, taskIds: string[]): FlightMetaV1 {
+  return {
+    schema: 'mupot.flight.meta/v1',
+    goal_id: `project-deploy:${project.id}`,
+    objective_id: 'feature-flight',
+    squad_ids: [squadId],
+    task_ids: taskIds,
+    done_when: ['Feature flight lands with a reviewable receipt against the project repo.'],
+    artifact_refs: project.repo_url ? [project.repo_url] : [],
+    receipt_refs: [],
+    confidentiality: 'internal',
+    publication_target: 'none',
+    parent_flight_id: null,
+  }
+}
+
+/**
+ * #1758: a deploy flight claims the project's repo as an artifact_ref, so a second deploy on the same repo while
+ * one is live is a HOLD-level collision. Decision: REFUSE (typed `flight_clearance_hold`) rather than create a
+ * held flight — deploy is an operator action with a synchronous caller, and a refusal leaves no orphan task,
+ * no 'deploying' status and no receipt for a deploy that never flew. The check runs BEFORE any write; the task
+ * id of the not-yet-created flight is brand new and cannot collide, so it is omitted from the proposed meta.
+ */
+async function deployBlockedByClearance(env: Env, project: Project): Promise<boolean> {
+  const squadId = project.assigned_squad_id
+  if (!squadId || !project.repo_url) return false // dispatchDeployFlight creates no flight in this case
+  const clearance = await clearFlightMeta(env, deployFlightMeta(project, squadId, []))
+  return !clearance.cleared
+}
+
 async function dispatchDeployFlight(
   env: Env,
   auth: AuthContext,
@@ -144,19 +178,7 @@ async function dispatchDeployFlight(
     goal: prompt,
     project_id: project.id,
     trigger_source: 'api',
-    meta: {
-      schema: 'mupot.flight.meta/v1',
-      goal_id: `project-deploy:${project.id}`,
-      objective_id: 'feature-flight',
-      squad_ids: [squadId],
-      task_ids: [task.id],
-      done_when: ['Feature flight lands with a reviewable receipt against the project repo.'],
-      artifact_refs: [project.repo_url],
-      receipt_refs: [],
-      confidentiality: 'internal',
-      publication_target: 'none',
-      parent_flight_id: null,
-    },
+    meta: deployFlightMeta(project, squadId, [task.id]),
   })
 }
 
@@ -179,6 +201,8 @@ export async function deployProject(
   const prompt = typeof input.prompt === 'string' && input.prompt.trim()
     ? input.prompt.trim()
     : `Dispatch a feature flight for ${project.name} against ${githubRepoSlug(project.repo_url) ?? project.repo_url}`
+
+  if (await deployBlockedByClearance(env, project)) return { ok: false, error: 'flight_clearance_hold' }
 
   await markProjectDeployStatus(env, project.id, 'deploying')
 

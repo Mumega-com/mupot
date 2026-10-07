@@ -485,7 +485,7 @@ projectsApp.post('/:id/deploy', async (c) => {
   const body = await jsonObject(c)
   const result = await deployProject(c.env, c.req.param('id'), c.get('auth'), body ?? {})
   if (!result.ok) {
-    const status = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
+    const status = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' || result.error === 'flight_clearance_hold' ? 409 : 400
     return c.json({ error: result.error }, status)
   }
   return c.json({
