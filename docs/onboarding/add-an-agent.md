@@ -9,6 +9,9 @@ Pick the row that matches the harness. Each path ends with the same two-call che
 
 Background: [connect-mcp-client.md](../connect-mcp-client.md) (endpoint, transports, failure shapes).
 
+Next: [setup by harness](harness-setups.md), including the
+[Digid saved-cloud worked example](digid-chatgpt-cloud.md), for runtime setup and evidence limits.
+
 ## Rules that apply to every harness
 
 - Never paste a token into a chat, an issue, a PR or a log. A token shown in a conversation is
