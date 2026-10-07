@@ -90,6 +90,13 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       gate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, department_key TEXT NOT NULL,
       action TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- migrations/0035 subset (mupot#1740): the dispatched-run claim now carries an in-write
+    -- stopped-seat fence (receiverNotStoppedSql) that reads fleet_agents. Same hand-written
+    -- subset class as the columns above (#703); empty here, so nothing is fenced.
+    CREATE TABLE fleet_agents (
+      agent_id TEXT NOT NULL, tenant TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running',
+      PRIMARY KEY (tenant, agent_id)
+    );
   `)
 }
 

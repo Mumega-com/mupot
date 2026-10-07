@@ -20,6 +20,7 @@ import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
+import { receiverNotStoppedSql } from '../fleet/registry'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -167,6 +168,7 @@ export type SendFailure = {
     | 'project_access_denied'
     | 'request_id_conflict'
     | 'dispatch_fenced'
+    | 'receiver_not_live'
     | 'send_target_not_visible'
     | 'inbox_full'
     | 'db_error'
@@ -199,6 +201,12 @@ interface Opts {
   routineRunFence?: { runId: string; projectId: string }
   /** Current durable guest-membership authority must still exist in the message INSERT. */
   guestVisibilityFence?: GuestVisibilityFence
+  /**
+   * mupot#1740 — the envelope INSERT itself refuses when the fleet row resolved for this
+   * agents.id is 'stopped' (concurrent detach between a liveness check and this write). Landing
+   * is decided from RETURNING rows; a refusal is reported as `receiver_not_live`.
+   */
+  receiverNotStopped?: { agentId: string }
 }
 
 function isRef(v: string): boolean {
@@ -220,6 +228,13 @@ async function routineDispatchAllowed(
         )
       LIMIT 1`,
   ).bind(fence.runId, tenant, fence.projectId).first()
+  return row !== null
+}
+
+async function receiverNotStopped(env: Env, agentId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok WHERE ${receiverNotStoppedSql('?1', '?2')}`,
+  ).bind(env.TENANT_SLUG, agentId).first()
   return row !== null
 }
 
@@ -420,15 +435,23 @@ export async function sendAgentMessage(
               AND project.id = ?12 AND project.status = 'active'
          )`
       : ''
+    let receiverFenceSql = ''
+    const receiverFence = opts.receiverNotStopped
+    if (receiverFence) {
+      values.push(receiverFence.agentId)
+      receiverFenceSql = `AND ${receiverNotStoppedSql('?2', `?${values.length}`)}`
+    }
     const routineRunParam = values.length + 1
-    const result = routineFence
-      ? await env.DB.prepare(
+    const returningSql = receiverFence ? ' RETURNING seq' : ''
+    const statement = routineFence
+      ? env.DB.prepare(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
+                 ${receiverFenceSql}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
@@ -438,17 +461,30 @@ export async function sendAgentMessage(
                          WHERE requested.run_id = rr.id AND requested.tenant = rr.tenant
                            AND requested.kind = 'cancellation_requested'
                       )
-                 )`,
-      ).bind(...values, routineFence.runId).run()
-      : await env.DB.prepare(
+                 )${returningSql}`,
+      ).bind(...values, routineFence.runId)
+      : env.DB.prepare(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
                WHERE (SELECT COUNT(*) FROM agent_messages
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
-                 ${activeRecipientProjectAccessSql}`,
-      ).bind(...values).run()
-    if ((result.meta?.changes ?? 0) === 0) {
+                 ${activeRecipientProjectAccessSql}
+                 ${receiverFenceSql}${returningSql}`,
+      ).bind(...values)
+    // Fenced writes decide from RETURNING rows (never meta.changes); unfenced keep meta.changes.
+    let landedRows: number
+    let landedSeq: number
+    if (receiverFence) {
+      const rows = await statement.all<{ seq: number }>()
+      landedRows = (rows.results ?? []).length
+      landedSeq = Number(rows.results?.[0]?.seq ?? 0)
+    } else {
+      const ran = await statement.run()
+      landedRows = ran.meta?.changes ?? 0
+      landedSeq = Number(ran.meta?.last_row_id ?? 0)
+    }
+    if (landedRows === 0) {
       if (routineFence && !await routineDispatchAllowed(env, tenant, routineFence)) {
         return { ok: false, reason: 'dispatch_fenced' }
       }
@@ -461,6 +497,9 @@ export async function sendAgentMessage(
       if (input.requestId !== undefined) {
         const existing = await findBySenderRequestId(env, tenant, input.fromAgent, input.requestId)
         if (existing) return idempotentOrConflict(existing, input, kind)
+      }
+      if (receiverFence && !await receiverNotStopped(env, receiverFence.agentId)) {
+        return { ok: false, reason: 'receiver_not_live' }
       }
       if (
         opts.requireActiveRecipientProjectAccess
@@ -490,7 +529,7 @@ export async function sendAgentMessage(
       }
       return { ok: false, reason: 'inbox_full', detail: `recipient at unread cap ${maxUnread}` }
     }
-    const seq = Number(result.meta?.last_row_id ?? 0)
+    const seq = landedSeq
 
     // mumega-com#970 — the push seam. Emitted HERE and nowhere else, because this is the
     // only point at which a row is proven to have landed:

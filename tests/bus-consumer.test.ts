@@ -477,6 +477,8 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     }
 
     function first(sql: string, b: unknown[]) {
+      // mupot#1740: post-refusal "is the seat stopped?" probe — this mock models no stopped seat.
+      if (sql.startsWith('SELECT 1 AS ok WHERE')) return { ok: 1 }
       // deliverDispatchToInbox reads the task text for the envelope; this mock models no task text.
       if (sql.includes('FROM tasks WHERE id = ?1 LIMIT 1') && sql.includes('title')) return null
       if (sql.includes('FROM task_dispatch_receipts')) {
@@ -573,6 +575,11 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
           bind(...a: unknown[]) { binds.push(...a); return api },
           async first<T>() { return first(sql, binds) as T },
           async run() { return run(sql, binds) },
+          // mupot#1740: the fenced envelope INSERT decides from RETURNING rows (.all()).
+          async all() {
+            const r = run(sql, binds) as { meta: { changes?: number; last_row_id?: number } }
+            return { results: r.meta.changes ? [{ seq: r.meta.last_row_id }] : [] }
+          },
         }
         return api
       },

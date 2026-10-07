@@ -55,6 +55,9 @@ export interface DispatchBridgeInput {
   dispatchedByMemberId: string
   /** Authoritative tasks.project_id inherited by the bus consumer. */
   projectId?: string | null
+  /** mupot#1740 — agents.id of the task assignee. When set, the envelope INSERT itself refuses
+   *  (ReceiverNotLiveError) if that seat's fleet row is 'stopped' at write time. */
+  receiverFenceAgentId?: string
 }
 
 export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
@@ -66,6 +69,9 @@ export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
  * retry that would just re-hit the same full inbox.
  */
 export class InboxFullError extends Error {}
+
+/** mupot#1740 — the in-write stopped-seat fence refused the envelope INSERT (concurrent detach). */
+export class ReceiverNotLiveError extends Error {}
 
 /** Max length (UTF-16 code units, after trim) of each task-text field copied into the envelope. */
 export const DISPATCH_ENVELOPE_TEXT_MAX = 2000
@@ -251,9 +257,17 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
   }, {
     system: true,
     reason: 'target is the internally-resolved task assignee (input.agentId), not attacker input',
-  }, { systemProjectAttribution: input.projectId != null })
+  }, {
+    systemProjectAttribution: input.projectId != null,
+    ...(input.receiverFenceAgentId ? { receiverNotStopped: { agentId: input.receiverFenceAgentId } } : {}),
+  })
 
   if (!res.ok) {
+    if (res.reason === 'receiver_not_live') {
+      throw new ReceiverNotLiveError(
+        `fleet-bridge: receiver ${input.receiverFenceAgentId} is stopped (receipt ${input.receiptId})`,
+      )
+    }
     if (res.reason === 'inbox_full') {
       throw new InboxFullError(
         `fleet-bridge: recipient ${input.agentId} inbox at capacity (receipt ${input.receiptId})`,

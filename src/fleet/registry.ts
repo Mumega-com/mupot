@@ -939,6 +939,34 @@ export async function getFleetAgentLiveness(
   return { runtime, live, agentId: String(row?.agent_id ?? ''), presenceMode }
 }
 
+/**
+ * receiverNotStoppedSql — mupot#1740. The ATOMIC form of the #1729 fence: a SQL conjunct for the
+ * WHERE of a delivery/claim write, true iff the fleet row that readFleetAgentRow would resolve
+ * for `agentIdParam` (an agents.id) is NOT status 'stopped'. Same resolution as
+ * readFleetAgentRow: an exact (tenant, agent_id) row wins; only when none exists does the slug
+ * fallback apply, and only for a tenant-unique slug with no canonical agents.id reserving it.
+ * No resolved row = no fleet surface = not stopped (in-Worker behaviour unchanged). A check
+ * done before the write is TOCTOU against a concurrent detach (markStopped); this conjunct is
+ * evaluated inside the same statement as the write, so the invariant "no delivery or execution
+ * to a stopped seat" cannot be raced. Both params are bound-parameter placeholders ("?3").
+ */
+export function receiverNotStoppedSql(tenantParam: string, agentIdParam: string): string {
+  const slug = `(SELECT slug FROM agents WHERE id = ${agentIdParam})`
+  return `NOT EXISTS (
+    SELECT 1 FROM fleet_agents fa
+     WHERE fa.tenant = ${tenantParam} AND fa.status = 'stopped'
+       AND (
+         fa.agent_id = ${agentIdParam}
+         OR (
+           NOT EXISTS (SELECT 1 FROM fleet_agents fx WHERE fx.tenant = ${tenantParam} AND fx.agent_id = ${agentIdParam})
+           AND fa.agent_id = ${slug}
+           AND (SELECT COUNT(*) FROM agents ax WHERE ax.slug = ${slug}
+                  AND NOT EXISTS (SELECT 1 FROM agents canonical WHERE canonical.id = ${slug})) = 1
+         )
+       )
+  )`
+}
+
 export interface ReceiverLivenessVerdict {
   /** False iff dispatching to this agent must be refused: the fleet row is 'stopped' (mupot#1729). */
   ok: boolean
