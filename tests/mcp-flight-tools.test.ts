@@ -1319,8 +1319,11 @@ describe('MCP granted multi-squad flight lifecycle', () => {
         -- shared production tables silently 500ing every hand-rolled fixture that never
         -- expected to need them is exactly the failure mode
         -- scripts/check-test-schema-source.mjs exists to catch).
+        -- migrations/0192 (mupot#1723): the in-flight dispatch check now reads settled_at;
+        -- same hand-written-subset class as above (#703).
         CREATE TABLE task_dispatch_receipts (
-          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, task_id TEXT NOT NULL, created_at TEXT NOT NULL
+          id TEXT PRIMARY KEY, tenant TEXT NOT NULL, task_id TEXT NOT NULL, created_at TEXT NOT NULL,
+          settled_stage TEXT, settled_at TEXT, settled_reason TEXT
         );
         CREATE TABLE task_dispatch_runtime_receipts (
           tenant TEXT NOT NULL, dispatch_receipt_id TEXT NOT NULL, stage TEXT NOT NULL

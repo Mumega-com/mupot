@@ -357,6 +357,8 @@ describe('bus queue consumer', () => {
             })),
           }
         }),
+        // mupot#1723: the interrupted branch now also settles the in-Worker dispatch receipt.
+        batch: vi.fn(async (stmts: unknown[]) => stmts.map(() => ({ meta: { changes: 1 } }))),
       },
     } as unknown as Env
     const item = message({

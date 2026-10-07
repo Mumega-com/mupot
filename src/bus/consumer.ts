@@ -24,6 +24,7 @@ import { deliverMessageCreatedEvent } from './hermes-delivery'
 import { isEventsEnabled } from '../mcp/events'
 import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './events-delivery'
 import { redactSecretPatterns } from '../lib/redact'
+import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -134,6 +135,10 @@ interface TaskDispatchReceiptState {
   execution_receipt_id: string | null
   execution_claim_expires_at: number | null
   task_status: Task['status'] | null
+  // 1 iff no newer dispatch receipt exists for the same task (mupot#1723); absent in hand-mocked rows.
+  is_latest_dispatch?: number
+  // set once the dispatch row itself is settled (mupot#1723); absent in hand-mocked rows.
+  settled_at?: string | null
   project_id: string | null
 }
 
@@ -170,8 +175,13 @@ async function readTaskDispatchReceipt(env: Env, event: BusEvent): Promise<TaskD
   const identity = taskDispatchIdentity(event)
   if (!identity || !event.agent_id) return null
   return await env.DB.prepare(
-    `SELECT r.consumed_at, r.claim_expires_at, t.execution_receipt_id,
-            t.execution_claim_expires_at, t.status AS task_status, t.project_id
+    `SELECT r.consumed_at, r.claim_expires_at, r.settled_at, t.execution_receipt_id,
+            t.execution_claim_expires_at, t.status AS task_status, t.project_id,
+            CASE WHEN NOT EXISTS (
+              SELECT 1 FROM task_dispatch_receipts n
+               WHERE n.tenant = r.tenant AND n.task_id = r.task_id
+                 AND (n.created_at > r.created_at OR (n.created_at = r.created_at AND n.rowid > r.rowid))
+            ) THEN 1 ELSE 0 END AS is_latest_dispatch
        FROM task_dispatch_receipts r
        LEFT JOIN tasks t ON t.id = r.task_id AND t.squad_id = r.squad_id
       WHERE r.tenant = ? AND r.id = ? AND r.task_id = ? AND r.agent_id = ?
@@ -314,8 +324,29 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       }
       const receipt = await readTaskDispatchReceipt(env, event)
       if (!receipt || receipt.consumed_at) return true
+      // mupot#1723 — a settled dispatch (in-Worker run ended, or operator-terminated) is
+      // finished. The settle clears the task's execution pointer, so without this a queue
+      // redelivery would fall through to a fresh routing decision and re-execute it.
+      if (receipt.settled_at) {
+        if (!(await consumeTaskDispatchReceipt(env, event))) {
+          throw new Error('settled task dispatch receipt consume failed')
+        }
+        return true
+      }
       if (receipt.execution_receipt_id === identity.receiptId) {
         if (receipt.task_status !== 'in_progress') {
+          // mupot#1723 / #1721 — backstop for the AgentDO's own settle (idempotent; the UPDATE's
+          // guards, not this branch, keep it off inbox-delivered dispatches). blocked = the run
+          // failed. rejected = the run produced work that a gate then rejected, so 'completed'
+          // is the accurate disposition for that run. Other statuses: nothing to settle.
+          const backstopStage = receipt.task_status === 'blocked' ? 'failed'
+            : receipt.task_status === 'rejected' ? 'completed' : null
+          if (backstopStage && event.agent_id) {
+            await settleInWorkerDispatchReceipt(env, {
+              dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id,
+              stage: backstopStage, reason: `in_worker_run_ended_task_${receipt.task_status}`,
+            })
+          }
           if (!(await consumeTaskDispatchReceipt(env, event))) {
             throw new Error('task dispatch receipt recovery consume failed')
           }
@@ -328,12 +359,25 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         if (!(await blockInterruptedTaskExecution(env, event, Date.now()))) {
           throw new Error('task interrupted execution recovery lost race')
         }
+        if (event.agent_id) {
+          await settleInWorkerDispatchReceipt(env, {
+            dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id,
+            stage: 'failed', reason: 'interrupted',
+          })
+        }
         if (!(await consumeTaskDispatchReceipt(env, event))) {
           throw new Error('task interrupted execution receipt consume failed')
         }
         return true
       }
-      if (receipt.execution_receipt_id !== null) {
+      // mupot#1723 — a task left blocked/rejected/open by an EARLIER run keeps that run's
+      // execution_receipt_id. A NEWER dispatch of the same task is then a legitimate fresh
+      // attempt (claimTaskProgress overwrites the pointer), not a superseded one; consuming it
+      // here silently dropped every re-dispatch after a failed run. Only the task's newest
+      // dispatch receipt, and only while the task is in a workable status, passes through.
+      const redispatchOfWorkable = receipt.is_latest_dispatch === 1
+        && (receipt.task_status === 'blocked' || receipt.task_status === 'rejected' || receipt.task_status === 'open')
+      if (receipt.execution_receipt_id !== null && !redispatchOfWorkable) {
         if (!(await consumeTaskDispatchReceipt(env, event))) {
           throw new Error('superseded task dispatch receipt consume failed')
         }
