@@ -109,7 +109,7 @@ export interface CreateFlightOptions {
    * is passed by exactly two server-side writers and is deliberately NOT a field of NewFlight or flight meta, so no
    * flight_dispatch / REST / MCP caller can set it. Such a flight never HOLDs clearance (it may still WARN).
    */
-  bookkeeping?: true
+  bookkeeping?: boolean
 }
 
 export class FlightCreateFenceError extends Error {
