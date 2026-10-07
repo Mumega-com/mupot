@@ -130,7 +130,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
     'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
-    'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_memory_list', 'project_recall', 'project_squad_list',
+    'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
     'project_wiki', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
     'routine_run_list', 'runner_list', 'secret_env_status', 'squad_member_list', 'squad_recall', 'status',
     'supabase_query', 'supabase_schema', 'task_board', 'task_get', 'task_intake_audit',

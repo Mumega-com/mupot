@@ -23,7 +23,7 @@ function auth(squad: string): AuthContext {
   }
 }
 
-describe('project_memory_get / project_memory_list', () => {
+describe('project_memory_get', () => {
   let h: SqliteD1Harness
   let env: Env
   beforeEach(() => {
@@ -86,18 +86,4 @@ describe('project_memory_get / project_memory_list', () => {
     expect(res.sha256).toBe(await sha(text))
   })
 
-  it('list: newest first, fenced, gated, preview <=200 chars', async () => {
-    put('a', `project:${P1}`, 'old', '2026-01-01 00:00:00')
-    put('b', `project:${P1}`, 'z'.repeat(500), '2026-02-01 00:00:00')
-    put('c', `project:${P2}`, 'foreign', '2026-03-01 00:00:00')
-    const r = await invokeTool(auth(SQ_IN), env, 'project_memory_list', { project_id: P1 }, 'test')
-    expect(r.ok).toBe(true)
-    if (!r.ok) return
-    const items = (r.result as { items: Array<{ id: string; preview: string; utf8_bytes: number }> }).items
-    expect(items.map((i) => i.id)).toEqual(['b', 'a'])
-    expect(items[0].preview.length).toBe(200)
-    expect(items[0].utf8_bytes).toBe(500)
-    const denied = await invokeTool(auth(SQ_OUT), env, 'project_memory_list', { project_id: P1 }, 'test')
-    expect(denied.ok).toBe(false)
-  })
 })

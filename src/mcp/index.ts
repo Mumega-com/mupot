@@ -4063,48 +4063,6 @@ const toolProjectMemoryGet: ToolSpec = {
   },
 }
 
-// project_memory_list — newest-first index of a project's memory records (id, created_at,
-// utf8_bytes, 200-char preview). Same gate + scope fence as project_memory_get.
-const toolProjectMemoryList: ToolSpec = {
-  name: 'project_memory_list',
-  scope: 'project memory',
-  min: 'observer',
-  args: '{ project_id: string, limit?: number, before?: string }',
-  inputSchema: {
-    type: 'object',
-    properties: { project_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA, before: STRING_SCHEMA },
-    required: ['project_id'],
-    additionalProperties: false,
-  },
-  async run(auth, env, args) {
-    const projectId = str(args.project_id)
-    if (!projectId) return fail(400, 'invalid_args', 'project_id required')
-    const limit = readLimit(args.limit, 20, 50)
-    if (typeof limit !== 'number') return limit
-    const before = str(args.before)
-
-    const project = await readableProject(env, projectId, readAccess(auth))
-    if (!project) return fail(404, 'not_found')
-
-    const scope = projectMemoryScope(projectId)
-    const stmt = before
-      ? env.DB.prepare(
-          'SELECT id, text, created_at FROM engrams WHERE agent_id = ? AND created_at < ? ORDER BY created_at DESC, id DESC LIMIT ?',
-        ).bind(scope, before, limit)
-      : env.DB.prepare(
-          'SELECT id, text, created_at FROM engrams WHERE agent_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
-        ).bind(scope, limit)
-    const rows = await stmt.all<{ id: string; text: string; created_at: string }>()
-    const items = (rows.results ?? []).map((r) => ({
-      id: r.id,
-      created_at: r.created_at,
-      utf8_bytes: new TextEncoder().encode(r.text).byteLength,
-      preview: Array.from(r.text).slice(0, 200).join(''),
-    }))
-    return done({ project_id: projectId, items })
-  },
-}
-
 // wake_agent — drive one cortex cycle of an agent. cap: lead+ on the AGENT's squad.
 const toolWakeAgent: ToolSpec = {
   name: 'wake_agent',
@@ -6410,7 +6368,6 @@ export const TOOLS: ToolSpec[] = [
   toolProjectRemember,
   toolProjectRecall,
   toolProjectMemoryGet,
-  toolProjectMemoryList,
   toolWakeAgent,
   toolRouterTick,
   toolExecutionMeterStatus,
