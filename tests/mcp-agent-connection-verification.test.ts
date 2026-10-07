@@ -140,6 +140,8 @@ describe('verify_agent_connection MCP callback', () => {
     expect(body.result.tools.find((tool) => tool.name === 'verify_agent_connection')).toEqual({
       name: 'verify_agent_connection',
       description: expect.any(String),
+      // mupot#1709: every tool now carries MCP annotations (values pinned in mcp-tool-annotations.test.ts).
+      annotations: expect.objectContaining({ readOnlyHint: false }),
       inputSchema: {
         type: 'object',
         properties: {

@@ -259,6 +259,7 @@ import { selfReportAtBoot } from '../fleet/boot-self-report'
 import { authLookupOrNull } from '../auth/fail-closed'
 import { PUBLIC_TOOL_ALLOWLIST } from './openapi-public-allowlist'
 import { NEEDS_YOU_PROFILE, profileEntry } from './profile-needs-you'
+import { toolAnnotations } from './tool-annotations'
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
@@ -6374,10 +6375,14 @@ function rpcError(id: unknown, code: number, message: string, data?: unknown, st
 }
 
 function mcpTool(spec: ToolSpec): Record<string, unknown> {
+  // mupot#1709: MCP `annotations` (hints only — authorization is unchanged). The table lives in
+  // tool-annotations.ts; tests/mcp-tool-annotations.test.ts fails if a registered tool lacks a row.
+  const annotations = toolAnnotations(spec.name)
   return {
     name: spec.name,
     description: `${spec.scope}; minimum capability: ${spec.min}. Args: ${spec.args}`,
     inputSchema: spec.inputSchema,
+    ...(annotations ? { annotations } : {}),
   }
 }
 

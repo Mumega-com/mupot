@@ -5,6 +5,7 @@
 import { applyD1Migrations, env as cfEnv } from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
 import worker from '../../src/index'
+import { toolAnnotations } from '../../src/mcp/tool-annotations'
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext
 
@@ -218,13 +219,14 @@ describe('with a real minted token (profile-audience), through the wrapper', () 
 })
 
 describe('with a real minted token (/mcp-audience), through the wrapper', () => {
-  it('/mcp is unchanged: full un-annotated registry; the same token on the profile path gets the 8-tool list', async () => {
+  it('/mcp serves the full registry with the #1718 annotation table on every tool; the same token on the profile path gets the 8-tool list', async () => {
     const { token, e } = await mintToken('https://pot.test/mcp')
     const full = await rpcAt('/mcp', e, token)
     expect(full.status).toBe(200)
-    const fullTools = ((await full.json()) as { result: { tools: Array<Record<string, unknown>> } }).result.tools
+    const fullTools = ((await full.json()) as { result: { tools: Array<{ name: string; annotations?: unknown }> } }).result.tools
     expect(fullTools.length).toBeGreaterThan(100)
-    expect(fullTools.some((t) => 'annotations' in t)).toBe(false)
+    // mupot#1718: every full-surface tool now carries its table annotations (through the real worker).
+    for (const t of fullTools) expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
     const prof = await rpcAt('/mcp/profile/needs-you', e, token)
     expect(prof.status).toBe(200)
     expect(((await prof.json()) as { result: { tools: unknown[] } }).result.tools).toHaveLength(8)
