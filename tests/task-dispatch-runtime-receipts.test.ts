@@ -387,6 +387,63 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
     }
   })
 
+  // mupot#1747 — a dispatch has ONE terminal disposition.
+  const rr = (fixture: ReturnType<typeof runtimeFixture>, stage: 'runtime_consumed' | 'completed' | 'failed', h: string) =>
+    recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
+      taskId: TASK_ID, dispatchReceiptId: DISPATCH_ID, messageId: MESSAGE_ID, stage,
+      runtimeReceiptHash: h.repeat(64), attempt: 1,
+      ...(stage === 'completed' ? { result: 'Late result.' } : {}),
+      ...(stage === 'failed' ? { reason: 'Runtime failed.' } : {}),
+    })
+
+  it('mupot#1747: consumed -> failed -> (assignee unblocks, pointer stays) -> completed is refused', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await rr(fixture, 'runtime_consumed', '1')
+      await rr(fixture, 'failed', '2')
+      // task_update blocked -> in_progress leaves execution_receipt_id on the failed dispatch.
+      fixture.harness.sqlite.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(TASK_ID)
+      expect(fixture.harness.sqlite.prepare('SELECT execution_receipt_id AS p FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ p: DISPATCH_ID })
+      await expect(rr(fixture, 'completed', '3')).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+      expect(fixture.harness.sqlite.prepare(
+        "SELECT COUNT(*) AS c FROM task_dispatch_runtime_receipts WHERE stage = 'completed'",
+      ).get()).toEqual({ c: 0 })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('mupot#1747: completed -> failed is refused (symmetric fence)', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await rr(fixture, 'runtime_consumed', '1')
+      await rr(fixture, 'completed', '2')
+      await expect(rr(fixture, 'failed', '3')).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'review' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
+  it('mupot#1747: a dispatch settled failed on its own row cannot later accept completed', async () => {
+    const fixture = runtimeFixture()
+    try {
+      await rr(fixture, 'runtime_consumed', '1')
+      fixture.harness.sqlite.prepare(
+        "UPDATE task_dispatch_receipts SET settled_stage = 'failed', settled_at = ?, settled_reason = 'x' WHERE id = ?",
+      ).run(T0, DISPATCH_ID)
+      await expect(rr(fixture, 'completed', '3')).rejects.toMatchObject({ code: 'runtime_receipt_transition_conflict' })
+      expect(fixture.harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress' })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('refuses completion before the same attempt has a runtime-consumed receipt', async () => {
     const fixture = runtimeFixture()
     try {

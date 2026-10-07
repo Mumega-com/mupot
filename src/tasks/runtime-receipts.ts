@@ -315,6 +315,29 @@ const clearExecutionPointerSql = `
         WHERE d.tenant = ?3 AND d.id = ?2 AND d.settled_at = ?4
      )`
 
+/**
+ * mupot#1747 — a dispatch has a SINGLE terminal disposition. One shared fragment, embedded in
+ * EVERY stage's mutation WHERE (consume / complete / fail): refuses when this dispatch already
+ * has a runtime receipt at any of `stages`, or (when `checkSettled`) its dispatch row settled
+ * as failed / reset_terminated. The execution pointer cannot stand in for this: a blocked ->
+ * in_progress task_update leaves the pointer on the failed dispatch.
+ */
+export function noConflictingTerminalSql(
+  tenantParam: string, dispatchParam: string, stages: readonly string[], checkSettled = false,
+): string {
+  const list = stages.map(st => `'${st}'`).join(', ')
+  return `NOT EXISTS (
+    SELECT 1 FROM task_dispatch_runtime_receipts term
+     WHERE term.tenant = ${tenantParam} AND term.dispatch_receipt_id = ${dispatchParam}
+       AND term.stage IN (${list})
+  )${checkSettled ? `
+  AND NOT EXISTS (
+    SELECT 1 FROM task_dispatch_receipts sd
+     WHERE sd.tenant = ${tenantParam} AND sd.id = ${dispatchParam}
+       AND sd.settled_stage IN ('failed', 'reset_terminated')
+  )` : ''}`
+}
+
 export type TaskDispatchRuntimeReceiptErrorCode =
   | 'agent_bound_workspace_credential_required'
   | 'runtime_receipt_invalid'
@@ -1225,12 +1248,7 @@ export async function recordTaskDispatchRuntimeReceipt(
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
              AND ${pointerAvailableForSql({ tenantParam: '?5', newReceiptParam: '?1' })}
-             AND NOT EXISTS (
-               SELECT 1 FROM task_dispatch_runtime_receipts failed
-                WHERE failed.tenant = ?5
-                  AND failed.dispatch_receipt_id = ?1
-                  AND failed.stage = 'failed'
-             )
+             AND ${noConflictingTerminalSql('?5', '?1', ['failed'])}
              -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time.
              AND ${envelopeHoldsSql('runtime_consumed', {
                tenant: '?5', messageId: '?6', dispatchId: '?1', attempt: '?7', agentId: '?4', now: '?2',
@@ -1253,6 +1271,8 @@ export async function recordTaskDispatchRuntimeReceipt(
                     AND consumed.stage = 'runtime_consumed'
                     AND consumed.attempt = ?7
                )
+               -- mupot#1747 — never complete a dispatch that already failed / was terminated.
+               AND ${noConflictingTerminalSql('?6', '?5', ['failed', 'reset_terminated'], true)}
                -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time: a
                -- re-lease (delivery_attempts moved), dead-letter, or lost custody between
                -- validateEnvelope and this batch changes zero rows and fails the batch.
@@ -1279,12 +1299,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                -- mupot#1539 round 2 (P2-a) — a dispatch that already settled 'completed' cannot
                -- later settle 'failed' (a stale failed@N would overwrite tasks.result and move a
                -- gate-rejected task to blocked). Rework after a rejection is a new dispatch.
-               AND NOT EXISTS (
-                 SELECT 1 FROM task_dispatch_runtime_receipts done_receipt
-                  WHERE done_receipt.tenant = ?6
-                    AND done_receipt.dispatch_receipt_id = ?5
-                    AND done_receipt.stage = 'completed'
-               )
+               AND ${noConflictingTerminalSql('?6', '?5', ['completed'])}
             RETURNING status
           `).bind(reason, now, input.taskId, agentId, input.dispatchReceiptId,
             env.TENANT_SLUG, messageId, input.attempt)
