@@ -2796,10 +2796,11 @@ const toolTaskDispatchRuntimeReceipt: ToolSpec = {
 //     settle leaves execution_receipt_id set permanently, and since #1736 it
 //     sets it to the failing dispatch even when that dispatch was never
 //     consumed. So a task whose dispatch failed — before OR after consume —
-//     gets 409 task_dispatched from this tool until a re-dispatch takes the
-//     pointer over (the next dispatch's runtime_consumed/failed, via
-//     pointerAvailableForSql) or an operator's `task_dispatch_lease_reset`,
-//     same as it already is for the runtime-receipt path itself.
+//     gets 409 task_dispatched from this tool. A re-dispatch does NOT clear
+//     that: its runtime_consumed/failed moves the pointer to the new dispatch
+//     (pointerAvailableForSql), which is still non-null, so this tool keeps
+//     refusing. Only an operator's `task_dispatch_lease_reset` clears the
+//     pointer; otherwise settle through task_dispatch_runtime_receipt.
 //   - requires the task's gate_owner to be an INDEPENDENT, live,
 //     credentialed gate (hasIndependentRuntimeGate — the SAME predicate the
 //     runtime-receipt path's `completed` stage requires, PLUS (mupot#1663)
