@@ -516,7 +516,9 @@ describe('routine runtime-neutral dispatch', () => {
       .resolves.toMatchObject({ ok: true, status: 'dispatched' })
 
     // Account for telemetry recording statement (32 statements total, well under free-tier 50 limit)
-    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 1)
+    // #1758: +1 for the control flight's clearance read (listLiveFlights) — the one added statement is the
+    // price of running the shared ATC clearance on the Routine writer; 33 statements total.
+    expect(statements).toBeLessThanOrEqual(50 - MAX_SCHEDULER_DB_STATEMENTS + 2)
   })
 
   // mupot#611 item 3, end-to-end: loadCandidates (src/routines/dispatch.ts) used
