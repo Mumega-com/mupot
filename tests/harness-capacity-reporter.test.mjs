@@ -9,6 +9,7 @@ const raw = {
   terminals: { ok: true, result: { terminals: [
     { handle: 'h1', connected: true, orphaned: false, agentIdentity: 'claude', lastOutputAt: NOW - 1000, preview: `export KEY=${SECRET}`, title: `deploy ${SECRET}`, worktreeId: '/home/x/secret-path' },
     { handle: 'h2', connected: true, orphaned: false, agentIdentity: null, lastOutputAt: NOW - 3_600_000, preview: SECRET, title: SECRET },
+    { handle: 'h4', connected: true, orphaned: true, agentIdentity: 'claude', lastOutputAt: NOW, preview: SECRET, title: SECRET },
     { handle: 'h3', connected: false, orphaned: true, agentIdentity: 'claude', lastOutputAt: NOW, preview: SECRET, title: SECRET },
   ] } },
   workers: { ok: true, result: { workers: [
@@ -23,7 +24,7 @@ const raw = {
 test('summarize computes counts', () => {
   const { counts } = summarize(raw, NOW)
   assert.deepEqual(counts, {
-    live_terminals: 2, agent_sessions: 1, busy_recent: 1, orphaned_terminals: 1,
+    live_terminals: 2, agent_sessions: 1, busy_recent: 1, orphaned_terminals: 2,
     workers_active: 1, workers_release_unknown: 1, worktrees_with_live: 1,
   })
 })

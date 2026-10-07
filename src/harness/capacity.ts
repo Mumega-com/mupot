@@ -44,6 +44,10 @@ function isCount(v: unknown, max = MAX_COUNT): v is number {
 
 /** Strict validation. Anything resembling free text (non-number summary values) is rejected. */
 export function parseCapacityArgs(args: Record<string, unknown>, now: number): ParseResult {
+  // Defense in depth with the tool schema's additionalProperties:false — reporter identity and any
+  // other unknown field can never ride along, even if the schema layer were relaxed.
+  const allowed = new Set<string>(['harness', 'host_key', 'observed_at', 'max_agents', 'summary', ...COUNT_FIELDS])
+  for (const k of Object.keys(args)) if (!allowed.has(k)) return { ok: false, error: 'unknown_field' }
   const harness = args.harness
   if (harness !== 'orca' && harness !== 'herdr') return { ok: false, error: 'invalid_harness' }
   const hostKey = args.host_key
