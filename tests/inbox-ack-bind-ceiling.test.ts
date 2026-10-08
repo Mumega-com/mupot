@@ -84,17 +84,66 @@ describe('mupot#1774: inbox_ack stays under the D1 bind ceiling', () => {
     const done = f.seed('done', 50)
     f.markRead(done)
     const foreign = f.seed('foreign', 10, 'agent-b')
-    // Interleave so each category straddles the 90-id chunk boundary.
-    const ids = [...done.slice(0, 25), ...fresh, ...foreign, ...done.slice(25)]
+    // Order so done, fresh and foreign each have ids on both sides of the 90-id chunk
+    // boundary: 0-44 done, 45-64 fresh, 65-69 foreign, 70-87 fresh, 88-92 done,
+    // 93-97 foreign, 98-99 fresh.
+    const ids = [
+      ...done.slice(0, 45), ...fresh.slice(0, 20), ...foreign.slice(0, 5), ...fresh.slice(20, 38),
+      ...done.slice(45), ...foreign.slice(5), ...fresh.slice(38),
+    ]
     expect(ids).toHaveLength(100)
 
     const res = await ackAgentMessages(f.env, { agent: 'agent-a', ids }, LATER)
     expect(res).toMatchObject({ ok: true })
     const out = res as { acked: string[]; already_read: string[]; refused: string[] }
-    expect(out.acked).toEqual(fresh)
-    expect(out.already_read).toEqual([...done.slice(0, 25), ...done.slice(25)])
-    expect(out.refused).toEqual(foreign)
+    expect(out.acked).toEqual(ids.filter((id) => id.startsWith('fresh-')))
+    expect(out.acked).toHaveLength(40)
+    expect(out.already_read).toEqual(ids.filter((id) => id.startsWith('done-')))
+    expect(out.refused).toEqual(ids.filter((id) => id.startsWith('foreign-')))
     expect(f.maxBound()).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMETERS)
+    f.harness.close()
+  })
+
+  it('a retried ack of a full lease is idempotent: 100 already-read ids classify in chunks', async () => {
+    // The lost-response retry the ack docstring promises: every id is already read, so the
+    // whole list goes to the classification SELECT (2 fixed parameters + 100 ids unchunked).
+    const f = fixture()
+    const ids = f.seed('m', 100)
+    expect((await ackAgentMessages(f.env, { agent: 'agent-a', ids }, LATER) as { acked: string[] }).acked).toEqual(ids)
+    const retry = await ackAgentMessages(f.env, { agent: 'agent-a', ids }, LATER)
+    expect(retry).toEqual({ ok: true, acked: [], already_read: ids, refused: [] })
+    expect(f.maxBound()).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMETERS)
+    f.harness.close()
+  })
+
+  it('classifies already-read ids beyond the first chunk (95 read + 5 fresh)', async () => {
+    const f = fixture()
+    const done = f.seed('done', 95)
+    f.markRead(done)
+    const fresh = f.seed('fresh', 5)
+    const res = await ackAgentMessages(f.env, { agent: 'agent-a', ids: [...done, ...fresh] }, LATER)
+    expect(res).toEqual({ ok: true, acked: fresh, already_read: done, refused: [] })
+    f.harness.close()
+  })
+
+  it('is all-or-nothing: a failure in a later chunk leaves every message unread', async () => {
+    const f = fixture()
+    const ids = f.seed('m', 100)
+    // Make the batch's second chunk fail inside the transaction.
+    const failing = {
+      ...f.env,
+      DB: new Proxy(f.env.DB, {
+        get(target, prop, receiver) {
+          if (prop !== 'batch') return Reflect.get(target, prop, receiver)
+          return (statements: unknown[]) => target.batch([
+            statements[0], target.prepare('SELECT * FROM no_such_table_1774'),
+          ] as Parameters<typeof target.batch>[0])
+        },
+      }),
+    } as Env
+    const res = await ackAgentMessages(failing, { agent: 'agent-a', ids }, LATER)
+    expect(res).toMatchObject({ ok: false, reason: 'db_error' })
+    expect(f.unread()).toBe(100)
     f.harness.close()
   })
 

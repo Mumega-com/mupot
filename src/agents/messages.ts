@@ -1817,9 +1817,9 @@ export async function ackAgentMessages(
   const now = opts.now ?? (() => new Date().toISOString())
 
   try {
-    // The fence lives in the statement below and in the post-check after it — see the note in
-    // leaseAgentInbox on why there is no pre-flight check here.
-    // One statement, RETURNING the ids it actually moved. Rows addressed to another agent
+    // The fence lives in the statements below and in the post-check after them — see the note
+    // in leaseAgentInbox on why there is no pre-flight check here.
+    // Each chunk's statement RETURNs the ids it actually moved. Rows addressed to another agent
     // never match `to_agent = ?2`, so a non-recipient's ack writes nothing at all — the
     // refusal is a property of the SQL, not of a check that could be skipped above it.
     // mupot#1774: a full lease (100 ids) plus the three fixed parameters exceeds D1's
