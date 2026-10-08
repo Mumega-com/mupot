@@ -5,6 +5,7 @@
 // remain the audit trail).
 
 import type { Env, Task } from '../types'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 export type GatePrincipalType = 'member' | 'agent'
 
@@ -252,15 +253,17 @@ export async function persistGateWakeNotice(env: Env, taskId: string, notice: st
  */
 export async function loadGateWakeNotices(env: Env, tasks: readonly Task[]): Promise<Task[]> {
   if (tasks.length === 0) return [...tasks]
-  const ids = tasks.map((task) => task.id)
-  const placeholders = ids.map(() => '?').join(', ')
+  const notices = new Map<string, string | null>()
   try {
-    const rows = await env.DB.prepare(
-      `SELECT id, gate_wake_notice FROM tasks WHERE id IN (${placeholders})`,
-    )
-      .bind(...ids)
-      .all<{ id: string; gate_wake_notice: string | null }>()
-    const notices = new Map((rows.results ?? []).map((row) => [row.id, row.gate_wake_notice]))
+    // mupot#1676: chunked so no statement exceeds D1's 100-parameter ceiling.
+    for (const ids of chunkForD1InList(tasks.map((task) => task.id))) {
+      const rows = await env.DB.prepare(
+        `SELECT id, gate_wake_notice FROM tasks WHERE id IN (${ids.map(() => '?').join(', ')})`,
+      )
+        .bind(...ids)
+        .all<{ id: string; gate_wake_notice: string | null }>()
+      for (const row of rows.results ?? []) notices.set(row.id, row.gate_wake_notice)
+    }
     return tasks.map((task) => ({
       ...task,
       gate_wake_notice: notices.get(task.id) ?? null,
