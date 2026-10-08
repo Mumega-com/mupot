@@ -1,45 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import type { D1Database } from '@cloudflare/workers-types'
 import { invokeTool } from '../src/mcp'
 import { D1_IN_LIST_CHUNK_SIZE, D1_MAX_BOUND_PARAMETERS, chunkForD1InList } from '../src/lib/d1-in-list'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { strictD1 } from './helpers/strict-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import type { AuthContext, Env } from '../src/types'
 
 // mupot#1676 — D1 refuses a statement with more than 100 bound parameters. The sqlite
 // double does not, so task_board passed in tests while production returned internal_error.
-// strictD1 refuses what production refuses and records the widest bind it saw.
+// strictD1 (tests/helpers/strict-d1.ts) refuses what production refuses.
 
 const TENANT = 'mumega'
 const SQUAD_ID = 'squad-chunk'
 const AGENT_ID = 'agent-chunk'
 const MEMBER_ID = 'member-chunk'
 const TASK_COUNT = 250
-
-function strictD1(db: D1Database): { db: D1Database; maxBound: () => number } {
-  let widest = 0
-  const wrapStatement = (statement: object): object => new Proxy(statement, {
-    get(target, prop, receiver) {
-      const value = Reflect.get(target, prop, receiver)
-      if (prop !== 'bind' || typeof value !== 'function') return value
-      return (...values: unknown[]) => {
-        widest = Math.max(widest, values.length)
-        if (values.length > D1_MAX_BOUND_PARAMETERS) {
-          throw new Error(`D1_ERROR: too many SQL variables (${values.length} > ${D1_MAX_BOUND_PARAMETERS})`)
-        }
-        return wrapStatement(value.apply(target, values) as object)
-      }
-    },
-  })
-  const wrapped = new Proxy(db, {
-    get(target, prop, receiver) {
-      const value = Reflect.get(target, prop, receiver)
-      if (prop !== 'prepare' || typeof value !== 'function') return value
-      return (sql: string) => wrapStatement(value.call(target, sql) as object)
-    },
-  })
-  return { db: wrapped, maxBound: () => widest }
-}
 
 function taskId(i: number): string {
   return `task-chunk-${String(i).padStart(3, '0')}`

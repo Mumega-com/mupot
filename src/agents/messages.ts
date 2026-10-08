@@ -20,6 +20,7 @@ import { createBus } from '../bus'
 import { resolveAgentRef } from '../org/resolve'
 import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability'
 import { sha256Hex } from '../lib/canonical-json'
+import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
@@ -1814,7 +1815,6 @@ export async function ackAgentMessages(
   // De-duplicate so a repeated id inside ONE call cannot land in both `acked` and `refused`.
   const ids = [...new Set(input.ids)]
   const now = opts.now ?? (() => new Date().toISOString())
-  const placeholders = ids.map((_, i) => `?${i + 4}`).join(', ')
 
   try {
     // The fence lives in the statement below and in the post-check after it — see the note in
@@ -1822,15 +1822,20 @@ export async function ackAgentMessages(
     // One statement, RETURNING the ids it actually moved. Rows addressed to another agent
     // never match `to_agent = ?2`, so a non-recipient's ack writes nothing at all — the
     // refusal is a property of the SQL, not of a check that could be skipped above it.
-    const acked = await env.DB.prepare(
-      `UPDATE agent_messages
-          SET read_at = ?3, lease_expires_at = NULL, lease_attempt_id = NULL
-        WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
-          AND id IN (${placeholders})
-          AND ${bearerFencePredicate('?1', '?2')}
-        RETURNING id`,
-    ).bind(tenant, input.agent, now(), ...ids).all<{ id: string }>()
-    const ackedIds = new Set((acked.results ?? []).map((r) => r.id))
+    // mupot#1774: a full lease (100 ids) plus the three fixed parameters exceeds D1's
+    // 100-parameter ceiling, so the ids go in chunks. One batch keeps the ack atomic: every
+    // chunk applies or none does, exactly as the single statement did.
+    const ackedAt = now()
+    const acked = await env.DB.batch<{ id: string }>(chunkForD1InList(ids).map((chunk) =>
+      env.DB.prepare(
+        `UPDATE agent_messages
+            SET read_at = ?3, lease_expires_at = NULL, lease_attempt_id = NULL
+          WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NULL
+            AND id IN (${chunk.map((_, i) => `?${i + 4}`).join(', ')})
+            AND ${bearerFencePredicate('?1', '?2')}
+          RETURNING id`,
+      ).bind(tenant, input.agent, ackedAt, ...chunk)))
+    const ackedIds = new Set(acked.flatMap((result) => result.results ?? []).map((r) => r.id))
 
     // Same post-check as lease: the in-statement predicate is the fence, this only turns a
     // lost race into an honest reason instead of a silent all-refused result.
@@ -1842,13 +1847,12 @@ export async function ackAgentMessages(
     // naming it is what makes the retry idempotent rather than ambiguous) or not theirs.
     const rest = ids.filter((id) => !ackedIds.has(id))
     const alreadyRead = new Set<string>()
-    if (rest.length > 0) {
-      const restPlaceholders = rest.map((_, i) => `?${i + 3}`).join(', ')
+    for (const chunk of chunkForD1InList(rest)) {
       const owned = await env.DB.prepare(
         `SELECT id FROM agent_messages
           WHERE tenant = ?1 AND to_agent = ?2 AND read_at IS NOT NULL
-            AND id IN (${restPlaceholders})`,
-      ).bind(tenant, input.agent, ...rest).all<{ id: string }>()
+            AND id IN (${chunk.map((_, i) => `?${i + 3}`).join(', ')})`,
+      ).bind(tenant, input.agent, ...chunk).all<{ id: string }>()
       for (const r of owned.results ?? []) alreadyRead.add(r.id)
     }
 
