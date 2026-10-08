@@ -19,6 +19,7 @@ import { OAuthProvider } from '@cloudflare/workers-oauth-provider'
 import type { Env } from './types'
 import { ROUTES } from './types'
 import { publicHealth } from './health'
+import { cliResponse } from './cli/serve'
 
 // Component routers (each subagent fills these in their folder).
 // Stubs are provided so the app type-checks before all components land.
@@ -98,6 +99,8 @@ export { McpOAuthApiHandler }
 export const app = new Hono<{ Bindings: Env }>()
 
 app.get('/health', (c) => c.json(publicHealth(c.env.TENANT_SLUG, c.env.RELEASE_SHA)))
+// The zero-dependency mupot CLI, exact file bytes (public; see src/cli/serve.ts, docs/cli.md).
+app.get('/cli', () => cliResponse())
 
 app.route(ROUTES.auth, authApp)
 app.route('/api/auth/sso', ssoApp)

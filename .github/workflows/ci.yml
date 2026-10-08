@@ -341,6 +341,9 @@ jobs:
         run: node --test tests/gen-schema-chain.test.mjs tests/check-schema-chain-fresh.test.mjs
       - name: Guard — schema-chain.generated.ts must match migrations/*.sql
         run: node scripts/check-schema-chain-fresh.mjs
+      # mupot CLI: GET /cli serves src/cli/bundle.generated.ts, baked from cli/mupot.mjs.
+      - name: Guard — src/cli/bundle.generated.ts must match cli/mupot.mjs
+        run: node scripts/check-cli-bundle-fresh.mjs
 
   operator-counts-source:
     runs-on: ubuntu-latest
