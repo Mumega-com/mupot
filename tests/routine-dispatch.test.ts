@@ -672,3 +672,35 @@ describe('#1756 control flight cancelled before the run observes it', () => {
     expect(delivered(harness)).toBe(1)
   })
 })
+
+describe('mupot#1571 archived task is inert at the routine delivery', () => {
+  it('a control task archived before the observe write: no agent message is delivered, run is not dispatched', async () => {
+    const harness = makeHarness()
+    const base = envFor(harness)
+    const db = harness.db
+    let armed = true
+    const env = {
+      ...base,
+      DB: {
+        prepare(sql: string) {
+          if (armed && /SET status = 'observing', assigned_agent_id = \?, task_id = \?/.test(sql)) {
+            armed = false
+            harness.sqlite.exec(`
+              INSERT INTO members (id, tenant, email, display_name, status) VALUES ('arch-op', 'tenant-a', 'arch@example.com', 'A', 'active');
+              INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
+                SELECT id, '2026-10-08T00:00:00.000Z', 'test', 'arch-op', status FROM tasks;
+            `)
+          }
+          return db.prepare(sql)
+        },
+        batch: db.batch.bind(db),
+      } as unknown as D1Database,
+    } as Env
+    const result = await dispatchRoutineRun(env, 'run-1', NOW)
+    expect(armed).toBe(false)
+    expect(result).toEqual({ ok: false, error: 'run_not_dispatchable' })
+    expect((harness.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'mupot-routines'").get() as { n: number }).n).toBe(0)
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+    harness.close()
+  })
+})
