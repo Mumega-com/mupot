@@ -129,6 +129,17 @@ function nowIso(): string {
  *  justified allowlist in tests/task-archive-action-boundary.test.ts (a raw-text seam
  *  scan that fails CI on a new unguarded writer). Only then is the write path here
  *  re-enabled. */
+/**
+ * mupot#1571 / #1778: archiving TASKS stays off unless `TASK_ARCHIVE_ENABLED` is exactly '1'.
+ * The action-boundary guards ship on every task writer regardless, but two gate rounds
+ * found effects that still reach an archived task (the gate-stall watchdog re-wake, and an
+ * in-flight-dispatch predicate that wedges settled inbox dispatches). Until those land
+ * (#1780), production must not create archived tasks. Do not set the flag before then.
+ */
+export function taskArchiveEnabled(env: Env): boolean {
+  return env.TASK_ARCHIVE_ENABLED === '1'
+}
+
 export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInput): Promise<ArchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
 
@@ -142,6 +153,7 @@ export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInpu
     case 'projects':
       return archiveProject(env, input)
     case 'tasks':
+      if (!taskArchiveEnabled(env)) return { ok: false, error: 'not_supported' }
       return archiveTask(env, input)
   }
 }
@@ -159,6 +171,7 @@ export async function unarchiveRow(env: Env, auth: AuthContext, input: Unarchive
     case 'projects':
       return unarchiveProject(env, input)
     case 'tasks':
+      if (!taskArchiveEnabled(env)) return { ok: false, error: 'not_supported' }
       return unarchiveTask(env, input)
   }
 }

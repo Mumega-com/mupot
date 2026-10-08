@@ -51,7 +51,8 @@ describe('archive substrate (mupot#1496)', () => {
   beforeEach(() => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
-    env = { TENANT_SLUG: TENANT, DB: harness.db } as unknown as Env
+    // mupot#1778: task archiving is opt-in (TASK_ARCHIVE_ENABLED); this suite exercises it.
+    env = { TENANT_SLUG: TENANT, DB: harness.db, TASK_ARCHIVE_ENABLED: '1' } as unknown as Env
 
     harness.sqlite.exec(`
       INSERT INTO members (id, tenant, email, display_name, status) VALUES
@@ -583,6 +584,24 @@ describe('archive substrate (mupot#1496)', () => {
   // ── tasks (mupot#1571 re-enabled once archive became an ACTION boundary) ───────
   // The action-boundary behaviour (router, concierge, task_update, verdict, dispatch,
   // runtime receipts, flights) lives in tests/task-archive-action-boundary.test.ts.
+
+  it.each([undefined, '', '0', 'true', 'yes'])(
+    'task archiving stays OFF unless TASK_ARCHIVE_ENABLED is exactly "1" (value %j): 409, nothing written',
+    async (flag) => {
+      // mupot#1778/#1780: production must not create archived tasks until #1780 lands.
+      const off = { TENANT_SLUG: TENANT, DB: harness.db, TASK_ARCHIVE_ENABLED: flag } as unknown as Env
+      const archived = await invokeTool(ORG_ADMIN, off, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'board reset' }, ORIGIN)
+      expect(archived).toMatchObject({ ok: false, status: 409, error: 'not_supported' })
+      expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind('task-2').first()).toBeNull()
+      expect(await env.DB.prepare(`SELECT 1 FROM archive_receipts WHERE entity_table = 'tasks'`).first()).toBeNull()
+
+      // Unarchive is refused too, even for a row archived while the flag was on.
+      await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'seeded with flag on' })
+      const unarchived = await invokeTool(ORG_ADMIN, off, 'unarchive_row', { table: 'tasks', id: 'task-2', reason: 'x' }, ORIGIN)
+      expect(unarchived).toMatchObject({ ok: false, status: 409, error: 'not_supported' })
+      expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind('task-2').first()).not.toBeNull()
+    },
+  )
 
   it('archives a task (side table, tasks.status untouched, receipt) and unarchive deletes the state + receipts', async () => {
     const archived = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'board reset' })

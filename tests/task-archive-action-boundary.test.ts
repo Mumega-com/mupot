@@ -343,6 +343,8 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     env = {
       DB: h.db,
       TENANT_SLUG: TENANT,
+      // mupot#1778: task archiving is opt-in (TASK_ARCHIVE_ENABLED); this suite exercises it.
+      TASK_ARCHIVE_ENABLED: '1',
       BUS: { send: async (e: BusEvent) => { events.push(e) } },
     } as unknown as Env
     h.sqlite.exec(`

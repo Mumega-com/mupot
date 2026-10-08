@@ -71,7 +71,7 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
     case 'must_deactivate_first':
       return fail(409, 'must_deactivate_first', { tool: outcome.tool })
     case 'not_supported':
-      return fail(409, 'not_supported')
+      return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
     case 'archive_refused_conflict':
       // mupot#1496 Round 4 (Athena confirmation-pass BLOCK): a 0-row guarded
       // write with no re-derivable refusal reason AND the row not actually
@@ -96,7 +96,7 @@ function unarchiveOutcomeToResult(outcome: Awaited<ReturnType<typeof unarchiveRo
     case 'cannot_affect_higher_rank':
       return fail(403, 'cannot_affect_higher_rank')
     case 'not_supported':
-      return fail(409, 'not_supported')
+      return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
   }
 }
 

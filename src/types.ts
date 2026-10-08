@@ -327,6 +327,10 @@ export interface Env {
   // and events/* are method_not_found. Served only on the full /mcp door, never on
   // /mcp/profile/needs-you, whatever the value. Read via isEventsEnabled() in src/mcp/events.ts.
   EVENTS_ENABLED?: string
+  // mupot#1571/#1778: archiving TASKS is off unless exactly "1". Unset => archive_row/unarchive_row on
+  // tasks return 409 not_supported, as before #1778. Must not be set until #1780 lands. Read via
+  // taskArchiveEnabled() in src/hygiene/archive.ts.
+  TASK_ARCHIVE_ENABLED?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
   // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
   // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.
