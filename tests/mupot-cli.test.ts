@@ -456,7 +456,7 @@ describe('P0: a credential is bound to one origin (never travels with the pot na
     expect(await run(['--pot', 'gaf', 'tools'], { env: { MUPOT_TOKEN: 'env-only-token-ABCDEFGHIJ' } })).toBe(0)
     expect(calls.length).toBeGreaterThan(0)
     for (const c of calls) {
-      expect(c.url.startsWith(GAF)).toBe(true)
+      expect(new URL(c.url).origin).toBe(new URL(GAF).origin)
       expect(c.headers.authorization).toBe(`Bearer ${SECOND}`)
     }
     expect(JSON.stringify(sentTokens())).not.toContain(SECRET)
@@ -502,7 +502,7 @@ describe('P1: --api never re-aims a bound token', () => {
     writeToken(join(home, '.config', 'mupot', 'mumega.token'), SECOND)
     expect(await run(['status', '--api', 'https://other.example'])).toBe(0)
     for (const c of calls) {
-      expect(c.url.startsWith('https://other.example')).toBe(true)
+      expect(new URL(c.url).origin).toBe('https://other.example')
       expect(c.headers.authorization).toBe(`Bearer ${SECRET}`)
     }
     expect(JSON.stringify(sentTokens())).not.toContain(SECOND)
