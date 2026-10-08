@@ -31,6 +31,8 @@ simple: deploy one pot, connect a runtime worker, grant scoped capabilities,
 send it work, gate risky actions, observe what happened, and verify the result
 against a real tool of record such as GitHub.
 
+Drive a pot from a shell with the zero-dependency `mupot` CLI (`curl` one file, no npm): [docs/cli.md](./docs/cli.md).
+
 Do not read a version from this README. The running version is whatever the pot's
 `/health` reports (source: `src/version.ts`), the released versions are the git tags
 (`git tag --list 'v*'`), and the next release candidate and its scope live only in
