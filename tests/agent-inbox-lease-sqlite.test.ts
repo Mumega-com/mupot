@@ -121,6 +121,12 @@ function flipBeforeStatement(env: Env, marker: string, flip: () => void): Env {
       if (!flipped && sql.includes(marker)) { flipped = true; flip() }
       return statement.all(...args)
     },
+    // The sqlite double's batch() runs each statement through executeAll (#1774: the ack
+    // is a batch), so the flip must fire there too — still immediately before the statement.
+    executeAll: (...args: unknown[]) => {
+      if (!flipped && sql.includes(marker)) { flipped = true; flip() }
+      return statement.executeAll(...args)
+    },
   })
   return { ...env, DB: { ...env.DB, prepare: (sql: string) => wrap(env.DB.prepare(sql), sql) } } as Env
 }
