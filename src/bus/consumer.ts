@@ -25,6 +25,7 @@ import { isEventsEnabled } from '../mcp/events'
 import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './events-delivery'
 import { redactSecretPatterns } from '../lib/redact'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -277,7 +278,8 @@ async function blockInterruptedTaskExecution(env: Env, event: BusEvent, now: num
             execution_claim_expires_at = NULL
       WHERE id = ? AND status = 'in_progress'
         AND execution_receipt_id = ?
-        AND execution_claim_expires_at IS NOT NULL AND execution_claim_expires_at <= ?`,
+        AND execution_claim_expires_at IS NOT NULL AND execution_claim_expires_at <= ?
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   ).bind(
     'Execution interrupted before a terminal receipt. Review the task before explicit redispatch.',
     timestamp,

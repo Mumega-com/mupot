@@ -27,6 +27,7 @@
 
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent , TokenUsage } from '../types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import { resolveTaskAssignee } from '../tasks/assignee'
@@ -143,6 +144,10 @@ export async function runTaskExecution(
   if (!claimed) {
     if (fenceStoppedReceiver && await receiverIsStopped(env, agent.id)) {
       return { ok: false, task_id: task.id, decided: '', error: 'receiver_not_live' }
+    }
+    // #1571: a 0-row claim on an archived task is an honest refusal, not a lost race.
+    if (await isTaskArchived(env, task.id)) {
+      return { ok: false, task_id: task.id, decided: '', error: 'task_archived' }
     }
     return { ok: false, task_id: task.id, decided: '', error: 'task_claim_lost' }
   }
@@ -521,6 +526,7 @@ async function claimTaskProgress(
               execution_receipt_id = ?3, execution_claim_expires_at = ?4
         WHERE id = ?5 AND squad_id = ?6 AND status = ?7 AND assignee_agent_id IS NULL
           AND assignee_member_id IS NULL
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           ${executionCondition}
           AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND status = 'active')
           ${stoppedFenceSql}`,
@@ -533,6 +539,7 @@ async function claimTaskProgress(
           SET status = 'in_progress', updated_at = ?1, execution_receipt_id = ?2,
               execution_claim_expires_at = ?3
         WHERE id = ?4 AND squad_id = ?5 AND status = ?6 AND assignee_agent_id = ?7
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           ${executionCondition}
           AND EXISTS (SELECT 1 FROM agents WHERE id = ?7 AND status = 'active')
           ${stoppedFenceSql}`,
@@ -582,7 +589,8 @@ async function finishTask(
     `UPDATE tasks
         SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?,
             execution_claim_expires_at = NULL, gate_owner = COALESCE(gate_owner, ?)
-      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
+      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(
       status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), gateOwnerFallback,
@@ -759,7 +767,8 @@ async function finishContentProposalWrite(
     `UPDATE tasks
         SET status = 'review', result = ?, completed_at = ?, updated_at = ?,
             gate_owner = COALESCE(gate_owner, ?), execution_claim_expires_at = NULL
-      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'`,
+      WHERE id = ? AND assignee_agent_id = ? AND execution_receipt_id = ? AND status = 'in_progress'
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(result, completedAt, completedAt, CONTENT_GATE_OWNER, taskId, agentId, executionReceiptId)
     .run()

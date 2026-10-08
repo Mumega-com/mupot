@@ -26,7 +26,7 @@ import { requireAuth } from '../auth'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError } from './service'
 import type { TaskStatus } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -53,6 +53,7 @@ import {
   PASSTHROUGH_FETCH_CAP,
 } from './ranking'
 import { loadAgentRuntimeStates, type AgentRuntimeState } from '../dashboard/observatory'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // ── validation helpers ───────────────────────────────────────────────────────
 type TaskActor = NonNullable<BusEvent['actor']>
@@ -1231,7 +1232,7 @@ tasksApp.post('/:id/local-smoke-complete', async (c) => {
     if (startErr) return c.json(startErr, 409)
     const startedAt = new Date().toISOString()
     await c.env.DB.prepare(
-      `UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2 AND status = 'open'`,
+      `UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2 AND status = 'open' AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
       .bind(startedAt, existing.id)
       .run()
@@ -1241,7 +1242,7 @@ tasksApp.post('/:id/local-smoke-complete', async (c) => {
   const update = await c.env.DB.prepare(
     `UPDATE tasks
         SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
-      WHERE id = ?3 AND status = 'in_progress'`,
+      WHERE id = ?3 AND status = 'in_progress' AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(result, completedAt, existing.id)
     .run()
@@ -1680,6 +1681,9 @@ tasksApp.post('/:id/verdict', async (c) => {
 
     return c.json(result, 201)
   } catch (err) {
+    if (err instanceof TaskArchivedError) {
+      return c.json({ error: 'task_archived' }, 409)
+    }
     if (err instanceof VerdictRaceError) {
       // K5: concurrent verdict won the race — task is no longer in 'review'.
       return c.json({ error: 'verdict_conflict', reason: 'task status changed concurrently; reload and retry' }, 409)
@@ -1742,6 +1746,7 @@ tasksApp.post('/:id/pipeline', async (c) => {
     if (err instanceof Error) {
       const code = (err as Error & { code?: string }).code
       if (code === 'task_not_found') return c.json({ error: 'task_not_found' }, 404)
+      if (code === 'task_archived') return c.json({ error: 'task_archived' }, 409)
       if (code === 'pipeline_already_started') {
         const instanceId = (err as Error & { instanceId?: string }).instanceId
         return c.json({ error: 'pipeline_already_started', instanceId }, 409)

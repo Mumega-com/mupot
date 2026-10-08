@@ -84,6 +84,7 @@ import {
   type OfficeResult,
   type OfficeRefusalReason,
 } from './freeze'
+import { TASK_NOT_ARCHIVED_SQL } from '../../hygiene/filters'
 
 export type { OfficeResult, OfficeRefusalReason } from './freeze'
 export { OFFICE_ADDON_KEY, OFFICE_GATE_OWNER, OFFICE_WORDPRESS_SLOT } from './freeze'
@@ -1062,11 +1063,12 @@ async function commitOfficeDoneReceipt(
     env.DB.prepare(
       `UPDATE office_publish_freezes SET outcome = 'done', outcome_detail = ?1, completed_at = ?2
         WHERE task_id = ?3 AND outcome IS NULL AND claimed_at IS NOT NULL
-          AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')`,
+          AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved' AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(freezeOutcomeDetail, now, taskId),
     env.DB.prepare(
       `UPDATE tasks SET status = 'done', result = ?1, completed_at = ?2, updated_at = ?2
         WHERE id = ?3 AND status = 'approved'
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           AND EXISTS (SELECT 1 FROM office_publish_freezes WHERE task_id = ?3 AND outcome = 'done' AND completed_at = ?2)`,
     ).bind(JSON.stringify(result), now, taskId),
   ])

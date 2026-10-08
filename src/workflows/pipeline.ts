@@ -26,6 +26,7 @@ import { runTaskExecution } from '../agents/execute'
 import type { ExecuteResult } from '../agents/execute'
 import { runApprovedActs } from '../integrations/ghl'
 import type { ActRunResult, GHLDeps } from '../integrations/ghl'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -420,6 +421,11 @@ export async function startTaskPipeline(
     throw Object.assign(new Error('task_not_found'), { code: 'task_not_found' as const })
   }
 
+  // mupot#1571: archived = no action — refuse before a Workflow instance is created.
+  if (await isTaskArchived(env, task.id)) {
+    throw Object.assign(new Error('task_archived'), { code: 'task_archived' as const })
+  }
+
   if (task.workflow_instance_id !== null) {
     throw Object.assign(new Error('pipeline_already_started'), {
       code: 'pipeline_already_started' as const,
@@ -452,7 +458,7 @@ export async function startTaskPipeline(
 
   // Persist the instance id so the verdict endpoint can resume the waiting instance.
   await env.DB.prepare(
-    `UPDATE tasks SET workflow_instance_id = ?, updated_at = ? WHERE id = ?`,
+    `UPDATE tasks SET workflow_instance_id = ?, updated_at = ? WHERE id = ? AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(instance.id, new Date().toISOString(), task.id)
     .run()

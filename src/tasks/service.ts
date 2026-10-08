@@ -13,6 +13,7 @@ import { resolveOutboundGitHubToken } from '../integrations/github-app'
 import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -309,7 +310,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode, readonly detail?: string) {
@@ -478,6 +479,9 @@ export function officeUpdateGuarded(existing: Pick<Task, 'gate_owner' | 'status'
  *  unresolved that is the typed, actionable refusal; otherwise the ordinary
  *  optimistic-concurrency conflict. */
 async function throwTaskUpdateConflict(env: Env, existing: Task): Promise<never> {
+  // mupot#1571: archived = no action. A 0-row write against an archived task is a typed
+  // refusal, not the generic optimistic-concurrency conflict.
+  if (await isTaskArchived(env, existing.id)) throw new TaskUpdateConflictError('task_archived')
   if (officeUpdateGuarded(existing)) {
     const unresolved = await env.DB.prepare(`SELECT ${officePublishUnresolvedSql('?1')} AS unresolved`)
       .bind(existing.id).first<{ unresolved: number }>()
@@ -503,7 +507,8 @@ function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1Prepa
   return env.DB.prepare(
     `UPDATE tasks
         SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
-      WHERE id = ? AND updated_at = ? AND project_id IS ?${officeGuard}`,
+      WHERE id = ? AND updated_at = ? AND project_id IS ?${officeGuard}
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   ).bind(
     next.title,
     next.body,
@@ -592,6 +597,7 @@ export interface VerdictReversalInput {
 export type VerdictReversalOutcome =
   | { ok: true; task: Task }
   | { ok: false; error: 'no_verdict_to_reverse' }
+  | { ok: false; error: 'task_archived' }
   // mupot#1616: an office publish is in flight or unresolved (claimed, no outcome).
   // Reversing now would let the rework loop mint a second freeze while a post may
   // already exist on WordPress.
@@ -669,7 +675,8 @@ export async function markApprovedTaskDoneFromGate(
   const guarded = row?.gate_owner === 'gate:office'
   const result = await env.DB.prepare(
     `UPDATE tasks SET status = 'done', result = ?, completed_at = ?, updated_at = ?
-           WHERE id = ? AND status = 'approved'${guarded ? ` AND NOT ${officePublishUnresolvedSql('tasks.id')}` : ''}`,
+           WHERE id = ? AND status = 'approved'${guarded ? ` AND NOT ${officePublishUnresolvedSql('tasks.id')}` : ''}
+             AND ${TASK_NOT_ARCHIVED_SQL()}`,
   ).bind(receiptResult, now, now, taskId).run()
   if ((result.meta?.changes ?? 0) > 0) return 'done'
   if (guarded) {
@@ -681,6 +688,9 @@ export async function markApprovedTaskDoneFromGate(
 
 export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput): Promise<VerdictReversalOutcome> {
   const { existing, next, tenant, reason, actorId, actorType } = input
+  // mupot#1571: refuse BEFORE step 1 closes the gate — a reversal on an archived task would
+  // otherwise stamp reversed_at and then fail step 2, a half-commit.
+  if (await isTaskArchived(env, existing.id)) return { ok: false, error: 'task_archived' }
   const verdict = await findLatestVerdict(env, existing.id)
   if (!verdict) return { ok: false, error: 'no_verdict_to_reverse' }
   const fromStatus = existing.status
@@ -939,7 +949,8 @@ export async function syncTaskStatusFromIssue(
     // open/in_progress → done. Leave review/approved/rejected/done untouched.
     const res = await env.DB.prepare(
       `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?
-        WHERE status IN ('open','in_progress') AND id IN (${idList})`,
+        WHERE status IN ('open','in_progress') AND id IN (${idList})
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
       .bind(now, now, ...writableIds)
       .run()
@@ -948,7 +959,8 @@ export async function syncTaskStatusFromIssue(
   // reopened: done → open (only if it was closed by us). Never touch gate states.
   const res = await env.DB.prepare(
     `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?
-      WHERE status = 'done' AND id IN (${idList})`,
+      WHERE status = 'done' AND id IN (${idList})
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(now, ...writableIds)
     .run()
@@ -1000,7 +1012,8 @@ export async function closeGitHubPrMirrorTasks(
       WHERE status IN ('open', 'in_progress')
         AND gate_owner IS NULL
         AND project_id IS NULL
-        AND title LIKE ?2 ESCAPE '\\'`,
+        AND title LIKE ?2 ESCAPE '\\'
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(now, like)
     .run()
@@ -1043,7 +1056,8 @@ export async function syncCiResultToTask(
   if (failed) {
     const res = await env.DB.prepare(
       `UPDATE tasks SET result = ?, status = 'in_progress', updated_at = ?
-        WHERE status = 'review' AND id IN (${idList})`,
+        WHERE status = 'review' AND id IN (${idList})
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
       .bind(note, now, ...writableIds)
       .run()
@@ -1052,7 +1066,8 @@ export async function syncCiResultToTask(
   // success/neutral/skipped: record the note without changing a gate state.
   const res = await env.DB.prepare(
     `UPDATE tasks SET result = ?, updated_at = ?
-      WHERE status IN ('review','in_progress','open') AND id IN (${idList})`,
+      WHERE status IN ('review','in_progress','open') AND id IN (${idList})
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(note, now, ...writableIds)
     .run()
@@ -1560,6 +1575,17 @@ export class VerdictRaceError extends Error {
   }
 }
 
+/** mupot#1571: archived = no action. Subclasses VerdictRaceError on purpose so every
+ *  pre-existing catch (HTTP verdict, MCP task_verdict, IM, office) still maps it to a 409
+ *  refusal rather than a 500; the surfaces that can name it do so with `task_archived`. */
+export class TaskArchivedError extends VerdictRaceError {
+  constructor(taskId: string) {
+    super(taskId)
+    this.message = `task_archived: task ${taskId} is archived; archived tasks accept no action`
+    this.name = 'TaskArchivedError'
+  }
+}
+
 // NonHumanVerdictRefusedError — FP-01 Slice 2 v2 round 2 (P2-4, kasra-review
 // adversarial round 2 on PR #1490): P0-3's verdictIsHuman only refused the
 // GRANT once the (non-human) verdict already existed — the task itself had
@@ -1690,6 +1716,10 @@ export async function resolveVerdictProposalId(env: Env, task: Task): Promise<st
 // before committing anything at all — not just before writeVerdict's own
 // two statements.
 export async function assertVerdictWritable(env: Env, task: Task): Promise<void> {
+  // mupot#1571: archived = no action. Runs before any other verdict side effect (this is
+  // also the origin-verdict dry-run and the office verdict pre-check), so a refusal
+  // reserves nothing.
+  if (await isTaskArchived(env, task.id)) throw new TaskArchivedError(task.id)
   // #399: like the UPDATE/INSERT below, this write's SET/INSERT never touches
   // squad_id/project_id, so 0061's narrowed trigger never fires for it. Re-check
   // before writing the verdict note (evidence-bearing, feeds
@@ -1767,12 +1797,12 @@ export function buildVerdictStatements(
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
-      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review'${guardSql}`,
+      `UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'review' AND ${TASK_NOT_ARCHIVED_SQL()}${guardSql}`,
     ).bind(newStatus, now, input.task.id, ...guardParams),
     env.DB.prepare(
       `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via, origin_agent_id, proposal_id)
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-          WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ?)`,
+          WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ? AND updated_at = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       verdictRow.id,
       verdictRow.task_id,
@@ -1900,6 +1930,7 @@ export async function writeVerdict(
     // the route can return 409 with a clear message. The INSERT in the same
     // batch is, by construction, also a no-op here (its EXISTS guard cannot
     // be satisfied) — nothing to roll back.
+    if (await isTaskArchived(env, input.task.id)) throw new TaskArchivedError(input.task.id)
     throw new VerdictRaceError(input.task.id)
   }
 

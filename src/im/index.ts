@@ -38,7 +38,7 @@ import type {
 } from '../types'
 import { resolveCapabilities, hasCapability, canOnSquad as sharedCanOnSquad } from '../auth/capability'
 import { createBus } from '../bus'
-import { createTask, writeVerdict, VerdictRaceError, TaskEvidenceFenceError, NonHumanVerdictRefusedError, DedicatedGatePredicateRequiredError } from '../tasks/service'
+import { createTask, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, NonHumanVerdictRefusedError, DedicatedGatePredicateRequiredError } from '../tasks/service'
 import { evaluateVerdictGates } from '../tasks/index'
 import { emitControlRequest } from '../fleet/control'
 import { CONTROL_VERBS, type ControlVerb } from '../fleet/control-request'
@@ -728,6 +728,9 @@ async function verdictReply(
       memberActor(member.id),
     )
   } catch (err) {
+    if (err instanceof TaskArchivedError) {
+      return `"${task.title}" is archived and accepts no verdict.`
+    }
     if (err instanceof VerdictRaceError) {
       return `"${task.title}" changed before I could record the verdict. Reload approvals and try again.`
     }

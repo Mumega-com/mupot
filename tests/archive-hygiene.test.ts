@@ -580,38 +580,135 @@ describe('archive substrate (mupot#1496)', () => {
     expect(after?.archived_prior_status).toBeNull()
   })
 
-  // mupot#1496 Round 3 scope cut (adversarial gate round 2): task archiving
-  // left this PR — https://github.com/Mumega-com/mupot/issues/1571.
-  // migrations/0173's tasks_archive_state table and the Round 2 reader
-  // filters stay (see tests/task-archive-readers.test.ts) — only the TOOL's
-  // ability to WRITE a tasks_archive_state row is gone.
-  it('archive_row/unarchive_row refuse table:tasks with 409 not_supported', async () => {
-    const archived = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-1', reason: 'x' })
-    expect(archived.ok).toBe(false)
-    if (archived.ok) return
-    expect(archived.status).toBe(409)
-    expect(archived.error).toBe('not_supported')
+  // ── tasks (mupot#1571 re-enabled once archive became an ACTION boundary) ───────
+  // The action-boundary behaviour (router, concierge, task_update, verdict, dispatch,
+  // runtime receipts, flights) lives in tests/task-archive-action-boundary.test.ts.
 
-    const unarchived = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-1', reason: 'x' })
-    expect(unarchived.ok).toBe(false)
-    if (unarchived.ok) return
-    expect(unarchived.status).toBe(409)
-    expect(unarchived.error).toBe('not_supported')
+  it('archives a task (side table, tasks.status untouched, receipt) and unarchive deletes the state + receipts', async () => {
+    const archived = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'board reset' })
+    expect(archived.ok).toBe(true)
+    if (!archived.ok) return
+    expect(archived.result).toMatchObject({ status: 'archived' })
+    const state = await env.DB.prepare('SELECT prior_status FROM tasks_archive_state WHERE task_id = ?1').bind('task-2').first<{ prior_status: string }>()
+    expect(state?.prior_status).toBe('open')
+    const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1').bind('task-2').first<{ status: string }>()
+    expect(task?.status).toBe('open')
 
-    // Never touched.
-    const stateRow = await env.DB.prepare('SELECT task_id FROM tasks_archive_state WHERE task_id = ?1').bind('task-1').first()
-    expect(stateRow).toBeNull()
+    const again = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'board reset' })
+    expect(again.ok && again.result).toMatchObject({ status: 'already_archived' })
+
+    const unarchived = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-2', reason: 'oops' })
+    expect(unarchived.ok).toBe(true)
+    expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind('task-2').first()).toBeNull()
+    const receipts = await env.DB.prepare(
+      `SELECT action, prior_status FROM archive_receipts WHERE entity_table = 'tasks' AND entity_id = ?1 ORDER BY created_at, action`,
+    ).bind('task-2').all<{ action: string; prior_status: string | null }>()
+    expect((receipts.results ?? []).map((r) => r.action).sort()).toEqual(['archive', 'unarchive'])
+    const again2 = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-2', reason: 'oops' })
+    expect(again2.ok && again2.result).toMatchObject({ status: 'not_archived' })
   })
 
-  it('archive_plan_expand always refuses 409 not_supported, regardless of input', async () => {
-    const result = await invoke(ORG_ADMIN, 'archive_plan_expand', {
-      table: 'tasks',
-      where: { status: ['open'], created_before: '2026-01-01', project_ids: ['proj-1'] },
+  it('unarchive restores tasks_archive_state.prior_status when the status was moved while archived', async () => {
+    await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    // A direct D1 edit (no guarded writer can do this) - unarchive must not trust it.
+    harness.sqlite.exec(`UPDATE tasks SET status = 'blocked' WHERE id = 'task-2';`)
+    const unarchived = await invoke(ORG_ADMIN, 'unarchive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    expect(unarchived.ok).toBe(true)
+    const task = await env.DB.prepare('SELECT status FROM tasks WHERE id = ?1').bind('task-2').first<{ status: string }>()
+    expect(task?.status).toBe('open')
+  })
+
+  it('archive_row(tasks) refuses plan drift per row (expected_status) and rejects an unknown status', async () => {
+    const drift = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x', expected_status: 'done' })
+    expect(drift.ok).toBe(false)
+    if (drift.ok) return
+    expect(drift.status).toBe(409)
+    expect(drift.error).toBe('status_drift')
+    expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind('task-2').first()).toBeNull()
+
+    const bogus = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x', expected_status: 'archived' })
+    expect(bogus.ok).toBe(false)
+    if (bogus.ok) return
+    expect(bogus.status).toBe(400)
+    expect(bogus.error).toBe('invalid_expected_status')
+
+    const match = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x', expected_status: 'open' })
+    expect(match.ok).toBe(true)
+  })
+
+  it('archive_row(tasks) keeps the org-admin / operator gate', async () => {
+    const memberOnly = auth({ capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: 'squad-1', capability: 'member' }] })
+    const refused = await invoke(memberOnly, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    expect(refused.ok).toBe(false)
+    const agentBound = await invoke(auth({ boundAgentId: 'agent-1' }), 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    expect(agentBound.ok).toBe(false)
+    if (agentBound.ok) return
+    expect(agentBound.error).toBe('operator_principal_required')
+    expect(await env.DB.prepare('SELECT 1 FROM tasks_archive_state').first()).toBeNull()
+  })
+
+  it('archive_row(tasks) refuses a live execution claim', async () => {
+    harness.sqlite.exec(`UPDATE tasks SET status='in_progress', execution_claim_expires_at = ${Date.now() + 600_000} WHERE id='task-2';`)
+    const refused = await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    expect(refused.ok).toBe(false)
+    if (refused.ok) return
+    expect(refused.error).toBe('live_execution_claim')
+  })
+
+  it('archived tasks no longer block squad/project archive as active dependents', async () => {
+    await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    const project = await invoke(ORG_ADMIN, 'archive_row', { table: 'projects', id: 'proj-1', reason: 'x' })
+    expect(project.ok).toBe(true)
+  })
+
+  it('archive_plan_expand: requires known statuses, returns current status per row, chunks >98 project_ids', async () => {
+    const unknown = await invoke(ORG_ADMIN, 'archive_plan_expand', {
+      table: 'tasks', where: { status: ['open', 'nonsense'], created_before: '2099-01-01', project_ids: ['proj-1'] },
     })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.status).toBe(409)
-    expect(result.error).toBe('not_supported')
+    expect(unknown.ok).toBe(false)
+    if (unknown.ok) return
+    expect(unknown.status).toBe(400)
+    expect(unknown.error).toBe('invalid_status')
+
+    // 250 project ids (well past D1's 100-bind ceiling): the real one is in the middle.
+    const ids = Array.from({ length: 250 }, (_, i) => `proj-fake-${i}`)
+    ids.splice(120, 0, 'proj-1')
+    // Enforce D1's real ceiling (node:sqlite allows ~32k): any statement binding >100 values throws.
+    const realDb = env.DB
+    const capped = {
+      prepare(sql: string) {
+        const stmt = realDb.prepare(sql)
+        return new Proxy(stmt, {
+          get(target, prop, receiver) {
+            if (prop === 'bind') {
+              return (...values: unknown[]) => {
+                if (values.length > 100) throw new Error(`D1_ERROR: too many SQL variables (${values.length})`)
+                return target.bind(...values)
+              }
+            }
+            return Reflect.get(target, prop, receiver)
+          },
+        })
+      },
+      batch: realDb.batch.bind(realDb),
+    } as unknown as Env['DB']
+    const cappedEnv = { ...env, DB: capped } as Env
+    const planned = await invokeTool(ORG_ADMIN, cappedEnv, 'archive_plan_expand', {
+      table: 'tasks', where: { status: ['open'], created_before: '2099-01-01', project_ids: ids },
+    }, ORIGIN)
+    expect(planned.ok).toBe(true)
+    if (!planned.ok) return
+    expect(planned.result).toMatchObject({ count: 1, truncated: false, ids: ['task-2'], rows: [{ id: 'task-2', status: 'open' }] })
+
+    await invoke(ORG_ADMIN, 'archive_row', { table: 'tasks', id: 'task-2', reason: 'x' })
+    const live = await invoke(ORG_ADMIN, 'archive_plan_expand', {
+      table: 'tasks', where: { status: ['open'], created_before: '2099-01-01', project_ids: ['proj-1'] },
+    })
+    expect(live.ok && live.result).toMatchObject({ count: 0 })
+    const archivedMode = await invoke(ORG_ADMIN, 'archive_plan_expand', {
+      table: 'tasks', mode: 'archived', where: { status: ['open'], created_before: '2099-01-01', project_ids: ['proj-1'] },
+    })
+    expect(archivedMode.ok && archivedMode.result).toMatchObject({ count: 1, ids: ['task-2'] })
   })
 
   // ── refusals ───────────────────────────────────────────────────────────────

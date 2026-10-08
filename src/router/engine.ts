@@ -3,6 +3,7 @@ import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
 import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import type { BusEvent, Env } from '../types'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export interface RouterTickInput {
   squadId: string
@@ -85,6 +86,7 @@ export async function runRouterTick(
       WHERE t.squad_id = ?1
         AND t.status = 'open'
         AND t.assignee_agent_id IS NULL
+        AND ${TASK_NOT_ARCHIVED_SQL('t')}
         -- mupot#1733 — a held task stays open+unassigned forever, so it must not occupy the
         -- bounded scan window (starvation). A real gate:* task is only scanned if SOME
         -- independent holder exists (assignee '' matches no agent: coarse, member+agent mode);
@@ -218,7 +220,8 @@ export async function runRouterTick(
                WHERE project_now.id = tasks.project_id
                  AND project_now.status = 'active'
             )
-          )`,
+          )
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(candidate.id, now, task.id, squadId, decision.tenant, authority.memberId).run()
 
     if (claim.meta.changes !== 1) {

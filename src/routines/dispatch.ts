@@ -15,6 +15,7 @@ import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
@@ -722,6 +723,7 @@ export async function dispatchRoutineRun(
             SELECT 1 FROM tasks t
              WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?
                AND t.assignee_agent_id = ? AND t.status IN ('open','in_progress')
+               AND ${TASK_NOT_ARCHIVED_SQL('t')}
           )
           AND EXISTS (
             SELECT 1 FROM flights f
@@ -737,6 +739,7 @@ export async function dispatchRoutineRun(
       `UPDATE tasks SET status = 'in_progress', updated_at = ?
         WHERE id = ? AND project_id = ? AND squad_id = ? AND assignee_agent_id = ?
           AND status IN ('open','in_progress')
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           AND EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.status = 'running'
