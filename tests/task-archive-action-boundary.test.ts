@@ -372,18 +372,41 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
   })
 
   // ── task_submit_result ──
-  it('task_submit_result refuses an archived in_progress task (named error, status unchanged)', async () => {
-    seedTask('s-dead', 'in_progress', { assignee: WORKER, gate: 'gate:gater' })
+  function seedSubmitFixture(taskId: string) {
+    h.sqlite.exec(`
+      INSERT INTO members (id, display_name, status, tenant) VALUES ('member-gate', 'G', 'active', '${TENANT}');
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-g', 'member-gate', 'squad', '${SQUAD}', 'member');
+      INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', '${GATE_AGENT}', 'member-gate', '${T0}');
+      INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, revoked_at, agent_id, tenant, expires_at)
+        VALUES ('tok-g', 'member-gate', 'hash-g', 'g', 'workspace', '${T0}', NULL, '${GATE_AGENT}', '${TENANT}', '2099-01-01T00:00:00.000Z');
+      INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+        VALUES ('gg-1', 'gate:gater', 'agent', '${GATE_AGENT}', '${OPERATOR}', '${T0}');
+    `)
+    seedTask(taskId, 'in_progress', { assignee: WORKER, gate: 'gate:gater' })
+  }
+  const submitAuth = () => adminAuth({
+    boundAgentId: WORKER,
+    capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: SQUAD, capability: 'member' }],
+  })
+  const submitArgs = (taskId: string) => ({ task_id: taskId, result: `Artifact: out.md\nSHA256: ${'a'.repeat(64)}` })
+
+  it('task_submit_result control: a live in_progress task moves to review', async () => {
+    seedSubmitFixture('s-live')
+    const result = await invoke(submitAuth(), 'task_submit_result', submitArgs('s-live'))
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    expect(row('s-live').status).toBe('review')
+  })
+
+  it('task_submit_result refuses an archived in_progress task as 409 task_archived (status unchanged)', async () => {
+    seedSubmitFixture('s-dead')
     archive('s-dead')
-    const agentAuth = adminAuth({
-      boundAgentId: WORKER,
-      capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: SQUAD, capability: 'member' }],
-    })
-    const result = await invoke(agentAuth, 'task_submit_result', {
-      task_id: 's-dead', result: 'Artifact: out.md\nSHA256: ' + 'a'.repeat(64),
-    })
+    const result = await invoke(submitAuth(), 'task_submit_result', submitArgs('s-dead'))
     expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('task_archived')
     expect(row('s-dead').status).toBe('in_progress')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM task_result_submissions WHERE task_id = ?').get('s-dead')).toEqual({ n: 0 })
   })
 
   // ── flight_dispatch ──
