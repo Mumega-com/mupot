@@ -1,6 +1,7 @@
 import { canOnSquad, resolveCapabilities } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJson, sha256Hex } from '../lib/canonical-json'
+import { chunkForD1InList } from '../lib/d1-in-list'
 import type { AuthContext, Env } from '../types'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_ENVELOPE_OPTIONAL_KEYS, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '../agents/messages'
@@ -100,8 +101,11 @@ export async function loadLatestDispatchReceiptsForTasks(
 ): Promise<Map<string, LatestDispatchReceiptInfo>> {
   const map = new Map<string, LatestDispatchReceiptInfo>()
   if (taskIds.length === 0) return map
-  const placeholders = taskIds.map((_, i) => `?${i + 2}`).join(', ')
-  const rows = await env.DB.prepare(`
+  // mupot#1676: one statement per chunk keeps each under D1's 100-parameter ceiling
+  // (?1 = tenant plus one per id).
+  for (const chunk of chunkForD1InList(taskIds)) {
+    const placeholders = chunk.map((_, i) => `?${i + 2}`).join(', ')
+    const rows = await env.DB.prepare(`
     SELECT d.task_id AS task_id, d.id AS dispatch_receipt_id, d.delivered_via AS delivered_via
       FROM task_dispatch_receipts d
       JOIN tasks t ON t.id = d.task_id
@@ -114,13 +118,14 @@ export async function loadLatestDispatchReceiptsForTasks(
             AND (newer.created_at > d.created_at
                  OR (newer.created_at = d.created_at AND newer.rowid > d.rowid))
        )
-  `).bind(env.TENANT_SLUG, ...taskIds)
-    .all<{ task_id: string; dispatch_receipt_id: string; delivered_via: string | null }>()
-  for (const row of rows.results ?? []) {
-    map.set(row.task_id, {
-      dispatch_receipt_id: row.dispatch_receipt_id,
-      delivered_via: row.delivered_via === 'inbox' || row.delivered_via === 'in_worker' ? row.delivered_via : null,
-    })
+  `).bind(env.TENANT_SLUG, ...chunk)
+      .all<{ task_id: string; dispatch_receipt_id: string; delivered_via: string | null }>()
+    for (const row of rows.results ?? []) {
+      map.set(row.task_id, {
+        dispatch_receipt_id: row.dispatch_receipt_id,
+        delivered_via: row.delivered_via === 'inbox' || row.delivered_via === 'in_worker' ? row.delivered_via : null,
+      })
+    }
   }
   return map
 }
