@@ -640,6 +640,62 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     expect(h.sqlite.prepare('SELECT workflow_instance_id AS w FROM tasks WHERE id = ?').get('rp')).toEqual({ w: null })
   })
 
+
+  // ── archive_row(tasks) write-time re-assertion: the state changes AFTER the pre-read ──
+  describe('archive_row(tasks) re-asserts its preconditions inside the write', () => {
+    const archiveRow = () => invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x', expected_status: 'open' })
+    const hookBeforeArchiveWrite = (mutate: () => void) => {
+      const realPrepare = h.db.prepare.bind(h.db)
+      let armed = true
+      h.db.prepare = ((sql: string) => {
+        if (armed && sql.includes('INSERT OR IGNORE INTO tasks_archive_state')) { armed = false; mutate() }
+        return realPrepare(sql)
+      }) as typeof h.db.prepare
+    }
+
+    it('plan drift: status changed after the pre-read -> status_drift, nothing archived', async () => {
+      seedTask('w-task', 'open')
+      hookBeforeArchiveWrite(() => h.sqlite.exec(`UPDATE tasks SET status = 'blocked' WHERE id = 'w-task'`))
+      const result = await archiveRow()
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('status_drift')
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+    })
+
+    it('live claim appeared after the pre-read -> live_execution_claim, nothing archived', async () => {
+      seedTask('w-task', 'open')
+      h.sqlite.exec(`UPDATE tasks SET status = 'in_progress' WHERE id = 'w-task'`)
+      hookBeforeArchiveWrite(() => h.sqlite.exec(`UPDATE tasks SET execution_claim_expires_at = ${Date.now() + 600_000} WHERE id = 'w-task'`))
+      const result = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x' })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('live_execution_claim')
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+    })
+
+    it('flight took the task after the pre-read -> in_air_flight, nothing archived', async () => {
+      seedTask('w-task', 'open')
+      hookBeforeArchiveWrite(() => h.sqlite.exec(
+        `INSERT INTO flights (id, tenant, agent, goal, status, meta)
+         VALUES ('fl-1', '${TENANT}', '${WORKER}', 'g', 'running', '{"task_ids":["w-task"]}')`,
+      ))
+      const result = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x' })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('in_air_flight')
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+    })
+
+    it('idempotent: a second archive of the same task is already_archived with ONE receipt', async () => {
+      seedTask('w-task', 'open')
+      expect((await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x' })).ok).toBe(true)
+      const again = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x' })
+      expect(again.ok && again.result).toMatchObject({ status: 'already_archived' })
+      expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM archive_receipts WHERE entity_id = 'w-task'`).get()).toEqual({ n: 1 })
+    })
+  })
+
   // ── executor claim ──
   it('the executor claim (agents/execute.ts) refuses an archived task as task_archived', async () => {
     seedTask('e-dead', 'open', { assignee: WORKER })
