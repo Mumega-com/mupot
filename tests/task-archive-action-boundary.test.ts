@@ -223,6 +223,21 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
   })
   afterEach(() => h.close())
 
+  /** Archive `taskId` the instant a statement matching `fragment` is prepared: the pre-read has
+   *  already passed, so only the writer's OWN WHERE can still refuse. This is what proves the SQL
+   *  guard is load-bearing rather than redundant behind a pre-check. */
+  function archiveWhenPrepared(fragment: string, taskId: string) {
+    const realPrepare = h.db.prepare.bind(h.db)
+    let armed = true
+    h.db.prepare = ((sql: string) => {
+      if (armed && sql.includes(fragment)) {
+        armed = false
+        archive(taskId)
+      }
+      return realPrepare(sql)
+    }) as typeof h.db.prepare
+  }
+
   const grantHadiGate = () => h.sqlite.exec(
     `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
        VALUES ('gg-hadi', 'gate:hadi', 'member', '${OPERATOR}', '${OPERATOR}', '${T0}')`,
@@ -279,16 +294,19 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       INSERT INTO projects (id, slug, name, description, goal, status) VALUES ('proj-c', 'proj-c', 'C', '', 'Ship it', 'active');
       INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-c', '${SQUAD}', 'write');
     `)
-    // Archived row sorts FIRST (oldest) so a SELECT that ignored archive would pick it first.
-    h.sqlite.prepare(
-      `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at)
-       VALUES ('c-dead', ?, 'proj-c', 'Old archived work', 'done', 'open', '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')`,
-    ).run(SQUAD)
+    // MAX_ROUTES_PER_TICK (5) archived rows sort FIRST (oldest): a SELECT that ignored archive would
+    // fill its whole LIMIT window with them and starve the live task behind (head-of-line stall).
+    for (let i = 0; i < 5; i += 1) {
+      h.sqlite.prepare(
+        `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at)
+         VALUES (?, ?, 'proj-c', 'Old archived work', 'done', 'open', ?, ?)`,
+      ).run(`c-dead-${i}`, SQUAD, `2020-01-0${i + 1}T00:00:00.000Z`, `2020-01-0${i + 1}T00:00:00.000Z`)
+      archive(`c-dead-${i}`)
+    }
     h.sqlite.prepare(
       `INSERT INTO tasks (id, squad_id, project_id, title, done_when, status, created_at, updated_at)
        VALUES ('c-live', ?, 'proj-c', 'Live work', 'done', 'open', '2021-01-01T00:00:00.000Z', '2021-01-01T00:00:00.000Z')`,
     ).run(SQUAD)
-    archive('c-dead')
     const reg = await registerModule(env, {
       identity: WORKER, kind: 'agent_system', adapter: 'cursor', projectId: null, capabilities: [BUILD_CAPABILITY],
     })
@@ -296,7 +314,7 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     void conciergeIdentity
     const result = await runProjectConcierge(env, project)
     expect(result.decision).toEqual({ action: 'route', routed: 1 })
-    expect(row('c-dead').a).toBeNull()
+    for (let i = 0; i < 5; i += 1) expect(row(`c-dead-${i}`).a).toBeNull()
     expect(row('c-live').a).toBe(WORKER)
   })
 
@@ -461,6 +479,16 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       expect(row('r-task').status).toBe('in_progress')
     })
 
+
+    it('RACE runtime_consumed: archived between the pre-check and the batch -> no claim, no receipt row', async () => {
+      seedTask('r-task', 'open', { assignee: WORKER, gate: 'gate:gater' })
+      seedRuntime('r-task')
+      archiveWhenPrepared("SET status = 'in_progress', execution_receipt_id", 'r-task')
+      await expect(recordTaskDispatchRuntimeReceipt(env, rtAuth(), receipt)).rejects.toBeInstanceOf(TaskDispatchRuntimeReceiptError)
+      expect(row('r-task')).toMatchObject({ status: 'open', r: null })
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_runtime_receipts').get()).toEqual({ n: 0 })
+    })
+
     it('the MCP tool maps the refusal to 409 task_archived', async () => {
       seedTask('r-task', 'open', { assignee: WORKER, gate: 'gate:gater' })
       seedRuntime('r-task')
@@ -555,6 +583,38 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     const wfEnv = { ...env, TASK_WORKFLOW: { create } } as unknown as Env
     await expect(startTaskPipeline(wfEnv, 'p-dead', SQUAD)).rejects.toMatchObject({ code: 'task_archived' })
     expect(create).not.toHaveBeenCalled()
+  })
+
+
+  // ── race proofs: archive lands AFTER the pre-read, so only the writer's own WHERE can refuse ──
+  it('RACE task_verdict: archived between the pre-check and the verdict batch -> task_archived, no verdict row', async () => {
+    seedTask('rv', 'review', { assignee: WORKER, gate: 'gate:hadi' })
+    grantHadiGate()
+    archiveWhenPrepared('UPDATE tasks SET status = ?, updated_at = ?', 'rv')
+    const result = await invoke(adminAuth(), 'task_verdict', { task_id: 'rv', verdict: 'approved' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('task_archived')
+    expect(row('rv').status).toBe('review')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = ?').get('rv')).toEqual({ n: 0 })
+  })
+
+  it('RACE task_dispatch: archived between the pre-read and the receipt INSERT -> task_archived, no receipt', async () => {
+    seedTask('rd', 'open', { assignee: WORKER })
+    archiveWhenPrepared('INSERT INTO task_dispatch_receipts', 'rd')
+    const result = await invoke(adminAuth(), 'task_dispatch', { task_id: 'rd' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('task_archived')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM task_dispatch_receipts WHERE task_id = ?').get('rd')).toEqual({ n: 0 })
+  })
+
+  it('RACE startTaskPipeline: archived after the instance was created -> instance id is NOT linked onto the archived task', async () => {
+    seedTask('rp', 'open', { assignee: WORKER })
+    archiveWhenPrepared('UPDATE tasks SET workflow_instance_id', 'rp')
+    const wfEnv = { ...env, TASK_WORKFLOW: { create: async () => ({ id: 'wf-1' }) } } as unknown as Env
+    await startTaskPipeline(wfEnv, 'rp', SQUAD)
+    expect(h.sqlite.prepare('SELECT workflow_instance_id AS w FROM tasks WHERE id = ?').get('rp')).toEqual({ w: null })
   })
 
   // ── executor claim ──
