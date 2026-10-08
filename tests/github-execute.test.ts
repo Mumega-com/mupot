@@ -12,7 +12,7 @@ function env(opts: { task?: { id: string; status: string } | null; token?: strin
   const DB = {
     prepare: (sql: string) => ({
       bind: (...args: unknown[]) => ({
-        first: async () => (sql.includes('FROM tasks') ? task : null),
+        first: async () => (/FROM tasks\b/.test(sql) ? task : null),
         run: async () => {
           if (sql.startsWith('UPDATE tasks')) updates.push({ sql, args })
           return { meta: { changes: 1 } }
@@ -68,7 +68,7 @@ describe('executeTaskAsPR', () => {
       prepare: (sql: string) => ({
         bind: (...args: unknown[]) => ({
           first: async () => {
-            if (sql.includes('FROM tasks')) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
+            if (/FROM tasks\b/.test(sql)) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
             if (sql.includes('FROM agents')) return agent
             return null
           },
@@ -99,7 +99,7 @@ describe('executeTaskAsPR', () => {
       prepare: (sql: string) => ({
         bind: (...args: unknown[]) => ({
           first: async () => {
-            if (sql.includes('FROM tasks')) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
+            if (/FROM tasks\b/.test(sql)) return { id: 'T1', status: 'open', assignee_agent_id: 'A1' }
             if (sql.includes('FROM agents')) return agent
             return null
           },

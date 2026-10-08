@@ -146,6 +146,10 @@ function makeVerdictEnv(opts: { updateChanges?: number } = {}) {
     return {
       sql,
       args,
+      // mupot#1571: writeVerdict reads tasks_archive_state (assertVerdictWritable); never archived here.
+      async first() {
+        return null
+      },
       async run() {
         runs.push({ sql, args })
         if (sql.includes('UPDATE tasks')) {
@@ -219,7 +223,7 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
     // landed-proof (id/status/updated_at EXISTS on `tasks`) — not a bare
     // unconditional INSERT.
     expect(runs[1].sql).toMatch(/INSERT INTO task_verdicts/)
-    expect(runs[1].sql).toMatch(/WHERE EXISTS \(SELECT 1 FROM tasks WHERE id = \? AND status = \? AND updated_at = \?\)/)
+    expect(runs[1].sql).toMatch(/WHERE EXISTS \(SELECT 1 FROM tasks WHERE id = \? AND status = \? AND updated_at = \? AND NOT EXISTS \(SELECT 1 FROM tasks_archive_state/)
     expect(runs[1].args).toEqual([
       result.verdict.id,
       task.id,

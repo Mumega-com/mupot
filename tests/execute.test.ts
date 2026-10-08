@@ -60,7 +60,7 @@ function makeEnv(opts: { task: Task | null; charter?: string | null; updateChang
           bind(...args: unknown[]) {
             return {
               async first<T>() {
-                if (sql.includes('FROM tasks')) return (opts.task as unknown as T) ?? null
+                if (/FROM tasks\b/.test(sql)) return (opts.task as unknown as T) ?? null
                 if (sql.includes('FROM agents')) return (AGENT as unknown as T)
                 if (sql.includes('SELECT department_id FROM squads')) {
                   return ({ department_id: 'dept-1' } as unknown as T)
