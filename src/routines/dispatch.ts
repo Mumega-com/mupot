@@ -625,10 +625,13 @@ export async function dispatchRoutineRun(
           AND EXISTS (
             SELECT 1 FROM flights cf
              WHERE cf.id = ? AND cf.tenant = routine_runs.tenant AND cf.status IN ('preflight','running')
-          )`,
+          )
+          -- mupot#1571: this write gates the agent message sent right after it; an archived
+          -- task is inert, so 0 rows here means no delivery (run_not_dispatchable below).
+          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
-      run.id, run.tenant, selected.agentId, flightId,
+      run.id, run.tenant, selected.agentId, flightId, task.id,
     ),
     env.DB.prepare(
       `INSERT INTO routine_run_events (

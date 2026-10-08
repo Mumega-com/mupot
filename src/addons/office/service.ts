@@ -66,6 +66,7 @@ import { parseSiteConnectorConfig, isRootSiteUrl, MCPWP_API_KEY_AUTH, checkMcpwp
 import { evaluateVerdictGates, canActOnSquad } from '../../tasks/index'
 import {
   VerdictRaceError,
+  TaskArchivedError,
   buildVerdictStatements,
   assertVerdictWritable,
   emitVerdictBusEvent,
@@ -84,7 +85,7 @@ import {
   type OfficeResult,
   type OfficeRefusalReason,
 } from './freeze'
-import { TASK_NOT_ARCHIVED_SQL } from '../../hygiene/filters'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../../hygiene/filters'
 
 export type { OfficeResult, OfficeRefusalReason } from './freeze'
 export { OFFICE_ADDON_KEY, OFFICE_GATE_OWNER, OFFICE_WORDPRESS_SLOT } from './freeze'
@@ -465,6 +466,7 @@ export async function reviewOfficeApproval(
     )
     return { ok: true, value: { task: written.task } }
   } catch (error) {
+    if (error instanceof TaskArchivedError) return { ok: false, reason: 'task_archived' }
     if (error instanceof VerdictRaceError) return { ok: false, reason: 'verdict_race' }
     throw error
   }
@@ -1221,11 +1223,16 @@ export async function publishOfficePost(
           WHERE task_id = ?3 AND verdict = 'approved' AND reversed_at IS NULL
           ORDER BY decided_at DESC, id DESC LIMIT 1
        )
-       AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved')
+       AND EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND status = 'approved' AND ${TASK_NOT_ARCHIVED_SQL()})
     RETURNING payload_json, payload_sha256, idempotency_key
   `).bind(claimant, claimTimestamp(), task.id, freezeRow.frozen_at, idempotencyKeyCandidate)
     .first<{ payload_json: string; payload_sha256: string; idempotency_key: string }>()
-  if (!claimed) return { ok: false, reason: 'publish_claimed' }
+  if (!claimed) {
+    // mupot#1571: archived = inert. The claim above is the ONLY thing between this call and the
+    // WordPress POST, so an archived task is refused here, named, with no fetch made.
+    if (await isTaskArchived(env, task.id)) return { ok: false, reason: 'task_archived' }
+    return { ok: false, reason: 'publish_claimed' }
+  }
 
   const frozenPayload = JSON.parse(claimed.payload_json) as { title: string; content: string }
   const slug = `${OFFICE_SLUG_PREFIX}${claimed.idempotency_key}`

@@ -15,6 +15,7 @@
 //   - Redact by construction: if a tail is ever needed, slice by index.
 
 import type { Env } from '../types'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 // ── GHL Env extension ─────────────────────────────────────────────────────────
 //
@@ -333,6 +334,14 @@ export async function runApprovedActs(
 
   const verdictId = verdictRow.id
 
+  // ── a2. Archived = inert (mupot#1571) ────────────────────────────────────
+  // An approved verdict does not outlive the task being archived: no outbound send. Acts stay
+  // 'pending' (inert, exactly like not_configured) so an unarchive can resume them. The per-act
+  // claim below re-asserts this in its own WHERE for the window between this check and the send.
+  if (await isTaskArchived(env, taskId)) {
+    return { ok: false, reason: 'task_archived', sent: 0, refused: 0, failed: 0 }
+  }
+
   // ── b. Config check — fails closed ───────────────────────────────────────
   if (!ghlConfigured(env)) {
     // Leave acts pending — they will be retried when the operator sets the secrets.
@@ -384,7 +393,8 @@ export async function runApprovedActs(
     const claim = await env.DB.prepare(
       `UPDATE outbound_acts
           SET status = 'sending', verdict_id = ?, sent_at = ?
-        WHERE id = ? AND status = 'pending'`,
+        WHERE id = ? AND status = 'pending'
+          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = outbound_acts.task_id AND ${TASK_NOT_ARCHIVED_SQL()})`,
     )
       .bind(verdictId, claimedAt, row.id)
       .run()

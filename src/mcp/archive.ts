@@ -52,6 +52,9 @@ function archiveOutcomeToResult(outcome: Awaited<ReturnType<typeof archiveRow>>)
       return fail(409, 'live_execution_claim')
     case 'in_air_flight':
       return fail(409, 'in_air_flight')
+    case 'in_flight_dispatch':
+      // mupot#1571: an unsettled dispatch receipt would still be delivered by the bus consumer.
+      return fail(409, 'in_flight_dispatch')
     case 'status_drift':
       // mupot#1571: the plan reviewed one status, the row now has another. Refused per row.
       return fail(409, 'status_drift', { expected: outcome.expected, actual: outcome.actual })
@@ -88,6 +91,8 @@ function unarchiveOutcomeToResult(outcome: Awaited<ReturnType<typeof unarchiveRo
       return fail(404, 'not_found')
     case 'invalid_reason':
       return fail(400, 'invalid_reason', 'reason must be 1-2000 characters')
+    case 'parent_archived':
+      return fail(409, 'parent_archived', { parent: outcome.parent })
     case 'cannot_affect_higher_rank':
       return fail(403, 'cannot_affect_higher_rank')
     case 'not_supported':
@@ -254,6 +259,8 @@ export const toolArchivePlanExpand: ToolSpec = {
 
     if (args.table !== 'tasks') return fail(400, 'unsupported_table', 'only table=tasks supports plan expansion')
     const mode = args.mode === 'archived' ? 'archived' : 'live'
+    // `as`: args is Record<string, unknown>; every field of this shape is re-validated below
+    // (array/string/ISO/enum checks) before any value is used, so the cast only names the shape.
     const where = (args.where ?? {}) as {
       status?: unknown
       created_before?: unknown
@@ -272,6 +279,8 @@ export const toolArchivePlanExpand: ToolSpec = {
       }
       statuses.push(value)
     }
+    // Dedupe: repeated statuses would inflate the bind count past D1's 100-variable ceiling.
+    const uniqueStatuses = Array.from(new Set(statuses))
     if (typeof where.created_before !== 'string' || !ISO_DATE_RE.test(where.created_before)) {
       return fail(400, 'invalid_args', 'where.created_before must be an ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)')
     }
@@ -288,8 +297,8 @@ export const toolArchivePlanExpand: ToolSpec = {
     // + one project_ids chunk stay well under it; each chunk is its own statement, results are
     // merged, ordered and capped here (a task has exactly one project_id, so chunks are disjoint).
     const archivedClause = mode === 'archived' ? 'ta.task_id IS NOT NULL' : 'ta.task_id IS NULL'
-    const statusPlaceholders = statuses.map((_, i) => `?${i + 1}`).join(',')
-    const dateIdx = statuses.length + 1
+    const statusPlaceholders = uniqueStatuses.map((_, i) => `?${i + 1}`).join(',')
+    const dateIdx = uniqueStatuses.length + 1
     const merged: Array<{ id: string; status: string; created_at: string }> = []
     for (const chunk of chunkForD1InList(Array.from(new Set(projectIds)))) {
       const projectPlaceholders = chunk.map((_, i) => `?${dateIdx + 1 + i}`).join(',')
@@ -302,7 +311,7 @@ export const toolArchivePlanExpand: ToolSpec = {
                     ORDER BY t.created_at ASC, t.id ASC
                     LIMIT ${PLAN_EXPAND_LIMIT + 1}`
       const { results } = await env.DB.prepare(sql)
-        .bind(...statuses, where.created_before, ...chunk)
+        .bind(...uniqueStatuses, where.created_before, ...chunk)
         .all<{ id: string; status: string; created_at: string }>()
       merged.push(...(results ?? []))
     }

@@ -27,6 +27,7 @@ import {
 } from '../src/tasks/service'
 import { persistGateWakeNotice } from '../src/gates/grants'
 import { startTaskPipeline } from '../src/workflows/pipeline'
+import { runApprovedActs, createOutboundAct } from '../src/integrations/ghl'
 import type { Agent, AuthContext, BusEvent, CapabilityGrant, Env, Project } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -50,18 +51,131 @@ interface TaskUpdateSite {
   statement: string
 }
 
-/** Statement text from `UPDATE tasks` to the closing backtick of its template literal,
- *  brace-aware so a nested `${ cond ? `...` : '' }` does not end it early. */
-function statementFrom(src: string, start: number): string {
-  let depth = 0
-  for (let i = start; i < src.length; i += 1) {
-    const c = src[i]
-    if (c === '$' && src[i + 1] === '{') { depth += 1; i += 1; continue }
-    if (c === '}' && depth > 0) { depth -= 1; continue }
-    if (c === '`' && depth === 0) return src.slice(start, i)
+/** Every string / template literal in a TS source, as raw text (outermost template only, nested
+ *  `${ ... }` included), with the offset it starts at. A real small lexer: comments are skipped, quotes
+ *  inside comments/regex/other literals cannot open a literal, and anything that is not provably inside
+ *  a literal is NOT scanned as SQL. Throws if the file ends mid-token so a mis-lex cannot pass silently. */
+function stringLiterals(src: string): Array<{ text: string; start: number }> {
+  const out: Array<{ text: string; start: number }> = []
+  let i = 0
+  const n = src.length
+  const skipTemplate = (from: number): number => {
+    // from points just after the opening backtick; returns index just after the closing backtick
+    let j = from
+    while (j < n) {
+      const c = src[j]
+      if (c === '\\') { j += 2; continue }
+      if (c === '`') return j + 1
+      if (c === '$' && src[j + 1] === '{') { j = skipBraces(j + 2); continue }
+      j += 1
+    }
+    throw new Error('unterminated template literal')
   }
-  return src.slice(start)
+  const skipQuoted = (from: number, q: string): number => {
+    let j = from
+    while (j < n) {
+      const c = src[j]
+      if (c === '\\') { j += 2; continue }
+      if (c === q) return j + 1
+      if (c === '\n') throw new Error('unterminated string literal')
+      j += 1
+    }
+    throw new Error('unterminated string literal')
+  }
+  // inside a template ${ ... }: code context, so nested literals/comments are lexed properly
+  const skipBraces = (from: number): number => {
+    let j = from
+    let depth = 1
+    while (j < n) {
+      const c = src[j]
+      if (c === '{') { depth += 1; j += 1; continue }
+      if (c === '}') { depth -= 1; j += 1; if (depth === 0) return j; continue }
+      j = stepCode(j)
+    }
+    throw new Error('unterminated ${')
+  }
+  let prevSignificant = ''
+  const stepCode = (j: number): number => {
+    const c = src[j]
+    const d = src[j + 1]
+    if (c === '/' && d === '/') { const e = src.indexOf('\n', j); return e === -1 ? n : e }
+    if (c === '/' && d === '*') { const e = src.indexOf('*/', j + 2); if (e === -1) throw new Error('unterminated comment'); return e + 2 }
+    if (c === '"' || c === "'") { const e = skipQuoted(j + 1, c); prevSignificant = 'x'; return e }
+    if (c === '`') { const e = skipTemplate(j + 1); prevSignificant = 'x'; return e }
+    if (c === '/' && (prevSignificant === '' || '(,=:[!&|?{};'.includes(prevSignificant))) {
+      // regex literal: scan to the closing slash, honouring escapes and [...] classes
+      let k = j + 1
+      let inClass = false
+      while (k < n) {
+        const ch = src[k]
+        if (ch === '\\') { k += 2; continue }
+        if (ch === '\n') throw new Error('unterminated regex at line ' + src.slice(0, j).split('\n').length)
+        if (ch === '[') inClass = true
+        else if (ch === ']') inClass = false
+        else if (ch === '/' && !inClass) break
+        k += 1
+      }
+      prevSignificant = 'x'
+      return k + 1
+    }
+    if (/[A-Za-z_$]/.test(c)) {
+      let k = j + 1
+      while (k < n && /[A-Za-z0-9_$]/.test(src[k])) k += 1
+      // a keyword that can precede an expression makes a following `/` a regex, not a division
+      prevSignificant = ['return', 'typeof', 'case', 'in', 'of', 'delete', 'void', 'throw', 'new', 'else', 'do'].includes(src.slice(j, k)) ? '(' : 'x'
+      return k
+    }
+    if (!/\s/.test(c)) prevSignificant = c
+    return j + 1
+  }
+  while (i < n) {
+    const c = src[i]
+    if (c === '"' || c === "'") {
+      const e = skipQuoted(i + 1, c)
+      out.push({ text: src.slice(i, e), start: i })
+      prevSignificant = 'x'
+      i = e
+    } else if (c === '`') {
+      const e = skipTemplate(i + 1)
+      out.push({ text: src.slice(i, e), start: i })
+      prevSignificant = 'x'
+      i = e
+    } else {
+      i = stepCode(i)
+    }
+  }
+  return out
 }
+
+/** Writers of `tasks` found in a source text: `UPDATE [OR x] tasks`, case-insensitive, inside a literal only. Each site's
+ *  statement runs from the match to the next `UPDATE tasks` match or the end of its literal. */
+export function findTaskUpdateSitesIn(src: string, file: string): TaskUpdateSite[] {
+  const sites: TaskUpdateSite[] = []
+  for (const lit of stringLiterals(src)) {
+    // `SET` is required: it separates a statement from prose such as tool-annotations' "UPDATE tasks (service.ts:540)".
+    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?"?tasks"?\s+SET\b/gi
+    const matches = [...lit.text.matchAll(re)]
+    matches.forEach((m, idx) => {
+      const from = m.index ?? 0
+      const to = idx + 1 < matches.length ? (matches[idx + 1].index ?? lit.text.length) : lit.text.length
+      sites.push({
+        file,
+        line: src.slice(0, lit.start + from).split('\n').length,
+        statement: lit.text.slice(from, to),
+      })
+    })
+  }
+  return sites
+}
+
+/** Claim statements on TASK-KEYED tables that precede an external effect. They are not `UPDATE tasks`, so the scan
+ *  above cannot see them; each must carry the task archive guard in its own WHERE. A general "every claim table" scan
+ *  is deliberately not attempted (no reliable marker for what is a claim); these are the ones that gate an outbound
+ *  effect today, found by enumerating the effect sites (see the PR body). */
+const EFFECT_CLAIMS: Array<{ file: string; marker: RegExp; effect: string }> = [
+  { file: 'src/addons/office/service.ts', marker: /UPDATE\s+office_publish_freezes\s+SET\s+claimed_by/i, effect: 'WordPress publish' },
+  { file: 'src/integrations/ghl.ts', marker: /UPDATE\s+outbound_acts\s+SET\s+status\s*=\s*'sending'/i, effect: 'GHL send' },
+]
 
 function findTaskUpdateSites(): TaskUpdateSite[] {
   const sites: TaskUpdateSite[] = []
@@ -69,17 +183,10 @@ function findTaskUpdateSites(): TaskUpdateSite[] {
     const file = relative(join(__dirname, '..'), full)
     // schema-chain.generated.ts embeds the migration SQL verbatim; migrations are DDL/backfill, not runtime writers.
     if (file.endsWith('schema-chain.generated.ts')) continue
-    const src = readFileSync(full, 'utf8')
-    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?tasks\b/g
-    let m: RegExpExecArray | null
-    while ((m = re.exec(src)) !== null) {
-      const lineStart = src.lastIndexOf('\n', m.index) + 1
-      const before = src.slice(lineStart, m.index)
-      const trimmed = before.trim()
-      // comments and prose (a `//` or `*` line, or text inside a single-quoted string with no template open)
-      if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*')) continue
-      if ((before.match(/'/g) ?? []).length % 2 === 1 && !before.includes('`')) continue
-      sites.push({ file, line: src.slice(0, m.index).split('\n').length, statement: statementFrom(src, m.index) })
+    try {
+      sites.push(...findTaskUpdateSitesIn(readFileSync(full, 'utf8'), file))
+    } catch (error) {
+      throw new Error(`seam scanner could not lex ${file}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   return sites
@@ -147,6 +254,35 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
     }
   })
 
+  it('the scanner itself: a single-quoted or lowercase UPDATE tasks is flagged; comments and prose are not', () => {
+    const probe = [
+      "env.DB.prepare('UPDATE tasks SET status = ? WHERE id = ?')",
+      'db.prepare("update tasks set status = 1")',
+      'db.prepare(`UPDATE\n   tasks SET x = 1`)',
+    ].join('\n')
+    expect(findTaskUpdateSitesIn(probe, 'probe.ts')).toHaveLength(3)
+    const quiet = [
+      '// UPDATE tasks SET status',
+      '/* UPDATE tasks SET status */',
+      "const msg = 'create or update the board'",
+      "const note = 'UPDATE tasks (service.ts:540) + gate INSERT'",
+      "const re = /[`'\"]UPDATE/",
+    ].join('\n')
+    expect(findTaskUpdateSitesIn(quiet, 'quiet.ts')).toEqual([])
+    // and a guarded one is not an offender
+    expect(findTaskUpdateSitesIn("db.prepare(`UPDATE tasks SET a = 1 WHERE ${TASK_NOT_ARCHIVED_SQL()}`)", 'g.ts')[0].statement)
+      .toContain('TASK_NOT_ARCHIVED_SQL(')
+  })
+
+  it('claims on task-keyed tables that precede an external effect carry the archive guard', () => {
+    for (const claim of EFFECT_CLAIMS) {
+      const src = readFileSync(join(__dirname, '..', claim.file), 'utf8')
+      const lits = stringLiterals(src).filter((l) => claim.marker.test(l.text))
+      expect(lits.length, `${claim.effect}: claim statement not found in ${claim.file}`).toBeGreaterThan(0)
+      for (const lit of lits) expect(lit.text, `${claim.effect} claim is unguarded`).toContain('TASK_NOT_ARCHIVED_SQL(')
+    }
+  })
+
   it('no other writer shapes bypass the scan (INSERT OR REPLACE INTO tasks / ON CONFLICT upserts)', () => {
     for (const full of walk(SRC_DIR)) {
       if (full.endsWith('schema-chain.generated.ts')) continue
@@ -158,9 +294,9 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
 
   it('the dispatch receipt INSERT is guarded in the same statement', () => {
     const src = readFileSync(join(SRC_DIR, 'mcp', 'index.ts'), 'utf8')
-    const at = src.indexOf('INSERT INTO task_dispatch_receipts')
-    expect(at).toBeGreaterThan(0)
-    expect(statementFrom(src, at)).toContain('TASK_NOT_ARCHIVED_SQL(')
+    const lits = stringLiterals(src).filter((l) => l.text.includes('INSERT INTO task_dispatch_receipts'))
+    expect(lits.length).toBe(1)
+    expect(lits[0].text).toContain('TASK_NOT_ARCHIVED_SQL(')
   })
 })
 
@@ -693,6 +829,142 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       const again = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'w-task', reason: 'x' })
       expect(again.ok && again.result).toMatchObject({ status: 'already_archived' })
       expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM archive_receipts WHERE entity_id = 'w-task'`).get()).toEqual({ n: 1 })
+    })
+  })
+
+
+  // ── GHL outbound sends (gate round 2, P1-2) ──
+  describe('GHL outbound acts (runApprovedActs, also the pipeline acts step)', () => {
+    const seedApprovedWithAct = async (id: string) => {
+      seedTask(id, 'approved', { assignee: WORKER, gate: 'gate:hadi' })
+      h.sqlite.prepare(
+        `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, decided_via) VALUES (?, ?, 'approved', NULL, ?, ?, NULL)`,
+      ).run(`v-${id}`, id, OPERATOR, T0)
+      const act = await createOutboundAct(env, id, 'add_contact', { email: 'a@example.com' })
+      return act.id
+    }
+    const ghlEnv = () => ({ ...env, GHL_API_KEY: 'k', GHL_LOCATION_ID: 'loc' }) as unknown as Env
+    const actStatus = (id: string) => (h.sqlite.prepare('SELECT status FROM outbound_acts WHERE id = ?').get(id) as { status: string }).status
+
+    it('control: a live approved task sends its pending act', async () => {
+      const act = await seedApprovedWithAct('ghl-live')
+      const ghlFetch = vi.fn(async () => ({ ok: true, status: 200 }))
+      const result = await runApprovedActs(ghlEnv(), 'ghl-live', { ghlFetch })
+      expect(result).toMatchObject({ ok: true, sent: 1 })
+      expect(ghlFetch).toHaveBeenCalledOnce()
+      expect(actStatus(act)).toBe('sent')
+    })
+
+    it('an archived approved task sends NOTHING: named task_archived, act stays pending', async () => {
+      const act = await seedApprovedWithAct('ghl-dead')
+      archive('ghl-dead')
+      const ghlFetch = vi.fn(async () => ({ ok: true, status: 200 }))
+      const result = await runApprovedActs(ghlEnv(), 'ghl-dead', { ghlFetch })
+      expect(result).toMatchObject({ ok: false, reason: 'task_archived', sent: 0 })
+      expect(ghlFetch).not.toHaveBeenCalled()
+      expect(actStatus(act)).toBe('pending')
+    })
+
+    it('RACE: archived after the pre-check, before the per-act claim -> the claim UPDATE refuses, no send', async () => {
+      const act = await seedApprovedWithAct('ghl-race')
+      archiveWhenPrepared("UPDATE outbound_acts\n          SET status = 'sending'", 'ghl-race')
+      const ghlFetch = vi.fn(async () => ({ ok: true, status: 200 }))
+      const result = await runApprovedActs(ghlEnv(), 'ghl-race', { ghlFetch })
+      expect(ghlFetch).not.toHaveBeenCalled()
+      expect(result.sent).toBe(0)
+      expect(actStatus(act)).toBe('pending')
+    })
+  })
+
+  // ── archive refuses a task the bus consumer would still deliver (gate round 2, P1-1) ──
+  it('archive_row refuses a task with an unsettled dispatch receipt: named in_flight_dispatch, nothing archived', async () => {
+    seedTask('inflight', 'open', { assignee: WORKER })
+    const dispatched = await invoke(adminAuth(), 'task_dispatch', { task_id: 'inflight' })
+    expect(dispatched.ok, JSON.stringify(dispatched)).toBe(true)
+    const result = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'inflight', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.status).toBe(409)
+    expect(result.error).toBe('in_flight_dispatch')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+  })
+
+  it('RACE archive vs dispatch: a dispatch receipt minted after the pre-read still blocks the archive write', async () => {
+    seedTask('inflight2', 'open', { assignee: WORKER })
+    const realPrepare = h.db.prepare.bind(h.db)
+    let armed = true
+    h.db.prepare = ((sql: string) => {
+      if (armed && sql.includes('INSERT OR IGNORE INTO tasks_archive_state')) {
+        armed = false
+        h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
+          VALUES ('dr-race', '${TENANT}', 'inflight2', '${SQUAD}', '${WORKER}', 'member', '${OPERATOR}', '${T0}', 1)`)
+      }
+      return realPrepare(sql)
+    }) as typeof h.db.prepare
+    const result = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'inflight2', reason: 'x' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('in_flight_dispatch')
+    expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+  })
+
+  it('archive_row accepts a task whose dispatch receipt has settled', async () => {
+    seedTask('settled', 'open', { assignee: WORKER })
+    h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts, settled_at)
+      VALUES ('dr-settled', '${TENANT}', 'settled', '${SQUAD}', '${WORKER}', 'member', '${OPERATOR}', '${T0}', 1, '${T0}')`)
+    const result = await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'settled', reason: 'x' })
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+  })
+
+  // ── unarchive cannot revive work inside an archived container (gate round 2, P2-1) ──
+  describe('unarchive_row(task) with an archived parent', () => {
+    it('squad archived after the task was archived -> parent_archived, task stays archived', async () => {
+      seedTask('child', 'open')
+      expect((await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'child', reason: 'x' })).ok).toBe(true)
+      h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${SQUAD}'`)
+      const result = await invoke(adminAuth(), 'unarchive_row', { table: 'tasks', id: 'child', reason: 'x' })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.status).toBe(409)
+      expect(result.error).toBe('parent_archived')
+      expect(result.detail).toEqual({ parent: 'squad' })
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 1 })
+      expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM archive_receipts WHERE action = 'unarchive'`).get()).toEqual({ n: 0 })
+    })
+
+    it('project archived -> parent_archived (project)', async () => {
+      h.sqlite.exec(`INSERT INTO projects (id, slug, name, status) VALUES ('pp', 'pp', 'PP', 'active'); INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('pp', '${SQUAD}', 'admin');`)
+      seedTask('child2', 'open', { project: 'pp' })
+      expect((await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'child2', reason: 'x' })).ok).toBe(true)
+      h.sqlite.exec(`UPDATE projects SET status = 'archived' WHERE id = 'pp'`)
+      const result = await invoke(adminAuth(), 'unarchive_row', { table: 'tasks', id: 'child2', reason: 'x' })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('parent_archived')
+      expect(result.detail).toEqual({ parent: 'project' })
+    })
+
+    it('RACE: squad archived after the pre-read -> the statements themselves refuse, nothing deleted or receipted', async () => {
+      seedTask('child3', 'open')
+      expect((await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'child3', reason: 'x' })).ok).toBe(true)
+      const realPrepare = h.db.prepare.bind(h.db)
+      let armed = true
+      h.db.prepare = ((sql: string) => {
+        if (armed && sql.includes("'unarchive'")) { armed = false; h.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${SQUAD}'`) }
+        return realPrepare(sql)
+      }) as typeof h.db.prepare
+      const result = await invoke(adminAuth(), 'unarchive_row', { table: 'tasks', id: 'child3', reason: 'x' })
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('parent_archived')
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 1 })
+      expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM archive_receipts WHERE action = 'unarchive'`).get()).toEqual({ n: 0 })
+    })
+
+    it('control: unarchive works when both parents are live', async () => {
+      seedTask('child4', 'open')
+      await invoke(adminAuth(), 'archive_row', { table: 'tasks', id: 'child4', reason: 'x' })
+      expect((await invoke(adminAuth(), 'unarchive_row', { table: 'tasks', id: 'child4', reason: 'x' })).ok).toBe(true)
     })
   })
 

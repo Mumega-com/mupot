@@ -711,6 +711,33 @@ describe('archive substrate (mupot#1496)', () => {
     expect(archivedMode.ok && archivedMode.result).toMatchObject({ count: 1, ids: ['task-2'] })
   })
 
+  it('archive_plan_expand dedupes statuses so duplicates cannot push the bind count past 100', async () => {
+    const realDb = env.DB
+    const capped = {
+      prepare(sql: string) {
+        const stmt = realDb.prepare(sql)
+        return new Proxy(stmt, {
+          get(target, prop, receiver) {
+            if (prop === 'bind') {
+              return (...values: unknown[]) => {
+                if (values.length > 100) throw new Error(`D1_ERROR: too many SQL variables (${values.length})`)
+                return target.bind(...values)
+              }
+            }
+            return Reflect.get(target, prop, receiver)
+          },
+        })
+      },
+      batch: realDb.batch.bind(realDb),
+    } as unknown as Env['DB']
+    const planned = await invokeTool(ORG_ADMIN, { ...env, DB: capped } as Env, 'archive_plan_expand', {
+      table: 'tasks', where: { status: Array.from({ length: 150 }, () => 'open'), created_before: '2099-01-01', project_ids: ['proj-1'] },
+    }, ORIGIN)
+    expect(planned.ok, JSON.stringify(planned)).toBe(true)
+    if (!planned.ok) return
+    expect(planned.result).toMatchObject({ count: 1, ids: ['task-2'] })
+  })
+
   // ── refusals ───────────────────────────────────────────────────────────────
 
   it('refuses to archive a squad with an active agent, active member, or open task — reports counts', async () => {

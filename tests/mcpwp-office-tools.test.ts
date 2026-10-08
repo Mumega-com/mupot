@@ -624,6 +624,83 @@ describe('T2b: the real write-capable binding lifecycle', () => {
   })
 })
 
+// mupot#1571 (gate round 2, P0-1/P2-3): ARCHIVED = INERT at the external effect. The publish claim's
+// own EXISTS must refuse an archived approved task BEFORE wordpressPublish, with a named error.
+describe('mupot#1571: an archived office task is inert', () => {
+  const archiveTask = (harness: SqliteD1Harness, taskId: string) => {
+    harness.sqlite.exec(`INSERT INTO members (id, tenant, email, display_name, status) VALUES ('arch-op', '${TENANT}', 'arch@example.com', 'A', 'active')`)
+    harness.sqlite.prepare(
+      `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status) VALUES (?, '2026-10-08T00:00:00.000Z', 'test', 'arch-op', 'approved')`,
+    ).run(taskId)
+  }
+
+  it('office.publish_post on an archived approved task: zero WordPress fetches, named task_archived, no claim', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-archived-publish')
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    archiveTask(harness, taskId)
+
+    const fetchSpy = vi.fn(async () => new Response('{}', { status: 201 })) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+    const result = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.status).toBe(409)
+      expect(result.error).toBe('task_archived')
+    }
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const freeze = harness.sqlite.prepare('SELECT claimed_at, outcome FROM office_publish_freezes WHERE task_id = ?').get(taskId) as { claimed_at: string | null; outcome: string | null }
+    expect(freeze.claimed_at).toBeNull()
+    expect(freeze.outcome).toBeNull()
+    expect((harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as { status: string }).status).toBe('approved')
+    harness.close()
+  })
+
+  it('control: the same flow on a live (unarchived) task still publishes exactly once', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-live-publish')
+    await installConfigureActivateOffice(testEnv, connectorId)
+    const { departmentId, squadId } = readOfficeDepartmentAndSquad(harness)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    await approveOfficeTask(testEnv, taskId)
+    const fetchSpy = vi.fn(async () => new Response(
+      JSON.stringify({ id: 77, url: 'https://wordpress.example.com/?p=77' }),
+      { status: 201, headers: { 'content-type': 'application/json' } },
+    )) as unknown as typeof fetch
+    vi.stubGlobal('fetch', fetchSpy)
+    const result = await invokeTool(officeLead(departmentId), testEnv, 'office.publish_post', { task_id: taskId }, ORIGIN)
+    expect(result.ok).toBe(true)
+    expect(fetchSpy).toHaveBeenCalledOnce()
+    harness.close()
+  })
+
+  it('office.review_approval on an archived review task names task_archived (not verdict_race)', async () => {
+    const harness = makeHarness()
+    const testEnv = env(harness)
+    const { squadId } = seedOfficeDepartmentAndSquad(harness)
+    const connectorId = await seedWordpressConnector(harness, 'https://wordpress.example.com', 'secret-archived-review')
+    seedActiveOfficeInstallation(harness, connectorId)
+    const taskId = await makeOfficeTask(testEnv, squadId)
+    const hash = await officeFreezeHash(testEnv, taskId)
+    archiveTask(harness, taskId)
+    const result = await invokeTool(
+      orgOwnerAuth(), testEnv, 'office.review_approval',
+      { task_id: taskId, verdict: 'approved', expected_payload_sha256: hash },
+      ORIGIN,
+    )
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error).toBe('task_archived')
+    expect((harness.sqlite.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as { status: string }).status).toBe('review')
+    harness.close()
+  })
+})
+
 describe('office.publish_post', () => {
   // P3-2 (kasra-review adversarial round 1, PR #1588): the ORIGINAL version of this
   // test published successfully through a binding whose capability is 'read' — the
