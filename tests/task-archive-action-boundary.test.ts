@@ -707,4 +707,15 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     expect(model.chat).not.toHaveBeenCalled()
     expect(row('e-dead')).toMatchObject({ status: 'open', a: WORKER, r: null })
   })
+
+  it('the executor claim also refuses an archived UNASSIGNED task (the self-claim branch)', async () => {
+    seedTask('e-dead2', 'open')
+    archive('e-dead2')
+    const model = { chat: vi.fn(async () => ({ content: 'x', usage: { prompt_tokens: 1, completion_tokens: 1 } })) }
+    const agent = h.sqlite.prepare('SELECT * FROM agents WHERE id = ?').get(WORKER) as unknown as Agent
+    const result = await runTaskExecution(env, agent, 'e-dead2', { model: model as never })
+    expect(result).toMatchObject({ ok: false, error: 'task_archived' })
+    expect(model.chat).not.toHaveBeenCalled()
+    expect(row('e-dead2')).toMatchObject({ status: 'open', a: null })
+  })
 })
