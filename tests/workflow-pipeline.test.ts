@@ -617,6 +617,8 @@ describe('startTaskPipeline', () => {
               return {
                 async first<T>() {
                   if (opts.task === null) return null as unknown as T
+                  // mupot#1571: the archive pre-check reads tasks_archive_state; this fixture is never archived.
+                  if (sql.includes('tasks_archive_state')) return null as unknown as T
                   // Return a row that matches the SELECT in startTaskPipeline.
                   // Use 'assignee_agent_id' in opts.task to detect explicit null
                   // (null and 'agent-wf-1' default are different cases).

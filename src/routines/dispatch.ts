@@ -15,6 +15,7 @@ import type { RoutinePolicySnapshot } from './types'
 import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
@@ -624,10 +625,13 @@ export async function dispatchRoutineRun(
           AND EXISTS (
             SELECT 1 FROM flights cf
              WHERE cf.id = ? AND cf.tenant = routine_runs.tenant AND cf.status IN ('preflight','running')
-          )`,
+          )
+          -- mupot#1571: this write gates the agent message sent right after it; an archived
+          -- task is inert, so 0 rows here means no delivery (run_not_dispatchable below).
+          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
-      run.id, run.tenant, selected.agentId, flightId,
+      run.id, run.tenant, selected.agentId, flightId, task.id,
     ),
     env.DB.prepare(
       `INSERT INTO routine_run_events (
@@ -722,6 +726,7 @@ export async function dispatchRoutineRun(
             SELECT 1 FROM tasks t
              WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?
                AND t.assignee_agent_id = ? AND t.status IN ('open','in_progress')
+               AND ${TASK_NOT_ARCHIVED_SQL('t')}
           )
           AND EXISTS (
             SELECT 1 FROM flights f
@@ -737,6 +742,7 @@ export async function dispatchRoutineRun(
       `UPDATE tasks SET status = 'in_progress', updated_at = ?
         WHERE id = ? AND project_id = ? AND squad_id = ? AND assignee_agent_id = ?
           AND status IN ('open','in_progress')
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           AND EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.status = 'running'

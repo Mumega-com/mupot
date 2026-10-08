@@ -6,6 +6,7 @@
 
 import type { Env, Task } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export type GatePrincipalType = 'member' | 'agent'
 
@@ -238,7 +239,7 @@ const MAX_GATE_WAKE_NOTICE_CHARS = 2000
  */
 export async function persistGateWakeNotice(env: Env, taskId: string, notice: string): Promise<void> {
   await env.DB.prepare(
-    `UPDATE tasks SET gate_wake_notice = ?1 WHERE id = ?2`,
+    `UPDATE tasks SET gate_wake_notice = ?1 WHERE id = ?2 AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(notice.slice(0, MAX_GATE_WAKE_NOTICE_CHARS), taskId)
     .run()

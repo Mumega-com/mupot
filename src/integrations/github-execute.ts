@@ -14,6 +14,7 @@ import { createBranch, putFile, openPullRequest, isValidRepoPath, type CommitIde
 import { githubCan } from './github-capabilities'
 import { isValidRepo } from './github-repo-write'
 import { officePublishUnresolvedSql } from '../tasks/service'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 /** Statuses execute-task may move to 'review' (work in flight). Never approved/done/review/etc. */
 const EXECUTABLE_FROM_STATUSES = ['open', 'in_progress'] as const
@@ -89,6 +90,8 @@ export async function executeTaskAsPR(
   // Fail BEFORE any GitHub side effect (branch/PR). The final UPDATE's WHERE re-enforces both
   // (this read can go stale) — the writer's WHERE is the invariant, this is the early refusal.
   if (task.unresolved) return { ok: false, error: 'office_publish_unresolved', stage: 'task' }
+  // mupot#1571: archived = no action; refuse before any branch/PR side effect.
+  if (await isTaskArchived(env, taskId)) return { ok: false, error: 'task_archived', stage: 'task' }
   if (!(EXECUTABLE_FROM_STATUSES as readonly string[]).includes(task.status)) {
     return { ok: false, error: 'invalid_transition', stage: 'task' }
   }
@@ -129,7 +132,8 @@ export async function executeTaskAsPR(
   const upd = await env.DB.prepare(
     `UPDATE tasks SET status = 'review', github_issue_url = ?1, updated_at = ?2
       WHERE id = ?3 AND status IN ('open', 'in_progress')
-        AND NOT ${officePublishUnresolvedSql('tasks.id')}`,
+        AND NOT ${officePublishUnresolvedSql('tasks.id')}
+        AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(pr.url, now, taskId)
     .run()
@@ -141,6 +145,7 @@ export async function executeTaskAsPR(
     )
       .bind(taskId)
       .first<{ status: string; unresolved: number }>()
+    if (await isTaskArchived(env, taskId)) return { ok: false, error: 'task_archived', stage: 'task' }
     return { ok: false, error: now2?.unresolved ? 'office_publish_unresolved' : 'invalid_transition', stage: 'task' }
   }
 

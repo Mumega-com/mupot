@@ -111,6 +111,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    -- mupot#1571: every task writer now carries TASK_NOT_ARCHIVED_SQL, which reads this table.
+    CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
   `)
 }
 

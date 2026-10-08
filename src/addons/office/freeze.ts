@@ -105,6 +105,8 @@ export type OfficeRefusalReason =
   | 'publish_outcome_unknown'
   | 'write_failed'
   | 'verdict_race'
+  // mupot#1571: the task is archived; archived = inert, so no publish/verdict/claim.
+  | 'task_archived'
 
 export type OfficeResult<T> =
   | { ok: true; value: T }

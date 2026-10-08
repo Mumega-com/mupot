@@ -65,6 +65,7 @@ function officeFailureStatus(reason: OfficeRefusalReason): 400 | 403 | 404 | 409
     case 'publish_outcome_unknown':
     case 'write_failed':
     case 'verdict_race':
+    case 'task_archived':
       return 409
     case 'expected_hash_required':
       return 400

@@ -55,6 +55,7 @@ import {
 } from '../tasks/effort-route'
 import type { Task } from '../types'
 import { registerModule, listPresence, type ModulePresence, type RegistryResult } from '../registry/service'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 /** Capability marker for "this roster entry can execute build work." The ONE place
  * that defines what counts as build-capable for dispatch purposes — extend here,
@@ -346,6 +347,7 @@ async function routeUnassignedWork(
         AND assignee_member_id IS NULL
         AND source_pot IS NULL
         AND external_source IS NULL
+        AND ${TASK_NOT_ARCHIVED_SQL()}
       ORDER BY created_at ASC
       LIMIT ?2`,
   )
@@ -390,7 +392,8 @@ async function routeUnassignedWork(
       // dies. A guard that turns a race into an exception is not a guard.
       `UPDATE tasks SET assignee_agent_id = ?1, updated_at = ?3
         WHERE id = ?2 AND status = 'open' AND assignee_agent_id IS NULL
-          AND assignee_member_id IS NULL`,
+          AND assignee_member_id IS NULL
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
       .bind(picked.agent.id, task.id, new Date().toISOString())
       .run()

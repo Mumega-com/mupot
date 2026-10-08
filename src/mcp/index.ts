@@ -88,6 +88,7 @@ import {
   validateTaskProjectAttribution,
   writeVerdict,
   VerdictRaceError,
+  TaskArchivedError,
   TaskEvidenceFenceError,
   NonHumanVerdictRefusedError,
   detectVerdictReversalRequest,
@@ -2302,6 +2303,7 @@ const toolTaskVerdict: ToolSpec = {
         // carrying the reason for the response's human_origin field.
         originFailure = originOutcome
       } catch (err) {
+        if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
         if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
         throw err
       }
@@ -2386,6 +2388,7 @@ const toolTaskVerdict: ToolSpec = {
           : {}
       return done({ ...result, ...humanOriginField })
     } catch (err) {
+      if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
       if (err instanceof TaskEvidenceFenceError) {
         // #399: owning squad no longer holds write/admin on the task's project.
@@ -2624,10 +2627,13 @@ const toolTaskDispatch: ToolSpec = {
     const memberId = auth.memberId as string
     const receiptId = crypto.randomUUID()
     const dispatchedAt = new Date().toISOString()
-    await env.DB.prepare(
+    // mupot#1571: the archive check rides INSIDE the receipt INSERT (one statement), so an
+    // archive that lands after the pre-read above cannot still mint a dispatch receipt.
+    const receiptInsert = await env.DB.prepare(
       `INSERT INTO task_dispatch_receipts
          (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
-       VALUES (?, ?, ?, ?, ?, 'member', ?, ?, 1)`,
+       SELECT ?, ?, ?, ?, ?, 'member', ?, ?, 1
+         FROM tasks WHERE id = ? AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(
       receiptId,
       env.TENANT_SLUG,
@@ -2636,7 +2642,9 @@ const toolTaskDispatch: ToolSpec = {
       task.assignee_agent_id,
       memberId,
       dispatchedAt,
+      task.id,
     ).run()
+    if (!receiptInsert.meta?.changes) return fail(409, 'task_archived')
 
     const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; delivery?: 'inbox' }> = {
       type: 'agent.wake',
@@ -2706,6 +2714,7 @@ function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutc
     || error.code === 'runtime_receipt_conflict'
     || error.code === 'runtime_artifact_required'
     || error.code === 'runtime_receipt_transition_conflict'
+    || error.code === 'task_archived'
     || error.code === 'dispatch_terminated'
   ) return fail(409, error.code)
   return fail(500, error.code)
@@ -2980,7 +2989,8 @@ const toolTaskSubmitResult: ToolSpec = {
             gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
             squadIdExpr: 'tasks.squad_id', tenantParam: '?7', nowParam: '?8',
             allowMemberHolders: true,
-          })}`,
+          })}
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(
       next.result, next.updated_at, next.id, existing.updated_at, existing.project_id,
       callerAgentId, env.TENANT_SLUG, now,
@@ -2996,6 +3006,7 @@ const toolTaskSubmitResult: ToolSpec = {
     )
     const results = await env.DB.batch([updateStmt, insertStmt])
     if (!results[0]?.meta?.changes) {
+      if (await isTaskArchived(env, next.id)) return fail(409, 'task_archived')
       return fail(409, 'task_update_conflict')
     }
 

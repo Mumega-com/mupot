@@ -82,6 +82,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       source_pot         TEXT,
       external_source    TEXT
     );
+    -- mupot#1571: every task writer carries TASK_NOT_ARCHIVED_SQL, which reads this table.
+    CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
     CREATE TABLE task_verdicts (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
       note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL

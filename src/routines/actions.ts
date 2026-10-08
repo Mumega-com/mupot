@@ -916,6 +916,7 @@ async function waitForHuman(
     ...(reason === 'review' ? [env.DB.prepare(
       `UPDATE tasks SET status = 'review', gate_owner = ?, updated_at = ?
         WHERE id = ? AND project_id = ? AND status IN ('in_progress','review')
+          AND ${TASK_NOT_ARCHIVED_SQL()}
           AND (gate_owner IS NULL OR gate_owner = ?)
           AND EXISTS (
             SELECT 1 FROM routine_run_actions

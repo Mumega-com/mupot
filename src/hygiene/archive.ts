@@ -45,6 +45,9 @@ import { revokeAllWebSessions } from '../auth/web-sessions'
 import { revokeAllAgentSessionsForMember } from '../auth/agent-sessions'
 import { exceedsTargetRankCeiling, targetLegacyRoleRank, capabilityRank } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { TASK_NOT_ARCHIVED_SQL } from './filters'
+import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
+import { inFlightDispatchReceiptExistsSql, hasInFlightDispatchReceipt } from '../tasks/runtime-receipts'
 
 export const ARCHIVABLE_TABLES = ['members', 'agents', 'squads', 'projects', 'tasks'] as const
 export type ArchivableTable = (typeof ARCHIVABLE_TABLES)[number]
@@ -58,6 +61,10 @@ export interface ArchiveInput {
   id: string
   reason: string
   actorMemberId: string
+  /** tasks only (mupot#1571 plan drift check): the status the reviewed plan saw. When set,
+   *  the archive is refused for this row if tasks.status no longer matches — checked inside
+   *  the guarded INSERT's own WHERE, not only in a pre-read. */
+  expectedStatus?: string
 }
 
 export interface UnarchiveInput {
@@ -80,6 +87,10 @@ export type ArchiveOutcome =
   | { ok: false; error: 'active_dependents'; counts: Record<string, number> }
   | { ok: false; error: 'live_execution_claim' }
   | { ok: false; error: 'in_air_flight' }
+  // mupot#1571: an unsettled dispatch receipt - the bus consumer would still deliver it.
+  | { ok: false; error: 'in_flight_dispatch' }
+  | { ok: false; error: 'status_drift'; expected: string; actual: string }
+  | { ok: false; error: 'invalid_expected_status'; accepted: readonly string[] }
   | { ok: false; error: 'owns_active_agent'; counts: { active_agents: number } }
   | { ok: false; error: 'cannot_archive_self' }
   | { ok: false; error: 'cannot_affect_higher_rank' }
@@ -93,6 +104,8 @@ export type UnarchiveOutcome =
   | { ok: true; status: 'not_archived' }
   | { ok: false; error: 'not_found' }
   | { ok: false; error: 'invalid_reason' }
+  // mupot#1571: a task cannot be revived inside an archived squad or project.
+  | { ok: false; error: 'parent_archived'; parent: 'squad' | 'project' }
   | { ok: false; error: 'cannot_affect_higher_rank' }
   | { ok: false; error: 'not_supported' }
 
@@ -106,20 +119,29 @@ function nowIso(): string {
 }
 
 /** archiveRow — the single entry point for marking members/agents/squads/
- *  projects archived. `tasks` is DELIBERATELY NOT SUPPORTED here (mupot#1496
- *  Round 3 scope cut, adversarial gate round 2): archiving a task is an
- *  action-boundary problem across ~10 mutating paths (task_update,
- *  task_verdict, task_dispatch, task_dispatch_runtime_receipt,
- *  task_dispatch_lease_reset, routine actions, flight dispatch, ...), not a
- *  single-table write — tracked as its own scoped follow-up,
- *  https://github.com/Mumega-com/mupot/issues/1571. migrations/0173's
- *  `tasks_archive_state` table and the reader-side exclusions already wired
- *  into task_list/task_board/task_dispatch/needs_you_list/routines/kanban
- *  (Round 2) stay — they are correct and harmless with an always-empty
- *  table, and go live the moment #1571 lands a real write path. */
+ *  projects/tasks archived.
+ *
+ *  `tasks` was held back in mupot#1496 Round 3 because archive was only a READER
+ *  filter: every task-mutating writer (router_tick, the concierge cron, task_update,
+ *  task_verdict, dispatch, runtime receipts, execute, routines, the bus consumer ...)
+ *  kept acting on an archived task. mupot#1571 made archive an ACTION boundary: every
+ *  `UPDATE tasks` in src/ carries TASK_NOT_ARCHIVED_SQL in its own WHERE or is on the
+ *  justified allowlist in tests/task-archive-action-boundary.test.ts (a raw-text seam
+ *  scan that fails CI on a new unguarded writer). Only then is the write path here
+ *  re-enabled. */
+/**
+ * mupot#1571 / #1778: archiving TASKS stays off unless `TASK_ARCHIVE_ENABLED` is exactly '1'.
+ * The action-boundary guards ship on every task writer regardless, but two gate rounds
+ * found effects that still reach an archived task (the gate-stall watchdog re-wake, and an
+ * in-flight-dispatch predicate that wedges settled inbox dispatches). Until those land
+ * (#1780), production must not create archived tasks. Do not set the flag before then.
+ */
+export function taskArchiveEnabled(env: Env): boolean {
+  return env.TASK_ARCHIVE_ENABLED === '1'
+}
+
 export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInput): Promise<ArchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
-  if (input.table === 'tasks') return { ok: false, error: 'not_supported' }
 
   switch (input.table) {
     case 'members':
@@ -130,12 +152,14 @@ export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInpu
       return archiveSquad(env, input)
     case 'projects':
       return archiveProject(env, input)
+    case 'tasks':
+      if (!taskArchiveEnabled(env)) return { ok: false, error: 'not_supported' }
+      return archiveTask(env, input)
   }
 }
 
 export async function unarchiveRow(env: Env, auth: AuthContext, input: UnarchiveInput): Promise<UnarchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
-  if (input.table === 'tasks') return { ok: false, error: 'not_supported' }
 
   switch (input.table) {
     case 'members':
@@ -146,6 +170,9 @@ export async function unarchiveRow(env: Env, auth: AuthContext, input: Unarchive
       return unarchiveSimple(env, 'squads', input, { statusColumn: 'status', restoreStatus: 'active' })
     case 'projects':
       return unarchiveProject(env, input)
+    case 'tasks':
+      if (!taskArchiveEnabled(env)) return { ok: false, error: 'not_supported' }
+      return unarchiveTask(env, input)
   }
 }
 
@@ -547,7 +574,7 @@ async function squadActiveDependentCounts(env: Env, squadId: string): Promise<{ 
         WHERE c.scope_type = 'squad' AND c.scope_id = ?1 AND m.archived_at IS NULL`,
     ).bind(squadId).first<{ n: number }>() as Promise<{ n: number }>,
     env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM tasks WHERE squad_id = ?1 AND status IN ('open','in_progress','review')`,
+      `SELECT COUNT(*) AS n FROM tasks WHERE squad_id = ?1 AND status IN ('open','in_progress','review') AND ${TASK_NOT_ARCHIVED_SQL()}`,
     ).bind(squadId).first<{ n: number }>() as Promise<{ n: number }>,
   ])
   return { agents: activeAgents, members: activeMembers, tasks: activeTasks }
@@ -579,7 +606,7 @@ async function archiveSquad(env: Env, input: ArchiveInput): Promise<ArchiveOutco
             SELECT 1 FROM capabilities c JOIN members m ON m.id = c.member_id
              WHERE c.scope_type = 'squad' AND c.scope_id = ?4 AND m.archived_at IS NULL
           )
-          AND NOT EXISTS (SELECT 1 FROM tasks WHERE squad_id = ?4 AND status IN ('open','in_progress','review'))`,
+          AND NOT EXISTS (SELECT 1 FROM tasks WHERE squad_id = ?4 AND status IN ('open','in_progress','review') AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(now, input.reason, input.actorMemberId, input.id),
     env.DB.prepare(
       `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
@@ -605,7 +632,7 @@ async function archiveSquad(env: Env, input: ArchiveInput): Promise<ArchiveOutco
 
 async function projectActiveTaskCount(env: Env, projectId: string): Promise<number> {
   const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?1 AND status IN ('open','in_progress','review')`,
+    `SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?1 AND status IN ('open','in_progress','review') AND ${TASK_NOT_ARCHIVED_SQL()}`,
   ).bind(projectId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -628,7 +655,7 @@ async function archiveProject(env: Env, input: ArchiveInput): Promise<ArchiveOut
       `UPDATE projects SET status = 'archived', archived_at = ?1, archived_reason = ?2,
               archived_by_member_id = ?3, archived_prior_status = status
         WHERE id = ?4 AND status != 'archived'
-          AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?4 AND status IN ('open','in_progress','review'))`,
+          AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?4 AND status IN ('open','in_progress','review') AND ${TASK_NOT_ARCHIVED_SQL()})`,
     ).bind(now, input.reason, input.actorMemberId, input.id),
     env.DB.prepare(
       `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
@@ -758,3 +785,197 @@ async function unarchiveProject(env: Env, input: UnarchiveInput): Promise<Unarch
   return { ok: true, status: 'unarchived', receiptId }
 }
 
+// ── tasks (side table — tasks.status is never written by ARCHIVE) ───────────
+//
+// mupot#1571. Archiving writes only tasks_archive_state (+ a receipt). The action
+// boundary lives in every task writer (TASK_NOT_ARCHIVED_SQL in each UPDATE's WHERE),
+// so while a row sits in that table nothing can claim, assign, advance, verdict or
+// dispatch it. UNARCHIVE restores tasks.status to the captured prior_status (a no-op in
+// every reachable case, since a guarded writer cannot move the status meanwhile; it
+// repairs a direct D1 edit rather than trusting that).
+
+// Non-terminal flight statuses: flights.status CHECK is
+// ('preflight','held','running','waiting','sleeping','landed','failed') —
+// only landed/failed are terminal.
+const IN_AIR_FLIGHT_STATUSES_SQL = `f.status NOT IN ('landed','failed')`
+
+async function taskArchivabilityBlocker(
+  env: Env,
+  taskId: string,
+  expectedStatus: string | undefined,
+): Promise<ArchiveOutcome | null> {
+  const row = await env.DB.prepare('SELECT status, execution_claim_expires_at FROM tasks WHERE id = ?1')
+    .bind(taskId)
+    .first<{ status: string; execution_claim_expires_at: number | null }>()
+  if (!row) return { ok: false, error: 'not_found' }
+  if (expectedStatus !== undefined && row.status !== expectedStatus) {
+    return { ok: false, error: 'status_drift', expected: expectedStatus, actual: row.status }
+  }
+  if (row.status === 'in_progress' && row.execution_claim_expires_at !== null && row.execution_claim_expires_at > Date.now()) {
+    return { ok: false, error: 'live_execution_claim' }
+  }
+  const inAirRow = await env.DB.prepare(
+    `SELECT 1 FROM flights f
+      WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
+        AND (
+          EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = ?1)
+          OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = ?1)
+          OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = ?1))
+        )
+      LIMIT 1`,
+  ).bind(taskId).first()
+  if (inAirRow) return { ok: false, error: 'in_air_flight' }
+  if (await hasInFlightDispatchReceipt(env, taskId)) return { ok: false, error: 'in_flight_dispatch' }
+  return null
+}
+
+async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcome> {
+  // Unknown status values are rejected, never compared: a typo'd expected status would
+  // otherwise read as "drifted" (or worse, silently match nothing).
+  if (input.expectedStatus !== undefined && !isTaskStatus(input.expectedStatus)) {
+    return { ok: false, error: 'invalid_expected_status', accepted: ALL_TASK_STATUSES }
+  }
+  const expected = input.expectedStatus ?? null
+
+  const exists = await env.DB.prepare('SELECT 1 FROM tasks WHERE id = ?1').bind(input.id).first()
+  if (!exists) return { ok: false, error: 'not_found' }
+
+  // Already archived is checked FIRST so an idempotent retry of a successful archive is
+  // never reported as drift/claim/flight (the status it saw is exactly what it archived).
+  if (await isTaskRowArchived(env, input.id)) {
+    await backfillTaskReceiptIfMissing(env, input.id, input.reason, input.actorMemberId)
+    return { ok: true, status: 'already_archived' }
+  }
+
+  const blocker = await taskArchivabilityBlocker(env, input.id, input.expectedStatus)
+  if (blocker) return blocker
+
+  const now = nowIso()
+  const receiptId = crypto.randomUUID()
+  // Write-time re-assertion: the drift, live-claim and in-air-flight predicates ride in the
+  // INSERT ... SELECT's own WHERE, so a change between the pre-read and the write converges
+  // to 0 rows and a freshly re-derived refusal. OR IGNORE: a concurrent archive of the same
+  // task (PRIMARY KEY) is a 0-row no-op, not an exception.
+  const stmts = [
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        SELECT t.id, ?1, ?2, ?3, t.status, ?1
+          FROM tasks t
+         WHERE t.id = ?4
+           AND (?6 IS NULL OR t.status = ?6)
+           AND NOT (
+             t.status = 'in_progress' AND t.execution_claim_expires_at IS NOT NULL
+             AND t.execution_claim_expires_at > ?5
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM flights f
+              WHERE ${IN_AIR_FLIGHT_STATUSES_SQL}
+                AND (
+                  EXISTS (SELECT 1 FROM flight_lanes fl WHERE fl.flight_id = f.id AND fl.task_id = t.id)
+                  OR EXISTS (SELECT 1 FROM flight_task_assignments fta WHERE fta.flight_id = f.id AND fta.task_id = t.id)
+                  OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = t.id))
+                )
+           )
+           AND NOT ${inFlightDispatchReceiptExistsSql({ tenantParam: '?7', taskIdExpr: 't.id' })}`,
+    ).bind(now, input.reason, input.actorMemberId, input.id, Date.now(), expected, env.TENANT_SLUG),
+    env.DB.prepare(
+      `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
+        SELECT ?1, ?2, 'tasks', ?3, 'archive', ?4, ?5, s.prior_status, ?6
+          FROM tasks_archive_state s WHERE s.task_id = ?3 AND changes() = 1`,
+    ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, now),
+  ]
+  const results = await env.DB.batch(stmts)
+  if (rowsWritten(results[0]) === 0) {
+    // 0 rows: a predicate changed since the pre-read, or a concurrent archive won. Re-derive.
+    if (await isTaskRowArchived(env, input.id)) {
+      await backfillTaskReceiptIfMissing(env, input.id, input.reason, input.actorMemberId)
+      return { ok: true, status: 'already_archived' }
+    }
+    const fresh = await taskArchivabilityBlocker(env, input.id, input.expectedStatus)
+    if (fresh) return fresh
+    return { ok: false, error: 'archive_refused_conflict' }
+  }
+  assertWritten(results[1], 'archive_row.tasks.receipt', 1)
+  return { ok: true, status: 'archived', receiptId }
+}
+
+async function isTaskRowArchived(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT 1 FROM tasks_archive_state WHERE task_id = ?1').bind(taskId).first()
+  return row !== null
+}
+
+async function backfillTaskReceiptIfMissing(env: Env, taskId: string, reason: string, actorMemberId: string): Promise<void> {
+  const existing = await env.DB.prepare(
+    `SELECT id FROM archive_receipts WHERE entity_table = 'tasks' AND entity_id = ?1 AND action = 'archive' LIMIT 1`,
+  ).bind(taskId).first<{ id: string }>()
+  if (existing) return
+  const state = await env.DB.prepare('SELECT prior_status FROM tasks_archive_state WHERE task_id = ?1')
+    .bind(taskId).first<{ prior_status: string }>()
+  await insertReceiptUnconditional(env, 'tasks', taskId, 'archive', reason, actorMemberId, state?.prior_status ?? null)
+}
+
+/** SQL: the task's squad and project are both NOT archived (a NULL project counts as fine). Embedded in
+ *  all three unarchive statements so a parent archived mid-call cannot be bypassed by the pre-read. */
+const TASK_PARENTS_ACTIVE_SQL = (taskParam: string): string => `NOT EXISTS (
+  SELECT 1 FROM tasks pt
+    LEFT JOIN squads psq ON psq.id = pt.squad_id
+    LEFT JOIN projects ppr ON ppr.id = pt.project_id
+   WHERE pt.id = ${taskParam} AND (psq.status = 'archived' OR ppr.status = 'archived')
+)`
+
+async function archivedParentOfTask(env: Env, taskId: string): Promise<'squad' | 'project' | null> {
+  const row = await env.DB.prepare(
+    `SELECT psq.status AS squad_status, ppr.status AS project_status FROM tasks pt
+       LEFT JOIN squads psq ON psq.id = pt.squad_id
+       LEFT JOIN projects ppr ON ppr.id = pt.project_id
+      WHERE pt.id = ?1`,
+  ).bind(taskId).first<{ squad_status: string | null; project_status: string | null }>()
+  if (row?.squad_status === 'archived') return 'squad'
+  if (row?.project_status === 'archived') return 'project'
+  return null
+}
+
+async function unarchiveTask(env: Env, input: UnarchiveInput): Promise<UnarchiveOutcome> {
+  const state = await env.DB.prepare('SELECT prior_status FROM tasks_archive_state WHERE task_id = ?1')
+    .bind(input.id).first<{ prior_status: string }>()
+  if (!state) {
+    const task = await env.DB.prepare('SELECT 1 FROM tasks WHERE id = ?1').bind(input.id).first()
+    return task ? { ok: true, status: 'not_archived' } : { ok: false, error: 'not_found' }
+  }
+  const parent = await archivedParentOfTask(env, input.id)
+  if (parent) return { ok: false, error: 'parent_archived', parent }
+  const now = nowIso()
+  const receiptId = crypto.randomUUID()
+  // ONE batch: restore status from the state row's own prior_status (read inside the
+  // statement, not carried from the pre-read), mint the receipt from the same row, then
+  // delete it. This UPDATE runs while the row is still archived and is allowlisted for
+  // exactly that reason (see tests/task-archive-action-boundary.test.ts).
+  const stmts = [
+    env.DB.prepare(
+      `UPDATE tasks SET status = (SELECT prior_status FROM tasks_archive_state WHERE task_id = ?1), updated_at = ?2
+        WHERE id = ?1
+          AND EXISTS (SELECT 1 FROM tasks_archive_state s WHERE s.task_id = ?1 AND s.prior_status != tasks.status)
+          AND ${TASK_PARENTS_ACTIVE_SQL('?1')}`,
+    ).bind(input.id, now),
+    env.DB.prepare(
+      `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)
+        SELECT ?1, ?2, 'tasks', ?3, 'unarchive', ?4, ?5, s.prior_status, ?6
+          FROM tasks_archive_state s WHERE s.task_id = ?3 AND ${TASK_PARENTS_ACTIVE_SQL('?3')}`,
+    ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, now),
+    env.DB.prepare(
+      `DELETE FROM tasks_archive_state
+        WHERE task_id = ?1
+          AND EXISTS (SELECT 1 FROM archive_receipts WHERE id = ?2)
+          AND ${TASK_PARENTS_ACTIVE_SQL('?1')}`,
+    ).bind(input.id, receiptId),
+  ]
+  const results = await env.DB.batch(stmts)
+  if (rowsWritten(results[2]) === 0) {
+    // Nothing deleted: either the parent got archived since the pre-read, or the state row was already gone.
+    const raced = await archivedParentOfTask(env, input.id)
+    if (raced) return { ok: false, error: 'parent_archived', parent: raced }
+    return { ok: true, status: 'not_archived' }
+  }
+  assertWritten(results[1], 'unarchive_row.tasks.receipt', 1)
+  return { ok: true, status: 'unarchived', receiptId }
+}

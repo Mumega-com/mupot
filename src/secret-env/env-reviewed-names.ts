@@ -129,6 +129,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
   'SUPABASE_WEBHOOK_SECRET',
+  'TASK_ARCHIVE_ENABLED', // mupot#1778: opt-in flag for task archiving (non-secret)
   'TASK_WORKFLOW',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_BRIDGE_URL',

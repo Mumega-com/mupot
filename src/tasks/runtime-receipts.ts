@@ -8,6 +8,7 @@ import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '.
 import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
+import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 
 export type TaskDispatchRuntimeStage = 'runtime_consumed' | 'completed' | 'failed'
 
@@ -353,6 +354,8 @@ export type TaskDispatchRuntimeReceiptErrorCode =
   | 'runtime_artifact_required'
   | 'runtime_gate_required'
   | 'runtime_receipt_transition_conflict'
+  // mupot#1571 — archived = no action: a runtime receipt cannot advance an archived task.
+  | 'task_archived'
   | 'runtime_receipt_persistence_conflict'
   // mupot#1494 v4 round 2 (P1-2, adversarial regression) — a dispatch an operator has
   // already declared TERMINAL (`reset(terminate: true)`, or a genuine `completed`/`failed`
@@ -1235,6 +1238,10 @@ export async function recordTaskDispatchRuntimeReceipt(
     return { receipt: publicTimelineReceipt(replay), task_status: task.status }
   }
 
+  // mupot#1571: archived = no action. Named refusal up front (a replay of an already-stored
+  // receipt returned above and is read-only); the SQL guards below make the same refusal
+  // atomic with each stage's write.
+  if (await isTaskArchived(env, input.taskId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
   const receiptId = crypto.randomUUID()
   const auditId = crypto.randomUUID()
   const requestId = `task-runtime-receipt:${input.dispatchReceiptId}:${input.stage}:${input.attempt}`
@@ -1252,6 +1259,7 @@ export async function recordTaskDispatchRuntimeReceipt(
             execution_claim_expires_at = NULL, updated_at = ?2
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
+             AND ${TASK_NOT_ARCHIVED_SQL()}
              AND ${pointerAvailableForSql({ tenantParam: '?5', newReceiptParam: '?1' })}
              AND ${noConflictingTerminalSql('?5', '?1', ['failed'])}
              -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time.
@@ -1265,6 +1273,7 @@ export async function recordTaskDispatchRuntimeReceipt(
             UPDATE tasks SET status = 'review', result = ?1, updated_at = ?2
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status = 'in_progress' AND execution_receipt_id = ?5
+               AND ${TASK_NOT_ARCHIVED_SQL()}
                AND ${independentGateHolderExistsSql({
                  gateOwnerExpr: 'tasks.gate_owner', assigneeIdExpr: 'tasks.assignee_agent_id',
                  squadIdExpr: 'tasks.squad_id', tenantParam: '?6', nowParam: '?8',
@@ -1294,6 +1303,7 @@ export async function recordTaskDispatchRuntimeReceipt(
               execution_receipt_id = ?5
              WHERE id = ?3 AND assignee_agent_id = ?4
                AND status IN ('open', 'in_progress', 'blocked', 'rejected')
+               AND ${TASK_NOT_ARCHIVED_SQL()}
                AND ${pointerAvailableForSql({ tenantParam: '?6', newReceiptParam: '?5' })}
                -- mupot#1539 round 2 (P0-1 / P2-b) — same envelope fence as consume/complete:
                -- live lease or this caller's consumed receipt at this attempt, re-asserted at
