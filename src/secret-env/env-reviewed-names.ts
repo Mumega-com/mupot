@@ -128,6 +128,10 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'TASK_WORKFLOW',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_BRIDGE_URL',
+  // Read by the mupot CLI (cli/mupot.mjs, bundled into src/cli/bundle.generated.ts) from the
+  // caller's shell, never by the Worker. Reserved so no pot secret can squat the CLI's token names.
+  'MUPOT_TOKEN',
+  'MUPOT_TOKEN_FILE',
   'TELEGRAM_CHAT_ID',
   'TENANT_SLUG',
   'TORIVERS_SECRET',
