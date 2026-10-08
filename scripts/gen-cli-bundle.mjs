@@ -8,7 +8,7 @@
 //   node scripts/gen-cli-bundle.mjs          # write src/cli/bundle.generated.ts
 
 import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { realpathSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -35,7 +35,17 @@ export function readCliSource() {
   return readFileSync(CLI_SOURCE_FILE, 'utf8')
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// Resolve both sides through realpath: run via a symlink, process.argv[1] is the link and a plain
+// string compare would silently skip the check (exit 0, nothing verified).
+function isMain() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+}
+
+if (isMain()) {
   writeFileSync(DEFAULT_OUTPUT_FILE, generateCliBundleModule(readCliSource()))
   process.stdout.write(`wrote ${DEFAULT_OUTPUT_FILE}\n`)
 }

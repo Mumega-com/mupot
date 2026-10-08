@@ -25,25 +25,34 @@ The file is also runnable straight from a checkout: `node cli/mupot.mjs ...`.
 
 ## Auth
 
-The token is read from, in order:
+A credential is bound to exactly ONE origin and is never sent anywhere else. The token comes from:
 
-1. the file named by `$MUPOT_TOKEN_FILE`
-2. the `token_file` of the selected pot in `~/.config/mupot/config.json`
-3. `~/.config/mupot/<pot>.token`
-4. the env var `MUPOT_TOKEN`
+1. the pot's own token: `token_file` in `~/.config/mupot/config.json`, else `~/.config/mupot/<pot>.token`.
+   When either exists it is the ONLY source; the env vars are ignored.
+2. otherwise, for the **default pot only**: the file named by `$MUPOT_TOKEN_FILE`, else the env var `MUPOT_TOKEN`.
+   An env token with any other pot is refused (exit 2): the env vars name no pot or origin of their own.
 
-Rules the CLI enforces:
+`--api` can point a pot elsewhere only if the credential follows explicitly: with a pot token present,
+`--api <other origin>` is refused (exit 2, "token is bound to <origin>; pass a token source for <new origin>")
+unless `MUPOT_TOKEN_FILE` or `MUPOT_TOKEN` is set alongside it on the default pot, in which case only the env
+token is sent there. A pot the config does not define cannot be used at all.
 
-- **A token is never accepted as an argument** (`--token`, `--bearer`, `--authorization`, ... are
-  refused, exit 2): argv is readable by every local user through `ps` and `/proc`.
-- A token file that is group- or world-accessible (`mode & 0o077`) is **refused** with a
-  `chmod 600` hint. Use `chmod 600 ~/.config/mupot/mumega.token`.
-- The token is never printed, including in errors: all stdout/stderr is redacted against every
-  secret the process loaded, even if a server echoes it back.
+Other rules the CLI enforces:
+
+- **A token is never accepted as an argument.** Any flag whose name contains `token`, `bearer`,
+  `authorization`, `secret`, `password` or `api-key` (any case) is refused, exit 2: argv is readable by every
+  local user through `ps` and `/proc`. Pass such a tool parameter with `--json-args -` (stdin).
+- A token file that is group- or world-accessible (`mode & 0o077`) is **refused** with a `chmod 600` hint.
+- The token is never printed, including in errors: every server reply is redacted before it is truncated or
+  formatted, and all stdout/stderr is redacted again against every secret the process loaded.
 - Redirects are never followed with the bearer (`redirect: 'manual'`; any 3xx is an error, exit 4).
-- A non-https `--api` is refused (loopback `http://127.0.0.1` is allowed for local dev).
+- A non-https API is refused (loopback `http://127.0.0.1` is allowed for local dev).
+- A reply is a success only if it is a JSON-RPC result/error carrying the id of the request.
+- In human mode, control characters in server-supplied text (ESC, CSI, OSC, BEL, CR, C1) are printed escaped
+  (`\x1b`); only newline and tab pass through. `--json` output is JSON with those escaped.
 
-`mupot tools` and `mupot help` work without a token (tools/list is public on the server).
+`tools/list` goes through the same binding. Production's `/mcp` requires a bearer even for `tools/list`, so
+`mupot tools` and `mupot help <tool>` need a token there (a bearerless call is a 401, exit 3).
 
 ## Pots and profiles
 
@@ -54,8 +63,8 @@ Rules the CLI enforces:
   "default": "mumega" }
 ```
 
-`--pot <name>` selects a profile, `--api <url>` overrides its API. With no config the default is
-pot `mumega` at `https://mupot.mumega.com`. A pot name with no `api` in the config needs `--api`.
+`--pot <name>` selects a profile. With no config the default is pot `mumega` at `https://mupot.mumega.com`.
+Every other pot must be defined in the config with an `api`.
 
 ## Commands
 
@@ -66,11 +75,11 @@ mupot <tool> --key value ...            # call any tool
 mupot <tool> --json-args '{"a":1}'      # raw args ('-' reads JSON from stdin); flags override keys
 mupot call <tool> ...                   # explicit form (when a tool name equals a shortcut)
 mupot agent-context                     # machine-readable JSON description of the CLI, for agents
-mupot --version
+mupot --version                        # also -V; global only as the first argument or when no tool is named
 ```
 
-Flags are coerced from the tool's `inputSchema`: numbers and integers are parsed, booleans take
-`--flag`, `--flag false` or `--no-flag`, arrays take repeated flags or a comma list (or a JSON
+Flags are coerced from the tool's `inputSchema`: numbers and integers are parsed (decimal only: no hex or exponent), booleans take
+`--flag`, `--flag false|no|0` or `--no-flag`, arrays take repeated flags or a comma list (or a JSON
 array), objects take a JSON string. Dashes in a flag name map to underscores (`--done-when`).
 
 Shortcuts (thin aliases; each target tool and arg is checked against `src/mcp` by a test):

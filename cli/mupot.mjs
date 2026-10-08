@@ -15,7 +15,7 @@
 
 import { createHash } from 'node:crypto'
 import {
-  closeSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync,
+  closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -31,10 +31,12 @@ const PROTOCOL_VERSION = '2025-06-18'
 const DEFAULT_TIMEOUT_S = 30
 const MIN_SECRET_LEN = 6
 
-// Auth-looking flag names that must never carry a secret on the command line.
-const FORBIDDEN_FLAGS = new Set(['token', 'bearer', 'authorization', 'auth-token', 'auth', 'api-key', 'apikey', 'access-token', 'password'])
+// Auth-looking flag names must never carry a secret on the command line (case-insensitive,
+// any flag whose name CONTAINS one of these words).
+const FORBIDDEN_FLAG_RE = /token|bearer|authorization|secret|password|api-?key|^auth$/i
+const isForbiddenFlag = (name) => FORBIDDEN_FLAG_RE.test(name)
 
-const GLOBAL_BOOL = new Set(['json', 'refresh', 'help', 'version'])
+const GLOBAL_BOOL = new Set(['json', 'refresh', 'help'])
 const GLOBAL_VALUE = new Set(['pot', 'api', 'json-args', 'timeout'])
 
 class CliError extends Error {
@@ -61,7 +63,17 @@ export const SHORTCUTS = {
     tool: 'send',
     usage: 'send <to> <text...> [--kind K] [--in-reply-to ID] [--request-id ID]',
     help: 'Send a message to an agent (send { to, body }).',
-    pos: (p) => ({ ...(p[0] ? { to: p[0] } : {}), ...(p.length > 1 ? { body: p.slice(1).join(' ') } : {}) }),
+    // `--to bob hello world` keeps the whole text as the body; `bob hello world` splits to/body.
+    pos: (p, f) => {
+      const out = {}
+      let words = p
+      if (f.to === undefined && p.length > 0) { out.to = p[0]; words = p.slice(1) }
+      if (words.length > 0) {
+        if (f.body !== undefined) throw usageError(`unexpected argument "${words[0]}": the text was already given with --body`)
+        out.body = words.join(' ')
+      }
+      return out
+    },
   },
   capacity: { tool: 'harness_capacity_list', usage: 'capacity [--harness orca|herdr] [--limit N]', help: 'Harness capacity snapshots (harness_capacity_list).' },
   'task list': { tool: 'task_list', usage: 'task list [--status S] [--squad-id ID] [--project-id ID] [--limit N]', help: 'List tasks (task_list).' },
@@ -102,13 +114,34 @@ global flags:
   --refresh         bypass the 1h tools/list cache (~/.cache/mupot/)
   --timeout <sec>   request timeout (default ${DEFAULT_TIMEOUT_S})
 
-auth: token file $MUPOT_TOKEN_FILE, else the profile token_file, else ~/.config/mupot/<pot>.token
-      (mode 0600 required), else env MUPOT_TOKEN. A token is never accepted as an argument.
+auth: the pot's own token (config token_file, else ~/.config/mupot/<pot>.token; mode 0600 required) is
+      used alone; $MUPOT_TOKEN_FILE / $MUPOT_TOKEN apply to the default pot only. A token is bound to its
+      origin and never accepted as an argument. tools/help need a token on production.
 
 exit codes: 0 ok, 1 tool error, 2 usage, 3 auth, 4 network
 `
 
 // ------------------------------------------------------------------ context & output
+
+/** Terminal safety: escape C0/C1 control characters (ESC, CSI, OSC, BEL, CR, ...) except \n and \t
+ *  in anything printed. JSON output never carries raw controls (see jsonText), so this is a no-op there. */
+function stripCtl(s) {
+  return String(s).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+}
+
+/** JSON.stringify, additionally escaping DEL and C1 controls (which JSON.stringify leaves raw and
+ *  a terminal may act on). The result is still valid, equivalent JSON. */
+function jsonText(v, indent) {
+  return JSON.stringify(v, null, indent).replace(/[\u007f-\u009f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
+/** Deep-map every string (and key) of a parsed server value. */
+function mapStrings(v, fn) {
+  if (typeof v === 'string') return fn(v)
+  if (Array.isArray(v)) return v.map((x) => mapStrings(x, fn))
+  if (v !== null && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [fn(k), mapStrings(x, fn)]))
+  return v
+}
 
 function makeCtx(io) {
   const env = io.env ?? process.env
@@ -130,8 +163,8 @@ function makeCtx(io) {
     readStdin: io.readStdin ?? (() => readFileSync(0, 'utf8')),
     secrets,
     redact,
-    out: (s) => rawOut(redact(s)),
-    err: (s) => rawErr(redact(s)),
+    out: (s) => rawOut(stripCtl(redact(s))),
+    err: (s) => rawErr(stripCtl(redact(s))),
     rid: 0,
     json: false,
     refresh: false,
@@ -148,6 +181,7 @@ function tokenize(argv) {
     if (rest) { items.push({ t: 'pos', v: a }); continue }
     if (a === '--') { rest = true; continue }
     if (a === '-h') { items.push({ t: 'flag', name: 'help', eq: 'true' }); continue }
+    if (a === '-V') { items.push({ t: 'flag', name: 'version' }); continue }
     if (a.startsWith('--') && a.length > 2) {
       const body = a.slice(2)
       const eqi = body.indexOf('=')
@@ -170,9 +204,19 @@ function parseBool(raw, name) {
 function extractGlobals(ctx, items) {
   const globals = {}
   const out = []
+  // A tool/command is "named" when a positional exists that is not the value of a global value flag.
+  const consumed = new Set()
+  items.forEach((x, i) => { if (x.t === 'flag' && GLOBAL_VALUE.has(x.name) && x.eq === undefined) consumed.add(i + 1) })
+  const hasPositional = items.some((x, i) => x.t === 'pos' && !consumed.has(i))
   for (let i = 0; i < items.length; i += 1) {
     const it = items[i]
-    if (it.t === 'flag' && FORBIDDEN_FLAGS.has(it.name)) {
+    // --version / -V is global ONLY as the first argv token or when no command/tool is named; after a
+    // tool name it is that tool's own parameter (routine_proposal_submit has a `version` param).
+    if (it.t === 'flag' && it.name === 'version' && it.eq === undefined && (i === 0 || !hasPositional)) {
+      globals.version = true
+      continue
+    }
+    if (it.t === 'flag' && isForbiddenFlag(it.name)) {
       // Register the would-be secret with the redactor, then refuse WITHOUT echoing it.
       const next = items[i + 1]
       const val = it.eq ?? (next && next.t === 'pos' ? next.v : undefined)
@@ -215,7 +259,8 @@ export function primaryType(schema) {
 function coerceScalar(name, type, raw) {
   if (typeof raw !== 'string') return raw // already typed (came from a JSON array)
   if (type === 'number' || type === 'integer') {
-    if (raw.trim() === '' || !Number.isFinite(Number(raw))) throw usageError(`--${name}: expected a number, got "${raw}"`)
+    // Decimal only: no hex (0x10), exponent (1e3), Infinity, blanks or signs other than a leading '-'.
+    if (!/^-?\d+(\.\d+)?$/.test(raw)) throw usageError(`--${name}: expected a decimal number, got "${raw}"`)
     const n = Number(raw)
     if (type === 'integer' && !Number.isInteger(n)) throw usageError(`--${name}: expected an integer, got "${raw}"`)
     return n
@@ -303,7 +348,7 @@ export function resolveArgs(items, schema) {
       val = it.eq
     } else if (type === 'boolean') {
       const next = items[i + 1]
-      if (next && next.t === 'pos' && /^(true|false)$/i.test(next.v)) { val = next.v; i += 1 } else val = 'true'
+      if (next && next.t === 'pos' && /^(true|false|yes|no|1|0)$/i.test(next.v)) { val = next.v; i += 1 } else val = 'true'
     } else {
       const next = items[i + 1]
       if (!next || next.t !== 'pos') throw usageError(`--${it.name} requires a value`)
@@ -340,23 +385,35 @@ function resolveTarget(ctx, globals) {
   const cfgPath = join(ctx.home, '.config', 'mupot', 'config.json')
   const cfg = readJsonFile(cfgPath, 'config') ?? {}
   const pots = cfg && typeof cfg.pots === 'object' && cfg.pots !== null ? cfg.pots : {}
-  const pot = globals.pot ?? (typeof cfg.default === 'string' ? cfg.default : DEFAULT_POT)
+  const defaultPot = typeof cfg.default === 'string' ? cfg.default : DEFAULT_POT
+  const pot = globals.pot ?? defaultPot
   if (!/^[A-Za-z0-9_.-]+$/.test(pot) || pot.startsWith('.')) throw usageError('invalid --pot name')
   const entry = Object.prototype.hasOwnProperty.call(pots, pot) && pots[pot] && typeof pots[pot] === 'object' ? pots[pot] : undefined
-  let api = globals.api ?? (entry && typeof entry.api === 'string' ? entry.api : undefined)
-  if (api === undefined) {
-    if (pot !== DEFAULT_POT) throw usageError(`pot "${pot}" has no api in ${cfgPath}; add it or pass --api`)
-    api = DEFAULT_API
+  // A pot's credential is bound to the origin its config declares. A pot the config does not define
+  // (other than the built-in default) has no declared origin, so no credential can be bound to it.
+  if (!entry && pot !== DEFAULT_POT) throw usageError(`pot "${pot}" is not defined in ${cfgPath}; add it with an api (and token_file)`)
+  const potApi = entry && typeof entry.api === 'string' ? entry.api : undefined
+  if (potApi === undefined && pot !== DEFAULT_POT) throw usageError(`pot "${pot}" has no api in ${cfgPath}`)
+  const parse = (api, what) => {
+    let url
+    try { url = new URL(api) } catch { throw usageError(`invalid ${what} URL`) }
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+      throw usageError('refusing a non-https API (the bearer token would cross the network in cleartext); http:// is allowed for loopback only')
+    }
+    if (url.username || url.password) throw usageError('credentials in the API URL are not accepted')
+    return url
   }
-  let url
-  try { url = new URL(api) } catch { throw usageError('invalid --api URL') }
-  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
-    throw usageError('refusing a non-https API (the bearer token would cross the network in cleartext); http:// is allowed for loopback only')
+  const boundUrl = parse(potApi ?? DEFAULT_API, 'pot api')
+  const url = globals.api !== undefined ? parse(globals.api, '--api') : boundUrl
+  return {
+    pot,
+    isDefaultPot: pot === defaultPot,
+    api: `${url.origin}${url.pathname.replace(/\/+$/, '')}`,
+    origin: url.origin,
+    boundOrigin: boundUrl.origin,
+    tokenFile: entry && typeof entry.token_file === 'string' ? entry.token_file : undefined,
   }
-  if (url.username || url.password) throw usageError('credentials in the API URL are not accepted')
-  const base = `${url.origin}${url.pathname.replace(/\/+$/, '')}`
-  return { pot, api: base, tokenFile: entry && typeof entry.token_file === 'string' ? entry.token_file : undefined }
 }
 
 /** Read a token file. Returns null only when the file does not exist. */
@@ -389,31 +446,64 @@ function validateToken(token, where) {
   return token
 }
 
-export function loadToken(ctx, target) {
+function envTokenSet(ctx) {
+  return Boolean(ctx.env.MUPOT_TOKEN_FILE) || Boolean((ctx.env.MUPOT_TOKEN ?? '').trim())
+}
+
+function loadEnvToken(ctx) {
   const explicit = ctx.env.MUPOT_TOKEN_FILE
   if (explicit) {
     const t = readTokenFile(ctx, expandHome(ctx, explicit))
     if (t === null) throw new CliError(EXIT.AUTH, `MUPOT_TOKEN_FILE ${explicit} does not exist`)
     return t
   }
-  if (target.tokenFile) {
-    const p = expandHome(ctx, target.tokenFile)
-    const t = readTokenFile(ctx, p)
-    if (t === null) throw new CliError(EXIT.AUTH, `token_file ${p} (pot "${target.pot}") does not exist`)
-    return t
+  return validateToken((ctx.env.MUPOT_TOKEN ?? '').trim(), 'MUPOT_TOKEN')
+}
+
+/**
+ * Credential binding. A credential is bound to exactly ONE origin and is never sent anywhere else.
+ *
+ *  1. A pot's own token (config token_file, else ~/.config/mupot/<pot>.token) is bound to the origin
+ *     that pot's config declares; when it exists it is the ONLY source (the env vars are ignored).
+ *  2. MUPOT_TOKEN_FILE / MUPOT_TOKEN apply only to the DEFAULT pot (they name no pot or origin of their
+ *     own), and only when the pot has no token of its own - or when explicitly paired with --api.
+ *  3. If --api points away from the origin a token is bound to, and no env token is paired with it,
+ *     refuse (exit 2): the token is never silently re-aimed.
+ * Returns the token, or null when there is none (the request then goes out bearerless).
+ */
+export function loadToken(ctx, target) {
+  const defPath = join(ctx.home, '.config', 'mupot', `${target.pot}.token`)
+  const ownPath = target.tokenFile ? expandHome(ctx, target.tokenFile) : existsSync(defPath) ? defPath : undefined
+  const apiMoved = target.origin !== target.boundOrigin
+  const envSet = envTokenSet(ctx)
+
+  if (ownPath !== undefined) {
+    if (!apiMoved) {
+      const t = readTokenFile(ctx, ownPath)
+      if (t === null) throw new CliError(EXIT.AUTH, `token_file ${ownPath} (pot "${target.pot}") does not exist`)
+      return t
+    }
+    if (target.isDefaultPot && envSet) return loadEnvToken(ctx) // explicit pairing: env token + --api
+    throw usageError(`the token of pot "${target.pot}" is bound to ${target.boundOrigin}; pass a token source for ${target.origin} (MUPOT_TOKEN_FILE or MUPOT_TOKEN, default pot only) or drop --api`)
   }
-  const def = join(ctx.home, '.config', 'mupot', `${target.pot}.token`)
-  const t = readTokenFile(ctx, def)
-  if (t !== null) return t
-  const envTok = (ctx.env.MUPOT_TOKEN ?? '').trim()
-  if (envTok) return validateToken(envTok, 'MUPOT_TOKEN')
+  if (envSet) {
+    if (!target.isDefaultPot) {
+      throw usageError(`MUPOT_TOKEN_FILE/MUPOT_TOKEN apply only to the default pot; pot "${target.pot}" has no token of its own (set token_file in the config or create ~/.config/mupot/${target.pot}.token)`)
+    }
+    return loadEnvToken(ctx)
+  }
   return null
 }
 
+function credential(ctx, target) {
+  if (ctx.cred === undefined) ctx.cred = { token: loadToken(ctx, target) }
+  return ctx.cred.token
+}
+
 function requireToken(ctx, target) {
-  const t = loadToken(ctx, target)
+  const t = credential(ctx, target)
   if (t === null) {
-    throw new CliError(EXIT.AUTH, `no token found for pot "${target.pot}". Provide a 0600 file via $MUPOT_TOKEN_FILE or ~/.config/mupot/${target.pot}.token, or set $MUPOT_TOKEN.`)
+    throw new CliError(EXIT.AUTH, `no token found for pot "${target.pot}". Provide a 0600 file via the pot's token_file, ~/.config/mupot/${target.pot}.token, or (default pot) $MUPOT_TOKEN_FILE, or set $MUPOT_TOKEN.`)
   }
   return t
 }
@@ -425,6 +515,10 @@ function safeSnippet(v) {
   return s.length > 200 ? `${s.slice(0, 200)}...` : s
 }
 
+function isRpcResponse(msg, id) {
+  return msg !== null && typeof msg === 'object' && !Array.isArray(msg) && msg.id === id && ('result' in msg || 'error' in msg)
+}
+
 function parseSse(text, id) {
   let found
   for (const block of text.split(/\r?\n\r?\n/)) {
@@ -432,7 +526,7 @@ function parseSse(text, id) {
     if (!data) continue
     try {
       const msg = JSON.parse(data)
-      if (msg && (msg.id === id || 'result' in msg || 'error' in msg)) found = msg
+      if (isRpcResponse(msg, id)) found = msg
     } catch { /* ignore non-JSON events */ }
   }
   return found
@@ -465,22 +559,37 @@ async function rpc(ctx, target, token, method, params) {
   if ((res.status >= 300 && res.status < 400) || res.type === 'opaqueredirect') {
     throw new CliError(EXIT.NETWORK, `${new URL(url).host} answered with a redirect (HTTP ${res.status}); refusing to follow it with credentials`)
   }
-  const text = await res.text()
+  let text
+  try {
+    text = await res.text()
+  } catch (e) {
+    const code = e && e.name === 'TimeoutError' ? 'timeout' : e && e.name === 'AbortError' ? 'aborted' : 'read error'
+    throw new CliError(EXIT.NETWORK, `network error reading the response from ${new URL(url).host} (${code})`)
+  }
   const ctype = (res.headers.get('content-type') ?? '').toLowerCase()
   let msg
   if (ctype.includes('text/event-stream')) msg = parseSse(text, id)
   else { try { msg = JSON.parse(text) } catch { msg = undefined } }
+  // Everything the server says is redacted HERE, before any truncation or formatting downstream, so a
+  // secret can never be cut in half and slip past the output redactor.
+  if (msg !== undefined) msg = mapStrings(msg, ctx.redact)
+  const isObj = msg !== null && typeof msg === 'object' && !Array.isArray(msg)
   if (res.status === 401 || res.status === 403) {
-    const why = safeSnippet(msg && (typeof msg.error === 'string' ? msg.error : msg.error && msg.error.message))
+    const e = isObj ? msg.error : undefined
+    const why = safeSnippet(typeof e === 'string' ? e : e && e.message)
     throw new CliError(EXIT.AUTH, `authentication/authorization failed (HTTP ${res.status}${why ? `: ${why}` : ''})`)
   }
-  if (!msg || typeof msg !== 'object') {
-    throw new CliError(res.status >= 500 || res.status === 429 ? EXIT.NETWORK : EXIT.TOOL, `unexpected non-JSON response (HTTP ${res.status})`)
+  if (!isObj) {
+    throw new CliError(EXIT.NETWORK, `unexpected non-JSON-RPC response (HTTP ${res.status})`)
+  }
+  // A success-shaped no-op is not a success: the reply must be a JSON-RPC response to THIS request.
+  if (!isRpcResponse(msg, id)) {
+    throw new CliError(EXIT.TOOL, `response is not a JSON-RPC result or error for request ${id} (HTTP ${res.status})`)
   }
   if (msg.error) {
     const e = msg.error
     const m = typeof e === 'string' ? e : e.message ?? 'error'
-    const detail = typeof e === 'object' && e.data !== undefined ? ` ${JSON.stringify(e.data)}` : ''
+    const detail = typeof e === 'object' && e !== null && e.data !== undefined && e.data !== null ? ` ${JSON.stringify(e.data)}` : ''
     throw new CliError(EXIT.TOOL, `${safeSnippet(String(m))}${detail}`.trim())
   }
   if (!res.ok) throw new CliError(res.status >= 500 ? EXIT.NETWORK : EXIT.TOOL, `HTTP ${res.status}`)
@@ -513,13 +622,15 @@ function writeCache(ctx, target, tools) {
   } catch { /* cache is best-effort */ }
 }
 
-/** tools/list is bearerless on the server; a token is sent when one exists, never required. */
+/** tools/list goes through the SAME credential binding as tools/call: the bearer is attached only for the
+ *  token's own bound origin. Production's /mcp (the OAuth wrapper) answers a bearerless tools/list with
+ *  401, which surfaces as exit 3; a token is not required client-side so a pot that serves it openly works. */
 async function getTools(ctx, target, { force = false } = {}) {
   if (!force && !ctx.refresh) {
     const hit = readCache(ctx, target)
     if (hit) return hit
   }
-  const token = loadToken(ctx, target)
+  const token = credential(ctx, target)
   const result = await rpc(ctx, target, token, 'tools/list', {})
   const tools = Array.isArray(result && result.tools) ? result.tools : null
   if (!tools) throw new CliError(EXIT.TOOL, 'server returned no tools list')
@@ -574,7 +685,7 @@ export function renderHuman(value, indent = 0) {
 }
 
 function printValue(ctx, value) {
-  ctx.out(`${ctx.json ? JSON.stringify(value, null, 2) : renderHuman(value)}\n`)
+  ctx.out(`${ctx.json ? jsonText(value, 2) : renderHuman(value)}\n`)
 }
 
 function toolBlurb(t) {
@@ -623,11 +734,11 @@ function handleToolResult(ctx, result) {
       const txt = Array.isArray(result.content) && result.content[0] ? result.content[0].text : undefined
       try { body = JSON.parse(txt) } catch { body = { error: safeSnippet(txt) || 'tool error' } }
     }
-    if (ctx.json) ctx.err(`${JSON.stringify(body)}\n`)
+    if (ctx.json) ctx.err(`${jsonText(body)}\n`)
     else {
       const b = isPlain(body) ? body : { error: String(body) }
       ctx.err(`error: ${scalar(b.error)}${b.status !== undefined ? ` (status ${b.status})` : ''}\n`)
-      if (b.detail !== undefined) ctx.err(`${renderHuman(b.detail, 2)}\n`)
+      if (b.detail !== undefined && b.detail !== null) ctx.err(`${renderHuman(b.detail, 2)}\n`)
       if (b.need !== undefined) ctx.err(`  need: ${typeof b.need === 'string' ? b.need : JSON.stringify(b.need)}\n`)
     }
     return EXIT.TOOL
@@ -646,7 +757,7 @@ async function cmdTools(ctx, target, positionals) {
   const filter = positionals[0]?.toLowerCase()
   const shown = filter ? tools.filter((t) => t.name.toLowerCase().includes(filter)) : tools
   if (ctx.json) {
-    ctx.out(`${JSON.stringify(shown, null, 2)}\n`)
+    ctx.out(`${jsonText(shown, 2)}\n`)
     return EXIT.OK
   }
   const w = Math.max(0, ...shown.map((t) => t.name.length))
@@ -663,7 +774,7 @@ async function cmdHelp(ctx, target, what) {
   const sc = SHORTCUTS[what]
   const name = sc ? sc.tool : what
   const tool = await findTool(ctx, target, name)
-  if (ctx.json) { ctx.out(`${JSON.stringify(tool.inputSchema ?? {}, null, 2)}\n`); return EXIT.OK }
+  if (ctx.json) { ctx.out(`${jsonText(tool.inputSchema ?? {}, 2)}\n`); return EXIT.OK }
   ctx.out(`${renderToolHelp(tool, sc && sc.usage)}\n`)
   return EXIT.OK
 }
@@ -693,7 +804,8 @@ export function agentContext() {
     ],
     exit_codes: { 0: 'ok', 1: 'tool error / isError / JSON-RPC error', 2: 'usage error', 3: 'auth (401/403, missing or unusable token)', 4: 'network (unreachable, timeout, redirect, 5xx without a JSON-RPC body)' },
     auth: {
-      token_sources_in_order: ['file at $MUPOT_TOKEN_FILE', 'token_file of the pot in ~/.config/mupot/config.json', '~/.config/mupot/<pot>.token', 'env MUPOT_TOKEN'],
+      token_sources_in_order: ['token_file of the pot in ~/.config/mupot/config.json', '~/.config/mupot/<pot>.token', 'default pot only: file at $MUPOT_TOKEN_FILE', 'default pot only: env MUPOT_TOKEN'],
+      token_binding: 'a token is bound to one origin; --api to another origin is refused unless an env token is paired with it (default pot)',
       token_file_mode: 'must not be group/world accessible (chmod 600)',
       never_on_argv: true,
     },
@@ -749,7 +861,7 @@ async function run(ctx, argv) {
   let rest = items.slice(1)
 
   if (command === 'agent-context') {
-    ctx.out(`${JSON.stringify(agentContext(), null, 2)}\n`)
+    ctx.out(`${jsonText(agentContext(), 2)}\n`)
     return EXIT.OK
   }
 
@@ -790,7 +902,10 @@ async function run(ctx, argv) {
     // Positional words are consumed by the shortcut's mapper; flags still go through the schema.
     const tool = await findTool(ctx, target, sc.tool)
     const { positionals, args: flagArgs } = resolveArgs(rest, tool.inputSchema ?? {})
-    const posArgs = sc.pos ? sc.pos(positionals) : {}
+    const posArgs = sc.pos ? sc.pos(positionals, flagArgs) : {}
+    for (const k of Object.keys(posArgs)) {
+      if (flagArgs[k] !== undefined) throw usageError(`"${k}" was given both positionally and as --${k.replace(/_/g, '-')}`)
+    }
     if (!sc.pos && positionals.length) throw usageError(`unexpected argument "${positionals[0]}" (usage: mupot ${sc.usage})`)
     const schema = tool.inputSchema ?? {}
     const jsonArgs = globals['json-args'] !== undefined ? readJsonArgs(ctx, globals['json-args']) : {}
