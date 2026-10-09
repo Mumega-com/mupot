@@ -233,6 +233,7 @@ import {
   listIncompleteFlightTaskIds,
   FlightProjectError,
   FlightIdempotencyConflictError,
+  FlightInsertConflictError,
   validateFlightProjectTarget,
   validateFlightTaskProjectConsistency,
   type FlightRow,
@@ -3530,6 +3531,7 @@ const toolFlightDispatch: ToolSpec = {
         if (raced) return raced
         return fail(409, 'client_request_id_conflict')
       }
+      if (error instanceof FlightInsertConflictError) return fail(409, 'flight_insert_conflict')
       if (!(error instanceof FlightProjectError)) throw error
       return flightProjectFailure(error)
     }
@@ -5227,6 +5229,11 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       // terminal receipt to; a directory-OAuth org-admin session with none can still reset
       // without terminate.
       return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
+    }
+    if (result.code === 'reset_refused_read_envelope_requires_override') {
+      // mupot#1780 - the envelope was READ, which does not prove the runner is dead; terminating it voids
+      // the runner's pending completed/failed. Confirm it is gone, then retry with override:true.
+      return fail(409, 'read_envelope_requires_override', { message_id: result.message_id, audit_id: result.audit_id })
     }
     if (result.code === 'reset_refused_consumed') {
       // mupot#1539 round 2 (P1-A) — the assignee already took custody (runtime_consumed); a

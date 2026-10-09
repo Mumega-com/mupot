@@ -726,3 +726,250 @@ describe('#1539 round 2 P2-a — failed cannot settle after the dispatch complet
     }
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// mupot#1780 part 3 — every "refuse while X" state needs a reachable repair exit.
+describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; archive then succeeds', () => {
+  const archiveEnv = (f: Fixture): Env => ({ ...f.env, TASK_ARCHIVE_ENABLED: '1' } as Env)
+  const tryArchive = (f: Fixture) => invokeTool(f.operatorAuth, archiveEnv(f), 'archive_row', { table: 'tasks', id: TASK_ID, reason: 'x' }, ORIGIN)
+  const dispatchRow = (f: Fixture) => f.harness.sqlite.prepare(
+    'SELECT settled_stage, settled_at FROM task_dispatch_receipts WHERE id = ?',
+  ).get(DISPATCH_ID) as { settled_stage: string | null; settled_at: string | null }
+  const auditOps = (f: Fixture) => (f.harness.sqlite.prepare(
+    "SELECT operation FROM mutation_audit_entries WHERE handler = 'task_dispatch_lease_reset' ORDER BY recorded_at, rowid",
+  ).all() as Array<{ operation: string }>).map(r => r.operation)
+
+  async function wedge(f: Fixture) {
+    await leaseAndConsume(f)
+    f.lapseLease()
+    // A later consumer reads the envelope (the lease has lapsed), then the runner dies.
+    expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+    expect(f.envelope().read_at).not.toBeNull()
+  }
+
+  it('P1: the wedge refuses archive, plain reset refuses, and terminate is the exit (settles atomically, then archive passes on an in_progress task)', async () => {
+    const f = fixture()
+    try {
+      await wedge(f)
+      expect(f.taskStatus()).toBe('in_progress')
+      expect(await tryArchive(f)).toMatchObject({ ok: false, error: 'in_flight_dispatch' })
+      // Plain reset is still refused (custody) - the exit is terminate only.
+      expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner dead',
+      })).toMatchObject({ ok: false, status: 409 })
+      const term = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner dead', terminate: true, override: true,
+      })
+      expect(term).toMatchObject({ ok: true, result: { reset: true, terminated: true, overrode: true } })
+      const ev = f.harness.sqlite.prepare(
+        "SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'reset_terminate_read_envelope'",
+      ).get() as { evidence_json: string }
+      expect(JSON.parse(ev.evidence_json).override_of).toMatchObject({ read_envelope: true, lease_live: false })
+      expect(f.receipts('reset_terminated')).toBe(1)
+      expect(dispatchRow(f)).toMatchObject({ settled_stage: 'reset_terminated' })
+      expect(dispatchRow(f).settled_at).not.toBeNull()
+      expect(auditOps(f)).toContain('reset_terminate_read_envelope')
+      // P3: task is still in_progress; the settled dispatch must no longer block archive.
+      expect(f.taskStatus()).toBe('in_progress')
+      const archived = await tryArchive(f)
+      expect(archived.ok, JSON.stringify(archived)).toBe(true)
+      // Terminating twice is refused, not duplicated.
+      expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'again', terminate: true, override: true,
+      })).toMatchObject({ ok: false, status: 409 })
+      expect(f.receipts('reset_terminated')).toBe(1)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  const terminateNoOverride = (f: Fixture) => f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+    task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'looks dead', terminate: true,
+  })
+  const expectNothingWritten = (f: Fixture) => {
+    expect(f.receipts('reset_terminated')).toBe(0)
+    expect(dispatchRow(f).settled_at).toBeNull()
+  }
+
+  it('PA (round-1 P1): lease -> consume -> inbox_ack (lease cleared) -> terminate WITHOUT override is refused, nothing written; runner can still complete', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      expect(await terminateNoOverride(f)).toMatchObject({ ok: false, status: 409, error: 'read_envelope_requires_override' })
+      expectNothingWritten(f)
+      expect(auditOps(f)).toContain('reset_refused_read_envelope_requires_override')
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed'))).toMatchObject({ ok: true })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('PB (round-1 P1): read envelope under a LIVE recovery lease: terminate without override refused; with override terminates and records override_of.lease_live', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      // runtime_consumed on a read envelope -> claimReadEnvelopeForRecovery grants a fresh live lease.
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))).toMatchObject({ ok: true })
+      expect(f.envelope().lease_expires_at).not.toBeNull()
+      expect(await terminateNoOverride(f)).toMatchObject({ ok: false, status: 409, error: 'read_envelope_requires_override' })
+      expectNothingWritten(f)
+      expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'confirmed dead', terminate: true, override: true,
+      })).toMatchObject({ ok: true, result: { terminated: true, overrode: true } })
+      const ev = f.harness.sqlite.prepare(
+        "SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'reset_terminate_read_envelope'",
+      ).get() as { evidence_json: string }
+      expect(JSON.parse(ev.evidence_json).override_of).toMatchObject({ read_envelope: true, lease_live: true })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('terminate keeps its authz: an agent-bound (non-operator) token cannot use the new exit; nothing settles', async () => {
+    const f = fixture()
+    try {
+      await wedge(f)
+      const denied = await f.call('task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'self', terminate: true, override: true,
+      })
+      expect(denied.ok).toBe(false)
+      expect(f.receipts('reset_terminated')).toBe(0)
+      expect(dispatchRow(f).settled_at).toBeNull()
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('the exit does not fire without custody: read envelope with NO runtime_consumed is refused, dispatch stays unsettled', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      const term = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'no custody', terminate: true, override: true,
+      })
+      expect(term.ok).toBe(false)
+      expect(f.receipts('reset_terminated')).toBe(0)
+      expect(dispatchRow(f).settled_at).toBeNull()
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('does not settle over a genuine terminal: completed dispatch with a read envelope stays completed', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      expect((await f.call('task_dispatch_runtime_receipt', settle('completed'))).ok).toBe(true)
+      await f.call('inbox_ack', { ids: [MESSAGE_ID] })
+      await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'noop', terminate: true, override: true,
+      })
+      expect(f.receipts('reset_terminated')).toBe(0)
+      expect(dispatchRow(f).settled_stage).not.toBe('reset_terminated')
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('P3: terminate on the UNREAD (lease-lapsed) wedge also settles the dispatch row, so an in_progress task archives', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      f.lapseLease()
+      expect(await tryArchive(f)).toMatchObject({ ok: false, error: 'in_flight_dispatch' })
+      expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner gone', terminate: true,
+      })).toMatchObject({ ok: true, result: { terminated: true } })
+      expect(dispatchRow(f)).toMatchObject({ settled_stage: 'reset_terminated' })
+      expect(f.taskStatus()).toBe('in_progress')
+      const archived = await tryArchive(f)
+      expect(archived.ok, JSON.stringify(archived)).toBe(true)
+    } finally {
+      f.harness.close()
+    }
+  })
+})
+
+describe('#1780 — claimReadEnvelopeForRecovery never leases the envelope of an archived task', () => {
+  it('read envelope + archived task: runtime_consumed is refused task_archived AND no lease is written', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      const before = f.envelope()
+      expect(before.lease_expires_at).toBeNull()
+      f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        VALUES ('${TASK_ID}', '${T0}', 'x', '${MEMBER_ID}', 'open', '${T0}')`)
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'task_archived' })
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('RACE: archived after the pre-check, at the claim UPDATE -> the UPDATE guard alone leaves the envelope untouched', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      const before = f.envelope()
+      const db = f.env.DB
+      const realPrepare = db.prepare.bind(db)
+      let armed = true
+      db.prepare = ((sql: string) => {
+        if (armed && sql.includes('SET delivery_attempts = ?7, lease_expires_at = ?3')) {
+          armed = false
+          f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+            VALUES ('${TASK_ID}', '${T0}', 'race', '${MEMBER_ID}', 'open', '${T0}')`)
+        }
+        return realPrepare(sql)
+      }) as typeof db.prepare
+      const out = await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))
+      expect(armed).toBe(false)
+      expect(out.ok).toBe(false)
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('pair-correlator claim (pristine envelope) on an archived task: refused task_archived, no lease written', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        VALUES ('${TASK_ID}', '${T0}', 'x', '${MEMBER_ID}', 'open', '${T0}')`)
+      const before = f.envelope()
+      expect(await f.call('task_dispatch_runtime_receipt', pairSettle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'task_archived' })
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('oracle: a non-owner agent probing an archived task id does NOT learn it is archived (pre-check scoped to own dispatch)', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        VALUES ('${TASK_ID}', '${T0}', 'x', '${MEMBER_ID}', 'open', '${T0}')`)
+      const before = f.envelope()
+      const out = await f.callAs(f.gateAuth, 'task_dispatch_runtime_receipt', settle('runtime_consumed'))
+      expect(out.ok).toBe(false)
+      if (!out.ok) expect(out.error).not.toBe('task_archived')
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('control: the same read envelope on a LIVE task is claimed (recovery still works)', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))).toMatchObject({ ok: true })
+      expect(f.envelope().delivery_attempts).toBe(1)
+    } finally {
+      f.harness.close()
+    }
+  })
+})

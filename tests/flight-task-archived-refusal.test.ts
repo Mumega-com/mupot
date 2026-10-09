@@ -8,7 +8,7 @@
 // wrapper to go through here, unlike the MCP-tool-level tests elsewhere).
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { validateFlightTaskProjectConsistency, FlightProjectError, createFlight } from '../src/flight/service'
+import { validateFlightTaskProjectConsistency, FlightProjectError, FlightInsertConflictError, createFlight } from '../src/flight/service'
 import { validateFlightMetaReferences } from '../src/flight/meta'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -148,6 +148,39 @@ describe('flight task validators refuse an archived task (mupot#1496)', () => {
       await expect(createFlight(env, { agent: 'a', goal: 'g', project_id: 'proj-1', meta: meta(['task-live']) }, opts))
         .rejects.toMatchObject(new FlightProjectError('task_archived'))
       expect(flightCount()).toEqual({ n: 1 })
+    })
+
+    it.each(variants)('%s branch: archive -> unarchive racing the INSERT (0 rows, nothing archived) throws flight_insert_conflict, never returns an id', async (name, options) => {
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      let armed = true
+      harness.db.prepare = ((sql: string) => {
+        if (armed && sql.includes('INSERT INTO flights')) {
+          armed = false
+          // Archived at INSERT time (so the guard writes 0 rows) and unarchived again before the re-derive read.
+          harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+            VALUES ('task-live', datetime('now'), 'race', 'mem-1', 'open', datetime('now'))`)
+          const stmt = realPrepare(sql)
+          const origBind = stmt.bind.bind(stmt)
+          stmt.bind = ((...v: unknown[]) => {
+            const bound = origBind(...v)
+            const origRun = bound.run.bind(bound)
+            bound.run = (async () => {
+              const r = await origRun()
+              harness.sqlite.exec(`DELETE FROM tasks_archive_state WHERE task_id = 'task-live'`)
+              return r
+            }) as typeof bound.run
+            return bound
+          }) as typeof stmt.bind
+          return stmt
+        }
+        return realPrepare(sql)
+      }) as typeof harness.db.prepare
+      const f = name === 'client_request_id'
+        ? { agent: 'a', goal: 'g', meta: meta(['task-live']), client_request_id: 'req-race' }
+        : { agent: 'a', goal: 'g', meta: meta(['task-live']) }
+      await expect(createFlight(env, f, options)).rejects.toBeInstanceOf(FlightInsertConflictError)
+      expect(armed).toBe(false)
+      expect(flightCount()).toEqual({ n: 0 })
     })
 
     it('a live task id still creates the flight (guard is not over-broad)', async () => {

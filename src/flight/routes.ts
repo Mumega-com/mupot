@@ -36,6 +36,7 @@ import {
   routineControlLandLacksWitness,
   FlightProjectError,
   FlightIdempotencyConflictError,
+  FlightInsertConflictError,
   type FlightStatus,
   type TriggerSource,
 } from './service'
@@ -334,6 +335,7 @@ flightsApp.post('/', async (c) => {
       if (raced) return raced
       return c.json({ error: 'client_request_id_conflict' }, 409)
     }
+    if (error instanceof FlightInsertConflictError) return c.json({ error: 'flight_insert_conflict' }, 409)
     if (!(error instanceof FlightProjectError)) throw error
     const status = error.code === 'project_not_found' || error.code === 'flight_task_not_found'
       ? 404

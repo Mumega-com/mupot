@@ -119,6 +119,14 @@ export class FlightCreateFenceError extends Error {
   }
 }
 
+/** The flight INSERT wrote 0 rows for a reason no guard can name (mupot#1780). */
+export class FlightInsertConflictError extends Error {
+  constructor() {
+    super('flight_insert_conflict')
+    this.name = 'FlightInsertConflictError'
+  }
+}
+
 /** A concurrent dispatch already claimed this (dispatcher, client_request_id). */
 export class FlightIdempotencyConflictError extends Error {
   constructor() {
@@ -330,6 +338,9 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       throw new FlightProjectError('task_archived')
     }
     if (options.routineRunFence) throw new FlightCreateFenceError()
+    // mupot#1780: 0 rows that neither the archive guard nor the run fence explains (archive -> unarchive
+    // raced the INSERT) must never return an id with no flight row behind it.
+    throw new FlightInsertConflictError()
   }
   return id
 }
