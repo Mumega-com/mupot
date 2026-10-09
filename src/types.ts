@@ -310,6 +310,10 @@ export interface Env {
   // alias because that is the name Cursor's own docs use.
   CURSOR_API_TOKEN?: string
   CURSOR_API_KEY?: string
+  // #1762: Studio cursor-cloud dispatch bounds (non-secret, integers; defaults 3 / 1 / 90). See src/dashboard/studio-limits.ts.
+  STUDIO_DISPATCH_MEMBER_LIMIT?: string
+  STUDIO_DISPATCH_REPO_LIMIT?: string
+  STUDIO_DISPATCH_WINDOW_MINUTES?: string
   // Workers for Platforms dispatch namespace (optional). When bound, project
   // preview routes (`/preview/:project_id/*` and `https://<project>.mupot.mumega.com`)
   // proxy to the project's user Worker. Absent ⇒ fallback preview renderer.

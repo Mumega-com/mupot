@@ -128,6 +128,9 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'SQUAD',
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
+  'STUDIO_DISPATCH_MEMBER_LIMIT', // mupot#1762: non-secret Studio dispatch bounds
+  'STUDIO_DISPATCH_REPO_LIMIT',
+  'STUDIO_DISPATCH_WINDOW_MINUTES',
   'SUPABASE_WEBHOOK_SECRET',
   'TASK_ARCHIVE_ENABLED', // mupot#1778: opt-in flag for task archiving (non-secret)
   'TASK_WORKFLOW',
