@@ -55,7 +55,7 @@
 // this ever runs (src/agents/messages.ts); a delivery failure here must never roll that
 // back and does not — this module only classifies an HTTP outcome and returns it, it never
 // touches D1. What DOES fail closed is the *event's* ack/retry: src/bus/consumer.ts throws
-// on every outcome except 'delivered' and 'not_configured', so the Cloudflare Queue's own
+// on every outcome except 'delivered', 'declined' and 'not_configured', so the Cloudflare Queue's own
 // retry/DLQ policy (wrangler.toml: max_retries = 3, dead_letter_queue = "mupot-events-dlq")
 // carries a failed delivery attempt forward instead of it being silently swallowed. A 404
 // today — the expected state, because the Hermes route is not registered yet — is exactly
@@ -109,9 +109,11 @@ export interface HermesEventEnvelope {
 export type DeliveryOutcome =
   | { kind: 'not_configured'; missing: string[] }
   | { kind: 'delivered'; status: number }
-  // The configured receiver deliberately filtered this event (gateway webhook.py answers
-  // 200 {"status":"ignored","reason":...,"route":<route>}). Authenticated decline, not a
-  // transport failure: the consumer acks it. See isDeclinedBody for the anti-spoof gate.
+  // The configured receiver's route filter deliberately declined this event (gateway
+  // webhook.py:599 answers 200 {"status":"ignored","reason":"filter","route":<route>}).
+  // Route-bound (the body names the route derived from our own URL), NOT authenticated: a
+  // route echo proves nothing about who answered. Only reason 'filter' qualifies; see
+  // classifyDeliveryOutcome for the gate.
   | { kind: 'declined'; status: number; reason: string; route: string }
   | { kind: 'unexpected_response'; status: number; detail: string }
   | { kind: 'unauthorized'; status: number; detail: string }
@@ -198,14 +200,16 @@ export async function classifyDeliveryOutcome(
         }
         // Deliberate decline from THIS route (mupot#1716). A bare {"status":"ignored"} from
         // any server is still unexpected_response: the body must also name the configured
-        // route (derived from our own URL) and carry a string reason. The gateway's ignored
+        // route (derived from our own URL) and carry reason 'filter'. The gateway's ignored
         // body echoes no event/delivery id (gateway/platforms/webhook.py:599), so there is
         // nothing further to bind it to.
         if (
           expectedRoute !== null &&
           b.status === 'ignored' &&
-          typeof b.reason === 'string' &&
-          b.reason.length > 0 &&
+          // ONLY 'filter' is a veto. reason 'script' (webhook.py:612) is also returned for a
+          // missing script/bash, timeout, exception, non-zero exit and non-JSON output
+          // (webhook_filters.py run_route_script) -- those are failures and must retry.
+          b.reason === 'filter' &&
           b.route === expectedRoute
         ) {
           return { kind: 'declined', status, reason: b.reason, route: expectedRoute }

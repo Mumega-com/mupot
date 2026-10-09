@@ -229,6 +229,16 @@ describe('classifyDeliveryOutcome', () => {
       expect(outcome.kind).toBe('unexpected_response')
     })
 
+    it("reason 'script' (a script FAILURE shape, webhook.py:612) -> unexpected_response", async () => {
+      const outcome = await classifyDeliveryOutcome(ignored({ reason: 'script' }), 'msg-123', 'mubot-inbox')
+      expect(outcome.kind).toBe('unexpected_response')
+    })
+
+    it('empty / whitespace-only reason -> unexpected_response', async () => {
+      expect((await classifyDeliveryOutcome(ignored({ reason: '' }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
+      expect((await classifyDeliveryOutcome(ignored({ reason: '  ' }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
+    })
+
     it('missing / non-string reason -> unexpected_response', async () => {
       expect((await classifyDeliveryOutcome(ignored({ reason: undefined }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
       expect((await classifyDeliveryOutcome(ignored({ reason: 5 }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
@@ -247,6 +257,8 @@ describe('classifyDeliveryOutcome', () => {
     it('expectedRouteFromUrl takes the last path segment, null when absent/invalid', () => {
       expect(expectedRouteFromUrl('https://h.test/webhooks/mubot-inbox')).toBe('mubot-inbox')
       expect(expectedRouteFromUrl('https://h.test/webhooks/mubot-inbox/')).toBe('mubot-inbox')
+      expect(expectedRouteFromUrl('https://h.test/webhooks/mubot-inbox?x=1#frag')).toBe('mubot-inbox')
+      expect(expectedRouteFromUrl('https://h.test/webhooks/mubot%2Dinbox')).toBe('mubot-inbox')
       expect(expectedRouteFromUrl('https://h.test/')).toBeNull()
       expect(expectedRouteFromUrl('not a url')).toBeNull()
       expect(expectedRouteFromUrl(undefined)).toBeNull()

@@ -1029,12 +1029,30 @@ describe('bus queue consumer — message.created delivery', () => {
 
   it('acks (no retry) when the configured route deliberately declines (ignored/filter) — mupot#1716', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(IGNORED_FILTER, { status: 200 }))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
     const item = message(messageCreatedEvent())
 
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
 
     expect(item.ack).toHaveBeenCalledOnce()
     expect(item.retry).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('declined by receiver'),
+      expect.objectContaining({ metric: 'hermes_delivery.declined', reason: 'filter', route: 'mubot-inbox' }),
+    )
+  })
+
+  it('still retries reason "script" (script failure, not a veto)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ status: 'ignored', reason: 'script', route: 'mubot-inbox' }), { status: 200 }),
+    )
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
   })
 
   it('still retries an ignored body naming a DIFFERENT route (unexpected_response)', async () => {
