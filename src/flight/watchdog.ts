@@ -26,6 +26,8 @@
 
 import type { Env } from '../types'
 import { routineEffectInFlightSql } from '../routines/running-action'
+import { routineControlId } from '../routines/identity'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import type { FlightRow, FlightStatus } from './service'
 import { getFlight, governedLandEligibilitySql } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
@@ -455,15 +457,42 @@ export async function reapStalledFlight(
   // so it is not a real failure): landing it would make findFinishedWorkConflict (rebooking.ts) 409 every
   // flight_dispatch for the task the deploy/studio flight carries in meta.task_ids (#1748 round 2 P1-B).
   const targetStatus: 'failed' | 'landed' = disposition === 'tasks_done' ? 'landed' : 'failed'
-  const gateReason =
+  // A unique marker lets downstream statements prove they follow THIS flight
+  // transition, rather than a prior/replayed failure that happens to share a
+  // timestamp and human-readable reason.
+  const reapTransitionId = crypto.randomUUID()
+  const gateReasonBase =
     disposition === 'failed'
       ? `watchdog_reap: ${reason.slice(0, 400)}`
       : disposition === 'bookkeeping_closed'
         ? `bookkeeping_closed: ${reason.slice(0, 400)}`
         : `watchdog_tasks_done: ${reason.slice(0, 400)}`
+  const gateReason = `${gateReasonBase} [transition:${reapTransitionId}]`
   const previousStatus = flight.status
   const nowIso = new Date(nowMs).toISOString()
   const runReason = `watchdog_reap: ${reason.slice(0, 200)}`
+
+  // A routine control task is attempt-scoped.  Read only enough to derive that
+  // deterministic identity; every value relied on below is re-checked in the
+  // batch after the flight and run have actually transitioned.  Ambiguous
+  // legacy/corrupt bindings deliberately receive no task repair.
+  type RoutineControlCandidate = { id: string; attempt: number; task_id: string | null }
+  const routineCandidates = await env.DB.prepare(
+    `SELECT id, attempt, task_id
+       FROM routine_runs
+      WHERE tenant = ?1 AND flight_id = ?2
+        AND status IN ('queued','leased','observing','waiting','running')
+      LIMIT 2`,
+  ).bind(env.TENANT_SLUG, flightId).all<RoutineControlCandidate>()
+  const routineCandidate = (routineCandidates.results ?? []).length === 1
+    ? (routineCandidates.results ?? [])[0]
+    : null
+  const expectedRoutineTaskId = routineCandidate?.task_id
+    ? await routineControlId('task', `${routineCandidate.id}:${routineCandidate.attempt}`)
+    : null
+  const taskFailureReason = routineCandidate && expectedRoutineTaskId
+    ? `${runReason} [flight:${flightId}; run:${routineCandidate.id}; attempt:${routineCandidate.attempt}]`
+    : null
 
   // Flight and its spawning routine_run must move together. The overlap
   // predicate treats a non-terminal run as a permanent pin; leaving the run
@@ -502,11 +531,105 @@ export async function reapStalledFlight(
         WHERE tenant = ?3
           AND flight_id = ?4
           AND status IN ('queued','leased','observing','waiting','running')
+          AND changes() = 1
           AND EXISTS (
             SELECT 1 FROM flights
-             WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5
+             WHERE id = ?4 AND tenant = ?3 AND status = 'failed' AND ended_at = ?5 AND gate_reason = ?6
           )`,
-    ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs),
+    ).bind(runReason, nowIso, env.TENANT_SLUG, flightId, nowMs, gateReason),
+    // A watchdog failure is terminal for the exact live routine attempt's
+    // control task too.  The status, archive, project, squad, assignee, run,
+    // attempt, and deterministic task-id fences all live in this transition;
+    // a pre-read is never permission to block some later/reassigned task.
+    env.DB.prepare(
+      `UPDATE tasks
+          SET status = 'blocked', result = ?1, updated_at = ?2
+        WHERE id = ?3
+          AND status = 'in_progress'
+          AND result IS NULL
+          AND execution_receipt_id IS NULL
+          AND execution_claim_expires_at IS NULL
+          AND ${TASK_NOT_ARCHIVED_SQL()}
+          AND changes() = 1
+          AND EXISTS (
+            SELECT 1
+              FROM routine_runs rr
+             WHERE rr.id = ?4
+               AND rr.tenant = ?5
+               AND rr.flight_id = ?6
+               AND rr.status = 'failed'
+               AND rr.finished_at = ?7
+               AND rr.result_summary = ?8
+               AND rr.attempt = ?9
+               AND rr.task_id = tasks.id
+               AND rr.project_id = tasks.project_id
+               AND rr.assigned_agent_id = tasks.assignee_agent_id
+               AND json_extract(rr.policy_json, '$.responsible_squad_id') = tasks.squad_id
+          )
+          AND EXISTS (
+            SELECT 1 FROM flights f
+             WHERE f.id = ?6 AND f.tenant = ?5
+               AND f.status = 'failed' AND f.ended_at = ?10 AND f.gate_reason = ?11
+          )
+        RETURNING id`,
+    ).bind(
+      taskFailureReason, nowIso, expectedRoutineTaskId, routineCandidate?.id ?? null,
+      env.TENANT_SLUG, flightId, nowIso, runReason, routineCandidate?.attempt ?? null, nowMs, gateReason,
+    ),
+    // The task write is direct to remain in the same atomic batch as the
+    // flight/run transition, so record its actual actor and flight correlation
+    // only when that guarded task write changed one row.
+    env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (
+         id, tenant, principal_kind, principal_id, origin, handler, operation,
+         target_kind, target_id, flight_id, task_id, request_id, evidence_json, recorded_at
+       )
+       SELECT ?1, ?2, ?3, ?4, 'controller', 'flight_watchdog',
+              'routine_control_task_blocked', 'task', t.id, ?5, t.id, ?6, ?7, ?8
+         FROM tasks t
+        WHERE changes() = 1
+          AND t.id = ?9 AND t.status = 'blocked' AND t.result = ?10
+          AND EXISTS (
+            SELECT 1 FROM routine_runs rr
+             WHERE rr.id = ?11 AND rr.tenant = ?2 AND rr.flight_id = ?5
+               AND rr.status = 'failed' AND rr.finished_at = ?8 AND rr.task_id = t.id
+          )`,
+    ).bind(
+      crypto.randomUUID(), env.TENANT_SLUG, principal.actor.kind, principal.actor.id, flightId,
+      `watchdog-reap:${flightId}:${reapTransitionId}`,
+      JSON.stringify({ reason: runReason, flight_id: flightId, task_id: expectedRoutineTaskId, attempt: routineCandidate?.attempt ?? null }),
+      nowIso, expectedRoutineTaskId, taskFailureReason, routineCandidate?.id ?? null,
+    ),
+    // Keep the run's append-only history correlated to the audit entry written
+    // from the task transition.  This cannot manufacture a history event when
+    // the task was not actually blocked.
+    env.DB.prepare(
+      `INSERT INTO routine_run_events (
+         id, tenant, project_id, run_id, kind, actor_type, actor_id,
+         occurred_at, metadata_json, correlation_id
+       )
+       SELECT ?1, rr.tenant, rr.project_id, rr.id, 'failed', ?2, ?3,
+              ?4, ?5, rr.id
+         FROM routine_runs rr
+        WHERE rr.id = ?6 AND rr.tenant = ?7 AND rr.flight_id = ?8
+          AND rr.status = 'failed' AND rr.finished_at = ?4
+          AND rr.task_id = ?9
+          AND EXISTS (
+            SELECT 1 FROM mutation_audit_entries a
+             WHERE a.tenant = rr.tenant AND a.flight_id = ?8 AND a.task_id = ?9
+               AND a.request_id = ?10 AND a.operation = 'routine_control_task_blocked'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM routine_run_events e
+             WHERE e.run_id = rr.id AND e.kind = 'failed'
+               AND CAST(json_extract(e.metadata_json, '$.attempt') AS INTEGER) = ?11
+          )`,
+    ).bind(
+      crypto.randomUUID(), principal.actor.kind, principal.actor.id, nowIso,
+      JSON.stringify({ reason: runReason, flight_id: flightId, task_id: expectedRoutineTaskId, attempt: routineCandidate?.attempt ?? null }),
+      routineCandidate?.id ?? null, env.TENANT_SLUG, flightId, expectedRoutineTaskId,
+      `watchdog-reap:${flightId}:${reapTransitionId}`, routineCandidate?.attempt ?? null,
+    ),
   ])
 
   const rows = transition[0]?.results ?? []
