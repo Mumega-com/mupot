@@ -294,6 +294,8 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 /** mupot#1794 W2: request-borne seat inputs that live in the JSON-RPC body (`params._meta`,
  *  `params.arguments._meta`). Header inputs are read from `c` directly. */
 interface SeatBodyMeta {
+  /** The curated profile door: never resolves a seat handle (it stays the human's own view). */
+  skipSeat?: boolean
   paramsMeta?: unknown
   argsMeta?: unknown
 }
@@ -448,7 +450,7 @@ async function resolveSeatSession(
   auth: AuthContext,
   bodyMeta?: SeatBodyMeta,
 ): Promise<AuthContext> {
-  if (!seatAutoEnrollEnabled(c.env)) return auth
+  if (!seatAutoEnrollEnabled(c.env) || bodyMeta?.skipSeat) return auth
   if (auth.channel !== 'directory' || auth.boundAgentId || !auth.harnessId) return auth
   const paramsFacts = extractMetaFacts(bodyMeta?.paramsMeta)
   const argsFacts = extractMetaFacts(bodyMeta?.argsMeta)
@@ -701,7 +703,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 502 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -6939,6 +6941,12 @@ export async function invokeTool(
   const spec = TOOL_BY_NAME.get(toolName)
   if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
 
+  // mupot#1794: a flag-gated tool refuses BEFORE args handling and schema validation, so a flag-off
+  // pot never reveals the tool's argument schema through an invalid_args response.
+  if (SEAT_FLAG_TOOLS.has(spec.name) && !seatAutoEnrollEnabled(env)) {
+    return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
+  }
+
   let args: Record<string, unknown>
   if (argsValue === undefined || argsValue === null) {
     args = {}
@@ -7107,7 +7115,7 @@ async function handleJsonRpc(
   if (method === 'tools/list') {
     if (profile === 'needs-you') {
       // The profile never discloses the registry to an unauthenticated caller (mupot#1609).
-      const profileAuth = await resolveAuth(c)
+      const profileAuth = await resolveAuth(c, { skipSeat: true })
       if (!profileAuth || profileAuth.tenant !== c.env.TENANT_SLUG) {
         return rpcError(id, -32001, 'unauthenticated', undefined, 401)
       }
@@ -7126,7 +7134,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta } : undefined)
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }

@@ -33,7 +33,6 @@ export interface SeatKeyArgs {
   folder?: unknown
   thread?: unknown
   squad?: unknown
-  harness_kind?: unknown
 }
 
 export interface NormalizedSeatKey {
@@ -41,8 +40,6 @@ export interface NormalizedSeatKey {
   squad: string
   folder: string
   thread: string
-  /** harness_kind as a display hint only; NOT part of the canonical key (harness id pins it). */
-  harnessKindHint: string
   /** Short human label: last folder segment, else the project. Never a full path. */
   labelBasename: string
 }
@@ -111,10 +108,6 @@ export function normalizeSeatKey(args: SeatKeyArgs): SeatKeyResult {
   if (!thread.ok) return { ok: false, error: thread.error, field: 'thread' }
   if (thread.value.length > MAX_COMPONENT) return { ok: false, error: 'component_too_long', field: 'thread' }
 
-  const hint = cleanText(args.harness_kind)
-  if (!hint.ok) return { ok: false, error: hint.error, field: 'harness_kind' }
-  if (hint.value.length > 32) return { ok: false, error: 'component_too_long', field: 'harness_kind' }
-
   // Folder: rewrite backslashes BEFORE the charset check (a Windows path is legitimate input),
   // then normalise lexically.
   let folder = ''
@@ -141,7 +134,6 @@ export function normalizeSeatKey(args: SeatKeyArgs): SeatKeyResult {
       squad: squad.value.toLowerCase(),
       folder,
       thread: thread.value,
-      harnessKindHint: hint.value.toLowerCase(),
       labelBasename,
     },
   }

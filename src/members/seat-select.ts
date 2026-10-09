@@ -8,7 +8,7 @@
 //
 // WHAT THIS IS NOT: it does not bind the calling session to the seat (that is W2: Mcp-Session-Id
 // + a seat lock in the auth build), it does not widen any capability, and it does not accept a
-// label as authority. project / squad / folder / thread / harness_kind are LABELS that feed the
+// label as authority. project / squad / folder / thread are LABELS that feed the
 // key and the display name; the squad argument never places the agent anywhere.
 //
 // FLAG: everything is behind SEAT_AUTO_ENROLL === '1' (unset in prod). Flag off -> the very first
@@ -47,6 +47,7 @@ import {
   prepareAgentIdentityWeldStatements,
   prepareDirectoryTokenInsert,
   resolveAgentMemberBinding,
+  sha256Hex,
   type AgentForMint,
 } from './service'
 import {
@@ -200,10 +201,11 @@ function isCapViolation(err: unknown): boolean {
 
 async function countLiveSeats(env: Env, memberId: string): Promise<number> {
   const row = await env.DB.prepare(
-    // Same definition of "live" as the agent_seats_cap_insert trigger (migration 0198): not retired
-    // AND the agent is still active. A deactivated seat agent frees its slot.
+    // Same definition of "live" as the agent_seats_cap_insert trigger (migration 0199, which replaces
+    // 0198's): not retired AND the agent is 'active' or 'paused'. Only 'inactive' or a retired seat
+    // frees a slot, so pause/resume can never be used to exceed the cap.
     `SELECT COUNT(*) AS n FROM agent_seats s JOIN agents a ON a.id = s.agent_id
-      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.retired_at IS NULL AND a.status = 'active'`,
+      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.retired_at IS NULL AND a.status IN ('active', 'paused')`,
   ).bind(env.TENANT_SLUG, memberId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -322,9 +324,14 @@ export async function seatSelect(
   // The display name is prefixed with the HUMAN's own local part and uses a charset-limited client
   // label, so an OAuth client registered as "River" / "Kasra" cannot mint an agent that reads as
   // that identity. It is still only a label (authority never reads it).
-  const emailRow = await env.DB.prepare(`SELECT email FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
-    .bind(memberId, env.TENANT_SLUG).first<{ email: string | null }>()
-  const ownerLabel = (emailRow?.email ?? '').split('@')[0].replace(/[^A-Za-z0-9._-]/g, '').slice(0, 24) || 'member'
+  // The owner label is the member's own DISPLAY NAME (already visible org-wide), never the email
+  // local part: the agent name is shown to squad peers and an email prefix is a disclosure. A name
+  // that is missing or looks like an address falls back to a short hash of the member id.
+  const nameRow = await env.DB.prepare(`SELECT display_name FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
+    .bind(memberId, env.TENANT_SLUG).first<{ display_name: string | null }>()
+  const rawName = nameRow?.display_name ?? ''
+  const cleanedName = rawName.includes('@') ? '' : rawName.replace(/[^A-Za-z0-9 ._-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24)
+  const ownerLabel = cleanedName || `member-${(await sha256Hex(memberId)).slice(0, 6)}`
   const clientLabel = harness.client_name.replace(/[^A-Za-z0-9 ._-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24) || harness.kind
   const displayName = sanitizeLabel(
     [ownerLabel, clientLabel, key.project, key.labelBasename !== key.project ? key.labelBasename : ''].filter(Boolean).join(' · '),

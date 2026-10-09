@@ -147,3 +147,20 @@ WHEN NEW.id IS NOT OLD.id
 BEGIN
   SELECT RAISE(ABORT, 'agent_seat_immutable');
 END;
+
+-- ── Live-seat cap counts 'paused' too (W1 round-2 gate, P3) ─────────────────────────────────────
+-- 0198's agent_seats_cap_insert counted only status = 'active', so pausing a seat agent freed a slot
+-- and resuming it exceeded the cap. A seat is live while its agent is 'active' OR 'paused'; only
+-- 'inactive' (deactivate_agent) or a retired seat frees a slot. Replaces the 0198 trigger.
+DROP TRIGGER IF EXISTS agent_seats_cap_insert;
+CREATE TRIGGER agent_seats_cap_insert
+BEFORE INSERT ON agent_seats
+FOR EACH ROW
+WHEN NEW.retired_at IS NULL
+ AND (SELECT COUNT(*) FROM agent_seats s
+       JOIN agents a ON a.id = s.agent_id
+       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id
+         AND s.retired_at IS NULL AND a.status IN ('active', 'paused')) >= NEW.max_live
+BEGIN
+  SELECT RAISE(ABORT, 'seat_cap_exceeded');
+END;

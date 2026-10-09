@@ -3540,7 +3540,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
   },
   {
     file: "0199_seat_handles.sql",
-    sha256: "678ffa68ad7a61bb2e043498ca87546b8f07b0b756237851e7ed9ebc83936d34",
+    sha256: "f841cb225da1507ed1a50f7363470ad7b780fff3d85300adba5fcab8a43107ee",
     statements: [
       "-- 0199_seat_handles.sql — mupot#1794 W2: seat handles (a selected seat authenticates AS its agent).\n--\n-- seat_select (W1) resolves a (human, harness, workspace) key to ONE agent. W2 lets a later\n-- request ACT as that agent by presenting an opaque SEAT HANDLE (header X-Mupot-Seat or\n-- _meta[\"mupot/seat\"]) alongside the human's ordinary OAuth grant. The handle is a SELECTOR, never a\n-- credential on its own: it only resolves while the human's directory grant (grant_token_id) is\n-- still live, still unbound, still on the same harness, and still held by the same member.\n--\n-- Only sha256(handle) is stored (32 random bytes, base64url, never persisted raw). The row pins\n-- WHO may use it (consenting member + the exact grant token + harness), so another human's grant,\n-- another harness of the same human, or a re-consented grant never matches.\n--\n-- Behind SEAT_AUTO_ENROLL (unset in prod): with the flag off no code writes or reads this table.\n-- Additive migration; nothing existing references it.\nCREATE TABLE IF NOT EXISTS seat_handles (\n  id                   TEXT PRIMARY KEY,\n  tenant               TEXT NOT NULL,\n  handle_hash          TEXT NOT NULL CHECK (length(handle_hash) = 64),\n  seat_id              TEXT NOT NULL REFERENCES agent_seats(id) ON DELETE RESTRICT,\n  agent_id             TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,\n  harness_id           TEXT NOT NULL REFERENCES harnesses(id) ON DELETE RESTRICT,\n  consenting_member_id TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  grant_token_id       TEXT NOT NULL CHECK (length(grant_token_id) BETWEEN 1 AND 128),\n  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  last_used_at         TEXT,\n  revoked_at           TEXT,\n  UNIQUE (tenant, handle_hash)\n);",
       "\n\nCREATE INDEX IF NOT EXISTS idx_seat_handles_seat_live ON seat_handles (seat_id, revoked_at);",
@@ -3556,6 +3556,8 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       "\n\nCREATE TRIGGER IF NOT EXISTS agent_seats_total_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN (SELECT COUNT(*) FROM agent_seats s\n       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id) >= NEW.max_total\nBEGIN\n  SELECT RAISE(ABORT, 'seat_total_cap_exceeded');\nEND;",
       "\n\n-- Replace the W1 immutability trigger so the new column is part of the identity record too.\nDROP TRIGGER IF EXISTS agent_seats_immutable;",
       "\nCREATE TRIGGER agent_seats_immutable\nBEFORE UPDATE ON agent_seats\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id\n  OR NEW.tenant IS NOT OLD.tenant\n  OR NEW.member_id IS NOT OLD.member_id\n  OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.key_hash IS NOT OLD.key_hash\n  OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.label_basename IS NOT OLD.label_basename\n  OR NEW.max_live IS NOT OLD.max_live\n  OR NEW.max_total IS NOT OLD.max_total\n  OR NEW.created_at IS NOT OLD.created_at\n  OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_immutable');\nEND;",
+      "\n\n-- ── Live-seat cap counts 'paused' too (W1 round-2 gate, P3) ─────────────────────────────────────\n-- 0198's agent_seats_cap_insert counted only status = 'active', so pausing a seat agent freed a slot\n-- and resuming it exceeded the cap. A seat is live while its agent is 'active' OR 'paused'; only\n-- 'inactive' (deactivate_agent) or a retired seat frees a slot. Replaces the 0198 trigger.\nDROP TRIGGER IF EXISTS agent_seats_cap_insert;",
+      "\nCREATE TRIGGER agent_seats_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.retired_at IS NULL\n AND (SELECT COUNT(*) FROM agent_seats s\n       JOIN agents a ON a.id = s.agent_id\n       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id\n         AND s.retired_at IS NULL AND a.status IN ('active', 'paused')) >= NEW.max_live\nBEGIN\n  SELECT RAISE(ABORT, 'seat_cap_exceeded');\nEND;",
     ],
     objects: [
       { type: "table", name: "seat_handles" },
@@ -3570,6 +3572,7 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "seat_handles_revoke_on_seat_retire" },
       { type: "trigger", name: "agent_seats_total_cap_insert" },
       { type: "trigger", name: "agent_seats_immutable" },
+      { type: "trigger", name: "agent_seats_cap_insert" },
     ],
   },
 ]
@@ -3577,4 +3580,4 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "dac6a1c4731b73c3cf5dfd8babf58f3869d65d030ee546a71a2cad7b629ca0a0"
+export const SCHEMA_CHAIN_DIGEST: string = "b92a0cb9f68b8c1c0043ba707afdf34a18b8ccb6f1362180dfbd2f5d2f9eed58"

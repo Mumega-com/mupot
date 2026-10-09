@@ -62,14 +62,14 @@ async function grant(env: Env, memberId: string, clientId = 'client-cursor', nam
   return { memberId, tokenId, harnessId: harness.id, ctx }
 }
 
-interface RpcOpts { headers?: Record<string, string>; meta?: Record<string, unknown>; argsMeta?: Record<string, unknown> }
+interface RpcOpts { path?: string; headers?: Record<string, string>; meta?: Record<string, unknown>; argsMeta?: Record<string, unknown> }
 interface Rpc { status: number; body: Record<string, unknown>; sc: Record<string, unknown> }
 
 /** Drive the real internal-header -> mcpApp path with a pre-built OAuth context. */
 async function rpc(env: Env, ctx: AuthContext, name: string, args: Record<string, unknown> = {}, o: RpcOpts = {}): Promise<Rpc> {
   const params: Record<string, unknown> = { name, arguments: o.argsMeta ? { ...args, _meta: o.argsMeta } : args }
   if (o.meta) params._meta = o.meta
-  const req = new Request('https://pot.test/mcp', {
+  const req = new Request(`https://pot.test${o.path ?? '/mcp'}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(o.headers ?? {}) },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params }),
@@ -704,5 +704,167 @@ describe('lifetime seat-creation bound (atomic, fail-closed)', () => {
       `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total)
        VALUES ('raw-seat', '${TENANT}', '${HUMAN}', '${g.harnessId}', '${'d'.repeat(64)}', 'raw-agent', 'x', 100, 2)`,
     )).toThrow(/seat_total_cap_exceeded/)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('gates exercised directly (defence in depth behind the OAuth builder / resolveAuth)', () => {
+  it('applySeatHandle refuses a bound ctx, a non-directory ctx, a harness-less ctx and a token-less ctx outright', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const hin = { headerHandle: a.handle, hints: NO_HINTS }
+    const bound = { ...g.ctx, boundAgentId: 'some-agent' }
+    expect(await applySeatHandle(env, bound, hin)).toBe(bound)
+    const ws = { ...g.ctx, channel: 'workspace' as const }
+    expect(await applySeatHandle(env, ws, hin)).toBe(ws)
+    const noHarness = { ...g.ctx, harnessId: undefined }
+    expect(await applySeatHandle(env, noHarness, hin)).toBe(noHarness)
+    const noTok = { ...g.ctx, tokenId: null }
+    expect(await applySeatHandle(env, noTok, hin)).toBe(noTok)
+    // positive control: the unmodified ctx binds
+    expect((await applySeatHandle(env, g.ctx, hin)).boundAgentId).toBe(a.agentId)
+  })
+
+  it('a forged seatBinding on a LEGACY bound blob is stripped: the receipt still says legacy_consent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const seatTok = h.sqlite.prepare(`SELECT id FROM member_tokens WHERE agent_id = ?`).get(a.agentId)!.id as string
+    const memberId = h.sqlite.prepare(`SELECT member_id FROM agent_member_bindings WHERE agent_id = ?`).get(a.agentId)!.member_id as string
+    const bound = await buildAuthContextFromProps(env, { memberId, tokenId: seatTok, email: null, channel: 'directory', boundAgentId: a.agentId, consentedByMemberId: HUMAN })
+    const forged = { ...bound!, seatBinding: { seatId: a.seatId, label: 'forged', harnessId: g.harnessId, grantTokenId: g.tokenId, humanMemberId: HUMAN } } as AuthContext
+    const r = await rpc(env, forged, 'boot_context', {})
+    expect(receiptOf(r)).toMatchObject({ binding_source: 'legacy_consent', seat: null })
+  })
+
+  it('the seat context carries NO latent authority beyond its clamped capabilities', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${HUMAN}', 'org', NULL, 'owner')`)
+    const seat = await applySeatHandle(env, g.ctx, { headerHandle: a.handle, hints: NO_HINTS })
+    expect(seat.latentCapabilities).toEqual(seat.capabilities)
+    for (const c of seat.latentCapabilities ?? []) expect(['observer', 'member']).toContain(c.capability)
+  })
+
+  it('the curated needs-you profile door never honours a seat handle', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const r = await rpc(env, g.ctx, 'boot_context', {}, { path: '/mcp/profile/needs-you', headers: { 'x-mupot-seat': a.handle } })
+    expect(r.status).toBe(200)
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(r.sc.member_id).toBe(HUMAN)
+  })
+
+  it('with the member-end revoke trigger absent, a suspended seat-agent member still cannot be impersonated', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    h.sqlite.exec(`DROP TRIGGER seat_handles_revoke_on_member_end`)
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${a.sc.member_id}'`)
+    const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle } })
+    expect(r.sc.bound_agent_id).toBeNull()
+  })
+
+  it('a raw handle row naming ANOTHER member as consenter / another harness never binds this grant', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const g2 = await grant(env, HUMAN, 'client-claude', 'Claude')
+    const a = await select(env, g, '/work/a')
+    // a handle for the same seat, re-pointed at the OTHER harness's harness id + grant (raw insert)
+    const hd = mintSeatHandle()
+    h.sqlite.prepare(`INSERT INTO seat_handles (id, tenant, handle_hash, seat_id, agent_id, harness_id, consenting_member_id, grant_token_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .run('raw-h', TENANT, await hashSeatHandle(hd), a.seatId, a.agentId, g2.harnessId, HUMAN, g2.tokenId)
+    const r = await rpc(env, g2.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': hd } })
+    expect(r.sc.bound_agent_id).toBeNull() // the seat belongs to harness 1, not harness 2
+    const hd2 = mintSeatHandle()
+    h.sqlite.prepare(`INSERT INTO seat_handles (id, tenant, handle_hash, seat_id, agent_id, harness_id, consenting_member_id, grant_token_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .run('raw-h2', TENANT, await hashSeatHandle(hd2), a.seatId, a.agentId, g.harnessId, HUMAN2, g.tokenId)
+    const r2 = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': hd2 } })
+    expect(r2.sc.bound_agent_id).toBeNull() // consenter differs from the seat's owner / the grant's member
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('W1 round-2 P3 folds', () => {
+  it('flag off: seat_select refuses 403 BEFORE argument validation (no schema disclosure)', async () => {
+    const off = envFor(h, { SEAT_AUTO_ENROLL: undefined })
+    const g = await grant(envFor(h), HUMAN)
+    for (const args of [{}, { project: 5 }, { bogus: true }, { project: 'p', harness_kind: 'x' }]) {
+      const out = await invokeTool(g.ctx, off, 'seat_select', args, 'https://pot.test')
+      if (out.ok) throw new Error('unreachable')
+      expect(out.status).toBe(403)
+      expect(out.error).toBe('seat_auto_enroll_disabled')
+    }
+    const nonObject = await invokeTool(g.ctx, off, 'seat_select', 'x', 'https://pot.test')
+    if (nonObject.ok) throw new Error('unreachable')
+    expect(nonObject.error).toBe('seat_auto_enroll_disabled')
+  })
+
+  it('flag on: harness_kind is no longer an input (strict schema rejects it)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const out = await invokeTool(g.ctx, env, 'seat_select', { project: 'p', harness_kind: 'x' }, 'https://pot.test')
+    if (out.ok) throw new Error('unreachable')
+    expect(out.error).toBe('invalid_args')
+  })
+
+  it('rate_limited is a 429 through the tool', async () => {
+    const env = envFor(h, { SEAT_MAX_PER_MEMBER: '100' })
+    const g = await grant(env, HUMAN)
+    for (let i = 0; i < 20; i++) await select(env, g, `/rl/${i}`)
+    const out = await invokeTool(g.ctx, env, 'seat_select', { project: 'p', folder: '/rl/over' }, 'https://pot.test')
+    if (out.ok) throw new Error('unreachable')
+    expect(out.status).toBe(429)
+    expect(out.error).toBe('rate_limited')
+  })
+
+  it('pause/resume cannot exceed the live-seat cap; only inactive frees a slot', async () => {
+    const env = envFor(h, { SEAT_MAX_PER_MEMBER: '2' })
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/a'); await select(env, g, '/b')
+    h.sqlite.exec(`UPDATE agents SET status = 'paused' WHERE id = '${a.agentId}'`)
+    // paused still holds its slot: a third seat is refused, at the app pre-check AND at the trigger
+    const refused = await rpc(env, g.ctx, 'seat_select', { project: 'p', folder: '/c' })
+    expect(JSON.stringify(refused.body)).toContain('seat_cap_reached')
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('raw-agent', '${(a.sc.agent as { squad_id: string }).squad_id}', 'raw-agent', 'Raw', 'active')`)
+    expect(() => h.sqlite.exec(
+      `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live)
+       VALUES ('raw-seat', '${TENANT}', '${HUMAN}', '${g.harnessId}', '${'e'.repeat(64)}', 'raw-agent', 'x', 2)`,
+    )).toThrow(/seat_cap_exceeded/)
+    h.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${a.agentId}'`)
+    expect(typeof (await select(env, g, '/c')).handle).toBe('string')
+  })
+
+  it("the agent display name uses the member's display name, never the email local part", async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`UPDATE members SET display_name = 'Hadi S.' , email = 'hadi.secret.mailbox@example.test' WHERE id = '${HUMAN}'`)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/a')
+    const name = (a.sc.agent as { name: string }).name
+    expect(name.startsWith('Hadi S. · ')).toBe(true)
+    expect(name).not.toContain('secret')
+    // a display name that is an address (or empty) falls back to a short hash, never the address
+    h.sqlite.exec(`UPDATE members SET display_name = 'leak@example.test' WHERE id = '${HUMAN2}'`)
+    const g2 = await grant(env, HUMAN2)
+    const b = await select(env, g2, '/a')
+    const nameB = (b.sc.agent as { name: string }).name
+    expect(nameB).toMatch(/^member-[0-9a-f]{6} · /)
+    expect(nameB).not.toContain('leak')
+  })
+
+  it('concurrent creators losing the total-cap race all report seat_cap_reached (never provisioning_failed)', async () => {
+    const env = envFor(h, { SEAT_MAX_TOTAL_PER_MEMBER: '3', SEAT_MAX_PER_MEMBER: '100' })
+    const g = await grant(env, HUMAN)
+    await select(env, g, '/seed/0'); await select(env, g, '/seed/1')
+    const results = await Promise.all(Array.from({ length: 10 }, (_, i) => rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: `/race2/${i}` })))
+    const failures = results.filter((r) => typeof r.sc.seat_handle !== 'string')
+    expect(failures).toHaveLength(9)
+    for (const f of failures) {
+      expect(JSON.stringify(f.body)).toContain('seat_cap_reached')
+      expect(JSON.stringify(f.body)).not.toContain('provisioning_failed')
+    }
   })
 })
