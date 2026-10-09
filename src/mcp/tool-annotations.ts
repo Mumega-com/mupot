@@ -173,10 +173,10 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   update_squad: MUT('updateUnitConfig UPDATE squads (org/service.ts:1265)'),
   team_bootstrap: ADD('INSERT project/squads/access/invites + credential claim + remember (org/team-bootstrap.ts:882,938)'),
   team_bootstrap_release: MUT('releaseTeamBootstrapSlugBase DELETE FROM projects (org/team-bootstrap.ts:1089)'),
-  archive_row: MUT('archiveRow archives members/agents/squads/projects (hygiene/archive.ts:120)'),
+  archive_row: MUT('archiveRow archives members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   // unarchive restores a previously archived row (the inverse of archive_row): changes state, destroys nothing.
-  unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects (hygiene/archive.ts:136)'),
-  archive_plan_expand: RO('always refuses 409 not_supported after the admin gate; no read or write (mcp/archive.ts:236)'),
+  unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
+  archive_plan_expand: RO('read-only SELECT expansion of a task archive plan (toolArchivePlanExpand); refuses 409 not_supported after the admin gate unless TASK_ARCHIVE_ENABLED=1, and never writes'),
   agent_lifecycle: MUTX('delegates to deactivate/move/grant/mint, and free-text intent calls Jev at api.typesafe.ai (mcp/agent-lifecycle.ts:156,258)'),
   bootstrap_self: ADD('bootstrapSelf INSERT department/squad/agent/capabilities + agent_audit + credential claim (members/bootstrap-self.ts:809-852)'),
   // One-shot reveal: the KV entry is deleted by the read, so the secret is gone afterwards.

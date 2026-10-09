@@ -369,8 +369,9 @@ export async function runTaskPipeline(
           instanceId,
           taskId,
           stepName: 'outbound-acts',
-          status: 'ok',
-          detail: JSON.stringify({ sent: result.sent, refused: result.refused, failed: result.failed }),
+          // #1780: an archived task sends nothing; do not record that as a plain 'ok'.
+          status: result.reason === 'task_archived' ? 'skipped_archived' : 'ok',
+          detail: JSON.stringify({ sent: result.sent, refused: result.refused, failed: result.failed, ...(result.reason ? { reason: result.reason } : {}) }),
         })
 
         return result

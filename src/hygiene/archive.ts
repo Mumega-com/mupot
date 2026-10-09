@@ -118,28 +118,27 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
-/** archiveRow — the single entry point for marking members/agents/squads/
- *  projects/tasks archived.
- *
- *  `tasks` was held back in mupot#1496 Round 3 because archive was only a READER
- *  filter: every task-mutating writer (router_tick, the concierge cron, task_update,
- *  task_verdict, dispatch, runtime receipts, execute, routines, the bus consumer ...)
- *  kept acting on an archived task. mupot#1571 made archive an ACTION boundary: every
- *  `UPDATE tasks` in src/ carries TASK_NOT_ARCHIVED_SQL in its own WHERE or is on the
- *  justified allowlist in tests/task-archive-action-boundary.test.ts (a raw-text seam
- *  scan that fails CI on a new unguarded writer). Only then is the write path here
- *  re-enabled. */
 /**
- * mupot#1571 / #1778: archiving TASKS stays off unless `TASK_ARCHIVE_ENABLED` is exactly '1'.
- * The action-boundary guards ship on every task writer regardless, but two gate rounds
- * found effects that still reach an archived task (the gate-stall watchdog re-wake, and an
- * in-flight-dispatch predicate that wedges settled inbox dispatches). Until those land
- * (#1780), production must not create archived tasks. Do not set the flag before then.
+ * mupot#1571 / #1778 / #1780: archiving TASKS stays off unless `TASK_ARCHIVE_ENABLED` is exactly '1'.
+ * The action-boundary guards ship on every task writer and on every autonomous effect site
+ * (cron sweeps and their effect helpers) regardless of the flag; the flag only gates CREATING
+ * archived tasks. Flipping it is a separate, deliberate change.
  */
 export function taskArchiveEnabled(env: Env): boolean {
   return env.TASK_ARCHIVE_ENABLED === '1'
 }
 
+/** archiveRow — the single entry point for marking members/agents/squads/projects/tasks archived.
+ *
+ *  `tasks` was held back in mupot#1496 Round 3 because archive was only a READER filter: every
+ *  task-mutating writer kept acting on an archived task. mupot#1571 made archive an ACTION
+ *  boundary: every `UPDATE tasks` in src/ carries TASK_NOT_ARCHIVED_SQL in its own WHERE or is on
+ *  the justified allowlist in tests/task-archive-action-boundary.test.ts (a raw-text seam scan
+ *  that fails CI on a new unguarded writer), and every autonomous effect site (scheduled sweeps
+ *  and the helpers they call) re-asserts not-archived at the point of effect (#1780).
+ *
+ *  `tasks` is additionally gated by taskArchiveEnabled(env): with the flag off the tasks arm
+ *  returns `not_supported` (the other four tables are unaffected). */
 export async function archiveRow(env: Env, auth: AuthContext, input: ArchiveInput): Promise<ArchiveOutcome> {
   if (!validReason(input.reason)) return { ok: false, error: 'invalid_reason' }
 

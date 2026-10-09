@@ -26,7 +26,7 @@ import {
   syncTaskStatusFromIssue, closeGitHubPrMirrorTasks, syncCiResultToTask, markApprovedTaskDoneFromGate, reverseTaskVerdict,
 } from '../src/tasks/service'
 import { persistGateWakeNotice } from '../src/gates/grants'
-import { startTaskPipeline } from '../src/workflows/pipeline'
+import { startTaskPipeline, runTaskPipeline } from '../src/workflows/pipeline'
 import { runApprovedActs, createOutboundAct } from '../src/integrations/ghl'
 import type { Agent, AuthContext, BusEvent, CapabilityGrant, Env, Project } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
@@ -874,7 +874,39 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       const result = await runApprovedActs(ghlEnv(), 'ghl-race', { ghlFetch })
       expect(ghlFetch).not.toHaveBeenCalled()
       expect(result.sent).toBe(0)
+      // #1780: the per-act race is NAMED, never success-shaped { ok: true, sent: 0 }.
+      expect(result).toMatchObject({ ok: false, reason: 'task_archived' })
       expect(actStatus(act)).toBe('pending')
+    })
+
+    describe.each([
+      ['archived before the acts step', false],
+      ['archived between the pre-check and the per-act claim', true],
+    ])('pipeline outbound-acts receipt (%s)', (_label, race) => {
+      it('records skipped_archived, never a plain ok, and sends nothing', async () => {
+        const id = race ? 'pipe-race' : 'pipe-pre'
+        const act = await seedApprovedWithAct(id)
+        if (race) archiveWhenPrepared("UPDATE outbound_acts\n          SET status = 'sending'", id)
+        else archive(id)
+        const ghlFetch = vi.fn(async () => ({ ok: true, status: 200 }))
+        const receipts: Array<{ stepName: string; status: string; detail?: string }> = []
+        const step = {
+          do: async (...a: unknown[]) => (a[a.length - 1] as () => Promise<unknown>)(),
+          waitForEvent: async () => ({ payload: {} }),
+        } as unknown as Parameters<typeof runTaskPipeline>[2]
+        await runTaskPipeline(ghlEnv(), { taskId: id, agentId: WORKER, squadId: SQUAD } as never, step, 'inst', {
+          loadAgent: async () => ({ id: WORKER } as Agent),
+          runTaskExecution: async () => ({ ok: true, task_id: id, decided: 'review', task_status: 'review' }),
+          readLatestVerdict: async () => ({ verdict: 'approved' }),
+          countPendingActs: async () => 1,
+          writeReceipt: async (_e, row) => { receipts.push(row) },
+          ghlDeps: { ghlFetch },
+        })
+        expect(ghlFetch).not.toHaveBeenCalled()
+        expect(actStatus(act)).toBe('pending')
+        const out = receipts.find((r) => r.stepName === 'outbound-acts')
+        expect(out?.status).toBe('skipped_archived')
+      })
     })
   })
 
