@@ -724,6 +724,20 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         case 'delivered':
           console.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
           break
+        case 'declined':
+          // The configured Hermes route deliberately filtered this event (mupot#1716).
+          // A route-bound (not authenticated) "not for me" answer, not a failure: ack, do not retry.
+          // (Falls through to the eventsEnqueueError check below, which still retries.)
+          // warn + metric: a misconfigured filter that drops 100% of messages must be visible.
+          // reason comes from the receiver, so bound it.
+          console.warn('bus: message.created — declined by receiver', {
+            ...logCtx,
+            status: outcome.status,
+            reason: outcome.reason.slice(0, 200),
+            route: outcome.route,
+            metric: 'hermes_delivery.declined',
+          })
+          break
         default:
           // unexpected_response | unauthorized | not_found | server_error | network_error:
           // all four are real, present-tense failures of a CONFIGURED delivery target.
