@@ -6390,7 +6390,7 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
-      nextStepOut = `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). ${nextStep}`
+      nextStepOut = `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`
     }
 
     return done({

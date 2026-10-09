@@ -617,9 +617,12 @@ describe('C1. GET /oauth/google-callback renders the consent screen', () => {
     expect(html.toLowerCase()).toContain('unbound')
   })
 
-  it('requires an explicit user selection: none of the radio buttons are pre-checked, all have required', async () => {
+  // mupot#1794 W3 seam: the explicit-consent invariant must hold with SEAT_AUTO_ENROLL on too, where
+  // the extra "Me — auto" option is rendered. A pre-checked radio there is a one-click silent grant.
+  it.each([[undefined], ['1']])('requires an explicit user selection (SEAT_AUTO_ENROLL=%s): none of the radio buttons are pre-checked, all have required', async (flag) => {
     const oauthProvider = stubOAuthProvider()
     const { env } = httpEnv(harness, oauthProvider)
+    if (flag !== undefined) (env as unknown as Record<string, unknown>).SEAT_AUTO_ENROLL = flag
     const { html } = await reachConsentScreen(env, oauthProvider, 'human@example.test')
     // No radio input should be pre-checked (zero silent welds, zero silent unbound defaults)
     expect(html).not.toMatch(/<input[^>]*type="radio"[^>]*checked/)

@@ -624,7 +624,7 @@ export async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Prom
   return names
 }
 
-/** Form value of the W3 harness consent option (mupot#1794). Never an agent id: ids are UUIDs. */
+/** Form value of the W3 harness consent option (mupot#1794). Never an agent id: it cannot collide with one, and memberMayConsentToAgent refuses it as an agent id. */
 const HARNESS_CONSENT_VALUE = '__harness__'
 
 /**
@@ -782,10 +782,10 @@ function renderConsentPage(
     <p class="panel-title">Let each thread pick its own agent</p>
     <div class="panel" id="p-harness">
       <label class="agent-option harness-option">
-        <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required checked data-label="Me — auto per workspace (harness)" data-top="member capability, capped at your own access">
+        <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required data-label="Me — auto per workspace (harness)" data-top="member capability, capped at your own access">
         <div class="opt-body">
           <div class="agent-title"><strong>Me — auto per workspace (harness)</strong></div>
-          <div class="agent-meta">Recommended for a coding tool or chat app you use across several projects. This connection is not tied to one agent. Instead, each thread or worktree picks its own agent by calling <code>seat_select</code>, and gets a seat handle to send with later requests. Every seat agent is capped at member level, and your own access is always the ceiling: a seat can never do more than you can.</div>
+          <div class="agent-meta">Recommended for a coding tool or chat app you use across several projects. This connection is not tied to one agent. Each thread or worktree picks its own agent by calling <code>seat_select</code> and gets a seat handle to send with later requests. Until a thread does that, it has no agent and no standing capability. Each seat agent is capped at member level, and your own access is always the ceiling: a seat can never do more than you can.</div>
         </div>
       </label>
     </div>
@@ -926,7 +926,7 @@ ${mintPanel}
         <input type="radio" name="agent_id" value="" required data-label="no agent" data-top="no standing capability">
         <div class="opt-body">
           <div class="agent-title"><strong>Continue unbound</strong></div>
-          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.</div>
+          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.${harnessOption ? ' This connection cannot pick seat agents; choose &ldquo;Me (auto)&rdquo; for that.' : ''}</div>
         </div>
       </label>
     </div>
@@ -1040,7 +1040,16 @@ ${mintPanel}
 </body>
 </html>`
 
-  return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+  // Clickjacking: this page mints a grant on one click, so nothing may frame it. Nothing legitimate
+  // does (it is a top-level OAuth redirect target). Flag-independent: a frame header is not W3 behaviour.
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Frame-Options': 'DENY',
+      'Content-Security-Policy': "frame-ancestors 'none'",
+    },
+  })
 }
 
 // ── resolveExternalToken — called by OAuthProvider for non-owned bearers ──────
@@ -1593,7 +1602,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // sentinel is normalised to '' here — before any other branch — so it reuses the unbound mint, the
     // W1 harness upsert and every gate unchanged. Flag off the sentinel is left as-is and falls into
     // the explicit-agent branch, where memberMayConsentToAgent rejects it (not a UUID of any agent).
-    if (agentIdRaw === HARNESS_CONSENT_VALUE && seatAutoEnrollEnabled(env)) agentIdRaw = ''
+    const harnessChosen = agentIdRaw === HARNESS_CONSENT_VALUE && seatAutoEnrollEnabled(env)
+    if (harnessChosen) agentIdRaw = ''
 
     if (!consentNonce) return new Response('Missing consent_nonce', { status: 400 })
 
@@ -1920,7 +1930,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const oauthProvider = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER
 
-    // mupot#1794 W1 — harness upsert, UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
+    // mupot#1794 W1/W3 — harness upsert, ONLY for the explicit "Me — auto per workspace" choice (flag on).
+    // A plain "continue unbound" ('') stays a pure unbound grant with no harness, so it cannot seat_select.
+    // (W1 originally upserted for any unbound consent; W3 narrows that to an explicit choice.)
+    // Original W1 note: UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
     // off (prod default) this block is skipped entirely: no read, no write, and the props below
     // are semantically identical to before. An agent-bound consent (boundAgentId set: legacy / Rava /
     // __bootstrap__ / __mint_new__) never reaches it. Best-effort and non-fatal, same posture as
@@ -1928,7 +1941,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // The harness key is the OAuth client_id from the library-parsed authorize request
     // (pending.stored), never a form field; the client NAME is a display label only.
     let harnessId: string | null = null
-    if (seatAutoEnrollEnabled(env) && !boundAgentId) {
+    if (harnessChosen && !boundAgentId) {
       try {
         const clientId = typeof pending.stored.clientId === 'string' ? pending.stored.clientId : ''
         let clientName: unknown = ''

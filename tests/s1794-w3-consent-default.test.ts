@@ -7,6 +7,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
 import { invokeTool } from '../src/mcp/index'
+import { seatSelect } from '../src/members/seat-select'
 import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS, mcpInitializeInstructions } from '../src/mcp/instructions'
 import type { AuthContext, Env } from '../src/types'
 
@@ -101,12 +102,15 @@ describe('W3 consent page', () => {
     }
   })
 
-  it('flag on: shows the harness option, preselects it, explains it, lands on its tab', async () => {
+  it('flag on: shows the harness option, explains it, lands on its tab, and pre-checks NOTHING', async () => {
     const { html } = await reachConsent(httpEnv(stubProvider(), '1'))
     expect(html).toContain('Me — auto per workspace (harness)')
-    const checked = html.match(/<input[^>]*type="radio"[^>]*checked[^>]*>/g) ?? []
-    expect(checked).toHaveLength(1)
-    expect(checked[0]).toContain('value="__harness__"')
+    // explicit consent: no radio is ever pre-checked, and every radio stays required
+    expect(html).not.toMatch(/<input[^>]*type="radio"[^>]*checked/)
+    const radios = html.match(/<input[^>]*type="radio"[^>]*>/g) ?? []
+    expect(radios.length).toBeGreaterThan(1)
+    for (const r of radios) expect(r).toContain('required')
+    expect(radios.some((r) => r.includes('value="__harness__"'))).toBe(true)
     expect(html).toContain('seat_select')
     expect(html).toMatch(/capped at member/)
     expect(html).toMatch(/your own access is always the ceiling/)
@@ -146,7 +150,7 @@ describe('W3 consent page', () => {
     expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM harnesses`).all()).toEqual([{ n: 0 }])
   })
 
-  it('flag on, plain "continue unbound" (empty value) is unchanged: unbound grant + harness', async () => {
+  it('flag on, "No agent" (empty value) stays a pure unbound grant: NO harness row, no harnessId, seat_select refused', async () => {
     const provider = stubProvider()
     const env = httpEnv(provider, '1')
     const { nonce } = await reachConsent(env)
@@ -154,6 +158,26 @@ describe('W3 consent page', () => {
     expect(res.status).toBe(302)
     const call = provider.completeAuthorization.mock.calls[0][0] as { props: Record<string, unknown> }
     expect(call.props.boundAgentId).toBeNull()
+    expect(call.props.harnessId).toBeUndefined()
+    expect(h.sqlite.prepare(`SELECT COUNT(*) AS n FROM harnesses`).all()).toEqual([{ n: 0 }])
+    const out = await seatSelect(env, { channel: 'directory', boundAgentId: null, memberId: HUMAN, harnessId: undefined }, { project: 'p' })
+    expect(out).toMatchObject({ ok: false, error: 'harness_required' })
+  })
+
+  it('the consent page carries frame-denial headers', async () => {
+    const env = httpEnv(stubProvider(), undefined)
+    const authorizeRes = await handleOAuthAuthorize(new Request(
+      'https://pot.test/authorize?client_id=client-1&response_type=code&redirect_uri=https://client.example.test/callback&code_challenge=abc&code_challenge_method=S256',
+    ), env)
+    const nonce = /mupot_oauth_nonce=([^;]+)/.exec(authorizeRes.headers.get('Set-Cookie') ?? '')![1]
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'gtok' }), { status: 200 })
+      return new Response(JSON.stringify({ id: 'google-sub-1', name: 'Human', email: 'human@example.test', verified_email: true }), { status: 200 })
+    }))
+    const res = await handleOAuthAuthorize(new Request(`https://pot.test/oauth/google-callback?code=abc&state=${nonce}`, { headers: { Cookie: `mupot_oauth_nonce=${nonce}` } }), env)
+    expect(res.headers.get('X-Frame-Options')).toBe('DENY')
+    expect(res.headers.get('Content-Security-Policy')).toBe("frame-ancestors 'none'")
   })
 })
 
@@ -199,6 +223,8 @@ describe('W3 boot_context doors', () => {
     expect(r.next_step).toContain('seat_handle')
     expect(r.next_step).toContain('identity_receipt')
     expect(r.next_step).toContain('seat-1')
+    expect(r.next_step).toMatch(/only while you keep sending the seat handle/)
+    expect(r.next_step).not.toContain('token is agent-bound')
     expect(r.next_step).not.toContain('IGNORE PREVIOUS')
     expect(r.available_doors.map((d) => d.tool)).not.toContain('seat_select')
     expect(r.identity_receipt).toBeDefined()
