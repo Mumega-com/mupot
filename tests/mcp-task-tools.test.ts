@@ -172,6 +172,12 @@ function makeEnv(
                   const scope = String(args[0])
                   const squadIds: string[] = scope.startsWith('[') ? JSON.parse(scope) : [scope]
                   let result = rows.filter((r) => squadIds.includes(r.squad_id))
+                  // mupot#1784: task_board's true-total query (COUNT(*) GROUP BY status).
+                  if (sql.includes('COUNT(*)') && sql.includes('GROUP BY status')) {
+                    const byStatus = new Map<string, number>()
+                    for (const r of result) byStatus.set(r.status, (byStatus.get(r.status) ?? 0) + 1)
+                    return { results: [...byStatus].map(([status, n]) => ({ status, n })) }
+                  }
                   if (sql.includes('status = ?2')) result = result.filter((r) => r.status === args[1])
                   if (sql.includes('assignee_agent_id')) {
                     const assignee = args.find((a) => typeof a === 'string' && String(a).startsWith('agent-'))

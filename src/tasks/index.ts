@@ -23,6 +23,7 @@ import { requireAuth } from '../auth'
 // Fine-grained RBAC. Creating/mutating/assigning a task requires member+ on the
 // task's SQUAD scope. The squad is data-derived (request body on POST, the loaded
 // row on PATCH), so we check inline rather than as static route middleware.
+import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from './pagination'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
@@ -236,6 +237,8 @@ tasksApp.get('/', async (c) =>
     squadId: c.req.query('squad_id'),
     status: c.req.query('status'),
     projectId: c.req.query('project_id'),
+    limit: c.req.query('limit'),
+    cursor: c.req.query('cursor'),
   }),
 )
 
@@ -249,12 +252,27 @@ function jsonResponse(body: unknown, status = 200): Response {
 export async function listTasksForAuth(
   env: Env,
   auth: AuthContext,
-  q: { squadId?: string; status?: string; projectId?: string },
+  q: { squadId?: string; status?: string; projectId?: string; limit?: string; cursor?: string },
 ): Promise<Response> {
   const squadId = q.squadId
   const status = q.status
   const projectId = q.projectId
-  
+  // mupot#1784: `limit` / `cursor` opt into keyset pagination. Neither given = the legacy
+  // bounded read (500 actionable + 100 terminal), now with an honest `truncated` flag.
+  const paged = q.limit !== undefined || q.cursor !== undefined
+  let pageLimit = 100
+  if (q.limit !== undefined) {
+    if (!/^\d{1,6}$/.test(q.limit) || Number(q.limit) < 1) {
+      return jsonResponse({ error: 'invalid_args', reason: 'limit must be a positive integer' }, 400)
+    }
+    pageLimit = Math.min(500, Number(q.limit))
+  }
+  let cursor: TaskCursor | null = null
+  if (q.cursor !== undefined) {
+    cursor = decodeTaskCursor(q.cursor)
+    if (!cursor) return jsonResponse({ error: 'invalid_args', reason: 'cursor is malformed' }, 400)
+  }
+
   if (status !== undefined && !isTaskStatus(status)) {
     return jsonResponse({ error: 'invalid_status' }, 400)
   }
@@ -283,7 +301,7 @@ export async function listTasksForAuth(
     candidateSquadIds = [squadId]
   } else {
     const scope = await resolveVisibleTaskScope(env, auth)
-    if (scope.squadIds.length === 0) return jsonResponse({ tasks: [] })
+    if (scope.squadIds.length === 0) return jsonResponse({ tasks: [], next_cursor: null, truncated: false })
     const visible = visibleTaskClause(scope, 1)
     binds.push(...(visible.binds as string[]))
     clauses.push(visible.sql)
@@ -303,6 +321,27 @@ export async function listTasksForAuth(
   // before rankTasks ever runs.
   const base = clauses.join(' AND ')
   const taskRows: Task[] = []
+  let truncated = false
+  let nextCursor: string | null = null
+
+  if (paged) {
+    const pageCtx = {
+      squadTag: squadId ?? '*',
+      filterTag: filterFingerprint({ status, projectId }),
+      status,
+    }
+    if (cursor && !cursorMatchesRequest(cursor, pageCtx)) {
+      return jsonResponse({ error: 'invalid_args', reason: 'cursor does not match this squad/filters' }, 400)
+    }
+    const page = await fetchTaskPage(env, { baseWhere: base, baseBinds: binds, limit: pageLimit, cursor, ctx: pageCtx })
+    const states: ReadonlyMap<string, AgentRuntimeState> =
+      page.rows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
+    return jsonResponse({
+      tasks: rankTasks(page.rows, states),
+      next_cursor: page.nextCursor,
+      truncated: page.nextCursor !== null,
+    })
+  }
 
   if (status !== undefined) {
     // Explicit ?status= filter: a single bounded query for that one status.
@@ -320,11 +359,13 @@ export async function listTasksForAuth(
          FROM tasks
         WHERE ${statusClauses.join(' AND ')}
         ORDER BY ${priorityOrderSql()}, created_at ${isActionable ? 'ASC' : 'DESC'}
-        LIMIT ${cap}`,
+        LIMIT ${cap + 1}`,
     )
       .bind(...statusBinds)
       .all<Task>()
-    taskRows.push(...(rows.results ?? []))
+    const got = rows.results ?? []
+    if (got.length > cap) truncated = true
+    taskRows.push(...got.slice(0, cap))
   } else {
     // No status filter: fetch actionable and terminal rows in SEPARATE,
     // independently-bounded queries so a squad with lots of `done` history
@@ -345,7 +386,7 @@ export async function listTasksForAuth(
         `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${actionableWhere}
            ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
-           LIMIT ${ACTIONABLE_FETCH_CAP}`,
+           LIMIT ${ACTIONABLE_FETCH_CAP + 1}`,
       )
         .bind(...binds)
         .all<Task>(),
@@ -353,12 +394,15 @@ export async function listTasksForAuth(
         `SELECT ${TASK_SELECT_COLUMNS}
            FROM tasks ${terminalWhere}
            ORDER BY ${priorityOrderSql()}, created_at DESC
-           LIMIT ${PASSTHROUGH_FETCH_CAP}`,
+           LIMIT ${PASSTHROUGH_FETCH_CAP + 1}`,
       )
         .bind(...binds)
         .all<Task>(),
     ])
-    taskRows.push(...(actionableRows.results ?? []), ...(terminalRows.results ?? []))
+    const aGot = actionableRows.results ?? []
+    const tGot = terminalRows.results ?? []
+    if (aGot.length > ACTIONABLE_FETCH_CAP || tGot.length > PASSTHROUGH_FETCH_CAP) truncated = true
+    taskRows.push(...aGot.slice(0, ACTIONABLE_FETCH_CAP), ...tGot.slice(0, PASSTHROUGH_FETCH_CAP))
   }
 
   // agentStates comes from the SAME radar classifier dashboard/radar.ts uses
@@ -369,7 +413,8 @@ export async function listTasksForAuth(
   const agentStates: ReadonlyMap<string, AgentRuntimeState> =
     taskRows.length > 0 ? await loadAgentRuntimeStates(env) : new Map()
 
-  return jsonResponse({ tasks: rankTasks(taskRows, agentStates) })
+  // `truncated`: the legacy bounded read hit its cap; pass ?limit= (or ?cursor=) to page it.
+  return jsonResponse({ tasks: rankTasks(taskRows, agentStates), next_cursor: nextCursor, truncated })
 }
 
 // ── GET /audit — audit task intake compliance across squad/tenant (Issue #1040 Phase 3) ──

@@ -129,10 +129,6 @@ import { claimTimestamp } from '../lib/claim-timestamp'
 // view — not a new query shape).
 import {
   rankTasks,
-  excludeFromRanking,
-  actionableStatusInSql,
-  terminalStatusInSql,
-  actionableStatusOrderSql,
   priorityOrderSql,
   TASK_SELECT_COLUMNS,
 } from '../tasks/ranking'
@@ -190,6 +186,7 @@ import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
+import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from '../tasks/pagination'
 import { hasProjectWriteForSquads, anySquadHasProjectWrite } from '../projects/access'
 import { ADDON_TOOLS } from './addons'
 import { GATE_GRANT_TOOLS } from './gates'
@@ -1103,7 +1100,7 @@ const toolTaskList: ToolSpec = {
   name: 'task_list',
   scope: 'squad',
   min: 'member',
-  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number }',
+  args: '{ squad_id?: string, project_id?: string|null, status?: "open"|"in_progress"|"blocked"|"done"|"review"|"approved"|"rejected", assignee_agent_id?: string, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1111,7 +1108,8 @@ const toolTaskList: ToolSpec = {
       project_id: NULLABLE_STRING_SCHEMA,
       status: STRING_SCHEMA,
       assignee_agent_id: STRING_SCHEMA,
-      limit: OPTIONAL_NUMBER_SCHEMA,
+      limit: { ...OPTIONAL_NUMBER_SCHEMA, description: 'Page size (default 25, max 100). This is a PAGE size, not a total cap: follow next_cursor to read further pages.' },
+      cursor: { ...STRING_SCHEMA, description: 'Opaque next_cursor from the previous page. Pass it back with the SAME squad_id/project_id/status/assignee_agent_id; a malformed or mismatched cursor is a 400 invalid_args. next_cursor null = no more pages.' },
     },
     additionalProperties: false,
   },
@@ -1149,67 +1147,28 @@ const toolTaskList: ToolSpec = {
       baseBinds.push(assignee.trim())
     }
 
-    // #22 v1 ATC ranking (src/tasks/ranking.ts). Fetch is SPLIT and BOUNDED
-    // at the SQL layer, not just reordered in JS after an unbounded read —
-    // see ranking.ts's "SQL fetch-boundary helpers" section for the full P1
-    // writeup (2026-07-16 adversarial finding): fetching unbounded rows
-    // (there is no real "D1 1000-row cap" backstopping that — a prior draft
-    // of this comment falsely claimed there was) ordered by raw recency lets
-    // a squad with lots of `done`/gate-pipeline history fill the fetch
-    // window entirely with terminal rows, hiding genuinely old, actionable,
-    // high-priority work before rankTasks ever runs.
-    const taskRows: Task[] = []
-
-    if (status) {
-      // Explicit ?status filter: one bounded query for that single status.
-      // Actionable statuses fetch oldest-first (anti-starvation matters even
-      // within one status); terminal statuses fetch newest-first (a caller
-      // filtering to done/review/etc. wants the recent ones).
-      const isActionable = !excludeFromRanking(status)
-      const clauses = [...baseClauses, `status = ?${baseBinds.length + 1}`]
-      const binds = [...baseBinds, status]
-      const rows = await env.DB.prepare(
-        `SELECT ${TASK_SELECT_COLUMNS}
-           FROM tasks
-          WHERE ${clauses.join(' AND ')}
-          ORDER BY ${priorityOrderSql()}, created_at ${isActionable ? 'ASC' : 'DESC'}
-          LIMIT ${limit}`,
-      )
-        .bind(...binds)
-        .all<Task>()
-      taskRows.push(...(rows.results ?? []))
-    } else {
-      // No status filter: actionable rows get first claim on the entire
-      // `limit` budget, fetched in the SAME band+age priority order rankTasks
-      // uses (so a limit that does bind never crowds out a higher-priority
-      // row). Terminal rows only fill whatever's left over — they can never
-      // compete with actionable rows for the same slots (the P1 finding's
-      // core failure mode).
-      const actionableRows = await env.DB.prepare(
-        `SELECT ${TASK_SELECT_COLUMNS}
-           FROM tasks
-          WHERE ${[...baseClauses, actionableStatusInSql()].join(' AND ')}
-          ORDER BY ${actionableStatusOrderSql()}, ${priorityOrderSql()}, created_at ASC
-          LIMIT ${limit}`,
-      )
-        .bind(...baseBinds)
-        .all<Task>()
-      taskRows.push(...(actionableRows.results ?? []))
-
-      const remaining = limit - taskRows.length
-      if (remaining > 0) {
-        const terminalRows = await env.DB.prepare(
-          `SELECT ${TASK_SELECT_COLUMNS}
-             FROM tasks
-            WHERE ${[...baseClauses, terminalStatusInSql()].join(' AND ')}
-            ORDER BY ${priorityOrderSql()}, created_at DESC
-            LIMIT ${remaining}`,
-        )
-          .bind(...baseBinds)
-          .all<Task>()
-        taskRows.push(...(terminalRows.results ?? []))
+    // #22 v1 ATC ranking (src/tasks/ranking.ts) + mupot#1784 keyset pagination.
+    // The fetch is SPLIT (actionable first, terminal fills the rest) and BOUNDED at the SQL
+    // layer, and paged by an opaque keyset cursor over the SAME ORDER BY (…, created_at, id)
+    // — see src/tasks/pagination.ts. `limit` is the PAGE size; next_cursor is non-null iff a
+    // further row exists, so a capped read can never pass for a complete one.
+    const filterTag = filterFingerprint({ status: typeof status === 'string' ? status : undefined, projectId, assignee: typeof assignee === 'string' ? assignee.trim() : undefined })
+    const pageCtx = { squadTag: squadRes.squad.id, filterTag, status: typeof status === 'string' ? status : undefined }
+    let cursor: TaskCursor | null = null
+    if (args.cursor !== undefined && args.cursor !== null) {
+      cursor = decodeTaskCursor(args.cursor)
+      if (!cursor || !cursorMatchesRequest(cursor, pageCtx)) {
+        return fail(400, 'invalid_args', 'cursor is malformed or does not match this squad/filters')
       }
     }
+    const page = await fetchTaskPage(env, {
+      baseWhere: baseClauses.join(' AND '),
+      baseBinds,
+      limit,
+      cursor,
+      ctx: pageCtx,
+    })
+    const taskRows: Task[] = page.rows
 
     const visibleTaskRows = await loadGateWakeNotices(env, taskRows)
     const agentStates: ReadonlyMap<string, AgentRuntimeState> =
@@ -1241,7 +1200,14 @@ const toolTaskList: ToolSpec = {
     // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
     if (!ctx?.sideEffectFree) await touchPollFleetPresence(env, auth.boundAgentId)
 
-    return done({ squad_id: squadRes.squad.id, tasks: rankedTasks })
+    return done({
+      squad_id: squadRes.squad.id,
+      tasks: rankedTasks,
+      // mupot#1784: null = this page reached the end; otherwise pass it back as `cursor`
+      // (with the same squad/filters) for the next page.
+      next_cursor: page.nextCursor,
+      truncated: page.nextCursor !== null,
+    })
   },
 }
 
@@ -1254,7 +1220,10 @@ const toolTaskBoard: ToolSpec = {
   args: '{ squad_id?: string, limit?: number }',
   inputSchema: {
     type: 'object',
-    properties: { squad_id: STRING_SCHEMA, limit: OPTIONAL_NUMBER_SCHEMA },
+    properties: {
+      squad_id: STRING_SCHEMA,
+      limit: { ...OPTIONAL_NUMBER_SCHEMA, description: 'Max rows shown across all columns (default 100, max 250). counts are TRUE totals; truncated/has_more say when columns hold fewer rows than counts. Page the full list with task_list + cursor.' },
+    },
     additionalProperties: false,
   },
   async run(auth, env, args) {
@@ -1295,10 +1264,26 @@ const toolTaskBoard: ToolSpec = {
       const enriched = info ? { ...task, dispatch_receipt_id: info.dispatch_receipt_id, delivered_via: info.delivered_via } : task
       if (columns[task.status]) columns[task.status].push(enriched)
     }
+    // mupot#1784 — `counts` are TRUE totals for the same squad + archive filter the rows come
+    // from (a separate COUNT(*) GROUP BY status), NOT columns[status].length: the row fetch is
+    // capped at `limit`, so counting returned rows would present a truncated board as complete.
+    const countRows = await env.DB.prepare(
+      `SELECT status, COUNT(*) AS n
+         FROM tasks
+        WHERE squad_id = ?1 AND ${TASK_NOT_ARCHIVED_SQL()}
+        GROUP BY status`,
+    )
+      .bind(squadRes.squad.id)
+      .all<{ status: string; n: number }>()
+    const totals = new Map((countRows.results ?? []).map((r) => [r.status, Number(r.n)]))
     const counts = Object.fromEntries(
-      ALL_TASK_STATUSES.map((status) => [status, columns[status].length]),
+      ALL_TASK_STATUSES.map((status) => [status, totals.get(status) ?? 0]),
     ) as Record<TaskStatus, number>
-    return done({ squad_id: squadRes.squad.id, counts, columns })
+    const has_more = Object.fromEntries(
+      ALL_TASK_STATUSES.map((status) => [status, counts[status] > columns[status].length]),
+    ) as Record<TaskStatus, boolean>
+    const truncated = ALL_TASK_STATUSES.some((status) => has_more[status])
+    return done({ squad_id: squadRes.squad.id, counts, columns, truncated, has_more, limit })
   },
 }
 
