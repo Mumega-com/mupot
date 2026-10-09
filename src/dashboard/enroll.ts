@@ -30,6 +30,7 @@ import { describeOrgStanding } from '../auth/refusal'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { listConsentableAgents, type ConsentableAgent } from '../mcp/oauth-authorize'
 import { mcpEndpoint, mcpServerKey } from './connect'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 export const DEFAULT_ENROLL_SEAT = 'unnamed-seat'
 
@@ -299,26 +300,33 @@ export async function loadEnrollView(
 }
 
 /** Live (non-revoked, non-expired) keys — never selects token_hash. */
-async function loadLiveKeysForAgents(
+export async function loadLiveKeysForAgents(
   env: Env,
   agentIds: string[],
 ): Promise<Map<string, EnrollLiveKey[]>> {
   const out = new Map<string, EnrollLiveKey[]>()
   if (agentIds.length === 0) return out
 
-  const placeholders = agentIds.map((_, i) => `?${i + 3}`).join(', ')
-  const rows = await env.DB.prepare(
-    `SELECT t.agent_id AS agent_id, t.label AS label, t.channel AS channel, t.created_at AS created_at
-       FROM member_tokens t
-      WHERE t.tenant = ?1
-        AND ${TOKEN_LIVE_PREDICATE('?2')}
-        AND t.agent_id IN (${placeholders})
-      ORDER BY t.created_at ASC`,
-  )
-    .bind(env.TENANT_SLUG, nowSqlUtc(), ...agentIds)
-    .all<{ agent_id: string; label: string; channel: string; created_at: string }>()
-
-  for (const row of rows.results ?? []) {
+  // mupot#1774: an org admin sees every bound agent, so the list is chunked (2 fixed binds).
+  const nowUtc = nowSqlUtc()
+  const collected: Array<{ agent_id: string; label: string; channel: string; created_at: string }> = []
+  for (const chunk of chunkForD1InList(agentIds, undefined, 2)) {
+    const placeholders = chunk.map((_, i) => `?${i + 3}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT t.agent_id AS agent_id, t.label AS label, t.channel AS channel, t.created_at AS created_at
+         FROM member_tokens t
+        WHERE t.tenant = ?1
+          AND ${TOKEN_LIVE_PREDICATE('?2')}
+          AND t.agent_id IN (${placeholders})
+        ORDER BY t.created_at ASC`,
+    )
+      .bind(env.TENANT_SLUG, nowUtc, ...chunk)
+      .all<{ agent_id: string; label: string; channel: string; created_at: string }>()
+    collected.push(...(rows.results ?? []))
+  }
+  // Chunks partition by agent, so a global created_at sort restores the single-statement order.
+  collected.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0))
+  for (const row of collected) {
     const list = out.get(row.agent_id) ?? []
     list.push({ label: row.label, channel: row.channel, created_at: row.created_at })
     out.set(row.agent_id, list)

@@ -41,6 +41,7 @@ import { authLookupOrNull } from '../auth/fail-closed'
 import { linkLoginIdentity } from '../auth/login-identity'
 import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -587,17 +588,20 @@ here to choose.</p>`
  * scopeLabel falls back to the raw identifier. A degraded consent screen that
  * shows an ugly id is acceptable; one that hides a grant is not.
  */
-async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Promise<ScopeNames> {
+export async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Promise<ScopeNames> {
   const names: ScopeNames = { squads: new Map(), departments: new Map(), org: env.TENANT_SLUG }
   const { squads, departments } = referencedScopeIds(agents.flatMap((a) => a.capabilities))
 
   const fill = async (table: 'squads' | 'departments', ids: string[], into: Map<string, string>) => {
     if (ids.length === 0) return
-    const placeholders = ids.map((_, i) => `?${i + 1}`).join(', ')
-    const rows = await env.DB.prepare(
-      `SELECT id, name FROM ${table} WHERE id IN (${placeholders})`,
-    ).bind(...ids).all<{ id: string; name: string }>()
-    for (const r of rows.results ?? []) into.set(r.id, r.name)
+    // mupot#1774: scope ids grow with the consentable agents' grants; chunk under D1's 100 binds.
+    for (const chunk of chunkForD1InList(ids)) {
+      const placeholders = chunk.map((_, i) => `?${i + 1}`).join(', ')
+      const rows = await env.DB.prepare(
+        `SELECT id, name FROM ${table} WHERE id IN (${placeholders})`,
+      ).bind(...chunk).all<{ id: string; name: string }>()
+      for (const r of rows.results ?? []) into.set(r.id, r.name)
+    }
   }
 
   try {

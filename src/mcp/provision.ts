@@ -75,6 +75,7 @@ import {
 import { revokeMemberToken } from '../members/service'
 import { setAgentSquadAccess, isAgentAccessCapability, type AgentAccessCapability } from '../members/agent-access'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
+import { chunkForD1InList } from '../lib/d1-in-list'
 import {
   GRANTABLE_SQUAD_MEMBER_CAPABILITIES,
   addSquadMember,
@@ -2318,18 +2319,22 @@ export const toolMoveAgentSquad: ToolSpec = {
         .filter((cap) => cap.startsWith('gate:')),
     )]
     if (severedGates.length > 0) {
-      const placeholders = severedGates.map((_, i) => `?${i + 2}`).join(', ')
-      const openGates = await env.DB.prepare(
-        `SELECT id, gate_owner, assignee_agent_id FROM tasks
-          WHERE squad_id = ?1
-            AND status != 'done'
-            AND gate_owner IN (${placeholders})`,
-      ).bind(agent.squad_id, ...severedGates).all<{
-        id: string
-        gate_owner: string
-        assignee_agent_id: string | null
-      }>()
-      const matches = openGates.results ?? []
+      // mupot#1774: severed gate capabilities scale with gate_grants; chunk under D1's 100 binds.
+      const matches: Array<{ id: string; gate_owner: string; assignee_agent_id: string | null }> = []
+      for (const chunk of chunkForD1InList(severedGates, undefined, 1)) {
+        const placeholders = chunk.map((_, i) => `?${i + 2}`).join(', ')
+        const openGates = await env.DB.prepare(
+          `SELECT id, gate_owner, assignee_agent_id FROM tasks
+            WHERE squad_id = ?1
+              AND status != 'done'
+              AND gate_owner IN (${placeholders})`,
+        ).bind(agent.squad_id, ...chunk).all<{
+          id: string
+          gate_owner: string
+          assignee_agent_id: string | null
+        }>()
+        matches.push(...(openGates.results ?? []))
+      }
       if (matches.length > 0) {
         return fail(409, 'gate_standings_change', {
           task_ids: matches.map((row) => row.id),

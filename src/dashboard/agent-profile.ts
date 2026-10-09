@@ -1,5 +1,6 @@
 import type { Env } from '../types'
 import { cancelledColumnSql, flightOutcome, isCancelledFlight, isCancelUnconfirmed } from '../flight/cancelled'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 /**
  * Agent profile panels.
@@ -330,11 +331,14 @@ export async function loadCollaborationPanel(
     const peerIds = [...new Set(rows.flatMap((r) => [r.from_agent, r.to_agent]).filter((id) => id && id !== agentId))]
     const names = new Map<string, string>()
     if (peerIds.length > 0) {
-      const placeholders = peerIds.map((_, i) => `?${i + 1}`).join(', ')
-      const nameRows = await env.DB.prepare(
-        `SELECT id, name FROM agents WHERE id IN (${placeholders})`,
-      ).bind(...peerIds).all<{ id: string; name: string }>()
-      for (const n of nameRows.results ?? []) names.set(n.id, n.name)
+      // mupot#1774: up to COLLABORATION_ROW_CAP messages can name > 100 distinct peers.
+      for (const chunk of chunkForD1InList(peerIds)) {
+        const placeholders = chunk.map((_, i) => `?${i + 1}`).join(', ')
+        const nameRows = await env.DB.prepare(
+          `SELECT id, name FROM agents WHERE id IN (${placeholders})`,
+        ).bind(...chunk).all<{ id: string; name: string }>()
+        for (const n of nameRows.results ?? []) names.set(n.id, n.name)
+      }
     }
     return ready(summariseCollaboration(agentId, rows, names))
   } catch (err) {

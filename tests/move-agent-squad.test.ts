@@ -19,6 +19,8 @@ import { createAgent } from '../src/org/service'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { strictD1 } from './helpers/strict-d1'
+import { D1_MAX_BOUND_PARAMETERS } from '../src/lib/d1-in-list'
 
 const ORIGIN = 'https://pot.test'
 const TENANT = 'test'
@@ -776,6 +778,31 @@ describe('move_agent_squad', () => {
     expect(await agentRow(agentId)).toEqual(before)
     expect(await auditRows()).toHaveLength(0)
     expect(events).toHaveLength(0)
+  })
+
+  it('mupot#1774: gate standings are found when severed gates exceed one bind chunk (150 > 90)', async () => {
+    const insGrant = harness.sqlite.prepare(
+      `INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
+       VALUES (?, ?, 'agent', ?, ?, '2026-09-18T00:00:00.000Z')`,
+    )
+    for (let i = 0; i < 150; i += 1) insGrant.run(`gg-${i}`, `gate:cap-${String(i).padStart(3, '0')}`, agentId, OPERATOR)
+    // The blocking task is owned by a gate in the LAST chunk; a first-chunk-only read would miss it.
+    harness.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, gate_owner)
+        VALUES ('task-late-gate', '${FROM_SQUAD}', 'late', '', 'verdict lands', 'review', NULL, 'gate:cap-149');
+    `)
+    const strict = strictD1(harness.db)
+    env.DB = strict.db
+    const result = await invoke(auth({ capabilities: bothAdmin }), {
+      agent: agentId,
+      to_squad: TO_SQUAD,
+      capability: 'member',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('gate_standings_change')
+    expect(result.detail).toEqual(expect.objectContaining({ task_ids: ['task-late-gate'] }))
+    expect(strict.maxBound()).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMETERS)
   })
 
   it('Athena hard-block 4 clause 2: done old-squad tasks with the same gate_owner do not block', async () => {

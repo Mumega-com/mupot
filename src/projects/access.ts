@@ -1,5 +1,6 @@
 import { capabilityRank, hasCapability } from '../auth/capability'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 export interface ProjectReadAccess {
   workspaceAdmin: boolean
@@ -72,18 +73,20 @@ export async function hasProjectWriteForSquads(
 ): Promise<boolean> {
   const uniqueSquadIds = [...new Set(squadIds)]
   if (uniqueSquadIds.length === 0) return false
-  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const rows = await env.DB.prepare(
-    `SELECT squad_id, access_level
-       FROM project_squad_access
-      WHERE project_id = ?1
-        AND squad_id IN (${placeholders})`,
-  ).bind(projectId, ...uniqueSquadIds).all<{ squad_id: string; access_level: string }>()
-  const writable = new Set(
-    (rows.results ?? [])
-      .filter((row) => row.access_level === 'write' || row.access_level === 'admin')
-      .map((row) => row.squad_id),
-  )
+  // mupot#1774: chunked under D1's 100-bind ceiling; the every-squad test runs over the union.
+  const writable = new Set<string>()
+  for (const chunk of chunkForD1InList(uniqueSquadIds, undefined, 1)) {
+    const placeholders = chunk.map((_, index) => `?${index + 2}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT squad_id, access_level
+         FROM project_squad_access
+        WHERE project_id = ?1
+          AND squad_id IN (${placeholders})`,
+    ).bind(projectId, ...chunk).all<{ squad_id: string; access_level: string }>()
+    for (const row of rows.results ?? []) {
+      if (row.access_level === 'write' || row.access_level === 'admin') writable.add(row.squad_id)
+    }
+  }
   return uniqueSquadIds.every((squadId) => writable.has(squadId))
 }
 
@@ -100,14 +103,18 @@ export async function anySquadHasProjectWrite(
 ): Promise<boolean> {
   const uniqueSquadIds = [...new Set(squadIds)]
   if (uniqueSquadIds.length === 0) return false
-  const placeholders = uniqueSquadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const row = await env.DB.prepare(
-    `SELECT 1 AS ok
-       FROM project_squad_access
-      WHERE project_id = ?1
-        AND squad_id IN (${placeholders})
-        AND access_level IN ('write', 'admin')
-      LIMIT 1`,
-  ).bind(projectId, ...uniqueSquadIds).first<{ ok: number }>()
-  return row !== null
+  // mupot#1774: chunked under D1's 100-bind ceiling; any chunk with a writable squad grants it.
+  for (const chunk of chunkForD1InList(uniqueSquadIds, undefined, 1)) {
+    const placeholders = chunk.map((_, index) => `?${index + 2}`).join(', ')
+    const row = await env.DB.prepare(
+      `SELECT 1 AS ok
+         FROM project_squad_access
+        WHERE project_id = ?1
+          AND squad_id IN (${placeholders})
+          AND access_level IN ('write', 'admin')
+        LIMIT 1`,
+    ).bind(projectId, ...chunk).first<{ ok: number }>()
+    if (row !== null) return true
+  }
+  return false
 }
