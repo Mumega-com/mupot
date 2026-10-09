@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   CHECK_RECEIPT_TYPE,
   REQUIRED_SCREENSHOTS,
@@ -92,7 +92,7 @@ function oversizedScreenshotPng(): Buffer {
 }
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-project-routine-lifecycle-'))
+  return makeTempDir('mupot-project-routine-lifecycle-')
 }
 
 function evidenceFor(step: string): Record<string, unknown> {

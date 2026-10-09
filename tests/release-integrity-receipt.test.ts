@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   CHECK_RECEIPT_TYPE,
   checkBundle,
@@ -15,7 +15,7 @@ const VERSION = '0.30.0'
 const TAG = `v${VERSION}`
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-release-integrity-'))
+  return makeTempDir('mupot-release-integrity-')
 }
 
 function git(repo: string, args: string[]) {

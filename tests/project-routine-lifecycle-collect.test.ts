@@ -1,9 +1,9 @@
 import { spawnSync, execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { deflateSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 
 import {
   CollectorError,
@@ -403,7 +403,7 @@ describe('project routine lifecycle collector', () => {
   })
 
   it('emits a complete bundle accepted by the existing lifecycle receipt checker', async () => {
-    const repoRoot = mkdtempSync(join(tmpdir(), 'mupot-routine-clean-repo-'))
+    const repoRoot = makeTempDir('mupot-routine-clean-repo-')
     const version = '0.25.0'
     mkdirSync(join(repoRoot, 'src'), { recursive: true })
     writeFileSync(join(repoRoot, 'package.json'), `${JSON.stringify({ name: 'mupot-receipt-fixture', version })}\n`)
@@ -417,7 +417,7 @@ describe('project routine lifecycle collector', () => {
     execFileSync('git', ['add', 'package.json', 'src/version.ts'], { cwd: repoRoot })
     execFileSync('git', ['commit', '-qm', 'receipt fixture'], { cwd: repoRoot })
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf8' }).trim()
-    const outputDir = mkdtempSync(join(tmpdir(), 'mupot-routine-collector-checker-'))
+    const outputDir = makeTempDir('mupot-routine-collector-checker-')
     const currentConfig = {
       ...config(),
       outputDir,
@@ -537,7 +537,7 @@ describe('project routine lifecycle collector', () => {
 
 describe('collector CLI', () => {
   it('imports --hooks-module dependencies and executes the collector', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-routine-collector-cli-'))
+    const dir = makeTempDir('mupot-routine-collector-cli-')
     const hooksPath = join(dir, 'collector-hooks.mjs')
     const outputDir = join(dir, 'receipt')
     const marker = join(dir, 'restart-called.txt')

@@ -1,15 +1,15 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import * as stableReceipt from '../scripts/stable-deployment-receipt.mjs'
 
 const VERSION = '0.23.0'
 const TAG = `v${VERSION}`
 
 function fixture(mutate?: (dir: string, outDir: string, commit: string) => void) {
-  const dir = mkdtempSync(join(tmpdir(), 'mupot-stable-deployment-'))
+  const dir = makeTempDir('mupot-stable-deployment-')
   const outDir = join(dir, 'tmp', 'stable-deployment', TAG)
   mkdirSync(join(dir, 'src'), { recursive: true })
   mkdirSync(outDir, { recursive: true })

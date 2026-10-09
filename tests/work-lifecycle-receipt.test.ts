@@ -1,7 +1,7 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   CHECK_RECEIPT_TYPE,
   REQUIRED_STEPS,
@@ -37,7 +37,7 @@ const TARGET = {
 }
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-work-lifecycle-'))
+  return makeTempDir('mupot-work-lifecycle-')
 }
 
 function evidenceFor(step: string) {

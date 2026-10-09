@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 
 import { checkBundle as checkIntegrity } from '../scripts/release-integrity-receipt.mjs'
 import {
@@ -91,7 +91,7 @@ describe('v0.30.0 repository release contract', () => {
   it('binds integrity to the v0.30 document, changelog entry, and roadmap section', () => {
     const receipt = checkIntegrity({
       repoRoot: process.cwd(),
-      outDir: mkdtempSync(join(tmpdir(), 'mupot-v030-integrity-')),
+      outDir: makeTempDir('mupot-v030-integrity-'),
       version: VERSION,
       repo: 'Mumega-com/mupot',
     })
@@ -114,7 +114,7 @@ describe('v0.30.0 repository release contract', () => {
     const receipt = checkReadiness({
       version: VERSION,
       contractPath: CONTRACT,
-      outDir: mkdtempSync(join(tmpdir(), 'mupot-v030-readiness-')),
+      outDir: makeTempDir('mupot-v030-readiness-'),
       checksPr: '1249',
       releaseSha: 'a'.repeat(40),
       phase: 'prepublication',

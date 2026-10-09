@@ -1,7 +1,7 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   CHECK_RECEIPT_TYPE,
   REQUIRED_STEPS,
@@ -45,7 +45,7 @@ function iso(ms: number) {
 }
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-staging-recovery-'))
+  return makeTempDir('mupot-staging-recovery-')
 }
 
 function baseReceipt(step: string, evidence: Record<string, unknown> = {}) {
