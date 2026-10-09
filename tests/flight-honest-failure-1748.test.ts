@@ -5,7 +5,7 @@
 // Three behaviours:
 //   1. a running flight whose tasks are ALL done (a task that skipped review/approved never parks the flight, so
 //      the 0172 trigger leaves it 'running') is LANDED by the watchdog, not failed;
-//   2. a bookkeeping flight (deploy/studio) is closed as landed / bookkeeping_closed, not failed;
+//   2. a bookkeeping flight (deploy/studio) is closed as bookkeeping_closed (status stays failed, relabelled by readers);
 //   3. isRealFailure / realFailureSql (failed AND not cancelled AND not bookkeeping) is the one predicate every
 //      flight failure counter uses: agent-profile, flights-deck (board phase), outcome feed.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -17,6 +17,7 @@ import { getFlight, listFlightOutcomes, listFlights } from '../src/flight/servic
 import { flightOutcome, isRealFailure, realFailureSql } from '../src/flight/cancelled'
 import { deriveFlightDeckKpis, flightFilterGroup } from '../src/dashboard/flights-deck'
 import { loadFlightPanel } from '../src/dashboard/agent-profile'
+import { findFinishedWorkConflict } from '../src/flight/rebooking'
 import type { Env } from '../src/types'
 
 const TENANT = 'digid'
@@ -89,6 +90,7 @@ describe('1. a flight whose tasks are all done lands, it is not failed by the st
     expect(r.status).toBe('landed')
     expect(String(r.gate_reason)).toContain('watchdog_tasks_done')
     expect(r.ended_at).toBe(STALLED_NOW)
+    expect(r.score).toBeNull() // seeded score is 1: a watchdog land must never read as throughput
     const receipt = h.sqlite.prepare('SELECT payload FROM flight_reap_receipts WHERE flight_id = ?').get('fl-done') as { payload: string }
     expect(JSON.parse(receipt.payload)).toMatchObject({ target_status: 'landed', disposition: 'tasks_done' })
   })
@@ -246,23 +248,38 @@ describe('1b. the watchdog done-land is the governed-land predicate, not a weake
   })
 })
 
-describe('2. bookkeeping flights are closed as landed / bookkeeping_closed, not failed', () => {
-  it('a stalled bookkeeping preflight flight lands with gate_reason bookkeeping_closed', async () => {
+describe('2. bookkeeping flights are closed with bookkeeping_closed, stay status failed, and never block the task', () => {
+  it('a stalled bookkeeping preflight flight is closed (still status failed) with gate_reason bookkeeping_closed', async () => {
     seedFlight('fl-bk', { status: 'preflight', bookkeeping: 1 })
     const res = await reapStalledFlight(env, 'fl-bk', WATCHDOG, 'preflight_exceeded_timeout', STALLED_NOW)
-    expect(res).toMatchObject({ transitioned: true, target_status: 'landed', disposition: 'bookkeeping_closed' })
-    expect(row('fl-bk').status).toBe('landed')
+    expect(res).toMatchObject({ transitioned: true, target_status: 'failed', disposition: 'bookkeeping_closed' })
+    expect(row('fl-bk').status).toBe('failed')
     expect(String(row('fl-bk').gate_reason)).toMatch(/^bookkeeping_closed:/)
+    expect(isRealFailure({ status: 'failed', cancelled: 0, bookkeeping: row('fl-bk').bookkeeping as number })).toBe(false)
   })
 
-  it('the sweep closes bookkeeping flights without counting a reap; a non-bookkeeping preflight flight still fails', async () => {
+  it('the sweep counts it as closed_without_failure, not reaped; a non-bookkeeping preflight flight still fails', async () => {
     seedFlight('fl-bk', { status: 'preflight', bookkeeping: 1 })
     seedFlight('fl-real', { status: 'preflight', bookkeeping: 0 })
     const sweep = await sweepStalledFlights(env, { nowMs: STALLED_NOW })
     expect(sweep.closed_without_failure_flight_ids).toEqual(['fl-bk'])
     expect(sweep.reaped).toBe(1)
-    expect(row('fl-bk').status).toBe('landed')
     expect(row('fl-real').status).toBe('failed')
+  })
+
+  it('P1-B: a reaped bookkeeping flight carrying task_ids does not make the task 409 on dispatch', async () => {
+    seedTask('t-deploy')
+    seedFlight('fl-bk', { status: 'preflight', bookkeeping: 1, taskIds: ['t-deploy'] })
+    await reapStalledFlight(env, 'fl-bk', WATCHDOG, 'x', STALLED_NOW)
+    expect(await findFinishedWorkConflict(env, ['t-deploy'])).toBeNull()
+  })
+
+  it('belt and braces: even a LANDED bookkeeping row (legacy) is ignored by the landed-task conflict check', async () => {
+    seedTask('t-deploy')
+    seedFlight('fl-bk-landed', { status: 'landed', bookkeeping: 1, taskIds: ['t-deploy'] })
+    expect(await findFinishedWorkConflict(env, ['t-deploy'])).toBeNull()
+    seedFlight('fl-real-landed', { status: 'landed', bookkeeping: 0, taskIds: ['t-deploy'] })
+    expect(await findFinishedWorkConflict(env, ['t-deploy'])).toMatchObject({ error: 'flight_task_already_landed' })
   })
 })
 

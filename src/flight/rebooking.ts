@@ -76,6 +76,7 @@ export async function listLandedFlightsForTasks(env: Env, taskIds: readonly stri
             json_each(CASE WHEN json_valid(f.meta) THEN f.meta ELSE '{}' END, '$.task_ids') ref
       WHERE f.tenant = ?1
         AND f.status = 'landed'
+        AND f.bookkeeping = 0
         AND ref.type = 'text'
         AND ref.value IN (SELECT value FROM json_each(?2))
       ORDER BY f.ended_at DESC, f.id ASC`,

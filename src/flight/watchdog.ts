@@ -78,7 +78,8 @@ export interface FlightReapResult {
   /**
    * Terminal status the flight was moved to. 'failed' is the stall give-up; 'landed' means the stall
    * clock fired but the flight's work was NOT a failure (every task done, or an unexecuted bookkeeping
-   * flight) so it was closed as a non-failure (mupot#1748/#1762).
+   * flight) so it was closed as a non-failure (mupot#1748/#1762). A bookkeeping closure stays status 'failed'
+   * (relabelled by readers); only finished work is 'landed'.
    */
   target_status?: 'failed' | 'landed'
   /** Why a 'landed' target was chosen: 'tasks_done' | 'bookkeeping_closed'. Absent for a failed reap. */
@@ -108,7 +109,7 @@ function tasksAllDoneSql(alias = 'f'): string {
 /**
  * The single chokepoint deciding what a stalled flight becomes (mupot#1748, #1762). A flight's terminal
  * status must reflect what happened to its work:
- *   - bookkeeping flight (deploy/studio; never executes, has no lifecycle)  -> landed / bookkeeping_closed
+ *   - bookkeeping flight (deploy/studio; never executes, has no lifecycle)  -> failed / bookkeeping_closed (not a real failure)
  *   - running flight whose tasks are ALL done (the executor finished but nothing landed it; the 0172
  *     waiting trigger only parks a flight when a task passes through review/approved, so a task that
  *     goes straight to done leaves the flight 'running')                      -> landed / tasks_done
@@ -450,7 +451,10 @@ export async function reapStalledFlight(
   }
 
   const disposition = await resolveReapDisposition(env, flight)
-  const targetStatus: 'failed' | 'landed' = disposition === 'failed' ? 'failed' : 'landed'
+  // Only a finished-work flight is LANDED. A bookkeeping flight stays 'failed' (readers relabel it via bookkeeping=1,
+  // so it is not a real failure): landing it would make findFinishedWorkConflict (rebooking.ts) 409 every
+  // flight_dispatch for the task the deploy/studio flight carries in meta.task_ids (#1748 round 2 P1-B).
+  const targetStatus: 'failed' | 'landed' = disposition === 'tasks_done' ? 'landed' : 'failed'
   const gateReason =
     disposition === 'failed'
       ? `watchdog_reap: ${reason.slice(0, 400)}`
@@ -473,7 +477,9 @@ export async function reapStalledFlight(
       `UPDATE flights
           SET status = ?5,
               gate_reason = ?3,
-              ended_at = ?4
+              ended_at = ?4,
+              -- a watchdog land is not a coherence measurement and must never read as throughput (as systemLandParkedFlight)
+              score = CASE WHEN ?6 = 'tasks_done' THEN NULL ELSE score END
         WHERE id = ?1
           AND tenant = ?2
           AND status IN ('preflight', 'running', 'sleeping')
@@ -1031,8 +1037,8 @@ export async function sweepStalledFlights(
         evaluation.reason,
         nowMs,
       )
-      if (result.transitioned && result.target_status === 'landed') {
-        // Stall clock fired, but the work did not fail (all tasks done / bookkeeping): closed as landed.
+      if (result.transitioned && result.disposition) {
+        // Stall clock fired, but the work did not fail (all tasks done -> landed / bookkeeping -> closed, not a real failure).
         closedWithoutFailure += 1
         closedWithoutFailureFlightIds.push(flight.id)
       } else if (result.transitioned) reaped += 1
