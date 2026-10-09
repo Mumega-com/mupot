@@ -175,13 +175,20 @@ const TERMINAL_RUNTIME_RECEIPT_STAGES_SQL = TERMINAL_RUNTIME_RECEIPT_STAGES.map(
  * already-safe bound-parameter placeholder) — never interpolate untrusted
  * caller input here.
  */
-export function inFlightDispatchReceiptExistsSql(p: { tenantParam: string; taskIdExpr: string }): string {
+export function inFlightDispatchReceiptExistsSql(p: {
+  tenantParam: string
+  taskIdExpr: string
+  /** Extra conjunct on the dispatch row `d` (mupot#1780: the archive path narrows "in flight" to
+   *  "genuinely pending"). Static SQL only. Default '' leaves every other caller's semantics unchanged. */
+  extraOnDispatch?: string
+}): string {
   return `EXISTS (
     SELECT 1
       FROM task_dispatch_receipts d
      WHERE d.tenant = ${p.tenantParam} AND d.task_id = ${p.taskIdExpr}
        -- mupot#1723 — an in-Worker dispatch has no runtime receipt; it settles on its own row.
        AND d.settled_at IS NULL
+       ${p.extraOnDispatch ?? ''}
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_receipts newer
           WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
@@ -231,6 +238,39 @@ export function pointerAvailableForSql(p: { tenantParam: string; newReceiptParam
 export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Promise<boolean> {
   const row = await env.DB.prepare(`
     SELECT 1 WHERE ${inFlightDispatchReceiptExistsSql({ tenantParam: '?1', taskIdExpr: '?2' })}
+  `).bind(env.TENANT_SLUG, taskId).first<{ 1: number }>()
+  return row !== null
+}
+
+/**
+ * archiveBlockingDispatchExistsSql — mupot#1780. For the ARCHIVE path only. "In flight" for
+ * dispatch/reassign guards means "no terminal runtime receipt yet", but the normal Claude-seat
+ * flow (inbox read + task_submit_result) never writes one, so a done task whose dispatch envelope
+ * was READ looked in flight forever and could not be archived (and task_dispatch_lease_reset only
+ * touches unread rows). Archive is blocked only while the dispatch can still be DELIVERED:
+ *   the queue event is not yet consumed (task_dispatch_receipts.consumed_at IS NULL), OR
+ *   its inbox envelope is unread AND not dead-lettered (agent_messages.read_at / dead_lettered_at).
+ * Layered on inFlightDispatchReceiptExistsSql (latest-dispatch / unsettled / no terminal receipt)
+ * so the two cannot drift; that function's own semantics are untouched.
+ */
+export function archiveBlockingDispatchExistsSql(p: { tenantParam: string; taskIdExpr: string }): string {
+  return inFlightDispatchReceiptExistsSql({
+    ...p,
+    extraOnDispatch: `AND (
+         d.consumed_at IS NULL
+         OR EXISTS (
+           SELECT 1 FROM agent_messages pm
+            WHERE pm.tenant = d.tenant AND pm.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+              AND pm.request_id = '${DISPATCH_INBOX_PREFIX}' || d.id
+              AND pm.read_at IS NULL AND pm.dead_lettered_at IS NULL
+         )
+       )`,
+  })
+}
+
+export async function hasArchiveBlockingDispatch(env: Env, taskId: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT 1 WHERE ${archiveBlockingDispatchExistsSql({ tenantParam: '?1', taskIdExpr: '?2' })}
   `).bind(env.TENANT_SLUG, taskId).first<{ 1: number }>()
   return row !== null
 }

@@ -47,7 +47,7 @@ import { exceedsTargetRankCeiling, targetLegacyRoleRank, capabilityRank } from '
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { TASK_NOT_ARCHIVED_SQL } from './filters'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
-import { inFlightDispatchReceiptExistsSql, hasInFlightDispatchReceipt } from '../tasks/runtime-receipts'
+import { archiveBlockingDispatchExistsSql, hasArchiveBlockingDispatch } from '../tasks/runtime-receipts'
 
 export const ARCHIVABLE_TABLES = ['members', 'agents', 'squads', 'projects', 'tasks'] as const
 export type ArchivableTable = (typeof ARCHIVABLE_TABLES)[number]
@@ -825,7 +825,7 @@ async function taskArchivabilityBlocker(
       LIMIT 1`,
   ).bind(taskId).first()
   if (inAirRow) return { ok: false, error: 'in_air_flight' }
-  if (await hasInFlightDispatchReceipt(env, taskId)) return { ok: false, error: 'in_flight_dispatch' }
+  if (await hasArchiveBlockingDispatch(env, taskId)) return { ok: false, error: 'in_flight_dispatch' }
   return null
 }
 
@@ -876,7 +876,7 @@ async function archiveTask(env: Env, input: ArchiveInput): Promise<ArchiveOutcom
                   OR (json_valid(f.meta) AND EXISTS (SELECT 1 FROM json_each(f.meta, '$.task_ids') WHERE value = t.id))
                 )
            )
-           AND NOT ${inFlightDispatchReceiptExistsSql({ tenantParam: '?7', taskIdExpr: 't.id' })}`,
+           AND NOT ${archiveBlockingDispatchExistsSql({ tenantParam: '?7', taskIdExpr: 't.id' })}`,
     ).bind(now, input.reason, input.actorMemberId, input.id, Date.now(), expected, env.TENANT_SLUG),
     env.DB.prepare(
       `INSERT INTO archive_receipts (id, tenant, entity_table, entity_id, action, reason, actor_member_id, prior_status, created_at)

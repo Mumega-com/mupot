@@ -918,6 +918,80 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     expect(result.ok, JSON.stringify(result)).toBe(true)
   })
 
+  // ── mupot#1780: archive blocks only a GENUINELY PENDING dispatch ─────────────────────
+  // The Claude-seat flow (inbox read + task_submit_result) never writes a terminal runtime receipt,
+  // so "no terminal receipt" must not wedge a done task whose envelope was already read.
+  describe('in_flight_dispatch is "can still be delivered", not "no runtime receipt" (#1780)', () => {
+    function seedDispatch(id: string, opts: { consumed: boolean; envelope?: { readAt?: string | null; deadLettered?: boolean } }): void {
+      h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at, attempts)
+        VALUES ('dr-${id}', '${TENANT}', '${id}', '${SQUAD}', '${WORKER}', 'member', '${OPERATOR}', '${T0}', ${opts.consumed ? `'${T0}'` : 'NULL'}, 1)`)
+      if (opts.envelope) {
+        h.sqlite.prepare(
+          `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, created_at, read_at, dead_lettered_at)
+           VALUES (?, ?, 'worker', 'mupot-dispatch', ?, 'request', '{}', ?, ?, ?, ?)`,
+        ).run(`msg-${id}`, TENANT, OPERATOR, `dispatch-inbox:dr-${id}`, T0, opts.envelope.readAt ?? null, opts.envelope.deadLettered ? T0 : null)
+      }
+    }
+    const tryArchive = (id: string) => invoke(adminAuth(), 'archive_row', { table: 'tasks', id, reason: 'x' })
+
+    it('done task, dispatch consumed, envelope READ, no runtime receipt -> archivable', async () => {
+      seedTask('read-done', 'done', { assignee: WORKER })
+      seedDispatch('read-done', { consumed: true, envelope: { readAt: T0 } })
+      const result = await tryArchive('read-done')
+      expect(result.ok, JSON.stringify(result)).toBe(true)
+    })
+
+    it('unread live envelope -> in_flight_dispatch (still deliverable)', async () => {
+      seedTask('unread', 'open', { assignee: WORKER })
+      seedDispatch('unread', { consumed: true, envelope: { readAt: null } })
+      const result = await tryArchive('unread')
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('in_flight_dispatch')
+    })
+
+    it('unread but DEAD-LETTERED envelope -> archivable', async () => {
+      seedTask('dead', 'open', { assignee: WORKER })
+      seedDispatch('dead', { consumed: true, envelope: { readAt: null, deadLettered: true } })
+      const result = await tryArchive('dead')
+      expect(result.ok, JSON.stringify(result)).toBe(true)
+    })
+
+    it('queue event not yet consumed -> in_flight_dispatch even with no envelope', async () => {
+      seedTask('queued', 'open', { assignee: WORKER })
+      seedDispatch('queued', { consumed: false })
+      const result = await tryArchive('queued')
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('in_flight_dispatch')
+    })
+
+    it('the in-write guard uses the narrowed predicate: an UNREAD dispatch minted after the pre-read blocks, a read one does not', async () => {
+      seedTask('race-unread', 'done', { assignee: WORKER })
+      const realPrepare = h.db.prepare.bind(h.db)
+      let armed = true
+      h.db.prepare = ((sql: string) => {
+        if (armed && sql.includes('INSERT OR IGNORE INTO tasks_archive_state')) {
+          armed = false
+          seedDispatch('race-unread', { consumed: true, envelope: { readAt: null } })
+        }
+        return realPrepare(sql)
+      }) as typeof h.db.prepare
+      const result = await tryArchive('race-unread')
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toBe('in_flight_dispatch')
+      expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+    })
+
+    it('dispatch/reassign guards keep the OLD semantics: a read envelope with no terminal receipt is still in flight there', async () => {
+      const { hasInFlightDispatchReceipt } = await import('../src/tasks/runtime-receipts')
+      seedTask('old-sem', 'done', { assignee: WORKER })
+      seedDispatch('old-sem', { consumed: true, envelope: { readAt: T0 } })
+      expect(await hasInFlightDispatchReceipt(env, 'old-sem')).toBe(true)
+    })
+  })
+
   // ── unarchive cannot revive work inside an archived container (gate round 2, P2-1) ──
   describe('unarchive_row(task) with an archived parent', () => {
     it('squad archived after the task was archived -> parent_archived, task stays archived', async () => {
