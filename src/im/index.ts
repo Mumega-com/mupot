@@ -166,7 +166,7 @@ async function resolveAgent(env: Env, ref: string): Promise<Agent | 'ambiguous' 
 // (the same "home is special" treatment G-FP1b already applies to workspace-
 // admin standing) — excluded from the ambiguity count here for that reason,
 // not merely to route around the collision.
-async function soleSquadGrant(env: Env, grants: CapabilityGrant[]): Promise<string | null> {
+export async function soleSquadGrant(env: Env, grants: CapabilityGrant[]): Promise<string | null> {
   const squadIds = [...new Set(
     grants.filter((g) => g.scope_type === 'squad' && g.scope_id).map((g) => g.scope_id as string),
   )]

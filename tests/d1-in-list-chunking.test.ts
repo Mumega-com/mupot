@@ -82,6 +82,23 @@ describe('chunkForD1InList', () => {
   })
 })
 
+describe('chunkForD1InList fixedParams (mupot#1774)', () => {
+  it('shrinks the chunk so list plus fixed binds fit the ceiling, with a 99 boundary', () => {
+    const ids = Array.from({ length: 250 }, (_, i) => i)
+    for (const fixed of [0, 1, 2, 4, 10, 99]) {
+      const chunks = chunkForD1InList(ids, undefined, fixed)
+      expect(chunks.flat()).toEqual(ids)
+      for (const chunk of chunks) expect(chunk.length + fixed).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMETERS)
+    }
+    // 99 fixed binds leave exactly one list slot; 100 leave none and must refuse.
+    expect(chunkForD1InList([1, 2, 3], undefined, 99).map((c) => c.length)).toEqual([1, 1, 1])
+    expect(() => chunkForD1InList([1], undefined, 100)).toThrow(RangeError)
+    expect(() => chunkForD1InList([1], 95, 6)).toThrow(RangeError)
+    expect(chunkForD1InList([1, 2], 95, 5)).toEqual([[1, 2]])
+    expect(() => chunkForD1InList([1], undefined, -1)).toThrow(RangeError)
+  })
+})
+
 describe('mupot#1676: task reads stay under the D1 bind ceiling', () => {
   it.each([
     ['task_board default limit', 'task_board', {}, 100],

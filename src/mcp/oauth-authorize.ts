@@ -588,7 +588,7 @@ here to choose.</p>`
  * scopeLabel falls back to the raw identifier. A degraded consent screen that
  * shows an ugly id is acceptable; one that hides a grant is not.
  */
-async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Promise<ScopeNames> {
+export async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Promise<ScopeNames> {
   const names: ScopeNames = { squads: new Map(), departments: new Map(), org: env.TENANT_SLUG }
   const { squads, departments } = referencedScopeIds(agents.flatMap((a) => a.capabilities))
 

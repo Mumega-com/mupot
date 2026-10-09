@@ -300,7 +300,7 @@ export async function loadEnrollView(
 }
 
 /** Live (non-revoked, non-expired) keys — never selects token_hash. */
-async function loadLiveKeysForAgents(
+export async function loadLiveKeysForAgents(
   env: Env,
   agentIds: string[],
 ): Promise<Map<string, EnrollLiveKey[]>> {

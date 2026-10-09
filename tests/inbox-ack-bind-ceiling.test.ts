@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import { ackAgentMessages, leaseAgentInbox } from '../src/agents/messages'
 import { D1_MAX_BOUND_PARAMETERS } from '../src/lib/d1-in-list'
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
 import { strictD1 } from './helpers/strict-d1'
@@ -123,26 +124,38 @@ describe('mupot#1774: inbox_ack stays under the D1 bind ceiling', () => {
     const fresh = f.seed('fresh', 5)
     const res = await ackAgentMessages(f.env, { agent: 'agent-a', ids: [...done, ...fresh] }, LATER)
     expect(res).toEqual({ ok: true, acked: fresh, already_read: done, refused: [] })
+    expect(f.maxBound()).toBeLessThanOrEqual(D1_MAX_BOUND_PARAMETERS)
     f.harness.close()
   })
 
-  it('is all-or-nothing: a failure in a later chunk leaves every message unread', async () => {
+  it('is all-or-nothing: one batch of per-chunk statements, and a failure in a later chunk leaves every message unread', async () => {
     const f = fixture()
     const ids = f.seed('m', 100)
-    // Make the batch's second chunk fail inside the transaction.
-    const failing = {
-      ...f.env,
-      DB: new Proxy(f.env.DB, {
-        get(target, prop, receiver) {
-          if (prop !== 'batch') return Reflect.get(target, prop, receiver)
-          return (statements: unknown[]) => target.batch([
-            statements[0], target.prepare('SELECT * FROM no_such_table_1774'),
-          ] as Parameters<typeof target.batch>[0])
-        },
-      }),
-    } as Env
+    // Count statements across EVERY batch call and fail the 2nd one globally, so a loop of
+    // per-chunk batch([stmt]) calls cannot pass as atomic: its first batch would commit alone.
+    let batchCalls = 0
+    let statementsSeen = 0
+    const batchSizes: number[] = []
+    const base = f.env.DB
+    const proxied = new Proxy(base, {
+      get(target, prop, receiver) {
+        if (prop !== 'batch') return Reflect.get(target, prop, receiver)
+        return (statements: D1PreparedStatement[]) => {
+          batchCalls += 1
+          batchSizes.push(statements.length)
+          const rewritten = statements.map((statement) => {
+            statementsSeen += 1
+            return statementsSeen === 2 ? target.prepare('SELECT * FROM no_such_table_1774') : statement
+          })
+          return target.batch(rewritten)
+        }
+      },
+    })
+    const failing: Env = { ...f.env, DB: proxied }
     const res = await ackAgentMessages(failing, { agent: 'agent-a', ids }, LATER)
     expect(res).toMatchObject({ ok: false, reason: 'db_error' })
+    expect(batchCalls).toBe(1)
+    expect(batchSizes).toEqual([2]) // 100 ids -> two chunks, applied as one transaction
     expect(f.unread()).toBe(100)
     f.harness.close()
   })
