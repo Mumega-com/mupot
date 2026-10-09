@@ -758,9 +758,13 @@ describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; 
         task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner dead',
       })).toMatchObject({ ok: false, status: 409 })
       const term = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner dead', terminate: true,
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'runner dead', terminate: true, override: true,
       })
-      expect(term).toMatchObject({ ok: true, result: { reset: true, terminated: true } })
+      expect(term).toMatchObject({ ok: true, result: { reset: true, terminated: true, overrode: true } })
+      const ev = f.harness.sqlite.prepare(
+        "SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'reset_terminate_read_envelope'",
+      ).get() as { evidence_json: string }
+      expect(JSON.parse(ev.evidence_json).override_of).toMatchObject({ read_envelope: true, lease_live: false })
       expect(f.receipts('reset_terminated')).toBe(1)
       expect(dispatchRow(f)).toMatchObject({ settled_stage: 'reset_terminated' })
       expect(dispatchRow(f).settled_at).not.toBeNull()
@@ -771,9 +775,52 @@ describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; 
       expect(archived.ok, JSON.stringify(archived)).toBe(true)
       // Terminating twice is refused, not duplicated.
       expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'again', terminate: true,
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'again', terminate: true, override: true,
       })).toMatchObject({ ok: false, status: 409 })
       expect(f.receipts('reset_terminated')).toBe(1)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  const terminateNoOverride = (f: Fixture) => f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+    task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'looks dead', terminate: true,
+  })
+  const expectNothingWritten = (f: Fixture) => {
+    expect(f.receipts('reset_terminated')).toBe(0)
+    expect(dispatchRow(f).settled_at).toBeNull()
+  }
+
+  it('PA (round-1 P1): lease -> consume -> inbox_ack (lease cleared) -> terminate WITHOUT override is refused, nothing written; runner can still complete', async () => {
+    const f = fixture()
+    try {
+      await leaseAndConsume(f)
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      expect(await terminateNoOverride(f)).toMatchObject({ ok: false, status: 409, error: 'read_envelope_requires_override' })
+      expectNothingWritten(f)
+      expect(auditOps(f)).toContain('reset_refused_read_envelope_requires_override')
+      expect(await f.call('task_dispatch_runtime_receipt', settle('completed'))).toMatchObject({ ok: true })
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('PB (round-1 P1): read envelope under a LIVE recovery lease: terminate without override refused; with override terminates and records override_of.lease_live', async () => {
+    const f = fixture()
+    try {
+      expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
+      // runtime_consumed on a read envelope -> claimReadEnvelopeForRecovery grants a fresh live lease.
+      expect(await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))).toMatchObject({ ok: true })
+      expect(f.envelope().lease_expires_at).not.toBeNull()
+      expect(await terminateNoOverride(f)).toMatchObject({ ok: false, status: 409, error: 'read_envelope_requires_override' })
+      expectNothingWritten(f)
+      expect(await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'confirmed dead', terminate: true, override: true,
+      })).toMatchObject({ ok: true, result: { terminated: true, overrode: true } })
+      const ev = f.harness.sqlite.prepare(
+        "SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'reset_terminate_read_envelope'",
+      ).get() as { evidence_json: string }
+      expect(JSON.parse(ev.evidence_json).override_of).toMatchObject({ read_envelope: true, lease_live: true })
     } finally {
       f.harness.close()
     }
@@ -784,7 +831,7 @@ describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; 
     try {
       await wedge(f)
       const denied = await f.call('task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'self', terminate: true,
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'self', terminate: true, override: true,
       })
       expect(denied.ok).toBe(false)
       expect(f.receipts('reset_terminated')).toBe(0)
@@ -799,7 +846,7 @@ describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; 
     try {
       expect(await f.call('inbox_ack', { ids: [MESSAGE_ID] })).toMatchObject({ ok: true })
       const term = await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'no custody', terminate: true,
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'no custody', terminate: true, override: true,
       })
       expect(term.ok).toBe(false)
       expect(f.receipts('reset_terminated')).toBe(0)
@@ -816,7 +863,7 @@ describe('#1780 — terminate exits the read-envelope + runtime_consumed wedge; 
       expect((await f.call('task_dispatch_runtime_receipt', settle('completed'))).ok).toBe(true)
       await f.call('inbox_ack', { ids: [MESSAGE_ID] })
       await f.callAs(f.operatorAuth, 'task_dispatch_lease_reset', {
-        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'noop', terminate: true,
+        task_id: TASK_ID, dispatch_receipt_id: DISPATCH_ID, reason: 'noop', terminate: true, override: true,
       })
       expect(f.receipts('reset_terminated')).toBe(0)
       expect(dispatchRow(f).settled_stage).not.toBe('reset_terminated')
@@ -880,6 +927,35 @@ describe('#1780 — claimReadEnvelopeForRecovery never leases the envelope of an
       const out = await f.call('task_dispatch_runtime_receipt', settle('runtime_consumed'))
       expect(armed).toBe(false)
       expect(out.ok).toBe(false)
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('pair-correlator claim (pristine envelope) on an archived task: refused task_archived, no lease written', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        VALUES ('${TASK_ID}', '${T0}', 'x', '${MEMBER_ID}', 'open', '${T0}')`)
+      const before = f.envelope()
+      expect(await f.call('task_dispatch_runtime_receipt', pairSettle('runtime_consumed')))
+        .toMatchObject({ ok: false, error: 'task_archived' })
+      expect(f.envelope()).toEqual(before)
+    } finally {
+      f.harness.close()
+    }
+  })
+
+  it('oracle: a non-owner agent probing an archived task id does NOT learn it is archived (pre-check scoped to own dispatch)', async () => {
+    const f = fixture()
+    try {
+      f.harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+        VALUES ('${TASK_ID}', '${T0}', 'x', '${MEMBER_ID}', 'open', '${T0}')`)
+      const before = f.envelope()
+      const out = await f.callAs(f.gateAuth, 'task_dispatch_runtime_receipt', settle('runtime_consumed'))
+      expect(out.ok).toBe(false)
+      if (!out.ok) expect(out.error).not.toBe('task_archived')
       expect(f.envelope()).toEqual(before)
     } finally {
       f.harness.close()

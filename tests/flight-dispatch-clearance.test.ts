@@ -43,7 +43,8 @@ function makeEnv(tenant = 'digid'): { env: Env; rows: Map<string, FlightRow> } {
                   const [id, t, reason, score, ended] = a as [string, string, string, number, number]
                   guarded(id, t, ['preflight'], (r) => { r.status = 'held'; r.gate_verdict = 'no_go'; r.gate_reason = reason; r.score = score; r.ended_at = ended })
                 }
-                return { success: true }
+                // createFlight treats a 0-row INSERT as a conflict (mupot#1780): report the row written.
+                return { success: true, meta: { changes: sql.includes('INSERT INTO flights') ? 1 : 0 } }
               },
               async first<T>() {
                 const [id, t] = a as [string, string]

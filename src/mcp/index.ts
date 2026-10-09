@@ -5227,6 +5227,11 @@ const toolTaskDispatchLeaseReset: ToolSpec = {
       // without terminate.
       return fail(409, 'terminate_credential_required', { audit_id: result.audit_id })
     }
+    if (result.code === 'reset_refused_read_envelope_requires_override') {
+      // mupot#1780 - the envelope was READ, which does not prove the runner is dead; terminating it voids
+      // the runner's pending completed/failed. Confirm it is gone, then retry with override:true.
+      return fail(409, 'read_envelope_requires_override', { message_id: result.message_id, audit_id: result.audit_id })
+    }
     if (result.code === 'reset_refused_consumed') {
       // mupot#1539 round 2 (P1-A) — the assignee already took custody (runtime_consumed); a
       // plain reset would rewind the attempt counter under it. Settle completed/failed, or

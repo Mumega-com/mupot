@@ -877,6 +877,8 @@ async function claimUnleasedForPairSettlement(
           WHERE dispatch.tenant = ?1 AND dispatch.id = ?5 AND dispatch.task_id = ?6
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
+            -- mupot#1780: no lease on an archived task's envelope (this runs before the archive refusal).
+            AND ${TASK_NOT_ARCHIVED_SQL('task')}
        )
        -- mupot#1494 v4 round 2 (P1-2, adversarial regression), NARROWED round 3 (P1-A) — a
        -- dispatch an operator has EXPLICITLY declared dead (reset(terminate:true), stage
@@ -968,6 +970,19 @@ function envelopeHoldsSql(
  *  - caller is active, is the dispatch's agent AND the task's assignee, the task is in a
  *    status the `runtime_consumed` transition accepts, and the bearer fence allows it.
  */
+/** Archive pre-check scoped to the CALLER's own dispatch (agent + task must match the dispatch row), so it
+ *  is not an oracle for whether an arbitrary task id is archived. The claim UPDATEs re-assert the guard. */
+async function isOwnDispatchTaskArchived(
+  env: Env, input: { dispatchReceiptId: string; taskId: string }, agentId: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT 1 FROM task_dispatch_receipts d
+     WHERE d.tenant = ?1 AND d.id = ?2 AND d.task_id = ?3 AND d.agent_id = ?4
+       AND EXISTS (SELECT 1 FROM tasks_archive_state a WHERE a.task_id = d.task_id)
+  `).bind(env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, agentId).first<{ 1: number }>()
+  return row !== null
+}
+
 async function claimReadEnvelopeForRecovery(
   env: Env,
   input: { messageId: string; dispatchReceiptId: string; taskId: string; callerAgentId: string; attempt: number; now: string },
@@ -1241,6 +1256,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   // a resident agent's inbox_lease() would have produced. See claimUnleasedForPairSettlement's
   // doc comment. Credential-gated: this runs only after the token check above succeeds.
   if (usedPairCorrelator && input.attempt === 1) {
+    if (!replay && await isOwnDispatchTaskArchived(env, input, agentId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
     await claimUnleasedForPairSettlement(env, {
       messageId,
       dispatchReceiptId: input.dispatchReceiptId,
@@ -1254,7 +1270,7 @@ export async function recordTaskDispatchRuntimeReceipt(
   if (input.stage === 'runtime_consumed') {
     // mupot#1780: refuse an archived task BEFORE the claim writes a lease onto its envelope (a stored-receipt
     // replay stays read-only and is exempt); the claim UPDATE re-asserts the same guard atomically.
-    if (!replay && await isTaskArchived(env, input.taskId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
+    if (!replay && await isOwnDispatchTaskArchived(env, input, agentId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
     await claimReadEnvelopeForRecovery(env, {
       messageId,
       dispatchReceiptId: input.dispatchReceiptId,
@@ -1660,6 +1676,7 @@ export type AdminResetDispatchLeaseCode =
   // a dispatch that has already resolved, and resetting its lease bookkeeping regardless
   // would let a resurrected/late runner settle a dispatch the record already closed.
   | 'reset_refused_already_terminal'
+  | 'reset_refused_read_envelope_requires_override'
 
 export interface AdminResetDispatchLeaseResult {
   /** True iff the row was reset to pristine. False means "not found", "refused" (already
@@ -1906,12 +1923,17 @@ export async function adminResetDispatchLease(
     dead_lettered_at: string | null
     to_agent: string
     lease_live: number
+    /** mupot#1780: liveness of the lease on a READ envelope (lease_live is 0 for any read row). */
+    read_lease_live: number
   }
   const loadMessage = (): Promise<MessageRow | null> => env.DB.prepare(`
     SELECT id, delivery_attempts, lease_expires_at, lease_attempt_id, read_at, dead_lettered_at, to_agent,
            CASE WHEN read_at IS NULL AND dead_lettered_at IS NULL
                      AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}
-                THEN 1 ELSE 0 END AS lease_live
+                THEN 1 ELSE 0 END AS lease_live,
+           CASE WHEN read_at IS NOT NULL AND dead_lettered_at IS NULL
+                     AND ${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')}
+                THEN 1 ELSE 0 END AS read_lease_live
       FROM agent_messages WHERE tenant = ?1 AND from_agent = ?4 AND request_id = ?2 LIMIT 1
   `).bind(env.TENANT_SLUG, dispatchInboxRequestId(input.dispatchReceiptId), now, DISPATCH_BRIDGE_SENDER).first<MessageRow>()
 
@@ -1998,6 +2020,23 @@ export async function adminResetDispatchLease(
     return { reset: false, code: 'reset_not_found', message_id: null, audit_id: auditId, overrode: false, terminated: false }
   }
 
+  // mupot#1780 (round-1 adversarial P1): a READ envelope is no proof the runner is dead - inbox_ack clears the
+  // lease of a healthy runner, and claimReadEnvelopeForRecovery gives a read envelope a fresh live one, yet
+  // lease_live above is 0 for every read row. Terminating it voids the runner's pending completed/failed, so
+  // the read-envelope exit is an explicit operator override, never a default.
+  if (terminate && message.read_at !== null && message.dead_lettered_at === null && !override) {
+    await writeAudit('reset_refused_read_envelope_requires_override', 'agent_message', message.id, evidence({
+      holder: message.to_agent,
+      lease_expires_at: message.lease_expires_at,
+      delivery_attempts: message.delivery_attempts,
+      read_lease_live: message.read_lease_live === 1,
+    }))
+    return {
+      reset: false, code: 'reset_refused_read_envelope_requires_override', message_id: message.id,
+      audit_id: auditId, overrode: false, terminated: false,
+    }
+  }
+
   // P1-A / P0 successor: a LIVE, unexpired lease (julianday-computed — see doc comment
   // above) on a row that is neither consumed nor dead-lettered is a genuinely in-flight
   // hand-out, not a wedge — refuse unless explicitly overridden.
@@ -2072,6 +2111,8 @@ export async function adminResetDispatchLease(
           WHERE m.tenant = ?1 AND m.from_agent = '${DISPATCH_BRIDGE_SENDER}'
             AND m.request_id = '${DISPATCH_INBOX_PREFIX}' || ?2
             AND m.read_at IS NOT NULL AND m.dead_lettered_at IS NULL
+            -- the write itself enforces the override: a live (recovery) lease needs override:true
+            AND (?6 = 1 OR NOT (${LEASE_LIVE_PREDICATE('m.lease_expires_at', '?3')}))
        )
        AND EXISTS (
          SELECT 1 FROM task_dispatch_runtime_receipts c
@@ -2084,6 +2125,7 @@ export async function adminResetDispatchLease(
        )
   `).bind(
     env.TENANT_SLUG, input.dispatchReceiptId, now, sanitizeReceiptText(text(input.reason, 500)), input.taskId,
+    override ? 1 : 0,
   )
   const leaseUpdateStmt = readEnvelopeTerminate ? readEnvelopeSettleStmt : env.DB.prepare(`
     UPDATE agent_messages
@@ -2107,7 +2149,19 @@ export async function adminResetDispatchLease(
   // never live to begin with), `changes() = 0` and the audit falls through to
   // `reset_refused_terminal` regardless of which branch we guessed.
   const successOperation = readEnvelopeTerminate ? 'reset_terminate_read_envelope' : useOverride ? 'reset_override' : 'reset'
-  const successEvidence = useOverride
+  const successEvidence = readEnvelopeTerminate
+    ? evidence({
+        override_of: {
+          read_envelope: true,
+          read_at: message.read_at,
+          lease_live: message.read_lease_live === 1,
+          holder: message.to_agent,
+          delivery_attempts: message.delivery_attempts,
+          lease_expires_at: message.lease_expires_at,
+          lease_attempt_id: message.lease_attempt_id,
+        },
+      })
+    : useOverride
     ? evidence({
         override_of: {
           holder: message.to_agent,
@@ -2208,7 +2262,7 @@ export async function adminResetDispatchLease(
   ]
   const results = await env.DB.batch(batchStmts)
   const reset = (results[0].meta as { changes?: number }).changes === 1
-  const overrode = reset && useOverride
+  const overrode = reset && (useOverride || readEnvelopeTerminate)
   // `terminated` reflects whether a `reset_terminated` row was ACTUALLY inserted (its own
   // INSERT...SELECT WHERE EXISTS/NOT EXISTS may still no-op even when `reset` succeeded —
   // e.g. a `completed`/`failed` dispatch that was already terminal for some OTHER reason,
