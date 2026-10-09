@@ -120,6 +120,30 @@ describe('1. a flight whose tasks are all done lands, it is not failed by the st
     }
   })
 
+  it('a routine-bound flight with all tasks done is NOT landed here (its run owns closure): it still fails', async () => {
+    const T = '2026-10-09T00:00:00.000Z'
+    h.sqlite.exec(`
+      INSERT INTO projects (id, slug, name, status) VALUES ('project-r','project-r','R','active');
+      INSERT INTO routines (id, tenant, project_id, name, objective, status, trigger_kind, run_once_at,
+        cron_expression, timezone, next_run_at, overlap_policy, execution_mode, responsible_squad_id,
+        budget_micro_usd, max_attempts, retry_backoff_seconds, max_occurrences, revision, enabled_by,
+        enabled_at, created_by, created_at, updated_at)
+      VALUES ('routine-r','${TENANT}','project-r','routine-r','o','enabled','cron',NULL,'* * * * *','UTC','${T}',
+        'skip','propose','${SQUAD}',100000,3,300,NULL,1,'o','${T}','o','${T}','${T}');
+    `)
+    seedTask('t1')
+    seedFlight('fl-routine', { taskIds: ['t1'] })
+    h.sqlite.exec(`
+      INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key,
+        trigger_kind, scheduled_for, status, attempt, flight_id, created_at, updated_at)
+      VALUES ('run-r','${TENANT}','project-r','routine-r',1,'{}','manual:run-r','cron','${T}','running',1,'fl-routine','${T}','${T}');
+    `)
+    h.sqlite.prepare("UPDATE tasks SET status = 'done'").run()
+    const res = await reapStalledFlight(env, 'fl-routine', WATCHDOG, 'x', STALLED_NOW)
+    expect(res).toMatchObject({ transitioned: true, target_status: 'failed' })
+    expect(row('fl-routine').status).toBe('failed')
+  })
+
   it('never lands a flight that is not past its stall timeout (the rule runs only inside the reap)', async () => {
     seedTask('t1')
     seedFlight('fl-young', { taskIds: ['t1'] })
