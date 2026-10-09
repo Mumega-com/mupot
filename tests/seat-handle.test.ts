@@ -959,6 +959,13 @@ describe('round-1 gate fixes', () => {
     const subsBefore = n(`SELECT COUNT(*) AS n FROM event_subscriptions`)
     const list = await call('events/list', {}, { 'x-mupot-seat': a.handle })
     expect(JSON.stringify(list.body)).toContain('"events"')
+    // identical to the human's own catalogue: the handle did not turn the session into a bound one
+    const plain = await call('events/list', {})
+    expect(JSON.stringify(list.body)).toBe(JSON.stringify(plain.body))
+    const boundCtx = await applySeatHandle(env, g.ctx, { headerHandle: a.handle, hints: NO_HINTS })
+    expect(boundCtx.boundAgentId).toBe(a.agentId) // positive control: this agent's catalogue would differ
+    const boundList = await mcpApp.fetch(mcpInternalRequest(new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'events/list', params: {} }) }), boundCtx), env)
+    expect(JSON.stringify(await boundList.json())).not.toBe(JSON.stringify(plain.body))
     const sub = { name: 'message.created', delivery: { mode: 'webhook', url: 'https://example.test/hook', secret: 'whsec_' + btoa('s'.repeat(32)) } }
     const viaHeader = await call('events/subscribe', sub, { 'x-mupot-seat': a.handle })
     expect(viaHeader.status).toBe(403)
