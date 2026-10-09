@@ -311,7 +311,7 @@ describe('gate-stall watchdog: archive is an action boundary (mupot#1780)', () =
     harness.close()
   })
 
-  it('a task archived between the sweep SELECT and the wake yields no effect and is not counted rewoken', async () => {
+  it('a task archived between the sweep SELECT and the wake yields no effect, burns no claim row and is not counted rewoken', async () => {
     const { env, sqlite, harness } = setup()
     seedReviewTask(sqlite, 'race')
     const realPrepare = harness.db.prepare.bind(harness.db)
@@ -325,8 +325,30 @@ describe('gate-stall watchdog: archive is an action boundary (mupot#1780)', () =
     }) as typeof harness.db.prepare
     const res = await sweepAt(env, T0)
     expect(res.rewoken).toBe(0)
-    expect(res.undelivered).toBe(1)
+    expect(res.undelivered).toBe(0)
+    expect(res.skipped_claimed).toBe(1)
     expect(effectRows(sqlite)).toBe(0)
+    // #1783 P3: the guard is IN the claim write, so the race burns no gate_stall_rewakes row either.
+    expect(sqlite.prepare(`SELECT COUNT(*) AS n FROM gate_stall_rewakes`).get()).toEqual({ n: 0 })
+    harness.close()
+  })
+
+  // ── #1783 P2-2: "no bus event" is asserted on the REAL emit seam (createBus -> env.BUS.send) ──
+  it('wakeGateOwnerOnReview emits NO bus event for an archived task, and does emit for a live one (spy is live)', async () => {
+    const { env, sqlite, harness } = setup()
+    const send = vi.fn(async () => undefined)
+    ;(env as unknown as Record<string, unknown>).BUS = { send }
+    seedReviewTask(sqlite, 'arch')
+    seedReviewTask(sqlite, 'live')
+    archive(sqlite, 'arch')
+    const { wakeGateOwnerOnReview } = await import('../src/mcp')
+    const archTask = sqlite.prepare(`SELECT * FROM tasks WHERE id = 'arch'`).get() as never
+    const liveTask = sqlite.prepare(`SELECT * FROM tasks WHERE id = 'live'`).get() as never
+    const outArch = await wakeGateOwnerOnReview(env, archTask, { kind: 'agent', id: 'x' }, 'x')
+    expect(outArch.status).toBe('task_archived')
+    expect(send).not.toHaveBeenCalled()
+    await wakeGateOwnerOnReview(env, liveTask, { kind: 'agent', id: 'x' }, 'x')
+    expect(send).toHaveBeenCalled()
     harness.close()
   })
 })
