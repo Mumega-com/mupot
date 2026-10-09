@@ -407,10 +407,17 @@ service instead of writing rows directly.
 MCP tools:
 
 - `task_create { squad_id, title, done_when, body?, assignee_agent_id? }`
-- `task_list { squad_id?, status?, assignee_agent_id?, limit? }`
+- `task_list { squad_id?, project_id?, status?, assignee_agent_id?, limit?, cursor? }`
 - `task_board { squad_id?, limit? }`
 - `task_update { task_id, title?, body?, done_when?, status?, assignee_agent_id?, gate_owner? }`
 - `task_dispatch { task_id }`
+
+`task_list` is keyset-paginated (mupot#1784): `limit` is the PAGE size (default 25, max 100),
+and the response carries `next_cursor` (opaque; `null` = last page) and `truncated`. Pass
+`next_cursor` back as `cursor` with the same squad/filters; a malformed or mismatched cursor is
+`400 invalid_args`. `task_board.counts` are true totals (not the returned rows); `truncated` and
+per-status `has_more` say when a column holds fewer rows than its count. `GET /api/tasks`
+accepts `?limit=&cursor=` the same way and flags a capped legacy read with `truncated`.
 
 Agent-bound tokens may omit `squad_id` for `task_list` and `task_board`; Mupot
 derives the caller's squad from the token's `auth.boundAgentId`. All task tools
