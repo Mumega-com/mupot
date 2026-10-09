@@ -311,6 +311,11 @@ export interface Env {
   CURSOR_API_TOKEN?: string
   CURSOR_API_KEY?: string
   // #1762: Studio cursor-cloud dispatch bounds (non-secret, integers; defaults 3 / 1 / 90). See src/dashboard/studio-limits.ts.
+  // mupot#1794 W1: zero-touch harness seats. '1' enables harness upsert on the unbound OAuth
+  // consent and the seat_select tool; anything else (including unset, the prod default) is a
+  // total no-op. SEAT_MAX_PER_MEMBER caps live seats per human (default 16, clamped 1..256).
+  SEAT_AUTO_ENROLL?: string
+  SEAT_MAX_PER_MEMBER?: string
   STUDIO_DISPATCH_MEMBER_LIMIT?: string
   STUDIO_DISPATCH_REPO_LIMIT?: string
   STUDIO_DISPATCH_WINDOW_MINUTES?: string
@@ -703,6 +708,13 @@ export interface AuthContext {
    */
   consentedByMemberId?: string | null
   tokenId?: string | null // exact live member_tokens row used for this request; server-derived only
+  /**
+   * mupot#1794 W1: the harness (OAuth client install) this UNBOUND directory grant was consented
+   * through. An identity POINTER only — carried from the encrypted OAuth props via the internal
+   * auth header, so it is never trusted on its own: seat_select / boot_context re-read the
+   * harnesses row (tenant + member + id) live before use. Absent on every other session.
+   */
+  harnessId?: string | null
   webSessionIdHash?: string | null
   webSessionMemberId?: string
 }

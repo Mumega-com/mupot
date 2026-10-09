@@ -3516,9 +3516,31 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_studio_slots_repo" },
     ],
   },
+  {
+    file: "0198_harness_seats.sql",
+    sha256: "f2b138faf53f9c4d726062b71224b880346ba85682d0aa3dbc15d97294e5f29a",
+    statements: [
+      "-- 0198_harness_seats.sql — mupot#1794 W1: harnesses + agent seats (zero-touch seat onboarding).\n--\n-- MODEL (three layers): the LOGIN is a human member; a HARNESS is one OAuth client install\n-- (Cursor, ChatGPT, Claude, Grok ...) that human consented through; an AGENT SEAT is one\n-- thread / worktree / bot inside that harness, resolved to ONE agent by a server-normalised\n-- workspace key. Names and folders are LABELS, never authority: authority is always the human\n-- member's live grants, clamped (see src/members/seat-select.ts).\n--\n-- Behind SEAT_AUTO_ENROLL (unset in prod). This migration is additive: with the flag off no\n-- row is ever written to either table and no existing code path reads them.\n--\n-- harnesses: one row per (tenant, member, oauth_client_id). client_name / kind are display\n-- labels taken from the OAuth client registration; they are updated on every re-consent and\n-- are NEVER consulted for an authorization decision.\nCREATE TABLE IF NOT EXISTS harnesses (\n  id              TEXT PRIMARY KEY,\n  tenant          TEXT NOT NULL,\n  member_id       TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  oauth_client_id TEXT NOT NULL CHECK (length(oauth_client_id) BETWEEN 1 AND 512),\n  client_name     TEXT NOT NULL DEFAULT '' CHECK (length(client_name) <= 120),   -- label only\n  kind            TEXT NOT NULL DEFAULT 'unknown' CHECK (length(kind) BETWEEN 1 AND 32),  -- label only\n  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  UNIQUE (tenant, member_id, oauth_client_id)\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_harnesses_member ON harnesses (tenant, member_id);",
+      "\n\n-- agent_seats: (tenant, member, harness, key_hash) -> exactly one agent.\n--   key_hash       sha256 of the canonical v1 key string (member id + harness id + normalised\n--                  project/squad/folder/thread). Only the hash is stored: a full filesystem\n--                  path is never persisted. label_basename is the last folder segment (or the\n--                  project) for human-readable display.\n--   agent_id       UNIQUE: one agent can back at most one seat, so a seat row can never be\n--                  re-pointed at somebody else's agent. RESTRICT: an agent with a seat cannot\n--                  be hard-deleted out from under it (agent_member_bindings already RESTRICTs).\n--   max_live       the per-member cap IN FORCE when the row was issued; the cap trigger below\n--                  reads it, so the cap is enforced INSIDE the same D1 batch/transaction that\n--                  creates the agent, and a refused seat rolls the WHOLE batch back (a\n--                  zero-row \"capped INSERT ... SELECT\" would instead commit the agent, member,\n--                  binding and token and leave them orphaned; D1 batches roll back on ERROR\n--                  only, never on a zero-row write).\n--   retired_at     set once; a retired seat's key is never resurrected.\nCREATE TABLE IF NOT EXISTS agent_seats (\n  id             TEXT PRIMARY KEY,\n  tenant         TEXT NOT NULL,\n  member_id      TEXT NOT NULL REFERENCES members(id) ON DELETE RESTRICT,\n  harness_id     TEXT NOT NULL REFERENCES harnesses(id) ON DELETE RESTRICT,\n  key_hash       TEXT NOT NULL CHECK (length(key_hash) = 64),\n  agent_id       TEXT NOT NULL UNIQUE REFERENCES agents(id) ON DELETE RESTRICT,\n  label_basename TEXT NOT NULL DEFAULT '' CHECK (length(label_basename) <= 64),\n  max_live       INTEGER NOT NULL CHECK (max_live BETWEEN 1 AND 256),\n  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  retired_at     TEXT,\n  UNIQUE (tenant, member_id, harness_id, key_hash)\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_seats_member_live ON agent_seats (tenant, member_id, retired_at);",
+      "\n\n-- Per-member cap, atomic with the insert. Counts LIVE (non-retired) seats for the same\n-- (tenant, member). Raises -> the entire seat_select batch (agent, member, binding, capability,\n-- token, audit, seat) rolls back: zero orphans.\nCREATE TRIGGER IF NOT EXISTS agent_seats_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.retired_at IS NULL\n AND (SELECT COUNT(*) FROM agent_seats s\n       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id AND s.retired_at IS NULL) >= NEW.max_live\nBEGIN\n  SELECT RAISE(ABORT, 'seat_cap_exceeded');\nEND;",
+      "\n\n-- A seat is an identity record: only retired_at may ever change, and only NULL -> value once.\nCREATE TRIGGER IF NOT EXISTS agent_seats_immutable\nBEFORE UPDATE ON agent_seats\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id\n  OR NEW.tenant IS NOT OLD.tenant\n  OR NEW.member_id IS NOT OLD.member_id\n  OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.key_hash IS NOT OLD.key_hash\n  OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.label_basename IS NOT OLD.label_basename\n  OR NEW.max_live IS NOT OLD.max_live\n  OR NEW.created_at IS NOT OLD.created_at\n  OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_immutable');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS agent_seats_no_delete\nBEFORE DELETE ON agent_seats\nFOR EACH ROW\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_immutable');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "harnesses" },
+      { type: "index", name: "idx_harnesses_member" },
+      { type: "table", name: "agent_seats" },
+      { type: "index", name: "idx_agent_seats_member_live" },
+      { type: "trigger", name: "agent_seats_cap_insert" },
+      { type: "trigger", name: "agent_seats_immutable" },
+      { type: "trigger", name: "agent_seats_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "e3fe7be20c5aad75ec832779b68c391b8b8140c42635be1e5f7f52f1c727699f"
+export const SCHEMA_CHAIN_DIGEST: string = "8ddaa0c30186c6e17dec62e58b8358c8569f2353e9f5cd30baa98a7c12a7edbd"
