@@ -3806,11 +3806,14 @@ const toolFlightReapStalled: ToolSpec = {
     }
 
     return done({
-      reaped: true,
+      // false when the stall clock closed a non-failure (finished work landed / bookkeeping closed): see disposition
+      reaped: !result.disposition,
       flight_id: result.flight_id,
       previous_status: result.previous_status,
       age_ms: result.age_ms,
       receipt: result.receipt,
+      target_status: result.target_status,
+      ...(result.disposition ? { disposition: result.disposition } : {}),
     })
   },
 }

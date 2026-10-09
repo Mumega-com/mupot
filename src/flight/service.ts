@@ -409,6 +409,44 @@ export interface GovernedLandingResult {
   receipt: boolean
 }
 
+/**
+ * The ONE governed-land eligibility predicate (mupot#1748 P1). A flight may be marked landed only when:
+ *   - it carries a budget policy (budget_micro_usd IS NOT NULL) and `budgetCompareSql` holds;
+ *   - its meta is valid JSON of schema mupot.flight.meta/v1;
+ *   - EVERY task in meta.task_ids exists, is in the flight's project, is `done`, and - if it has a gate_owner -
+ *     its LATEST verdict is 'approved' (a gated task abandoned after a rejection, or done with no verdict, blocks).
+ * Used by landGovernedFlight (the executor's land) AND by the watchdog's done-land (resolveReapDisposition + its
+ * guarded UPDATE), so the stall clock cannot land a flight the governed land would refuse. Do not copy it.
+ *
+ * `alias` is the flights table alias (plain identifier, interpolated); `budgetCompareSql` is a caller-owned boolean
+ * fragment (the land compares the claimed cost, the watchdog the recorded cost) and must be built from literals.
+ */
+export function governedLandEligibilitySql(alias: string, budgetCompareSql: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error('invalid_sql_alias')
+  const a = alias
+  return `(${a}.budget_micro_usd IS NOT NULL AND ${budgetCompareSql}
+       AND json_valid(${a}.meta)
+       AND json_extract(${a}.meta, '$.schema') = 'mupot.flight.meta/v1'
+       AND NOT EXISTS (
+         SELECT 1
+           FROM json_each(${a}.meta, '$.task_ids') AS task_ref
+           LEFT JOIN tasks AS task ON task.id = task_ref.value
+          WHERE task.id IS NULL
+             OR (${a}.project_id IS NOT NULL AND task.project_id IS NOT ${a}.project_id)
+             OR task.status <> 'done'
+             OR (
+               task.gate_owner IS NOT NULL
+               AND COALESCE((
+                 SELECT verdict
+                   FROM task_verdicts
+                  WHERE task_id = task.id
+                  ORDER BY decided_at DESC, id DESC
+                  LIMIT 1
+               ), '') <> 'approved'
+             )
+       ))`
+}
+
 export async function landGovernedFlight(
   env: Env,
   id: string,
@@ -475,27 +513,8 @@ export async function landGovernedFlight(
      WHERE id=?1 AND tenant=?2
        AND (?3 IS NULL OR agent=?3)
        AND status IN ('running','waiting','sleeping')
-       AND budget_micro_usd IS NOT NULL AND (?7 = 0 OR ?4 <= budget_micro_usd)
-       AND json_valid(meta)
-       AND json_extract(meta, '$.schema') = 'mupot.flight.meta/v1'
-       AND NOT EXISTS (
-         SELECT 1
-           FROM json_each(flights.meta, '$.task_ids') AS task_ref
-           LEFT JOIN tasks AS task ON task.id = task_ref.value
-          WHERE task.id IS NULL
-             OR (flights.project_id IS NOT NULL AND task.project_id IS NOT flights.project_id)
-             OR task.status <> 'done'
-             OR (
-               task.gate_owner IS NOT NULL
-               AND COALESCE((
-                 SELECT verdict
-                   FROM task_verdicts
-                  WHERE task_id = task.id
-                  ORDER BY decided_at DESC, id DESC
-                  LIMIT 1
-               ), '') <> 'approved'
-             )
-       )${routineWitnessSql}
+       AND ${governedLandEligibilitySql('flights', '(?7 = 0 OR ?4 <= flights.budget_micro_usd)')}
+       ${routineWitnessSql}
      RETURNING score, cost_micro_usd, cost_metered, budget_micro_usd`,
   )
     .bind(

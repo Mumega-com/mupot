@@ -8,11 +8,11 @@
 import type { FlightRow, FlightStatus } from './service'
 import { detectFlightCollisions } from './clearance'
 import type { FlightCollision } from './clearance'
-import { isCancelledFlight, isCancelUnconfirmed } from './cancelled'
+import { isBookkeepingClosed, isCancelledFlight, isCancelUnconfirmed } from './cancelled'
 
 // The board metaphor (plain mupot language): running=flying, waiting=holding (at a
 // human gate), sleeping=between flights. preflight/held/landed/failed keep their names.
-export type FlightPhase = 'preflight' | 'flying' | 'holding' | 'sleeping' | 'held' | 'landed' | 'failed' | 'cancelled'
+export type FlightPhase = 'preflight' | 'flying' | 'holding' | 'sleeping' | 'held' | 'landed' | 'failed' | 'cancelled' | 'bookkeeping'
 
 const PHASE: Record<FlightStatus, FlightPhase> = {
   preflight: 'preflight',
@@ -105,7 +105,13 @@ function nextDeparture(row: FlightRow, nowMs: number): string | null {
 export function buildBoard(rows: FlightRow[], nowMs: number): FlightCard[] {
   return rows.map((row, i) => {
     // #1748: a cancelled flight is stored as 'failed' but is its own phase, never a failure.
-    const phase: FlightPhase = isCancelledFlight(row) ? 'cancelled' : PHASE[row.status]
+    // #1762: a TERMINAL bookkeeping flight (deploy/studio; closed by the watchdog, or a pre-fix reap stored as 'failed')
+    // never flew, so it is its own phase: never a failure and never a landing (it must not move PR-rate counters).
+    const phase: FlightPhase = isBookkeepingClosed(row)
+      ? 'bookkeeping'
+      : isCancelledFlight(row)
+        ? 'cancelled'
+        : PHASE[row.status]
     const over =
       row.cost_metered !== 0 && row.budget_micro_usd != null && Number.isFinite(row.budget_micro_usd) && row.cost_micro_usd > row.budget_micro_usd
 

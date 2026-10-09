@@ -1,5 +1,5 @@
 import type { Env } from '../types'
-import { cancelledColumnSql, flightOutcome, isCancelledFlight, isCancelUnconfirmed } from '../flight/cancelled'
+import { cancelledColumnSql, flightOutcome, isBookkeepingClosed, isCancelledFlight, isCancelUnconfirmed, isRealFailure } from '../flight/cancelled'
 import { chunkForD1InList } from '../lib/d1-in-list'
 
 /**
@@ -113,6 +113,8 @@ export interface FlightSummary {
   cancelled: number
   /** #1756: of `cancelled`, how many did not fence the routine effect. Still NOT counted as failed. */
   cancelUnconfirmed: number
+  /** #1762: terminal bookkeeping flights (landed bookkeeping_closed, or pre-fix failed reaps); NOT counted in `landed` or `failed`. */
+  bookkeeping: number
   held: number
   running: number
   /** Total spend in micro-USD across every flight this agent flew. */
@@ -127,7 +129,7 @@ export interface FlightSummary {
  * the most interesting failure mode on this deployment.
  */
 export function summariseFlights(
-  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; cancel_unconfirmed?: number; created_at: string }[],
+  rows: { id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered?: number; cancelled: number | undefined; bookkeeping?: number; cancel_unconfirmed?: number; created_at: string }[],
 ): FlightSummary {
   const summary: FlightSummary = {
     total: rows.length,
@@ -136,18 +138,20 @@ export function summariseFlights(
     failed: 0,
     cancelled: 0,
     cancelUnconfirmed: 0,
+    bookkeeping: 0,
     held: 0,
     running: 0,
     costMicroUsd: 0,
     recent: [],
   }
   for (const r of rows) {
-    if (r.status === 'landed') summary.landed += 1
+    if (isBookkeepingClosed(r)) summary.bookkeeping += 1
+    else if (r.status === 'landed') summary.landed += 1
     else if (isCancelledFlight(r)) {
       summary.cancelled += 1
       if (isCancelUnconfirmed(r)) summary.cancelUnconfirmed += 1
     }
-    else if (r.status === 'failed') summary.failed += 1
+    else if (isRealFailure({ status: r.status, cancelled: r.cancelled, bookkeeping: r.bookkeeping })) summary.failed += 1
     else if (r.status === 'held') summary.held += 1
     else if (r.status === 'running') summary.running += 1
     // #1732: an unmetered flight has no known cost; skip it rather than add a fabricated 0.
@@ -168,13 +172,13 @@ export function summariseFlights(
 export async function loadFlightPanel(env: Env, agentId: string): Promise<PanelResult<FlightSummary>> {
   try {
     const res = await env.DB.prepare(
-      `SELECT id, goal, status, cost_micro_usd, cost_metered, created_at, ${cancelledColumnSql('flights')}
+      `SELECT id, goal, status, cost_micro_usd, cost_metered, bookkeeping, created_at, ${cancelledColumnSql('flights')}
          FROM flights
         WHERE tenant = ?1 AND agent = ?2
         ORDER BY created_at DESC
         LIMIT ${PANEL_ROW_CAP}`,
     ).bind(env.TENANT_SLUG, agentId).all<{
-      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; cancelled: number; cancel_unconfirmed: number; created_at: string
+      id: string; goal: string; status: string; cost_micro_usd: number | null; cost_metered: number; cancelled: number; cancel_unconfirmed: number; bookkeeping: number; created_at: string
     }>()
     const rows = res.results ?? []
     if (rows.length === 0) return empty()
