@@ -175,9 +175,10 @@ not a public listing: it returns `401` without a token and `404` with one.)
 > Off unless the pot sets `SEAT_AUTO_ENROLL=1`. With it off, none of this exists: the consent
 > screen, `boot_context` and the initialize instructions are unchanged.
 
-When the flag is on, the consent screen preselects **Me — auto per workspace (harness)**. That
-authorises the connector as *you*, with no agent bound. Each thread or worktree then picks its
-own agent:
+When the flag is on, the consent screen offers **Me — auto per workspace (harness)**. Nothing is
+preselected; you must choose it explicitly. That authorises the connector as *you*, with no agent
+bound. Choosing **No agent** instead gives a plain unbound grant that cannot use `seat_select`.
+After choosing the harness option, each thread or worktree picks its own agent:
 
 1. Call `seat_select { project, folder?, thread? }`. The values are labels that key the seat;
    they grant nothing. The seat agent is capped at member, and your own access is the ceiling.
