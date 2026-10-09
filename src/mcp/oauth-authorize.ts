@@ -296,7 +296,7 @@ const RANK_ORDER: readonly Capability[] = ['owner', 'admin', 'lead', 'member', '
  *  returning the actual ceiling rank instead of a yes/no against a fixed `min`).
  *  0 = holds nothing there. Used only to CLAMP an agent's grant down to what the
  *  human backing the session can actually reach — never to grant anything itself. */
-async function humanMaxRankOnScope(
+export async function humanMaxRankOnScope(
   env: Env,
   humanGrants: CapabilityGrant[],
   scopeType: CapabilityScopeType,

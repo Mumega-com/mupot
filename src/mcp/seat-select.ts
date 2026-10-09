@@ -14,7 +14,7 @@ const toolSeatSelect: ToolSpec = {
   name: 'seat_select',
   scope: 'self (find-or-create the agent seat for this harness + workspace; unbound directory session only)',
   min: 'authenticated',
-  args: '{ project: string, folder?: string, thread?: string, squad?: string, harness_kind?: string }  // all values are LABELS that key the seat; none grants authority',
+  args: '{ project: string, folder?: string, thread?: string, squad?: string }  // all values are LABELS that key the seat; none grants authority',
   inputSchema: {
     type: 'object',
     properties: {
@@ -22,7 +22,6 @@ const toolSeatSelect: ToolSpec = {
       folder: { type: 'string', description: 'Working folder or worktree path. Normalised server-side; only a hash and the last segment are stored.' },
       thread: { type: 'string', description: 'Thread / conversation / bot identifier inside the harness, if the seat is per-thread.' },
       squad: { type: 'string', description: 'Squad label. Part of the seat key only; it never places the agent.' },
-      harness_kind: { type: 'string', description: 'Display hint for the harness kind (e.g. cursor). The server derives the real kind from the OAuth client.' },
     },
     required: ['project'],
     additionalProperties: false,
@@ -33,7 +32,6 @@ const toolSeatSelect: ToolSpec = {
       folder: args.folder,
       thread: args.thread,
       squad: args.squad,
-      harness_kind: args.harness_kind,
     })
 
     if (result.ok) {
@@ -43,6 +41,7 @@ const toolSeatSelect: ToolSpec = {
         harness: result.harness,
         agent: result.agent,
         member_id: result.member_id,
+        seat_handle: result.seat_handle,
         audit_id: result.audit_id,
         note: result.note,
       })
@@ -74,7 +73,7 @@ const toolSeatSelect: ToolSpec = {
           'You do not hold admin on your own home squad, so a seat agent cannot be placed there. Ask an org admin to restore your home squad grant.',
         )
       case 'rate_limited':
-        return fail(403, result.error, result.detail)
+        return fail(429, result.error, result.detail)
       case 'seat_cap_reached':
         return fail(409, result.error, result.detail)
       case 'seat_agent_inactive':

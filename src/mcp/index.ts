@@ -48,6 +48,8 @@ import {
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
+import { applySeatHandle, SEAT_HANDLE_PREFIX } from '../members/seat-handle'
+import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import {
   getOrCreateAgentSession,
@@ -289,16 +291,47 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 // JSON blob for a memberId that must still pass the live token liveness check inside
 // buildAuthContextFromProps — the header alone cannot elevate privileges.
 
+/** mupot#1794 W2: request-borne seat inputs that live in the JSON-RPC body (`params._meta`,
+ *  `params.arguments._meta`). Header inputs are read from `c` directly. */
+interface SeatBodyMeta {
+  /** The curated profile door: never resolves a seat handle (it stays the human's own view). */
+  skipSeat?: boolean
+  paramsMeta?: unknown
+  argsMeta?: unknown
+}
+
+/** `X-Mupot-Seat` is BOTH the legacy cosmetic seat label (ctx.seat) and, with SEAT_AUTO_ENROLL on,
+ *  the carrier of a seat handle. A value shaped like a handle is a SELECTOR: it must never be echoed
+ *  into enroll URLs, session labels or receipts as if it were a label. Flag off: unchanged. */
+function seatLabelHeader(env: Pick<Env, 'SEAT_AUTO_ENROLL'>, raw: string | undefined): string | undefined {
+  if (raw !== undefined && seatAutoEnrollEnabled(env) && raw.trim().startsWith(SEAT_HANDLE_PREFIX)) return undefined
+  return raw
+}
+
+/** True when the request carries a seat handle by either carrier (prefixed header, or `_meta`). */
+function requestPresentsSeatHandle(
+  c: { req: { header: (name: string) => string | undefined } },
+  params: unknown,
+): boolean {
+  if ((c.req.header('x-mupot-seat') ?? '').trim().startsWith(SEAT_HANDLE_PREFIX)) return true
+  const p = typeof params === 'object' && params !== null ? params as Record<string, unknown> : {}
+  return extractMetaFacts(p._meta).metaSeat !== null
+}
+
 async function resolveAuth(c: {
   req: {
     header: (name: string) => string | undefined
   }
   env: Env
-}): Promise<AuthContext | null> {
+}, bodyMeta?: SeatBodyMeta): Promise<AuthContext | null> {
   const injected = c.req.header(AUTH_CONTEXT_HEADER)
   if (injected) {
     try {
       const auth = JSON.parse(injected) as AuthContext
+      // mupot#1794 W2: seat state is derived HERE, per request, from a presented handle. A blob that
+      // already claims it is forged (the OAuth handler never sets it): drop it unconditionally.
+      delete auth.seatBinding
+      delete auth.seatInputs
       // Validate the minimal invariants we require before accepting the injected context.
       if (typeof auth.userId === 'string' && typeof auth.tenant === 'string') {
         // Boundary re-resolve (post-#266 hardening): the OAuth-convergence fix in
@@ -409,13 +442,46 @@ async function resolveAuth(c: {
         } else {
           auth.tokenId = null
         }
-        return auth
+        return await resolveSeatSession(c, auth, bodyMeta)
       }
     } catch {
       // Malformed internal header — fall through to authenticateMember.
     }
   }
   return authenticateMember(c)
+}
+
+// mupot#1794 W2 — the ONE place a presented seat handle turns the human's unbound directory grant
+// into the seat agent's context (applySeatHandle holds all the checks; this just gathers inputs).
+// Flag off, or any non-(unbound directory + harness) context: returns `auth` untouched and reads
+// nothing — legacy agent-bound grants and workspace keys never reach the handle.
+async function resolveSeatSession(
+  c: { req: { header: (name: string) => string | undefined }; env: Env },
+  auth: AuthContext,
+  bodyMeta?: SeatBodyMeta,
+): Promise<AuthContext> {
+  if (!seatAutoEnrollEnabled(c.env) || bodyMeta?.skipSeat) return auth
+  if (auth.channel !== 'directory' || auth.boundAgentId || !auth.harnessId) return auth
+  const paramsFacts = extractMetaFacts(bodyMeta?.paramsMeta)
+  const argsFacts = extractMetaFacts(bodyMeta?.argsMeta)
+  const headerSeat = c.req.header('x-mupot-seat')?.trim() || null
+  const metaSeat = paramsFacts.metaSeat ?? argsFacts.metaSeat
+  const facts = {
+    openaiSession: paramsFacts.openaiSession ?? argsFacts.openaiSession,
+    openaiSubject: paramsFacts.openaiSubject ?? argsFacts.openaiSubject,
+    codexThreadId: paramsFacts.codexThreadId ?? argsFacts.codexThreadId,
+  }
+  // Step-0 observability: presence + hashes only, sampled, never raw, never fails the request.
+  await maybeEmitHarnessIdentityProbe(c.env, auth.tokenId ?? auth.userId, {
+    headerSeat,
+    metaSeat,
+    ...facts,
+    metaKeys: paramsFacts.metaKeys,
+    clientInfoName: paramsFacts.clientInfoName,
+    hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
+    protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
+  })
+  return applySeatHandle(c.env, auth, { headerHandle: headerSeat, metaHandle: metaSeat, hints: hintsFrom(facts) })
 }
 
 // ── member memory scope ──────────────────────────────────────────────────────
@@ -647,7 +713,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 500 | 502 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -6072,14 +6138,18 @@ async function buildIdentityReceipt(
 ): Promise<Record<string, unknown>> {
   const boundAgentId = auth.boundAgentId ?? null
   const consented = auth.channel === 'directory' && boundAgentId !== null
-  const bindingSource: 'legacy_consent' | 'workspace_token' | 'none' =
-    boundAgentId === null ? 'none' : consented ? 'legacy_consent' : 'workspace_token'
+  // mupot#1794 W2: a seat-handle session is bound by the SERVER (applySeatHandle set seatBinding);
+  // it is distinct from a legacy /oauth/consent binding even though both are directory + bound.
+  const seat = boundAgentId !== null ? auth.seatBinding ?? null : null
+  const bindingSource: 'seat_handle' | 'legacy_consent' | 'workspace_token' | 'none' =
+    boundAgentId === null ? 'none' : seat ? 'seat_handle' : consented ? 'legacy_consent' : 'workspace_token'
   // The human: the unbound directory seat IS the human's member; a consent-bound seat records the
   // consenting human separately; an agent-bound workspace key has no human in the token.
   const humanMemberId = boundAgentId === null ? (auth.memberId ?? null) : (auth.consentedByMemberId ?? null)
 
-  const harnessRow = auth.memberId && auth.harnessId && boundAgentId === null
-    ? await loadHarness(env, auth.memberId, auth.harnessId).catch(() => null)
+  const harnessOwner = seat ? seat.humanMemberId : boundAgentId === null ? (auth.memberId ?? null) : null
+  const harnessRow = harnessOwner && auth.harnessId
+    ? await loadHarness(env, harnessOwner, auth.harnessId).catch(() => null)
     : null
 
   const agentRow = boundAgentId
@@ -6127,6 +6197,12 @@ async function buildIdentityReceipt(
       scopes: grants.slice(0, 20).map((g) => ({ scope_type: g.scope_type, scope_id: g.scope_id, capability: g.capability })),
     },
     seat_label_conflict: conflict,
+    // W2: the seat the SERVER bound this request to (null = none), and what the request presented.
+    // Hints are presence booleans only: openai/session, openai/subject and Codex threadId never
+    // select a seat. seat_handle_rejected = a handle was presented and did NOT resolve.
+    seat: seat ? { id: seat.seatId, label: seat.label } : null,
+    hints: auth.seatInputs?.hints ?? { openai_session: false, openai_subject: false, codex_thread_id: false },
+    seat_handle_rejected: auth.seatInputs?.handleRejected ?? false,
   }
 }
 
@@ -6875,6 +6951,12 @@ export async function invokeTool(
   const spec = TOOL_BY_NAME.get(toolName)
   if (!spec) return { ...fail(400, 'unknown_tool', toolName), tool: toolName }
 
+  // mupot#1794: a flag-gated tool refuses BEFORE args handling and schema validation, so a flag-off
+  // pot never reveals the tool's argument schema through an invalid_args response.
+  if (SEAT_FLAG_TOOLS.has(spec.name) && !seatAutoEnrollEnabled(env)) {
+    return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
+  }
+
   let args: Record<string, unknown>
   if (argsValue === undefined || argsValue === null) {
     args = {}
@@ -7043,7 +7125,7 @@ async function handleJsonRpc(
   if (method === 'tools/list') {
     if (profile === 'needs-you') {
       // The profile never discloses the registry to an unauthenticated caller (mupot#1609).
-      const profileAuth = await resolveAuth(c)
+      const profileAuth = await resolveAuth(c, { skipSeat: true })
       if (!profileAuth || profileAuth.tenant !== c.env.TENANT_SLUG) {
         return rpcError(id, -32001, 'unauthenticated', undefined, 401)
       }
@@ -7055,12 +7137,22 @@ async function handleJsonRpc(
   }
 
   if (method === 'tools/call') {
-    const auth = await resolveAuth(c)
+    const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+    // mupot#1794 W2: `_meta` on the call (params._meta, or a `_meta` argument) can carry a seat handle
+    // and harness hints. Read-only here; resolveAuth decides (flag-gated) what, if anything, it means.
+    const argsObject = typeof params.arguments === 'object' && params.arguments !== null && !Array.isArray(params.arguments)
+      ? params.arguments as Record<string, unknown>
+      : null
+    // The curated profile door never carries a seat handle: it stays the human's own read-only view.
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
-
-    const params = typeof body.params === 'object' && body.params !== null ? body.params as Record<string, unknown> : {}
+    // With the flag on, a `_meta` ARGUMENT is transport metadata, not a tool argument: strip it so
+    // the tool's own (additionalProperties:false) schema never sees it. Flag off: untouched.
+    const toolArguments = profile === undefined && seatAutoEnrollEnabled(c.env) && argsObject !== null && '_meta' in argsObject
+      ? Object.fromEntries(Object.entries(argsObject).filter(([k]) => k !== '_meta'))
+      : params.arguments
     // Profile allowlist: refuse BEFORE invokeTool, regardless of the caller's capabilities.
     // Authentication above still comes first (401 for an anonymous caller, never a probe of
     // which names are allowlisted).
@@ -7080,12 +7172,12 @@ async function handleJsonRpc(
       origin: new URL(c.req.url).origin,
       transport: 'mcp',
       waitUntil: safeWaitUntil(c),
-      seat: c.req.header('x-mupot-seat'),
+      seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
       source: c.req.header('x-mupot-source'),
       // Profile mode = no session side effects (see ToolCtx.sideEffectFree).
       ...(profile === 'needs-you' ? { sideEffectFree: true } : {}),
     }
-    const outcome = await invokeTool(auth, c.env, params.name, params.arguments, ctx)
+    const outcome = await invokeTool(auth, c.env, params.name, toolArguments, ctx)
     if (outcome.ok) return ok(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     // mupot#1667: a tool-level refusal is an EXECUTION error, not a transport/protocol error. Per the
@@ -7116,7 +7208,10 @@ async function handleJsonRpc(
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
   // an unknown method, and no auth/DB work happens at all.
   if (EVENTS_METHODS.has(method) && eventsOn) {
-    const auth = await resolveAuth(c)
+    // mupot#1794 W2: events never resolve a seat handle. A subscription stores its principal and its
+    // liveness never re-checks a handle or the human's grant token, so a seat session must not be able
+    // to mint one; the call is evaluated as the human's own (unbound) session.
+    const auth = await resolveAuth(c, { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -7150,6 +7245,11 @@ async function handleJsonRpc(
     // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on, on the
     // full /mcp door (never the profile door), and an authenticated caller; the handlers refuse
     // unbound / zero-capability sessions themselves.
+    if (method === 'events/subscribe' && seatAutoEnrollEnabled(c.env) && requestPresentsSeatHandle(c, body.params)) {
+      return rpcError(id, -32602, 'seat_session_events_unsupported', {
+        reason: 'events subscriptions are not available to a seat-handle session; call events/subscribe without the seat handle',
+      }, 403)
+    }
     const floorOk = callerFloorOk(auth, hasWorkspaceAdmin(auth))
     const out = method === 'events/subscribe'
       ? await eventsSubscribe(c.env, auth, floorOk, body.params)
@@ -7223,7 +7323,9 @@ mcpApp.post('/', async (c) => {
 
   if (isJsonRpcRequest(body)) return handleJsonRpc(c, body)
 
-  const auth = await resolveAuth(c)
+  // The legacy {tool,args} body has no _meta and is not a seat-handle door: skipSeat keeps it the
+  // human's own session even if a handle header is present.
+  const auth = await resolveAuth(c, { skipSeat: true })
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
   if (auth.tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)
@@ -7233,7 +7335,7 @@ mcpApp.post('/', async (c) => {
     origin: new URL(c.req.url).origin,
     transport: 'mcp',
     waitUntil: safeWaitUntil(c),
-    seat: c.req.header('x-mupot-seat'),
+    seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
     source: c.req.header('x-mupot-source'),
   }
   const outcome = await invokeTool(auth, c.env, body.tool, body.args, ctx)
@@ -7391,7 +7493,7 @@ mcpActionsApp.post('/actions/:tool', async (c) => {
     origin: new URL(c.req.url).origin,
     transport: 'rest',
     waitUntil: safeWaitUntil(c),
-    seat: c.req.header('x-mupot-seat'),
+    seat: seatLabelHeader(c.env, c.req.header('x-mupot-seat')),
     source: c.req.header('x-mupot-source'),
   }
   const outcome = await invokeTool(auth, c.env, c.req.param('tool'), args, ctx)

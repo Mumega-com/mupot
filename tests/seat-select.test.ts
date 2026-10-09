@@ -496,10 +496,9 @@ describe('seat key normalisation', () => {
     expect(await hash({ project: 'p', folder: '/a/b' }, 'm1', 'h2')).not.toBe(base) // other harness
   })
 
-  it('project and squad are case-insensitive; thread is not; harness_kind is a hint, not key material', async () => {
+  it('project and squad are case-insensitive; thread is not', async () => {
     expect(await hash({ project: 'MuPot', squad: 'Core' })).toBe(await hash({ project: 'mupot', squad: 'core' }))
     expect(await hash({ project: 'p', thread: 'T' })).not.toBe(await hash({ project: 'p', thread: 't' }))
-    expect(await hash({ project: 'p', harness_kind: 'cursor' })).toBe(await hash({ project: 'p', harness_kind: 'grok' }))
   })
 
   it('NFC-equivalent strings are one key', async () => {
@@ -890,7 +889,8 @@ describe('creation throttle and display-name hygiene', () => {
     const hid = await harnessFor(env, HUMAN, 'client-evil', 'River <script>\nKasra')
     const out = await seatSelect(env, authFor(HUMAN, hid), { project: 'proj', folder: '/x/y' })
     if (!out.ok) throw new Error(JSON.stringify(out))
-    expect(out.agent.name.startsWith('member-human-1 · ')).toBe(true)
+    expect(out.agent.name.startsWith('Human member-human-1 · ')).toBe(true)
+    expect(out.agent.name).not.toContain('@')
     expect(out.agent.name).not.toMatch(/[<>\n]/)
     expect(out.agent.name.length).toBeLessThanOrEqual(120)
   })

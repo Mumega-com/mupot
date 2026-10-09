@@ -316,6 +316,9 @@ export interface Env {
   // total no-op. SEAT_MAX_PER_MEMBER caps live seats per human (default 16, clamped 1..256).
   SEAT_AUTO_ENROLL?: string
   SEAT_MAX_PER_MEMBER?: string
+  // mupot#1794 W2: LIFETIME bound on agent_seats rows per member, retired/inactive included
+  // (migration 0199 trigger; default 64, clamped 1..4096). Atomic and fail-closed.
+  SEAT_MAX_TOTAL_PER_MEMBER?: string
   STUDIO_DISPATCH_MEMBER_LIMIT?: string
   STUDIO_DISPATCH_REPO_LIMIT?: string
   STUDIO_DISPATCH_WINDOW_MINUTES?: string
@@ -715,6 +718,14 @@ export interface AuthContext {
    * harnesses row (tenant + member + id) live before use. Absent on every other session.
    */
   harnessId?: string | null
+  /**
+   * mupot#1794 W2: set ONLY by applySeatHandle (src/members/seat-handle.ts) when a valid seat handle
+   * turned the human's grant into the seat agent's context. Server-derived on every request;
+   * resolveAuth deletes any such field arriving in the internal header blob.
+   */
+  seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string }
+  /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */
+  seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean } }
   webSessionIdHash?: string | null
   webSessionMemberId?: string
 }
