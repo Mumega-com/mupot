@@ -131,11 +131,23 @@ describe('flight task validators refuse an archived task (mupot#1496)', () => {
           VALUES ('run-1', '${TENANT}', 'proj-1', 'routine-1', 1, '{}', 'manual:1', 'manual', 'observing', '2026-07-19T12:00:00.000Z', '2026-07-19T12:00:00.000Z');
       `)
       const opts = { routineRunFence: { runId: 'run-1', tenant: TENANT } }
-      await expect(createFlight(env, { agent: 'a', goal: 'g', meta: meta(['task-dead']) }, opts))
+      // control: a live task passes the fence (proves the fixture satisfies the fence, so a refusal below is the ARCHIVE guard)
+      const ok = await createFlight(env, { agent: 'a', goal: 'g', project_id: 'proj-1', meta: meta(['task-live']) }, opts)
+      expect(harness.sqlite.prepare('SELECT id FROM flights WHERE id = ?').get(ok)).toEqual({ id: ok })
+      // task archived between the validators and the fenced INSERT
+      const realPrepare = harness.db.prepare.bind(harness.db)
+      let armed = true
+      harness.db.prepare = ((sql: string) => {
+        if (armed && sql.includes('INSERT INTO flights')) {
+          armed = false
+          harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status, created_at)
+            VALUES ('task-live', datetime('now'), 'race', 'mem-1', 'open', datetime('now'))`)
+        }
+        return realPrepare(sql)
+      }) as typeof harness.db.prepare
+      await expect(createFlight(env, { agent: 'a', goal: 'g', project_id: 'proj-1', meta: meta(['task-live']) }, opts))
         .rejects.toMatchObject(new FlightProjectError('task_archived'))
-      expect(flightCount()).toEqual({ n: 0 })
-      const id = await createFlight(env, { agent: 'a', goal: 'g', project_id: 'proj-1', meta: meta(['task-live']) }, opts)
-      expect(harness.sqlite.prepare('SELECT id FROM flights WHERE id = ?').get(id)).toEqual({ id })
+      expect(flightCount()).toEqual({ n: 1 })
     })
 
     it('a live task id still creates the flight (guard is not over-broad)', async () => {
