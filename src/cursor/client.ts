@@ -248,6 +248,11 @@ async function cursorRequest(token: string, path: string, init: RequestInit = {}
     }
   }
 
+  // #1762 P3: with redirect:'manual' (create POST) a 3xx means the request may have been applied and a follow would have
+  // rewritten POST->GET / stripped auth, so a later 4xx proves nothing. 502 is not a clean refusal -> maybe_launched.
+  if (init.redirect === 'manual' && response.status >= 300 && response.status < 400) {
+    throw new CursorApiError(502, 'cursor_unexpected_redirect', `Cursor returned redirect ${response.status}`)
+  }
   if (!response.ok) {
     throw parseErrorBody(body, response.status)
   }
@@ -275,6 +280,7 @@ export async function createCursorAgent(
 
   const body = await cursorRequest(token, '/agents', {
     method: 'POST',
+    redirect: 'manual',
     body: JSON.stringify(payload),
   })
   return parseAgentResult(body)

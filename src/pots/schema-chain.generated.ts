@@ -3502,9 +3502,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_harness_capacity_received" },
     ],
   },
+  {
+    file: "0197_studio_dispatch_slots.sql",
+    sha256: "e0ad24a9a0b1b302790b5a37b11d21e819e207ffe98b2e6db0d9b79b3cd17ed0",
+    statements: [
+      "-- 0197_studio_dispatch_slots.sql — mupot#1762 (a). Studio dispatch (member floor) can launch a real Cursor agent against a\n-- member-chosen repoUrl; a maybe-launched / launched flight HOLDs that repo's clearance for 60-84 min. This table is the\n-- atomic per-actor bound: a slot is reserved by ONE conditional INSERT...SELECT (count-in-window < limit) BEFORE the\n-- external launch, so concurrent requests cannot both pass a read-then-write check. state: reserved (launch in flight),\n-- launched (agent exists), maybe (POST may have reached Cursor). A clean refusal / no-launch deletes the slot; leaked\n-- 'reserved' slots age out of the window. Additive; no backfill.\nCREATE TABLE IF NOT EXISTS studio_dispatch_slots (\n  id         TEXT PRIMARY KEY,\n  member_key TEXT NOT NULL,\n  repo_key   TEXT NOT NULL,\n  state      TEXT NOT NULL CHECK (state IN ('reserved','launched','maybe')),\n  created_at INTEGER NOT NULL\n);",
+      "\nCREATE INDEX IF NOT EXISTS idx_studio_slots_member ON studio_dispatch_slots (member_key, created_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_studio_slots_repo ON studio_dispatch_slots (repo_key, state, created_at);",
+    ],
+    objects: [
+      { type: "table", name: "studio_dispatch_slots" },
+      { type: "index", name: "idx_studio_slots_member" },
+      { type: "index", name: "idx_studio_slots_repo" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "17ffe63dd913466209d320be408c404c5ba25fbc54fa8675a4dd0e12c181f31d"
+export const SCHEMA_CHAIN_DIGEST: string = "e3fe7be20c5aad75ec832779b68c391b8b8140c42635be1e5f7f52f1c727699f"

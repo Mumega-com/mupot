@@ -12,6 +12,7 @@
 // launches a Cursor Cloud agent. Chat is always-on: admin/owner sessions
 // get full tool-calling; member / guest sessions stay read-only.
 
+import { reserveStudioSlot, settleStudioSlot, type StudioSlot } from './studio-limits'
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
@@ -182,7 +183,7 @@ export async function dispatchStudioFlight(
   env: Env,
   auth: AuthContext,
   input: StudioDispatchInput,
-): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 409; error: string }> {
+): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 409 | 429; error: string }> {
   const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : ''
   if (!prompt) return { ok: false, status: 400, error: 'prompt_required' }
 
@@ -201,8 +202,15 @@ export async function dispatchStudioFlight(
   let cursor: { agent_id: string; run_id: string; agent_url: string } | null = null
   let cursorMaybeLaunched = false
   const token = model === 'cursor-cloud' ? resolveCursorApiToken(env) : null
+  let slot: StudioSlot | null = null
   if (token && repoUrl) {
+    // #1762 (a): atomic per-member / per-repo bound BEFORE the external launch (a launched / maybe-launched flight HOLDs
+    // the repo for 60-84 min, and any member can pick the repo). Fails closed with 429.
+    const reserved = await reserveStudioSlot(env, auth.memberId ?? auth.userId, repoUrl)
+    if (!reserved.ok) return { ok: false, status: 429, error: reserved.error }
+    slot = reserved.slot
     const outcome = await launchCursorAgent(token, { name: title, repoUrl, prompt: launchedPrompt })
+    await settleStudioSlot(env, slot, outcome.state === 'launched' ? 'launched' : outcome.state === 'maybe_launched' ? 'maybe' : 'released')
     if (outcome.state === 'launched') {
       cursor = {
         agent_id: outcome.result.agent.id,
