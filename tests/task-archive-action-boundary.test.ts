@@ -147,13 +147,25 @@ function stringLiterals(src: string): Array<{ text: string; start: number }> {
   return out
 }
 
+/** SQL/JS comments removed, so a guard token that only appears inside a comment cannot satisfy a guard check (#1780). */
+export function stripComments(sql: string): string {
+  return sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ')
+}
+
+/** True only when the guard call appears in live (non-comment) text of the statement. */
+export function hasArchiveGuard(statement: string): boolean {
+  return stripComments(statement).includes('TASK_NOT_ARCHIVED_SQL(')
+}
+
 /** Writers of `tasks` found in a source text: `UPDATE [OR x] tasks`, case-insensitive, inside a literal only. Each site's
  *  statement runs from the match to the next `UPDATE tasks` match or the end of its literal. */
 export function findTaskUpdateSitesIn(src: string, file: string): TaskUpdateSite[] {
   const sites: TaskUpdateSite[] = []
   for (const lit of stringLiterals(src)) {
     // `SET` is required: it separates a statement from prose such as tool-annotations' "UPDATE tasks (service.ts:540)".
-    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?"?tasks"?\s+SET\b/gi
+    // Accepts the quoting/qualifier/alias spellings SQLite allows for the same table: tasks, "tasks", `tasks`,
+    // [tasks], main.tasks / temp."tasks", and `tasks AS t` / `tasks t` (#1780). Not covered (see PR body): INDEXED BY.
+    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?(?:(?:main|temp)\s*\.\s*)?(?:"tasks"|`tasks`|\[tasks\]|tasks)(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\b/gi
     const matches = [...lit.text.matchAll(re)]
     matches.forEach((m, idx) => {
       const from = m.index ?? 0
@@ -231,7 +243,7 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
 
   it('no unguarded, un-allowlisted UPDATE tasks', () => {
     const offenders = sites.filter((site) => {
-      if (site.statement.includes('TASK_NOT_ARCHIVED_SQL(')) return false
+      if (hasArchiveGuard(site.statement)) return false
       return !UNARCHIVED_UPDATE_ALLOWLIST.some((e) => e.file === site.file && site.statement.includes(e.contains))
     })
     expect(
@@ -250,7 +262,7 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
   it('an allowlisted statement never also needs the guard (entries do not hide guarded writers)', () => {
     for (const entry of UNARCHIVED_UPDATE_ALLOWLIST) {
       const s = sites.find((x) => x.file === entry.file && x.statement.includes(entry.contains))
-      expect(s?.statement.includes('TASK_NOT_ARCHIVED_SQL(')).toBe(false)
+      expect(s !== undefined && hasArchiveGuard(s.statement)).toBe(false)
     }
   })
 
@@ -279,7 +291,7 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
       const src = readFileSync(join(__dirname, '..', claim.file), 'utf8')
       const lits = stringLiterals(src).filter((l) => claim.marker.test(l.text))
       expect(lits.length, `${claim.effect}: claim statement not found in ${claim.file}`).toBeGreaterThan(0)
-      for (const lit of lits) expect(lit.text, `${claim.effect} claim is unguarded`).toContain('TASK_NOT_ARCHIVED_SQL(')
+      for (const lit of lits) expect(hasArchiveGuard(lit.text), `${claim.effect} claim is unguarded`).toBe(true)
     }
   })
 
@@ -296,7 +308,36 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
     const src = readFileSync(join(SRC_DIR, 'mcp', 'index.ts'), 'utf8')
     const lits = stringLiterals(src).filter((l) => l.text.includes('INSERT INTO task_dispatch_receipts'))
     expect(lits.length).toBe(1)
-    expect(lits[0].text).toContain('TASK_NOT_ARCHIVED_SQL(')
+    expect(hasArchiveGuard(lits[0].text)).toBe(true)
+  })
+
+  it('lexer hardening (#1780): alias / qualified / quoted spellings are flagged; a guard token in a comment does not count', () => {
+    const spellings = [
+      'UPDATE tasks AS t SET status = 1 WHERE t.id = ?',
+      'UPDATE tasks t SET status = 1 WHERE t.id = ?',
+      'UPDATE main.tasks SET status = 1',
+      'UPDATE main . tasks AS t SET status = 1',
+      'UPDATE temp."tasks" SET status = 1',
+      'UPDATE [tasks] SET status = 1',
+      'UPDATE "tasks" SET status = 1',
+      'UPDATE `tasks` SET status = 1',
+      'UPDATE OR IGNORE main.tasks AS t SET status = 1',
+    ]
+    for (const sql of spellings) {
+      expect(findTaskUpdateSitesIn(`db.prepare('${sql}')`, 'p.ts'), sql).toHaveLength(1)
+    }
+    // near-misses that must NOT be flagged (other tables / prose without SET)
+    for (const sql of ['UPDATE tasks_archive_state SET x = 1', 'UPDATE mytasks SET x = 1', 'UPDATE task_verdicts SET x = 1']) {
+      expect(findTaskUpdateSitesIn(`db.prepare('${sql}')`, 'p.ts'), sql).toHaveLength(0)
+    }
+    // guard only inside a comment is NOT a guard
+    const commented = findTaskUpdateSitesIn("db.prepare(`UPDATE tasks SET a = 1 WHERE id = ? -- ${TASK_NOT_ARCHIVED_SQL()}`)", 'c.ts')[0]
+    expect(hasArchiveGuard(commented.statement)).toBe(false)
+    const blockCommented = findTaskUpdateSitesIn("db.prepare(`UPDATE tasks SET a = 1 /* ${TASK_NOT_ARCHIVED_SQL()} */ WHERE id = ?`)", 'c.ts')[0]
+    expect(hasArchiveGuard(blockCommented.statement)).toBe(false)
+    // a real guard still counts, and a guard on a following line after an unrelated comment still counts
+    const real = findTaskUpdateSitesIn("db.prepare(`UPDATE tasks AS t SET a = 1 -- note\n WHERE ${TASK_NOT_ARCHIVED_SQL('t')}`)", 'r.ts')[0]
+    expect(hasArchiveGuard(real.statement)).toBe(true)
   })
 })
 
