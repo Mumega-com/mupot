@@ -124,6 +124,7 @@ describe('1. a flight whose tasks are all done lands, it is not failed by the st
     const T = '2026-10-09T00:00:00.000Z'
     h.sqlite.exec(`
       INSERT INTO projects (id, slug, name, status) VALUES ('project-r','project-r','R','active');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('project-r','${SQUAD}','write');
       INSERT INTO routines (id, tenant, project_id, name, objective, status, trigger_kind, run_once_at,
         cron_expression, timezone, next_run_at, overlap_policy, execution_mode, responsible_squad_id,
         budget_micro_usd, max_attempts, retry_backoff_seconds, max_occurrences, revision, enabled_by,
