@@ -624,6 +624,9 @@ export async function loadScopeNames(env: Env, agents: ConsentableAgent[]): Prom
   return names
 }
 
+/** Form value of the W3 harness consent option (mupot#1794). Never an agent id: it cannot collide with one, and memberMayConsentToAgent refuses it as an agent id. */
+const HARNESS_CONSENT_VALUE = '__harness__'
+
 /**
  * Renders the consent screen — the only thing a person reads before a token is
  * minted, and therefore the surface where "what am I granting?" must be
@@ -680,6 +683,9 @@ function renderConsentPage(
   agentsListed = true,
   squads: ConsentableSquad[] = [],
   scopeNames: ScopeNames = { squads: new Map(), departments: new Map(), org: '' },
+  // mupot#1794 W3: true ONLY when SEAT_AUTO_ENROLL === '1' (the caller decides). False renders the
+  // page byte-identically to before this option existed.
+  harnessOption = false,
 ): Response {
   const rows = agents.map((a) => {
     const groups = summarizeGrants(a.capabilities, scopeNames)
@@ -768,6 +774,22 @@ function renderConsentPage(
           </div>
         </label>` : `
         <p class="empty-hint">You do not hold admin on any squad, so you cannot create a new seat here. Ask someone who administers the squad to create it, then reconnect.</p>`
+
+  // mupot#1794 W3 — the harness option. Posts the sentinel `__harness__`, which the consent handler
+  // maps (flag on only) onto the EXISTING unbound path: no agent bound, a harness row upserted, and
+  // each thread/worktree then picks its own agent through seat_select. Nothing here grants authority.
+  const harnessPanel = harnessOption ? `
+    <p class="panel-title">Let each thread pick its own agent</p>
+    <div class="panel" id="p-harness">
+      <label class="agent-option harness-option">
+        <input type="radio" name="agent_id" value="${HARNESS_CONSENT_VALUE}" required data-label="Me — auto per workspace (harness)" data-top="member capability, capped at your own access">
+        <div class="opt-body">
+          <div class="agent-title"><strong>Me — auto per workspace (harness)</strong></div>
+          <div class="agent-meta">Recommended for a coding tool or chat app you use across several projects. This connection is not tied to one agent. Each thread or worktree picks its own agent by calling <code>seat_select</code> and gets a seat handle to send with later requests. Until a thread does that, it has no agent and no standing capability. Each seat agent is capped at member level, and your own access is always the ceiling: a seat can never do more than you can.</div>
+        </div>
+      </label>
+    </div>
+` : ''
 
   const html = `<!doctype html>
 <html lang="en">
@@ -877,12 +899,12 @@ function renderConsentPage(
   <input type="hidden" name="consent_nonce" value="${escapeHtml(consentNonce)}">
 
   <div class="tabbar" role="tablist">
-    <button type="button" class="tab" role="tab" data-panel="p-existing" aria-selected="true">Existing agent${agents.length > 0 ? ` (${agents.length})` : ''}</button>
+    ${harnessOption ? '<button type="button" class="tab" role="tab" data-panel="p-harness" aria-selected="true">Me (auto)</button>\n    ' : ''}<button type="button" class="tab" role="tab" data-panel="p-existing" aria-selected="${harnessOption ? 'false' : 'true'}">Existing agent${agents.length > 0 ? ` (${agents.length})` : ''}</button>
     <button type="button" class="tab" role="tab" data-panel="p-new" aria-selected="false">New agent</button>
     <button type="button" class="tab" role="tab" data-panel="p-none" aria-selected="false">No agent</button>
   </div>
 
-  <div class="panels" id="panels">
+  <div class="panels" id="panels">${harnessPanel}
     <div class="panel" id="p-existing">
       ${agentsListed && agents.length === 0 && !canOfferFirstAgent ? EMPTY_STATE_HINT : ''}
       ${canOfferFirstAgent ? '<p class="empty-hint">You do not have an agent yet. Open <strong>New agent</strong> to name your first one and continue in one step.</p>' : ''}
@@ -904,7 +926,7 @@ ${mintPanel}
         <input type="radio" name="agent_id" value="" required data-label="no agent" data-top="no standing capability">
         <div class="opt-body">
           <div class="agent-title"><strong>Continue unbound</strong></div>
-          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.</div>
+          <div class="agent-meta">Zero standing capabilities. Read-only directory queries.${harnessOption ? ' This connection cannot pick seat agents; choose &ldquo;Me (auto)&rdquo; for that.' : ''}</div>
         </div>
       </label>
     </div>
@@ -982,9 +1004,9 @@ ${mintPanel}
   })
   // Land on the tab that actually has something in it. A newcomer whose only
   // option is to create their first agent should not have to find that tab.
-  selectTab(document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
+  selectTab(${harnessOption ? `'p-harness'` : `document.querySelector('#p-new .first-run') && !document.querySelector('#p-existing .agent-option')
     ? 'p-new'
-    : 'p-existing')
+    : 'p-existing'`})
 
   // The required attribute is correct in the markup: with no scripting every panel is
   // visible, so the browser can enforce it and focus whatever is invalid. Once
@@ -1018,7 +1040,16 @@ ${mintPanel}
 </body>
 </html>`
 
-  return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+  // Clickjacking: this page mints a grant on one click, so nothing may frame it. Nothing legitimate
+  // does (it is a top-level OAuth redirect target). Flag-independent: a frame header is not W3 behaviour.
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Frame-Options': 'DENY',
+      'Content-Security-Policy': "frame-ancestors 'none'",
+    },
+  })
 }
 
 // ── resolveExternalToken — called by OAuthProvider for non-owned bearers ──────
@@ -1539,7 +1570,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // loader, so a naming outage degrades the wording and never the disclosure.
     const scopeNames = await loadScopeNames(env, agents)
 
-    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames)
+    const page = renderConsentPage(consentNonce, googleUser.email, agents, agentsListed, squads, scopeNames, seatAutoEnrollEnabled(env))
     // B3-style: bind the consent nonce to this browser. Clears the earlier
     // google-callback CSRF cookie (its job is done) and sets the consent one,
     // scoped to the /oauth/consent path only.
@@ -1566,7 +1597,13 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     if (action === 'continue' && !form.has('agent_id')) {
       return new Response('Missing agent_id: explicit consent choice is required', { status: 400 })
     }
-    const agentIdRaw = String(form.get('agent_id') ?? '').trim()
+    let agentIdRaw = String(form.get('agent_id') ?? '').trim()
+    // mupot#1794 W3: the harness option is the EXISTING unbound path under another name. Flag on, the
+    // sentinel is normalised to '' here — before any other branch — so it reuses the unbound mint, the
+    // W1 harness upsert and every gate unchanged. Flag off the sentinel is left as-is and falls into
+    // the explicit-agent branch, where memberMayConsentToAgent rejects it (not a UUID of any agent).
+    const harnessChosen = agentIdRaw === HARNESS_CONSENT_VALUE && seatAutoEnrollEnabled(env)
+    if (harnessChosen) agentIdRaw = ''
 
     if (!consentNonce) return new Response('Missing consent_nonce', { status: 400 })
 
@@ -1893,7 +1930,10 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const oauthProvider = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER
 
-    // mupot#1794 W1 — harness upsert, UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
+    // mupot#1794 W1/W3 — harness upsert, ONLY for the explicit "Me — auto per workspace" choice (flag on).
+    // A plain "continue unbound" ('') stays a pure unbound grant with no harness, so it cannot seat_select.
+    // (W1 originally upserted for any unbound consent; W3 narrows that to an explicit choice.)
+    // Original W1 note: UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
     // off (prod default) this block is skipped entirely: no read, no write, and the props below
     // are semantically identical to before. An agent-bound consent (boundAgentId set: legacy / Rava /
     // __bootstrap__ / __mint_new__) never reaches it. Best-effort and non-fatal, same posture as
@@ -1901,7 +1941,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // The harness key is the OAuth client_id from the library-parsed authorize request
     // (pending.stored), never a form field; the client NAME is a display label only.
     let harnessId: string | null = null
-    if (seatAutoEnrollEnabled(env) && !boundAgentId) {
+    if (harnessChosen && !boundAgentId) {
       try {
         const clientId = typeof pending.stored.clientId === 'string' ? pending.stored.clientId : ''
         let clientName: unknown = ''

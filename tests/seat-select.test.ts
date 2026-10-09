@@ -600,10 +600,10 @@ async function consent(env: Env, agentId: string): Promise<Response> {
 describe('OAuth consent harness upsert', () => {
   afterEach(() => { vi.unstubAllGlobals() })
 
-  it('flag ON + unbound consent: harness row written, props.harnessId set, label from the OAuth client', async () => {
+  it('flag ON + explicit harness choice (__harness__): harness row written, props.harnessId set, label from the OAuth client', async () => {
     const p = stubOAuthProvider('Cursor')
     const env = httpEnv(p, { SEAT_AUTO_ENROLL: '1' })
-    const res = await consent(env, '')
+    const res = await consent(env, '__harness__')
     expect(res.status).toBe(302)
     const props = (p.completeAuthorization.mock.calls[0] as unknown as [{ props: Record<string, unknown> }])[0].props
     const row = h.sqlite.prepare(`SELECT * FROM harnesses`).all()
@@ -616,16 +616,25 @@ describe('OAuth consent harness upsert', () => {
   it('re-consent through the same client reuses the harness row (no duplicate)', async () => {
     const p = stubOAuthProvider('Cursor')
     const env = httpEnv(p, { SEAT_AUTO_ENROLL: '1' })
-    await consent(env, '')
-    await consent(env, '')
+    await consent(env, '__harness__')
+    await consent(env, '__harness__')
     expect(n(h, `SELECT COUNT(*) AS n FROM harnesses`)).toBe(1)
   })
 
   it('flag ON but the OAuth client has no lookup: harness still written (label empty)', async () => {
     const p = stubOAuthProvider(null)
     const env = httpEnv(p, { SEAT_AUTO_ENROLL: '1' })
-    expect((await consent(env, '')).status).toBe(302)
+    expect((await consent(env, '__harness__')).status).toBe(302)
     expect(h.sqlite.prepare(`SELECT client_name, kind FROM harnesses`).get()).toMatchObject({ client_name: '', kind: 'other' })
+  })
+
+  it('flag ON + plain "No agent" (empty): NO harness row, props carry no harnessId (W3 narrowing of W1)', async () => {
+    const p = stubOAuthProvider('Cursor')
+    const env = httpEnv(p, { SEAT_AUTO_ENROLL: '1' })
+    expect((await consent(env, '')).status).toBe(302)
+    const props = (p.completeAuthorization.mock.calls[0] as unknown as [{ props: Record<string, unknown> }])[0].props
+    expect('harnessId' in props).toBe(false)
+    expect(n(h, `SELECT COUNT(*) AS n FROM harnesses`)).toBe(0)
   })
 
   it('flag OFF: no harness read/write and props carry NO harnessId key at all (legacy shape)', async () => {
