@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import { parseAllDocuments, stringify } from 'yaml'
 import { PLUGIN_FILES, pluginBundleHash } from '../fleet-runtime/hermes-plugin-smoke.mjs'
 import { normalizeAgentProfile } from '../fleet-runtime/profile-contract.mjs'
@@ -276,7 +276,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('emits a redacted passing receipt for an immutable rendered DME deployment', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const policy = join(dir, 'network-policy.yaml')
     const config = join(dir, 'config.json')
@@ -344,7 +344,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('fails closed on mutable images, weakened policy, placeholders, and digest mismatch', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const mutable = buildKubernetesAgentHostReceipt({
       deploymentPath,
       networkPolicyPath,
@@ -375,7 +375,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('fails when the trusted Kubernetes key group differs from runtime GID 10000', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     writeFileSync(deployment, readFileSync(deploymentPath, 'utf8').replace('runAsGroup: 10000', 'runAsGroup: 20000'))
 
@@ -385,7 +385,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('fails when the Kubernetes inbox adds an unverified agent or legacy command', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const config = JSON.parse(readFileSync(configPath, 'utf8'))
     config.inbox.agents[0].command = 'sh -c unverified'
     config.inbox.agents.push({ agent_id: 'unverified-agent', command: 'true' })
@@ -403,7 +403,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('fails when the declared project differs from the enforced profile project', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const config = JSON.parse(readFileSync(configPath, 'utf8'))
     config.project_id = 'declared-project'
     config.inbox.agents[0].profile.allowed_project_ids = ['different-project']
@@ -421,7 +421,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('recursively rejects private JWKs and credential-bearing fields without exposing values', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const config = JSON.parse(readFileSync(configPath, 'utf8'))
     const privateScalar = 'private-scalar-must-not-appear'
     const passwordValue = 'password-value-must-not-appear'
@@ -456,7 +456,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
     ]
 
     for (const mutate of mutators) {
-      const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+      const dir = makeTempDir('mupot-k8s-agent-host-')
       const config = JSON.parse(readFileSync(configPath, 'utf8'))
       mutate(config)
       const configFile = join(dir, 'config.json')
@@ -467,7 +467,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('recursively rejects a private JWK in an extra rendered ConfigMap entry', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const privateScalar = 'rendered-private-scalar-must-not-appear'
     writeFileSync(
@@ -487,7 +487,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('recursively rejects an embedded private JWK in any rendered Kubernetes document', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const privateScalar = 'deployment-private-scalar-must-not-appear'
     writeFileSync(
@@ -505,7 +505,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('rejects unapproved container environment entries', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const secretScalar = 'opaque-environment-value-must-not-appear'
     writeFileSync(
@@ -535,7 +535,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
     ]
 
     for (const [index, mutate] of mutations.entries()) {
-      const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+      const dir = makeTempDir('mupot-k8s-agent-host-')
       const deployment = join(dir, 'deployment.yaml')
       writeFileSync(deployment, mutate(readFileSync(deploymentPath, 'utf8')))
       const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
@@ -556,7 +556,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
       ),
     ]
     for (const mutate of mutations) {
-      const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+      const dir = makeTempDir('mupot-k8s-agent-host-')
       const deployment = join(dir, 'deployment.yaml')
       writeFileSync(deployment, mutate(readFileSync(deploymentPath, 'utf8')))
       const receipt = buildKubernetesAgentHostReceipt({ deploymentPath: deployment, networkPolicyPath, configPath })
@@ -565,7 +565,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('fails when the DME Hermes home or plugin mount is removed', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     writeFileSync(
       deployment,
@@ -578,7 +578,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('rejects credential data in an additional rendered Kubernetes Secret', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const secretScalar = 'rendered-secret-value-must-not-appear'
     writeFileSync(
@@ -597,7 +597,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('normalizes camelCase credential field names in rendered annotations', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     const secretScalar = 'camel-case-secret-value-must-not-appear'
     writeFileSync(
@@ -615,7 +615,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('limits Kubernetes credential-field exemptions to their pod-spec paths', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     writeFileSync(
       deployment,
@@ -631,7 +631,7 @@ describe('Kubernetes Agent Host deployment contract', () => {
   })
 
   it('allows the service-account token field only when the pod spec disables it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mupot-k8s-agent-host-'))
+    const dir = makeTempDir('mupot-k8s-agent-host-')
     const deployment = join(dir, 'deployment.yaml')
     writeFileSync(
       deployment,

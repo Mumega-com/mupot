@@ -1,8 +1,8 @@
 import { generateKeyPairSync } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   APP_FILE,
   CHECK_RECEIPT_TYPE,
@@ -22,7 +22,7 @@ const INSTALLATION_ID = '789012'
 const integrationDocs = readFileSync(new URL('../docs/github-app-integration.md', import.meta.url), 'utf8')
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-github-app-permissions-'))
+  return makeTempDir('mupot-github-app-permissions-')
 }
 
 function writeApp(
@@ -37,7 +37,7 @@ function writeApp(
     html_url: 'https://github.com/apps/mupot',
     owner: { login: 'Mumega-com', id: 999, type: 'Organization' },
     permissions,
-  }, null, 2))
+  }, null, 2), { mode: 0o600 })
   writeFileSync(join(dir, INSTALLATION_FILE), JSON.stringify({
     id: Number(INSTALLATION_ID),
     app_id: 123456,
@@ -48,7 +48,7 @@ function writeApp(
     created_at: '2026-07-01T00:00:00.000Z',
     updated_at: '2026-07-10T00:00:00.000Z',
     suspended_at: null,
-  }, null, 2))
+  }, null, 2), { mode: 0o600 })
 }
 
 describe('GitHub App permissions receipt checker', () => {
@@ -167,7 +167,7 @@ describe('GitHub App permissions receipt checker', () => {
     const dir = tempDir()
     const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
     const privateKeyFile = join(dir, 'app-key.pem')
-    writeFileSync(privateKeyFile, privateKey.export({ format: 'pem', type: 'pkcs8' }).toString())
+    writeFileSync(privateKeyFile, privateKey.export({ format: 'pem', type: 'pkcs8' }).toString(), { mode: 0o600 })
     const calls: Array<{ url: string, auth: string }> = []
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       const requestedUrl = String(url)
@@ -402,7 +402,7 @@ describe('GitHub App permissions receipt checker', () => {
       id: 654321,
       slug: 'wrong-app',
       permissions: REQUIRED_APP_PERMISSIONS,
-    }, null, 2))
+    }, null, 2), { mode: 0o600 })
 
     const receipt = checkBundle({ outDir: dir, app: 'mupot', installationId: INSTALLATION_ID })
 
@@ -455,7 +455,7 @@ describe('GitHub App permissions receipt checker', () => {
     writeApp(dir)
     const installation = JSON.parse(readFileSync(join(dir, INSTALLATION_FILE), 'utf8'))
     installation.id = 42
-    writeFileSync(join(dir, INSTALLATION_FILE), JSON.stringify(installation, null, 2))
+    writeFileSync(join(dir, INSTALLATION_FILE), JSON.stringify(installation, null, 2), { mode: 0o600 })
 
     const receipt = checkBundle({ outDir: dir, app: 'mupot', installationId: INSTALLATION_ID })
 
@@ -474,7 +474,7 @@ describe('GitHub App permissions receipt checker', () => {
     const installation = JSON.parse(readFileSync(join(dir, INSTALLATION_FILE), 'utf8'))
     installation.access_tokens_url = 'https://api.github.test/installations/789012/access_tokens'
     installation.account.private_email = 'hidden@example.test'
-    writeFileSync(join(dir, INSTALLATION_FILE), JSON.stringify(installation, null, 2))
+    writeFileSync(join(dir, INSTALLATION_FILE), JSON.stringify(installation, null, 2), { mode: 0o600 })
 
     const receipt = checkBundle({ outDir: dir, app: 'mupot', installationId: INSTALLATION_ID })
 

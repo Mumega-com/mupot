@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import { buildBundle, exportBundle } from '../fleet-runtime/receipt-bundle.mjs'
 import {
   CHECK_RECEIPT_TYPE,
@@ -18,7 +18,7 @@ import {
 } from '../scripts/release-readiness-receipt.mjs'
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-release-readiness-'))
+  return makeTempDir('mupot-release-readiness-')
 }
 
 function writeJson(path: string, value: unknown) {

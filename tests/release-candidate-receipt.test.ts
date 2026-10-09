@@ -1,15 +1,15 @@
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import { CHECK_RECEIPT_TYPE, DEPLOYMENT_RECEIPT_TYPE, checkBundle, formatPlan, normalizeSourceVersion, normalizeVersion, parseArgs } from '../scripts/release-candidate-receipt.mjs'
 
 const VERSION = '0.23.0-rc.1'
 const TAG = `v${VERSION}`
 
 function fixture(mutate?: (dir: string, outDir: string, commit: string) => void, sourceVersion = VERSION) {
-  const dir = mkdtempSync(join(tmpdir(), 'mupot-rc-receipt-'))
+  const dir = makeTempDir('mupot-rc-receipt-')
   const outDir = join(dir, 'tmp', 'release-candidate', TAG)
   mkdirSync(join(dir, 'src'), { recursive: true })
   mkdirSync(outDir, { recursive: true })

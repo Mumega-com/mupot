@@ -1,7 +1,7 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 import {
   CHECK_RECEIPT_TYPE,
   REQUIRED_STEPS,
@@ -40,7 +40,7 @@ const TARGET = {
 }
 
 function tempDir() {
-  return mkdtempSync(join(tmpdir(), 'mupot-external-pr-cycle-'))
+  return makeTempDir('mupot-external-pr-cycle-')
 }
 
 function evidenceFor(step: string): Record<string, unknown> {

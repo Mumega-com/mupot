@@ -1,9 +1,9 @@
 import { generateKeyPairSync, webcrypto } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { makeTempDir } from './helpers/tmp-dirs'
 
 import * as localHooks from '../scripts/project-routine-lifecycle-local-hooks.mjs'
 
@@ -169,7 +169,7 @@ describe('Project Routine local lifecycle hooks', () => {
 
   it('fails closed before making dependencies when the explicit Wrangler restart contract is absent', async () => {
     for (const key of ENV_KEYS) delete process.env[key]
-    const root = mkdtempSync(join(tmpdir(), 'mupot-routine-hooks-missing-'))
+    const root = makeTempDir('mupot-routine-hooks-missing-')
     const { privateJwk } = signingJwks()
 
     await expect(createCollectorDependencies(
@@ -178,7 +178,7 @@ describe('Project Routine local lifecycle hooks', () => {
   })
 
   it('provides every collector callback and rejects non-loopback targets', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mupot-routine-hooks-surface-'))
+    const root = makeTempDir('mupot-routine-hooks-surface-')
     const { privateJwk } = signingJwks()
     installRestartContract(root, 8787)
 
@@ -212,7 +212,7 @@ describe('Project Routine local lifecycle hooks', () => {
   })
 
   it('uses real loopback HTTP for MCP mint, scheduled ticks, and Ed25519 runtime lifecycle', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mupot-routine-hooks-http-'))
+    const root = makeTempDir('mupot-routine-hooks-http-')
     const outputDir = join(root, 'artifacts')
     const { privateJwk, publicJwk } = signingJwks()
     const observations: Array<{ path: string; authorization?: string; value?: any }> = []
@@ -380,7 +380,7 @@ describe('Project Routine local lifecycle hooks', () => {
   })
 
   it('uses Playwright for the owner routine, approval, screenshots, and rendered parity surfaces', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'mupot-routine-hooks-browser-'))
+    const root = makeTempDir('mupot-routine-hooks-browser-')
     const outputDir = join(root, 'receipt')
     const { privateJwk } = signingJwks()
     let routineStatus = 'draft'
