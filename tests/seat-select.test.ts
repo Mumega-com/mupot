@@ -665,6 +665,15 @@ describe('OAuth consent harness upsert', () => {
     const envOff = envFor(h, { SEAT_AUTO_ENROLL: undefined })
     const off = (await buildAuthContextFromProps(envOff, props))!
     expect('harnessId' in off).toBe(false)
+    // a consent-BOUND directory token (props smuggling a harnessId) never carries it
+    const seat = await seatSelect(envOn, authFor(HUMAN, hid), { project: 'p', folder: '/a' })
+    if (!seat.ok) throw new Error('unreachable')
+    const boundTok = h.sqlite.prepare(`SELECT id FROM member_tokens WHERE agent_id = ?`).get(seat.agent.id)!.id as string
+    const bound = (await buildAuthContextFromProps(envOn, {
+      memberId: seat.member_id, tokenId: boundTok, email: null, channel: 'directory', boundAgentId: seat.agent.id,
+      consentedByMemberId: HUMAN, harnessId: hid,
+    }))!
+    expect('harnessId' in bound).toBe(false)
     // a workspace-channel token never carries it, flag on or not
     h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('tok-w', '${HUMAN}', 'hash-w', 'ws', 'workspace', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
     const ws = (await buildAuthContextFromProps(envOn, { ...props, tokenId: 'tok-w' }))!
