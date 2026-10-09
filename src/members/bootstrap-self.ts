@@ -226,7 +226,7 @@ import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
 // bootstrap-creation record and an update_agent correction record are directly
 // comparable — same shape, different story (nonexistent -> created, vs. one
 // value -> another).
-const AGENT_SNAPSHOT_FIELDS = [
+export const AGENT_SNAPSHOT_FIELDS = [
   'squad_id', 'slug', 'name', 'role', 'status', 'model', 'model_fallback',
   'purpose', 'owner', 'capabilities', 'skills', 'parent_agent_id', 'qnft_ref',
   'budget_cap_cents', 'budget_window',
@@ -235,7 +235,7 @@ const AGENT_SNAPSHOT_FIELDS = [
 /** The honest "this agent did not exist" image — every audited field null. Not
  *  the blank-string sentinel updateAgentProfile's two-phase write uses; a real
  *  JSON object that says nothing existed yet. */
-function emptyIdentitySnapshot(): Record<string, unknown> {
+export function emptyIdentitySnapshot(): Record<string, unknown> {
   const snapshot: Record<string, unknown> = {}
   for (const field of AGENT_SNAPSHOT_FIELDS) snapshot[field] = null
   return snapshot
@@ -244,7 +244,7 @@ function emptyIdentitySnapshot(): Record<string, unknown> {
 /** The full created-agent snapshot, read directly off the in-memory object this
  *  function already holds — never re-SELECTed from D1. There is nothing to race:
  *  these are the exact values about to be INSERTed. */
-function createdAgentSnapshot(agent: Agent): Record<string, unknown> {
+export function createdAgentSnapshot(agent: Agent): Record<string, unknown> {
   return {
     squad_id: agent.squad_id,
     slug: agent.slug,
@@ -345,7 +345,7 @@ function isEntitlementLimitReason(reason: unknown): boolean {
 // passes a full AuthContext, which is trivially assignable to this narrower type.
 export type BootstrapAuth = Pick<AuthContext, 'channel' | 'boundAgentId' | 'memberId'>
 
-function isUnboundDirectorySession(auth: BootstrapAuth): auth is BootstrapAuth & { memberId: string } {
+export function isUnboundDirectorySession(auth: BootstrapAuth): auth is BootstrapAuth & { memberId: string } {
   return auth.channel === 'directory' && !auth.boundAgentId && typeof auth.memberId === 'string'
 }
 

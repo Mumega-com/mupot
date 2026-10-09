@@ -38,8 +38,10 @@ import { MODEL_RE } from '../fleet/boot-self-report'
 // THE FIX: kind is no longer a field any Input interface can carry, so no
 // JSON body — however permissive its parsing — can ever set it. It is instead
 // a SEPARATE parameter (`opts.kind`) that only a caller with the TypeScript
-// reference to these functions can pass, and the only caller that ever does is
-// src/members/bootstrap-self.ts. A route handler that hands a request body
+// reference to these functions can pass, and the callers that ever do are
+// src/members/bootstrap-self.ts and (mupot#1794 W1, behind SEAT_AUTO_ENROLL) src/members/seat-select.ts,
+// which also creates home-kind agents, capped per member by SEAT_MAX_PER_MEMBER. The home-kind
+// entitlement exemption for those seat agents is PENDING A RULING (mupot#1794). A route handler that hands a request body
 // straight to input can no longer reach this parameter at all — not because
 // something strips the key, but because the key has nowhere to bind to. A
 // fourth route added later inherits this for free; there is no allowlist to

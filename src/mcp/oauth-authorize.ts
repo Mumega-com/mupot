@@ -34,7 +34,7 @@ import {
   summarizeGrants,
   type ScopeNames,
 } from './consent-view'
-import { sha256Hex, mintRawToken, resolveAgentMemberBinding, mintAgentBoundToken } from '../members/service'
+import { sha256Hex, resolveAgentMemberBinding, mintAgentBoundToken, prepareDirectoryTokenInsert } from '../members/service'
 import { createAgent } from '../org/service'
 import { redactSecretPatterns } from '../lib/redact'
 import { authLookupOrNull } from '../auth/fail-closed'
@@ -42,6 +42,7 @@ import { linkLoginIdentity } from '../auth/login-identity'
 import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -71,6 +72,14 @@ export interface OAuthMemberProps {
    * See resolveConsentedAgentCapabilities.
    */
   consentedByMemberId?: string | null
+  /**
+   * mupot#1794 W1: the harness (OAuth client install) row this UNBOUND directory grant was
+   * consented through. Written ONLY when SEAT_AUTO_ENROLL === '1' and the consent chose no
+   * agent; ABSENT on every legacy / agent-bound grant (Rava et al.), which keep their exact
+   * existing props shape and code path. It is a pointer, not authority: consumers re-read the
+   * harnesses row live (tenant + member + id) before trusting it.
+   */
+  harnessId?: string
 }
 
 const CONNECTION_CHANNELS: readonly ConnectionChannel[] = ['workspace', 'im', 'dashboard', 'directory']
@@ -181,13 +190,11 @@ async function mintDirectoryToken(
   label: string,
   agentId: string | null = null,
 ): Promise<{ tokenId: string; tokenHash: string }> {
-  const raw = mintRawToken()
-  const tokenHash = await sha256Hex(raw)
-  const tokenId = crypto.randomUUID()
-  await env.DB.prepare(
-    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
-     VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), ?5, ?6)`,
-  ).bind(tokenId, memberId, tokenHash, label, agentId, env.TENANT_SLUG).run()
+  // mupot#1794 W1: the statement is built by the shared prepareDirectoryTokenInsert (same SQL,
+  // same binds) so the seat path mints the identical token shape; this caller still runs it
+  // immediately, exactly as before.
+  const { tokenId, tokenHash, statement } = await prepareDirectoryTokenInsert(env, memberId, label, agentId)
+  await statement.run()
   // Raw is intentionally discarded here — the OAuth access token IS the credential;
   // the member_tokens row exists purely for capability resolution and revocation.
   // The raw token is never returned to the caller (it is not the OAuth access token).
@@ -1233,6 +1240,12 @@ async function buildAuthContextFromPropsInner(
     // header — same "never trust the blob's capabilities claim" posture as every
     // other channel there.
     consentedByMemberId: channel === 'directory' ? (props.consentedByMemberId ?? null) : null,
+    // mupot#1794 W1: harness pointer, UNBOUND directory sessions only, and only while the flag is
+    // on. Spread-when-set so every other AuthContext (legacy bound grants, workspace keys, flag
+    // off) keeps exactly its prior shape. Re-verified against the harnesses table by every reader.
+    ...(seatAutoEnrollEnabled(env) && channel === 'directory' && !boundAgentId && typeof props.harnessId === 'string' && props.harnessId.length > 0
+      ? { harnessId: props.harnessId }
+      : {}),
     // LATENT capabilities: what this member actually holds, resolved but NOT active.
     //
     // The ceiling above is right about STANDING authority — an OAuth seat must never
@@ -1879,6 +1892,33 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
     // via ctx.props on every authenticated request.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const oauthProvider = (env as unknown as { OAUTH_PROVIDER: any }).OAUTH_PROVIDER
+
+    // mupot#1794 W1 — harness upsert, UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
+    // off (prod default) this block is skipped entirely: no read, no write, and the props below
+    // are semantically identical to before. An agent-bound consent (boundAgentId set: legacy / Rava /
+    // __bootstrap__ / __mint_new__) never reaches it. Best-effort and non-fatal, same posture as
+    // the receipt write above: a failed upsert only means this session cannot call seat_select.
+    // The harness key is the OAuth client_id from the library-parsed authorize request
+    // (pending.stored), never a form field; the client NAME is a display label only.
+    let harnessId: string | null = null
+    if (seatAutoEnrollEnabled(env) && !boundAgentId) {
+      try {
+        const clientId = typeof pending.stored.clientId === 'string' ? pending.stored.clientId : ''
+        let clientName: unknown = ''
+        try {
+          if (typeof oauthProvider?.lookupClient === 'function') {
+            const info = await oauthProvider.lookupClient(clientId) as { clientName?: unknown } | null
+            clientName = info?.clientName ?? ''
+          }
+        } catch {
+          // label lookup is cosmetic; the harness is keyed on client_id alone.
+        }
+        const harness = await upsertHarness(env, pending.memberId, clientId, clientName)
+        harnessId = harness?.id ?? null
+      } catch (err) {
+        console.error('[oauth-authorize] harness upsert failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))
+      }
+    }
     let redirectTo: string
     try {
       const result = await oauthProvider.completeAuthorization({
@@ -1907,6 +1947,9 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
           // path — pending.memberId there already equals mintMemberId (=pending.memberId,
           // the human), so there is no separate "consenting human" to record.
           consentedByMemberId: boundAgentId ? pending.memberId : null,
+          // mupot#1794 W1: spread only when set, so a flag-off / bound grant's props are
+          // semantically what they were before this feature existed.
+          ...(harnessId ? { harnessId } : {}),
         } satisfies OAuthMemberProps,
       })
       redirectTo = result.redirectTo

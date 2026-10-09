@@ -113,7 +113,8 @@ describe('/mcp is unchanged (regression guard)', () => {
   it('tools/list on /mcp returns the FULL registry; annotations are the full-table hints (#1709), not the profile ones', async () => {
     const { json } = await rpc('/', 'tools/list', undefined, {}, makeEnv())
     const tools = json!.result.tools as Array<{ name: string; annotations?: unknown }>
-    expect(tools.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name))
+    // SEAT_AUTO_ENROLL is unset in this env: the flag-gated seat_select (mupot#1794) is not advertised.
+    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select').map((t) => t.name))
     expect(tools.length).toBeGreaterThan(NEEDS_YOU_PROFILE.length * 5)
     // mupot#1709: every /mcp entry now ALSO carries `annotations` (tests/mcp-tool-annotations.test.ts pins
     // their values). Deliberate update: the pre-#1709 shape had none. Everything else is unchanged.

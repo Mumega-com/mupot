@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
+import { resolveCapabilities, hasCapability, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -47,6 +47,7 @@ import {
 } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
+import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import {
   getOrCreateAgentSession,
@@ -179,6 +180,7 @@ import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
+import { SEAT_SELECT_TOOLS } from './seat-select'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
@@ -357,6 +359,16 @@ async function resolveAuth(c: {
         } else {
           auth.capabilities = []
           auth.boundAgentId = null
+        }
+
+        // mupot#1794 W1: a harness pointer is meaningful ONLY on an unbound directory session
+        // while SEAT_AUTO_ENROLL is on; the blob cannot smuggle it onto any other session shape.
+        // (Readers still re-verify the harnesses row live — this just keeps the field honest.)
+        if (
+          auth.harnessId !== undefined
+          && !(seatAutoEnrollEnabled(c.env) && auth.channel === 'directory' && !auth.boundAgentId)
+        ) {
+          delete auth.harnessId
         }
 
         // The internal blob may name a token, but it cannot establish token
@@ -6041,6 +6053,83 @@ function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
 //
 // ADDITIVE: all existing fields remain unchanged; identity_status is a NEW field on
 // the response. No breaking changes to callers who ignore unknown fields.
+// mupot#1794 W1 — the boot_context identity receipt: WHO (human), THROUGH WHAT (harness), AS WHICH
+// agent, HOW that binding was established, with WHAT effective authority, and whether a label the
+// client sent disagrees with the bound agent.
+//
+// binding_source: 'legacy_consent' = a directory grant consent-bound to one agent at /oauth/consent;
+// 'workspace_token' = an agent-bound workspace/im key; 'none' = unbound. (A seat-locked source joins
+// this set when the session lock ships in a later wave.)
+//
+// seat_label_conflict is TRUE only when a supplied label (x-mupot-seat, or the seat / label args)
+// resolves to an agent (by id or slug) on the bound agent's own squad OTHER than the bound one. A label that names no agent
+// (a folder, a project) is never a conflict — labels are not authority, the conflict flag just stops
+// a client from believing it is somebody it is not.
+async function buildIdentityReceipt(
+  env: Env,
+  auth: AuthContext,
+  labels: Array<string | null>,
+): Promise<Record<string, unknown>> {
+  const boundAgentId = auth.boundAgentId ?? null
+  const consented = auth.channel === 'directory' && boundAgentId !== null
+  const bindingSource: 'legacy_consent' | 'workspace_token' | 'none' =
+    boundAgentId === null ? 'none' : consented ? 'legacy_consent' : 'workspace_token'
+  // The human: the unbound directory seat IS the human's member; a consent-bound seat records the
+  // consenting human separately; an agent-bound workspace key has no human in the token.
+  const humanMemberId = boundAgentId === null ? (auth.memberId ?? null) : (auth.consentedByMemberId ?? null)
+
+  const harnessRow = auth.memberId && auth.harnessId && boundAgentId === null
+    ? await loadHarness(env, auth.memberId, auth.harnessId).catch(() => null)
+    : null
+
+  const agentRow = boundAgentId
+    ? await env.DB.prepare(`SELECT id, slug, name, status, squad_id FROM agents WHERE id = ?1 LIMIT 1`)
+        .bind(boundAgentId).first<{ id: string; slug: string; name: string; status: string; squad_id: string }>()
+        .catch(() => null)
+    : null
+
+  const grants = auth.capabilities ?? []
+  const highest = grants.reduce<string | null>(
+    (best, g) => (best === null || capabilityRank(g.capability) > capabilityRank(best as Capability) ? g.capability : best),
+    null,
+  )
+
+  let conflict = false
+  const claimed = labels.map((l) => (l ?? '').trim()).filter((l) => l.length > 0 && l.length <= 128)
+  if (boundAgentId && agentRow && claimed.length > 0) {
+    // Scoped to the bound agent's OWN squad: those are peers the session can already see, so this
+    // lookup cannot be used to probe for the existence of agents elsewhere in the tenant.
+    for (const label of claimed) {
+      const rows = await env.DB.prepare(`SELECT id FROM agents WHERE squad_id = ?2 AND (id = ?1 OR slug = ?1) LIMIT 8`)
+        .bind(label, agentRow.squad_id).all<{ id: string }>().catch(() => null)
+      const ids = rows?.results ?? []
+      if (ids.length > 0 && !ids.some((r) => r.id === boundAgentId)) {
+        conflict = true
+        break
+      }
+    }
+  }
+
+  return {
+    human: { member_id: humanMemberId },
+    harness: harnessRow
+      ? { id: harnessRow.id, client_name: harnessRow.client_name, kind: harnessRow.kind }
+      : null,
+    agent: agentRow
+      ? { id: agentRow.id, uuid: agentRow.id, slug: agentRow.slug, name: agentRow.name, status: agentRow.status }
+      : boundAgentId
+        ? { id: boundAgentId, uuid: boundAgentId }
+        : null,
+    binding_source: bindingSource,
+    effective_capabilities: {
+      count: grants.length,
+      highest,
+      scopes: grants.slice(0, 20).map((g) => ({ scope_type: g.scope_type, scope_id: g.scope_id, capability: g.capability })),
+    },
+    seat_label_conflict: conflict,
+  }
+}
+
 const toolBootContext: ToolSpec = {
   name: 'boot_context',
   scope: 'self (read-only — no args required)',
@@ -6197,6 +6286,13 @@ const toolBootContext: ToolSpec = {
           }
         : undefined
 
+    // mupot#1794 W1 — identity receipt. Additive, and present ONLY while SEAT_AUTO_ENROLL is on so
+    // a flag-off response is semantically identical to before. Every value is server-derived; labels the
+    // caller supplied (seat / label args, x-mupot-seat) are only COMPARED, never believed.
+    const identityReceipt = seatAutoEnrollEnabled(env)
+      ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
+      : undefined
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -6215,6 +6311,7 @@ const toolBootContext: ToolSpec = {
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
+      ...(identityReceipt ? { identity_receipt: identityReceipt } : {}),
     })
   },
 }
@@ -6567,6 +6664,7 @@ export const TOOLS: ToolSpec[] = [
   ...ARCHIVE_TOOLS,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
+  ...SEAT_SELECT_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
@@ -6589,6 +6687,15 @@ export const TOOLS: ToolSpec[] = [
 ]
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
+
+// mupot#1794 W1: tools that exist only while a feature flag is on. With the flag off they are
+// not ADVERTISED (tools/list, GET /mcp/tools, openapi.full.json); a direct call still reaches the
+// tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
+// drift from the others.
+const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL'>): ToolSpec[] {
+  return seatAutoEnrollEnabled(env) ? TOOLS : TOOLS.filter((t) => !SEAT_FLAG_TOOLS.has(t.name))
+}
 
 interface JsonRpcRequest {
   jsonrpc?: unknown
@@ -6944,7 +7051,7 @@ async function handleJsonRpc(
     }
     // 2026-07-28 (SEP-2549): tools/list is a CacheableResult — ttlMs + cacheScope REQUIRED. 0/private =
     // "do not reuse", the conservative value (no freshness claim is made for the registry).
-    return ok(id, { tools: TOOLS.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
+    return ok(id, { tools: advertisedTools(c.env).map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
   }
 
   if (method === 'tools/call') {
@@ -7065,7 +7172,7 @@ mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.
 mcpApp.get('/tools', (c) =>
   c.json({
     contract: 'POST /mcp {tool, args} — bearer member token in Authorization header',
-    tools: TOOLS.map((t) => ({
+    tools: advertisedTools(c.env).map((t) => ({
       name: t.name,
       scope: t.scope,
       min_capability: t.min,
@@ -7260,7 +7367,7 @@ mcpActionsApp.get('/openapi.full.json', async (c) => {
   }
   if (!hasWorkspaceAdmin(auth)) return c.json({ error: 'forbidden', need: 'org:admin' }, 403)
   const url = new URL(c.req.url)
-  return c.json(openApiSpec(url.origin, TOOLS, FULL_OPENAPI_DESCRIPTION))
+  return c.json(openApiSpec(url.origin, advertisedTools(c.env), FULL_OPENAPI_DESCRIPTION))
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {

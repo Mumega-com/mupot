@@ -360,6 +360,65 @@ export async function prepareAgentBoundTokenMint(
   return prepareAgentBoundTokenMintForBinding(env, agent, label, grantCapability, binding, opts.expiresAt, opts.revokePriorTokenId, opts.issuedBy)
 }
 
+/**
+ * The IDENTITY WELD for a brand-new agent, as three prepared (uncommitted) statements in the
+ * order the schema requires: the agent's dedicated member, the immutable
+ * agent_member_bindings row, and the home-squad capability (clamped by the caller to
+ * observer/member). The binding MUST precede any member_tokens row for the agent — migration
+ * 0071's member_tokens_agent_binding_insert trigger aborts a token whose
+ * (tenant, agent_id, member_id) is not already bound.
+ *
+ * Extracted verbatim from prepareAgentBoundTokenMintForBinding (mupot#1794 W1) so the seat
+ * path composes the SAME weld statements instead of forking a second provisioner; the
+ * existing mint callers get byte-identical statements, binds and order.
+ */
+export function prepareAgentIdentityWeldStatements(
+  env: Env,
+  agent: AgentForMint,
+  memberId: string,
+  createdAt: string,
+  grantCapability: AgentTokenCapability,
+): D1PreparedStatement[] {
+  return [
+    env.DB.prepare(
+      `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
+    env.DB.prepare(
+      `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
+       VALUES (?, ?, ?, ?)`,
+    ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt),
+    env.DB.prepare(
+      `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
+       VALUES (?, ?, 'squad', ?, ?)`,
+    ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
+  ]
+}
+
+/**
+ * A PREPARED directory-channel member_tokens insert (the OAuth-seat token shape — see
+ * mintDirectoryToken in src/mcp/oauth-authorize.ts, which delegates here). The raw secret is
+ * generated, hashed and DISCARDED inside this function: the row exists purely so capability
+ * resolution, deactivate_agent's revocation sweep and the 0071 weld liveness checks see a
+ * live credential; nothing can ever present it. Returns the statement so a caller can place
+ * it in a batch AFTER the agent_member_bindings row it depends on.
+ */
+export async function prepareDirectoryTokenInsert(
+  env: Env,
+  memberId: string,
+  label: string,
+  agentId: string | null,
+): Promise<{ tokenId: string; tokenHash: string; statement: D1PreparedStatement }> {
+  const raw = mintRawToken()
+  const tokenHash = await sha256Hex(raw)
+  const tokenId = crypto.randomUUID()
+  const statement = env.DB.prepare(
+    `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant)
+     VALUES (?1, ?2, ?3, ?4, 'directory', datetime('now'), ?5, ?6)`,
+  ).bind(tokenId, memberId, tokenHash, label, agentId, env.TENANT_SLUG)
+  return { tokenId, tokenHash, statement }
+}
+
 export async function prepareAgentBoundTokenMintForBinding(
   env: Env,
   agent: AgentForMint,
@@ -432,20 +491,7 @@ export async function prepareAgentBoundTokenMintForBinding(
   const statements: D1PreparedStatement[] = []
 
   if (creating) {
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO members (id, email, display_name, telegram_chat_id, status, created_at, tenant)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(memberId, null, agent.name, null, 'active', createdAt, env.TENANT_SLUG),
-      env.DB.prepare(
-        `INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
-         VALUES (?, ?, ?, ?)`,
-      ).bind(env.TENANT_SLUG, agent.id, memberId, createdAt),
-      env.DB.prepare(
-        `INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
-         VALUES (?, ?, 'squad', ?, ?)`,
-      ).bind(crypto.randomUUID(), memberId, agent.squad_id, grantCapability),
-    )
+    statements.push(...prepareAgentIdentityWeldStatements(env, agent, memberId, createdAt, grantCapability))
   }
 
   // A rotation inserts the replacement only while the named prior token remains

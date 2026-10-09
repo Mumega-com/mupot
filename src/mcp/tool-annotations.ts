@@ -179,6 +179,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   archive_plan_expand: RO('read-only SELECT expansion of a task archive plan (toolArchivePlanExpand); refuses 409 not_supported after the admin gate unless TASK_ARCHIVE_ENABLED=1, and never writes'),
   agent_lifecycle: MUTX('delegates to deactivate/move/grant/mint, and free-text intent calls Jev at api.typesafe.ai (mcp/agent-lifecycle.ts:156,258)'),
   bootstrap_self: ADD('bootstrapSelf INSERT department/squad/agent/capabilities + agent_audit + credential claim (members/bootstrap-self.ts:809-852)'),
+  seat_select: ADD('seatSelect INSERT agent/member/binding/capability/token/audit/seat (members/seat-select.ts); flag-gated SEAT_AUTO_ENROLL'),
   // One-shot reveal: the KV entry is deleted by the read, so the secret is gone afterwards.
   reveal_credential_claim: MUT('revealCredentialClaim SESSIONS.delete consumes the one-time secret (auth/credential-claim.ts:149)'),
 
