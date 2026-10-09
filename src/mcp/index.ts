@@ -48,7 +48,7 @@ import {
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
-import { applySeatHandle, isWellFormedSeatHandle } from '../members/seat-handle'
+import { applySeatHandle, SEAT_HANDLE_PREFIX } from '../members/seat-handle'
 import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import {
@@ -304,8 +304,18 @@ interface SeatBodyMeta {
  *  the carrier of a seat handle. A value shaped like a handle is a SELECTOR: it must never be echoed
  *  into enroll URLs, session labels or receipts as if it were a label. Flag off: unchanged. */
 function seatLabelHeader(env: Pick<Env, 'SEAT_AUTO_ENROLL'>, raw: string | undefined): string | undefined {
-  if (raw !== undefined && seatAutoEnrollEnabled(env) && isWellFormedSeatHandle(raw.trim())) return undefined
+  if (raw !== undefined && seatAutoEnrollEnabled(env) && raw.trim().startsWith(SEAT_HANDLE_PREFIX)) return undefined
   return raw
+}
+
+/** True when the request carries a seat handle by either carrier (prefixed header, or `_meta`). */
+function requestPresentsSeatHandle(
+  c: { req: { header: (name: string) => string | undefined } },
+  params: unknown,
+): boolean {
+  if ((c.req.header('x-mupot-seat') ?? '').trim().startsWith(SEAT_HANDLE_PREFIX)) return true
+  const p = typeof params === 'object' && params !== null ? params as Record<string, unknown> : {}
+  return extractMetaFacts(p._meta).metaSeat !== null
 }
 
 async function resolveAuth(c: {
@@ -7198,7 +7208,10 @@ async function handleJsonRpc(
   // MCP Events (mupot#1618, PR 1: catalogue only). Flag OFF (default) => indistinguishable from
   // an unknown method, and no auth/DB work happens at all.
   if (EVENTS_METHODS.has(method) && eventsOn) {
-    const auth = await resolveAuth(c)
+    // mupot#1794 W2: events never resolve a seat handle. A subscription stores its principal and its
+    // liveness never re-checks a handle or the human's grant token, so a seat session must not be able
+    // to mint one; the call is evaluated as the human's own (unbound) session.
+    const auth = await resolveAuth(c, { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
@@ -7232,6 +7245,11 @@ async function handleJsonRpc(
     // events/subscribe | events/unsubscribe (mupot#1618 PR 2). Reached only with the flag on, on the
     // full /mcp door (never the profile door), and an authenticated caller; the handlers refuse
     // unbound / zero-capability sessions themselves.
+    if (method === 'events/subscribe' && seatAutoEnrollEnabled(c.env) && requestPresentsSeatHandle(c, body.params)) {
+      return rpcError(id, -32602, 'seat_session_events_unsupported', {
+        reason: 'events subscriptions are not available to a seat-handle session; call events/subscribe without the seat handle',
+      }, 403)
+    }
     const floorOk = callerFloorOk(auth, hasWorkspaceAdmin(auth))
     const out = method === 'events/subscribe'
       ? await eventsSubscribe(c.env, auth, floorOk, body.params)
@@ -7305,7 +7323,9 @@ mcpApp.post('/', async (c) => {
 
   if (isJsonRpcRequest(body)) return handleJsonRpc(c, body)
 
-  const auth = await resolveAuth(c)
+  // The legacy {tool,args} body has no _meta and is not a seat-handle door: skipSeat keeps it the
+  // human's own session even if a handle header is present.
+  const auth = await resolveAuth(c, { skipSeat: true })
   if (!auth) return c.json({ error: 'unauthenticated' }, 401)
   if (auth.tenant !== c.env.TENANT_SLUG) {
     return c.json({ error: 'forbidden', reason: 'tenant_scope' }, 403)

@@ -8,7 +8,6 @@
 //
 // Nothing here selects or authorises anything, writes anything, or can fail a request.
 
-import { sha256Hex } from '../members/service'
 import type { Env } from '../types'
 import { seatAutoEnrollEnabled } from '../members/harness'
 import type { HarnessHints } from '../members/seat-handle'
@@ -63,8 +62,15 @@ export function hintsFrom(facts: Pick<ProbeInputs, 'openaiSession' | 'openaiSubj
   }
 }
 
-async function shortHash(v: string | null): Promise<string | null> {
-  return v === null ? null : (await sha256Hex(v)).slice(0, 12)
+// Hashes are HMAC-SHA256 under a per-deploy server secret (domain-separated), so a logged
+// openai/subject or Codex threadId digest cannot be correlated with the same value hashed anywhere
+// else, or reversed by guessing candidates. With no secret configured NO hash is emitted (null):
+// presence booleans still are.
+async function keyedHash(secret: string | undefined, v: string | null): Promise<string | null> {
+  if (v === null || !secret) return null
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`mupot:harness-probe:v1:${v}`))
+  return Array.from(new Uint8Array(mac)).map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 12)
 }
 
 /** Test seam: forget the sampling state. */
@@ -73,29 +79,31 @@ export function resetHarnessProbeSampling(): void {
 }
 
 export async function maybeEmitHarnessIdentityProbe(
-  env: Pick<Env, 'SEAT_AUTO_ENROLL'>,
+  env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'CONNECTOR_MASTER_KEY'>,
   grantKey: string,
   inputs: ProbeInputs,
   nowMs: number = Date.now(),
 ): Promise<void> {
   if (!seatAutoEnrollEnabled(env)) return
   try {
-    const key = (await sha256Hex(grantKey)).slice(0, 16)
+    const secret = env.CONNECTOR_MASTER_KEY
+    // The sampling key never leaves the isolate; the logged `grant` field is the keyed hash (or null).
+    const key = (await keyedHash(secret, grantKey)) ?? grantKey
     const last = lastLogged.get(key)
     if (last !== undefined && nowMs - last < PROBE_INTERVAL_MS) return
     if (lastLogged.size >= PROBE_MAX_TRACKED) lastLogged.clear()
     lastLogged.set(key, nowMs)
     console.info(JSON.stringify({
       metric: HARNESS_PROBE_METRIC,
-      grant: key,
+      grant: await keyedHash(secret, grantKey),
       x_mupot_seat: inputs.headerSeat !== null,
       meta_mupot_seat: inputs.metaSeat !== null,
       openai_session: inputs.openaiSession !== null,
-      openai_session_h: await shortHash(inputs.openaiSession),
+      openai_session_h: await keyedHash(secret, inputs.openaiSession),
       openai_subject: inputs.openaiSubject !== null,
-      openai_subject_h: await shortHash(inputs.openaiSubject),
+      openai_subject_h: await keyedHash(secret, inputs.openaiSubject),
       codex_thread_id: inputs.codexThreadId !== null,
-      codex_thread_id_h: await shortHash(inputs.codexThreadId),
+      codex_thread_id_h: await keyedHash(secret, inputs.codexThreadId),
       client_info_name: inputs.clientInfoName === null ? null : inputs.clientInfoName.replace(/[^A-Za-z0-9 ._/-]/g, '?').slice(0, 40),
       mcp_session_id: inputs.hasMcpSessionId,
       protocol_version: inputs.protocolVersionHeader === null ? null : inputs.protocolVersionHeader.replace(/[^0-9A-Za-z.-]/g, '?').slice(0, 16),

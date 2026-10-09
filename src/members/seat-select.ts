@@ -375,9 +375,9 @@ export async function seatSelect(
   //     idempotency, and either one aborting rolls back every statement above it.
   const seatId = crypto.randomUUID()
   const seatStatement = env.DB.prepare(
-    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
-  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, createdAt)
+    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, token.tokenId, createdAt)
 
   // W2: the first handle rides in the SAME batch, AFTER the seat row (FK). Only the INSERT goes in:
   // a brand-new seat has no handles to evict, and the eviction statement legitimately writes 0 rows.

@@ -104,10 +104,10 @@ afterEach(() => { h.close(); vi.restoreAllMocks() })
 describe('handle format', () => {
   it('mints 32 random bytes as 43 base64url chars; only well-formed values pass the cheap guard', () => {
     const a = mintSeatHandle(); const b = mintSeatHandle()
-    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(a).toMatch(/^mseat_[A-Za-z0-9_-]{43}$/)
     expect(a).not.toBe(b)
     expect(isWellFormedSeatHandle(a)).toBe(true)
-    for (const bad of ['', 'x', a + 'x', a.slice(1), `${a.slice(1)}=`, 42, null, undefined, 'a b'.padEnd(43, 'c')]) expect(isWellFormedSeatHandle(bad)).toBe(false)
+    for (const bad of ['', 'x', a + 'x', a.slice(1), a.slice(6), `${a.slice(0, -1)}=`, 42, null, undefined, 'a b'.padEnd(49, 'c'), 'x'.repeat(43)]) expect(isWellFormedSeatHandle(bad)).toBe(false)
   })
 })
 
@@ -388,15 +388,21 @@ describe('fallbacks and revocation', () => {
     expect(r.sc.member_id).toBe(HUMAN)
   })
 
-  it('malformed / unknown / garbage handles never 500 and never bind', async () => {
+  it('malformed / unknown prefixed handles never 500 and never bind; unprefixed values are just labels', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await select(env, g, '/work/a')
-    for (const hd of ['nope', 'x'.repeat(43), '../../etc/passwd', 'A'.repeat(500), mintSeatHandle()]) {
+    for (const hd of ['mseat_nope', `mseat_${'x'.repeat(43)}`, 'mseat_../../etc/passwd', `mseat_${'A'.repeat(500)}`, mintSeatHandle()]) {
       const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': hd } })
       expect(r.status).toBe(200)
       expect(r.sc.bound_agent_id).toBeNull()
       expect(receiptOf(r).seat_handle_rejected).toBe(true)
+    }
+    for (const label of ['nope', 'x'.repeat(43), '../../etc/passwd']) {
+      const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': label } })
+      expect(r.status).toBe(200)
+      expect(r.sc.bound_agent_id).toBeNull()
+      expect(receiptOf(r).seat_handle_rejected).toBe(false)
     }
   })
 })
@@ -462,14 +468,29 @@ describe('other carriers and non-carriers', () => {
     expect(r.sc.bound_agent_id).toBe(a.agentId)
   })
 
-  it('header wins over _meta, and a wrong header is NOT rescued by a right _meta', async () => {
+  it('a _meta handle wins over a handle header; a wrong header handle does not block a right _meta one', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     const a = await select(env, g, '/work/a'); const b = await select(env, g, '/work/b')
     const both = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle }, meta: { 'mupot/seat': b.handle } })
-    expect(both.sc.bound_agent_id).toBe(a.agentId)
+    expect(both.sc.bound_agent_id).toBe(b.agentId)
     const wrong = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': mintSeatHandle() }, meta: { 'mupot/seat': a.handle } })
-    expect(wrong.sc.bound_agent_id).toBeNull()
+    expect(wrong.sc.bound_agent_id).toBe(a.agentId)
+  })
+
+  it('a cosmetic X-Mupot-Seat LABEL never hides a _meta handle, and is itself never treated as a handle', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const withMeta = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': 'cursor-mac' }, meta: { 'mupot/seat': a.handle } })
+    expect(withMeta.sc.bound_agent_id).toBe(a.agentId)
+    const labelOnly = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': 'cursor-mac' } })
+    expect(labelOnly.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(labelOnly).seat_handle_rejected).toBe(false) // a label is not a rejected handle
+    // an UNPREFIXED value of the handle's body is a label, not a carrier
+    const bare = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle.slice(6) } })
+    expect(bare.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(bare).seat_handle_rejected).toBe(false)
   })
 
   it('Mcp-Session-Id, openai/session, openai/subject, codex threadId NEVER select a seat; presence is only recorded', async () => {
@@ -614,8 +635,8 @@ describe('flag OFF', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('step-0 harness_identity_probe', () => {
-  it('logs once per grant per hour: booleans + hashes, never raw values', async () => {
-    const env = envFor(h)
+  it('logs once per grant per hour: booleans + KEYED hashes, never raw values', async () => {
+    const env = envFor(h, { CONNECTOR_MASTER_KEY: 'test-master-key-A' })
     const g = await grant(env, HUMAN)
     const spy = vi.spyOn(console, 'info').mockImplementation(() => {})
     const raw = { session: 'conv-RAW-123', subject: 'user-RAW-456', thread: 'thread-RAW-789' }
@@ -629,6 +650,16 @@ describe('step-0 harness_identity_probe', () => {
     expect(rec.meta_keys).toEqual(expect.arrayContaining(['openai/session', 'threadId', 'x/other']))
     for (const v of [raw.session, raw.subject, raw.thread, 'sess-RAW']) expect(lines[0]).not.toContain(v)
     expect(rec.openai_session_h).toMatch(/^[0-9a-f]{12}$/)
+    // keyed: not the plain sha256 prefix an outsider could compute, and it changes with the secret
+    const plain = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw.session)))).map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 12)
+    expect(rec.openai_session_h).not.toBe(plain)
+    expect(rec.openai_subject_h).not.toBe(rec.openai_session_h)
+    resetHarnessProbeSampling()
+    spy.mockClear()
+    await rpc(envFor(h, { CONNECTOR_MASTER_KEY: 'test-master-key-B' }), g.ctx, 'boot_context', {}, { meta })
+    const other = JSON.parse(spy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('harness_identity_probe'))[0])
+    expect(other.openai_session_h).not.toBe(rec.openai_session_h)
+    expect(other.grant).not.toBe(rec.grant)
   })
 
   it('a different grant logs separately; a seat handle in the header is only ever a boolean', async () => {
@@ -866,5 +897,163 @@ describe('W1 round-2 P3 folds', () => {
       expect(JSON.stringify(f.body)).toContain('seat_cap_reached')
       expect(JSON.stringify(f.body)).not.toContain('provisioning_failed')
     }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('round-1 gate fixes', () => {
+  const SQ = 'sq-x'
+  function seedSquadX(): void {
+    h.sqlite.exec(`INSERT INTO departments (id, slug, name, created_at) VALUES ('dx', 'dx', 'DX', datetime('now'))`)
+    h.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name, created_at) VALUES ('${SQ}', 'dx', 'sq-x', 'X', datetime('now'))`)
+  }
+  const grantRow = (member: string, cap: string) =>
+    h.sqlite.exec(`INSERT INTO capabilities (member_id, scope_type, scope_id, capability) VALUES ('${member}', 'squad', '${SQ}', '${cap}')`)
+  const seatScope = (ctx: AuthContext, scopeId: string) => (ctx.capabilities ?? []).find((c) => c.scope_type === 'squad' && c.scope_id === scopeId)
+
+  it("per-scope clamp: a grant on the AGENT for squad X does not reach the seat while the human is not on X; human on X gets member; removing the human removes X", async () => {
+    const env = envFor(h)
+    seedSquadX()
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    grantRow(a.sc.member_id as string, 'lead') // someone granted the AGENT lead on X; the human is nowhere near X
+    const hin = { headerHandle: a.handle, hints: NO_HINTS }
+    const none = await applySeatHandle(env, g.ctx, hin)
+    expect(none.boundAgentId).toBe(a.agentId)
+    expect(seatScope(none, SQ)).toBeUndefined()
+    expect(await canOnSquad(env, none.capabilities ?? [], SQ, 'observer')).toBe(false)
+    // the human is on X as lead: the seat gets min(human lead, agent lead, member) = member
+    grantRow(HUMAN, 'lead')
+    expect(seatScope(await applySeatHandle(env, g.ctx, hin), SQ)?.capability).toBe('member')
+    // an observer human caps the seat at observer even though the agent holds lead
+    h.sqlite.exec(`UPDATE capabilities SET capability = 'observer' WHERE member_id = '${HUMAN}' AND scope_id = '${SQ}'`)
+    expect(seatScope(await applySeatHandle(env, g.ctx, hin), SQ)?.capability).toBe('observer')
+    // the human is removed from X: the seat loses X on the next request
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${HUMAN}' AND scope_id = '${SQ}'`)
+    expect(seatScope(await applySeatHandle(env, g.ctx, hin), SQ)).toBeUndefined()
+    // and the same through the real request path
+    const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle } })
+    expect((r.sc.capabilities as Array<{ scope_id: string }>).some((c) => c.scope_id === SQ)).toBe(false)
+  })
+
+  it('the human must be ADMIN on the agent\'s home squad (member is not enough)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const agentSquad = (a.sc.agent as { squad_id: string }).squad_id
+    h.sqlite.exec(`UPDATE capabilities SET capability = 'member' WHERE member_id = '${HUMAN}' AND scope_id = '${agentSquad}'`)
+    expect(await resolveSeatCapabilities(env, { humanMemberId: HUMAN, agentId: a.agentId, agentSquadId: agentSquad, agentMemberId: a.sc.member_id as string })).toEqual([])
+    const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle } })
+    expect(r.sc.bound_agent_id).toBeNull()
+  })
+
+  it('events: a handle is ignored on events/list, and events/subscribe from a handle session is refused distinctly (no subscription row)', async () => {
+    const env = envFor(h, { EVENTS_ENABLED: 'true', CONNECTOR_MASTER_KEY: 'k'.repeat(32) })
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const call = async (method: string, params: Record<string, unknown>, headers: Record<string, string> = {}) => {
+      const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
+      const res = await mcpApp.fetch(mcpInternalRequest(req, g.ctx), env)
+      return { status: res.status, body: (await res.json()) as Record<string, unknown> }
+    }
+    const subsBefore = n(`SELECT COUNT(*) AS n FROM event_subscriptions`)
+    const list = await call('events/list', {}, { 'x-mupot-seat': a.handle })
+    expect(JSON.stringify(list.body)).toContain('"events"')
+    const sub = { name: 'message.created', delivery: { mode: 'webhook', url: 'https://example.test/hook', secret: 'whsec_' + btoa('s'.repeat(32)) } }
+    const viaHeader = await call('events/subscribe', sub, { 'x-mupot-seat': a.handle })
+    expect(viaHeader.status).toBe(403)
+    expect(JSON.stringify(viaHeader.body)).toContain('seat_session_events_unsupported')
+    const viaMeta = await call('events/subscribe', { ...sub, _meta: { 'mupot/seat': a.handle } })
+    expect(JSON.stringify(viaMeta.body)).toContain('seat_session_events_unsupported')
+    expect(n(`SELECT COUNT(*) AS n FROM event_subscriptions`)).toBe(subsBefore)
+    // a bare label header is not a handle: it reaches the (human) handler, which refuses unbound itself
+    const label = await call('events/subscribe', sub, { 'x-mupot-seat': 'cursor-mac' })
+    expect(JSON.stringify(label.body)).not.toContain('seat_session_events_unsupported')
+  })
+
+  it('the legacy {tool,args} POST ignores a handle (human session)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const req = new Request('https://pot.test/mcp', { method: 'POST', headers: { 'content-type': 'application/json', 'x-mupot-seat': a.handle }, body: JSON.stringify({ tool: 'boot_context', args: {} }) })
+    const res = await mcpApp.fetch(mcpInternalRequest(req, g.ctx), env)
+    const body = (await res.json()) as { result: Record<string, unknown> }
+    expect(body.result.bound_agent_id).toBeNull()
+    expect(body.result.member_id).toBe(HUMAN)
+  })
+
+  it('the seat token is found by its explicit stored id: a look-alike labelled token cannot stand in', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    const stored = h.sqlite.prepare(`SELECT seat_token_id AS t FROM agent_seats WHERE id = ?`).get(a.seatId)!.t as string
+    expect(stored).toBe(h.sqlite.prepare(`SELECT id FROM member_tokens WHERE agent_id = ?`).get(a.agentId)!.id)
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = '${stored}'`)
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES ('look-alike', '${a.sc.member_id}', 'hash-la', 'seat:look-alike', 'directory', datetime('now'), '${a.agentId}', '${TENANT}')`)
+    const r = await rpc(env, g.ctx, 'boot_context', {}, { headers: { 'x-mupot-seat': a.handle } })
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(() => h.sqlite.exec(`UPDATE agent_seats SET seat_token_id = 'x' WHERE id = '${a.seatId}'`)).toThrow(/agent_seat_immutable/)
+  })
+})
+
+// Each case violates EXACTLY ONE conjunct of findLiveSeatForHandle, with every other conjunct
+// satisfied, so deleting that one conjunct from the SQL turns the case green->bound (and red here).
+describe('findLiveSeatForHandle: one violated conjunct per case', () => {
+  it("h.harness_id = ?5: the presented grant's harness differs from the handle's (seat/handle/harness all agree with each other)", async () => {
+    const env = envFor(h)
+    const g1 = await grant(env, HUMAN, 'client-cursor', 'Cursor')
+    const g2 = await grant(env, HUMAN, 'client-claude', 'Claude')
+    const a = await select(env, g1, '/work/a')
+    const hd = mintSeatHandle()
+    h.sqlite.prepare(`INSERT INTO seat_handles (id, tenant, handle_hash, seat_id, agent_id, harness_id, consenting_member_id, grant_token_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .run('c1', TENANT, await hashSeatHandle(hd), a.seatId, a.agentId, g1.harnessId, HUMAN, g2.tokenId)
+    expect((await applySeatHandle(env, g2.ctx, { headerHandle: hd, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
+    // positive control: the same row IS honoured on the grant whose harness it names
+    const hd2 = mintSeatHandle()
+    h.sqlite.prepare(`INSERT INTO seat_handles (id, tenant, handle_hash, seat_id, agent_id, harness_id, consenting_member_id, grant_token_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .run('c1b', TENANT, await hashSeatHandle(hd2), a.seatId, a.agentId, g1.harnessId, HUMAN, g1.tokenId)
+    expect((await applySeatHandle(env, g1.ctx, { headerHandle: hd2, hints: NO_HINTS })).boundAgentId).toBe(a.agentId)
+  })
+
+  it("grant token channel = 'directory': a grant token that is no longer a directory token", async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    h.sqlite.exec(`UPDATE member_tokens SET channel = 'workspace' WHERE id = '${g.tokenId}'`)
+    expect((await applySeatHandle(env, g.ctx, { headerHandle: a.handle, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
+  })
+
+  it('grant token agent_id IS NULL: the grant token has since been welded to an agent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    // The 0071 weld trigger would refuse this row (a human's token cannot name an agent); drop it for
+    // the fixture so the ONLY thing left to refuse the handle is the `agent_id IS NULL` conjunct.
+    for (const t of h.sqlite.prepare(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'member_tokens'`).all()) {
+      h.sqlite.exec(`DROP TRIGGER "${t.name as string}"`)
+    }
+    h.sqlite.exec(`UPDATE member_tokens SET agent_id = '${a.agentId}' WHERE id = '${g.tokenId}'`)
+    expect((await applySeatHandle(env, g.ctx, { headerHandle: a.handle, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
+  })
+
+  it("hm.status = 'active': the consenting human is suspended (revoke trigger absent, so nothing else refuses)", async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await select(env, g, '/work/a')
+    h.sqlite.exec(`DROP TRIGGER seat_handles_revoke_on_member_end`)
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${HUMAN}'`)
+    expect((await applySeatHandle(env, g.ctx, { headerHandle: a.handle, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
+  })
+
+  it("h.consenting_member_id = ?4: the handle's consenter is another member who genuinely owns the seat and harness", async () => {
+    const env = envFor(h)
+    const g1 = await grant(env, HUMAN); const g2 = await grant(env, HUMAN2)
+    const b = await select(env, g2, '/work/b') // HUMAN2's own seat, harness, agent
+    const hd = mintSeatHandle()
+    h.sqlite.prepare(`INSERT INTO seat_handles (id, tenant, handle_hash, seat_id, agent_id, harness_id, consenting_member_id, grant_token_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .run('c5', TENANT, await hashSeatHandle(hd), b.seatId, b.agentId, g2.harnessId, HUMAN2, g1.tokenId)
+    // HUMAN's grant (token g1.tokenId, member HUMAN), presenting HUMAN2's harness id so ?5 agrees:
+    const ctx = { ...g1.ctx, harnessId: g2.harnessId }
+    expect((await applySeatHandle(env, ctx, { headerHandle: hd, hints: NO_HINTS })).boundAgentId ?? null).toBeNull()
   })
 })

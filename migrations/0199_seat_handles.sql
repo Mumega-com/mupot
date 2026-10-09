@@ -119,6 +119,12 @@ END;
 -- caller); DEFAULT 64 only covers a raw insert that omits it.
 ALTER TABLE agent_seats ADD COLUMN max_total INTEGER NOT NULL DEFAULT 64 CHECK (max_total BETWEEN 1 AND 4096);
 
+-- The seat agent's server-held directory token (minted by seat_select, raw value discarded), stored
+-- by EXPLICIT id so seat resolution never has to guess it from a label. NULL only for a seat created
+-- before this column existed; such a seat cannot be resolved through a handle (it falls back to the
+-- human) until it is re-created.
+ALTER TABLE agent_seats ADD COLUMN seat_token_id TEXT;
+
 CREATE TRIGGER IF NOT EXISTS agent_seats_total_cap_insert
 BEFORE INSERT ON agent_seats
 FOR EACH ROW
@@ -142,6 +148,7 @@ WHEN NEW.id IS NOT OLD.id
   OR NEW.label_basename IS NOT OLD.label_basename
   OR NEW.max_live IS NOT OLD.max_live
   OR NEW.max_total IS NOT OLD.max_total
+  OR NEW.seat_token_id IS NOT OLD.seat_token_id
   OR NEW.created_at IS NOT OLD.created_at
   OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at)
 BEGIN

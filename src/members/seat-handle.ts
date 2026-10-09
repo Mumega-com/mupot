@@ -3,7 +3,7 @@
 //
 // MODEL. seat_select (W1) resolves (human, harness, workspace key) -> ONE agent and now also mints
 // an opaque SEAT HANDLE (32 random bytes, base64url; only sha256 is stored — migration 0199). A
-// later request presents the handle (header `X-Mupot-Seat`, or `_meta["mupot/seat"]` on the call)
+// later request presents the handle (header `X-Mupot-Seat` carrying the `mseat_` prefix, or `_meta["mupot/seat"]` on the call)
 // next to the human's ordinary OAuth grant. applySeatHandle() then builds the request context AS
 // the seat agent.
 //
@@ -19,11 +19,13 @@
 // `seat_handle_rejected` for the identity receipt — it never errors, never 500s, and never
 // reveals which condition failed.
 //
-// AUTHORITY. The resulting context is `resolveSeatCapabilities`: the human's live grants clamped to
-// min(grant, 'member'), plus the agent's own home grant clamped likewise; re-derived live on every
-// request, never frozen. Org / department grants keep hasCapability's existing rule: they do not
-// reach a kind='home' squad. Admin/owner is never produced here. Zero capabilities -> the human's
-// ORIGINAL context comes back (never a zero-capability context wearing the agent's member id).
+// AUTHORITY. The resulting context is `resolveSeatCapabilities`: per scope, min(the human's LIVE rank
+// on that scope, the agent's rank where the scope comes from the agent's own grant, 'member'); a scope
+// the human holds nothing on is dropped, so an agent's grant can only narrow, never widen. The human
+// must still be admin on the agent's home squad. Re-derived live on every request, never frozen.
+// Org / department grants keep hasCapability's existing rule: they do not reach a kind='home' squad.
+// Admin/owner is never produced here. Zero capabilities -> the human's ORIGINAL context comes back
+// (never a zero-capability context wearing the agent's member id).
 //
 // WHAT NEVER SELECTS A SEAT: Mcp-Session-Id (ChatGPT re-initialises per call, Claude web shares one
 // session, spec 2026-07-28 removes protocol sessions), clientInfo, openai/session, openai/subject,
@@ -34,6 +36,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Capability, CapabilityGrant, Env } from '../types'
 import { capabilityRank, resolveCapabilities, canOnSquad } from '../auth/capability'
+import { humanMaxRankOnScope } from '../mcp/oauth-authorize'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAutoEnrollEnabled } from './harness'
 import { sha256Hex } from './service'
@@ -47,9 +50,13 @@ export const SEAT_HANDLE_MAX_LIVE_PER_SEAT = 32
 export const SEAT_HANDLE_TOUCH_INTERVAL_MS = 10 * 60 * 1000
 
 const HANDLE_BYTES = 32
-// 32 bytes -> 43 base64url chars, no padding. Anything else cannot be a handle we issued, so it is
-// rejected before any DB read (cheap guard against probing with garbage).
-const HANDLE_RE = /^[A-Za-z0-9_-]{43}$/
+/** Recognisable prefix. X-Mupot-Seat is ALSO a long-standing cosmetic seat LABEL header (e.g.
+ *  'cursor-mac'); only a value starting with this prefix is treated as a handle carrier, anything
+ *  else stays a plain label and is never looked up or counted as a rejected handle. */
+export const SEAT_HANDLE_PREFIX = 'mseat_'
+// prefix + 32 bytes -> 43 base64url chars, no padding. Anything else cannot be a handle we issued,
+// so it is rejected before any DB read (cheap guard against probing with garbage).
+const HANDLE_RE = /^mseat_[A-Za-z0-9_-]{43}$/
 
 /** The member-rank ceiling a seat session can ever hold. */
 const SEAT_CEILING: Capability = 'member'
@@ -58,7 +65,7 @@ export function mintSeatHandle(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(HANDLE_BYTES))
   let bin = ''
   for (const b of bytes) bin += String.fromCharCode(b)
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return SEAT_HANDLE_PREFIX + btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 export function isWellFormedSeatHandle(value: unknown): value is string {
@@ -107,42 +114,52 @@ export async function prepareSeatHandleIssue(
 
 // ── capabilities ────────────────────────────────────────────────────────────
 
-function clampToCeiling(capability: Capability): Capability {
-  return capabilityRank(capability) > capabilityRank(SEAT_CEILING) ? SEAT_CEILING : capability
-}
 
 /**
- * The effective capability set of a seat session: the human's LIVE grants clamped to
- * min(grant, 'member'), plus the agent's own home grant clamped likewise, merged per scope at the
- * higher of the two, every grant re-stamped to the agent's dedicated member id. Returns [] (the
- * caller then falls back to the human's original context) when the human no longer holds at least
- * 'member' on the agent's own squad.
+ * The effective capability set of a seat session, per scope:
  *
- * Org / department grants are passed through unchanged in SCOPE: hasCapability's planeCoversScope
- * already refuses to let them cover another member's kind='home' squad, which is the same rule
- * listConsentableAgents applies. Nothing here widens that, and nothing here produces admin/owner.
+ *     min( the human's LIVE rank on that scope, the agent's rank where the scope comes from the
+ *          agent's own grant, 'member' )
+ *
+ * with a scope the human holds NOTHING on dropped outright. The human side uses the SAME ladder walk
+ * as resolveConsentedAgentCapabilities (humanMaxRankOnScope, reused, not copied), so department/org
+ * inheritance and the "org grants never cover a kind='home' squad" rule are identical. The agent's
+ * grants can therefore only narrow the result, never widen it: a grant someone gave the agent on a
+ * squad the human is not on yields nothing there, and removing the human from a squad removes it from
+ * the seat on the very next request.
+ *
+ * Precondition: the human must still stand as ADMIN on the agent's own (home) squad, the same floor
+ * /oauth/consent applies. Returns [] otherwise, and the caller falls back to the human's context.
+ * Every grant is re-stamped to the agent's dedicated member id. Admin/owner is never produced.
  */
 export async function resolveSeatCapabilities(
   env: Env,
   p: { humanMemberId: string; agentId: string; agentSquadId: string; agentMemberId: string },
 ): Promise<CapabilityGrant[]> {
   const humanGrants = await resolveCapabilities(env, p.humanMemberId)
-  // The human must still stand on the agent's own squad (their home squad): the P0-2 analogue.
-  if (!(await canOnSquad(env, humanGrants, p.agentSquadId, 'member'))) return []
+  if (!(await canOnSquad(env, humanGrants, p.agentSquadId, 'admin'))) return []
   const agentGrants = await resolveCapabilities(env, p.agentMemberId)
 
+  const memberRank = capabilityRank(SEAT_CEILING)
   const merged = new Map<string, CapabilityGrant>()
-  for (const g of [...humanGrants, ...agentGrants]) {
-    const cap = clampToCeiling(g.capability)
-    if (capabilityRank(cap) <= 0) continue // unknown / zero-rank values are dropped, never defaulted
+  const consider = async (g: CapabilityGrant, fromAgent: boolean): Promise<void> => {
+    const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
+    const rank = Math.min(humanRank, memberRank, fromAgent ? capabilityRank(g.capability) : memberRank)
+    if (rank <= 0) return // the human holds nothing here (or the value is unknown): dropped, never defaulted
+    const cap = RANK_ASC.find((c) => capabilityRank(c) === rank)
+    if (!cap) return
     const key = `${g.scope_type}\u0000${g.scope_id ?? ''}`
     const prior = merged.get(key)
-    if (!prior || capabilityRank(cap) > capabilityRank(prior.capability)) {
+    if (!prior || rank > capabilityRank(prior.capability)) {
       merged.set(key, { member_id: p.agentMemberId, scope_type: g.scope_type, scope_id: g.scope_id, capability: cap })
     }
   }
+  for (const g of humanGrants) await consider(g, false)
+  for (const g of agentGrants) await consider(g, true)
   return [...merged.values()]
 }
+
+const RANK_ASC: readonly Capability[] = ['observer', 'member', 'lead', 'admin', 'owner']
 
 // ── request inputs ──────────────────────────────────────────────────────────
 
@@ -163,12 +180,14 @@ export interface SeatRequestInputs {
 
 export const NO_HINTS: HarnessHints = { openai_session: false, openai_subject: false, codex_thread_id: false }
 
-/** What the request carried, resolved to ONE candidate: the header wins, then _meta. A header that
- *  is present but wrong is NOT retried against _meta (one candidate, one verdict). */
+/** What the request carried, resolved to ONE candidate. A `_meta` handle wins when present. The
+ *  header is a handle carrier ONLY when it carries the handle prefix; otherwise it is a cosmetic
+ *  label and contributes nothing here. A chosen candidate that fails is NOT retried against the
+ *  other carrier (one candidate, one verdict). */
 function pickHandle(inputs: SeatRequestInputs): string | null {
-  for (const c of [inputs.headerHandle, inputs.metaHandle]) {
-    if (typeof c === 'string' && c.length > 0) return c
-  }
+  if (typeof inputs.metaHandle === 'string' && inputs.metaHandle.length > 0) return inputs.metaHandle
+  const header = typeof inputs.headerHandle === 'string' ? inputs.headerHandle.trim() : ''
+  if (header.startsWith(SEAT_HANDLE_PREFIX)) return header
   return null
 }
 
@@ -201,10 +220,9 @@ async function findLiveSeatForHandle(
             s.label_basename AS seat_label, a.id AS agent_id, a.squad_id AS agent_squad_id,
             b.member_id AS agent_member_id, am.email AS agent_email, h.harness_id AS harness_id,
             (SELECT t.id FROM member_tokens t
-              WHERE t.member_id = b.member_id AND t.agent_id = a.id AND t.tenant = ?1
-                AND t.channel = 'directory' AND t.label LIKE 'seat:%'
-                AND ${TOKEN_LIVE_PREDICATE('?6')}
-              ORDER BY t.created_at DESC LIMIT 1) AS seat_token_id
+              WHERE t.id = s.seat_token_id AND t.member_id = b.member_id AND t.agent_id = a.id
+                AND t.tenant = ?1 AND t.channel = 'directory'
+                AND ${TOKEN_LIVE_PREDICATE('?6')}) AS seat_token_id
        FROM seat_handles h
        JOIN agent_seats s ON s.id = h.seat_id AND s.tenant = h.tenant
        JOIN agents a ON a.id = h.agent_id
