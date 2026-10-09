@@ -66,10 +66,19 @@ export function genuinelyFailedFlightSql(alias = 'f'): string {
   return realFailureSql(alias)
 }
 
-/** SQL fragment: a terminal bookkeeping row stored as 'failed' (pre-fix watchdog reaps), not cancelled. */
+/**
+ * SQL fragment: a TERMINAL bookkeeping row, whatever its terminal status (landed = bookkeeping_closed, failed = a
+ * pre-fix watchdog reap). Checked FIRST by every reader: a bookkeeping flight never flew, so it is never a landing,
+ * a failure or a cancel in any counter (#1748 P2-a).
+ */
 export function bookkeepingClosedFlightSql(alias = 'f'): string {
   const a = safeAlias(alias)
-  return `(${a}.status = 'failed' AND ${a}.bookkeeping = 1 AND NOT ${cancelledFlightSql(a)})`
+  return `(${a}.status IN ('landed', 'failed') AND ${a}.bookkeeping = 1)`
+}
+
+/** JS side of bookkeepingClosedFlightSql: the ONE bookkeeping check every reader runs before anything else. */
+export function isBookkeepingClosed(row: { status: string; bookkeeping?: number | boolean | null }): boolean {
+  return (row.status === 'landed' || row.status === 'failed') && isBookkeepingFlight(row)
 }
 
 /** 1 for a server-marked bookkeeping flight. Absent key (hand-built rows, older queries) = not bookkeeping. */
@@ -99,9 +108,9 @@ export function isCancelledFlight(row: { status: string; cancelled: number | boo
 export function flightOutcome<S extends string>(
   row: { status: S; cancelled: number | boolean | null | undefined; bookkeeping?: number | boolean | null },
 ): S | 'cancelled' | 'bookkeeping' {
+  // Bookkeeping FIRST, whatever the terminal status (landed = bookkeeping_closed, failed = pre-fix reap).
+  if (isBookkeepingClosed(row)) return 'bookkeeping'
   if (isCancelledFlight(row)) return 'cancelled'
-  // A bookkeeping flight stored as 'failed' (a pre-fix watchdog reap) is not a failure: its own outcome.
-  if (row.status === 'failed' && isBookkeepingFlight(row)) return 'bookkeeping'
   return row.status
 }
 
@@ -118,9 +127,10 @@ export function outcomeFilterSql(outcomes: readonly string[], alias = 'f'): stri
   const parts = new Set<string>()
   for (const o of outcomes) {
     if (!/^[a-z_]+$/.test(o)) throw new Error('invalid_outcome')
-    if (o === 'cancelled') parts.add(`(${a}.status = 'failed' AND ${cancelledFlightSql(a)})`)
+    if (o === 'cancelled') parts.add(`(${a}.status = 'failed' AND ${a}.bookkeeping = 0 AND ${cancelledFlightSql(a)})`)
     else if (o === 'failed') parts.add(realFailureSql(a))
     else if (o === 'bookkeeping') parts.add(bookkeepingClosedFlightSql(a))
+    else if (o === 'landed') parts.add(`(${a}.status = 'landed' AND ${a}.bookkeeping = 0)`)
     else parts.add(`${a}.status = '${o}'`)
   }
   return `(${[...parts].join(' OR ')})`

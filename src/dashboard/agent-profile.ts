@@ -1,5 +1,5 @@
 import type { Env } from '../types'
-import { cancelledColumnSql, flightOutcome, isBookkeepingFlight, isCancelledFlight, isCancelUnconfirmed, isRealFailure } from '../flight/cancelled'
+import { cancelledColumnSql, flightOutcome, isBookkeepingClosed, isCancelledFlight, isCancelUnconfirmed, isRealFailure } from '../flight/cancelled'
 import { chunkForD1InList } from '../lib/d1-in-list'
 
 /**
@@ -113,7 +113,7 @@ export interface FlightSummary {
   cancelled: number
   /** #1756: of `cancelled`, how many did not fence the routine effect. Still NOT counted as failed. */
   cancelUnconfirmed: number
-  /** #1762: bookkeeping flights stored as 'failed' (pre-fix watchdog reaps); NOT counted in `failed`. */
+  /** #1762: terminal bookkeeping flights (landed bookkeeping_closed, or pre-fix failed reaps); NOT counted in `landed` or `failed`. */
   bookkeeping: number
   held: number
   running: number
@@ -145,13 +145,13 @@ export function summariseFlights(
     recent: [],
   }
   for (const r of rows) {
-    if (r.status === 'landed') summary.landed += 1
+    if (isBookkeepingClosed(r)) summary.bookkeeping += 1
+    else if (r.status === 'landed') summary.landed += 1
     else if (isCancelledFlight(r)) {
       summary.cancelled += 1
       if (isCancelUnconfirmed(r)) summary.cancelUnconfirmed += 1
     }
     else if (isRealFailure({ status: r.status, cancelled: r.cancelled, bookkeeping: r.bookkeeping })) summary.failed += 1
-    else if (r.status === 'failed' && isBookkeepingFlight(r)) summary.bookkeeping += 1
     else if (r.status === 'held') summary.held += 1
     else if (r.status === 'running') summary.running += 1
     // #1732: an unmetered flight has no known cost; skip it rather than add a fabricated 0.

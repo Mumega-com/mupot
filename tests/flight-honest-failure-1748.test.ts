@@ -51,15 +51,18 @@ function seedTask(id: string, status = 'in_progress'): void {
     .run(id, SQUAD, status, AGENT)
 }
 
-function seedFlight(id: string, o: { status?: string; taskIds?: string[]; bookkeeping?: number; startedAt?: number } = {}): void {
-  const meta = JSON.stringify({ schema: 'mupot.flight.meta/v1', squad_ids: [SQUAD], ...(o.taskIds ? { task_ids: o.taskIds } : {}) })
+function seedFlight(
+  id: string,
+  o: { status?: string; taskIds?: string[]; bookkeeping?: number; startedAt?: number; budget?: number | null; cost?: number; schema?: string } = {},
+): void {
+  const meta = JSON.stringify({ schema: o.schema ?? 'mupot.flight.meta/v1', squad_ids: [SQUAD], ...(o.taskIds ? { task_ids: o.taskIds } : {}) })
   h.sqlite
     .prepare(
       `INSERT INTO flights (id, tenant, agent, dispatched_by_agent_id, goal, status, trigger_source, gate_verdict, gate_reason,
          score, budget_micro_usd, cost_micro_usd, created_at, started_at, meta, bookkeeping)
-       VALUES (?, ?, ?, 'agent-2222', 'g', ?, 'api', 'go', '', 1, 0, 0, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, 'agent-2222', 'g', ?, 'api', 'go', '', 1, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(id, TENANT, AGENT, o.status ?? 'running', T0, o.startedAt ?? T0, meta, o.bookkeeping ?? 0)
+    .run(id, TENANT, AGENT, o.status ?? 'running', o.budget === undefined ? 0 : o.budget, o.cost ?? 0, T0, o.startedAt ?? T0, meta, o.bookkeeping ?? 0)
 }
 
 function row(id: string): Record<string, unknown> {
@@ -174,6 +177,67 @@ describe('1. a flight whose tasks are all done lands, it is not failed by the st
   })
 })
 
+describe('1b. the watchdog done-land is the governed-land predicate, not a weaker copy (P1)', () => {
+  function gatedTask(id: string): void {
+    seedTask(id)
+    h.sqlite.prepare("UPDATE tasks SET gate_owner = 'gate:hadi' WHERE id = ?").run(id)
+  }
+  function verdict(id: string, v: 'approved' | 'rejected', at: string): void {
+    h.sqlite
+      .prepare("INSERT INTO task_verdicts (id, task_id, verdict, decided_by, decided_at) VALUES (?, ?, ?, 'someone', ?)")
+      .run(`v-${id}-${at}`, id, v, at)
+  }
+  async function reap(id: string) {
+    return reapStalledFlight(env, id, WATCHDOG, 'running_exceeded_timeout', STALLED_NOW)
+  }
+
+  it('gated task rejected then abandoned to done (latest verdict rejected) -> failed', async () => {
+    gatedTask('g1')
+    verdict('g1', 'rejected', '2026-10-09T00:00:00.000Z')
+    seedFlight('fl-g', { taskIds: ['g1'] })
+    h.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = 'g1'").run()
+    expect(await reap('fl-g')).toMatchObject({ transitioned: true, target_status: 'failed' })
+    expect(row('fl-g').status).toBe('failed')
+  })
+
+  it('gated task done with no verdict at all -> failed', async () => {
+    gatedTask('g1')
+    seedFlight('fl-g', { taskIds: ['g1'] })
+    h.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = 'g1'").run()
+    expect(await reap('fl-g')).toMatchObject({ target_status: 'failed' })
+  })
+
+  it('gated task whose LATEST verdict is approved (earlier rejected) and within budget -> landed', async () => {
+    gatedTask('g1')
+    verdict('g1', 'rejected', '2026-10-09T00:00:00.000Z')
+    verdict('g1', 'approved', '2026-10-09T01:00:00.000Z')
+    seedFlight('fl-g', { taskIds: ['g1'], budget: 100, cost: 100 })
+    h.sqlite.prepare("UPDATE tasks SET status = 'done' WHERE id = 'g1'").run()
+    expect(await reap('fl-g')).toMatchObject({ target_status: 'landed', disposition: 'tasks_done' })
+    expect(row('fl-g').status).toBe('landed')
+  })
+
+  it('over budget (metered) -> failed; null budget -> failed; wrong meta schema -> failed', async () => {
+    seedTask('t1')
+    seedFlight('fl-over', { taskIds: ['t1'], budget: 5, cost: 10 })
+    seedFlight('fl-null', { taskIds: ['t1'], budget: null })
+    seedFlight('fl-schema', { taskIds: ['t1'], schema: 'other/v9' })
+    h.sqlite.prepare("UPDATE tasks SET status = 'done'").run()
+    for (const id of ['fl-over', 'fl-null', 'fl-schema']) {
+      expect(await reap(id)).toMatchObject({ transitioned: true, target_status: 'failed' })
+      expect(row(id).status).toBe('failed')
+    }
+  })
+
+  it('an unmetered flight (cost_metered=0) skips the budget comparison but still needs a budget policy', async () => {
+    seedTask('t1')
+    seedFlight('fl-unm', { taskIds: ['t1'], budget: 5, cost: 10 })
+    h.sqlite.prepare("UPDATE flights SET cost_metered = 0 WHERE id = 'fl-unm'").run()
+    h.sqlite.prepare("UPDATE tasks SET status = 'done'").run()
+    expect(await reap('fl-unm')).toMatchObject({ target_status: 'landed' })
+  })
+})
+
 describe('2. bookkeeping flights are closed as landed / bookkeeping_closed, not failed', () => {
   it('a stalled bookkeeping preflight flight lands with gate_reason bookkeeping_closed', async () => {
     seedFlight('fl-bk', { status: 'preflight', bookkeeping: 1 })
@@ -235,6 +299,22 @@ describe('3. one real-failure predicate for every counter', () => {
     expect(phases).toMatchObject({ 'f-real': 'failed', 'f-cancel': 'cancelled', 'f-book': 'bookkeeping' })
     expect(flightFilterGroup('bookkeeping')).toBe('bookkeeping')
     expect(deriveFlightDeckKpis(cards).failed).toBe(1)
+  })
+
+  it('P2-a: a LANDED bookkeeping row is bookkeeping in every reader, never landed', async () => {
+    seedFlight('f-bk-landed', { status: 'landed', bookkeeping: 1 })
+    seedFlight('f-real-landed', { status: 'landed', bookkeeping: 0 })
+    expect(flightOutcome({ status: 'landed', cancelled: 0, bookkeeping: 1 })).toBe('bookkeeping')
+    const panel = await loadFlightPanel(env, AGENT)
+    if (panel.state !== 'ready') throw new Error('panel not ready')
+    expect(panel.data).toMatchObject({ landed: 1, bookkeeping: 1, failed: 0 })
+    const cards = buildBoard(await listFlights(env, 50), STALLED_NOW)
+    expect(Object.fromEntries(cards.map((c) => [c.id, c.phase]))).toMatchObject({ 'f-bk-landed': 'bookkeeping', 'f-real-landed': 'landed' })
+    expect(deriveFlightDeckKpis(cards).landed).toBe(1)
+    const bk = await listFlightOutcomes(env, { limit: 50, outcomes: ['bookkeeping'] })
+    expect(bk.rows.map((r) => r.id)).toEqual(['f-bk-landed'])
+    const landed = await listFlightOutcomes(env, { limit: 50, outcomes: ['landed'] })
+    expect(landed.rows.map((r) => r.id)).toEqual(['f-real-landed'])
   })
 
   it('outcome feed: ?failed returns only the real failure; ?bookkeeping returns the closure', async () => {

@@ -27,7 +27,7 @@
 import type { Env } from '../types'
 import { routineEffectInFlightSql } from '../routines/running-action'
 import type { FlightRow, FlightStatus } from './service'
-import { getFlight } from './service'
+import { getFlight, governedLandEligibilitySql } from './service'
 import { FLIGHT_META_TIMEOUT_MS_MAX, FLIGHT_META_TIMEOUT_MS_MIN, parseFlightMetaV1 } from './meta'
 import { evaluateStructuralSignal, type ChildTaskRow, type StructuralBlockReason } from '../projects/completion-gate'
 
@@ -89,22 +89,19 @@ export interface FlightReapResult {
 export type ReapDisposition = 'failed' | 'tasks_done' | 'bookkeeping_closed'
 
 /**
- * SQL boolean fragment (alias `f`): the flight's own work finished. meta.task_ids is a non-empty array,
- * every id resolves to a task in the flight's project that is `done`, and the flight is not bound to a
- * routine run (a routine flight is closed by its run, same carve-out as the 0172 waiting triggers).
+ * SQL boolean fragment: the flight's own work finished AND the governed land would accept it. meta.task_ids is a
+ * non-empty array, the shared governed-land predicate holds, and the flight is not bound to a routine run (a routine flight is closed by its run, same carve-out as the 0172 waiting triggers).
  * A flight with no task_ids has no evidence of finished work and is never matched.
  */
 function tasksAllDoneSql(alias = 'f'): string {
+  // Eligibility is landGovernedFlight's own predicate (budget policy, meta schema v1, every task done in project
+  // with an approved latest verdict where gated), shared, never copied (#1748 P1). The watchdog compares the
+  // RECORDED cost (an unmetered flight has no cost to compare). Only the routine carve-out and the non-empty
+  // task_ids requirement are watchdog-specific.
   return `(json_valid(${alias}.meta)
     AND json_type(${alias}.meta, '$.task_ids') = 'array'
     AND json_array_length(${alias}.meta, '$.task_ids') > 0
-    AND NOT EXISTS (
-      SELECT 1 FROM json_each(${alias}.meta, '$.task_ids') ref
-        LEFT JOIN tasks t ON t.id = ref.value
-       WHERE t.id IS NULL
-          OR t.status <> 'done'
-          OR (${alias}.project_id IS NOT NULL AND t.project_id IS NOT ${alias}.project_id)
-    )
+    AND ${governedLandEligibilitySql(alias, `(${alias}.cost_metered = 0 OR ${alias}.cost_micro_usd <= ${alias}.budget_micro_usd)`)}
     AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = ${alias}.id AND rr.tenant = ${alias}.tenant))`
 }
 
