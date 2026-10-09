@@ -2014,7 +2014,7 @@ function reviewWakeRequestId(taskId: string, ts: string): string {
 //      non-DO runtime polling GET /api/inbox — the bash wake-hooks — also picks up
 //      the review delegation without needing a hand relay.
 export type GateWakeOutcome = {
-  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'resolution_failed'
+  status: 'delivered' | 'partial' | 'delivery_failed' | 'ambiguous' | 'no_live_holder' | 'requires_human' | 'resolution_failed' | 'task_archived'
   capability: string
   principal?: GatePrincipalRef
   active_holders: readonly GatePrincipalRef[]
@@ -2044,6 +2044,21 @@ export async function wakeGateOwnerOnReview(
   actor: { kind: 'member' | 'agent'; id: string },
   byId: string,
 ): Promise<GateWakeOutcome> {
+  // Archive is an ACTION boundary (mupot#1571/#1780): an archived task causes no effect from any
+  // actor, including the cron watchdog. Re-asserted HERE (not only in the sweep's SELECT) because
+  // this helper has several callers. Nothing is written, not even the notice: persistGateWakeNotice
+  // is guarded too, so surfaceGateWakeOutcome would be a no-op, but we skip it for clarity.
+  if (await isTaskArchived(env, task.id)) {
+    return {
+      status: 'task_archived',
+      capability: task.gate_owner ?? '',
+      active_holders: [],
+      inactive_holders: [],
+      grant_count: 0,
+      notice: 'Gate wake not attempted: task is archived.',
+      notice_persisted: false,
+    }
+  }
   const gateOwner = task.gate_owner
   if (!gateOwner) {
     return surfaceGateWakeOutcome(env, task.id, {

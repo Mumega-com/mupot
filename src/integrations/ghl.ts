@@ -336,8 +336,10 @@ export async function runApprovedActs(
 
   // ── a2. Archived = inert (mupot#1571) ────────────────────────────────────
   // An approved verdict does not outlive the task being archived: no outbound send. Acts stay
-  // 'pending' (inert, exactly like not_configured) so an unarchive can resume them. The per-act
-  // claim below re-asserts this in its own WHERE for the window between this check and the send.
+  // 'pending' (inert, exactly like not_configured). Nothing resumes them automatically: the only
+  // caller of runApprovedActs is the task pipeline (workflows/pipeline.ts), so an unarchive does NOT
+  // re-run them; a fresh pipeline run (or operator action) would be needed. The per-act claim below
+  // re-asserts not-archived in its own WHERE for the window between this check and the send.
   if (await isTaskArchived(env, taskId)) {
     return { ok: false, reason: 'task_archived', sent: 0, refused: 0, failed: 0 }
   }
@@ -400,7 +402,12 @@ export async function runApprovedActs(
       .run()
     const claimed = (claim.meta?.changes ?? 0) === 1
     if (!claimed) {
-      // Already claimed/sent by a prior attempt — do NOT re-send.
+      // 0 rows: either a prior attempt already claimed/sent this act (do NOT re-send), or the task
+      // was archived between the a2 pre-check and this claim (#1780). The latter must not read as a
+      // success-shaped { ok: true, sent: 0 }: stop and report task_archived so callers record it.
+      if (await isTaskArchived(env, taskId)) {
+        return { ok: false, reason: 'task_archived', sent, refused: 0, failed }
+      }
       continue
     }
 

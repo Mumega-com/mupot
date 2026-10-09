@@ -46,6 +46,8 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
       external_source TEXT,
       created_at TEXT NOT NULL
     );
+    -- mupot#1780: archived tasks are inert; countOpenBacklog excludes them via tasks_archive_state.
+    CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
   `)
 }
 
@@ -149,6 +151,13 @@ describe('backpressure governor — provenance on the unassigned branch (C10)', 
     const result = await runGoalCycle(env(), makeAgent(), deps())
     expect(result.decided).toBe('backpressure')
     expect(result.spawned).toBe(0)
+  })
+
+  it('archived open tasks (mupot#1780) do not exert backpressure: archived = inert', async () => {
+    seed(MAX_OPEN_TASKS, {}, 'archived')
+    harness.sqlite.exec(`INSERT INTO tasks_archive_state (task_id) SELECT id FROM tasks`)
+    const result = await runGoalCycle(env(), makeAgent(), deps())
+    expect(result.decided).toBe('spawned')
   })
 
   it('THE DEFECT: external-integration imports at the cap must NOT stop the loop', async () => {

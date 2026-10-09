@@ -27,6 +27,7 @@
 
 import type { Env, Agent, Effort, Autonomy } from '../types'
 import { asData } from '../lib/prompt-safety'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // ── Version ─────────────────────────────────────────────────────────────────
 
@@ -272,6 +273,7 @@ async function safeReadSchedule(
       `SELECT status, COUNT(*) AS cnt
          FROM tasks
         WHERE assignee_agent_id = ?
+          AND ${TASK_NOT_ARCHIVED_SQL()}
         GROUP BY status`,
     )
       .bind(agent.id)
@@ -296,7 +298,8 @@ async function safeReadSchedule(
          FROM tasks
         WHERE assignee_agent_id = ?
           AND status IN ('open','in_progress')
-          AND created_at < ?`,
+          AND created_at < ?
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
     )
       .bind(agent.id, overdueThreshold)
       .first<{ cnt: number }>()
@@ -309,6 +312,7 @@ async function safeReadSchedule(
          FROM tasks
         WHERE assignee_agent_id = ?
           AND status = 'open'
+          AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY created_at ASC, id ASC
         LIMIT ?`,
     )
@@ -372,6 +376,7 @@ async function safeReadDelegations(
          FROM tasks
         WHERE assignee_agent_id = ?
           AND status NOT IN ('done','approved','rejected')
+          AND ${TASK_NOT_ARCHIVED_SQL()}
         ORDER BY created_at ASC, id ASC
         LIMIT ?`,
     )

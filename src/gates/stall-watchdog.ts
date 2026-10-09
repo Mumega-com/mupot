@@ -18,6 +18,7 @@ import type { Env, Task } from '../types'
 // Static import: a dynamic import('../mcp') here made esbuild lazy-wrap the module graph and emit a
 // top-level await inside a sync initializer ("Unexpected reserved word" at Worker startup).
 import { wakeGateOwnerOnReview } from '../mcp'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 export const DEFAULT_GATE_STALL_THRESHOLD_MINUTES = 30
 export const DEFAULT_GATE_STALL_MAX_REWAKES = 3
@@ -51,6 +52,7 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
   const rows = await env.DB.prepare(
     `SELECT t.* FROM tasks t
       WHERE t.status = 'review' AND t.gate_owner IS NOT NULL AND t.gate_owner <> ''
+        AND ${TASK_NOT_ARCHIVED_SQL('t')}
         AND datetime(t.updated_at) <= datetime(?1)
         AND NOT EXISTS (
           SELECT 1 FROM task_verdicts v

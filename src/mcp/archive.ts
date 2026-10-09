@@ -24,6 +24,7 @@ import {
   unarchiveRow,
   isArchivableTable,
   ARCHIVABLE_TABLES,
+  taskArchiveEnabled,
   type ArchivableTable,
 } from '../hygiene/archive'
 
@@ -106,7 +107,9 @@ export const toolArchiveRow: ToolSpec = {
   min: 'admin',
   args: '{ table: "members"|"agents"|"squads"|"projects"|"tasks", id: string, reason: string, expected_status?: string }' +
     ' -- org-admin only, operator principal only (no agent-bound caller).' +
-    ' tasks: an archived task accepts NO action (router/concierge claim, task_update,' +
+    ' tasks: REQUIRES the pot to opt in with TASK_ARCHIVE_ENABLED=1; with it off, archive_row/unarchive_row on' +
+    ' table=tasks return 409 not_supported {table, issue} (the other four tables are unaffected).' +
+    ' An archived task accepts NO action (router/concierge claim, task_update,' +
     ' task_verdict, dispatch, runtime receipts, flight_dispatch all refuse it); refuses' +
     ' live_execution_claim and in_air_flight; expected_status (a plan\'s reviewed status) is' +
     ' re-checked inside the write and refused per row as status_drift; an unknown value is' +
@@ -227,7 +230,8 @@ export const toolArchivePlanExpand: ToolSpec = {
   scope: 'org',
   min: 'admin',
   args: '{ table: "tasks", mode?: "live"|"archived", where: { status: string[] (>=1, known task statuses only), created_before: string (ISO, required), project_ids: string[] (>=1, required; any length) } }' +
-    ' -- read-only. Returns the tasks a bulk archive/unarchive plan would touch, without' +
+    ' -- read-only. Requires TASK_ARCHIVE_ENABLED=1 (otherwise 409 not_supported, same as archive_row on tasks).' +
+    ' Returns the tasks a bulk archive/unarchive plan would touch, without' +
     ' archiving anything. project_ids, created_before, and a non-empty status list are' +
     ' ALL required — there is no unscoped "match everything" shape. mode="live" (default)' +
     ' matches tasks with NO tasks_archive_state row (for an archive plan); mode="archived"' +
@@ -258,6 +262,10 @@ export const toolArchivePlanExpand: ToolSpec = {
     if (gateFail) return gateFail
 
     if (args.table !== 'tasks') return fail(400, 'unsupported_table', 'only table=tasks supports plan expansion')
+    // Parity with archive_row/unarchive_row: a plan for an archive that cannot run is misleading.
+    if (!taskArchiveEnabled(env)) {
+      return fail(409, 'not_supported', { table: 'tasks', issue: 'https://github.com/Mumega-com/mupot/issues/1571' })
+    }
     const mode = args.mode === 'archived' ? 'archived' : 'live'
     // `as`: args is Record<string, unknown>; every field of this shape is re-validated below
     // (array/string/ISO/enum checks) before any value is used, so the cast only names the shape.
