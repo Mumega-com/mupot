@@ -111,6 +111,7 @@ describe('#1762 P3 cursor create POST redirect handling', () => {
     vi.stubGlobal('fetch', f)
     const o = await launchCursorAgent('tok', { name: 'n', repoUrl: REPO, prompt: 'p' })
     expect(o.state).toBe('maybe_launched')
+    if (o.state === 'maybe_launched') expect(o.error).toMatchObject({ status: 502, code: 'cursor_unexpected_redirect' })
     expect(f).toHaveBeenCalledOnce()
     const init = (f.mock.calls[0] as unknown as [string, RequestInit])[1]
     expect(init.redirect).toBe('manual')
