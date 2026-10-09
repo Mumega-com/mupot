@@ -67,6 +67,7 @@ import type { EpisodeInput, Episode } from './episodic'
 import { computeKpiSignal } from './kpi-sources'
 import type { KpiSignalResult } from './kpi-sources'
 import { GATE_LOOPS } from '../gates/lanes'
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 
 // The gate stamped on tasks an agent's own loop creates under
 // execute_with_approval.
@@ -867,7 +868,8 @@ async function countOpenBacklog(env: Env, agent: Agent): Promise<number> {
        WHERE status = 'open'
          AND (assignee_agent_id = ?
               OR (assignee_agent_id IS NULL AND squad_id = ?
-                  AND source_pot IS NULL AND external_source IS NULL))`,
+                  AND source_pot IS NULL AND external_source IS NULL))
+         AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(agent.id, agent.squad_id)
     .first<{ cnt: number }>()
