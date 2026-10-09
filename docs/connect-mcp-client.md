@@ -170,6 +170,31 @@ client registration, self-serve sign-in). So the allowlist removes the
 `tools/list` is filtered by the caller's capability floor. (`GET /mcp/tools` is
 not a public listing: it returns `401` without a token and `404` with one.)
 
+## Harness seats: one connector, one agent per thread (behind `SEAT_AUTO_ENROLL`)
+
+> Off unless the pot sets `SEAT_AUTO_ENROLL=1`. With it off, none of this exists: the consent
+> screen, `boot_context` and the initialize instructions are unchanged.
+
+When the flag is on, the consent screen preselects **Me — auto per workspace (harness)**. That
+authorises the connector as *you*, with no agent bound. Each thread or worktree then picks its
+own agent:
+
+1. Call `seat_select { project, folder?, thread? }`. The values are labels that key the seat;
+   they grant nothing. The seat agent is capped at member, and your own access is the ceiling.
+2. The result carries a seat handle (prefix `mseat_`). Send it on every later request as the
+   `X-Mupot-Seat` header, or as `_meta["mupot/seat"]` if the client cannot set headers.
+3. `boot_context` now shows an `identity_receipt` naming the agent you act as. The handle only
+   selects a seat; it is not a credential, and it stops working when your grant is revoked.
+
+| Harness | How the handle travels |
+|---|---|
+| Claude Code, Cursor, Grok | Header. Set `X-Mupot-Seat` from a per-worktree env var in that worktree's MCP config. |
+| Codex | `_meta["mupot/seat"]`, or the header if your Codex config can set one. |
+| ChatGPT, Claude (web) | Call `seat_select` in the chat, then pass the handle in `_meta` on later tool calls. |
+
+Choosing an existing agent on the consent screen still works exactly as before, and an existing
+agent-bound connection is untouched.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

@@ -258,7 +258,7 @@ import { loadFlightSquads, parseFlightMetaV1, validateFlightMetaReferences, type
 import { AUTH_CONTEXT_HEADER } from './auth-header'
 import { isExternallySourced } from '../tasks/provenance'
 import { MUPOT_PUBLIC_API_VERSION } from '../version'
-import { MUPOT_MCP_INITIALIZE_INSTRUCTIONS } from './instructions'
+import { mcpInitializeInstructions } from './instructions'
 // The SAME predicate the meter enforces with. Imported rather than restated —
 // these were two copies and they drifted (#1179 gate R6).
 import { getAuthorizedMeterStatus, isEnforceableCap } from '../agents/meter'
@@ -6290,6 +6290,17 @@ const toolBootContext: ToolSpec = {
         : 'unbound_workspace'
 
     const availableDoors = buildAvailableDoors(onboardingState)
+    // mupot#1794 W3 — an unbound harness session (consented as "Me — auto per workspace") has ONE
+    // right first move: seat_select. Flag off, or any other session shape, leaves the doors and
+    // next_step untouched. Gate mirrors resolveSeatSession's: the very sessions a handle can serve.
+    const harnessSeatDoor = seatAutoEnrollEnabled(env) && !isMinted && auth.channel === 'directory' && !!auth.harnessId
+    if (harnessSeatDoor) {
+      availableDoors.unshift({
+        tool: 'seat_select',
+        does: 'find-or-create the agent seat for this thread/worktree and receive a seat handle (prefix mseat_); send it as the X-Mupot-Seat header, or _meta["mupot/seat"] if your client cannot set headers, on every later request',
+        requires: 'nothing beyond this connection — the seat agent is capped at member and your own access is the ceiling',
+      })
+    }
     const enrollHref = enrollUrl(
       canonicalOrigin(env, ctx.origin),
       (str(args.seat) || str(args.label) || ctx?.seat || '').trim() || null,
@@ -6311,13 +6322,17 @@ const toolBootContext: ToolSpec = {
     // The workspace-channel wording is unchanged: bootstrap_self is gated to the
     // directory channel inside bootstrapSelf, so advertising it here would be a door
     // that refuses the caller it was offered to.
-    const nextStep = isMinted
+    const nextStepBase = isMinted
       ? 'call orient (no args — your token is agent-bound) to receive your full basin-drop packet'
       : onboardingState === 'unbound_no_agent'
         ? 'you have no agent yet — call bootstrap_self { agent_name: "<the name you are giving it>" } to create it, mint its credential and grant yourself admin on its squad in one act. No other human is required. See available_doors for every door open to you.'
         : onboardingState === 'unbound_agent_exists'
           ? 'you already bootstrapped an agent — bind this session to it at /oauth/consent, or call connect { agent_name: "<slug>" } to claim it session-locally now. See available_doors.'
           : 'if you know your agent slug/id: call connect { agent_name: "<slug>" } to claim your identity now (session-local). For a permanent weld: ask an org-admin to call mint_agent_token for your agent, then reconnect with the minted token.'
+
+    const nextStep = harnessSeatDoor
+      ? 'this connection is a harness session with no agent yet — call seat_select { project: "<workspace name>", folder?, thread? } first; it returns a seat handle (mseat_...) to send as the X-Mupot-Seat header or _meta["mupot/seat"] on every later request. See available_doors.'
+      : nextStepBase
 
     // THE DOOR MUST SAY WHAT IT IS (#712).
     //
@@ -6369,6 +6384,15 @@ const toolBootContext: ToolSpec = {
       ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
       : undefined
 
+    // mupot#1794 W3 — a request bound through a seat handle says so in plain words, from the
+    // server-derived receipt (never from anything the caller sent).
+    let nextStepOut = nextStep
+    if (identityReceipt && auth.seatBinding) {
+      const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
+      const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
+      nextStepOut = `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). ${nextStep}`
+    }
+
     return done({
       // principal fields (mirrors the status tool's self-echo, kept stable)
       tenant: auth.tenant,
@@ -6383,7 +6407,7 @@ const toolBootContext: ToolSpec = {
       ...(selfReport ? { registry: selfReport } : {}),
       onboarding_state: onboardingState,
       available_doors: availableDoors,
-      next_step: nextStep,
+      next_step: nextStepOut,
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
@@ -7107,14 +7131,14 @@ async function handleJsonRpc(
         protocolVersion: EVENTS_PROTOCOL_VERSION,
         capabilities: eventsProtocolCapabilities(),
         serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
-        instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
+        instructions: mcpInitializeInstructions(c.env),
       })
     }
     return ok(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
-      instructions: MUPOT_MCP_INITIALIZE_INSTRUCTIONS,
+      instructions: mcpInitializeInstructions(c.env),
     })
   }
 

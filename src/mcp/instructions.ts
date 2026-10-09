@@ -68,3 +68,20 @@ export const MUPOT_MCP_INITIALIZE_INSTRUCTIONS = `=== MUPOT AGENT ONBOARDING & R
          flight_id: "<uuid>"                // optional — active leased flight UUID
        })
    - Distinct seats on the same member persist independently. Do not reuse another harness's seat id.`
+
+
+// mupot#1794 W3 — appended to the initialize instructions ONLY while SEAT_AUTO_ENROLL === '1'.
+// Same invariant as above: strictly static and tenant-neutral. Flag off, initialize serves the
+// constant above, byte-identical to before this section existed.
+export const MUPOT_MCP_SEAT_INSTRUCTIONS = `
+
+SEAT HANDLES (zero-touch seats; applies when your connector was authorised as "Me — auto per workspace")
+   - If boot_context reports a harness session with no bound agent, your FIRST step is 'seat_select' with { project: "<workspace name>", folder?: "<worktree path>", thread?: "<thread id>" }. Every value is a label that keys your seat; none of them grants authority.
+   - It returns a seat handle (prefix "mseat_"). Send it on every later request as the X-Mupot-Seat header, or as _meta["mupot/seat"] when your client cannot set headers. The handle only selects which seat agent you act as; it is not a credential, and your own grant stays the ceiling.
+   - Once a request carries a valid handle, boot_context shows an identity_receipt naming the agent you act as and how it was bound.`
+
+export function mcpInitializeInstructions(env: { SEAT_AUTO_ENROLL?: string }): string {
+  return env.SEAT_AUTO_ENROLL === '1'
+    ? MUPOT_MCP_INITIALIZE_INSTRUCTIONS + MUPOT_MCP_SEAT_INSTRUCTIONS
+    : MUPOT_MCP_INITIALIZE_INSTRUCTIONS
+}
