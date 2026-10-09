@@ -109,6 +109,10 @@ export interface HermesEventEnvelope {
 export type DeliveryOutcome =
   | { kind: 'not_configured'; missing: string[] }
   | { kind: 'delivered'; status: number }
+  // The configured receiver deliberately filtered this event (gateway webhook.py answers
+  // 200 {"status":"ignored","reason":...,"route":<route>}). Authenticated decline, not a
+  // transport failure: the consumer acks it. See isDeclinedBody for the anti-spoof gate.
+  | { kind: 'declined'; status: number; reason: string; route: string }
   | { kind: 'unexpected_response'; status: number; detail: string }
   | { kind: 'unauthorized'; status: number; detail: string }
   | { kind: 'not_found'; status: number; detail: string }
@@ -142,6 +146,23 @@ export function buildHermesEventEnvelope(event: BusEvent<MessageCreatedPayload>,
 }
 
 /**
+ * Route name of the configured webhook URL: the last non-empty path segment
+ * (".../webhooks/mubot-inbox" -> "mubot-inbox"). Null when it cannot be derived, in which
+ * case 'declined' is never accepted.
+ */
+export function expectedRouteFromUrl(url: string | undefined): string | null {
+  if (!url) return null
+  try {
+    const segs = new URL(url).pathname.split('/').filter((x) => x.length > 0)
+    const last = segs[segs.length - 1]
+    if (!last) return null
+    return decodeURIComponent(last)
+  } catch {
+    return null
+  }
+}
+
+/**
  * Classify an HTTP response into a distinct, loud outcome. Never collapses to a bare
  * `resp.ok` boolean (see file header — that is the bus_notify.ts defect this must not
  * repeat). A 2xx only counts as 'delivered' if the body proves THIS endpoint accepted
@@ -149,7 +170,11 @@ export function buildHermesEventEnvelope(event: BusEvent<MessageCreatedPayload>,
  * (a health check, a proxy's default page, some other service entirely answering on the
  * hostname) is 'unexpected_response' — a 2xx is necessary but not sufficient for a receipt.
  */
-export async function classifyDeliveryOutcome(resp: Response, sentEventId: string): Promise<DeliveryOutcome> {
+export async function classifyDeliveryOutcome(
+  resp: Response,
+  sentEventId: string,
+  expectedRoute: string | null = null,
+): Promise<DeliveryOutcome> {
   const status = resp.status
   if (status === 401 || status === 403) {
     const detail = await resp.text().catch(() => '')
@@ -170,6 +195,20 @@ export async function classifyDeliveryOutcome(resp: Response, sentEventId: strin
           (b.status === 'accepted' && b.delivery_id === sentEventId)
         ) {
           return { kind: 'delivered', status }
+        }
+        // Deliberate decline from THIS route (mupot#1716). A bare {"status":"ignored"} from
+        // any server is still unexpected_response: the body must also name the configured
+        // route (derived from our own URL) and carry a string reason. The gateway's ignored
+        // body echoes no event/delivery id (gateway/platforms/webhook.py:599), so there is
+        // nothing further to bind it to.
+        if (
+          expectedRoute !== null &&
+          b.status === 'ignored' &&
+          typeof b.reason === 'string' &&
+          b.reason.length > 0 &&
+          b.route === expectedRoute
+        ) {
+          return { kind: 'declined', status, reason: b.reason, route: expectedRoute }
         }
       }
     } catch {
@@ -227,5 +266,5 @@ export async function deliverMessageCreatedEvent(
   } finally {
     clearTimeout(timer)
   }
-  return classifyDeliveryOutcome(resp, envelope.event_id)
+  return classifyDeliveryOutcome(resp, envelope.event_id, expectedRouteFromUrl(url))
 }

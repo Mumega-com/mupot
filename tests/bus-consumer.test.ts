@@ -4,6 +4,12 @@ import { handleQueue } from '../src/bus/consumer'
 import type { BusEvent, Env, MessageCreatedPayload } from '../src/types'
 import { postAgentActivity } from '../src/channels'
 
+import { enqueueMessageCreatedDeliveries } from '../src/bus/events-delivery'
+
+vi.mock('../src/bus/events-delivery', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/bus/events-delivery')>()
+  return { ...actual, enqueueMessageCreatedDeliveries: vi.fn(actual.enqueueMessageCreatedDeliveries) }
+})
 vi.mock('../src/channels', () => ({ postAgentActivity: vi.fn(async () => undefined) }))
 
 function message(event: BusEvent) {
@@ -1013,6 +1019,55 @@ describe('bus queue consumer — message.created delivery', () => {
 
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, envForDelivery())
 
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  const IGNORED_FILTER = JSON.stringify({ status: 'ignored', reason: 'filter', route: 'mubot-inbox' })
+  const mubotEnv = (o: Partial<Env> = {}): Env =>
+    envForDelivery({ HERMES_EVENTS_WEBHOOK_URL: 'https://hermes-kay.mumega.test/webhooks/mubot-inbox', ...o })
+
+  it('acks (no retry) when the configured route deliberately declines (ignored/filter) — mupot#1716', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(IGNORED_FILTER, { status: 200 }))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+  })
+
+  it('still retries an ignored body naming a DIFFERENT route (unexpected_response)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ status: 'ignored', reason: 'filter', route: 'elsewhere' }), { status: 200 }),
+    )
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('still retries an unknown 2xx body', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ status: 'ok' }), { status: 200 }))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('a declined Hermes leg does NOT suppress the MCP-events fan-out retry', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(IGNORED_FILTER, { status: 200 }))
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.mocked(enqueueMessageCreatedDeliveries).mockRejectedValueOnce(new Error('queue down'))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv({ EVENTS_ENABLED: 'true' }))
+
+    expect(enqueueMessageCreatedDeliveries).toHaveBeenCalled()
     expect(item.retry).toHaveBeenCalledOnce()
     expect(item.ack).not.toHaveBeenCalled()
   })

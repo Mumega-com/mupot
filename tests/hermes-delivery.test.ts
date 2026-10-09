@@ -21,6 +21,7 @@ import {
   buildHermesEventEnvelope,
   classifyDeliveryOutcome,
   deliverMessageCreatedEvent,
+  expectedRouteFromUrl,
   REPLAY_WINDOW_SECONDS,
   type HermesEventEnvelope,
 } from '../src/bus/hermes-delivery'
@@ -207,6 +208,61 @@ describe('classifyDeliveryOutcome', () => {
     const resp = new Response('<html>ok</html>', { status: 200 })
     const outcome = await classifyDeliveryOutcome(resp, 'msg-123')
     expect(outcome.kind).toBe('unexpected_response')
+  })
+
+  describe('declined (gateway filter ignore, mupot#1716)', () => {
+    const ignored = (extra: Record<string, unknown> = {}, status = 200): Response =>
+      new Response(JSON.stringify({ status: 'ignored', reason: 'filter', route: 'mubot-inbox', ...extra }), { status })
+
+    it('ignored + string reason + matching route -> declined', async () => {
+      const outcome = await classifyDeliveryOutcome(ignored(), 'msg-123', 'mubot-inbox')
+      expect(outcome).toEqual({ kind: 'declined', status: 200, reason: 'filter', route: 'mubot-inbox' })
+    })
+
+    it('wrong route -> unexpected_response', async () => {
+      const outcome = await classifyDeliveryOutcome(ignored({ route: 'other' }), 'msg-123', 'mubot-inbox')
+      expect(outcome.kind).toBe('unexpected_response')
+    })
+
+    it('missing route -> unexpected_response', async () => {
+      const outcome = await classifyDeliveryOutcome(ignored({ route: undefined }), 'msg-123', 'mubot-inbox')
+      expect(outcome.kind).toBe('unexpected_response')
+    })
+
+    it('missing / non-string reason -> unexpected_response', async () => {
+      expect((await classifyDeliveryOutcome(ignored({ reason: undefined }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
+      expect((await classifyDeliveryOutcome(ignored({ reason: 5 }), 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
+    })
+
+    it('no derivable expected route -> never declined', async () => {
+      expect((await classifyDeliveryOutcome(ignored(), 'msg-123', null)).kind).toBe('unexpected_response')
+      expect((await classifyDeliveryOutcome(ignored(), 'msg-123')).kind).toBe('unexpected_response')
+    })
+
+    it('ignored on a non-2xx stays server_error', async () => {
+      const outcome = await classifyDeliveryOutcome(ignored({}, 500), 'msg-123', 'mubot-inbox')
+      expect(outcome.kind).toBe('server_error')
+    })
+
+    it('expectedRouteFromUrl takes the last path segment, null when absent/invalid', () => {
+      expect(expectedRouteFromUrl('https://h.test/webhooks/mubot-inbox')).toBe('mubot-inbox')
+      expect(expectedRouteFromUrl('https://h.test/webhooks/mubot-inbox/')).toBe('mubot-inbox')
+      expect(expectedRouteFromUrl('https://h.test/')).toBeNull()
+      expect(expectedRouteFromUrl('not a url')).toBeNull()
+      expect(expectedRouteFromUrl(undefined)).toBeNull()
+    })
+
+    it('end to end: deliverMessageCreatedEvent derives the route from HERMES_EVENTS_WEBHOOK_URL', async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async () => ignored())
+      const env = { HERMES_WEBHOOK_SECRET: 's', HERMES_EVENTS_WEBHOOK_URL: 'https://h.test/webhooks/mubot-inbox' } as Env
+      const evt = {
+        type: 'message.created', tenant: 't', agent_id: 'a', actor: { kind: 'agent', id: 'x' }, ts: '2026-01-01T00:00:00.000Z',
+        payload: { message_id: 'm1', seq: 1, to_agent: 'a', from_agent: 'b', from_member: 'c', kind: 'note', request_id: null, in_reply_to: null, project_id: null, created_at: '2026-01-01T00:00:00.000Z' },
+      } as unknown as BusEvent<MessageCreatedPayload>
+      expect((await deliverMessageCreatedEvent(env, evt)).kind).toBe('declined')
+      const env2 = { ...env, HERMES_EVENTS_WEBHOOK_URL: 'https://h.test/webhooks/other-route' } as Env
+      expect((await deliverMessageCreatedEvent(env2, evt)).kind).toBe('unexpected_response')
+    })
   })
 
   it('500 -> server_error', async () => {
