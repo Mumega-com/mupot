@@ -236,6 +236,14 @@ describe('1b. the watchdog done-land is the governed-land predicate, not a weake
     h.sqlite.prepare("UPDATE tasks SET status = 'done'").run()
     expect(await reap('fl-unm')).toMatchObject({ target_status: 'landed' })
   })
+
+  it('an unmetered flight with a NULL budget policy is still failed (budget policy required even when unmetered)', async () => {
+    seedTask('t1')
+    seedFlight('fl-unm-null', { taskIds: ['t1'], budget: null })
+    h.sqlite.prepare("UPDATE flights SET cost_metered = 0 WHERE id = 'fl-unm-null'").run()
+    h.sqlite.prepare("UPDATE tasks SET status = 'done'").run()
+    expect(await reap('fl-unm-null')).toMatchObject({ target_status: 'failed' })
+  })
 })
 
 describe('2. bookkeeping flights are closed as landed / bookkeeping_closed, not failed', () => {
