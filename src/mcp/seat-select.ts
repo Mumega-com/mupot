@@ -43,6 +43,7 @@ const toolSeatSelect: ToolSpec = {
         harness: result.harness,
         agent: result.agent,
         member_id: result.member_id,
+        seat_handle: result.seat_handle,
         audit_id: result.audit_id,
         note: result.note,
       })

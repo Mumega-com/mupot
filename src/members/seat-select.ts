@@ -57,9 +57,22 @@ import {
 } from './bootstrap-self'
 import { loadHarness, sanitizeLabel, seatAutoEnrollEnabled, type HarnessRow } from './harness'
 import { normalizeSeatKey, seatKeyHash, type SeatKeyArgs } from './seat-key'
+import { prepareSeatHandleIssue } from './seat-handle'
 
 export const SEAT_MAX_PER_MEMBER_DEFAULT = 16
 const SEAT_MAX_PER_MEMBER_CEILING = 256
+export const SEAT_MAX_TOTAL_PER_MEMBER_DEFAULT = 64
+const SEAT_MAX_TOTAL_CEILING = 4096
+
+/** SEAT_MAX_TOTAL_PER_MEMBER: the LIFETIME bound on agent_seats rows per member, retired/inactive
+ *  rows included (migration 0199 trigger). Parsed defensively like seatCap. */
+export function seatTotalCap(env: Pick<Env, 'SEAT_MAX_TOTAL_PER_MEMBER'>): number {
+  const raw = env.SEAT_MAX_TOTAL_PER_MEMBER
+  if (typeof raw !== 'string' || !/^\d{1,5}$/.test(raw.trim())) return SEAT_MAX_TOTAL_PER_MEMBER_DEFAULT
+  const n = parseInt(raw.trim(), 10)
+  if (n < 1) return SEAT_MAX_TOTAL_PER_MEMBER_DEFAULT
+  return Math.min(n, SEAT_MAX_TOTAL_CEILING)
+}
 
 /** SEAT_MAX_PER_MEMBER, parsed defensively: garbage / <1 -> default, >256 -> 256. */
 export function seatCap(env: Pick<Env, 'SEAT_MAX_PER_MEMBER'>): number {
@@ -115,7 +128,10 @@ export interface SeatSelectOk {
   /** The agent's own dedicated member id (never the human's). */
   member_id: string
   audit_id: string | null
-  /** Honest scope note: W1 find-or-creates the seat; the session lock is a later wave. */
+  /** W2: opaque seat handle, returned ONCE (only its sha256 is stored). Present it as header
+   *  `X-Mupot-Seat` or `_meta["mupot/seat"]` to act as this seat's agent. null when none could be
+   *  issued (no live grant token id on the session, or a lost cap race). */
+  seat_handle: string | null
   note: string
 }
 
@@ -127,7 +143,7 @@ export interface SeatSelectErr {
 
 export type SeatSelectResult = SeatSelectOk | SeatSelectErr
 
-export type SeatSelectAuth = Pick<AuthContext, 'channel' | 'boundAgentId' | 'memberId' | 'harnessId'>
+export type SeatSelectAuth = Pick<AuthContext, 'channel' | 'boundAgentId' | 'memberId' | 'harnessId' | 'tokenId'>
 
 interface SeatRow {
   id: string
@@ -138,11 +154,44 @@ interface SeatRow {
 }
 
 const W1_NOTE =
-  'Seat resolved. This session is not yet bound to the seat (session lock lands in a later wave); '
-  + 'the agent exists with member capability on your home squad and no admin.'
+  'Seat resolved. To act as this seat, send the seat_handle as header X-Mupot-Seat (or _meta["mupot/seat"]) '
+  + 'on later requests; the handle is shown once. Without it this session stays your own unbound identity. '
+  + 'The agent has member capability at most and no admin.'
+
+/** Issue a handle for an EXISTING seat (its own batch: evict-LRU-at-cap + insert). Any failure
+ *  yields null — the seat itself is already resolved, the caller can simply retry. */
+async function issueHandleForExistingSeat(
+  env: Env,
+  seat: { id: string; agent_id: string },
+  harnessId: string,
+  memberId: string,
+  grantTokenId: string | null | undefined,
+): Promise<string | null> {
+  if (typeof grantTokenId !== 'string' || grantTokenId.length === 0) return null
+  try {
+    const issue = await prepareSeatHandleIssue(env, {
+      seatId: seat.id, agentId: seat.agent_id, harnessId, consentingMemberId: memberId, grantTokenId,
+    })
+    const writes = await env.DB.batch(issue.statements)
+    assertBatchWritten([writes[issue.insertIndex]], 'seat_handle', 1)
+    return issue.handle
+  } catch {
+    return null
+  }
+}
 
 function isUniqueViolation(err: unknown): boolean {
   return err instanceof Error && /UNIQUE constraint failed/i.test(err.message)
+}
+
+function isTotalCapViolation(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('seat_total_cap_exceeded')
+}
+
+async function countAllSeats(env: Env, memberId: string): Promise<number> {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND member_id = ?2`)
+    .bind(env.TENANT_SLUG, memberId).first<{ n: number }>()
+  return row?.n ?? 0
 }
 
 function isCapViolation(err: unknown): boolean {
@@ -170,7 +219,7 @@ async function findSeat(env: Env, memberId: string, harnessId: string, keyHash: 
 
 /** An EXISTING seat is only handed back while its agent is still a live, welded identity. An
  *  inactive / missing agent or a retired seat refuses — a key is never resurrected. */
-async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow): Promise<SeatSelectResult> {
+async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow, grantTokenId?: string | null): Promise<SeatSelectResult> {
   if (seat.retired_at !== null) return { ok: false, error: 'seat_agent_inactive', detail: { reason: 'seat_retired' } }
   const agent = await env.DB.prepare(
     `SELECT id, slug, name, squad_id, status FROM agents WHERE id = ?1 LIMIT 1`,
@@ -190,6 +239,7 @@ async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow):
     agent: { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
     member_id: binding.memberId,
     audit_id: null,
+    seat_handle: await issueHandleForExistingSeat(env, seat, harness.id, harness.member_id, grantTokenId),
     note: W1_NOTE,
   }
 }
@@ -212,6 +262,7 @@ export async function seatSelect(
   if (!seatAutoEnrollEnabled(env)) return { ok: false, error: 'seat_auto_enroll_disabled' }
 
   // 2. Gate: unbound, directory channel. A bound token already has a voice (and its own agent).
+  const grantTokenIdClaim = auth.tokenId // read before the type guard narrows too (W2: the human's grant token)
   const claimedHarnessId = auth.harnessId // read before the type guard narrows `auth` to BootstrapAuth
   if (!isUnboundDirectorySession(auth)) return { ok: false, error: 'not_unbound_directory_session' }
   const memberId = auth.memberId
@@ -240,7 +291,7 @@ export async function seatSelect(
 
   // 6. Idempotent fast path.
   const found = await findSeat(env, memberId, harness.id, keyHash)
-  if (found) return existingSeatResult(env, found, harness)
+  if (found) return existingSeatResult(env, found, harness, grantTokenIdClaim)
 
   // 6b. Throttle the creation path (after the idempotent fast path above).
   const rl = await checkSeatSelectRateLimit(env, memberId)
@@ -251,6 +302,10 @@ export async function seatSelect(
   const cap = seatCap(env)
   if ((await countLiveSeats(env, memberId)) >= cap) {
     return { ok: false, error: 'seat_cap_reached', detail: { cap } }
+  }
+  const totalCap = seatTotalCap(env)
+  if ((await countAllSeats(env, memberId)) >= totalCap) {
+    return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
   }
 
   // 8. The human's own home squad (idempotent find-or-create). The agent lives THERE and nowhere
@@ -313,9 +368,16 @@ export async function seatSelect(
   //     idempotency, and either one aborting rolls back every statement above it.
   const seatId = crypto.randomUUID()
   const seatStatement = env.DB.prepare(
-    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
-  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, createdAt)
+    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, createdAt)
+
+  // W2: the first handle rides in the SAME batch, AFTER the seat row (FK). Only the INSERT goes in:
+  // a brand-new seat has no handles to evict, and the eviction statement legitimately writes 0 rows.
+  const grantTokenId = typeof grantTokenIdClaim === 'string' && grantTokenIdClaim.length > 0 ? grantTokenIdClaim : null
+  const handleIssue = grantTokenId
+    ? await prepareSeatHandleIssue(env, { seatId, agentId: agent.id, harnessId: harness.id, consentingMemberId: memberId, grantTokenId }, createdAt)
+    : null
 
   const statements: D1PreparedStatement[] = [
     ...preparedAgent.value.statements,
@@ -323,6 +385,7 @@ export async function seatSelect(
     token.statement,
     auditStatement,
     seatStatement,
+    ...(handleIssue ? [handleIssue.statements[handleIssue.insertIndex]] : []),
   ]
 
   try {
@@ -330,13 +393,14 @@ export async function seatSelect(
     assertBatchWritten(writes, 'seat_select', 1)
   } catch (err) {
     // The batch is atomic: nothing from it is live, so there is nothing to compensate.
+    if (isTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
     if (isCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { cap } }
     if (isUniqueViolation(err)) {
       // A concurrent caller for the SAME key won (key UNIQUE, or the derived slug on the home
       // squad). Hand back the winner; if there is no winner for this key it was a genuine slug
       // collision with something else — refuse rather than guess.
       const winner = await findSeat(env, memberId, harness.id, keyHash)
-      if (winner) return existingSeatResult(env, winner, harness)
+      if (winner) return existingSeatResult(env, winner, harness, grantTokenIdClaim)
       return { ok: false, error: 'provisioning_failed', detail: { stage: 'batch', reason: 'unique_conflict_without_winner' } }
     }
     return {
@@ -354,6 +418,7 @@ export async function seatSelect(
     agent: { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
     member_id: agentMemberId,
     audit_id: auditId,
+    seat_handle: handleIssue ? handleIssue.handle : null,
     note: W1_NOTE,
   }
 }
