@@ -123,6 +123,21 @@ describe('flight task validators refuse an archived task (mupot#1496)', () => {
       expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM flight_redispatch_receipts').get()).toEqual({ n: 0 })
     })
 
+    it('routineRunFence branch: archived task refused task_archived (not the fence error); a live task passes the same fence', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO routines (id, tenant, project_id, name, objective, status, trigger_kind, timezone, overlap_policy, execution_mode, responsible_squad_id, budget_micro_usd, max_attempts, retry_backoff_seconds, revision, enabled_by, enabled_at, created_by, created_at, updated_at)
+          VALUES ('routine-1', '${TENANT}', 'proj-1', 'R', 'O', 'enabled', 'manual', 'UTC', 'skip', 'propose', 'squad-1', 0, 3, 300, 1, 'mem-1', '2026-07-19T08:00:00.000Z', 'mem-1', '2026-07-19T08:00:00.000Z', '2026-07-19T08:00:00.000Z');
+        INSERT INTO routine_runs (id, tenant, project_id, routine_id, routine_revision, policy_json, occurrence_key, trigger_kind, status, created_at, updated_at)
+          VALUES ('run-1', '${TENANT}', 'proj-1', 'routine-1', 1, '{}', 'manual:1', 'manual', 'observing', '2026-07-19T12:00:00.000Z', '2026-07-19T12:00:00.000Z');
+      `)
+      const opts = { routineRunFence: { runId: 'run-1', tenant: TENANT } }
+      await expect(createFlight(env, { agent: 'a', goal: 'g', meta: meta(['task-dead']) }, opts))
+        .rejects.toMatchObject(new FlightProjectError('task_archived'))
+      expect(flightCount()).toEqual({ n: 0 })
+      const id = await createFlight(env, { agent: 'a', goal: 'g', project_id: 'proj-1', meta: meta(['task-live']) }, opts)
+      expect(harness.sqlite.prepare('SELECT id FROM flights WHERE id = ?').get(id)).toEqual({ id })
+    })
+
     it('a live task id still creates the flight (guard is not over-broad)', async () => {
       const id = await createFlight(env, { agent: 'a', goal: 'g', meta: meta(['task-live']) })
       expect(harness.sqlite.prepare('SELECT id FROM flights WHERE id = ?').get(id)).toEqual({ id })
