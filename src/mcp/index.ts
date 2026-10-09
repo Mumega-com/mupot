@@ -233,6 +233,7 @@ import {
   listIncompleteFlightTaskIds,
   FlightProjectError,
   FlightIdempotencyConflictError,
+  FlightInsertConflictError,
   validateFlightProjectTarget,
   validateFlightTaskProjectConsistency,
   type FlightRow,
@@ -3530,6 +3531,7 @@ const toolFlightDispatch: ToolSpec = {
         if (raced) return raced
         return fail(409, 'client_request_id_conflict')
       }
+      if (error instanceof FlightInsertConflictError) return fail(409, 'flight_insert_conflict')
       if (!(error instanceof FlightProjectError)) throw error
       return flightProjectFailure(error)
     }

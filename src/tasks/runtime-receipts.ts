@@ -992,6 +992,9 @@ async function claimReadEnvelopeForRecovery(
             AND dispatch.agent_id = ?4
             AND task.assignee_agent_id = ?4
             AND task.status IN ('open', 'blocked', 'rejected')
+            -- mupot#1780: the claim runs BEFORE the isTaskArchived refusal; an archived task must not
+            -- get a 1h lease written onto its envelope.
+            AND ${TASK_NOT_ARCHIVED_SQL('task')}
        )
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_runtime_receipts any_receipt
@@ -1249,6 +1252,9 @@ export async function recordTaskDispatchRuntimeReceipt(
   // mupot#1539 round 2 (P0-3) — recover a dispatch envelope that was marked read before
   // custody. No-op unless every condition in claimReadEnvelopeForRecovery holds.
   if (input.stage === 'runtime_consumed') {
+    // mupot#1780: refuse an archived task BEFORE the claim writes a lease onto its envelope (a stored-receipt
+    // replay stays read-only and is exempt); the claim UPDATE re-asserts the same guard atomically.
+    if (!replay && await isTaskArchived(env, input.taskId)) throw new TaskDispatchRuntimeReceiptError('task_archived')
     await claimReadEnvelopeForRecovery(env, {
       messageId,
       dispatchReceiptId: input.dispatchReceiptId,
@@ -2050,7 +2056,36 @@ export async function adminResetDispatchLease(
   // (must-be-live). Exactly one is spliced into the single UPDATE below.
   const notLiveGuard = `NOT (${LEASE_LIVE_PREDICATE('lease_expires_at', '?3')})`
   const liveGuard = LEASE_LIVE_PREDICATE('lease_expires_at', '?3')
-  const leaseUpdateStmt = env.DB.prepare(`
+  // mupot#1780 (wedge exit): a runtime_consumed dispatch whose envelope was READ by a later consumer
+  // (inbox / REST / inbox_ack) after the lease lapsed, with no terminal receipt, has nothing for the lease
+  // UPDATE to reset (read_at IS NOT NULL) yet the archive block (clause (b)) still holds it. `terminate`
+  // must be an exit from that state too: settle the dispatch row itself, as the primary statement of the
+  // same batch, so the audit CASE and the reset_terminated receipt key off its changes() exactly as they
+  // do off the lease UPDATE. Every guard is inside the one UPDATE (no check-then-write).
+  const readEnvelopeTerminate = terminate && message.read_at !== null && message.dead_lettered_at === null
+  const readEnvelopeSettleStmt = env.DB.prepare(`
+    UPDATE task_dispatch_receipts
+       SET settled_stage = 'reset_terminated', settled_at = ?3, settled_reason = ?4
+     WHERE tenant = ?1 AND id = ?2 AND task_id = ?5 AND settled_at IS NULL
+       AND EXISTS (
+         SELECT 1 FROM agent_messages m
+          WHERE m.tenant = ?1 AND m.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+            AND m.request_id = '${DISPATCH_INBOX_PREFIX}' || ?2
+            AND m.read_at IS NOT NULL AND m.dead_lettered_at IS NULL
+       )
+       AND EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts c
+          WHERE c.tenant = ?1 AND c.dispatch_receipt_id = ?2 AND c.stage = 'runtime_consumed'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM task_dispatch_runtime_receipts t
+          WHERE t.tenant = ?1 AND t.dispatch_receipt_id = ?2
+            AND t.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+       )
+  `).bind(
+    env.TENANT_SLUG, input.dispatchReceiptId, now, sanitizeReceiptText(text(input.reason, 500)), input.taskId,
+  )
+  const leaseUpdateStmt = readEnvelopeTerminate ? readEnvelopeSettleStmt : env.DB.prepare(`
     UPDATE agent_messages
        SET delivery_attempts = 0, lease_expires_at = NULL, lease_attempt_id = NULL,
            read_at = CASE WHEN ?4 = 1 THEN ?3 ELSE read_at END
@@ -2071,7 +2106,7 @@ export async function adminResetDispatchLease(
   // real outcome is known: if the UPDATE's WHERE does not match (a race, or the row was
   // never live to begin with), `changes() = 0` and the audit falls through to
   // `reset_refused_terminal` regardless of which branch we guessed.
-  const successOperation = useOverride ? 'reset_override' : 'reset'
+  const successOperation = readEnvelopeTerminate ? 'reset_terminate_read_envelope' : useOverride ? 'reset_override' : 'reset'
   const successEvidence = useOverride
     ? evidence({
         override_of: {
@@ -2151,7 +2186,26 @@ export async function adminResetDispatchLease(
   // logic embedded in the other statements' SQL (which exists so THEIR content is correct
   // even if something inspects the DB directly, not so this function has to trust it).
   const resolvedTerminalReceiptStmt = terminalReceiptStmt ? await terminalReceiptStmt : null
-  const batchStmts = [leaseUpdateStmt, auditStmt, ...(resolvedTerminalReceiptStmt ? [resolvedTerminalReceiptStmt] : [])]
+  // mupot#1780 (P3): a reset_terminated receipt must also SETTLE the dispatch row, or archive clause (b)'s
+  // in_progress arm (keyed on settled_at IS NULL) still fires for an operator-terminated dispatch whose
+  // task is in_progress. No-op when the primary statement already settled it, and when no receipt landed.
+  const settleOnTerminateStmt = resolvedTerminalReceiptStmt
+    ? env.DB.prepare(`
+        UPDATE task_dispatch_receipts
+           SET settled_stage = 'reset_terminated', settled_at = ?3, settled_reason = ?4
+         WHERE tenant = ?1 AND id = ?2 AND settled_at IS NULL
+           AND EXISTS (
+             SELECT 1 FROM task_dispatch_runtime_receipts r
+              WHERE r.tenant = ?1 AND r.dispatch_receipt_id = ?2
+                AND r.stage = 'reset_terminated' AND r.audit_entry_id = ?5
+           )
+      `).bind(env.TENANT_SLUG, input.dispatchReceiptId, now, sanitizeReceiptText(text(input.reason, 500)), auditId)
+    : null
+  const batchStmts = [
+    leaseUpdateStmt, auditStmt,
+    ...(resolvedTerminalReceiptStmt ? [resolvedTerminalReceiptStmt] : []),
+    ...(settleOnTerminateStmt ? [settleOnTerminateStmt] : []),
+  ]
   const results = await env.DB.batch(batchStmts)
   const reset = (results[0].meta as { changes?: number }).changes === 1
   const overrode = reset && useOverride
