@@ -55,7 +55,7 @@
 // this ever runs (src/agents/messages.ts); a delivery failure here must never roll that
 // back and does not — this module only classifies an HTTP outcome and returns it, it never
 // touches D1. What DOES fail closed is the *event's* ack/retry: src/bus/consumer.ts throws
-// on every outcome except 'delivered', 'declined' and 'not_configured', so the Cloudflare Queue's own
+// on every outcome except 'delivered', 'duplicate', 'declined' and 'not_configured', so the Cloudflare Queue's own
 // retry/DLQ policy (wrangler.toml: max_retries = 3, dead_letter_queue = "mupot-events-dlq")
 // carries a failed delivery attempt forward instead of it being silently swallowed. A 404
 // today — the expected state, because the Hermes route is not registered yet — is exactly
@@ -115,6 +115,11 @@ export type DeliveryOutcome =
   // route echo proves nothing about who answered. Only reason 'filter' qualifies; see
   // classifyDeliveryOutcome for the gate.
   | { kind: 'declined'; status: number; reason: string; route: string }
+  // The receiver already processed THIS delivery (gateway webhook.py answers 200
+  // {"status":"duplicate","delivery_id":<id>}), e.g. an earlier attempt landed but its response
+  // was lost, or the source message was retried after an MCP-events fan-out error. delivery_id
+  // must exactly equal the event id we sent; the consumer acks it like 'delivered'.
+  | { kind: 'duplicate'; status: number }
   | { kind: 'unexpected_response'; status: number; detail: string }
   | { kind: 'unauthorized'; status: number; detail: string }
   | { kind: 'not_found'; status: number; detail: string }
@@ -197,6 +202,22 @@ export async function classifyDeliveryOutcome(
           (b.status === 'accepted' && b.delivery_id === sentEventId)
         ) {
           return { kind: 'delivered', status }
+        }
+        // Receiver-side idempotency hit: the delivery already happened. Same anti-spoof rule
+        // as 'accepted': delivery_id must be exactly the event id we sent (a bare
+        // {"status":"duplicate"} or a different id is not a receipt -> unexpected_response).
+        if (b.status === 'duplicate' && b.delivery_id === sentEventId) {
+          return { kind: 'duplicate', status }
+        }
+        // Event-type allowlist ignore (gateway webhook.py answers {"status":"ignored","event":T}
+        // with no reason/route). Stays a loud failure (config error: route does not accept
+        // message.created) but is tagged so it is distinguishable from other bad bodies.
+        if (b.status === 'ignored' && typeof b.event === 'string' && b.reason === undefined) {
+          return {
+            kind: 'unexpected_response',
+            status,
+            detail: `hermes_event_type_ignored event=${b.event.slice(0, 100)}`,
+          }
         }
         // Deliberate decline from THIS route (mupot#1716). A bare {"status":"ignored"} from
         // any server is still unexpected_response: the body must also name the configured

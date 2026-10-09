@@ -724,6 +724,15 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
         case 'delivered':
           console.log('bus: message.created — delivered', { ...logCtx, status: outcome.status })
           break
+        case 'duplicate':
+          // Receiver already processed this delivery (mupot#1791): ack, do not retry. Logged
+          // distinctly. eventsEnqueueError below still retries the source message.
+          console.log('bus: message.created — duplicate (already delivered)', {
+            ...logCtx,
+            status: outcome.status,
+            metric: 'hermes_delivery.duplicate',
+          })
+          break
         case 'declined':
           // The configured Hermes route deliberately filtered this event (mupot#1716).
           // A route-bound (not authenticated) "not for me" answer, not a failure: ack, do not retry.

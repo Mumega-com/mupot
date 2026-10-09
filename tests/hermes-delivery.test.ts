@@ -277,6 +277,43 @@ describe('classifyDeliveryOutcome', () => {
     })
   })
 
+  describe('duplicate (receiver idempotency hit, mupot#1791)', () => {
+    const dup = (extra: Record<string, unknown> = {}, status = 200): Response =>
+      new Response(JSON.stringify({ status: 'duplicate', delivery_id: 'msg-123', ...extra }), { status })
+
+    it('duplicate + delivery_id === sent event id -> duplicate', async () => {
+      expect(await classifyDeliveryOutcome(dup(), 'msg-123')).toEqual({ kind: 'duplicate', status: 200 })
+    })
+
+    it('mismatched delivery_id -> unexpected_response (retry)', async () => {
+      expect((await classifyDeliveryOutcome(dup({ delivery_id: 'msg-999' }), 'msg-123')).kind).toBe('unexpected_response')
+    })
+
+    it('missing / non-string delivery_id -> unexpected_response (retry)', async () => {
+      expect((await classifyDeliveryOutcome(dup({ delivery_id: undefined }), 'msg-123')).kind).toBe('unexpected_response')
+      expect((await classifyDeliveryOutcome(dup({ delivery_id: 123 }), 'msg-123')).kind).toBe('unexpected_response')
+      expect((await classifyDeliveryOutcome(dup({ delivery_id: null }), 'msg-123')).kind).toBe('unexpected_response')
+    })
+
+    it('duplicate on a non-2xx stays server_error', async () => {
+      expect((await classifyDeliveryOutcome(dup({}, 500), 'msg-123')).kind).toBe('server_error')
+    })
+  })
+
+  describe('event-type ignore stays loud but tagged (mupot#1791)', () => {
+    it('{status:ignored,event} -> unexpected_response tagged hermes_event_type_ignored', async () => {
+      const resp = new Response(JSON.stringify({ status: 'ignored', event: 'message.created' }), { status: 200 })
+      const outcome = await classifyDeliveryOutcome(resp, 'msg-123', 'mubot-inbox')
+      expect(outcome.kind).toBe('unexpected_response')
+      expect(outcome.kind === 'unexpected_response' && outcome.detail).toContain('hermes_event_type_ignored')
+    })
+
+    it('is not mistaken for a filter decline even with a matching route', async () => {
+      const resp = new Response(JSON.stringify({ status: 'ignored', event: 'x', route: 'mubot-inbox' }), { status: 200 })
+      expect((await classifyDeliveryOutcome(resp, 'msg-123', 'mubot-inbox')).kind).toBe('unexpected_response')
+    })
+  })
+
   it('500 -> server_error', async () => {
     const resp = new Response('boom', { status: 500 })
     const outcome = await classifyDeliveryOutcome(resp, 'msg-123')

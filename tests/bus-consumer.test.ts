@@ -1090,6 +1090,63 @@ describe('bus queue consumer — message.created delivery', () => {
     expect(item.ack).not.toHaveBeenCalled()
   })
 
+  const echoDuplicate = (idOverride?: string | null) =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const sent = JSON.parse(String((init as RequestInit).body)) as { event_id: string }
+      const delivery_id = idOverride === undefined ? sent.event_id : idOverride
+      return new Response(JSON.stringify({ status: 'duplicate', ...(delivery_id === null ? {} : { delivery_id }) }), { status: 200 })
+    })
+
+  it('acks (no retry) on gateway duplicate with delivery_id === event id — mupot#1791', async () => {
+    echoDuplicate()
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.ack).toHaveBeenCalledOnce()
+    expect(item.retry).not.toHaveBeenCalled()
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('duplicate'),
+      expect.objectContaining({ metric: 'hermes_delivery.duplicate' }),
+    )
+  })
+
+  it('retries a duplicate whose delivery_id is a different id', async () => {
+    echoDuplicate('someone-elses-id')
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('retries a duplicate with no delivery_id', async () => {
+    echoDuplicate(null)
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv())
+
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
+  it('a duplicate Hermes leg does NOT suppress the MCP-events fan-out retry', async () => {
+    echoDuplicate()
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.mocked(enqueueMessageCreatedDeliveries).mockRejectedValueOnce(new Error('queue down'))
+    const item = message(messageCreatedEvent())
+
+    await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, mubotEnv({ EVENTS_ENABLED: 'true' }))
+
+    expect(enqueueMessageCreatedDeliveries).toHaveBeenCalled()
+    expect(item.retry).toHaveBeenCalledOnce()
+    expect(item.ack).not.toHaveBeenCalled()
+  })
+
   it('the delivered envelope carries the EMITTING tenant, never anything caller-controlled', async () => {
     let sentTenant: unknown
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
