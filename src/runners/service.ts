@@ -3,6 +3,7 @@
 import type { Env } from '../types'
 import type { RunnerReceipt, RecordRunnerInput, ListRunnersFilter, RunnerStatus } from './types'
 import { verifyRunnerReceiptSig } from './signature'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 const VALID_STATUSES: Set<RunnerStatus> = new Set(['running', 'landed', 'failed'])
 
@@ -154,13 +155,15 @@ export async function listRunners(
   const params: unknown[] = [tenant]
   let pIdx = 2
 
+  // mupot#1774: the squad list scales with the caller's squad grants, so it is split across
+  // statements (each stays under D1's 100-bind ceiling) and the per-chunk pages are merged.
+  let squadChunks: string[][] | null = null
   if (filter.squad_ids !== undefined && filter.squad_ids !== null) {
     if (filter.squad_ids.length === 0) {
       return [] // fail-closed
     }
-    const placeholders = filter.squad_ids.map(() => `?${pIdx++}`).join(', ')
-    conditions.push(`squad_id IN (${placeholders})`)
-    params.push(...filter.squad_ids)
+    // Fixed binds besides the squad list: tenant + optional seat/status + limit (<= 4).
+    squadChunks = chunkForD1InList([...new Set(filter.squad_ids)], undefined, 4)
   } else if (filter.squad_id) {
     conditions.push(`squad_id = ?${pIdx++}`)
     params.push(filter.squad_id)
@@ -177,9 +180,23 @@ export async function listRunners(
   }
 
   const limit = Math.min(Math.max(filter.limit ?? 50, 1), 200)
-  params.push(limit)
-
-  const sql = `SELECT * FROM runner_receipts WHERE ${conditions.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?${pIdx}`
-  const result = await env.DB.prepare(sql).bind(...params).all<RunnerReceipt>()
-  return result.results ?? []
+  const runChunk = async (squadChunk: string[] | null): Promise<RunnerReceipt[]> => {
+    const where = [...conditions]
+    const binds = [...params]
+    let idx = pIdx
+    if (squadChunk !== null) {
+      where.push(`squad_id IN (${squadChunk.map(() => `?${idx++}`).join(', ')})`)
+      binds.push(...squadChunk)
+    }
+    binds.push(limit)
+    const sql = `SELECT * FROM runner_receipts WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?${idx}`
+    const result = await env.DB.prepare(sql).bind(...binds).all<RunnerReceipt>()
+    return result.results ?? []
+  }
+  if (squadChunks === null) return runChunk(null)
+  // Each chunk returns its own newest `limit`; the global newest `limit` is among their union.
+  const merged: RunnerReceipt[] = []
+  for (const squadChunk of squadChunks) merged.push(...await runChunk(squadChunk))
+  merged.sort((a, b) => (a.created_at === b.created_at ? (a.id < b.id ? 1 : -1) : a.created_at < b.created_at ? 1 : -1))
+  return merged.slice(0, limit)
 }

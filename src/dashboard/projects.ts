@@ -49,6 +49,7 @@ import {
   PROJECT_WORKER_SUBDOMAIN_ROOT,
   PROJECT_WORKER_TEMPLATES,
 } from '../projects/provisioner'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
@@ -311,14 +312,18 @@ async function projectManageAccessContextFor(
   if (squadIds.length === 0) {
     return { authorized: false, workspaceAdmin: false, authorizingSquadIds: [], actorSquadIds: [] }
   }
-  const placeholders = squadIds.map((_, index) => `?${index + 2}`).join(', ')
-  const rows = await env.DB.prepare(
-    `SELECT squad_id FROM project_squad_access
-      WHERE project_id = ?1
-        AND squad_id IN (${placeholders})
-        AND access_level IN ('write', 'admin')`,
-  ).bind(projectId, ...squadIds).all<{ squad_id: string }>()
-  const authorizingSquadIds = (rows.results ?? []).map((row) => row.squad_id)
+  // mupot#1774: taskableSquadIds scales with squad grants; chunk under D1's 100-bind ceiling.
+  const authorizingSquadIds: string[] = []
+  for (const chunk of chunkForD1InList(squadIds, undefined, 1)) {
+    const placeholders = chunk.map((_, index) => `?${index + 2}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT squad_id FROM project_squad_access
+        WHERE project_id = ?1
+          AND squad_id IN (${placeholders})
+          AND access_level IN ('write', 'admin')`,
+    ).bind(projectId, ...chunk).all<{ squad_id: string }>()
+    authorizingSquadIds.push(...(rows.results ?? []).map((row) => row.squad_id))
+  }
   return { authorized: authorizingSquadIds.length > 0, workspaceAdmin: false, authorizingSquadIds, actorSquadIds: squadIds }
 }
 

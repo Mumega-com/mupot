@@ -14,6 +14,7 @@ import { isBlankProvenance } from './provenance'
 import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -943,28 +944,27 @@ export async function syncTaskStatusFromIssue(
   ).bind(issueUrl, ...matchStatuses).all<{ id: string; project_id: string | null; squad_id: string }>()
   const writableIds = await filterProjectWritableTaskIds(env, candidates.results ?? [])
   if (writableIds.length === 0) return { updated: false }
-  const idList = writableIds.map(() => '?').join(', ')
 
+  // mupot#1774: every task linked to one issue URL is bound, so the ids are split across a single
+  // atomic batch (D1 caps a statement at 100 binds). The status guard stays in each chunk's WHERE.
   if (action === 'closed') {
     // open/in_progress → done. Leave review/approved/rejected/done untouched.
-    const res = await env.DB.prepare(
-      `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?
-        WHERE status IN ('open','in_progress') AND id IN (${idList})
-          AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    )
-      .bind(now, now, ...writableIds)
-      .run()
-    return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+    const results = await env.DB.batch(chunkForD1InList(writableIds, undefined, 2).map((chunk) =>
+      env.DB.prepare(
+        `UPDATE tasks SET status = 'done', completed_at = ?, updated_at = ?
+          WHERE status IN ('open','in_progress') AND id IN (${chunk.map(() => '?').join(', ')})
+            AND ${TASK_NOT_ARCHIVED_SQL()}`,
+      ).bind(now, now, ...chunk)))
+    return { updated: results.some((res) => (res.meta?.changes ?? 0) > 0) }
   }
   // reopened: done → open (only if it was closed by us). Never touch gate states.
-  const res = await env.DB.prepare(
-    `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?
-      WHERE status = 'done' AND id IN (${idList})
-        AND ${TASK_NOT_ARCHIVED_SQL()}`,
-  )
-    .bind(now, ...writableIds)
-    .run()
-  return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+  const results = await env.DB.batch(chunkForD1InList(writableIds, undefined, 1).map((chunk) =>
+    env.DB.prepare(
+      `UPDATE tasks SET status = 'open', completed_at = NULL, updated_at = ?
+        WHERE status = 'done' AND id IN (${chunk.map(() => '?').join(', ')})
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
+    ).bind(now, ...chunk)))
+  return { updated: results.some((res) => (res.meta?.changes ?? 0) > 0) }
 }
 
 /**
@@ -1051,27 +1051,25 @@ export async function syncCiResultToTask(
   ).bind(suffix, ...matchStatuses).all<{ id: string; project_id: string | null; squad_id: string }>()
   const writableIds = await filterProjectWritableTaskIds(env, candidates.results ?? [])
   if (writableIds.length === 0) return { updated: false }
-  const idList = writableIds.map(() => '?').join(', ')
 
+  // mupot#1774: ids split across one atomic batch so no statement binds more than 100.
   if (failed) {
-    const res = await env.DB.prepare(
-      `UPDATE tasks SET result = ?, status = 'in_progress', updated_at = ?
-        WHERE status = 'review' AND id IN (${idList})
-          AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    )
-      .bind(note, now, ...writableIds)
-      .run()
-    return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+    const results = await env.DB.batch(chunkForD1InList(writableIds, undefined, 2).map((chunk) =>
+      env.DB.prepare(
+        `UPDATE tasks SET result = ?, status = 'in_progress', updated_at = ?
+          WHERE status = 'review' AND id IN (${chunk.map(() => '?').join(', ')})
+            AND ${TASK_NOT_ARCHIVED_SQL()}`,
+      ).bind(note, now, ...chunk)))
+    return { updated: results.some((res) => (res.meta?.changes ?? 0) > 0) }
   }
   // success/neutral/skipped: record the note without changing a gate state.
-  const res = await env.DB.prepare(
-    `UPDATE tasks SET result = ?, updated_at = ?
-      WHERE status IN ('review','in_progress','open') AND id IN (${idList})
-        AND ${TASK_NOT_ARCHIVED_SQL()}`,
-  )
-    .bind(note, now, ...writableIds)
-    .run()
-  return { updated: Boolean(res.meta?.changes && res.meta.changes > 0) }
+  const results = await env.DB.batch(chunkForD1InList(writableIds, undefined, 2).map((chunk) =>
+    env.DB.prepare(
+      `UPDATE tasks SET result = ?, updated_at = ?
+        WHERE status IN ('review','in_progress','open') AND id IN (${chunk.map(() => '?').join(', ')})
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
+    ).bind(note, now, ...chunk)))
+  return { updated: results.some((res) => (res.meta?.changes ?? 0) > 0) }
 }
 
 function eventAgentId(task: Task, actor?: TaskActor): string | undefined {

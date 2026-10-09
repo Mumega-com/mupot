@@ -61,6 +61,7 @@ import { answerRoutineRun, getRoutinePendingQuestion, getRoutineProjectAccessReq
 import { routinePrincipal } from '../routines/access'
 import { projectReadAccessFromGrants, projectVisibilityClause } from '../projects/access'
 import { completeTelegramUpdate, reserveTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
+import { chunkForD1InList } from '../lib/d1-in-list'
 
 type AppEnv = { Bindings: Env }
 
@@ -171,11 +172,15 @@ async function soleSquadGrant(env: Env, grants: CapabilityGrant[]): Promise<stri
   )]
   if (squadIds.length === 0) return null
   if (squadIds.length === 1) return squadIds[0]
-  const placeholders = squadIds.map((_, index) => `?${index + 1}`).join(', ')
-  const rows = await env.DB.prepare(
-    `SELECT id FROM squads WHERE id IN (${placeholders}) AND kind != 'home'`,
-  ).bind(...squadIds).all<{ id: string }>()
-  const nonHomeIds = rows.results ?? []
+  // mupot#1774: grows with the member's squad grants, so chunked under D1's 100-bind ceiling.
+  const nonHomeIds: Array<{ id: string }> = []
+  for (const chunk of chunkForD1InList(squadIds)) {
+    const placeholders = chunk.map((_, index) => `?${index + 1}`).join(', ')
+    const rows = await env.DB.prepare(
+      `SELECT id FROM squads WHERE id IN (${placeholders}) AND kind != 'home'`,
+    ).bind(...chunk).all<{ id: string }>()
+    nonHomeIds.push(...(rows.results ?? []))
+  }
   return nonHomeIds.length === 1 ? nonHomeIds[0].id : null
 }
 
