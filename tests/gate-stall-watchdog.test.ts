@@ -240,3 +240,93 @@ describe('gate-stall watchdog', () => {
     harness.close()
   })
 })
+
+describe('gate-stall watchdog: archive is an action boundary (mupot#1780)', () => {
+  const archive = (sqlite: Sqlite, id: string): void => {
+    sqlite.prepare(`INSERT OR IGNORE INTO members (id, display_name, status, tenant) VALUES ('m1', 'M', 'active', ?)`).run(TENANT)
+    sqlite
+      .prepare(
+        `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
+         VALUES (?, '2026-10-06T11:00:00.000Z', 'test', 'm1', 'review')`,
+      )
+      .run(id)
+  }
+  const effectRows = (sqlite: Sqlite): number =>
+    (sqlite.prepare(`SELECT COUNT(*) AS n FROM agent_messages`).get() as { n: number }).n
+
+  it('sweep over an archived stalled review task produces no wake, inbox row, claim or message', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 'arch')
+    archive(sqlite, 'arch')
+    const emit = vi.fn()
+    ;(env as unknown as Record<string, unknown>).BUS_EVENTS = { send: emit }
+    const res = await sweepAt(env, T0)
+    expect(res).toMatchObject({ scanned: 0, rewoken: 0, undelivered: 0, errors: 0 })
+    expect(effectRows(sqlite)).toBe(0)
+    expect(wakeCount(sqlite, 'arch')).toBe(0)
+    expect(sqlite.prepare(`SELECT COUNT(*) AS n FROM gate_stall_rewakes`).get()).toEqual({ n: 0 })
+    harness.close()
+  })
+
+  it('SELECT guard is what stops the sweep: an un-archived sibling still wakes', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 'arch')
+    seedReviewTask(sqlite, 'live')
+    archive(sqlite, 'arch')
+    const res = await sweepAt(env, T0)
+    expect(res).toMatchObject({ scanned: 1, rewoken: 1 })
+    expect(wakeCount(sqlite, 'arch')).toBe(0)
+    expect(wakeCount(sqlite, 'live')).toBe(1)
+    harness.close()
+  })
+
+  it('wakeGateOwnerOnReview itself refuses an archived task: no rows, no notice, no bus event', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 'arch')
+    archive(sqlite, 'arch')
+    const task = sqlite.prepare(`SELECT * FROM tasks WHERE id = 'arch'`).get() as never
+    const { wakeGateOwnerOnReview } = await import('../src/mcp')
+    const prepared: string[] = []
+    const realPrepare = harness.db.prepare.bind(harness.db)
+    harness.db.prepare = ((sql: string) => {
+      prepared.push(sql)
+      return realPrepare(sql)
+    }) as typeof harness.db.prepare
+    const out = await wakeGateOwnerOnReview(env, task, { kind: 'agent', id: 'x' }, 'x')
+    expect(out.status).toBe('task_archived')
+    expect(effectRows(sqlite)).toBe(0)
+    expect(prepared.some((s) => /agent_messages|INSERT/i.test(s))).toBe(false)
+    expect(sqlite.prepare(`SELECT gate_wake_notice FROM tasks WHERE id = 'arch'`).get()).toEqual({ gate_wake_notice: null })
+    harness.close()
+  })
+
+  it('wakeGateOwnerOnReview still delivers for a live task (guard is not over-broad)', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 'live')
+    const task = sqlite.prepare(`SELECT * FROM tasks WHERE id = 'live'`).get() as never
+    const { wakeGateOwnerOnReview } = await import('../src/mcp')
+    const out = await wakeGateOwnerOnReview(env, task, { kind: 'agent', id: 'x' }, 'x')
+    expect(out.status).not.toBe('task_archived')
+    expect(effectRows(sqlite)).toBe(1)
+    harness.close()
+  })
+
+  it('a task archived between the sweep SELECT and the wake yields no effect and is not counted rewoken', async () => {
+    const { env, sqlite, harness } = setup()
+    seedReviewTask(sqlite, 'race')
+    const realPrepare = harness.db.prepare.bind(harness.db)
+    let armed = true
+    harness.db.prepare = ((sql: string) => {
+      if (armed && sql.includes('INSERT INTO gate_stall_rewakes')) {
+        armed = false
+        archive(sqlite, 'race')
+      }
+      return realPrepare(sql)
+    }) as typeof harness.db.prepare
+    const res = await sweepAt(env, T0)
+    expect(res.rewoken).toBe(0)
+    expect(res.undelivered).toBe(1)
+    expect(effectRows(sqlite)).toBe(0)
+    harness.close()
+  })
+})
