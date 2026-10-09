@@ -175,20 +175,13 @@ const TERMINAL_RUNTIME_RECEIPT_STAGES_SQL = TERMINAL_RUNTIME_RECEIPT_STAGES.map(
  * already-safe bound-parameter placeholder) — never interpolate untrusted
  * caller input here.
  */
-export function inFlightDispatchReceiptExistsSql(p: {
-  tenantParam: string
-  taskIdExpr: string
-  /** Extra conjunct on the dispatch row `d` (mupot#1780: the archive path narrows "in flight" to
-   *  "genuinely pending"). Static SQL only. Default '' leaves every other caller's semantics unchanged. */
-  extraOnDispatch?: string
-}): string {
+export function inFlightDispatchReceiptExistsSql(p: { tenantParam: string; taskIdExpr: string }): string {
   return `EXISTS (
     SELECT 1
       FROM task_dispatch_receipts d
      WHERE d.tenant = ${p.tenantParam} AND d.task_id = ${p.taskIdExpr}
        -- mupot#1723 — an in-Worker dispatch has no runtime receipt; it settles on its own row.
        AND d.settled_at IS NULL
-       ${p.extraOnDispatch ?? ''}
        AND NOT EXISTS (
          SELECT 1 FROM task_dispatch_receipts newer
           WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
@@ -243,29 +236,61 @@ export async function hasInFlightDispatchReceipt(env: Env, taskId: string): Prom
 }
 
 /**
- * archiveBlockingDispatchExistsSql — mupot#1780. For the ARCHIVE path only. "In flight" for
- * dispatch/reassign guards means "no terminal runtime receipt yet", but the normal Claude-seat
- * flow (inbox read + task_submit_result) never writes one, so a done task whose dispatch envelope
- * was READ looked in flight forever and could not be archived (and task_dispatch_lease_reset only
- * touches unread rows). Archive is blocked only while the dispatch can still be DELIVERED:
- *   the queue event is not yet consumed (task_dispatch_receipts.consumed_at IS NULL), OR
- *   its inbox envelope is unread AND not dead-lettered (agent_messages.read_at / dead_lettered_at).
- * Layered on inFlightDispatchReceiptExistsSql (latest-dispatch / unsettled / no terminal receipt)
- * so the two cannot drift; that function's own semantics are untouched.
+ * archiveBlockingDispatchExistsSql — mupot#1780 / #1783. For the ARCHIVE path only. It is its OWN
+ * explicit OR of blocking conditions, NOT a narrowing of inFlightDispatchReceiptExistsSql: an AND-ed
+ * conjunct can only shrink the base, and the base already lets through a dispatch with a terminal
+ * runtime receipt and any dispatch that is not the latest.
+ *
+ * Archive is refused while the task's dispatch can still be EXECUTED or REDELIVERED:
+ *  (a) the LATEST dispatch is unsettled (settled_at IS NULL) and its queue event is unconsumed;
+ *  (b) the LATEST dispatch is unsettled and the task is 'in_progress', or a non-terminal
+ *      'runtime_consumed' receipt exists for it with no terminal-stage receipt (a runtime is running);
+ *  (c) ANY dispatch envelope of the task (any dispatch receipt, not just the latest) is unread AND not
+ *      dead-lettered — regardless of settlement or terminal runtime receipts (a failed receipt can be
+ *      written while read_at is NULL, and the lease can expire and redeliver).
+ * A done task whose envelope was READ with no runtime receipt (normal Claude-seat flow) is NOT blocked.
+ * `taskIdExpr` must be a column ref / bound placeholder (it is used to look up tasks.status too).
  */
 export function archiveBlockingDispatchExistsSql(p: { tenantParam: string; taskIdExpr: string }): string {
-  return inFlightDispatchReceiptExistsSql({
-    ...p,
-    extraOnDispatch: `AND (
-         d.consumed_at IS NULL
-         OR EXISTS (
-           SELECT 1 FROM agent_messages pm
-            WHERE pm.tenant = d.tenant AND pm.from_agent = '${DISPATCH_BRIDGE_SENDER}'
-              AND pm.request_id = '${DISPATCH_INBOX_PREFIX}' || d.id
-              AND pm.read_at IS NULL AND pm.dead_lettered_at IS NULL
+  return `(
+    EXISTS (
+      SELECT 1
+        FROM task_dispatch_receipts d
+       WHERE d.tenant = ${p.tenantParam} AND d.task_id = ${p.taskIdExpr}
+         AND d.settled_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM task_dispatch_receipts newer
+            WHERE newer.tenant = d.tenant AND newer.task_id = d.task_id
+              AND (newer.created_at > d.created_at
+                   OR (newer.created_at = d.created_at AND newer.rowid > d.rowid))
          )
-       )`,
-  })
+         AND (
+           d.consumed_at IS NULL
+           OR (SELECT st.status FROM tasks st WHERE st.id = d.task_id) = 'in_progress'
+           OR (
+             EXISTS (
+               SELECT 1 FROM task_dispatch_runtime_receipts rc
+                WHERE rc.tenant = d.tenant AND rc.dispatch_receipt_id = d.id
+                  AND rc.stage = 'runtime_consumed'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM task_dispatch_runtime_receipts rt
+                WHERE rt.tenant = d.tenant AND rt.dispatch_receipt_id = d.id
+                  AND rt.stage IN (${TERMINAL_RUNTIME_RECEIPT_STAGES_SQL})
+             )
+           )
+         )
+    )
+    OR EXISTS (
+      SELECT 1
+        FROM task_dispatch_receipts ad
+        JOIN agent_messages pm
+          ON pm.tenant = ad.tenant AND pm.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+         AND pm.request_id = '${DISPATCH_INBOX_PREFIX}' || ad.id
+       WHERE ad.tenant = ${p.tenantParam} AND ad.task_id = ${p.taskIdExpr}
+         AND pm.read_at IS NULL AND pm.dead_lettered_at IS NULL
+    )
+  )`
 }
 
 export async function hasArchiveBlockingDispatch(env: Env, taskId: string): Promise<boolean> {

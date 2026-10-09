@@ -236,6 +236,14 @@ function mapFlightProjectInsertError(error: unknown): never {
   throw error
 }
 
+/** mupot#1783 — createFlight's atomic archive guard. Rides in the INSERT..SELECT's own WHERE (?9 = the meta
+ *  JSON), so a task archived between validateFlightTaskProjectConsistency's read and the write converges to
+ *  0 rows. Archive's own in-write in-air-flight check is the mirror, so the two serialize either way. */
+const FLIGHT_TASKS_NOT_ARCHIVED_SQL = `NOT (json_valid(?9) AND EXISTS (
+  SELECT 1 FROM json_each(?9, '$.task_ids') ref
+    JOIN tasks_archive_state arch ON arch.task_id = ref.value
+))`
+
 // Create a flight in `preflight` — it has not launched; the gate decides next.
 export async function createFlight(env: Env, f: NewFlight, options: CreateFlightOptions = {}): Promise<string> {
   await validateFlightProjectAttribution(env, f)
@@ -269,7 +277,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
-          WHERE EXISTS (
+          WHERE ${FLIGHT_TASKS_NOT_ARCHIVED_SQL}
+            AND EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ?10 AND rr.tenant = ?11 AND rr.project_id = ?3
                AND rr.status IN ('leased','observing')
@@ -283,7 +292,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
     } else if (f.client_request_id !== undefined || options.redispatchReceipt) {
       const insert = env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, client_request_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10)`,
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, ?10
+          WHERE ${FLIGHT_TASKS_NOT_ARCHIVED_SQL}`,
       ).bind(...values, f.client_request_id ?? null)
       if (options.redispatchReceipt) {
         const [inserted] = await env.DB.batch([insert, redispatchReceiptStatement(env, id, options.redispatchReceipt)])
@@ -296,7 +306,8 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       // clearance HOLD read always names f.bookkeeping, so migration 0195 must be applied before this code ships.
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta, bookkeeping)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, 1)`,
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9, 1
+          WHERE ${FLIGHT_TASKS_NOT_ARCHIVED_SQL}`,
       ).bind(...values).run()
     } else {
       // No key → the pre-0172 statement, byte for byte. Deploy-order safety: until an
@@ -305,14 +316,20 @@ export async function createFlight(env: Env, f: NewFlight, options: CreateFlight
       // depends on the migration.
       result = await env.DB.prepare(
         `INSERT INTO flights (id, tenant, project_id, agent, dispatched_by_agent_id, goal, status, trigger_source, budget_micro_usd, meta)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9)`,
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'preflight', ?7, ?8, ?9
+          WHERE ${FLIGHT_TASKS_NOT_ARCHIVED_SQL}`,
       ).bind(...values).run()
     }
   } catch (error) {
     mapFlightProjectInsertError(error)
   }
-  if (options.routineRunFence && (result?.meta?.changes ?? 0) === 0) {
-    throw new FlightCreateFenceError()
+  if ((result?.meta?.changes ?? 0) === 0) {
+    // mupot#1783: 0 rows is either the atomic archive guard or (routine path) the run fence. Re-derive which.
+    const refs = f.meta?.task_ids
+    if (refs && refs.length > 0 && await anyTaskArchived(env, refs)) {
+      throw new FlightProjectError('task_archived')
+    }
+    if (options.routineRunFence) throw new FlightCreateFenceError()
   }
   return id
 }

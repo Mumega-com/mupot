@@ -73,7 +73,8 @@ export async function sweepStalledGateReviews(env: Env, now: Date = new Date()):
       // the window has elapsed and the cap is not reached. A concurrent sweep that lost sees 0.
       const claim = await env.DB.prepare(
         `INSERT INTO gate_stall_rewakes (task_id, review_since, rewake_count, last_rewake_at)
-         VALUES (?1, ?2, 1, ?3)
+         SELECT ?1, ?2, 1, ?3
+          WHERE NOT EXISTS (SELECT 1 FROM tasks_archive_state WHERE tasks_archive_state.task_id = ?1)  -- mupot#1783: no ledger row for an archived task
          ON CONFLICT(task_id) DO UPDATE SET
            rewake_count = CASE WHEN gate_stall_rewakes.review_since <> excluded.review_since
                                THEN 1 ELSE gate_stall_rewakes.rewake_count + 1 END,

@@ -164,8 +164,8 @@ export function findTaskUpdateSitesIn(src: string, file: string): TaskUpdateSite
   for (const lit of stringLiterals(src)) {
     // `SET` is required: it separates a statement from prose such as tool-annotations' "UPDATE tasks (service.ts:540)".
     // Accepts the quoting/qualifier/alias spellings SQLite allows for the same table: tasks, "tasks", `tasks`,
-    // [tasks], main.tasks / temp."tasks", and `tasks AS t` / `tasks t` (#1780). Not covered (see PR body): INDEXED BY.
-    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?(?:(?:main|temp)\s*\.\s*)?(?:"tasks"|`tasks`|\[tasks\]|tasks)(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\b/gi
+    // [tasks], main.tasks / "main"."tasks" / temp."tasks", and `tasks AS t` / `tasks t` (#1780). Not covered (see PR body): INDEXED BY.
+    const re = /\bUPDATE\s+(?:OR\s+\w+\s+)?(?:(?:"main"|`main`|\[main\]|main|"temp"|`temp`|\[temp\]|temp)\s*\.\s*)?(?:"tasks"|`tasks`|\[tasks\]|tasks)(?:\s+(?:AS\s+)?(?!SET\b)\w+)?\s+SET\b/gi
     const matches = [...lit.text.matchAll(re)]
     matches.forEach((m, idx) => {
       const from = m.index ?? 0
@@ -318,6 +318,8 @@ describe('every UPDATE tasks in src/ carries the archive guard or a justified ex
       'UPDATE main.tasks SET status = 1',
       'UPDATE main . tasks AS t SET status = 1',
       'UPDATE temp."tasks" SET status = 1',
+      'UPDATE "main"."tasks" SET status = 1',
+      'UPDATE [main].[tasks] AS t SET status = 1',
       'UPDATE [tasks] SET status = 1',
       'UPDATE "tasks" SET status = 1',
       'UPDATE `tasks` SET status = 1',
@@ -949,6 +951,32 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
         expect(out?.status).toBe('skipped_archived')
       })
     })
+
+    it('#1783: archived MID-LOOP after one act already went out -> receipt is partial_archived (never skipped_archived / ok)', async () => {
+      const id = 'pipe-partial'
+      const first = await seedApprovedWithAct(id)
+      const second = (await createOutboundAct(env, id, 'add_contact', { email: 'b@example.com' })).id
+      const ghlFetch = vi.fn(async () => { archive(id); return { ok: true, status: 200 } })
+      const receipts: Array<{ stepName: string; status: string; detail?: string }> = []
+      const step = {
+        do: async (...a: unknown[]) => (a[a.length - 1] as () => Promise<unknown>)(),
+        waitForEvent: async () => ({ payload: {} }),
+      } as unknown as Parameters<typeof runTaskPipeline>[2]
+      await runTaskPipeline(ghlEnv(), { taskId: id, agentId: WORKER, squadId: SQUAD } as never, step, 'inst', {
+        loadAgent: async () => ({ id: WORKER } as Agent),
+        runTaskExecution: async () => ({ ok: true, task_id: id, decided: 'review', task_status: 'review' }),
+        readLatestVerdict: async () => ({ verdict: 'approved' }),
+        countPendingActs: async () => 2,
+        writeReceipt: async (_e, row) => { receipts.push(row) },
+        ghlDeps: { ghlFetch },
+      })
+      expect(ghlFetch).toHaveBeenCalledTimes(1)
+      expect(actStatus(first)).toBe('sent')
+      expect(actStatus(second)).toBe('pending')
+      const out = receipts.find((r) => r.stepName === 'outbound-acts')
+      expect(out?.status).toBe('partial_archived')
+      expect(JSON.parse(out?.detail ?? '{}')).toMatchObject({ sent: 1, reason: 'task_archived' })
+    })
   })
 
   // ── archive refuses a task the bus consumer would still deliver (gate round 2, P1-1) ──
@@ -1062,6 +1090,139 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       seedTask('old-sem', 'done', { assignee: WORKER })
       seedDispatch('old-sem', { consumed: true, envelope: { readAt: T0 } })
       expect(await hasInFlightDispatchReceipt(env, 'old-sem')).toBe(true)
+    })
+
+    // ── mupot#1783: the archive predicate is its OWN OR of execute/redeliver conditions ──
+    // (a base-AND-conjunct can only narrow: the base already lets through a terminal-receipt dispatch and any
+    // non-latest dispatch). Each case builds an explicit fixture; ids are per-dispatch so several can coexist.
+    describe('execute / redeliver blocking (#1783)', () => {
+      const ts = (n: number) => `2026-10-07T00:00:0${n}.000Z`
+      function dispatch(taskId: string, key: string, o: { n: number; consumed?: boolean; settled?: boolean; env?: 'read' | 'unread' | 'dead' | 'none' }): string {
+        const id = `dr-${key}`
+        h.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at, settled_at, attempts)
+          VALUES ('${id}', '${TENANT}', '${taskId}', '${SQUAD}', '${WORKER}', 'member', '${OPERATOR}', '${ts(o.n)}', ${o.consumed === false ? 'NULL' : `'${ts(o.n)}'`}, ${o.settled ? `'${ts(o.n)}'` : 'NULL'}, 1)`)
+        const e = o.env ?? 'none'
+        if (e !== 'none') {
+          h.sqlite.prepare(
+            `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, created_at, read_at, dead_lettered_at)
+             VALUES (?, ?, 'worker', 'mupot-dispatch', ?, 'request', '{}', ?, ?, ?, ?)`,
+          ).run(`msg-${key}`, TENANT, OPERATOR, `dispatch-inbox:${id}`, ts(o.n), e === 'read' ? ts(o.n) : null, e === 'dead' ? ts(o.n) : null)
+        }
+        return id
+      }
+      function runtimeReceipt(taskId: string, drId: string, stage: 'runtime_consumed' | 'completed' | 'failed'): void {
+        // FK parents (message / credential / audit) are irrelevant to the predicate under test.
+        h.sqlite.exec('PRAGMA foreign_keys = OFF')
+        const hex = 'a'.repeat(64)
+        h.sqlite.prepare(
+          `INSERT INTO task_dispatch_runtime_receipts (id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id, stage, attempt,
+             runtime_address, runtime_receipt_hash, request_digest, result, reason, audit_entry_id, created_at)
+           VALUES (?, ?, ?, ?, ?, 'm', ?, 'c', ?, 1, 'rt', ?, ?, ?, ?, ?, ?)`,
+        ).run(`rr-${drId}-${stage}`, TENANT, drId, taskId, WORKER, OPERATOR, stage, hex, hex, stage === 'completed' ? 'ok' : null, stage === 'failed' ? 'boom' : null, `audit-${drId}-${stage}`, T0)
+        h.sqlite.exec('PRAGMA foreign_keys = ON')
+      }
+      const blocked = async (id: string) => {
+        const r = await tryArchive(id)
+        expect(r.ok).toBe(false)
+        if (r.ok) return
+        expect(r.error).toBe('in_flight_dispatch')
+        expect(h.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks_archive_state').get()).toEqual({ n: 0 })
+      }
+
+      it('P1: consumed + envelope READ + runtime_consumed (non-terminal) -> refused (runtime still executing)', async () => {
+        seedTask('p1', 'review', { assignee: WORKER })
+        const dr = dispatch('p1', 'p1', { n: 1, env: 'read' })
+        runtimeReceipt('p1', dr, 'runtime_consumed')
+        await blocked('p1')
+      })
+
+      it('in_progress task, dispatch consumed, envelope read, no runtime receipt -> refused', async () => {
+        seedTask('prog', 'in_progress', { assignee: WORKER })
+        dispatch('prog', 'prog', { n: 1, env: 'read' })
+        await blocked('prog')
+      })
+
+      it('P2-1: consumed, envelope UNREAD, FAILED terminal receipt -> refused (lease expiry can redeliver)', async () => {
+        seedTask('p21', 'open', { assignee: WORKER })
+        const dr = dispatch('p21', 'p21', { n: 1, env: 'unread' })
+        runtimeReceipt('p21', dr, 'failed')
+        await blocked('p21')
+      })
+
+      it('older dispatch UNREAD envelope + newer SETTLED dispatch -> refused (any dispatch, not just the latest)', async () => {
+        seedTask('older', 'open', { assignee: WORKER })
+        dispatch('older', 'older-1', { n: 1, env: 'unread' })
+        dispatch('older', 'older-2', { n: 2, settled: true, env: 'read' })
+        await blocked('older')
+      })
+
+      it('older UNREAD envelope that is dead-lettered + newer settled -> archivable', async () => {
+        seedTask('older-dead', 'open', { assignee: WORKER })
+        dispatch('older-dead', 'od-1', { n: 1, env: 'dead' })
+        dispatch('older-dead', 'od-2', { n: 2, settled: true, env: 'read' })
+        const r = await tryArchive('older-dead')
+        expect(r.ok, JSON.stringify(r)).toBe(true)
+      })
+
+      it('dead-lettered unread envelope -> archivable', async () => {
+        seedTask('dl', 'open', { assignee: WORKER })
+        dispatch('dl', 'dl', { n: 1, env: 'dead' })
+        const r = await tryArchive('dl')
+        expect(r.ok, JSON.stringify(r)).toBe(true)
+      })
+
+      it('the wedge stays fixed: done + envelope READ + no runtime receipt -> archivable', async () => {
+        seedTask('wedge', 'done', { assignee: WORKER })
+        dispatch('wedge', 'wedge', { n: 1, env: 'read' })
+        const r = await tryArchive('wedge')
+        expect(r.ok, JSON.stringify(r)).toBe(true)
+      })
+
+      it('done + terminal COMPLETED receipt + envelope read -> archivable', async () => {
+        seedTask('doneterm', 'done', { assignee: WORKER })
+        const dr = dispatch('doneterm', 'doneterm', { n: 1, env: 'read' })
+        runtimeReceipt('doneterm', dr, 'runtime_consumed')
+        runtimeReceipt('doneterm', dr, 'completed')
+        const r = await tryArchive('doneterm')
+        expect(r.ok, JSON.stringify(r)).toBe(true)
+      })
+
+      it('the in-write guard (not just the pre-read) enforces (b): a runtime_consumed receipt landing after the pre-read blocks', async () => {
+        seedTask('race-b', 'review', { assignee: WORKER })
+        const dr = dispatch('race-b', 'race-b', { n: 1, env: 'read' })
+        const realPrepare = h.db.prepare.bind(h.db)
+        let armed = true
+        h.db.prepare = ((sql: string) => {
+          if (armed && sql.includes('INSERT OR IGNORE INTO tasks_archive_state')) {
+            armed = false
+            runtimeReceipt('race-b', dr, 'runtime_consumed')
+          }
+          return realPrepare(sql)
+        }) as typeof h.db.prepare
+        await blocked('race-b')
+      })
+
+      it('the in-write guard enforces (c): an older-dispatch unread envelope landing after the pre-read blocks', async () => {
+        seedTask('race-c', 'done', { assignee: WORKER })
+        dispatch('race-c', 'race-c-new', { n: 2, settled: true, env: 'read' })
+        const realPrepare = h.db.prepare.bind(h.db)
+        let armed = true
+        h.db.prepare = ((sql: string) => {
+          if (armed && sql.includes('INSERT OR IGNORE INTO tasks_archive_state')) {
+            armed = false
+            dispatch('race-c', 'race-c-old', { n: 1, settled: true, env: 'unread' })
+          }
+          return realPrepare(sql)
+        }) as typeof h.db.prepare
+        await blocked('race-c')
+      })
+
+      it('archiveBlockingDispatchExistsSql is not built on the in-flight predicate (no narrowing) and the in-flight SQL is the pre-#1781 text', async () => {
+        const { archiveBlockingDispatchExistsSql, inFlightDispatchReceiptExistsSql } = await import('../src/tasks/runtime-receipts')
+        const p = { tenantParam: '?1', taskIdExpr: '?2' }
+        expect(inFlightDispatchReceiptExistsSql(p)).not.toContain('consumed_at')
+        expect(archiveBlockingDispatchExistsSql(p)).toContain('OR EXISTS')
+      })
     })
   })
 
