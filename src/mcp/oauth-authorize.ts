@@ -1895,7 +1895,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 
     // mupot#1794 W1 — harness upsert, UNBOUND consent only, behind SEAT_AUTO_ENROLL. With the flag
     // off (prod default) this block is skipped entirely: no read, no write, and the props below
-    // are byte-identical to before. An agent-bound consent (boundAgentId set: legacy / Rava /
+    // are semantically identical to before. An agent-bound consent (boundAgentId set: legacy / Rava /
     // __bootstrap__ / __mint_new__) never reaches it. Best-effort and non-fatal, same posture as
     // the receipt write above: a failed upsert only means this session cannot call seat_select.
     // The harness key is the OAuth client_id from the library-parsed authorize request
@@ -1948,7 +1948,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
           // the human), so there is no separate "consenting human" to record.
           consentedByMemberId: boundAgentId ? pending.memberId : null,
           // mupot#1794 W1: spread only when set, so a flag-off / bound grant's props are
-          // byte-for-byte what they were before this feature existed.
+          // semantically what they were before this feature existed.
           ...(harnessId ? { harnessId } : {}),
         } satisfies OAuthMemberProps,
       })

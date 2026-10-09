@@ -18,7 +18,8 @@ import { normalizeSeatKey, normalizeFolderPath, seatKeyHash, canonicalSeatKeyStr
 import { upsertHarness, seatAutoEnrollEnabled, classifyHarnessKind } from '../src/members/harness'
 import { bootstrapSelf, findExistingBootstrap } from '../src/members/bootstrap-self'
 import { buildAuthContextFromProps, handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
-import { invokeTool } from '../src/mcp/index'
+import { invokeTool, mcpApp } from '../src/mcp/index'
+import { AUTH_CONTEXT_HEADER } from '../src/mcp/auth-header'
 import type { AuthContext, Env } from '../src/types'
 
 const TENANT = 'mumega'
@@ -746,5 +747,176 @@ describe('boot_context identity receipt', () => {
     expect((await boot(bound, env, { label: b.agent.id })).identity_receipt).toMatchObject({ seat_label_conflict: true })
     // a label that names no agent at all (a folder/project) -> NOT a conflict
     expect((await boot(bound, env, { label: 'my-project-folder' }, 'some-folder')).identity_receipt).toMatchObject({ seat_label_conflict: false })
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. Round-1 gate fixes
+// ════════════════════════════════════════════════════════════════════════════
+describe('discovery is flag-gated', () => {
+  async function rpcToolNames(env: Env): Promise<string[]> {
+    const res = await mcpApp.fetch(new Request('http://localhost/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }), env)
+    const body = (await res.json()) as { result: { tools: { name: string }[] } }
+    return body.result.tools.map((t) => t.name)
+  }
+  async function restToolNames(env: Env): Promise<string[]> {
+    const res = await mcpApp.fetch(new Request('http://localhost/tools'), env)
+    return ((await res.json()) as { tools: { name: string }[] }).tools.map((t) => t.name)
+  }
+
+  it('flag off: tools/list and GET /tools exclude seat_select (other tools still listed); flag on: include', async () => {
+    const off = envFor(h, { SEAT_AUTO_ENROLL: undefined })
+    const on = envFor(h)
+    for (const names of [await rpcToolNames(off), await restToolNames(off)]) {
+      expect(names).not.toContain('seat_select')
+      expect(names).toContain('bootstrap_self')
+    }
+    for (const names of [await rpcToolNames(on), await restToolNames(on)]) expect(names).toContain('seat_select')
+  })
+})
+
+describe('cap counts only LIVE seats (active agent AND not retired)', () => {
+  it('cap 3: deactivating one seat agent frees a slot for a new key', async () => {
+    const env = envFor(h, { SEAT_MAX_PER_MEMBER: '3' })
+    const hid = await harnessFor(env, HUMAN)
+    const seats = []
+    for (const f of ['/a', '/b', '/c']) {
+      const o = await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: f })
+      if (!o.ok) throw new Error(JSON.stringify(o))
+      seats.push(o)
+    }
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/d' })).toMatchObject({ error: 'seat_cap_reached' })
+    h.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${seats[0].agent.id}'`)
+    const fresh = await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/d' })
+    expect(fresh).toMatchObject({ ok: true, disposition: 'created' })
+  })
+
+  it('retired_at IS NULL is pinned: retiring a seat (agent still active) frees its slot', async () => {
+    const env = envFor(h, { SEAT_MAX_PER_MEMBER: '2' })
+    const hid = await harnessFor(env, HUMAN)
+    const a = await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/a' })
+    await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/b' })
+    if (!a.ok) throw new Error('unreachable')
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/c' })).toMatchObject({ error: 'seat_cap_reached' })
+    h.sqlite.exec(`UPDATE agent_seats SET retired_at = '2026-10-09T00:00:00.000Z' WHERE id = '${a.seat.id}'`)
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/c' })).toMatchObject({ ok: true })
+  })
+
+  it('the DB trigger itself counts the same way (raw insert after deactivation succeeds)', async () => {
+    const env = envFor(h)
+    const hid = await harnessFor(env, HUMAN)
+    const a = await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/a' })
+    if (!a.ok) throw new Error('unreachable')
+    h.sqlite.exec(`INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('raw-agent', '${a.agent.squad_id}', 'raw-agent', 'Raw', 'active')`)
+    h.sqlite.exec(`UPDATE agents SET status = 'inactive' WHERE id = '${a.agent.id}'`)
+    expect(() => h.sqlite.exec(
+      `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live)
+       VALUES ('raw-seat', '${TENANT}', '${HUMAN}', '${hid}', '${'c'.repeat(64)}', 'raw-agent', 'x', 1)`,
+    )).not.toThrow()
+  })
+})
+
+describe('existing seat re-validates the weld', () => {
+  it("an agent whose dedicated member is no longer active is seat_agent_inactive (binding check pinned)", async () => {
+    const env = envFor(h)
+    const hid = await harnessFor(env, HUMAN)
+    const a = await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/a' })
+    if (!a.ok) throw new Error('unreachable')
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = '${a.member_id}'`)
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/a' }))
+      .toMatchObject({ ok: false, error: 'seat_agent_inactive', detail: { reason: 'agent_binding_missing' } })
+  })
+})
+
+describe('forged x-mupot-auth-context harnessId is stripped by resolveAuth (end to end)', () => {
+  async function receiptHarness(env: Env, blob: Record<string, unknown>): Promise<unknown> {
+    const res = await mcpApp.fetch(new Request('http://localhost/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(blob) },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }),
+    }), env)
+    const body = (await res.json()) as { result: { structuredContent: { identity_receipt: { harness: unknown } } } }
+    return body.result.structuredContent.identity_receipt.harness
+  }
+  const blob = (over: Record<string, unknown>) => ({
+    userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, capabilities: [], ...over,
+  })
+
+  it('positive control: an unbound directory blob keeps its (verified) harness; a workspace-channel blob does not', async () => {
+    const env = envFor(h)
+    const hid = await harnessFor(env, HUMAN)
+    expect(await receiptHarness(env, blob({ channel: 'directory', boundAgentId: null, harnessId: hid })))
+      .toMatchObject({ id: hid, kind: 'cursor' })
+    expect(await receiptHarness(env, blob({ channel: 'workspace', boundAgentId: null, harnessId: hid }))).toBeNull()
+  })
+
+  it('flag off: even an unbound directory blob carries no harness', async () => {
+    const on = envFor(h)
+    const hid = await harnessFor(on, HUMAN)
+    const off = envFor(h, { SEAT_AUTO_ENROLL: undefined })
+    const res = await mcpApp.fetch(new Request('http://localhost/', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AUTH_CONTEXT_HEADER]: JSON.stringify(blob({ channel: 'directory', boundAgentId: null, harnessId: hid })) },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }),
+    }), off)
+    const sc = ((await res.json()) as { result: { structuredContent: Record<string, unknown> } }).result.structuredContent
+    expect('identity_receipt' in sc).toBe(false)
+  })
+})
+
+describe('creation throttle and display-name hygiene', () => {
+  it('20 creations per member per hour, then rate_limited; existing seats still resolve; fails open on KV error', async () => {
+    const env = envFor(h, { SEAT_MAX_PER_MEMBER: '100' })
+    const hid = await harnessFor(env, HUMAN)
+    for (let i = 0; i < 20; i++) {
+      expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: `/f${i}` })).toMatchObject({ ok: true })
+    }
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/f20' })).toMatchObject({ ok: false, error: 'rate_limited' })
+    expect(await seatSelect(env, authFor(HUMAN, hid), { project: 'p', folder: '/f3' })).toMatchObject({ ok: true, disposition: 'existing' })
+    // a different human has their own budget
+    const h2 = await harnessFor(env, HUMAN2)
+    expect(await seatSelect(env, authFor(HUMAN2, h2), { project: 'p', folder: '/f0' })).toMatchObject({ ok: true })
+    // KV down -> fail open
+    const broken = { ...env, SESSIONS: { get: async () => { throw new Error('kv down') }, put: async () => { throw new Error('kv down') } } } as unknown as Env
+    expect(await seatSelect(broken, authFor(HUMAN, hid), { project: 'p', folder: '/f21' })).toMatchObject({ ok: true })
+  })
+
+  it('an OAuth client registered as an impersonation label cannot make the agent read as that identity', async () => {
+    const env = envFor(h)
+    const hid = await harnessFor(env, HUMAN, 'client-evil', 'River <script>\nKasra')
+    const out = await seatSelect(env, authFor(HUMAN, hid), { project: 'proj', folder: '/x/y' })
+    if (!out.ok) throw new Error(JSON.stringify(out))
+    expect(out.agent.name.startsWith('member-human-1 · ')).toBe(true)
+    expect(out.agent.name).not.toMatch(/[<>\n]/)
+    expect(out.agent.name.length).toBeLessThanOrEqual(120)
+  })
+})
+
+describe('seat_label_conflict is not a tenant-wide existence oracle', () => {
+  it('a label naming an agent on ANOTHER squad is not a conflict; a peer on the same squad is', async () => {
+    const env = envFor(h)
+    const h1 = await harnessFor(env, HUMAN)
+    const h2 = await harnessFor(env, HUMAN2)
+    const a = await seatSelect(env, authFor(HUMAN, h1), { project: 'p', folder: '/a' })
+    const peer = await seatSelect(env, authFor(HUMAN, h1), { project: 'p', folder: '/b' })
+    const stranger = await seatSelect(env, authFor(HUMAN2, h2), { project: 'p', folder: '/a' })
+    if (!a.ok || !peer.ok || !stranger.ok) throw new Error('unreachable')
+    const bound: AuthContext = {
+      userId: a.member_id, email: null, role: 'member', tenant: TENANT, memberId: a.member_id, channel: 'directory',
+      capabilities: [{ member_id: a.member_id, scope_type: 'squad', scope_id: a.agent.squad_id, capability: 'member' }],
+      boundAgentId: a.agent.id, consentedByMemberId: HUMAN,
+    }
+    const call = async (label: string) => {
+      const out = await invokeTool(bound, env, 'boot_context', { label }, { origin: 'https://pot.test', sideEffectFree: true })
+      if (!out.ok) throw new Error(JSON.stringify(out))
+      return (out.result as { identity_receipt: { seat_label_conflict: boolean } }).identity_receipt.seat_label_conflict
+    }
+    expect(await call(stranger.agent.slug)).toBe(false)
+    expect(await call(stranger.agent.id)).toBe(false)
+    expect(await call(peer.agent.slug)).toBe(true)
   })
 })

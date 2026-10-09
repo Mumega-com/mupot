@@ -6055,7 +6055,7 @@ function buildAvailableDoors(state: OnboardingState): OnboardingDoor[] {
 // this set when the session lock ships in a later wave.)
 //
 // seat_label_conflict is TRUE only when a supplied label (x-mupot-seat, or the seat / label args)
-// resolves to an existing agent (by id or slug) OTHER than the bound one. A label that names no agent
+// resolves to an agent (by id or slug) on the bound agent's own squad OTHER than the bound one. A label that names no agent
 // (a folder, a project) is never a conflict — labels are not authority, the conflict flag just stops
 // a client from believing it is somebody it is not.
 async function buildIdentityReceipt(
@@ -6076,8 +6076,8 @@ async function buildIdentityReceipt(
     : null
 
   const agentRow = boundAgentId
-    ? await env.DB.prepare(`SELECT id, slug, name, status FROM agents WHERE id = ?1 LIMIT 1`)
-        .bind(boundAgentId).first<{ id: string; slug: string; name: string; status: string }>()
+    ? await env.DB.prepare(`SELECT id, slug, name, status, squad_id FROM agents WHERE id = ?1 LIMIT 1`)
+        .bind(boundAgentId).first<{ id: string; slug: string; name: string; status: string; squad_id: string }>()
         .catch(() => null)
     : null
 
@@ -6089,10 +6089,12 @@ async function buildIdentityReceipt(
 
   let conflict = false
   const claimed = labels.map((l) => (l ?? '').trim()).filter((l) => l.length > 0 && l.length <= 128)
-  if (boundAgentId && claimed.length > 0) {
+  if (boundAgentId && agentRow && claimed.length > 0) {
+    // Scoped to the bound agent's OWN squad: those are peers the session can already see, so this
+    // lookup cannot be used to probe for the existence of agents elsewhere in the tenant.
     for (const label of claimed) {
-      const rows = await env.DB.prepare(`SELECT id FROM agents WHERE id = ?1 OR slug = ?1 LIMIT 8`)
-        .bind(label).all<{ id: string }>().catch(() => null)
+      const rows = await env.DB.prepare(`SELECT id FROM agents WHERE squad_id = ?2 AND (id = ?1 OR slug = ?1) LIMIT 8`)
+        .bind(label, agentRow.squad_id).all<{ id: string }>().catch(() => null)
       const ids = rows?.results ?? []
       if (ids.length > 0 && !ids.some((r) => r.id === boundAgentId)) {
         conflict = true
@@ -6278,7 +6280,7 @@ const toolBootContext: ToolSpec = {
         : undefined
 
     // mupot#1794 W1 — identity receipt. Additive, and present ONLY while SEAT_AUTO_ENROLL is on so
-    // a flag-off response is byte-identical to before. Every value is server-derived; labels the
+    // a flag-off response is semantically identical to before. Every value is server-derived; labels the
     // caller supplied (seat / label args, x-mupot-seat) are only COMPARED, never believed.
     const identityReceipt = seatAutoEnrollEnabled(env)
       ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
@@ -6679,6 +6681,15 @@ export const TOOLS: ToolSpec[] = [
 
 const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 
+// mupot#1794 W1: tools that exist only while a feature flag is on. With the flag off they are
+// not ADVERTISED (tools/list, GET /mcp/tools, openapi.full.json); a direct call still reaches the
+// tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
+// drift from the others.
+const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL'>): ToolSpec[] {
+  return seatAutoEnrollEnabled(env) ? TOOLS : TOOLS.filter((t) => !SEAT_FLAG_TOOLS.has(t.name))
+}
+
 interface JsonRpcRequest {
   jsonrpc?: unknown
   id?: unknown
@@ -7033,7 +7044,7 @@ async function handleJsonRpc(
     }
     // 2026-07-28 (SEP-2549): tools/list is a CacheableResult — ttlMs + cacheScope REQUIRED. 0/private =
     // "do not reuse", the conservative value (no freshness claim is made for the registry).
-    return ok(id, { tools: TOOLS.map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
+    return ok(id, { tools: advertisedTools(c.env).map(mcpTool), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) })
   }
 
   if (method === 'tools/call') {
@@ -7154,7 +7165,7 @@ mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.
 mcpApp.get('/tools', (c) =>
   c.json({
     contract: 'POST /mcp {tool, args} — bearer member token in Authorization header',
-    tools: TOOLS.map((t) => ({
+    tools: advertisedTools(c.env).map((t) => ({
       name: t.name,
       scope: t.scope,
       min_capability: t.min,
@@ -7349,7 +7360,7 @@ mcpActionsApp.get('/openapi.full.json', async (c) => {
   }
   if (!hasWorkspaceAdmin(auth)) return c.json({ error: 'forbidden', need: 'org:admin' }, 403)
   const url = new URL(c.req.url)
-  return c.json(openApiSpec(url.origin, TOOLS, FULL_OPENAPI_DESCRIPTION))
+  return c.json(openApiSpec(url.origin, advertisedTools(c.env), FULL_OPENAPI_DESCRIPTION))
 })
 
 mcpActionsApp.post('/actions/:tool', async (c) => {

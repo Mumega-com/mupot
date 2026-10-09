@@ -56,15 +56,19 @@ CREATE TABLE IF NOT EXISTS agent_seats (
 
 CREATE INDEX IF NOT EXISTS idx_agent_seats_member_live ON agent_seats (tenant, member_id, retired_at);
 
--- Per-member cap, atomic with the insert. Counts LIVE (non-retired) seats for the same
--- (tenant, member). Raises -> the entire seat_select batch (agent, member, binding, capability,
+-- Per-member cap, atomic with the insert. Counts LIVE seats for the same (tenant, member): a seat
+-- is live while retired_at IS NULL AND its agent is still status='active'. Counting the agent's
+-- status matters because nothing writes retired_at yet: a deactivated seat agent must stop holding
+-- a cap slot, or the cap becomes a permanent lockout. Raises -> the entire seat_select batch (agent, member, binding, capability,
 -- token, audit, seat) rolls back: zero orphans.
 CREATE TRIGGER IF NOT EXISTS agent_seats_cap_insert
 BEFORE INSERT ON agent_seats
 FOR EACH ROW
 WHEN NEW.retired_at IS NULL
  AND (SELECT COUNT(*) FROM agent_seats s
-       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id AND s.retired_at IS NULL) >= NEW.max_live
+       JOIN agents a ON a.id = s.agent_id
+       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id
+         AND s.retired_at IS NULL AND a.status = 'active') >= NEW.max_live
 BEGIN
   SELECT RAISE(ABORT, 'seat_cap_exceeded');
 END;

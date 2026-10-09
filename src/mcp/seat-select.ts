@@ -73,6 +73,8 @@ const toolSeatSelect: ToolSpec = {
           result.error,
           'You do not hold admin on your own home squad, so a seat agent cannot be placed there. Ask an org admin to restore your home squad grant.',
         )
+      case 'rate_limited':
+        return fail(403, result.error, result.detail)
       case 'seat_cap_reached':
         return fail(409, result.error, result.detail)
       case 'seat_agent_inactive':

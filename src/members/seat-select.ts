@@ -70,6 +70,30 @@ export function seatCap(env: Pick<Env, 'SEAT_MAX_PER_MEMBER'>): number {
   return Math.min(n, SEAT_MAX_PER_MEMBER_CEILING)
 }
 
+// ── per-member creation throttle (mirrors bootstrap_self's, src/members/bootstrap-self.ts) ──
+// Keyed on the MEMBER, not the IP. Spent only on the CREATION path (an existing seat resolves
+// before it, so a seat re-opened every session never burns budget). KV read-then-put is not an
+// atomic counter and fails OPEN on KV errors — the same documented posture as bootstrap_self; the
+// hard bound on agents is the cap trigger, this only limits attempt rate.
+const SEAT_RL_MAX = 20
+const SEAT_RL_TTL = 3600 // seconds
+
+export async function checkSeatSelectRateLimit(
+  env: Env,
+  memberId: string,
+): Promise<{ allowed: boolean; retryAfter: number }> {
+  const key = `seat-select-rl:${memberId}`
+  try {
+    const raw = await env.SESSIONS.get(key)
+    const count = raw !== null ? parseInt(raw, 10) : 0
+    if (count >= SEAT_RL_MAX) return { allowed: false, retryAfter: SEAT_RL_TTL }
+    await env.SESSIONS.put(key, String(count + 1), { expirationTtl: SEAT_RL_TTL })
+    return { allowed: true, retryAfter: 0 }
+  } catch {
+    return { allowed: true, retryAfter: 0 }
+  }
+}
+
 export type SeatSelectFailure =
   | 'seat_auto_enroll_disabled'
   | 'not_unbound_directory_session'
@@ -78,6 +102,7 @@ export type SeatSelectFailure =
   | 'invalid_args'
   | 'home_rank_insufficient'
   | 'seat_cap_reached'
+  | 'rate_limited'
   | 'seat_agent_inactive'
   | 'provisioning_failed'
 
@@ -126,7 +151,10 @@ function isCapViolation(err: unknown): boolean {
 
 async function countLiveSeats(env: Env, memberId: string): Promise<number> {
   const row = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND member_id = ?2 AND retired_at IS NULL`,
+    // Same definition of "live" as the agent_seats_cap_insert trigger (migration 0198): not retired
+    // AND the agent is still active. A deactivated seat agent frees its slot.
+    `SELECT COUNT(*) AS n FROM agent_seats s JOIN agents a ON a.id = s.agent_id
+      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.retired_at IS NULL AND a.status = 'active'`,
   ).bind(env.TENANT_SLUG, memberId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -214,6 +242,10 @@ export async function seatSelect(
   const found = await findSeat(env, memberId, harness.id, keyHash)
   if (found) return existingSeatResult(env, found, harness)
 
+  // 6b. Throttle the creation path (after the idempotent fast path above).
+  const rl = await checkSeatSelectRateLimit(env, memberId)
+  if (!rl.allowed) return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: rl.retryAfter } }
+
   // 7. Cap pre-check (cheap, no writes). The authoritative cap is the trigger inside the batch;
   //    this just keeps a capped human from provisioning a home squad / burning slugs for nothing.
   const cap = seatCap(env)
@@ -232,10 +264,15 @@ export async function seatSelect(
   // 9. Server-derived slug + display name. Neither comes from the caller verbatim.
   const slug = `seat-${keyHash.slice(0, 12)}`
   if (!isValidSlug(slug)) return { ok: false, error: 'provisioning_failed', detail: { stage: 'slug_derivation' } }
-  const harnessLabel = sanitizeLabel(harness.client_name, 40) || harness.kind
-  const kindLabel = key.harnessKindHint && harness.kind === 'unknown' ? key.harnessKindHint : harnessLabel
+  // The display name is prefixed with the HUMAN's own local part and uses a charset-limited client
+  // label, so an OAuth client registered as "River" / "Kasra" cannot mint an agent that reads as
+  // that identity. It is still only a label (authority never reads it).
+  const emailRow = await env.DB.prepare(`SELECT email FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
+    .bind(memberId, env.TENANT_SLUG).first<{ email: string | null }>()
+  const ownerLabel = (emailRow?.email ?? '').split('@')[0].replace(/[^A-Za-z0-9._-]/g, '').slice(0, 24) || 'member'
+  const clientLabel = harness.client_name.replace(/[^A-Za-z0-9 ._-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24) || harness.kind
   const displayName = sanitizeLabel(
-    [kindLabel, key.project, key.labelBasename !== key.project ? key.labelBasename : ''].filter(Boolean).join(' · '),
+    [ownerLabel, clientLabel, key.project, key.labelBasename !== key.project ? key.labelBasename : ''].filter(Boolean).join(' · '),
     120,
   )
 
