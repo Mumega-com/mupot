@@ -3811,6 +3811,8 @@ const toolFlightReapStalled: ToolSpec = {
       previous_status: result.previous_status,
       age_ms: result.age_ms,
       receipt: result.receipt,
+      target_status: result.target_status,
+      ...(result.disposition ? { disposition: result.disposition } : {}),
     })
   },
 }

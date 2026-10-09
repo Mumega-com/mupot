@@ -50,10 +50,42 @@ export function isCancelUnconfirmed(
   return isCancelledFlight(row) && (row.cancel_unconfirmed === 1 || row.cancel_unconfirmed === true)
 }
 
-/** SQL fragment: a genuinely failed flight (status failed AND no cancel receipt). */
-export function genuinelyFailedFlightSql(alias = 'f'): string {
+/**
+ * SQL fragment: a REAL failure for counting purposes (mupot#1748, #1762): status failed AND not cancelled AND not a
+ * bookkeeping flight. Bookkeeping flights (deploy/studio, flights.bookkeeping=1, migration 0195) never execute, so a
+ * failed row for one is the watchdog closing a lifecycle-less record, not a failure of work. EVERY failure counter
+ * uses this fragment (or isRealFailure on the JS side); there is no second copy of the predicate.
+ */
+export function realFailureSql(alias = 'f'): string {
   const a = safeAlias(alias)
-  return `(${a}.status = 'failed' AND NOT ${cancelledFlightSql(a)})`
+  return `(${a}.status = 'failed' AND ${a}.bookkeeping = 0 AND NOT ${cancelledFlightSql(a)})`
+}
+
+/** Back-compat name for realFailureSql (the outcome-feed filter predates the bookkeeping exclusion). */
+export function genuinelyFailedFlightSql(alias = 'f'): string {
+  return realFailureSql(alias)
+}
+
+/** SQL fragment: a terminal bookkeeping row stored as 'failed' (pre-fix watchdog reaps), not cancelled. */
+export function bookkeepingClosedFlightSql(alias = 'f'): string {
+  const a = safeAlias(alias)
+  return `(${a}.status = 'failed' AND ${a}.bookkeeping = 1 AND NOT ${cancelledFlightSql(a)})`
+}
+
+/** 1 for a server-marked bookkeeping flight. Absent key (hand-built rows, older queries) = not bookkeeping. */
+export function isBookkeepingFlight(row: { bookkeeping?: number | boolean | null }): boolean {
+  return row.bookkeeping === 1 || row.bookkeeping === true
+}
+
+/**
+ * JS side of realFailureSql, over a row read with cancelledColumnSql() and the bookkeeping column.
+ * `bookkeeping` is a REQUIRED key (value may be undefined only for hand-built rows) for the same reason `cancelled`
+ * is: a reader whose row type lacks it fails to compile instead of counting bookkeeping reaps as failures.
+ */
+export function isRealFailure(
+  row: { status: string; cancelled: number | boolean | null | undefined; bookkeeping: number | boolean | null | undefined },
+): boolean {
+  return row.status === 'failed' && !isCancelledFlight(row) && !isBookkeepingFlight(row)
 }
 
 /** JS side of the predicate, over a row read with cancelledColumnSql(). */
@@ -64,8 +96,13 @@ export function isCancelledFlight(row: { status: string; cancelled: number | boo
 }
 
 /** The outcome a reader should DISPLAY/COUNT: 'cancelled' replaces 'failed' for cancels only. */
-export function flightOutcome<S extends string>(row: { status: S; cancelled: number | boolean | null | undefined }): S | 'cancelled' {
-  return isCancelledFlight(row) ? 'cancelled' : row.status
+export function flightOutcome<S extends string>(
+  row: { status: S; cancelled: number | boolean | null | undefined; bookkeeping?: number | boolean | null },
+): S | 'cancelled' | 'bookkeeping' {
+  if (isCancelledFlight(row)) return 'cancelled'
+  // A bookkeeping flight stored as 'failed' (a pre-fix watchdog reap) is not a failure: its own outcome.
+  if (row.status === 'failed' && isBookkeepingFlight(row)) return 'bookkeeping'
+  return row.status
 }
 
 /**
@@ -82,7 +119,8 @@ export function outcomeFilterSql(outcomes: readonly string[], alias = 'f'): stri
   for (const o of outcomes) {
     if (!/^[a-z_]+$/.test(o)) throw new Error('invalid_outcome')
     if (o === 'cancelled') parts.add(`(${a}.status = 'failed' AND ${cancelledFlightSql(a)})`)
-    else if (o === 'failed') parts.add(genuinelyFailedFlightSql(a))
+    else if (o === 'failed') parts.add(realFailureSql(a))
+    else if (o === 'bookkeeping') parts.add(bookkeepingClosedFlightSql(a))
     else parts.add(`${a}.status = '${o}'`)
   }
   return `(${[...parts].join(' OR ')})`

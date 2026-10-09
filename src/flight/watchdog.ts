@@ -75,6 +75,56 @@ export interface FlightReapResult {
   reason?: string
   receipt?: boolean
   error?: string
+  /**
+   * Terminal status the flight was moved to. 'failed' is the stall give-up; 'landed' means the stall
+   * clock fired but the flight's work was NOT a failure (every task done, or an unexecuted bookkeeping
+   * flight) so it was closed as a non-failure (mupot#1748/#1762).
+   */
+  target_status?: 'failed' | 'landed'
+  /** Why a 'landed' target was chosen: 'tasks_done' | 'bookkeeping_closed'. Absent for a failed reap. */
+  disposition?: ReapDisposition
+}
+
+/** What a stalled flight turns into. 'failed' is the only disposition that counts as a real failure. */
+export type ReapDisposition = 'failed' | 'tasks_done' | 'bookkeeping_closed'
+
+/**
+ * SQL boolean fragment (alias `f`): the flight's own work finished. meta.task_ids is a non-empty array,
+ * every id resolves to a task in the flight's project that is `done`, and the flight is not bound to a
+ * routine run (a routine flight is closed by its run, same carve-out as the 0172 waiting triggers).
+ * A flight with no task_ids has no evidence of finished work and is never matched.
+ */
+function tasksAllDoneSql(alias = 'f'): string {
+  return `(json_valid(${alias}.meta)
+    AND json_type(${alias}.meta, '$.task_ids') = 'array'
+    AND json_array_length(${alias}.meta, '$.task_ids') > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(${alias}.meta, '$.task_ids') ref
+        LEFT JOIN tasks t ON t.id = ref.value
+       WHERE t.id IS NULL
+          OR t.status <> 'done'
+          OR (${alias}.project_id IS NOT NULL AND t.project_id IS NOT ${alias}.project_id)
+    )
+    AND NOT EXISTS (SELECT 1 FROM routine_runs rr WHERE rr.flight_id = ${alias}.id AND rr.tenant = ${alias}.tenant))`
+}
+
+/**
+ * The single chokepoint deciding what a stalled flight becomes (mupot#1748, #1762). A flight's terminal
+ * status must reflect what happened to its work:
+ *   - bookkeeping flight (deploy/studio; never executes, has no lifecycle)  -> landed / bookkeeping_closed
+ *   - running flight whose tasks are ALL done (the executor finished but nothing landed it; the 0172
+ *     waiting trigger only parks a flight when a task passes through review/approved, so a task that
+ *     goes straight to done leaves the flight 'running')                      -> landed / tasks_done
+ *   - anything else                                                           -> failed
+ * Read-only; the guarded UPDATE in reapStalledFlight re-asserts the same predicate.
+ */
+export async function resolveReapDisposition(env: Env, flight: FlightRow): Promise<ReapDisposition> {
+  if (flight.bookkeeping === 1) return 'bookkeeping_closed'
+  if (flight.status !== 'running') return 'failed'
+  const hit = await env.DB.prepare(
+    `SELECT 1 AS ok FROM flights f WHERE f.id = ?1 AND f.tenant = ?2 AND ${tasksAllDoneSql('f')}`,
+  ).bind(flight.id, env.TENANT_SLUG).first<{ ok: number }>()
+  return hit ? 'tasks_done' : 'failed'
 }
 
 /**
@@ -402,7 +452,14 @@ export async function reapStalledFlight(
     }
   }
 
-  const gateReason = `watchdog_reap: ${reason.slice(0, 400)}`
+  const disposition = await resolveReapDisposition(env, flight)
+  const targetStatus: 'failed' | 'landed' = disposition === 'failed' ? 'failed' : 'landed'
+  const gateReason =
+    disposition === 'failed'
+      ? `watchdog_reap: ${reason.slice(0, 400)}`
+      : disposition === 'bookkeeping_closed'
+        ? `bookkeeping_closed: ${reason.slice(0, 400)}`
+        : `watchdog_tasks_done: ${reason.slice(0, 400)}`
   const previousStatus = flight.status
   const nowIso = new Date(nowMs).toISOString()
   const runReason = `watchdog_reap: ${reason.slice(0, 200)}`
@@ -412,17 +469,24 @@ export async function reapStalledFlight(
   // behind after this UPDATE is how cron died on 2026-08-22 (mupot#1369).
   // Statement 2 is guarded on the flight already being failed in this
   // transaction, so a raced no-op on the flight cannot fail the run alone.
+  // A non-failure disposition never touches a run: bookkeeping flights have none
+  // (createFlight refuses the combination) and tasksAllDoneSql excludes routine-bound flights.
   const transition = await env.DB.batch([
     env.DB.prepare(
       `UPDATE flights
-          SET status = 'failed',
+          SET status = ?5,
               gate_reason = ?3,
               ended_at = ?4
         WHERE id = ?1
           AND tenant = ?2
           AND status IN ('preflight', 'running', 'sleeping')
+          AND (
+            ?5 = 'failed'
+            OR (?6 = 'bookkeeping_closed' AND flights.bookkeeping = 1)
+            OR (?6 = 'tasks_done' AND flights.status = 'running' AND flights.bookkeeping = 0 AND ${tasksAllDoneSql('flights')})
+          )
         RETURNING id, status`,
-    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs),
+    ).bind(flightId, env.TENANT_SLUG, gateReason, nowMs, targetStatus, disposition),
     env.DB.prepare(
       `UPDATE routine_runs
           SET status = 'failed',
@@ -473,7 +537,8 @@ export async function reapStalledFlight(
   const receiptPayload = JSON.stringify({
     flight_id: flightId,
     previous_status: previousStatus,
-    target_status: 'failed',
+    target_status: targetStatus,
+    disposition,
     reap_reason: reason,
     predicate_reason: evalResult.reason,
     age_ms: evalResult.ageMs,
@@ -529,6 +594,8 @@ export async function reapStalledFlight(
     age_ms: evalResult.ageMs,
     reason: gateReason,
     receipt,
+    target_status: targetStatus,
+    ...(disposition === 'failed' ? {} : { disposition }),
   }
 }
 
@@ -845,6 +912,12 @@ export interface FlightWatchdogSweepResult {
   /** Finished, independently-approved parked flights the watchdog landed after the grace. */
   system_landed: number
   system_landed_flight_ids: string[]
+  /**
+   * Stalled flights the sweep closed as LANDED rather than failed (mupot#1748/#1762): every task done, or an
+   * unexecuted bookkeeping flight. NOT included in `reaped` (which is failures only).
+   */
+  closed_without_failure: number
+  closed_without_failure_flight_ids: string[]
   /** Reap attempted and refused/errored. Does not abort the sweep. */
   failed: number
   /** The scan hit its LIMIT: this pass is PARTIAL, not a clean sweep. */
@@ -885,6 +958,8 @@ export async function sweepStalledFlights(
   const nowMs = opts.nowMs ?? Date.now()
 
   let reaped = 0
+  let closedWithoutFailure = 0
+  const closedWithoutFailureFlightIds: string[] = []
   let escalated = 0
   let failed = 0
   const escalatedFlightIds: string[] = []
@@ -959,7 +1034,11 @@ export async function sweepStalledFlights(
         evaluation.reason,
         nowMs,
       )
-      if (result.transitioned) reaped += 1
+      if (result.transitioned && result.target_status === 'landed') {
+        // Stall clock fired, but the work did not fail (all tasks done / bookkeeping): closed as landed.
+        closedWithoutFailure += 1
+        closedWithoutFailureFlightIds.push(flight.id)
+      } else if (result.transitioned) reaped += 1
       else failed += 1
     } catch (error) {
       // Fail-soft: a single bad flight must not strand the rest of the pass.
@@ -998,6 +1077,8 @@ export async function sweepStalledFlights(
     escalated_flight_ids: escalatedFlightIds,
     system_landed: systemLanded,
     system_landed_flight_ids: systemLandedFlightIds,
+    closed_without_failure: closedWithoutFailure,
+    closed_without_failure_flight_ids: closedWithoutFailureFlightIds,
     failed,
     capped: scan.capped,
     scanned: scan.scanned,

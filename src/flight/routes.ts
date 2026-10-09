@@ -57,7 +57,7 @@ import {
 const TRIGGERS: ReadonlySet<string> = new Set(['manual', 'schedule', 'api', 'event', 'cron'])
 const STATUSES: ReadonlySet<string> = new Set(['preflight', 'held', 'running', 'waiting', 'sleeping', 'landed', 'failed'])
 // #1748: 'cancelled' is an outcome filter, not a stored status (a cancel is stored as 'failed' + a receipt).
-const OUTCOME_FILTERS: ReadonlySet<string> = new Set([...STATUSES, 'cancelled'])
+const OUTCOME_FILTERS: ReadonlySet<string> = new Set([...STATUSES, 'cancelled', 'bookkeeping'])
 
 function asBool(v: unknown): boolean {
   return v === true
@@ -227,7 +227,7 @@ export function parseDispatchBody(raw: unknown): { ok: true; value: DispatchBody
   }
 }
 
-export type OutcomeFilter = FlightStatus | 'cancelled'
+export type OutcomeFilter = FlightStatus | 'cancelled' | 'bookkeeping'
 
 export interface OutcomeQuery {
   statuses: OutcomeFilter[] | null // null = all
@@ -235,7 +235,7 @@ export interface OutcomeQuery {
   limit: number
 }
 
-/** Parse the outcome-feed query (?status=landed,failed,cancelled&since=<ms>&limit=N). 'failed' excludes cancels (#1748). */
+/** Parse the outcome-feed query (?status=landed,failed,cancelled&since=<ms>&limit=N). 'failed' excludes cancels (#1748) and bookkeeping closures (#1762). */
 export function parseOutcomeQuery(q: URLSearchParams): OutcomeQuery {
   const statusRaw = q.get('status')
   const statuses = statusRaw

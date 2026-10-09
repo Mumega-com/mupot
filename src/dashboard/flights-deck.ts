@@ -14,8 +14,8 @@ import { pageHeader, kpiRow } from './ui'
 export const FLIGHT_DECK_POLL_MS = 12_000
 export const FLIGHT_PIPELINE_STAGES = ['Plan', 'Sandbox', 'Tests', 'Gate', 'PR', 'Deploy'] as const
 export type FlightPipelineStage = (typeof FLIGHT_PIPELINE_STAGES)[number]
-export type FlightDeckFilter = 'all' | 'flying' | 'landed' | 'held' | 'failed' | 'cancelled'
-export type FlightDeckBadge = 'flying' | 'landed' | 'held' | 'failed' | 'cancelled'
+export type FlightDeckFilter = 'all' | 'flying' | 'landed' | 'held' | 'failed' | 'cancelled' | 'bookkeeping'
+export type FlightDeckBadge = 'flying' | 'landed' | 'held' | 'failed' | 'cancelled' | 'bookkeeping'
 
 export interface FlightPersona {
   emoji: string
@@ -159,6 +159,7 @@ export function flightFilterGroup(phase: FlightPhase): Exclude<FlightDeckFilter,
   if (phase === 'landed') return 'landed'
   if (phase === 'failed') return 'failed'
   if (phase === 'cancelled') return 'cancelled'
+  if (phase === 'bookkeeping') return 'bookkeeping'
   if (phase === 'held' || phase === 'holding') return 'held'
   return 'flying'
 }
@@ -273,7 +274,7 @@ function renderArtifactButtons(artifacts: FlightArtifacts): string {
 function renderBadge(kind: FlightDeckBadge, unconfirmed = false): string {
   // #1756: a cancel whose routine effect was not fenced says so; the badge kind (and every count) stays 'cancelled'.
   const label =
-    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : kind === 'cancelled' ? (unconfirmed ? 'Cancelled (effect unconfirmed)' : 'Cancelled') : 'Failed'
+    kind === 'flying' ? 'Flying' : kind === 'landed' ? 'Landed' : kind === 'held' ? 'Held' : kind === 'cancelled' ? (unconfirmed ? 'Cancelled (effect unconfirmed)' : 'Cancelled') : kind === 'bookkeeping' ? 'Bookkeeping' : 'Failed'
   return `<span class="fd-badge fd-badge-${kind}">${kind === 'flying' ? '<span class="fd-pulse" aria-hidden="true"></span>' : ''}${escHtml(label)}</span>`
 }
 
@@ -322,6 +323,7 @@ function filterCounts(cards: FlightCard[]): Record<FlightDeckFilter, number> {
     held: 0,
     failed: 0,
     cancelled: 0,
+    bookkeeping: 0,
   }
   for (const card of cards) counts[flightFilterGroup(card.phase)] += 1
   return counts
@@ -404,6 +406,7 @@ const DECK_CSS = `
   .fd-badge-landed { color: var(--fd-teal); background: color-mix(in srgb, var(--fd-teal) 12%, transparent); border-color: color-mix(in srgb, var(--fd-teal) 35%, var(--border)); }
   .fd-badge-held { color: var(--fd-amber); background: color-mix(in srgb, var(--fd-amber) 12%, transparent); border-color: color-mix(in srgb, var(--fd-amber) 35%, var(--border)); }
   .fd-badge-failed { color: var(--fd-red); background: color-mix(in srgb, var(--fd-red) 12%, transparent); border-color: color-mix(in srgb, var(--fd-red) 35%, var(--border)); }
+  .fd-badge-bookkeeping { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); border-color: color-mix(in srgb, var(--muted) 35%, var(--border)); }
   .fd-badge-cancelled { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); border-color: color-mix(in srgb, var(--muted) 35%, var(--border)); }
   .fd-pulse {
     width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
