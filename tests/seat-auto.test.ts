@@ -835,6 +835,36 @@ describe('#1818: a seat row is only handed back by the pool whose source matches
     expect(n(`SELECT COUNT(*) AS n FROM seat_handles WHERE seat_id = ? AND revoked_at IS NULL`, autoSeatId)).toBe(0)
   })
 
+  it('race path: a concurrent winner of the other pool (UNIQUE loser re-read) is refused too, never handed back', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, chatgpt('conv-race'))
+    const key = await craft('conv-race')
+    // Hide the seat from the FIRST lookup only (as if the other pool's insert landed after it): the create
+    // batch then loses on UNIQUE and re-reads the winner, which belongs to the auto pool.
+    let hidden = false
+    const realPrepare = h.db.prepare.bind(h.db)
+    const db = new Proxy(h.db, {
+      get(target, prop, recv) {
+        if (prop !== 'prepare') return Reflect.get(target, prop, recv)
+        return (sql: string) => {
+          const st = realPrepare(sql)
+          if (!hidden && /FROM agent_seats\s+WHERE tenant = \?1 AND member_id = \?2 AND harness_id = \?3 AND key_hash = \?4/.test(sql)) {
+            hidden = true
+            return { bind: () => ({ first: async () => null }) }
+          }
+          return st
+        }
+      },
+    })
+    const before = counts()
+    const r = await rpc({ ...env, DB: db } as Env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    expect(hidden).toBe(true)
+    expect(JSON.stringify(r.body)).toContain('seat_key_source_conflict')
+    expect(r.sc.seat_handle).toBeUndefined()
+    expect(counts()).toEqual(before)
+  })
+
   it('same-source idempotent path is unchanged: seat_select twice on one key returns existing; auto twice returns the same agent', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
