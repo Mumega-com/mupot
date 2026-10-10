@@ -3651,9 +3651,38 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_seats_immutable" },
     ],
   },
+  {
+    file: "0205_auto_seat_pool.sql",
+    sha256: "9fc38fc50dc847465eb4557726d1ba4c09624d2b47f194be941d4603a8cfd362",
+    statements: [
+      "-- mupot W5a round 2 — a SEPARATE, bounded pool for auto-seats (seats created from a per-conversation\n-- client key, src/members/seat-auto.ts), so ordinary ChatGPT conversations can never exhaust the\n-- member-wide caps that explicit seat_select seats use.\n--\n-- 1. agent_seats.source: 'select' (seat_select; every pre-existing row) or 'auto' (W5a). Immutable.\n--    max_auto_live: the per-HARNESS live cap for auto seats IN FORCE when the row was issued (like\n--    max_live / max_total); last_used_at: LRU bookkeeping for reclaim (mutable, touched at most every\n--    10 minutes by the auto path).\n-- 2. The three member/harness caps (0198/0199/0204) now count and apply to source='select' ONLY. An auto\n--    seat consumes none of them; an explicit seat's caps behave exactly as before.\n-- 3. agent_seats_auto_live_cap_insert: atomic per-harness LIVE cap for auto seats. Reclaim (retire the LRU\n--    auto seat of the harness) runs inside the creating batch BEFORE the insert, so a full pool turns\n--    into a retire + create; if the retire did not free a slot the trigger aborts the whole batch.\n-- 4. auto_seat_windows: ONE counter row per (tenant, harness) holding the creation window. It is spent by a\n--    single atomic UPSERT ... WHERE (changes()=0 means refused), never a KV read-compare-put, and a\n--    failed statement is treated as a refusal (fail closed).\n\nALTER TABLE agent_seats ADD COLUMN source TEXT NOT NULL DEFAULT 'select' CHECK (source IN ('select', 'auto'));",
+      "\nALTER TABLE agent_seats ADD COLUMN max_auto_live INTEGER NOT NULL DEFAULT 32 CHECK (max_auto_live BETWEEN 1 AND 4096);",
+      "\nALTER TABLE agent_seats ADD COLUMN last_used_at TEXT;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_seats_harness_auto ON agent_seats (tenant, harness_id, source, retired_at);",
+      "\n\nDROP TRIGGER IF EXISTS agent_seats_cap_insert;",
+      "\nCREATE TRIGGER agent_seats_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.retired_at IS NULL AND NEW.source = 'select'\n AND (SELECT COUNT(*) FROM agent_seats s\n       JOIN agents a ON a.id = s.agent_id\n       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id AND s.source = 'select'\n         AND s.retired_at IS NULL AND a.status IN ('active', 'paused')) >= NEW.max_live\nBEGIN\n  SELECT RAISE(ABORT, 'seat_cap_exceeded');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS agent_seats_total_cap_insert;",
+      "\nCREATE TRIGGER agent_seats_total_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.source = 'select'\n AND (SELECT COUNT(*) FROM agent_seats s\n       WHERE s.tenant = NEW.tenant AND s.member_id = NEW.member_id AND s.source = 'select') >= NEW.max_total\nBEGIN\n  SELECT RAISE(ABORT, 'seat_total_cap_exceeded');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS agent_seats_harness_total_cap_insert;",
+      "\nCREATE TRIGGER agent_seats_harness_total_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.source = 'select'\n AND (SELECT COUNT(*) FROM agent_seats s\n       WHERE s.tenant = NEW.tenant AND s.harness_id = NEW.harness_id AND s.source = 'select') >= NEW.max_harness_total\nBEGIN\n  SELECT RAISE(ABORT, 'seat_harness_total_cap_exceeded');\nEND;",
+      "\n\nCREATE TRIGGER agent_seats_auto_live_cap_insert\nBEFORE INSERT ON agent_seats\nFOR EACH ROW\nWHEN NEW.retired_at IS NULL AND NEW.source = 'auto'\n AND (SELECT COUNT(*) FROM agent_seats s\n       JOIN agents a ON a.id = s.agent_id\n       WHERE s.tenant = NEW.tenant AND s.harness_id = NEW.harness_id AND s.source = 'auto'\n         AND s.retired_at IS NULL AND a.status IN ('active', 'paused')) >= NEW.max_auto_live\nBEGIN\n  SELECT RAISE(ABORT, 'seat_auto_cap_exceeded');\nEND;",
+      "\n\nDROP TRIGGER IF EXISTS agent_seats_immutable;",
+      "\nCREATE TRIGGER agent_seats_immutable\nBEFORE UPDATE ON agent_seats\nFOR EACH ROW\nWHEN NEW.id IS NOT OLD.id\n  OR NEW.tenant IS NOT OLD.tenant\n  OR NEW.member_id IS NOT OLD.member_id\n  OR NEW.harness_id IS NOT OLD.harness_id\n  OR NEW.key_hash IS NOT OLD.key_hash\n  OR NEW.agent_id IS NOT OLD.agent_id\n  OR NEW.label_basename IS NOT OLD.label_basename\n  OR NEW.max_live IS NOT OLD.max_live\n  OR NEW.max_total IS NOT OLD.max_total\n  OR NEW.max_harness_total IS NOT OLD.max_harness_total\n  OR NEW.source IS NOT OLD.source\n  OR NEW.max_auto_live IS NOT OLD.max_auto_live\n  OR NEW.seat_token_id IS NOT OLD.seat_token_id\n  OR NEW.created_at IS NOT OLD.created_at\n  OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_seat_immutable');\nEND;",
+      "\n\nCREATE TABLE IF NOT EXISTS auto_seat_windows (\n  tenant       TEXT NOT NULL,\n  harness_id   TEXT NOT NULL REFERENCES harnesses(id) ON DELETE CASCADE,\n  window_start INTEGER NOT NULL,\n  count        INTEGER NOT NULL CHECK (count >= 0),\n  PRIMARY KEY (tenant, harness_id)\n);",
+    ],
+    objects: [
+      { type: "index", name: "idx_agent_seats_harness_auto" },
+      { type: "trigger", name: "agent_seats_cap_insert" },
+      { type: "trigger", name: "agent_seats_total_cap_insert" },
+      { type: "trigger", name: "agent_seats_harness_total_cap_insert" },
+      { type: "trigger", name: "agent_seats_auto_live_cap_insert" },
+      { type: "trigger", name: "agent_seats_immutable" },
+      { type: "table", name: "auto_seat_windows" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "8c2051c3ebc0292dffa466b3e67f5ba858e7dc79139508c9cc7690d3968c70e2"
+export const SCHEMA_CHAIN_DIGEST: string = "af2864e6ea04e71ef63e7115613e377c5c3f6abaeaac1bbd27a5f8912f395c7a"

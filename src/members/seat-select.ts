@@ -58,7 +58,7 @@ import {
   isUnboundDirectorySession,
 } from './bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled, type HarnessRow } from './harness'
-import { normalizeSeatKey, seatKeyHash, type SeatKeyArgs } from './seat-key'
+import { normalizeSeatKey, seatKeyHash, type NormalizedSeatKey, type SeatKeyArgs } from './seat-key'
 import { prepareSeatHandleIssue } from './seat-handle'
 import { deriveSeatName } from './seat-name'
 
@@ -119,6 +119,45 @@ export async function checkSeatSelectRateLimit(
     return { allowed: true, retryAfter: 0 }
   } catch {
     return { allowed: true, retryAfter: 0 }
+  }
+}
+
+// W5a: auto-seat creation window per HARNESS, and the auto pool's live cap. Auto seats are a SEPARATE
+// budget (migration 0205): they never count against the member live/lifetime caps or the per-harness
+// lifetime cap that seat_select seats use. Two bounds apply instead:
+//   * LIVE pool: at most AUTO_SEAT_LIVE_PER_HARNESS live auto seats per harness. A full pool RECLAIMS: the
+//     least-recently-used live auto seat of that harness is retired inside the creating batch (and its
+//     agent deactivated, seat token revoked), then the new seat is inserted. Atomic trigger backstop.
+//   * CREATION window: AUTO_SEAT_HARNESS_WINDOW_MAX creations per AUTO_SEAT_HARNESS_WINDOW_TTL seconds per
+//     harness, spent by ONE atomic UPSERT...WHERE on auto_seat_windows. It never depends on KV and a
+//     failed statement is a refusal (fails CLOSED). Reclaim makes the pool unrefusable, so this window
+//     is the hard abuse bound on auto creation (12 per 5 min = 3456/day/harness worst case).
+export const AUTO_SEAT_LIVE_PER_HARNESS = 32
+export const AUTO_SEAT_HARNESS_WINDOW_MAX = 12
+export const AUTO_SEAT_HARNESS_WINDOW_TTL = 300 // seconds
+
+export async function spendAutoSeatWindow(
+  env: Env,
+  harnessId: string,
+  nowMs: number,
+  max: number = AUTO_SEAT_HARNESS_WINDOW_MAX,
+): Promise<{ allowed: boolean; retryAfter: number }> {
+  const windowMs = AUTO_SEAT_HARNESS_WINDOW_TTL * 1000
+  try {
+    const r = await env.DB.prepare(
+      `INSERT INTO auto_seat_windows (tenant, harness_id, window_start, count) VALUES (?1, ?2, ?3, 1)
+       ON CONFLICT (tenant, harness_id) DO UPDATE SET
+         window_start = CASE WHEN auto_seat_windows.window_start <= ?4 THEN ?3 ELSE auto_seat_windows.window_start END,
+         count = CASE WHEN auto_seat_windows.window_start <= ?4 THEN 1 ELSE auto_seat_windows.count + 1 END
+       WHERE auto_seat_windows.window_start <= ?4 OR auto_seat_windows.count < ?5`,
+    ).bind(env.TENANT_SLUG, harnessId, nowMs, nowMs - windowMs, max).run()
+    if ((r.meta?.changes ?? 0) >= 1) return { allowed: true, retryAfter: 0 }
+    const row = await env.DB.prepare(`SELECT window_start FROM auto_seat_windows WHERE tenant = ?1 AND harness_id = ?2`)
+      .bind(env.TENANT_SLUG, harnessId).first<{ window_start: number }>()
+    const remainingMs = row ? row.window_start + windowMs - nowMs : windowMs
+    return { allowed: false, retryAfter: Math.max(1, Math.ceil(remainingMs / 1000)) }
+  } catch {
+    return { allowed: false, retryAfter: AUTO_SEAT_HARNESS_WINDOW_TTL } // fail CLOSED
   }
 }
 
@@ -204,7 +243,7 @@ function isTotalCapViolation(err: unknown): boolean {
 }
 
 async function countAllSeats(env: Env, memberId: string): Promise<number> {
-  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND member_id = ?2`)
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND member_id = ?2 AND source = 'select'`)
     .bind(env.TENANT_SLUG, memberId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -214,7 +253,7 @@ function isHarnessTotalCapViolation(err: unknown): boolean {
 }
 
 async function countHarnessSeats(env: Env, harnessId: string): Promise<number> {
-  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2`)
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'select'`)
     .bind(env.TENANT_SLUG, harnessId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -249,7 +288,7 @@ async function countLiveSeats(env: Env, memberId: string): Promise<number> {
     // 0198's): not retired AND the agent is 'active' or 'paused'. Only 'inactive' or a retired seat
     // frees a slot, so pause/resume can never be used to exceed the cap.
     `SELECT COUNT(*) AS n FROM agent_seats s JOIN agents a ON a.id = s.agent_id
-      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.retired_at IS NULL AND a.status IN ('active', 'paused')`,
+      WHERE s.tenant = ?1 AND s.member_id = ?2 AND s.source = 'select' AND s.retired_at IS NULL AND a.status IN ('active', 'paused')`,
   ).bind(env.TENANT_SLUG, memberId).first<{ n: number }>()
   return row?.n ?? 0
 }
@@ -288,6 +327,45 @@ async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow, 
     seat_handle: await issueHandleForExistingSeat(env, seat, harness.id, harness.member_id, grantTokenId),
     note: W1_NOTE,
   }
+}
+
+async function refundAutoSeatWindow(env: Env, harnessId: string): Promise<void> {
+  try {
+    await env.DB.prepare(`UPDATE auto_seat_windows SET count = MAX(count - 1, 0) WHERE tenant = ?1 AND harness_id = ?2`)
+      .bind(env.TENANT_SLUG, harnessId).run()
+  } catch {
+    // A failed refund only leaves the window stricter, never looser.
+  }
+}
+
+/** Reclaim statements for a full auto pool (see resolveOrCreateSeat). Params: 1 tenant, 2 harness,
+ *  3 now, 4 live cap. The victim is chosen INSIDE the statement (LRU among LIVE auto seats of this
+ *  harness), so concurrent batches serialise on the cap, never on a stale pre-read. */
+export function prepareAutoSeatReclaim(env: Env, harnessId: string, liveCap: number, nowIso: string): D1PreparedStatement[] {
+  const live = `SELECT s.id FROM agent_seats s JOIN agents a ON a.id = s.agent_id
+                 WHERE s.tenant = ?1 AND s.harness_id = ?2 AND s.source = 'auto' AND s.retired_at IS NULL
+                   AND a.status IN ('active', 'paused')`
+  const retired = `SELECT agent_id FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'auto' AND retired_at = ?3`
+  return [
+    env.DB.prepare(
+      `UPDATE agent_seats SET retired_at = ?3
+        WHERE id = (${live} ORDER BY COALESCE(s.last_used_at, s.created_at) ASC, s.created_at ASC LIMIT 1)
+          AND retired_at IS NULL
+          AND (SELECT COUNT(*) FROM (${live})) >= ?4`,
+    ).bind(env.TENANT_SLUG, harnessId, nowIso, liveCap),
+    env.DB.prepare(`UPDATE agents SET status = 'inactive' WHERE status <> 'inactive' AND id IN (${retired})`)
+      .bind(env.TENANT_SLUG, harnessId, nowIso),
+    env.DB.prepare(
+      `UPDATE member_tokens SET revoked_at = ?3 WHERE revoked_at IS NULL
+          AND id IN (SELECT seat_token_id FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'auto' AND retired_at = ?3)`,
+    ).bind(env.TENANT_SLUG, harnessId, nowIso),
+    env.DB.prepare(
+      `INSERT INTO agent_audit (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
+       SELECT lower(hex(randomblob(16))), agent_id, 'system:seat_auto_reclaim', 'system', 'seat_auto_retire',
+              '["status"]', '{"status":"active"}', '{"status":"inactive"}'
+         FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'auto' AND retired_at = ?3`,
+    ).bind(env.TENANT_SLUG, harnessId, nowIso),
+  ]
 }
 
 export interface SeatSelectDeps {
@@ -340,31 +418,64 @@ export async function seatSelect(
   const key = normalized.key
   const keyHash = await seatKeyHash(memberId, harness.id, key)
 
+  return resolveOrCreateSeat(env, { memberId, harness, key, keyHash, grantTokenIdClaim, source: 'select' }, deps)
+}
+
+/** The shared find-or-create core: ONE implementation for seat_select and the W5a client-key auto-seat,
+ *  so both mint the same agent_seats identity under the same caps, clamp, throttle, cap triggers and audit.
+ *  Callers have ALREADY verified flag, unbound directory session, live harness pointer and active member.
+ *  `source: 'auto'` additionally spends the per-harness short-window creation cap. */
+export async function resolveOrCreateSeat(
+  env: Env,
+  p: {
+    memberId: string
+    harness: HarnessRow
+    key: NormalizedSeatKey
+    keyHash: string
+    grantTokenIdClaim: string | null | undefined
+    source: 'select' | 'auto'
+    /** Test seam only: production uses the constants. */
+    limits?: { autoLive?: number; windowMax?: number }
+    nowMs?: number
+  },
+  deps: SeatSelectDeps = defaultSeatSelectDeps(),
+): Promise<SeatSelectResult> {
+  const { memberId, harness, key, keyHash, grantTokenIdClaim } = p
+
   // 6. Idempotent fast path.
   const found = await findSeat(env, memberId, harness.id, keyHash)
   if (found) return existingSeatResult(env, found, harness, grantTokenIdClaim)
 
-  // 6a. An expired token harness frees its seats before any cap is evaluated (see the helper).
-  await retireSeatsOfExpiredTokenHarnesses(env, memberId)
-
-  // 6b. Throttle the creation path (after the idempotent fast path above).
-  const rl = await checkSeatSelectRateLimit(env, memberId)
-  if (!rl.allowed) return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: rl.retryAfter } }
-
-  // 7. Cap pre-check (cheap, no writes). The authoritative cap is the trigger inside the batch;
-  //    this just keeps a capped human from provisioning a home squad / burning slugs for nothing.
+  const isAuto = p.source === 'auto'
   const cap = seatCap(env)
-  if ((await countLiveSeats(env, memberId)) >= cap) {
-    return { ok: false, error: 'seat_cap_reached', detail: { cap } }
-  }
   const totalCap = seatTotalCap(env)
-  if ((await countAllSeats(env, memberId)) >= totalCap) {
-    return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
-  }
   const harnessTotalCap = seatHarnessTotalCap(env)
-  if ((await countHarnessSeats(env, harness.id)) >= harnessTotalCap) {
-    return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
+  if (!isAuto) {
+    // 6a. An expired token harness frees its seats before any cap is evaluated (see the helper).
+    await retireSeatsOfExpiredTokenHarnesses(env, memberId)
+
+    // 6b. Throttle the creation path (after the idempotent fast path above).
+    const rl = await checkSeatSelectRateLimit(env, memberId)
+    if (!rl.allowed) return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: rl.retryAfter } }
+
+    // 7. Cap pre-check (cheap, no writes). The authoritative cap is the trigger inside the batch;
+    //    this just keeps a capped human from provisioning a home squad / burning slugs for nothing.
+    if ((await countLiveSeats(env, memberId)) >= cap) {
+      return { ok: false, error: 'seat_cap_reached', detail: { cap } }
+    }
+    if ((await countAllSeats(env, memberId)) >= totalCap) {
+      return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
+    }
+    if ((await countHarnessSeats(env, harness.id)) >= harnessTotalCap) {
+      return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
+    }
   }
+  // An AUTO seat has its own pool (migration 0205): none of the member-wide caps above apply to it and it
+  // NEVER spends the member's seat_select throttle. Its pool is bounded by reclaim + the creation window,
+  // which is spent below, AFTER every check that can refuse, immediately before the batch.
+  const autoLiveCap = p.limits?.autoLive ?? AUTO_SEAT_LIVE_PER_HARNESS
+  const windowMax = p.limits?.windowMax ?? AUTO_SEAT_HARNESS_WINDOW_MAX
+  const nowMs = p.nowMs ?? Date.now()
 
   // 8. The human's own home squad (idempotent find-or-create). The agent lives THERE and nowhere
   //    else; the human must hold admin on it.
@@ -423,23 +534,33 @@ export async function seatSelect(
   const auditStatement = env.DB.prepare(
     `INSERT INTO agent_audit
        (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
-     VALUES (?1, ?2, ?3, 'user', 'seat_select', ?4, ?5, ?6)`,
+     VALUES (?1, ?2, ?3, ?7, ?8, ?4, ?5, ?6)`,
   ).bind(
     auditId,
     agent.id,
-    memberId,
+    // An auto seat is created by the SERVER on a request, not by the human acting: actor_type 'system',
+    // action 'seat_auto', and the human the request ran for rides in the actor id.
+    isAuto ? `system:seat_auto:${memberId}` : memberId,
     JSON.stringify(AGENT_SNAPSHOT_FIELDS),
     JSON.stringify(emptyIdentitySnapshot()),
     JSON.stringify(createdAgentSnapshot(agent)),
+    isAuto ? 'system' : 'user',
+    isAuto ? 'seat_auto' : 'seat_select',
   )
 
   // 12. Seat row LAST — its BEFORE INSERT trigger enforces the cap and its UNIQUE key the
   //     idempotency, and either one aborting rolls back every statement above it.
   const seatId = crypto.randomUUID()
   const seatStatement = env.DB.prepare(
-    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at, max_harness_total)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
-  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, token.tokenId, createdAt, harnessTotalCap)
+    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at, max_harness_total, source, max_auto_live)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
+  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, token.tokenId, createdAt, harnessTotalCap, p.source, autoLiveCap)
+
+  // AUTO only: RECLAIM. When this harness's auto pool is full, the least-recently-used live auto seat is
+  // retired in the SAME batch, before the insert (its handles are revoked by the 0199 trigger, its agent
+  // deactivated, its server-held token revoked, an audit row written). All four are conditional and may
+  // legitimately write 0 rows. A retired seat is never resurrected: a returning conversation gets a fresh one.
+  const reclaim: D1PreparedStatement[] = isAuto ? prepareAutoSeatReclaim(env, harness.id, autoLiveCap, createdAt) : []
 
   // W2: the first handle rides in the SAME batch, AFTER the seat row (FK). Only the INSERT goes in:
   // a brand-new seat has no handles to evict, and the eviction statement legitimately writes 0 rows.
@@ -453,15 +574,27 @@ export async function seatSelect(
     ...weld,
     token.statement,
     auditStatement,
+    ...reclaim,
     seatStatement,
     ...(handleIssue ? [handleIssue.statements[handleIssue.insertIndex]] : []),
   ]
 
+  // AUTO only: spend the creation window NOW (all pre-checks above have passed). One atomic UPSERT.
+  if (isAuto) {
+    const w = await spendAutoSeatWindow(env, harness.id, nowMs, windowMax)
+    if (!w.allowed) return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: w.retryAfter, scope: 'harness_window' } }
+  }
+
   try {
     const writes = await deps.batch(env, statements)
-    assertBatchWritten(writes, 'seat_select', 1)
+    // The reclaim statements are conditional (0 rows is correct); every other statement must have written.
+    const reclaimStart = statements.length - (handleIssue ? 1 : 0) - 1 - reclaim.length
+    assertBatchWritten(writes.filter((_, i) => i < reclaimStart || i >= reclaimStart + reclaim.length), 'seat_select', 1)
   } catch (err) {
-    // The batch is atomic: nothing from it is live, so there is nothing to compensate.
+    // The batch is atomic: nothing from it is live, so there is nothing to compensate (the window spend
+    // is refunded: a creation that did not happen must not eat the abuse budget).
+    if (isAuto) await refundAutoSeatWindow(env, harness.id)
+    if (err instanceof Error && err.message.includes('seat_auto_cap_exceeded')) return { ok: false, error: 'seat_cap_reached', detail: { auto_live_cap: autoLiveCap } }
     if (isTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
     if (isHarnessTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
     if (isCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { cap } }

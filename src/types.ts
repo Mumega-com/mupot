@@ -740,9 +740,9 @@ export interface AuthContext {
    * turned the human's grant into the seat agent's context. Server-derived on every request;
    * resolveAuth deletes any such field arriving in the internal header blob.
    */
-  seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string }
+  seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string; source: 'handle' | 'auto:openai_session' | 'auto:codex_thread' }
   /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */
-  seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean } }
+  seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string }
   webSessionIdHash?: string | null
   webSessionMemberId?: string
 }

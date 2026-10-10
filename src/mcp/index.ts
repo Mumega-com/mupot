@@ -55,7 +55,8 @@ import {
 import {
   clientInfoFromMeta, readCredentialSharing, recordCredentialSession, sharedCredentialDetectEnabled, sharedCredentialHint,
 } from '../members/credential-sharing'
-import { applySeatHandle, SEAT_HANDLE_PREFIX } from '../members/seat-handle'
+import { SEAT_HANDLE_PREFIX } from '../members/seat-handle'
+import { applySeatForRequest } from '../members/seat-auto'
 import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
 import {
@@ -308,6 +309,9 @@ type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 interface SeatBodyMeta {
   /** The curated profile door: never resolves a seat handle (it stays the human's own view). */
   skipSeat?: boolean
+  /** The tool a tools/call names. seat_select is exempt from auto-binding so a client that always sends a
+   *  conversation key (Codex threadId) can still obtain a handle. */
+  toolName?: string
   paramsMeta?: unknown
   argsMeta?: unknown
 }
@@ -522,7 +526,19 @@ async function resolveSeatSession(
     hasMcpSessionId: c.req.header('mcp-session-id') !== undefined,
     protocolVersionHeader: c.req.header('mcp-protocol-version') ?? null,
   })
-  return applySeatHandle(c.env, auth, { headerHandle: headerSeat, metaHandle: metaSeat, hints: hintsFrom(facts) })
+  // mupot W5a: handle first (wins, rejected = final); with NO handle presented, a per-thread client key
+  // (openai/session, then Codex threadId) selects/creates the member's own seat under THIS harness.
+  return applySeatForRequest(c.env, auth, {
+    headerHandle: headerSeat,
+    metaHandle: metaSeat,
+    hints: hintsFrom(facts),
+    // The auto key comes ONLY from the request-level params._meta (written by the client harness), never
+    // from params.arguments._meta (written by the MODEL, so a model could pick its own seat). seat_select
+    // is exempt (see SeatBodyMeta.toolName).
+    autoKeys: bodyMeta?.toolName === 'seat_select'
+      ? undefined
+      : { openaiSession: paramsFacts.openaiSession, codexThreadId: paramsFacts.codexThreadId },
+  })
 }
 
 // ── member memory scope ──────────────────────────────────────────────────────
@@ -6249,8 +6265,12 @@ async function buildIdentityReceipt(
   // mupot#1794 W2: a seat-handle session is bound by the SERVER (applySeatHandle set seatBinding);
   // it is distinct from a legacy /oauth/consent binding even though both are directory + bound.
   const seat = boundAgentId !== null ? auth.seatBinding ?? null : null
-  const bindingSource: 'seat_handle' | 'legacy_consent' | 'workspace_token' | 'none' =
-    boundAgentId === null ? 'none' : seat ? 'seat_handle' : consented ? 'legacy_consent' : 'workspace_token'
+  const bindingSource: 'seat_handle' | 'auto_seat' | 'legacy_consent' | 'workspace_token' | 'none' =
+    boundAgentId === null
+      ? 'none'
+      : seat
+        ? (seat.source === 'auto:openai_session' || seat.source === 'auto:codex_thread' ? 'auto_seat' : 'seat_handle')
+        : consented ? 'legacy_consent' : 'workspace_token'
   // The human: the unbound directory seat IS the human's member; a consent-bound seat records the
   // consenting human separately; an agent-bound workspace key has no human in the token.
   const humanMemberId = boundAgentId === null ? (auth.memberId ?? null) : (auth.consentedByMemberId ?? null)
@@ -6308,9 +6328,11 @@ async function buildIdentityReceipt(
     // W2: the seat the SERVER bound this request to (null = none), and what the request presented.
     // Hints are presence booleans only: openai/session, openai/subject and Codex threadId never
     // select a seat. seat_handle_rejected = a handle was presented and did NOT resolve.
-    seat: seat ? { id: seat.seatId, label: seat.label } : null,
+    seat: seat ? { id: seat.seatId, label: seat.label, source: seat.source } : null,
     hints: auth.seatInputs?.hints ?? { openai_session: false, openai_subject: false, codex_thread_id: false },
     seat_handle_rejected: auth.seatInputs?.handleRejected ?? false,
+    // W5a: an auto-seat was attempted from a client key and refused (reason code); null otherwise.
+    auto_seat_refused: auth.seatInputs?.autoSeatRefused ?? null,
   }
 }
 
@@ -6519,7 +6541,9 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
-      nextStepOut = `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`
+      nextStepOut = auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
+        ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
+        : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`
     }
 
     return done({
@@ -7318,7 +7342,7 @@ async function handleJsonRpc(
       ? params.arguments as Record<string, unknown>
       : null
     // The curated profile door never carries a seat handle: it stays the human's own read-only view.
-    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta } : { skipSeat: true })
+    const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta, toolName: typeof params.name === 'string' ? params.name : undefined } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
     }
