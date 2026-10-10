@@ -702,7 +702,7 @@ describe('round 2: seat_select exemption, audit clarity, member pin', () => {
     expect(typeof sel.sc.seat_handle).toBe('string')
     const r = await boot(env, g, chatgpt('conv-craft'))
     expect(r.sc.bound_agent_id).toBeNull()
-    expect(receiptOf(r)).toMatchObject({ auto_seat_refused: 'seat_not_live' })
+    expect(receiptOf(r)).toMatchObject({ auto_seat_refused: 'seat_key_source_conflict' })
   })
 
   it('an auto seat is reachable from ANY live unbound grant of the same member + harness (e.g. after a re-consent), never from another member\'s', async () => {
@@ -776,5 +776,76 @@ describe('harness TOKEN credential (Codex / CI): threadId auto-seats through the
     expect(miss.seatBinding).toBeUndefined()
     expect(miss.seatInputs?.autoSeatRefused).toBe('harness_required')
     expect(seatCount()).toBe(before)
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('#1818: a seat row is only handed back by the pool whose source matches it', () => {
+  const craft = (raw: string) => autoSeatKey({ source: 'auto:openai_session', raw })
+  const counts = () => ({
+    seats: seatCount(),
+    agents: n(`SELECT COUNT(*) AS n FROM agents`),
+    handles: n(`SELECT COUNT(*) AS n FROM seat_handles`),
+    audit: n(`SELECT COUNT(*) AS n FROM agent_audit`),
+    windows: n(`SELECT COALESCE(SUM(count), 0) AS n FROM auto_seat_windows`),
+  })
+
+  it('select -> auto: seat_select with args that normalise to an auto seat\'s key is refused: no handle, no new row, no writes', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const auto = await boot(env, g, chatgpt('conv-a'))
+    expect(typeof auto.sc.bound_agent_id).toBe('string')
+    const key = await craft('conv-a')
+    const before = counts()
+    const r = await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    expect(JSON.stringify(r.body)).toContain('seat_key_source_conflict')
+    expect(r.sc.seat_handle).toBeUndefined()
+    expect(counts()).toEqual(before)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seats WHERE source = 'select'`)).toBe(0)
+  })
+
+  it('auto -> select: an auto key crafted onto an explicit seat is refused with the typed error: no binding, no new seat, no window spend', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const key = await craft('conv-b')
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    expect(typeof sel.sc.seat_handle).toBe('string')
+    const before = counts()
+    const r = await boot(env, g, chatgpt('conv-b'))
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(r)).toMatchObject({ auto_seat_refused: 'seat_key_source_conflict' })
+    expect(counts()).toEqual(before)
+  })
+
+  it('reclaim never retires a seat that was handed out through seat_select: the refused select holds no handle on the auto seat it collided with', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const lim = { autoLive: 2, windowMax: 100 }
+    const make = (k: string) => applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: k, codexThreadId: null } }, Date.now(), lim)
+    const a1 = await make('r1')
+    const autoSeatId = String(h.sqlite.prepare(`SELECT id AS v FROM agent_seats WHERE agent_id = ?`).get(a1.boundAgentId)!.v)
+    h.sqlite.exec(`UPDATE agent_seats SET last_used_at = '2000-01-01T00:00:00.000Z' WHERE id = '${autoSeatId}'`)
+    const key = await craft('r1')
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    expect(sel.sc.seat_handle).toBeUndefined()
+    expect(n(`SELECT COUNT(*) AS n FROM seat_handles WHERE seat_id = ?`, autoSeatId)).toBe(0)
+    // The auto pool then reclaims its own LRU row (r1): nobody holds it as explicit.
+    await make('r2'); await make('r3')
+    expect(h.sqlite.prepare(`SELECT retired_at AS v FROM agent_seats WHERE id = ?`).get(autoSeatId)!.v).not.toBeNull()
+    expect(n(`SELECT COUNT(*) AS n FROM seat_handles WHERE seat_id = ? AND revoked_at IS NULL`, autoSeatId)).toBe(0)
+  })
+
+  it('same-source idempotent path is unchanged: seat_select twice on one key returns existing; auto twice returns the same agent', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const s1 = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/same' })
+    const s2 = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/same' })
+    expect(s1.sc.disposition).toBe('created')
+    expect(s2.sc.disposition).toBe('existing')
+    expect((s2.sc.agent as { id: string }).id).toBe((s1.sc.agent as { id: string }).id)
+    const a1 = await boot(env, g, chatgpt('conv-same'))
+    const a2 = await boot(env, g, chatgpt('conv-same'))
+    expect(a1.sc.bound_agent_id).toBe(a2.sc.bound_agent_id)
+    expect(typeof a1.sc.bound_agent_id).toBe('string')
   })
 })

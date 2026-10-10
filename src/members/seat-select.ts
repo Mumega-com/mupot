@@ -171,6 +171,7 @@ export type SeatSelectFailure =
   | 'seat_cap_reached'
   | 'rate_limited'
   | 'seat_agent_inactive'
+  | 'seat_key_source_conflict'
   | 'provisioning_failed'
 
 export interface SeatSelectOk {
@@ -205,6 +206,7 @@ interface SeatRow {
   label_basename: string
   created_at: string
   retired_at: string | null
+  source: string
 }
 
 const W1_NOTE =
@@ -295,11 +297,15 @@ async function countLiveSeats(env: Env, memberId: string): Promise<number> {
 
 async function findSeat(env: Env, memberId: string, harnessId: string, keyHash: string): Promise<SeatRow | null> {
   return env.DB.prepare(
-    `SELECT id, agent_id, label_basename, created_at, retired_at
+    `SELECT id, agent_id, label_basename, created_at, retired_at, source
        FROM agent_seats
       WHERE tenant = ?1 AND member_id = ?2 AND harness_id = ?3 AND key_hash = ?4
       LIMIT 1`,
   ).bind(env.TENANT_SLUG, memberId, harnessId, keyHash).first<SeatRow>()
+}
+
+function seatSourceConflict(): SeatSelectResult {
+  return { ok: false, error: 'seat_key_source_conflict' }
 }
 
 /** An EXISTING seat is only handed back while its agent is still a live, welded identity. An
@@ -444,7 +450,10 @@ export async function resolveOrCreateSeat(
 
   // 6. Idempotent fast path.
   const found = await findSeat(env, memberId, harness.id, keyHash)
-  if (found) return existingSeatResult(env, found, harness, grantTokenIdClaim)
+  // A seat row is only ever handed back by the pool that owns it (#1818): UNIQUE(tenant, member, harness,
+  // key_hash) forbids a second row, and auto reclaim (source='auto') must never retire a seat a caller
+  // holds as explicit. Refuse with no writes, no handle and no audit.
+  if (found) return found.source !== p.source ? seatSourceConflict() : existingSeatResult(env, found, harness, grantTokenIdClaim)
 
   const isAuto = p.source === 'auto'
   const cap = seatCap(env)
@@ -603,7 +612,7 @@ export async function resolveOrCreateSeat(
       // squad). Hand back the winner; if there is no winner for this key it was a genuine slug
       // collision with something else — refuse rather than guess.
       const winner = await findSeat(env, memberId, harness.id, keyHash)
-      if (winner) return existingSeatResult(env, winner, harness, grantTokenIdClaim)
+      if (winner) return winner.source !== p.source ? seatSourceConflict() : existingSeatResult(env, winner, harness, grantTokenIdClaim)
       return { ok: false, error: 'provisioning_failed', detail: { stage: 'batch', reason: 'unique_conflict_without_winner' } }
     }
     return {
