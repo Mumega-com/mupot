@@ -17,8 +17,8 @@
 // (INSERT ... SELECT ... WHERE changes() = 1), so an idempotent repeat writes no second audit row.
 
 import type { AuthContext } from '../types'
-import { canOnSquadAuth } from '../auth/capability'
 import { releaseExecutionHold } from '../agents/execution-brakes'
+import { canReleaseExecutionHold } from '../agents/execution-release-policy'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -170,10 +170,13 @@ export const toolExecutionRelease: ToolSpec = {
   min: 'member', // the real bar (org-admin or squad-admin of the task's squad, human only) is enforced in run()
   args: '{ task_id: string, reason: string }' +
     ' -- HUMAN only: no agent-bound caller; org-admin or squad-admin of the task\'s squad. Releases the' +
-    ' escalation HOLD that the executor retry ceiling (3 refused attempts per task, across all agents and' +
-    ' dispatches) places on a task, and resets its refusal counter. A held task is out of executor pickup for' +
-    ' EVERY agent until released; nothing else (an assignee change, a re-dispatch, an agent task_update)' +
-    ' releases it. Audited. Returns released | not_held. After releasing, assign/dispatch the task as usual.',
+    ' escalation HOLD that the executor retry ceiling (3 refused attempts per task, across all agents,' +
+    ' dispatches and external runtimes) places on a task, and resets its refusal counter. A held task is out of' +
+    ' executor pickup for EVERY agent and refused by task_dispatch (task_held) until released. ONE release policy' +
+    ' (same bar everywhere): the only other release is a task_update / PATCH /tasks/:id assignment to an agent by a' +
+    ' non-agent-bound human holding the SAME bar (org-admin or squad-admin of the task\'s squad); an assignment to an' +
+    ' agent by anyone below that bar is refused with 409 task_held. Audited. Returns released | not_held.' +
+    ' After releasing, assign/dispatch the task as usual. task_get shows execution_hold.',
   inputSchema: {
     type: 'object',
     properties: { task_id: STRING_SCHEMA, reason: STRING_SCHEMA },
@@ -191,8 +194,7 @@ export const toolExecutionRelease: ToolSpec = {
 
     const task = await env.DB.prepare(`SELECT id, squad_id FROM tasks WHERE id = ?1`).bind(taskId).first<{ id: string; squad_id: string }>()
     if (!task) return fail(404, 'not_found')
-    const allowed = hasWorkspaceAdmin(auth) || await canOnSquadAuth(env, auth, task.squad_id, 'admin')
-    if (!allowed) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    if (!(await canReleaseExecutionHold(env, auth, task.squad_id))) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
 
     const outcome = await releaseExecutionHold(env, { taskId: task.id, memberId: auth.memberId, reason, via: 'execution_release' })
     return done({ status: outcome, task_id: task.id })

@@ -9,6 +9,11 @@ import { resolveTaskAssignee } from './assignee'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
+import {
+  dispatchBrakesClearSql, diagnoseDispatchBrake, isRetryCeilingReached, releasedSinceSql, type DispatchBrakeReason,
+} from '../agents/execution-brake-sql'
+// Circular with execution-brakes (which imports humanGateHolderExistsSql from here): safe, the use is inside a function body.
+import { escalateRefusedTask } from '../agents/execution-brakes'
 
 export type TaskDispatchRuntimeStage = 'runtime_consumed' | 'completed' | 'failed'
 
@@ -381,6 +386,51 @@ export async function settleInWorkerDispatchReceipt(
   return (results[0].meta as { changes?: number }).changes === 1
 }
 
+/**
+ * settleBrakeRefusedDispatchReceipt - loop brakes (mupot#1809). An EXTERNAL runtime's
+ * runtime_consumed was refused because the task is held / at the retry ceiling / its agent or squad
+ * is paused. Settles the dispatch receipt failed with the distinct `<reason>_settle` audit label so
+ * it is never left consumable forever (the consume UPDATE also refuses a settled-failed dispatch).
+ * Unlike settleInWorkerDispatchReceipt this is for an INBOX-delivered dispatch (an envelope exists):
+ * the fence is "not settled yet and NO runtime receipt of any stage exists" - never touches a run
+ * that already took custody. The audit row is anchored on changes() = 1 of the settle UPDATE.
+ */
+export async function settleBrakeRefusedDispatchReceipt(
+  env: Env,
+  input: { dispatchReceiptId: string; taskId: string; agentId: string; reason: DispatchBrakeReason },
+): Promise<boolean> {
+  const now = new Date().toISOString()
+  const results = await env.DB.batch([
+    env.DB.prepare(`
+      UPDATE task_dispatch_receipts
+         SET settled_stage = 'failed', settled_at = ?1, settled_reason = ?2
+       WHERE tenant = ?3 AND id = ?4 AND task_id = ?5 AND agent_id = ?6
+         AND settled_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM task_dispatch_runtime_receipts r
+            WHERE r.tenant = ?3 AND r.dispatch_receipt_id = ?4
+         )
+    `).bind(now, input.reason, env.TENANT_SLUG, input.dispatchReceiptId, input.taskId, input.agentId),
+    env.DB.prepare(`
+      INSERT INTO mutation_audit_entries (
+        id, tenant, principal_kind, principal_id, member_id, agent_id,
+        credential_id, origin, handler, operation, target_kind, target_id,
+        task_id, request_id, idempotency_key, evidence_json, recorded_at
+      )
+      SELECT ?1, ?2, 'system', 'execution_brake', NULL, ?3,
+             NULL, 'worker_callback', ?4, 'settle_failed', 'dispatch_receipt', ?5,
+             ?6, ?7, ?7, ?8, ?9
+       WHERE changes() = 1
+    `).bind(
+      crypto.randomUUID(), env.TENANT_SLUG, input.agentId, `${input.reason}_settle`, input.dispatchReceiptId,
+      input.taskId, `brake-settle:${input.dispatchReceiptId}`,
+      canonicalJson({ dispatch_receipt_id: input.dispatchReceiptId, stage: 'failed', reason: input.reason, via: 'runtime_consumed' }),
+      now,
+    ),
+  ])
+  return (results[0].meta as { changes?: number }).changes === 1
+}
+
 const clearExecutionPointerSql = `
   UPDATE tasks SET execution_receipt_id = NULL, execution_claim_expires_at = NULL
    WHERE id = ?1 AND execution_receipt_id = ?2 AND status <> 'in_progress' AND ?5 = 1
@@ -430,6 +480,11 @@ export type TaskDispatchRuntimeReceiptErrorCode =
   // settle) can never be settled again through ANY path, regardless of the underlying
   // message's own lease/read state.
   | 'dispatch_terminated'
+  // Loop brakes (mupot#1809): an external runtime may not take custody of a task that is held, at
+  // the retry ceiling, or whose agent / current squad is paused. The dispatch is settled failed.
+  | 'task_held'
+  | 'retry_ceiling_reached'
+  | 'execution_paused'
 
 export class TaskDispatchRuntimeReceiptError extends Error {
   readonly name = 'TaskDispatchRuntimeReceiptError'
@@ -1351,7 +1406,12 @@ export async function recordTaskDispatchRuntimeReceipt(
              AND status IN ('open', 'blocked', 'rejected')
              AND ${TASK_NOT_ARCHIVED_SQL()}
              AND ${pointerAvailableForSql({ tenantParam: '?5', newReceiptParam: '?1' })}
-             AND ${noConflictingTerminalSql('?5', '?1', ['failed'])}
+             -- checkSettled: a dispatch already settled failed (loop-brake settle, reset, receiver fence) is dead.
+             AND ${noConflictingTerminalSql('?5', '?1', ['failed'], true)}
+             -- Loop brakes (mupot#1809): an external runtime may not take custody of a held / at-ceiling
+             -- task or for a paused agent / squad. In the SAME UPDATE as the claim, so a hold placed
+             -- between dispatch and consume (or concurrently with this write) cannot slip through.
+             AND ${dispatchBrakesClearSql('?4', 'tasks.id')}
              -- mupot#1539 round 2 (P0-1) — the envelope must STILL hold at write time.
              AND ${envelopeHoldsSql('runtime_consumed', {
                tenant: '?5', messageId: '?6', dispatchId: '?1', attempt: '?7', agentId: '?4', now: '?2',
@@ -1434,9 +1494,48 @@ export async function recordTaskDispatchRuntimeReceipt(
         agentId, messageId, memberId, credentialId, input.stage, input.attempt,
         runtimeAddress, input.runtimeReceiptHash, requestDigest, JSON.stringify(artifactRefs),
         artifactSha256, result, reason, auditId, now),
+      // Loop brakes (mupot#1809): a runtime `failed` receipt for a dispatch whose runtime TOOK CUSTODY
+      // (a runtime_consumed receipt by the same agent exists) counts toward the per-task ceiling,
+      // anchored on the failed receipt row just inserted (no row = no count). A failed with no prior
+      // custody never started the work (delivery / outage class) and is NOT counted. No runtime-
+      // supplied label can exempt a count (a self-declared "outage" flag would be a gameable door).
+      ...(input.stage === 'failed' ? [env.DB.prepare(`
+        INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, last_reason, first_at, last_at)
+        SELECT r.task_id, 1, r.agent_id, 'runtime_failed', ?2, ?2
+          FROM task_dispatch_runtime_receipts r
+         WHERE r.id = ?1 AND r.stage = 'failed'
+           AND EXISTS (
+             SELECT 1 FROM task_dispatch_runtime_receipts c
+              WHERE c.tenant = r.tenant AND c.dispatch_receipt_id = r.dispatch_receipt_id
+                AND c.stage = 'runtime_consumed' AND c.agent_id = r.agent_id
+                -- a human release/reassign AFTER custody began makes this failure stale: not counted
+                AND NOT ${releasedSinceSql('r.task_id', 'c.created_at')}
+           )
+        ON CONFLICT (task_id) DO UPDATE
+           SET refused_count = refused_count + 1,
+               last_agent_id = excluded.last_agent_id,
+               last_reason = excluded.last_reason,
+               last_at = excluded.last_at
+      `).bind(receiptId, now)] : []),
     ])
   } catch {
+    // Loop brakes (mupot#1809): a refused runtime_consumed because a brake now covers (agent, task)
+    // is a distinct, terminal refusal - settle the dispatch failed so it is not consumable forever.
+    if (input.stage === 'runtime_consumed') {
+      const brake = await diagnoseDispatchBrake(env, agentId, input.taskId)
+      if (brake) {
+        await settleBrakeRefusedDispatchReceipt(env, {
+          dispatchReceiptId: input.dispatchReceiptId, taskId: input.taskId, agentId, reason: brake,
+        })
+        throw new TaskDispatchRuntimeReceiptError(brake)
+      }
+    }
     throw new TaskDispatchRuntimeReceiptError('runtime_receipt_transition_conflict')
+  }
+  // The counter bump above may have reached the ceiling: place the hold (idempotent, anchored on the
+  // hold row - see escalateRefusedTask). Eligibility is re-checked inside it.
+  if (input.stage === 'failed' && await isRetryCeilingReached(env, input.taskId)) {
+    await escalateRefusedTask(env, agentId, input.taskId)
   }
 
   const persisted = await env.DB.prepare('SELECT * FROM task_dispatch_runtime_receipts WHERE id = ?1')

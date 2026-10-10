@@ -17,7 +17,7 @@ import type { MessageBatch, Message } from '@cloudflare/workers-types'
 import type { Env, BusEvent, Task , MessageCreatedPayload } from '../types'
 import { postAgentActivity } from '../channels'
 import { evaluateReceiverLiveness, getFleetAgentLiveness, type FleetAgentRouteInfo } from '../fleet/registry'
-import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
+import { deliverDispatchToInbox, dispatchInboxDelivered, InboxFullError, ReceiverNotLiveError, DispatchBrakeRefusedError, DISPATCH_INBOX_PREFIX } from './fleet-bridge'
 import { notifyHadi } from '../telegram-bridge/bus_notify'
 import { publishSeatHint } from '../agents/seat-events'
 import { deliverMessageCreatedEvent } from './hermes-delivery'
@@ -526,6 +526,9 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
             dispatchedByMemberId: dispatchMemberId(event),
             projectId: receipt.project_id,
             receiverFenceAgentId: event.agent_id,
+            // Loop brakes (mupot#1809): an external runtime's inbox must not receive a held / at-ceiling
+            // task or a paused agent's work. In the envelope INSERT itself (not a pre-read).
+            brakeFenceAgentId: event.agent_id,
           })
         } else {
           // IN-WORKER route: reached whenever `resolveDispatchDeliveryMode` returns
@@ -549,6 +552,7 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       } catch (error) {
         // mupot#1740 — the envelope INSERT's own fence refused: no envelope landed.
         if (error instanceof ReceiverNotLiveError) return refuseReceiverNotLive()
+        if (error instanceof DispatchBrakeRefusedError) return refuseReceiverNotLive(error.brake)
         await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, error)
         if (error instanceof InboxFullError) {
           throw new RetryAfterError(error.message, INBOX_FULL_RETRY_DELAY_SEC)

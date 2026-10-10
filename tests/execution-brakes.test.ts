@@ -737,3 +737,114 @@ describe('per-TASK retry ceiling + escalation HOLD', () => {
     })
   })
 })
+
+// ───────── mupot#1809 follow-up: ONE release policy + the stale-attempt re-hold race ─────────
+
+describe('one release policy across execution_release, task_update and REST PATCH (mupot#1809)', () => {
+  async function held() {
+    for (let i = 1; i <= EXECUTION_RETRY_CEILING; i++) await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    expect(hold()?.released_at).toBeNull()
+  }
+  const lowly = (): AuthContext => ({
+    userId: MEMBER, memberId: MEMBER, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: null,
+    capabilities: [{ member_id: MEMBER, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'member' }],
+  }) as AuthContext
+  const squadAdmin = (): AuthContext => ({
+    userId: MEMBER, memberId: MEMBER, email: null, role: 'member', tenant: TENANT, channel: 'workspace', boundAgentId: null,
+    capabilities: [{ member_id: MEMBER, scope_type: 'squad', scope_id: SQUAD_ID, capability: 'admin' }],
+  }) as AuthContext
+
+  it('task_update assigning a HELD task is refused 409 task_held below the bar (squad member), task untouched, hold stays', async () => {
+    await held()
+    const before = task()
+    const res = await call(lowly(), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID })
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'task_held' })
+    expect(task()).toEqual(before)
+    expect(hold()?.released_at).toBeNull()
+  })
+
+  it('the SAME member is refused by execution_release too (one bar)', async () => {
+    await held()
+    expect(await call(lowly(), 'execution_release', { task_id: TASK_ID, reason: 'r' })).toMatchObject({ ok: false, status: 403 })
+  })
+
+  it('an agent-bound caller reassigning a held task is refused task_held (never assigned-but-stalled)', async () => {
+    await held()
+    const before = task()
+    expect(await call(agentBoundAuth(AGENT_ID), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID }))
+      .toMatchObject({ ok: false, status: 409, error: 'task_held' })
+    expect(task()).toEqual(before)
+  })
+
+  it('a squad-admin human task_update releases (same bar as execution_release)', async () => {
+    await held()
+    const res = await call(squadAdmin(), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID })
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    expect(hold()?.released_at).not.toBeNull()
+    expect(attempts()).toBeUndefined()
+  })
+
+  it('a non-assigning edit by a member on a held task is allowed and the hold stays visible', async () => {
+    await held()
+    const res = await call(lowly(), 'task_update', { task_id: TASK_ID, title: 'renamed' })
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    expect(hold()?.released_at).toBeNull()
+  })
+
+  it('a member reassigning a NON-held task is unaffected', async () => {
+    const res = await call(lowly(), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID })
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+  })
+})
+
+describe('stale-attempt bookkeeping cannot re-hold a task a human just reassigned (mupot#1809 re-hold race)', () => {
+  /** The third refusal's bookkeeping runs AFTER the attempt settles; a human reassign lands in between
+   *  (emit('task.blocked') is awaited after settle and before bookkeeping). */
+  function raceDeps(humanAction: () => Promise<unknown>) {
+    let fired = false
+    return deps({
+      emit: async (e: BusEvent) => {
+        if (e.type === 'task.blocked' && !fired) { fired = true; await humanAction() }
+      },
+    })
+  }
+
+  it('a human reassign between the 3rd refusal settling and its bookkeeping: counter NOT bumped, NO hold, new assignment executes', async () => {
+    await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    expect(attempts()?.refused_count).toBe(2)
+    const r = await runTaskExecution(env, agentRow(), TASK_ID, raceDeps(async () => {
+      const out = await call(orgAdminAuth(), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID })
+      expect(out.ok, JSON.stringify(out)).toBe(true)
+    }))
+    expect(r).toMatchObject({ ok: false })
+    expect(attempts()?.refused_count).toBe(2) // the stale 3rd attempt was dropped
+    expect(hold()).toBeUndefined()
+    expect(task()).toMatchObject({ assignee_agent_id: AGENT_ID, status: 'blocked' })
+    const before = modelCalls
+    await runTaskExecution(env, agentRow(), TASK_ID, deps()) // the newly assigned agent really executes
+    expect(modelCalls).toBe(before + 1)
+  })
+
+  it('control: with NO human action in between, the 3rd refusal still holds', async () => {
+    await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    await runTaskExecution(env, agentRow(), TASK_ID, raceDeps(async () => undefined))
+    expect(hold()).toMatchObject({ released_at: null })
+  })
+
+  it('the epoch is stamped by an execution_release too, and a late bump after the counter was already AT the ceiling is cleared by the release', async () => {
+    seedAttempts(EXECUTION_RETRY_CEILING) // counter at ceiling, hold not yet placed
+    const rel = await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'human looked' })
+    expect(rel).toMatchObject({ ok: true, result: { status: 'not_held' } })
+    expect(attempts()).toBeUndefined() // ceiling-without-hold cleared
+    expect(harness.sqlite.prepare(`SELECT task_id FROM task_execution_attempts WHERE task_id LIKE 'release-epoch:%'`).all())
+      .toEqual([{ task_id: `release-epoch:${TASK_ID}` }])
+  })
+
+  it('an attempt that STARTS after the release counts normally', async () => {
+    await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'epoch' })
+    await runTaskExecution(env, agentRow(), TASK_ID, deps())
+    expect(attempts()?.refused_count).toBe(1)
+  })
+})

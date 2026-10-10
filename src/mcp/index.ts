@@ -34,7 +34,7 @@ import type {
   Squad,
   Task,
 } from '../types'
-import { resolveCapabilities, hasCapability, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
+import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
@@ -198,6 +198,8 @@ import { ARCHIVE_TOOLS } from './archive'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
 import { releaseExecutionHold } from '../agents/execution-brakes'
+import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake } from '../agents/execution-brake-sql'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from '../tasks/pagination'
@@ -922,10 +924,8 @@ async function resolveReadableTaskSquad(
 // org-admin check instead of re-deriving it — the MCP-side equivalent of
 // src/auth/capability.ts#isOrgAdmin (dashboard route gate), translated from coarse
 // session role to the capability-grant system real MCP callers carry.
-export function hasWorkspaceAdmin(auth: AuthContext): boolean {
-  if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
-  return hasCapability(auth.capabilities, 'org', null, 'admin')
-}
+// hasWorkspaceAdmin lives in auth/capability (shared with the execution-release policy); re-exported here.
+export { hasWorkspaceAdmin }
 
 // Org owner/admin by EITHER route. hasWorkspaceAdmin alone is not enough: when
 // capabilities are present it ignores auth.role entirely, so a principal whose
@@ -1447,8 +1447,15 @@ const toolTaskGet: ToolSpec = {
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
     // Shared projection (tasks/ranking.ts) + execution_receipt_id; the response is then narrowed
     // to TASK_GET_FIELDS so a column added to the shared projection never widens this reader.
+    // mupot#1809: the execution hold rides the SAME query (LEFT JOIN on a prefixed projection, so no
+    // column of TASK_SELECT_COLUMNS becomes ambiguous) - one round-trip, no per-field follow-up read.
     const full = await env.DB.prepare(
-      `SELECT ${TASK_SELECT_COLUMNS}, execution_receipt_id FROM tasks WHERE id = ?1 LIMIT 1`,
+      `SELECT ${TASK_SELECT_COLUMNS}, execution_receipt_id,
+              hold.hold_task_id, hold.hold_held_at, hold.hold_released_at
+         FROM tasks
+         LEFT JOIN (SELECT task_id AS hold_task_id, held_at AS hold_held_at, released_at AS hold_released_at
+                      FROM execution_holds) hold ON hold.hold_task_id = tasks.id
+        WHERE tasks.id = ?1 LIMIT 1`,
     ).bind(taskId).first<Record<string, unknown> & { id: string; squad_id: string }>()
     if (!full || !(await canReadTask(env, auth, { id: full.id, squad_id: full.squad_id }))) {
       return fail(404, 'task_not_found')
@@ -1489,6 +1496,13 @@ const toolTaskGet: ToolSpec = {
     }
     return done({
       task: row,
+      // Loop brakes: the per-task execution hold, readable by anyone who can read the task. held =
+      // an UNRELEASED hold exists; escalated_at / released_at are null when never held / not released.
+      execution_hold: {
+        held: full.hold_task_id != null && full.hold_released_at == null,
+        escalated_at: full.hold_held_at ?? null,
+        released_at: full.hold_released_at ?? null,
+      },
       latest_verdict: latestVerdict,
       latest_dispatch_receipt: latestDispatch,
       dispatch_timeline: dispatchTimeline,
@@ -1999,6 +2013,15 @@ const toolTaskUpdate: ToolSpec = {
     }
 
     stampTaskUpdate(next, existing.status, new Date().toISOString())
+    // Execution hold (migration 0203) - ONE release policy (agents/execution-release-policy.ts): assigning
+    // a HELD task to an agent is refused below the release bar rather than leaving it assigned-but-stalled.
+    const assigningAgent = typeof args.assignee_agent_id === 'string' && typeof next.assignee_agent_id === 'string'
+    if (assigningAgent && (await decideReassignOverHold(env, auth, existing)).action === 'refuse') {
+      return fail(409, 'task_held', {
+        task_id: existing.id,
+        detail: 'task has an unreleased execution hold; only a non-agent-bound org-admin or squad-admin may reassign it (or use execution_release)',
+      })
+    }
     try {
       if (reversesVerdict) {
         // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
@@ -2018,12 +2041,13 @@ const toolTaskUpdate: ToolSpec = {
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code, error.detail)
       throw error
     }
-    // Execution hold (migration 0203): a HUMAN (no agent binding) assigning the task to an agent (even the
-    // agent it already names: an agent can self-assign, so "no change" proves nothing) is the
-    // explicit release of an escalation hold + reset of its refusal counter. An agent-bound principal
-    // never reaches this (an agent cannot lift the hold on a loop it is in). A no-op unless held.
-    if (!auth.boundAgentId && typeof args.assignee_agent_id === 'string' && typeof next.assignee_agent_id === 'string') {
-      await releaseExecutionHold(env, { taskId: existing.id, memberId: auth.memberId as string, reason: 'human reassign via task_update', via: 'human_reassign' })
+    // Release: the SAME policy as execution_release (canReleaseExecutionHold) - a non-agent-bound human
+    // with org-admin / squad-admin assigning the task to an agent (even the agent it already names: an
+    // agent can self-assign, so "no change" proves nothing) lifts the hold, resets the counter and
+    // stamps the release epoch (a no-op for the hold itself unless held).
+    if (assigningAgent && await canReleaseExecutionHold(env, auth, existing.squad_id)) {
+      await releaseExecutionHold(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
+        reason: 'human reassign via task_update', via: 'human_reassign' })
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
@@ -2768,11 +2792,15 @@ const toolTaskDispatch: ToolSpec = {
     const dispatchedAt = new Date().toISOString()
     // mupot#1571: the archive check rides INSIDE the receipt INSERT (one statement), so an
     // archive that lands after the pre-read above cannot still mint a dispatch receipt.
+    // Loop brakes (mupot#1809): the hold / retry ceiling / agent-or-squad pause ride in the SAME
+    // INSERT..SELECT (dispatchBrakesClearSql), so a hold placed concurrently with this dispatch cannot
+    // slip between a read and the write. On 0 rows the refusal is named from the CURRENT state.
     const receiptInsert = await env.DB.prepare(
       `INSERT INTO task_dispatch_receipts
          (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, attempts)
-       SELECT ?, ?, ?, ?, ?, 'member', ?, ?, 1
-         FROM tasks WHERE id = ? AND ${TASK_NOT_ARCHIVED_SQL()}`,
+       SELECT ?1, ?2, ?3, ?4, ?5, 'member', ?6, ?7, 1
+         FROM tasks WHERE id = ?3 AND ${TASK_NOT_ARCHIVED_SQL()}
+          AND ${dispatchBrakesClearSql('?5', 'tasks.id')}`,
     ).bind(
       receiptId,
       env.TENANT_SLUG,
@@ -2781,9 +2809,13 @@ const toolTaskDispatch: ToolSpec = {
       task.assignee_agent_id,
       memberId,
       dispatchedAt,
-      task.id,
     ).run()
-    if (!receiptInsert.meta?.changes) return fail(409, 'task_archived')
+    if (!receiptInsert.meta?.changes) {
+      if (await isTaskArchived(env, task.id)) return fail(409, 'task_archived')
+      const brake = await diagnoseDispatchBrake(env, task.assignee_agent_id, task.id)
+      if (brake) return fail(409, brake, { task_id: task.id, agent_id: task.assignee_agent_id })
+      return fail(409, 'task_not_dispatchable')
+    }
 
     const event: BusEvent<{ task_id: string; by: string; dispatch_receipt_id: string; delivery?: 'inbox' }> = {
       type: 'agent.wake',
@@ -2855,6 +2887,9 @@ function runtimeReceiptFailure(error: TaskDispatchRuntimeReceiptError): ToolOutc
     || error.code === 'runtime_receipt_transition_conflict'
     || error.code === 'task_archived'
     || error.code === 'dispatch_terminated'
+    || error.code === 'task_held'
+    || error.code === 'retry_ceiling_reached'
+    || error.code === 'execution_paused'
   ) return fail(409, error.code)
   return fail(500, error.code)
 }

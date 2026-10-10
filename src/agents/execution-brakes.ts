@@ -17,70 +17,21 @@ import type { Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import { GATE_AGENT_SELF_COMPLETION, GATE_ESCALATION } from '../gates/lanes'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
+import {
+  EXECUTION_RETRY_CEILING, EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR,
+  executionPausedSql, taskHeldSql, retryCeilingReachedSql, dispatchBrakesClearSql,
+  isExecutionPaused, isTaskHeld, isRetryCeilingReached, diagnoseDispatchBrake,
+  RELEASE_EPOCH_PREFIX, releasedSinceSql,
+  type DispatchBrakeReason,
+} from './execution-brake-sql'
 
-/** Refused/failed completions for the same TASK (any agent, any dispatch) before it is held. */
-export const EXECUTION_RETRY_CEILING = 3
-
-/** Terminal executor refusals the dispatch receipt must be settled-failed for (nothing executed). */
-export const EXECUTION_PAUSED_ERROR = 'execution_paused'
-export const RETRY_CEILING_ERROR = 'retry_ceiling_reached'
-export const TASK_HELD_ERROR = 'task_held'
-
-/**
- * Boolean SQL fragment: an ACTIVE pause covers this agent, directly or via its CURRENT squad
- * (resolved in-statement, so an agent moved between squads follows the squad pause of the moment).
- * `agentIdExpr` is a bind placeholder / column expression holding agents.id. It is embedded
- * verbatim, never user text.
- */
-export function executionPausedSql(agentIdExpr: string): string {
-  return `EXISTS (
-    SELECT 1 FROM execution_pauses ep
-     WHERE ep.resumed_at IS NULL
-       AND (
-         (ep.scope_type = 'agent' AND ep.scope_id = ${agentIdExpr})
-         OR (ep.scope_type = 'squad'
-             AND ep.scope_id = (SELECT pa.squad_id FROM agents pa WHERE pa.id = ${agentIdExpr}))
-       )
-  )`
+export {
+  EXECUTION_RETRY_CEILING, EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR,
+  executionPausedSql, taskHeldSql, retryCeilingReachedSql, dispatchBrakesClearSql,
+  isExecutionPaused, isTaskHeld, isRetryCeilingReached, diagnoseDispatchBrake,
+  RELEASE_EPOCH_PREFIX, releasedSinceSql,
 }
-
-export async function isExecutionPaused(env: Env, agentId: string): Promise<boolean> {
-  const row = await env.DB.prepare(`SELECT 1 AS paused WHERE ${executionPausedSql('?1')}`)
-    .bind(agentId)
-    .first<{ paused: number }>()
-  return row !== null
-}
-
-/** Boolean SQL fragment: the task has an UNRELEASED escalation hold (any agent). */
-export function taskHeldSql(taskIdExpr: string): string {
-  return `EXISTS (
-    SELECT 1 FROM execution_holds eh
-     WHERE eh.task_id = ${taskIdExpr} AND eh.released_at IS NULL
-  )`
-}
-
-/** Boolean SQL fragment: the task's refusal counter has reached the ceiling. */
-export function retryCeilingReachedSql(taskIdExpr: string): string {
-  return `EXISTS (
-    SELECT 1 FROM task_execution_attempts tea
-     WHERE tea.task_id = ${taskIdExpr}
-       AND tea.refused_count >= ${EXECUTION_RETRY_CEILING}
-  )`
-}
-
-export async function isTaskHeld(env: Env, taskId: string): Promise<boolean> {
-  const row = await env.DB.prepare(`SELECT 1 AS held WHERE ${taskHeldSql('?1')}`)
-    .bind(taskId)
-    .first<{ held: number }>()
-  return row !== null
-}
-
-export async function isRetryCeilingReached(env: Env, taskId: string): Promise<boolean> {
-  const row = await env.DB.prepare(`SELECT 1 AS hit WHERE ${retryCeilingReachedSql('?1')}`)
-    .bind(taskId)
-    .first<{ hit: number }>()
-  return row !== null
-}
+export type { DispatchBrakeReason }
 
 /**
  * Count one refused/failed completion for the TASK in ONE atomic statement and return the new
@@ -92,18 +43,22 @@ export async function recordRefusedAttempt(
   agentId: string,
   taskId: string,
   reason: string,
+  /** When the attempt STARTED. If a human released / reassigned the task after that, this attempt is
+   *  stale: it is NOT counted (returns 0) - see releasedSinceSql. Omitted = always count. */
+  attemptStartedAt?: string,
 ): Promise<number> {
   const now = new Date().toISOString()
   const row = await env.DB.prepare(
     `INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, last_reason, first_at, last_at)
-     VALUES (?1, 1, ?2, ?3, ?4, ?4)
+     SELECT ?1, 1, ?2, ?3, ?4, ?4
+      WHERE ?5 IS NULL OR NOT ${releasedSinceSql('?1', '?5')}
      ON CONFLICT (task_id) DO UPDATE
         SET refused_count = refused_count + 1,
             last_agent_id = excluded.last_agent_id,
             last_reason = excluded.last_reason,
             last_at = excluded.last_at
      RETURNING refused_count`,
-  ).bind(taskId, agentId, reason.slice(0, 500), now).first<{ refused_count: number }>()
+  ).bind(taskId, agentId, reason.slice(0, 500), now, attemptStartedAt ?? null).first<{ refused_count: number }>()
   return row?.refused_count ?? 0
 }
 
@@ -241,6 +196,20 @@ export async function releaseExecutionHold(
         WHERE task_id = ?1
           AND EXISTS (SELECT 1 FROM execution_holds WHERE task_id = ?1 AND release_id = ?2)`,
     ).bind(input.taskId, releaseId),
+    // A counter AT/OVER the ceiling with no hold row yet (bookkeeping landed between settle and hold) is
+    // the same stuck state; an authorised human releasing the task lifts it too.
+    env.DB.prepare(
+      `DELETE FROM task_execution_attempts
+        WHERE task_id = ?1 AND refused_count >= ${EXECUTION_RETRY_CEILING}`,
+    ).bind(input.taskId),
+    // RELEASE EPOCH (always, held or not): retry bookkeeping of any attempt that STARTED before this
+    // moment is stale and must not count (releasedSinceSql). Without it a late third-refusal bump
+    // re-holds the task for the agent the human just assigned, without that agent executing.
+    env.DB.prepare(
+      `INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, last_reason, first_at, last_at)
+       VALUES ('${RELEASE_EPOCH_PREFIX}' || ?1, 0, NULL, 'release_epoch', ?2, ?2)
+       ON CONFLICT (task_id) DO UPDATE SET last_at = excluded.last_at`,
+    ).bind(input.taskId, now),
   ])
   return (results[0]?.meta as { changes?: number } | undefined)?.changes === 1 ? 'released' : 'not_held'
 }

@@ -122,10 +122,11 @@ export async function runTaskExecution(
   taskId: string,
   deps: ExecuteDeps = {},
 ): Promise<ExecuteResult> {
+  const attemptStartedAt = new Date().toISOString()
   const result = await runTaskExecutionAttempt(env, agent, taskId, deps)
   if (result.task_status === 'blocked' && !result.ok && !result.outage && !(result.error && METER_REFUSAL_ERRORS.has(result.error))) {
     try {
-      const count = await recordRefusedAttempt(env, agent.id, result.task_id, result.error || result.decided || 'execution_failed')
+      const count = await recordRefusedAttempt(env, agent.id, result.task_id, result.error || result.decided || 'execution_failed', attemptStartedAt)
       if (count >= EXECUTION_RETRY_CEILING) await escalateRefusedTask(env, agent.id, result.task_id)
     } catch (brakeErr) {
       console.error('execute: retry-ceiling bookkeeping failed', brakeErr)
