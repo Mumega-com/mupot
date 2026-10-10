@@ -14,9 +14,9 @@ import { dispatchFlight } from '../flight/dispatch'
 import type { DispatchResult } from '../flight/dispatch'
 import type { FlightSignals } from '../flight/preflight'
 import { FLIGHT_META_V1_SCHEMA } from '../flight/meta'
-import { createCursorAgent, resolveCursorApiToken } from './client'
+import { launchCursorAgent, resolveCursorApiToken } from './client'
 import {
-  bindVendorExecution,
+  bindVendorExecutionWithTaskBinding,
   claimAttachLease,
   computeRequestDigest,
   getReservation,
@@ -344,29 +344,42 @@ export async function attachCursorCloudExecution(
   const promptText = promptLines.join('\n').trim()
   const agentName = `mupot:${reservationId.slice(0, 8)} ${task.title}`
 
-  try {
-    const launched = await createCursorAgent(token, {
-      name: agentName,
-      repoUrl,
-      prompt: promptText,
-      model,
-    })
+  // #1762 tri-state: only a clean refusal (or no request sent) is a plain failure. A maybe_launched outcome may have
+  // created a real agent on the repo, so the reservation records that explicitly and the key is never re-launched.
+  const outcome = await launchCursorAgent(token, {
+    name: agentName,
+    repoUrl,
+    prompt: promptText,
+    model,
+  })
 
-    await bindVendorExecution(env, reservationId, {
-      agentId: launched.agent.id,
-      runId: launched.run.id,
-      url: launched.agent.url,
-      status: launched.run.status,
-    })
-
-    const cursorRecord: CursorCloudRecord = {
-      agentId: launched.agent.id,
-      runId: launched.run.id,
-      agentUrl: launched.agent.url,
+  if (outcome.state !== 'launched') {
+    const detail = outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
+    const msg = outcome.state === 'maybe_launched' ? `launch_unconfirmed: ${detail}` : detail
+    await markReservationFailed(env, reservationId, msg)
+    return {
+      reservationId,
+      state: 'failed',
+      error: msg,
+      replay: false,
     }
+  }
 
-    await appendCursorCloudBinding(env, task.id, cursorRecord)
+  const launched = outcome.result
+  const cursorRecord: CursorCloudRecord = {
+    agentId: launched.agent.id,
+    runId: launched.run.id,
+    agentUrl: launched.agent.url,
+  }
 
+  try {
+    // One atomic batch: the reservation flips to attached and the task body gains the vendor binding together.
+    // The task write is guarded by EXISTS on the just-flipped reservation row, so it can never land without it.
+    const binding = await bindVendorExecutionWithTaskBinding(env, reservationId, task.id, cursorRecord, launched.run.status)
+    if (!binding) {
+      // Lease lost to another attacher: do not claim the vendor ids as ours.
+      return { reservationId, state: 'attaching', replay: false }
+    }
     return {
       reservationId,
       state: 'attached',
@@ -375,11 +388,12 @@ export async function attachCursorCloudExecution(
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
-    await markReservationFailed(env, reservationId, msg)
+    // The agent exists; failing to record it must not read as a clean failure.
+    await markReservationFailed(env, reservationId, `bind_unconfirmed: ${msg}`)
     return {
       reservationId,
       state: 'failed',
-      error: msg,
+      error: `bind_unconfirmed: ${msg}`,
       replay: false,
     }
   }
@@ -421,12 +435,11 @@ export async function recordCursorCloudWork(
   })
 
   if (input.cursor) {
-    await bindVendorExecution(env, reserved.reservationId, {
-      agentId: input.cursor.agentId,
-      runId: input.cursor.runId,
-      url: input.cursor.agentUrl,
-    })
-    await appendCursorCloudBinding(env, reserved.task.id, input.cursor)
+    // The row starts 'reserved'; the bind guard requires 'attaching', so take the lease first (it was skipped
+    // before, which left this wrapper's reservation unbound).
+    if (await claimAttachLease(env, reserved.reservationId)) {
+      await bindVendorExecutionWithTaskBinding(env, reserved.reservationId, reserved.task.id, input.cursor)
+    }
   }
 
   return { task: reserved.task, flight: reserved.flight }

@@ -230,6 +230,45 @@ export async function bindVendorExecution(
   return (result.meta?.changes ?? 0) > 0
 }
 
+/**
+ * Atomic attach: flip the reservation to attached AND append the vendor binding to the task body in ONE batch.
+ * The task UPDATE is guarded by EXISTS on the reservation row that the first statement just flipped (same vendor
+ * run id), never a scalar compare, so a lost lease writes nothing to the task. Returns false when the lease guard
+ * matched no row.
+ */
+export async function bindVendorExecutionWithTaskBinding(
+  env: Env,
+  reservationId: string,
+  taskId: string,
+  cursor: { agentId: string; runId: string; agentUrl: string },
+  vendorStatus?: string,
+): Promise<boolean> {
+  const now = new Date().toISOString()
+  const extra = ['', `cursor_agent: ${cursor.agentId}`, `cursor_run: ${cursor.runId}`, `cursor_url: ${cursor.agentUrl}`].join('\n')
+  const [bound] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE harness_reservations
+       SET state = 'attached',
+           vendor_agent_id = ?, vendor_run_id = ?, vendor_url = ?,
+           last_vendor_status = coalesce(?, last_vendor_status),
+           attached_at = coalesce(attached_at, ?),
+           attach_lease_until = NULL,
+           updated_at = ?
+       WHERE tenant = ? AND id = ? AND state = 'attaching'`,
+    ).bind(cursor.agentId, cursor.runId, cursor.agentUrl, vendorStatus ?? null, now, now, env.TENANT_SLUG, reservationId),
+    env.DB.prepare(
+      `UPDATE tasks
+       SET body = body || ?, updated_at = ?
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM harness_reservations
+           WHERE tenant = ? AND id = ? AND state = 'attached' AND vendor_run_id = ?
+         )`,
+    ).bind(extra, now, taskId, env.TENANT_SLUG, reservationId, cursor.runId),
+  ])
+  return (bound?.meta?.changes ?? 0) > 0
+}
+
 export async function markReservationFailed(
   env: Env,
   id: string,

@@ -1,6 +1,6 @@
 -- 0206_harness_reservations.sql — Harness Adapter SPI & pre-dispatch reservations.
 --
--- mupot#1428 / Flight f0150aed-caee-4411-9690-1d03d7d9ea43
+-- mupot#1428
 --
 -- Why this table exists:
 -- Vendor agent dispatches (e.g. Cursor Cloud, Grok CLI, Hermes, Codex) must be
