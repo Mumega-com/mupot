@@ -348,6 +348,15 @@ describe('external runtime failures count toward the per-task ceiling', () => {
     expect((await dispatch()).ok).toBe(false)
   })
 
+  it('a failure whose custody began BEFORE a human release/reassign is stale and NOT counted', async () => {
+    const { dispatchId, messageId } = await dispatchedAndDelivered()
+    await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), consumeInput(dispatchId, messageId))
+    h.sqlite.exec(`INSERT INTO task_execution_attempts (task_id, refused_count, last_reason, first_at, last_at)
+      VALUES ('release-epoch:${TASK}', 0, 'release_epoch', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')`)
+    await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+    expect(attempts()).toBeUndefined()
+  })
+
   it('a replayed failed receipt does not double count', async () => {
     const { dispatchId, messageId } = await dispatchedAndDelivered()
     await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), consumeInput(dispatchId, messageId))

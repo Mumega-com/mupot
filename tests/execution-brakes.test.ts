@@ -763,6 +763,15 @@ describe('one release policy across execution_release, task_update and REST PATC
     expect(hold()?.released_at).toBeNull()
   })
 
+  it('an agent-bound caller that holds ORG ADMIN is still refused task_held (an agent never lifts its own loop)', async () => {
+    await held()
+    const before = task()
+    expect(await call(orgAdminAuth({ boundAgentId: AGENT_ID }), 'task_update', { task_id: TASK_ID, assignee_agent_id: AGENT_ID }))
+      .toMatchObject({ ok: false, status: 409, error: 'task_held' })
+    expect(task()).toEqual(before)
+    expect(hold()?.released_at).toBeNull()
+  })
+
   it('the SAME member is refused by execution_release too (one bar)', async () => {
     await held()
     expect(await call(lowly(), 'execution_release', { task_id: TASK_ID, reason: 'r' })).toMatchObject({ ok: false, status: 403 })
