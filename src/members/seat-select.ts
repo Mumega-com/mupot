@@ -41,6 +41,7 @@
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, AuthContext } from '../types'
 import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 import { createHomeForMember, prepareAgentCreate, isValidSlug } from '../org/service'
 import { capabilityRank } from '../auth/capability'
 import {
@@ -56,13 +57,16 @@ import {
   emptyIdentitySnapshot,
   isUnboundDirectorySession,
 } from './bootstrap-self'
-import { loadHarness, sanitizeLabel, seatAutoEnrollEnabled, type HarnessRow } from './harness'
+import { loadHarness, seatAutoEnrollEnabled, type HarnessRow } from './harness'
 import { normalizeSeatKey, seatKeyHash, type SeatKeyArgs } from './seat-key'
 import { prepareSeatHandleIssue } from './seat-handle'
+import { deriveSeatName } from './seat-name'
 
 export const SEAT_MAX_PER_MEMBER_DEFAULT = 16
 const SEAT_MAX_PER_MEMBER_CEILING = 256
 export const SEAT_MAX_TOTAL_PER_MEMBER_DEFAULT = 64
+export const SEAT_MAX_TOTAL_PER_HARNESS_DEFAULT = 32
+const SEAT_MAX_TOTAL_PER_HARNESS_CEILING = 4096
 const SEAT_MAX_TOTAL_CEILING = 4096
 
 /** SEAT_MAX_TOTAL_PER_MEMBER: the LIFETIME bound on agent_seats rows per member, retired/inactive
@@ -73,6 +77,16 @@ export function seatTotalCap(env: Pick<Env, 'SEAT_MAX_TOTAL_PER_MEMBER'>): numbe
   const n = parseInt(raw.trim(), 10)
   if (n < 1) return SEAT_MAX_TOTAL_PER_MEMBER_DEFAULT
   return Math.min(n, SEAT_MAX_TOTAL_CEILING)
+}
+
+/** SEAT_MAX_TOTAL_PER_HARNESS: the LIFETIME bound on agent_seats rows per HARNESS (one shared token can
+ *  not burn the member's whole lifetime budget). Parsed defensively like seatTotalCap (migration 0202). */
+export function seatHarnessTotalCap(env: Pick<Env, 'SEAT_MAX_TOTAL_PER_HARNESS'>): number {
+  const raw = env.SEAT_MAX_TOTAL_PER_HARNESS
+  if (typeof raw !== 'string' || !/^\d{1,5}$/.test(raw.trim())) return SEAT_MAX_TOTAL_PER_HARNESS_DEFAULT
+  const n = parseInt(raw.trim(), 10)
+  if (n < 1) return SEAT_MAX_TOTAL_PER_HARNESS_DEFAULT
+  return Math.min(n, SEAT_MAX_TOTAL_PER_HARNESS_CEILING)
 }
 
 /** SEAT_MAX_PER_MEMBER, parsed defensively: garbage / <1 -> default, >256 -> 256. */
@@ -124,7 +138,7 @@ export interface SeatSelectOk {
   ok: true
   disposition: 'created' | 'existing'
   seat: { id: string; label: string; created_at: string }
-  harness: { id: string; client_name: string; kind: string }
+  harness: { id: string; client_name: string; kind: string; credential_kind?: string }
   agent: { id: string; slug: string; name: string; squad_id: string }
   /** The agent's own dedicated member id (never the human's). */
   member_id: string
@@ -195,6 +209,36 @@ async function countAllSeats(env: Env, memberId: string): Promise<number> {
   return row?.n ?? 0
 }
 
+function isHarnessTotalCapViolation(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('seat_harness_total_cap_exceeded')
+}
+
+async function countHarnessSeats(env: Env, harnessId: string): Promise<number> {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS n FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2`)
+    .bind(env.TENANT_SLUG, harnessId).first<{ n: number }>()
+  return row?.n ?? 0
+}
+
+/** Seats on a token harness whose token has EXPIRED are retired lazily, here, before any cap is
+ *  evaluated: an expired credential frees its live-cap slots exactly like a revoked one (whose
+ *  trigger retires them at revoke time). Without this, rotating an expiring CI token locks the member
+ *  out at the live cap until a human retires the old seats. Retiring is the same one-way write the
+ *  revoke trigger does (the seat-handle revoke trigger then fires); a retired key is never resurrected.
+ *  Scoped to this member + tenant; the retire count still counts toward the lifetime bounds. */
+async function retireSeatsOfExpiredTokenHarnesses(env: Env, memberId: string): Promise<void> {
+  try {
+    await env.DB.prepare(
+      `UPDATE agent_seats SET retired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        WHERE tenant = ?1 AND member_id = ?2 AND retired_at IS NULL
+          AND harness_id IN (SELECT hh.id FROM harnesses hh JOIN member_tokens t ON t.id = hh.token_id
+                              WHERE hh.tenant = ?1 AND hh.member_id = ?2 AND hh.credential_kind = 'token'
+                                AND t.expires_at IS NOT NULL AND julianday(t.expires_at) <= julianday(?3))`,
+    ).bind(env.TENANT_SLUG, memberId, nowSqlUtc()).run()
+  } catch {
+    // Housekeeping only: a failure leaves the (stricter) cap in force, never a looser one.
+  }
+}
+
 function isCapViolation(err: unknown): boolean {
   return err instanceof Error && err.message.includes('seat_cap_exceeded')
 }
@@ -237,7 +281,7 @@ async function existingSeatResult(env: Env, seat: SeatRow, harness: HarnessRow, 
     ok: true,
     disposition: 'existing',
     seat: { id: seat.id, label: seat.label_basename, created_at: seat.created_at },
-    harness: { id: harness.id, client_name: harness.client_name, kind: harness.kind },
+    harness: { id: harness.id, client_name: harness.client_name, kind: harness.kind, credential_kind: harness.credential_kind },
     agent: { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
     member_id: binding.memberId,
     audit_id: null,
@@ -276,6 +320,11 @@ export async function seatSelect(
   }
   const harness = await loadHarness(env, memberId, claimedHarnessId)
   if (!harness) return { ok: false, error: 'harness_required' }
+  // mupot#1794 W4: a TOKEN harness is valid only for the very credential that IS it. A pointer that
+  // names a token harness while the session was authenticated by any other credential is refused.
+  if (harness.credential_kind === 'token' && harness.token_id !== grantTokenIdClaim) {
+    return { ok: false, error: 'harness_required' }
+  }
 
   // 4. The human must still be an active member of this tenant.
   const member = await env.DB.prepare(
@@ -295,6 +344,9 @@ export async function seatSelect(
   const found = await findSeat(env, memberId, harness.id, keyHash)
   if (found) return existingSeatResult(env, found, harness, grantTokenIdClaim)
 
+  // 6a. An expired token harness frees its seats before any cap is evaluated (see the helper).
+  await retireSeatsOfExpiredTokenHarnesses(env, memberId)
+
   // 6b. Throttle the creation path (after the idempotent fast path above).
   const rl = await checkSeatSelectRateLimit(env, memberId)
   if (!rl.allowed) return { ok: false, error: 'rate_limited', detail: { retry_after_seconds: rl.retryAfter } }
@@ -308,6 +360,10 @@ export async function seatSelect(
   const totalCap = seatTotalCap(env)
   if ((await countAllSeats(env, memberId)) >= totalCap) {
     return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
+  }
+  const harnessTotalCap = seatHarnessTotalCap(env)
+  if ((await countHarnessSeats(env, harness.id)) >= harnessTotalCap) {
+    return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
   }
 
   // 8. The human's own home squad (idempotent find-or-create). The agent lives THERE and nowhere
@@ -332,11 +388,17 @@ export async function seatSelect(
   const rawName = nameRow?.display_name ?? ''
   const cleanedName = rawName.includes('@') ? '' : rawName.replace(/[^A-Za-z0-9 ._-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24)
   const ownerLabel = cleanedName || `member-${(await sha256Hex(memberId)).slice(0, 6)}`
-  const clientLabel = harness.client_name.replace(/[^A-Za-z0-9 ._-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 24) || harness.kind
-  const displayName = sanitizeLabel(
-    [ownerLabel, clientLabel, key.project, key.labelBasename !== key.project ? key.labelBasename : ''].filter(Boolean).join(' · '),
-    120,
-  )
+  // Naming lives in ONE pure function (src/members/seat-name.ts). The result is a LABEL: the slug
+  // above is derived from the key hash and nothing here ever looks an existing agent up by name.
+  const displayName = deriveSeatName({
+    harnessKind: harness.kind,
+    harnessLabel: harness.client_name,
+    memberLabel: ownerLabel,
+    tenant: env.TENANT_SLUG,
+    project: key.project,
+    workspaceLabel: key.labelBasename,
+    thread: key.thread,
+  })
 
   const preparedAgent = await prepareAgentCreate(
     env,
@@ -375,9 +437,9 @@ export async function seatSelect(
   //     idempotency, and either one aborting rolls back every statement above it.
   const seatId = crypto.randomUUID()
   const seatStatement = env.DB.prepare(
-    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
-  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, token.tokenId, createdAt)
+    `INSERT INTO agent_seats (id, tenant, member_id, harness_id, key_hash, agent_id, label_basename, max_live, max_total, seat_token_id, created_at, max_harness_total)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+  ).bind(seatId, env.TENANT_SLUG, memberId, harness.id, keyHash, agent.id, key.labelBasename, cap, totalCap, token.tokenId, createdAt, harnessTotalCap)
 
   // W2: the first handle rides in the SAME batch, AFTER the seat row (FK). Only the INSERT goes in:
   // a brand-new seat has no handles to evict, and the eviction statement legitimately writes 0 rows.
@@ -401,6 +463,7 @@ export async function seatSelect(
   } catch (err) {
     // The batch is atomic: nothing from it is live, so there is nothing to compensate.
     if (isTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { total_cap: totalCap } }
+    if (isHarnessTotalCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { harness_total_cap: harnessTotalCap } }
     if (isCapViolation(err)) return { ok: false, error: 'seat_cap_reached', detail: { cap } }
     if (isUniqueViolation(err)) {
       // A concurrent caller for the SAME key won (key UNIQUE, or the derived slug on the home
@@ -421,7 +484,7 @@ export async function seatSelect(
     ok: true,
     disposition: 'created',
     seat: { id: seatId, label: key.labelBasename, created_at: createdAt },
-    harness: { id: harness.id, client_name: harness.client_name, kind: harness.kind },
+    harness: { id: harness.id, client_name: harness.client_name, kind: harness.kind, credential_kind: harness.credential_kind },
     agent: { id: agent.id, slug: agent.slug, name: agent.name, squad_id: agent.squad_id },
     member_id: agentMemberId,
     audit_id: auditId,

@@ -319,6 +319,14 @@ export interface Env {
   // mupot#1794 W2: LIFETIME bound on agent_seats rows per member, retired/inactive included
   // (migration 0199 trigger; default 64, clamped 1..4096). Atomic and fail-closed.
   SEAT_MAX_TOTAL_PER_MEMBER?: string
+  // mupot#1794 W4 (migration 0202): LIFETIME bound on seats per HARNESS (default 32, clamped 1..4096).
+  SEAT_MAX_TOTAL_PER_HARNESS?: string
+  // mupot#1794 W4: shared-credential detection (default OFF; its own flag so flag-off adds no query,
+  // write or response field for any existing credential). '1' records a throttled per-session
+  // fingerprint per credential and surfaces `shared_credential` in boot_context when more than
+  // SHARED_CREDENTIAL_MAX_SESSIONS (default 3) distinct fingerprints are seen in 15 minutes.
+  SHARED_CREDENTIAL_DETECT?: string
+  SHARED_CREDENTIAL_MAX_SESSIONS?: string
   STUDIO_DISPATCH_MEMBER_LIMIT?: string
   STUDIO_DISPATCH_REPO_LIMIT?: string
   STUDIO_DISPATCH_WINDOW_MINUTES?: string
@@ -718,6 +726,15 @@ export interface AuthContext {
    * harnesses row (tenant + member + id) live before use. Absent on every other session.
    */
   harnessId?: string | null
+  /**
+   * mupot#1794 W4: true when this session was authenticated by a HARNESS-TOKEN credential (a
+   * member_tokens row with harness_kind set) and NO seat handle has been applied. Derived per request
+   * from the authenticating token ROW itself (never from the internal header blob, never from a second
+   * lookup); such a session has ZERO capabilities and ZERO latent capabilities, and invokeTool admits
+   * only HARNESS_SESSION_ALLOWED_TOOLS for it (src/members/harness-credential.ts). A seat session built
+   * by applySeatHandle never carries it.
+   */
+  harnessCredential?: boolean
   /**
    * mupot#1794 W2: set ONLY by applySeatHandle (src/members/seat-handle.ts) when a valid seat handle
    * turned the human's grant into the seat agent's context. Server-derived on every request;
