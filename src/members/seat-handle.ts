@@ -27,9 +27,11 @@
 // Admin/owner is never produced here. Zero capabilities -> the human's ORIGINAL context comes back
 // (never a zero-capability context wearing the agent's member id).
 //
-// WHAT NEVER SELECTS A SEAT: Mcp-Session-Id (ChatGPT re-initialises per call, Claude web shares one
-// session, spec 2026-07-28 removes protocol sessions), clientInfo, openai/session, openai/subject,
-// Codex _meta.threadId. Those are HINTS: only their presence is recorded (booleans), never used.
+// WHAT NEVER SELECTS A SEAT BY ITSELF: Mcp-Session-Id (ChatGPT re-initialises per call, Claude web shares
+// one session, spec 2026-07-28 removes protocol sessions), clientInfo, openai/subject. Within THIS
+// module the hints are presence-only. W5a (src/members/seat-auto.ts) is the one place a client key
+// (openai/session, then Codex threadId) selects the member's OWN seat under the SAME harness, and only
+// when no handle was presented.
 //
 // FLAG: SEAT_AUTO_ENROLL === '1'. Off -> applySeatHandle returns its input untouched before any read.
 
@@ -184,7 +186,7 @@ export const NO_HINTS: HarnessHints = { openai_session: false, openai_subject: f
  *  header is a handle carrier ONLY when it carries the handle prefix; otherwise it is a cosmetic
  *  label and contributes nothing here. A chosen candidate that fails is NOT retried against the
  *  other carrier (one candidate, one verdict). */
-function pickHandle(inputs: SeatRequestInputs): string | null {
+export function pickHandle(inputs: SeatRequestInputs): string | null {
   if (typeof inputs.metaHandle === 'string' && inputs.metaHandle.length > 0) return inputs.metaHandle
   const header = typeof inputs.headerHandle === 'string' ? inputs.headerHandle.trim() : ''
   if (header.startsWith(SEAT_HANDLE_PREFIX)) return header
@@ -261,17 +263,73 @@ async function touchHandle(env: Env, row: MatchRow, nowMs: number): Promise<void
 }
 
 /** Seat state a downstream reader (the identity receipt) needs. Never client-controlled. */
+export type SeatBindingSource = 'handle' | 'auto:openai_session' | 'auto:codex_thread'
+
 export interface SeatBinding {
   seatId: string
   label: string
   harnessId: string
   grantTokenId: string
   humanMemberId: string
+  /** How the server bound this request to the seat. 'handle' = a presented mseat_ handle; 'auto:*' =
+   *  W5a client-key auto-seat (src/members/seat-auto.ts). Server-derived, never client-controlled. */
+  source: SeatBindingSource
 }
 
 export interface SeatInputsRecord {
   handleRejected: boolean
   hints: HarnessHints
+  /** W5a: an auto-seat was attempted and refused (cap, throttle, inactive seat...). The request stays
+   *  the human's own unbound context; this is receipt input only. */
+  autoSeatRefused?: string
+}
+
+/** The columns buildSeatContext needs; MatchRow (handle path) and the auto-seat match both satisfy it. */
+export type SeatContextRow = Pick<MatchRow, 'seat_id' | 'seat_label' | 'agent_id' | 'agent_squad_id' | 'agent_member_id' | 'agent_email' | 'harness_id'> & { seat_token_id: string }
+
+/**
+ * ONE place that turns a verified seat row + the human's unbound grant into the seat agent's request
+ * context (shared by the handle path and the W5a auto-seat). Returns null on zero capabilities.
+ */
+export async function buildSeatContext(
+  env: Env,
+  human: { memberId: string; tokenId: string },
+  row: SeatContextRow,
+  hints: HarnessHints,
+  source: SeatBindingSource,
+): Promise<AuthContext | null> {
+  const capabilities = await resolveSeatCapabilities(env, {
+    humanMemberId: human.memberId,
+    agentId: row.agent_id,
+    agentSquadId: row.agent_squad_id,
+    agentMemberId: row.agent_member_id,
+  })
+  if (capabilities.length === 0) return null
+  return {
+    userId: row.agent_member_id,
+    email: row.agent_email,
+    role: 'member', // coarse org-role; real authz is `capabilities`
+    tenant: env.TENANT_SLUG,
+    memberId: row.agent_member_id,
+    channel: 'directory',
+    capabilities,
+    // The seat session is deliberately NOT given the human's raw standing grants as "latent"
+    // authority: latent == the clamped set, so the explicit-named-act escape hatch cannot widen it.
+    latentCapabilities: capabilities,
+    boundAgentId: row.agent_id,
+    consentedByMemberId: human.memberId,
+    tokenId: row.seat_token_id,
+    harnessId: row.harness_id,
+    seatBinding: {
+      seatId: row.seat_id,
+      label: row.seat_label,
+      harnessId: row.harness_id,
+      grantTokenId: human.tokenId,
+      humanMemberId: human.memberId,
+      source,
+    },
+    seatInputs: { handleRejected: false, hints },
+  }
 }
 
 /**
@@ -311,40 +369,11 @@ export async function applySeatHandle(
     const row = await findLiveSeatForHandle(env, hash, human.tokenId, human.memberId, human.harnessId)
     if (!row || !row.seat_token_id) return record(true)
 
-    const capabilities = await resolveSeatCapabilities(env, {
-      humanMemberId: human.memberId,
-      agentId: row.agent_id,
-      agentSquadId: row.agent_squad_id,
-      agentMemberId: row.agent_member_id,
-    })
+    const bound = await buildSeatContext(env, { memberId: human.memberId, tokenId: human.tokenId }, { ...row, seat_token_id: row.seat_token_id }, inputs.hints, 'handle')
     // Never a zero-capability context wearing the agent's identity: fall back to the human.
-    if (capabilities.length === 0) return record(true)
-
+    if (!bound) return record(true)
     await touchHandle(env, row, nowMs)
-    return {
-      userId: row.agent_member_id,
-      email: row.agent_email,
-      role: 'member', // coarse org-role; real authz is `capabilities`
-      tenant: env.TENANT_SLUG,
-      memberId: row.agent_member_id,
-      channel: 'directory',
-      capabilities,
-      // The seat session is deliberately NOT given the human's raw standing grants as "latent"
-      // authority: latent == the clamped set, so the explicit-named-act escape hatch cannot widen it.
-      latentCapabilities: capabilities,
-      boundAgentId: row.agent_id,
-      consentedByMemberId: human.memberId,
-      tokenId: row.seat_token_id,
-      harnessId: row.harness_id,
-      seatBinding: {
-        seatId: row.seat_id,
-        label: row.seat_label,
-        harnessId: row.harness_id,
-        grantTokenId: human.tokenId,
-        humanMemberId: human.memberId,
-      },
-      seatInputs: { handleRejected: false, hints: inputs.hints },
-    }
+    return bound
   } catch {
     return record(true)
   }

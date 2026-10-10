@@ -54,7 +54,7 @@ const toolSeatSelect: ToolSpec = {
         return fail(
           403,
           result.error,
-          'seat_select only runs for an unbound directory-channel session. An agent-bound token already has an identity.',
+          'seat_select only runs for an unbound directory-channel session. This session is already bound to an agent identity (an agent-bound connection, a seat handle you sent, or a conversation-keyed auto seat), so it cannot select another seat. To pick a seat explicitly, call seat_select from an unbound session: send no seat handle on that call.',
         )
       case 'harness_required':
         return fail(

@@ -191,7 +191,55 @@ After choosing the harness option, each thread or worktree picks its own agent:
 |---|---|
 | Claude Code, Cursor, Grok | Header. Set `X-Mupot-Seat` from a per-worktree env var in that worktree's MCP config. |
 | Codex | `_meta["mupot/seat"]`, or the header if your Codex config can set one. |
-| ChatGPT, Claude (web) | Call `seat_select` in the chat, then pass the handle in `_meta` on later tool calls. |
+| ChatGPT | Nothing to do: see **ChatGPT: each conversation is its own seat** below. |
+| Claude (web) | Call `seat_select` in the chat, then pass the handle in `_meta` on later tool calls. |
+
+### ChatGPT: each conversation is its own seat
+
+Connect with **Me — auto per workspace**. Each ChatGPT conversation then automatically becomes its
+own seat agent. No `seat_select` and no handle are needed.
+
+How it works: the model cannot add `_meta` to its own tool calls, but the ChatGPT client sends a
+per-conversation `_meta["openai/session"]` at the request level (`params._meta`) on every tool call.
+When a harness session presents **no seat handle**, the server hashes that value (and, as a second
+choice, a Codex `_meta.threadId`) into the same seat identity `seat_select` uses, keyed by your member id,
+the harness and the hashed key, and binds the request to that seat agent. The same conversation always
+reaches the same agent; another conversation gets another. The key is read ONLY from the request-level
+`params._meta`, never from `arguments._meta` (which the model writes), and `seat_select` itself is exempt,
+so a client that always sends a conversation key (Codex) can still call `seat_select` and get a handle.
+`boot_context` shows `identity_receipt.binding_source: "auto_seat"` and `seat.source`:
+`auto:openai_session`, `auto:codex_thread`, or `handle` when an explicit handle bound the request.
+
+Budget (auto seats are a separate pool from `seat_select` seats):
+
+- Auto seats never count against the member live cap (`SEAT_MAX_PER_MEMBER`, default 16), the member
+  lifetime cap (`SEAT_MAX_TOTAL_PER_MEMBER`, default 64) or the per-harness lifetime cap
+  (`SEAT_MAX_TOTAL_PER_HARNESS`, default 32). Those apply to `seat_select` seats only, exactly as before,
+  and auto seats never spend the member's `seat_select` throttle.
+- Each harness has at most 32 live auto seats. When the pool is full, the least-recently-used live auto
+  seat of that harness is **reclaimed** (retired, its agent deactivated, its token revoked) instead of
+  refusing the new conversation. A reclaimed conversation is never resurrected: if it returns it gets a
+  **fresh** seat (a new agent with none of the old one's identity). Each conversation key can be refreshed
+  this way up to 8 times.
+- Creation is limited to 12 new auto seats per harness per 5 minutes, counted in one atomic D1 row (not
+  KV) that fails closed. Existing conversations are never throttled. Refusals (window, inactive agent) do
+  not fail the call: it stays your own unbound session, `identity_receipt.auto_seat_refused` names the
+  reason, and the refusal is cached for 30 seconds so a refused conversation does not re-run the
+  creation path on every call.
+- Auto seats get the same member-capability ceiling and audit trail as a `seat_select` seat, recorded as
+  action `seat_auto` by a system actor naming your member id (reclaims are `seat_auto_retire`).
+- Auto-seat sessions are seat sessions: they cannot release execution holds.
+- Applies only to an unbound harness grant or harness token with `SEAT_AUTO_ENROLL=1`. Agent-bound
+  connections, workspace tokens, the curated profile doors and non-harness sessions are untouched.
+  `Mcp-Session-Id` is never used.
+
+Trust: the conversation key is supplied by the client, so it only selects among **your own** seats
+under **that harness**; it cannot reach another member's seat, another harness's seat, or an existing
+agent. The raw key is never stored. A forged key just creates or reaches another seat of the same
+member and harness, so conversations behind one grant are not isolated from a hostile holder of that
+grant (the same stance as `seat_select` labels). An auto seat is reachable from ANY live, unbound grant of
+the same member and harness (for example after a re-consent), not only the grant that created it. The
+agent's name is a label, never authority.
 
 Choosing an existing agent on the consent screen still works exactly as before, and an existing
 agent-bound connection is untouched.

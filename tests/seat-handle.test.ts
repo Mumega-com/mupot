@@ -493,16 +493,16 @@ describe('other carriers and non-carriers', () => {
     expect(receiptOf(bare).seat_handle_rejected).toBe(false)
   })
 
-  it('Mcp-Session-Id, openai/session, openai/subject, codex threadId NEVER select a seat; presence is only recorded', async () => {
+  it('Mcp-Session-Id and openai/subject NEVER select a seat; presence is only recorded (openai/session + threadId are the W5a auto-seat keys: tests/seat-auto.test.ts)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     const a = await select(env, g, '/work/a')
     const r = await rpc(env, g.ctx, 'boot_context', {}, {
       headers: { 'mcp-session-id': a.handle },
-      meta: { 'openai/session': a.handle, 'openai/subject': a.handle, threadId: a.handle },
+      meta: { 'openai/subject': a.handle },
     })
     expect(r.sc.bound_agent_id).toBeNull()
-    expect(receiptOf(r)).toMatchObject({ binding_source: 'none', seat_handle_rejected: false, hints: { openai_session: true, openai_subject: true, codex_thread_id: true } })
+    expect(receiptOf(r)).toMatchObject({ binding_source: 'none', seat_handle_rejected: false, hints: { openai_session: false, openai_subject: true, codex_thread_id: false } })
   })
 
   it('the handle is never echoed into labels (enroll_url) and never written anywhere', async () => {
