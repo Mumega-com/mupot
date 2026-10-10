@@ -7,6 +7,10 @@ import { leaseAgentInbox, sendAgentMessage } from '../src/agents/messages'
 import { cancelFlight } from '../src/flight/watchdog'
 import { dispatchRoutineRun } from '../src/routines/dispatch'
 import { cancelRoutineRun } from '../src/routines/actions'
+import { runRouterTick } from '../src/router/engine'
+import { runProjectConcierge, BUILD_CAPABILITY } from '../src/concierge/service'
+import { registerModule } from '../src/registry/service'
+import type { Project } from '../src/types'
 import type { RoutinePrincipal } from '../src/routines/access'
 import { MAX_SCHEDULER_DB_STATEMENTS } from '../src/routines/scheduler'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -225,7 +229,7 @@ describe('routine runtime-neutral dispatch', () => {
       }),
       expect.objectContaining({
         systemProjectAttribution: true,
-        routineRunFence: { runId: 'run-1', projectId: 'project-1' },
+        routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' },
       }),
     )
     expect(row(harness, "SELECT COUNT(*) AS count FROM routine_runs WHERE routine_id = 'routine-1'")).toEqual({ count: 1 })
@@ -664,7 +668,7 @@ describe('#1756 control flight cancelled before the run observes it', () => {
     const send = () => sendAgentMessage(envFor(harness), {
       fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
       requestId: 'routine-run:run-1', projectId: 'project-1',
-    }, { system: true, reason: 'test' }, { systemProjectAttribution: true, routineRunFence: { runId: 'run-1', projectId: 'project-1' } })
+    }, { system: true, reason: 'test' }, { systemProjectAttribution: true, routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' } })
     expect(await send()).toEqual({ ok: false, reason: 'dispatch_fenced' })
     expect(delivered(harness)).toBe(0)
     harness.sqlite.exec("UPDATE flights SET status = 'running' WHERE id = 'cf-1'")
@@ -796,5 +800,192 @@ describe('routine dispatch respects execution_pauses', () => {
     expect(harness.sqlite.prepare("SELECT status FROM routine_runs WHERE id = 'run-1'").get()).toEqual({ status: 'queued' })
     expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE status = 'in_progress'").get()).toEqual({ n: 0 })
     expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+  })
+
+  // mupot#1814 - the routine.run/v1 envelope INSERT is itself pause-fenced.
+  it('RACE: a pause landing between the observing UPDATE and the envelope INSERT: no envelope, settled paused, no orphan task left assigned', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const env = envFor(h)
+    const real = h.db
+    const raced = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes('INSERT INTO agent_messages')) { armed = false; pause(h, 'agent', 'agent-preferred') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    const result = await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(armed).toBe(false)
+    expect(result).toEqual({ ok: true, status: 'retry_scheduled', reason: 'execution_paused', run_id: 'run-1' })
+    expect(row(h, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'"))
+      .toEqual({ status: 'queued', result_summary: 'execution_paused' })
+    expect(sent(h)).toBe(0)
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+    // the control task the attempt created is released, never left assigned to the paused agent
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE assignee_agent_id = 'agent-preferred'").get()).toEqual({ n: 0 })
+    expect(h.sqlite.prepare("SELECT status, assignee_agent_id AS a FROM tasks WHERE title LIKE 'Routine:%'").all())
+      .toEqual([{ status: 'blocked', a: null }])
+    expect(h.sqlite.prepare("SELECT status FROM flights WHERE agent = 'agent-preferred'").all()).toEqual([{ status: 'failed' }])
+  })
+
+  it('RACE: the same envelope-insert pause via the agent\'s SQUAD', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const real = h.db
+    const raced = {
+      ...envFor(h),
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes('INSERT INTO agent_messages')) { armed = false; pause(h, 'squad', 'squad-1') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'execution_paused' })
+    expect(sent(h)).toBe(0)
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE assignee_agent_id IS NOT NULL").get()).toEqual({ n: 0 })
+  })
+
+  // ---- mupot#1814 round 2 ----
+  const raceBefore = (h: SqliteD1Harness, fragment: string, action: () => void): Env => {
+    let armed = true
+    const real = h.db
+    return {
+      ...envFor(h),
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes(fragment)) { armed = false; action() }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+  }
+  // The fleet row keyed by SLUG (registry slug fallback): selected.inboxAgentId is then 'preferred'.
+  const slugKeyFleet = (h: SqliteD1Harness) => h.sqlite.exec(
+    `UPDATE fleet_agents SET agent_id = 'preferred' WHERE agent_id = 'agent-preferred';
+     UPDATE fleet_agents SET agent_id = 'fallback' WHERE agent_id = 'agent-fallback'`)
+  const tasksOf = (h: SqliteD1Harness) => h.sqlite.prepare(
+    "SELECT status, assignee_agent_id AS a FROM tasks WHERE title LIKE 'Routine:%'").all()
+  const releaseAudits = (h: SqliteD1Harness) => (h.sqlite.prepare(
+    "SELECT COUNT(*) AS n FROM mutation_audit_entries WHERE handler = 'routine_dispatch_pause_release'").get() as { n: number }).n
+
+  it('slug-keyed fleet row control: the envelope goes to the SLUG inbox when no pause is active', async () => {
+    harness = makeHarness()
+    slugKeyFleet(harness)
+    expect(await dispatchRoutineRun(envFor(harness), 'run-1', NOW)).toMatchObject({ ok: true, status: 'dispatched' })
+    expect(harness.sqlite.prepare("SELECT to_agent FROM agent_messages WHERE from_agent = 'mupot-routines'").all())
+      .toEqual([{ to_agent: 'preferred' }])
+  })
+
+  for (const scope of ['agent', 'squad'] as const) {
+    it(`RACE r2: slug-keyed fleet row + ${scope} pause before the envelope INSERT -> no envelope (canonical id fenced)`, async () => {
+      harness = makeHarness()
+      const h = harness
+      slugKeyFleet(h)
+      const raced = raceBefore(h, 'INSERT INTO agent_messages', () => pause(h, scope, scope === 'agent' ? 'agent-preferred' : 'squad-1'))
+      expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'execution_paused' })
+      expect(sent(h)).toBe(0)
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    })
+  }
+
+  it('the released orphan is blocked + unassigned with an audit row (envelope-insert path)', async () => {
+    harness = makeHarness()
+    const h = harness
+    await dispatchRoutineRun(raceBefore(h, 'INSERT INTO agent_messages', () => pause(h, 'agent', 'agent-preferred')), 'run-1', NOW)
+    expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    expect(h.sqlite.prepare("SELECT result FROM tasks WHERE title LIKE 'Routine:%'").get()).toMatchObject({ result: expect.stringContaining('execution_paused') })
+    expect(releaseAudits(h)).toBe(1)
+  })
+
+  it('the released orphan is released on the OBSERVING-UPDATE pause path too', async () => {
+    harness = makeHarness()
+    const h = harness
+    const raced = raceBefore(h, "SET status = 'observing'", () => pause(h, 'squad', 'squad-1'))
+    expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ reason: 'execution_paused' })
+    expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    expect(releaseAudits(h)).toBe(1)
+  })
+
+  it('the released orphan is released on the POST-ENVELOPE pause path too', async () => {
+    harness = makeHarness()
+    const h = harness
+    const raced = raceBefore(h, "SET status = 'running'", () => pause(h, 'squad', 'squad-1'))
+    expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ reason: 'execution_paused' })
+    expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    expect(releaseAudits(h)).toBe(1)
+  })
+
+  it('release guard: an agent that moved the task to in_progress during the window keeps it (not blocked, not unassigned, no audit)', async () => {
+    harness = makeHarness()
+    const h = harness
+    const raced = raceBefore(h, 'INSERT INTO agent_messages', () => {
+      pause(h, 'agent', 'agent-preferred')
+      h.sqlite.exec("UPDATE tasks SET status = 'in_progress' WHERE title LIKE 'Routine:%'")
+    })
+    await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(tasksOf(h)).toEqual([{ status: 'in_progress', a: 'agent-preferred' }])
+    expect(releaseAudits(h)).toBe(0)
+  })
+
+  it('release guard: a task reassigned to another agent during the window is left alone', async () => {
+    harness = makeHarness()
+    const h = harness
+    const raced = raceBefore(h, 'INSERT INTO agent_messages', () => {
+      pause(h, 'agent', 'agent-preferred')
+      h.sqlite.exec("UPDATE tasks SET assignee_agent_id = 'agent-fallback' WHERE title LIKE 'Routine:%'")
+    })
+    await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(tasksOf(h)).toEqual([{ status: 'open', a: 'agent-fallback' }])
+    expect(releaseAudits(h)).toBe(0)
+  })
+
+  describe('the released orphan is non-routable (r2 P3-1)', () => {
+    async function orphan(h: SqliteD1Harness) {
+      await dispatchRoutineRun(raceBefore(h, 'INSERT INTO agent_messages', () => pause(h, 'agent', 'agent-preferred')), 'run-1', NOW)
+      // the pause is lifted: only the task's shape may keep it from being re-picked
+      h.sqlite.exec("UPDATE execution_pauses SET resumed_at = '2026-07-19T16:30:00.000Z', resumed_by_member_id = 'op-1'")
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    }
+
+    it('router_tick skips it (a plain open unassigned task IS scanned: control)', async () => {
+      harness = makeHarness()
+      const h = harness
+      await orphan(h)
+      h.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id)
+          VALUES ('plain-1', 'squad-1', 'project-1', 'Plain', 'b', 'done', 'open', NULL);
+        INSERT INTO presence (tenant, member_id, display_name, source, label, agent_id, first_seen_at, last_seen_at)
+          VALUES ('tenant-a', 'seat-f', 'F', 'test', 'seat-f', 'agent-fallback', datetime('now'), datetime('now'))`)
+      const out = await runRouterTick(envFor(h),
+        { ok: true, tenant: 'tenant-a', squadId: 'squad-1', agentId: null, source: 'principal' },
+        { squadId: 'squad-1', dryRun: false }, { memberId: 'op-1' })
+      expect(out.decisions.map(d => d.task_id)).toEqual(['plain-1'])
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    })
+
+    it('the concierge router does not re-assign it', async () => {
+      harness = makeHarness()
+      const h = harness
+      await orphan(h)
+      const env = envFor(h)
+      expect((await registerModule(env, {
+        identity: 'agent-fallback', kind: 'agent_system', adapter: 'cursor', projectId: null, capabilities: [BUILD_CAPABILITY],
+      })).ok).toBe(true)
+      const project: Project = {
+        id: 'project-1', slug: 'project-1', name: 'Project One', description: '', goal: 'Reach a verified outcome',
+        status: 'active', parent_project_id: null, target_date: null, created_at: NOW.toISOString(), updated_at: NOW.toISOString(),
+      }
+      await runProjectConcierge(env, project)
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    })
   })
 })

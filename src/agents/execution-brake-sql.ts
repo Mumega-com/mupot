@@ -115,14 +115,17 @@ export const RELEASE_EPOCH_PREFIX = 'release-epoch:'
  * a STALE attempt must not count (it would re-hold the task for the agent a human just assigned,
  * without that agent ever executing).
  *
- * `startedAtSecondPrecision` (mupot#1812 P3): runtime receipts are stored at SECOND precision
- * (nowSqlUtc) while the epoch is stored at ms. At ms, a failure that lands in the SAME second as (but
- * after) a release would look "stale" (epoch .500 > receipt .000) and be silently dropped. With the flag
- * both sides floor to the second, so stale means "the release is in a LATER second than the recorded
- * start" - the one case where the release is certainly after the real start. The error direction is
- * deliberate: a failure after a release is NEVER dropped; the only cost is a same-second failure that
- * truly preceded the release being counted once. Callers whose start is a ms ISO stamp (the in-worker
- * executor) keep ms precision (no flag), so their same-second staleness still holds.
+ * `startedAtSecondPrecision` (mupot#1812 P3, narrowed by mupot#1814): set it ONLY when `startedExpr` is a
+ * SECOND-granular stamp. The runtime_consumed receipt is stored at second precision (nowSqlUtc) while the
+ * epoch is stored at ms. At ms, a failure that lands in the SAME second as (but after) a release would
+ * look "stale" (epoch .500 > receipt .000) and be silently dropped. With the flag both sides floor to the
+ * second, so stale means "the release is in a LATER second than the recorded start" - the one case where
+ * the release is certainly after the real start. The error direction is deliberate: a failure after a
+ * release is NEVER dropped; the only cost is a same-second failure that truly preceded the release being
+ * counted once. Operands that are ms ISO stamps - the in-worker executor's attempt start AND the
+ * task_dispatch receipt created_at (dispatchedAt = new Date().toISOString()) - must NOT set the flag:
+ * they are already ms-precise, so a same-second release after the dispatch is correctly stale, and the
+ * flag would only make that case count a failure that preceded the release.
  */
 export function releasedSinceSql(taskIdExpr: string, startedExpr: string, startedAtSecondPrecision = false): string {
   const cmp = startedAtSecondPrecision

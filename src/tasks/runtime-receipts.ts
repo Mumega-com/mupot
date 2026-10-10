@@ -1519,7 +1519,9 @@ export async function recordTaskDispatchRuntimeReceipt(
              -- task assigned to itself, lease the envelope and send failed) still counts: the failed
              -- receipt was only accepted because that lease was live (or consumed) at write time.
              -- Same staleness rule, measured from the dispatch (the only start the runtime did not
-             -- author): a human release/reassign after the dispatch was issued makes it stale.
+             -- author): a human release/reassign after the dispatch was issued makes it stale. The
+             -- dispatch created_at is an ISO MS stamp (mcp task_dispatch dispatchedAt), so this operand
+             -- compares at ms precision (no second-precision flag; mupot#1814).
              OR EXISTS (
                SELECT 1 FROM task_dispatch_receipts d
                  JOIN agent_messages e
@@ -1530,7 +1532,7 @@ export async function recordTaskDispatchRuntimeReceipt(
                   AND e.request_id = '${DISPATCH_INBOX_PREFIX}' || r.dispatch_receipt_id
                   AND e.dead_lettered_at IS NULL
                   AND e.delivery_attempts >= 1 AND e.lease_expires_at IS NOT NULL
-                  AND NOT ${releasedSinceSql('r.task_id', 'd.created_at', true)}
+                  AND NOT ${releasedSinceSql('r.task_id', 'd.created_at')}
              )
            )
         ON CONFLICT (task_id) DO UPDATE

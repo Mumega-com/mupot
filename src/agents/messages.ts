@@ -22,7 +22,7 @@ import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
-import { dispatchBrakesClearSql, diagnoseDispatchBrake } from './execution-brake-sql'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedSql, isExecutionPaused } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -203,8 +203,10 @@ interface Opts {
   systemProjectAttribution?: boolean
   /** System sender is exempt, but the active recipient must still have Project-linked membership at INSERT. */
   requireActiveRecipientProjectAccess?: boolean
-  /** Internal atomic fence for a Routine dispatch envelope. */
-  routineRunFence?: { runId: string; projectId: string }
+  /** Internal atomic fence for a Routine dispatch envelope. `agentId` is the CANONICAL agents.id the
+   *  run was assigned to (mupot#1814 r2): the envelope's `toAgent` is the fleet row's agent_id, which can
+   *  be the agent's SLUG, so the execution pause must be evaluated on the canonical id, never on toAgent. */
+  routineRunFence?: { runId: string; projectId: string; agentId: string }
   /** Current durable guest-membership authority must still exist in the message INSERT. */
   guestVisibilityFence?: GuestVisibilityFence
   /**
@@ -477,6 +479,9 @@ export async function sendAgentMessage(
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
+                 -- mupot#1814: the routine envelope is a mupot-mediated start; a pause (agent, or the
+                 -- canonical agent's CURRENT squad) landing after the observing UPDATE must refuse the insert
+                 AND NOT ${executionPausedSql(`?${routineRunParam + 1}`)}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
@@ -491,7 +496,7 @@ export async function sendAgentMessage(
                            AND requested.kind = 'cancellation_requested'
                       )
                  )${returningSql}`,
-      ).bind(...values, routineFence.runId)
+      ).bind(...values, routineFence.runId, routineFence.agentId)
       : env.DB.prepare(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14, ?15
@@ -534,6 +539,9 @@ export async function sendAgentMessage(
       if (brakeFence) {
         const brake = await diagnoseDispatchBrake(env, brakeFence.agentId, brakeFence.taskId)
         if (brake) return { ok: false, reason: brake }
+      }
+      if (routineFence && await isExecutionPaused(env, routineFence.agentId)) {
+        return { ok: false, reason: 'execution_paused' }
       }
       if (
         opts.requireActiveRecipientProjectAccess
