@@ -188,6 +188,7 @@ import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
+import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from '../tasks/pagination'
@@ -6762,6 +6763,7 @@ export const TOOLS: ToolSpec[] = [
   toolTeamBootstrap,
   toolTeamBootstrapRelease,
   ...ARCHIVE_TOOLS,
+  ...INCIDENT_REVERT_TOOLS,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,

@@ -3576,9 +3576,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "agent_seats_cap_insert" },
     ],
   },
+  {
+    file: "0201_task_incident_revert_receipts.sql",
+    sha256: "83333c3785efd93ec3aa0c4d423f48cc42f942b0744355ec7136d1b3c7919dea",
+    statements: [
+      "-- 0201_task_incident_revert_receipts.sql — append-only evidence for the audited admin tool\n-- `task_incident_revert` (mupot#1780 incident recovery, option C).\n--\n-- The task state machine (TRANSITIONS, src/tasks/service.ts) has no edge back to 'open', so no\n-- supported tool can undo an accidental mass assignment. task_incident_revert is the one audited\n-- exception: a per-row compare-and-set that returns a task to open + unassigned. Every revert\n-- writes ONE row here holding the FULL pre-revert task row (every column, as JSON) in the same\n-- D1 batch as the UPDATE, so nothing the tool overwrote is lost and nothing is invented.\n--\n-- Append-only: UPDATE and DELETE are refused by trigger, like execution_receipts (0123).\n-- No FK to tasks/members on purpose: the evidence must outlive a later task/member rebuild or\n-- archive, and a RESTRICT FK would block the members-table rebuilds documented in 0173.\n-- NOT applied by this build; a human applies it (migrate first, then deploy the code).\n\nCREATE TABLE task_incident_revert_receipts (\n  id                          TEXT PRIMARY KEY,\n  tenant                      TEXT NOT NULL CHECK (length(trim(tenant)) > 0),\n  incident_ref                TEXT NOT NULL CHECK (length(trim(incident_ref)) BETWEEN 1 AND 500),\n  reason                      TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2000),\n  task_id                     TEXT NOT NULL,\n  actor_member_id             TEXT NOT NULL CHECK (length(trim(actor_member_id)) > 0),\n  expected_status             TEXT NOT NULL,\n  expected_assignee_agent_id  TEXT,\n  expected_updated_at         TEXT NOT NULL,\n  pre_row_json                TEXT NOT NULL CHECK (json_valid(pre_row_json)),\n  new_updated_at              TEXT NOT NULL,\n  created_at                  TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX idx_task_incident_revert_receipts_task\n  ON task_incident_revert_receipts(tenant, task_id, created_at);",
+      "\nCREATE INDEX idx_task_incident_revert_receipts_incident\n  ON task_incident_revert_receipts(tenant, incident_ref, created_at);",
+      "\n\nCREATE TRIGGER task_incident_revert_receipts_no_update\nBEFORE UPDATE ON task_incident_revert_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'task incident revert receipts are append-only');\nEND;",
+      "\n\nCREATE TRIGGER task_incident_revert_receipts_no_delete\nBEFORE DELETE ON task_incident_revert_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'task incident revert receipts are append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "task_incident_revert_receipts" },
+      { type: "index", name: "idx_task_incident_revert_receipts_task" },
+      { type: "index", name: "idx_task_incident_revert_receipts_incident" },
+      { type: "trigger", name: "task_incident_revert_receipts_no_update" },
+      { type: "trigger", name: "task_incident_revert_receipts_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "537bc861bb46487918b4e5e0039a508d03d0531526a76b6ed28ef866fad5ad4c"
+export const SCHEMA_CHAIN_DIGEST: string = "d7b373380a8b32cc7ffcf13878c09b877d86a7c451e04c2c5aed75735e67df38"
