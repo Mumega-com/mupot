@@ -79,7 +79,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
     'send', 'broadcast', 'squad_message', 'wake_agent', 'task_create', 'task_list', 'task_update', 'task_verdict',
     'task_verdict_reverse', 'task_dispatch', 'task_submit_result', 'remember', 'squad_remember', 'project_remember',
     'presence_register', 'presence_heartbeat', 'presence_deregister', 'check_in', 'mint_agent_token', 'revoke_agent_token',
-    'archive_row', 'unarchive_row', 'flight_dispatch', 'flight_land', 'office.health', 'office.publish_post',
+    'archive_row', 'unarchive_row', 'task_incident_revert', 'flight_dispatch', 'flight_land', 'office.health', 'office.publish_post',
     'secret_env_request', 'supabase_mutate', 'create_agent', 'deactivate_agent', 'routine_create', 'routine_run_now',
     'request_elevation', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
   ]
@@ -88,7 +88,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
   })
 
   const KNOWN_DESTRUCTIVE = [
-    'revoke_agent_token', 'revoke_agent_session', 'archive_row', 'deactivate_agent', 'routine_archive', 'task_verdict',
+    'revoke_agent_token', 'revoke_agent_session', 'archive_row', 'task_incident_revert', 'deactivate_agent', 'routine_archive', 'task_verdict',
     'task_verdict_reverse', 'pot_release', 'revoke_gate_capability', 'task_update', 'update_agent', 'move_agent_squad',
     'squad_member_remove', 'project_squad_remove', 'end_agent_session', 'reveal_credential_claim', 'secret_env_request',
     'addon_disable', 'addon_archive', 'supabase_mutate', 'office.publish_post', 'task_dispatch_lease_reset',
@@ -146,7 +146,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
     'routine_update', 'runner_record', 'secret_env_request', 'set_agent_inbox_consumer',
     'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
-    'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
+    'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
     'update_agent', 'update_squad',
   ]
   const ALL_OPEN_WORLD = [
