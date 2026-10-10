@@ -11,14 +11,22 @@ never placed in argv or in a message.
 
 ## What the tool does and does not do
 
+- Only `blocked` and `in_progress` rows are revertable. Any other `expected_status` (open, review,
+  approved, rejected, done) is refused per row as `status_not_revertable`, before any write.
 - Per row, ONE guarded UPDATE sets `status='open'`, `assignee_agent_id=NULL`, `updated_at=now`, and
-  only when `status`, `assignee_agent_id` (NULL-safe) and `updated_at` all equal the values you pass.
-  Any other row is skipped and reported `drifted` with its actual values. Nothing is forced.
-- It writes no other column. `result`, `completed_at`, `execution_receipt_id` and
-  `execution_claim_expires_at` stay as they are. The full pre-revert row is saved, every column, in
-  `task_incident_revert_receipts` (append-only) in the same D1 batch.
-- It refuses archived tasks, and tasks with a live execution claim (`drifted`, reason
-  `live_execution_claim`).
+  only when `status`, `assignee_agent_id` (NULL-safe), `updated_at` all equal the values you pass AND
+  `assignee_member_id IS NULL` (so "open and unassigned" is true). Any other row is skipped and reported
+  `drifted` with its actual values. Nothing is forced.
+- Also refused as `drifted`, with a reason: a live execution claim (`live_execution_claim`); an
+  `in_progress` task that still holds an `execution_receipt_id` without an expired claim
+  (`runtime_held`); a dispatch that can still be executed or redelivered, the same predicate
+  `archive_row` uses (`in_flight_dispatch`). A `blocked` task keeps the `execution_receipt_id` of its
+  finished run, and is not refused for that alone.
+- It writes no other column. `result`, `completed_at`, `cost_micro_usd`, `gate_owner`,
+  `execution_receipt_id` and `execution_claim_expires_at` stay exactly as they are. The full pre-revert
+  row is saved, every column, in `task_incident_revert_receipts` (append-only) in the same D1 batch.
+- It refuses archived tasks (`archived`). A row that throws is reported as `error` and the remaining rows
+  still run, so the response always carries one outcome per row.
 - It does NOT neutralise queued wakes. See "Stale wakes" below. Pausing mumcp first is mandatory.
 
 ## Preconditions
@@ -33,7 +41,8 @@ never placed in argv or in a message.
 
 Use the execution-pause control from the parallel PR for agent mumcp
 (`3070ddc1-10c8-4ac7-881d-c8a3760b4024`). Confirm it took effect: `execution_meter` for
-`mumega:3070ddc1…` stops advancing (it was count 89, window start 2026-10-09T03:23:48Z), and no
+mumcp stops advancing. The key is per day (`mumega:3070ddc1…:<YYYY-MM-DD>`): read the CURRENT day's key,
+not 2026-10-09's (that one was count 89, window start 2026-10-09T03:23:48Z), and no
 task row changes for one alarm interval (`ALARM_INTERVAL_MS` = 15 minutes, `src/agents/agent-do.ts`).
 Do not continue until both hold.
 
@@ -53,6 +62,19 @@ since the bookmark, so it is a separate decision for Hadi.
 
 Before the call, confirm the 23 rows below still match (read-only `task_get` or `task_list`). The
 tool re-checks inside the write, so this is a courtesy to see drift before it happens.
+
+### 3b. Read the per-row residue before running
+
+The tool leaves `result`, `completed_at`, `cost_micro_usd` and `gate_owner` untouched, so a reverted `open`
+task can still carry them. Read these for each of the 23 rows now and record them in the #1780 thread:
+
+- `cost_micro_usd`: set by the failed executions (`finishTask`); the real values are not in the incident
+  comment.
+- `gate_owner`: `finishTask` writes `gate_owner = COALESCE(gate_owner, fallback)` (`src/agents/execute.ts`,
+  around lines 589-591), so a row may have gained a gate owner it did not have before the incident.
+- `result` and `completed_at`.
+
+The tool does NOT clear any of them; a later, separate decision (by Hadi) covers cleanup.
 
 ### 4. Call the tool
 
@@ -91,20 +113,23 @@ tool re-checks inside the write, so this is a courtesy to see drift before it ha
 ```
 
 That is 23 rows: 22 blocked and assigned to mumcp, plus `18f4d03e` (in_progress, unassigned).
-`5d24a00a-66fa-4d4f-b19c-fc9645a55d87` is already `open` and unassigned, so it is deliberately
-excluded. The tool rejects a row that is already open and unassigned.
-
 The comment's table lists 24 task ids. `5d24a00a-66fa-4d4f-b19c-fc9645a55d87` is already `open` and
-unassigned there, so it is deliberately excluded (the tool also rejects a row that is already open and
-unassigned), leaving the 23 rows above. The router's unrouted row `c2733636-0085-47da-90ff-540c668e2f2f`
-was never assigned and is not in the table. The comment's prose says `61b36118` and `565a917f` were
-already `blocked` by mumcp before Kasra's 03:27Z unassign, so their live `updated_at` may differ from
-the table's: the compare-and-set reports them `drifted` instead of reverting them if it does. Re-check
-all 23 at step 3.
+unassigned there, so it is deliberately excluded (the tool would refuse it as `status_not_revertable`).
+The router's unrouted row `c2733636-0085-47da-90ff-540c668e2f2f` was never assigned and is not in the table.
+Re-check all 23 at step 3.
+
+`18f4d03e` was claimed by the executor (03:24:39Z), so it probably carries an `execution_receipt_id`.
+The tool reverts it only if its `execution_claim_expires_at` has passed. If the claim is NULL it is
+refused as `runtime_held`: a human decides (for example, confirm no runtime holds it, then act through
+a supported tool). The tool never overrides this.
+
+If the call returns HTTP 500 or times out, do NOT re-send blindly. First query the receipts by
+`incident_ref` (the SQL in step 5) to see which rows landed, then retry only if needed: a retry is safe
+because of the compare-and-set (rows already reverted come back `drifted`, rows not yet reverted proceed).
 
 ### 5. Verify
 
-- The response: `reverted: 23, drifted: 0, not_found: 0, archived: 0`, and 23 `receipt_ids`. Anything
+- The response: `reverted: 23, drifted: 0, status_not_revertable: 0, not_found: 0, archived: 0, error: 0`, and 23 `receipt_ids`. Anything
   else: stop, do not retry blindly. Each `drifted` row carries its actual values; a human decides.
 - Rows are `open` and unassigned (`task_list` for squad-core, or `task_get` per row).
 - 23 receipts exist for the incident (read-only, from a D1 console or a debug query):
@@ -126,9 +151,10 @@ them, re-pause immediately and see "Stale wakes".
 ## Rollback
 
 Each receipt holds the full pre-revert row as JSON in two levels (`part1`..`part3`, each an object of
-the task's columns; 25 columns in total, nested because D1 limits SQL functions to 32 arguments). To
-restore one row by hand, apply the saved values back. The D1 time-travel bookmark from step 2 is the
-whole-database rollback, with the cost described in step 2.
+the task's columns; 25 columns in total, nested because D1 limits SQL functions to 32 arguments).
+Restoring a row from its receipt by hand is a direct database write and needs Hadi's explicit go; do not
+do it on a runbook's authority. The D1 time-travel bookmark from step 2 is the whole-database rollback,
+with the cost described in step 2, and a restore also needs his explicit go.
 
 ## Stale wakes: what the tool does NOT fence
 
@@ -167,6 +193,7 @@ current status, current assignee, and `updated_at`. It does NOT record, for any 
   (`assigned 24 to mumcp (3070ddc1-10c8-4ac7-881d-c8a3760b4024)`), not from the table. Verify it
   against a live row at step 3.
 - the current `result` text of each row (the comment says only "a failed-completion result text");
+- `cost_micro_usd` and `gate_owner` of each row (see step 3b: read them before running);
 - `completed_at` (the blocked path of `finishTask` sets it, so it is probably non-NULL on the 22
   blocked rows; not confirmed);
 - `execution_receipt_id` and `execution_claim_expires_at` (the in_progress row `18f4d03e` may carry a

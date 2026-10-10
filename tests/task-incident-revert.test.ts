@@ -4,9 +4,9 @@
 // through invokeTool (scripts/check-mcp-tool-seam.mjs). Each guard here was MUTATED in the source to
 // prove the test that names it fails without it (ledger in the PR description).
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
-import { TASK_ROW_COLUMNS, INCIDENT_REVERT_MAX_ROWS } from '../src/tasks/incident-revert'
+import { TASK_ROW_COLUMNS, INCIDENT_REVERT_MAX_ROWS, SNAPSHOT_PART_SIZE, SNAPSHOT_PART_KEYS, SNAPSHOT_JSON_SQL } from '../src/tasks/incident-revert'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -77,12 +77,11 @@ describe('task_incident_revert', () => {
     expect(receipts()).toHaveLength(0)
   })
 
-  it('validates input: cap, duplicates, no-op open row, done, missing assignee field, unknown key, empty reason', async () => {
+  it('validates input: cap, duplicates, unknown status, missing assignee field, unknown key, empty reason', async () => {
     const many = Array.from({ length: INCIDENT_REVERT_MAX_ROWS + 1 }, (_, i) => snap(`t-${i}`))
     expect(await revert(many)).toMatchObject({ ok: false, status: 400 })
     expect(await revert([snap('t-blocked'), snap('t-blocked')])).toMatchObject({ ok: false, status: 400 })
-    expect(await revert([snap('t-open', 'open', null)])).toMatchObject({ ok: false, status: 400 })
-    expect(await revert([snap('t-blocked', 'done')])).toMatchObject({ ok: false, status: 400 })
+    expect(await revert([snap('t-blocked', 'not_a_status')])).toMatchObject({ ok: false, status: 400 })
     expect(await revert([{ task_id: 't-blocked', expected_status: 'blocked', expected_updated_at: T0 } as unknown as Snap])).toMatchObject({ ok: false, status: 400 })
     expect(await revert([{ ...snap('t-blocked'), extra: 1 } as unknown as Snap])).toMatchObject({ ok: false, status: 400 })
     expect(await call(auth(), { reason: '  ', incident_ref: 'x', rows: [snap('t-blocked')] })).toMatchObject({ ok: false, status: 400 })
@@ -125,6 +124,108 @@ describe('task_incident_revert', () => {
   it('TASK_ROW_COLUMNS covers every column of the real tasks table (a new column fails here until the snapshot learns it)', () => {
     const live = (harness.sqlite.prepare('PRAGMA table_info(tasks)').all() as { name: string }[]).map((c) => c.name)
     expect([...TASK_ROW_COLUMNS].sort()).toEqual(live.sort())
+  })
+
+  // ── narrowed statuses ───────────────────────────────────────────────────────
+  it.each(['open', 'review', 'approved', 'rejected', 'done'])(
+    'expected_status %s is refused per row as status_not_revertable: no write, no receipt, the CAS-matching row is untouched',
+    async (status) => {
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, status, done_when, assignee_agent_id, updated_at) VALUES (?, 'squad-1', 't', ?, 'n/a', ?, ?)`)
+        .run(`s-${status}`, status, MUMCP, T0)
+      const out = result(await revert([snap(`s-${status}`, status), snap('t-blocked')]))
+      expect(out.rows[0]).toMatchObject({ outcome: 'status_not_revertable', status })
+      expect(out.rows[1]).toMatchObject({ outcome: 'reverted' }) // the other row is unaffected
+      expect(row(`s-${status}`)).toMatchObject({ status, assignee_agent_id: MUMCP, updated_at: T0 })
+      expect(receipts(`s-${status}`)).toHaveLength(0)
+    },
+  )
+
+  // ── runtime-held / in-flight / member-owned ─────────────────────────────────
+  it('refuses an in_progress task holding an execution_receipt_id with NO claim (runtime_held); an EXPIRED claim does not hold it', async () => {
+    harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, status, done_when, assignee_agent_id, updated_at, execution_receipt_id, execution_claim_expires_at)
+      VALUES ('rt-held', 'squad-1', 't', 'in_progress', 'n/a', ?, ?, 'exec-live', NULL)`).run(MUMCP, T0)
+    const out = result(await revert([snap('rt-held', 'in_progress', MUMCP)]))
+    expect(out.rows[0]).toMatchObject({ outcome: 'drifted', reason: 'runtime_held' })
+    expect(row('rt-held')).toMatchObject({ status: 'in_progress', assignee_agent_id: MUMCP })
+    expect(receipts()).toHaveLength(0)
+    harness.sqlite.prepare('UPDATE tasks SET execution_claim_expires_at = ? WHERE id = ?').run(Date.now() - 1000, 'rt-held')
+    expect(result(await revert([snap('rt-held', 'in_progress', MUMCP)])).reverted).toBe(1)
+  })
+
+  it('refuses a task whose dispatch is still in flight (the archive_row predicate), blocked or not', async () => {
+    harness.sqlite.exec(`INSERT INTO task_dispatch_receipts (id, tenant, task_id, squad_id, agent_id, actor_kind, actor_id, created_at, consumed_at)
+      VALUES ('disp-1', '${TENANT}', 't-blocked', 'squad-1', '${MUMCP}', 'member', '${OPERATOR}', '${T0}', NULL)`)
+    const out = result(await revert([snap('t-blocked')]))
+    expect(out.rows[0]).toMatchObject({ outcome: 'drifted', reason: 'in_flight_dispatch' })
+    expect(row('t-blocked')).toMatchObject({ status: 'blocked', assignee_agent_id: MUMCP })
+    expect(receipts()).toHaveLength(0)
+  })
+
+  it('a human assignee_member_id is part of the compare-and-set: the task is not "unassigned", so it is skipped', async () => {
+    harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, status, done_when, assignee_agent_id, assignee_member_id, updated_at)
+      VALUES ('mem-owned', 'squad-1', 't', 'blocked', 'n/a', NULL, ?, ?)`).run(OPERATOR, T0)
+    const out = result(await revert([snap('mem-owned', 'blocked', null)]))
+    expect(out.rows[0]).toMatchObject({ outcome: 'drifted', reason: 'mismatch', actual: { assignee_member_id: OPERATOR } })
+    expect(row('mem-owned').assignee_member_id).toBe(OPERATOR)
+    expect(receipts()).toHaveLength(0)
+  })
+
+  // ── per-row isolation ───────────────────────────────────────────────────────
+  it('a row that throws is reported as error and the loop continues; every row has an outcome', async () => {
+    let calls = 0
+    const realBatch = harness.db.batch.bind(harness.db)
+    const spy = {
+      ...harness.db,
+      prepare: harness.db.prepare.bind(harness.db),
+      batch: async (stmts: D1PreparedStatement[]) => {
+        calls += 1
+        if (calls === 1) throw new Error('D1_ERROR: simulated failure with secret-ish detail')
+        return realBatch(stmts)
+      },
+    } as unknown as D1Database
+    const o = await invokeTool(auth(), { ...env, DB: spy } as Env, 'task_incident_revert',
+      { reason: 'r', incident_ref: 'i', rows: [snap('t-blocked'), snap('t-orphan', 'in_progress', null)] }, ORIGIN)
+    const out = result(o)
+    expect(out.rows).toHaveLength(2)
+    expect(out.rows[0]).toEqual({ task_id: 't-blocked', outcome: 'error', code: 'row_failed' }) // message not echoed
+    expect(out.rows[1]).toMatchObject({ outcome: 'reverted' })
+    expect(row('t-blocked').status).toBe('blocked')
+    expect(row('t-orphan').status).toBe('open')
+  })
+
+  // ── same-millisecond updated_at ─────────────────────────────────────────────
+  it('updated_at always MOVES, even when the clock reads the exact expected_updated_at millisecond', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(T0))
+      const out = result(await revert([snap('t-blocked')]))
+      expect(out.rows[0]).toMatchObject({ outcome: 'reverted' })
+      expect(row('t-blocked').updated_at).toBe(new Date(Date.parse(T0) + 1).toISOString())
+      expect(row('t-blocked').updated_at).not.toBe(T0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // ── D1 32-argument function limit ───────────────────────────────────────────
+  it('no json_object call in the snapshot SQL exceeds D1\'s 32-argument function limit', () => {
+    expect(SNAPSHOT_PART_SIZE * 2).toBeLessThanOrEqual(32)
+    expect(SNAPSHOT_PART_KEYS.length * 2).toBeLessThanOrEqual(32)
+    const sql = SNAPSHOT_JSON_SQL
+    const widest: number[] = []
+    for (let i = sql.indexOf('json_object('); i !== -1; i = sql.indexOf('json_object(', i + 1)) {
+      let depth = 0
+      let args = 1
+      for (let j = i + 'json_object'.length; j < sql.length; j++) {
+        const ch = sql[j]
+        if (ch === '(') depth += 1
+        else if (ch === ')') { depth -= 1; if (depth === 0) break }
+        else if (ch === ',' && depth === 1) args += 1
+      }
+      widest.push(args)
+    }
+    expect(widest.length).toBeGreaterThan(1)
+    expect(Math.max(...widest)).toBeLessThanOrEqual(32)
   })
 
   // ── compare-and-set ─────────────────────────────────────────────────────────

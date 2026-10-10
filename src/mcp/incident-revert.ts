@@ -7,9 +7,9 @@
 
 import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
+import { ALL_TASK_STATUSES, isTaskStatus } from '../tasks/service'
 import {
   INCIDENT_REVERT_MAX_ROWS,
-  REVERTABLE_STATUSES,
   revertTasksForIncident,
   type RevertRowInput,
 } from '../tasks/incident-revert'
@@ -42,8 +42,9 @@ function parseRows(raw: unknown): { ok: true; rows: RevertRowInput[] } | { ok: f
     const status = str(rec.expected_status)
     const updatedAt = str(rec.expected_updated_at)
     if (!taskId) return { ok: false, detail: `rows[${i}].task_id required` }
-    if (!status || !(REVERTABLE_STATUSES as readonly string[]).includes(status)) {
-      return { ok: false, detail: `rows[${i}].expected_status must be one of ${REVERTABLE_STATUSES.join(', ')}` }
+    // Any KNOWN status parses; the non-revertable ones are refused per row (status_not_revertable).
+    if (!status || !isTaskStatus(status)) {
+      return { ok: false, detail: `rows[${i}].expected_status must be one of ${ALL_TASK_STATUSES.join(', ')}` }
     }
     if (!updatedAt) return { ok: false, detail: `rows[${i}].expected_updated_at required` }
     if (!('expected_assignee_agent_id' in rec)) {
@@ -52,9 +53,6 @@ function parseRows(raw: unknown): { ok: true; rows: RevertRowInput[] } | { ok: f
     const assignee = rec.expected_assignee_agent_id
     if (assignee !== null && !str(assignee)) {
       return { ok: false, detail: `rows[${i}].expected_assignee_agent_id must be a non-empty string or null` }
-    }
-    if (status === 'open' && assignee === null) {
-      return { ok: false, detail: `rows[${i}] is already open and unassigned: nothing to revert` }
     }
     if (seen.has(taskId)) return { ok: false, detail: `rows[${i}].task_id is duplicated` }
     seen.add(taskId)
@@ -73,14 +71,20 @@ export const toolTaskIncidentRevert: ToolSpec = {
   scope: 'org',
   min: 'admin',
   args: '{ reason: string (1-2000), incident_ref: string (1-500), rows: [{ task_id, expected_status, expected_assignee_agent_id: string|null, expected_updated_at }] (1-50) }' +
-    ' -- org-admin only, operator principal only (no agent-bound caller). Incident recovery: the audited' +
-    ' exception to the task state machine (which has no edge back to open). Per row, ONE guarded UPDATE' +
-    ' sets status=open, assignee_agent_id=NULL, updated_at=now ONLY when status, assignee and updated_at' +
-    ' all equal the expected values; a row that does not match is SKIPPED and reported drifted with its' +
-    ' actual values, never forced. result, completed_at and every other column are left untouched; the' +
-    ' FULL pre-revert row is saved in task_incident_revert_receipts in the same batch. Refuses archived' +
-    ' tasks and tasks with a live execution claim. Outcomes: reverted | drifted | not_found | archived.' +
-    ' This does NOT fence queued agent.wake events: pause the executing agent first.',
+    ' -- FOR AUDITED INCIDENT RECOVERY ONLY. org-admin only, operator principal only (no agent-bound caller).' +
+    ' The audited exception to the task state machine (which has no edge back to open). Only blocked and' +
+    ' in_progress rows are revertable; any other expected_status is refused per row as status_not_revertable.' +
+    ' Per row, ONE guarded UPDATE sets status=open, assignee_agent_id=NULL, updated_at=now ONLY when status,' +
+    ' assignee, updated_at all equal the expected values AND assignee_member_id IS NULL; a row that does not' +
+    ' match is SKIPPED and reported drifted with its actual values, never forced. Also refused (drifted, with a' +
+    ' reason): a live execution claim (live_execution_claim); an in_progress task that still holds an' +
+    ' execution_receipt_id without an expired claim (runtime_held); a dispatch that can still be executed or' +
+    ' redelivered, the archive_row predicate (in_flight_dispatch). A blocked task keeps the execution_receipt_id of' +
+    ' its finished run and is NOT refused for that alone. Archived tasks are refused (archived). result,' +
+    ' completed_at, cost_micro_usd, gate_owner and every other column are left untouched; the FULL pre-revert' +
+    ' row is saved in task_incident_revert_receipts in the same batch. A row that throws is reported as outcome' +
+    ' error and the rest continue. Outcomes: reverted | drifted | status_not_revertable | not_found | archived |' +
+    ' error. This does NOT fence queued agent.wake events: pause the executing agent first.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -94,7 +98,7 @@ export const toolTaskIncidentRevert: ToolSpec = {
           type: 'object',
           properties: {
             task_id: { type: 'string' },
-            expected_status: { type: 'string', enum: [...REVERTABLE_STATUSES] },
+            expected_status: { type: 'string', enum: [...ALL_TASK_STATUSES] },
             expected_assignee_agent_id: { type: ['string', 'null'] },
             expected_updated_at: { type: 'string' },
           },
@@ -132,6 +136,8 @@ export const toolTaskIncidentRevert: ToolSpec = {
       drifted: count('drifted'),
       not_found: count('not_found'),
       archived: count('archived'),
+      status_not_revertable: count('status_not_revertable'),
+      error: count('error'),
       receipt_ids: outcomes.flatMap((r) => (r.outcome === 'reverted' ? [r.receipt_id] : [])),
       rows: outcomes,
     })
