@@ -94,6 +94,7 @@ test('runSeatStream: a 401 logs exactly one line, calls openOnce exactly once, n
     openOnce: async () => { opens++; throw Object.assign(new Error('HTTP 401'), { status: 401 }) },
     log: (l) => lines.push(l),
     sleep: async () => { sleeps++ },
+    shouldContinue: () => opens < 5, // a regressed policy fails fast instead of looping forever
   })
   assert.deepEqual(out, { stopped: true, status: 401 })
   assert.equal(opens, 1)
