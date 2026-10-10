@@ -573,18 +573,37 @@ function humanResponse(run: DispatchRunRow): { question: string; answer: string 
 
 /**
  * mupot#1814: a pause refused this attempt AFTER ensureTask created its control task (open, assigned to the
- * paused agent). Unassign it so a resumed agent cannot self-dispatch a task whose run was settled paused.
- * Unassign, not close: there is no cancelled status, `done` would claim an outcome that never happened, and
- * `blocked` stays actionable and receipt-eligible. Only an untouched OPEN task still held by this agent is
- * released (an in_progress task means a runtime already took custody - never rip that away). The retry
- * mints a new task (id keyed on run:attempt), so nothing reuses this one.
+ * paused agent). Move it to `blocked` AND unassign it, with a clear result, so it is inert for everyone:
+ *  - a resumed agent cannot self-dispatch it (unassigned);
+ *  - the concierge `routeUnassignedWork` and `router_tick` scan only `status = 'open' AND assignee IS NULL`,
+ *    so a blocked task is never re-routed to some other agent (open+unassigned WAS re-routable, r2 P3-1);
+ *  - blocked stays visible and actionable for a human (same shape escalateRefusedTask leaves).
+ * Not `done` (a false outcome) and there is no cancelled status. Only an untouched OPEN task still held by
+ * this agent is touched; an in_progress task means a runtime already took custody - never rip that away.
+ * The retry mints a new task (id keyed on run:attempt). An audit row is written only when the update landed.
  */
 async function releasePausedControlTask(env: Env, taskId: string, agentId: string, nowIso: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE tasks SET assignee_agent_id = NULL, updated_at = ?
-      WHERE id = ? AND assignee_agent_id = ? AND status = 'open'
-        AND ${TASK_NOT_ARCHIVED_SQL()}`,
-  ).bind(nowIso, taskId, agentId).run()
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE tasks SET status = 'blocked', assignee_agent_id = NULL, result = ?, updated_at = ?
+        WHERE id = ? AND assignee_agent_id = ? AND status = 'open'
+          AND ${TASK_NOT_ARCHIVED_SQL()}`,
+    ).bind('execution_paused: routine dispatch refused by an execution pause; task released', nowIso, taskId, agentId),
+    env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (
+         id, tenant, principal_kind, principal_id, member_id, agent_id,
+         credential_id, origin, handler, operation, target_kind, target_id,
+         task_id, request_id, idempotency_key, evidence_json, recorded_at
+       )
+       SELECT ?1, ?2, 'system', 'execution_brake', NULL, ?3,
+              NULL, 'worker_callback', 'routine_dispatch_pause_release', 'release_control_task', 'task', ?4,
+              ?4, ?5, ?5, ?6, ?7
+        WHERE changes() = 1`,
+    ).bind(
+      crypto.randomUUID(), env.TENANT_SLUG, agentId, taskId, `routine-pause-release:${taskId}`,
+      JSON.stringify({ reason: EXECUTION_PAUSED_ERROR, from_status: 'open', to_status: 'blocked' }), nowIso,
+    ),
+  ])
 }
 
 export async function dispatchRoutineRun(
@@ -725,7 +744,7 @@ export async function dispatchRoutineRun(
     reason: 'routine target is a live, canonically welded agent selected from the responsible squad',
   }, {
     systemProjectAttribution: true,
-    routineRunFence: { runId: run.id, projectId: run.project_id },
+    routineRunFence: { runId: run.id, projectId: run.project_id, agentId: selected.agentId },
   })
   if (!delivery.ok) {
     if (delivery.reason === 'dispatch_fenced') {
