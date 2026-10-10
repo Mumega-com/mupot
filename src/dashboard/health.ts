@@ -386,7 +386,7 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       `SELECT id, squad_id, title, status, result, updated_at
          FROM tasks
         WHERE status IN ('blocked', 'rejected')
-          AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1')}
+          AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
         ORDER BY updated_at DESC
         LIMIT 5`,
       [tenant],

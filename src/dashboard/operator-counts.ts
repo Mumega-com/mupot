@@ -144,7 +144,7 @@ export async function loadTaskStatusCounts(env: Env): Promise<Map<string, number
   // mupot#1821: released routine control orphans (pause-race leftovers) are inert, not failures.
   const rs = await env.DB.prepare(
     `SELECT status, COUNT(*) AS count FROM tasks
-      WHERE ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1')}
+      WHERE ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
       GROUP BY status`,
   ).bind(env.TENANT_SLUG).all<TaskStatusRow>()
   const map = new Map<string, number>()

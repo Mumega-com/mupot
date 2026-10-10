@@ -501,7 +501,7 @@ export async function loadProjectSituation(
             AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
             -- mupot#1821: released routine control orphans (pause-race leftovers) are inert, not blockers
-            AND ${notReleasedControlOrphanSql('t.id', 't.result', '?7')}
+            AND ${notReleasedControlOrphanSql('t.id', 't.result', '?7', 't.status')}
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
        review_rows AS (

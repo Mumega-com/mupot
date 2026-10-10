@@ -22,7 +22,7 @@ import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
-import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedSql } from './execution-brake-sql'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedAtSql, executionPausedSql } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -251,30 +251,28 @@ async function routineDispatchAllowed(
 }
 
 /**
- * mupot#1821: was a routine-fenced INSERT that wrote 0 rows refused by the execution pause? Decided by ELIMINATION
- * from the refusal itself, so a pause the operator lifted a moment after the refusing write still counts as the
- * pause that refused it (re-reading only "is a pause active now" reported such a refusal as inbox_full).
- * The routine INSERT has exactly two guards that can lift: the unread cap and the pause (the run/flight fence is
- * monotone and was re-checked before this point). So: a pause active now, OR the cap is NOT reached now, means the
- * pause is what refused it. Only a still-full inbox with no pause is a real inbox_full.
- * One statement (the same single read the unconditional re-check used), no new write.
+ * mupot#1821: was a routine-fenced INSERT that wrote 0 rows refused by the execution pause? Decided by TIME: a pause
+ * that covered the agent at `at` (the timestamp bound into the refusing INSERT) counts even if it has been lifted
+ * since. A pause active now always counts (unchanged). The unread cap is NOT inferred from its current level: when
+ * a lifted pause and a still-full inbox are both true, the label stays what it always was (inbox_full).
+ * One read, no write.
  */
 async function routineRefusalWasPause(
   env: Env,
   tenant: string,
   toAgent: string,
   fenceAgentId: string,
+  at: string,
   maxUnread: number,
-  opts: { otherLiftableGuards: boolean },
 ): Promise<boolean> {
   const row = await env.DB.prepare(
-    `SELECT ${executionPausedSql('?1')} AS paused,
+    `SELECT ${executionPausedSql('?1')} AS paused_now,
+            ${executionPausedAtSql('?1', '?4')} AS paused_at_write,
             (SELECT COUNT(*) FROM agent_messages WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) AS unread`,
-  ).bind(fenceAgentId, tenant, toAgent).first<{ paused: number; unread: number }>()
+  ).bind(fenceAgentId, tenant, toAgent, at).first<{ paused_now: number; paused_at_write: number; unread: number }>()
   if (!row) return false
-  if (Number(row.paused) === 1) return true
-  if (opts.otherLiftableGuards) return false
-  return Number(row.unread) < maxUnread
+  if (Number(row.paused_now) === 1) return true
+  return Number(row.paused_at_write) === 1 && Number(row.unread) < maxUnread
 }
 
 async function receiverNotStopped(env: Env, agentId: string): Promise<boolean> {
@@ -569,10 +567,7 @@ export async function sendAgentMessage(
       }
       if (
         routineFence
-        && await routineRefusalWasPause(env, tenant, input.toAgent, routineFence.agentId, maxUnread, {
-          // the guest/project-access guards can lift too; when they are in play they answer for themselves below
-          otherLiftableGuards: opts.requireActiveRecipientProjectAccess === true || guestVisibilityFence !== undefined,
-        })
+        && await routineRefusalWasPause(env, tenant, input.toAgent, routineFence.agentId, createdAt, maxUnread)
       ) {
         return { ok: false, reason: 'execution_paused' }
       }

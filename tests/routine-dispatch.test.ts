@@ -15,6 +15,7 @@ import type { RoutinePrincipal } from '../src/routines/access'
 import { MAX_SCHEDULER_DB_STATEMENTS } from '../src/routines/scheduler'
 import { loadProjectSituation } from '../src/projects/situation'
 import { loadOpsHealth } from '../src/dashboard/health'
+import { loadListMetrics, type ProjectAccess } from '../src/dashboard/projects'
 import { loadTaskStatusCounts } from '../src/dashboard/operator-counts'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
@@ -1005,7 +1006,8 @@ describe('routine dispatch respects execution_pauses', () => {
       let lifted = false
       const lift = () => {
         lifted = true
-        h.sqlite.prepare("UPDATE execution_pauses SET resumed_at = '2026-07-19T16:00:01.000Z', resumed_by_member_id = 'op-1' WHERE resumed_at IS NULL").run()
+        h.sqlite.prepare('UPDATE execution_pauses SET resumed_at = ?, resumed_by_member_id = ? WHERE resumed_at IS NULL')
+          .run(new Date().toISOString(), 'op-1')
       }
       return {
         ...envFor(h),
@@ -1092,6 +1094,127 @@ describe('routine dispatch respects execution_pauses', () => {
     })
   })
 
+  // mupot#1821 round 2: a refusal is attributed to the pause by TIME (what held at the refusing write), never by
+  // inferring from the state afterwards. The unread cap, an archive and a flight state can all move back.
+  describe('mupot#1821 refusal attributed by time, not by elimination', () => {
+    const fullInbox = (h: SqliteD1Harness, rows: number) => h.sqlite.exec(`
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${rows})
+      INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, created_at)
+        SELECT 'seed-' || i, 'tenant-a', 'agent-preferred', 'someone', 'member-fallback', 'note', 'x', '2026-07-19T15:00:00.000Z' FROM n`)
+    const drainOne = (h: SqliteD1Harness) => h.sqlite.exec(
+      "UPDATE agent_messages SET read_at = '2026-07-19T16:00:02.000Z' WHERE id = 'seed-1'")
+    const audits = releaseAudits
+    // arms at the first prepare containing `armAt` (running onArm), then runs onRead on the first SELECT prepared after
+    function windowRace(h: SqliteD1Harness, armAt: string, onArm: () => void, onRead: () => void): Env {
+      const real = h.db
+      let armed = false
+      let done = false
+      return {
+        ...envFor(h),
+        DB: {
+          prepare(sql: string) {
+            if (!armed && sql.includes(armAt)) { armed = true; onArm() }
+            else if (armed && !done && /^\s*SELECT/i.test(sql)) { done = true; onRead() }
+            return real.prepare(sql)
+          },
+          batch: real.batch.bind(real),
+        } as unknown as D1Database,
+      } as Env
+    }
+    const routineSend = (env: Env, maxUnread?: number) => sendAgentMessage(env, {
+      fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
+      requestId: 'routine-run:run-1', projectId: 'project-1',
+    }, { system: true, reason: 'test' }, {
+      systemProjectAttribution: true, ...(maxUnread === undefined ? {} : { maxUnread }),
+      routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' },
+    })
+    const observingRun = (h: SqliteD1Harness) => h.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, cost_metered, created_at, project_id)
+        VALUES ('cf-1', 'tenant-a', 'agent-preferred', 'g', 'running', 100, '{}', 1, 1, 'project-1');
+      UPDATE routine_runs SET status = 'observing', flight_id = 'cf-1' WHERE id = 'run-1'`)
+
+    it('drain race at the send: receiver at cap, NO pause ever, one read before the diagnosis -> inbox_full', async () => {
+      harness = makeHarness()
+      const h = harness
+      observingRun(h)
+      fullInbox(h, 1)
+      const result = await routineSend(windowRace(h, 'INSERT INTO agent_messages', () => undefined, () => drainOne(h)), 1)
+      expect(result).toMatchObject({ ok: false, reason: 'inbox_full' })
+    })
+
+    it('drain race through dispatch (1000 unread): reported inbox_full, task NOT released, no audit, no stamp', async () => {
+      harness = makeHarness()
+      const h = harness
+      fullInbox(h, 1000)
+      const result = await dispatchRoutineRun(windowRace(h, 'INSERT INTO agent_messages', () => undefined, () => drainOne(h)), 'run-1', NOW)
+      expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'inbox_full' })
+      expect(audits(h)).toBe(0)
+      expect(tasksOf(h)).toEqual([{ status: 'open', a: 'agent-preferred' }])
+    })
+
+    it('a pause that ended BEFORE the write does not turn a drained-cap refusal into a pause', async () => {
+      harness = makeHarness()
+      const h = harness
+      pause(h, 'agent', 'agent-preferred')
+      h.sqlite.exec("UPDATE execution_pauses SET resumed_at = '2026-07-19T16:00:01.000Z', resumed_by_member_id = 'op-1'")
+      observingRun(h)
+      fullInbox(h, 1)
+      const result = await routineSend(windowRace(h, 'INSERT INTO agent_messages', () => undefined, () => drainOne(h)), 1)
+      expect(result).toMatchObject({ ok: false, reason: 'inbox_full' })
+    })
+
+    it('a pause that began only AFTER the write does not turn a drained-cap refusal into a pause', async () => {
+      harness = makeHarness()
+      const h = harness
+      h.sqlite.exec(`INSERT INTO members (id, tenant, display_name, status) VALUES ('op-1', 'tenant-a', 'Op', 'active') ON CONFLICT DO NOTHING;
+        INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at, resumed_at, resumed_by_member_id)
+        VALUES ('p-future', 'tenant-a', 'agent', 'agent-preferred', 'r', 'op-1', '2999-01-01T00:00:00.000Z', '2999-01-02T00:00:00.000Z', 'op-1')`)
+      observingRun(h)
+      fullInbox(h, 1)
+      const result = await routineSend(windowRace(h, 'INSERT INTO agent_messages', () => undefined, () => drainOne(h)), 1)
+      expect(result).toMatchObject({ ok: false, reason: 'inbox_full' })
+    })
+
+    it('pause AND full inbox both true, pause lifts, inbox stays full: still inbox_full, no false audit (pinned, unchanged)', async () => {
+      harness = makeHarness()
+      const h = harness
+      fullInbox(h, 1000)
+      const result = await dispatchRoutineRun(
+        windowRace(h, 'INSERT INTO agent_messages', () => pause(h, 'agent', 'agent-preferred'), () =>
+          h.sqlite.prepare('UPDATE execution_pauses SET resumed_at = ?, resumed_by_member_id = ? WHERE resumed_at IS NULL').run(new Date().toISOString(), 'op-1')),
+        'run-1', NOW)
+      expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'inbox_full' })
+      expect(audits(h)).toBe(0)
+      expect(tasksOf(h)).toEqual([{ status: 'open', a: 'agent-preferred' }])
+    })
+
+    it('a pause that lands between the refusal-time stamp and the write (active now, paused_at later) still releases', async () => {
+      harness = makeHarness()
+      const h = harness
+      const late = () => h.sqlite.exec(`INSERT INTO members (id, tenant, display_name, status) VALUES ('op-1', 'tenant-a', 'Op', 'active') ON CONFLICT DO NOTHING;
+        INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at)
+        VALUES ('p-late', 'tenant-a', 'agent', 'agent-preferred', 'r', 'op-1', '2999-01-01T00:00:00.000Z')`)
+      const result = await dispatchRoutineRun(windowRace(h, "SET status = 'observing'", late, () => undefined), 'run-1', NOW)
+      expect(result).toMatchObject({ reason: 'execution_paused' })
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+      expect(audits(h)).toBe(1)
+    })
+
+    it('archive UNDONE in the window with no pause ever: not labelled a pause, task not released, no audit', async () => {
+      harness = makeHarness()
+      const h = harness
+      const archive = () => h.sqlite.exec(`
+        INSERT INTO members (id, tenant, email, display_name, status) VALUES ('arch-op', 'tenant-a', 'arch@example.com', 'A', 'active');
+        INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
+          SELECT id, '2026-10-08T00:00:00.000Z', 'test', 'arch-op', status FROM tasks WHERE title LIKE 'Routine:%'`)
+      const unarchive = () => h.sqlite.exec('DELETE FROM tasks_archive_state')
+      const result = await dispatchRoutineRun(windowRace(h, "SET status = 'observing'", archive, unarchive), 'run-1', NOW)
+      expect(result).toEqual({ ok: false, error: 'run_not_dispatchable' })
+      expect(audits(h)).toBe(0)
+      expect(tasksOf(h)).toEqual([{ status: 'open', a: 'agent-preferred' }])
+    })
+  })
+
   // The not-archived guard in releasePausedControlTask is NOT redundant: the observing step's own check runs
   // BEFORE the window in which an archive can land, so the release itself must refuse an archived task.
   it('mupot#1821 release guard: a control task archived during the window is inert - not blocked, not unassigned, no audit', async () => {
@@ -1152,6 +1275,24 @@ describe('routine dispatch respects execution_pauses', () => {
       expect(failureTitles.sort()).toEqual(REAL_IDS.map(id => `Real ${id}`).sort())
     })
 
+    it('a human-reopened orphan reappears in the open counts even with its stamp intact (only BLOCKED orphans are hidden)', async () => {
+      harness = makeHarness()
+      await orphanPlusRealBlocked(harness)
+      harness.sqlite.exec("UPDATE tasks SET status = 'open' WHERE title LIKE 'Routine:%'")
+      const counts = await loadTaskStatusCounts(envFor(harness))
+      expect(counts.get('open')).toBe(1)
+      expect(counts.get('blocked')).toBe(REAL_IDS.length)
+    })
+
+    it('projects list open_work agrees with situation, counts and health (orphan excluded)', async () => {
+      harness = makeHarness()
+      await orphanPlusRealBlocked(harness)
+      // only readableSquadIds is read by loadListMetrics; the rest of ProjectAccess is not needed here
+      const access = { readableSquadIds: null, taskableSquadIds: null } as ProjectAccess
+      const metrics = await loadListMetrics(envFor(harness), ['project-1'], access)
+      expect(metrics.get('project-1')?.openWork).toBe(REAL_IDS.length)
+    })
+
     it('an orphan a human re-works under a new result is counted again (the stamp, not the title, identifies it)', async () => {
       harness = makeHarness()
       await orphanPlusRealBlocked(harness)
@@ -1208,6 +1349,37 @@ describe('routine dispatch respects execution_pauses', () => {
       const { n, result } = await count(harness, "SET status = 'running'")
       expect(result).toMatchObject({ reason: 'execution_paused' })
       expect(n).toBeLessThanOrEqual(POST_ENVELOPE_PAUSE_CAP)
+    })
+    // The path the held-pause pin above does NOT exercise: the pause is lifted after the refusing finishing batch, so
+    // the diagnosis has to do its full work. Measured at 38 on this path; pinned.
+    const LIFTED_POST_ENVELOPE_CAP = 38
+    it('LIFTED post-envelope path (pause gone before the diagnosis) stays at or under its pinned cap', async () => {
+      harness = makeHarness()
+      const h = harness
+      const inner = ((): Env => {
+        const real = h.db
+        let armed = false
+        let done = false
+        return {
+          ...envFor(h),
+          DB: {
+            prepare(sql: string) {
+              if (!armed && sql.includes("SET status = 'running'")) { armed = true; pause(h, 'squad', 'squad-1') }
+              else if (armed && !done && /^\s*SELECT/i.test(sql)) {
+                done = true
+                h.sqlite.prepare('UPDATE execution_pauses SET resumed_at = ?, resumed_by_member_id = ? WHERE resumed_at IS NULL').run(new Date().toISOString(), 'op-1')
+              }
+              return real.prepare(sql)
+            },
+            batch: real.batch.bind(real),
+          } as unknown as D1Database,
+        } as Env
+      })()
+      let n = 0
+      const counted = { ...inner, DB: { prepare(sql: string) { n += 1; return inner.DB.prepare(sql) }, batch: inner.DB.batch.bind(inner.DB) } as unknown as D1Database } as Env
+      const result = await dispatchRoutineRun(counted, 'run-1', NOW)
+      expect(result).toMatchObject({ reason: 'execution_paused' })
+      expect(n).toBeLessThanOrEqual(LIFTED_POST_ENVELOPE_CAP)
     })
     it('envelope-insert and observing pause paths stay under the success cap', async () => {
       for (const at of ['INSERT INTO agent_messages', "SET status = 'observing'"]) {

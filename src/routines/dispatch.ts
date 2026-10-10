@@ -18,7 +18,7 @@ import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
 import {
   EXECUTION_PAUSED_ERROR, PAUSE_RELEASE_AUDIT_HANDLER, PAUSE_RELEASE_RESULT,
-  executionPausedSql, isExecutionPaused,
+  executionPausedSql, pausedAtOrNow,
 } from '../agents/execution-brake-sql'
 
 const ROUTINE_MEMBER = 'system:routines'
@@ -575,74 +575,6 @@ function humanResponse(run: DispatchRunRow): { question: string; answer: string 
 }
 
 /**
- * The observing write's guards EXCEPT the pause, in one place so the write and the diagnosis below can never
- * drift apart. Five positional binds, in order: run id, tenant, agent id, flight id, task id.
- */
-function observingGuardsSql(): string {
-  return `id = ? AND tenant = ? AND status IN ('leased','observing')
-          AND assigned_agent_id = ?
-          AND ${sqlNotCancellationPending('routine_runs')}
-          AND EXISTS (
-            SELECT 1 FROM flights cf
-             WHERE cf.id = ? AND cf.tenant = routine_runs.tenant AND cf.status IN ('preflight','running')
-          )
-          -- mupot#1571: this write gates the agent message sent right after it; an archived
-          -- task is inert, so 0 rows here means no delivery (run_not_dispatchable below).
-          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})`
-}
-
-/**
- * mupot#1821: was the refused observing write refused by the pause? Decided by ELIMINATION from the refusal
- * itself: every other guard (run state, cancellation, control flight, archive) is monotone, so if they ALL pass
- * now the only thing that can have refused the write is a pause - even one an operator lifted in the meantime.
- * (Re-reading only "is a pause active now" sent such a run down the not-dispatchable path with the control task
- * still assigned and the control flight still live.)
- */
-async function pauseRefusedObserving(
-  env: Env, run: DispatchRunRow, agentId: string, flightId: string, taskId: string,
-): Promise<boolean> {
-  if (await isExecutionPaused(env, agentId)) return true
-  const others = await env.DB.prepare(`SELECT 1 AS ok FROM routine_runs WHERE ${observingGuardsSql()}`)
-    .bind(run.id, run.tenant, agentId, flightId, taskId).first()
-  return others !== null
-}
-
-/**
- * The finishing write's run guards EXCEPT the pause (same single-copy rule). Positional binds, in order: run id,
- * tenant, task id, project id, squad id, agent id, flight id, tenant, project id, agent id.
- */
-function finishingGuardsSql(): string {
-  return `id = ? AND tenant = ? AND status = 'observing'
-          AND ${sqlNotCancellationPending('routine_runs')}
-          AND EXISTS (
-            SELECT 1 FROM tasks t
-             WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?
-               AND t.assignee_agent_id = ? AND t.status IN ('open','in_progress')
-               AND ${TASK_NOT_ARCHIVED_SQL('t')}
-          )
-          AND EXISTS (
-            SELECT 1 FROM flights f
-             WHERE f.id = ? AND f.tenant = ? AND f.project_id = ?
-               AND f.agent = ? AND f.status = 'running'
-          )`
-}
-
-/**
- * mupot#1821: the finishing batch's pause diagnosis, same elimination rule as pauseRefusedObserving. The task
- * UPDATE rides behind the run UPDATE (it requires the run to be 'running' and carries the same task guards), so
- * the run guards passing now (the run is still 'observing' only if its write was refused) is the whole question.
- */
-async function pauseRefusedFinishing(
-  env: Env, run: DispatchRunRow, squadId: string, agentId: string, flightId: string, taskId: string,
-): Promise<boolean> {
-  if (await isExecutionPaused(env, agentId)) return true
-  const others = await env.DB.prepare(`SELECT 1 AS ok FROM routine_runs WHERE ${finishingGuardsSql()}`)
-    .bind(run.id, run.tenant, taskId, run.project_id, squadId, agentId, flightId, run.tenant, run.project_id, agentId)
-    .first()
-  return others !== null
-}
-
-/**
  * mupot#1814: a pause refused this attempt AFTER ensureTask created its control task (open, assigned to the
  * paused agent). Move it to `blocked` AND unassign it, with a clear result, so it is inert for everyone:
  *  - a resumed agent cannot self-dispatch it (unassigned);
@@ -737,11 +669,22 @@ export async function dispatchRoutineRun(
   })
   const situationDigest = await canonicalJsonDigest(situation)
   const nowIso = now.toISOString()
+  // mupot#1821: the refusing write's time. A refusal is a pause iff a pause covered the agent at this instant.
+  const observeAt = new Date().toISOString()
   const observed = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = 'observing', assigned_agent_id = ?, task_id = ?,
               flight_id = ?, situation_digest = ?, updated_at = ?
-        WHERE ${observingGuardsSql()}
+        WHERE id = ? AND tenant = ? AND status IN ('leased','observing')
+          AND assigned_agent_id = ?
+          AND ${sqlNotCancellationPending('routine_runs')}
+          AND EXISTS (
+            SELECT 1 FROM flights cf
+             WHERE cf.id = ? AND cf.tenant = routine_runs.tenant AND cf.status IN ('preflight','running')
+          )
+          -- mupot#1571: this write gates the agent message sent right after it; an archived
+          -- task is inert, so 0 rows here means no delivery (run_not_dispatchable below).
+          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})
           -- mupot#1812 P2-2: this write gates the message too; a pause landing after selection = 0 rows
           AND NOT ${executionPausedSql('routine_runs.assigned_agent_id')}`,
     ).bind(
@@ -770,7 +713,7 @@ export async function dispatchRoutineRun(
     ),
   ])
   if (!wrote(observed[0])) {
-    if (await pauseRefusedObserving(env, run, selected.agentId, flightId, task.id)) {
+    if (await pausedAtOrNow(env, selected.agentId, observeAt)) {
       await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
       await releasePausedControlTask(env, task.id, selected.agentId, nowIso)
       return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
@@ -842,12 +785,25 @@ export async function dispatchRoutineRun(
     taskId: task.id,
   })
 
+  const finishAt = new Date().toISOString()
   const finished = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = 'running', waiting_reason = NULL,
               lease_owner = NULL, lease_expires_at = NULL, retry_at = NULL,
               assigned_agent_id = ?, task_id = ?, flight_id = ?, situation_digest = ?, updated_at = ?
-        WHERE ${finishingGuardsSql()}
+        WHERE id = ? AND tenant = ? AND status = 'observing'
+          AND ${sqlNotCancellationPending('routine_runs')}
+          AND EXISTS (
+            SELECT 1 FROM tasks t
+             WHERE t.id = ? AND t.project_id = ? AND t.squad_id = ?
+               AND t.assignee_agent_id = ? AND t.status IN ('open','in_progress')
+               AND ${TASK_NOT_ARCHIVED_SQL('t')}
+          )
+          AND EXISTS (
+            SELECT 1 FROM flights f
+             WHERE f.id = ? AND f.tenant = ? AND f.project_id = ?
+               AND f.agent = ? AND f.status = 'running'
+          )
           -- mupot#1812 P2-2: the dispatch is only real if no pause covers the agent at write time
           AND NOT ${executionPausedSql('routine_runs.assigned_agent_id')}`,
     ).bind(
@@ -915,7 +871,7 @@ export async function dispatchRoutineRun(
     // only a pause landing in the window between that insert and these writes): settle the run waiting with
     // the pause reason. The already-delivered envelope cannot be recalled; the routine target is an external
     // runtime, and the run is no longer 'running', so its proposal submit is refused as inert.
-    if (await pauseRefusedFinishing(env, run, policy.responsible_squad_id, selected.agentId, flightId, task.id)) {
+    if (await pausedAtOrNow(env, selected.agentId, finishAt)) {
       await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
       await releasePausedControlTask(env, task.id, selected.agentId, nowIso)
       return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
