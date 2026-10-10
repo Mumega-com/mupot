@@ -3,8 +3,8 @@
 # wrangler.<yourpot>.toml, and apply migrations. The manual path may copy this template,
 # create the resources, and replace the <YOUR_*> placeholders before deployment.
 # This file is the BINDING CONTRACT every component builds against (see src/types.ts Env).
-name = "mupot"
-main = "src/index.ts"
+name = "mupot-alt-fixture-marker"
+main = "../../src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -13,15 +13,13 @@ command = "node scripts/generate-build-info.mjs"
 
 # ── tenant config (non-secret; secrets via `wrangler secret put`) ──
 [vars]
-TENANT_SLUG = "mumega"          # your org slug
+TENANT_SLUG = "alt-fixture-marker"
 # OWNER_TENANT_SLUG = "mumega"  # UNCOMMENT only on the operator's own pot deployment —
                                  # set to the SAME value as TENANT_SLUG above. Gates
                                  # env-level operator creds (e.g. POSTHOG_*) so they are
                                  # only ever used on behalf of the owning tenant, never a
                                  # customer/forked deployment (src/types.ts Env, #473).
 BRAND = "Mumega"                   # dashboard brand
-# GATE_STALL_THRESHOLD_MINUTES = "30"  # re-send the gate wake for a review task with no verdict after this long (mupot#1705)
-# GATE_STALL_MAX_REWAKES = "3"         # re-wakes per review episode, then the stall is only surfaced in Needs You (stuck)
 IDP_PROVIDER = "google"           # google | telegram
                                   # NOT `OAUTH_PROVIDER` — that binding name is RESERVED by
                                   # @cloudflare/workers-oauth-provider, which injects its helpers
@@ -34,30 +32,7 @@ IDP_PROVIDER = "google"           # google | telegram
 # PUBLIC_ORIGIN = "https://mupot.example.com"
 FLEET_PROJECT = "sos"             # pot fleet label (legacy name; CF-native messaging, not SOS Redis — ADR #473)
 FLEET_OPS_AGENT = "kasra"         # ops agent that receives control asks via agent_messages (explicit — resolvers fail closed, no code default)
-# REALTIME_SEAT_EVENTS = "1"      # opt-in body-free seat-events channel (/api/fleet/events). Off by default.
 # REALTIME_PRESENCE = "1"         # opt-in live roster WebSocket fan-out (ADR #473). Off by default.
-# EVENTS_ENABLED = "true"          # mupot#1618: MCP Events (protocol 2026-07-28) catalogue. ONLY the exact string "true" enables;
-                                  # off = byte-identical to before (server/discover + events/* are method_not_found). Full /mcp door only; also gates the PR 2 delivery hook.
-# EVENTS_CALLBACK_HOSTS = "hooks.example.com"  # exact-hostname allowlist (comma list) of webhook callback hosts. DEFAULT EMPTY =
-                                  # every callback URL is refused. Needs the CONNECTOR_MASTER_KEY secret (signing secrets are stored encrypted).
-POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout (/api/pots/checkout,
-                                  # /api/pots/public/checkout, /t/<home>/api/pots/...) and the /pricing
-                                  # buttons. ONLY the exact string "true" enables; anything else = 503
-                                  # checkout_unavailable. Keep "false" until the create_pot webhook
-                                  # provisions the pot (today a buyer is billed and gets no pot).
-# EMAIL_LOGIN_ENABLED = "true"    # mupot#1564/#1442: email one-time link/code sign-in beside Google
-                                  # (POST /auth/email/start, GET/POST /auth/email/verify). ONLY the
-                                  # exact string "true" enables; anything else/unset = 404 on those
-                                  # routes and the landing page hides the "Continue with email" form.
-                                  # Requires RESEND_API_KEY (secret, below) + RESEND_FROM_EMAIL (var,
-                                  # below) in production, or EMAIL_PROVIDER="console"/LOCAL_TEST_AUTH=1
-                                  # for local dev (logs the link+code instead of sending real mail).
-# EMAIL_PROVIDER = "console"      # dev/test only — see src/auth/email-sender.ts. Leave unset in prod
-                                  # (Resend is the only real provider today).
-# RESEND_FROM_EMAIL = "Mumega <login@mumega.com>"  # non-secret from-address. SAME var name as
-                                  # workers/inkwell-api's own request-code sender — one Resend key
-                                  # can serve both workers. Secret RESEND_API_KEY is set via
-                                  # `wrangler secret put RESEND_API_KEY` — see below, NOT here.
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
 # routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).
@@ -107,9 +82,6 @@ queue = "mupot-events"
 [[queues.consumers]]
 queue = "mupot-events"
 max_batch_size = 10
-# Seat-event hints ride this queue (src/agents/seat-events.ts), so batching delay is hint latency.
-# Unset, the platform default batch timeout applies; 1s bounds the queue's share of commit->hint.
-max_batch_timeout = 1
 max_retries = 3
 dead_letter_queue = "mupot-events-dlq"
 
@@ -169,19 +141,9 @@ class_name = "PresenceChannelDO"
 tag = "v1"
 new_sqlite_classes = ["AgentDO", "SquadCoordinatorDO"]
 
-# Body-free seat-events channel: one hibernating WebSocket per fleet host. Binding always
-# declared so the class can deploy; inert until REALTIME_SEAT_EVENTS=1 under [vars].
-[[durable_objects.bindings]]
-name = "SEAT_EVENTS"
-class_name = "SeatEventsDO"
-
 [[migrations]]
 tag = "v2"
 new_classes = ["PresenceChannelDO"]
-
-[[migrations]]
-tag = "v3"
-new_sqlite_classes = ["SeatEventsDO"]
 
 # ── durable task pipeline (issue #7) ──
 # Opt-in: start via POST /api/tasks/:id/pipeline.  The legacy direct-execute
@@ -212,19 +174,6 @@ crons = ["* * * * *", "0-9,15-24,30-39,45-54 * * * *"]
 # Until these secrets are set the GHL channel is inert (fails closed):
 #   - Outbound sends return { ok: false, reason: 'not_configured' }
 #   - Inbound webhook returns 503 { error: 'not_configured' }
-
-# ── Email login secrets (mupot#1564/#1442) ──
-# npx wrangler secret put RESEND_API_KEY   # Resend API key — sends the sign-in link+code email.
-#                                           # SAME var name workers/inkwell-api's own request-code
-#                                           # sender uses (src/routes/auth.ts) — one Resend key/from
-#                                           # pair can serve both workers.
-# RESEND_FROM_EMAIL is NON-secret (a from-address) — set it in [vars] above, not here.
-# Rollout: 1) APPLY migrations/0174_email_login_attempts.sql FIRST (email_login_attempts +
-# email_login_rate_limits — every route below reads/writes these unconditionally once the flag is
-# on), 2) wrangler secret put RESEND_API_KEY, 3) set RESEND_FROM_EMAIL + EMAIL_LOGIN_ENABLED="true"
-# in [vars], 4) deploy. Missing RESEND_API_KEY/RESEND_FROM_EMAIL with EMAIL_LOGIN_ENABLED="true":
-# /auth/email/start still 200s (no account-existence oracle) and logs one structured error; nothing
-# sends. See docs/operations/email-login.md for the full runbook.
 
 # ── Hermes push delivery (mumega-com#970) — bus consumer's outbound leg for
 # message.created (and future) events. Same shared secret as the Telegram bridge's
