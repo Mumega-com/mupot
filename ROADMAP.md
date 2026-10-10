@@ -6,20 +6,27 @@ numbers.
 
 ## Current version
 
+Version policy: [docs/VERSIONING.md](docs/VERSIONING.md).
+
 | State | Version | Meaning |
 |---|---|---|
-| Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
-| Current production version | `0.31.0` | Last recorded deploy `d954c1ab` (2026-09-29); live `/health` reported `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
-| Last tagged stable release | `v0.31.0` | Deployed 2026-09-29 (#1604, code first as Cloudflare version `6d1d7c6c`, migration 0181 applied immediately after — 0 identity drift, 0 generation/binding split on the post-deploy check). **The annotated git tag itself is pending**: Kasra-core cuts `release/v0.31.0` and pushes `v0.31.0` against this commit range next — no tag object exists as of this commit, so read the tag, not a SHA copied in here, once it lands. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
-| Next stable candidate | `v0.31.1` | P0 cherry-picks onto `release/v0.31.0` only, once cut — never a re-cut from wherever `main` happens to be. |
-| Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this release and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
+| Current source version | `0.31.0` | `package.json` today; the `0.32.0` changelog section is written and the bump is held for its own runtime PR (addon compatibility pins and a backfill migration, see VERSIONING.md "Status of 0.32.0"). Read the commit with `git rev-parse origin/main` — this table does not pin it. |
+| Current production version | set at deploy; read `/health` | Authoritative source is live `/health`. Last recorded deploy: version `0.31.0`, 2026-09-29, `clean:true`. `main` and production move independently. |
+| Last tagged stable release | `v0.31.0` | Annotated tag exists (2026-09-29, "v0.31.0 — Office"). Read the tag, not a SHA copied here. Prior tag: `v0.30.0` (2026-09-26). |
+| Next stable candidate | `v0.32.0` | 22 commits since `v0.31.0` are described in CHANGELOG `[0.32.0]`: task_get, task_submit_result, MCP Events (flag on, discovery only), Office publishing, visibility chokepoint, access panel. |
+| Future development target | `v0.33.0` | "Compounding Project Knowledge" (below). Distribution and Commercial Operations moves to `v0.34.0`. |
 
-`0.31.0` is the version the source reports as of this commit, and (as of 2026-09-29) the
-version live in production too — the source version string and the deployed version
-agree for the first time since `v0.30.0`. `v0.30.0` remains the only version with a real
-git tag and release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) until
-`v0.31.0`'s annotated tag is cut. `main` continues past `d954c1ab` as preview; nothing on
-`main` after it is covered by whatever evidence bundle the `v0.31.0` tag ends up bound to.
+### Near-term rows (open, unordered within a release)
+
+| Row | Issue | Target |
+|---|---|---|
+| Onboard mode, incl. one-connector-per-harness | mupot#1664, #544, #1668 | v0.33.0 |
+| Unattended loop via routines | mupot#1675 | v0.33.0 |
+| Elevation list predicate | mupot#1673 | v0.32.x |
+| `task_get` follow-ups | mupot#1666 | v0.32.x |
+| Connector client scope | mupot#1661 | v0.33.0 |
+| Office health on activate | mupot#1662 | v0.32.x |
+| Human office gate independence | mupot#1663 | v0.32.x |
 
 ## Shipped — v0.31.0 "Office" (2026-09-29)
 
@@ -32,9 +39,8 @@ auth residuals (#1583), the seat-events channel for fleet hosts and its
 hardening (#1593, #1595 — a separate, concurrent Hadi-led effort that landed
 in the same window, not originally named in this flight), an SSRF/dependency
 security fix (#1601), and the v0.31.0 version bump + native-addon identity
-backfill (#1604). Office publishing remains inert (mupot#1592, PR #1602 in
-review) and the public `/openapi.json` still discloses admin tools (PR #1603
-in review) — see CHANGELOG.md "Known limitations" for both.
+backfill (#1604). Both known limitations named here at the time have since landed on `main` (#1602 payload-hash
+binding, #1603 public OpenAPI allowlist; see CHANGELOG `[0.32.0]`).
 
 Gate rule (Hadi, 2026-09-16): P0 blocks, P1 ships with a follow-up issue, two
 adversarial gate rounds maximum per artifact.
@@ -824,7 +830,7 @@ Activation:
   after recovery and cost gates pass.
 - `reuse` and `pinned` sessions remain opt-in.
 
-### v0.32.0: Compounding Project Knowledge - planned
+### v0.33.0: Compounding Project Knowledge - planned
 
 **One promise:** Projects improve from measured outcomes without confusing generated
 memory with evidence or allowing agents to widen their own authority.
@@ -847,7 +853,7 @@ Activation:
 - Promotion and policy changes: human approval required.
 - Automated Project prioritization: opt-in only after held-out evaluation.
 
-### v0.33.0: Distribution and Commercial Operations - planned
+### v0.34.0: Distribution and Commercial Operations - planned
 
 **One promise:** A customer can install, operate, upgrade, and commercially license a
 Mupot without Mumega performing hidden manual steps.
@@ -915,11 +921,11 @@ as a claim about what the tagged `v0.31.0` contains.
 | Governed realtime push subscription | `v0.31.0` | Polling fallback retained; default-on only after soak |
 | Exact runtime consumption, ACK, and artifact receipts | `v0.31.0` | Enforced for the canonical receiver |
 | Isolated Agent Computers | `v0.31.0` | Initially opt-in |
-| Memory dreamer worker | `v0.32.0` | Proposal-only; promotion gated |
-| Reviewed knowledge and coherence evaluation | `v0.32.0` | Promotion gated |
-| Commercial installation and operations | `v0.33.0` | License/entitlement dependent |
-| Operated Presence (metered guest check-in/out) | `v0.33.0` | Owner opt-in per engagement, fail-closed, revocable |
-| Commercial tiers and support entitlements | `v0.33.0` | Payment-gated support; free = public updates only |
+| Memory dreamer worker | `v0.33.0` | Proposal-only; promotion gated |
+| Reviewed knowledge and coherence evaluation | `v0.33.0` | Promotion gated |
+| Commercial installation and operations | `v0.34.0` | License/entitlement dependent |
+| Operated Presence (metered guest check-in/out) | `v0.34.0` | Owner opt-in per engagement, fail-closed, revocable |
+| Commercial tiers and support entitlements | `v0.34.0` | Payment-gated support; free = public updates only |
 | Governed business loop GA | `v1.0.0` | Stable supported product |
 
 ## Scope-control rules

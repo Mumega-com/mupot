@@ -1,62 +1,148 @@
 # Changelog
 
-## [Unreleased] — main since v0.31.0
+Versioning policy: [docs/VERSIONING.md](docs/VERSIONING.md). Pre-1.0 semver: a MINOR
+bump for any new tool, route, dashboard surface, migration, addon or observable
+behaviour change (removals and tightenings are flagged **Breaking**); PATCH for fixes and
+docs only.
 
-- **task_get** (`kasra/task-get-read-tool`) - new member-tier MCP read tool
-  `task_get { task_id }`: one task row plus its latest `task_verdicts` row and latest
-  dispatch receipt (id + derived status). Row gate is `canReadTask` from the shared
-  task-visibility chokepoint (`src/tasks/visibility.ts`, mupot#1647), archived tasks
-  excluded exactly as `task_list` excludes them; an invisible task returns the same
-  `404 task_not_found` as a nonexistent id. Added to the public OpenAPI allowlist
-  (member tier). Pinned by `tests/mcp-task-get.test.ts` (agreement with `task_list`
-  across a real-grant caller matrix, strict bind-count wrapper).
-- **#1603** (mupot#1596 phase 1a) — unauthenticated `GET /openapi.json` (Custom
-  GPT Actions discovery) now serves an explicit, committed allowlist
-  (`src/mcp/openapi-public-allowlist.ts`, member-tier-or-below, 91 of 144 tools)
-  instead of the whole registry, with a runtime min-capability floor. A new
-  org-admin-gated `GET /openapi.full.json` serves the full registry. CI ratchet
-  `scripts/check-openapi-public-allowlist.mjs`. **Not a full fix for admin-tool
-  disclosure:** a JSON-RPC `tools/list` on `POST /mcp` still returns every tool
-  to any valid token (#1609, phase 1b); agent-bound org-admin bearers can read
+## [Unreleased]
+
+## [0.32.0] — 2026-10-06 (planned date; the version bump itself is not yet applied — see "Release mechanics" below)
+
+Covers every commit in `git log v0.31.0..origin/main` (22 commits, 2026-09-29 to
+2026-10-05). Migrations in this range: 0182, 0183, 0184, 0185, 0187, 0188, 0189 (0186 is
+intentionally absent from the chain). **Apply migrations 0182–0189 before deploying the
+code that depends on them** — each fails closed (clean error, no partial state) if its
+table or column is missing, but the dependent tool or surface is non-functional until it
+lands.
+
+### Breaking
+
+Behaviour an agent or operator could observe has been tightened. None of it widens
+authority; all of it narrows what a caller can read or do.
+
+- **Task and project reads share one visibility rule (#1649, #1647; partial #1645).**
+  `project_get`, `project_context`, `GET /projects/:id`, the dashboard project detail and
+  `GET /tasks/:id` now answer through `canReadTask` (`src/tasks/visibility.ts`). An
+  observer-only grant no longer sees task rows in the situation/activity of those
+  surfaces (member rank is the floor, matching `task_list`). Operator-reported decision,
+  recorded in `docs/architecture/task-visibility.md` (#1652).
+- **Public `GET /openapi.json` is an explicit allowlist (#1603, #1596 phase 1a).** It no
+  longer lists the whole registry (91 of 144 tools at #1603, 92 with `task_get`; member tier or below). Full
+  registry moved to the org-admin-gated `GET /openapi.full.json`. Clients that scraped
+  admin tools from `/openapi.json` lose them.
+- **Department grants on home departments are refused at every writer (#1648, #1646).**
+  Home squads are excluded from the department resolver.
+- **Secret-env requests are gated and capped (#1627).** Callers need non-home standing,
+  reserved Env names are refused, requests are capped and rate-limited.
+- **Office publish approval is bound to the shown payload hash (#1602, #1592).** A
+  `gate:office` task in review refuses title/body/note/reason edits, and the generic
+  verdict surfaces (`task_verdict`, `POST /tasks/:id/verdict`, IM and Telegram verdict
+  paths) refuse to decide it; only `office_review_approval` decides.
+
+### Added
+
+- **`task_get { task_id }` (#1665).** Member-tier MCP read tool: one task row, its latest
+  verdict (via the shared `findLatestVerdict`, carrying `reversed` / `reversed_at`) and
+  the latest dispatch receipt. Row gate is `canReadTask`; an invisible or archived task
+  answers the same `404 task_not_found` as a missing id. `latest_dispatch_receipt` and
+  `execution_receipt_id` are returned to the assigned agent only; dispatch status
+  reflects runtime-terminal stages. On the public OpenAPI allowlist (member tier).
+- **`task_submit_result` (#1600, #1586; migration 0183).** The agent assignee of a
+  hand-worked, never-dispatched task reports completion evidence and enters `review` in
+  one atomic step (`task_result_submissions` receipt rides the same batch). Same
+  `verifyTaskArtifactShape` gate as every review-entry path; requires an independent,
+  live, credentialed gate owner; refuses a live `execution_receipt_id` or in-flight
+  dispatch. Member tier, deliberately not on the public OpenAPI allowlist.
+- **One shared task-visibility chokepoint (#1649, #1647).** `src/tasks/visibility.ts`
+  with a design doc (condition x reader table) and a seam matrix test. Also closes the
+  `project_context` task leak (#1645, situation slices only; follow-ups remain).
+- **MCP Events, flag-gated (#1629, #1633; migration 0188).** 2026-07-28 protocol
+  negotiation (only an explicit ask gets it; every other `initialize` is unchanged),
+  `server/discover`, `events/list` (catalogue `message.created`, `needs_you.created`),
+  `events/subscribe` / `events/unsubscribe` with callback verification, AES-GCM secret
+  storage via the connector vault, Standard Webhooks signing, HTTPS-only, no redirects,
+  append-only `event_delivery_receipts`. Everything is behind `EVENTS_ENABLED` (default
+  off, method-not-found). The deployed flag is on; **discovery only** — the
+  `EVENTS_CALLBACK_HOSTS` allowlist is empty, so no subscription can be verified and no
+  delivery can occur. Not served on the profile door.
+- **Write-capable connector bindings; Office publishing live (#1614, T2b, #1610;
+  migrations 0184, 0185).** `addon_connector_bindings.capability_v2` (legacy column
+  frozen at `read`); a `write` requirement is allowed only for `external_mcp` +
+  `external_isolated` manifests with zero isolation violations, re-proved on every call.
+  Publish claim stamps an idempotency key into the WordPress post slug;
+  `office_reconcile_stalled_publish` queries WordPress by that key before clearing the
+  double-post guard (check failed means refuse, never treated as absent).
+- **Org-admin Access panel (#1626; migration 0187).** `POST /agents/:id/access` edits an
+  agent's squad access; the append-only `agent_access_receipts` insert carries the
+  authority guard inside the same batch, with compare-and-swap over memberships and
+  capabilities.
+- **Curated read-only ChatGPT profile (#1624).** `/mcp/profile/needs-you` exposes an
+  explicit 8-tool read allowlist with readOnly/destructive/openWorld annotations; calls
+  outside it are refused before dispatch; no session side effects (no presence bump, no
+  poll last-seen, no induction row). `/mcp` unchanged. New CI ratchet
+  `scripts/check-mcp-profile-needs-you.mjs`.
+- **Self-describing dispatch envelope (#1639).** `runtime.dispatch/v1` inbox bodies carry
+  optional `title`, `done_when`, `truncated` and a constant `settle` object so a seat that
+  does not know the protocol can call `task_dispatch_runtime_receipt`. Stays v1;
+  bounded to the 8000-char encoded body budget; redelivery reuses the stored body.
+- **Decision-model port microkernel (#1622; migration 0189).** `decide()`, adapters and
+  receipts (`decision_receipts`). Draft: no callers wired, no behaviour change.
+- **Public OpenAPI allowlist and ratchet (#1603).** `src/mcp/openapi-public-allowlist.ts`
+  plus `scripts/check-openapi-public-allowlist.mjs`; runtime min-capability floor.
+  Not a full fix: JSON-RPC `tools/list` on `POST /mcp` still returns every tool to any
+  valid token (#1609, phase 1b); agent-bound org-admin bearers can read
   `/openapi.full.json` (#1608). #1596 stays open.
-- **mupot#1586** (`kasra/task-result-path-1586`) — new `task_submit_result`
-  MCP tool: the agent ASSIGNEE of a hand-worked (never-dispatched) task can
-  now report its completion evidence and enter `review` in one atomic step,
-  closing the board deadlock where such a task (`task_update` refuses an
-  unknown `result` field since #1388; `task_dispatch_runtime_receipt` 409s
-  `task_not_runnable` for anything never dispatched) sat `in_progress`
-  forever. Same `verifyTaskArtifactShape` gate every other review-entry path
-  enforces (a shape check only — it does not open a file or match a hash);
-  assignee-only, refuses a live `execution_receipt_id` or an in-flight
-  unconsumed dispatch (a dispatched task keeps using
-  `task_dispatch_runtime_receipt`, unchanged), only from `in_progress`
-  (immutable once in `review` until sent back). The task's `gate_owner` must
-  be an INDEPENDENT, live, credentialed gate (`hasIndependentRuntimeGate` —
-  the same predicate the runtime-receipt path's `completed` stage requires,
-  factored into shared SQL fragments both paths now call so they cannot
-  drift); this tool never accepts `gate_owner` as an argument — the assignee
-  cannot choose its own reviewer, and a task without an independent gate
-  already set (by its creator or an admin via `task_update`) cannot enter
-  review through this door at all. The UPDATE and the append-only receipt
-  INSERT (new `task_result_submissions` table, migration 0183) land in one
-  `env.DB.batch` — an INSERT failure rolls the UPDATE back too, so a task can
-  never reach `review` without its receipt. **Migration 0183 must be applied
-  before this code is deployed** — the batch fails closed (a clean error, no
-  partial state) if it is not, but the tool is non-functional until it is.
-  `assignee_cannot_self_close` is untouched. Two adversarial gate rounds:
-  round 1 found the missing-`result`-writer gap and a tautological
-  defense-in-depth guard (fixed to bind the real caller); round 2 (kasra-review,
-  PR comment 5882361732) BLOCKed on a P0 self-close bypass via
-  `gate:agent-self-completion` or an unheld gate, plus two P1s (a
-  never-consumed in-flight dispatch bypassing the runtime-receipt fence; the
-  UPDATE/INSERT non-atomicity) — all fixed and mutation-tested. Athena
-  reviewed GREEN with one P1 tracked separately as #1613. Migration 0183
-  renumbered from an initial 0181 to avoid colliding with 0181/0182 reserved
-  for the v0.31.0 release PR and mupot#1592. `task_submit_result` is
-  member-tier and deliberately left out of #1603's public `/openapi.json`
-  allowlist (private by default; add it only if a Custom GPT facade needs
-  it). Not merged; state it as merged only once `gh pr view` on this PR
-  reports `MERGED`.
+
+### Changed
+
+- **Office MCPWP connector authenticates with the vaulted API key and publishes
+  idempotently via post meta (#1653, #1616).** Reconcile receipt is atomic; no reversal
+  over an unresolved publish; subdirectory WordPress installs are refused rather than
+  probed at the wrong endpoint; design in `docs/architecture/office-mcpwp-connector.md`.
+- **Office publish approval binding (#1602, #1592; migration 0182).** Payload frozen at
+  review entry, bound to the approving verdict in the same batch, voided on reject or
+  reversal. See Breaking.
+
+### Fixed
+
+- **Receipts: `runtime_consumed` settle bound a surplus parameter and failed on real D1
+  (#1641).** `task_dispatch_runtime_receipt(runtime_consumed)` returned `internal_error`
+  in production; the node:sqlite test double had silently dropped the extra bind. Added a
+  strict-binding wrapper that enforces D1's count rule.
+- **Elevation approval always refused (#1628).** The action checkboxes sat outside
+  `#decide-form`; "Approve narrowed access" received an empty action list. Only Deny
+  worked.
+
+### Security
+
+- **Home-department grants refused; home squads excluded from the resolver (#1648,
+  #1646).** See Breaking.
+- **Secret-env P1 authz gate, Env-name reservation, request cap and rate limit,
+  requester visibility (#1627).** Known open: a bind-versus-reject race is documented,
+  not closed.
+- **Dependency advisories that were blocking the audit gate (#1631, #1623).** fast-uri
+  override to 4.1.5 (GHSA-hrr3-gc8f-f4qj, GHSA-jvvf-x445-j334; lockfile resolves 4.2.1);
+  undici override to 7.29.1 (GHSA-rfgv-xxqx-mfg5, GHSA-w293-vg96-wgc3).
+- **`project_context` task leak partially closed (#1649, #1645).**
+
+### Documentation
+
+- Spine entries for the kasra node, roster row and capability profile refreshed, with the
+  live model qualified as seat-dependent and no org-admin claim (#1638).
+- Observer-floor decision recorded in `docs/architecture/task-visibility.md`, worded as
+  operator-reported (#1652).
+
+### Release mechanics
+
+`package.json` and `src/version.ts` still read `0.31.0`. Bumping `src/version.ts` to
+`0.32.0` is a runtime change: `assertAddonRuntimeContract` gives native addons a
+one-minor grace band only, so the five native manifests pinned `^0.30.0` and the
+`^0.31.0` mcpwp-office manifest (external, strict semver) would throw
+`addon_mupot_incompatible` at boot; moving their pins changes manifest digests and
+drifts every live installation, which needs a backfill migration in the style of 0181.
+The bump therefore ships as its own runtime PR together with that migration. Details and
+the proposed decoupling in [docs/VERSIONING.md](docs/VERSIONING.md).
 
 ## [0.31.0] — 2026-09-29 (tagged; v0.31.0 — see tag for the exact frozen commit)
 
