@@ -1109,8 +1109,9 @@ async function resolveExternalTokenInner(
 
   if (!row || row.status !== 'active') return null
 
-  // mupot#1794 W4: a directory/unbound bearer is a harness-token credential or it is REFUSED
-  // (decideHarnessBearer: fail closed on flag off, a missing harness row or a failed lookup). The
+  // mupot#1794 W4: a harness-token credential (row has harness_kind) is REFUSED on flag off, a missing
+  // harness row or a failed lookup (decideHarnessBearer); a directory/unbound bearer without
+  // harness_kind proceeds exactly as on main (buildAuthContextFromProps zeroes it). The
   // decision is made from this token ROW's own shape; zero standing is re-applied from the row again in
   // buildAuthContextFromProps, so it never depends on this lookup succeeding.
   const harnessDecision = await decideHarnessBearer(env, { ...row, member_id: row.member_id, token_id: row.token_id })

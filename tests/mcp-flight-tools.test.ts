@@ -1289,6 +1289,8 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           -- every authenticated call in the file returned 500. Prefer the migration
           -- harness (tests/token-lifecycle-real-schema.test.ts) for anything new.
           expires_at TEXT, last_used_at TEXT,
+          -- migrations/0204 (mupot#1794 W4): the bearer lookup reads the credential class from the row.
+          harness_kind TEXT,
           agent_id TEXT, tenant TEXT NOT NULL
         );
         CREATE TABLE agent_member_bindings (

@@ -46,6 +46,9 @@ export interface BearerTokenShape {
 
 export type HarnessBearerDecision =
   | { kind: 'not_directory_unbound' }
+  /** directory/unbound with NO harness_kind: not a harness credential. Main's behaviour is kept (a
+   *  zero-capability directory session); no harness lookup is made, so none can fail open. */
+  | { kind: 'plain_directory_unbound' }
   | { kind: 'refuse' }
   | { kind: 'harness'; harnessId: string }
 
@@ -53,8 +56,8 @@ export type HarnessBearerDecision =
  * Decide what a presented bearer token is, from ITS OWN row. Fail closed:
  *   - not a directory/unbound token                         -> 'not_directory_unbound' (every legacy
  *     credential; this module changes nothing about it)
- *   - directory/unbound but no harness_kind                 -> 'refuse' (no legitimate bearer has this
- *     shape: raw directory tokens are discarded at mint; it must never become a human session)
+ *   - directory/unbound but no harness_kind                 -> 'plain_directory_unbound' (main's
+ *     behaviour: a zero-capability directory session; never the human's capabilities)
  *   - harness_kind set but the flag is off                  -> 'refuse' (inert)
  *   - harness_kind set, the harness row lookup errors/absent -> 'refuse'
  *   - otherwise                                             -> 'harness' with the live harness id
@@ -63,7 +66,7 @@ export type HarnessBearerDecision =
  */
 export async function decideHarnessBearer(env: Env, t: BearerTokenShape): Promise<HarnessBearerDecision> {
   if (t.channel !== 'directory' || t.bound_agent_id) return { kind: 'not_directory_unbound' }
-  if (t.harness_kind === null || t.harness_kind === undefined) return { kind: 'refuse' }
+  if (t.harness_kind === null || t.harness_kind === undefined) return { kind: 'plain_directory_unbound' }
   if (!seatAutoEnrollEnabled(env)) return { kind: 'refuse' }
   try {
     const harness = await loadHarnessForToken(env, t.member_id, t.token_id)

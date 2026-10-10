@@ -460,8 +460,11 @@ async function resolveAuth(c: {
           // inactive by now (expired/revoked between buildAuthContextFromProps and this re-read)
           // fails CLOSED. Nulling tokenId and continuing would leave an unmarked unbound directory
           // session that the harness chokepoint cannot recognise (bootstrap_self would run).
-          if ((!token || token.member_status !== 'active') && !knownNonDirectory && !auth.boundAgentId) {
-            return null
+          // Narrowed (CI fix): only when the session points at a TOKEN harness (or that lookup fails),
+          // so a plain unbound directory session keeps main's zero-capability semantics.
+          if ((!token || token.member_status !== 'active') && !knownNonDirectory && !auth.boundAgentId && auth.harnessId) {
+            const hr = await loadHarness(c.env, auth.userId, auth.harnessId).catch(() => 'error' as const)
+            if (hr === 'error' || hr === null || hr.credential_kind === 'token') return null
           }
           if (!token || token.member_status !== 'active') {
             auth.tokenId = null
@@ -625,9 +628,9 @@ async function authenticateMemberInner(c: {
 
   if (!row) return null
 
-  // mupot#1794 W4: a directory/unbound bearer is a harness-token credential or it is REFUSED (see
-  // decideHarnessBearer: fail closed on flag off, a missing harness row, or a failed lookup). Standing is
-  // decided by the SHAPE of this very row, before any lookup resolves anything.
+  // mupot#1794 W4: a harness-token credential (row has harness_kind) is REFUSED on flag off, a missing
+  // harness row or a failed lookup (decideHarnessBearer); a directory/unbound bearer WITHOUT harness_kind
+  // keeps main's zero-capability session. Standing is decided by the SHAPE of this very row.
   const harnessDecision = await decideHarnessBearer(c.env, row)
   if (harnessDecision.kind === 'refuse') return null
   const harnessId = harnessDecision.kind === 'harness' ? harnessDecision.harnessId : undefined
@@ -641,7 +644,9 @@ async function authenticateMemberInner(c: {
   void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
 
-  const capabilities = harnessId ? [] : await resolveCapabilities(c.env, row.member_id)
+  // A directory/unbound bearer (harness or not) carries ZERO capabilities, never the human's own: the
+  // directory door's ceiling (B1), applied here from the row's shape.
+  const capabilities = harnessId || harnessDecision.kind === 'plain_directory_unbound' ? [] : await resolveCapabilities(c.env, row.member_id)
 
   // role is the coarse org-role field on AuthContext; a member principal is
   // 'member' at the org-role layer. The REAL authorization is `capabilities`.

@@ -80,12 +80,19 @@ afterEach(() => h.close())
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('1. zero standing is decided by the token ROW and fails closed', () => {
-  it('a directory/unbound bearer WITHOUT harness_kind is refused at both doors (never a human session)', async () => {
+  it('a directory/unbound bearer WITHOUT harness_kind keeps main\'s ZERO-capability session at both doors (never the human\'s caps), even if the harness table is broken', async () => {
     const env = envFor(h)
     h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant)
                    VALUES ('t-plain', '${HUMAN}', '${await sha('mupot_plain')}', 'x', 'directory', '2026-10-10', '${TENANT}')`)
-    expect(await resolveExternalToken(env, 'mupot_plain')).toBeNull()
-    expect((await rpcCall(env, 'mupot_plain', 'boot_context')).status).toBe(401)
+    h.sqlite.exec(`ALTER TABLE harnesses RENAME TO harnesses_broken`) // no lookup is made for a non-harness token
+    const ctx = await externalCtx(env, 'mupot_plain')
+    expect(ctx).toMatchObject({ channel: 'directory', boundAgentId: null })
+    expect(ctx?.capabilities).toEqual([])
+    expect(ctx?.harnessCredential).toBeUndefined()
+    const r = await rpcCall(env, 'mupot_plain', 'boot_context') // authenticateMember door
+    expect(r.status).toBe(200)
+    expect(sc(r).capabilities).toEqual([]) // the member holds org admin; the session does not
+    expect(sc(r).channel).toBe('directory')
   })
 
   it('harness row ABSENT (token live) -> refused at both doors', async () => {
@@ -171,6 +178,22 @@ describe('1. zero standing is decided by the token ROW and fails closed', () => 
     const r2 = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } },
       { [AUTH_CONTEXT_HEADER]: JSON.stringify(ctx2) })
     expect(r2.status).toBe(401)
+  })
+
+  it('RACE scope: the fail-closed return applies ONLY to a token-harness pointer; a plain unbound directory session (or an OAuth harness) keeps main\'s zero-capability semantics', async () => {
+    const env = envFor(h)
+    const plain: AuthContext = { userId: HUMAN, email: null, role: 'member', tenant: TENANT, memberId: HUMAN, channel: 'directory', capabilities: [], boundAgentId: null, tokenId: 'gone-token' }
+    const rp = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify(plain) })
+    expect(rp.status).toBe(200)
+    expect(sc(rp).capabilities).toEqual([])
+    // OAuth-kind harness pointer (credential_kind 'oauth'): unchanged from W1-W3 semantics
+    const { upsertHarness } = await import('../src/members/harness')
+    const oh = await upsertHarness(env, HUMAN, 'client-cursor', 'Cursor')
+    const ro = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, harnessId: oh!.id }) })
+    expect(ro.status).toBe(200)
+    // an unknown / unreadable harness pointer fails closed
+    const rx = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'boot_context', arguments: {} } }, { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...plain, harnessId: 'no-such-harness' }) })
+    expect(rx.status).toBe(401)
   })
 
   it('PRESENCE (gate P2): a confined harness session writes no presence under the human (boot_context or seat_select)', async () => {
