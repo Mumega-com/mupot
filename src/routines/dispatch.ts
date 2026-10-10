@@ -629,16 +629,13 @@ function finishingGuardsSql(): string {
 
 /**
  * mupot#1821: the finishing batch's pause diagnosis, same elimination rule as pauseRefusedObserving. The task
- * UPDATE rides behind the run UPDATE (it requires the run to be 'running'), and both run in one transaction, so a
- * pause can only be what refused the batch when the RUN write is the one that was refused; if the run write
- * landed, the task write was refused for a task-state reason and no pause is to blame.
+ * UPDATE rides behind the run UPDATE (it requires the run to be 'running' and carries the same task guards), so
+ * the run guards passing now (the run is still 'observing' only if its write was refused) is the whole question.
  */
 async function pauseRefusedFinishing(
   env: Env, run: DispatchRunRow, squadId: string, agentId: string, flightId: string, taskId: string,
-  runWriteLanded: boolean,
 ): Promise<boolean> {
   if (await isExecutionPaused(env, agentId)) return true
-  if (runWriteLanded) return false
   const others = await env.DB.prepare(`SELECT 1 AS ok FROM routine_runs WHERE ${finishingGuardsSql()}`)
     .bind(run.id, run.tenant, taskId, run.project_id, squadId, agentId, flightId, run.tenant, run.project_id, agentId)
     .first()
@@ -918,7 +915,7 @@ export async function dispatchRoutineRun(
     // only a pause landing in the window between that insert and these writes): settle the run waiting with
     // the pause reason. The already-delivered envelope cannot be recalled; the routine target is an external
     // runtime, and the run is no longer 'running', so its proposal submit is refused as inert.
-    if (await pauseRefusedFinishing(env, run, policy.responsible_squad_id, selected.agentId, flightId, task.id, wrote(finished[0]))) {
+    if (await pauseRefusedFinishing(env, run, policy.responsible_squad_id, selected.agentId, flightId, task.id)) {
       await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
       await releasePausedControlTask(env, task.id, selected.agentId, nowIso)
       return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
