@@ -15,7 +15,7 @@ import { mcpApp } from '../src/mcp/index'
 import { mcpInternalRequest } from '../src/mcp/internal-dispatch'
 import { membersApp } from '../src/members'
 import { resetHarnessProbeSampling } from '../src/mcp/harness-identity-probe'
-import { NO_HINTS } from '../src/members/seat-handle'
+import { NO_HINTS, prepareSeatHandleIssue } from '../src/members/seat-handle'
 import { applySeatForRequest, autoSeatKey, pickAutoSeatKey, findLiveAutoSeat, resetAutoSeatRefusalCache, AUTO_SEAT_KEY_MAX_LEN } from '../src/members/seat-auto'
 import { seatKeyHash } from '../src/members/seat-key'
 import { AUTO_SEAT_HARNESS_WINDOW_MAX } from '../src/members/seat-select'
@@ -877,5 +877,105 @@ describe('#1818: a seat row is only handed back by the pool whose source matches
     const a2 = await boot(env, g, chatgpt('conv-same'))
     expect(a1.sc.bound_agent_id).toBe(a2.sc.bound_agent_id)
     expect(typeof a1.sc.bound_agent_id).toBe('string')
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+describe('#1820: #1819 residuals', () => {
+  const craft = (raw: string) => autoSeatKey({ source: 'auto:openai_session', raw })
+
+  it('mirror race: an AUTO caller that loses the UNIQUE race to a SELECT winner is refused, never handed the explicit seat', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const key = await craft('conv-mirror')
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    expect(typeof sel.sc.seat_handle).toBe('string')
+    // Hide the select seat from the FIRST key lookup only: the auto create batch then loses on UNIQUE and
+    // re-reads the winner, which belongs to the select pool.
+    let hidden = false
+    const realPrepare = h.db.prepare.bind(h.db)
+    const db = new Proxy(h.db, {
+      get(target, prop, recv) {
+        if (prop !== 'prepare') return Reflect.get(target, prop, recv)
+        return (sql: string) => {
+          if (!hidden && /FROM agent_seats\s+WHERE tenant = \?1 AND member_id = \?2 AND harness_id = \?3 AND key_hash = \?4/.test(sql)) {
+            hidden = true
+            return { bind: () => ({ first: async () => null }) }
+          }
+          return realPrepare(sql)
+        }
+      },
+    })
+    const seatsBefore = seatCount()
+    const r = await boot({ ...env, DB: db } as Env, g, chatgpt('conv-mirror'))
+    expect(hidden).toBe(true)
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(r)).toMatchObject({ auto_seat_refused: 'seat_key_source_conflict' })
+    expect(seatCount()).toBe(seatsBefore)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seats WHERE source = 'auto'`)).toBe(0)
+  })
+
+  it('handle redemption: a seat_handles row on an AUTO seat (legacy, pre-#1819) never redeems', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const a = await boot(env, g, chatgpt('conv-legacy'))
+    expect(typeof a.sc.bound_agent_id).toBe('string')
+    const seat = h.sqlite.prepare(`SELECT id, agent_id, harness_id FROM agent_seats WHERE source = 'auto'`).get() as { id: string; agent_id: string; harness_id: string }
+    const issue = await prepareSeatHandleIssue(env, { seatId: seat.id, agentId: seat.agent_id, harnessId: seat.harness_id, consentingMemberId: HUMAN, grantTokenId: g.tokenId })
+    await h.db.batch(issue.statements)
+    expect(n(`SELECT COUNT(*) AS n FROM seat_handles WHERE seat_id = ? AND revoked_at IS NULL`, seat.id)).toBe(1)
+    // No session key, so only the handle could bind: it must be rejected.
+    const r = await boot(env, g, undefined, { headers: { 'x-mupot-seat': issue.handle } })
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(r)).toMatchObject({ seat_handle_rejected: true })
+  })
+
+  it('handle redemption: a legitimate select-seat handle still redeems', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const s = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/work/ok' })
+    const handle = String(s.sc.seat_handle)
+    const r = await boot(env, g, undefined, { headers: { 'x-mupot-seat': handle } })
+    expect(r.sc.bound_agent_id).toBe((s.sc.agent as { id: string }).id)
+  })
+
+  it('refusal cache: a seat_key_source_conflict is remembered per (harness, key) for the TTL, then re-evaluated', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const key = await craft('conv-cache')
+    await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    let seatQueries = 0
+    const realPrepare = h.db.prepare.bind(h.db)
+    const db = new Proxy(h.db, {
+      get(target, prop, recv) {
+        if (prop !== 'prepare') return Reflect.get(target, prop, recv)
+        return (sql: string) => { if (/agent_seats/.test(sql)) seatQueries++; return realPrepare(sql) }
+      },
+    })
+    const env2 = { ...env, DB: db } as Env
+    const t0 = Date.now()
+    const call = (at: number) => applySeatForRequest(env2, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-cache', codexThreadId: null } }, at)
+    const first = await call(t0)
+    expect(first.seatInputs?.autoSeatRefused ?? null).toBe('seat_key_source_conflict')
+    const afterFirst = seatQueries
+    expect(afterFirst).toBeGreaterThan(0)
+    const second = await call(t0 + 1000)
+    expect(second.seatInputs?.autoSeatRefused ?? null).toBe('seat_key_source_conflict')
+    expect(seatQueries).toBe(afterFirst) // served from the cache: no database round trip
+    await call(t0 + 31_000)
+    expect(seatQueries).toBeGreaterThan(afterFirst) // TTL elapsed: evaluated again
+  })
+
+  it('a conflict on generation 0 STOPS the generation loop (same member only): no later-generation seat is created', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const key = await craft('conv-gen')
+    await rpc(env, g.ctx, 'seat_select', { project: key.project, thread: key.thread })
+    const before = seatCount()
+    const r = await boot(env, g, chatgpt('conv-gen'))
+    expect(r.sc.bound_agent_id).toBeNull()
+    expect(receiptOf(r)).toMatchObject({ auto_seat_refused: 'seat_key_source_conflict' })
+    expect(seatCount()).toBe(before)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seats WHERE source = 'auto'`)).toBe(0)
   })
 })
