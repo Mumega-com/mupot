@@ -457,6 +457,25 @@ describe('caps and throttle (refusal never fails the request)', () => {
     expect(n(`SELECT COUNT(*) AS n FROM agent_seats WHERE harness_id = ? AND source = 'auto' AND retired_at IS NULL`, g.harnessId)).toBe(3)
   })
 
+  it('RECLAIM never retires an explicit seat_select seat on the SAME harness, even when it is the oldest / least-recently-used row', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const sel = await rpc(env, g.ctx, 'seat_select', { project: 'mupot', folder: '/explicit' })
+    expect(typeof sel.sc.seat_handle).toBe('string')
+    const explicitAgent = String(h.sqlite.prepare(`SELECT agent_id AS v FROM agent_seats WHERE harness_id = ? AND source = 'select'`).get(g.harnessId)!.v)
+    // Make the explicit seat the oldest, least-recently-used row on the harness — the row an unfiltered LRU would pick first.
+    h.sqlite.exec(`UPDATE agent_seats SET last_used_at = '2000-01-01T00:00:00.000Z' WHERE agent_id = '${explicitAgent}'`)
+    const lim = { autoLive: 2, windowMax: 100 }
+    const make = (k: string) => applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: k, codexThreadId: null } }, Date.now(), lim)
+    await make('x1'); await make('x2')
+    const x3 = await make('x3') // pool full -> reclaim must pick an AUTO seat
+    expect(typeof x3.boundAgentId).toBe('string')
+    expect(h.sqlite.prepare(`SELECT retired_at AS v FROM agent_seats WHERE agent_id = ?`).get(explicitAgent)!.v).toBeNull()
+    expect(n(`SELECT COUNT(*) AS n FROM agents WHERE id = ? AND status = 'active'`, explicitAgent)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seats WHERE harness_id = ? AND source = 'auto' AND retired_at IS NOT NULL`, g.harnessId)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE agent_id = ? AND action = 'seat_auto_retire'`, explicitAgent)).toBe(0)
+  })
+
   it('a reclaimed conversation is never resurrected: when it returns it gets a FRESH seat (new agent), and keeps it', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
