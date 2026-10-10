@@ -22,8 +22,13 @@ function message(event: BusEvent) {
   }
 }
 
+// Loop brake (migration 0203): wakeAgent now reads execution_pauses before touching the DO, so every
+// wake env needs a DB; this stub answers "no row" (not paused) to any probe.
+const NOT_PAUSED_DB = { prepare: () => ({ bind: () => ({ first: async () => null }) }) }
+
 function envForWake(responseStatus: number): Env {
   return {
+    DB: NOT_PAUSED_DB,
     AGENT: {
       idFromName: vi.fn(() => 'agent-do-id'),
       get: vi.fn(() => ({ fetch: vi.fn(async () => new Response(null, { status: responseStatus })) })),
@@ -485,6 +490,8 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     function first(sql: string, b: unknown[]) {
       // mupot#1740: post-refusal "is the seat stopped?" probe — this mock models no stopped seat.
       if (sql.startsWith('SELECT 1 AS ok WHERE')) return { ok: 1 }
+      // Loop-brake pause probe (migration 0203): this mock models no pause.
+      if (sql.includes('execution_pauses')) return null
       // deliverDispatchToInbox reads the task text for the envelope; this mock models no task text.
       if (sql.includes('FROM tasks WHERE id = ?1 LIMIT 1') && sql.includes('title')) return null
       if (sql.includes('FROM task_dispatch_receipts')) {

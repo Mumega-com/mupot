@@ -30,6 +30,11 @@ import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
+import {
+  EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR, EXECUTION_RETRY_CEILING,
+  executionPausedSql, retryCeilingReachedSql, taskHeldSql,
+  isExecutionPaused, isTaskHeld, isRetryCeilingReached, recordRefusedAttempt, escalateRefusedTask,
+} from './execution-brakes'
 import { resolveTaskAssignee } from '../tasks/assignee'
 import { createModel } from '../model'
 import { createBus } from '../bus'
@@ -73,6 +78,9 @@ export interface ExecuteResult {
   decided: string
   task_status?: Task['status']
   error?: string
+  /** True when the failure was the model/provider/gateway being unavailable (not a refusal of the
+   *  agent's own output): such an attempt never counts toward the per-task retry ceiling. */
+  outage?: true
 }
 
 // Injectable seams so the orchestration can be unit-tested without a DO or a
@@ -94,7 +102,39 @@ export interface ExecuteDeps {
   }
 }
 
+// Meter refusals (daily rate/token/cost caps) are load shedding that clears on its own window, and
+// model/provider outages are not a refusal of the agent's own output; neither counts toward the
+// per-task retry ceiling.
+const METER_REFUSAL_ERRORS: ReadonlySet<string> = new Set(['rate_limited', 'budget_exhausted', 'budget_cap_exceeded'])
+
+/**
+ * runTaskExecution — one execution attempt. This wrapper is the SINGLE chokepoint for the per-task
+ * retry ceiling (migration 0203): every attempt that lands the task 'blocked' with a failure (artifact
+ * verification refusal, placeholder done_when, non-outage exception, content-proposal failure) bumps
+ * the per-TASK counter in one atomic statement; reaching the ceiling HOLDS the task (out of pickup for
+ * every agent until a human releases it) and raises it to the human queue. The claim UPDATE (claimTaskProgress) independently refuses a task at the ceiling, so a wake that
+ * races the bump still cannot re-claim it. Counting is best-effort: a counter write failure never
+ * changes the attempt's own result (the next refusal bumps it again).
+ */
 export async function runTaskExecution(
+  env: Env,
+  agent: Agent,
+  taskId: string,
+  deps: ExecuteDeps = {},
+): Promise<ExecuteResult> {
+  const result = await runTaskExecutionAttempt(env, agent, taskId, deps)
+  if (result.task_status === 'blocked' && !result.ok && !result.outage && !(result.error && METER_REFUSAL_ERRORS.has(result.error))) {
+    try {
+      const count = await recordRefusedAttempt(env, agent.id, result.task_id, result.error || result.decided || 'execution_failed')
+      if (count >= EXECUTION_RETRY_CEILING) await escalateRefusedTask(env, agent.id, result.task_id)
+    } catch (brakeErr) {
+      console.error('execute: retry-ceiling bookkeeping failed', brakeErr)
+    }
+  }
+  return result
+}
+
+async function runTaskExecutionAttempt(
   env: Env,
   agent: Agent,
   taskId: string,
@@ -110,6 +150,13 @@ export async function runTaskExecution(
   // Load within this tenant DB, then fail closed on assignment and current
   // authority. The coarse response intentionally does not reveal which check failed.
   let task = await loadTaskById(env, taskId)
+  // Escalation HOLD (migration 0203): a task with an unreleased hold is out of pickup for EVERY agent,
+  // however it got here (an unassigned task, a queued wake, another agent). Checked before the
+  // assignment check so a queued wake for a held, now-unassigned task is a terminal refusal, not a
+  // retried 'task_not_found'. The claim UPDATE below re-asserts it atomically.
+  if (task && await isTaskHeld(env, taskId)) {
+    return { ok: false, task_id: taskId, decided: '', error: TASK_HELD_ERROR }
+  }
   if (!task || !(await canAgentExecuteTask(env, agent, task))) {
     return { ok: false, task_id: taskId, decided: `task ${taskId} not found`, error: 'task_not_found' }
   }
@@ -144,6 +191,25 @@ export async function runTaskExecution(
   if (!claimed) {
     if (fenceStoppedReceiver && await receiverIsStopped(env, agent.id)) {
       return { ok: false, task_id: task.id, decided: '', error: 'receiver_not_live' }
+    }
+    // Loop brakes (migration 0203): the claim UPDATE itself refuses a paused agent/squad and a
+    // task that hit the per-(agent, task) retry ceiling; classify the refusal so the caller can
+    // settle it terminally instead of retrying a claim that can never succeed.
+    if (await isTaskHeld(env, task.id)) {
+      return { ok: false, task_id: task.id, decided: '', error: TASK_HELD_ERROR }
+    }
+    if (await isExecutionPaused(env, agent.id)) {
+      return { ok: false, task_id: task.id, decided: '', error: EXECUTION_PAUSED_ERROR }
+    }
+    if (await isRetryCeilingReached(env, task.id)) {
+      // The counter hit the ceiling but no hold exists yet (a crash between bump and hold): place it
+      // now. Best-effort: the claim is refused either way, and the next refusal retries the hold.
+      try {
+        await escalateRefusedTask(env, agent.id, task.id)
+      } catch (escalateErr) {
+        console.error('execute: escalation after ceiling refusal failed', escalateErr)
+      }
+      return { ok: false, task_id: task.id, decided: '', error: RETRY_CEILING_ERROR }
     }
     // #1571: a 0-row claim on an archived task is an honest refusal, not a lost race.
     if (await isTaskArchived(env, task.id)) {
@@ -241,6 +307,8 @@ export async function runTaskExecution(
   // when the call failed mid-flight — an attempted call consumed budget even if
   // we never got a usage record back.
   let recordedCostMicroUsd = cycleCostMicroUsd
+  // Set when the model call itself threw (see the tagged call below).
+  let modelUnavailable = false
 
   try {
     const charter = await loadSquadCharter(env, task.squad_id)
@@ -251,9 +319,18 @@ export async function runTaskExecution(
       { role: 'system', content: buildExecuteSystem(agent, charter, externalMarker(task)) },
       { role: 'user', content: buildExecutePrompt(task) },
     ]
-    const chatResult = model.chatWithUsage
-      ? await model.chatWithUsage(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
-      : { text: await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS }), usage: undefined }
+    // A throw from the model call itself is an outage (provider/model/gateway), not a refusal of the
+    // agent's own output: tagged so it never counts toward the retry ceiling.
+    const chatResult = await (async () => {
+      try {
+        return model.chatWithUsage
+          ? await model.chatWithUsage(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS })
+          : { text: await model.chat(messages, { model: agent.model, maxTokens: EXECUTE_MAX_TOKENS }), usage: undefined }
+      } catch (modelErr) {
+        modelUnavailable = true
+        throw modelErr
+      }
+    })()
     chatUsage = chatResult.usage
     // P0 (River gate): the recorded cost must come from REAL usage when the
     // provider reported it — usage-derived, estimate only as fallback. The old
@@ -400,7 +477,7 @@ export async function runTaskExecution(
       cacheRead: chatUsage?.cacheRead,
       cacheWrite: chatUsage?.cacheWrite,
     })
-    return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg }
+    return { ok: false, task_id: task.id, decided: '', task_status: 'blocked', error: msg, ...(modelUnavailable ? { outage: true as const } : {}) }
   }
 }
 
@@ -529,6 +606,9 @@ async function claimTaskProgress(
           AND ${TASK_NOT_ARCHIVED_SQL()}
           ${executionCondition}
           AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND status = 'active')
+          AND NOT ${executionPausedSql('?1')}
+          AND NOT ${retryCeilingReachedSql('tasks.id')}
+          AND NOT ${taskHeldSql('tasks.id')}
           ${stoppedFenceSql}`,
     ).bind(
       agent.id, updatedAt, executionReceiptId, executionClaimExpiresAt,
@@ -542,6 +622,9 @@ async function claimTaskProgress(
           AND ${TASK_NOT_ARCHIVED_SQL()}
           ${executionCondition}
           AND EXISTS (SELECT 1 FROM agents WHERE id = ?7 AND status = 'active')
+          AND NOT ${executionPausedSql('?7')}
+          AND NOT ${retryCeilingReachedSql('tasks.id')}
+          AND NOT ${taskHeldSql('tasks.id')}
           ${stoppedFenceSql}`,
     ).bind(
       updatedAt, executionReceiptId, executionClaimExpiresAt,
@@ -948,16 +1031,18 @@ export async function runDispatchedTaskExecution(
   deps: ExecuteDeps = {},
 ): Promise<ExecuteResult> {
   const r = await runTaskExecution(env, agent, taskId, { ...deps, executionReceiptId })
-  if (executionReceiptId && r.error === 'receiver_not_live') {
+  if (executionReceiptId && (r.error === 'receiver_not_live' || r.error === EXECUTION_PAUSED_ERROR || r.error === RETRY_CEILING_ERROR || r.error === TASK_HELD_ERROR)) {
     // mupot#1740 — the claim UPDATE's stopped-seat fence refused: nothing executed, no pointer
     // set. Same terminal disposition as the consumer's pre-check (delivered_via stays NULL).
+    // Loop brakes (0203): a paused agent/squad and a task at the retry ceiling are the same shape —
+    // nothing executed, and retrying the claim can never succeed, so settle terminally.
     try {
       await settleInWorkerDispatchReceipt(env, {
         dispatchReceiptId: executionReceiptId, taskId: r.task_id, agentId: agent.id,
-        stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
+        stage: 'failed', reason: r.error, deliveredVia: 'none', ...(r.error === 'receiver_not_live' ? {} : { auditLabel: r.error }),
       })
     } catch (settleErr) {
-      console.error('execute: receiver_not_live settle failed', settleErr)
+      console.error('execute: terminal refusal settle failed', settleErr)
     }
   } else if (executionReceiptId) {
     const stage = inWorkerSettleStage(r)

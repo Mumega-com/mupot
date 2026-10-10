@@ -3594,9 +3594,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "task_incident_revert_receipts_no_delete" },
     ],
   },
+  {
+    file: "0203_execution_brakes.sql",
+    sha256: "f243c1c3b647733d068728d12f0e3bc7ba3e7acbc6d73152089e4a175275d1c8",
+    statements: [
+      "-- 0203_execution_brakes.sql — \"agents as themselves\" step 1: LOOP BRAKES (incident 2026-10-09,\n-- mupot#1780: a bulk router_tick assigned 24 tasks, the queued agent.wake messages could not be\n-- recalled, and the in-Worker executor re-claimed refused tasks for 89 executions).\n--\n-- Additive; nothing existing references these tables. APPLY THIS MIGRATION BEFORE the code deploy\n-- (the executor claim UPDATE, the consumer and AgentDO read these tables).\n--\n-- 1. execution_pauses — the kill switch for IN-WORKER autonomous execution (one agent or one squad).\n--    ACTIVE while resumed_at IS NULL; the partial unique index makes pause an idempotent\n--    INSERT ... ON CONFLICT DO NOTHING. The row is the receipt for pause AND resume; the tools also\n--    append an audit row anchored on the transition.\n--\n-- 2. task_execution_attempts — per-TASK refusal counter (all agents, all dispatches). One atomic\n--    INSERT ... ON CONFLICT DO UPDATE ... RETURNING bumps it. Nothing resets it implicitly: a column\n--    change (assignee, status) or a re-dispatch must NOT re-arm the brake, because any actor that can\n--    write the assignee (an agent, a seat, the executor's own claim, an operator unassign) would\n--    otherwise re-arm the loop. Only a HUMAN, in code where the caller is known, resets it\n--    (execution_release / a human task_update that assigns).\n--\n-- 3. execution_holds — the escalation HOLD, per TASK. Once the counter reaches the ceiling a row is\n--    stamped and the task is out of executor pickup for EVERY agent until a human releases it\n--    (released_at set by execution_release / human reassign). The claim UPDATE (both branches) and the\n--    executor's WORKABLE pickup refuse a task with an unreleased hold. One row per task: a re-escalation\n--    after release rewrites the row; the history lives in mutation_audit_entries.\n\nCREATE TABLE IF NOT EXISTS execution_pauses (\n  id                   TEXT PRIMARY KEY,\n  tenant               TEXT NOT NULL,\n  scope_type           TEXT NOT NULL CHECK (scope_type IN ('agent', 'squad')),\n  scope_id             TEXT NOT NULL CHECK (length(trim(scope_id)) > 0),\n  reason               TEXT NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 2000),\n  paused_by_member_id  TEXT NOT NULL CHECK (length(trim(paused_by_member_id)) > 0),\n  paused_at            TEXT NOT NULL,\n  resumed_at           TEXT,\n  resumed_by_member_id TEXT,\n  resume_reason        TEXT CHECK (resume_reason IS NULL OR length(trim(resume_reason)) BETWEEN 1 AND 2000),\n  CHECK ((resumed_at IS NULL) = (resumed_by_member_id IS NULL))\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_execution_pauses_active\n  ON execution_pauses (scope_type, scope_id)\n  WHERE resumed_at IS NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_execution_pauses_scope\n  ON execution_pauses (scope_type, scope_id, paused_at);",
+      "\n\nCREATE TABLE IF NOT EXISTS task_execution_attempts (\n  task_id       TEXT PRIMARY KEY,\n  refused_count INTEGER NOT NULL DEFAULT 0 CHECK (refused_count >= 0),\n  last_agent_id TEXT,\n  last_reason   TEXT,\n  first_at      TEXT NOT NULL,\n  last_at       TEXT NOT NULL\n);",
+      "\n\nCREATE TABLE IF NOT EXISTS execution_holds (\n  task_id                TEXT PRIMARY KEY,\n  escalation_id          TEXT NOT NULL,\n  agent_id               TEXT NOT NULL,\n  refused_count          INTEGER NOT NULL,\n  reason                 TEXT,\n  held_at                TEXT NOT NULL,\n  released_at            TEXT,\n  released_by_member_id  TEXT,\n  release_id             TEXT,\n  release_reason         TEXT CHECK (release_reason IS NULL OR length(trim(release_reason)) BETWEEN 1 AND 2000),\n  CHECK ((released_at IS NULL) = (released_by_member_id IS NULL))\n);",
+    ],
+    objects: [
+      { type: "table", name: "execution_pauses" },
+      { type: "index", name: "uq_execution_pauses_active" },
+      { type: "index", name: "idx_execution_pauses_scope" },
+      { type: "table", name: "task_execution_attempts" },
+      { type: "table", name: "execution_holds" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "d7b373380a8b32cc7ffcf13878c09b877d86a7c451e04c2c5aed75735e67df38"
+export const SCHEMA_CHAIN_DIGEST: string = "9133831faf04d71772eaf1a9fbb8cc2239784cccad5cff30f56ddccafeff7dd1"

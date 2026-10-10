@@ -326,6 +326,9 @@ export async function settleInWorkerDispatchReceipt(
     dispatchReceiptId: string; taskId: string; agentId: string; stage: 'completed' | 'failed'; reason: string
     /** mupot#1729: 'none' = refused before any delivery (delivered_via stays NULL). Default in_worker. */
     deliveredVia?: 'in_worker' | 'none'
+    /** Loop brakes: distinct audit handler/principal for a brake refusal ('execution_paused',
+     *  'retry_ceiling_reached', 'task_held') instead of the receiver-fence label. [a-z_] only. */
+    auditLabel?: 'execution_paused' | 'retry_ceiling_reached' | 'task_held'
   },
 ): Promise<boolean> {
   const now = new Date().toISOString()
@@ -358,8 +361,8 @@ export async function settleInWorkerDispatchReceipt(
         credential_id, origin, handler, operation, target_kind, target_id,
         task_id, request_id, idempotency_key, evidence_json, recorded_at
       )
-      SELECT ?1, ?2, 'system', ${deliveredVia ? "'in_worker_execute'" : "'dispatch_receiver_fence'"}, NULL, ?3,
-             NULL, 'worker_callback', ${deliveredVia ? "'in_worker_dispatch_settle'" : "'receiver_not_live_settle'"}, ?4, 'dispatch_receipt', ?5,
+      SELECT ?1, ?2, 'system', ${deliveredVia ? "'in_worker_execute'" : input.auditLabel ? "'execution_brake'" : "'dispatch_receiver_fence'"}, NULL, ?3,
+             NULL, 'worker_callback', ${deliveredVia ? "'in_worker_dispatch_settle'" : input.auditLabel ? `'${input.auditLabel}_settle'` : "'receiver_not_live_settle'"}, ?4, 'dispatch_receipt', ?5,
              ?6, ?7, ?7, ?8, ?9
        WHERE changes() = 1
     `).bind(

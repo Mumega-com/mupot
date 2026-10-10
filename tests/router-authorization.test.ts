@@ -398,6 +398,61 @@ describe('router_tick authorization and squad fencing', () => {
     expect(harness.sqlite.prepare('SELECT member_id FROM presence WHERE tenant = ? AND member_id = ?').get(TENANT, 'lead-a')).toEqual({ member_id: 'lead-a' })
   })
 
+  // Loop brake #1 (incident 2026-10-09, mupot#1780): without an explicit dry_run:false the MCP tool
+  // returns the plan and writes NOTHING (no assignment, no agent.wake on the queue, no presence touch).
+  it('defaults to a dry run when dry_run is omitted: returns the plan, assigns nothing, queues no wake', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    insertTask(harness.sqlite, 'task-b', SQUAD_A)
+    const writes = { value: 0 }
+    const { env, events } = makeEnv(harness, { writes })
+    const deferred: Promise<unknown>[] = []
+
+    const result = await invokeTool(
+      auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]),
+      env,
+      'router_tick',
+      { squad_id: SQUAD_A },
+      { origin: 'https://pot.example', waitUntil: (promise) => deferred.push(promise) },
+    )
+    await Promise.all(deferred)
+
+    expect(result).toMatchObject({ ok: true, result: { dry_run: true, dry_run_defaulted: true, assigned: 0 } })
+    expect((result as { result: { decisions: unknown[] } }).result.decisions).toEqual([
+      { task_id: 'task-a', outcome: 'would_assign', agent_id: AGENT_A },
+      { task_id: 'task-b', outcome: 'would_assign', agent_id: AGENT_A },
+    ])
+    expect(events).toHaveLength(0)
+    expect(writes.value).toBe(0)
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM tasks WHERE assignee_agent_id IS NOT NULL').get()).toEqual({ n: 0 })
+    expect(harness.sqlite.prepare('SELECT member_id FROM presence WHERE tenant = ? AND member_id = ?').get(TENANT, 'lead-a')).toBeUndefined()
+  })
+
+  it('an explicit dry_run:true is a dry run without the defaulted marker; only an explicit false executes', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env, events } = makeEnv(harness)
+
+    const dry = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, { squad_id: SQUAD_A, dry_run: true })
+    expect(dry).toMatchObject({ ok: true, result: { dry_run: true, assigned: 0 } })
+    expect((dry as { result: Record<string, unknown> }).result).not.toHaveProperty('dry_run_defaulted')
+    expect(events).toHaveLength(0)
+
+    const real = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, { squad_id: SQUAD_A, dry_run: false })
+    expect(real).toMatchObject({ ok: true, result: { dry_run: false, assigned: 1 } })
+    expect(events).toHaveLength(1)
+  })
+
+  it('the defaulted dry run is observer-visible (router:read) but an observer still cannot execute', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env, events } = makeEnv(harness)
+
+    const plan = await routerTick(auth('observer-a', [grant('observer-a', 'observer', SQUAD_A)]), env, { squad_id: SQUAD_A })
+    expect(plan).toMatchObject({ ok: true, result: { dry_run: true, assigned: 0 } })
+
+    const exec = await routerTick(auth('observer-a', [grant('observer-a', 'observer', SQUAD_A)]), env, { squad_id: SQUAD_A, dry_run: false })
+    expect(exec).toMatchObject({ ok: false, status: 403 })
+    expect(events).toHaveLength(0)
+  })
+
   it('rejects malformed dry_run before it can select a presence-touch branch', async () => {
     const writes = { value: 0 }
     const { env } = makeEnv(harness, { writes })
@@ -477,5 +532,54 @@ describe('root-mounted router REST route', () => {
 
     const duplicatedChild = await app.fetch(rootRequest('/api/router/tick/tick', { squad_id: SQUAD_A, dry_run: false }, true), env)
     expect(duplicatedChild.status).toBe(404)
+  })
+  it('a pause landing between the candidate read and the claim is refused by the claim UPDATE itself (lost_claim, no wake)', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const { env, events } = makeEnv(harness, {
+      beforeClaim: () => harness.sqlite.exec(`INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at)
+        VALUES ('p-race', '${TENANT}', 'agent', '${AGENT_A}', 'race', 'org-admin', datetime('now'))`),
+    })
+    const result = await routerTick(auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)]), env, { squad_id: SQUAD_A, dry_run: false })
+    expect((result as { result: { decisions: unknown[] } }).result.decisions).toEqual([{ task_id: 'task-a', outcome: 'lost_claim', agent_id: AGENT_A }])
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: null })
+  })
+
+  it('POST /api/router/tick is dry-run by default like the MCP tool: only an explicit dry_run:false assigns', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    const env = rootEnv(harness, sessionFor('org-admin'))
+
+    const plan = await app.fetch(rootRequest('/api/router/tick', { squad_id: SQUAD_A }, true), env)
+    expect(plan.status).toBe(200)
+    await expect(plan.json()).resolves.toMatchObject({ ok: true, result: { dry_run: true, assigned: 0 } })
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: null })
+
+    const live = await app.fetch(rootRequest('/api/router/tick', { squad_id: SQUAD_A, dry_run: false }, true), env)
+    await expect(live.json()).resolves.toMatchObject({ ok: true, result: { dry_run: false, assigned: 1 } })
+  })
+
+  it('a paused agent is never a routing candidate: neither the dry run nor the live tick plans or assigns to it', async () => {
+    insertTask(harness.sqlite, 'task-a', SQUAD_A)
+    harness.sqlite.exec(`INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at)
+      VALUES ('p1', '${TENANT}', 'agent', '${AGENT_A}', 'stop', 'org-admin', datetime('now'))`)
+    const { env, events } = makeEnv(harness)
+    const lead = auth('lead-a', [grant('lead-a', 'lead', SQUAD_A)])
+
+    const dry = await routerTick(lead, env, { squad_id: SQUAD_A })
+    expect(dry).toMatchObject({ ok: true, result: { assigned: 0, unrouted: 1 } })
+    expect((dry as { result: { decisions: unknown[] } }).result.decisions).toEqual([{ task_id: 'task-a', outcome: 'unrouted', agent_id: null }])
+
+    const live = await routerTick(lead, env, { squad_id: SQUAD_A, dry_run: false })
+    expect(live).toMatchObject({ ok: true, result: { assigned: 0, unrouted: 1 } })
+    expect(events).toHaveLength(0)
+    expect(harness.sqlite.prepare('SELECT assignee_agent_id FROM tasks WHERE id = ?').get('task-a')).toEqual({ assignee_agent_id: null })
+
+    // squad-scoped pause covers it too, and resuming restores routing
+    harness.sqlite.exec(`UPDATE execution_pauses SET resumed_at = datetime('now'), resumed_by_member_id = 'org-admin'`)
+    harness.sqlite.exec(`INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at)
+      VALUES ('p2', '${TENANT}', 'squad', '${SQUAD_A}', 'stop', 'org-admin', datetime('now'))`)
+    expect(await routerTick(lead, env, { squad_id: SQUAD_A })).toMatchObject({ ok: true, result: { unrouted: 1 } })
+    harness.sqlite.exec(`UPDATE execution_pauses SET resumed_at = datetime('now'), resumed_by_member_id = 'org-admin' WHERE id = 'p2'`)
+    expect(await routerTick(lead, env, { squad_id: SQUAD_A })).toMatchObject({ ok: true, result: { decisions: [{ outcome: 'would_assign', agent_id: AGENT_A }] } })
   })
 })
