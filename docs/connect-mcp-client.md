@@ -196,6 +196,53 @@ After choosing the harness option, each thread or worktree picks its own agent:
 Choosing an existing agent on the consent screen still works exactly as before, and an existing
 agent-bound connection is untouched.
 
+## Shared environments (env-secret tokens, CI, Cursor, Grok bots)
+
+> Needs `SEAT_AUTO_ENROLL=1` on the pot. The shared-credential warning below also needs
+> `SHARED_CREDENTIAL_DETECT=1` (its own flag, default off). With both off, none of this exists.
+
+One token is often shared by many actors: a Codex cloud environment secret, GitHub Actions, a
+shared `.env`, a fleet hook that gives every Claude Code seat the same agent token, or one MCP
+config inside Cursor or a Grok bot. Every thread behind that token collapses into **one** identity.
+The cure is to make the shared credential a **harness** and let each thread pick its own seat.
+
+**1. Mint a harness token.** An org admin mints it for a member, through the same endpoint and
+the same checks as any member token (org-admin floor, and you cannot mint for someone who outranks
+you):
+
+```bash
+curl -sS -X POST "https://<pot>/api/members/members/<member-id>/tokens" \
+  -H "Cookie: mupot_session=<admin session>" -H "Content-Type: application/json" \
+  -d '{"harness_kind":"ci","label":"gh-actions mupot","expires_in_days":90}'
+```
+
+`harness_kind` is one of `claude-code`, `cursor`, `codex`, `grok`, `ci`, `other` (a display label,
+never authority). `label` is required. Default expiry is 30 days; a harness token is never
+non-expiring. The raw token is returned once. By itself it has **no capabilities**: it can only
+call `seat_select`. It cannot be used on the REST API.
+
+**2. Set it as the env secret** (for example `MUPOT_TOKEN`) and connect as usual with
+`Authorization: Bearer $MUPOT_TOKEN`.
+
+**3. Each thread calls `seat_select`.** Every thread, job or worktree behind the shared token calls
+`seat_select { project, folder?, thread? }` with its own labels and gets its own seat agent and a
+seat handle (`mseat_...`). Send the handle as `X-Mupot-Seat` (or `_meta["mupot/seat"]`) on that
+thread's requests. Same labels, same agent; different labels, different agents. Seats are capped
+(live seats per member, plus a lifetime bound), clamped to your own live access and never above
+member, and **do not count toward your plan's agent limit**.
+
+**Rotate or revoke.** Revoking the token retires every seat on its harness and revokes their
+handles. Note that anyone holding the shared token can call `seat_select` with any label, so seats
+separate honest threads from each other; they do not defend against a hostile holder of the token.
+
+**Warning for shared credentials.** With `SHARED_CREDENTIAL_DETECT=1`, any credential (agent-bound
+tokens included) that shows more than 3 distinct concurrent sessions in 15 minutes gets a
+`shared_credential` block in `boot_context`:
+"this credential is used by N sessions; connect via a harness token or the harness OAuth option and
+call seat_select so each thread gets its own agent". It is advice only: it never blocks or changes
+authentication. Sessions are counted from a hashed fingerprint of `Mcp-Session-Id`, client thread
+hints and the user-agent family; no raw session id, user-agent or IP is stored.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
