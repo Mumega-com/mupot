@@ -1,4 +1,4 @@
--- 0156_harness_reservations.sql — Harness Adapter SPI & pre-dispatch reservations.
+-- 0206_harness_reservations.sql — Harness Adapter SPI & pre-dispatch reservations.
 --
 -- mupot#1428 / Flight f0150aed-caee-4411-9690-1d03d7d9ea43
 --
