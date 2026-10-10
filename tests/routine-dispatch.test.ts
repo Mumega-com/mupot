@@ -1012,8 +1012,9 @@ describe('routine dispatch respects execution_pauses', () => {
         DB: {
           prepare(sql: string) {
             if (!paused && sql.includes(pauseAt)) { paused = true; pause(h, 'agent', 'agent-preferred') }
-            // a post-refusal re-read of the pause (the pre-fix diagnosis) sees it already lifted
-            if (paused && !lifted && sql.includes('SELECT 1 AS paused WHERE')) lift()
+            // any read issued after the refusing write (every diagnosis is a SELECT; the writes are all prepared
+            // before they run) finds the pause already lifted
+            if (paused && !lifted && /^\s*SELECT/i.test(sql)) lift()
             const statement = real.prepare(sql)
             sqlOf.set(statement, sql)
             return statement
