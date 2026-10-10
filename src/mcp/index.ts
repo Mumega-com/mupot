@@ -189,6 +189,8 @@ import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
 import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
+import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
+import { releaseExecutionHold } from '../agents/execution-brakes'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, visibleTaskClause } from '../tasks/visibility'
 import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprint, type TaskCursor } from '../tasks/pagination'
@@ -1965,6 +1967,13 @@ const toolTaskUpdate: ToolSpec = {
       if (error instanceof TaskIntakeContractError) return fail(400, error.code, error.message)
       if (error instanceof TaskUpdateConflictError) return fail(409, error.code, error.detail)
       throw error
+    }
+    // Execution hold (migration 0203): a HUMAN (no agent binding) assigning the task to an agent (even the
+    // agent it already names: an agent can self-assign, so "no change" proves nothing) is the
+    // explicit release of an escalation hold + reset of its refusal counter. An agent-bound principal
+    // never reaches this (an agent cannot lift the hold on a loop it is in). A no-op unless held.
+    if (!auth.boundAgentId && typeof args.assignee_agent_id === 'string' && typeof next.assignee_agent_id === 'string') {
+      await releaseExecutionHold(env, { taskId: existing.id, memberId: auth.memberId as string, reason: 'human reassign via task_update', via: 'human_reassign' })
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
@@ -4355,7 +4364,7 @@ const toolWakeAgent: ToolSpec = {
       context,
       maxActions,
     })
-    if (!routed.ok) return fail(409, 'wake_failed')
+    if (!routed.ok) return routed.reason === 'paused' ? fail(409, 'execution_paused') : fail(409, 'wake_failed')
     if (routed.route === 'agent_do') return done({ agent_id: agent.id, runtime: routed.runtime })
     return done({
       agent_id: agent.id,
@@ -4367,13 +4376,19 @@ const toolWakeAgent: ToolSpec = {
   },
 }
 
-// router_tick — one named squad only. Dry-run is observer-visible; mutation is lead-gated.
+// router_tick — one named squad only. DRY-RUN BY DEFAULT (loop brake #1, incident 2026-10-09
+// mupot#1780: an operator call without dry_run assigned 24 tasks and queued 24 unrecallable
+// agent.wake messages). Without an explicit `dry_run:false` the tool returns the plan it WOULD
+// execute and writes nothing; that default is observer-visible (router:read). Mutation needs
+// `dry_run:false` AND lead-gated router:mutate authority. The engine (runRouterTick) and the other
+// caller (the REST route in src/router/routes.ts) are unchanged: the default lives only here.
 const toolRouterTick: ToolSpec = {
   name: 'router_tick',
   scope: 'named squad',
   min: 'authenticated',
-  shouldTouchPresence: (args) => args.dry_run !== true,
-  args: '{ squad_id: string, dry_run?: boolean, limit?: number }',
+  // Presence is touched only for a call that actually mutates (explicit dry_run:false).
+  shouldTouchPresence: (args) => args.dry_run === false,
+  args: '{ squad_id: string, dry_run?: boolean (DEFAULT true: returns the plan, writes nothing; pass false to assign + wake), limit?: number }',
   inputSchema: {
     type: 'object',
     properties: {
@@ -4393,7 +4408,9 @@ const toolRouterTick: ToolSpec = {
     if (args.dry_run !== undefined && typeof args.dry_run !== 'boolean') {
       return fail(400, 'invalid_args', 'dry_run must be boolean')
     }
-    const dryRun = args.dry_run === true
+    // Default-safe: ONLY an explicit `false` executes.
+    const dryRunDefaulted = args.dry_run === undefined
+    const dryRun = args.dry_run !== false
     const decision = await authorizeExecutionScope(env, auth, {
       action: dryRun ? 'router:read' : 'router:mutate',
       squadId,
@@ -4403,7 +4420,12 @@ const toolRouterTick: ToolSpec = {
 
     const limit = typeof args.limit === 'number' ? args.limit : undefined
     const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId })
-    return done(result)
+    if (!dryRun) return done(result)
+    return done({
+      ...result,
+      ...(dryRunDefaulted ? { dry_run_defaulted: true } : {}),
+      note: 'DRY RUN: nothing was assigned or woken. Pass dry_run:false to execute this plan.',
+    })
   },
 }
 
@@ -6764,6 +6786,7 @@ export const TOOLS: ToolSpec[] = [
   toolTeamBootstrapRelease,
   ...ARCHIVE_TOOLS,
   ...INCIDENT_REVERT_TOOLS,
+  ...EXECUTION_PAUSE_TOOLS,
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,

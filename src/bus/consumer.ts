@@ -26,6 +26,7 @@ import { deliverSubscriptionEvent, enqueueMessageCreatedDeliveries } from './eve
 import { redactSecretPatterns } from '../lib/redact'
 import { settleInWorkerDispatchReceipt } from '../tasks/runtime-receipts'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR, isExecutionPaused } from '../agents/execution-brakes'
 
 // Internal origin for DO fetch routing. DO fetch ignores host; the path carries
 // the intent. The agents component routes these paths inside its DO classes.
@@ -49,7 +50,13 @@ class RetryAfterError extends Error {
   }
 }
 
-async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<'ok' | 'receiver_not_live'> {
+type WakeOutcome = 'ok' | 'receiver_not_live' | typeof EXECUTION_PAUSED_ERROR | typeof RETRY_CEILING_ERROR | typeof TASK_HELD_ERROR
+
+async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<WakeOutcome> {
+  // Loop brake (migration 0203): the pause is checked HERE, when the queued wake is consumed (not
+  // only at enqueue), and again inside AgentDO.wake / the executor's claim UPDATE. A paused agent's
+  // queued agent.wake is a terminal no-op — never a retry (a retry would just re-ask a paused agent).
+  if (await isExecutionPaused(env, agentId)) return EXECUTION_PAUSED_ERROR
   const id = env.AGENT.idFromName(agentId)
   const stub = env.AGENT.get(id)
   const res = await stub.fetch(`${DO_ORIGIN}/wake`, {
@@ -63,6 +70,11 @@ async function wakeAgent(env: Env, agentId: string, event: BusEvent): Promise<'o
     if (res.status === 409) {
       const body = await res.json().catch(() => null) as { error?: unknown } | null
       if (body?.error === 'receiver_not_live') return 'receiver_not_live'
+      // Loop brakes (0203): terminal refusals from the DO / executor (paused after our check, or
+      // the task hit the per-(agent, task) retry ceiling). Not retryable.
+      if (body?.error === EXECUTION_PAUSED_ERROR) return EXECUTION_PAUSED_ERROR
+      if (body?.error === RETRY_CEILING_ERROR) return RETRY_CEILING_ERROR
+      if (body?.error === TASK_HELD_ERROR) return TASK_HELD_ERROR
     }
     throw new Error(`AgentDO ${agentId} wake failed: ${res.status}`)
   }
@@ -470,17 +482,20 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
       // poll seat is delivered to its inbox as before (mailbox preserved).
       // mupot#1740 — settle + consume the refusal. Shared by the fast-fail pre-check below and
       // by the in-write fences (envelope INSERT / in-Worker claim) that close the TOCTOU window.
-      const refuseReceiverNotLive = async (): Promise<true> => {
+      const refuseReceiverNotLive = async (
+        refusal: 'receiver_not_live' | typeof EXECUTION_PAUSED_ERROR | typeof RETRY_CEILING_ERROR | typeof TASK_HELD_ERROR = 'receiver_not_live',
+      ): Promise<true> => {
         const settled = await settleInWorkerDispatchReceipt(env, {
           dispatchReceiptId: identity.receiptId, taskId: identity.taskId, agentId: event.agent_id as string,
-          stage: 'failed', reason: 'receiver_not_live', deliveredVia: 'none',
+          stage: 'failed', reason: refusal, deliveredVia: 'none',
+          ...(refusal === 'receiver_not_live' ? {} : { auditLabel: refusal }),
         })
         // The in-Worker route's DO settles first; an already-settled-failed receipt is landed.
         const alreadySettled = !settled && (await env.DB.prepare(
           `SELECT settled_reason FROM task_dispatch_receipts WHERE tenant = ? AND id = ? AND settled_stage = 'failed' LIMIT 1`,
-        ).bind(event.tenant, identity.receiptId).first<{ settled_reason: string | null }>())?.settled_reason === 'receiver_not_live'
+        ).bind(event.tenant, identity.receiptId).first<{ settled_reason: string | null }>())?.settled_reason === refusal
         if (!settled && !alreadySettled) {
-          const err = new Error('receiver_not_live settle did not land')
+          const err = new Error(`${refusal} settle did not land`)
           await releaseTaskDispatchReceipt(env, event, leaseExpiresAt, err)
           throw err
         }
@@ -528,9 +543,8 @@ async function routeEvent(env: Env, event: BusEvent): Promise<boolean> {
           // as `delivery_forced_predicted: 'no_delivery_mode'`, never silently dropped here).
           // This remains the only path that executes in-Worker: exactly one route is chosen
           // and acted on per lease-holder (BLOCK-2 fix, unchanged).
-          if (await wakeAgent(env, event.agent_id, event) === 'receiver_not_live') {
-            return refuseReceiverNotLive()
-          }
+          const woke = await wakeAgent(env, event.agent_id, event)
+          if (woke !== 'ok') return refuseReceiverNotLive(woke)
         }
       } catch (error) {
         // mupot#1740 — the envelope INSERT's own fence refused: no envelope landed.

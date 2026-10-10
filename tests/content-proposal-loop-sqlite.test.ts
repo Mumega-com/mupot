@@ -84,6 +84,20 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
     );
     -- mupot#1571: every task writer carries TASK_NOT_ARCHIVED_SQL, which reads this table.
     CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
+    -- migration 0203 loop brakes: runTaskExecution's claim UPDATE reads these (triggers omitted: hand fixture).
+    CREATE TABLE execution_pauses (
+      id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+      reason TEXT NOT NULL, paused_by_member_id TEXT NOT NULL, paused_at TEXT NOT NULL,
+      resumed_at TEXT, resumed_by_member_id TEXT, resume_reason TEXT
+    );
+    CREATE TABLE task_execution_attempts (
+      task_id TEXT PRIMARY KEY, refused_count INTEGER NOT NULL DEFAULT 0, last_agent_id TEXT,
+      last_reason TEXT, first_at TEXT NOT NULL, last_at TEXT NOT NULL
+    );
+    CREATE TABLE execution_holds (
+      task_id TEXT PRIMARY KEY, escalation_id TEXT NOT NULL, agent_id TEXT NOT NULL, refused_count INTEGER NOT NULL,
+      reason TEXT, held_at TEXT NOT NULL, released_at TEXT, released_by_member_id TEXT, release_id TEXT, release_reason TEXT
+    );
     CREATE TABLE task_verdicts (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
       note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL

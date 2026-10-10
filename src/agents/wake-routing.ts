@@ -2,6 +2,7 @@ import type { Agent, BusEvent, Env } from '../types'
 import { createBus } from '../bus'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { sendAgentMessage } from './messages'
+import { isExecutionPaused } from './execution-brakes'
 
 const WAKE_ROUTER_SENDER = 'mupot-wake-router'
 const DO_ORIGIN = 'https://agent'
@@ -23,7 +24,7 @@ export type WakeRouteResult =
       seq: number
       duplicate: boolean
     }
-  | { ok: false; reason: 'wake_failed' }
+  | { ok: false; reason: 'wake_failed' | 'paused' }
 
 type DurableRoute = Extract<WakeRouteResult, { delivered: true }>
 
@@ -102,6 +103,10 @@ async function emitRoutedObservation(
 
 /** Select and execute exactly one wake route for a server-resolved canonical agent. */
 export async function routeAgentWake(env: Env, input: WakeRouteInput): Promise<WakeRouteResult> {
+  // Loop brake (migration 0203): a wake is a request to RUN the agent. A paused agent/squad gets an
+  // explicit 'paused' outcome - never the inbox-fallback success, which would read as "woken" while
+  // nothing runs. (Plain messages via send/inbox still deliver; see execution_pause.)
+  if (await isExecutionPaused(env, input.agent.id)) return { ok: false, reason: 'paused' }
   const idempotencyKey = `wake:${crypto.randomUUID()}`
   const external = await getFleetAgentLiveness(env, input.agent.id)
 

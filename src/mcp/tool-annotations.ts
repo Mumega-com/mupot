@@ -102,7 +102,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
 
   // ── wake / routing / messaging ─────────────────────────────────────────────────────────────
   wake_agent: ADDX('routeAgentWake POSTs AgentDO /wake (agents/wake-routing.ts:123); the DO runs one cortex cycle synchronously via createModel (agents/agent-do.ts:16,136) which calls the model provider through the AI Gateway, and advances the DO cycle/alarm'),
-  router_tick: MUT('runRouterTick UPDATE tasks (claims/assigns) + bus emit; dry_run skips only some writes (router/engine.ts:123,197)'),
+  router_tick: MUT('runRouterTick UPDATE tasks (claims/assigns) + bus emit ONLY when dry_run:false is explicit; dry_run defaults to true (toolRouterTick) and the dry path writes nothing (router/engine.ts dryRun branch)'),
   execution_meter_status: RO('getAuthorizedMeterStatus SELECT only (agents/meter.ts:287)'),
   squad_message: ADD('createBus().emit queue send (index.ts:4148)'),
   send: ADD('sendToRef -> sendAgentMessage INSERT agent_messages + bus emit (agents/messages.ts:426,511)'),
@@ -177,6 +177,10 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // unarchive restores a previously archived row (the inverse of archive_row): changes state, destroys nothing.
   unarchive_row: ADD('unarchiveRow restores archived members/agents/squads/projects, and tasks only when TASK_ARCHIVE_ENABLED=1 (taskArchiveEnabled)'),
   task_incident_revert: MUT('task_incident_revert INSERT task_incident_revert_receipts + guarded UPDATE tasks status/assignee/updated_at (tasks/incident-revert.ts); org-admin operator only'),
+  // Loop brakes (migration 0203): additive state rows, no data destroyed; resume is the exact inverse.
+  execution_pause: ADD('toolExecutionPause INSERT execution_pauses ON CONFLICT DO NOTHING + INSERT mutation_audit_entries (mcp/execution-pause.ts); stops nothing already written, no task/agent row changes'),
+  execution_release: ADD('toolExecutionRelease UPDATE execution_holds released_at + DELETE task_execution_attempts + INSERT mutation_audit_entries (agents/execution-brakes.ts releaseExecutionHold); lifts a hold, destroys only the refusal counter'),
+  execution_resume: ADD('toolExecutionResume UPDATE execution_pauses resumed_at + INSERT mutation_audit_entries (mcp/execution-pause.ts); inverse of execution_pause'),
   archive_plan_expand: RO('read-only SELECT expansion of a task archive plan (toolArchivePlanExpand); refuses 409 not_supported after the admin gate unless TASK_ARCHIVE_ENABLED=1, and never writes'),
   agent_lifecycle: MUTX('delegates to deactivate/move/grant/mint, and free-text intent calls Jev at api.typesafe.ai (mcp/agent-lifecycle.ts:156,258)'),
   bootstrap_self: ADD('bootstrapSelf INSERT department/squad/agent/capabilities + agent_audit + credential claim (members/bootstrap-self.ts:809-852)'),

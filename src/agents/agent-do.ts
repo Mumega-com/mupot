@@ -19,6 +19,7 @@ import { runDispatchedTaskExecution, resolveTaskId, resolveDispatchReceiptId } f
 import { runGoalCycle } from './loop'
 import { COOLDOWN_EXTENSION_MS } from './observer'
 import { resolveAgentIdentity } from './identity'
+import { EXECUTION_PAUSED_ERROR, isExecutionPaused } from './execution-brakes'
 
 // Wake request body — who/why woke this agent, and how hard it may work.
 //
@@ -129,6 +130,10 @@ export class AgentDO extends DurableObject<Env> {
     // that don't self-schedule still get the heartbeat re-arm.
     if (result.ok && !result.rescheduled) {
       await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS)
+    } else if (result.error === EXECUTION_PAUSED_ERROR) {
+      // Paused: do nothing this tick (no model call, no task writes) but keep the heartbeat armed
+      // so a resume takes effect without needing an out-of-band wake. The cost is one D1 read.
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS)
     }
   }
 
@@ -153,6 +158,12 @@ export class AgentDO extends DurableObject<Env> {
     }
     if (agent.status !== 'active') {
       return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: 'agent_paused' }
+    }
+    // Loop brake (migration 0203): an org-admin execution pause (this agent, or its whole squad)
+    // makes EVERY entry — alarm, /wake, a queued agent.wake consumed late — a no-op. Read from D1 at
+    // the moment of execution, not cached, so a pause set after enqueue still stops the queued wake.
+    if (await isExecutionPaused(this.env, agent.id)) {
+      return { ok: false, agent_id: agent.id, cycle: this.getCycles(), decided: '', actions: 0, error: EXECUTION_PAUSED_ERROR }
     }
 
     // EXECUTE MODE — a wake carrying a task_id (top-level or in a BusEvent payload)

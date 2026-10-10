@@ -40,8 +40,11 @@ routerApp.post('/tick', async (c) => {
     return c.json({ error: 'invalid_args', message: 'limit must be number' }, 400)
   }
 
+  // Default-safe like the MCP tool (loop brake): ONLY an explicit dry_run:false mutates. Omitted
+  // dry_run is a plan (router:read), writes nothing.
+  const dryRun = body.dry_run !== false
   const decision = await authorizeExecutionScope(c.env, auth, {
-    action: 'router:mutate', squadId: body.squad_id,
+    action: dryRun ? 'router:read' : 'router:mutate', squadId: body.squad_id,
   })
   if (!decision.ok) return c.json({ error: decision.error }, decision.status)
   if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
@@ -49,7 +52,7 @@ routerApp.post('/tick', async (c) => {
   try {
     const result = await runRouterTick(c.env, decision, {
       squadId: body.squad_id,
-      dryRun: body.dry_run === true,
+      dryRun,
       limit: body.limit,
     }, { memberId: auth.memberId })
     return c.json({ ok: true, result })

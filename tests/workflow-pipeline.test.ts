@@ -268,6 +268,8 @@ describe('shared execution authorization', () => {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+        -- migration 0203 loop brakes: the executor's hold pre-check reads this table.
+        CREATE TABLE execution_holds (task_id TEXT PRIMARY KEY, released_at TEXT);
         CREATE TABLE engrams (
           id TEXT PRIMARY KEY,
           agent_id TEXT NOT NULL,

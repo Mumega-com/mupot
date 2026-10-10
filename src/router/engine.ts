@@ -4,6 +4,7 @@ import { nowSqlUtc } from '../auth/token-lifecycle'
 import { hasIndependentRuntimeGate, independentGateHolderExistsSql } from '../tasks/runtime-receipts'
 import type { BusEvent, Env } from '../types'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { executionPausedSql } from '../agents/execution-brakes'
 
 export interface RouterTickInput {
   squadId: string
@@ -127,6 +128,9 @@ export async function runRouterTick(
         WHERE a.squad_id = ?2
           AND a.status = 'active'
           AND p.last_seen_at >= datetime('now', '-10 minutes')
+          -- Loop brake (migration 0203): a paused agent/squad is never a routing candidate, so neither a
+          -- dry run nor a live tick plans or makes an assignment the executor would only refuse.
+          AND NOT ${executionPausedSql('a.id')}
         ORDER BY a.id ASC
         LIMIT 50`,
     ).bind(decision.tenant, squadId).all<RouterAgentRow>()
@@ -207,6 +211,7 @@ export async function runRouterTick(
                AND a.squad_id = ?4
                AND a.status = 'active'
                AND presence_now.last_seen_at >= datetime('now', '-10 minutes')
+               AND NOT ${executionPausedSql('a.id')}
           )
           AND (
             project_id IS NULL

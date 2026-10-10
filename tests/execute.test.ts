@@ -61,6 +61,9 @@ function makeEnv(opts: { task: Task | null; charter?: string | null; updateChang
             return {
               async first<T>() {
                 if (/FROM tasks\b/.test(sql)) return (opts.task as unknown as T) ?? null
+                // The loop-brake probes (execution_pauses / task_execution_attempts / execution_holds) also reference
+                // `agents`; they must read as "not paused / not at ceiling" (no row), not as the agent.
+                if (sql.includes('execution_pauses') || sql.includes('task_execution_attempts') || sql.includes('execution_holds')) return null as unknown as T
                 if (sql.includes('FROM agents')) return (AGENT as unknown as T)
                 if (sql.includes('SELECT department_id FROM squads')) {
                   return ({ department_id: 'dept-1' } as unknown as T)
