@@ -456,6 +456,13 @@ async function resolveAuth(c: {
             auth.boundAgentId = null
             auth.harnessCredential = true
           }
+          // mupot#1794 W4 (gate P2): an unbound directory session whose token row is gone or
+          // inactive by now (expired/revoked between buildAuthContextFromProps and this re-read)
+          // fails CLOSED. Nulling tokenId and continuing would leave an unmarked unbound directory
+          // session that the harness chokepoint cannot recognise (bootstrap_self would run).
+          if ((!token || token.member_status !== 'active') && !knownNonDirectory && !auth.boundAgentId) {
+            return null
+          }
           if (!token || token.member_status !== 'active') {
             auth.tokenId = null
             if (knownNonDirectory) auth.boundAgentId = null
@@ -6284,7 +6291,9 @@ const toolBootContext: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
-    if (auth.memberId && !ctx?.sideEffectFree) {
+    // mupot#1794 W4 (gate P2): boot_context is allowlisted for a confined harness session as a READ;
+    // it must not write presence under the human with a caller-chosen seat label.
+    if (auth.memberId && !ctx?.sideEffectFree && !isHarnessCredentialSession(auth)) {
       const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
       const bootTouch = (async () => {
         const id = await loadMemberIdentity(env, auth)
@@ -7137,7 +7146,9 @@ export async function invokeTool(
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
 
-  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
+  // the token is shared, so any holder could otherwise mint presence rows in the human's name.
+  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

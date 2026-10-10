@@ -152,6 +152,38 @@ describe('1. zero standing is decided by the token ROW and fails closed', () => 
       { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...wsCtx, harnessCredential: true }) })
     expect(refusalText(asserted)).not.toContain('harness_session_seat_required')
   })
+
+  it('RACE (gate P2): token expires between props build and the internal-header re-read -> fails closed, bootstrap_self never runs', async () => {
+    const env = envFor(h)
+    const m = await mintOk(env)
+    const ctx = (await externalCtx(env, m.raw))!
+    expect(ctx).not.toBeNull()
+    h.sqlite.exec(`UPDATE member_tokens SET expires_at = '2020-01-01 00:00:00' WHERE id = '${m.tokenId}'`)
+    const agentsBefore = n(`SELECT COUNT(*) AS n FROM agents`)
+    const r = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'bootstrap_self', arguments: { agent_name: 'race' } } },
+      { [AUTH_CONTEXT_HEADER]: JSON.stringify({ ...ctx, harnessCredential: false }) })
+    expect(r.status).toBe(401)
+    expect(n(`SELECT COUNT(*) AS n FROM agents`)).toBe(agentsBefore)
+    // same for a revoked token
+    const m2 = await mintOk(env, 'ci-runner-2')
+    const ctx2 = (await externalCtx(env, m2.raw))!
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = '${m2.tokenId}'`)
+    const r2 = await postJson(env, '/', null, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'status', arguments: {} } },
+      { [AUTH_CONTEXT_HEADER]: JSON.stringify(ctx2) })
+    expect(r2.status).toBe(401)
+  })
+
+  it('PRESENCE (gate P2): a confined harness session writes no presence under the human (boot_context or seat_select)', async () => {
+    const env = envFor(h)
+    const m = await mintOk(env)
+    const before = n(`SELECT COUNT(*) AS n FROM presence WHERE member_id = ?`, HUMAN)
+    for (let i = 0; i < 5; i++) {
+      await rpcCall(env, m.raw, 'boot_context', { seat: `River-admin-${i}` })
+      await rpcCall(env, m.raw, 'seat_select', { project: 'p', folder: `/a${i}` })
+    }
+    await new Promise((r) => setTimeout(r, 50))
+    expect(n(`SELECT COUNT(*) AS n FROM presence WHERE member_id = ?`, HUMAN)).toBe(before)
+  })
 })
 
 async function sha(raw: string): Promise<string> {
