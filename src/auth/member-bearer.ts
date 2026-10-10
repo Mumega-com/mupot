@@ -67,6 +67,11 @@ async function resolveMemberByTokenInner(env: Env, raw: string | null): Promise<
         -- enforced in one but not the other would make THIS the door an expired
         -- credential still opens, so both execute the one export.
         AND ${TOKEN_LIVE_PREDICATE('?3')}
+        -- mupot#1794 W4: a 'directory' unbound token is a zero-standing harness credential (seat_select
+        -- only). These REST surfaces authorise by member id, so letting it resolve here would turn a
+        -- zero-standing credential into the human's FULL authority. No other directory token is ever
+        -- presentable (raw discarded at mint), so this is inert for every existing credential.
+        AND t.channel <> 'directory'
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())
@@ -103,6 +108,7 @@ export async function memberTokenHashIsLive(
         AND t.tenant = ?2
         AND m.tenant = ?2
         AND ${TOKEN_LIVE_PREDICATE('?3')}
+        AND t.channel <> 'directory' -- mupot#1794 W4: see resolveMemberByToken
       LIMIT 1`,
   )
     .bind(tokenHash, env.TENANT_SLUG, nowSqlUtc())

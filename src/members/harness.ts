@@ -25,7 +25,23 @@ export interface HarnessRow {
   client_name: string
   kind: string
   created_at: string
+  /** mupot#1794 W4 (migration 0202): what the harness IS. 'oauth' = an OAuth client install (every
+   *  W1-W3 row); 'token' = a member-scoped token minted as a harness credential. */
+  credential_kind: 'oauth' | 'token'
+  /** The member_tokens row that IS the credential (token kind only; null for oauth). */
+  token_id: string | null
 }
+
+/** The harness kinds a TOKEN harness may declare (migration 0202 CHECKs the same list). Display
+ *  labels only: a kind is never authority. */
+export const HARNESS_TOKEN_KINDS = ['claude-code', 'cursor', 'codex', 'grok', 'ci', 'other'] as const
+export type HarnessTokenKind = (typeof HARNESS_TOKEN_KINDS)[number]
+
+export function isHarnessTokenKind(v: unknown): v is HarnessTokenKind {
+  return typeof v === 'string' && (HARNESS_TOKEN_KINDS as readonly string[]).includes(v)
+}
+
+const HARNESS_COLUMNS = 'id, tenant, member_id, oauth_client_id, client_name, kind, created_at, credential_kind, token_id'
 
 // Label-only classifier. Unknown names fall to 'other'; this is display text, not policy.
 const KIND_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
@@ -73,9 +89,9 @@ export async function upsertHarness(
      DO UPDATE SET client_name = excluded.client_name, kind = excluded.kind`,
   ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, clientId, clientName, kind).run()
   return env.DB.prepare(
-    `SELECT id, tenant, member_id, oauth_client_id, client_name, kind, created_at
+    `SELECT ${HARNESS_COLUMNS}
        FROM harnesses
-      WHERE tenant = ?1 AND member_id = ?2 AND oauth_client_id = ?3
+      WHERE tenant = ?1 AND member_id = ?2 AND oauth_client_id = ?3 AND credential_kind = 'oauth'
       LIMIT 1`,
   ).bind(env.TENANT_SLUG, memberId, clientId).first<HarnessRow>()
 }
@@ -85,9 +101,21 @@ export async function upsertHarness(
 export async function loadHarness(env: Env, memberId: string, harnessId: string): Promise<HarnessRow | null> {
   if (typeof harnessId !== 'string' || harnessId.length === 0) return null
   return env.DB.prepare(
-    `SELECT id, tenant, member_id, oauth_client_id, client_name, kind, created_at
+    `SELECT ${HARNESS_COLUMNS}
        FROM harnesses
       WHERE id = ?1 AND tenant = ?2 AND member_id = ?3
       LIMIT 1`,
   ).bind(harnessId, env.TENANT_SLUG, memberId).first<HarnessRow>()
+}
+
+/** The token harness whose credential IS `tokenId`, for this member + tenant. Null when the token is
+ *  not a harness credential. Callers gate on the flag first; this does no flag logic. */
+export async function loadHarnessForToken(env: Env, memberId: string, tokenId: string): Promise<HarnessRow | null> {
+  if (typeof tokenId !== 'string' || tokenId.length === 0) return null
+  return env.DB.prepare(
+    `SELECT ${HARNESS_COLUMNS}
+       FROM harnesses
+      WHERE tenant = ?1 AND member_id = ?2 AND credential_kind = 'token' AND token_id = ?3
+      LIMIT 1`,
+  ).bind(env.TENANT_SLUG, memberId, tokenId).first<HarnessRow>()
 }

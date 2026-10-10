@@ -47,7 +47,10 @@ import {
 } from '../gates/grants'
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
-import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
+import { loadHarness, loadHarnessForToken, seatAutoEnrollEnabled } from '../members/harness'
+import {
+  clientInfoFromMeta, readCredentialSharing, recordCredentialSession, sharedCredentialDetectEnabled, sharedCredentialHint,
+} from '../members/credential-sharing'
 import { applySeatHandle, SEAT_HANDLE_PREFIX } from '../members/seat-handle'
 import { extractMetaFacts, hintsFrom, maybeEmitHarnessIdentityProbe } from './harness-identity-probe'
 import { resolveConsentedAgentCapabilities } from './oauth-authorize'
@@ -451,7 +454,12 @@ async function resolveAuth(c: {
       // Malformed internal header — fall through to authenticateMember.
     }
   }
-  return authenticateMember(c)
+  const bearerAuth = await authenticateMember(c)
+  // mupot#1794 W4: a harness-token session (the only authenticateMember result that carries a
+  // harnessId) resolves a presented seat handle exactly like an OAuth harness grant. Every other
+  // bearer result returns untouched.
+  if (bearerAuth && bearerAuth.harnessId) return resolveSeatSession(c, bearerAuth, bodyMeta)
+  return bearerAuth
 }
 
 // mupot#1794 W2 — the ONE place a presented seat handle turns the human's unbound directory grant
@@ -590,6 +598,18 @@ async function authenticateMemberInner(c: {
 
   if (!row) return null
 
+  // mupot#1794 W4: an UNBOUND directory-channel bearer can only be a harness-token credential (every
+  // other directory token's raw secret is discarded at mint). Such a credential is ZERO-STANDING by
+  // construction, like the OAuth directory door (B1 ceiling in buildAuthContextFromProps): capabilities
+  // [] and a harness pointer so seat_select works. Flag off: a token linked to a harness is inert.
+  // Tokens of any other shape (workspace/im/dashboard, agent-bound) skip this block entirely.
+  let harnessId: string | undefined
+  if (row.channel === 'directory' && !row.bound_agent_id) {
+    const harness = await loadHarnessForToken(c.env, row.member_id, row.token_id).catch(() => null)
+    if (harness && !seatAutoEnrollEnabled(c.env)) return null
+    if (harness) harnessId = harness.id
+  }
+
   // 0099: stamp last_used_at. Best-effort by construction — this is telemetry that
   // makes credential cleanup POSSIBLE (without it nothing separates a live agent's
   // token from an abandoned one, so the safe action is always "leave it" and the set
@@ -599,7 +619,7 @@ async function authenticateMemberInner(c: {
   void touchTokenLastUsed(c.env, tokenHash)
   if (row.status !== 'active') return null
 
-  const capabilities = await resolveCapabilities(c.env, row.member_id)
+  const capabilities = harnessId ? [] : await resolveCapabilities(c.env, row.member_id)
 
   // role is the coarse org-role field on AuthContext; a member principal is
   // 'member' at the org-role layer. The REAL authorization is `capabilities`.
@@ -613,6 +633,7 @@ async function authenticateMemberInner(c: {
     capabilities,
     boundAgentId: row.bound_agent_id ?? null, // the weld: an agent-scoped token orients ITSELF
     tokenId: row.token_id,
+    ...(harnessId ? { harnessId } : {}),
   }
   return auth
 }
@@ -6206,7 +6227,7 @@ async function buildIdentityReceipt(
   return {
     human: { member_id: humanMemberId },
     harness: harnessRow
-      ? { id: harnessRow.id, client_name: harnessRow.client_name, kind: harnessRow.kind }
+      ? { id: harnessRow.id, client_name: harnessRow.client_name, kind: harnessRow.kind, credential_kind: harnessRow.credential_kind }
       : null,
     agent: agentRow
       ? { id: agentRow.id, uuid: agentRow.id, slug: agentRow.slug, name: agentRow.name, status: agentRow.status }
@@ -6407,6 +6428,23 @@ const toolBootContext: ToolSpec = {
       ? await buildIdentityReceipt(env, auth, [str(args.seat), str(args.label), ctx?.seat ?? null])
       : undefined
 
+    // mupot#1794 W4 — shared-credential hint. Present ONLY with SHARED_CREDENTIAL_DETECT on, only when
+    // the credential this session came in on shows more than N concurrent session fingerprints, and
+    // never on a seat-handle session (that thread already has its own agent). Advice only: it changes
+    // nothing about authentication or authority.
+    let sharedCredential: Record<string, unknown> | undefined
+    if (sharedCredentialDetectEnabled(env) && !auth.seatBinding && auth.tokenId) {
+      const sharing = await readCredentialSharing(env, auth.tokenId)
+      if (sharing?.shared_suspected) {
+        sharedCredential = {
+          shared_suspected: true,
+          sessions: sharing.sessions,
+          window_minutes: sharing.window_minutes,
+          hint: sharedCredentialHint(sharing.sessions, seatAutoEnrollEnabled(env)),
+        }
+      }
+    }
+
     // mupot#1794 W3 — a request bound through a seat handle says so in plain words, from the
     // server-derived receipt (never from anything the caller sent).
     let nextStepOut = nextStep
@@ -6434,7 +6472,8 @@ const toolBootContext: ToolSpec = {
       ...(isMinted ? {} : { enroll_url: enrollHref }),
       // Present ONLY on the directory channel — its absence is itself information.
       ...(directoryNote ? { channel_limits: directoryNote } : {}),
-      ...(identityReceipt ? { identity_receipt: identityReceipt } : {}),
+      ...(identityReceipt ? { identity_receipt: sharedCredential ? { ...identityReceipt, shared_credential: sharedCredential } : identityReceipt } : {}),
+      ...(sharedCredential ? { shared_credential: sharedCredential } : {}),
     })
   },
 }
@@ -7196,6 +7235,23 @@ async function handleJsonRpc(
     const auth = await resolveAuth(c, profile === undefined ? { paramsMeta: params._meta, argsMeta: argsObject?._meta } : { skipSeat: true })
     if (!auth || auth.tenant !== c.env.TENANT_SLUG) {
       return rpcError(id, -32001, 'unauthenticated', undefined, 401)
+    }
+    // mupot#1794 W4: shared-credential detection (SHARED_CREDENTIAL_DETECT, default off). Records a
+    // session fingerprint against the CREDENTIAL (a seat session's credential is the human's grant
+    // token). Observability only: it cannot fail, delay beyond one throttled write, or alter this
+    // request. Skipped for the curated profile door. Flag off: returns before any read or write.
+    if (profile === undefined && sharedCredentialDetectEnabled(c.env)) {
+      const ci = clientInfoFromMeta(params._meta ?? argsObject?._meta)
+      const mf = extractMetaFacts(params._meta)
+      const af = extractMetaFacts(argsObject?._meta)
+      await recordCredentialSession(c.env, auth.seatBinding?.grantTokenId ?? auth.tokenId, {
+        mcpSessionId: c.req.header('mcp-session-id') ?? null,
+        codexThreadId: mf.codexThreadId ?? af.codexThreadId,
+        openaiSession: mf.openaiSession ?? af.openaiSession,
+        userAgent: c.req.header('user-agent') ?? null,
+        clientName: ci.name,
+        clientVersion: ci.version,
+      })
     }
     // With the flag on, a `_meta` ARGUMENT is transport metadata, not a tool argument: strip it so
     // the tool's own (additionalProperties:false) schema never sees it. Flag off: untouched.

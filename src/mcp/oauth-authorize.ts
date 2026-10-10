@@ -42,7 +42,7 @@ import { linkLoginIdentity } from '../auth/login-identity'
 import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { chunkForD1InList } from '../lib/d1-in-list'
-import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
+import { seatAutoEnrollEnabled, upsertHarness, loadHarnessForToken } from '../members/harness'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -1106,10 +1106,26 @@ async function resolveExternalTokenInner(
 
   if (!row || row.status !== 'active') return null
 
+  // mupot#1794 W4: a member-scoped TOKEN minted as a harness credential (POST /members/:id/tokens with
+  // harness_kind). Only an UNBOUND directory token can be one. Flag on: the live harness row (member +
+  // tenant + token scoped) becomes the session's harness pointer, so seat_select works exactly as for
+  // the OAuth harness option. Flag off: the token is INERT (null, same refusal as a bad token) — it must
+  // never fall through to a session. Any other token shape never reaches this block.
+  let harnessId: string | undefined
+  if (row.channel === 'directory' && !row.bound_agent_id) {
+    if (!seatAutoEnrollEnabled(env)) {
+      if (await loadHarnessForToken(env, row.member_id, row.token_id).catch(() => null)) return null
+    } else {
+      const harness = await loadHarnessForToken(env, row.member_id, row.token_id).catch(() => null)
+      if (harness) harnessId = harness.id
+    }
+  }
+
   return {
     props: {
       memberId: row.member_id,
       tokenId: row.token_id,
+      ...(harnessId ? { harnessId } : {}),
       email: row.email,
       channel: isConnectionChannel(row.channel) ? row.channel : 'workspace',
       boundAgentId: row.bound_agent_id ?? null,

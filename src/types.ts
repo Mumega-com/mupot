@@ -319,6 +319,12 @@ export interface Env {
   // mupot#1794 W2: LIFETIME bound on agent_seats rows per member, retired/inactive included
   // (migration 0199 trigger; default 64, clamped 1..4096). Atomic and fail-closed.
   SEAT_MAX_TOTAL_PER_MEMBER?: string
+  // mupot#1794 W4: shared-credential detection (default OFF; its own flag so flag-off adds no query,
+  // write or response field for any existing credential). '1' records a throttled per-session
+  // fingerprint per credential and surfaces `shared_credential` in boot_context when more than
+  // SHARED_CREDENTIAL_MAX_SESSIONS (default 3) distinct fingerprints are seen in 15 minutes.
+  SHARED_CREDENTIAL_DETECT?: string
+  SHARED_CREDENTIAL_MAX_SESSIONS?: string
   STUDIO_DISPATCH_MEMBER_LIMIT?: string
   STUDIO_DISPATCH_REPO_LIMIT?: string
   STUDIO_DISPATCH_WINDOW_MINUTES?: string

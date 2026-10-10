@@ -70,7 +70,9 @@ import { createProjectInvite, type CreateProjectInviteError } from './project-in
 // this codebase already shares (see that module's header) — reused here so
 // "does this member hold a live token" can never drift into a second,
 // differently-worded copy of what "live" means.
-import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
+import { TOKEN_LIVE_PREDICATE, resolveAgentTokenExpiry } from '../auth/token-lifecycle'
+import { seatAutoEnrollEnabled, isHarnessTokenKind, HARNESS_TOKEN_KINDS } from './harness'
+import { mintHarnessToken } from './harness-token'
 // mupot#1551 (case-insensitivity gate finding on #1557): the SAME normalizer
 // /auth/callback's own email-match check (pendingInviteEmailsMatch) already
 // uses — trim + lowercase, matching idx_members_email_lower (0146). Reused
@@ -1341,6 +1343,10 @@ membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c)
 interface MintTokenBody {
   label?: unknown
   channel?: unknown
+  /** mupot#1794 W4: present => mint a HARNESS token (claude-code|cursor|codex|grok|ci|other). */
+  harness_kind?: unknown
+  expires_in_days?: unknown
+  non_expiring?: unknown
 }
 
 membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), async (c) => {
@@ -1376,6 +1382,35 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
 
   const label = body.label === undefined ? '' : body.label
   if (typeof label !== 'string' || label.length > 64) return c.json({ error: 'invalid_label' }, 400)
+
+  // mupot#1794 W4 — harness token branch. It sits AFTER every gate above (org-admin floor via
+  // requireCapability, member status/tenant, target-rank ceiling), so it is the SAME mint door with
+  // the SAME authority checks, not a second one. It forces channel 'directory' (zero standing) itself;
+  // a caller-supplied channel is refused so the pinned 'directory is not a mintable channel' rule
+  // (tests/directory-channel-token-mint-refused.test.ts) is untouched for every other body shape.
+  if (body.harness_kind !== undefined) {
+    if (!seatAutoEnrollEnabled(c.env)) return c.json({ error: 'seat_auto_enroll_disabled' }, 404)
+    if (member.status !== 'active') return c.json({ error: 'member_not_active' }, 409)
+    if (body.channel !== undefined) return c.json({ error: 'channel_not_allowed_with_harness_kind' }, 400)
+    if (!isHarnessTokenKind(body.harness_kind)) {
+      return c.json({ error: 'invalid_harness_kind', allowed: HARNESS_TOKEN_KINDS }, 400)
+    }
+    if (label.trim().length === 0) return c.json({ error: 'harness_label_required' }, 400)
+    // Standard 30-day default expiry; never non-expiring (an env-secret credential should rotate).
+    if (body.non_expiring !== undefined && body.non_expiring !== false) return c.json({ error: 'non_expiring_not_allowed' }, 400)
+    if (body.expires_in_days !== undefined && typeof body.expires_in_days !== 'number') return c.json({ error: 'invalid_expiry' }, 400)
+    const expiry = resolveAgentTokenExpiry({ expiresInDays: body.expires_in_days, allowNonExpiring: false })
+    if (!expiry.ok) return c.json({ error: expiry.code }, 400)
+    try {
+      const minted = await mintHarnessToken(c.env, {
+        memberId, kind: body.harness_kind, label, expiresAt: expiry.expiresAt,
+      })
+      protectRawTokenResponse(c)
+      return c.json({ token: minted.token, harness: minted.harness }, 201)
+    } catch {
+      return c.json({ error: 'harness_token_mint_failed' }, 500)
+    }
+  }
 
   const channel: ConnectionChannel = body.channel === undefined ? 'workspace' : (body.channel as ConnectionChannel)
   // mupot#1551 round 3 (P2): isChannelService's own allowlist (CHANNELS,

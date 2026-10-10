@@ -230,6 +230,7 @@ async function findLiveSeatForHandle(
        JOIN members am ON am.id = b.member_id AND am.tenant = h.tenant AND am.status = 'active'
        JOIN members hm ON hm.id = h.consenting_member_id AND hm.tenant = h.tenant AND hm.status = 'active'
        JOIN harnesses hr ON hr.id = h.harness_id AND hr.tenant = h.tenant AND hr.member_id = h.consenting_member_id
+                        AND (hr.credential_kind = 'oauth' OR hr.token_id = h.grant_token_id)
       WHERE h.tenant = ?1
         AND h.handle_hash = ?2
         AND h.revoked_at IS NULL
