@@ -23,6 +23,31 @@
 ALTER TABLE harnesses ADD COLUMN credential_kind TEXT NOT NULL DEFAULT 'oauth' CHECK (credential_kind IN ('oauth', 'token'));
 ALTER TABLE harnesses ADD COLUMN token_id TEXT;
 
+-- ZERO STANDING IS A PROPERTY OF THE CREDENTIAL ITSELF (W4 round 2). The token ROW says it is a harness
+-- credential (member_tokens.harness_kind), so every door that authenticates it reads that from the
+-- SAME row that authenticated it: no second lookup decides standing, and a failed lookup cannot hand
+-- out the human's authority. A harness token is channel 'directory', agent_id NULL, for life.
+ALTER TABLE member_tokens ADD COLUMN harness_kind TEXT CHECK (harness_kind IS NULL OR harness_kind IN ('claude-code', 'cursor', 'codex', 'grok', 'ci', 'other'));
+
+CREATE TRIGGER IF NOT EXISTS member_tokens_harness_shape_insert
+BEFORE INSERT ON member_tokens
+FOR EACH ROW
+WHEN NEW.harness_kind IS NOT NULL AND (NEW.channel <> 'directory' OR NEW.agent_id IS NOT NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'harness_token_shape');
+END;
+
+-- Immutable credential class, and never weldable: no agent_id may ever be set on a harness token
+-- (connect's durable weld, or any future writer), and it can never be re-classed or re-channelled.
+CREATE TRIGGER IF NOT EXISTS member_tokens_harness_immutable
+BEFORE UPDATE ON member_tokens
+FOR EACH ROW
+WHEN NEW.harness_kind IS NOT OLD.harness_kind
+  OR (OLD.harness_kind IS NOT NULL AND (NEW.agent_id IS NOT OLD.agent_id OR NEW.channel IS NOT OLD.channel OR NEW.member_id IS NOT OLD.member_id))
+BEGIN
+  SELECT RAISE(ABORT, 'harness_token_immutable');
+END;
+
 -- One harness per token; the existing UNIQUE (tenant, member_id, oauth_client_id) already makes the
 -- reserved pointer unique too.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_harnesses_token ON harnesses (tenant, token_id) WHERE token_id IS NOT NULL;
@@ -42,7 +67,8 @@ WHEN (NEW.credential_kind = 'oauth'
            OR NEW.kind NOT IN ('claude-code', 'cursor', 'codex', 'grok', 'ci', 'other')
            OR NOT EXISTS (SELECT 1 FROM member_tokens t
                            WHERE t.id = NEW.token_id AND t.member_id = NEW.member_id
-                             AND t.tenant = NEW.tenant AND t.channel = 'directory' AND t.agent_id IS NULL)))
+                             AND t.tenant = NEW.tenant AND t.channel = 'directory' AND t.agent_id IS NULL
+                             AND t.harness_kind = NEW.kind)))
 BEGIN
   SELECT RAISE(ABORT, 'harness_credential_shape');
 END;
@@ -59,6 +85,19 @@ WHEN NEW.id IS NOT OLD.id
   OR NEW.token_id IS NOT OLD.token_id
 BEGIN
   SELECT RAISE(ABORT, 'harness_immutable');
+END;
+
+-- A token harness cannot be deleted while its token is live: the token would keep authenticating with
+-- no harness row (the doors refuse that state, but the row is part of the credential's identity).
+CREATE TRIGGER IF NOT EXISTS harnesses_token_delete_guard
+BEFORE DELETE ON harnesses
+FOR EACH ROW
+WHEN OLD.credential_kind = 'token'
+ AND EXISTS (SELECT 1 FROM member_tokens t
+              WHERE t.id = OLD.token_id AND t.revoked_at IS NULL
+                AND (t.expires_at IS NULL OR julianday(t.expires_at) > julianday('now')))
+BEGIN
+  SELECT RAISE(ABORT, 'harness_token_live');
 END;
 
 -- 2. Revoking (or deleting) the harness token retires every seat on its harness, mirroring the
@@ -105,3 +144,42 @@ CREATE TABLE IF NOT EXISTS credential_session_fingerprints (
 );
 
 CREATE INDEX IF NOT EXISTS idx_credential_session_fp_seen ON credential_session_fingerprints (tenant, token_id, last_seen);
+-- Serves the bounded global prune (dead credentials' rows must not accumulate forever).
+CREATE INDEX IF NOT EXISTS idx_credential_session_fp_global ON credential_session_fingerprints (tenant, last_seen);
+
+-- 4. Per-HARNESS lifetime seat bound (W4 round 2). agent_seats_total_cap_insert (0199) bounds a MEMBER's
+-- lifetime seats; one shared token minting a seat per CI run could burn that whole budget. This bounds
+-- the seats EVER created on ONE harness (retired included). max_harness_total is the cap IN FORCE when
+-- the row was issued (env-derived by seat_select, never from the caller); the DEFAULT only covers a raw
+-- insert that omits it. Atomic: the trigger raises inside the creating batch, which rolls back whole.
+ALTER TABLE agent_seats ADD COLUMN max_harness_total INTEGER NOT NULL DEFAULT 32 CHECK (max_harness_total BETWEEN 1 AND 4096);
+
+CREATE TRIGGER IF NOT EXISTS agent_seats_harness_total_cap_insert
+BEFORE INSERT ON agent_seats
+FOR EACH ROW
+WHEN (SELECT COUNT(*) FROM agent_seats s WHERE s.tenant = NEW.tenant AND s.harness_id = NEW.harness_id) >= NEW.max_harness_total
+BEGIN
+  SELECT RAISE(ABORT, 'seat_harness_total_cap_exceeded');
+END;
+
+-- Replace the 0199 immutability trigger so the new column is part of the identity record too.
+DROP TRIGGER IF EXISTS agent_seats_immutable;
+CREATE TRIGGER agent_seats_immutable
+BEFORE UPDATE ON agent_seats
+FOR EACH ROW
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.tenant IS NOT OLD.tenant
+  OR NEW.member_id IS NOT OLD.member_id
+  OR NEW.harness_id IS NOT OLD.harness_id
+  OR NEW.key_hash IS NOT OLD.key_hash
+  OR NEW.agent_id IS NOT OLD.agent_id
+  OR NEW.label_basename IS NOT OLD.label_basename
+  OR NEW.max_live IS NOT OLD.max_live
+  OR NEW.max_total IS NOT OLD.max_total
+  OR NEW.max_harness_total IS NOT OLD.max_harness_total
+  OR NEW.seat_token_id IS NOT OLD.seat_token_id
+  OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.retired_at IS NOT NULL AND NEW.retired_at IS NOT OLD.retired_at)
+BEGIN
+  SELECT RAISE(ABORT, 'agent_seat_immutable');
+END;

@@ -438,17 +438,21 @@ describe('revoking the token revokes its harness seats', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('migration 0202 shape guards (the DB refuses what the code never writes)', () => {
-  const insertToken = (id: string, channel: string, agentId: string | null) =>
-    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id) VALUES ('${id}', '${HUMAN}', 'h-${id}', 'x', '${channel}', '2026-10-10', '${TENANT}', ${agentId ? `'${agentId}'` : 'NULL'})`)
+  const insertToken = (id: string, channel: string, agentId: string | null, harnessKind: string | null = 'ci') =>
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, agent_id, harness_kind) VALUES ('${id}', '${HUMAN}', 'h-${id}', 'x', '${channel}', '2026-10-10', '${TENANT}', ${agentId ? `'${agentId}'` : 'NULL'}, ${harnessKind ? `'${harnessKind}'` : 'NULL'})`)
   const insertHarness = (id: string, clientId: string, kind: string, credential: string, tokenId: string | null, member = HUMAN) =>
     h.sqlite.exec(`INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, kind, credential_kind, token_id) VALUES ('${id}', '${TENANT}', '${member}', '${clientId}', 'n', '${kind}', '${credential}', ${tokenId ? `'${tokenId}'` : 'NULL'})`)
 
   it('token harness must point at an UNBOUND DIRECTORY token of the SAME member', () => {
-    insertToken('t-ws', 'workspace', null)
+    expect(() => insertToken('t-ws', 'workspace', null)).toThrow(/harness_token_shape/) // a harness_kind token must be directory/unbound
+    insertToken('t-ws', 'workspace', null, null)
     expect(() => insertHarness('h1', 'token:t-ws', 'ci', 'token', 't-ws')).toThrow(/harness_credential_shape/)
+    insertToken('t-nokind', 'directory', null, null) // directory/unbound but NOT classed as a harness credential
+    expect(() => insertHarness('h1b', 'token:t-nokind', 'ci', 'token', 't-nokind')).toThrow(/harness_credential_shape/)
     insertToken('t-dir', 'directory', null)
     expect(() => insertHarness('h2', 'token:t-dir', 'ci', 'token', 't-dir', HUMAN2)).toThrow(/harness_credential_shape/)
     expect(() => insertHarness('h3', 'token:t-dir', 'mainframe', 'token', 't-dir')).toThrow(/harness_credential_shape/)
+    expect(() => insertHarness('h3b', 'token:t-dir', 'cursor', 'token', 't-dir')).toThrow(/harness_credential_shape/) // kind must equal the token's own harness_kind
     expect(() => insertHarness('h4', 'wrong-pointer', 'ci', 'token', 't-dir')).toThrow(/harness_credential_shape/)
     expect(() => insertHarness('h5', 'token:t-dir', 'ci', 'token', 'nope')).toThrow(/harness_credential_shape/)
     insertHarness('ok', 'token:t-dir', 'ci', 'token', 't-dir')

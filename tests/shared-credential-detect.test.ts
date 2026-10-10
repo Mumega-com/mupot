@@ -11,7 +11,7 @@ import { mcpApp } from '../src/mcp/index'
 import { mintMemberToken } from '../src/members/service'
 import { membersApp } from '../src/members'
 import {
-  buildFingerprint, CRED_FP_MAX_ROWS, CRED_FP_WINDOW_MS, readCredentialSharing, recordCredentialSession,
+  buildFingerprint, CRED_FP_GLOBAL_PRUNE_LIMIT, CRED_FP_MAX_ROWS, CRED_FP_WINDOW_MS, readCredentialSharing, recordCredentialSession,
   resetCredentialSessionMemo, sharedCredentialHint, sharedCredentialThreshold, uaFamily, upsertCredentialFingerprint,
 } from '../src/members/credential-sharing'
 import type { Env } from '../src/types'
@@ -96,7 +96,10 @@ describe('flag on', () => {
     for (let i = 0; i < 5; i++) await call(env, t.raw, 'boot_context', { 'mcp-session-id': `s${i}` })
     const sc = (await call(env, t.raw, 'boot_context', { 'mcp-session-id': 's5' })).sc
     expect((sc.shared_credential as { hint: string }).hint).toContain('connect via a harness token or the harness OAuth option and call seat_select so each thread gets its own agent')
-    expect((sc.identity_receipt as Record<string, unknown>).shared_credential).toBeTruthy()
+    // emitted ONCE: top level only, never duplicated inside the identity receipt
+    expect(sc.shared_credential).toBeTruthy()
+    expect(sc.identity_receipt as Record<string, unknown>).not.toHaveProperty('shared_credential')
+    expect(JSON.stringify(sc).split('"shared_credential"').length - 1).toBe(1)
   })
 
   it('threshold is configurable and clamped', () => {
@@ -165,6 +168,22 @@ describe('window, bounds, privacy', () => {
     // two hours later every old row is pruned by the next write, freeing the cap
     await upsertCredentialFingerprint(env, await buildFingerprint('tok', { mcpSessionId: 'late' }), now + 2 * 3600_000)
     expect(n(`SELECT COUNT(*) AS n FROM credential_session_fingerprints WHERE token_id = 'tok'`)).toBe(1)
+  })
+
+  it('GLOBAL prune: a write for one credential also removes (bounded) stale rows of dead credentials', async () => {
+    const env = envFor(h)
+    const now = Date.parse('2026-10-10T12:00:00.000Z')
+    for (let i = 0; i < 40; i++) {
+      h.sqlite.exec(`INSERT INTO credential_session_fingerprints (tenant, token_id, fp, first_seen, last_seen) VALUES ('${TENANT}', 'dead-${i}', '${String(i).padStart(32, '0')}', '2026-10-09T00:00:00.000Z', '2026-10-09T00:00:00.000Z')`)
+    }
+    h.sqlite.exec(`INSERT INTO credential_session_fingerprints (tenant, token_id, fp, first_seen, last_seen) VALUES ('${TENANT}', 'recent', '${'f'.repeat(32)}', '2026-10-10T11:59:00.000Z', '2026-10-10T11:59:00.000Z')`)
+    await upsertCredentialFingerprint(env, await buildFingerprint('live', { mcpSessionId: 'x' }), now)
+    // bounded: one write removes at most CRED_FP_GLOBAL_PRUNE_LIMIT stale rows of OTHER credentials
+    expect(n(`SELECT COUNT(*) AS n FROM credential_session_fingerprints WHERE token_id LIKE 'dead-%'`)).toBe(40 - CRED_FP_GLOBAL_PRUNE_LIMIT)
+    await upsertCredentialFingerprint(env, await buildFingerprint('live', { mcpSessionId: 'x' }), now + 1000)
+    expect(n(`SELECT COUNT(*) AS n FROM credential_session_fingerprints WHERE token_id LIKE 'dead-%'`)).toBe(0)
+    // fresh rows of other credentials are never touched
+    expect(n(`SELECT COUNT(*) AS n FROM credential_session_fingerprints WHERE token_id = 'recent'`)).toBe(1)
   })
 
   it('stores no raw session id, user-agent, IP or thread id — only a hash and sanitised labels', async () => {

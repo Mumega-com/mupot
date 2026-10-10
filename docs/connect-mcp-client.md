@@ -218,8 +218,20 @@ curl -sS -X POST "https://<pot>/api/members/members/<member-id>/tokens" \
 
 `harness_kind` is one of `claude-code`, `cursor`, `codex`, `grok`, `ci`, `other` (a display label,
 never authority). `label` is required. Default expiry is 30 days; a harness token is never
-non-expiring. The raw token is returned once. By itself it has **no capabilities**: it can only
-call `seat_select`. It cannot be used on the REST API.
+non-expiring. The raw token is returned once. The token is **zero-standing by construction** (the
+token itself is marked as a harness credential and can never be re-classed or welded to an agent).
+Until a request carries a seat handle, a connection on it can do exactly this and nothing else:
+
+| Allowed without a seat handle | |
+|---|---|
+| `seat_select` | find or create the seat agent for a workspace key and receive a seat handle |
+| `boot_context` | read-only identity: who you are, the harness, the identity receipt, hints |
+| `initialize`, `tools/list` | protocol handshake and the tool listing (no tool runs) |
+
+Every other tool (`connect`, `bootstrap_self`, `recall`, `remember`, `reveal_credential_claim`, ...),
+`/actions/:tool`, the legacy `{tool,args}` body, `events/*` and the profile door answer
+`harness_session_seat_required` until you send a valid seat handle. It cannot be used on the REST API.
+With a valid handle the request is the seat agent's, not yours.
 
 **2. Set it as the env secret** (for example `MUPOT_TOKEN`) and connect as usual with
 `Authorization: Bearer $MUPOT_TOKEN`.
@@ -228,11 +240,17 @@ call `seat_select`. It cannot be used on the REST API.
 `seat_select { project, folder?, thread? }` with its own labels and gets its own seat agent and a
 seat handle (`mseat_...`). Send the handle as `X-Mupot-Seat` (or `_meta["mupot/seat"]`) on that
 thread's requests. Same labels, same agent; different labels, different agents. Seats are capped
-(live seats per member, plus a lifetime bound), clamped to your own live access and never above
-member, and **do not count toward your plan's agent limit**.
+(live seats per member, a lifetime bound per member, and a lifetime bound **per harness**,
+`SEAT_MAX_TOTAL_PER_HARNESS`, default 32), clamped to your own live access and never above member,
+and **do not count toward your plan's agent limit**.
+
+**Use STABLE labels.** Retired seats still count toward the lifetime bounds, so a label that changes
+on every run (a run id, a timestamp) burns the budget. Key CI seats on something that repeats, such
+as the repo plus the workflow (`project: "org/repo"`, `thread: "release"`), not the run.
 
 **Rotate or revoke.** Revoking the token retires every seat on its harness and revokes their
-handles. Note that anyone holding the shared token can call `seat_select` with any label, so seats
+handles. When a token expires, its seats stop counting toward the live cap the next time you create
+a seat (they are retired then), so rotating an expiring token never locks you out. Note that anyone holding the shared token can call `seat_select` with any label, so seats
 separate honest threads from each other; they do not defend against a hostile holder of the token.
 
 **Warning for shared credentials.** With `SHARED_CREDENTIAL_DETECT=1`, any credential (agent-bound

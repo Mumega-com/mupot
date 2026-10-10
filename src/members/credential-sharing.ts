@@ -33,6 +33,8 @@ import { sanitizeLabel } from './harness'
 export const CRED_FP_WINDOW_MS = 15 * 60 * 1000 // "concurrent" = seen within this window
 export const CRED_FP_PRUNE_AFTER_MS = 60 * 60 * 1000
 export const CRED_FP_MAX_ROWS = 64
+/** Rows removed per write by the global prune (any credential), so dead tokens' rows cannot accumulate. */
+export const CRED_FP_GLOBAL_PRUNE_LIMIT = 25
 export const CRED_FP_THRESHOLD_DEFAULT = 3
 const CRED_FP_MEMO_MS = 30 * 1000
 const CRED_FP_MEMO_MAX = 4000
@@ -119,7 +121,8 @@ export async function buildFingerprint(tokenId: string, i: SessionFingerprintInp
 }
 
 /**
- * The atomic write. One batch, two statements: prune this credential's stale rows, then ONE upsert.
+ * The atomic write. One batch: prune this credential's stale rows, a bounded global prune of any
+ * credential's stale rows, then ONE upsert.
  * The upsert inserts a new fingerprint only while the credential holds fewer than CRED_FP_MAX_ROWS rows
  * (an existing fingerprint always updates), and bumps `hits` in SQL — never read-then-write.
  * Exported without the memo so tests can hammer it; request code uses recordCredentialSession.
@@ -131,6 +134,12 @@ export async function upsertCredentialFingerprint(env: Env, row: FingerprintRow,
     env.DB.prepare(
       `DELETE FROM credential_session_fingerprints WHERE tenant = ?1 AND token_id = ?2 AND last_seen < ?3`,
     ).bind(env.TENANT_SLUG, row.tokenId, pruneBefore),
+    // Bounded GLOBAL prune: stale rows of ANY credential (a dead token never writes again, so its own
+    // credential-scoped prune never runs). LIMITed so one write can never turn into an unbounded delete.
+    env.DB.prepare(
+      `DELETE FROM credential_session_fingerprints WHERE rowid IN (
+         SELECT rowid FROM credential_session_fingerprints WHERE tenant = ?1 AND last_seen < ?2 LIMIT ?3)`,
+    ).bind(env.TENANT_SLUG, pruneBefore, CRED_FP_GLOBAL_PRUNE_LIMIT),
     env.DB.prepare(
       `INSERT INTO credential_session_fingerprints
          (tenant, token_id, fp, client_name, client_version, ua_family, first_seen, last_seen, hits)

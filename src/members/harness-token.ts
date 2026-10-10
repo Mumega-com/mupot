@@ -4,11 +4,17 @@
 // MCP config inside Cursor / Grok bots). Minting the credential AS a harness makes every thread behind
 // it call seat_select and get its own seat agent, instead of all collapsing into one identity.
 //
-// SHAPE: a normal member_tokens row — channel 'directory', agent_id NULL, member = the human — plus a
-// harnesses row (credential_kind 'token') in the SAME batch. The directory channel is what makes the
-// credential ZERO-STANDING: buildAuthContextFromProps / authenticateMember clamp a directory session
-// to no capabilities, exactly like the OAuth "Me — auto per workspace" grant. The only thing it can do
-// is seat_select; a seat agent is then capped at min(human live rank, agent rank, member).
+// SHAPE: a normal member_tokens row — channel 'directory', agent_id NULL, harness_kind set (the row
+// ITSELF says it is a harness credential, for life: migration 0202 makes harness_kind immutable and
+// refuses any agent_id write on it) — plus a harnesses row (credential_kind 'token') in the SAME batch.
+//
+// ZERO STANDING is a property of that row, enforced at the doors from the very read that authenticates
+// the bearer (src/members/harness-credential.ts): zero capabilities, zero latent capabilities. And ONE
+// chokepoint (invokeTool) confines a harness session that has no applied seat handle to exactly:
+// `seat_select` and `boot_context` (plus initialize / tools/list); every other tool, /actions/:tool, the
+// legacy {tool,args} body, events/* and the profile door answer `harness_session_seat_required`. With a
+// valid seat handle the request is the SEAT AGENT's (capped at member and at the human's own live rank).
+// It cannot be used on the REST API and can never be welded to an agent.
 //
 // AUTHORITY: this module does NO authz. The ONLY caller is POST /members/:id/tokens
 // (src/members/index.ts), which has already enforced requireCapability(org, 'admin') and
@@ -48,9 +54,9 @@ export async function mintHarnessToken(
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
-      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at)
-       VALUES (?1, ?2, ?3, ?4, 'directory', ?5, NULL, ?6, ?7)`,
-    ).bind(tokenId, p.memberId, tokenHash, `harness:${label}`.slice(0, 64), createdAt, env.TENANT_SLUG, p.expiresAt),
+      `INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant, expires_at, harness_kind)
+       VALUES (?1, ?2, ?3, ?4, 'directory', ?5, NULL, ?6, ?7, ?8)`,
+    ).bind(tokenId, p.memberId, tokenHash, `harness:${label}`.slice(0, 64), createdAt, env.TENANT_SLUG, p.expiresAt, p.kind),
     // The harness row follows its token (the shape trigger in 0202 re-reads it). A trigger refusal
     // rolls the WHOLE batch back, so a token is never left without its harness.
     env.DB.prepare(

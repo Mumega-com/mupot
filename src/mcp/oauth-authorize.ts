@@ -42,7 +42,8 @@ import { linkLoginIdentity } from '../auth/login-identity'
 import { MemberAttachDeniedError } from '../members/human-identity'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { chunkForD1InList } from '../lib/d1-in-list'
-import { seatAutoEnrollEnabled, upsertHarness, loadHarnessForToken } from '../members/harness'
+import { seatAutoEnrollEnabled, upsertHarness } from '../members/harness'
+import { decideHarnessBearer } from '../members/harness-credential'
 
 // ── OAuth props stored via completeAuthorization ─────────────────────────────
 // Encrypted by the library; read back via resolveExternalToken.
@@ -1081,7 +1082,8 @@ async function resolveExternalTokenInner(
   const tokenHash = await sha256Hex(token)
   const row = await env.DB.prepare(
     `SELECT m.id AS member_id, m.email AS email, m.status AS status,
-            t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id
+            t.id AS token_id, t.channel AS channel, t.agent_id AS bound_agent_id,
+            t.harness_kind AS harness_kind
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.token_hash = ?1
@@ -1102,24 +1104,18 @@ async function resolveExternalTokenInner(
     token_id: string
     channel: ConnectionChannel | null
     bound_agent_id: string | null
+    harness_kind: string | null
   }>()
 
   if (!row || row.status !== 'active') return null
 
-  // mupot#1794 W4: a member-scoped TOKEN minted as a harness credential (POST /members/:id/tokens with
-  // harness_kind). Only an UNBOUND directory token can be one. Flag on: the live harness row (member +
-  // tenant + token scoped) becomes the session's harness pointer, so seat_select works exactly as for
-  // the OAuth harness option. Flag off: the token is INERT (null, same refusal as a bad token) — it must
-  // never fall through to a session. Any other token shape never reaches this block.
-  let harnessId: string | undefined
-  if (row.channel === 'directory' && !row.bound_agent_id) {
-    if (!seatAutoEnrollEnabled(env)) {
-      if (await loadHarnessForToken(env, row.member_id, row.token_id).catch(() => null)) return null
-    } else {
-      const harness = await loadHarnessForToken(env, row.member_id, row.token_id).catch(() => null)
-      if (harness) harnessId = harness.id
-    }
-  }
+  // mupot#1794 W4: a directory/unbound bearer is a harness-token credential or it is REFUSED
+  // (decideHarnessBearer: fail closed on flag off, a missing harness row or a failed lookup). The
+  // decision is made from this token ROW's own shape; zero standing is re-applied from the row again in
+  // buildAuthContextFromProps, so it never depends on this lookup succeeding.
+  const harnessDecision = await decideHarnessBearer(env, { ...row, member_id: row.member_id, token_id: row.token_id })
+  if (harnessDecision.kind === 'refuse') return null
+  const harnessId = harnessDecision.kind === 'harness' ? harnessDecision.harnessId : undefined
 
   return {
     props: {
@@ -1198,7 +1194,8 @@ async function buildAuthContextFromPropsInner(
   // authorization. Both arms matter: this runs per-request, so it is also the only
   // thing that ends a session whose credential expires while it is open.
   const tokenRow = await env.DB.prepare(
-    `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id
+    `SELECT m.status AS status, m.email AS email, t.channel AS channel, t.agent_id AS bound_agent_id,
+            t.harness_kind AS harness_kind
        FROM member_tokens t
        JOIN members m ON m.id = t.member_id
       WHERE t.id = ?1
@@ -1215,9 +1212,16 @@ async function buildAuthContextFromPropsInner(
     email: string | null
     channel?: ConnectionChannel | null
     bound_agent_id?: string | null
+    harness_kind?: string | null
   }>()
 
   if (!tokenRow || tokenRow.status !== 'active') return null
+
+  // mupot#1794 W4: the token ROW says it is a harness credential. Zero standing is a property of the
+  // credential, applied here from the row that just authenticated it (no second lookup): zero
+  // capabilities, zero latent capabilities, confined to the allowlist at invokeTool. Flag off: inert.
+  const isHarnessCredential = tokenRow.harness_kind !== null && tokenRow.harness_kind !== undefined
+  if (isHarnessCredential && !seatAutoEnrollEnabled(env)) return null
 
   // Re-resolve capabilities every request (C2: revocation propagates immediately).
   // The resolved grants are NOT used for the directory channel — see B1 comment above —
@@ -1250,7 +1254,9 @@ async function buildAuthContextFromPropsInner(
   // never wider than what the human backing the session currently holds. See the
   // design block above resolveConsentedAgentCapabilities.
   const capabilities: CapabilityGrant[] =
-    channel === 'directory'
+    isHarnessCredential
+      ? []
+      : channel === 'directory'
       ? boundAgentId
         ? await resolveConsentedAgentCapabilities(env, boundAgentId, props.consentedByMemberId ?? null)
         : []
@@ -1321,8 +1327,11 @@ async function buildAuthContextFromPropsInner(
     // `connect`'s claimGrants fallback, reopening P0-1 through a second door. The
     // human's identity for a bound seat lives in consentedByMemberId instead;
     // resolveHumanStandingGrants re-derives THEIR grants, live and status-gated.
+    ...(isHarnessCredential ? { harnessCredential: true } : {}),
     latentCapabilities:
-      channel === 'directory'
+      isHarnessCredential
+        ? []
+        : channel === 'directory'
         ? boundAgentId
           ? (props.consentedByMemberId ? await resolveHumanStandingGrants(env, props.consentedByMemberId) : [])
           : resolvedCapabilities
