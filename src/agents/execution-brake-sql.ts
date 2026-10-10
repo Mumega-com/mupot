@@ -113,12 +113,24 @@ export const RELEASE_EPOCH_PREFIX = 'release-epoch:'
  * Boolean SQL fragment: a human release/reassign of the task landed AFTER the attempt started
  * (`startedExpr` = an ISO/SQL timestamp expression of the attempt's start). Retry bookkeeping of such
  * a STALE attempt must not count (it would re-hold the task for the agent a human just assigned,
- * without that agent ever executing). julianday() on both sides: ISO and 'YYYY-MM-DD HH:MM:SS' agree.
+ * without that agent ever executing).
+ *
+ * `startedAtSecondPrecision` (mupot#1812 P3): runtime receipts are stored at SECOND precision
+ * (nowSqlUtc) while the epoch is stored at ms. At ms, a failure that lands in the SAME second as (but
+ * after) a release would look "stale" (epoch .500 > receipt .000) and be silently dropped. With the flag
+ * both sides floor to the second, so stale means "the release is in a LATER second than the recorded
+ * start" - the one case where the release is certainly after the real start. The error direction is
+ * deliberate: a failure after a release is NEVER dropped; the only cost is a same-second failure that
+ * truly preceded the release being counted once. Callers whose start is a ms ISO stamp (the in-worker
+ * executor) keep ms precision (no flag), so their same-second staleness still holds.
  */
-export function releasedSinceSql(taskIdExpr: string, startedExpr: string): string {
+export function releasedSinceSql(taskIdExpr: string, startedExpr: string, startedAtSecondPrecision = false): string {
+  const cmp = startedAtSecondPrecision
+    ? `CAST(strftime('%s', rel.last_at) AS INTEGER) > CAST(strftime('%s', ${startedExpr}) AS INTEGER)`
+    : `julianday(rel.last_at) > julianday(${startedExpr})`
   return `EXISTS (
     SELECT 1 FROM task_execution_attempts rel
      WHERE rel.task_id = '${RELEASE_EPOCH_PREFIX}' || ${taskIdExpr}
-       AND julianday(rel.last_at) > julianday(${startedExpr})
+       AND ${cmp}
   )`
 }

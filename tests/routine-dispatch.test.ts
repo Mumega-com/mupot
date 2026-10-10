@@ -704,3 +704,97 @@ describe('mupot#1571 archived task is inert at the routine delivery', () => {
     harness.close()
   })
 })
+
+// mupot#1812 P2-2 - the execution pause reaches routine dispatch (selection AND the writes).
+describe('routine dispatch respects execution_pauses', () => {
+  let harness: SqliteD1Harness | undefined
+  afterEach(() => { harness?.close(); harness = undefined })
+  const pause = (h: SqliteD1Harness, scope: 'agent' | 'squad', id: string) => h.sqlite.exec(
+    `INSERT INTO members (id, tenant, display_name, status) VALUES ('op-1', 'tenant-a', 'Op', 'active') ON CONFLICT DO NOTHING;
+     INSERT INTO execution_pauses (id, tenant, scope_type, scope_id, reason, paused_by_member_id, paused_at)
+     VALUES ('p-${scope}', 'tenant-a', '${scope}', '${id}', 'r', 'op-1', '2026-07-19T15:00:00.000Z')`)
+  const sent = (h: SqliteD1Harness) =>
+    (h.sqlite.prepare("SELECT COUNT(*) AS n FROM agent_messages WHERE from_agent = 'mupot-routines'").get() as { n: number }).n
+
+  it('a paused preferred agent is skipped for the live unpaused alternative', async () => {
+    harness = makeHarness()
+    pause(harness, 'agent', 'agent-preferred')
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+    expect(result).toMatchObject({ ok: true, status: 'dispatched', agent_id: 'agent-fallback' })
+  })
+
+  it('a squad pause covers every agent: the run settles with a clear reason, no task, flight or envelope', async () => {
+    harness = makeHarness()
+    pause(harness, 'squad', 'squad-1')
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+    expect(result).toEqual({ ok: true, status: 'retry_scheduled', reason: 'execution_paused', run_id: 'run-1' })
+    expect(row(harness, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'"))
+      .toEqual({ status: 'queued', result_summary: 'execution_paused' })
+    expect(harness.sqlite.prepare('SELECT COUNT(*) AS n FROM tasks').get()).toEqual({ n: 0 })
+    expect(sent(harness)).toBe(0)
+  })
+
+  it('after max attempts a paused run waits on agent (not looping) with the pause reason', async () => {
+    harness = makeHarness()
+    pause(harness, 'squad', 'squad-1')
+    harness.sqlite.prepare("UPDATE routine_runs SET attempt = 3 WHERE id = 'run-1'").run()
+    const result = await dispatchRoutineRun(envFor(harness), 'run-1', NOW)
+    expect(result).toEqual({ ok: true, status: 'waiting', reason: 'agent', run_id: 'run-1' })
+    expect(row(harness, "SELECT status, waiting_reason, result_summary FROM routine_runs WHERE id = 'run-1'"))
+      .toEqual({ status: 'waiting', waiting_reason: 'agent', result_summary: 'execution_paused' })
+  })
+
+  it('a resumed pause lets the run dispatch', async () => {
+    harness = makeHarness()
+    pause(harness, 'squad', 'squad-1')
+    harness.sqlite.prepare("UPDATE execution_pauses SET resumed_at = '2026-07-19T15:30:00.000Z', resumed_by_member_id = 'op-1'").run()
+    expect(await dispatchRoutineRun(envFor(harness), 'run-1', NOW)).toMatchObject({ ok: true, status: 'dispatched' })
+  })
+
+  it('RACE: a pause landing after selection is refused by the observing UPDATE: no envelope, settled paused', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const env = envFor(h)
+    const real = h.db
+    const raced = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes("SET status = 'observing'")) { armed = false; pause(h, 'squad', 'squad-1') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    const result = await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(armed).toBe(false)
+    expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'execution_paused' })
+    expect(sent(h)).toBe(0)
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+  })
+
+  it('RACE: a pause landing after the envelope is refused by the in_progress UPDATE: task not in_progress, run not running', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const env = envFor(h)
+    const real = h.db
+    const raced = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes("SET status = 'running'")) { armed = false; pause(h, 'squad', 'squad-1') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    const result = await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(armed).toBe(false)
+    expect(result).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'execution_paused' })
+    expect(harness.sqlite.prepare("SELECT status FROM routine_runs WHERE id = 'run-1'").get()).toEqual({ status: 'queued' })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE status = 'in_progress'").get()).toEqual({ n: 0 })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+  })
+})
