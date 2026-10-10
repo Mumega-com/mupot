@@ -22,7 +22,7 @@ import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
-import { dispatchBrakesClearSql, diagnoseDispatchBrake } from './execution-brake-sql'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedSql, isExecutionPaused } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -477,6 +477,9 @@ export async function sendAgentMessage(
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
                  ${brakeFenceSql}
+                 -- mupot#1814: the routine envelope is a mupot-mediated start; a pause (agent, or the
+                 -- recipient's CURRENT squad) landing after the observing UPDATE must refuse the insert
+                 AND NOT ${executionPausedSql('?3')}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
@@ -534,6 +537,9 @@ export async function sendAgentMessage(
       if (brakeFence) {
         const brake = await diagnoseDispatchBrake(env, brakeFence.agentId, brakeFence.taskId)
         if (brake) return { ok: false, reason: brake }
+      }
+      if (routineFence && await isExecutionPaused(env, input.toAgent)) {
+        return { ok: false, reason: 'execution_paused' }
       }
       if (
         opts.requireActiveRecipientProjectAccess

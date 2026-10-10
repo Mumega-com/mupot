@@ -87,7 +87,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   task_verdict: MUT('writeVerdict batch INSERT task_verdicts + task status (tasks/service.ts:1896)'),
   task_verdict_reverse: MUT('reverseTaskVerdict UPDATE task_verdicts.reversed_at + INSERT verdict_reversals (tasks/service.ts:694,758)'),
   task_dispatch: ADD('INSERT task_dispatch_receipts + bus emit (index.ts:2542,2570)'),
-  task_dispatch_runtime_receipt: MUT('UPDATE tasks status/result + INSERT mutation_audit_entries + runtime receipt (tasks/runtime-receipts.ts); a failed receipt after delivered+leased custody UPSERTs the task_execution_attempts retry counter and, at the ceiling, places the execution_holds row, blocks and unassigns the task (escalateRefusedTask); runtime_consumed is refused by hold/ceiling/pause brakes'),
+  task_dispatch_runtime_receipt: MUT('UPDATE tasks status/result + INSERT mutation_audit_entries + runtime receipt (tasks/runtime-receipts.ts); a failed receipt after runtime_consumed custody OR delivered+leased custody UPSERTs the task_execution_attempts retry counter and, at the ceiling, places the execution_holds row, blocks and unassigns the task (escalateRefusedTask); runtime_consumed is refused by hold/ceiling/pause brakes, and that brake refusal also settles the dispatch receipt failed (settleBrakeRefusedDispatchReceipt: UPDATE task_dispatch_receipts settled failed + INSERT mutation_audit_entries + clearExecutionPointer UPDATE tasks)'),
   task_submit_result: MUTX('UPDATE tasks status=review,result + INSERT task_result_submissions (index.ts:2878,2895) + mirrorTaskUpdate GitHub (index.ts:2908)'),
   task_intake_audit: RO('SELECT + pure evaluateTaskIntakeContract (index.ts:2937-3045)'),
 

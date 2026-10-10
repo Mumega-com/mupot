@@ -380,6 +380,55 @@ describe('external runtime failures count toward the per-task ceiling', () => {
     expect(attempts()?.refused_count).toBe(1)
   })
 
+  // mupot#1814 - each OR branch of the failed-count predicate is pinned by a fixture where ONLY it can hold.
+  describe('release-epoch precision per branch', () => {
+    const iso = (sec: string, ms: string) => `2026-09-05T10:00:${sec}.${ms}Z`
+    const release = (at: string) => h.sqlite.prepare(`INSERT INTO task_execution_attempts (task_id, refused_count, last_reason, first_at, last_at)
+      VALUES (?, 0, 'release_epoch', ?, ?)`).run(`release-epoch:${TASK}`, at, at)
+    const setDispatchAt = (id: string, at: string) => h.sqlite.prepare('UPDATE task_dispatch_receipts SET created_at = ? WHERE id = ?').run(at, id)
+    // runtime receipts are append-only: read the consume second the receipt was really stored in
+    const consumeSecond = () => (h.sqlite.prepare(`SELECT created_at c FROM task_dispatch_runtime_receipts WHERE stage = 'runtime_consumed'`).get() as { c: string }).c.replace(' ', 'T').slice(0, 19)
+    const plusSeconds = (sec: string, n: number) => new Date(new Date(`${sec}.000Z`).getTime() + n * 1000).toISOString().slice(0, 19)
+
+    // consume branch alone: the dispatch is in an EARLIER second, so the envelope branch is stale in
+    // every case below and only the consume branch (second-granular receipt stamp) can hold.
+    async function consumeOnlyFixture() {
+      const { dispatchId, messageId } = await dispatchedAndDelivered()
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), consumeInput(dispatchId, messageId))
+      const sec = consumeSecond()
+      setDispatchAt(dispatchId, `${plusSeconds(sec, -5)}.000Z`) // an EARLIER second than the consume
+      return { dispatchId, messageId, sec }
+    }
+    it('consume branch: dispatch in an earlier second, release at .100 of the consume second -> counted (1)', async () => {
+      const { dispatchId, messageId, sec } = await consumeOnlyFixture()
+      release(`${sec}.100Z`)
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+      expect(attempts()?.refused_count).toBe(1)
+    })
+    it('consume branch control: release in the NEXT second -> stale (0)', async () => {
+      const { dispatchId, messageId, sec } = await consumeOnlyFixture()
+      release(`${plusSeconds(sec, 1)}.000Z`)
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+      expect(attempts()).toBeUndefined()
+    })
+
+    // envelope branch alone: no runtime_consumed. The dispatch created_at is an ms stamp.
+    it('envelope branch: dispatch at .200, release at .500 of the same second -> stale (0)', async () => {
+      const { dispatchId, messageId } = await dispatchedAndDelivered()
+      setDispatchAt(dispatchId, iso('05', '200'))
+      release(iso('05', '500'))
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+      expect(attempts()).toBeUndefined()
+    })
+    it('envelope branch control: release at .100, BEFORE the .200 dispatch in the same second -> counted (1)', async () => {
+      const { dispatchId, messageId } = await dispatchedAndDelivered()
+      setDispatchAt(dispatchId, iso('05', '200'))
+      release(iso('05', '100'))
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+      expect(attempts()?.refused_count).toBe(1)
+    })
+  })
+
   it('the failure that reaches the ceiling PLACES THE HOLD (blocked, unassigned, escalated) and dispatch is then refused', async () => {
     seedCeiling(2)
     const { dispatchId, messageId } = await dispatchedAndDelivered()

@@ -797,4 +797,55 @@ describe('routine dispatch respects execution_pauses', () => {
     expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE status = 'in_progress'").get()).toEqual({ n: 0 })
     expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
   })
+
+  // mupot#1814 - the routine.run/v1 envelope INSERT is itself pause-fenced.
+  it('RACE: a pause landing between the observing UPDATE and the envelope INSERT: no envelope, settled paused, no orphan task left assigned', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const env = envFor(h)
+    const real = h.db
+    const raced = {
+      ...env,
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes('INSERT INTO agent_messages')) { armed = false; pause(h, 'agent', 'agent-preferred') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    const result = await dispatchRoutineRun(raced, 'run-1', NOW)
+    expect(armed).toBe(false)
+    expect(result).toEqual({ ok: true, status: 'retry_scheduled', reason: 'execution_paused', run_id: 'run-1' })
+    expect(row(h, "SELECT status, result_summary FROM routine_runs WHERE id = 'run-1'"))
+      .toEqual({ status: 'queued', result_summary: 'execution_paused' })
+    expect(sent(h)).toBe(0)
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM routine_run_events WHERE kind = 'dispatched'").get()).toEqual({ n: 0 })
+    // the control task the attempt created is released, never left assigned to the paused agent
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE assignee_agent_id = 'agent-preferred'").get()).toEqual({ n: 0 })
+    expect(h.sqlite.prepare("SELECT status, assignee_agent_id AS a FROM tasks WHERE title LIKE 'Routine:%'").all())
+      .toEqual([{ status: 'open', a: null }])
+    expect(h.sqlite.prepare("SELECT status FROM flights WHERE agent = 'agent-preferred'").all()).toEqual([{ status: 'failed' }])
+  })
+
+  it('RACE: the same envelope-insert pause via the agent\'s SQUAD', async () => {
+    harness = makeHarness()
+    const h = harness
+    let armed = true
+    const real = h.db
+    const raced = {
+      ...envFor(h),
+      DB: {
+        prepare(sql: string) {
+          if (armed && sql.includes('INSERT INTO agent_messages')) { armed = false; pause(h, 'squad', 'squad-1') }
+          return real.prepare(sql)
+        },
+        batch: real.batch.bind(real),
+      } as unknown as D1Database,
+    } as Env
+    expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ ok: true, status: 'retry_scheduled', reason: 'execution_paused' })
+    expect(sent(h)).toBe(0)
+    expect(h.sqlite.prepare("SELECT COUNT(*) AS n FROM tasks WHERE assignee_agent_id IS NOT NULL").get()).toEqual({ n: 0 })
+  })
 })

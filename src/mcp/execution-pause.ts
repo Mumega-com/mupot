@@ -81,9 +81,12 @@ export const toolExecutionPause: ToolSpec = {
     ' EXECUTION of one agent (agents.id) or every agent in a squad (squads.id; the agent\'s CURRENT squad' +
     ' decides). Stopped while paused: the in-worker executor (bus consumer, AgentDO wake/alarm, executor' +
     ' claim, wake_agent, router_tick assignment), task_dispatch and its inbox envelope, an external' +
-    ' runtime\'s runtime_consumed receipt, and routine dispatch (the run waits/retries with reason' +
-    ' execution_paused). NOT stopped: plain inbox delivery and polling (send, squad_message, inbox),' +
-    ' completed/failed receipts for custody the runtime already took, task_update, or anything the agent' +
+    ' runtime\'s runtime_consumed receipt, and routine dispatch including its routine.run/v1 envelope' +
+    ' insert (the run waits/retries with reason execution_paused and its control task is unassigned).' +
+    ' NOT stopped: plain inbox delivery and polling (send, squad_message, inbox), flight_dispatch (its' +
+    ' flight.dispatch/v1 envelope is not pause-fenced), the actions of a routine run that is ALREADY' +
+    ' running (dispatch_flight, create_task), completed/failed receipts for custody the runtime already' +
+    ' took, task_update, or anything the agent' +
     ' does outside mupot. Already-queued agent.wake messages become no-ops when consumed. Idempotent: an' +
     ' already-paused target returns already_paused (no second receipt). Does not unassign tasks.',
   inputSchema: inputSchema(),
