@@ -42,6 +42,7 @@
 // does not attempt to collapse.
 
 import type { Agent, AuthContext, Env } from '../types'
+import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
 import { loadApprovals, type ApprovalsQueue } from './approvals'
 
@@ -140,7 +141,12 @@ interface TaskStatusRow {
  *  Health's "Task queues" check, which also shows open/in_progress in its detail text)
  *  call this directly instead of hand-writing a second GROUP BY. */
 export async function loadTaskStatusCounts(env: Env): Promise<Map<string, number>> {
-  const rs = await env.DB.prepare('SELECT status, COUNT(*) AS count FROM tasks GROUP BY status').all<TaskStatusRow>()
+  // mupot#1821: released routine control orphans (pause-race leftovers) are inert, not failures.
+  const rs = await env.DB.prepare(
+    `SELECT status, COUNT(*) AS count FROM tasks
+      WHERE ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1', 'tasks.status')}
+      GROUP BY status`,
+  ).bind(env.TENANT_SLUG).all<TaskStatusRow>()
   const map = new Map<string, number>()
   for (const row of rs.results ?? []) {
     const n = typeof row.count === 'number' ? row.count : Number(row.count)

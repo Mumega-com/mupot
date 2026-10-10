@@ -1,4 +1,5 @@
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 import { projectLinkTimestampMsSql } from '../addons/project-link/timestamps'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { routineTablesReady } from '../routines/schema-ready'
@@ -499,6 +500,8 @@ export async function loadProjectSituation(
             AND (?2 = 1 OR t.squad_id IN (SELECT CAST(value AS TEXT) FROM json_each(?3)))
             AND ${TASK_NOT_ARCHIVED_SQL('t')}
             AND t.id NOT IN (SELECT CAST(value AS TEXT) FROM json_each(?6))
+            -- mupot#1821: released routine control orphans (pause-race leftovers) are inert, not blockers
+            AND ${notReleasedControlOrphanSql('t.id', 't.result', '?7', 't.status')}
           ORDER BY t.updated_at, t.id LIMIT ?4
        ),
        review_rows AS (
@@ -537,7 +540,7 @@ export async function loadProjectSituation(
        UNION ALL SELECT * FROM open_rows
        ORDER BY status_order, updated_at, id
        LIMIT ?5`,
-    ).bind(project.id, taskUnrestricted, taskIds, snapshotLimit, snapshotLimit * 4, excludedTaskIds).all<SituationTaskRow>(),
+    ).bind(project.id, taskUnrestricted, taskIds, snapshotLimit, snapshotLimit * 4, excludedTaskIds, env.TENANT_SLUG).all<SituationTaskRow>(),
     env.DB.prepare(
       `SELECT f.id, f.agent, f.goal, f.status, f.created_at
          FROM flights f
