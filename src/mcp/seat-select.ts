@@ -78,6 +78,8 @@ const toolSeatSelect: ToolSpec = {
         return fail(409, result.error, result.detail)
       case 'seat_agent_inactive':
         return fail(409, result.error, result.detail)
+      case 'seat_key_source_conflict':
+        return fail(409, result.error, 'This seat key already belongs to a seat created by a different pool (explicit vs conversation-keyed auto). Choose a different project/thread.')
       case 'provisioning_failed':
         return fail(500, result.error, result.detail)
       /* c8 ignore next 2 -- SeatSelectFailure is exhaustively handled above; kept as a safety net. */
