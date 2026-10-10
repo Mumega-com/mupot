@@ -39,6 +39,24 @@ export async function isExecutionPaused(env: Env, agentId: string): Promise<bool
   return row !== null
 }
 
+/** Audit handler + result stamp written when a routine pause-race releases its control task. */
+export const PAUSE_RELEASE_AUDIT_HANDLER = 'routine_dispatch_pause_release'
+export const PAUSE_RELEASE_RESULT = 'execution_paused: routine dispatch refused by an execution pause; task released'
+
+/**
+ * Boolean SQL fragment: this task is NOT a released routine control orphan. The orphan is identified by the
+ * append-only system audit row the release writes (never by title, which a human can set) AND its result still
+ * carrying the release stamp, so a task a human later re-works under a new result is counted again. Used to keep
+ * those inert tasks out of human-facing blocked lists and totals. Exprs are column expressions / placeholders.
+ */
+export function notReleasedControlOrphanSql(taskIdExpr: string, resultExpr: string, tenantExpr: string): string {
+  return `NOT (COALESCE(${resultExpr}, '') = '${PAUSE_RELEASE_RESULT}' AND EXISTS (
+    SELECT 1 FROM mutation_audit_entries pra
+     WHERE pra.tenant = ${tenantExpr} AND pra.task_id = ${taskIdExpr}
+       AND pra.handler = '${PAUSE_RELEASE_AUDIT_HANDLER}'
+  ))`
+}
+
 /** Boolean SQL fragment: the task has an UNRELEASED escalation hold (any agent). */
 export function taskHeldSql(taskIdExpr: string): string {
   return `EXISTS (

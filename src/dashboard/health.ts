@@ -8,6 +8,7 @@ import type { Agent, AuthContext, Env } from '../types'
 import { loadAgentStats, loadAgentRuntimeStates, type AgentStat, type AgentRuntimeState } from './observatory'
 import { loadApprovals, type ApprovalsQueue } from './approvals'
 import { computeOperatorCounts, loadTaskStatusCounts, type OperatorCounts } from './operator-counts'
+import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 
 export type HealthTone = 'ok' | 'warn' | 'danger' | 'dim'
 
@@ -385,8 +386,10 @@ export async function loadOpsHealth(env: Env, auth: AuthContext, nowMs = Date.no
       `SELECT id, squad_id, title, status, result, updated_at
          FROM tasks
         WHERE status IN ('blocked', 'rejected')
+          AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', '?1')}
         ORDER BY updated_at DESC
         LIMIT 5`,
+      [tenant],
     ),
     safeAll<WorkflowReceiptRow>(
       env,

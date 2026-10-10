@@ -13,6 +13,9 @@ import { registerModule } from '../src/registry/service'
 import type { Project } from '../src/types'
 import type { RoutinePrincipal } from '../src/routines/access'
 import { MAX_SCHEDULER_DB_STATEMENTS } from '../src/routines/scheduler'
+import { loadProjectSituation } from '../src/projects/situation'
+import { loadOpsHealth } from '../src/dashboard/health'
+import { loadTaskStatusCounts } from '../src/dashboard/operator-counts'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
@@ -986,6 +989,232 @@ describe('routine dispatch respects execution_pauses', () => {
       }
       await runProjectConcierge(env, project)
       expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+    })
+  })
+
+  // ---- mupot#1821 ----
+  // A pause lifted AFTER the refusing write must not change what the refusal is reported as, nor leave the
+  // control task assigned with a live control flight. The pause lands just before `pauseAt` is prepared and is
+  // lifted the moment the refusing write has run (after the batch that carries it, or - for any re-read that is
+  // issued afterwards - just before that re-read executes), so only an outcome decided at the write survives.
+  describe('mupot#1821 pause lifted between the refusing write and its diagnosis', () => {
+    function liftRace(h: SqliteD1Harness, pauseAt: string): Env {
+      const real = h.db
+      const sqlOf = new WeakMap<object, string>()
+      let paused = false
+      let lifted = false
+      const lift = () => {
+        lifted = true
+        h.sqlite.prepare("UPDATE execution_pauses SET resumed_at = '2026-07-19T16:00:01.000Z', resumed_by_member_id = 'op-1' WHERE resumed_at IS NULL").run()
+      }
+      return {
+        ...envFor(h),
+        DB: {
+          prepare(sql: string) {
+            if (!paused && sql.includes(pauseAt)) { paused = true; pause(h, 'agent', 'agent-preferred') }
+            // a post-refusal re-read of the pause (the pre-fix diagnosis) sees it already lifted
+            if (paused && !lifted && sql.includes('SELECT 1 AS paused WHERE')) lift()
+            const statement = real.prepare(sql)
+            sqlOf.set(statement, sql)
+            return statement
+          },
+          async batch(statements: D1PreparedStatement[]) {
+            const out = await real.batch(statements)
+            if (paused && !lifted && statements.some(st => sqlOf.get(st)?.includes(pauseAt))) lift()
+            return out
+          },
+        } as unknown as D1Database,
+      } as Env
+    }
+    const liveControlFlights = (h: SqliteD1Harness) => (h.sqlite.prepare(
+      "SELECT COUNT(*) AS n FROM flights WHERE status IN ('preflight','running')").get() as { n: number }).n
+    const expectSettledPaused = (h: SqliteD1Harness, result: unknown) => {
+      expect(result).toEqual({ ok: true, status: 'retry_scheduled', reason: 'execution_paused', run_id: 'run-1' })
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+      expect(liveControlFlights(h)).toBe(0)
+      expect(releaseAudits(h)).toBe(1)
+    }
+
+    it('envelope INSERT refused by the pause, pause lifted before the diagnosis: reported paused, task released, flight failed (not inbox_full)', async () => {
+      harness = makeHarness()
+      const result = await dispatchRoutineRun(liftRace(harness, 'INSERT INTO agent_messages'), 'run-1', NOW)
+      expectSettledPaused(harness, result)
+      expect(sent(harness)).toBe(0)
+    })
+
+    it('observing UPDATE refused by the pause, pause lifted before the diagnosis: task released, flight failed (not left assigned + live)', async () => {
+      harness = makeHarness()
+      const result = await dispatchRoutineRun(liftRace(harness, "SET status = 'observing'"), 'run-1', NOW)
+      expectSettledPaused(harness, result)
+      expect(sent(harness)).toBe(0)
+    })
+
+    it('post-envelope UPDATE refused by the pause, pause lifted before the diagnosis: task released, flight failed', async () => {
+      harness = makeHarness()
+      const result = await dispatchRoutineRun(liftRace(harness, "SET status = 'running'"), 'run-1', NOW)
+      expectSettledPaused(harness, result)
+    })
+
+    it('sendAgentMessage under the routine fence reports execution_paused (not inbox_full) when the pause lifts after the refusal', async () => {
+      harness = makeHarness()
+      const h = harness
+      h.sqlite.exec(`
+        INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, cost_metered, created_at, project_id)
+          VALUES ('cf-1', 'tenant-a', 'agent-preferred', 'g', 'running', 100, '{}', 1, 1, 'project-1');
+        UPDATE routine_runs SET status = 'observing', flight_id = 'cf-1' WHERE id = 'run-1'`)
+      const result = await sendAgentMessage(liftRace(h, 'INSERT INTO agent_messages'), {
+        fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
+        requestId: 'routine-run:run-1', projectId: 'project-1',
+      }, { system: true, reason: 'test' }, {
+        systemProjectAttribution: true,
+        routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' },
+      })
+      expect(result).toMatchObject({ ok: false, reason: 'execution_paused' })
+      expect(sent(h)).toBe(0)
+    })
+
+    it('control: a genuinely full inbox with no pause is still reported inbox_full', async () => {
+      harness = makeHarness()
+      const h = harness
+      h.sqlite.exec(`
+        INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, cost_metered, created_at, project_id)
+          VALUES ('cf-1', 'tenant-a', 'agent-preferred', 'g', 'running', 100, '{}', 1, 1, 'project-1');
+        UPDATE routine_runs SET status = 'observing', flight_id = 'cf-1' WHERE id = 'run-1'`)
+      const result = await sendAgentMessage(envFor(h), {
+        fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
+        requestId: 'routine-run:run-1', projectId: 'project-1',
+      }, { system: true, reason: 'test' }, {
+        systemProjectAttribution: true, maxUnread: 0,
+        routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' },
+      })
+      expect(result).toMatchObject({ ok: false, reason: 'inbox_full' })
+    })
+  })
+
+  // The not-archived guard in releasePausedControlTask is NOT redundant: the observing step's own check runs
+  // BEFORE the window in which an archive can land, so the release itself must refuse an archived task.
+  it('mupot#1821 release guard: a control task archived during the window is inert - not blocked, not unassigned, no audit', async () => {
+    harness = makeHarness()
+    const h = harness
+    const raced = raceBefore(h, 'INSERT INTO agent_messages', () => {
+      pause(h, 'agent', 'agent-preferred')
+      h.sqlite.exec(`
+        INSERT INTO members (id, tenant, email, display_name, status) VALUES ('arch-op', 'tenant-a', 'arch@example.com', 'A', 'active');
+        INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status)
+          SELECT id, '2026-10-08T00:00:00.000Z', 'test', 'arch-op', status FROM tasks WHERE title LIKE 'Routine:%'`)
+    })
+    expect(await dispatchRoutineRun(raced, 'run-1', NOW)).toMatchObject({ reason: 'execution_paused' })
+    expect(tasksOf(h)).toEqual([{ status: 'open', a: 'agent-preferred' }])
+    expect(releaseAudits(h)).toBe(0)
+  })
+
+  describe('mupot#1821 released control orphans stay out of human-facing blocked lists and totals', () => {
+    const REAL_IDS = ['real-1', 'real-2', 'real-3', 'real-4', 'real-5']
+    async function orphanPlusRealBlocked(h: SqliteD1Harness): Promise<void> {
+      // the ORPHAN comes from the real dispatch pause-race path (never a hand-written row)
+      await dispatchRoutineRun(raceBefore(h, 'INSERT INTO agent_messages', () => pause(h, 'agent', 'agent-preferred')), 'run-1', NOW)
+      expect(tasksOf(h)).toEqual([{ status: 'blocked', a: null }])
+      // real blockers are OLDER than the orphan, so the orphan is the newest failure and the freshest blocked row
+      REAL_IDS.forEach((id, i) => h.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, result, updated_at)
+          VALUES ('${id}', 'squad-1', 'project-1', 'Real ${id}', 'b', 'done', 'blocked', NULL, 'needs a human', '2026-07-19T10:0${i}:00.000Z')`))
+    }
+    const project: Project = {
+      id: 'project-1', slug: 'project-1', name: 'Project One', description: '', goal: 'Reach a verified outcome',
+      status: 'active', parent_project_id: null, target_date: null, created_at: NOW.toISOString(), updated_at: NOW.toISOString(),
+    }
+
+    it('project situation: blocked count and blocker list carry only the real blocked tasks', async () => {
+      harness = makeHarness()
+      await orphanPlusRealBlocked(harness)
+      const situation = await loadProjectSituation(envFor(harness), project, null)
+      expect(situation.task_counts.blocked).toBe(REAL_IDS.length)
+      expect(situation.blockers.map(b => b.id).sort()).toEqual([...REAL_IDS].sort())
+    })
+
+    it('project situation: a project whose only blocked task is an orphan is not reported blocked', async () => {
+      harness = makeHarness()
+      await dispatchRoutineRun(raceBefore(harness, 'INSERT INTO agent_messages', () => pause(harness!, 'agent', 'agent-preferred')), 'run-1', NOW)
+      const situation = await loadProjectSituation(envFor(harness), project, null)
+      expect(situation.task_counts.blocked).toBe(0)
+      expect(situation.health).not.toBe('blocked')
+    })
+
+    it('dashboard totals and recent failures count only the real ones (limit 5 is not consumed by the orphan)', async () => {
+      harness = makeHarness()
+      await orphanPlusRealBlocked(harness)
+      const env = envFor(harness)
+      expect((await loadTaskStatusCounts(env)).get('blocked')).toBe(REAL_IDS.length)
+      const health = await loadOpsHealth(env, { userId: 'owner-1', email: 'o@test', role: 'owner', tenant: 'tenant-a' }, NOW.getTime())
+      expect(health.kpis.blockedOrRejected).toBe(REAL_IDS.length)
+      const failureTitles = health.recentFailures.map(f => f.title).filter(t => t.startsWith('Real') || t.startsWith('Routine:'))
+      expect(failureTitles.sort()).toEqual(REAL_IDS.map(id => `Real ${id}`).sort())
+    })
+
+    it('an orphan a human re-works under a new result is counted again (the stamp, not the title, identifies it)', async () => {
+      harness = makeHarness()
+      await orphanPlusRealBlocked(harness)
+      harness.sqlite.exec("UPDATE tasks SET result = 'human picked this up' WHERE title LIKE 'Routine:%'")
+      expect((await loadTaskStatusCounts(envFor(harness))).get('blocked')).toBe(REAL_IDS.length + 1)
+    })
+
+    it('a human task merely TITLED "Routine:" is never treated as an orphan', async () => {
+      harness = makeHarness()
+      harness.sqlite.exec(`
+        INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, assignee_agent_id, result, updated_at)
+          VALUES ('lookalike', 'squad-1', 'project-1', 'Routine: look-alike', 'b', 'done', 'blocked', NULL, 'execution_paused: routine dispatch refused by an execution pause; task released', '2026-07-19T10:00:00.000Z')`)
+      expect((await loadTaskStatusCounts(envFor(harness))).get('blocked')).toBe(1)
+    })
+  })
+
+  // mupot#1821 item 3: the post-envelope pause path legitimately costs more than the success path (it has already
+  // run preflight + telemetry before the finishing batch refuses, then settles). Counted as prepared statements.
+  describe('mupot#1821 D1 statement budget is pinned per path', () => {
+    // 50 free-tier statements minus the scheduler's worst case, plus the telemetry statement: the success path is
+    // exactly AT this budget, so nothing may be added to it (the pause diagnoses below ride only on refusals).
+    const SUCCESS_CAP = 50 - MAX_SCHEDULER_DB_STATEMENTS + 1
+    // The post-envelope pause path has already prepared the whole finishing batch (6) plus preflight + telemetry
+    // before it is refused, then spends pause read + failFlight + release (2) + settle (2). Its measured cost is
+    // 38; that is ACCEPTED (it only bites a 50-statement plan whose scheduler also did worst-case work in the same
+    // invocation, on a rare pause race) and pinned here so it cannot grow unnoticed.
+    const POST_ENVELOPE_PAUSE_CAP = 38
+    async function count(h: SqliteD1Harness, raceAt?: string): Promise<{ n: number; result: unknown }> {
+      let n = 0
+      const real = h.db
+      let armed = raceAt !== undefined
+      const env = {
+        ...envFor(h),
+        DB: {
+          prepare(sql: string) {
+            n += 1
+            if (armed && raceAt && sql.includes(raceAt)) { armed = false; pause(h, 'squad', 'squad-1') }
+            return real.prepare(sql)
+          },
+          batch: real.batch.bind(real),
+        } as unknown as D1Database,
+      } as Env
+      const result = await dispatchRoutineRun(env, 'run-1', NOW)
+      return { n, result }
+    }
+    it('success path stays at or under its cap', async () => {
+      harness = makeHarness()
+      const { n, result } = await count(harness)
+      expect(result).toMatchObject({ ok: true, status: 'dispatched' })
+      expect(n).toBeLessThanOrEqual(SUCCESS_CAP)
+    })
+    it('post-envelope pause path stays at or under its own (documented, accepted) cap', async () => {
+      harness = makeHarness()
+      const { n, result } = await count(harness, "SET status = 'running'")
+      expect(result).toMatchObject({ reason: 'execution_paused' })
+      expect(n).toBeLessThanOrEqual(POST_ENVELOPE_PAUSE_CAP)
+    })
+    it('envelope-insert and observing pause paths stay under the success cap', async () => {
+      for (const at of ['INSERT INTO agent_messages', "SET status = 'observing'"]) {
+        const h = makeHarness()
+        const { n } = await count(h, at)
+        h.close()
+        expect(n).toBeLessThanOrEqual(SUCCESS_CAP)
+      }
     })
   })
 })
