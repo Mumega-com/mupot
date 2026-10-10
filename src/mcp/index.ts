@@ -1455,7 +1455,7 @@ const toolTaskGet: ToolSpec = {
          FROM tasks
          LEFT JOIN (SELECT task_id AS hold_task_id, held_at AS hold_held_at, released_at AS hold_released_at
                       FROM execution_holds) hold ON hold.hold_task_id = tasks.id
-        WHERE tasks.id = ?1 LIMIT 1`,
+        WHERE id = ?1 LIMIT 1`,
     ).bind(taskId).first<Record<string, unknown> & { id: string; squad_id: string }>()
     if (!full || !(await canReadTask(env, auth, { id: full.id, squad_id: full.squad_id }))) {
       return fail(404, 'task_not_found')

@@ -1297,6 +1297,15 @@ describe('MCP granted multi-squad flight lifecycle', () => {
           tenant TEXT NOT NULL, agent_id TEXT NOT NULL, member_id TEXT NOT NULL,
           created_at TEXT NOT NULL, PRIMARY KEY (tenant, agent_id), UNIQUE (tenant, member_id)
         );
+        -- migrations/0203: task_update's assign-over-hold decision reads execution_holds (mupot#1809).
+        CREATE TABLE execution_holds (
+          task_id TEXT PRIMARY KEY, escalation_id TEXT NOT NULL, agent_id TEXT NOT NULL, refused_count INTEGER NOT NULL,
+          reason TEXT, held_at TEXT NOT NULL, released_at TEXT, released_by_member_id TEXT, release_id TEXT, release_reason TEXT
+        );
+        CREATE TABLE task_execution_attempts (
+          task_id TEXT PRIMARY KEY, refused_count INTEGER NOT NULL DEFAULT 0, last_agent_id TEXT, last_reason TEXT,
+          first_at TEXT NOT NULL, last_at TEXT NOT NULL
+        );
         CREATE TABLE memberships (
           id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, squad_id TEXT NOT NULL,
           capability TEXT NOT NULL, UNIQUE (agent_id, squad_id)
