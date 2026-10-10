@@ -115,6 +115,7 @@ test('runSeatStream: transient errors back off 1s,2s,4s... capped at 30s, then a
     },
     log: () => {},
     sleep: async (ms) => { delays.push(ms) },
+    shouldContinue: () => n < 20,
   })
   assert.equal(out.stopped, true)
   assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000])
