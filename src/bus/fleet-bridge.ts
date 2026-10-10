@@ -20,6 +20,7 @@
 
 import type { Env } from '../types'
 import { sendAgentMessage, MAX_BODY_CHARS } from '../agents/messages'
+import type { DispatchBrakeReason } from '../agents/execution-brake-sql'
 
 // Sender identity for a bridged dispatch message. This is NOT a welded agent — task_dispatch is
 // invoked by a human member through the mupot tool surface, not by an agent acting as sender, so
@@ -58,6 +59,10 @@ export interface DispatchBridgeInput {
   /** mupot#1740 — agents.id of the task assignee. When set, the envelope INSERT itself refuses
    *  (ReceiverNotLiveError) if that seat's fleet row is 'stopped' at write time. */
   receiverFenceAgentId?: string
+  /** Loop brakes (mupot#1809) - agents.id of the task assignee. When set, the envelope INSERT itself
+   *  refuses (DispatchBrakeRefusedError) if the task is held / at the retry ceiling or this agent /
+   *  its current squad is paused at write time. */
+  brakeFenceAgentId?: string
 }
 
 export type BridgeResult = { delivered: true; seq: number; duplicate: boolean }
@@ -72,6 +77,13 @@ export class InboxFullError extends Error {}
 
 /** mupot#1740 — the in-write stopped-seat fence refused the envelope INSERT (concurrent detach). */
 export class ReceiverNotLiveError extends Error {}
+
+/** The envelope INSERT's loop-brake fence refused (mupot#1809); `brake` names which one. */
+export class DispatchBrakeRefusedError extends Error {
+  constructor(message: string, readonly brake: DispatchBrakeReason) {
+    super(message)
+  }
+}
 
 /** Max length (UTF-16 code units, after trim) of each task-text field copied into the envelope. */
 export const DISPATCH_ENVELOPE_TEXT_MAX = 2000
@@ -260,9 +272,15 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
   }, {
     systemProjectAttribution: input.projectId != null,
     ...(input.receiverFenceAgentId ? { receiverNotStopped: { agentId: input.receiverFenceAgentId } } : {}),
+    ...(input.brakeFenceAgentId ? { dispatchBrakeFence: { agentId: input.brakeFenceAgentId, taskId: input.taskId } } : {}),
   })
 
   if (!res.ok) {
+    if (res.reason === 'task_held' || res.reason === 'execution_paused' || res.reason === 'retry_ceiling_reached') {
+      throw new DispatchBrakeRefusedError(
+        `fleet-bridge: ${res.reason} for task ${input.taskId} (receipt ${input.receiptId})`, res.reason,
+      )
+    }
     if (res.reason === 'receiver_not_live') {
       throw new ReceiverNotLiveError(
         `fleet-bridge: receiver ${input.receiverFenceAgentId} is stopped (receipt ${input.receiptId})`,

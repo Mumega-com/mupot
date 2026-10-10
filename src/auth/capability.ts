@@ -1168,3 +1168,11 @@ export function requireSurfaceCap(surface: string): MiddlewareHandler<AppEnv> {
     await next()
   }
 }
+
+/** Org-admin by grant (or, with no capability list at all, by the legacy role). Shared by the MCP
+ *  surface (re-exported from mcp/index) and the execution-release policy. */
+export function hasWorkspaceAdmin(auth: AuthContext): boolean {
+  if (auth.capabilities === undefined) return auth.role === 'owner' || auth.role === 'admin'
+  return hasCapability(auth.capabilities, 'org', null, 'admin')
+}
+

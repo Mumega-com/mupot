@@ -22,6 +22,7 @@ import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -170,6 +171,10 @@ export type SendFailure = {
     | 'request_id_conflict'
     | 'dispatch_fenced'
     | 'receiver_not_live'
+    // Loop brakes (mupot#1809): the dispatch envelope INSERT's brake fence refused.
+    | 'execution_paused'
+    | 'task_held'
+    | 'retry_ceiling_reached'
     | 'send_target_not_visible'
     | 'inbox_full'
     | 'db_error'
@@ -208,6 +213,13 @@ interface Opts {
    * is decided from RETURNING rows; a refusal is reported as `receiver_not_live`.
    */
   receiverNotStopped?: { agentId: string }
+  /**
+   * Loop brakes (mupot#1809) - the envelope INSERT itself refuses when the task is held / at the retry
+   * ceiling or the agent (agents.id) / its current squad is paused, at write time. A 0-row landing
+   * is then named with the current brake (`task_held` | `execution_paused` | `retry_ceiling_reached`).
+   * Only for a task-dispatch envelope; agentId MUST be agents.id (pauses key on it), not a slug.
+   */
+  dispatchBrakeFence?: { agentId: string; taskId: string }
 }
 
 function isRef(v: string): boolean {
@@ -446,8 +458,15 @@ export async function sendAgentMessage(
       values.push(receiverFence.agentId)
       receiverFenceSql = `AND ${receiverNotStoppedSql('?2', `?${values.length}`)}`
     }
+    let brakeFenceSql = ''
+    const brakeFence = opts.dispatchBrakeFence
+    if (brakeFence) {
+      values.push(brakeFence.agentId, brakeFence.taskId)
+      brakeFenceSql = `AND ${dispatchBrakesClearSql(`?${values.length - 1}`, `?${values.length}`)}`
+    }
     const routineRunParam = values.length + 1
-    const returningSql = receiverFence ? ' RETURNING seq' : ''
+    const fenced = receiverFence !== undefined || brakeFence !== undefined
+    const returningSql = fenced ? ' RETURNING seq' : ''
     const statement = routineFence
       ? env.DB.prepare(
         `INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body, request_id, in_reply_to, created_at, project_id, target_seat, body_length, checksum_sha256)
@@ -457,6 +476,7 @@ export async function sendAgentMessage(
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
                  ${receiverFenceSql}
+                 ${brakeFenceSql}
                  AND EXISTS (
                    SELECT 1 FROM routine_runs rr
                     WHERE rr.id = ?${routineRunParam} AND rr.tenant = ?2 AND rr.project_id = ?12
@@ -479,12 +499,13 @@ export async function sendAgentMessage(
                        WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) < ?11
                  ${guestVisibilitySql}
                  ${activeRecipientProjectAccessSql}
-                 ${receiverFenceSql}${returningSql}`,
+                 ${receiverFenceSql}
+                 ${brakeFenceSql}${returningSql}`,
       ).bind(...values)
     // Fenced writes decide from RETURNING rows (never meta.changes); unfenced keep meta.changes.
     let landedRows: number
     let landedSeq: number
-    if (receiverFence) {
+    if (fenced) {
       const rows = await statement.all<{ seq: number }>()
       landedRows = (rows.results ?? []).length
       landedSeq = Number(rows.results?.[0]?.seq ?? 0)
@@ -509,6 +530,10 @@ export async function sendAgentMessage(
       }
       if (receiverFence && !await receiverNotStopped(env, receiverFence.agentId)) {
         return { ok: false, reason: 'receiver_not_live' }
+      }
+      if (brakeFence) {
+        const brake = await diagnoseDispatchBrake(env, brakeFence.agentId, brakeFence.taskId)
+        if (brake) return { ok: false, reason: brake }
       }
       if (
         opts.requireActiveRecipientProjectAccess

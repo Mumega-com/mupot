@@ -33,7 +33,8 @@ never placed in argv or in a message.
 
 1. The PR is merged, migration `0201_task_incident_revert_receipts.sql` is applied, and the worker is
    deployed (migrate first, then deploy). Check `task_incident_revert` is in `tools/list`.
-2. The execution-pause kill switch (the parallel PR, migration 0200) is deployed.
+2. The execution-pause kill switch (loop brakes, `0203_execution_brakes.sql`) is deployed: migrations 0201 and 0203
+   are both applied BEFORE the matching code deploy, and their apply receipts are retained with the incident record.
 
 ## Steps
 

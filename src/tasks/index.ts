@@ -13,6 +13,8 @@
 // a token minted for another tenant can never touch this pot. Mutations are RBAC
 // gated. The GitHub token is read from env only — it is never echoed or logged.
 
+import { releaseExecutionHold } from '../agents/execution-brakes'
+import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
 import type { Env, AuthContext, Task, Squad, Capability, OrgKind } from '../types'
@@ -1163,6 +1165,17 @@ tasksApp.patch('/:id', async (c) => {
   stampTaskUpdate(next, existing.status, new Date().toISOString())
 
   const auth = c.get('auth')
+  // Execution hold (migration 0203, mupot#1809) - the SAME release policy as MCP task_update and
+  // execution_release (agents/execution-release-policy.ts). Before: this route persisted the reassign
+  // and answered 200 with the hold still active (the task dropped out of needs_you and every wake settled
+  // task_held). Now: below the bar a reassign of a HELD task is refused 409 task_held; at the bar it releases.
+  const assigningAgent = typeof body.assignee_agent_id === 'string' && typeof next.assignee_agent_id === 'string'
+  if (assigningAgent && (await decideReassignOverHold(c.env, auth, existing)).action === 'refuse') {
+    return c.json({
+      error: 'task_held',
+      detail: 'task has an unreleased execution hold; only a non-agent-bound org-admin or squad-admin may reassign it',
+    }, 409)
+  }
   try {
     if (reversesVerdict) {
       // FP-01 Slice 2 v2 round 2 (P0): ONE function, reversed_at stamped
@@ -1184,6 +1197,11 @@ tasksApp.patch('/:id', async (c) => {
     }
     if (error instanceof TaskUpdateConflictError) return c.json({ error: error.code, ...(error.detail ? { detail: error.detail } : {}) }, 409)
     throw error
+  }
+
+  if (assigningAgent && await canReleaseExecutionHold(c.env, auth, existing.squad_id)) {
+    await releaseExecutionHold(c.env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
+      reason: 'human reassign via PATCH /tasks/:id', via: 'human_reassign' })
   }
 
   // A stale update must never reach the external mirror. The mirror remains
