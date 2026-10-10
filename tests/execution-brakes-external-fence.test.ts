@@ -331,10 +331,53 @@ describe('external runtime failures count toward the per-task ceiling', () => {
     expect(holdRow()).toBeUndefined()
   })
 
-  it('a failed receipt with NO prior custody (never started: delivery/outage class) is NOT counted', async () => {
+  it('a failed receipt on a delivered + LEASED envelope counts even with NO runtime_consumed (#1812: custody the runtime cannot skip)', async () => {
     const { dispatchId, messageId } = await dispatchedAndDelivered()
     await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+    expect(attempts()).toMatchObject({ refused_count: 1, last_reason: 'runtime_failed' })
+  })
+
+  it('#1812 repro: 4 self-dispatch -> lease -> failed cycles with NO runtime_consumed place the hold at 3 and then refuse', async () => {
+    const selfDispatch = () => invokeTool(runtimeAuth(), env, 'task_dispatch', { task_id: TASK }, 'https://pot.example')
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      // a raw edit back to open+assigned is NOT a release (only the human release policy is)
+      h.sqlite.exec(`UPDATE tasks SET status = 'open', assignee_agent_id = '${AGENT}', gate_owner = NULL WHERE id = '${TASK}'`)
+      const out = await selfDispatch()
+      if (cycle === 4) {
+        expect(out).toMatchObject({ ok: false, error: 'task_held' }) // the 4th cycle never starts
+        break
+      }
+      expect(out.ok, JSON.stringify(out)).toBe(true)
+      await deliver(events[events.length - 1])
+      const dispatchId = receiptRow().id as string
+      const msg = h.sqlite.prepare('SELECT id FROM agent_messages WHERE request_id = ?').get(`dispatch-inbox:${dispatchId}`) as { id: string }
+      h.sqlite.prepare(`UPDATE agent_messages SET delivery_attempts = 1, lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?`).run(msg.id)
+      await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, msg.id))
+      expect(attempts()?.refused_count).toBe(cycle)
+      expect(holdRow() === undefined).toBe(cycle < 3) // no hold at 1 and 2, placed AT 3
+      if (cycle === 3) expect(taskRow()).toMatchObject({ status: 'blocked', a: null })
+    }
+    expect(holdRow()).toMatchObject({ released_at: null })
+  })
+
+  it('a no-consume failure whose dispatch predates a human release is stale and NOT counted', async () => {
+    const { dispatchId, messageId } = await dispatchedAndDelivered()
+    h.sqlite.exec(`INSERT INTO task_execution_attempts (task_id, refused_count, last_reason, first_at, last_at)
+      VALUES ('release-epoch:${TASK}', 0, 'release_epoch', '2099-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')`)
+    await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
     expect(attempts()).toBeUndefined()
+  })
+
+  it('same-second precision: a failure in the SAME second as (but after) a release is counted, never stale', async () => {
+    const { dispatchId, messageId } = await dispatchedAndDelivered()
+    await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), consumeInput(dispatchId, messageId))
+    // epoch at ms precision inside the second the consume receipt was stored in (stored at second precision)
+    const consumedAt = (h.sqlite.prepare(`SELECT created_at c FROM task_dispatch_runtime_receipts WHERE stage = 'runtime_consumed'`).get() as { c: string }).c
+    const sameSecondMs = new Date(`${consumedAt.replace(' ', 'T').slice(0, 19)}.999Z`).toISOString()
+    h.sqlite.prepare(`INSERT INTO task_execution_attempts (task_id, refused_count, last_reason, first_at, last_at)
+      VALUES (?, 0, 'release_epoch', ?, ?)`).run(`release-epoch:${TASK}`, sameSecondMs, sameSecondMs)
+    await recordTaskDispatchRuntimeReceipt(env, runtimeAuth(), failInput(dispatchId, messageId))
+    expect(attempts()?.refused_count).toBe(1)
   })
 
   it('the failure that reaches the ceiling PLACES THE HOLD (blocked, unassigned, escalated) and dispatch is then refused', async () => {

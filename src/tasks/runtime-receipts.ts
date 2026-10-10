@@ -1494,22 +1494,44 @@ export async function recordTaskDispatchRuntimeReceipt(
         agentId, messageId, memberId, credentialId, input.stage, input.attempt,
         runtimeAddress, input.runtimeReceiptHash, requestDigest, JSON.stringify(artifactRefs),
         artifactSha256, result, reason, auditId, now),
-      // Loop brakes (mupot#1809): a runtime `failed` receipt for a dispatch whose runtime TOOK CUSTODY
-      // (a runtime_consumed receipt by the same agent exists) counts toward the per-task ceiling,
-      // anchored on the failed receipt row just inserted (no row = no count). A failed with no prior
-      // custody never started the work (delivery / outage class) and is NOT counted. No runtime-
-      // supplied label can exempt a count (a self-declared "outage" flag would be a gameable door).
+      // Loop brakes (mupot#1809, #1812): a runtime `failed` receipt for a dispatch whose runtime TOOK
+      // CUSTODY counts toward the per-task ceiling - custody = a runtime_consumed receipt by the same
+      // agent OR a delivered + leased envelope for the dispatch (the runtime cannot skip the lease).
+      // Anchored on the failed receipt row just inserted (no row = no count). A failed whose release
+      // epoch is newer than the custody start is stale. No runtime-supplied label can exempt a count
+      // (a self-declared "outage" flag would be a gameable door).
       ...(input.stage === 'failed' ? [env.DB.prepare(`
         INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, last_reason, first_at, last_at)
         SELECT r.task_id, 1, r.agent_id, 'runtime_failed', ?2, ?2
           FROM task_dispatch_runtime_receipts r
          WHERE r.id = ?1 AND r.stage = 'failed'
-           AND EXISTS (
-             SELECT 1 FROM task_dispatch_runtime_receipts c
-              WHERE c.tenant = r.tenant AND c.dispatch_receipt_id = r.dispatch_receipt_id
-                AND c.stage = 'runtime_consumed' AND c.agent_id = r.agent_id
-                -- a human release/reassign AFTER custody began makes this failure stale: not counted
-                AND NOT ${releasedSinceSql('r.task_id', 'c.created_at')}
+           AND (
+             EXISTS (
+               SELECT 1 FROM task_dispatch_runtime_receipts c
+                WHERE c.tenant = r.tenant AND c.dispatch_receipt_id = r.dispatch_receipt_id
+                  AND c.stage = 'runtime_consumed' AND c.agent_id = r.agent_id
+                  -- a human release/reassign AFTER custody began makes this failure stale: not counted
+                  AND NOT ${releasedSinceSql('r.task_id', 'c.created_at', true)}
+             )
+             -- mupot#1812 P2-1 - custody the runtime CANNOT skip: the envelope for THIS dispatch was
+             -- DELIVERED (delivery_attempts >= 1) and LEASED (lease_expires_at set) to this agent. A
+             -- runtime that never sends runtime_consumed (an agent-bound runtime may self-dispatch a
+             -- task assigned to itself, lease the envelope and send failed) still counts: the failed
+             -- receipt was only accepted because that lease was live (or consumed) at write time.
+             -- Same staleness rule, measured from the dispatch (the only start the runtime did not
+             -- author): a human release/reassign after the dispatch was issued makes it stale.
+             OR EXISTS (
+               SELECT 1 FROM task_dispatch_receipts d
+                 JOIN agent_messages e
+                   ON e.tenant = d.tenant AND e.id = r.message_id
+                WHERE d.tenant = r.tenant AND d.id = r.dispatch_receipt_id
+                  AND d.task_id = r.task_id AND d.agent_id = r.agent_id
+                  AND e.from_agent = '${DISPATCH_BRIDGE_SENDER}'
+                  AND e.request_id = '${DISPATCH_INBOX_PREFIX}' || r.dispatch_receipt_id
+                  AND e.dead_lettered_at IS NULL
+                  AND e.delivery_attempts >= 1 AND e.lease_expires_at IS NOT NULL
+                  AND NOT ${releasedSinceSql('r.task_id', 'd.created_at', true)}
+             )
            )
         ON CONFLICT (task_id) DO UPDATE
            SET refused_count = refused_count + 1,

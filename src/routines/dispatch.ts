@@ -16,6 +16,7 @@ import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import { EXECUTION_PAUSED_ERROR, executionPausedSql, isExecutionPaused } from '../agents/execution-brake-sql'
 
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
@@ -73,12 +74,17 @@ export interface CandidateRow {
   department_id: string
   kind: OrgKind
   member_id: string
+  /** 1 iff an active execution pause covers this agent or its CURRENT squad (mupot#1812), read in the
+   *  SAME statement so routine dispatch keeps its D1 statement headroom */
+  paused: number
 }
 
 type AgentSelection =
   | { kind: 'selected'; agentId: string; inboxAgentId: string }
   | { kind: 'none' }
   | { kind: 'offline' }
+  /** every otherwise-eligible agent is covered by an active execution pause (agent or its current squad) */
+  | { kind: 'paused' }
 
 export type RoutineDispatchResult =
   | {
@@ -94,7 +100,7 @@ export type RoutineDispatchResult =
   | {
       ok: true
       status: 'retry_scheduled'
-      reason: 'agent_offline' | 'inbox_full' | 'delivery_failed'
+      reason: 'agent_offline' | 'inbox_full' | 'delivery_failed' | typeof EXECUTION_PAUSED_ERROR
       run_id: string
     }
   | { ok: false; error: 'run_not_found' | 'run_not_dispatchable' | 'invalid_policy' | 'invalid_public_origin' }
@@ -236,7 +242,8 @@ export async function loadCandidates(
   limit: number = CANDIDATE_LIMIT,
 ): Promise<CandidateRow[]> {
   const result = await env.DB.prepare(
-    `SELECT a.id, a.slug, s.department_id, s.kind, b.member_id
+    `SELECT a.id, a.slug, s.department_id, s.kind, b.member_id,
+            CASE WHEN ${executionPausedSql('a.id')} THEN 1 ELSE 0 END AS paused
        FROM agents a
        JOIN squads s ON s.id = ?1
        JOIN agent_member_bindings b
@@ -314,12 +321,18 @@ async function selectAgent(
     return left.id.localeCompare(right.id)
   })
   if (!eligible.length) return { kind: 'none' }
+  // mupot#1812 P2-2 - the execution pause (agent, or the agent's CURRENT squad) is the only brake that
+  // reaches a routine: every run mints a fresh task, so a per-task hold never matches. Drop paused
+  // agents here (read-side, loaded by loadCandidates, so a pause with a live alternative picks the
+  // alternative); the writes below re-assert the same predicate atomically.
+  const runnable = eligible.filter(candidate => candidate.paused !== 1)
+  if (!runnable.length) return { kind: 'paused' }
   const states = await getFleetAgentRuntimeStates(
     env,
-    eligible.map(candidate => ({ agent_id: candidate.id, slug: candidate.slug })),
+    runnable.map(candidate => ({ agent_id: candidate.id, slug: candidate.slug })),
     now.getTime(),
   )
-  for (const candidate of eligible) {
+  for (const candidate of runnable) {
     const state = states.get(candidate.id)
     if (state?.runtime && state.presence === 'live') {
       return { kind: 'selected', agentId: candidate.id, inboxAgentId: state.agent_id }
@@ -401,7 +414,7 @@ async function waitForAgent(env: Env, run: DispatchRunRow, now: Date, reason: st
     retryAt, eventKind: 'retry_scheduled',
   })
   if (!transitioned) return { ok: false, error: 'run_not_dispatchable' }
-  const publicReason = reason === 'agent_offline' || reason === 'inbox_full'
+  const publicReason = reason === 'agent_offline' || reason === 'inbox_full' || reason === EXECUTION_PAUSED_ERROR
     ? reason
     : 'delivery_failed'
   return { ok: true, status: 'retry_scheduled', reason: publicReason, run_id: run.id }
@@ -595,6 +608,9 @@ export async function dispatchRoutineRun(
   const selected = await selectAgent(env, policy, now, run.assigned_agent_id)
   if (selected.kind === 'none') return waitForAgent(env, run, now, 'no_eligible_agent')
   if (selected.kind === 'offline') return waitForAgent(env, run, now, 'agent_offline')
+  // A pause is operator-lifted, so it settles like an offline agent: bounded retries on the backoff
+  // clock, then waiting on 'agent', always with the distinct result_summary 'execution_paused'.
+  if (selected.kind === 'paused') return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
 
   const reserved = await env.DB.prepare(
     `UPDATE routine_runs SET assigned_agent_id = ?, updated_at = ?
@@ -628,7 +644,9 @@ export async function dispatchRoutineRun(
           )
           -- mupot#1571: this write gates the agent message sent right after it; an archived
           -- task is inert, so 0 rows here means no delivery (run_not_dispatchable below).
-          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})`,
+          AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = ? AND ${TASK_NOT_ARCHIVED_SQL()})
+          -- mupot#1812 P2-2: this write gates the message too; a pause landing after selection = 0 rows
+          AND NOT ${executionPausedSql('routine_runs.assigned_agent_id')}`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso,
       run.id, run.tenant, selected.agentId, flightId, task.id,
@@ -655,6 +673,10 @@ export async function dispatchRoutineRun(
     ),
   ])
   if (!wrote(observed[0])) {
+    if (await isExecutionPaused(env, selected.agentId)) {
+      await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
+      return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
+    }
     // #1756: the control flight was cancelled in the create-before-observe window. Fail closed: no message goes out.
     await closeRunIfControlFlightCancelled(env, run, flightId, nowIso)
     return { ok: false, error: 'run_not_dispatchable' }
@@ -732,7 +754,9 @@ export async function dispatchRoutineRun(
             SELECT 1 FROM flights f
              WHERE f.id = ? AND f.tenant = ? AND f.project_id = ?
                AND f.agent = ? AND f.status = 'running'
-          )`,
+          )
+          -- mupot#1812 P2-2: the dispatch is only real if no pause covers the agent at write time
+          AND NOT ${executionPausedSql('routine_runs.assigned_agent_id')}`,
     ).bind(
       selected.agentId, task.id, flightId, situationDigest, nowIso, run.id, run.tenant,
       task.id, run.project_id, policy.responsible_squad_id, selected.agentId,
@@ -743,6 +767,7 @@ export async function dispatchRoutineRun(
         WHERE id = ? AND project_id = ? AND squad_id = ? AND assignee_agent_id = ?
           AND status IN ('open','in_progress')
           AND ${TASK_NOT_ARCHIVED_SQL()}
+          AND NOT ${executionPausedSql('tasks.assignee_agent_id')}
           AND EXISTS (
             SELECT 1 FROM routine_runs rr
              WHERE rr.id = ? AND rr.tenant = ? AND rr.status = 'running'
@@ -793,6 +818,12 @@ export async function dispatchRoutineRun(
     ).bind(crypto.randomUUID(), delivery.id, nowIso, run.id, run.tenant, task.id, flightId, situationDigest, nowIso),
   ])
   if (!wrote(finished[0]) || !wrote(finished[1])) {
+    // A pause that landed after the envelope went out: settle the run waiting with the pause reason
+    // (the envelope cannot be recalled; the executor's own pause fence refuses it).
+    if (await isExecutionPaused(env, selected.agentId)) {
+      await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
+      return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
+    }
     await failFlight(env, flightId, 'routine_run_not_dispatchable')
     return { ok: false, error: 'run_not_dispatchable' }
   }

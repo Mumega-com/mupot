@@ -4,10 +4,15 @@
 //
 // While a pause is ACTIVE: the bus consumer's wakeAgent, AgentDO.wake (alarm, /wake, queued wakes) and
 // the executor's claim UPDATE all refuse (src/agents/execution-brakes.ts). Resume clears it.
-// SCOPE OF THE CLAIM: this stops IN-WORKER autonomous execution (and wake_agent) only. It does NOT stop
-// inbox/poll delivery to an external runtime (send, task_dispatch to an inbox-routed agent): an external
-// runtime that polls its inbox keeps receiving messages. It is a brake on the Worker-side executor,
-// not a firewall around the agent.
+// SCOPE OF THE CLAIM (accurate after #1811 and #1812). STOPPED while a pause covers the agent or its
+// CURRENT squad: in-worker execution (bus consumer wake, AgentDO wake/alarm, executor claim, wake_agent,
+// router_tick assignment); task_dispatch (refused execution_paused, no receipt, no envelope); the inbox
+// envelope INSERT of a dispatch (refused); the external runtime's runtime_consumed receipt (refused, the
+// dispatch settles failed); and routine dispatch (the run settles waiting/retry with result_summary
+// 'execution_paused'; its writes re-check the pause atomically). NOT STOPPED: plain inbox delivery and
+// polling (send, squad_message, inbox, inbox_lease), an external runtime's completed/failed receipts for
+// custody it ALREADY took, a task a human assigns or edits (task_update), and any work the agent does
+// outside mupot. It is a brake on mupot-mediated starts of work, not a firewall around the agent.
 //
 // Gate: org-admin only, operator principal only (no agent-bound caller) — the archive_row pattern
 // (src/mcp/archive.ts). An agent must never be able to pause or un-pause itself or a peer.
@@ -73,12 +78,14 @@ export const toolExecutionPause: ToolSpec = {
   min: 'admin',
   args: '{ scope: "agent"|"squad", id: string, reason: string }' +
     ' -- org-admin only, operator principal only (no agent-bound caller). Pauses IN-WORKER AUTONOMOUS' +
-    ' EXECUTION of one agent (agents.id) or every agent in a squad (squads.id): the bus consumer, AgentDO' +
-    ' wake/alarm, the executor claim, wake_agent and router_tick assignment all refuse the paused agent, so' +
-    ' already-queued agent.wake messages become no-ops when consumed. This is NOT a kill switch for an' +
-    ' external runtime: inbox/poll delivery (send, task_dispatch routed to an inbox) is NOT stopped and an' +
-    ' external runtime keeps receiving it. Idempotent: an already-paused target returns already_paused' +
-    ' (no second receipt). Does not unassign tasks.',
+    ' EXECUTION of one agent (agents.id) or every agent in a squad (squads.id; the agent\'s CURRENT squad' +
+    ' decides). Stopped while paused: the in-worker executor (bus consumer, AgentDO wake/alarm, executor' +
+    ' claim, wake_agent, router_tick assignment), task_dispatch and its inbox envelope, an external' +
+    ' runtime\'s runtime_consumed receipt, and routine dispatch (the run waits/retries with reason' +
+    ' execution_paused). NOT stopped: plain inbox delivery and polling (send, squad_message, inbox),' +
+    ' completed/failed receipts for custody the runtime already took, task_update, or anything the agent' +
+    ' does outside mupot. Already-queued agent.wake messages become no-ops when consumed. Idempotent: an' +
+    ' already-paused target returns already_paused (no second receipt). Does not unassign tasks.',
   inputSchema: inputSchema(),
   async run(auth, env, args) {
     const gateFail = requireOperatorOrgAdmin(auth)

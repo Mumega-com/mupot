@@ -196,6 +196,27 @@ export async function releaseExecutionHold(
         WHERE task_id = ?1
           AND EXISTS (SELECT 1 FROM execution_holds WHERE task_id = ?1 AND release_id = ?2)`,
     ).bind(input.taskId, releaseId),
+    // mupot#1812 P3 - AUDIT the counter-only reset. A release that lifts only an at/over-ceiling counter
+    // (no hold row yet) used to clear it silently. Anchored on the counter row itself (no row = no
+    // audit) and on THIS call not having released a hold (that case is audited above); it must run
+    // BEFORE the DELETE below removes the row it reads.
+    env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (
+         id, tenant, principal_kind, principal_id, member_id, agent_id,
+         credential_id, origin, handler, operation, target_kind, target_id,
+         task_id, request_id, idempotency_key, evidence_json, recorded_at
+       )
+       SELECT ?1, ?2, 'member', ?3, ?3, NULL,
+              NULL, 'mcp', 'execution_release', 'counter_reset', 'task', ?5,
+              ?5, ?6, ?6,
+              json_object('task_id', ?5, 'reason', ?8, 'via', ?4, 'refused_count', refused_count,
+                          'last_agent_id', last_agent_id),
+              ?7
+         FROM task_execution_attempts
+        WHERE task_id = ?5 AND refused_count >= ${EXECUTION_RETRY_CEILING}
+          AND NOT EXISTS (SELECT 1 FROM execution_holds WHERE task_id = ?5 AND release_id = ?6)`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, input.memberId, input.via, input.taskId, releaseId, now,
+      input.reason.slice(0, 2000)),
     // A counter AT/OVER the ceiling with no hold row yet (bookkeeping landed between settle and hold) is
     // the same stuck state; an authorised human releasing the task lifts it too.
     env.DB.prepare(

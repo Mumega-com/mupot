@@ -2,7 +2,7 @@
 // (mupot#1809). Before this, three doors had three bars: execution_release required org-admin or
 // squad-admin, MCP task_update released for anyone with `member`, REST PATCH /tasks/:id never
 // released (200 with the hold still active). A hold is lifted - and a held task reassigned - only by
-// a non-agent-bound HUMAN with admin on the task's squad (or org-admin).
+// a PLAIN human (no agent binding, no harness session) with admin on the task's squad (or org-admin).
 
 import type { AuthContext, Env } from '../types'
 import { canOnSquadAuth, hasWorkspaceAdmin } from '../auth/capability'
@@ -20,6 +20,14 @@ export function releaseActorMemberId(auth: AuthContext): string | null {
 /** True iff this principal may release an execution hold on a task in `squadId`. */
 export async function canReleaseExecutionHold(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
   if (auth.boundAgentId) return false // an agent never lifts the hold on a loop it may be in
+  // mupot#1812 P2-3 - a HARNESS session is an agent's runtime wearing a human's grant, not the human.
+  // applySeatHandle falls back to the plain human session when a seat handle is missing or rejected, and
+  // an OAuth harness grant carries harnessId without any seat, so boundAgentId alone let a harness
+  // session (e.g. a squad-admin's) release holds on the loop it is running. Refuse every shape:
+  // harnessId (OAuth harness grant, seat or not), harnessCredential (harness-token session), seatBinding.
+  // A release needs a PLAIN human principal: a dashboard cookie session, a workspace/operator member
+  // token, or a member-bound OAuth grant with no harness.
+  if (auth.harnessId || auth.harnessCredential || auth.seatBinding) return false
   if (!releaseActorMemberId(auth)) return false
   return hasWorkspaceAdmin(auth) || await canOnSquadAuth(env, auth, squadId, 'admin')
 }

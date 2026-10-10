@@ -83,11 +83,11 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   task_get: RO('SELECT receipts/verdicts only (index.ts:1312)'),
   task_board: RO('SELECT only (index.ts:1245)'),
   kanban_board: RO('loadKanbanData SELECT only (dashboard/kanban-routes.ts:59)'),
-  task_update: MUTX('persistTaskUpdate UPDATE tasks (tasks/service.ts:540) + gate reassignment INSERT (index.ts:1941) + mirrorTaskUpdate GitHub PATCH (index.ts:1898)'),
+  task_update: MUTX('persistTaskUpdate UPDATE tasks (tasks/service.ts:540) + gate reassignment INSERT (index.ts:1941) + mirrorTaskUpdate GitHub PATCH (index.ts:1898) + a plain-human reassign of a HELD task runs releaseExecutionHold (UPDATE execution_holds, DELETE task_execution_attempts counter, UPSERT release-epoch row, INSERT mutation_audit_entries; agents/execution-brakes.ts, policy agents/execution-release-policy.ts); an agent, harness or below-admin caller on a held task is refused task_held'),
   task_verdict: MUT('writeVerdict batch INSERT task_verdicts + task status (tasks/service.ts:1896)'),
   task_verdict_reverse: MUT('reverseTaskVerdict UPDATE task_verdicts.reversed_at + INSERT verdict_reversals (tasks/service.ts:694,758)'),
   task_dispatch: ADD('INSERT task_dispatch_receipts + bus emit (index.ts:2542,2570)'),
-  task_dispatch_runtime_receipt: MUT('UPDATE tasks status/result + INSERT mutation_audit_entries + runtime receipt (tasks/runtime-receipts.ts:1038-1123)'),
+  task_dispatch_runtime_receipt: MUT('UPDATE tasks status/result + INSERT mutation_audit_entries + runtime receipt (tasks/runtime-receipts.ts); a failed receipt after delivered+leased custody UPSERTs the task_execution_attempts retry counter and, at the ceiling, places the execution_holds row, blocks and unassigns the task (escalateRefusedTask); runtime_consumed is refused by hold/ceiling/pause brakes'),
   task_submit_result: MUTX('UPDATE tasks status=review,result + INSERT task_result_submissions (index.ts:2878,2895) + mirrorTaskUpdate GitHub (index.ts:2908)'),
   task_intake_audit: RO('SELECT + pure evaluateTaskIntakeContract (index.ts:2937-3045)'),
 
@@ -179,7 +179,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   task_incident_revert: MUT('task_incident_revert INSERT task_incident_revert_receipts + guarded UPDATE tasks status/assignee/updated_at (tasks/incident-revert.ts); org-admin operator only'),
   // Loop brakes (migration 0203): additive state rows, no data destroyed; resume is the exact inverse.
   execution_pause: ADD('toolExecutionPause INSERT execution_pauses ON CONFLICT DO NOTHING + INSERT mutation_audit_entries (mcp/execution-pause.ts); stops nothing already written, no task/agent row changes'),
-  execution_release: ADD('toolExecutionRelease UPDATE execution_holds released_at + DELETE task_execution_attempts + INSERT mutation_audit_entries (agents/execution-brakes.ts releaseExecutionHold); lifts a hold, destroys only the refusal counter'),
+  execution_release: ADD('toolExecutionRelease UPDATE execution_holds released_at + DELETE task_execution_attempts + INSERT mutation_audit_entries (agents/execution-brakes.ts releaseExecutionHold); lifts a hold, destroys only the refusal counter; also UPSERTs the release-epoch row and audits a counter-only reset; refused for agent-bound, harness and seat sessions (agents/execution-release-policy.ts)'),
   execution_resume: ADD('toolExecutionResume UPDATE execution_pauses resumed_at + INSERT mutation_audit_entries (mcp/execution-pause.ts); inverse of execution_pause'),
   archive_plan_expand: RO('read-only SELECT expansion of a task archive plan (toolArchivePlanExpand); refuses 409 not_supported after the admin gate unless TASK_ARCHIVE_ENABLED=1, and never writes'),
   agent_lifecycle: MUTX('delegates to deactivate/move/grant/mint, and free-text intent calls Jev at api.typesafe.ai (mcp/agent-lifecycle.ts:156,258)'),

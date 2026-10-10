@@ -851,6 +851,26 @@ describe('stale-attempt bookkeeping cannot re-hold a task a human just reassigne
       .toEqual([{ task_id: `release-epoch:${TASK_ID}` }])
   })
 
+  it('mupot#1812 P3: a counter-only reset (at ceiling, no hold row) writes ONE audit row; a not-at-ceiling release writes none', async () => {
+    seedAttempts(EXECUTION_RETRY_CEILING)
+    const rel = await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'reset stuck counter' })
+    expect(rel).toMatchObject({ ok: true, result: { status: 'not_held' } })
+    const rows = harness.sqlite.prepare(
+      `SELECT operation, member_id, json_extract(evidence_json, '$.refused_count') AS n, json_extract(evidence_json, '$.reason') AS why
+         FROM mutation_audit_entries WHERE handler = 'execution_release'`).all()
+    expect(rows).toEqual([{ operation: 'counter_reset', member_id: ADMIN, n: EXECUTION_RETRY_CEILING, why: 'reset stuck counter' }])
+    // a second release finds no counter: no second audit row
+    await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'again' })
+    expect(harness.sqlite.prepare(`SELECT count(*) AS n FROM mutation_audit_entries WHERE handler = 'execution_release'`).get()).toEqual({ n: 1 })
+  })
+
+  it('a below-ceiling counter is cleared by nothing and audited by nothing (release of a clean task)', async () => {
+    seedAttempts(1)
+    await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'noop' })
+    expect(harness.sqlite.prepare(`SELECT count(*) AS n FROM mutation_audit_entries WHERE handler = 'execution_release'`).get()).toEqual({ n: 0 })
+    expect(attempts()?.refused_count).toBe(1)
+  })
+
   it('an attempt that STARTS after the release counts normally', async () => {
     await call(orgAdminAuth(), 'execution_release', { task_id: TASK_ID, reason: 'epoch' })
     await runTaskExecution(env, agentRow(), TASK_ID, deps())
