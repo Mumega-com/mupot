@@ -103,11 +103,13 @@ interface AutoMatchRow extends SeatContextRow {
 // prep, window UPSERT) on every call. Deterministic refusals are remembered per (harness, key hash) for
 // a short TTL, per isolate (lossy by design: a cold isolate just re-evaluates once). A window refusal is
 // remembered per HARNESS too, so a looping client stalls on one map hit, not on a database round trip.
-// Never cached: 'error' / 'provisioning_failed' (transient).
+// Never cached: 'error' / 'provisioning_failed' (transient). seat_key_source_conflict is deterministic for a
+// (member, harness, key hash): the key is the member's own and a seat row's source never changes, so the
+// per-(harness, key hash) cache key and the 30s TTL are safe (never harness-wide: not a window refusal).
 export const AUTO_SEAT_REFUSAL_TTL_MS = 30_000
 const REFUSAL_CACHE_MAX = 2000
 const refusalCache = new Map<string, { reason: string; until: number }>()
-const CACHEABLE = new Set(['rate_limited', 'seat_agent_inactive', 'home_rank_insufficient', 'member_not_active', 'harness_required', 'seat_not_live', 'seat_cap_reached'])
+const CACHEABLE = new Set(['rate_limited', 'seat_agent_inactive', 'home_rank_insufficient', 'member_not_active', 'harness_required', 'seat_not_live', 'seat_cap_reached', 'seat_key_source_conflict'])
 
 export function resetAutoSeatRefusalCache(): void { refusalCache.clear() }
 
@@ -254,6 +256,9 @@ export async function applySeatForRequest(
         // grantTokenIdClaim null: an auto-seat needs no handle row, so none is issued.
         made = await resolveOrCreateSeat(env, { memberId, harness, key: g.key, keyHash: g.hash, grantTokenIdClaim: null, source: 'auto', limits, nowMs })
         // Only a RETIRED (reclaimed) seat moves on to a fresh generation; a deactivated agent stays refused.
+        // A seat_key_source_conflict deliberately BREAKS the loop (does not advance a generation): the
+        // key was taken by the SAME member's explicit seat (nobody else can derive it), so the member can
+        // only unseat their own conversation. Pinned by a test (#1820).
         const retired = !made.ok && made.error === 'seat_agent_inactive'
           && typeof made.detail === 'object' && made.detail !== null && (made.detail as { reason?: unknown }).reason === 'seat_retired'
         if (!retired) break

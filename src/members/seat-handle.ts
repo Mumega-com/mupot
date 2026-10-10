@@ -208,6 +208,10 @@ interface MatchRow {
 
 /**
  * The single, atomic match. Everything that must be true is in ONE statement.
+ * `s.source = 'select'` (#1820): handles are issued for explicit seats only (seatSelect is the one caller
+ * that passes a grant token, and resolveOrCreateSeat refuses a source mismatch before issuing). An
+ * auto seat is reached by its own key, never by a handle, so a legacy handle row minted on one
+ * (pre-#1819, via a crafted key) must not redeem.
  *   ?1 tenant  ?2 handle hash  ?3 grant token id  ?4 human member id  ?5 harness id  ?6 now
  */
 async function findLiveSeatForHandle(
@@ -239,6 +243,7 @@ async function findLiveSeatForHandle(
         AND h.consenting_member_id = ?4
         AND h.harness_id = ?5
         AND s.retired_at IS NULL
+        AND s.source = 'select'
         AND s.agent_id = h.agent_id
         AND s.member_id = h.consenting_member_id
         AND s.harness_id = h.harness_id
