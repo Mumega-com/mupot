@@ -1,0 +1,47 @@
+# Example seed: an Astro content site deployed to Cloudflare Pages.
+# A seed REQUESTS. Nothing here grants authority; every want is accepted by a human.
+schema: mupot.seed/v1
+slug: mumega-com
+name: Mumega.com
+kind: site/astro
+goal: Publish and maintain the public site and blog; keep it fast and accurate.
+owner: site-owner
+repo: https://github.com/example-org/example-site
+live: https://example.com
+deploy:
+  via: cf-pages
+  cmd: npm run deploy
+  receipt: deploy receipt recorded on the project
+  human_only: true
+surfaces:
+  - path: content/en/**
+    mode: propose
+  - path: src/components/**
+    mode: propose
+data:
+  - store: content/en
+    tier: public
+  - store: project notes
+    tier: project
+tools:
+  - mcp: https://tools.example.com/mcp
+    cred_slot: SITE_TOOLS_TOKEN
+wants:
+  memory: [project]
+  gates:
+    - action: publish_post
+      gate: gate:editor
+  routines:
+    - id: weekly-content-audit
+      cron: "0 9 * * 1"
+      approval: human_accept
+  seats:
+    squad: web
+    max: 2
+signals:
+  health: [https://example.com/health]
+  outcome: [posts_published_per_week]
+risk:
+  class: medium
+  forbidden: [delete_content, change_dns]
+  human_only: [deploy, domain_changes]
