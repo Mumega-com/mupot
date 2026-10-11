@@ -652,3 +652,122 @@ describe('round 3: fencing, recovery, token key derivation', () => {
     expect(await call(adm, await full(adm))).toMatchObject({ ok: false, status: 503, error: 'accept_token_unavailable' })
   })
 })
+
+describe('round 3b: races on the create path, accept-token edges', () => {
+  // Plant SQL just before the statement matching `re` is prepared: the row appears AFTER the lookup.
+  function plantBefore(re: RegExp, sql: string): void {
+    const real = env.DB
+    let done = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (q: string) => {
+            if (!done && re.test(q)) { done = true; harness.sqlite.exec(sql) }
+            return target.prepare(q)
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+  }
+
+  it('project race: a competitor project created just before our INSERT is never adopted', async () => {
+    plantBefore(/INSERT INTO projects/, `INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-race', 'mumega-com-prj', 'R', 'g', 'adm2')`)
+    const r = await apply(adm)
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'seed_slug_unavailable' })
+    expect(count('project_squad_access')).toBe(0)
+    expect(count('mutation_audit_entries')).toBe(0)
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM project_seeds WHERE project_id IS NOT NULL").get()).toEqual({ n: 0 })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM squads WHERE slug = 'mumega-com-sqd'").get()).toEqual({ n: 0 })
+  })
+
+  it('squad race: a competitor squad created just before our INSERT is never adopted and gains no admin edge', async () => {
+    plantBefore(/INSERT INTO squads/, `INSERT INTO squads (id, department_id, slug, name, created_by_member_id)
+      SELECT 'sq-race', id, 'mumega-com-sqd', 'Racer', 'adm2' FROM departments WHERE slug = 'dept-projects'`)
+    const r = await apply(adm)
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'seed_slug_unavailable' })
+    expect(count('project_squad_access')).toBe(0)
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM project_seeds WHERE squad_id IS NOT NULL").get()).toEqual({ n: 0 })
+    expect(count('mutation_audit_entries')).toBe(0)
+  })
+
+  it('squad race: a home squad the caller itself created is still refused (home fence on the race branch)', async () => {
+    plantBefore(/INSERT INTO squads/, `INSERT INTO squads (id, department_id, slug, name, kind, created_by_member_id)
+      SELECT 'sq-home', id, 'mumega-com-sqd', 'Home', 'home', 'adm' FROM departments WHERE slug = 'dept-projects'`)
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(count('project_squad_access')).toBe(0)
+  })
+
+  it('require_provenance also disables the org-admin adopt override (project and squad limbs)', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-x', 'mumega-com-prj', 'X', 'g', 'adm2')`)
+    const { teamBootstrap } = await import('../src/org/team-bootstrap')
+    const base = { slug_base: 'mumega-com', name: 'N', department: 'dept', bot: { enabled: false }, humans: [], adopt: true }
+    expect(await teamBootstrap(env, adm, { ...base, require_provenance: true })).toMatchObject({ ok: false, error: 'project_slug_taken' })
+    harness.sqlite.exec(`DELETE FROM project_squad_access; DELETE FROM projects WHERE id = 'p-x';
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id) VALUES ('sq-x', 'dept', 'mumega-com-sqd', 'X', 'adm2')`)
+    expect(await teamBootstrap(env, adm, { ...base, require_provenance: true })).toMatchObject({ ok: false, error: 'squad_slug_taken' })
+    expect(count('project_squad_access')).toBe(0)
+  })
+
+  it('the same race without require_provenance still adopts (non-seed callers unchanged)', async () => {
+    plantBefore(/INSERT INTO projects/, `INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-race', 'mumega-com-prj', 'R', 'g', 'adm2')`)
+    const { teamBootstrap } = await import('../src/org/team-bootstrap')
+    expect(await teamBootstrap(env, adm, { slug_base: 'mumega-com', name: 'N', department: 'dept', bot: { enabled: false }, humans: [] })).toMatchObject({ ok: true })
+  })
+
+  it('a flip that loses its claim after creating the project is recoverable by the creator once the other claim lapses', async () => {
+    const real = env.DB
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            const stmt = target.prepare(sql)
+            if (!/INSERT INTO team_bootstrap_receipts/.test(sql)) return stmt
+            return new Proxy(stmt, { get(st, k) {
+              if (k === 'bind') return (...v: unknown[]) => {
+                const bound = st.bind(...v)
+                return new Proxy(bound, { get(b, kk) {
+                  if (kk === 'run') return async (...a: unknown[]) => {
+                    harness.sqlite.exec(`UPDATE project_seeds SET lease_token = 'stolen', applied_by_member_id = 'adm2', lease_expires_at = '${STALE}'`)
+                    return (b.run as (...x: unknown[]) => Promise<unknown>)(...a)
+                  }
+                  const x = Reflect.get(b, kk)
+                  return typeof x === 'function' ? x.bind(b) : x
+                } })
+              }
+              const x = Reflect.get(st, k)
+              return typeof x === 'function' ? x.bind(st) : x
+            } })
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+    expect(await apply(adm)).toMatchObject({ ok: false, detail: { reason: 'claim_lost' } })
+    env = { ...env, DB: harness.db } as Env
+    expect(okResult(await apply(adm))).toMatchObject({ ok: true, replay: false, status: 'applied' })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM projects WHERE slug = 'mumega-com-prj'").get()).toEqual({ n: 1 })
+    expect(harness.sqlite.prepare('SELECT applied_by_member_id, status FROM project_seeds').get()).toEqual({ applied_by_member_id: 'adm', status: 'applied' })
+  })
+
+  it('accept-token skew boundary: +60 s accepted, +60.001 s refused', async () => {
+    const { issueAcceptToken, verifyAcceptToken } = await import('../src/seeds/accept-token')
+    const now = 1_800_000_000_000
+    const sha = 'a'.repeat(64)
+    const ok = await issueAcceptToken(env, 'adm', sha, now + 60_000)
+    const bad = await issueAcceptToken(env, 'adm', sha, now + 60_001)
+    expect(await verifyAcceptToken(env, 'adm', sha, ok, now)).toBe('ok')
+    expect(await verifyAcceptToken(env, 'adm', sha, bad, now)).toBe('invalid')
+  })
+
+  it('accept-token has one spelling: a leading-zero timestamp is refused', async () => {
+    const { issueAcceptToken, verifyAcceptToken } = await import('../src/seeds/accept-token')
+    const now = 1_800_000_000_000
+    const sha = 'b'.repeat(64)
+    const t = await issueAcceptToken(env, 'adm', sha, now)
+    expect(await verifyAcceptToken(env, 'adm', sha, t, now)).toBe('ok')
+    expect(await verifyAcceptToken(env, 'adm', sha, `0${t}`, now)).toBe('invalid')
+  })
+})

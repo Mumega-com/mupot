@@ -661,7 +661,7 @@ export async function teamBootstrap(
       input.require_provenance === true,
     )
     if (!projectGround) {
-      if (input.adopt === true && isOrgAdmin(auth)) {
+      if (input.adopt === true && input.require_provenance !== true && isOrgAdmin(auth)) {
         // Explicit, informed override — fall through and adopt. Not folded
         // into `projectGround` (which means "adoptable without an override")
         // so the disposition computed below still counts this as 'adopted',
@@ -739,7 +739,7 @@ export async function teamBootstrap(
       // ('adopted', below) rather than silently folded into 'existing'. Not
       // folded into `squadGround` for the same reason as the project limb
       // above.
-      if (input.adopt === true && isOrgAdmin(auth)) {
+      if (input.adopt === true && input.require_provenance !== true && isOrgAdmin(auth)) {
         // fall through and adopt
       } else {
         const owners = await listSquadCapabilityHolders(env, existingSquad.id)
@@ -790,6 +790,11 @@ export async function teamBootstrap(
       // so it cannot apply retroactively here.
       const raced = await findProjectBySlug(env, projectSlug)
       if (!raced) return { ok: false, error: 'provisioning_failed', detail: { stage: 'project', reason: created.error } }
+      // require_provenance (seed apply): a row that appeared between the lookup and the insert is adopted
+      // ONLY if this actor created it; the lookup-path guard cannot see a row that did not exist yet.
+      if (input.require_provenance === true && raced.created_by_member_id !== actorMemberId) {
+        return { ok: false, error: 'project_slug_taken' }
+      }
       project = raced
     } else {
       return { ok: false, error: 'provisioning_failed', detail: { stage: 'project', reason: created.error } }
@@ -827,6 +832,10 @@ export async function teamBootstrap(
     } else if (created.error === 'slug_taken') {
       const raced = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
       if (!raced) return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: created.error } }
+      // require_provenance (seed apply): same rule as the project race above, plus the home-squad fence.
+      if (input.require_provenance === true && (raced.created_by_member_id !== actorMemberId || raced.kind === 'home')) {
+        return { ok: false, error: 'squad_slug_taken' }
+      }
       squad = raced
     } else {
       const mapped = created.error === 'squad_limit_reached' ? 'squad_limit_reached' : 'provisioning_failed'

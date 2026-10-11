@@ -51,7 +51,7 @@ export async function verifyAcceptToken(
   const key = env.CONNECTOR_MASTER_KEY ? await deriveMacKey(env.CONNECTOR_MASTER_KEY) : null
   if (!key) return 'unavailable'
   if (typeof token !== 'string') return 'invalid'
-  const m = /^(\d{10,16})\.([0-9a-f]{64})$/.exec(token)
+  const m = /^([1-9]\d{9,15})\.([0-9a-f]{64})$/.exec(token)
   if (!m) return 'invalid'
   const issued = Number(m[1])
   if (!Number.isSafeInteger(issued) || issued > nowMs + 60_000 || nowMs - issued > ACCEPT_TOKEN_TTL_MS) return 'invalid'
