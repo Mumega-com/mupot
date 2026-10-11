@@ -757,6 +757,18 @@ export interface ElevationUsageLogRow {
   tool_name: string | null
   detail_json: string | null
   occurred_at: string
+  /** Two-phase receipt outcome (migration 0208). */
+  status: 'pending' | 'applied' | 'failed'
+  error_code: string | null
+  resolved_at: string | null
+}
+
+/** Human label for a usage row: an attempt is shown as an action that occurred
+ *  ONLY when status is 'applied'. */
+export function elevationUsageOutcomeLabel(row: Pick<ElevationUsageLogRow, 'status' | 'error_code'>): string {
+  if (row.status === 'applied') return 'Applied'
+  if (row.status === 'failed') return row.error_code ? `Failed (${row.error_code})` : 'Failed'
+  return 'Pending (not yet confirmed)'
 }
 
 /** recordElevationUsage — exported (step 4) so a tool that must record a
@@ -805,7 +817,8 @@ export async function recordElevationUsage(
 export async function listElevationUsage(env: Env, tenant: string, grantId: string): Promise<ElevationUsageLogRow[]> {
   try {
     const rows = await env.DB.prepare(
-      `SELECT id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at
+      `SELECT id, tenant, elevation_grant_id, agent_session_id, action, tool_name, detail_json, occurred_at,
+              status, error_code, resolved_at
          FROM elevation_usage_log WHERE tenant = ?1 AND elevation_grant_id = ?2 ORDER BY occurred_at ASC`,
     )
       .bind(tenant, grantId)
@@ -1079,7 +1092,7 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   create_squad: 'action:project_lifecycle',
   routine_enable: 'action:routine_policy',
   routine_pause: 'action:routine_policy',
-  routine_archive: 'action:routine_policy',
+  routine_archive: 'action:routine_archive',
   routine_update: 'action:routine_policy',
   project_update: 'action:project_status',
   unarchive_row: 'action:project_status',

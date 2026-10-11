@@ -1,6 +1,6 @@
 // A live elevation grant lets an agent-bound caller use the member-only
 // lifecycle tools through the same predicate mint/grant use (hasElevatedAction):
-//   routine_enable/pause/archive/update -> action:routine_policy (routine's squad)
+//   routine_enable/pause/update -> action:routine_policy, routine_archive -> action:routine_archive (routine's squad)
 //   project_update (status only), unarchive_row (projects/squads)
 //                                        -> action:project_status
 // Real migration chain + the real tool surface (invokeTool); no mocked D1.
@@ -14,6 +14,7 @@ import {
   createElevationRequest,
   decideElevationRequest,
   listElevationUsage,
+  elevationUsageOutcomeLabel,
   revokeElevationGrant,
   type ElevationGrantRecord,
 } from '../src/auth/elevation'
@@ -207,11 +208,12 @@ describe('routine_enable/pause/archive/update under action:routine_policy', () =
     expect((await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
     const update = await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'Renamed' }, ORIGIN)
     expect(update.ok).toBe(true)
-    expect((await invokeTool(agentAuth(), env, 'routine_archive', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
+    // archive is NOT part of routine_policy (P1-A): it has its own irreversible action
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_archive', { routine_id: routineTarget }, ORIGIN))
 
     const usage = await listElevationUsage(env, TENANT, grant.id)
     const tools = usage.map((u) => u.tool_name).sort()
-    expect(tools).toEqual(['routine_archive', 'routine_enable', 'routine_pause', 'routine_update'])
+    expect(tools).toEqual(['routine_enable', 'routine_pause', 'routine_update'])
     expect(usage.every((u) => u.elevation_grant_id === grant.id && u.action === 'action:routine_policy')).toBe(true)
     expect(usage.every((u) => JSON.parse(u.detail_json as string).routine_id === routineTarget)).toBe(true)
     const row = await env.DB.prepare('SELECT enabled_by FROM routines WHERE id = ?1').bind(routineTarget).first<{ enabled_by: string }>()
@@ -262,8 +264,31 @@ describe('routine_enable/pause/archive/update under action:routine_policy', () =
     expect((await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
     expect((await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
     expect((await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'N' }, ORIGIN)).ok).toBe(true)
+    expect(await usageRows()).toBe(3)
+  })
+
+  it('P1-A: an action:routine_archive grant archives ONLY; enable/pause/update are refused', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:routine_archive', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN))
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN))
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'Z' }, ORIGIN))
+    expect(await usageRows()).toBe(0)
     expect((await invokeTool(agentAuth(), env, 'routine_archive', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
-    expect(await usageRows()).toBe(4)
+    const usage = await listElevationUsage(env, TENANT, grant.id)
+    expect(usage.map((u) => [u.tool_name, u.action])).toEqual([['routine_archive', 'action:routine_archive']])
+    const row = await env.DB.prepare('SELECT status FROM routines WHERE id = ?1').bind(routineTarget).first<{ status: string }>()
+    expect(row?.status).toBe('archived')
+  })
+
+  it('P1-A: an action:routine_policy grant (org) is refused on routine_archive and nothing is archived', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:routine_policy', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_archive', { routine_id: routineTarget }, ORIGIN)
+    expectRefused(res)
+    if (!res.ok) expect(JSON.stringify(res.detail)).toContain('action:routine_archive')
+    const row = await env.DB.prepare('SELECT status FROM routines WHERE id = ?1').bind(routineTarget).first<{ status: string }>()
+    expect(row?.status).not.toBe('archived')
   })
 
   it('a failed routine mutation leaves a FAILED receipt, never an applied one', async () => {
@@ -271,6 +296,11 @@ describe('routine_enable/pause/archive/update under action:routine_policy', () =
     await approve(sessionId, 'action:routine_policy', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
     expect((await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN)).ok).toBe(false) // draft cannot pause
     expect(await receiptStatuses()).toEqual(['failed'])
+    // P1-B: the usage view carries the outcome and error code of the refused pause
+    const failedUsage = (await listElevationUsage(env, TENANT, (await env.DB.prepare('SELECT elevation_grant_id AS g FROM elevation_usage_log').first<{ g: string }>())!.g))[0]
+    expect(failedUsage).toMatchObject({ tool_name: 'routine_pause', status: 'failed', error_code: 'invalid_state' })
+    expect(failedUsage.resolved_at).not.toBeNull()
+    expect(elevationUsageOutcomeLabel(failedUsage)).toBe('Failed (invalid_state)')
     expect((await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
     expect(await receiptStatuses()).toEqual(['applied', 'failed'])
   })
