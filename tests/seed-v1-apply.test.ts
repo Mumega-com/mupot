@@ -54,6 +54,8 @@ const tables = () => (harness.sqlite.prepare("SELECT name FROM sqlite_master WHE
 const counts = (): Record<string, number> => Object.fromEntries(tables().map((t) => [t, count(t)]))
 const snapshot = () => JSON.stringify(counts())
 const dump = () => JSON.stringify(tables().map((t) => [t, harness.sqlite.prepare(`SELECT * FROM "${t}"`).all()]))
+// A successful apply refreshes presence (second-resolution timestamp); compare everything else.
+const dumpNoPresence = () => JSON.stringify(tables().filter((t) => t !== 'presence').map((t) => [t, harness.sqlite.prepare(`SELECT * FROM "${t}"`).all()]))
 
 type Out = Awaited<ReturnType<typeof call>>
 const okResult = (r: Out): Record<string, unknown> => {
@@ -137,9 +139,10 @@ describe('apply: what it creates, and what it never does', () => {
     const after = counts()
     const moved = tables().filter((t) => after[t] !== before[t])
     // Exactly these tables grow (departments: the shared dept-projects container, first use only;
-    // team_bootstrap_receipts: the team_bootstrap core's own receipt row). Nothing else.
+    // team_bootstrap_receipts: the team_bootstrap core's own receipt row; presence: the framework's
+    // post-call refresh, which an apply (unlike a dry run) performs). Nothing else.
     expect(moved.sort()).toEqual(
-      ['departments', 'mutation_audit_entries', 'project_seeds', 'project_squad_access', 'projects', 'squads', 'team_bootstrap_receipts'],
+      ['departments', 'mutation_audit_entries', 'presence', 'project_seeds', 'project_squad_access', 'projects', 'squads', 'team_bootstrap_receipts'],
     )
     expect(after.team_bootstrap_receipts - before.team_bootstrap_receipts).toBe(1)
     expect(after.departments - before.departments).toBe(1)
@@ -187,19 +190,19 @@ describe('apply: what it creates, and what it never does', () => {
 describe('apply: idempotency', () => {
   it('a second apply of the same seed is a replay and changes no row anywhere', async () => {
     okResult(await apply())
-    const after1 = dump()
+    const after1 = dumpNoPresence()
     const again = okResult(await apply())
     expect(again).toMatchObject({ ok: true, replay: true, status: 'applied' })
-    expect(dump()).toBe(after1)
+    expect(dumpNoPresence()).toBe(after1)
   })
 
   it('YAML vs JSON form of the same seed replays (digest is the key)', async () => {
     okResult(await apply())
-    const after1 = dump()
+    const after1 = dumpNoPresence()
     const { parse } = await import('yaml')
     const asJson = JSON.stringify(parse(base))
     expect(okResult(await apply(adm, asJson))).toMatchObject({ replay: true })
-    expect(dump()).toBe(after1)
+    expect(dumpNoPresence()).toBe(after1)
   })
 
   it('the same slug with a different digest is 409 seed_digest_conflict and mutates nothing', async () => {
@@ -500,7 +503,7 @@ describe('round 2: failures never reserve the slug', () => {
         return typeof v === 'function' ? v.bind(target) : v
       },
     }) } as Env
-    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_apply_failed', detail: { reason: 'claim_lost' } })
+    expect(await apply(adm)).toMatchObject({ ok: false, status: 409, error: 'seed_apply_in_progress' })
     expect(count('mutation_audit_entries')).toBe(0)
     expect(harness.sqlite.prepare('SELECT status FROM project_seeds').get()).toEqual({ status: 'applying' })
   })
@@ -745,7 +748,7 @@ describe('round 3b: races on the create path, accept-token edges', () => {
         return typeof v === 'function' ? v.bind(target) : v
       },
     }) } as Env
-    expect(await apply(adm)).toMatchObject({ ok: false, detail: { reason: 'claim_lost' } })
+    expect(await apply(adm)).toMatchObject({ ok: false, status: 409, error: 'seed_apply_in_progress' })
     env = { ...env, DB: harness.db } as Env
     expect(okResult(await apply(adm))).toMatchObject({ ok: true, replay: false, status: 'applied' })
     expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM projects WHERE slug = 'mumega-com-prj'").get()).toEqual({ n: 1 })
@@ -769,5 +772,162 @@ describe('round 3b: races on the create path, accept-token edges', () => {
     const t = await issueAcceptToken(env, 'adm', sha, now)
     expect(await verifyAcceptToken(env, 'adm', sha, t, now)).toBe('ok')
     expect(await verifyAcceptToken(env, 'adm', sha, `0${t}`, now)).toBe('invalid')
+  })
+})
+
+describe('round 5', () => {
+  function hookRun(re: RegExp, fn: () => Promise<void>): void {
+    const real = env.DB
+    let fired = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            const stmt = target.prepare(sql)
+            if (!re.test(sql)) return stmt
+            return new Proxy(stmt, { get(st, k) {
+              if (k === 'bind') return (...v: unknown[]) => {
+                const bound = st.bind(...v)
+                return new Proxy(bound, { get(b, kk) {
+                  if (kk === 'run' || kk === 'first') return async (...a: unknown[]) => {
+                    if (!fired) { fired = true; await fn() }
+                    return (b[kk] as (...x: unknown[]) => Promise<unknown>)(...a)
+                  }
+                  const x = Reflect.get(b, kk)
+                  return typeof x === 'function' ? x.bind(b) : x
+                } })
+              }
+              const x = Reflect.get(st, k)
+              return typeof x === 'function' ? x.bind(st) : x
+            } })
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+  }
+  const DEPT_FIND = /^\s*SELECT id FROM departments WHERE slug = \?1 LIMIT 1/
+
+  it('FIX-1: an apply fenced out of its flip returns 409 in_progress, not a success; exactly one audit receipt', async () => {
+    const args = await full(adm)
+    const resumerArgs = await full(adm)
+    const clean = { ...env } as Env
+    const real = env.DB
+    let armed = false
+    let fired = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            if (/UPDATE project_seeds SET status = 'applied'/.test(sql)) armed = true // the flip batch is next
+            return target.prepare(sql)
+          }
+        }
+        if (key === 'batch') {
+          return async (stmts: unknown[]) => {
+            if (armed && !fired) {
+              fired = true
+              // A resume by the same member (new lease token) commits before the original reaches its flip.
+              harness.sqlite.exec(`UPDATE project_seeds SET lease_expires_at = '${STALE}'`)
+              expect(await invokeTool(adm, clean, 'seed_attach', resumerArgs, 'https://pot.test')).toMatchObject({ ok: true })
+            }
+            return (target.batch as (s: unknown[]) => Promise<unknown>)(stmts)
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+    expect(await call(adm, args)).toMatchObject({ ok: false, status: 409, error: 'seed_apply_in_progress' })
+    expect(fired).toBe(true)
+    expect(count('mutation_audit_entries')).toBe(1)
+    expect(harness.sqlite.prepare('SELECT status FROM project_seeds').get()).toEqual({ status: 'applied' })
+  })
+
+  it('FIX-2: a pre-existing weaker edge is refused (footprint incompatible), never finalized as applied', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-p', 'dept-projects', 'Projects');
+      INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-mine', 'mumega-com-prj', 'N', 'g', 'adm');
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id) VALUES ('sq-mine', 'dept-p', 'mumega-com-sqd', 'S', 'adm');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p-mine', 'sq-mine', 'read');`)
+    const r = await apply(adm)
+    expect(r).toMatchObject({ ok: false, status: 409, error: 'seed_footprint_incompatible', detail: { existing_edge: 'read' } })
+    expect(harness.sqlite.prepare('SELECT status FROM project_seeds').get()).toEqual({ status: 'applying' })
+    expect(count('mutation_audit_entries')).toBe(0)
+    expect(harness.sqlite.prepare('SELECT access_level FROM project_squad_access').get()).toEqual({ access_level: 'read' })
+  })
+
+  it('FIX-3: a caller-owned ARCHIVED project or squad is refused generically at the claim, nothing written', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id, status) VALUES ('p-arch', 'mumega-com-prj', 'N', 'g', 'adm', 'archived')`)
+    const before = dump()
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(dump()).toBe(before)
+    harness.sqlite.exec(`DELETE FROM projects WHERE id = 'p-arch';
+      INSERT INTO departments (id, slug, name) VALUES ('dept-p', 'dept-projects', 'Projects');
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id, status) VALUES ('sq-arch', 'dept-p', 'mumega-com-sqd', 'S', 'adm', 'archived')`)
+    const before2 = dump()
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(dump()).toBe(before2)
+  })
+
+  it('FIX-4: a foreign project that appears after the claim releases the claim; the slug is not reserved', async () => {
+    const args = await full(adm)
+    hookRun(DEPT_FIND, async () => {
+      harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-f', 'mumega-com-prj', 'F', 'g', 'adm2')`)
+    })
+    expect(await call(adm, args)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(claimRows()).toBe(0)
+    env = { ...env, DB: harness.db } as Env
+    harness.sqlite.exec(`DELETE FROM projects WHERE id = 'p-f'`)
+    const other = seedText.replace('Publish and maintain', 'Publish and keep')
+    expect(okResult(await apply(adm, other))).toMatchObject({ ok: true, replay: false })
+  })
+
+  it('FIX-5: NFC-equivalent / trailing-space variants of one seed persist identically whichever form applies first', async () => {
+    const variant = (name: string, owner: string, action: string) =>
+      seedText.replace('name: Mumega.com', `name: "${name}"`).replace('owner: site-owner', `owner: "${owner}"`).replace('action: publish_post', `action: "${action}"`)
+    const composed = variant('Café Site', 'René', 'publísh')
+    const decomposed = variant('Café Site ', 'René ', 'publísh')
+    async function snapshotAfter(text: string) {
+      setup()
+      okResult(await apply(adm, text))
+      return {
+        seed: harness.sqlite.prepare('SELECT seed_sha256, canonical_json, requests_json, owner_label FROM project_seeds').get(),
+        project: harness.sqlite.prepare("SELECT name FROM projects WHERE slug = 'mumega-com-prj'").get(),
+        squad: harness.sqlite.prepare("SELECT name FROM squads WHERE slug = 'mumega-com-sqd'").get(),
+      }
+    }
+    const a = await snapshotAfter(composed)
+    const b = await snapshotAfter(decomposed)
+    expect(b).toEqual(a)
+    expect((a.project as { name: string }).name).toBe('Café Site')
+  })
+
+  it('FIX-6: identical requests get distinct keys; path and type direct surfaces on one target do not collapse', async () => {
+    const { parse } = await import('yaml')
+    const doc = parse(base) as Record<string, unknown>
+    doc.surfaces = [{ path: 'wp.media', mode: 'direct' }, { type: 'wp.media', mode: 'direct' }]
+    doc.risk = { class: 'medium', allow_direct: ['wp.media'] }
+    const dupText = JSON.stringify(doc)
+    const all = await keys(dupText)
+    const direct = all.filter((k) => k.startsWith('direct_surface:'))
+    expect(direct).toHaveLength(2)
+    expect(new Set(all).size).toBe(all.length)
+    expect(direct[1]).toBe(`${direct[0]}#2`)
+    const r = await call(adm, await full(adm, dupText, { accept: all.filter((k) => k !== direct[1]) }))
+    expect(r).toMatchObject({ ok: false, error: 'requests_not_accepted', detail: { missing: [{ key: direct[1] }] } })
+    expect(okResult(await apply(adm, dupText))).toMatchObject({ ok: true })
+    // non-duplicate seeds keep plain keys
+    expect((await keys()).every((k) => !k.includes('#'))).toBe(true)
+  })
+
+  it('FIX-7: a dry run writes nothing at all (presence included); an apply refreshes presence', async () => {
+    const before = dump()
+    okResult(await call(adm, { seed: seedText }))
+    expect(dump()).toBe(before)
+    expect(count('presence')).toBe(0)
+    okResult(await apply(adm))
+    expect(count('presence')).toBe(1)
   })
 })

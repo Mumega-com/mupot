@@ -52,8 +52,9 @@ const toolSeedAttach: ToolSpec = {
     required: ['seed'],
     additionalProperties: false,
   },
-  // Dry run must write NOTHING, including the framework's post-call presence bump.
-  shouldTouchPresence: () => false,
+  // Dry run must write NOTHING, including the framework's post-call presence bump; apply refreshes
+  // presence like any other mutating tool.
+  shouldTouchPresence: (args) => args.dry_run === false,
   async run(auth, env, args) {
     if (args.dry_run !== undefined && typeof args.dry_run !== 'boolean') return fail(400, 'invalid_args', 'dry_run must be a boolean')
     const apply = args.dry_run === false

@@ -17,7 +17,7 @@ import { readAccess, readableProject } from '../mcp/projects'
 import { teamBootstrap, isValidSlugBase } from '../org/team-bootstrap'
 import { resolveProjectSquadDepartmentId, PROJECT_SQUAD_DEPARTMENT_SLUG } from '../projects/start-gate'
 import type { SeedRequest, SeedV1 } from './contract'
-import { requestKey } from './canonical'
+import { requestKey, canonicalText } from './canonical'
 import { verifyAcceptToken } from './accept-token'
 
 export const SEED_PROJECT_SLUG_SUFFIX = '-prj'
@@ -25,20 +25,32 @@ const LEASE_MS = 120_000
 
 // The no-takeover predicate, shared by the claim INSERT and the resume UPDATE: true only when no project
 // `<slug>-prj` and no squad `<slug>-sqd` (in the shared projects department) exists that the caller did not
-// create. NULL provenance and home squads count as "not theirs".
+// create, or that is archived. NULL provenance and home squads count as "not theirs".
 const noTakeoverSql = (slugP: string, callerP: string, squadSlugP: string, deptSlugP: string): string =>
   `NOT EXISTS (SELECT 1 FROM projects p WHERE p.slug = ${slugP}
-        AND (p.created_by_member_id IS NULL OR p.created_by_member_id <> ${callerP}))
+        AND (p.created_by_member_id IS NULL OR p.created_by_member_id <> ${callerP} OR p.status = 'archived'))
    AND NOT EXISTS (SELECT 1 FROM squads q WHERE q.slug = ${squadSlugP}
         AND q.department_id IN (SELECT id FROM departments WHERE slug = ${deptSlugP})
-        AND (q.kind = 'home' OR q.created_by_member_id IS NULL OR q.created_by_member_id <> ${callerP}))`
+        AND (q.kind = 'home' OR q.status = 'archived' OR q.created_by_member_id IS NULL OR q.created_by_member_id <> ${callerP}))`
 const MAX_ACCEPT = 400
 const ACCEPT_KEY_MAX = 80
 
 export interface KeyedSeedRequest extends SeedRequest { key: string }
 
+// Every displayed request gets a DISTINCT key. A repeat of an identical request (same kind and fields,
+// e.g. a `path` and a `type` direct surface naming the same target) gets a `#n` occurrence suffix, so
+// accepting one can never stand for both. The first occurrence keeps the plain key (stable for
+// seeds with no repeats).
 export async function keyRequests(requests: SeedRequest[]): Promise<KeyedSeedRequest[]> {
-  return Promise.all(requests.map(async (r) => ({ ...r, key: await requestKey(r) })))
+  const seen = new Map<string, number>()
+  const out: KeyedSeedRequest[] = []
+  for (const r of requests) {
+    const base = await requestKey(r)
+    const n = (seen.get(base) ?? 0) + 1
+    seen.set(base, n)
+    out.push({ ...r, key: n === 1 ? base : `${base}#${n}` })
+  }
+  return out
 }
 
 export interface ValidatedSeed {
@@ -108,13 +120,14 @@ function replayResult(v: ValidatedSeed, row: SeedRow): SeedApplyOutcome {
   }
 }
 
-async function releaseClaim(env: Env, rowId: string, token: string, projectSlug: string): Promise<void> {
-  // Nothing of ours exists -> drop the claim so another digest can use the slug; otherwise expire the
+async function releaseClaim(env: Env, rowId: string, token: string, projectSlug: string, caller: string): Promise<void> {
+  // Decided by provenance: if no project of that slug was created by THIS caller, nothing of ours exists
+  // (a foreign project is not ours) -> drop the claim so the slug is not reserved; otherwise expire the
   // lease so the same member can resume at once.
   const dropped = await env.DB.prepare(
     `DELETE FROM project_seeds WHERE id = ?1 AND status = 'applying' AND lease_token = ?2
-        AND NOT EXISTS (SELECT 1 FROM projects WHERE slug = ?3)`,
-  ).bind(rowId, token, projectSlug).run()
+        AND NOT EXISTS (SELECT 1 FROM projects WHERE slug = ?3 AND created_by_member_id = ?4)`,
+  ).bind(rowId, token, projectSlug, caller).run()
   if (dropped.meta.changes === 1) return
   await env.DB.prepare(
     `UPDATE project_seeds SET lease_expires_at = ?3 WHERE id = ?1 AND status = 'applying' AND lease_token = ?2`,
@@ -147,8 +160,13 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
   const rowId = crypto.randomUUID()
   let token = crypto.randomUUID()
   const nowIso = new Date().toISOString()
-  const seatCap = v.seed.wants?.seats?.max ?? null
-  const requestsJson = JSON.stringify(v.requests.map((r) => ({ key: r.key, kind: r.kind, fields: r.fields, status: 'pending_human' })))
+  // EVERYTHING persisted or passed on is built from the CANONICAL seed (NFC, trailing whitespace trimmed),
+  // never from the raw validated strings: NFC-equivalent spellings of one seed yield identical rows.
+  const cs = JSON.parse(v.canonical) as SeedV1 // as: v.canonical is canonicalSeedJson of the validated seed
+  const seatCap = cs.wants?.seats?.max ?? null
+  const canonFields = (f: Record<string, string>): Record<string, string> =>
+    Object.fromEntries(Object.entries(f).map(([k, x]) => [k, canonicalText(x)]))
+  const requestsJson = JSON.stringify(v.requests.map((r) => ({ key: r.key, kind: r.kind, fields: canonFields(r.fields), status: 'pending_human' })))
 
   // INSERT FIRST. The WHERE blocks the claim when a project of that slug exists that this caller did
   // not create, or when a squad `<slug>-sqd` exists in the shared projects department that this caller
@@ -165,7 +183,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
         WHERE ${noTakeoverSql('?3', '?9', '?13', '?14')}
        ON CONFLICT (tenant, project_slug) DO NOTHING`,
     ).bind(
-      rowId, tenant, projectSlug, v.seedSha256, v.canonical, requestsJson, v.seed.owner, seatCap,
+      rowId, tenant, projectSlug, v.seedSha256, v.canonical, requestsJson, cs.owner, seatCap,
       caller, nowIso, token, new Date(Date.now() + LEASE_MS).toISOString(), squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG,
     ).run()
     return r.meta.changes === 1
@@ -213,7 +231,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
               AND EXISTS (SELECT 1 FROM projects p WHERE p.slug = ?11 AND p.created_by_member_id = ?4)
               AND ${noTakeoverSql('?11', '?4', '?12', '?13')}`,
         ).bind(row.id, takeoverToken, new Date(Date.now() + LEASE_MS).toISOString(), caller, v.seedSha256, v.canonical,
-          requestsJson, v.seed.owner, seatCap, new Date().toISOString(), projectSlug, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).run()
+          requestsJson, cs.owner, seatCap, new Date().toISOString(), projectSlug, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).run()
         if (took.meta.changes === 1) {
           token = takeoverToken
           claimedRowId = row.id
@@ -255,7 +273,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
     // ── create phase: every create goes through the existing team_bootstrap core ──────────────────
     const departmentId = await resolveProjectSquadDepartmentId(env, caller)
     if (!departmentId) {
-      await releaseClaim(env, claimedRowId, token, projectSlug)
+      await releaseClaim(env, claimedRowId, token, projectSlug, caller)
       return { ok: false, status: 409, error: 'seed_apply_failed', detail: { reason: 'department_unavailable' } }
     }
     // FENCE: re-assert the claim's lease immediately before creating anything, renewing it. If a sweep
@@ -266,15 +284,22 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
     ).bind(claimedRowId, token, new Date(Date.now() + LEASE_MS).toISOString(), new Date().toISOString()).run()
     if (fenced.meta.changes !== 1) return IN_PROGRESS
     // Prefixed with the slug so a seed cannot name its squad to look like an existing one (e.g. squad-core).
-    const squadName = `${slug}: ${v.seed.wants?.seats?.squad ?? 'core'}`
+    const squadName = `${slug}: ${cs.wants?.seats?.squad ?? 'core'}`
     const boot = await teamBootstrap(env, auth, {
-      slug_base: slug, name: v.seed.name, department: departmentId, squad_name: squadName,
+      slug_base: slug, name: cs.name, department: departmentId, squad_name: squadName,
       bot: { enabled: false }, humans: [], adopt: false, require_provenance: true,
     })
     if (!boot.ok) {
-      await releaseClaim(env, claimedRowId, token, projectSlug)
+      await releaseClaim(env, claimedRowId, token, projectSlug, caller)
       if (boot.error === 'project_slug_taken' || boot.error === 'squad_slug_taken' || boot.error === 'cannot_adopt_home_squad') return UNAVAILABLE
       return { ok: false, status: 409, error: 'seed_apply_failed', detail: { reason: boot.error } }
+    }
+
+    // A pre-existing project<->squad edge below ADMIN (team_bootstrap never raises one) means this apply
+    // cannot deliver its footprint: refuse, keep the claim resumable, never finalize as applied.
+    if (boot.edge_kept !== null) {
+      await releaseClaim(env, claimedRowId, token, projectSlug, caller)
+      return { ok: false, status: 409, error: 'seed_footprint_incompatible', detail: { existing_edge: boot.edge_kept, needs: 'admin' } }
     }
 
     // ── flip + receipt in ONE batch; the receipt is written only when this call won the flip ──────
@@ -285,7 +310,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
       seed_sha256: v.seedSha256, accepted_keys: [...accepted].sort(), project_slug: projectSlug,
       squad_id: squadId, seat_cap: seatCap, grants: 'none',
     })
-    await env.DB.batch([
+    const flip = await env.DB.batch([
       env.DB.prepare(
         `UPDATE project_seeds SET status = 'applied', project_id = ?2, squad_id = ?3, applied_at = ?4,
                 lease_token = NULL, lease_expires_at = NULL
@@ -300,10 +325,9 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
          ON CONFLICT DO NOTHING`,
       ).bind(crypto.randomUUID(), tenant, caller, projectId, `seed-apply:${claimedRowId}`, v.seedSha256, evidence, appliedAt),
     ])
-    const final = await env.DB.prepare(`SELECT ${SEED_COLUMNS} FROM project_seeds WHERE id = ?1`).bind(claimedRowId).first<SeedRow>()
-    if (!final || final.status !== 'applied') {
-      return { ok: false, status: 409, error: 'seed_apply_failed', detail: { reason: 'claim_lost' } }
-    }
+    // The guarded UPDATE is the only proof this call won. 0 rows = fenced out (a resume or sweep replaced
+    // our claim): never present as the winner, whatever a later read of the row shows.
+    if (flip[0].meta.changes !== 1) return IN_PROGRESS
     return {
       ok: true,
       result: {
@@ -317,7 +341,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
   } catch (err) {
     // Any uncaught failure after the claim: never leave the slug reserved. Releases only when nothing was
     // created; otherwise the lease is expired so the same member can resume.
-    try { await releaseClaim(env, claimedRowId, token, projectSlug) } catch { /* release is best effort */ }
+    try { await releaseClaim(env, claimedRowId, token, projectSlug, caller) } catch { /* release is best effort */ }
     return { ok: false, status: 409, error: 'seed_apply_failed', detail: { reason: 'internal_error' } }
   }
 }
