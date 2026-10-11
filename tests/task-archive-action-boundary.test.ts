@@ -569,7 +569,7 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
     boundAgentId: WORKER,
     capabilities: [{ member_id: OPERATOR, scope_type: 'squad', scope_id: SQUAD, capability: 'member' }],
   })
-  const submitArgs = (taskId: string) => ({ task_id: taskId, result: `Artifact: out.md\nSHA256: ${'a'.repeat(64)}` })
+  const submitArgs = (taskId: string) => ({ task_id: taskId, result: `Artifact: out.md\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88` })
 
   it('task_submit_result control: a live in_progress task moves to review', async () => {
     seedSubmitFixture('s-live')
@@ -678,7 +678,7 @@ describe('archived = no action (real SQLite, full migration chain)', () => {
       h.sqlite.exec(`UPDATE tasks SET execution_claim_expires_at = NULL WHERE id = 'r-task'`)
       archive('r-task')
       await expect(recordTaskDispatchRuntimeReceipt(env, rtAuth(), {
-        ...receipt, stage: 'completed', result: 'Artifact: out.md\nSHA256: ' + 'b'.repeat(64), artifactRefs: ['out.md'], artifactSha256: 'b'.repeat(64),
+        ...receipt, stage: 'completed', result: 'Artifact: out.md\nSHA256: ' + '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88', artifactRefs: ['out.md'], artifactSha256: '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88',
       })).rejects.toBeInstanceOf(TaskDispatchRuntimeReceiptError)
       expect(row('r-task').status).toBe('in_progress')
     })

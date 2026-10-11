@@ -23,7 +23,7 @@ const inProgressUngated: Task = {
   // gate-exit guard), but present so the artifact gate (mupot#76e25fc2,
   // FLIGHT-07B) doesn't interfere with these fixtures now that it also
   // covers this REST route.
-  result: `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${'a'.repeat(64)}`,
+  result: `Done.\nArtifact: /tmp/marker.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88`,
   completed_at: null,
   gate_owner: null,
   created_at: '2026-07-14T01:00:00.000Z',

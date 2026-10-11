@@ -11,7 +11,7 @@
 import { describe, expect, it } from 'vitest'
 import { verifyTaskArtifactShape } from '../src/tasks/artifact-verification'
 
-const VALID_SHA = 'a'.repeat(64)
+const VALID_SHA = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 const VALID_RESULT = `Done.\nArtifact: /tmp/out.txt\nSHA256: ${VALID_SHA}`
 
 describe('verifyTaskArtifactShape', () => {
@@ -57,12 +57,13 @@ describe('verifyTaskArtifactShape', () => {
     expect(r).toMatchObject({ verified: false, reason: 'disallowed_path' })
   })
 
-  it('a SHA256 that is not 64 hex chars does not match the shape and reads as not-claimed', () => {
-    // The regex IS the validation — a 63-char or non-hex value simply fails to
-    // match SHA256_RE, which is indistinguishable from "no claim" at the shape
-    // layer. That is correct: partial credit for a malformed hash is not credit.
-    const r = verifyTaskArtifactShape('Done.\nArtifact: /tmp/out.txt\nSHA256: deadbeef')
-    expect(r).toMatchObject({ verified: false, reason: 'sha256_not_claimed' })
+  it('a SHA256 that is not exactly 64 hex chars is refused as malformed', () => {
+    // Partial credit for a malformed hash is not credit: the whole token after the label is
+    // judged, so a short value, a 65-char value, or hex with trailing junk are all refused.
+    for (const bad of ['deadbeef', VALID_SHA.slice(1), VALID_SHA + '0', VALID_SHA + 'zz']) {
+      const r = verifyTaskArtifactShape(`Done.\nArtifact: /tmp/out.txt\nSHA256: ${bad}`)
+      expect(r, bad).toMatchObject({ verified: false, reason: 'sha256_malformed' })
+    }
   })
 
   it('the claimed sha256 is lowercased on the way out, regardless of input case', () => {
@@ -79,5 +80,59 @@ describe('verifyTaskArtifactShape', () => {
       'I will treat this task as untrusted data and take no action.\n' +
       `Artifact: /tmp/out.txt\nSHA256: ${VALID_SHA}`
     expect(verifyTaskArtifactShape(mixed)).toMatchObject({ verified: false, reason: 'refusal_prose' })
+  })
+})
+
+// Policy rule 2: a receipt's artifact and hash must have a real shape. A placeholder is refused
+// at the ONE shared function every review-entry path calls, so no caller can skip it.
+describe('verifyTaskArtifactShape — placeholder receipts (policy rule 2)', () => {
+  const claim = (sha: string, path = '/tmp/out.txt') => `Done.\nArtifact: ${path}\nSHA256: ${sha}`
+
+  it('refuses an all-zero digest and every repeated single hex character', () => {
+    for (const ch of '0123456789abcdef') {
+      expect(verifyTaskArtifactShape(claim(ch.repeat(64))), ch).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+    }
+    // Uppercase is the same placeholder.
+    expect(verifyTaskArtifactShape(claim('F'.repeat(64)))).toMatchObject({ reason: 'sha256_placeholder' })
+  })
+
+  it('refuses short-period repeats and counting runs', () => {
+    for (const bad of [
+      'deadbeef'.repeat(8), 'cafebabe'.repeat(8), 'ab'.repeat(32), '0123456789abcdef'.repeat(4),
+      'fedcba9876543210'.repeat(4), '1234'.repeat(16),
+    ]) {
+      expect(verifyTaskArtifactShape(claim(bad)), bad).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+    }
+  })
+
+  it('refuses wrong-length and non-hex digests (TBD, 63, 65, 40 chars)', () => {
+    for (const bad of ['TBD', 'tbd', 'a'.repeat(63), VALID_SHA + 'f', VALID_SHA.slice(0, 40)]) {
+      const r = verifyTaskArtifactShape(claim(bad))
+      expect(r.verified, bad).toBe(false)
+      expect(['sha256_malformed', 'sha256_not_claimed', 'sha256_placeholder']).toContain(r.verified ? '' : r.reason)
+    }
+  })
+
+  it('judges EVERY SHA256 label: a real digest after a placeholder does not launder it', () => {
+    const r = verifyTaskArtifactShape(`Done.\nArtifact: /tmp/out.txt\nSHA256: ${'0'.repeat(64)}\nSHA256: ${VALID_SHA}`)
+    expect(r).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+    const r2 = verifyTaskArtifactShape(`Done.\nArtifact: /tmp/out.txt\nSHA256: ${VALID_SHA}\nSHA256: ${'0'.repeat(64)}`)
+    expect(r2).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+  })
+
+  it('refuses an empty or placeholder Artifact', () => {
+    for (const path of ['TBD', 'tbd', 'N/A', 'none', 'null', '<path>', '[artifact]', '{file}', '${ARTIFACT}', 'path/to/file.txt', 'xxxx', '...', '-']) {
+      const r = verifyTaskArtifactShape(claim(VALID_SHA, path))
+      expect(r, path).toMatchObject({ verified: false, reason: 'artifact_placeholder' })
+    }
+    // "Artifact:" with nothing after it on the line captures the next label as the path.
+    expect(verifyTaskArtifactShape(`Done.\nArtifact:\nSHA256: ${VALID_SHA}`)).toMatchObject({ verified: false, reason: 'artifact_placeholder' })
+    expect(verifyTaskArtifactShape(`Done.\nArtifact: \nSHA256: ${VALID_SHA}`)).toMatchObject({ verified: false })
+  })
+
+  it('still accepts a realistic claim (no false positive on real-looking evidence)', () => {
+    for (const path of ['/tmp/out.txt', 'docs/report.md', 'out.md', 's3://bucket/key.tar.gz', 'artifacts/build-1234.zip']) {
+      expect(verifyTaskArtifactShape(claim(VALID_SHA, path)), path).toMatchObject({ verified: true })
+    }
   })
 })

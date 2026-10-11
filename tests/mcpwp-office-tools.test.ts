@@ -3957,7 +3957,7 @@ describe('gate:office via task_submit_result (mupot#1663)', () => {
   const AGENT_MEMBER = 'member-office-builder'
   const OWNER = 'mem-owner-y'
   const HOLDER = 'mem-holder-z'
-  const SHA256 = 'b'.repeat(64)
+  const SHA256 = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 
   async function setup() {
     const harness = makeHarness()

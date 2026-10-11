@@ -159,7 +159,7 @@ async function runtimeCompletes(receiptId: string): Promise<void> {
     runtime_receipt_hash: 'a'.repeat(64), attempt: 1,
   }, 'https://pot.example')
   expect(consumed.ok, JSON.stringify(consumed)).toBe(true)
-  const sha = 'b'.repeat(64)
+  const sha = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
   const completed = await invokeTool(agentAuth(), env, 'task_dispatch_runtime_receipt', {
     task_id: TASK_ID, dispatch_receipt_id: receiptId, stage: 'completed',
     runtime_receipt_hash: 'c'.repeat(64), attempt: 1,
@@ -420,7 +420,7 @@ describe('in_worker dispatch receipts settle (mupot#1723, #1721)', () => {
   })
 
   describe('AgentDO settle by outcome (runDispatchedTaskExecution)', () => {
-    const goodModel = { chat: vi.fn(async () => 'ok\nArtifact: /tmp/a.txt\nSHA256: ' + 'a'.repeat(64)) }
+    const goodModel = { chat: vi.fn(async () => 'ok\nArtifact: /tmp/a.txt\nSHA256: ' + '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88') }
     const deps = (model: { chat: () => Promise<string> }) => ({
       model, emit: async () => {}, remember: async () => 'e',
       meter: { checkAndReserve: async () => ({ ok: true }), recordTokens: async () => {} } as never, // test double

@@ -185,7 +185,7 @@ describe('FP-01 Slice 2 v2 — project_access chain (successor to PR #1488)', ()
       // so it never has a real result) so this test can focus on the
       // reversal semantics it actually exercises.
       fixture.harness.sqlite.exec(
-        `UPDATE tasks SET result = 'Artifact: docs/routine-control.md\nSHA256: ${'a'.repeat(64)}' WHERE id = 'control-task'`,
+        `UPDATE tasks SET result = 'Artifact: docs/routine-control.md\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88' WHERE id = 'control-task'`,
       )
 
       const verdictRow = row(fixture, "SELECT id, reversed_at FROM task_verdicts WHERE task_id = 'control-task'")

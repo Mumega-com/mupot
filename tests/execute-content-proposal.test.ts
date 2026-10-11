@@ -181,7 +181,7 @@ describe('runTaskExecution — content-intent short-circuit', () => {
       // mupot#76e25fc2 (FLIGHT-07B): completions reaching review/done need
       // Artifact:/SHA256: evidence now — see tests/execute.test.ts's
       // WITH_ARTIFACT_EVIDENCE for the shared shape.
-      model: { chat: vi.fn(async () => 'A normal LLM answer.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)) },
+      model: { chat: vi.fn(async () => 'A normal LLM answer.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88') },
       emit: async (e) => {
         events.push(e)
       },

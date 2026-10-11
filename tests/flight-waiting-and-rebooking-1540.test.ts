@@ -140,7 +140,7 @@ function seed(harness: SqliteD1Harness, taskIds: string[]): void {
          VALUES (?, ?, 'T', 'body', 'done', 'in_progress', ?, ?, ?, datetime('now'), datetime('now'))`,
       )
       // Server-side artifact verification is shape-only (src/tasks/artifact-verification.ts).
-      .run(id, SQUAD_ID, GATE, EXEC_AGENT, `Work done.\nArtifact: /tmp/${id}.txt\nSHA256: ${'a'.repeat(64)}`)
+      .run(id, SQUAD_ID, GATE, EXEC_AGENT, `Work done.\nArtifact: /tmp/${id}.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88`)
   }
 }
 

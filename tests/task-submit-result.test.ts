@@ -43,7 +43,7 @@ const GATE_AGENT_ID = 'agent-gate'
 const GATE_TOKEN_ID = 'token-gate'
 const TASK_ID = 'task-under-test'
 const T0 = '2026-09-29T00:00:00.000Z'
-const VALID_SHA = 'a'.repeat(64)
+const VALID_SHA = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 const VALID_RESULT = `Built + tested.\nArtifact: /tmp/marker.txt\nSHA256: ${VALID_SHA}`
 const INDEPENDENT_GATE = 'gate:reviewer'
 
@@ -266,7 +266,7 @@ describe('task_submit_result (mupot#1586)', () => {
 
     const second = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
       task_id: TASK_ID,
-      result: `Different.\nArtifact: /tmp/other.txt\nSHA256: ${'b'.repeat(64)}`,
+      result: `Different.\nArtifact: /tmp/other.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88`,
     }, URL)
     expect(second).toMatchObject({ ok: false, status: 409, error: 'task_not_in_progress' })
     const row = taskRow(harness)
@@ -414,6 +414,27 @@ describe('task_submit_result (mupot#1586)', () => {
     expect(res).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason: 'refusal_prose' } })
     const row = taskRow(harness)
     expect(row.status).toBe('in_progress')
+  })
+
+  it('policy rule 2: refuses a placeholder hash or placeholder artifact through the real tool, leaving the task untouched', async () => {
+    const cases: Array<[string, string, string]> = [
+      ['all-zero digest', `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${'0'.repeat(64)}`, 'sha256_placeholder'],
+      ['repeated single char', `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${'a'.repeat(64)}`, 'sha256_placeholder'],
+      ['TBD digest', 'Done.\nArtifact: /tmp/marker.txt\nSHA256: TBD', 'sha256_malformed'],
+      ['wrong length', `Done.\nArtifact: /tmp/marker.txt\nSHA256: ${VALID_SHA.slice(0, 63)}`, 'sha256_malformed'],
+      ['placeholder artifact', `Done.\nArtifact: TBD\nSHA256: ${VALID_SHA}`, 'artifact_placeholder'],
+      ['empty artifact', `Done.\nArtifact:\nSHA256: ${VALID_SHA}`, 'artifact_placeholder'],
+    ]
+    for (const [label, result, reason] of cases) {
+      const { harness, env } = freshEnv()
+      seed(harness.sqlite)
+      const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', { task_id: TASK_ID, result }, URL)
+      expect(res, label).toMatchObject({ ok: false, status: 409, error: 'artifact_verification_failed', detail: { reason } })
+      const row = taskRow(harness)
+      expect(row.status, label).toBe('in_progress')
+      expect(row.result, label).toBeNull()
+      expect(submissionRows(harness), label).toHaveLength(0)
+    }
   })
 
   it('rejects result as an unknown arg on task_update (#1388 stays fixed) — task_submit_result is the ONLY supported write path', async () => {
