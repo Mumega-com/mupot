@@ -8,6 +8,9 @@
 // LABEL (or herdr agent name), never anything a pane says about itself. Mupot identity is the
 // peer row it joins to by slug; a seat that joins to zero or several peers is NOT guessed at.
 
+/** A peer slug safe to join into a token path. */
+export const PEER_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
+
 /** Lowercase, `_` -> `-`, trim. `muvps_kasra` and `muvps-kasra` compare equal. */
 export function normalizeSeatName(raw) {
   return String(raw ?? '').trim().toLowerCase().replace(/_/g, '-')
@@ -72,7 +75,8 @@ export function buildSeatSet({ herdrAgents, herdrWorkspaces = [], peers, overrid
   for (const a of herdrAgents) {
     const name = labelByWs.get(a.workspace_id) || a.name || null
     if (!name) { skipped.push({ herdr: null, pane_id: a.pane_id ?? null, reason: 'no_label' }); continue }
-    if (seen.has(name)) continue // two panes in one workspace: one seat per label
+    // Two panes sharing a label: one seat per label, but never a silent drop.
+    if (seen.has(name)) { skipped.push({ herdr: name, pane_id: a.pane_id ?? null, reason: 'duplicate_label' }); continue }
     seen.add(name)
 
     const ov = overrideByName.get(name)
@@ -86,10 +90,25 @@ export function buildSeatSet({ herdrAgents, herdrWorkspaces = [], peers, overrid
     if (matches.length === 0) { skipped.push({ herdr: name, reason: 'no_peer_match' }); continue }
     if (matches.length > 1) { skipped.push({ herdr: name, reason: 'ambiguous_peer_match' }); continue }
     const peer = matches[0]
+    // The slug is joined into a filesystem path by the caller: refuse anything but a plain slug.
+    if (!PEER_SLUG_RE.test(peer.slug)) { skipped.push({ herdr: name, mupot_agent_id: peer.id, reason: 'invalid_peer_slug' }); continue }
     const tokenFile = tokenFileFor ? tokenFileFor(peer.slug) : null
     if (!tokenFile) { skipped.push({ herdr: name, mupot_agent_id: peer.id, reason: 'no_token_file' }); continue }
     seats.push({ herdr: name, mupot_agent_id: peer.id, mupot_token_file: tokenFile, source: 'discover' })
   }
+
+  // Two herdr seats claiming ONE mupot agent id would double-inject (the bridge keys cursors and pane
+  // injection by label): neither is trusted, both are skipped.
+  const claims = new Map()
+  for (const s of seats) if (s.source === 'discover') claims.set(s.mupot_agent_id, (claims.get(s.mupot_agent_id) ?? 0) + 1)
+  const deduped = []
+  for (const s of seats) {
+    if (s.source === 'discover' && claims.get(s.mupot_agent_id) > 1) {
+      skipped.push({ herdr: s.herdr, mupot_agent_id: s.mupot_agent_id, reason: 'duplicate_peer_claim' })
+    } else deduped.push(s)
+  }
+  seats.length = 0
+  seats.push(...deduped)
 
   // An override for a seat herdr does not currently list is kept: seats.json stays authoritative
   // for hand-declared seats (e.g. a pane that is not up yet).
@@ -99,43 +118,53 @@ export function buildSeatSet({ herdrAgents, herdrWorkspaces = [], peers, overrid
   return { seats, skipped }
 }
 
-/** HTTP statuses that mean "this credential will not work until a human fixes it". Retrying is noise. */
-export const TERMINAL_AUTH_STATUSES = new Set([401, 403])
+/** Long backoff for refusals a human may fix (token file rewritten) or an outage: 5 minutes. */
+export const LONG_BACKOFF_MS = 300000
 
 /**
  * Decide what a failed inbox-stream open means.
- * Returns { action: 'stop', line } for 401/403 (one loud line, never retry),
- * or { action: 'retry' } for everything else (network error, 5xx, 429 ...).
+ *   stop     401, or 403 whose body says `not_agent_bound` (the credential can never work as-is)
+ *   backoff  any other 403 (policy/WAF/transient) or 5xx: wait LONG_BACKOFF_MS, re-read the token
+ *   retry    network error, 429, anything else: 1s -> 30s doubling
  */
-export function classifyStreamFailure(seat, status) {
-  if (TERMINAL_AUTH_STATUSES.has(status)) {
+export function classifyStreamFailure(seat, status, body = '') {
+  const terminal403 = status === 403 && /not_agent_bound/.test(String(body ?? ''))
+  if (status === 401 || terminal403) {
     return {
       action: 'stop',
       line: `SEAT DEAF: ${seat} inbox stream refused with HTTP ${status} (token rejected). `
         + 'NOT retrying; this seat receives no mail until its token is re-minted and seatlink is restarted.',
     }
   }
+  if (status === 403 || (typeof status === 'number' && status >= 500)) return { action: 'backoff' }
   return { action: 'retry' }
 }
 
 /**
- * Run one seat's stream loop under the policy. `openOnce()` performs one connect+consume cycle and
- * returns normally when the stream ends, or throws an Error carrying `.status` for an HTTP refusal.
- * Returns { stopped: true, status } after a terminal auth failure; otherwise loops forever (or until
- * `shouldContinue()` is false, used by tests). Backoff doubles from 1s to a 30s cap on retryable errors.
+ * Run one seat's stream loop under the policy. `openOnce(token)` performs one connect+consume cycle and
+ * returns normally when the stream ends, or throws an Error carrying `.status` (and optionally `.body`)
+ * for an HTTP refusal. `readToken()` is called at the top of EVERY cycle so a re-minted token file is
+ * picked up without a restart. Returns { stopped: true, status } after a terminal failure; otherwise
+ * loops forever (or until `shouldContinue()` is false, used by tests).
  */
-export async function runSeatStream({ seat, openOnce, log, sleep, shouldContinue = () => true }) {
+export async function runSeatStream({ seat, openOnce, readToken = () => undefined, log, sleep, shouldContinue = () => true }) {
   let backoff = 1000
   while (shouldContinue()) {
     try {
-      await openOnce()
+      await openOnce(readToken())
       backoff = 1000
+      await sleep(1000) // a normal stream end must not hot-loop
     } catch (e) {
       const status = typeof e?.status === 'number' ? e.status : null
-      const verdict = classifyStreamFailure(seat, status)
+      const verdict = classifyStreamFailure(seat, status, e?.body)
       if (verdict.action === 'stop') {
         log(verdict.line)
         return { stopped: true, status }
+      }
+      if (verdict.action === 'backoff') {
+        log(`SSE ${seat}: ${e?.message ?? e}, HTTP ${status}, backing off ${LONG_BACKOFF_MS}ms (token re-read next cycle)`)
+        await sleep(LONG_BACKOFF_MS)
+        continue
       }
       log(`SSE ${seat}: ${e?.message ?? e}, retry ${backoff}ms`)
       await sleep(backoff)

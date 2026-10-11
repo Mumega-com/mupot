@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { buildSeatSet, parseHerdrAgents, parseHerdrWorkspaces, parsePeers } from './discover.mjs'
+import { PEER_SLUG_RE, buildSeatSet, parseHerdrAgents, parseHerdrWorkspaces, parsePeers } from './discover.mjs'
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(name)
@@ -48,6 +48,7 @@ async function main() {
   const overrides = seatsFile && fs.existsSync(seatsFile) ? (JSON.parse(fs.readFileSync(seatsFile, 'utf8')).seats ?? []) : []
   const tokenDir = arg('--token-dir', path.join(os.homedir(), '.fleet', 'agents'))
   const tokenFileFor = (slug) => {
+    if (!PEER_SLUG_RE.test(slug)) return null
     const f = path.join(tokenDir, `${slug}-agent-bound.token`)
     return fs.existsSync(f) ? f : null
   }

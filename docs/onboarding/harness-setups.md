@@ -115,9 +115,23 @@ are in [seat-events-channel](../fleet/seat-events-channel.md).
   joins `herdr agent list` / `herdr workspace list` (workspace label = seat name) to the
   mupot `peers` roster by agent slug, and prints the seat set it would run. `seats.json`
   stays as an optional per-seat override.
-- A `401`/`403` on a seat's inbox stream is terminal: seatlink logs one `SEAT DEAF:` line
-  naming the seat and stops that seat's loop (no 30 s retry). Re-mint the token, restart seatlink.
+- Once the installed bridge is wired per `plugins/seatlink/README.md`: a `401`, or a `403` whose body says
+  `not_agent_bound`, on a seat's inbox stream is terminal: seatlink logs one `SEAT DEAF:` line naming the
+  seat and stops that seat's loop. Any other `403` or a `5xx` backs off 5 minutes and re-reads the token file
+  each cycle. Until wired, the installed bridge keeps its old retry behaviour.
+- Discovery never guesses: duplicate herdr labels, two seats claiming one mupot agent id, and peer slugs
+  outside `^[a-z0-9][a-z0-9-]{0,63}$` are reported under `skipped` with a reason.
 - Setup and install notes: `plugins/seatlink/README.md`.
+
+### Routing effect of the seat runtime fill (S2)
+
+`check_in` from a seat-bound session fills an UNSET `fleet_agents.runtime` from the harness kind the server
+holds (token kinds `claude-code`, `codex`, `grok`, `cursor`; OAuth `codex`, `grok`, `cursor` -> `cursor-ide`,
+`gemini`; OAuth `claude` stays unset because it is only a Claude Desktop/claude.ai guess). The label is not
+a liveness claim, but a non-empty runtime changes routing: a LIVE seat becomes eligible for external inbox wakes
+(`routeAgentWake`) and routine runs (`selectAgent`). A forced `delivery:'inbox'` needs live presence or a poll
+registration (`hasRegisteredDeliverySurface`), so a seat that went quiet is not a forced-inbox target. A
+daemon or signed-attach runtime always wins (fill-only); key-registered agents are never filled by bearer check-in.
 
 ## Consolidation boundary
 

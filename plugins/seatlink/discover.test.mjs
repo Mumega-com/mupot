@@ -3,7 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildSeatSet, classifyStreamFailure, parseHerdrAgents, parseHerdrWorkspaces, parsePeers,
-  runSeatStream, slugCandidates,
+  runSeatStream, slugCandidates, LONG_BACKOFF_MS,
 } from './discover.mjs'
 
 const herdrAgentsRaw = JSON.stringify({ id: 'cli:agent:list', result: { agents: [
@@ -75,14 +75,17 @@ test('bad herdr output parses to an empty list, never throws', () => {
   assert.deepEqual(parseHerdrAgents({ error: 'x' }), [])
 })
 
-test('401 policy: 401 and 403 stop with one loud line naming the seat; 5xx / network retry', () => {
-  for (const status of [401, 403]) {
-    const v = classifyStreamFailure('muvps_kasra', status)
+test('401 policy: 401 and 403-not_agent_bound stop with one loud line naming the seat; 5xx / network retry', () => {
+  for (const [status, body] of [[401, ''], [403, '{"error":"not_agent_bound"}']]) {
+    const v = classifyStreamFailure('muvps_kasra', status, body)
     assert.equal(v.action, 'stop')
     assert.match(v.line, /muvps_kasra/)
     assert.match(v.line, new RegExp(String(status)))
   }
-  for (const status of [500, 502, 429, null]) assert.equal(classifyStreamFailure('s', status).action, 'retry')
+  for (const status of [429, null]) assert.equal(classifyStreamFailure('s', status).action, 'retry')
+  for (const [status, body] of [[403, ''], [403, 'forbidden'], [500, ''], [502, ''], [503, '']]) {
+    assert.equal(classifyStreamFailure('s', status, body).action, 'backoff', `${status} ${body}`)
+  }
 })
 
 test('runSeatStream: a 401 logs exactly one line, calls openOnce exactly once, never sleeps', async () => {
@@ -103,14 +106,14 @@ test('runSeatStream: a 401 logs exactly one line, calls openOnce exactly once, n
   assert.match(lines[0], /muvps_loom/)
 })
 
-test('runSeatStream: transient errors back off 1s,2s,4s... capped at 30s, then a 401 stops it', async () => {
+test('runSeatStream: network errors back off 1s,2s,4s... capped at 30s, then a 401 stops it', async () => {
   const delays = []
   let n = 0
   const out = await runSeatStream({
     seat: 's',
     openOnce: async () => {
       n++
-      if (n <= 8) throw Object.assign(new Error('HTTP 503'), { status: 503 })
+      if (n <= 8) throw new Error('ECONNRESET')
       throw Object.assign(new Error('HTTP 401'), { status: 401 })
     },
     log: () => {},
@@ -119,4 +122,93 @@ test('runSeatStream: transient errors back off 1s,2s,4s... capped at 30s, then a
   })
   assert.equal(out.stopped, true)
   assert.deepEqual(delays, [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000])
+})
+
+test('duplicate peer claim: two herdr seats resolving to one mupot agent id are BOTH skipped', () => {
+  const { seats, skipped } = buildSeatSet({
+    herdrAgents: [{ name: 'a', workspace_id: 'w1', pane_id: 'w1:p1' }, { name: 'b', workspace_id: 'w2', pane_id: 'w2:p1' }, { name: 'c', workspace_id: 'w3', pane_id: 'w3:p1' }],
+    herdrWorkspaces: [{ workspace_id: 'w1', label: 'muvps_kasra' }, { workspace_id: 'w2', label: 'kasra' }, { workspace_id: 'w3', label: 'athena' }],
+    peers: [{ id: 'id-kasra', slug: 'kasra' }, { id: 'id-athena', slug: 'athena' }],
+    tokenFileFor: (s) => `/t/${s}.token`,
+  })
+  assert.deepEqual(seats.map((s) => s.herdr), ['athena'])
+  const dup = skipped.filter((s) => s.reason === 'duplicate_peer_claim')
+  assert.deepEqual(dup.map((s) => s.herdr).sort(), ['kasra', 'muvps_kasra'])
+  assert.ok(dup.every((s) => s.mupot_agent_id === 'id-kasra'))
+})
+
+test('duplicate herdr label is skipped with a reason, never silently dropped', () => {
+  const { seats, skipped } = buildSeatSet({
+    herdrAgents: [{ name: 'x', workspace_id: 'w1', pane_id: 'w1:p1' }, { name: 'x', workspace_id: 'w1', pane_id: 'w1:p2' }],
+    herdrWorkspaces: [{ workspace_id: 'w1', label: 'kasra' }],
+    peers: [{ id: 'id-kasra', slug: 'kasra' }],
+    tokenFileFor: (s) => `/t/${s}.token`,
+  })
+  assert.equal(seats.length, 1)
+  assert.deepEqual(skipped, [{ herdr: 'kasra', pane_id: 'w1:p2', reason: 'duplicate_label' }])
+})
+
+test('peer slug is validated before it reaches a path: traversal / odd slugs are skipped', () => {
+  const calls = []
+  for (const slug of ['../etc/passwd', 'a/b', '-lead', 'UP', 'a'.repeat(65), 'sp ace']) {
+    const { seats, skipped } = buildSeatSet({
+      herdrAgents: [{ name: 'n', workspace_id: 'w1' }],
+      herdrWorkspaces: [{ workspace_id: 'w1', label: slug }],
+      peers: [{ id: 'id-1', slug }],
+      tokenFileFor: (s) => { calls.push(s); return `/t/${s}.token` },
+    })
+    assert.equal(seats.length, 0, slug)
+    assert.ok(['invalid_peer_slug', 'no_peer_match'].includes(skipped[0].reason), `${slug} -> ${skipped[0].reason}`)
+  }
+  const { skipped } = buildSeatSet({
+    herdrAgents: [{ name: 'n', workspace_id: 'w1' }],
+    herdrWorkspaces: [{ workspace_id: 'w1', label: 'a/b' }],
+    peers: [{ id: 'id-1', slug: 'a/b' }],
+    tokenFileFor: () => '/x',
+  })
+  assert.equal(skipped[0].reason, 'invalid_peer_slug')
+  assert.deepEqual(calls, [], 'tokenFileFor is never called with an unvalidated slug')
+})
+
+test('runSeatStream: 403 without not_agent_bound and 5xx back off 5 min, re-read the token every cycle, never stop', async () => {
+  const delays = []
+  const tokensSeen = []
+  let reads = 0
+  let n = 0
+  const out = await runSeatStream({
+    seat: 's',
+    readToken: () => `tok${++reads}`,
+    openOnce: async (tok) => {
+      tokensSeen.push(tok)
+      n++
+      throw Object.assign(new Error('refused'), n % 2 ? { status: 403, body: 'waf' } : { status: 503 })
+    },
+    log: () => {},
+    sleep: async (ms) => { delays.push(ms) },
+    shouldContinue: () => n < 4,
+  })
+  assert.equal(out.stopped, false)
+  assert.deepEqual(delays, [LONG_BACKOFF_MS, LONG_BACKOFF_MS, LONG_BACKOFF_MS, LONG_BACKOFF_MS])
+  assert.deepEqual(tokensSeen, ['tok1', 'tok2', 'tok3', 'tok4'])
+})
+
+test('runSeatStream: 403 with not_agent_bound stops once', async () => {
+  let n = 0
+  const out = await runSeatStream({
+    seat: 's',
+    openOnce: async () => { n++; throw Object.assign(new Error('x'), { status: 403, body: '{"error":"not_agent_bound"}' }) },
+    log: () => {}, sleep: async () => {}, shouldContinue: () => n < 5,
+  })
+  assert.deepEqual(out, { stopped: true, status: 403 })
+  assert.equal(n, 1)
+})
+
+test('runSeatStream: a normal stream end sleeps 1s before reconnecting (no hot loop)', async () => {
+  const delays = []
+  let n = 0
+  await runSeatStream({
+    seat: 's', openOnce: async () => { n++ }, log: () => {},
+    sleep: async (ms) => { delays.push(ms) }, shouldContinue: () => n < 3,
+  })
+  assert.deepEqual(delays, [1000, 1000, 1000])
 })
