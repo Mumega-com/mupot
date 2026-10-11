@@ -703,25 +703,28 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
   if (existing.gate_owner === 'gate:office') {
     const stamped = await env.DB.prepare(
       `UPDATE task_verdicts SET reversed_at = ?1
-        WHERE id = (
-          SELECT id FROM task_verdicts WHERE task_id = ?2 AND reversed_at IS NULL
-           ORDER BY decided_at DESC, id DESC LIMIT 1
-        )
-        AND NOT ${officePublishUnresolvedSql('?2')}`,
-    ).bind(next.updated_at, existing.id).run()
+        WHERE id = ?2 AND task_id = ?3 AND reversed_at IS NULL
+          AND id = (
+            SELECT id FROM task_verdicts WHERE task_id = ?3
+             ORDER BY decided_at DESC, id DESC LIMIT 1
+          )
+          AND NOT ${officePublishUnresolvedSql('?3')}`,
+    ).bind(next.updated_at, verdict.id, existing.id).run()
     if ((stamped.meta?.changes ?? 0) === 0) {
       // 0 rows is either "already reversed" (idempotent retry) or the guard.
       const unresolved = await env.DB.prepare(`SELECT ${officePublishUnresolvedSql('?1')} AS unresolved`).bind(existing.id).first<{ unresolved: number }>()
       if (unresolved?.unresolved) return { ok: false, error: 'office_publish_unresolved', detail: OFFICE_PUBLISH_UNRESOLVED_MESSAGE }
+      if (!verdict.reversed_at) throw new TaskUpdateConflictError('task_update_conflict')
     }
   } else {
-    await markVerdictReversed(env, existing.id, next.updated_at)
+    const stamped = await markVerdictReversed(env, verdict.id, existing.id, next.updated_at)
+    if (!stamped && !verdict.reversed_at) throw new TaskUpdateConflictError('task_update_conflict')
   }
 
   // Step 1b (mupot#1592 NEW-2) — office.publish_post's frozen-payload binding must
   // die with the verdict it was bound to. Idempotent (WHERE voided_at IS NULL, like
   // every other step here) and scoped to the one gate namespace that has a freeze
-  // table at all — a plain UPDATE by task_id, no batch needed: publishOfficePost's
+  // table at all — an exact selected-verdict UPDATE, no batch needed: publishOfficePost's
   // own claim guard already re-derives "is there a live, unreversed, approved
   // verdict bound to this exact freeze" from task_verdicts directly (see
   // src/addons/office/service.ts), so even a failed/skipped write here is not a
@@ -731,8 +734,16 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
   if (existing.gate_owner === 'gate:office') {
     await env.DB.prepare(
       `UPDATE office_publish_freezes SET voided_at = ?1, voided_reason = 'reversed'
-        WHERE task_id = ?2 AND voided_at IS NULL`,
-    ).bind(next.updated_at, existing.id).run()
+        WHERE task_id = ?2 AND verdict_id = ?3 AND voided_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM task_verdicts v
+             WHERE v.id = ?3 AND v.task_id = ?2 AND v.reversed_at IS NOT NULL
+               AND v.id = (
+                 SELECT id FROM task_verdicts WHERE task_id = ?2
+                  ORDER BY decided_at DESC, id DESC LIMIT 1
+               )
+          )`,
+    ).bind(next.updated_at, existing.id, verdict.id).run()
   }
 
   // Step 2 — the FULL task update (status flip + whatever else this PATCH
@@ -765,13 +776,24 @@ export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput):
   // Step 3 — the audit receipt, deterministic id keyed on the verdict.
   const receiptId = `reversal:${verdict.id}`
   try {
-    await env.DB.prepare(
+    const receipt = await env.DB.prepare(
       `INSERT INTO verdict_reversals
          (id, tenant, task_id, squad_id, from_status, to_status, prior_verdict, reason, actor_id, actor_type)
-       VALUES (?, ?, ?, ?, ?, 'review', ?, ?, ?, ?)`,
+       SELECT ?1, ?2, ?3, ?4, ?5, 'review', ?6, ?7, ?8, ?9
+        WHERE EXISTS (
+          SELECT 1 FROM task_verdicts v
+           WHERE v.id = ?10 AND v.task_id = ?3 AND v.reversed_at IS NOT NULL
+             AND v.id = (
+               SELECT id FROM task_verdicts WHERE task_id = ?3
+                ORDER BY decided_at DESC, id DESC LIMIT 1
+             )
+        )`,
     ).bind(
-      receiptId, tenant, landed.id, landed.squad_id, fromStatus, fromStatus, reason, actorId, actorType,
+      receiptId, tenant, landed.id, landed.squad_id, fromStatus, fromStatus, reason, actorId, actorType, verdict.id,
     ).run()
+    if ((receipt.meta?.changes ?? 0) === 0) {
+      throw new TaskUpdateConflictError('task_update_conflict')
+    }
   } catch (error) {
     if (!isUniqueViolation(error)) throw error
   }
@@ -1642,18 +1664,25 @@ export async function controlTaskGatesProjectAccess(env: Env, task: Task): Promi
 // same two call sites that already write the verdict_reversals receipt) at
 // the exact moment a reversal is confirmed, so the two facts (the audit
 // receipt existing, and the verdict itself being marked reversed) can never
-// drift apart. Targets the SAME row `ORDER BY decided_at DESC, id DESC LIMIT 1`
-// resolves for approvedGate/latestTaskVerdict-style reads — the one this
-// reversal is actually undoing — and is a no-op (0 rows) if that row is
-// already reversed, making the call idempotent under retry.
-export async function markVerdictReversed(env: Env, taskId: string, reversedAt: string): Promise<void> {
-  await env.DB.prepare(
+// drift apart. Targets the explicitly selected row only while it is still the
+// current latest verdict for that task and unreversed. A retry may therefore
+// no-op on the stamp only for that same already-reversed row; it can never
+// fall back to older unreversed history after a newer verdict was selected.
+export async function markVerdictReversed(
+  env: Env,
+  verdictId: string,
+  taskId: string,
+  reversedAt: string,
+): Promise<boolean> {
+  const result = await env.DB.prepare(
     `UPDATE task_verdicts SET reversed_at = ?
-      WHERE id = (
-        SELECT id FROM task_verdicts WHERE task_id = ? AND reversed_at IS NULL
-         ORDER BY decided_at DESC, id DESC LIMIT 1
-      )`,
-  ).bind(reversedAt, taskId).run()
+      WHERE id = ? AND task_id = ? AND reversed_at IS NULL
+        AND id = (
+          SELECT id FROM task_verdicts WHERE task_id = ?
+           ORDER BY decided_at DESC, id DESC LIMIT 1
+        )`,
+  ).bind(reversedAt, verdictId, taskId, taskId).run()
+  return (result.meta?.changes ?? 0) === 1
 }
 
 // verdictIsHuman — FP-01 Slice 2 v2 (successor to PR #1488, P0-3): the ONE

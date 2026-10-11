@@ -95,6 +95,30 @@ async function approveControlTask(fixture: ReadyRoutineFixture): Promise<void> {
   expect(outcome.ok).toBe(true)
 }
 
+async function rejectThenReworkAndApprove(fixture: ReadyRoutineFixture): Promise<{ rejectedId: string; approvedId: string }> {
+  await seedMember(fixture, 'owner-1')
+  fixture.harness.sqlite.exec(
+    `UPDATE tasks SET status = 'review', gate_owner = 'gate:outreach', ` +
+    `result = 'Artifact: docs/fixture.md\nSHA256: ${'a'.repeat(64)}' WHERE id = 'control-task'`,
+  )
+  const rejected = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+    task_id: 'control-task', verdict: 'rejected', note: 'needs rework',
+  })
+  expect(rejected.ok).toBe(true)
+  fixture.harness.sqlite.exec("UPDATE tasks SET status = 'in_progress' WHERE id = 'control-task'; UPDATE tasks SET status = 'review' WHERE id = 'control-task'")
+  const approved = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
+    task_id: 'control-task', verdict: 'approved', note: 'rework accepted',
+  })
+  expect(approved.ok).toBe(true)
+  const rows = fixture.harness.sqlite.prepare(
+    "SELECT id, verdict FROM task_verdicts WHERE task_id = 'control-task' ORDER BY decided_at ASC, id ASC",
+  ).all() as Array<{ id: string; verdict: string }>
+  const rejectedId = rows.find((candidate) => candidate.verdict === 'rejected')?.id
+  const approvedId = rows.find((candidate) => candidate.verdict === 'approved')?.id
+  if (!rejectedId || !approvedId) throw new Error('rework fixture did not create both verdicts')
+  return { rejectedId, approvedId }
+}
+
 describe('task_verdict_reverse — reversed_at-first, atomic, idempotent (FP-01 Slice 2 v2 round 2, P0)', () => {
   let fixture: ReadyRoutineFixture | undefined
   afterEach(() => {
@@ -179,6 +203,110 @@ describe('task_verdict_reverse — reversed_at-first, atomic, idempotent (FP-01 
     expect(retried.ok).toBe(true)
     expect(row(fixture, 'SELECT COUNT(*) AS n FROM verdict_reversals WHERE task_id = \'control-task\'')).toEqual({ n: 1 })
   })
+
+  it.each(['gate:outreach', 'gate:office'])(
+    'REPRODUCES BUG (%s): retrying the newest already-reversed verdict must not reverse older rework history',
+    async (gateOwner) => {
+    fixture = await makeReadyRoutineFixture('propose')
+    const { rejectedId, approvedId } = await rejectThenReworkAndApprove(fixture)
+
+    // A prior attempt closed the newest approval but lost before recording
+    // its receipt. The retry is allowed to complete that exact operation.
+    fixture.harness.sqlite.exec(`
+      UPDATE task_verdicts SET reversed_at = '2026-10-11T00:00:00.000Z' WHERE id = '${approvedId}';
+      UPDATE tasks SET status = 'review', gate_owner = '${gateOwner}', updated_at = '2026-10-11T00:00:00.000Z' WHERE id = 'control-task';
+    `)
+
+    const retried = await invokeTool(ownerAuth(), fixture.env, 'task_verdict_reverse', {
+      task_id: 'control-task', reason: 'approved in error',
+    })
+
+    expect(retried.ok).toBe(true)
+    expect(row(fixture, `SELECT reversed_at FROM task_verdicts WHERE id = '${rejectedId}'`))
+      .toEqual({ reversed_at: null })
+    expect(row(fixture, `SELECT id FROM verdict_reversals WHERE task_id = 'control-task'`))
+      .toEqual({ id: `reversal:${approvedId}` })
+    },
+  )
+
+  it.each(['gate:outreach', 'gate:office'])(
+    'REPRODUCES RACE (%s): losing latest-verdict ownership leaves every verdict and task state unchanged',
+    async (gateOwner) => {
+    fixture = await makeReadyRoutineFixture('propose')
+    await approveControlTask(fixture)
+    fixture.harness.sqlite.prepare(`UPDATE tasks SET gate_owner = '${gateOwner}' WHERE id = 'control-task'`).run()
+    const selected = row(fixture, "SELECT id FROM task_verdicts WHERE task_id = 'control-task'") as { id: string }
+    const prepare = fixture.env.DB.prepare.bind(fixture.env.DB)
+    let raced = false
+    fixture.env.DB.prepare = ((sql: string) => {
+      if (!raced && sql.includes('UPDATE task_verdicts SET reversed_at')) {
+        raced = true
+        fixture!.harness.sqlite.prepare(
+          `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, project_id)
+           VALUES ('newer-race-verdict', 'control-task', 'approved', 'raced', 'owner-1', '2099-01-01T00:00:00.000Z', 'project-1')`,
+        ).run()
+      }
+      return prepare(sql)
+    }) as typeof fixture.env.DB.prepare
+
+    const reversed = await invokeTool(ownerAuth(), fixture.env, 'task_verdict_reverse', {
+      task_id: 'control-task', reason: 'approved in error',
+    })
+
+    expect(reversed.ok).toBe(false)
+    expect(row(fixture, `SELECT reversed_at FROM task_verdicts WHERE id = '${selected.id}'`)).toEqual({ reversed_at: null })
+    expect(row(fixture, "SELECT reversed_at FROM task_verdicts WHERE id = 'newer-race-verdict'")).toEqual({ reversed_at: null })
+    expect(row(fixture, "SELECT status FROM tasks WHERE id = 'control-task'")).toEqual({ status: 'approved' })
+    expect(row(fixture, "SELECT COUNT(*) AS n FROM verdict_reversals WHERE task_id = 'control-task'")).toEqual({ n: 0 })
+    },
+  )
+
+  it.each(['gate:outreach', 'gate:office'])(
+    'REPRODUCES RETRY RACE (%s): a newer verdict prevents receipt attribution to the older reversed verdict',
+    async (gateOwner) => {
+      fixture = await makeReadyRoutineFixture('propose')
+      await approveControlTask(fixture)
+      const selected = row(fixture, "SELECT id FROM task_verdicts WHERE task_id = 'control-task'") as { id: string }
+      fixture.harness.sqlite.exec(`
+        UPDATE task_verdicts SET reversed_at = '2026-10-11T00:00:00.000Z' WHERE id = '${selected.id}';
+        UPDATE tasks SET status = 'review', gate_owner = '${gateOwner}', updated_at = '2026-10-11T00:00:00.000Z' WHERE id = 'control-task';
+      `)
+      const prepare = fixture.env.DB.prepare.bind(fixture.env.DB)
+      let raced = false
+      fixture.env.DB.prepare = ((sql: string) => {
+        if (!raced && sql.includes('UPDATE task_verdicts SET reversed_at')) {
+          raced = true
+          fixture!.harness.sqlite.prepare(
+            `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at, project_id)
+             VALUES ('newer-retry-race', 'control-task', 'approved', 'new', 'owner-1', '2099-01-01T00:00:00.000Z', 'project-1')`,
+          ).run()
+          if (gateOwner === 'gate:office') {
+            fixture!.harness.sqlite.prepare(
+              `INSERT INTO office_publish_freezes (
+                 task_id, payload_json, payload_sha256, installation_id, connector_id, site_origin,
+                 frozen_by, frozen_at, verdict_id
+               ) VALUES ('control-task', '{}', '${'b'.repeat(64)}', 'installation', 'connector', 'https://example.test',
+                 'owner-1', '2026-10-11T00:00:00.000Z', 'newer-retry-race')`,
+            ).run()
+          }
+        }
+        return prepare(sql)
+      }) as typeof fixture.env.DB.prepare
+
+      const retried = await invokeTool(ownerAuth(), fixture.env, 'task_verdict_reverse', {
+        task_id: 'control-task', reason: 'approved in error',
+      })
+
+      expect(retried.ok).toBe(false)
+      expect(row(fixture, `SELECT reversed_at FROM task_verdicts WHERE id = '${selected.id}'`)).not.toEqual({ reversed_at: null })
+      expect(row(fixture, "SELECT reversed_at FROM task_verdicts WHERE id = 'newer-retry-race'")).toEqual({ reversed_at: null })
+      expect(row(fixture, "SELECT COUNT(*) AS n FROM verdict_reversals WHERE task_id = 'control-task'")).toEqual({ n: 0 })
+      if (gateOwner === 'gate:office') {
+        expect(row(fixture, "SELECT voided_at FROM office_publish_freezes WHERE task_id = 'control-task'"))
+          .toEqual({ voided_at: null })
+      }
+    },
+  )
 
   it('IDEMPOTENT full replay: reversing an already-fully-reversed task twice writes nothing extra and never errors the caller into a bad state', async () => {
     fixture = await makeReadyRoutineFixture('propose')
