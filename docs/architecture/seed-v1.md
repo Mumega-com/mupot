@@ -5,7 +5,8 @@ pot. It states what the project is, where it lives, what it would like to do, an
 would like to be allowed to do. It is a **request, never a grant**: nothing in a seed is
 authority, and validating one grants nothing.
 
-Status: contract + validator + `seed_attach` dry run. Applying a seed is a later change.
+Status: contract + validator + `seed_attach` dry run + apply (`dry_run:false`). Apply creates a
+minimal footprint and grants nothing; accepting the individual requests is a later, separate step.
 
 ## Document shape
 
@@ -102,17 +103,63 @@ spoof-resistant request text: use plain-text names.
 
 ## The tool
 
-`seed_attach { seed: string, dry_run?: boolean }` — member capability floor.
+`seed_attach { seed: string, dry_run?: boolean, accept?: string[] }` — member capability floor for
+the dry run; apply needs more (below).
 
 - `dry_run` defaults to **true**: validate and return
   `{ok, dry_run, seed_sha256, requests[], diffs[]}`. Nothing is written, including the
-  generic presence bump. `diffs` compares name, goal, repo and live against an existing
-  project with the same slug, only if the caller can already read that project.
-- `dry_run: false` is not implemented yet and answers `501 seed_apply_not_built`.
-- `requests` is a list of `{kind, fields, needs, text}`: `fields` is the structured source of
-  truth, `needs` is always `human_accept`, and `text` is a rendered one-line sentence in which
-  every author value is JSON-quoted (U+2028/U+2029 escaped).
+  generic presence bump. `diffs` compares name, goal, repo and live against the existing
+  project the seed would apply to (`<slug>-prj`), only if the caller can already read it.
+- `requests` is a list of `{key, kind, fields, needs, text}`: `key` is stable (`kind:` plus 12 hex of
+  the digest of the request), `fields` is the structured source of truth, `needs` is always
+  `human_accept`, and `text` is a rendered one-line sentence in which every author value is
+  JSON-quoted (U+2028/U+2029 escaped).
 - A refused seed is `400 invalid_seed` with `{code, path, message}`.
+
+### Apply (`dry_run: false`)
+
+Apply is a **human act**. Required, in this order:
+
+| Check | Refusal |
+|---|---|
+| caller is not agent-bound (any agent token, whatever it holds) | `403 human_accept_required` |
+| caller is a member with org admin standing (the `team_bootstrap` floor) | `403 forbidden` |
+| seed re-validated server-side (a prior dry run is never trusted) | `400 invalid_seed` |
+| `accept` present and every key known to this seed | `400 invalid_args`, `400 unknown_accept_keys` |
+| EVERY request key is in `accept` (nothing is auto-accepted) | `409 requests_not_accepted` `{missing:[{key,kind}]}` |
+| `slug` can derive `<slug>-prj` / `<slug>-sqd` (at most 44 chars, not ending `-prj`, `-sqd`, `-bot`) | `400 seed_slug_not_applicable` |
+
+Then, **insert-first**: one `project_seeds` row (UNIQUE `tenant + project_slug`) is inserted before
+anything is created. The INSERT itself refuses when a project of that slug exists that the caller did
+not create (a project with no recorded creator counts as not theirs). On the UNIQUE key:
+
+- same `seed_sha256`, applied: `replay: true`, nothing created (also while another apply of the same
+  seed is in flight: `replay: true, status: "applying"`).
+- different `seed_sha256`: `409 seed_digest_conflict`. A seed is never silently updated; update is a
+  later feature.
+- an existing project of that slug the caller did not create, or a seed row the caller cannot see:
+  `409 seed_slug_unavailable`, **one generic body** (no id, name or creator). Use the dry run's `diffs`
+  to see a project you can read.
+- an apply that crashed after the claim holds a 120 second lease; only the same member may resume it
+  after the lease lapses, and the resume creates nothing twice.
+
+What apply creates is **exactly**: the project (`<slug>-prj`, `created_by_member_id` = the caller),
+the squad (`<slug>-sqd`, display name from `wants.seats.squad` or `<slug>-core`) with the ADMIN
+squad-project edge (both through `team_bootstrap`'s find-or-create core, which also writes its own
+`team_bootstrap_receipts` row), the shared `dept-projects` department if this pot has none yet, the
+seat **cap** (`wants.seats.max`, recorded only), one `project_seeds` row and one audit receipt
+(`mutation_audit_entries`, handler `seed_attach`, operation `apply`, keyed `seed-apply:<row id>`,
+carrying `seed_sha256`, the caller and the accepted keys).
+
+What apply **never** creates: gate capabilities or grants, routines, connectors or credentials,
+deploy rights, agents, tokens, invites. Every request stays in `requests_json` with status
+`pending_human` for later explicit tools. The row stores only `canonical_json` and the digest, never
+the raw source; `owner` is stored as a label (`owner_label`) and is never resolved to a member. The
+project's goal, repo and live URL are recorded in `canonical_json` and are not copied onto the
+project row by this slice.
+
+Errors from creation itself (`squad_limit_reached`, archived project, ...) are `409 seed_apply_failed`
+`{reason}`; the claim is released so a retry starts clean.
 
 ## Attach protocol
 
@@ -123,12 +170,12 @@ spoof-resistant request text: use plain-text names.
 | 3 | Review the requests and diffs | human |
 | 4 | Accept requests, one by one (gates, routines, seats, memory, data, tool credentials, direct surfaces, allow_direct) | **human only** |
 | 5 | Bind each credential slot to a real credential in the vault | **human only** |
-| 6 | Apply: find-or-create project, squad and seats keyed by `seed_sha256` (not built yet) | member, after step 4 |
+| 6 | Apply: find-or-create project and squad keyed by `seed_sha256`; records the seat cap (built; accepts every request key, grants none) | human org admin |
 | 7 | Deploy, DNS and production changes | **human only**, always |
 
 ### Apply preconditions (normative)
 
-When apply is built it MUST:
+Apply MUST (and is tested to):
 
 1. Store only the **canonical form** (`canonical`), never the raw source. Comments and
    whitespace can carry secrets and still pass validation.
@@ -138,7 +185,9 @@ When apply is built it MUST:
 4. Show requests from their structured `fields`; author text is never rendered unescaped
    (`src/seeds/render.ts` JSON-quotes every field).
 
-Steps 4, 5 and 7 can never be performed by validation or by an agent acting alone.
+Step 6's `accept` is the human listing every request key it saw in the dry run; it records the
+requests and grants none of them. Steps 4, 5 and 7 can never be performed by validation or by an
+agent acting alone.
 
 ## Example 1 — Astro site
 
@@ -157,7 +206,8 @@ Both examples are test fixtures: CI validates them (`tests/seed-v1-validate.test
 ## Code
 
 `src/seeds/contract.ts` (types, enums, caps), `src/seeds/validate.ts` (validator and request
-list), `src/seeds/canonical.ts` (canonical JSON and digest), `src/mcp/seed.ts` (tool).
+list), `src/seeds/canonical.ts` (canonical JSON, digest, request keys), `src/seeds/apply.ts` (apply),
+`src/mcp/seed.ts` (tool), `migrations/0209_project_seeds.sql`.
 
 ## Mutation checks
 
@@ -184,3 +234,10 @@ Each test below was written to fail when the named mutation is applied to the co
 - Let `seed_attach` write on a dry run, or apply on `dry_run: false`: the whole-database snapshot tests fail.
 - Lower the tool floor below `member`: the observer test (403 forbidden) fails.
 - Change how `allow_direct` matches `path` and `type`: the allow_direct matching test fails.
+- Drop the agent-bound or org-admin refusal on apply, or the all-requests-accepted check: the apply authority tests fail.
+- Skip the insert-first claim, or let a repeat or racing apply past the UNIQUE key: the replay and concurrent-apply tests fail.
+- Remove the no-takeover guard from the claim INSERT, or treat a project with no recorded creator as the caller's: the takeover tests fail.
+- Compare digests loosely (or not at all) on a repeat: the digest-conflict test fails.
+- Store the raw source anywhere: the canary-comment test fails.
+- Let apply create a bot, agent, capability or gate: the whole-database footprint test fails.
+- Drop the receipt or its UNIQUE key: the footprint and concurrent-apply tests fail.
