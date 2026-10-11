@@ -49,6 +49,15 @@ export function colonyHostnames(env: Pick<Env, 'PUBLIC_ORIGIN'>): Set<string> {
   return out
 }
 
+/** Strip leading/trailing dots without a backtracking regex. */
+function trimDots(value: string): string {
+  let start = 0
+  let end = value.length
+  while (start < end && value[start] === '.') start++
+  while (end > start && value[end - 1] === '.') end--
+  return value.slice(start, end)
+}
+
 function isSameOrSubdomain(hostname: string, parent: string): boolean {
   return hostname === parent || hostname.endsWith(`.${parent}`)
 }
@@ -64,7 +73,7 @@ export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | '
   if (!host || !HOST_RE.test(host)) return null
   const name = hostnameOf(host)
   for (const colony of colonyHostnames(env)) if (isSameOrSubdomain(name, colony)) return null
-  const potSuffix = env.DEFAULT_POT_HOST_SUFFIX?.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+  const potSuffix = trimDots(env.DEFAULT_POT_HOST_SUFFIX?.trim().toLowerCase() ?? '')
   if (potSuffix && isSameOrSubdomain(name, potSuffix)) return null
   return host
 }

@@ -779,6 +779,7 @@ describe('approvalHostGate (the first statement of the worker fetch)', () => {
     expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.colony.example.test', PUBLIC_ORIGIN: 'https://colony.example.test' }))).toBeNull()
     expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.mupot.mumega.com' }))).toBeNull()
     expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.pots.example.test', DEFAULT_POT_HOST_SUFFIX: 'pots.example.test' }))).toBeNull()
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.pots.example.test', DEFAULT_POT_HOST_SUFFIX: '..pots.example.test.' }))).toBeNull()
     expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.example.test.' }))).toBe('approve.example.test')
     expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.example.test' }))).toBe('approve.example.test')
   })
