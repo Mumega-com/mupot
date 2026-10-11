@@ -255,7 +255,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   runtime_seat_register_pending: ADD('registerPendingRuntimeSeat INSERT runtime_seats + seat_attestations (flight-spine/seats.ts:439,530)'),
 
   // ── external services ──────────────────────────────────────────────────────────────────────
-  cursor_dispatch: ADDX('createCursorAgent POST to the Cursor API + recordCursorCloudWork INSERT (cursor/client.ts:257; cursor/dispatch.ts:63)'),
+  cursor_dispatch: ADDX('createCursorAgent POST to the Cursor API + reserveCursorCloudWork INSERT harness_reservations/tasks/flights, attach binds vendor ids (cursor/client.ts createCursorAgent; cursor/dispatch.ts reserveCursorCloudWork, attachCursorCloudExecution)'),
   cursor_run_status: ROX('getCursorRun GET to the Cursor API (cursor/client.ts:307)'),
   athena_review_pr: RO('pure reviewPullRequest over the supplied diff; no D1, KV or network (athena/reviewer.ts:288)'),
   pot_provision: ADDX('provisionSovereignPot creates D1/KV/Worker via the Cloudflare API + INSERT pots (pots/service.ts:104-463,1516)'),

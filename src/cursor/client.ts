@@ -259,6 +259,8 @@ async function cursorRequest(token: string, path: string, init: RequestInit = {}
   return body
 }
 
+export const CURSOR_LAUNCH_TIMEOUT_MS = 20_000
+
 export async function createCursorAgent(
   token: string,
   options: CreateCursorAgentOptions,
@@ -281,6 +283,9 @@ export async function createCursorAgent(
   const body = await cursorRequest(token, '/agents', {
     method: 'POST',
     redirect: 'manual',
+    // 20s client abort, well inside the 45s attach lease. An abort throws (cursor_unreachable) and launchCursorAgent
+    // classifies it maybe_launched -> launch_unconfirmed: the POST may have landed, so the key is never re-launched.
+    signal: AbortSignal.timeout(CURSOR_LAUNCH_TIMEOUT_MS),
     body: JSON.stringify(payload),
   })
   return parseAgentResult(body)
