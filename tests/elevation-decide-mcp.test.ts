@@ -301,6 +301,8 @@ describe('elevation_decide — human MCP approval through the shared decision fu
     const id = await request(['action:project_status'])
     await adminWebSession()
     await refused({ ...adminAuth(), tokenId: 'tok-im' }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
+    // and the reverse: an auth object saying im over a workspace row is refused too (both must agree)
+    await refused({ ...adminAuth(), channel: 'im' }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
     await refused({ ...adminAuth(), tokenId: 'tok-dash' }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
     await refused({ ...adminAuth(), tokenId: 'no-such-token' }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
     await refused({ ...adminAuth(), tokenId: undefined }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
@@ -461,5 +463,18 @@ describe('elevation_decide — human MCP approval through the shared decision fu
     // a different credential has its own budget
     await invokeTool(dashAuth(), env, 'elevation_decide', { request_id: id, decision: 'approve' }, BASE)
     expect(await receipts()).toBe(REFUSAL_RECEIPTS_PER_MIN + 1)
+  })
+
+  it('the success receipt id always names a real row: on a receipt conflict the EXISTING row id is returned, never a phantom id', async () => {
+    const id = await request(['action:project_status'])
+    await adminWebSession()
+    await env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (id, tenant, principal_kind, principal_id, member_id, origin, handler, operation, target_kind, target_id, request_id, evidence_json, recorded_at)
+       VALUES ('pre-existing-receipt', ?1, 'member', ?2, ?2, 'mcp', 'elevation_decide', 'approve', 'elevation_request', ?3, ?4, '{}', datetime('now'))`,
+    ).bind(TENANT, ADMIN, id, `elevation-decide:${id}`).run()
+    const ok = await invokeTool(adminAuth(), env, 'elevation_decide', { request_id: id, decision: 'approve' }, BASE)
+    expect(ok.ok).toBe(true)
+    expect((ok.result as { audit_receipt_id: string }).audit_receipt_id).toBe('pre-existing-receipt')
+    expect(await receipts('approve')).toBe(1)
   })
 })
