@@ -212,6 +212,9 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   presence_deregister: MUT('deregisterModule UPDATE module_registry deactivates the module (registry/service.ts:449)'),
   presence_list: RO('listPresence/listOwnModules SELECT only (registry/service.ts:466,493)'),
 
+  // ── seeds ──────────────────────────────────────────────────────────────────────────────────
+  seed_attach: RO('validateSeed is pure; projects SELECT only; dry_run:false answers 501 without writing (mcp/seed.ts)'),
+
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────
   define_circuit: ADD('defineCircuit batch INSERT circuits/nodes/edges (addons/workflow-circuits/service.ts:284-303)'),
   advance_node: MUT('advanceNode UPDATE workflow_circuit_nodes.done_state + INSERT events (workflow-circuits/service.ts:443,447)'),
