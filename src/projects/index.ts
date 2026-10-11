@@ -23,7 +23,7 @@ import {
 } from './service'
 import type { ProjectMutationError, UpdateProjectInput } from './service'
 import { projectSelectSql } from './columns'
-import { deployProject } from './deploy'
+import { deployErrorStatus, deployProject } from './deploy'
 import { startProject, defaultStartGateDeps } from './start-gate'
 import { stripExternalLifecycleFields } from './lifecycle-input'
 import {
@@ -485,8 +485,7 @@ projectsApp.post('/:id/deploy', async (c) => {
   const body = await jsonObject(c)
   const result = await deployProject(c.env, c.req.param('id'), c.get('auth'), body ?? {})
   if (!result.ok) {
-    const status = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
-    return c.json({ error: result.error }, status)
+    return c.json({ error: result.error }, deployErrorStatus(result.error))
   }
   return c.json({
     deployment: result.deployment,

@@ -17,7 +17,7 @@ import {
 } from '../projects/service'
 import type { ProjectMutationError } from '../projects/service'
 import { projectSelectSql } from '../projects/columns'
-import { deployProject } from '../projects/deploy'
+import { deployErrorStatus, deployProject } from '../projects/deploy'
 import { defaultStartGateDeps, startProject } from '../projects/start-gate'
 import { isSquadArchived } from '../hygiene/filters'
 import { stripExternalLifecycleFields } from '../projects/lifecycle-input'
@@ -744,13 +744,19 @@ const toolProjectDeploy: ToolSpec = {
   name: 'project_deploy',
   scope: 'workspace project worker deploy',
   min: 'admin',
-  args: '{ project_id: string, commit_sha?: string, prompt?: string }',
+  args: '{ project_id: string, commit_sha?: string, prompt?: string, canary_receipt?: string, rollback?: string }' +
+    ' -- canary_receipt and rollback are REQUIRED when the project is seed-attached (created by seed_attach):' +
+    ' canary_receipt is the id of a task in this project gated by gate:canary, approved within the last 24 hours by someone other than the caller;' +
+    ' rollback is a non-empty line saying how to undo the deploy. Refusals: canary_receipt_required | canary_receipt_not_found | canary_receipt_wrong_project |' +
+    ' canary_receipt_not_canary | canary_receipt_not_passed | canary_receipt_stale | canary_receipt_self_certified | rollback_required (all 409).',
   inputSchema: {
     type: 'object',
     properties: {
       project_id: STRING_SCHEMA,
       commit_sha: STRING_SCHEMA,
       prompt: STRING_SCHEMA,
+      canary_receipt: STRING_SCHEMA,
+      rollback: STRING_SCHEMA,
     },
     required: ['project_id'],
     additionalProperties: false,
@@ -763,11 +769,10 @@ const toolProjectDeploy: ToolSpec = {
     const result = await deployProject(env, projectId, auth, {
       commit_sha: args.commit_sha,
       prompt: args.prompt,
+      canary_receipt: args.canary_receipt,
+      rollback: args.rollback,
     })
-    if (!result.ok) {
-      const code = result.error === 'project_not_found' ? 404 : result.error === 'receipt_failed' ? 409 : 400
-      return fail(code, result.error)
-    }
+    if (!result.ok) return fail(deployErrorStatus(result.error), result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.project.id, {
       status: result.project.status,
     })

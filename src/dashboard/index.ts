@@ -294,7 +294,7 @@ import { makeAccountApp } from './account'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
-import { deployProject } from '../projects/deploy'
+import { deployProject, isDeployPolicyError } from '../projects/deploy'
 import { studioDispatchPath } from '../projects/urls'
 import {
   copilotDrawerCss,
@@ -1535,6 +1535,11 @@ dashboardApp.post('/projects/:id/deploy', async (c) => {
   if (!result.ok) {
     if (result.error === 'project_not_found') {
       return c.html(shell(c.env, 'Project not found', projectNotFoundBody()), 404)
+    }
+    if (isDeployPolicyError(result.error)) {
+      // A seed-attached project needs a canary receipt and a rollback line, which this one-click
+      // form cannot carry: say so plainly instead of a bare code.
+      return c.html(shell(c.env, 'Projects', errorBody(`Deploy refused (${result.error}): a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool or POST /api/projects/:id/deploy with canary_receipt and rollback.`)), 409)
     }
     return c.html(shell(c.env, 'Projects', errorBody(`Deploy failed: ${result.error}`)), 400)
   }

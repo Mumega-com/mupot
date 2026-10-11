@@ -1,0 +1,260 @@
+// tests/project-deploy-policy.test.ts — policy rule 5: a deploy-class action on a SEED-ATTACHED project
+// needs a canary receipt and a rollback line, refused in the tool with a distinct error code each.
+//
+// The project is made seed-attached by running the REAL seed_attach apply (not by inserting a row), and
+// the canary receipt is a REAL task approved through the REAL verdict write. Every deploy entry point
+// is exercised: deployProject, the project_deploy MCP tool, POST /api/projects/:id/deploy, and the
+// dashboard deploy button. Each refusal asserts nothing was written (no deploy_status flip, no task,
+// no flight, no deployment receipt).
+
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
+import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+
+const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
+vi.mock('../src/auth', () => ({
+  requireAuth: async (
+    c: { get: (key: 'auth') => AuthContext | undefined; set: (key: 'auth', value: AuthContext) => void; json: (body: unknown, status: 401) => Response },
+    next: () => Promise<void>,
+  ) => {
+    if (!authState.current) return c.json({ error: 'unauthenticated' }, 401)
+    c.set('auth', authState.current)
+    await next()
+  },
+}))
+
+const { invokeTool, TOOLS } = await import('../src/mcp/index')
+const { deployProject, CANARY_GATE_OWNER, CANARY_RECEIPT_MAX_AGE_HOURS } = await import('../src/projects/deploy')
+const { writeVerdict } = await import('../src/tasks/service')
+const { projectsApp } = await import('../src/projects')
+const { dashboardApp } = await import('../src/dashboard')
+
+const TENANT = 'tenant-a'
+const MASTER = 'a1'.repeat(32)
+const ORIGIN = 'https://pot.test'
+const seedText = readFileSync(join(__dirname, '..', 'docs', 'examples', 'seeds', 'mumega-com.seed.yaml'), 'utf8')
+const ROLLBACK = 'Revert the release commit and redeploy the previous build.'
+
+const grant = (capability: CapabilityGrant['capability']): CapabilityGrant =>
+  ({ member_id: 'n/a', scope_type: 'org', scope_id: null, capability }) as CapabilityGrant
+const adminAuth = (memberId: string): AuthContext => ({
+  userId: memberId, email: `${memberId}@example.test`, role: 'owner', tenant: TENANT, channel: 'workspace',
+  memberId, capabilities: [grant('admin')], boundAgentId: null,
+})
+const deployer = adminAuth('adm')
+
+let harness: SqliteD1Harness
+let env: Env
+let projectId: string
+let otherProjectId: string
+
+function sql<T>(text: string, ...params: unknown[]): T[] {
+  return harness.sqlite.prepare(text).all(...(params as never[])) as T[]
+}
+
+/** A real seed apply: returns the seed-attached project id. */
+async function applySeed(): Promise<string> {
+  const dry = (await invokeTool(deployer, env, 'seed_attach', { seed: seedText }, ORIGIN)) as unknown as { ok: boolean; result: { requests: Array<{ key: string }>; accept_token: string } }
+  expect(dry.ok).toBe(true)
+  const res = (await invokeTool(deployer, env, 'seed_attach', {
+    seed: seedText, dry_run: false, accept: dry.result.requests.map((r) => r.key), accept_token: dry.result.accept_token,
+  }, ORIGIN)) as unknown as { ok: boolean; result: { project_id: string } }
+  expect(res.ok, JSON.stringify(res)).toBe(true)
+  const row = harness.sqlite.prepare(`SELECT project_id FROM project_seeds`).get() as { project_id: string }
+  harness.sqlite.prepare(`UPDATE projects SET repo_url = 'https://github.com/example-org/example-site' WHERE id = ?`).run(row.project_id)
+  // Give the project a worker squad with an active agent so a deploy actually dispatches a task + flight.
+  const squad = (harness.sqlite.prepare(`SELECT squad_id FROM project_squad_access WHERE project_id = ? LIMIT 1`).get(row.project_id) as { squad_id: string }).squad_id
+  harness.sqlite.prepare(`UPDATE projects SET assigned_squad_id = ? WHERE id = ?`).run(squad, row.project_id)
+  harness.sqlite.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-deploy', ?, 'agent-deploy', 'D', 'r', 'm', 'active')`).run(squad)
+  return row.project_id
+}
+
+let seq = 0
+/** A task in `project` gated by `gate`, put in review and given a REAL verdict by `decidedBy`. */
+async function canaryTask(opts: {
+  project?: string; gate?: string; verdict?: 'approved' | 'rejected' | null; decidedBy?: string
+  decidedAgoHours?: number; reverse?: boolean
+} = {}): Promise<string> {
+  const id = `canary-${++seq}`
+  const project = opts.project ?? projectId
+  // A task may only sit in a project whose access list includes its squad (a DB trigger).
+  const squad = (harness.sqlite.prepare(
+    `SELECT squad_id FROM project_squad_access WHERE project_id = ? LIMIT 1`,
+  ).get(project) as { squad_id: string }).squad_id
+  harness.sqlite.prepare(
+    `INSERT INTO tasks (id, squad_id, project_id, title, body, done_when, status, gate_owner, assignee_agent_id, created_at, updated_at)
+     VALUES (?, ?, ?, 'canary', 'b', 'canary green', 'review', ?, NULL, datetime('now'), datetime('now'))`,
+  ).run(id, squad, project, opts.gate ?? CANARY_GATE_OWNER)
+  const verdict = opts.verdict === undefined ? 'approved' : opts.verdict
+  if (verdict) {
+    const task = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(id) as never
+    // Verdict rows are append-only, so an old approval is made by writing the verdict "in the past".
+    if (opts.decidedAgoHours !== undefined) vi.useFakeTimers({ toFake: ['Date'], now: Date.now() - opts.decidedAgoHours * 3_600_000 })
+    try {
+      await writeVerdict(env, { task, verdict, note: null, decidedBy: opts.decidedBy ?? 'canary-approver' })
+    } finally {
+      vi.useRealTimers()
+    }
+    if (opts.reverse) {
+      harness.sqlite.prepare(`UPDATE task_verdicts SET reversed_at = datetime('now') WHERE task_id = ?`).run(id)
+      harness.sqlite.prepare(`UPDATE tasks SET status = 'review' WHERE id = ?`).run(id)
+    }
+  }
+  return id
+}
+
+function writes(): string {
+  const n = (t: string) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n
+  const status = (harness.sqlite.prepare(`SELECT deploy_status FROM projects WHERE id = ?`).get(projectId) as { deploy_status: string }).deploy_status
+  return JSON.stringify({ deployments: n('project_deployments'), tasks: n('tasks'), flights: n('flights'), status })
+}
+
+beforeEach(async () => {
+  harness = createSqliteD1()
+  applyAllMigrations(harness.sqlite)
+  harness.sqlite.exec(`
+    INSERT INTO org_settings (key, value) VALUES ('billing_state', '{"tier":"scale"}');
+    INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
+    INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'a', 'A');
+    INSERT INTO members (id, email, display_name, status, tenant) VALUES
+      ('adm', 'adm@example.test', 'Adm', 'active', '${TENANT}'),
+      ('canary-approver', 'ca@example.test', 'CA', 'active', '${TENANT}');
+    INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-x', 'squad-a', 'agent-x', 'X', 'r', 'm', 'active');
+    INSERT INTO projects (id, slug, name, status, repo_url, created_at, updated_at)
+      VALUES ('plain-project', 'plain', 'Plain', 'active', 'https://github.com/example-org/plain', datetime('now'), datetime('now'));
+    INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('plain-project', 'squad-a', 'write');
+  `)
+  env = { DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: MASTER, RELEASE_SHA: 'b'.repeat(7) + '1' } as Env
+  projectId = await applySeed()
+  otherProjectId = 'plain-project'
+})
+afterEach(() => {
+  authState.current = null
+  harness.close()
+})
+
+const deploy = (input: Record<string, unknown>) => deployProject(env, projectId, deployer, input)
+
+describe('policy rule 5 — a seed-attached project needs a canary receipt and a rollback line', () => {
+  it('the project really is seed-attached (setup guard: the policy is in force)', () => {
+    expect(sql<{ project_id: string }>('SELECT project_id FROM project_seeds')[0]?.project_id).toBe(projectId)
+  })
+
+  it('HAPPY PATH: a fresh, independent, approved canary of the same project plus a rollback line deploys', async () => {
+    const receipt = await canaryTask()
+    const res = await deploy({ canary_receipt: receipt, rollback: ROLLBACK, prompt: 'Ship it' })
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+    // The evidence travels with the work: the dispatched task body and the flight meta carry it.
+    const body = (sql<{ body: string }>(`SELECT body FROM tasks WHERE body LIKE '%source: project-worker-deploy%'`)[0])?.body ?? ''
+    expect(body).toContain(`canary_receipt: ${receipt}`)
+    expect(body).toContain(`rollback: ${ROLLBACK}`)
+    expect(JSON.stringify(sql<{ meta: string }>('SELECT meta FROM flights'))).toContain(receipt)
+  })
+
+  describe('refusals, each with its own code and NO write', () => {
+    const cases: Array<[string, () => Promise<Record<string, unknown>>, string]> = [
+      ['no canary_receipt', async () => ({ rollback: ROLLBACK }), 'canary_receipt_required'],
+      ['blank canary_receipt', async () => ({ canary_receipt: '   ', rollback: ROLLBACK }), 'canary_receipt_required'],
+      ['non-string canary_receipt', async () => ({ canary_receipt: 42, rollback: ROLLBACK }), 'canary_receipt_required'],
+      ['unknown receipt id', async () => ({ canary_receipt: 'no-such-task', rollback: ROLLBACK }), 'canary_receipt_not_found'],
+      ['a canary of ANOTHER project', async () => ({ canary_receipt: await canaryTask({ project: otherProjectId }), rollback: ROLLBACK }), 'canary_receipt_wrong_project'],
+      ['an approved task that is NOT a canary (other gate)', async () => ({ canary_receipt: await canaryTask({ gate: 'gate:review' }), rollback: ROLLBACK }), 'canary_receipt_not_canary'],
+      ['a canary still in review (no verdict)', async () => ({ canary_receipt: await canaryTask({ verdict: null }), rollback: ROLLBACK }), 'canary_receipt_not_passed'],
+      ['a canary that was REJECTED', async () => ({ canary_receipt: await canaryTask({ verdict: 'rejected' }), rollback: ROLLBACK }), 'canary_receipt_not_passed'],
+      ['a canary approval that was later REVERSED', async () => ({ canary_receipt: await canaryTask({ reverse: true }), rollback: ROLLBACK }), 'canary_receipt_not_passed'],
+      ['a canary approved too long ago', async () => ({ canary_receipt: await canaryTask({ decidedAgoHours: CANARY_RECEIPT_MAX_AGE_HOURS + 1 }), rollback: ROLLBACK }), 'canary_receipt_stale'],
+      ['a canary approved by the deployer themself', async () => ({ canary_receipt: await canaryTask({ decidedBy: 'adm' }), rollback: ROLLBACK }), 'canary_receipt_self_certified'],
+      ['no rollback', async () => ({ canary_receipt: await canaryTask() }), 'rollback_required'],
+      ['blank rollback', async () => ({ canary_receipt: await canaryTask(), rollback: '  \n ' }), 'rollback_required'],
+      ['placeholder rollback', async () => ({ canary_receipt: await canaryTask(), rollback: 'TBD' }), 'rollback_required'],
+      ['oversized rollback', async () => ({ canary_receipt: await canaryTask(), rollback: 'x '.repeat(400) }), 'rollback_required'],
+    ]
+    for (const [label, build, error] of cases) {
+      it(`${label} -> ${error}`, async () => {
+        const input = await build()
+        const before = writes()
+        expect(await deploy(input)).toEqual({ ok: false, error })
+        expect(writes()).toBe(before)
+      })
+    }
+  })
+
+  describe('a row set that disagrees with itself fails closed (each condition is independently exercised)', () => {
+    it('an approved canary that later reached done still vouches', async () => {
+      const id = await canaryTask()
+      harness.sqlite.prepare(`UPDATE tasks SET status = 'done' WHERE id = ?`).run(id)
+      expect((await deploy({ canary_receipt: id, rollback: ROLLBACK })).ok).toBe(true)
+    })
+    it('status not approved/done, even with an un-reversed approval on file', async () => {
+      for (const status of ['review', 'in_progress', 'open', 'rejected']) {
+        const id = await canaryTask()
+        harness.sqlite.prepare(`UPDATE tasks SET status = ? WHERE id = ?`).run(status, id)
+        expect(await deploy({ canary_receipt: id, rollback: ROLLBACK }), status).toEqual({ ok: false, error: 'canary_receipt_not_passed' })
+      }
+    })
+    it('a reversed verdict on a row whose status was not reset', async () => {
+      const id = await canaryTask()
+      harness.sqlite.prepare(`UPDATE task_verdicts SET reversed_at = datetime('now') WHERE task_id = ?`).run(id)
+      expect(await deploy({ canary_receipt: id, rollback: ROLLBACK })).toEqual({ ok: false, error: 'canary_receipt_not_passed' })
+    })
+    it('a latest verdict that is a rejection on a row whose status says approved', async () => {
+      const id = await canaryTask({ verdict: 'rejected' })
+      harness.sqlite.prepare(`UPDATE tasks SET status = 'approved' WHERE id = ?`).run(id)
+      expect(await deploy({ canary_receipt: id, rollback: ROLLBACK })).toEqual({ ok: false, error: 'canary_receipt_not_passed' })
+    })
+  })
+
+  it('the freshness boundary: just inside the window passes, just outside is stale', async () => {
+    const inside = await canaryTask({ decidedAgoHours: CANARY_RECEIPT_MAX_AGE_HOURS - 0.5 })
+    expect((await deploy({ canary_receipt: inside, rollback: ROLLBACK })).ok).toBe(true)
+  })
+
+  it('a project that is NOT seed-attached is unaffected (no live caller breaks)', async () => {
+    const res = await deployProject(env, otherProjectId, deployer, {})
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+  })
+
+  describe('every deploy entry point goes through the same check', () => {
+    it('MCP project_deploy: 409 with the code; with evidence it succeeds', async () => {
+      const refused = await invokeTool(deployer, env, 'project_deploy', { project_id: projectId }, ORIGIN)
+      expect(refused).toMatchObject({ ok: false, status: 409, error: 'canary_receipt_required' })
+      const receipt = await canaryTask()
+      const refused2 = await invokeTool(deployer, env, 'project_deploy', { project_id: projectId, canary_receipt: receipt }, ORIGIN)
+      expect(refused2).toMatchObject({ ok: false, status: 409, error: 'rollback_required' })
+      const ok = await invokeTool(deployer, env, 'project_deploy', { project_id: projectId, canary_receipt: receipt, rollback: ROLLBACK }, ORIGIN)
+      expect(ok).toMatchObject({ ok: true })
+    })
+
+    it('REST POST /api/projects/:id/deploy: 409 {error}; with evidence 201', async () => {
+      authState.current = deployer
+      const post = (body: unknown) => projectsApp.fetch(new Request(`https://pot.test/${projectId}/deploy`, {
+        method: 'POST', headers: { Origin: 'https://pot.test', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      }), env)
+      const refused = await post({})
+      expect(refused.status).toBe(409)
+      expect(await refused.json()).toEqual({ error: 'canary_receipt_required' })
+      const receipt = await canaryTask()
+      const ok = await post({ canary_receipt: receipt, rollback: ROLLBACK })
+      expect(ok.status).toBe(201)
+    })
+
+    it('dashboard deploy button: 409 with a readable message, nothing written', async () => {
+      authState.current = deployer
+      const before = writes()
+      const res = await dashboardApp.fetch(new Request(`https://pot.test/projects/${projectId}/deploy`, {
+        method: 'POST', headers: { Origin: 'https://pot.test' },
+      }), env)
+      expect(res.status).toBe(409)
+      expect(await res.text()).toContain('canary_receipt_required')
+      expect(writes()).toBe(before)
+    })
+  })
+
+  it('CLOSED LIST: the only deploy-class tool is project_deploy; a new one must be added to this policy on purpose', () => {
+    const deployClass = TOOLS.map((t) => t.name).filter((n) => /deploy|flip|go_live|canary/i.test(n)).sort()
+    expect(deployClass).toEqual(['project_deploy'])
+  })
+})
