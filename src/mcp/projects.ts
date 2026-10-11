@@ -37,7 +37,7 @@ import { loadProjectSituation } from '../projects/situation'
 import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
-import { memberOrElevatedAgent, recordElevatedUse } from './elevated-principal'
+import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
@@ -472,7 +472,7 @@ const toolProjectContext: ToolSpec = {
 
 /**
  * An agent-bound caller refused by the workspace-admin gate may change a
- * project's STATUS (and nothing else) under a live action:project_lifecycle
+ * project's STATUS (and nothing else) under a live action:project_status
  * ORG-scope grant (a squad-scoped grant is refused). Any other
  * field or a missing grant refuses with the gate's own
  * refusal (`denied`), so nothing about the target is revealed.
@@ -488,7 +488,7 @@ async function projectStatusElevation(
   if (!auth.boundAgentId || !auth.memberId || !projectId || !onlyStatus || str(args.status) === null) return { ok: false, outcome: denied }
   // ORG scope only, like project_create: a squad-scoped grant is a squad admin's
   // approval and must not change the status of a project that squad merely writes to.
-  const acting = await memberOrElevatedAgent(auth, env, 'action:project_lifecycle', { type: 'org' }, {
+  const acting = await memberOrElevatedAgent(auth, env, 'action:project_status', { type: 'org' }, {
     toolName: 'project_update',
     refusalCode: 'forbidden',
     detail: { project_id: projectId, status: args.status },
@@ -501,7 +501,7 @@ async function projectStatusElevation(
 
 const toolProjectUpdate: ToolSpec = {
   name: 'project_update',
-  scope: 'workspace project lifecycle, including archive and restore (an agent holding a live action:project_lifecycle elevation grant may change status only)',
+  scope: 'workspace project lifecycle, including archive and restore (an agent holding a live action:project_status elevation grant may change status only)',
   min: 'admin',
   args: '{ project_id: string, slug?: string, name?: string, description?: string, goal?: string, status?: "planned"|"active"|"paused"|"completed"|"archived", parent_project_id?: string|null, target_date?: string|null }',
   inputSchema: {
@@ -522,7 +522,7 @@ const toolProjectUpdate: ToolSpec = {
   async run(auth, env, args) {
     const denied = requireWorkspaceAdmin(auth, 'project_update')
     // elevationGrant: set only when this call ran under a live
-    // action:project_lifecycle grant instead of standing workspace admin.
+    // action:project_status grant instead of standing workspace admin.
     let elevationGrant: ElevationGrantRecord | undefined
     if (denied) {
       const elevated = await projectStatusElevation(auth, env, args, denied)
@@ -562,13 +562,26 @@ const toolProjectUpdate: ToolSpec = {
       }
     }
 
-    const result = await updateProject(env, projectId, input)
+    let result: Awaited<ReturnType<typeof updateProject>>
+    if (elevationGrant) {
+      // Two-phase receipt: pending row first, flipped to applied INSIDE updateProject's
+      // own UPDATE batch (atomic with the status write), failed on any refusal.
+      const receipted = await withElevationReceipt(
+        env, auth, elevationGrant, 'project_update', { project_id: projectId, status: args.status },
+        (receiptId) => updateProject(env, projectId, input, { elevationReceiptId: receiptId }),
+        (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
+        { inBatch: true },
+      )
+      if (!receipted.began) return receipted.outcome
+      result = receipted.value
+    } else {
+      result = await updateProject(env, projectId, input)
+    }
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, {
       status: result.value.status,
       ...(elevationGrant ? { elevation_grant_id: elevationGrant.id } : {}),
     })
-    if (elevationGrant) await recordElevatedUse(env, auth, elevationGrant, 'project_update', { project_id: projectId, status: args.status })
     return done({ project: result.value })
   },
 }

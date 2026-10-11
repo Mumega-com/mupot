@@ -4,7 +4,7 @@ import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../ro
 import { principalCanReadProject, routinePrincipal, type RoutinePrincipal } from '../routines/access'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
-import { memberOrElevatedAgent, recordElevatedUse } from './elevated-principal'
+import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
 import { callerHoldsGateCapability } from '../tasks/index'
 import { hasCapability } from '../auth/capability'
 import { publicRoutineRun } from '../routines/public'
@@ -273,7 +273,7 @@ type RoutinePolicyOperation = 'update' | 'enable' | 'pause' | 'archive'
 /**
  * The principal a routine policy mutation (update/enable/pause/archive) runs as.
  * A non-agent caller keeps its own principal. An agent-bound caller runs as a
- * member-typed principal ONLY when a live action:workspace_project elevation
+ * member-typed principal ONLY when a live action:routine_policy elevation
  * grant covers the routine's responsible squad (an org-scope grant covers every
  * non-home squad, exactly as hasElevatedAction defines it); the principal then
  * carries just the standing the grant stands in for, never more. An unknown
@@ -300,7 +300,7 @@ async function routinePolicyPrincipal(
   if (typeof destinationSquadId === 'string' && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
   let grant: ElevationGrantRecord | null = null
   for (const squadId of squads) {
-    const acting = await memberOrElevatedAgent(auth, env, 'action:workspace_project', { type: 'squad', id: squadId }, {
+    const acting = await memberOrElevatedAgent(auth, env, 'action:routine_policy', { type: 'squad', id: squadId }, {
       toolName,
       refusalCode: 'forbidden',
       detail: { routine_id: routineId, operation, squad_id: squadId },
@@ -338,8 +338,18 @@ const routineUpdate: ToolSpec = {
     if (!acting.ok) return acting.outcome
     if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
     if (!input) return fail(400, 'invalid_args')
-    const result = await updateRoutine(env, acting.principal, routineId, input)
-    if (result.ok && acting.elevation) await recordElevatedUse(env, auth, acting.elevation.grant, 'routine_update', acting.elevation.detail)
+    const principal = acting.principal
+    if (!acting.elevation) {
+      const result = await updateRoutine(env, principal, routineId, input)
+      return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
+    }
+    const receipted = await withElevationReceipt(
+      env, auth, acting.elevation.grant, 'routine_update', acting.elevation.detail,
+      () => updateRoutine(env, principal, routineId, input),
+      (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
+    )
+    if (!receipted.began) return receipted.outcome
+    const result = receipted.value
     return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
   },
 }
@@ -353,8 +363,19 @@ function lifecycle(name: 'routine_enable' | 'routine_pause' | 'routine_archive',
       const acting = await routinePolicyPrincipal(auth, env, args.routine_id, name, name.slice('routine_'.length) as RoutinePolicyOperation) // as: name is one of the three lifecycle literals, so the suffix is a RoutinePolicyOperation
       if (!acting.ok) return acting.outcome
       if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
-      const result = await operation(env, acting.principal, args.routine_id)
-      if (result.ok && acting.elevation) await recordElevatedUse(env, auth, acting.elevation.grant, name, acting.elevation.detail)
+      const principal = acting.principal
+      const routineId = args.routine_id
+      if (!acting.elevation) {
+        const result = await operation(env, principal, routineId)
+        return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
+      }
+      const receipted = await withElevationReceipt(
+        env, auth, acting.elevation.grant, name, acting.elevation.detail,
+        () => operation(env, principal, routineId),
+        (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
+      )
+      if (!receipted.began) return receipted.outcome
+      const result = receipted.value
       return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
     },
   }

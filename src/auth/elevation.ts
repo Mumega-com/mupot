@@ -1077,12 +1077,12 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   grant_agent_capability: 'action:manage_access',
   mint_agent_token: 'action:mint_token',
   create_squad: 'action:project_lifecycle',
-  routine_enable: 'action:workspace_project',
-  routine_pause: 'action:workspace_project',
-  routine_archive: 'action:workspace_project',
-  routine_update: 'action:workspace_project',
-  project_update: 'action:project_lifecycle',
-  unarchive_row: 'action:project_lifecycle',
+  routine_enable: 'action:routine_policy',
+  routine_pause: 'action:routine_policy',
+  routine_archive: 'action:routine_policy',
+  routine_update: 'action:routine_policy',
+  project_update: 'action:project_status',
+  unarchive_row: 'action:project_status',
 })
 
 /** elevationHint — the refusal hint naming request_elevation + the action key

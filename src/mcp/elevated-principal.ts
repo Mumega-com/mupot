@@ -19,16 +19,16 @@ import {
   elevationHint,
   elevationRemedyMessage,
   hasElevatedAction,
-  recordElevationUsage,
   resolveScopeDepartmentId,
   type ElevationGrantRecord,
 } from '../auth/elevation'
+import { beginElevationReceipt, finishElevationReceipt } from '../auth/elevation-receipt'
 import { fail, type ToolOutcome } from './index'
 
 /** The only two actions this gate answers for. A union (not `string`) so the
  *  hasElevatedAction call sites below keep naming their action as a literal —
  *  tests/elevation-actions-enforced.test.ts scans for exactly that. */
-export type LifecycleElevationAction = 'action:workspace_project' | 'action:project_lifecycle'
+export type LifecycleElevationAction = 'action:routine_policy' | 'action:project_status'
 
 export type ElevationTarget = { type: 'org' } | { type: 'squad'; id: string }
 
@@ -44,7 +44,7 @@ export interface ElevatedPrincipalOptions {
   refusalCode: string
   detail?: unknown
   /** false: scan targets without writing an elevation_usage_log row; the tool
-   *  then calls recordElevatedUse once, AFTER its mutation succeeds. Default true. */
+   *  then wraps its mutation in withElevationReceipt. Default true. */
   recordUsage?: boolean
 }
 
@@ -59,10 +59,10 @@ async function checkAction(
   const squadDepartmentId = target.type === 'squad' ? await resolveScopeDepartmentId(env, 'squad', target.id) : null
   const callOpts = { toolName: opts.toolName, detail: opts.detail, squadDepartmentId, recordUsage: opts.recordUsage }
   // Literal action at each call site (see LifecycleElevationAction).
-  if (action === 'action:workspace_project') {
-    return hasElevatedAction(env, auth, 'action:workspace_project', target.type, scopeId, callOpts)
+  if (action === 'action:routine_policy') {
+    return hasElevatedAction(env, auth, 'action:routine_policy', target.type, scopeId, callOpts)
   }
-  return hasElevatedAction(env, auth, 'action:project_lifecycle', target.type, scopeId, callOpts)
+  return hasElevatedAction(env, auth, 'action:project_status', target.type, scopeId, callOpts)
 }
 
 /**
@@ -99,17 +99,47 @@ export async function memberOrElevatedAgent(
 }
 
 /**
- * recordElevatedUse — the single audit row for a successful elevated call, for
- * tools that scanned with recordUsage:false. Same write path as
- * hasElevatedAction's own usage log (not swallowed: a failed log write fails
- * the call).
+ * withElevationReceipt — durable two-phase receipt around an elevated mutation
+ * (PR #1831 F2). Call ONLY after authorization passed (a refused call writes
+ * nothing). Order: INSERT a 'pending' elevation_usage_log row -> run `mutate`
+ * -> resolve the row.
+ *  - the pending INSERT fails: `mutate` is never called, the tool refuses.
+ *  - `mutate` reports not-applied (or throws): the row becomes 'failed' with the
+ *    error code (never left 'pending').
+ *  - applied: when the mutation's own D1 batch carried the flip
+ *    (inBatch: true, via appliedReceiptStatement) nothing more is written;
+ *    otherwise the row is flipped to 'applied' right after the mutation.
+ * A row that still ends up 'pending' is surfaced by elevation_status as
+ * stuck_receipts after 10 minutes.
  */
-export async function recordElevatedUse(
+export async function withElevationReceipt<R>(
   env: Env,
   auth: AuthContext,
   grant: ElevationGrantRecord,
   toolName: string,
   detail: unknown,
-): Promise<void> {
-  await recordElevationUsage(env, auth.tenant, grant.id, grant.agent_session_id, grant.action, toolName, detail, Date.now())
+  mutate: (receiptId: string) => Promise<R>,
+  classify: (result: R) => { applied: true } | { applied: false; code: string },
+  opts: { inBatch?: boolean } = {},
+): Promise<{ began: true; value: R } | { began: false; outcome: ToolOutcome }> {
+  let receiptId: string
+  try {
+    receiptId = await beginElevationReceipt(env, auth.tenant, grant, toolName, detail)
+  } catch {
+    return { began: false, outcome: fail(500, 'elevation_receipt_failed', 'the elevation audit receipt could not be written; nothing was changed') }
+  }
+  let value: R
+  try {
+    value = await mutate(receiptId)
+  } catch (err) {
+    await finishElevationReceipt(env, receiptId, { status: 'failed', errorCode: 'exception' }).catch(() => undefined)
+    throw err
+  }
+  const verdict = classify(value)
+  if (!verdict.applied) {
+    await finishElevationReceipt(env, receiptId, { status: 'failed', errorCode: verdict.code })
+  } else if (!opts.inBatch) {
+    await finishElevationReceipt(env, receiptId, { status: 'applied' })
+  }
+  return { began: true, value }
 }
