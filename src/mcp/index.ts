@@ -81,7 +81,6 @@ import {
   assertCompletableDoneWhen,
   assigneeCannotMutateOwnAssignment,
   assigneeChangesInReview,
-  assigneeColumnsDiffer,
   assigneeSelfClose,
   checkTransition,
   createTask,
@@ -1912,10 +1911,6 @@ const toolTaskUpdate: ToolSpec = {
     // lets a non-party appoint itself. Also enforced in persistTaskUpdate and in the UPDATE's WHERE.
     if (assigneeChangesInReview(existing, next)) {
       return fail(409, 'assignee_frozen_in_review', 'a task in review has a frozen assignee; move it out of review first')
-    }
-    // A verdict reversal restores the same work to review; it must not also pick the assignee.
-    if (reversesVerdict && assigneeColumnsDiffer(existing, next)) {
-      return fail(409, 'assignee_change_with_reversal', 'reverse the verdict first; the assignee cannot change in the same call')
     }
     // Hoisted: the receipt write after the update commits needs both, and the
     // gate_owner block below is where they are decided.

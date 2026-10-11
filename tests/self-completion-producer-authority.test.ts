@@ -151,6 +151,36 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect((await verdict(adminAuth())).ok).toBe(true)
   })
 
+  it('only the LATEST ledger row is the producer: an earlier submitter who is the assignee again is refused', async () => {
+    sql().prepare(`UPDATE tasks SET assignee_agent_id = 'G' WHERE id = ?`).run(TASK)
+    await produce('G') // G's row is first
+    sql().prepare(`UPDATE tasks SET status = 'rejected', assignee_agent_id = 'A', execution_receipt_id = NULL WHERE id = ?`).run(TASK)
+    await produce('A')
+    expect(submitters()).toEqual(['G', 'A'])
+    sql().prepare(`UPDATE tasks SET assignee_agent_id = 'G' WHERE id = ?`).run(TASK) // outside task_update
+    const res = await verdict(agentAuth('G'))
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+    expect(verdictRows()).toBe(0)
+  })
+
+  it('a result cleared by rework ends the exemption even for the latest producer (no result, no authority at the write)', async () => {
+    await produce('A')
+    const t = sql().prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+    sql().prepare(`UPDATE tasks SET result = NULL WHERE id = ?`).run(TASK)
+    // the pre-check snapshot said producer; the write re-reads and refuses
+    await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'A' })).rejects.toBeInstanceOf(VerdictIndependenceError)
+    expect(verdictRows()).toBe(0)
+  })
+
+  it('a MEMBER whose id equals the producer-assignee agent id is not the agent (type is checked at the pre-check)', async () => {
+    await produce('A')
+    const res = await verdict({
+      userId: 'A', email: 'a@test.com', role: 'member', tenant: TENANT, memberId: 'A', capabilities: FLOOR, boundAgentId: null,
+    } as AuthContext)
+    expect(res).toMatchObject({ ok: false, error: 'self_verdict' })
+    expect(verdictRows()).toBe(0)
+  })
+
   // ── the probed bypass: reject -> G reassigns -> in_progress -> review -> verdict ─
   it('MCP: the full probed lap is stopped at -> review (no fresh submission), and nothing G does lands a verdict', async () => {
     await rejectedAfterProducedByA()
@@ -243,6 +273,12 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
       remember: async () => undefined,
       meter: { checkAndReserve: async () => ({ ok: true }), recordTokens: async () => undefined } as unknown as ExecuteDeps['meter'],
     }
+    await runTaskExecution(env, agentRow('A'), TASK, deps)
+    expect(seen).toEqual([null])
+
+    // and out of an UNASSIGNED rejected task (the other claim statement)
+    sql().prepare(`UPDATE tasks SET status = 'rejected', result = 'y', execution_receipt_id = NULL, assignee_agent_id = NULL WHERE id = ?`).run(TASK)
+    seen.length = 0
     await runTaskExecution(env, agentRow('A'), TASK, deps)
     expect(seen).toEqual([null])
   })
