@@ -12,6 +12,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { verifyAccessJwt, resetAccessJwksCache, type AccessJwtConfig } from '../src/access/jwt'
 import { approveApp } from '../src/access/routes'
+import { approvalHostGate } from '../src/access/host-gate'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest } from '../src/auth/elevation'
 import { approveUrl, accessApproveStatus } from '../src/access/config'
@@ -756,5 +757,22 @@ describe('authority before any write', () => {
     const res = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf: t ?? '', decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' } })
     expect(res.status).toBe(409)
     expect(count('web_sessions')).toBe(0)
+  })
+})
+
+describe('approvalHostGate (the first statement of the worker fetch)', () => {
+  const g = (host: string, path: string, e: Env = env) => approvalHostGate(new Request(`https://${host}${path}`), e)
+  it('approval host: only /approve/* continues; colony host: /approve/* is stopped at the gate itself', () => {
+    expect(g(HOST, '/approve/seed/x')).toBeNull()
+    expect(g(HOST, '/mcp')?.status).toBe(404)
+    expect(g(HOST, '/preview/p/x')?.status).toBe(404)
+    expect(g('colony.example.test', '/approve/seed/x')?.status).toBe(404)
+    expect(g('colony.example.test', '/%61pprove/seed/x')?.status).toBe(404)
+    expect(g('colony.example.test', '/mcp')).toBeNull()
+  })
+  it('flag off: inert', () => {
+    const off = baseEnv({ ACCESS_APPROVE_ENABLED: undefined })
+    expect(g(HOST, '/mcp', off)).toBeNull()
+    expect(g(HOST, '/approve/seed/x', off)).toBeNull()
   })
 })
