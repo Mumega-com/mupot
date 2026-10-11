@@ -1672,7 +1672,7 @@ export class VerdictIndependenceError extends Error {
  * assignee column alone is not authority: it is writable by any squad member+ outside review, so
  * an exemption keyed on it is only as narrow as whoever can write it. No ledger row, or a result
  * cleared by rework, means NO exemption (the decider is then judged like on any other lane).
- * `taskIdExpr` / `deciderParam` are SQL expressions; the fragment binds the decider TWICE.
+ * `taskIdExpr` is a SQL expression; bind selfCompletionProducerParams(decider, tenant) (4 values) for the fragment.
  */
 export function selfCompletionProducerSql(taskIdExpr: string): string {
   // Bound to the CURRENT result: the latest ledger row (this tenant, MAX(seq)) must be the
