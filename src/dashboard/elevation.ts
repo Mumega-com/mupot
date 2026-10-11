@@ -627,7 +627,7 @@ function grantsScript(): Html {
               var ul = document.createElement('ul');
               list.forEach(function (u) {
                 var li = document.createElement('li');
-                var bits = [(u.occurred_at || ''), (u.tool_name || u.action || '')];
+                var bits = [(u.occurred_at || ''), (u.tool_name || u.action || ''), (u.outcome || 'Pending (not yet confirmed)')];
                 if (u.detail) { try { bits.push(JSON.stringify(u.detail)); } catch (e) {} }
                 li.textContent = bits.join(' — ');
                 ul.appendChild(li);

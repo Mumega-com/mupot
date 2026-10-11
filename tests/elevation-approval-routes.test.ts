@@ -13,6 +13,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest, loadElevationGrantById } from '../src/auth/elevation'
+import { beginElevationReceipt, finishElevationReceipt } from '../src/auth/elevation-receipt'
 
 const TENANT = 'local'
 const DEPT = 'dept-1'
@@ -359,5 +360,33 @@ describe('elevation approval — integration through authApp (real D1)', () => {
 
     const grant = await loadElevationGrantById(adminEnv, TENANT, grantId)
     expect(grant?.revoked_at).toBeNull()
+  })
+
+  it('P1-B: GET /elevation/:id/usage renders status + error_code + resolved_at; only applied reads as applied', async () => {
+    const env = makeEnv('admin@x.test')
+    const { session } = await seedFixture(env)
+    const request = await seedPendingRequest(env, session.id, ['action:project_lifecycle'])
+    const cookie = await devLogin(env)
+    const decideRes = await authApp.request(
+      `/elevation/requests/${request.id}/decide`,
+      { method: 'POST', headers: { cookie: `mupot_session=${cookie}`, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'approve', actions: ['action:project_lifecycle'] }) },
+      env,
+    )
+    const grantId = ((await decideRes.json()) as { grants: Array<{ id: string }> }).grants[0].id
+    const grant = (await loadElevationGrantById(env, TENANT, grantId))!
+    const applied = await beginElevationReceipt(env, TENANT, grant, 'create_squad', { n: 1 }, Date.parse('2026-10-01T00:00:01Z'))
+    await finishElevationReceipt(env, applied, { status: 'applied' })
+    const failed = await beginElevationReceipt(env, TENANT, grant, 'routine_pause', { n: 2 }, Date.parse('2026-10-01T00:00:02Z'))
+    await finishElevationReceipt(env, failed, { status: 'failed', errorCode: 'invalid_state' })
+    const pending = await beginElevationReceipt(env, TENANT, grant, 'create_squad', { n: 3 }, Date.parse('2026-10-01T00:00:03Z'))
+
+    const res = await authApp.request(`/elevation/${grantId}/usage`, { headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { usage: Array<{ id: string; status: string; error_code: string | null; resolved_at: string | null; outcome: string }> }
+    const by = (id: string) => body.usage.find((u) => u.id === id)!
+    expect(by(applied)).toMatchObject({ status: 'applied', error_code: null, outcome: 'Applied' })
+    expect(by(applied).resolved_at).not.toBeNull()
+    expect(by(failed)).toMatchObject({ status: 'failed', error_code: 'invalid_state', outcome: 'Failed (invalid_state)' })
+    expect(by(pending)).toMatchObject({ status: 'pending', resolved_at: null, outcome: 'Pending (not yet confirmed)' })
   })
 })
