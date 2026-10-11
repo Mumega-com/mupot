@@ -214,7 +214,7 @@ describe('Pre-dispatch Reservation & Idempotency', () => {
     expect(row?.vendor_agent_id).toBe(AGENT_ID)
     expect(row?.vendor_run_id).toBe(RUN_ID)
 
-    const task = harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(reserved.task.id) as { body: string }
+    const task = harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(reserved.task?.id) as { body: string }
     expect(task.body).toContain(`cursor_agent: ${AGENT_ID}`)
     expect(task.body).toContain(`cursor_run: ${RUN_ID}`)
     expect(task.body).toContain(`cursor_url: ${AGENT_URL}`)
@@ -321,14 +321,14 @@ describe('Pre-dispatch Reservation & Idempotency', () => {
     expect(waitUntilMock).toHaveBeenCalled()
 
     // Before background promise finishes: D1 reservation is already stored and attaching
-    const reservationBefore = await getReservationByIdempotency(env, 'cursor-cloud', 'async-key-01')
+    const reservationBefore = await getReservationByIdempotency(env, 'cursor-cloud', 'squad-core', 'async-key-01')
     expect(['reserved', 'attaching']).toContain(reservationBefore?.state)
 
     // Now resolve background tasks
     await Promise.all(backgroundPromises)
 
     // After background attach finishes: vendor IDs are bound
-    const reservationAfter = await getReservationByIdempotency(env, 'cursor-cloud', 'async-key-01')
+    const reservationAfter = await getReservationByIdempotency(env, 'cursor-cloud', 'squad-core', 'async-key-01')
     expect(reservationAfter?.state).toBe('attached')
     expect(reservationAfter?.vendor_agent_id).toBe(AGENT_ID)
   })
@@ -400,11 +400,12 @@ describe('Pre-dispatch Reservation & Idempotency', () => {
       reserveCursorCloudWork(env, req),
     ])
 
-    expect(first.task.id).toBeDefined()
-    expect(second.task.id).toBeDefined()
-    // Both callers agree on the canonical reservation ID (no orphan local UUID)
+    // Insert-first: exactly one caller owns Task + Flight; the loser replays the row (task null = not yet bound, or
+    // the winner's ids once bound). Both agree on the canonical reservation ID.
+    const winner = first.replay ? second : first
+    expect(winner.task?.id).toBeDefined()
+    expect(winner.flight?.id).toBeDefined()
     expect(first.reservationId).toBe(second.reservationId)
-    expect(first.flight.id).toBe(second.flight.id)
     const exactlyOneReplay = (first.replay && !second.replay) || (!first.replay && second.replay)
     expect(exactlyOneReplay).toBe(true)
   })
@@ -422,6 +423,7 @@ describe('Grokbot Harness Adapter', () => {
       agentId: 'agent-builder',
       actor: { kind: 'member', id: 'member-builder' },
       idempotencyKey: 'grok-review-01',
+      dryRun: false,
     })
 
     expect(outcome.accepted).toBe(true)
@@ -438,6 +440,7 @@ describe('Grokbot Harness Adapter', () => {
       title: string
       body: string
     }
+    expect(row?.vendor_run_id).toBe(outcome.vendorRunId) // really stored, not a fabricated id
     expect(task.title).toBe('Grok Review PR')
     expect(task.body).toContain('harness: grok-cli')
   })

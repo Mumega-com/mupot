@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cursorCloudAdapter } from '../src/harness/adapters/cursor'
-import { recordCursorCloudWork, reserveCursorCloudWork } from '../src/cursor/dispatch'
+import { reserveCursorCloudWork } from '../src/cursor/dispatch'
 import { bindVendorExecutionWithTaskBinding, claimAttachLease, getReservation } from '../src/harness/reservations'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
@@ -56,13 +56,67 @@ describe('idempotency key guard (mutation-proven)', () => {
     expect(count(harness, 'tasks')).toBe(1)
   })
 
-  it('same key raced concurrently: one reservation row, exactly one replay flag', async () => {
+  it('forced interleave: both callers pass the lookup together -> 1 reservation, 1 task, 1 flight, 1 vendor call', async () => {
+    // The sqlite harness serializes calls, so a plain Promise.all never interleaves. Barrier the idempotency LOOKUP
+    // (any SELECT on harness_reservations by idempotency_key): the first caller to reach it waits for the second
+    // (or 25ms), so with a lookup-then-insert ordering BOTH would pass the lookup before either inserted.
     const { harness, env } = setup()
-    const [a, b] = await Promise.all([reserveCursorCloudWork(env, req), reserveCursorCloudWork(env, req)])
-    expect(a.reservationId).toBe(b.reservationId)
+    let arrived = 0
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const barrier = async () => {
+      arrived += 1
+      if (arrived >= 2) release()
+      await Promise.race([gate, new Promise((resolve) => setTimeout(resolve, 25))])
+    }
+    const realDb = env.DB
+    const lookup = /FROM harness_reservations[^]*idempotency_key = \?/
+    const racing = new Proxy(realDb, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            const stmt = target.prepare(sql)
+            if (!lookup.test(sql)) return stmt
+            return new Proxy(stmt, {
+              get(st, k) {
+                if (k === 'bind') {
+                  return (...values: unknown[]) => {
+                    const bound = st.bind(...values)
+                    return new Proxy(bound, {
+                      get(b, kk) {
+                        if (kk === 'first') return async (...a: unknown[]) => { await barrier(); return (b.first as (...x: unknown[]) => Promise<unknown>)(...a) }
+                        const v = Reflect.get(b, kk)
+                        return typeof v === 'function' ? v.bind(b) : v
+                      },
+                    })
+                  }
+                }
+                const v = Reflect.get(st, k)
+                return typeof v === 'function' ? v.bind(st) : v
+              },
+            })
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    })
+    const racingEnv = { ...env, DB: racing } as unknown as Env
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({
+        agent: { id: 'bc-r', name: 'a', status: 'ACTIVE', url: 'https://cursor.com/agents/bc-r', createdAt: 'x', updatedAt: 'x', latestRunId: 'rr', repos: [] },
+        run: { id: 'rr', agentId: 'bc-r', status: 'CREATING', createdAt: 'x', updatedAt: 'x' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const [a, b] = await Promise.all([
+      cursorCloudAdapter.dispatch(racingEnv, { ...req, idempotencyKey: 'k-race' }),
+      cursorCloudAdapter.dispatch(racingEnv, { ...req, idempotencyKey: 'k-race' }),
+    ])
+    expect(a.accepted && b.accepted).toBe(true)
     expect(count(harness, 'harness_reservations')).toBe(1)
-    expect(Number(a.replay) + Number(b.replay)).toBe(1)
-    expect(count(harness, 'tasks')).toBe(1) // loser must not leave an orphan task
+    expect(count(harness, 'tasks')).toBe(1)
+    expect(count(harness, 'flights')).toBe(1)
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 })
 
@@ -75,6 +129,8 @@ describe('attach semantics after rebase onto tri-state launch', () => {
     const again = await cursorCloudAdapter.dispatch(env, { ...req, idempotencyKey: 'k-5xx' })
     expect(first.accepted).toBe(false)
     expect(again.accepted).toBe(false)
+    // replay of a failed row reports the row's real reason, never a fabricated flight_gate_held
+    expect(again.accepted === false && again.error).toBe('launch_unconfirmed')
     const row = harness.sqlite.prepare('SELECT state, last_error FROM harness_reservations').get() as { state: string; last_error: string }
     expect(row.state).toBe('failed')
     expect(row.last_error).toMatch(/^launch_unconfirmed:/)
@@ -85,26 +141,16 @@ describe('attach semantics after rebase onto tri-state launch', () => {
     const { harness, env } = setup()
     const r = await reserveCursorCloudWork(env, { ...req, idempotencyKey: 'k-lease' })
     const cursor = { agentId: 'bc-9', runId: 'r9', agentUrl: 'https://cursor.com/agents/bc-9' }
+    const taskId = r.task!.id
     // Never leased: state is 'reserved', so the guard matches nothing and the task body stays untouched.
-    expect(await bindVendorExecutionWithTaskBinding(env, r.reservationId, r.task.id, cursor)).toBe(false)
-    const body0 = (harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(r.task.id) as { body: string }).body
+    expect(await bindVendorExecutionWithTaskBinding(env, r.reservationId, 'no-lease', taskId, cursor)).toBe(false)
+    const body0 = (harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(taskId) as { body: string }).body
     expect(body0).not.toContain('cursor_agent')
-    expect(await claimAttachLease(env, r.reservationId)).toBe(true)
-    expect(await bindVendorExecutionWithTaskBinding(env, r.reservationId, r.task.id, cursor)).toBe(true)
-    const body1 = (harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(r.task.id) as { body: string }).body
+    const leaseId = await claimAttachLease(env, r.reservationId)
+    expect(leaseId).toBeTruthy()
+    expect(await bindVendorExecutionWithTaskBinding(env, r.reservationId, leaseId!, taskId, cursor)).toBe(true)
+    const body1 = (harness.sqlite.prepare('SELECT body FROM tasks WHERE id = ?').get(taskId) as { body: string }).body
     expect(body1).toContain('cursor_run: r9')
     expect((await getReservation(env, r.reservationId))?.state).toBe('attached')
-  })
-
-  it('recordCursorCloudWork wrapper really binds the reservation', async () => {
-    const { env } = setup()
-    const out = await recordCursorCloudWork(env, {
-      name: 'W', repoUrl: req.repoUrl, prompt: 'p', squadId: 'squad-core', agentId: 'agent-builder',
-      cursor: { agentId: 'bc-w', runId: 'rw', agentUrl: 'https://cursor.com/agents/bc-w' },
-    })
-    const res = await getReservation(env, (await env.DB.prepare('SELECT id FROM harness_reservations').first<{ id: string }>())!.id)
-    expect(res?.state).toBe('attached')
-    expect(res?.vendor_run_id).toBe('rw')
-    expect(out.task.id).toBeDefined()
   })
 })

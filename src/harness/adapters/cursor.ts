@@ -153,10 +153,10 @@ export const cursorCloudAdapter: HarnessAdapter = {
 
       // Synchronous attach fallback (for unit tests or non-waitUntil callers)
       const attached = await attachCursorCloudExecution(env, reserved.reservationId, { model: req.model })
-      if (attached.state === 'failed') {
+      if (attached.state === 'failed' || attached.error === 'execution_paused') {
         return {
           accepted: false,
-          error: attached.error ?? 'attach_failed',
+          error: publicHarnessError(attached.error),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,

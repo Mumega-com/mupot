@@ -292,6 +292,32 @@ export async function bindVendorExecution(
 }
 
 /**
+ * The task-body append of the atomic attach. Only valid as the statement AFTER the fenced reservation flip inside
+ * one batch: `changes() = 1` anchors it on that flip, and the EXISTS re-checks the lease id AND run id (defence in
+ * depth: the row it appends for must be exactly this call's binding).
+ */
+export function taskBindingStatement(
+  env: Env,
+  reservationId: string,
+  leaseId: string,
+  taskId: string,
+  cursor: { agentId: string; runId: string; agentUrl: string },
+  now: string,
+) {
+  const extra = ['', `cursor_agent: ${cursor.agentId}`, `cursor_run: ${cursor.runId}`, `cursor_url: ${cursor.agentUrl}`].join('\n')
+  return env.DB.prepare(
+    `UPDATE tasks
+     SET body = body || ?, updated_at = ?
+     WHERE id = ?
+       AND changes() = 1
+       AND EXISTS (
+         SELECT 1 FROM harness_reservations
+         WHERE tenant = ? AND id = ? AND state = 'attached' AND vendor_run_id = ? AND attach_lease_id = ?
+       )`,
+  ).bind(extra, now, taskId, env.TENANT_SLUG, reservationId, cursor.runId, leaseId)
+}
+
+/**
  * Atomic attach: flip the reservation to attached AND append the vendor binding to the task body in ONE batch.
  * Statement 1 is fenced on this call's lease id. Statement 2 (the task body append) runs only if statement 1
  * flipped a row IN THIS BATCH (`changes() = 1`) AND the reservation still carries this lease id + run id, so a
@@ -306,7 +332,6 @@ export async function bindVendorExecutionWithTaskBinding(
   vendorStatus?: string,
 ): Promise<boolean> {
   const now = new Date().toISOString()
-  const extra = ['', `cursor_agent: ${cursor.agentId}`, `cursor_run: ${cursor.runId}`, `cursor_url: ${cursor.agentUrl}`].join('\n')
   const [bound] = await env.DB.batch([
     env.DB.prepare(
       `UPDATE harness_reservations
@@ -318,16 +343,7 @@ export async function bindVendorExecutionWithTaskBinding(
            updated_at = ?
        WHERE tenant = ? AND id = ? AND state = 'attaching' AND attach_lease_id = ?`,
     ).bind(cursor.agentId, cursor.runId, cursor.agentUrl, vendorStatus ?? null, now, now, env.TENANT_SLUG, reservationId, leaseId),
-    env.DB.prepare(
-      `UPDATE tasks
-       SET body = body || ?, updated_at = ?
-       WHERE id = ?
-         AND changes() = 1
-         AND EXISTS (
-           SELECT 1 FROM harness_reservations
-           WHERE tenant = ? AND id = ? AND state = 'attached' AND vendor_run_id = ? AND attach_lease_id = ?
-         )`,
-    ).bind(extra, now, taskId, env.TENANT_SLUG, reservationId, cursor.runId, leaseId),
+    taskBindingStatement(env, reservationId, leaseId, taskId, cursor, now),
   ])
   return (bound?.meta?.changes ?? 0) > 0
 }
