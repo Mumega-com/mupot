@@ -1651,10 +1651,12 @@ export async function evaluateVerdictGates(
   //   'affiliated'  the decider only acts for a party. An org owner/admin (legacyOwnerAdmin) is the
   //                 existing supervisory path and passes with an 'admin_supervisory' waiver; this
   //                 closes the grant-only route, not the admin role.
-  // gate:agent-self-completion deliberately WAIVES the rule (its purpose is that the completing
-  // agent closes it; the caller already had to BE that assignee to reach this point).
+  // gate:agent-self-completion exempts ONLY the current assignee closing its own task (the write
+  // re-reads the assignee in its WHERE). The lane also admits legacy org owner/admin principals;
+  // those are judged like any other lane, so a direct party cannot ride the lane's waiver.
   let independenceWaiver: VerdictIndependenceWaiver | undefined
-  if (!isSelfCompletionGate) {
+  const assigneeClosingOwnTask = isSelfCompletionGate && principal.id === task.assignee_agent_id
+  if (!assigneeClosingOwnTask) {
     // The assignee the CALLER passed is judged first (no query), then the task's whole party set
     // read from the database. Both must hold: a caller-supplied row that omits the assignee must
     // not skip the stored one, and a stale stored row must not hide the passed one.

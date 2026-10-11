@@ -208,10 +208,62 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     // (the genuine runner MR stays refused: see the REFUSED cases above, same fixture)
   })
 
-  it('the gate:agent-self-completion lane waives independence by design (the completing agent closes it)', async () => {
-    seedWorld(harness.sqlite, { gateOwner: 'gate:agent-self-completion' })
-    const res = await decide(env, agentAuth('A'))
-    expect(res.ok, JSON.stringify(res)).toBe(true)
+  describe('the gate:agent-self-completion lane exempts ONLY the current assignee', () => {
+    const LANE = 'gate:agent-self-completion'
+
+    it('the current assignee closes its own task', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, agentAuth('A'))
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+      expect(verdictRows(harness.sqlite)).toBe(1)
+    })
+
+    it('an org admin who is a direct party (ran it) but is NOT the current assignee is refused self_verdict', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, memberAuth('MR', 'admin'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
+
+    it('the pre-check predicate refuses the direct-party admin on the lane and allows the assignee', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const gateTask = { id: TASK, squad_id: SQUAD, gate_owner: LANE, assignee_agent_id: 'A' }
+      expect(await evaluateVerdictGates(env, memberAuth('MR', 'admin'), gateTask, 'approved')).toMatchObject({ allowed: false, code: 'self_verdict' })
+      expect((await evaluateVerdictGates(env, agentAuth('A'), gateTask, 'approved')).allowed).toBe(true)
+    })
+
+    it('the same admin with the org owner explicit override is allowed', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, memberAuth('MR', 'owner'), { override_self_verdict: true })
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+      expect(verdictRows(harness.sqlite)).toBe(1)
+    })
+
+    it('a former assignee that submitted a result (S) is refused on the lane too, at the write', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'S' }))
+        .rejects.toBeInstanceOf(VerdictIndependenceError)
+      expect(verdictRows(harness.sqlite)).toBe(0)
+    })
+
+    it('reassignment race: pre-check sees the decider as assignee, the task is reassigned before the write; the write refuses', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      const gate = await evaluateVerdictGates(env, agentAuth('A'), { id: t.id, squad_id: t.squad_id, gate_owner: LANE, assignee_agent_id: t.assignee_agent_id }, 'approved')
+      expect(gate.allowed).toBe(true)
+      harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'G' WHERE id = ?`).run(TASK)
+      // A is still a party (it was the assignee the stale row says), but no longer the CURRENT assignee.
+      harness.sqlite.prepare(
+        `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+         VALUES ('sub-a', ?, ?, ?, 'A', '/tmp/z', ?, ?)`,
+      ).run(TENANT, TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32))
+      await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'A' }))
+        .rejects.toBeInstanceOf(VerdictIndependenceError)
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
   })
 
   describe('a task owned by a HUMAN (assignee_member_id), no assignee agent', () => {
