@@ -373,8 +373,8 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     const id = await dispatchedId(env, ['task-1'])
     await toReview(env, 'task-1')
     // The lane's authority is the producer of the current result: record EXEC_AGENT's submission.
-    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
-      VALUES ('sub-1540', ?, 'task-1', ?, ?, '/tmp/task-1.txt', ?, ?)`).run(TENANT, SQUAD_ID, EXEC_AGENT, '9f'.repeat(32), '1e'.repeat(32))
+    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('sub-1540', ?, 'task-1', ?, ?, '/tmp/task-1.txt', ?, ?, (SELECT result FROM tasks WHERE id = 'task-1'))`).run(TENANT, SQUAD_ID, EXEC_AGENT, '9f'.repeat(32), '1e'.repeat(32))
     const own = await invokeTool(execAuth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved', note: 'mine' }, ORIGIN)
     expect(own.ok, JSON.stringify(own)).toBe(true)
     await close(env, 'task-1')

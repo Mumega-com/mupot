@@ -1659,8 +1659,8 @@ export async function evaluateVerdictGates(
   //   'affiliated'  the decider only acts for a party. An org owner/admin (legacyOwnerAdmin) is the
   //                 existing supervisory path and passes with an 'admin_supervisory' waiver; this
   //                 closes the grant-only route, not the admin role.
-  // gate:agent-self-completion exempts ONLY the current assignee closing its own task (the write
-  // re-reads the assignee in its WHERE). The lane also admits legacy org owner/admin principals;
+  // gate:agent-self-completion exempts ONLY the producer of the task's current result while it is
+  // also the current assignee (the write re-reads both, and the result binding, in its WHERE). The lane also admits legacy org owner/admin principals;
   // those are judged like any other lane, so a direct party cannot ride the lane's waiver.
   let independenceWaiver: VerdictIndependenceWaiver | undefined
   // Lane authority is the PRODUCER of the current result who is also the current assignee (the

@@ -24,6 +24,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { Env, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { runTaskExecution } from '../src/agents/execute'
 import { kernelMintCtx } from '../src/departments/kernel'
 import { getRegistered } from '../src/departments/registry'
@@ -34,101 +35,13 @@ const TENANT = 'viamar-test'
 const SQUAD_ID = 'squad-content'
 const AGENT_ID = 'agent-editor'
 
-function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
-  sqlite.exec(`
-    CREATE TABLE departments (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL);
-    CREATE TABLE squads (
-      id TEXT PRIMARY KEY, department_id TEXT NOT NULL, slug TEXT NOT NULL,
-      name TEXT NOT NULL, charter TEXT
-    );
-    CREATE TABLE agents (
-      id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, slug TEXT NOT NULL, name TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'member', model TEXT NOT NULL DEFAULT '@cf/meta/llama-3.3',
-      status TEXT NOT NULL DEFAULT 'active'
-    );
-    CREATE TABLE tasks (
-      id                 TEXT PRIMARY KEY,
-      squad_id           TEXT NOT NULL,
-      project_id         TEXT,
-      title              TEXT NOT NULL,
-      body               TEXT NOT NULL DEFAULT '',
-      status             TEXT NOT NULL DEFAULT 'open'
-                           CHECK (status IN ('open','in_progress','blocked','done','review','approved','rejected')),
-      -- priority + parent_task_id (migrations/0079) added by hand: this fixture
-      -- hand-writes tasks instead of applying the committed chain, so it breaks
-      -- whenever a column joins the shared projection. Third time in one day (#703).
-      priority           TEXT,
-      parent_task_id     TEXT,
-      -- assignee_member_id (migrations/0150) hand-added: this fixture writes its own
-      -- own tasks DDL instead of applying the committed chain, so any purely-additive column
-      -- breaks it. FOURTH fixture patched for this one column in this single change —
-      -- alongside tasks-cross-squad-assignment, mcp-flight-tools and workflow-pipeline.
-      -- That count IS the cost of the pattern: none of these four failures had anything to
-      -- do with the test's own subject, and none surfaced until a FULL suite ran. Tracked
-      -- for conversion in #703, where the check-test-schema-source ratchet permits the shrink.
-      assignee_agent_id  TEXT,
-      assignee_member_id TEXT,
-      github_issue_url   TEXT,
-      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
-      result             TEXT,
-      completed_at       TEXT,
-      gate_owner         TEXT,
-      cost_micro_usd     INTEGER NOT NULL DEFAULT 0,
-      workflow_instance_id TEXT,
-      done_when          TEXT NOT NULL DEFAULT '(backfill required)',
-      execution_receipt_id TEXT,
-      execution_claim_expires_at INTEGER,
-      source_pot         TEXT,
-      external_source    TEXT
-    );
-    -- mupot#1571: every task writer carries TASK_NOT_ARCHIVED_SQL, which reads this table.
-    CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
-    -- producer receipt (migrations/0183), written by the review landing in execute.ts; hand-added like the columns above.
-    CREATE TABLE task_result_submissions (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, tenant TEXT NOT NULL, task_id TEXT NOT NULL,
-      squad_id TEXT NOT NULL, submitted_by_agent_id TEXT NOT NULL, artifact_path TEXT NOT NULL,
-      artifact_sha256 TEXT NOT NULL, result_digest TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-    );
-    -- migration 0203 loop brakes: runTaskExecution's claim UPDATE reads these (triggers omitted: hand fixture).
-    CREATE TABLE execution_pauses (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
-      reason TEXT NOT NULL, paused_by_member_id TEXT NOT NULL, paused_at TEXT NOT NULL,
-      resumed_at TEXT, resumed_by_member_id TEXT, resume_reason TEXT
-    );
-    CREATE TABLE task_execution_attempts (
-      task_id TEXT PRIMARY KEY, refused_count INTEGER NOT NULL DEFAULT 0, last_agent_id TEXT,
-      last_reason TEXT, first_at TEXT NOT NULL, last_at TEXT NOT NULL
-    );
-    CREATE TABLE execution_holds (
-      task_id TEXT PRIMARY KEY, escalation_id TEXT NOT NULL, agent_id TEXT NOT NULL, refused_count INTEGER NOT NULL,
-      reason TEXT, held_at TEXT NOT NULL, released_at TEXT, released_by_member_id TEXT, release_id TEXT, release_reason TEXT
-    );
-    CREATE TABLE task_verdicts (
-      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, verdict TEXT NOT NULL CHECK(verdict IN ('approved','rejected')),
-      note TEXT, decided_by TEXT NOT NULL, decided_at TEXT NOT NULL
-    );
-    CREATE TABLE department_proposals (
-      gate_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, department_key TEXT NOT NULL,
-      action TEXT NOT NULL, payload_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    -- migrations/0035 subset (mupot#1740): the dispatched-run claim now carries an in-write
-    -- stopped-seat fence (receiverNotStoppedSql) that reads fleet_agents. Same hand-written
-    -- subset class as the columns above (#703); empty here, so nothing is fenced.
-    CREATE TABLE fleet_agents (
-      agent_id TEXT NOT NULL, tenant TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'running',
-      PRIMARY KEY (tenant, agent_id)
-    );
-  `)
-}
-
 describe('content-publish loop — real SQLite, propose → approve → execute → done', () => {
   let harness: SqliteD1Harness
   let env: Env
 
   beforeEach(() => {
     harness = createSqliteD1()
-    createSchema(harness.sqlite)
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.prepare('INSERT INTO departments (id, slug, name) VALUES (?, ?, ?)').run('dept-1', 'growth', 'Marketing & Sales')
     harness.sqlite.prepare('INSERT INTO squads (id, department_id, slug, name, charter) VALUES (?, ?, ?, ?, ?)')
       .run(SQUAD_ID, 'dept-1', 'content', 'Content', 'Write it well.')

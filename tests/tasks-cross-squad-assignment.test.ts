@@ -3,6 +3,7 @@ import { runTaskExecution } from '../src/agents/execute'
 import { tasksApp } from '../src/tasks'
 import type { Agent, BusEvent, Env, ModelPort, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const TENANT = 'tenant-a'
 const TARGET_SQUAD_ID = 'squad-target'
@@ -30,131 +31,28 @@ const CROSS_AGENT: Agent = {
   created_at: '2026-07-12T00:00:00.000Z',
 }
 
-function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
-  sqlite.exec(`
-    CREATE TABLE squads (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, charter TEXT, kind TEXT NOT NULL DEFAULT 'work');
-    CREATE TABLE agents (id TEXT PRIMARY KEY, squad_id TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE members (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, status TEXT NOT NULL);
-    CREATE TABLE member_tokens (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      tenant TEXT NOT NULL,
-      channel TEXT NOT NULL DEFAULT 'workspace',
-      revoked_at TEXT,
-      expires_at TEXT
-    );
-    CREATE TABLE agent_member_bindings (
-      tenant TEXT NOT NULL,
-      agent_id TEXT NOT NULL,
-      member_id TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (tenant, agent_id),
-      UNIQUE (tenant, member_id)
-    );
-    CREATE TABLE capabilities (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      scope_type TEXT NOT NULL,
-      scope_id TEXT,
-      capability TEXT NOT NULL
-    );
-    CREATE TABLE channel_capability_grants (
-      id TEXT PRIMARY KEY,
-      member_id TEXT NOT NULL,
-      squad_id TEXT NOT NULL,
-      capability TEXT NOT NULL
-    );
-    CREATE TABLE gate_grants (
-      id TEXT PRIMARY KEY,
-      capability TEXT NOT NULL,
-      principal_type TEXT NOT NULL,
-      principal_id TEXT NOT NULL,
-      granted_by TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    -- priority + parent_task_id (migrations/0079) added by hand: this fixture hand-writes
-    -- tasks rather than applying the committed chain, so a purely-additive column breaks it
-    -- (persistTaskUpdate writes every column it owns). The fixture did not catch a bug; it
-    -- lied about the schema and blocked a feature. One of the 13 tracked in #703.
-    --
-    -- assignee_member_id (migrations/0150) added by hand for the SAME reason, which is now the
-    -- third time this fixture has had to be patched to keep up with a purely-additive column.
-    -- Recording that count deliberately: the cost of a hand-written schema is not that it fails,
-    -- it is that it fails LATER, in someone else's feature, for a reason that has nothing to do
-    -- with the test's subject. This one costs the mutual-exclusion trigger too — the fixture
-    -- cannot carry it, so the one-owner invariant is unenforced here and is proven instead in
-    -- tests/task-assignee-member.test.ts against the real chain. Converting this file to
-    -- applyAllMigrations would SHRINK the check-test-schema-source baseline, which the ratchet
-    -- explicitly permits; it is the right fix and it is not this PR's scope.
-    CREATE TABLE tasks (
-      id TEXT PRIMARY KEY,
-      squad_id TEXT NOT NULL,
-      project_id TEXT,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL,
-      done_when TEXT NOT NULL,
-      priority TEXT,
-      parent_task_id TEXT,
-      status TEXT NOT NULL,
-      assignee_agent_id TEXT,
-      assignee_member_id TEXT,
-      github_issue_url TEXT,
-      result TEXT,
-      completed_at TEXT,
-      gate_owner TEXT,
-      cost_micro_usd INTEGER NOT NULL DEFAULT 0,
-      execution_receipt_id TEXT,
-      execution_claim_expires_at INTEGER,
-      source_pot TEXT,
-      external_source TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    -- mupot#1571: every task writer now carries TASK_NOT_ARCHIVED_SQL, which reads this table.
-    CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
-    -- producer receipt (migrations/0183), written by the review landing in execute.ts; hand-added like the columns above.
-    CREATE TABLE task_result_submissions (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, tenant TEXT NOT NULL, task_id TEXT NOT NULL,
-      squad_id TEXT NOT NULL, submitted_by_agent_id TEXT NOT NULL, artifact_path TEXT NOT NULL,
-      artifact_sha256 TEXT NOT NULL, result_digest TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-    );
-    -- migration 0203 loop brakes: runTaskExecution's claim UPDATE reads these (triggers omitted: hand fixture).
-    CREATE TABLE execution_pauses (
-      id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
-      reason TEXT NOT NULL, paused_by_member_id TEXT NOT NULL, paused_at TEXT NOT NULL,
-      resumed_at TEXT, resumed_by_member_id TEXT, resume_reason TEXT
-    );
-    CREATE TABLE task_execution_attempts (
-      task_id TEXT PRIMARY KEY, refused_count INTEGER NOT NULL DEFAULT 0, last_agent_id TEXT,
-      last_reason TEXT, first_at TEXT NOT NULL, last_at TEXT NOT NULL
-    );
-    CREATE TABLE execution_holds (
-      task_id TEXT PRIMARY KEY, escalation_id TEXT NOT NULL, agent_id TEXT NOT NULL, refused_count INTEGER NOT NULL,
-      reason TEXT, held_at TEXT NOT NULL, released_at TEXT, released_by_member_id TEXT, release_id TEXT, release_reason TEXT
-    );
-  `)
-}
-
 function addCrossSquadIdentity(sqlite: SqliteD1Harness['sqlite'], capability: 'member' | 'observer'): void {
   sqlite.exec(`
-    INSERT INTO squads (id, department_id, charter)
-    VALUES ('${HOME_SQUAD_ID}', 'department-home', 'Home squad charter.');
-    INSERT INTO squads (id, department_id, charter)
-    VALUES ('${TARGET_SQUAD_ID}', 'department-target', 'Target squad charter.');
-    INSERT INTO agents (id, squad_id, status) VALUES
-      ('${CROSS_AGENT_ID}', '${HOME_SQUAD_ID}', 'active'),
-      ('${GATE_AGENT_ID}', '${TARGET_SQUAD_ID}', 'active');
-    INSERT INTO members (id, tenant, status) VALUES
-      ('${MEMBER_ID}', '${TENANT}', 'active'),
-      ('${GATE_MEMBER_ID}', '${TENANT}', 'active');
+    INSERT INTO departments (id, slug, name) VALUES
+      ('department-home', 'home', 'Home'),
+      ('department-target', 'target', 'Target');
+    INSERT INTO squads (id, department_id, slug, name, charter)
+    VALUES ('${HOME_SQUAD_ID}', 'department-home', 'home-squad', 'Home squad', 'Home squad charter.');
+    INSERT INTO squads (id, department_id, slug, name, charter)
+    VALUES ('${TARGET_SQUAD_ID}', 'department-target', 'target-squad', 'Target squad', 'Target squad charter.');
+    INSERT INTO agents (id, squad_id, slug, name, status) VALUES
+      ('${CROSS_AGENT_ID}', '${HOME_SQUAD_ID}', 'cross-agent', 'Cross agent', 'active'),
+      ('${GATE_AGENT_ID}', '${TARGET_SQUAD_ID}', 'gate-agent', 'Gate agent', 'active');
+    INSERT INTO members (id, tenant, display_name, status) VALUES
+      ('${MEMBER_ID}', '${TENANT}', 'Cross member', 'active'),
+      ('${GATE_MEMBER_ID}', '${TENANT}', 'Gate member', 'active');
     INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at)
     VALUES
       ('${TENANT}', '${CROSS_AGENT_ID}', '${MEMBER_ID}', '2026-07-24T00:00:00.000Z'),
       ('${TENANT}', '${GATE_AGENT_ID}', '${GATE_MEMBER_ID}', '2026-07-24T00:00:00.000Z');
-    INSERT INTO member_tokens (id, member_id, agent_id, tenant, channel, revoked_at, expires_at) VALUES
-      ('token-cross', '${MEMBER_ID}', '${CROSS_AGENT_ID}', '${TENANT}', 'workspace', NULL, '2099-01-01T00:00:00.000Z'),
-      ('token-gate', '${GATE_MEMBER_ID}', '${GATE_AGENT_ID}', '${TENANT}', 'workspace', NULL, '2099-01-01T00:00:00.000Z');
+    INSERT INTO member_tokens (id, member_id, agent_id, tenant, channel, token_hash, revoked_at, expires_at) VALUES
+      ('token-cross', '${MEMBER_ID}', '${CROSS_AGENT_ID}', '${TENANT}', 'workspace', 'hash-cross', NULL, '2099-01-01T00:00:00.000Z'),
+      ('token-gate', '${GATE_MEMBER_ID}', '${GATE_AGENT_ID}', '${TENANT}', 'workspace', 'hash-gate', NULL, '2099-01-01T00:00:00.000Z');
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability)
       VALUES ('grant-gate', '${GATE_MEMBER_ID}', 'squad', '${TARGET_SQUAD_ID}', 'member');
     INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at)
@@ -198,7 +96,7 @@ describe('cross-squad task assignment over HTTP', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    createSchema(harness.sqlite)
+    applyAllMigrations(harness.sqlite)
     env = ownerEnv(harness)
   })
 

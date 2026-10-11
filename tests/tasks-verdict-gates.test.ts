@@ -247,8 +247,8 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     // The lane exempts the agent that produced the current result (latest task_result_submissions row) while it is the assignee.
     harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, result, created_at, updated_at)
       VALUES ('task-under-gate', 'squad-1', 'T', 'b', 'done', 'review', 'gate:agent-self-completion', 'agent-self', 'r', datetime('now'), datetime('now'))`).run()
-    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
-      VALUES ('sub-self', ?, 'task-under-gate', 'squad-1', 'agent-self', '/tmp/x', ?, ?)`).run(TENANT, '9f'.repeat(32), '1e'.repeat(32))
+    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+      VALUES ('sub-self', ?, 'task-under-gate', 'squad-1', 'agent-self', '/tmp/x', ?, ?, 'r')`).run(TENANT, '9f'.repeat(32), '1e'.repeat(32))
     seedAgentBoundToken(harness.sqlite, 'member-self', 'agent-self')
     const env = makeEnv(harness)
     const auth = await authenticateMember({ ...requestWith(RAW_TOKEN), env })

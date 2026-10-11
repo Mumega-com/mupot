@@ -396,6 +396,18 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
       ...(stage === 'failed' ? { reason: 'Runtime failed.' } : {}),
     })
 
+  it('runtime_consumed out of rejected supersedes the rejected result (no stale result survives into the new attempt)', async () => {
+    const fixture = runtimeFixture()
+    try {
+      fixture.harness.sqlite.prepare("UPDATE tasks SET status = 'rejected', result = 'stale rejected result' WHERE id = ?").run(TASK_ID)
+      await rr(fixture, 'runtime_consumed', '1')
+      expect(fixture.harness.sqlite.prepare('SELECT status, result FROM tasks WHERE id = ?').get(TASK_ID))
+        .toEqual({ status: 'in_progress', result: null })
+    } finally {
+      fixture.harness.close()
+    }
+  })
+
   it('mupot#1747: consumed -> failed -> (assignee unblocks, pointer stays) -> completed is refused', async () => {
     const fixture = runtimeFixture()
     try {

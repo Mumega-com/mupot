@@ -694,13 +694,13 @@ async function finishTask(
   // claim never leaves a receipt behind.
   const insertStmt = env.DB.prepare(
     `INSERT INTO task_result_submissions
-       (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
-     SELECT ?, ?, t.id, t.squad_id, ?, ?, ?, ?
+       (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+     SELECT ?, ?, t.id, t.squad_id, ?, ?, ?, ?, ?
        FROM tasks t
       WHERE t.id = ? AND t.status = 'review' AND t.updated_at = ? AND t.assignee_agent_id = ?
         AND t.execution_receipt_id = ?`,
   ).bind(
-    crypto.randomUUID(), env.TENANT_SLUG, agentId, submission.path, submission.sha256, await sha256HexOf(result),
+    crypto.randomUUID(), env.TENANT_SLUG, agentId, submission.path, submission.sha256, await sha256HexOf(result), result,
     taskId, completedAt, agentId, executionReceiptId,
   )
   const results = await env.DB.batch([updateStmt, insertStmt])

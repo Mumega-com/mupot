@@ -89,13 +89,14 @@ function seedWorld(sqlite: SqliteD1Harness['sqlite'], opts: { gateOwner?: string
   }
 }
 
-/** The agent `producer` produced the task's CURRENT result: a ledger row newer than every other, and a result on the row. */
+/** The agent `producer` produced the task's CURRENT result: a ledger row newer than every other whose result_text equals the task's current result. */
 function producedCurrentResult(sqlite: SqliteD1Harness['sqlite'], producer: string, id = `sub-lane-${producer}`): void {
+  const resultText = `Artifact: /tmp/lane\nSHA256: ${'9f'.repeat(32)}`
   sqlite.prepare(
-    `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
-     VALUES (?, ?, ?, ?, ?, '/tmp/lane', ?, ?)`,
-  ).run(id, TENANT, TASK, SQUAD, producer, '9f'.repeat(32), '1e'.repeat(32))
-  sqlite.prepare(`UPDATE tasks SET result = ? WHERE id = ?`).run(`Artifact: /tmp/lane\nSHA256: ${'9f'.repeat(32)}`, TASK)
+    `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+     VALUES (?, ?, ?, ?, ?, '/tmp/lane', ?, ?, ?)`,
+  ).run(id, TENANT, TASK, SQUAD, producer, '9f'.repeat(32), '1e'.repeat(32), resultText)
+  sqlite.prepare(`UPDATE tasks SET result = ? WHERE id = ?`).run(resultText, TASK)
 }
 
 interface Outcome { ok: boolean; status?: number; error?: string }

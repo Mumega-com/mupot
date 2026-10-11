@@ -7,7 +7,6 @@
     "tests/addon-routes.test.ts",
     "tests/addon-service.test.ts",
     "tests/backlog-provenance-sqlite.test.ts",
-    "tests/content-proposal-loop-sqlite.test.ts",
     "tests/cro-apply-loop.test.ts",
     "tests/fixtures/marketing-monitor-intrinsic-poisoning.ts",
     "tests/fleet-agent-liveness.test.ts",
@@ -23,7 +22,6 @@
     "tests/routine-cancellation-fence.test.ts",
     "tests/seo-meta-fix-loop-sqlite.test.ts",
     "tests/task-assignee-sqlite.test.ts",
-    "tests/tasks-cross-squad-assignment.test.ts",
     "tests/tasks-source-pot-assignment-rbac.test.ts",
     "tests/workflow-circuits-service.test.ts",
     "tests/workflow-pipeline.test.ts"

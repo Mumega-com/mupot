@@ -184,6 +184,9 @@ describe('task_submit_result (mupot#1586)', () => {
       artifact_sha256: VALID_SHA,
       task_id: TASK_ID,
     })
+    // the exact submitted text rides in the same batch (binds the receipt to the current result)
+    expect(harness.sqlite.prepare('SELECT result_text AS t FROM task_result_submissions WHERE task_id = ?').get(TASK_ID))
+      .toEqual({ t: VALID_RESULT })
   })
 
   it('invariant (b): a non-assignee agent cannot submit a result for someone else\'s task', async () => {

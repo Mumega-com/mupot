@@ -3729,9 +3729,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_project_seeds_project" },
     ],
   },
+  {
+    file: "0210_task_result_submissions_result_text.sql",
+    sha256: "7ffbc032660bba265ebcac63e5959ba75c87cc142aef9e780d0bb810bd848640",
+    statements: [
+      "-- 0210 - bind the producer receipt to the exact result it submitted.\n--\n-- gate:agent-self-completion verdict authority is \"the agent that produced the CURRENT result\".\n-- The ledger row alone did not say WHICH result: supported writers replace tasks.result without\n-- appending a submission (the CI-result sync, an artifact-shaped dispatch failure reason, a\n-- blocked -> in_progress -> review walk), so a stale row could vouch for a result its agent never\n-- wrote. result_text is the exact text that was submitted; the lane compares it to tasks.result\n-- (text equality) inside the verdict UPDATE's WHERE.\n--\n-- ADD COLUMN only (no table rebuild: the append-only triggers from 0183 stay in force). Rows that\n-- predate this migration keep result_text NULL and therefore fail closed on the lane (an org admin\n-- still can). It also preserves the submitted text append-only, so clearing tasks.result on rework\n-- no longer destroys the only verbatim copy of a rejected result.\n\nALTER TABLE task_result_submissions ADD COLUMN result_text TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a32a561e484b007a5457c810451fa21b7d53e75d6af022598b69664c1310994c"
+export const SCHEMA_CHAIN_DIGEST: string = "9a1dab70cc8e7e613b4179da084ffd27d47649dfd5439f242eafc108eba6b8f5"

@@ -29,7 +29,7 @@ vi.mock('../src/auth', async (importOriginal) => {
 import { invokeTool } from '../src/mcp/index'
 import { tasksApp, evaluateVerdictGates } from '../src/tasks'
 import { runTaskExecution, type ExecuteDeps } from '../src/agents/execute'
-import { buildVerdictStatements, writeVerdict, VerdictRaceError, VerdictIndependenceError } from '../src/tasks/service'
+import { buildVerdictStatements, syncCiResultToTask, writeVerdict, VerdictRaceError, VerdictIndependenceError } from '../src/tasks/service'
 import type { Agent, AuthContext, CapabilityGrant, Env, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
@@ -290,6 +290,84 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect(rev.ok, JSON.stringify(rev)).toBe(true)
     expect(row().result).not.toBeNull()
     expect((await verdict(agentAuth('A'))).ok).toBe(true)
+  })
+
+  // ── the ledger row is bound to the CURRENT result (result_text = tasks.result) ─────────────
+  // DEFECT CLASS: authority derived from a record that is not bound to the thing being approved.
+  it('CI-sync overwrites the result in review: the producer\'s row no longer matches, A cannot self-close; an admin still can', async () => {
+    sql().prepare(`UPDATE tasks SET github_issue_url = 'https://github.com/o/r/pull/77' WHERE id = ?`).run(TASK)
+    await produce('A')
+    expect((await syncCiResultToTask(env, 77, 'success')).updated).toBe(true)
+    expect(row().result).toBe('CI: success')
+    const res = await verdict(agentAuth('A'))
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+    expect(verdictRows()).toBe(0)
+    // the write itself (stale pre-check snapshot) refuses too
+    const t = sql().prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+    await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'A' })).rejects.toBeInstanceOf(VerdictIndependenceError)
+    expect((await verdict(adminAuth())).ok).toBe(true)
+  })
+
+  it('a foreign result is written and the task reassigned to the original producer: A is refused', async () => {
+    await rejectedAfterProducedByA()
+    // G\'s work reaches the row by a path that appends no submission, then the task goes back to A
+    sql().prepare(`UPDATE tasks SET status = 'review', result = ?, assignee_agent_id = 'A' WHERE id = ?`).run(`G's work\nArtifact: /tmp/g.txt\nSHA256: ${SHA}`, TASK)
+    expect(submitters()).toEqual(['A'])
+    const res = await verdict(agentAuth('A'))
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+    expect(verdictRows()).toBe(1) // only the admin's rejection
+  })
+
+  it('a fresh own submission is bound to its result and is allowed; the ledger stores the exact text', async () => {
+    await produce('A')
+    const ledger = sql().prepare(`SELECT result_text AS t FROM task_result_submissions WHERE task_id = ?`).get(TASK) as { t: string | null }
+    expect(ledger.t).toBe(row().result)
+    expect(ledger.t).toContain('Artifact: /tmp/work.txt')
+    expect((await verdict(agentAuth('A'))).ok).toBe(true)
+  })
+
+  it('LEGACY row (result_text NULL): the assignee is refused, an admin still closes', async () => {
+    sql().prepare(`UPDATE tasks SET status = 'review', result = ? WHERE id = ?`).run(`legacy\nArtifact: /tmp/l\nSHA256: ${SHA}`, TASK)
+    sql().prepare(
+      `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+       VALUES ('legacy-1', ?, ?, ?, 'A', '/tmp/l', ?, ?)`,
+    ).run(TENANT, TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32))
+    expect((sql().prepare(`SELECT result_text AS t FROM task_result_submissions WHERE id = 'legacy-1'`).get() as { t: string | null }).t).toBeNull()
+    expect(await verdict(agentAuth('A'))).toMatchObject({ ok: false, error: 'self_verdict' })
+    expect(verdictRows()).toBe(0)
+    expect((await verdict(adminAuth())).ok).toBe(true)
+  })
+
+  it('the ledger is tenant-scoped: a matching row under ANOTHER tenant is not the producer record', async () => {
+    const text = `x\nArtifact: /tmp/x\nSHA256: ${SHA}`
+    sql().prepare(`UPDATE tasks SET status = 'review', result = ? WHERE id = ?`).run(text, TASK)
+    sql().prepare(
+      `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+       VALUES ('other-tenant', 'someone-else', ?, ?, 'A', '/tmp/x', ?, ?, ?)`,
+    ).run(TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32), text)
+    expect(await verdict(agentAuth('A'))).toMatchObject({ ok: false, error: 'self_verdict' })
+    expect(verdictRows()).toBe(0)
+  })
+
+  it('a LATER row from another tenant does not shadow the real latest row (the MAX is tenant-scoped too)', async () => {
+    await produce('A')
+    sql().prepare(
+      `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+       VALUES ('other-tenant-later', 'someone-else', ?, ?, 'G', '/tmp/x', ?, ?, 'whatever')`,
+    ).run(TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32))
+    const res = await verdict(agentAuth('A'))
+    expect(res.ok, JSON.stringify(res)).toBe(true)
+  })
+
+  it('rework no longer destroys the rejected text: the ledger keeps it append-only after the clear', async () => {
+    await rejectedAfterProducedByA()
+    const rejectedText = row().result
+    expect(rejectedText).toContain('Artifact: /tmp/work.txt')
+    expect((await update(adminAuth(), { status: 'in_progress' })).ok).toBe(true)
+    expect(row().result).toBeNull()
+    const kept = sql().prepare(`SELECT result_text AS t FROM task_result_submissions WHERE task_id = ?`).all(TASK) as Array<{ t: string }>
+    expect(kept.map((r) => r.t)).toEqual([rejectedText])
+    expect(() => sql().prepare(`UPDATE task_result_submissions SET result_text = 'x'`).run()).toThrow(/append-only/)
   })
 
   // ── P2s ──────────────────────────────────────────────────────────────────────

@@ -1668,18 +1668,29 @@ export class VerdictIndependenceError extends Error {
  * independence: the agent that PRODUCED THE CURRENT RESULT, and only while it is also the task's
  * current assignee. "Produced" is read from the append-only task_result_submissions ledger (the
  * execute.ts finish and task_submit_result both write a row for the submitting agent): the
- * producer is the submitter of the LATEST row, and the task must still carry a result. The
+ * producer is the submitter of the LATEST row (this tenant), and that row's result_text must equal the task's current result. The
  * assignee column alone is not authority: it is writable by any squad member+ outside review, so
  * an exemption keyed on it is only as narrow as whoever can write it. No ledger row, or a result
  * cleared by rework, means NO exemption (the decider is then judged like on any other lane).
  * `taskIdExpr` / `deciderParam` are SQL expressions; the fragment binds the decider TWICE.
  */
 export function selfCompletionProducerSql(taskIdExpr: string): string {
+  // Bound to the CURRENT result: the latest ledger row (this tenant, MAX(seq)) must be the
+  // decider's AND carry the exact text now on tasks.result. A result replaced by any writer that
+  // appends no submission (CI sync, a failure reason, a foreign agent) no longer equals the row's
+  // result_text, and a legacy row (result_text NULL) never equals anything: both fail closed.
   return `(tasks.assignee_agent_id = ? AND tasks.result IS NOT NULL AND EXISTS (
     SELECT 1 FROM task_result_submissions lane_sub
-     WHERE lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
-       AND lane_sub.seq = (SELECT MAX(lane_max.seq) FROM task_result_submissions lane_max WHERE lane_max.task_id = ${taskIdExpr})
+     WHERE lane_sub.tenant = ? AND lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
+       AND lane_sub.result_text IS NOT NULL AND lane_sub.result_text = tasks.result
+       AND lane_sub.seq = (SELECT MAX(lane_max.seq) FROM task_result_submissions lane_max
+                            WHERE lane_max.tenant = ? AND lane_max.task_id = ${taskIdExpr})
   ))`
+}
+
+/** Bind values for selfCompletionProducerSql, in placeholder order. */
+export function selfCompletionProducerParams(decidedBy: string, tenant: string): string[] {
+  return [decidedBy, tenant, decidedBy, tenant]
 }
 
 /** True iff the task is on the self-completion lane and the decider produced its current result AND is its assignee RIGHT NOW. */
@@ -1690,7 +1701,7 @@ export async function isCurrentSelfCompletionProducer(
   if (input.task.gate_owner !== 'gate:agent-self-completion') return false
   const row = await env.DB.prepare(
     `SELECT 1 AS one FROM tasks WHERE id = ? AND gate_owner = 'gate:agent-self-completion' AND ${selfCompletionProducerSql('tasks.id')}`,
-  ).bind(input.task.id, input.decidedBy, input.decidedBy).first<{ one: number }>()
+  ).bind(input.task.id, ...selfCompletionProducerParams(input.decidedBy, env.TENANT_SLUG)).first<{ one: number }>()
   return row !== null
 }
 
@@ -1956,7 +1967,7 @@ export function buildVerdictStatements(
       : ` AND NOT ${independence.sql}`
     : ''
   const independenceParams: unknown[] = independence
-    ? selfCompletionLane ? [input.decidedBy, input.decidedBy, input.decidedBy, ...independence.params] : independence.params
+    ? selfCompletionLane ? [...selfCompletionProducerParams(input.decidedBy, env.TENANT_SLUG), input.decidedBy, ...independence.params] : independence.params
     : []
 
   const guardSql = `${laneGuardSql}${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
