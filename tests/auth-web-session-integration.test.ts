@@ -411,7 +411,9 @@ describe('web-session registry — integration through authApp (real D1)', () =>
     const dir = path.join(process.cwd(), 'migrations')
     const files = fs.readdirSync(dir).filter((f) => f.endsWith('.sql')).sort()
     for (const file of files) {
-      if (file.startsWith('0143_') || file.startsWith('0144_')) continue
+      // 0210 rebuilds elevation_grants (FK -> web_sessions), so a DB that predates web_sessions
+      // necessarily predates it too: skipped with the tables it depends on.
+      if (file.startsWith('0143_') || file.startsWith('0144_') || file.startsWith('0210_')) continue
       bareHarness.sqlite.exec(fs.readFileSync(path.join(dir, file), 'utf8'))
     }
     const env = makeEnv('owner@x.test')
