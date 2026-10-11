@@ -73,9 +73,15 @@ async function previewHandler(c: Context<AppEnv>): Promise<Response> {
 // cache/conditional/range, content-type/length, origin, referer, user-agent and
 // x-requested-with pass, plus method, streamed body and redirect mode. Cookie,
 // Authorization, Proxy-Authorization, Cf-Access-* and x-mupot-* are never forwarded, and
-// any Set-Cookie on the Worker's response is dropped so it cannot shadow or fixate the
-// colony session. (The `<project>.<root>` hostname branch is the Worker's own origin; it
+// the Worker's response is rebuilt from a header allow-list (no Set-Cookie,
+// Service-Worker-Allowed, Clear-Site-Data, Refresh, Link, CORS or policy headers) and served
+// with a CSP `sandbox` (no allow-same-origin), so the page gets an opaque origin and cannot
+// act with the colony's cookies or storage. The embedding iframe omits allow-same-origin too. (The `<project>.<root>` hostname branch is the Worker's own origin; it
 // keeps its own cookies/Authorization but still loses Cf-Access-* and x-mupot-*.)
+//
+// PREVIEWS ARE BEST EFFORT. Containment takes priority over fidelity: a preview does not
+// behave exactly like the Worker on its own hostname. Use the Worker's own URL for full
+// fidelity.
 //
 // requireAuth answers 401 JSON rather than redirecting, so the dashboard's preview iframe
 // fails cleanly instead of rendering login HTML into itself. That was the stated reason
@@ -202,7 +208,7 @@ export function projectLivePreviewSplitHtml(input: ProjectPreviewSplitInput): Ht
         <iframe
           src="${iframeSrc}"
           title="Project live preview"
-          sandbox="allow-scripts allow-same-origin allow-forms"
+          sandbox="allow-scripts allow-forms"
           referrerpolicy="no-referrer"
           data-preview-iframe="${project.id}"
         ></iframe>

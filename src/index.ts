@@ -378,6 +378,7 @@ export default {
       PUBLIC_ORIGIN: env.PUBLIC_ORIGIN,
       TENANT_SLUG: env.TENANT_SLUG,
       DISPATCHER: env.DISPATCHER,
+      DB: env.DB,
     })
     if (apexRoute.kind === 'home') {
       req = apexRoute.request

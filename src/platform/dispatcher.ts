@@ -15,7 +15,9 @@ import { projectSelectSql } from '../projects/columns'
 import { getProject } from '../projects/service'
 import {
   buildForwardRequest,
-  stripResponseCookies,
+  refuseServiceWorkerScript,
+  sanitizeColonyOriginResponse,
+  sanitizeOwnOriginResponse,
   type ForwardPolicy,
 } from './forward-policy'
 
@@ -226,6 +228,10 @@ export async function dispatchProjectRequest(
   // Default is the STRICT policy: callers must opt in to forwarding cookies/Authorization.
   policy: ForwardPolicy = 'colony-origin',
 ): Promise<Response> {
+  if (policy === 'colony-origin') {
+    const refused = refuseServiceWorkerScript(request)
+    if (refused) return refused
+  }
   const reason = fallbackReasonForStatus(project.deploy_status)
   if (reason) return fallbackPreviewResponse(project, reason)
 
@@ -246,8 +252,13 @@ export async function dispatchProjectRequest(
 
   try {
     const response = await worker.fetch(rewriteForWorker(request, remainder, policy))
-    // Same-origin on the colony: the Worker must not set cookies on the colony origin.
-    return policy === 'colony-origin' ? stripResponseCookies(response) : response
+    // Same-origin on the colony: contain the response (header allow-list + CSP sandbox).
+    return policy === 'colony-origin'
+      ? sanitizeColonyOriginResponse(response, {
+          requestUrl: request.url,
+          pathPrefix: previewIframePath(project.id, '/'),
+        })
+      : sanitizeOwnOriginResponse(response)
   } catch (err) {
     if (isWorkerMissing(err)) return fallbackPreviewResponse(project, 'not_provisioned')
     return fallbackPreviewResponse(

@@ -10,6 +10,12 @@ import { createProject } from '../src/projects/service'
 import { platformApp } from '../src/platform/routes'
 import { handlePlatformDispatch } from '../src/platform/dispatcher'
 import { routeApexPathTenant } from '../src/dispatcher'
+import { projectLivePreviewSplitHtml } from '../src/platform/routes'
+import {
+  SANDBOX_CSP,
+  sanitizeColonyOriginResponse,
+  sanitizeOwnOriginResponse,
+} from '../src/platform/forward-policy'
 
 let harness: SqliteD1Harness | null = null
 afterEach(() => { harness?.close(); harness = null })
@@ -100,10 +106,15 @@ describe('/preview/* forwards no ambient credentials', () => {
     expect(cap.seen[0].redirect).toBe('manual')
   })
 
-  it('strips Set-Cookie from the user Worker response on /preview', async () => {
+  it('rebuilds the response from a header allow-list and adds the sandbox CSP', async () => {
     const h = setup()
     const cap = capture(() => {
-      const r = new Response('body', { status: 201, headers: { 'x-keep': '1' } })
+      const r = new Response('body', { status: 201, headers: {
+        'content-type': 'text/html', etag: '"v1"', 'x-keep-not': '1',
+        'service-worker-allowed': '/', 'clear-site-data': '"cookies"', refresh: '0;url=/',
+        link: '</x>; rel=preload', 'access-control-allow-origin': '*',
+        'permissions-policy': 'camera=()', 'content-security-policy-report-only': 'default-src *',
+      } })
       r.headers.append('set-cookie', 'mupot_session=attacker; Path=/')
       r.headers.append('set-cookie', 'other=1')
       return r
@@ -114,9 +125,86 @@ describe('/preview/* forwards no ambient credentials', () => {
       headers: { cookie: 'mupot_session=live' },
     }), env)
     expect(res.status).toBe(201)
-    expect(res.headers.get('set-cookie')).toBeNull()
-    expect(res.headers.get('x-keep')).toBe('1')
+    for (const name of ['set-cookie', 'service-worker-allowed', 'clear-site-data', 'refresh', 'link',
+      'access-control-allow-origin', 'permissions-policy', 'x-keep-not', 'content-security-policy-report-only']) {
+      expect(res.headers.has(name), name).toBe(false)
+    }
+    expect(res.headers.get('etag')).toBe('"v1"')
+    expect(res.headers.get('content-type')).toBe('text/html')
+    expect(res.headers.get('content-security-policy')).toBe(SANDBOX_CSP)
+    expect(SANDBOX_CSP).not.toContain('allow-same-origin')
     expect(await res.text()).toBe('body')
+  })
+
+  it('keeps the Worker\'s own CSP AND adds the sandbox', async () => {
+    const h = setup()
+    const cap = capture(() => new Response('x', { headers: { 'content-security-policy': "default-src 'self'" } }))
+    const env = envFor(h, cap.binding)
+    const id = await healthy(h, env, 'strip-target')
+    const res = await platformApp.fetch(new Request(`https://mupot.mumega.com/preview/${id}/`, { headers: { cookie: 'mupot_session=live' } }), env)
+    const csp = res.headers.get('content-security-policy') ?? ''
+    expect(csp).toContain("default-src 'self'")
+    expect(csp).toContain('sandbox allow-scripts')
+    expect(csp).not.toContain('allow-same-origin')
+  })
+
+  it('drops a Location that leaves the preview prefix, keeps in-prefix and external', async () => {
+    const h = setup()
+    let loc = '/login'
+    const cap = capture(() => new Response(null, { status: 302, headers: { location: loc } }))
+    const env = envFor(h, cap.binding)
+    const id = await healthy(h, env, 'strip-target')
+    const get = async (l: string) => {
+      loc = l
+      const res = await platformApp.fetch(new Request(`https://mupot.mumega.com/preview/${id}/a/b`, { redirect: 'manual', headers: { cookie: 'mupot_session=live' } }), env)
+      return res.headers.get('location')
+    }
+    expect(await get('/login')).toBeNull()
+    expect(await get('/dashboard/projects')).toBeNull()
+    expect(await get(`/preview/${id}/next`)).toBe(`/preview/${id}/next`)
+    expect(await get('sibling')).toBe('sibling')
+    expect(await get('https://example.org/x')).toBe('https://example.org/x')
+    expect(await get('javascript:alert(1)')).toBeNull()
+  })
+
+  it('refuses a service-worker script fetch without consulting the namespace', async () => {
+    const h = setup()
+    const cap = capture()
+    const env = envFor(h, cap.binding)
+    const id = await healthy(h, env, 'strip-target')
+    const res = await platformApp.fetch(new Request(`https://mupot.mumega.com/preview/${id}/sw.js`, {
+      headers: { 'service-worker': 'script', cookie: 'mupot_session=live' },
+    }), env)
+    expect(res.status).toBe(403)
+    expect(cap.seen).toHaveLength(0)
+  })
+
+  it('propagates client disconnect to the user Worker', async () => {
+    const h = setup()
+    const cap = capture()
+    const env = envFor(h, cap.binding)
+    const id = await healthy(h, env, 'strip-target')
+    const ac = new AbortController()
+    await platformApp.fetch(new Request(`https://mupot.mumega.com/preview/${id}/`, { signal: ac.signal, headers: { cookie: 'mupot_session=live' } }), env)
+    expect(cap.seen[0].signal.aborted).toBe(false)
+    ac.abort()
+    expect(cap.seen[0].signal.aborted).toBe(true)
+  })
+
+  it('a 101 upgrade is never rewrapped into a crash on either policy', () => {
+    const upgrade = { status: 101, headers: new Headers(), body: null } as unknown as Response
+    expect(sanitizeOwnOriginResponse(upgrade)).toBe(upgrade)
+    const colony = sanitizeColonyOriginResponse(upgrade, { requestUrl: 'https://x.test/preview/i/', pathPrefix: '/preview/i/' })
+    expect(colony.status).toBe(501)
+  })
+
+  it('the embedding iframe does not grant allow-same-origin', () => {
+    const out = String(projectLivePreviewSplitHtml({ project: {
+      id: 'p1', name: 'P', slug: 'p', repo_url: null, live_url: null, worker_name: 'p', deploy_status: 'healthy',
+    } } as never))
+    const m = out.match(/sandbox="([^"]*)"/)
+    expect(m?.[1]).toContain('allow-scripts')
+    expect(m?.[1]).not.toContain('allow-same-origin')
   })
 })
 
@@ -126,6 +214,7 @@ describe('project hostname branch (the Worker\'s own origin)', () => {
     const cap = capture(() => {
       const r = new Response('ok')
       r.headers.append('set-cookie', 'own=1; Path=/')
+      r.headers.append('set-cookie', 'planted=1; Domain=mupot.mumega.com; Path=/')
       return r
     })
     const env = envFor(h, cap.binding)
@@ -139,26 +228,85 @@ describe('project hostname branch (the Worker\'s own origin)', () => {
     expect(fwd.headers.get('authorization')).toBe('Bearer colony-token')
     for (const name of ['proxy-authorization', 'cf-access-jwt-assertion', 'cf-access-client-id',
       'cf-access-client-secret', 'cf-access-authenticated-user-email', 'x-mupot-seat',
-      'x-mupot-auth-context', 'mcp-session-id']) {
+      'x-mupot-auth-context']) {
       expect(fwd.headers.has(name), name).toBe(false)
     }
-    expect(res?.headers.get('set-cookie')).toContain('own=1')
+    expect(fwd.headers.get('mcp-session-id')).toBe('sid') // the project's own session id
+    const setCookies = (res?.headers as Headers & { getSetCookie(): string[] }).getSetCookie()
+    expect(setCookies).toEqual(["own=1; Path=/"])
   })
 })
 
 describe('/t/{tenant} path door (same-origin tenant dispatch)', () => {
-  it('drops cf-access-*/x-mupot-* too and strips response Set-Cookie', async () => {
+  function registerPot(h: SqliteD1Harness, slug: string, status = 'active', script = slug) {
+    h.sqlite.exec(`INSERT INTO pots (id, slug, worker_script, status) VALUES ('pot-${slug}', '${slug}', '${script}', '${status}')`)
+  }
+
+  it('uses the colony-origin allow-list and contains the response', async () => {
+    const h = setup()
+    registerPot(h, 'gaf')
     const cap = capture(() => {
-      const r = new Response('ok')
+      const r = new Response('ok', { headers: { 'mcp-session-id': 'x', 'x-other': '1' } })
       r.headers.append('set-cookie', 'mupot_session=attacker')
       return r
     })
     const route = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/gaf/mcp', {
-      method: 'POST', headers: AMBIENT, body: 'x',
-    }), { TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never })
+      method: 'POST', headers: { ...AMBIENT, 'x-unknown': '1', accept: 'application/json' }, body: 'x',
+    }), { TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never, DB: h.db })
     expect(route.kind).toBe('respond')
     const fwd = cap.seen[0]
-    for (const name of Object.keys(AMBIENT)) expect(fwd.headers.has(name), name).toBe(false)
-    if (route.kind === 'respond') expect(route.response.headers.get('set-cookie')).toBeNull()
+    for (const name of [...Object.keys(AMBIENT), 'x-unknown']) expect(fwd.headers.has(name), name).toBe(false)
+    expect(fwd.headers.get('accept')).toBe('application/json')
+    if (route.kind !== 'respond') return
+    for (const name of ['set-cookie', 'x-other', 'mcp-session-id']) expect(route.response.headers.has(name), name).toBe(false)
+    expect(route.response.headers.get('content-security-policy')).toBe(SANDBOX_CSP)
+  })
+
+  it('refuses (404) a project Worker name and never consults the namespace', async () => {
+    const h = setup()
+    const cap = capture()
+    const env = envFor(h, cap.binding)
+    await healthy(h, env, 'agent-project')
+    const route = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/agent-project/'), {
+      TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never, DB: h.db,
+    })
+    expect(route.kind).toBe('respond')
+    if (route.kind === 'respond') expect(route.response.status).toBe(404)
+    expect(cap.binding.get).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['provisioning', 'gaf'],
+    ['released', 'gaf'],
+    ['active', 'other-script'],
+  ])('refuses a registered pot with status %s / script %s mismatch', async (status, script) => {
+    const h = setup()
+    registerPot(h, 'gaf', status, script)
+    const cap = capture()
+    const route = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/gaf/'), {
+      TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never, DB: h.db,
+    })
+    if (route.kind === 'respond') expect(route.response.status).toBe(404)
+    expect(cap.binding.get).not.toHaveBeenCalled()
+  })
+
+  it('fails closed with no registry binding', async () => {
+    const cap = capture()
+    const route = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/gaf/'), {
+      TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never,
+    })
+    if (route.kind === 'respond') expect(route.response.status).toBe(404)
+    expect(cap.binding.get).not.toHaveBeenCalled()
+  })
+
+  it('refuses a service-worker script fetch', async () => {
+    const h = setup()
+    registerPot(h, 'gaf')
+    const cap = capture()
+    const route = await routeApexPathTenant(new Request('https://mupot.mumega.com/t/gaf/sw.js', {
+      headers: { 'service-worker': 'script' },
+    }), { TENANT_SLUG: 'mumega', DISPATCHER: cap.binding as never, DB: h.db })
+    if (route.kind === 'respond') expect(route.response.status).toBe(403)
+    expect(cap.seen).toHaveLength(0)
   })
 })

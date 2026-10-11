@@ -9,7 +9,12 @@
 //   3. Single billed request across the chain: Dispatch Worker -> User Worker.
 
 import { RESERVED_TENANT_SLUGS } from './pots/service'
-import { isColonyCredentialHeader, stripResponseCookies } from './platform/forward-policy'
+import {
+  buildForwardRequest,
+  refuseServiceWorkerScript,
+  sanitizeColonyOriginResponse,
+  sanitizeOwnOriginResponse,
+} from './platform/forward-policy'
 
 export interface DispatcherEnv {
   DISPATCHER: {
@@ -132,13 +137,6 @@ const TENANT_OVERRIDE_HEADERS = ['x-mupot-tenant-slug', 'x-pot-tenant']
 // The path door is same-origin (`mupot.mumega.com`), so unlike subdomain
 // routing the browser/operator credentials arrive with the request — strip
 // them before dispatch. Tenant Workers authenticate through their own door.
-function colonyCredentialHeaderNames(request: Request): string[] {
-  const names: string[] = []
-  request.headers.forEach((_value, name) => {
-    if (isColonyCredentialHeader(name)) names.push(name)
-  })
-  return names
-}
 
 function stripHeaders(request: Request, names: string[]): Request {
   const headers = new Headers(request.headers)
@@ -177,11 +175,13 @@ export function resolveApexPathTenant(
   }
   // Foreign tenant: the rewritten request carries no client tenant-override
   // and no colony credentials into the isolate (Athena gate 2026-09-04).
-  const rewritten = rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder)
-  const dispatchRequest = stripHeaders(
-    rewritten,
-    [...TENANT_OVERRIDE_HEADERS, ...colonyCredentialHeaderNames(rewritten)],
-  )
+  // Colony-origin request allow-list: this door is same-origin on the colony, so the
+  // browser's credentials are the colony's and must not reach the tenant isolate. The
+  // allow-list also drops any client tenant-override header by construction.
+  const forwardUrl = new URL(request.url)
+  forwardUrl.hostname = `${parsed.slug}.${rootDomain}`
+  forwardUrl.pathname = parsed.remainder
+  const dispatchRequest = buildForwardRequest(request, forwardUrl, 'colony-origin')
   return {
     kind: 'dispatch',
     slug: parsed.slug,
@@ -189,10 +189,25 @@ export function resolveApexPathTenant(
   }
 }
 
+async function isRegisteredActivePot(db: D1Database | undefined, slug: string): Promise<boolean> {
+  if (!db) return false
+  try {
+    const row = await db
+      .prepare("SELECT 1 AS ok FROM pots WHERE slug = ?1 AND worker_script = ?1 AND status = 'active' LIMIT 1")
+      .bind(slug)
+      .first()
+    return row !== null
+  } catch {
+    return false
+  }
+}
+
 export interface ApexPathEnv {
   PUBLIC_ORIGIN?: string
   TENANT_SLUG?: string
   DISPATCHER?: DispatcherEnv['DISPATCHER']
+  /** Pot registry. `/t/{slug}` resolves ONLY for slugs registered here; absent = fail closed. */
+  DB?: D1Database
 }
 
 export type ApexPathRoute =
@@ -239,6 +254,20 @@ export async function routeApexPathTenant(req: Request, env: ApexPathEnv): Promi
       ),
     }
   }
+  // FAIL CLOSED: the dispatch namespace also holds project Workers (agent-deployable) that
+  // are not tenant pots. `/t/` is an unauthenticated door, so it resolves only a slug that
+  // the pot registry lists as an active pot whose script is that slug.
+  if (!(await isRegisteredActivePot(env.DB, pathTenant.slug))) {
+    return {
+      kind: 'respond',
+      response: new Response(
+        JSON.stringify({ error: 'pot_not_found', tenant: pathTenant.slug }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      ),
+    }
+  }
+  const refusedSw = refuseServiceWorkerScript(req)
+  if (refusedSw) return { kind: 'respond', response: refusedSw }
   // No FALLBACK_POT: that field was removed from DispatcherEnv in mupot#1301 because
   // nothing ever read it — extractTenantSlug returns the module constant. Passing it here
   // would re-add a knob that does nothing.
@@ -246,8 +275,14 @@ export async function routeApexPathTenant(req: Request, env: ApexPathEnv): Promi
     DISPATCHER: env.DISPATCHER,
     ROOT_DOMAIN: rootHost,
   })
-  // Same-origin door: the tenant Worker must not set cookies on the colony origin.
-  return { kind: 'respond', response: stripResponseCookies(response) }
+  // Same-origin door: contain the tenant Worker's response (header allow-list + CSP sandbox).
+  return {
+    kind: 'respond',
+    response: sanitizeColonyOriginResponse(response, {
+      requestUrl: req.url,
+      pathPrefix: `/t/${pathTenant.slug}/`,
+    }),
+  }
 }
 
 
@@ -314,7 +349,11 @@ const dispatcher = {
 
     try {
       const userWorker = env.DISPATCHER.get(tenantSlug, {}, { limits })
-      return await userWorker.fetch(request)
+      // Own-origin deny-list: drop colony gateway identity headers (cf-access-*, x-mupot-*,
+      // proxy-authorization); the tenant's own cookies/Authorization pass.
+      return sanitizeOwnOriginResponse(
+        await userWorker.fetch(buildForwardRequest(request, new URL(request.url), 'own-origin')),
+      )
     } catch (err) {
       const isNotFound = err instanceof Error && (err.message.includes('not found') || err.message.includes('No user worker'))
       if (isNotFound) {
