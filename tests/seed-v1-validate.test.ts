@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { validateSeed } from '../src/seeds/validate'
 import { canonicalSeedJson } from '../src/seeds/canonical'
-import { SEED_MAX_BYTES } from '../src/seeds/contract'
 
 const example = (name: string) => readFileSync(join(__dirname, '..', 'docs', 'examples', 'seeds', name), 'utf8')
 
@@ -103,7 +102,7 @@ describe('rule 4: strict, size-capped, depth-capped', () => {
     expect((await refused(`${BASE}\ndeploy:\n  via: cf-pages\n  human_only: true\n  sneaky: 1\n`)).code).toBe('unknown_key')
   })
   it('over 32 KiB refused', async () => {
-    expect((await refused(`${BASE}\ngoal: ${'x'.repeat(SEED_MAX_BYTES)}\n`)).code).toBe('seed_too_large')
+    expect((await refused(`${BASE}\ngoal: ${'x'.repeat(32 * 1024)}\n`)).code).toBe('seed_too_large')
   })
   it('deep nesting refused', async () => {
     const deep = '{"a":'.repeat(12) + '1' + '}'.repeat(12)
