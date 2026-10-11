@@ -1679,12 +1679,17 @@ export function selfCompletionProducerSql(taskIdExpr: string): string {
   // decider's AND carry the exact text now on tasks.result. A result replaced by any writer that
   // appends no submission (CI sync, a failure reason, a foreign agent) no longer equals the row's
   // result_text, and a legacy row (result_text NULL) never equals anything: both fail closed.
+  // A submission that an (unreversed) rejection came after is spent: equal bytes written back by
+  // another path (a failure reason, a foreign runtime) cannot revive it; only a fresh submission can.
   return `(tasks.assignee_agent_id = ? AND tasks.result IS NOT NULL AND EXISTS (
     SELECT 1 FROM task_result_submissions lane_sub
      WHERE lane_sub.tenant = ? AND lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
        AND lane_sub.result_text IS NOT NULL AND lane_sub.result_text = tasks.result
        AND lane_sub.seq = (SELECT MAX(lane_max.seq) FROM task_result_submissions lane_max
                             WHERE lane_max.tenant = ? AND lane_max.task_id = ${taskIdExpr})
+       AND NOT EXISTS (SELECT 1 FROM task_verdicts lane_rej
+                        WHERE lane_rej.task_id = ${taskIdExpr} AND lane_rej.verdict = 'rejected'
+                          AND lane_rej.reversed_at IS NULL AND lane_rej.decided_at >= lane_sub.created_at)
   ))`
 }
 

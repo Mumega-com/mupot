@@ -318,6 +318,22 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect(verdictRows()).toBe(1) // only the admin's rejection
   })
 
+  it('a REJECTED submission is spent: its exact text written back by another path cannot revive it for A', async () => {
+    await rejectedAfterProducedByA()
+    const rejectedText = (sql().prepare(`SELECT result_text FROM task_result_submissions WHERE task_id = ? ORDER BY seq DESC LIMIT 1`).get(TASK) as { result_text: string }).result_text
+    // another path (a failure reason, a foreign runtime) writes A's rejected text back, no new submission
+    sql().prepare(`UPDATE tasks SET status = 'review', result = ?, assignee_agent_id = 'A' WHERE id = ?`).run(rejectedText, TASK)
+    expect(submitters()).toEqual(['A'])
+    const res = await verdict(agentAuth('A'))
+    expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+    const t = sql().prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+    await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'A' })).rejects.toBeInstanceOf(VerdictIndependenceError)
+    expect(verdictRows()).toBe(1) // only the admin's rejection
+    // a reversed rejection does not spend the submission
+    sql().prepare(`UPDATE task_verdicts SET reversed_at = ? WHERE task_id = ? AND verdict = 'rejected'`).run(new Date().toISOString(), TASK)
+    expect((await verdict(agentAuth('A'))).ok).toBe(true)
+  })
+
   it('a fresh own submission is bound to its result and is allowed; the ledger stores the exact text', async () => {
     await produce('A')
     const ledger = sql().prepare(`SELECT result_text AS t FROM task_result_submissions WHERE task_id = ?`).get(TASK) as { t: string | null }
