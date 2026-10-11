@@ -146,6 +146,12 @@ describe('elevation_decide over harness-attested human origin', () => {
 
   // ── the origin itself ────────────────────────────────────────────────────
 
+  it('a suspended owner is refused member_inactive', async () => {
+    const id = await request(['action:project_status'])
+    await env.DB.prepare(`UPDATE members SET status = 'suspended' WHERE id = ?1`).bind(HUMAN).run()
+    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'member_inactive')
+  })
+
   it('origin from a chat the owner is not bound to is refused origin_member_mismatch', async () => {
     const id = await request(['action:project_status'])
     await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id), { user_id: '999', chat_id: '999' }) }, 403, 'origin_member_mismatch')
