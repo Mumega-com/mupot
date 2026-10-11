@@ -483,7 +483,7 @@ async function projectStatusElevation(
   args: Record<string, unknown>,
   denied: ToolOutcome,
 ): Promise<{ ok: true; grant: ElevationGrantRecord } | { ok: false; outcome: ToolOutcome }> {
-  const projectId = str(args.project_id)
+  const projectId = str(args.project_id)?.trim() ?? null // canonical id: authorized and written as the same value
   const onlyStatus = Object.keys(args).every((key) => key === 'project_id' || key === 'status')
   if (!auth.boundAgentId || !auth.memberId || !projectId || !onlyStatus || str(args.status) === null) return { ok: false, outcome: denied }
   // ORG scope only, like project_create: a squad-scoped grant is a squad admin's
@@ -529,7 +529,7 @@ const toolProjectUpdate: ToolSpec = {
       if (!elevated.ok) return elevated.outcome
       elevationGrant = elevated.grant
     }
-    const projectId = str(args.project_id)
+    const projectId = str(args.project_id)?.trim() ?? null // canonical id, same value the elevation check used
     if (!projectId) return fail(400, 'invalid_project_id')
     const { project_id: _projectId, ...rawInput } = args
     // Strip internal lifecycle flags even though schema forbids them — class coverage.
@@ -567,7 +567,7 @@ const toolProjectUpdate: ToolSpec = {
       // Two-phase receipt: pending row first, flipped to applied INSIDE updateProject's
       // own UPDATE batch (atomic with the status write), failed on any refusal.
       const receipted = await withElevationReceipt(
-        env, auth, elevationGrant, 'project_update', { project_id: projectId, status: args.status },
+        env, elevationGrant, 'project_update', { project_id: projectId, status: args.status },
         (receiptId) => updateProject(env, projectId, input, { elevationReceiptId: receiptId }),
         (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
         { inBatch: true },

@@ -297,7 +297,9 @@ async function routinePolicyPrincipal(
   // the refusal is identical to an uncovered routine (no existence oracle).
   if (!row) return { ok: false, outcome: fail(403, 'forbidden') }
   const squads = [row.responsible_squad_id]
-  if (typeof destinationSquadId === 'string' && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
+  // Defense in depth: callers canonicalize, but the id authorized here must equal the id written.
+  const destination = typeof destinationSquadId === 'string' ? destinationSquadId.trim() : null
+  if (destination !== null && destination !== row.responsible_squad_id) squads.push(destination)
   let grant: ElevationGrantRecord | null = null
   for (const squadId of squads) {
     const policyOpts = {
@@ -335,7 +337,14 @@ const routineUpdate: ToolSpec = {
   args: '{ routine_id: string, ...policy fields }',
   inputSchema: { type: 'object', properties: { routine_id: id(), ...policyProperties }, required: ['routine_id'], additionalProperties: false },
   async run(auth, env, args) {
-    const { routine_id: routineId, ...rawPolicy } = args
+    const { routine_id: routineId, ...untrimmedPolicy } = args
+    // Canonicalize the destination squad id ONCE, before authorization: the id the
+    // elevation scope check authorizes must be byte-identical to the id written
+    // (updateRoutine trims it too, so a padded value would otherwise be authorized
+    // raw -> squad lookup misses -> home-squad fence skipped -> trimmed home id written).
+    const rawPolicy = typeof untrimmedPolicy.responsible_squad_id === 'string'
+      ? { ...untrimmedPolicy, responsible_squad_id: untrimmedPolicy.responsible_squad_id.trim() }
+      : untrimmedPolicy
     const input = policy(rawPolicy, false)
     if (!validId(routineId)) return fail(404, 'routine_not_found')
     const acting = await routinePolicyPrincipal(auth, env, routineId, 'routine_update', 'update', rawPolicy.responsible_squad_id)
@@ -348,7 +357,7 @@ const routineUpdate: ToolSpec = {
       return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
     }
     const receipted = await withElevationReceipt(
-      env, auth, acting.elevation.grant, 'routine_update', acting.elevation.detail,
+      env, acting.elevation.grant, 'routine_update', acting.elevation.detail,
       () => updateRoutine(env, principal, routineId, input),
       (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
     )
@@ -374,7 +383,7 @@ function lifecycle(name: 'routine_enable' | 'routine_pause' | 'routine_archive',
         return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
       }
       const receipted = await withElevationReceipt(
-        env, auth, acting.elevation.grant, name, acting.elevation.detail,
+        env, acting.elevation.grant, name, acting.elevation.detail,
         () => operation(env, principal, routineId),
         (r) => (r.ok ? { applied: true } : { applied: false, code: String(r.error) }),
       )

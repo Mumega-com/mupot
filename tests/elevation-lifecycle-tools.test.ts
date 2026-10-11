@@ -542,3 +542,106 @@ describe('unarchive_row under action:project_status', () => {
     expectRefused(await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'members', id: ADMIN, reason: 'restore' }, ORIGIN))
   })
 })
+
+describe('canonical ids: the id authorized is the id written', () => {
+  const pad = (s: string): string => ` ${s}\t`
+
+  async function appliedCount(): Promise<number> {
+    return (await receiptStatuses()).filter((s) => s === 'applied').length
+  }
+
+  it('routine_update with a PADDED home-squad destination + org grant is refused; nothing written, 0 applied receipts', async () => {
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-target', '${KIND_HOME_SQUAD}', 'write')`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:routine_policy', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, responsible_squad_id: pad(KIND_HOME_SQUAD) }, ORIGIN)
+    expectRefused(res)
+    const row = await env.DB.prepare('SELECT responsible_squad_id FROM routines WHERE id = ?1').bind(routineTarget).first<{ responsible_squad_id: string }>()
+    expect(row?.responsible_squad_id).toBe(TARGET_SQUAD)
+    expect(await appliedCount()).toBe(0)
+  })
+
+  it('routine_update with a PADDED non-home destination is canonicalized: the stored value equals the authorized value', async () => {
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-target', '${OTHER_SQUAD}', 'write')`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:routine_policy', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, responsible_squad_id: pad(OTHER_SQUAD) }, ORIGIN)
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT responsible_squad_id FROM routines WHERE id = ?1').bind(routineTarget).first<{ responsible_squad_id: string }>()
+    expect(row?.responsible_squad_id).toBe(OTHER_SQUAD)
+    expect(await appliedCount()).toBe(1)
+  })
+
+  it('unarchive_row with a PADDED home squad id + org grant is refused and the row stays archived', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${KIND_HOME_SQUAD}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    expectRefused(await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: pad(KIND_HOME_SQUAD), reason: 'restore' }, ORIGIN))
+    const row = await env.DB.prepare('SELECT status FROM squads WHERE id = ?1').bind(KIND_HOME_SQUAD).first<{ status: string }>()
+    expect(row?.status).toBe('archived')
+    expect(await appliedCount()).toBe(0)
+  })
+
+  it('unarchive_row with a padded non-home squad id is canonicalized and restores exactly that row', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${OTHER_SQUAD}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: pad(OTHER_SQUAD), reason: 'restore' }, ORIGIN)
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT status FROM squads WHERE id = ?1').bind(OTHER_SQUAD).first<{ status: string }>()
+    expect(row?.status).toBe('active')
+    expect(await appliedCount()).toBe(1)
+  })
+
+  it('project_update with a padded project id under an org grant changes exactly the canonical project', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'project_update', { project_id: pad('proj-other'), status: 'paused' }, ORIGIN)
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-other').first<{ status: string }>()
+    expect(row?.status).toBe('paused')
+    expect(await appliedCount()).toBe(1)
+  })
+
+  it('concurrent unarchive_row on one row: exactly ONE applied receipt, the loser is failed', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${OTHER_SQUAD}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    const call = () => invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: OTHER_SQUAD, reason: 'restore' }, ORIGIN)
+    await Promise.all([call(), call()])
+    const statuses = await receiptStatuses()
+    expect(statuses.filter((s) => s === 'applied')).toHaveLength(1)
+    expect(statuses.filter((s) => s === 'pending')).toHaveLength(0)
+  })
+})
+
+describe('step-up: irreversible action:routine_archive needs a fresh reauth', () => {
+  async function decide(action: string, recentReauthOk: boolean): Promise<Awaited<ReturnType<typeof decideElevationRequest>>> {
+    const sessionId = await checkIn()
+    const nowMs = Date.now()
+    const web = await createWebSession(env, `raw-stepup-${action}-${recentReauthOk}`, { tenant: TENANT, memberId: ADMIN, loginIdentityId: ADMIN_IDENTITY }, nowMs)
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: sessionId, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: [action], scopeType: 'squad', scopeId: TARGET_SQUAD, durationMinutes: 60, reason: 'step-up test',
+    }, nowMs)
+    if (!created.ok) throw new Error(`setup: request failed: ${JSON.stringify(created)}`)
+    return decideElevationRequest(env, {
+      tenant: TENANT, requestId: created.request.id, decision: 'approve', selectedActions: [action],
+      decidedByMemberId: ADMIN,
+      decidedByCapabilities: [{ member_id: ADMIN, scope_type: 'squad', scope_id: TARGET_SQUAD, capability: 'admin' }],
+      decidedByWebSessionHash: web.id_hash, recentReauthOk,
+    }, nowMs)
+  }
+
+  it('routine_archive without recent reauth -> reauth_required; with recent reauth -> approved', async () => {
+    const stale = await decide('action:routine_archive', false)
+    expect(stale.ok).toBe(false)
+    if (!stale.ok) expect(stale.reason).toBe('reauth_required')
+    const fresh = await decide('action:routine_archive', true)
+    expect(fresh.ok).toBe(true)
+  })
+
+  it.each(['action:routine_policy', 'action:project_status'])('%s does NOT require step-up', async (action) => {
+    expect((await decide(action, false)).ok).toBe(true)
+  })
+})

@@ -117,7 +117,6 @@ export async function memberOrElevatedAgent(
  */
 export async function withElevationReceipt<R>(
   env: Env,
-  auth: AuthContext,
   grant: ElevationGrantRecord,
   toolName: string,
   detail: unknown,
@@ -127,7 +126,7 @@ export async function withElevationReceipt<R>(
 ): Promise<{ began: true; value: R } | { began: false; outcome: ToolOutcome }> {
   let receiptId: string
   try {
-    receiptId = await beginElevationReceipt(env, auth.tenant, grant, toolName, detail)
+    receiptId = await beginElevationReceipt(env, env.TENANT_SLUG, grant, toolName, detail)
   } catch {
     return { began: false, outcome: fail(500, 'elevation_receipt_failed', 'the elevation audit receipt could not be written; nothing was changed') }
   }
