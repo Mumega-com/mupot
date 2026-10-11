@@ -354,6 +354,21 @@ describe('gate:agent-self-completion lane: verdict authority is the PRODUCER of 
     expect((await verdict(adminAuth())).ok).toBe(true)
   })
 
+  it('a rejection in the SAME millisecond as the submission still spends it (mixed timestamp precision)', async () => {
+    const text = `x\nArtifact: /tmp/x\nSHA256: ${SHA}`
+    sql().prepare(`UPDATE tasks SET status = 'review', result = ? WHERE id = ?`).run(text, TASK)
+    // the ledger default is '...SS.mmmZ'; a verdict's decided_at carries sub-millisecond digits '...SS.mmmNNNNNNZ'
+    sql().prepare(
+      `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text, created_at)
+       VALUES ('same-ms', ?, ?, ?, 'A', '/tmp/x', ?, ?, ?, '2026-10-11T12:00:00.185Z')`,
+    ).run(env.TENANT_SLUG, TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32), text)
+    sql().prepare(
+      `INSERT INTO task_verdicts (id, task_id, verdict, note, decided_by, decided_at) VALUES ('rej-same-ms', ?, 'rejected', NULL, 'mem-admin', '2026-10-11T12:00:00.185000123Z')`,
+    ).run(TASK)
+    // raw TEXT order would put the rejection first ('0' < 'Z'); at millisecond precision it is a tie, which counts
+    expect(await verdict(agentAuth('A'))).toMatchObject({ ok: false, error: 'self_verdict' })
+  })
+
   it('the ledger is tenant-scoped: a matching row under ANOTHER tenant is not the producer record', async () => {
     const text = `x\nArtifact: /tmp/x\nSHA256: ${SHA}`
     sql().prepare(`UPDATE tasks SET status = 'review', result = ? WHERE id = ?`).run(text, TASK)

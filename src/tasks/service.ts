@@ -1681,6 +1681,9 @@ export function selfCompletionProducerSql(taskIdExpr: string): string {
   // result_text, and a legacy row (result_text NULL) never equals anything: both fail closed.
   // A submission that an (unreversed) rejection came after is spent: equal bytes written back by
   // another path (a failure reason, a foreign runtime) cannot revive it; only a fresh submission can.
+  // Compared at millisecond precision: decided_at carries extra sub-millisecond digits and created_at
+  // ends in 'Z', so a raw string compare would sort a same-millisecond rejection BEFORE the submission
+  // (a digit sorts below 'Z') and ignore it. A tie counts as rejected (fails closed).
   return `(tasks.assignee_agent_id = ? AND tasks.result IS NOT NULL AND EXISTS (
     SELECT 1 FROM task_result_submissions lane_sub
      WHERE lane_sub.tenant = ? AND lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
@@ -1689,7 +1692,8 @@ export function selfCompletionProducerSql(taskIdExpr: string): string {
                             WHERE lane_max.tenant = ? AND lane_max.task_id = ${taskIdExpr})
        AND NOT EXISTS (SELECT 1 FROM task_verdicts lane_rej
                         WHERE lane_rej.task_id = ${taskIdExpr} AND lane_rej.verdict = 'rejected'
-                          AND lane_rej.reversed_at IS NULL AND lane_rej.decided_at >= lane_sub.created_at)
+                          AND lane_rej.reversed_at IS NULL
+                          AND substr(lane_rej.decided_at, 1, 23) >= substr(lane_sub.created_at, 1, 23))
   ))`
 }
 
