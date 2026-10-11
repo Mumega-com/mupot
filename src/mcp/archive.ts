@@ -18,8 +18,9 @@
 import type { AuthContext, Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
-import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
-import { memberOrElevatedAgent, type ElevationTarget } from './elevated-principal'
+import { type ToolSpec, type ToolOutcome, fail, done, str, hasWorkspaceAdmin } from './index'
+import type { ElevationGrantRecord } from '../auth/elevation'
+import { memberOrElevatedAgent, recordElevatedUse, type ElevationTarget } from './elevated-principal'
 import {
   archiveRow,
   unarchiveRow,
@@ -171,41 +172,40 @@ const ELEVATION_REASON_SUFFIX_MAX = 80
 
 /**
  * An agent-bound unarchive_row caller (refused by requireOperatorOrgAdmin) may
- * restore a project or squad under a live action:project_lifecycle grant that
- * covers the org, the squad itself, or one of the project's writable squads.
- * Anything else — another table, no covering grant, no member identity —
- * returns `null` and the caller falls through to the unchanged refusal.
+ * restore a squad under a live action:project_lifecycle grant covering that
+ * squad (an org grant covers non-home squads only), or a project under an
+ * ORG-scope grant only. A covered table with no covering grant returns the
+ * helper's refusal (with the request_elevation hint); any other table or no
+ * member identity returns `null` and the caller falls through to the unchanged
+ * refusal.
  */
 async function elevatedUnarchive(
   auth: AuthContext,
   env: Env,
   args: Record<string, unknown>,
-): Promise<{ grantId: string; table: ArchivableTable; id: string; reason: string } | { refusal: ReturnType<typeof fail> } | null> {
+): Promise<{ grant: ElevationGrantRecord; table: ArchivableTable; id: string; reason: string } | { refusal: ToolOutcome } | null> {
   if (!auth.boundAgentId || !auth.memberId) return null
   if (typeof args.table !== 'string' || !ELEVATED_UNARCHIVE_TABLES.includes(args.table) || !isArchivableTable(args.table)) return null
   const id = str(args.id)
   const reason = str(args.reason)
   if (!id || !reason) return null
-  const targets: ElevationTarget[] = [{ type: 'org' }]
-  if (args.table === 'squads') {
-    targets.push({ type: 'squad', id })
-  } else {
-    const { results } = await env.DB.prepare(
-      `SELECT squad_id FROM project_squad_access WHERE project_id = ?1 AND access_level IN ('write','admin')`,
-    ).bind(id).all<{ squad_id: string }>()
-    for (const row of results ?? []) targets.push({ type: 'squad', id: row.squad_id })
-  }
-  const acting = await memberOrElevatedAgent(auth, env, 'action:project_lifecycle', targets, {
-    toolName: 'unarchive_row',
-    refusalCode: 'operator_principal_required',
-    detail: { table: args.table, id },
-  })
-  if (!acting.ok) return null
-  if (acting.via !== 'elevation') return null
   if (reason.length > 2000 - ELEVATION_REASON_SUFFIX_MAX) {
     return { refusal: fail(400, 'invalid_reason', 'reason must be 1-2000 characters') }
   }
-  return { grantId: acting.grant.id, table: args.table, id, reason: `${reason} [elevation_grant:${acting.grant.id}]` }
+  // Target is exactly the row's own scope. A squad: ONLY {squad,id} (never {org}
+  // first) so hasElevatedAction's home-squad fence runs; an org grant still covers
+  // a non-home squad through it. A project: ORG scope only — a squad-scoped grant
+  // (a squad admin's approval) never restores a project, same as project_create.
+  const target: ElevationTarget = args.table === 'squads' ? { type: 'squad', id } : { type: 'org' }
+  const acting = await memberOrElevatedAgent(auth, env, 'action:project_lifecycle', target, {
+    toolName: 'unarchive_row',
+    refusalCode: 'operator_principal_required',
+    detail: { table: args.table, id },
+    recordUsage: false,
+  })
+  if (!acting.ok) return { refusal: acting.outcome }
+  if (acting.via !== 'elevation') return null
+  return { grant: acting.grant, table: args.table, id, reason: `${reason} [elevation_grant:${acting.grant.id}]` }
 }
 
 export const toolUnarchiveRow: ToolSpec = {
@@ -214,7 +214,7 @@ export const toolUnarchiveRow: ToolSpec = {
   min: 'admin',
   args: '{ table: "members"|"agents"|"squads"|"projects"|"tasks", id: string, reason: string }' +
     ' -- org-admin only, operator principal only. The one exception: an agent-bound caller holding a live' +
-    ' action:project_lifecycle elevation grant covering the org or the squad/project squad may restore' +
+    ' action:project_lifecycle elevation grant covering the squad (squads) or the org (projects) may restore' +
     ' table=projects or table=squads (the receipt reason records the grant id); every other table stays operator-only.',
   inputSchema: {
     type: 'object',
@@ -232,12 +232,14 @@ export const toolUnarchiveRow: ToolSpec = {
       const elevated = await elevatedUnarchive(auth, env, args)
       if (!elevated) return gateFail
       if ('refusal' in elevated) return elevated.refusal
-      return unarchiveOutcomeToResult(await unarchiveRow(env, auth, {
+      const outcome = await unarchiveRow(env, auth, {
         table: elevated.table,
         id: elevated.id,
         reason: elevated.reason,
         actorMemberId: auth.memberId as string, // as: elevatedUnarchive returns null unless auth.memberId is set
-      }))
+      })
+      if (outcome.ok) await recordElevatedUse(env, auth, elevated.grant, 'unarchive_row', { table: elevated.table, id: elevated.id })
+      return unarchiveOutcomeToResult(outcome)
     }
 
     if (!isArchivableTable(args.table)) {

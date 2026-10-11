@@ -4,7 +4,7 @@ import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../ro
 import { principalCanReadProject, routinePrincipal, type RoutinePrincipal } from '../routines/access'
 import type { ElevationGrantRecord } from '../auth/elevation'
 import type { AuthContext, CapabilityGrant, Env } from '../types'
-import { memberOrElevatedAgent } from './elevated-principal'
+import { memberOrElevatedAgent, recordElevatedUse } from './elevated-principal'
 import { callerHoldsGateCapability } from '../tasks/index'
 import { hasCapability } from '../auth/capability'
 import { publicRoutineRun } from '../routines/public'
@@ -287,20 +287,24 @@ async function routinePolicyPrincipal(
   toolName: string,
   operation: RoutinePolicyOperation,
   destinationSquadId?: unknown,
-): Promise<{ ok: true; principal: RoutinePrincipal } | { ok: false; outcome: ToolOutcome }> {
+): Promise<{ ok: true; principal: RoutinePrincipal; elevation?: { grant: ElevationGrantRecord; detail: unknown } } | { ok: false; outcome: ToolOutcome }> {
   const base = routinePrincipal(auth)
   if (!auth.boundAgentId) return { ok: true, principal: base }
   const row = await env.DB.prepare('SELECT responsible_squad_id FROM routines WHERE id = ?1 AND tenant = ?2 LIMIT 1')
     .bind(routineId, env.TENANT_SLUG)
     .first<{ responsible_squad_id: string }>()
-  const squads = [row?.responsible_squad_id ?? '']
-  if (typeof destinationSquadId === 'string' && row && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
+  // Unknown id: refuse BEFORE any grant check so no usage-log row is written and
+  // the refusal is identical to an uncovered routine (no existence oracle).
+  if (!row) return { ok: false, outcome: fail(403, 'forbidden') }
+  const squads = [row.responsible_squad_id]
+  if (typeof destinationSquadId === 'string' && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
   let grant: ElevationGrantRecord | null = null
   for (const squadId of squads) {
     const acting = await memberOrElevatedAgent(auth, env, 'action:workspace_project', { type: 'squad', id: squadId }, {
       toolName,
       refusalCode: 'forbidden',
       detail: { routine_id: routineId, operation, squad_id: squadId },
+      recordUsage: false,
     })
     if (!acting.ok) return acting
     if (acting.via === 'elevation') grant = grant ?? acting.grant
@@ -316,7 +320,9 @@ async function routinePolicyPrincipal(
       actor_type: 'member',
       workspace_admin: grant.scope_type === 'org',
       grants: [...base.grants, ...standing],
+      elevation_grant_id: grant.id,
     },
+    elevation: { grant, detail: { routine_id: routineId, operation, squad_ids: squads } },
   }
 }
 
@@ -333,6 +339,7 @@ const routineUpdate: ToolSpec = {
     if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
     if (!input) return fail(400, 'invalid_args')
     const result = await updateRoutine(env, acting.principal, routineId, input)
+    if (result.ok && acting.elevation) await recordElevatedUse(env, auth, acting.elevation.grant, 'routine_update', acting.elevation.detail)
     return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
   },
 }
@@ -347,6 +354,7 @@ function lifecycle(name: 'routine_enable' | 'routine_pause' | 'routine_archive',
       if (!acting.ok) return acting.outcome
       if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
       const result = await operation(env, acting.principal, args.routine_id)
+      if (result.ok && acting.elevation) await recordElevatedUse(env, auth, acting.elevation.grant, name, acting.elevation.detail)
       return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
     },
   }

@@ -19,6 +19,7 @@ import {
   elevationHint,
   elevationRemedyMessage,
   hasElevatedAction,
+  recordElevationUsage,
   resolveScopeDepartmentId,
   type ElevationGrantRecord,
 } from '../auth/elevation'
@@ -42,6 +43,9 @@ export interface ElevatedPrincipalOptions {
    *  refusal text does not change for a caller without a grant. */
   refusalCode: string
   detail?: unknown
+  /** false: scan targets without writing an elevation_usage_log row; the tool
+   *  then calls recordElevatedUse once, AFTER its mutation succeeds. Default true. */
+  recordUsage?: boolean
 }
 
 async function checkAction(
@@ -53,7 +57,7 @@ async function checkAction(
 ): Promise<Awaited<ReturnType<typeof hasElevatedAction>>> {
   const scopeId = target.type === 'squad' ? target.id : null
   const squadDepartmentId = target.type === 'squad' ? await resolveScopeDepartmentId(env, 'squad', target.id) : null
-  const callOpts = { toolName: opts.toolName, detail: opts.detail, squadDepartmentId }
+  const callOpts = { toolName: opts.toolName, detail: opts.detail, squadDepartmentId, recordUsage: opts.recordUsage }
   // Literal action at each call site (see LifecycleElevationAction).
   if (action === 'action:workspace_project') {
     return hasElevatedAction(env, auth, 'action:workspace_project', target.type, scopeId, callOpts)
@@ -92,4 +96,20 @@ export async function memberOrElevatedAgent(
       ...(hint ? { hint } : {}),
     }),
   }
+}
+
+/**
+ * recordElevatedUse — the single audit row for a successful elevated call, for
+ * tools that scanned with recordUsage:false. Same write path as
+ * hasElevatedAction's own usage log (not swallowed: a failed log write fails
+ * the call).
+ */
+export async function recordElevatedUse(
+  env: Env,
+  auth: AuthContext,
+  grant: ElevationGrantRecord,
+  toolName: string,
+  detail: unknown,
+): Promise<void> {
+  await recordElevationUsage(env, auth.tenant, grant.id, grant.agent_session_id, grant.action, toolName, detail, Date.now())
 }

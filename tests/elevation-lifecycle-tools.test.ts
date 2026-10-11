@@ -14,6 +14,7 @@ import {
   createElevationRequest,
   decideElevationRequest,
   listElevationUsage,
+  revokeElevationGrant,
   type ElevationGrantRecord,
 } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
@@ -24,6 +25,7 @@ const DEPT_ID = 'dept-1'
 const HOME_SQUAD = 'squad-home'
 const TARGET_SQUAD = 'squad-target'
 const OTHER_SQUAD = 'squad-other'
+const KIND_HOME_SQUAD = 'squad-kindhome'
 const AGENT_ID = 'agent-acting'
 const AGENT_MEMBER = 'member-acting'
 const TOKEN_ID = 'tok-acting'
@@ -67,7 +69,9 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
     INSERT INTO squads (id, department_id, slug, name) VALUES
       ('${HOME_SQUAD}', '${DEPT_ID}', 'home', 'Home'),
       ('${TARGET_SQUAD}', '${DEPT_ID}', 'target', 'Target'),
-      ('${OTHER_SQUAD}', '${DEPT_ID}', 'other', 'Other');
+      ('${OTHER_SQUAD}', '${DEPT_ID}', 'other', 'Other'),
+      ('${KIND_HOME_SQUAD}', '${DEPT_ID}', 'kindhome', 'Kind Home');
+    UPDATE squads SET kind = 'home' WHERE id = '${KIND_HOME_SQUAD}';
     INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('${AGENT_ID}', '${HOME_SQUAD}', 'acting', 'Acting', 'active');
     INSERT INTO members (id, display_name, status, tenant) VALUES
       ('${AGENT_MEMBER}', 'Acting', 'active', '${TENANT}'),
@@ -78,7 +82,8 @@ function seed(sqlite: SqliteD1Harness['sqlite']): void {
       VALUES ('${TOKEN_ID}', '${AGENT_MEMBER}', 'hash-acting', 'primary', 'workspace', '${TENANT}', '${AGENT_ID}', datetime('now'));
     INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES
       ('cap-admin-target', '${ADMIN}', 'squad', '${TARGET_SQUAD}', 'admin'),
-      ('cap-admin-other', '${ADMIN}', 'squad', '${OTHER_SQUAD}', 'admin');
+      ('cap-admin-other', '${ADMIN}', 'squad', '${OTHER_SQUAD}', 'admin'),
+      ('cap-admin-org', '${ADMIN}', 'org', NULL, 'admin');
     INSERT INTO human_login_identities (id, tenant, provider, provider_subject, verified_email, member_id, created_at)
       VALUES ('${ADMIN_IDENTITY}', '${TENANT}', 'google', '${ADMIN}', 'admin@x.test', '${ADMIN}', datetime('now'));
     INSERT INTO projects (id, slug, name, status) VALUES
@@ -110,24 +115,30 @@ async function checkIn(): Promise<string> {
 async function approve(
   sessionId: string,
   action: string,
-  scope: { type: 'squad'; id: string },
+  scope: { type: 'squad'; id: string } | { type: 'org' },
   minutes: number,
   nowMs: number,
 ): Promise<ElevationGrantRecord> {
-  const web = await createWebSession(env, `raw-${nowMs}-${action}-${scope.id}`, { tenant: TENANT, memberId: ADMIN, loginIdentityId: ADMIN_IDENTITY }, nowMs)
+  const scopeId = scope.type === 'squad' ? scope.id : ''
+  const web = await createWebSession(env, `raw-${nowMs}-${action}-${scope.type}-${scopeId}`, { tenant: TENANT, memberId: ADMIN, loginIdentityId: ADMIN_IDENTITY }, nowMs)
   const created = await createElevationRequest(env, {
     tenant: TENANT, agentSessionId: sessionId, agentId: AGENT_ID, memberId: AGENT_MEMBER,
-    actions: [action], scopeType: scope.type, scopeId: scope.id, durationMinutes: minutes, reason: 'lifecycle tools test',
+    actions: [action], scopeType: scope.type, scopeId, durationMinutes: minutes, reason: 'lifecycle tools test',
   }, nowMs)
   if (!created.ok) throw new Error(`setup: request failed: ${JSON.stringify(created)}`)
   const decision = await decideElevationRequest(env, {
     tenant: TENANT, requestId: created.request.id, decision: 'approve', selectedActions: [action],
     decidedByMemberId: ADMIN,
-    decidedByCapabilities: [{ member_id: ADMIN, scope_type: 'squad', scope_id: scope.id, capability: 'admin' }],
+    decidedByCapabilities: [{ member_id: ADMIN, scope_type: scope.type, scope_id: scope.type === 'squad' ? scope.id : null, capability: 'admin' }],
     decidedByWebSessionHash: web.id_hash, recentReauthOk: true,
   }, nowMs)
   if (!decision.ok) throw new Error(`setup: decide failed: ${JSON.stringify(decision)}`)
   return decision.grants[0]
+}
+
+async function usageRows(): Promise<number> {
+  const r = await env.DB.prepare('SELECT COUNT(*) AS n FROM elevation_usage_log').first<{ n: number }>()
+  return Number(r?.n ?? 0)
 }
 
 function expectRefused(res: Awaited<ReturnType<typeof invokeTool>>): void {
@@ -160,6 +171,16 @@ describe('routine_enable/pause/archive/update under action:workspace_project', (
     const res = await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)
     expectRefused(res)
     if (!res.ok) expect(JSON.stringify(res.detail)).toContain('action:workspace_project')
+  })
+
+  it('a HOME-kind squad routine is refused even with an org grant', async () => {
+    const homeRoutine = await createRoutine('proj-target', TARGET_SQUAD)
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-target', '${KIND_HOME_SQUAD}', 'write')`)
+    harness.sqlite.exec(`UPDATE routines SET responsible_squad_id = '${KIND_HOME_SQUAD}' WHERE id = '${homeRoutine}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:workspace_project', { type: 'org' }, 60, Date.now())
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: homeRoutine }, ORIGIN))
+    expect(await usageRows()).toBe(0)
   })
 
   it('an EXPIRED grant is refused', async () => {
@@ -215,6 +236,62 @@ describe('routine_enable/pause/archive/update under action:workspace_project', (
     expect(row?.responsible_squad_id).toBe(TARGET_SQUAD)
   })
 
+  it('unknown routine id + org grant -> 403 and ZERO usage rows (no oracle)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:workspace_project', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: '00000000-0000-4000-8000-000000000000' }, ORIGIN)
+    expectRefused(res)
+    expect(await usageRows()).toBe(0)
+  })
+
+  it('a REVOKED grant is refused', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:workspace_project', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    await revokeElevationGrant(env, TENANT, grant.id, 'test')
+    expectRefused(await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN))
+  })
+
+  it('ORG grant passes each routine tool on a non-home squad', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:workspace_project', { type: 'org' }, 60, Date.now())
+    expect((await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'N' }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(agentAuth(), env, 'routine_archive', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
+    expect(await usageRows()).toBe(4)
+  })
+
+  it('a failed routine mutation writes NO usage row (archive an already-draft->enable twice)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:workspace_project', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    expect((await invokeTool(agentAuth(), env, 'routine_pause', { routine_id: routineTarget }, ORIGIN)).ok).toBe(false) // draft cannot pause
+    expect(await usageRows()).toBe(0)
+    expect((await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)).ok).toBe(true)
+    expect(await usageRows()).toBe(1)
+  })
+
+  it('routine_update moving to another squad writes exactly ONE usage row', async () => {
+    const sessionId = await checkIn()
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-target', '${OTHER_SQUAD}', 'write')`)
+    await approve(sessionId, 'action:workspace_project', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, responsible_squad_id: OTHER_SQUAD }, ORIGIN)
+    expect(res.ok).toBe(true)
+    expect(await usageRows()).toBe(1)
+  })
+
+  it('routine mutations name the grant on the routine row; a member mutation clears it', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:workspace_project', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    const read = async () => (await env.DB.prepare('SELECT last_elevation_grant_id AS g FROM routines WHERE id = ?1').bind(routineTarget).first<{ g: string | null }>())?.g
+    expect(await read()).toBeNull()
+    await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'A' }, ORIGIN)
+    expect(await read()).toBe(grant.id)
+    await invokeTool(operatorAuth(), env, 'routine_update', { routine_id: routineTarget, name: 'B' }, ORIGIN)
+    expect(await read()).toBeNull()
+    await invokeTool(agentAuth(), env, 'routine_enable', { routine_id: routineTarget }, ORIGIN)
+    expect(await read()).toBe(grant.id)
+  })
+
   it('routine_create stays member-only even with a live grant', async () => {
     const sessionId = await checkIn()
     await approve(sessionId, 'action:workspace_project', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
@@ -244,14 +321,14 @@ describe('project_update status under action:project_lifecycle', () => {
     const t0 = Date.parse('2026-09-01T00:00:00.000Z')
     vi.setSystemTime(t0)
     const sessionId = await checkIn()
-    await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 15, t0)
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 15, t0)
     vi.setSystemTime(t0 + 16 * 60 * 1000)
     expectRefused(await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'paused' }, ORIGIN))
   })
 
-  it('live grant on the project squad passes, is logged with the grant id, and only status may change', async () => {
+  it('live ORG grant passes, is logged ONCE with the grant id, and only status may change', async () => {
     const sessionId = await checkIn()
-    const grant = await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    const grant = await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
     const res = await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'paused' }, ORIGIN)
     expect(res.ok).toBe(true)
     const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-target').first<{ status: string }>()
@@ -266,23 +343,40 @@ describe('project_update status under action:project_lifecycle', () => {
     expectRefused(mixed)
   })
 
-  it('live grant for a squad the project is NOT attached to -> 403, status unchanged', async () => {
+  it('a SQUAD-scoped grant (even on the project squad) is refused for status changes, no usage row', async () => {
     const sessionId = await checkIn()
     await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
-    expectRefused(await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-other', status: 'paused' }, ORIGIN))
-    const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-other').first<{ status: string }>()
+    const res = await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'paused' }, ORIGIN)
+    expectRefused(res)
+    const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-target').first<{ status: string }>()
     expect(row?.status).toBe('active')
+    expect(await usageRows()).toBe(0)
   })
 
-  it('grant for a different action -> 403', async () => {
+  it('a REVOKED org grant -> 403', async () => {
     const sessionId = await checkIn()
-    await approve(sessionId, 'action:workspace_project', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    const grant = await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    await revokeElevationGrant(env, TENANT, grant.id, 'test')
+    expectRefused(await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'paused' }, ORIGIN))
+  })
+
+  it('a failed mutation writes NO usage row (invalid status)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'bogus' }, ORIGIN)
+    expect(res.ok).toBe(false)
+    expect(await usageRows()).toBe(0)
+  })
+
+it('grant for a different action -> 403', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:workspace_project', { type: 'org' }, 60, Date.now())
     expectRefused(await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-target', status: 'paused' }, ORIGIN))
   })
 
   it('an elevated caller cannot trigger the planned -> active start gate', async () => {
     const sessionId = await checkIn()
-    await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
     expectRefused(await invokeTool(agentAuth(), env, 'project_update', { project_id: 'proj-planned', status: 'active' }, ORIGIN))
     const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-planned').first<{ status: string }>()
     expect(row?.status).toBe('planned')
@@ -316,13 +410,14 @@ describe('unarchive_row under action:project_lifecycle', () => {
     const t0 = Date.parse('2026-09-01T00:00:00.000Z')
     vi.setSystemTime(t0)
     const sessionId = await checkIn()
-    await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 15, t0)
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 15, t0)
     vi.setSystemTime(t0 + 16 * 60 * 1000)
     expectRefused(await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'projects', id: 'proj-target', reason: 'restore' }, ORIGIN))
   })
 
-  it('live grant: restores the project and the squad, and the receipt names the grant id', async () => {
+  it('live grants: ORG grant restores the project, squad grant restores the squad, receipts name the grant id', async () => {
     const sessionId = await checkIn()
+    const orgGrant = await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
     const grant = await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
     const proj = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'projects', id: 'proj-target', reason: 'restore' }, ORIGIN)
     expect(proj.ok).toBe(true)
@@ -332,9 +427,62 @@ describe('unarchive_row under action:project_lifecycle', () => {
       `SELECT entity_table, reason FROM archive_receipts WHERE action = 'unarchive' ORDER BY entity_table`,
     ).all<{ entity_table: string; reason: string }>()
     expect(receipts.results.map((r) => r.entity_table)).toEqual(['projects', 'squads'])
-    expect(receipts.results.every((r) => r.reason.includes(`[elevation_grant:${grant.id}]`))).toBe(true)
-    const usage = await listElevationUsage(env, TENANT, grant.id)
-    expect(usage.map((u) => u.tool_name)).toEqual(['unarchive_row', 'unarchive_row'])
+    const byTable = Object.fromEntries(receipts.results.map((r) => [r.entity_table, r.reason]))
+    expect(byTable.projects).toContain(`[elevation_grant:${orgGrant.id}]`)
+    expect(byTable.squads).toContain(`[elevation_grant:${grant.id}]`)
+    expect(await usageRows()).toBe(2)
+  })
+
+  it('a SQUAD-scoped grant on the project squad does NOT restore a project; no usage row', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'projects', id: 'proj-target', reason: 'restore' }, ORIGIN)
+    expectRefused(res)
+    if (!res.ok) expect(JSON.stringify(res.detail)).toContain('request_elevation')
+    const row = await env.DB.prepare('SELECT status FROM projects WHERE id = ?1').bind('proj-target').first<{ status: string }>()
+    expect(row?.status).toBe('archived')
+    expect(await usageRows()).toBe(0)
+  })
+
+  it('a REVOKED org grant -> 403', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    await revokeElevationGrant(env, TENANT, grant.id, 'test')
+    expectRefused(await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'projects', id: 'proj-target', reason: 'restore' }, ORIGIN))
+  })
+
+  it('an uncovered squad returns the helper refusal WITH the request_elevation hint', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'squad', id: TARGET_SQUAD }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: OTHER_SQUAD, reason: 'restore' }, ORIGIN)
+    expectRefused(res)
+    if (!res.ok) expect(JSON.stringify(res.detail)).toContain('request_elevation')
+  })
+
+  it('an over-long reason is a 400 before any grant check (no usage row)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'projects', id: 'proj-target', reason: 'x'.repeat(1990) }, ORIGIN)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.status).toBe(400)
+    expect(await usageRows()).toBe(0)
+  })
+
+  it('ORG grant restores a NON-home squad', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: OTHER_SQUAD, reason: 'restore' }, ORIGIN)
+    expect(res.ok).toBe(true)
+  })
+
+  it('ORG grant does NOT restore a kind=home squad (home-squad fence); stays archived', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${KIND_HOME_SQUAD}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_lifecycle', { type: 'org' }, 60, Date.now())
+    expectRefused(await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: KIND_HOME_SQUAD, reason: 'restore' }, ORIGIN))
+    const row = await env.DB.prepare('SELECT status FROM squads WHERE id = ?1').bind(KIND_HOME_SQUAD).first<{ status: string }>()
+    expect(row?.status).toBe('archived')
+    expect(await usageRows()).toBe(0)
   })
 
   it('live grant on the wrong squad -> 403, row stays archived', async () => {

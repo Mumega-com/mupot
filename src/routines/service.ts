@@ -455,12 +455,12 @@ export async function updateRoutine(
       cron_expression = ?, timezone = ?, next_run_at = ?, overlap_policy = ?, execution_mode = ?,
       responsible_squad_id = ?, preferred_agent_id = ?, budget_micro_usd = ?, max_attempts = ?,
       retry_backoff_seconds = ?, max_occurrences = ?, stop_at = ?, revision = revision + 1,
-      updated_at = ? WHERE id = ? AND tenant = ? AND revision = ?`,
+      last_elevation_grant_id = ?, updated_at = ? WHERE id = ? AND tenant = ? AND revision = ?`,
   ).bind(
     p.name, p.objective, p.trigger_kind, p.run_once_at, p.cron_expression, p.timezone,
     next?.toISOString() ?? null, p.overlap_policy, p.execution_mode, p.responsible_squad_id,
     p.preferred_agent_id, p.budget_micro_usd, p.max_attempts, p.retry_backoff_seconds,
-    p.max_occurrences, p.stop_at, updatedAt, id, env.TENANT_SLUG, existing.revision,
+    p.max_occurrences, p.stop_at, principal.elevation_grant_id ?? null, updatedAt, id, env.TENANT_SLUG, existing.revision,
   ).run()
   if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   const updated = await directRoutine(env, id)
@@ -498,10 +498,10 @@ async function transitionRoutine(
     `UPDATE routines SET status = ?, next_run_at = ?, revision = revision + 1,
       enabled_by = CASE WHEN ? = 'enabled' THEN ? ELSE enabled_by END,
       enabled_at = CASE WHEN ? = 'enabled' THEN ? ELSE enabled_at END,
-      updated_at = ? WHERE id = ? AND tenant = ? AND revision = ?`,
+      last_elevation_grant_id = ?, updated_at = ? WHERE id = ? AND tenant = ? AND revision = ?`,
   ).bind(
     target, next?.toISOString() ?? null, target, principal.actor_id, target,
-    now.toISOString(), now.toISOString(), id, env.TENANT_SLUG, existing.revision,
+    now.toISOString(), principal.elevation_grant_id ?? null, now.toISOString(), id, env.TENANT_SLUG, existing.revision,
   ).run()
   if (!wrote(result)) return { ok: false, error: 'receipt_failed' }
   const updated = await directRoutine(env, id)
