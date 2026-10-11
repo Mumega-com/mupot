@@ -915,7 +915,7 @@ export const toolMintAgentToken: ToolSpec = {
     if (elevatedGrant) {
       await recordElevationUsage(
         env,
-        auth.tenant,
+        env.TENANT_SLUG,
         elevatedGrant.id,
         elevatedGrant.agent_session_id,
         'action:mint_token',

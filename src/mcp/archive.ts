@@ -186,7 +186,8 @@ async function elevatedUnarchive(
 ): Promise<{ grant: ElevationGrantRecord; table: ArchivableTable; id: string; reason: string } | { refusal: ToolOutcome } | null> {
   if (!auth.boundAgentId || !auth.memberId) return null
   if (typeof args.table !== 'string' || !ELEVATED_UNARCHIVE_TABLES.includes(args.table) || !isArchivableTable(args.table)) return null
-  const id = str(args.id)
+  // Canonical (trimmed) id: authorized and written as the same value.
+  const id = str(args.id)?.trim() ?? null
   const reason = str(args.reason)
   if (!id || !reason) return null
   if (reason.length > 2000 - ELEVATION_REASON_SUFFIX_MAX) {
@@ -233,7 +234,7 @@ export const toolUnarchiveRow: ToolSpec = {
       if (!elevated) return gateFail
       if ('refusal' in elevated) return elevated.refusal
       const receipted = await withElevationReceipt(
-        env, auth, elevated.grant, 'unarchive_row', { table: elevated.table, id: elevated.id },
+        env, elevated.grant, 'unarchive_row', { table: elevated.table, id: elevated.id },
         (receiptId) => unarchiveRow(env, auth, {
           table: elevated.table,
           id: elevated.id,

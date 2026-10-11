@@ -244,4 +244,5 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:secrets',
   'action:register_key',
   'action:mint_token',
+  'action:routine_archive', // irreversible
 ])
