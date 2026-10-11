@@ -714,17 +714,18 @@ describe('S353 v2 — route-to-one-executor dispatch bridge', () => {
     expect(db._receipt.deliveredVia).toBe('in_worker')
   })
 
-  it("delivery:'inbox' IS honored against a STALE-but-registered resident (runtime declared, heartbeat stale) — this is what force is for", async () => {
+  // S2 round 2 (P2-a): check_in fills `runtime` for seats, so a runtime WITHOUT live presence is no
+  // longer a delivery surface; force falls back to in_worker instead of stranding the task.
+  it("delivery:'inbox' is IGNORED against a STALE runtime-declared row (no live presence) — S2 strand closed", async () => {
     const db = makeWorld({ fleet: STALE_RUNTIME })
     const { env, fetch } = envWith(db)
     const item = message(dispatchEvent({ payload: { task_id: 'task-1', dispatch_receipt_id: 'receipt-1', delivery: 'inbox' } }))
 
     await handleQueue({ messages: [item] } as unknown as MessageBatch<BusEvent>, env)
 
-    expect(fetch).not.toHaveBeenCalled()
-    expect(db._messages).toHaveLength(1)
-    expect(db._messages[0].to_agent).toBe('agent-1-ext')
-    expect(db._receipt.deliveredVia).toBe('inbox')
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(db._messages).toHaveLength(0)
+    expect(db._receipt.deliveredVia).toBe('in_worker')
   })
 
   it("delivery:'inbox' is additive, never subtractive: a live resident runtime still routes to inbox exactly as it would unforced", async () => {
