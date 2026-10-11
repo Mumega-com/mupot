@@ -39,6 +39,54 @@ export async function isExecutionPaused(env: Env, agentId: string): Promise<bool
   return row !== null
 }
 
+/**
+ * mupot#1821: boolean SQL fragment - a pause covered this agent (directly or via its CURRENT squad) at the instant
+ * `atExpr` (an ISO timestamp expression), whether or not it is still active. A refusal is attributed to the pause
+ * by TIME (what held at the refusing write), never by inferring from what is true later: the unread cap, an
+ * archive and a flight state can all move back, so "everything else looks fine now" proves nothing.
+ */
+export function executionPausedAtSql(agentIdExpr: string, atExpr: string): string {
+  return `EXISTS (
+    SELECT 1 FROM execution_pauses ep
+     WHERE ep.paused_at <= ${atExpr}
+       AND (ep.resumed_at IS NULL OR ep.resumed_at >= ${atExpr})
+       AND (
+         (ep.scope_type = 'agent' AND ep.scope_id = ${agentIdExpr})
+         OR (ep.scope_type = 'squad'
+             AND ep.scope_id = (SELECT pa.squad_id FROM agents pa WHERE pa.id = ${agentIdExpr}))
+       )
+  )`
+}
+
+/** A pause is active now, or one covered the agent at `atIso` (the refusing write's time). One read. */
+export async function pausedAtOrNow(env: Env, agentId: string, atIso: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS paused WHERE ${executionPausedSql('?1')} OR ${executionPausedAtSql('?1', '?2')}`,
+  ).bind(agentId, atIso).first<{ paused: number }>()
+  return row !== null
+}
+
+/** Audit handler + result stamp written when a routine pause-race releases its control task. */
+export const PAUSE_RELEASE_AUDIT_HANDLER = 'routine_dispatch_pause_release'
+export const PAUSE_RELEASE_RESULT = 'execution_paused: routine dispatch refused by an execution pause; task released'
+
+/**
+ * Boolean SQL fragment: this task is NOT a released routine control orphan. The orphan is identified by the
+ * append-only system audit row the release writes (never by title, which a human can set) AND its result still
+ * carrying the release stamp, so a task a human later re-works under a new result is counted again. Only a BLOCKED
+ * task can be one, so a human-reopened orphan reappears in every other count. The single chokepoint for every
+ * human-facing blocked list/total (situation, dashboard counts, health, projects). Exprs are column expressions / placeholders.
+ */
+export function notReleasedControlOrphanSql(
+  taskIdExpr: string, resultExpr: string, tenantExpr: string, statusExpr: string,
+): string {
+  return `NOT (${statusExpr} = 'blocked' AND COALESCE(${resultExpr}, '') = '${PAUSE_RELEASE_RESULT}' AND EXISTS (
+    SELECT 1 FROM mutation_audit_entries pra
+     WHERE pra.tenant = ${tenantExpr} AND pra.task_id = ${taskIdExpr}
+       AND pra.handler = '${PAUSE_RELEASE_AUDIT_HANDLER}'
+  ))`
+}
+
 /** Boolean SQL fragment: the task has an UNRELEASED escalation hold (any agent). */
 export function taskHeldSql(taskIdExpr: string): string {
   return `EXISTS (

@@ -22,7 +22,7 @@ import { canOnSquad, loadSquadScope, planeCoversScope } from '../auth/capability
 import { sha256Hex } from '../lib/canonical-json'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { receiverNotStoppedSql } from '../fleet/registry'
-import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedSql, isExecutionPaused } from './execution-brake-sql'
+import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedAtSql, executionPausedSql } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
 
@@ -248,6 +248,31 @@ async function routineDispatchAllowed(
       LIMIT 1`,
   ).bind(fence.runId, tenant, fence.projectId).first()
   return row !== null
+}
+
+/**
+ * mupot#1821: was a routine-fenced INSERT that wrote 0 rows refused by the execution pause? Decided by TIME: a pause
+ * that covered the agent at `at` (the timestamp bound into the refusing INSERT) counts even if it has been lifted
+ * since. A pause active now always counts (unchanged). The unread cap is NOT inferred from its current level: when
+ * a lifted pause and a still-full inbox are both true, the label stays what it always was (inbox_full).
+ * One read, no write.
+ */
+async function routineRefusalWasPause(
+  env: Env,
+  tenant: string,
+  toAgent: string,
+  fenceAgentId: string,
+  at: string,
+  maxUnread: number,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT ${executionPausedSql('?1')} AS paused_now,
+            ${executionPausedAtSql('?1', '?4')} AS paused_at_write,
+            (SELECT COUNT(*) FROM agent_messages WHERE tenant = ?2 AND to_agent = ?3 AND read_at IS NULL) AS unread`,
+  ).bind(fenceAgentId, tenant, toAgent, at).first<{ paused_now: number; paused_at_write: number; unread: number }>()
+  if (!row) return false
+  if (Number(row.paused_now) === 1) return true
+  return Number(row.paused_at_write) === 1 && Number(row.unread) < maxUnread
 }
 
 async function receiverNotStopped(env: Env, agentId: string): Promise<boolean> {
@@ -540,7 +565,10 @@ export async function sendAgentMessage(
         const brake = await diagnoseDispatchBrake(env, brakeFence.agentId, brakeFence.taskId)
         if (brake) return { ok: false, reason: brake }
       }
-      if (routineFence && await isExecutionPaused(env, routineFence.agentId)) {
+      if (
+        routineFence
+        && await routineRefusalWasPause(env, tenant, input.toAgent, routineFence.agentId, createdAt, maxUnread)
+      ) {
         return { ok: false, reason: 'execution_paused' }
       }
       if (

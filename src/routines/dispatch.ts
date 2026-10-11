@@ -16,7 +16,10 @@ import { sqlNotCancellationPending } from './cancellation-fence'
 import { routineControlId, routineRequestId } from './identity'
 import { logSubagentTokenUsage } from '../telemetry/subagent-usage'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { EXECUTION_PAUSED_ERROR, executionPausedSql, isExecutionPaused } from '../agents/execution-brake-sql'
+import {
+  EXECUTION_PAUSED_ERROR, PAUSE_RELEASE_AUDIT_HANDLER, PAUSE_RELEASE_RESULT,
+  executionPausedSql, pausedAtOrNow,
+} from '../agents/execution-brake-sql'
 
 const ROUTINE_MEMBER = 'system:routines'
 // mupot#611 item 2: this used to be a SILENT ceiling — past the Nth agent in a
@@ -588,7 +591,7 @@ async function releasePausedControlTask(env: Env, taskId: string, agentId: strin
       `UPDATE tasks SET status = 'blocked', assignee_agent_id = NULL, result = ?, updated_at = ?
         WHERE id = ? AND assignee_agent_id = ? AND status = 'open'
           AND ${TASK_NOT_ARCHIVED_SQL()}`,
-    ).bind('execution_paused: routine dispatch refused by an execution pause; task released', nowIso, taskId, agentId),
+    ).bind(PAUSE_RELEASE_RESULT, nowIso, taskId, agentId),
     env.DB.prepare(
       `INSERT INTO mutation_audit_entries (
          id, tenant, principal_kind, principal_id, member_id, agent_id,
@@ -596,7 +599,7 @@ async function releasePausedControlTask(env: Env, taskId: string, agentId: strin
          task_id, request_id, idempotency_key, evidence_json, recorded_at
        )
        SELECT ?1, ?2, 'system', 'execution_brake', NULL, ?3,
-              NULL, 'worker_callback', 'routine_dispatch_pause_release', 'release_control_task', 'task', ?4,
+              NULL, 'worker_callback', '${PAUSE_RELEASE_AUDIT_HANDLER}', 'release_control_task', 'task', ?4,
               ?4, ?5, ?5, ?6, ?7
         WHERE changes() = 1`,
     ).bind(
@@ -666,6 +669,8 @@ export async function dispatchRoutineRun(
   })
   const situationDigest = await canonicalJsonDigest(situation)
   const nowIso = now.toISOString()
+  // mupot#1821: the refusing write's time. A refusal is a pause iff a pause covered the agent at this instant.
+  const observeAt = new Date().toISOString()
   const observed = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = 'observing', assigned_agent_id = ?, task_id = ?,
@@ -708,7 +713,7 @@ export async function dispatchRoutineRun(
     ),
   ])
   if (!wrote(observed[0])) {
-    if (await isExecutionPaused(env, selected.agentId)) {
+    if (await pausedAtOrNow(env, selected.agentId, observeAt)) {
       await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
       await releasePausedControlTask(env, task.id, selected.agentId, nowIso)
       return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)
@@ -780,6 +785,7 @@ export async function dispatchRoutineRun(
     taskId: task.id,
   })
 
+  const finishAt = new Date().toISOString()
   const finished = await env.DB.batch([
     env.DB.prepare(
       `UPDATE routine_runs SET status = 'running', waiting_reason = NULL,
@@ -865,7 +871,7 @@ export async function dispatchRoutineRun(
     // only a pause landing in the window between that insert and these writes): settle the run waiting with
     // the pause reason. The already-delivered envelope cannot be recalled; the routine target is an external
     // runtime, and the run is no longer 'running', so its proposal submit is refused as inert.
-    if (await isExecutionPaused(env, selected.agentId)) {
+    if (await pausedAtOrNow(env, selected.agentId, finishAt)) {
       await failFlight(env, flightId, EXECUTION_PAUSED_ERROR)
       await releasePausedControlTask(env, task.id, selected.agentId, nowIso)
       return waitForAgent(env, run, now, EXECUTION_PAUSED_ERROR)

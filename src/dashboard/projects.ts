@@ -50,6 +50,7 @@ import {
   PROJECT_WORKER_TEMPLATES,
 } from '../projects/provisioner'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { notReleasedControlOrphanSql } from '../agents/execution-brake-sql'
 
 const MAX_PROJECTS = 100
 const PARENT_OPTIONS_PAGE_SIZE = 500
@@ -424,7 +425,7 @@ async function loadParentContexts(env: Env, parentIds: string[]): Promise<Map<st
   return new Map((result.results ?? []).map((parent) => [parent.id, parent]))
 }
 
-async function loadListMetrics(
+export async function loadListMetrics(
   env: Env,
   projectIds: string[],
   access: ProjectAccess,
@@ -443,7 +444,8 @@ async function loadListMetrics(
               WHERE project_id = p.id${squadFilter}) AS direct_squads,
             (SELECT COUNT(*) FROM tasks
               WHERE project_id = p.id${squadFilter}
-                AND status IN ('open', 'in_progress', 'blocked', 'review')) AS open_work,
+                AND status IN ('open', 'in_progress', 'blocked', 'review')
+                AND ${notReleasedControlOrphanSql('tasks.id', 'tasks.result', tenantParam, 'tasks.status')}) AS open_work,
             (SELECT COUNT(*) FROM flights f
               WHERE f.project_id = p.id
                 AND f.tenant = ${tenantParam}
