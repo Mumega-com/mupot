@@ -536,7 +536,7 @@ async function commitOriginDecision(
 
   // THE decisive check (round 4) — did the verdict itself land? Everything
   // else in this batch was gated on this exact row's existence, so this one
-  // read subsumes checking the bind and the reservation separately.
+  // read subsumes checking the reservation separately.
   const verdictLanded = rowsChanged(results[verdictInsertIndex]) === 1
 
   if (!verdictLanded) {
@@ -558,9 +558,11 @@ async function commitOriginDecision(
       const reason: HumanOriginFailureReason =
         fresh?.status !== 'active'
           ? 'member_inactive'
-          : fresh?.telegram_chat_id && fresh.telegram_chat_id !== origin.chat_id
-            ? 'origin_member_mismatch'
-            : 'member_not_eligible'
+          : fresh?.telegram_chat_id == null
+            ? 'origin_chat_not_bound'
+            : fresh.telegram_chat_id !== origin.chat_id
+              ? 'origin_member_mismatch'
+              : 'member_not_eligible'
       await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason }))
       return { replayed: false, applied: false, reason }
     }
@@ -576,7 +578,7 @@ async function commitOriginDecision(
 
   // Real defence in depth (confirmed live by Athena's own probe on this PR):
   // resolve via the SAME helper the IM path uses (memberForChat) — proves
-  // this bind (or pre-existing bind) reads back exactly the way /approve
+  // the existing bind reads back exactly the way /approve
   // etc. over the real Telegram webhook would see it, not merely that our
   // own write believes it landed. Kept even though the batch above already
   // proves the write landed structurally.

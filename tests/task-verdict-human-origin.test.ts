@@ -742,7 +742,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // proven live: 403, task still 'review', zero task_verdicts, but a
   // durable Telegram bind HAD landed. assertVerdictWritable is now called
   // inside dryRunAuthorize, before ANY write. ─────────────────────────────
-  it('P0-B: the project-write fence refuses BEFORE any write — telegram_chat_id stays NULL, zero receipts, zero verdicts', async () => {
+  it('P0-B: the project-write fence refuses BEFORE any write — telegram_chat_id stays as seeded, zero receipts, zero verdicts', async () => {
     seedAgent(harness.sqlite, 'agent-fence')
     seedGateGrant(harness.sqlite, 'agent', 'agent-fence')
     seedMember(harness.sqlite, 'member-fence', { telegramChatId: '515151' })
@@ -837,6 +837,48 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     ).bind('member-race-ownership').first<{ n: number }>()
     expect(memberVerdictCount?.n).toBe(0) // no verdict AS the member
   })
+
+  // ── The owner's chat binding changes in the instant between the dry run and the commit batch.
+  // The dry run already refuses an unbound or mismatched owner, so only the verdict write's own
+  // SQL guard (`telegram_chat_id = ?`) can refuse here. Same interleaving as P1-C. ─────────────
+  for (const [label, rebindTo] of [['unbound', null], ['re-paired to another chat', '7778889']] as const) {
+    it(`chat race: owner ${label} between the dry run and the commit batch — no verdict as the member`, async () => {
+      const id = rebindTo === null ? 'unbind' : 'rebind'
+      seedAgent(harness.sqlite, `agent-race-${id}`)
+      seedGateGrant(harness.sqlite, 'agent', `agent-race-${id}`)
+      seedMember(harness.sqlite, `member-race-${id}`, { telegramChatId: '5551234' })
+      setAgentOwner(harness.sqlite, `agent-race-${id}`, `member-race-${id}`)
+      seedSquadMemberCapability(harness.sqlite, `member-race-${id}`)
+      seedGateGrant(harness.sqlite, 'member', `member-race-${id}`)
+      seedReviewTask(harness.sqlite, `task-race-${id}`)
+
+      const realBatch = env.DB.batch.bind(env.DB)
+      const raceEnv: Env = {
+        ...env,
+        DB: {
+          ...env.DB,
+          batch: (statements: D1PreparedStatement[]): Promise<D1Result[]> => {
+            harness.sqlite.prepare('UPDATE members SET telegram_chat_id = ? WHERE id = ?').run(rebindTo, `member-race-${id}`)
+            return realBatch(statements)
+          },
+        } as unknown as Env['DB'],
+      }
+
+      const result = expectApplied(await invokeVerdict(raceEnv, harnessAuth(`agent-race-${id}`), {
+        task_id: `task-race-${id}`, verdict: 'approved', human_origin: origin({ text: `approve task-race-${id}` }),
+      }))
+      expect(result.human_origin).toEqual({
+        applied: false,
+        reason: rebindTo === null ? 'origin_chat_not_bound' : 'origin_member_mismatch',
+      })
+      expect(result.verdict.decided_by).toBe(`agent-race-${id}`) // fell back to the agent
+
+      const memberVerdictCount = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM task_verdicts WHERE decided_by = ? AND decided_via = 'agent_attested_origin'`,
+      ).bind(`member-race-${id}`).first<{ n: number }>()
+      expect(memberVerdictCount?.n).toBe(0) // no verdict AS the member
+    })
+  }
 
   // ── full chain: the P0-1 floor+ceiling fix, proven to also close the
   // downstream task_verdict path — an owner_member_id set that was BLOCKED

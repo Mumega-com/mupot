@@ -36,7 +36,7 @@ relaying a message the human sent it over Telegram.
    verdicts); not rate-limited (one applied `human_origin` verdict per member per 30s);
    `evaluateVerdictGates` — the SAME predicate every verdict surface uses — actually
    authorizes this task+verdict; `assertVerdictWritable`'s project-evidence fence holds.
-4. `commitOriginDecision` (`src/im/origin-verdict.ts:451`) — reached only if the dry run
+4. `commitOriginDecision` (`src/im/origin-verdict.ts:459`) — reached only if the dry run
    authorized — writes the reservation and the verdict in **one atomic `env.DB.batch()`**, anchored on the verdict row (see Receipts).
 5. Response returns `{ task, verdict, human_origin: { applied: true } }` on
    success, or `{ applied: false, reason: <conjunct> }` and falls back to the calling
