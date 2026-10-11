@@ -13,6 +13,13 @@
 import type { Env, Project, ProjectDeployStatus } from '../types'
 import { projectSelectSql } from '../projects/columns'
 import { getProject } from '../projects/service'
+import {
+  buildForwardRequest,
+  refuseServiceWorkerScript,
+  sanitizeColonyOriginResponse,
+  sanitizeOwnOriginResponse,
+  type ForwardPolicy,
+} from './forward-policy'
 
 export const DEFAULT_PREVIEW_ROOT_DOMAIN = 'mupot.mumega.com'
 
@@ -201,11 +208,11 @@ export function fallbackPreviewResponse(
   })
 }
 
-function rewriteForWorker(request: Request, remainder: string): Request {
+function rewriteForWorker(request: Request, remainder: string, policy: ForwardPolicy): Request {
   const url = new URL(request.url)
   url.pathname = remainder.startsWith('/') ? remainder : `/${remainder}`
   if (!url.pathname) url.pathname = '/'
-  return new Request(url.toString(), request)
+  return buildForwardRequest(request, url, policy)
 }
 
 function isWorkerMissing(err: unknown): boolean {
@@ -218,7 +225,13 @@ export async function dispatchProjectRequest(
   env: Env,
   project: Project,
   remainder: string,
+  // Default is the STRICT policy: callers must opt in to forwarding cookies/Authorization.
+  policy: ForwardPolicy = 'colony-origin',
 ): Promise<Response> {
+  if (policy === 'colony-origin') {
+    const refused = refuseServiceWorkerScript(request)
+    if (refused) return refused
+  }
   const reason = fallbackReasonForStatus(project.deploy_status)
   if (reason) return fallbackPreviewResponse(project, reason)
 
@@ -238,7 +251,14 @@ export async function dispatchProjectRequest(
   }
 
   try {
-    return await worker.fetch(rewriteForWorker(request, remainder))
+    const response = await worker.fetch(rewriteForWorker(request, remainder, policy))
+    // Same-origin on the colony: contain the response (header allow-list + CSP sandbox).
+    return policy === 'colony-origin'
+      ? sanitizeColonyOriginResponse(response, {
+          requestUrl: request.url,
+          pathPrefix: previewIframePath(project.id, '/'),
+        })
+      : sanitizeOwnOriginResponse(response)
   } catch (err) {
     if (isWorkerMissing(err)) return fallbackPreviewResponse(project, 'not_provisioned')
     return fallbackPreviewResponse(
@@ -266,7 +286,13 @@ export async function handlePlatformDispatch(request: Request, env: Env): Promis
     )
   }
 
-  return dispatchProjectRequest(request, env, project, target.remainder)
+  return dispatchProjectRequest(
+    request,
+    env,
+    project,
+    target.remainder,
+    target.kind === 'path' ? 'colony-origin' : 'own-origin',
+  )
 }
 
 /** Hostname-only entry for the Worker fetch wrapper. Path `/preview/*` is left to Hono. */
