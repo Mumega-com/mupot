@@ -3717,9 +3717,21 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_elevation_usage_log_pending" },
     ],
   },
+  {
+    file: "0209_project_seeds.sql",
+    sha256: "38111865d4bc638d67314b4d7ca3b1e0e0d58956b3eefe053519406174610468",
+    statements: [
+      "-- 0209_project_seeds.sql — durable record of an applied mupot.seed/v1 (seed_attach, dry_run:false).\n--\n-- Additive only. One row per (tenant, derived project slug). The row is INSERTED FIRST (status\n-- 'applying') and its UNIQUE key is the idempotency lock: a racing or repeated apply of the same seed\n-- hits the UNIQUE constraint and creates nothing. Digest equal -> replay; digest different -> refused.\n--\n-- STORES ONLY THE CANONICAL FORM (canonical_json) and its digest — never the raw seed source, whose\n-- comments and whitespace can carry secrets and still pass validation. `owner_label` is a label and is\n-- never resolved to a member. `requests_json` lists every request the seed makes, each recorded as\n-- 'pending_human': applying a seed GRANTS NOTHING (no gate, routine, credential, deploy right, agent).\n-- `seat_cap` records the maximum seats the seed asked for; no agent or token is created from it.\nCREATE TABLE IF NOT EXISTS project_seeds (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  project_slug TEXT NOT NULL,\n  project_id TEXT,\n  squad_id TEXT,\n  seed_sha256 TEXT NOT NULL CHECK (\n    length(seed_sha256) = 64 AND seed_sha256 = lower(seed_sha256) AND seed_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  canonical_json TEXT NOT NULL CHECK (json_valid(canonical_json)),\n  requests_json TEXT NOT NULL CHECK (json_valid(requests_json)),\n  owner_label TEXT NOT NULL,\n  seat_cap INTEGER CHECK (seat_cap IS NULL OR seat_cap BETWEEN 1 AND 8),\n  applied_by_member_id TEXT NOT NULL,\n  applied_at TEXT NOT NULL,\n  status TEXT NOT NULL CHECK (status IN ('applying', 'applied')),\n  lease_token TEXT,\n  lease_expires_at TEXT,\n  UNIQUE (tenant, project_slug)\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS idx_project_seeds_project\n  ON project_seeds(project_id) WHERE project_id IS NOT NULL;",
+    ],
+    objects: [
+      { type: "table", name: "project_seeds" },
+      { type: "index", name: "idx_project_seeds_project" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "d02d6749e6bdc966b431b518dea7270fba7a7f3d29c757045e26a26f46031afc"
+export const SCHEMA_CHAIN_DIGEST: string = "a32a561e484b007a5457c810451fa21b7d53e75d6af022598b69664c1310994c"

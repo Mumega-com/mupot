@@ -227,6 +227,16 @@ export interface TeamBootstrapInput {
   bot?: TeamBootstrapBotInput
   seed_memory?: string
   /**
+   * Display name for a NEWLY created squad (default: `name`). Never changes the derived slug.
+   * Not exposed on the team_bootstrap tool schema; used by seed_attach apply.
+   */
+  squad_name?: string
+  /**
+   * Adopt a pre-existing project or squad ONLY on the provenance ground (created_by_member_id === caller),
+   * never on a bare prior-receipt ground. Used by seed_attach apply. Not exposed on the tool schema.
+   */
+  require_provenance?: boolean
+  /**
    * Explicit, informed override to adopt a pre-existing project or squad
    * that this caller did not create and no prior team_bootstrap attempt
    * named (P0, see file header). Ignored unless the caller is org:admin
@@ -399,8 +409,9 @@ async function findAdoptGround(
   resourceId: string,
   createdByMemberId: string | null,
   actorMemberId: string,
+  requireProvenance = false,
 ): Promise<AdoptGround | null> {
-  const priorAttempt = await env.DB.prepare(
+  const priorAttempt = requireProvenance ? null : await env.DB.prepare(
     // disposition IN ('created','adopted') — kasra-review adversarial gate, P0,
     // 2026-09-22: a 'failed' receipt (in particular a 'name_resolution'
     // refusal) must NEVER itself become adoption ground on the next call —
@@ -616,7 +627,10 @@ export async function teamBootstrap(
   const existingProject = await findProjectBySlug(env, projectSlug)
 
   // ── project status checked BEFORE the squad is ever created (P1-1) ───────
-  if (existingProject && existingProject.status === 'archived') {
+  // Under require_provenance a project this actor did not create is never described (not even as archived):
+  // fall through to the provenance refusal below, which is the generic project_slug_taken.
+  const foreignUnderProvenance = input.require_provenance === true && existingProject?.created_by_member_id !== actorMemberId
+  if (existingProject && existingProject.status === 'archived' && !foreignUnderProvenance) {
     // P2 (kasra-review adversarial gate, 2026-09-22): this refusal used to
     // return with ZERO receipt — the only refusal in this function that
     // didn't. Receipted now, same as every other name_resolution refusal.
@@ -647,9 +661,10 @@ export async function teamBootstrap(
       existingProject.id,
       existingProject.created_by_member_id,
       actorMemberId,
+      input.require_provenance === true,
     )
     if (!projectGround) {
-      if (input.adopt === true && isOrgAdmin(auth)) {
+      if (input.adopt === true && input.require_provenance !== true && isOrgAdmin(auth)) {
         // Explicit, informed override — fall through and adopt. Not folded
         // into `projectGround` (which means "adoptable without an override")
         // so the disposition computed below still counts this as 'adopted',
@@ -688,6 +703,8 @@ export async function teamBootstrap(
   }
 
   const existingSquad = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
+  // squads.status exists since migration 0173; the Squad type omits it, SELECT * returns it.
+  const isArchivedSquad = (sq: Squad): boolean => (sq as Squad & { status?: string }).status === 'archived'
 
   // ── HOME FENCE (P2-4): never adopt a home squad, even with adopt:true ────
   if (existingSquad && existingSquad.kind === 'home') {
@@ -708,6 +725,10 @@ export async function teamBootstrap(
     return { ok: false, error: 'cannot_adopt_home_squad', detail: { squad_id: existingSquad.id, receipt_id: receiptId } }
   }
 
+  if (existingSquad && input.require_provenance === true && isArchivedSquad(existingSquad)) {
+    return { ok: false, error: 'squad_slug_taken' }
+  }
+
   let squadGround: AdoptGround | null = null
   if (existingSquad) {
     squadGround = await findAdoptGround(
@@ -718,6 +739,7 @@ export async function teamBootstrap(
       existingSquad.id,
       existingSquad.created_by_member_id,
       actorMemberId,
+      input.require_provenance === true,
     )
     if (!squadGround) {
       // Athena, round-2 sharpening on PR #1510: "find-or-create is create +
@@ -726,7 +748,7 @@ export async function teamBootstrap(
       // ('adopted', below) rather than silently folded into 'existing'. Not
       // folded into `squadGround` for the same reason as the project limb
       // above.
-      if (input.adopt === true && isOrgAdmin(auth)) {
+      if (input.adopt === true && input.require_provenance !== true && isOrgAdmin(auth)) {
         // fall through and adopt
       } else {
         const owners = await listSquadCapabilityHolders(env, existingSquad.id)
@@ -777,6 +799,11 @@ export async function teamBootstrap(
       // so it cannot apply retroactively here.
       const raced = await findProjectBySlug(env, projectSlug)
       if (!raced) return { ok: false, error: 'provisioning_failed', detail: { stage: 'project', reason: created.error } }
+      // require_provenance (seed apply): a row that appeared between the lookup and the insert is adopted
+      // ONLY if this actor created it; the lookup-path guard cannot see a row that did not exist yet.
+      if (input.require_provenance === true && raced.created_by_member_id !== actorMemberId) {
+        return { ok: false, error: 'project_slug_taken' }
+      }
       project = raced
     } else {
       return { ok: false, error: 'provisioning_failed', detail: { stage: 'project', reason: created.error } }
@@ -807,13 +834,17 @@ export async function teamBootstrap(
   let squad = existingSquad
   let squadCreated = false
   if (!squad) {
-    const created = await createSquad(env, departmentId, { slug: squadSlug, name }, { createdByMemberId: actorMemberId })
+    const created = await createSquad(env, departmentId, { slug: squadSlug, name: input.squad_name?.trim() || name }, { createdByMemberId: actorMemberId })
     if (created.ok) {
       squad = created.value
       squadCreated = true
     } else if (created.error === 'slug_taken') {
       const raced = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
       if (!raced) return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: created.error } }
+      // require_provenance (seed apply): same rule as the project race above, plus the home-squad fence.
+      if (input.require_provenance === true && (raced.created_by_member_id !== actorMemberId || raced.kind === 'home' || isArchivedSquad(raced))) {
+        return { ok: false, error: 'squad_slug_taken' }
+      }
       squad = raced
     } else {
       const mapped = created.error === 'squad_limit_reached' ? 'squad_limit_reached' : 'provisioning_failed'

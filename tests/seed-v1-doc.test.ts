@@ -61,7 +61,7 @@ describe('seed-v1 doc caps equal SEED_CAPS', () => {
     expect(section).toMatch(/leading whitespace is NOT trimmed/)
   })
   it('documents the request shape in the tool section', () => {
-    expect(doc).toContain('{kind, fields, needs, text}')
+    expect(doc).toContain('{key, kind, fields, needs, text}')
   })
 })
 

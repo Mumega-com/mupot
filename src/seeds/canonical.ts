@@ -31,3 +31,10 @@ export async function seedSha256(seed: unknown): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', bytes)
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
+
+// Stable key for one request: kind + a short digest of its structured fields. The dry run shows it;
+// apply requires the human to list it in `accept`. Same request -> same key on every call.
+export async function requestKey(request: { kind: string; fields: Record<string, string> }): Promise<string> {
+  const digest = await seedSha256({ kind: request.kind, fields: request.fields })
+  return `${request.kind}:${digest.slice(0, 12)}`
+}

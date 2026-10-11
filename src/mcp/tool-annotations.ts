@@ -213,7 +213,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   presence_list: RO('listPresence/listOwnModules SELECT only (registry/service.ts:466,493)'),
 
   // ── seeds ──────────────────────────────────────────────────────────────────────────────────
-  seed_attach: RO('validateSeed is pure; projects SELECT only; dry_run:false answers 501 without writing (mcp/seed.ts)'),
+  seed_attach: ADD('dry_run (default) is pure + SELECT only; dry_run:false INSERTs project_seeds + projects/squads/project_squad_access via teamBootstrap + mutation_audit_entries, human org admin only, grants nothing (mcp/seed.ts, seeds/apply.ts)'),
 
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────
   define_circuit: ADD('defineCircuit batch INSERT circuits/nodes/edges (addons/workflow-circuits/service.ts:284-303)'),
