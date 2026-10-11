@@ -1,50 +1,49 @@
 # Next release flights
 
-This is the execution runway from the current `0.31.0` source cut (tagged
-`v0.31.0` "Office", 2026-09-29) to the next tagged release. Version
-ownership remains in [ROADMAP.md](../../ROADMAP.md); the shipped record remains in
-[CHANGELOG.md](../../CHANGELOG.md).
+This is the execution runway from the `v0.31.0` tag ("Office", 2026-09-29) to the next
+tagged release, `v0.32.0`. Version ownership remains in [ROADMAP.md](../../ROADMAP.md);
+the shipped record remains in [CHANGELOG.md](../../CHANGELOG.md). Rewritten 2026-10-11;
+the v0.30 flight queue it replaces is superseded by the tags that shipped.
 
-## Release truth at 2026-09-29
+## Release truth at 2026-10-11
 
 | Surface | Exact state |
 |---|---|
-| Current `main` | `0.31.0` — not pinned here; read `git rev-parse origin/main` |
-| Current production | `0.31.0` — read live `/health`; recorded deploy of the `v0.31.0` tag commit `52299bab`, `clean:true`, 2026-09-29 (migrations 0175–0181 applied). `main` and production move independently; this line ages on the next merge or deploy. |
-| Latest tagged stable release | `v0.31.0` — annotated tag at `52299bab` on `main`, 2026-09-29, with GitHub Release "v0.31.0 — Office" (see CHANGELOG.md `[0.31.0]`) |
-| Next stable candidate | `v0.31.1` — office publishing live (#1592 approval binding, T2b write bindings, #1610) |
-| Next development release | `v0.32.0` |
+| Current `main` | Far past the tag — read `git rev-list --count v0.31.0..origin/main` and `git rev-parse origin/main`; not pinned here. Migrations 0182 onward are unreleased. |
+| Current production | Read live `/health`; it moves independently of `main` and of tags. |
+| Latest tagged stable release | `v0.31.0` — annotated tag at `52299bab`, 2026-09-29, with GitHub Release "v0.31.0 — Office" |
+| Next stable candidate | `v0.32.0` — "Agents as themselves and governed autonomy" |
+| Branch for it | `release/v0.32.0` (read the branch; this line does not pin it). `release/v0.31.0` was never cut; there is no `v0.31.x` patch path. |
 
-The three states are intentionally different. Code on `main` is not necessarily
-deployed; deployed code is not necessarily stable; a stable claim requires the exact
-tag, GitHub Release, deployment, contract receipts, and final readiness verdict to
-agree.
+Code on `main` is not necessarily deployed; deployed code is not necessarily stable; a
+stable claim requires the exact tag, GitHub Release, deployment, release receipts, and
+final readiness verdict to agree.
 
-## Ordered flight queue
+## Ordered flight queue — v0.32.0
 
-Flight identifiers are assigned only when a flight is launched. The names below own
-the order and acceptance boundary; they are not reusable historical flight IDs.
+Flight identifiers are assigned only when a flight is launched. The steps below own the
+order and acceptance boundary. They are the release contract in ROADMAP.md.
 
-| Order | Flight | Deliverable | Gate | State |
-|---|---|---|---|---|
-| A | Freeze the v0.30 candidate | One immutable `main` SHA with no later merge contaminating its evidence | Push CI and CodeQL green at the frozen SHA; Athena exact-head release gate | **BLOCKED ON A FREEZE MECHANISM.** Two attempts invalidated: `55c1c3ef` (46 commits landed after it) and `v0.30.0-rc.1` at `0bb9c256` (15 after). Both were invalidated by correct merges closing measured-exploitable defects. A third attempt on the same terms will be invalidated the same way. See [ROADMAP.md](../../ROADMAP.md) § "Why no version has been tagged since v0.25.0" for the three options |
-| B | Build the v0.30 evidence bundle | Fresh install, upgrade, host, permission, lifecycle, external-PR, recovery, browser, runtime, MCP, and ACK receipts from the frozen SHA | `mupot-v030-prepublication-readiness/v1` prerequisites pass without reconstructed evidence | Pending A |
-| C | Publish and soak the RC | RC tag, prerelease, exact deployment, smoke, soak, and release-candidate receipt | Separate Hadi approval for tag and deployment; no merge after the RC receipt | Pending B — `v0.30.0-rc.1` exists but is superseded; a new RC is required |
-| D | Publish `v0.30.0` stable | Stable deployment, tag, GitHub Release, release-integrity receipt, and final readiness receipt at one SHA | Separate Hadi approvals for stable deployment and publication; Athena verifies the final bundle | Pending C |
-| E | Converge the v0.31 receiver | One default-disabled Mupot-to-Codex receiver and host runner, built from the Hadi-admin operational implementation plus the Hadi-dev contract and policy lane | Required CI, identity/seat adversarial gate, replay proof, and one separately approved synthetic live canary | Post-v0.30 |
+| Order | Step | Done when |
+|---|---|---|
+| 1 | Seats without manual mint | A member's Claude Code, Codex, and ChatGPT threads each act under their own seat agent with no manual token mint, proven by the seat canary receipts recorded on the flight parent (one read-only call each under `SEAT_AUTO_ENROLL=1`, seat rows read back) |
+| 2 | Loop brakes | Dry-run default, pause, per-task retry ceiling, and human-only release are deployed and covered by tests |
+| 3 | Close P0 #1565 | Issue closed with the fix on `main` |
+| 4 | Close admin-tool disclosure | #1608 and #1609 (the #1596 phase-1b disclosure items) closed; #1596 itself is the Cloudflare Forge adoption epic and is not required to close |
+| 5 | Freeze and gate | One frozen SHA; two independent review lenses GREEN; CI green; the release evidence bundle `mupot-v032-prepublication-readiness/v1` built from that SHA (successor of the v0.30 contract; schema to be written before the freeze) |
+| 6 | Cut and publish | `release/v0.32.0` cut; annotated tag and GitHub Release published |
 
-Any merge after Flight A invalidates Flights B and C. Land the correction through the
-normal exact-head gate, freeze the new `main`, and restart from Flight A. No prior RC
-receipt rolls forward to a different commit.
+Any merge after step 5 begins invalidates its evidence: land the correction through the
+normal gate, re-freeze, and restart step 5.
 
 ## Evidence hygiene — read before building the aggregate bundle
 
-`/home/mumega/.fleet/receipts/mumega-vps-codex-attach/` contains two receipts dated
+The host-side receipts directory for the Codex attach contains two receipts dated
 2026-08-30, **both `status: "fail"` with `release_sha: null`**. It is the only Host-Go-shaped
 bundle on the host, and it has neither `manifest.json` nor `cutover-gate.json`.
 
 A glob such as `*-check.json` when assembling the aggregate evidence directory **will sweep
-these in**. Exclude the path explicitly, or move it aside first. The contract's own rule —
+these in**. Exclude that directory explicitly (it holds two `status: fail` receipts with `release_sha: null`), or move it aside first. The contract's own rule —
 an unbound historical outer bundle cannot admit a bound prior bundle — means including it
 does not merely add noise, it invalidates the bundle.
 
@@ -53,80 +52,8 @@ Verified state of the prepublication receipts as of 2026-09-04: **1 of 11 exists
 `release_sha` binding — so it is the only receipt that survives a re-freeze). The other ten
 must be produced fresh from whatever SHA is frozen.
 
-## Supersession — 2026-09-04
-
-`v0.30.0-rc.1` was tagged at `0bb9c256` on 2026-09-03. `main` is now 13 commits ahead of it.
-By this document's own rule below, and release order step 7 in the contract, **no prior RC
-receipt rolls forward** — the RC is superseded and Flights A and B must be re-run from a
-newly frozen `main`.
-
-Three PRs that this document's scope boundary routed OUT of `v0.30.0` have since landed on
-`main` — #1246 (routed to v0.31.0), #1247 (routed to post-v0.30.0) and #1248 (routed to
-v0.33.0). They were merged on 2026-09-04 at Hadi's direction as part of clearing the open-PR
-backlog. The consequence is factual and unresolved: **the contents of `main` no longer match
-the written scope of the v0.30.0 stable candidate.**
-
-Two ways forward, and the choice is the owner's:
-
-1. **Re-cut v0.30.0 to include them.** The scope boundary table below is then rewritten
-   rather than merely annotated, and the security train section gains the three defects
-   closed on 2026-09-04.
-2. **Take the stable candidate from a commit that predates them.** This preserves the
-   written scope but excludes three closed production vulnerabilities from the stable
-   release, which is the harder position to defend.
-
-Until that is decided, the rows below describe the plan as written, not the state of `main`.
-
-## v0.30 scope boundary
-
-The following work is useful but excluded from the `v0.30.0` stable contract:
-
-| Work | Routing |
-|---|---|
-| #1246 device grant | `v0.31.0` identity/onboarding; restack and re-gate. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
-| #1247 missing-token 503 | Post-`v0.30.0` patch candidate; rebase and exact-head gate. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
-| #1248 tenant path dispatcher | `v0.33.0` distribution/self-hosting surface. **LANDED ON `main` 2026-09-04** — routing above is the plan as written, not the current state. |
-| #1253 MCP self-registration | `v0.31.0` identity/onboarding; remains draft |
-| #1254 enrollment chooser and seat key | `v0.31.0` identity/access; requires an independent exact-head security gate |
-| `servathadi/cc#1` receiver engineering record | Evidence source for Flight E, not a Mupot product merge |
-
-Closing or deferring an item is not a claim that its design is wrong. It protects the
-stable candidate from scope drift and gives each surface its own evidence boundary.
-
-## Flight E convergence inputs
-
-The receiver flight starts only after `v0.30.0` is stable and pins these inputs before
-any reconciliation:
-
-- Mupot server receipt implementation: #1249 merge `16390d1e`;
-- Hadi-dev contract/reference head `f52f89daca4701cb4e4a0edfc393745a61bb2d75`,
-  package subtree `f72c70101dd1ddf2deaaf027bfde68d2eacb2f47`;
-- Hadi-admin operational package subtree
-  `807eb57b894945c74c101104f6c4af4708471df5`;
-- private engineering record `servathadi/cc#1` at the exact reviewed head used by
-  the flight.
-
-The Hadi-admin package is the executable base. Hadi-dev contributes the canonical MCP
-mapping, identity normalization, fixed receipt transport, plain-record/no-fetch
-hardening, host-policy gates, plugin packaging, and cross-harness contract. The trees
-must be reconciled requirement by requirement; they must not be mechanically merged or
-allowed to become a third receiver.
-
-Flight E is complete only when:
-
-1. one canonical package and runner remain;
-2. bearer-derived agent identity and server-authorized seat selection agree across
-   `check_in`, inbox lease/ACK, and send;
-3. CI reproduces both source suites, dry runs, secret scans, no-network assertions,
-   quarantine, artifact mismatch, and zero-duplicate replay cases;
-4. a bounded synthetic live canary produces one exact chain:
-   `dispatch -> lease -> accepted start -> runtime consumption -> correlated ACK ->
-   artifact hash -> review -> independent verdict`;
-5. persistent service installation and real-seat activation remain separately approved.
-
 ## Authority boundary
 
 This runway authorizes documentation, branch preparation, tests, and evidence
 collection. It does not authorize a merge, tag, GitHub Release, deployment, migration,
-credential operation, App Server start, persistent service installation, ACL change, or
-real customer task.
+credential operation, or real customer task.

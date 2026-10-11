@@ -2,6 +2,13 @@
 
 ## [Unreleased] — main since v0.31.0
 
+> **Re-scope (2026-10-11):** `v0.32.0` is now "Agents as themselves and governed
+> autonomy": per-seat agent identity for Claude Code, Codex, and ChatGPT threads, plus
+> the loop brakes, with P0 #1565 and #1608 and #1609 (the #1596 phase-1b disclosure items) closed
+> before the cut. "Compounding Project Knowledge" moves to `v0.33.0` and "Distribution
+> and Commercial Operations" to `v0.34.0`. `v0.31.1` was never a path (`release/v0.31.0`
+> was not cut). See [ROADMAP.md](ROADMAP.md) for the release contract.
+
 - **task_get** (`kasra/task-get-read-tool`) - new member-tier MCP read tool
   `task_get { task_id }`: one task row plus its latest `task_verdicts` row and latest
   dispatch receipt (id + derived status). Row gate is `canReadTask` from the shared
@@ -1386,7 +1393,7 @@ resolved the identity/connection model into a three-tier security posture.
   MEDIUM-tier OAuth spec with 4 adversarial P0s closed (in flight, gated, not deployed).
 
 ### Fixed
-- **OAuth tenant-provisioning 503** — a stale `/home/sos` path after the mirror relocation
+- **OAuth tenant-provisioning 503** — a stale hard-coded filesystem path after the mirror relocation
   blocked ALL signups. (engine)
 - **MCP connector wrong-endpoint trap** — `/sse` rejected OAuth tokens cryptically; now
   points OAuth clients to the root URL. (mcp-dispatcher)
