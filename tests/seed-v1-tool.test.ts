@@ -46,9 +46,9 @@ const observer = auth('obs', [grant('observer', 'squad', 'squad-a')])
 const call = (env: Env, a: AuthContext, args: unknown) => invokeTool(a, env, 'seed_attach', args, 'https://pot.test')
 
 describe('seed_attach registration', () => {
-  it('is registered once, member floor, and no other seed tool exists', () => {
+  it('is registered once, member floor, and seed_draft is the only other seed tool', () => {
     const spec = TOOLS.filter((t) => t.name.startsWith('seed'))
-    expect(spec.map((t) => t.name)).toEqual(['seed_attach'])
+    expect(spec.map((t) => t.name)).toEqual(['seed_attach', 'seed_draft'])
     expect(spec[0].min).toBe('member')
   })
   it('an observer is refused at the capability floor', async () => {
