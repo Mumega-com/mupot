@@ -10,7 +10,7 @@ the test that proves it (every refusal was mutation-checked: removing the guard 
 | A receipt's artifact and hash must be well formed, not placeholders | `verifyTaskArtifactShape`, `src/tasks/artifact-verification.ts`. Every review-entry path calls it: `task_submit_result`, `task_update`, REST task PATCH, runtime receipts, in-Worker execution | `artifact_verification_failed` with `detail.reason` = `artifact_placeholder`, `sha256_placeholder`, `sha256_malformed`, `sha256_not_claimed`, `no_artifact_claimed`, `disallowed_path`, `refusal_prose`, `no_result` | `tests/artifact-verification.test.ts`, `tests/task-submit-result.test.ts` |
 | Nobody gives a verdict on their own task | the verdict write itself: `buildVerdictStatements`, `src/tasks/service.ts` (its `UPDATE ... WHERE`), using the fragments in `src/tasks/verdict-independence.ts`; `evaluateVerdictGates` runs the same fragments as the pre-check | `409 self_verdict` | `tests/verdict-independence-matrix.test.ts` |
 | Effectful tools with a `dry_run` argument default to the dry run | CI ratchet `scripts/check-effectful-tools-dry-run.mjs` (job `effectful-tools-dry-run`) | build fails | `tests/check-effectful-tools-dry-run.test.mjs` |
-| A deploy on a seed-attached project needs a canary receipt and a rollback line | `checkDeployPolicy`, `src/projects/deploy-policy.ts`, called inside `deployProject` (the MCP tool, the REST route and the dashboard button all go through it) | `409` with `canary_receipt_required`, `canary_receipt_not_found`, `canary_receipt_wrong_project`, `canary_receipt_not_canary`, `canary_receipt_not_passed`, `canary_receipt_stale`, `canary_receipt_self_certified` or `rollback_required` | `tests/project-deploy-policy.test.ts` |
+| A deploy on a seed-attached project needs a canary receipt and a rollback line | `checkDeployPolicy`, `src/projects/deploy-policy.ts`, called inside `deployProject` (the MCP tool, the REST route and the dashboard button all go through it) | `409` with `canary_receipt_required`, `canary_receipt_not_found`, `canary_receipt_archived`, `canary_receipt_wrong_project`, `canary_receipt_not_canary`, `canary_receipt_not_passed`, `canary_receipt_stale`, `canary_receipt_self_certified`, `canary_receipt_reused` or `rollback_required`; and Studio dispatch of such a project's repository is refused with `409 studio_dispatch_seed_attached_use_project_deploy` | `tests/project-deploy-policy.test.ts`, `tests/repo-identity.test.ts` |
 
 ## Receipt shape
 
@@ -94,13 +94,17 @@ Studio dispatch has no canary path. `dispatchStudioFlight` (`POST /api/studio/di
 `/dispatch`) refuses outright, with `409 studio_dispatch_seed_attached_use_project_deploy`, any `repoUrl` that is
 the repository of a seed-attached project, before any slot is reserved, any agent launched, or any task or
 flight written. Use `project_deploy`. Repositories are compared by identity, not by string: scheme, userinfo,
-port, host case, a trailing-dot host, percent-encoding (decoded until stable), repeated trailing slashes and
+port, host case, a trailing-dot host, percent-encoding (each path segment decoded on its own, at most 3 passes; a segment that has a bad escape or is still changing after the third pass makes the identity unsure, which matches), repeated trailing slashes and
 `.git`, `ssh://` and scp-style forms, the `www.`, `api.` and `codeload.` GitHub hosts, and anything after
 owner/repo (`/tree/main`) all fold to one repository. When unsure the match is coarser, so the refusal errs
 toward refusing: an owner-only GitHub URL matches every repository of that owner.
 
 Not covered, by design: `task_create` and ordinary task or flight creation. The policy guards deploy entry points
 only; it does not stop a member from creating a task that describes a deploy.
+
+Not covered yet: `cursor_dispatch` (`src/mcp/cursor.ts`). It launches Cursor cloud runs against any `repo_url`
+and has no seed-attached check, so it is a way around the Studio refusal for a seed-attached project's
+repository. Tracked as a follow-up issue.
 
 The policy check (every refusal code except the concurrent-claim case above) runs before anything is written:
 such a refusal leaves no `deploy_status` flip, no task, no flight and no deployment receipt. The accepted evidence is recorded in the dispatched task body and the flight

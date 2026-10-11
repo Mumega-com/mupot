@@ -1568,9 +1568,9 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
 // POST /api/studio/dispatch — create a flight + task from a Studio prompt.
 dashboardApp.post('/api/studio/dispatch', async (c) => {
   const auth = getAuthContext(c)
-  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown}
+  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown }
   try {
-    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown}
+    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown }
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }

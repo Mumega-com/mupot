@@ -79,3 +79,39 @@ describe('repoIdentity — non-GitHub hosts compare by host + path', () => {
     expect(sameRepository('https://git2.example.com/org/site', base)).toBe(false)
   })
 })
+
+describe('repoIdentity — a bad escape never undoes the folding of the rest, and is UNSURE (matches)', () => {
+  const BASE = 'https://github.com/acme/widget'
+  const bad = [
+    'https://github.com/%61cme/widget/tree/%',
+    'https://github.com/%61cme/widget/%zz',
+    'https://github.com/%61cme/widget/%e0%a4%a',
+    'https://github.com/%61cme/widget/tree/main/%',
+    'https://github.com/acme/widget/%',
+    'https://github.com/acme/%zzwidget',
+    'https://github.com/%zz/%61cme/widget',
+  ]
+  for (const url of bad) {
+    it(`${url} matches a GitHub project (refuse), whatever else it names`, () => {
+      expect(repoIdentity(url)?.kind).toBe('github-unsure')
+      expect(sameRepository(url, BASE)).toBe(true)
+      expect(sameRepository(BASE, url)).toBe(true)
+      expect(sameRepository(url, 'https://github.com/other/thing')).toBe(true) // coarse on purpose
+      expect(sameRepository(url, 'https://gitlab.com/acme/widget')).toBe(false)
+    })
+  }
+  it('a segment still changing after 3 passes is unsure too', () => {
+    expect(repoIdentity('https://github.com/acme/wid%252525252567et')?.kind).toBe('github-unsure')
+  })
+  it('a clean URL is unaffected (precise identity, no false match)', () => {
+    expect(repoIdentity(BASE)).toEqual({ kind: 'github', owner: 'acme', repo: 'widget' })
+    expect(repoIdentity('https://github.com/%61cme/widget/tree/main')).toEqual({ kind: 'github', owner: 'acme', repo: 'widget' })
+    expect(sameRepository('https://github.com/%61cme/widget/tree/main', 'https://github.com/other/thing')).toBe(false)
+  })
+  it('a non-GitHub host with a bad escape matches only that host', () => {
+    const base = 'https://git.example.com/org/site'
+    expect(sameRepository('https://git.example.com/%6frg/site/%zz', base)).toBe(true)
+    expect(sameRepository('https://git.example.com/%6frg/site/%zz', 'https://git.example.com/another/repo')).toBe(true)
+    expect(sameRepository('https://git.example.com/%6frg/site/%zz', 'https://other.example.com/org/site')).toBe(false)
+  })
+})

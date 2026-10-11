@@ -335,7 +335,7 @@ describe('policy rule 5 — a seed-attached project needs a canary receipt and a
       authState.current = deployer
       const receipt = await canaryTask()
       const before = flightsAndTasks()
-      for (const repoUrl of [SEEDED_REPO, `${SEEDED_REPO}.git`, `${SEEDED_REPO}/`, `${SEEDED_REPO}.git/`, `${SEEDED_REPO}.git.git`, 'https://GitHub.com./Example-Org/Example-Site', 'https://www.github.com/example-org/example-site/tree/main', 'https://github.com/example-org/%65xample-site']) {
+      for (const repoUrl of [SEEDED_REPO, `${SEEDED_REPO}.git`, `${SEEDED_REPO}/`, `${SEEDED_REPO}.git/`, `${SEEDED_REPO}.git.git`, 'https://GitHub.com./Example-Org/Example-Site', 'https://www.github.com/example-org/example-site/tree/main', 'https://github.com/example-org/%65xample-site', 'https://github.com/%65xample-org/example-site/tree/%', 'https://github.com/%65xample-org/example-site/%zz']) {
         for (const extra of [{}, { canary_receipt: receipt, rollback: ROLLBACK }]) {
           const res = await studio({ prompt: 'launch', repoUrl, ...extra })
           expect(res.status, repoUrl).toBe(409)
