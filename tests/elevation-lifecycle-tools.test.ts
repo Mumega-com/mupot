@@ -429,7 +429,8 @@ describe('unarchive_row under action:project_lifecycle', () => {
     expect(receipts.results.map((r) => r.entity_table)).toEqual(['projects', 'squads'])
     const byTable = Object.fromEntries(receipts.results.map((r) => [r.entity_table, r.reason]))
     expect(byTable.projects).toContain(`[elevation_grant:${orgGrant.id}]`)
-    expect(byTable.squads).toContain(`[elevation_grant:${grant.id}]`)
+    // either live grant covers a non-home squad; which one matches first is unspecified
+    expect([orgGrant.id, grant.id].some((id) => byTable.squads.includes(`[elevation_grant:${id}]`))).toBe(true)
     expect(await usageRows()).toBe(2)
   })
 
