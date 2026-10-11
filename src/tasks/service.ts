@@ -312,7 +312,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode, readonly detail?: string) {
@@ -492,6 +492,23 @@ async function throwTaskUpdateConflict(env: Env, existing: Task): Promise<never>
   throw new TaskUpdateConflictError('task_update_conflict')
 }
 
+/**
+ * Review freezes the assignee. A task in `review` is awaiting someone else's verdict, and rule 3
+ * (verdict independence) and the self-completion lane both key on who the assignee IS, so a
+ * writable assignee at that status lets any squad member+ pick who counts as "the assignee"
+ * (probed: S/R/G each task_update{assignee_agent_id: self} on a review task then verdicted it).
+ * True when `next` would change either assignee column of a task that is in review. Enforced in
+ * the MCP and REST pre-checks, in persistTaskUpdate, and again inside the UPDATE's own WHERE.
+ */
+export function assigneeChangesInReview(
+  existing: Pick<Task, 'status' | 'assignee_agent_id' | 'assignee_member_id'>,
+  next: Pick<Task, 'assignee_agent_id' | 'assignee_member_id'>,
+): boolean {
+  return existing.status === 'review'
+    && ((existing.assignee_agent_id ?? null) !== (next.assignee_agent_id ?? null)
+      || (existing.assignee_member_id ?? null) !== (next.assignee_member_id ?? null))
+}
+
 function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
   // mupot#1616: the ONE shared status/field UPDATE every generic writer reaches
   // (MCP task_update, REST PATCH, routine actions, reversal step 2). For an
@@ -510,7 +527,8 @@ function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1Prepa
     `UPDATE tasks
         SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
       WHERE id = ? AND updated_at = ? AND project_id IS ?${officeGuard}
-        AND ${TASK_NOT_ARCHIVED_SQL()}`,
+        AND ${TASK_NOT_ARCHIVED_SQL()}
+        AND (tasks.status <> 'review' OR (tasks.assignee_agent_id IS ? AND tasks.assignee_member_id IS ?))`,
   ).bind(
     next.title,
     next.body,
@@ -528,6 +546,10 @@ function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1Prepa
     next.id,
     existing.updated_at,
     existing.project_id,
+    // Assignee freeze in review, in the write itself: a row that is (now) in review must still
+    // carry exactly the assignee this write carries, so a stale snapshot cannot slip a change in.
+    next.assignee_agent_id ?? null,
+    next.assignee_member_id ?? null,
   )
 }
 
@@ -541,6 +563,8 @@ export async function persistTaskUpdate(
   if ((existing.priority !== next.priority || existing.body !== next.body || existing.project_id !== next.project_id || existing.parent_task_id !== next.parent_task_id) && (next.priority === 'P0' || next.priority === 'P1')) {
     assertValidIntakeContract(next, { allowDeferredPredicate: true })
   }
+
+  if (assigneeChangesInReview(existing, next)) throw new TaskUpdateConflictError('assignee_frozen_in_review')
 
   let result
   try {
@@ -1596,8 +1620,9 @@ export interface WriteVerdictInput {
    *                         existing supervisory path); never waives a direct party;
    *   'owner_override'    — the org owner's explicit, audited override_self_verdict:true.
    * The `gate:agent-self-completion` lane exempts ONLY the task's CURRENT assignee (re-read inside
-   * the UPDATE's WHERE) and needs no waiver for that; any other decider on that lane (e.g. an
-   * org admin who is a party) is judged like every other lane.
+   * the UPDATE's WHERE, together with the lane itself) and needs no waiver for that. An AGENT
+   * decider on that lane passes only as current assignee; a non-agent decider (an org admin) is
+   * judged like every other lane (e.g. an admin who is a party is refused).
    */
   independenceWaiver?: VerdictIndependenceWaiver
 }
@@ -1617,7 +1642,7 @@ async function isCurrentSelfCompletionAssignee(
   input: { task: Pick<Task, 'id' | 'gate_owner'>; decidedBy: string },
 ): Promise<boolean> {
   if (input.task.gate_owner !== 'gate:agent-self-completion') return false
-  const row = await env.DB.prepare(`SELECT 1 AS one FROM tasks WHERE id = ? AND assignee_agent_id = ?`)
+  const row = await env.DB.prepare(`SELECT 1 AS one FROM tasks WHERE id = ? AND assignee_agent_id = ? AND gate_owner = 'gate:agent-self-completion'`)
     .bind(input.task.id, input.decidedBy).first<{ one: number }>()
   return row !== null
 }
@@ -1855,7 +1880,10 @@ export function buildVerdictStatements(
 
   // Policy rule 3, at the one chokepoint every verdict surface (HTTP, MCP, IM, harness-attested
   // origin, office) funnels through. The conflict is re-evaluated INSIDE the UPDATE's WHERE, so a
-  // party change between a caller's pre-check and this write cannot land a self-verdict.
+  // decider that BECOMES a party (it submitted/ran, or was made assignee) between a caller's
+  // pre-check and this write is refused. It does not freeze the party set: a decider that was never
+  // a party is not refused by a reassignment, which is why the assignee is frozen while in review
+  // (assigneeChangesInReview) and why the self-completion lane re-checks its own authority below.
   const selfCompletionLane = input.task.gate_owner === 'gate:agent-self-completion'
   const independenceKinds: VerdictConflictKind[] = input.independenceWaiver === 'owner_override'
     ? []
@@ -1863,16 +1891,23 @@ export function buildVerdictStatements(
   const independence = independenceKinds.length > 0
     ? compileVerdictIndependenceSql(independenceKinds, input.decidedBy, { column: 'tasks.id' })
     : null
-  // Self-completion lane: the CURRENT assignee (as the task row says at write time) closes its own
-  // task; nobody else gets that exemption. Evaluated in the WHERE so a reassignment between a
-  // caller's pre-check and this write cannot land it.
+  // Self-completion lane. Two facts are re-read INSIDE the UPDATE's WHERE (never trusted from the
+  // caller's snapshot):
+  //   1. the lane itself: tasks.gate_owner must STILL be the lane (an owner re-gate between the
+  //      caller's read and this write refuses the verdict outright);
+  //   2. the decider's lane authority. An AGENT holds this lane only as the CURRENT assignee, so
+  //      for an agent decider the only passing branch is `tasks.assignee_agent_id = decider`; it
+  //      does NOT fall through to NOT <conflict> (a former assignee who never submitted/ran is no
+  //      party, so that branch would admit it with no lane authority at all). The NOT <conflict>
+  //      branch is kept only for deciders that are not agents (members holding the lane by
+  //      org-admin standing, which the caller asserted), who are judged like any other lane.
   const independenceSql = independence
     ? selfCompletionLane
-      ? ` AND (tasks.assignee_agent_id = ? OR NOT ${independence.sql})`
+      ? ` AND tasks.gate_owner = 'gate:agent-self-completion' AND (tasks.assignee_agent_id = ? OR (NOT EXISTS (SELECT 1 FROM agents lane_agent WHERE lane_agent.id = ?) AND NOT ${independence.sql}))`
       : ` AND NOT ${independence.sql}`
     : ''
   const independenceParams: unknown[] = independence
-    ? selfCompletionLane ? [input.decidedBy, ...independence.params] : independence.params
+    ? selfCompletionLane ? [input.decidedBy, input.decidedBy, ...independence.params] : independence.params
     : []
 
   const guardSql = `${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`

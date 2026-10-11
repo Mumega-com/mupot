@@ -80,6 +80,7 @@ import { createMemory } from '../memory'
 import {
   assertCompletableDoneWhen,
   assigneeCannotMutateOwnAssignment,
+  assigneeChangesInReview,
   assigneeSelfClose,
   checkTransition,
   createTask,
@@ -1905,6 +1906,12 @@ const toolTaskUpdate: ToolSpec = {
         changed = true
       }
     }
+    // Assignee FROZEN in review (any caller, any role). The verdict-independence rule and the
+    // gate:agent-self-completion lane both key on who the assignee is, so a writable assignee here
+    // lets a non-party appoint itself. Also enforced in persistTaskUpdate and in the UPDATE's WHERE.
+    if (assigneeChangesInReview(existing, next)) {
+      return fail(409, 'assignee_frozen_in_review', 'a task in review has a frozen assignee; move it out of review first')
+    }
     // Hoisted: the receipt write after the update commits needs both, and the
     // gate_owner block below is where they are decided.
     let reassignsGatedReview = false
@@ -1993,6 +2000,11 @@ const toolTaskUpdate: ToolSpec = {
         // never coerce. Legal form: 'gate:<owner>' only.
         if (!isValidGateOwnerForm(trimmed)) {
           return fail(400, 'invalid_gate_owner', "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant")
+        }
+        // Reserved lane: only finishTask (src/agents/execute.ts) stamps it, exactly as task_create
+        // refuses it. A no-op write of the value a task already carries is not a change.
+        if (trimmed === 'gate:agent-self-completion' && existing.gate_owner !== trimmed) {
+          return fail(403, 'gate_owner_reserved', 'this gate is reserved for its own subsystem and cannot be set at task_update')
         }
         next.gate_owner = trimmed
       } else {

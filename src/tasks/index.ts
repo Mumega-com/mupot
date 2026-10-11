@@ -29,7 +29,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -1078,6 +1078,11 @@ tasksApp.patch('/:id', async (c) => {
       }
     }
   }
+  // Assignee FROZEN in review (any caller): verdict independence and the self-completion lane key
+  // on who the assignee is. Also enforced in persistTaskUpdate and in the UPDATE's WHERE.
+  if (assigneeChangesInReview(existing, next)) {
+    return c.json({ error: 'assignee_frozen_in_review', detail: 'a task in review has a frozen assignee; move it out of review first' }, 409)
+  }
   // gate_owner may only be set/changed while status is open or in_progress.
   // Once a task enters review/approved/rejected/done the gate is locked, except
   // for owner/admin recovery of historical review rows created without a gate.
@@ -1118,6 +1123,9 @@ tasksApp.patch('/:id', async (c) => {
           { error: 'invalid_gate_owner', detail: "gate_owner must be of the form 'gate:<owner>' — nothing else can match an insertable grant" },
           400,
         )
+      }
+      if (trimmed === 'gate:agent-self-completion' && existing.gate_owner !== trimmed) {
+        return c.json({ error: 'gate_owner_reserved', detail: 'this gate is reserved for its own subsystem and cannot be set at task update' }, 403)
       }
       next.gate_owner = trimmed
     } else {
