@@ -386,6 +386,9 @@ describe('MCP task cutover tools', () => {
       'task-1',
       '2026-07-08T00:00:00.000Z',
       null,
+      // Trailing: the review-freeze guard's own bind pair (next assignee_agent_id, assignee_member_id).
+      AGENT_ID,
+      null,
     ])
     expect(events).toEqual([
       expect.objectContaining({
