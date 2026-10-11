@@ -72,6 +72,11 @@ split by separators (`. / - : , ~ =`) into short runs is NOT detected. The real 
 structural: apply stores only the canonical form (never raw source), and credentials are named
 slots bound by a human, never values in a seed.
 
+Text fields refuse default-ignorable characters, so emoji variation selectors (such as a
+heart emoji with U+FE0F, or keycap sequences), ZWJ emoji families and Persian ZWNJ spellings are
+rejected in `name`, `goal` and every other text field. This is deliberate strictness for
+spoof-resistant request text: use plain-text names.
+
 ## Rules the validator enforces
 
 1. **Authority is never declared.** Any key named like a grant, token, secret, password, API

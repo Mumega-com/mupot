@@ -133,7 +133,7 @@ function text(input: unknown, path: string, max: number, required = true): strin
   const value = input.replace(/\r?\n$/, '')
   if (value.length > max) refuse('invalid_field', path, `longer than ${max} characters`)
   if (CONTROL_RE.test(value)) refuse('invalid_field', path, 'control characters are not allowed')
-  if (SPOOF_RE.test(value)) refuse('invalid_field', path, 'zero-width and bidirectional control characters are not allowed')
+  if (SPOOF_RE.test(value)) refuse('invalid_field', path, 'invisible, formatting or default-ignorable characters (e.g. zero-width, bidirectional, variation selectors, joiners) are not allowed')
   return value
 }
 
