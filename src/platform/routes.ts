@@ -66,11 +66,16 @@ async function previewHandler(c: Context<AppEnv>): Promise<Response> {
 // i.e. a database lookup ran for an anonymous stranger, and for a project in `healthy`
 // state the request would have been dispatched into that project's Worker.
 //
-// It also forwards credentials, and unlike the WFP hostname branch it cannot rely on the
-// browser's own scoping to prevent that: `/preview/*` is SAME-ORIGIN on the colony, so the
-// browser attaches the colony's host-only `mupot_session` cookie, and dispatchProjectRequest
-// hands the request on with headers intact. The cookie being host-only is precisely why it
-// IS sent here — the host is the colony.
+// CREDENTIALS NEVER REACH THE USER WORKER. `/preview/*` is SAME-ORIGIN on the colony, so
+// the browser attaches the colony's host-only `mupot_session` cookie (host-only is exactly
+// why it is sent here). The preview proxy therefore builds the forwarded request through
+// src/platform/forward-policy.ts with the 'colony-origin' ALLOW-LIST: only accept*,
+// cache/conditional/range, content-type/length, origin, referer, user-agent and
+// x-requested-with pass, plus method, streamed body and redirect mode. Cookie,
+// Authorization, Proxy-Authorization, Cf-Access-* and x-mupot-* are never forwarded, and
+// any Set-Cookie on the Worker's response is dropped so it cannot shadow or fixate the
+// colony session. (The `<project>.<root>` hostname branch is the Worker's own origin; it
+// keeps its own cookies/Authorization but still loses Cf-Access-* and x-mupot-*.)
 //
 // requireAuth answers 401 JSON rather than redirecting, so the dashboard's preview iframe
 // fails cleanly instead of rendering login HTML into itself. That was the stated reason

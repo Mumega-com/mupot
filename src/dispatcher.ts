@@ -9,6 +9,7 @@
 //   3. Single billed request across the chain: Dispatch Worker -> User Worker.
 
 import { RESERVED_TENANT_SLUGS } from './pots/service'
+import { isColonyCredentialHeader, stripResponseCookies } from './platform/forward-policy'
 
 export interface DispatcherEnv {
   DISPATCHER: {
@@ -131,7 +132,13 @@ const TENANT_OVERRIDE_HEADERS = ['x-mupot-tenant-slug', 'x-pot-tenant']
 // The path door is same-origin (`mupot.mumega.com`), so unlike subdomain
 // routing the browser/operator credentials arrive with the request — strip
 // them before dispatch. Tenant Workers authenticate through their own door.
-const CREDENTIAL_HEADERS = ['cookie', 'authorization', 'proxy-authorization']
+function colonyCredentialHeaderNames(request: Request): string[] {
+  const names: string[] = []
+  request.headers.forEach((_value, name) => {
+    if (isColonyCredentialHeader(name)) names.push(name)
+  })
+  return names
+}
 
 function stripHeaders(request: Request, names: string[]): Request {
   const headers = new Headers(request.headers)
@@ -170,9 +177,10 @@ export function resolveApexPathTenant(
   }
   // Foreign tenant: the rewritten request carries no client tenant-override
   // and no colony credentials into the isolate (Athena gate 2026-09-04).
+  const rewritten = rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder)
   const dispatchRequest = stripHeaders(
-    rewriteRequest(request, `${parsed.slug}.${rootDomain}`, parsed.remainder),
-    [...TENANT_OVERRIDE_HEADERS, ...CREDENTIAL_HEADERS],
+    rewritten,
+    [...TENANT_OVERRIDE_HEADERS, ...colonyCredentialHeaderNames(rewritten)],
   )
   return {
     kind: 'dispatch',
@@ -238,7 +246,8 @@ export async function routeApexPathTenant(req: Request, env: ApexPathEnv): Promi
     DISPATCHER: env.DISPATCHER,
     ROOT_DOMAIN: rootHost,
   })
-  return { kind: 'respond', response }
+  // Same-origin door: the tenant Worker must not set cookies on the colony origin.
+  return { kind: 'respond', response: stripResponseCookies(response) }
 }
 
 
