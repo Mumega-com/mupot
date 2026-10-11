@@ -232,6 +232,11 @@ export interface TeamBootstrapInput {
    */
   squad_name?: string
   /**
+   * Adopt a pre-existing project or squad ONLY on the provenance ground (created_by_member_id === caller),
+   * never on a bare prior-receipt ground. Used by seed_attach apply. Not exposed on the tool schema.
+   */
+  require_provenance?: boolean
+  /**
    * Explicit, informed override to adopt a pre-existing project or squad
    * that this caller did not create and no prior team_bootstrap attempt
    * named (P0, see file header). Ignored unless the caller is org:admin
@@ -404,8 +409,9 @@ async function findAdoptGround(
   resourceId: string,
   createdByMemberId: string | null,
   actorMemberId: string,
+  requireProvenance = false,
 ): Promise<AdoptGround | null> {
-  const priorAttempt = await env.DB.prepare(
+  const priorAttempt = requireProvenance ? null : await env.DB.prepare(
     // disposition IN ('created','adopted') — kasra-review adversarial gate, P0,
     // 2026-09-22: a 'failed' receipt (in particular a 'name_resolution'
     // refusal) must NEVER itself become adoption ground on the next call —
@@ -652,6 +658,7 @@ export async function teamBootstrap(
       existingProject.id,
       existingProject.created_by_member_id,
       actorMemberId,
+      input.require_provenance === true,
     )
     if (!projectGround) {
       if (input.adopt === true && isOrgAdmin(auth)) {
@@ -723,6 +730,7 @@ export async function teamBootstrap(
       existingSquad.id,
       existingSquad.created_by_member_id,
       actorMemberId,
+      input.require_provenance === true,
     )
     if (!squadGround) {
       // Athena, round-2 sharpening on PR #1510: "find-or-create is create +

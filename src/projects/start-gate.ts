@@ -351,7 +351,7 @@ async function pickWritableSquad(
 // createHomeForMember applies to a member's home department
 // (src/org/service.ts). A second project with no squad reuses the SAME
 // department; only the squad itself is per-project.
-const PROJECT_SQUAD_DEPARTMENT_SLUG = 'dept-projects'
+export const PROJECT_SQUAD_DEPARTMENT_SLUG = 'dept-projects'
 const PROJECT_SQUAD_DEPARTMENT_NAME = 'Projects'
 const AUTO_SQUAD_SLUG_SUFFIX = '-sqd'
 
