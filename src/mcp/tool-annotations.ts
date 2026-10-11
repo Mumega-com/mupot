@@ -215,6 +215,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // ── seeds ──────────────────────────────────────────────────────────────────────────────────
   seed_attach: ADD('dry_run (default) is pure + SELECT only; dry_run:false INSERTs project_seeds + projects/squads/project_squad_access via teamBootstrap + mutation_audit_entries, human org admin only, grants nothing (mcp/seed.ts, seeds/apply.ts)'),
 
+  seed_draft: RO('pure: draftSeed builds text and runs the validator; no D1, KV or fetch, presence bump suppressed (mcp/seed.ts, seeds/draft.ts)'),
   seed_attach_request: ADD('INSERT seed_attach_requests (pending, single-use, 24h, per-requester cap); applies nothing and grants nothing; a human decides on the Access approve page (mcp/seed.ts, access/seed-request.ts)'),
 
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────

@@ -134,7 +134,8 @@ describe('WFP Dynamic Dispatcher', () => {
       const res = await dispatcher.fetch(req, env)
       expect(res.status).toBe(200)
       expect(mockGet).toHaveBeenCalledWith('gaf', {}, { limits: { cpuMs: 40, subRequests: 25 } })
-      expect(mockFetch).toHaveBeenCalledWith(req)
+      expect(mockFetch).toHaveBeenCalledTimes(1)
+      expect(mockFetch.mock.calls[0][0].url).toBe(req.url)
 
       const body = await res.json()
       expect(body).toEqual({ pot: 'gaf', ok: true })

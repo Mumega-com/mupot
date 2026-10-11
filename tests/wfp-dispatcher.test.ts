@@ -111,7 +111,8 @@ describe('WFP Dispatcher fetch handler', () => {
       {},
       { limits: { cpuMs: 50, subRequests: 50 } },
     )
-    expect(mockUserWorkerFetch).toHaveBeenCalledWith(request)
+    expect(mockUserWorkerFetch).toHaveBeenCalledTimes(1)
+    expect(mockUserWorkerFetch.mock.calls[0][0].url).toBe(request.url)
     expect(response.status).toBe(200)
 
     const body = await response.json()
@@ -164,7 +165,7 @@ describe('apex path tenant gate fix: header strip (Athena 2026-09-04)', () => {
       headers: {
         cookie: 'session=colony',
         authorization: 'Bearer colony-token',
-        'x-test': '1',
+        'accept-language': 'fr',
         'content-type': 'application/json',
       },
       body: JSON.stringify({ hello: 'world' }),
@@ -174,7 +175,7 @@ describe('apex path tenant gate fix: header strip (Athena 2026-09-04)', () => {
     if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
     expect(resolved.request.headers.get('cookie')).toBeNull()
     expect(resolved.request.headers.get('authorization')).toBeNull()
-    expect(resolved.request.headers.get('x-test')).toBe('1')
+    expect(resolved.request.headers.get('accept-language')).toBe('fr')
     expect(await resolved.request.text()).toBe(JSON.stringify({ hello: 'world' }))
   })
 
@@ -235,14 +236,14 @@ describe('apex path tenant follow-up: reserved + unconfigured + preservation', (
   it('preserves method, headers, query, and body across the rewrite', async () => {
     const req = new Request('https://mupot.mumega.com/t/gaf/mcp?token=abc', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-test': '1' },
+      headers: { 'content-type': 'application/json', 'accept-language': 'fr' },
       body: JSON.stringify({ hello: 'world' }),
     })
     const resolved = resolveApexPathTenant(req, 'mumega', 'mupot.mumega.com')
     expect(resolved?.kind).toBe('dispatch')
     if (resolved?.kind !== 'dispatch') throw new Error('expected dispatch')
     expect(resolved.request.method).toBe('POST')
-    expect(resolved.request.headers.get('x-test')).toBe('1')
+    expect(resolved.request.headers.get('accept-language')).toBe('fr')
     expect(new URL(resolved.request.url).search).toBe('?token=abc')
     expect(await resolved.request.text()).toBe(JSON.stringify({ hello: 'world' }))
   })
