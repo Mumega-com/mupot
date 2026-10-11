@@ -19,6 +19,9 @@ import {
   type ElevationGrantRecord,
 } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
+import { hasElevatedAction } from '../src/auth/elevation'
+import { routinePolicyPrincipal } from '../src/mcp/routines'
+import { listStuckReceipts } from '../src/auth/elevation-receipt'
 
 const TENANT = 'tenant-elevlife'
 const ORIGIN = 'https://pot.test'
@@ -643,5 +646,74 @@ describe('step-up: irreversible action:routine_archive needs a fresh reauth', ()
 
   it.each(['action:routine_policy', 'action:project_status'])('%s does NOT require step-up', async (action) => {
     expect((await decide(action, false)).ok).toBe(true)
+  })
+})
+
+describe('round 2: fail closed on a nonexistent squad target', () => {
+  it('hasElevatedAction: an ORG grant does not cover a squad id that has no squad row', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    const real = await hasElevatedAction(env, agentAuth(), 'action:project_status', 'squad', OTHER_SQUAD, { recordUsage: false })
+    expect(real.granted).toBe(true)
+    const ghost = await hasElevatedAction(env, agentAuth(), 'action:project_status', 'squad', 'squad-does-not-exist', { recordUsage: false })
+    expect(ghost).toEqual({ granted: false, reason: 'no_matching_grant' })
+  })
+
+  it('unarchive_row on an unknown squad id refuses with the SAME body as a home squad (no existence oracle)', async () => {
+    harness.sqlite.exec(`UPDATE squads SET status = 'archived' WHERE id = '${KIND_HOME_SQUAD}'`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:project_status', { type: 'org' }, 60, Date.now())
+    const home = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: KIND_HOME_SQUAD, reason: 'restore' }, ORIGIN)
+    const ghost = await invokeTool(agentAuth(), env, 'unarchive_row', { table: 'squads', id: 'squad-does-not-exist', reason: 'restore' }, ORIGIN)
+    expectRefused(home)
+    expectRefused(ghost)
+    expect(JSON.stringify(ghost)).toBe(JSON.stringify(home))
+  })
+})
+
+describe('round 2: routinePolicyPrincipal canonicalizes the destination itself', () => {
+  it('a padded non-home destination is trimmed by the principal (authorized set holds the canonical id)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:routine_policy', { type: 'org' }, 60, Date.now())
+    const res = await routinePolicyPrincipal(agentAuth(), env, routineTarget, 'routine_update', 'update', ` ${OTHER_SQUAD}\t`)
+    expect(res.ok).toBe(true)
+    if (res.ok) expect(res.elevation?.detail).toMatchObject({ squad_ids: [TARGET_SQUAD, OTHER_SQUAD] })
+  })
+})
+
+describe('round 2: routine_update tool-level trim is pinned independently of the principal trim', () => {
+  it('a padded destination that only fits the 200-char id bound AFTER the tool trim is accepted and stored canonical', async () => {
+    const longId = `squad-${'x'.repeat(190)}`
+    harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name) VALUES ('${longId}', '${DEPT_ID}', 'long', 'Long')`)
+    harness.sqlite.exec(`INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-target', '${longId}', 'write')`)
+    const sessionId = await checkIn()
+    await approve(sessionId, 'action:routine_policy', { type: 'org' }, 60, Date.now())
+    const res = await invokeTool(agentAuth(), env, 'routine_update', { routine_id: routineTarget, responsible_squad_id: `${' '.repeat(10)}${longId}` }, ORIGIN)
+    expect(res.ok).toBe(true)
+    const row = await env.DB.prepare('SELECT responsible_squad_id FROM routines WHERE id = ?1').bind(routineTarget).first<{ responsible_squad_id: string }>()
+    expect(row?.responsible_squad_id).toBe(longId)
+  })
+})
+
+describe('round 2: receipts are tenant-keyed by env.TENANT_SLUG, not auth.tenant', () => {
+  it('a mint under a grant writes its itemized usage row under env.TENANT_SLUG and the readers find it there', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:mint_token', { type: 'org' }, 60, Date.now())
+    // Re-key the session/grant graph to a DIFFERENT tenant than env.TENANT_SLUG, so
+    // auth.tenant resolves the grant while env.TENANT_SLUG is the receipt key.
+    for (const t of ['agent_sessions', 'elevation_grants', 'elevation_requests', 'web_sessions']) {
+      harness.sqlite.exec(`UPDATE ${t} SET tenant = 'tenant-auth-differs'`)
+    }
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-acting-home', '${AGENT_MEMBER}', 'squad', '${HOME_SQUAD}', 'member')`)
+    const auth = { ...agentAuth(), tenant: 'tenant-auth-differs' } as AuthContext
+    const res = await invokeTool(auth, env, 'mint_agent_token', { agent: AGENT_ID, label: 'tenant-key' }, ORIGIN)
+    if (!res.ok) throw new Error(JSON.stringify(res))
+    expect(res.ok).toBe(true)
+    const rows = await env.DB.prepare(`SELECT tenant, detail_json FROM elevation_usage_log WHERE elevation_grant_id = ?1 AND detail_json LIKE '%minted_token_id%'`).bind(grant.id).all<{ tenant: string; detail_json: string | null }>()
+    expect(rows.results).toHaveLength(1)
+    expect(rows.results[0].tenant).toBe(env.TENANT_SLUG)
+    expect((await listElevationUsage(env, env.TENANT_SLUG, grant.id)).some((u) => u.detail_json?.includes('minted_token_id'))).toBe(true)
+    expect(await listElevationUsage(env, 'tenant-auth-differs', grant.id)).not.toContainEqual(expect.objectContaining({ detail_json: expect.stringContaining('minted_token_id') }))
+    expect(await listStuckReceipts(env, env.TENANT_SLUG, sessionId, Date.now() + 3_600_000)).toEqual([])
   })
 })

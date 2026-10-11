@@ -935,6 +935,12 @@ export async function hasElevatedAction(
   const inheritancePlaneCovers = (plane: 'org' | 'department'): boolean =>
     targetSquadScope ? planeCoversScopeForMatch(plane, targetSquadScope) : true
 
+  // Fail closed: a squad-scope check against a squad that does not exist must
+  // never be 'covered' by an org/department grant (inheritancePlaneCovers has no
+  // scope to compare, so it would answer true) — and must refuse identically to
+  // a covered-by-nothing squad, so existence is not an oracle.
+  if (scopeType === 'squad' && scopeId && !targetSquadScope) return { granted: false, reason: 'no_matching_grant' }
+
   const grants = await loadLiveElevationGrantsForSession(env, tenant, liveSession.id, nowMs)
   const match = grants.find((g) => {
     if (g.action !== action) return false

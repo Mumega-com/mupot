@@ -280,7 +280,7 @@ type RoutinePolicyOperation = 'update' | 'enable' | 'pause' | 'archive'
  * routine id and an uncovered one are refused identically, so the refusal is
  * not an existence oracle.
  */
-async function routinePolicyPrincipal(
+export async function routinePolicyPrincipal(
   auth: AuthContext,
   env: Env,
   routineId: string,
