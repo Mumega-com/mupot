@@ -175,6 +175,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
       .bind(tenant, projectSlug).first<SeedRow>()
 
   let claimedRowId = rowId
+  let tookOver = false
   let claimed = await tryClaim()
   if (!claimed) {
     let row = await loadRow()
@@ -200,32 +201,53 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
       // is the place a caller who CAN read that project learns about it).
       return UNAVAILABLE
     } else {
-      if (!(await callerCanSee(env, auth, row, caller))) return UNAVAILABLE
-      if (row.seed_sha256 !== v.seedSha256) {
+      // RECOVERY: a claim another member left 'applying' whose lease lapsed, while the project of that slug
+      // was created by THIS caller (the split a stalled apply can leave: project under A, row under B).
+      // The caller takes the row over in one conditional statement and resumes; nothing is created twice.
+      if (row.status === 'applying' && row.applied_by_member_id !== caller) {
+        const takeoverToken = crypto.randomUUID()
+        const took = await env.DB.prepare(
+          `UPDATE project_seeds SET applied_by_member_id = ?4, seed_sha256 = ?5, canonical_json = ?6,
+                  requests_json = ?7, owner_label = ?8, seat_cap = ?9, lease_token = ?2, lease_expires_at = ?3
+            WHERE id = ?1 AND status = 'applying' AND lease_expires_at <= ?10
+              AND EXISTS (SELECT 1 FROM projects p WHERE p.slug = ?11 AND p.created_by_member_id = ?4)
+              AND ${noTakeoverSql('?11', '?4', '?12', '?13')}`,
+        ).bind(row.id, takeoverToken, new Date(Date.now() + LEASE_MS).toISOString(), caller, v.seedSha256, v.canonical,
+          requestsJson, v.seed.owner, seatCap, new Date().toISOString(), projectSlug, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).run()
+        if (took.meta.changes === 1) {
+          token = takeoverToken
+          claimedRowId = row.id
+          tookOver = true
+        }
+      }
+      if (!tookOver && !(await callerCanSee(env, auth, row, caller))) return UNAVAILABLE
+      if (!tookOver && row.seed_sha256 !== v.seedSha256) {
         return { ok: false, status: 409, error: 'seed_digest_conflict',
           detail: { existing_seed_sha256: row.seed_sha256, submitted_seed_sha256: v.seedSha256 } }
       }
-      if (row.status === 'applied') return replayResult(v, row)
+      if (!tookOver && row.status === 'applied') return replayResult(v, row)
       // Same digest, still 'applying' (a project exists, or the lease is live). Only the member who
       // started it may resume, and only once the lease lapsed. The owner check is defence in depth:
       // callerCanSee above already refuses other members while project_id is NULL.
       const expired = row.lease_expires_at === null || row.lease_expires_at <= new Date().toISOString()
-      if (!(expired && row.applied_by_member_id === caller)) return IN_PROGRESS
-      token = crypto.randomUUID()
-      const resumed = await env.DB.prepare(
-        `UPDATE project_seeds SET lease_token = ?2, lease_expires_at = ?3
-          WHERE id = ?1 AND status = 'applying' AND applied_by_member_id = ?4
-            AND (lease_expires_at IS NULL OR lease_expires_at <= ?5)
-            AND ${noTakeoverSql('?6', '?4', '?7', '?8')}`,
-      ).bind(row.id, token, new Date(Date.now() + LEASE_MS).toISOString(), caller, new Date().toISOString(),
-        projectSlug, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).run()
-      if (resumed.meta.changes !== 1) {
-        // The resume is itself guarded: a foreign project or squad appeared under that name since the claim.
-        const clear = await env.DB.prepare(`SELECT 1 AS ok WHERE ${noTakeoverSql('?1', '?2', '?3', '?4')}`)
-          .bind(projectSlug, caller, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).first()
-        return clear ? IN_PROGRESS : UNAVAILABLE
+      if (!tookOver && !(expired && row.applied_by_member_id === caller)) return IN_PROGRESS
+      if (!tookOver) {
+        token = crypto.randomUUID()
+        const resumed = await env.DB.prepare(
+          `UPDATE project_seeds SET lease_token = ?2, lease_expires_at = ?3
+            WHERE id = ?1 AND status = 'applying' AND applied_by_member_id = ?4
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?5)
+              AND ${noTakeoverSql('?6', '?4', '?7', '?8')}`,
+        ).bind(row.id, token, new Date(Date.now() + LEASE_MS).toISOString(), caller, new Date().toISOString(),
+          projectSlug, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).run()
+        if (resumed.meta.changes !== 1) {
+          // The resume is itself guarded: a foreign project or squad appeared under that name since the claim.
+          const clear = await env.DB.prepare(`SELECT 1 AS ok WHERE ${noTakeoverSql('?1', '?2', '?3', '?4')}`)
+            .bind(projectSlug, caller, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).first()
+          return clear ? IN_PROGRESS : UNAVAILABLE
+        }
+        claimedRowId = row.id
       }
-      claimedRowId = row.id
     }
   }
 
@@ -236,6 +258,13 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
       await releaseClaim(env, claimedRowId, token, projectSlug)
       return { ok: false, status: 409, error: 'seed_apply_failed', detail: { reason: 'department_unavailable' } }
     }
+    // FENCE: re-assert the claim's lease immediately before creating anything, renewing it. If a sweep
+    // deleted or replaced our row while we stalled, abort and create nothing (the other apply owns the slug).
+    const fenced = await env.DB.prepare(
+      `UPDATE project_seeds SET lease_expires_at = ?3
+        WHERE id = ?1 AND lease_token = ?2 AND status = 'applying' AND lease_expires_at > ?4`,
+    ).bind(claimedRowId, token, new Date(Date.now() + LEASE_MS).toISOString(), new Date().toISOString()).run()
+    if (fenced.meta.changes !== 1) return IN_PROGRESS
     // Prefixed with the slug so a seed cannot name its squad to look like an existing one (e.g. squad-core).
     const squadName = `${slug}: ${v.seed.wants?.seats?.squad ?? 'core'}`
     const boot = await teamBootstrap(env, auth, {

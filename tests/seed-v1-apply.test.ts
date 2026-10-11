@@ -11,6 +11,7 @@ import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const TENANT = 'tenant-a'
+const MASTER = 'a1'.repeat(32) // 64 hex chars, the CONNECTOR_MASTER_KEY shape
 const CANARY = 'RAW-SOURCE-CANARY-9c41e7'
 const base = readFileSync(join(__dirname, '..', 'docs', 'examples', 'seeds', 'mumega-com.seed.yaml'), 'utf8')
 // A comment is dropped by validation; it must never reach any stored column.
@@ -43,7 +44,7 @@ function setup(): void {
       ('m1', 'm1@example.test', 'M1', 'active', '${TENANT}');
     INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-x', 'squad-a', 'agent-x', 'X', 'r', 'm', 'active');
   `)
-  env = { DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: 'test-master-key' } as Env
+  env = { DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: MASTER } as Env
 }
 beforeEach(setup)
 
@@ -543,5 +544,101 @@ describe('round 2: accept_token binds apply to a dry run', () => {
     const before = dump()
     expect(await call(adm, await full(adm))).toMatchObject({ ok: false, status: 503, error: 'accept_token_unavailable' })
     expect(dump()).toBe(before)
+  })
+})
+
+describe('round 3: fencing, recovery, token key derivation', () => {
+  // Run `fn` (async) just before the bound statement matching `re` executes its `first()`.
+  function stallBefore(re: RegExp, fn: () => Promise<void>): void {
+    const real = env.DB
+    let fired = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            const stmt = target.prepare(sql)
+            if (!re.test(sql)) return stmt
+            return new Proxy(stmt, { get(st, k) {
+              if (k === 'bind') return (...v: unknown[]) => {
+                const bound = st.bind(...v)
+                return new Proxy(bound, { get(b, kk) {
+                  if (kk === 'first') return async (...a: unknown[]) => {
+                    if (!fired) { fired = true; await fn() }
+                    return (b.first as (...x: unknown[]) => Promise<unknown>)(...a)
+                  }
+                  const x = Reflect.get(b, kk)
+                  return typeof x === 'function' ? x.bind(b) : x
+                } })
+              }
+              const x = Reflect.get(st, k)
+              return typeof x === 'function' ? x.bind(st) : x
+            } })
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+  }
+
+  it('stalled apply: A claims, its lease lapses, B sweeps + claims + finishes; A aborts and creates nothing', async () => {
+    const argsA = await full(adm)
+    const argsB = await full(adm2)
+    const cleanEnv = { ...env } as Env
+    stallBefore(/^\s*SELECT id FROM departments WHERE slug = \?1 LIMIT 1/, async () => {
+      harness.sqlite.exec(`UPDATE project_seeds SET lease_expires_at = '${STALE}'`) // the clock passes A's lease
+      const b = await invokeTool(adm2, cleanEnv, 'seed_attach', argsB, 'https://pot.test')
+      expect(b).toMatchObject({ ok: true })
+    })
+    const a = await call(adm, argsA)
+    expect(a).toMatchObject({ ok: false, status: 409, error: 'seed_apply_in_progress' })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM projects WHERE slug = 'mumega-com-prj'").get()).toEqual({ n: 1 })
+    expect(harness.sqlite.prepare("SELECT COUNT(*) AS n FROM squads WHERE slug = 'mumega-com-sqd'").get()).toEqual({ n: 1 })
+    expect(count('project_seeds')).toBe(1)
+    expect(harness.sqlite.prepare('SELECT applied_by_member_id, status FROM project_seeds').get()).toEqual({ applied_by_member_id: 'adm2', status: 'applied' })
+    expect(harness.sqlite.prepare("SELECT created_by_member_id FROM projects WHERE slug = 'mumega-com-prj'").get()).toEqual({ created_by_member_id: 'adm2' })
+    expect(count('team_bootstrap_receipts')).toBe(1) // A's refused attempt wrote no failed receipt
+    expect(count('mutation_audit_entries')).toBe(1)
+  })
+
+  it('the split state (project under A, lapsed claim under B) is recoverable by A, creating nothing twice', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-a', 'mumega-com-prj', 'N', 'g', 'adm')`)
+    await plantClaim('adm2', STALE)
+    const projects = count('projects')
+    expect(okResult(await apply(adm))).toMatchObject({ ok: true, replay: false, status: 'applied' })
+    expect(count('projects')).toBe(projects)
+    expect(harness.sqlite.prepare('SELECT applied_by_member_id, status FROM project_seeds').get()).toEqual({ applied_by_member_id: 'adm', status: 'applied' })
+    expect(count('mutation_audit_entries')).toBe(1)
+  })
+
+  it('recovery is not takeover: B cannot take a lapsed claim over a project A created, and a live lease is untouched', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-a', 'mumega-com-prj', 'N', 'g', 'adm')`)
+    await plantClaim('adm', STALE)
+    const before = dump()
+    expect(await apply(adm2)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(dump()).toBe(before)
+    harness.sqlite.exec(`UPDATE project_seeds SET applied_by_member_id = 'adm2', lease_expires_at = '${FUTURE}'`)
+    const live = dump()
+    expect(await apply(adm)).toMatchObject({ ok: false })
+    expect(dump()).toBe(live)
+  })
+
+  it('tokens minted with the master key used directly no longer verify (HKDF-derived key)', async () => {
+    const res = okResult(await call(adm, { seed: seedText }))
+    const issued = Date.now()
+    const raw = new Uint8Array(32)
+    for (let i = 0; i < 32; i++) raw[i] = parseInt(MASTER.slice(i * 2, i * 2 + 2), 16)
+    const key = await crypto.subtle.importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`mupot:seed-accept:v1|${res.seed_sha256}|adm|${issued}`))
+    const old = `${issued}.${[...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')}`
+    const before = dump()
+    expect(await call(adm, await full(adm, seedText, { accept_token: old }))).toMatchObject({ ok: false, error: 'accept_token_invalid' })
+    expect(dump()).toBe(before)
+  })
+
+  it('a malformed master key issues no token and fails closed', async () => {
+    env = { ...env, CONNECTOR_MASTER_KEY: 'not-hex' } as Env
+    expect(okResult(await call(adm, { seed: seedText })).accept_token).toBeNull()
+    expect(await call(adm, await full(adm))).toMatchObject({ ok: false, status: 503, error: 'accept_token_unavailable' })
   })
 })
