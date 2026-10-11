@@ -15,7 +15,7 @@ import { approveApp } from '../src/access/routes'
 import { approvalHostGate } from '../src/access/host-gate'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest } from '../src/auth/elevation'
-import { approveUrl, accessApproveStatus } from '../src/access/config'
+import { approveUrl, accessApproveStatus, dedicatedApprovalHost } from '../src/access/config'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 import { claimSeedRequest, createSeedRequest } from '../src/access/seed-request'
 import { issueCsrfToken, verifyCsrfToken } from '../src/access/csrf'
@@ -762,13 +762,25 @@ describe('authority before any write', () => {
 
 describe('approvalHostGate (the first statement of the worker fetch)', () => {
   const g = (host: string, path: string, e: Env = env) => approvalHostGate(new Request(`https://${host}${path}`), e)
-  it('approval host: only /approve/* continues; colony host: /approve/* is stopped at the gate itself', () => {
-    expect(g(HOST, '/approve/seed/x')).toBeNull()
-    expect(g(HOST, '/mcp')?.status).toBe(404)
-    expect(g(HOST, '/preview/p/x')?.status).toBe(404)
-    expect(g('colony.example.test', '/approve/seed/x')?.status).toBe(404)
-    expect(g('colony.example.test', '/%61pprove/seed/x')?.status).toBe(404)
+  const status = (r: Response | 'approve' | null) => (r instanceof Response ? r.status : r)
+  it('approval host: /approve/* goes DIRECTLY to the approve app; everything else is 404; colony host: /approve/* stopped', () => {
+    expect(g(HOST, '/approve/seed/x')).toBe('approve')
+    expect(status(g(HOST, '/mcp'))).toBe(404)
+    expect(status(g(HOST, '/preview/p/x'))).toBe(404)
+    expect(status(g('colony.example.test', '/approve/seed/x'))).toBe(404)
+    expect(status(g('colony.example.test', '/%61pprove/seed/x'))).toBe(404)
     expect(g('colony.example.test', '/mcp')).toBeNull()
+  })
+  it('a trailing-dot spelling of the approval host is the same host', () => {
+    expect(g(`${HOST}.`, '/approve/seed/x')).toBe('approve')
+    expect(status(g(`${HOST}.`, '/mcp'))).toBe(404)
+  })
+  it('refuses an approval host under the colony domain or under the pot host suffix (first-label routing would own it)', () => {
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.colony.example.test', PUBLIC_ORIGIN: 'https://colony.example.test' }))).toBeNull()
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.mupot.mumega.com' }))).toBeNull()
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.pots.example.test', DEFAULT_POT_HOST_SUFFIX: 'pots.example.test' }))).toBeNull()
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.example.test.' }))).toBe('approve.example.test')
+    expect(dedicatedApprovalHost(baseEnv({ ACCESS_CANONICAL_HOST: 'approve.example.test' }))).toBe('approve.example.test')
   })
   it('flag off: inert', () => {
     const off = baseEnv({ ACCESS_APPROVE_ENABLED: undefined })

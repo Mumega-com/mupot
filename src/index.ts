@@ -261,6 +261,7 @@ app.route('/invite', inviteApp)
 // Feature-flagged OFF: every /approve/* path answers 404 unless ACCESS_APPROVE_ENABLED. Before the
 // dashboard '/' catch-all so it is never shadowed.
 app.route('/approve', approveApp)
+const approvalHostApp = new Hono<{ Bindings: Env }>().route('/approve', approveApp)
 
 app.route(ROUTES.dashboard, dashboardApp)
 
@@ -369,6 +370,9 @@ export default {
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
     // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
     const gated = approvalHostGate(req, env)
+    // On the approval host, /approve/* goes straight to the approve app: no tenant routing, hostname dispatch or
+    // any other handler runs, so nothing on this host can forward the Access cookie into a user Worker.
+    if (gated === 'approve') return approvalHostApp.fetch(req, env, ctx)
     if (gated) return gated
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
     //

@@ -28,14 +28,23 @@ function safeDecode(p: string): string {
   }
 }
 
-/** A Response to return immediately, or null to let the normal pipeline run. */
-export function approvalHostGate(req: Request, env: Env): Response | null {
+/** Lower-case host with any trailing root dot removed (`approve.example.` names the same host as `approve.example`). */
+function normalizeHost(host: string): string {
+  return host.toLowerCase().replace(/\.(?=(:\d{1,5})?$)/, '')
+}
+
+/**
+ * 'approve' = serve the approve app DIRECTLY and nothing else (the caller must not fall through to tenant routing,
+ * hostname dispatch or any other handler: on the approval host those could reach a user Worker and hand it the
+ * Access cookie). A Response = return it immediately. null = not the approval host and not /approve: normal pipeline.
+ */
+export function approvalHostGate(req: Request, env: Env): Response | 'approve' | null {
   if (!accessApproveEnabled(env)) return null
   const url = new URL(req.url)
   const approvalHost = dedicatedApprovalHost(env)
-  const onApprovalHost = approvalHost !== null && url.host.toLowerCase() === approvalHost
+  const onApprovalHost = approvalHost !== null && normalizeHost(url.host) === approvalHost
   // The router decodes the path before matching, so a percent-encoded spelling (/%61pprove) counts as /approve too.
   const approve = isApprovePath(url.pathname) || isApprovePath(safeDecode(url.pathname))
-  if (onApprovalHost) return approve ? null : NOT_FOUND()
+  if (onApprovalHost) return approve ? 'approve' : NOT_FOUND()
   return approve ? NOT_FOUND() : null
 }

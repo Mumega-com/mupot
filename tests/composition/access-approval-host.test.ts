@@ -63,6 +63,21 @@ describe('approval host gate (real worker)', () => {
     const e = env({ ACCESS_CANONICAL_HOST: COLONY })
     expect((await hit(COLONY, '/approve/seed/x', 'GET', e)).status).toBe(404)
   })
+  it('approval host + /approve/* never reaches tenant routing or any user Worker (the Access cookie stays put)', async () => {
+    const calls: string[] = []
+    const DISPATCHER = { get: (name: string) => { calls.push(name); return { fetch: async () => new Response('USER WORKER') } } }
+    const e = env({ DISPATCHER, DEFAULT_POT_HOST_SUFFIX: 'pots.example.test' })
+    const req = new Request(`https://${APPROVAL}/approve/seed/x`, { headers: { cookie: 'CF_Authorization=jwt' } })
+    const res = await worker.fetch(req, e, ctx)
+    expect(await res.text()).not.toBe('USER WORKER')
+    expect(res.status).toBe(403)
+    expect(calls).toEqual([])
+  })
+  it('misconfigured (approval host UNDER the colony domain): the page never enables, so no approve host exists', async () => {
+    const e = env({ ACCESS_CANONICAL_HOST: `approve.${COLONY}` })
+    expect((await hit(`approve.${COLONY}`, '/approve/seed/x', 'GET', e)).status).toBe(404)
+    expect((await hit(COLONY, '/approve/seed/x', 'GET', e)).status).toBe(404)
+  })
   it('flag off: the approval host is not special (gate inert) and /approve is still 404', async () => {
     const e = env({ ACCESS_APPROVE_ENABLED: undefined })
     expect((await hit(COLONY, '/approve/seed/x', 'GET', e)).status).toBe(404)

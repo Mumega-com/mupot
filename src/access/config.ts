@@ -49,11 +49,23 @@ export function colonyHostnames(env: Pick<Env, 'PUBLIC_ORIGIN'>): Set<string> {
   return out
 }
 
-/** The dedicated approval hostname if it is set, well-formed and DISTINCT from every colony host; else null. */
-export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | 'PUBLIC_ORIGIN'>): string | null {
-  const host = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase()
+function isSameOrSubdomain(hostname: string, parent: string): boolean {
+  return hostname === parent || hostname.endsWith(`.${parent}`)
+}
+
+/**
+ * The dedicated approval hostname if it is set, well-formed, and neither a colony host nor UNDER one (nor under the
+ * pot host suffix); else null. A host under the colony domain is refused because tenant/project hostname routing
+ * keys on the first label (an agent project named `approve` would own `approve.<colony>`), and because the Access
+ * cookie is scoped to the domain and its subdomains.
+ */
+export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | 'PUBLIC_ORIGIN' | 'DEFAULT_POT_HOST_SUFFIX'>): string | null {
+  const host = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase().replace(/\.$/, '')
   if (!host || !HOST_RE.test(host)) return null
-  if (colonyHostnames(env).has(hostnameOf(host))) return null
+  const name = hostnameOf(host)
+  for (const colony of colonyHostnames(env)) if (isSameOrSubdomain(name, colony)) return null
+  const potSuffix = env.DEFAULT_POT_HOST_SUFFIX?.trim().toLowerCase().replace(/^\.+|\.+$/g, '')
+  if (potSuffix && isSameOrSubdomain(name, potSuffix)) return null
   return host
 }
 
@@ -68,7 +80,7 @@ export function accessApproveStatus(env: Env): AccessApproveStatus {
   const raw = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase()
   if (!raw) return { state: 'misconfigured', reason: 'ACCESS_CANONICAL_HOST is not set (the approval page needs its own dedicated hostname)' }
   if (!dedicatedApprovalHost(env)) {
-    return { state: 'misconfigured', reason: 'ACCESS_CANONICAL_HOST is malformed or equals a colony host; it must be a dedicated hostname distinct from the colony host' }
+    return { state: 'misconfigured', reason: 'ACCESS_CANONICAL_HOST is malformed, equals a colony host, or sits under the colony or pot host domain; it must be a dedicated hostname outside them' }
   }
   const cfg = loadAccessApproveConfig(env)
   if (!cfg) return { state: 'misconfigured', reason: 'ACCESS_TEAM_DOMAIN or ACCESS_AUD is missing or malformed' }

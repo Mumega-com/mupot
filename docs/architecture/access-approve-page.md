@@ -17,7 +17,9 @@ The Cloudflare Access cookie (`CF_Authorization`) is scoped to a HOST. Anything 
 
 - the approval page lives ONLY on its own hostname, `ACCESS_CANONICAL_HOST`, which must be set and must differ from every colony host (`PUBLIC_ORIGIN`'s host and the built-in default colony host). Unset, malformed, or equal to a colony host: the page is never enabled (`seed_attach_request` refuses with the reason, no `approve_url` is issued, `/approve/*` is a 404);
 - a host gate runs as the very first statement of the Worker's `fetch` (before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard): on the approval host every path except `/approve/*` is a 404, and `/approve/*` on any other host is a 404 (percent-encoded spellings included);
-- the Access application must cover the WHOLE approval hostname (not a path), and the hostname must be distinct from the colony host.
+- the Access application must cover the WHOLE approval hostname (not a path), and the hostname must be distinct from the colony host and must NOT sit under the colony domain or the pot host suffix (`approve.<colony>` is refused: tenant/project hostname routing keys on the first label, so an agent project named `approve` could own it). Use a host under a domain the colony does not route, e.g. `approve.<company domain>`;
+- on the approval host, `/approve/*` is served directly by the approve app: tenant routing, hostname dispatch and every other handler are skipped, so nothing on that host can forward the Access cookie into a user Worker;
+- create no other DNS records under the approval host, and use Access's Binding Cookie: Cloudflare scopes `CF_Authorization` to the domain and its subdomains unless the cookie path attribute is set.
 
 ## Flag
 
