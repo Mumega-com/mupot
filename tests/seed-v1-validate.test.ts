@@ -286,8 +286,10 @@ describe('human-review text spoofing', () => {
   it('RTL override in name refused', async () => {
     expect((await refused(BASE.replace('name: Demo', 'name: "Demo‮evil"'))).code).toBe('invalid_field')
   })
-  it('zero-width in owner refused', async () => {
-    expect((await refused(BASE.replace('owner: someone', 'owner: "some​one"'))).code).toBe('invalid_field')
+  it('zero-width in owner refused, and the message names the refused class', async () => {
+    const e = await refused(BASE.replace('owner: someone', 'owner: "some\u200bone"'))
+    expect(e.code).toBe('invalid_field')
+    expect(e.message).toMatch(/invisible, formatting or default-ignorable.*variation selectors, joiners/)
   })
   it('author text cannot masquerade as a request line', async () => {
     const { renderRequest } = await import('../src/seeds/render')
