@@ -269,6 +269,25 @@ jobs:
       - name: Guard — ChatGPT needs-you MCP profile must stay read-only, annotated and allowlist-enforced
         run: node scripts/check-mcp-profile-needs-you.mjs
 
+  effectful-tools-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The guard uses the TypeScript compiler API (already a devDependency) to read every
+      # ToolSpec declaration in src/mcp/*.ts and the annotation table — needs node_modules.
+      - run: npm ci
+      # Ratchet: an MCP tool that takes a `dry_run` argument and writes state must DEFAULT to the
+      # dry run (router_tick once assigned 24 tasks from a call that omitted dry_run). Hard gate,
+      # not a baseline; the only exemption is a justified entry in the script's ALLOW map, and a
+      # stale or redundant entry fails too. Self-tests FIRST, as with the sibling ratchets.
+      - name: Ratchet self-tests
+        run: node --test tests/check-effectful-tools-dry-run.test.mjs
+      - name: Guard — effectful tools with a dry_run argument must default to the dry run
+        run: node scripts/check-effectful-tools-dry-run.mjs
+
   bare-squad-id-authz:
     runs-on: ubuntu-latest
     steps:

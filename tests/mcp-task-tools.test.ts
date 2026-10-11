@@ -8,7 +8,7 @@ import type { AuthContext, Capability, CapabilityGrant, Env, Task } from '../src
 // (that is tests/artifact-verification.test.ts and tests/helpers/
 // artifact-verify-local.ts's job). Fixtures for a review/done transition need
 // SOME valid-shaped result now; this is the shared one.
-const VALID_ARTIFACT_RESULT = 'Done.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)
+const VALID_ARTIFACT_RESULT = 'Done.\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 
 const TENANT = 'test-tenant'
 const MEMBER_ID = 'member-1'

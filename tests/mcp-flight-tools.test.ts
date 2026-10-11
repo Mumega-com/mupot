@@ -1438,7 +1438,7 @@ describe('MCP granted multi-squad flight lifecycle', () => {
            'in_progress', NULL, NULL,
            'Census verified.
 Artifact: /tmp/fixture-marker.txt
-SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+SHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88',
            NULL, NULL,
            '2026-07-12T00:00:00.000Z', '2026-07-12T00:00:00.000Z');
       `)

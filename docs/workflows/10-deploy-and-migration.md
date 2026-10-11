@@ -124,4 +124,5 @@ check in.
 - `project_deploy` (`src/mcp/projects.ts:562`) is a distinct, code-driven workflow for
   tenant-project deploys via a dispatched flight (`src/projects/deploy.ts`) — it is not
   covered by this doc and has its own receipt table (`project_deployments`); a follow-up
-  workflow doc for it is out of scope here.
+  workflow doc for it is out of scope here. On a seed-attached project it additionally requires a
+  canary receipt and a rollback line (`docs/architecture/attach-policy-enforcement.md`).

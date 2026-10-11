@@ -7,6 +7,7 @@ authority, and validating one grants nothing.
 
 Status: contract + validator + `seed_attach` dry run + apply (`dry_run:false`). Apply creates a
 minimal footprint and grants nothing; accepting the individual requests is a later, separate step.
+The rules a seed-attached project then works under are listed in `attach-policy-enforcement.md`.
 
 ## Document shape
 

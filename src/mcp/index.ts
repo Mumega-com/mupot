@@ -106,6 +106,7 @@ import {
   detectVerdictReversalRequest,
   reverseTaskVerdict,
   DedicatedGatePredicateRequiredError,
+  VerdictIndependenceError,
   findLatestVerdict,
 } from '../tasks/service'
 // mupot#1586 — the same completion-size ceiling execute.ts's own finishTask
@@ -114,7 +115,7 @@ import {
 // AgentDO path already guards against.
 import { MAX_RESULT_CHARS } from '../agents/execute'
 import { loadKanbanData } from '../dashboard/kanban-routes'
-import type { TaskStatus } from '../tasks/service'
+import type { TaskStatus, VerdictIndependenceWaiver } from '../tasks/service'
 import { isTaskPriority, TASK_PRIORITIES } from '../types'
 import type { TaskPriority } from '../types'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from '../tasks/assignee'
@@ -2508,11 +2509,14 @@ const toolTaskVerdict: ToolSpec = {
     const gateResult = await evaluateVerdictGates(
       env,
       auth,
-      { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+      { id: task.id, squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
       verdict,
     )
     const principal = gateResult.principal
     let fallbackNote = note
+    // The write re-asserts independence inside its own UPDATE; it must carry any exemption the
+    // gate predicate granted, or the org owner's explicit, audited override below.
+    let independenceWaiver: VerdictIndependenceWaiver | undefined = gateResult.allowed ? gateResult.independenceWaiver : undefined
 
     if (!gateResult.allowed) {
       if (gateResult.code === 'no_gate_capability') {
@@ -2536,12 +2540,13 @@ const toolTaskVerdict: ToolSpec = {
       }
       const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
       fallbackNote = fallbackNote ? `${overrideNote} ${fallbackNote}` : overrideNote
+      independenceWaiver = 'owner_override'
     }
 
     try {
       const result = await writeVerdict(
         env,
-        { task, verdict, note: fallbackNote, decidedBy: principal.id },
+        { task, verdict, note: fallbackNote, decidedBy: principal.id, ...(independenceWaiver ? { independenceWaiver } : {}) },
         principal.actor,
       )
       // Best-effort Workflow resume — D1 is authoritative; a dropped event is fine.
@@ -2571,6 +2576,11 @@ const toolTaskVerdict: ToolSpec = {
       return done({ ...result, ...humanOriginField })
     } catch (err) {
       if (err instanceof TaskArchivedError) return fail(409, 'task_archived')
+      if (err instanceof VerdictIndependenceError) {
+        return fail(409, 'self_verdict', {
+          reason: 'decider is a party to this task (assignee, submitter or runner) or acts for one; self-approval is forbidden',
+        })
+      }
       if (err instanceof VerdictRaceError) return fail(409, 'verdict_race')
       if (err instanceof TaskEvidenceFenceError) {
         // #399: owning squad no longer holds write/admin on the task's project.

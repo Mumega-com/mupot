@@ -67,10 +67,75 @@ export type ArtifactRejectionReason =
   | 'refusal_prose'
   | 'no_artifact_claimed'
   | 'disallowed_path'
+  | 'artifact_placeholder'
   | 'sha256_not_claimed'
+  | 'sha256_malformed'
+  | 'sha256_placeholder'
 
-const ARTIFACT_RE = /[Aa]rtifact:\s*(\S+)/
-const SHA256_RE = /SHA256:\s*([0-9a-fA-F]{64})/
+const ARTIFACT_LABEL_RE = /[Aa]rtifact:\s*/
+const MD_LINK_RE = /^\[[^\]\n]*\]\(([^)\s]+)\)/
+const URL_SCHEME_RE = /^(?:[a-z][a-z0-9+.-]*:\/\/|mailto:)/i
+// The label may be wrapped in bold or a code span: `SHA256:`, `**SHA256:**`, `**SHA256**:`, `` `SHA256:` ``.
+const SHA256_LABEL_RE = /SHA256[`*_]*:[`*_]*\s*(\S*)/g
+const HEX64_RE = /^[0-9a-f]{64}$/i
+const HEX_RUN_RE = /^[0-9a-f]+$/i
+const SHA_PLACEHOLDER_WORDS = new Set(['tbd', 'tba', 'todo', 'wip', 'na', 'n/a', 'none', 'null', 'nil', 'undefined', 'unknown', 'pending', 'placeholder', 'xxx'])
+
+/**
+ * The claimed artifact target. A markdown link `[text](target)`, a parenthesised path, backticks and
+ * a real URL autolink `<https://...>` are REAL ways to write a path, so the wrapper is removed and
+ * the TARGET is judged. A bare `<path>`, `[artifact]`, `{file}` is not unwrapped: those are the
+ * template placeholders the placeholder rule exists to refuse.
+ */
+function extractArtifactTarget(body: string): string | null {
+  const label = ARTIFACT_LABEL_RE.exec(body)
+  if (!label) return null
+  const rest = body.slice(label.index + label[0].length)
+  const link = MD_LINK_RE.exec(rest)
+  let token = link ? link[1]! : (/^\S+/.exec(rest)?.[0] ?? '')
+  if (token === '') return null
+  for (let i = 0; i < 4; i++) {
+    const inner = unwrapOnce(token)
+    if (inner === null) break
+    token = inner
+  }
+  return token
+}
+
+function unwrapOnce(token: string): string | null {
+  const t = token.replace(/[.,;]+$/, '')
+  if (t.length >= 3 && t.startsWith('`') && t.endsWith('`')) return t.slice(1, -1)
+  if (t.length >= 3 && t.startsWith('(') && t.endsWith(')')) return t.slice(1, -1)
+  if (t.length >= 3 && t.startsWith('<') && t.endsWith('>') && URL_SCHEME_RE.test(t.slice(1, -1))) return t.slice(1, -1)
+  return null
+}
+
+type ShaJudgement =
+  | { kind: 'valid'; hex: string }
+  | { kind: 'placeholder' }
+  | { kind: 'malformed' }
+  | { kind: 'ignore' }
+
+/**
+ * Judge one `SHA256:` label's value. Only a value that LOOKS LIKE a hash attempt is judged: a hex run
+ * of 32+ characters (or any hex run on the receipt's primary, line-initial label), a template
+ * placeholder, or a placeholder word on a primary label. Prose (`see above`) and a short hex on a
+ * non-primary label (`Commit SHA256: abc1234`) are ignored, not refused. A `sha256:` / `sha256-`
+ * prefix and a trailing `-dirty`-style suffix are tolerated.
+ */
+function judgeShaValue(raw: string, primary: boolean): ShaJudgement {
+  let v = raw.replace(/^[`*_"'(\[<]+/, '').replace(/[`*_"')\]>.,;]+$/, '')
+  v = v.replace(/^sha256[:-]/i, '').replace(/^[<\[(]+/, '').replace(/[>\])]+$/, '')
+  const suffix = /^([0-9a-f]+)-[a-z][a-z0-9]*$/i.exec(v)
+  if (suffix) v = suffix[1]!
+  if (v === '') return primary ? { kind: 'malformed' } : { kind: 'ignore' }
+  if (HEX64_RE.test(v)) return isPlaceholderSha256(v) ? { kind: 'placeholder' } : { kind: 'valid', hex: v.toLowerCase() }
+  if (/^[0-9a-f]{32,}/i.test(v)) return { kind: 'malformed' }
+  if (HEX_RUN_RE.test(v)) return primary ? { kind: 'malformed' } : { kind: 'ignore' }
+  if (SHA_PLACEHOLDER_WORDS.has(v.toLowerCase()) || /^(.)\1+$/.test(v)) return primary ? { kind: 'malformed' } : { kind: 'ignore' }
+  if (/^[<\[{].*[>\]}]$/.test(raw.trim())) return primary ? { kind: 'malformed' } : { kind: 'ignore' } // <hash>, [digest]
+  return { kind: 'ignore' }
+}
 
 // Deliberately no `explicitPath` parameter. hermes's local CLI accepts one for
 // testing convenience; a server chokepoint that let a SEPARATE argument
@@ -110,6 +175,46 @@ function looksDisallowed(path: string): boolean {
   return false
 }
 
+
+// PLACEHOLDER DETECTION (policy rule 2). A receipt is only evidence if its artifact and hash are
+// the real thing's shape. These are the values a lazy or templated submission carries: an
+// all-zero / single-repeated-character / short-period-repeated hash, a counting sequence, and an
+// artifact path that is a stand-in word or an unfilled template. Shape only (see the module
+// header): a well-formed hash that matches nothing is still undetectable here.
+const PLACEHOLDER_WORDS = new Set([
+  'tbd', 'tba', 'todo', 'wip', 'na', 'n/a', 'none', 'null', 'nil', 'undefined', 'unknown', 'pending',
+  'placeholder', 'path', 'file', 'artifact', 'example', 'sample', 'dummy', 'xxx', 'foo', 'bar',
+  'sha256:', 'artifact:', '-', '--', '...', '\u2026', '?',
+])
+
+/** True iff a 64-hex digest is an obvious placeholder (not a real SHA-256 output). */
+export function isPlaceholderSha256(hex: string): boolean {
+  const h = hex.toLowerCase()
+  if (/^(.)\1*$/.test(h)) return true // 000...0, fff...f, aaa...a: one repeated character
+  // A short unit repeated to fill the digest (deadbeef x8, 0123456789abcdef x4, abab...).
+  for (const period of [2, 4, 8, 16, 32]) {
+    if (64 % period === 0 && h === h.slice(0, period).repeat(64 / period)) return true
+  }
+  // Pure counting runs (0123...f repeated is caught above; a single ascending/descending pass of
+  // the 16 hex digits tiled four times in either direction).
+  const asc = '0123456789abcdef'
+  if (h === asc.repeat(4) || h === [...asc].reverse().join('').repeat(4)) return true
+  return false
+}
+
+/** True iff a claimed artifact path is an obvious stand-in rather than a real location. */
+export function isPlaceholderArtifactPath(path: string): boolean {
+  const p = path.trim().replace(/[.,;]+$/, '')
+  if (p.length === 0) return true
+  if (PLACEHOLDER_WORDS.has(p.toLowerCase())) return true
+  if (/^[<\[{(].*[>\]})]$/.test(p)) return true // <path>, [artifact], {file}, (tbd)
+  if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(p)) return true // ${ARTIFACT} / $PATH unexpanded
+  if (/^path\/to\//i.test(p) || /(^|\/)(path|file)\/to\//i.test(p)) return true
+  if (/^(.)\1*$/.test(p)) return true // "xxxx", "----"
+  if (p.endsWith(':')) return true // "Artifact: SHA256: ..." captured the next label as the path
+  return false
+}
+
 /**
  * Verify a task's claimed completion evidence has the required SHAPE. This is
  * the unconditional, always-enforced half of FLIGHT-07B — see module header
@@ -123,19 +228,35 @@ export function verifyTaskArtifactShape(resultBody: string | null | undefined): 
     return { verified: false, reason: 'refusal_prose' }
   }
 
-  const artifactMatch = resultBody.match(ARTIFACT_RE)
-  const claimedPath = artifactMatch?.[1]
+  const claimedPath = extractArtifactTarget(resultBody)
   if (!claimedPath) {
     return { verified: false, reason: 'no_artifact_claimed' }
   }
   if (looksDisallowed(claimedPath)) {
     return { verified: false, reason: 'disallowed_path', path: claimedPath }
   }
-
-  const shaMatch = resultBody.match(SHA256_RE)
-  if (!shaMatch) {
-    return { verified: false, reason: 'sha256_not_claimed', path: claimedPath }
+  if (isPlaceholderArtifactPath(claimedPath)) {
+    return { verified: false, reason: 'artifact_placeholder', path: claimedPath }
   }
 
-  return { verified: true, path: claimedPath, sha256Claimed: shaMatch[1]!.toLowerCase() }
+  // Every SHA256 label that looks like a hash attempt is judged, not just the first: a placeholder
+  // anywhere is a refusal (a real digest placed after a template one does not launder it), and the
+  // claimed digest is the first well-formed one. See judgeShaValue for what is NOT judged.
+  let claimed: string | null = null
+  let sawMalformed = false
+  for (const m of resultBody.matchAll(SHA256_LABEL_RE)) {
+    const lineStart = resultBody.lastIndexOf('\n', m.index - 1) + 1
+    const primary = /^[\s>*_`\-\u2022#]*$/.test(resultBody.slice(lineStart, m.index))
+    const j = judgeShaValue(m[1] ?? '', primary)
+    if (j.kind === 'placeholder') return { verified: false, reason: 'sha256_placeholder', path: claimedPath }
+    if (j.kind === 'malformed') sawMalformed = true
+    if (j.kind === 'valid' && claimed === null) claimed = j.hex
+  }
+  if (sawMalformed) {
+    return { verified: false, reason: 'sha256_malformed', path: claimedPath }
+  }
+  if (claimed === null) {
+    return { verified: false, reason: 'sha256_not_claimed', path: claimedPath }
+  }
+  return { verified: true, path: claimedPath, sha256Claimed: claimed }
 }

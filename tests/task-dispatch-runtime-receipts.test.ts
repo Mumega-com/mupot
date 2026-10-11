@@ -812,7 +812,7 @@ describe('recordTaskDispatchRuntimeReceipt', () => {
         result: 'Implemented and tested.',
       })).rejects.toMatchObject({ code: 'runtime_artifact_required' })
 
-      const sha = '1'.repeat(64)
+      const sha = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
       const completed = await recordTaskDispatchRuntimeReceipt(fixture.env, fixture.auth, {
         taskId: TASK_ID,
         dispatchReceiptId: DISPATCH_ID,

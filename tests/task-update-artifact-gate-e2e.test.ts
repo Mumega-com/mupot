@@ -25,7 +25,7 @@ const AGENT_ID = 'agent-caller'
 // (a different, earlier-checked guard) before ever reaching the artifact gate.
 const ASSIGNEE_ID = 'agent-assignee'
 const TASK_ID = 'task-under-test'
-const VALID_SHA = 'a'.repeat(64)
+const VALID_SHA = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 
 function seed(sqlite: SqliteD1Harness['sqlite'], opts: { status: string; gateOwner: string | null; result: string | null; assigneeAgentId?: string | null }): void {
   sqlite.exec(`

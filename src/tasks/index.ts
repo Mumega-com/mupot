@@ -29,12 +29,13 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError } from './service'
-import type { TaskStatus } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError } from './service'
+import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTaskDispatchReceiptTimeline } from './runtime-receipts'
+import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
@@ -1429,6 +1430,10 @@ export async function callerHoldsGateCapability(
 // the write path layers the override check on top of this function's
 // 'self_verdict' denial, exactly as it did before this refactor.
 export interface VerdictGateTask {
+  // REQUIRED (not optional): the independence rule (policy rule 3) is evaluated against the task's
+  // whole party set (assignee, submitters, runners), which is keyed by task id. An optional id
+  // would let a caller silently skip it.
+  id: string
   squad_id: string
   gate_owner: string
   assignee_agent_id: string | null
@@ -1437,7 +1442,13 @@ export interface VerdictGateTask {
 export type VerdictGateDenialCode = 'no_gate_capability' | 'missing_surface_cap' | 'self_verdict'
 
 export type VerdictGateResult =
-  | { allowed: true; principal: ReturnType<typeof verdictPrincipal> }
+  | {
+      allowed: true
+      principal: ReturnType<typeof verdictPrincipal>
+      // Set when the caller was let through an independence exemption; the write must carry it
+      // (WriteVerdictInput.independenceWaiver) or buildVerdictStatements' own guard refuses.
+      independenceWaiver?: VerdictIndependenceWaiver
+    }
   | { allowed: false; code: VerdictGateDenialCode; principal: ReturnType<typeof verdictPrincipal> }
 
 // mupot#1319 gate BLOCK-1 (River, adversarial pass): decorateApprovals
@@ -1484,10 +1495,31 @@ export interface VerdictGateCache {
   // mupot#1688 P3: memberAffiliatedWithAssignee is also verdict-independent — one D1 read per
   // (member, assignee agent) per request, shared by every row and both verdicts.
   readonly affiliation: Map<string, Promise<boolean>>
+  // Policy rule 3: one independence read per (decider, task) per request, shared by both verdicts.
+  readonly independence: Map<string, Promise<VerdictConflictKind | null>>
 }
 
 export function createVerdictGateCache(): VerdictGateCache {
-  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map() }
+  return { gateCapability: new Map(), surfaceCapability: new Map(), affiliation: new Map(), independence: new Map() }
+}
+
+/**
+ * Read-side listings (decorateApprovals, the attention queue) call this once with every task id
+ * they are about to evaluate, so the per-row evaluateVerdictGates calls hit the cache instead of
+ * issuing one independence query per row. The values come from the SAME fragments the write
+ * guard uses (findVerdictIndependenceConflicts).
+ */
+export async function primeVerdictIndependence(
+  env: Env,
+  auth: AuthContext,
+  cache: VerdictGateCache,
+  taskIds: readonly string[],
+): Promise<void> {
+  const deciderId = verdictPrincipal(auth).id
+  const missing = taskIds.filter((id) => !cache.independence.has(`${deciderId}:${id}`))
+  if (missing.length === 0) return
+  const found = await findVerdictIndependenceConflicts(env, deciderId, missing)
+  for (const [taskId, kind] of found) cache.independence.set(`${deciderId}:${taskId}`, Promise.resolve(kind))
 }
 
 function memberAffiliated(
@@ -1506,6 +1538,22 @@ function memberAffiliated(
   return hit
 }
 
+function independenceConflict(
+  env: Env,
+  deciderId: string,
+  taskId: string,
+  cache: VerdictGateCache | undefined,
+): Promise<VerdictConflictKind | null> {
+  if (!cache) return findVerdictIndependenceConflict(env, deciderId, taskId)
+  const key = `${deciderId}:${taskId}`
+  let hit = cache.independence.get(key)
+  if (!hit) {
+    hit = findVerdictIndependenceConflict(env, deciderId, taskId)
+    cache.independence.set(key, hit)
+  }
+  return hit
+}
+
 // mupot#1702 — the ONE definition of "does this caller hold the task's gate_owner lane live".
 // Extracted verbatim from evaluateVerdictGates (which now calls it), so the verdict write path
 // and the receipt-visibility read path (canViewTaskReceipts) can never drift apart.
@@ -1518,7 +1566,7 @@ function memberAffiliated(
 async function holdsTaskGateLane(
   env: Env,
   auth: AuthContext,
-  task: VerdictGateTask,
+  task: Omit<VerdictGateTask, 'id'>,
   cache?: VerdictGateCache,
 ): Promise<boolean> {
   const principal = verdictPrincipal(auth)
@@ -1592,35 +1640,41 @@ export async function evaluateVerdictGates(
     }
   }
 
-  // K4: self-verdict prevention. "Own work" = the principal IS the task assignee.
-  // gate:agent-self-completion deliberately WAIVES this (its entire purpose is that
-  // the completing agent closes it — see the isSelfCompletionGate branch above,
-  // which already required the caller to BE that assignee to reach this point).
-  const isSelfVerdict = principal.id === task.assignee_agent_id
-  if (isSelfVerdict && !isSelfCompletionGate) {
-    return { allowed: false, code: 'self_verdict', principal }
+  // Policy rule 3 — nobody gives a verdict on their own task. ONE predicate
+  // (src/tasks/verdict-independence.ts) over the task's whole party set: the assignee (agent or
+  // human), every agent that submitted a result, every agent / member recorded as running it, and
+  // anyone acting for one of them (a member who owns / is bound to / holds the key of a party
+  // agent; an agent whose owner or bound member is such a member or a party member). The same
+  // fragment is re-asserted inside the verdict write's own WHERE (buildVerdictStatements).
+  //   'direct'      the decider IS a party. Never waived here (the org owner's explicit
+  //                 override_self_verdict is applied by the write-time call sites).
+  //   'affiliated'  the decider only acts for a party. An org owner/admin (legacyOwnerAdmin) is the
+  //                 existing supervisory path and passes with an 'admin_supervisory' waiver; this
+  //                 closes the grant-only route, not the admin role.
+  // gate:agent-self-completion deliberately WAIVES the rule (its purpose is that the completing
+  // agent closes it; the caller already had to BE that assignee to reach this point).
+  let independenceWaiver: VerdictIndependenceWaiver | undefined
+  if (!isSelfCompletionGate) {
+    // The assignee the CALLER passed is judged first (no query), then the task's whole party set
+    // read from the database. Both must hold: a caller-supplied row that omits the assignee must
+    // not skip the stored one, and a stale stored row must not hide the passed one.
+    if (principal.id === task.assignee_agent_id) {
+      return { allowed: false, code: 'self_verdict', principal }
+    }
+    const conflict = await independenceConflict(env, principal.id, task.id, cache)
+    if (conflict === 'direct') {
+      return { allowed: false, code: 'self_verdict', principal }
+    }
+    const affiliated = conflict === 'affiliated'
+      || (principal.type === 'member' && task.assignee_agent_id !== null
+        && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache)))
+    if (affiliated) {
+      if (!legacyOwnerAdmin(auth)) return { allowed: false, code: 'self_verdict', principal }
+      independenceWaiver = 'admin_supervisory'
+    }
   }
 
-  // mupot#1663 P2: a MEMBER who is the assignee agent's owner (or another member
-  // row of that owner, or the agent's own bound identity) is not independent of
-  // the work — task_verdict's harness-attested human_origin (#1425) writes the
-  // verdict AS the owner, so a gate GRANT held by the owner must not let them
-  // decide their own agent's task. Same predicate review entry uses
-  // (memberAffiliatedWithAssigneeSql). An org owner/admin (legacyOwnerAdmin) is
-  // exempt: they pass every gate by role already and are the existing
-  // supervisory path — this closes the grant-only route, not the admin role.
-  // Owner-less agents (owner_member_id NULL) fall back to the old rule.
-  if (
-    !isSelfCompletionGate
-    && principal.type === 'member'
-    && task.assignee_agent_id
-    && !legacyOwnerAdmin(auth)
-    && (await memberAffiliated(env, principal.id, task.assignee_agent_id, cache))
-  ) {
-    return { allowed: false, code: 'self_verdict', principal }
-  }
-
-  return { allowed: true, principal }
+  return independenceWaiver ? { allowed: true, principal, independenceWaiver } : { allowed: true, principal }
 }
 
 tasksApp.post('/:id/verdict', async (c) => {
@@ -1677,10 +1731,13 @@ tasksApp.post('/:id/verdict', async (c) => {
   const gateResult = await evaluateVerdictGates(
     c.env,
     auth,
-    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+    { id: task.id, squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
     body.verdict,
   )
   const principal = gateResult.principal
+  // Independence waiver the write must carry: the gate predicate's own exemption, or the org
+  // owner's explicit override below. Without one, buildVerdictStatements refuses a self-verdict.
+  let independenceWaiver: VerdictIndependenceWaiver | undefined = gateResult.allowed ? gateResult.independenceWaiver : undefined
 
   if (!gateResult.allowed) {
     if (gateResult.code === 'no_gate_capability') {
@@ -1714,6 +1771,7 @@ tasksApp.post('/:id/verdict', async (c) => {
     // Org owner explicit override: audit note is prepended to any caller-provided note.
     const overrideNote = `[self_verdict_override by org owner ${principal.id}]`
     note = note ? `${overrideNote} ${note}` : overrideNote
+    independenceWaiver = 'owner_override'
   }
 
   // Write verdict with conditional UPDATE guard (K5 race protection).
@@ -1721,7 +1779,7 @@ tasksApp.post('/:id/verdict', async (c) => {
   try {
     const result = await writeVerdict(
       c.env,
-      { task, verdict: body.verdict, note, decidedBy },
+      { task, verdict: body.verdict, note, decidedBy, ...(independenceWaiver ? { independenceWaiver } : {}) },
       principal.actor,
     )
 
@@ -1746,6 +1804,9 @@ tasksApp.post('/:id/verdict', async (c) => {
   } catch (err) {
     if (err instanceof TaskArchivedError) {
       return c.json({ error: 'task_archived' }, 409)
+    }
+    if (err instanceof VerdictIndependenceError) {
+      return c.json({ error: 'self_verdict', reason: 'decider is a party to this task or acts for one; self-approval is forbidden' }, 409)
     }
     if (err instanceof VerdictRaceError) {
       // K5: concurrent verdict won the race — task is no longer in 'review'.

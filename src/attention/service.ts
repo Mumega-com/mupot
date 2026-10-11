@@ -14,7 +14,7 @@ import {
 import type { RoutinePrincipal } from '../routines/access'
 import { routineTablesReady } from '../routines/schema-ready'
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
-import { createVerdictGateCache, evaluateVerdictGates, type VerdictGateCache } from '../tasks/index'
+import { createVerdictGateCache, evaluateVerdictGates, primeVerdictIndependence, type VerdictGateCache } from '../tasks/index'
 import { canReadSquadTasks } from '../tasks/visibility'
 import { humanGateHolderExistsSql } from '../tasks/runtime-receipts'
 
@@ -819,6 +819,13 @@ async function resolveTaskDecisions(
   visible: Map<string, Promise<boolean>>,
   informationOnly: boolean,
 ): Promise<SourceRow[]> {
+  // One independence read for the whole page (policy rule 3), not one per approval row.
+  if (!informationOnly) {
+    await primeVerdictIndependence(
+      env, auth, cache,
+      rows.filter((r) => r.source_type === 'task' && r.kind === 'approval' && r.gate_owner !== null).map((r) => r.source_id),
+    )
+  }
   const kept = await Promise.all(rows.map(async (row) => {
     if (row.source_type !== 'task') return true
     if (row.squad_id === null) return false
@@ -830,7 +837,7 @@ async function resolveTaskDecisions(
     if (!(await canRead)) return false
     // The admin 'stuck' view is information only: no verb is offered, so no verdict predicate runs.
     if (informationOnly || row.kind !== 'approval' || row.gate_owner === null) return true
-    const task = { squad_id: row.squad_id, gate_owner: row.gate_owner, assignee_agent_id: row.assignee_agent_id }
+    const task = { id: row.source_id, squad_id: row.squad_id, gate_owner: row.gate_owner, assignee_agent_id: row.assignee_agent_id }
     const [approve, reject] = await Promise.all([
       evaluateVerdictGates(env, auth, task, 'approved', cache),
       evaluateVerdictGates(env, auth, task, 'rejected', cache),

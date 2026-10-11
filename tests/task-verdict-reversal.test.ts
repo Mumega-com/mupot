@@ -87,7 +87,7 @@ async function approveControlTask(fixture: ReadyRoutineFixture): Promise<void> {
   // execute.ts's finishTask, which is what normally writes a real result).
   fixture.harness.sqlite.exec(
     `UPDATE tasks SET status = 'review', gate_owner = 'gate:outreach', ` +
-    `result = 'Artifact: docs/fixture.md\nSHA256: ${'a'.repeat(64)}' WHERE id = 'control-task'`,
+    `result = 'Artifact: docs/fixture.md\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88' WHERE id = 'control-task'`,
   )
   const outcome = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
     task_id: 'control-task', verdict: 'approved', note: 'approved for testing',
@@ -99,7 +99,7 @@ async function rejectThenReworkAndApprove(fixture: ReadyRoutineFixture): Promise
   await seedMember(fixture, 'owner-1')
   fixture.harness.sqlite.exec(
     `UPDATE tasks SET status = 'review', gate_owner = 'gate:outreach', ` +
-    `result = 'Artifact: docs/fixture.md\nSHA256: ${'a'.repeat(64)}' WHERE id = 'control-task'`,
+    `result = 'Artifact: docs/fixture.md\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88' WHERE id = 'control-task'`,
   )
   const rejected = await invokeTool(ownerAuth(), fixture.env, 'task_verdict', {
     task_id: 'control-task', verdict: 'rejected', note: 'needs rework',

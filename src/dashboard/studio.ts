@@ -25,6 +25,10 @@ import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
+import { seedAttachedProjectsForRepo } from '../projects/deploy-policy'
+
+/** Studio dispatch is refused for a seed-attached project's repository; its deploys go through project_deploy. */
+export const STUDIO_SEED_ATTACHED_REFUSAL = 'studio_dispatch_seed_attached_use_project_deploy'
 import { peekSessionAuth } from '../auth'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
@@ -190,6 +194,14 @@ export async function dispatchStudioFlight(
   const repoUrl = typeof input.repoUrl === 'string' ? input.repoUrl.trim() : ''
   if (repoUrl && !isSafeRepoUrl(repoUrl)) {
     return { ok: false, status: 400, error: 'invalid_repo_url' }
+  }
+
+  // Deploy policy: a Studio dispatch against the repository of a seed-attached project launches work
+  // (a flight, and with a cloud agent a real run) exactly like a deploy. Studio has no canary path:
+  // it is refused outright, before any slot is reserved, any agent launched, or any task or flight
+  // written, and the caller is pointed at project_deploy, which carries the canary and rollback.
+  if (repoUrl && (await seedAttachedProjectsForRepo(env, repoUrl)).length > 0) {
+    return { ok: false, status: 409, error: STUDIO_SEED_ATTACHED_REFUSAL }
   }
 
   const model = normalizeStudioModel(input.model)

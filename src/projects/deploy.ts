@@ -3,6 +3,9 @@ import { createFlight } from '../flight/service'
 import { createTask } from '../tasks/service'
 import { getProject } from './service'
 import { githubRepoSlug, studioDispatchPath } from './urls'
+import { CANARY_DEPLOYMENT_PREFIX, canaryDeploymentId, checkDeployPolicy, type DeployPolicyError } from './deploy-policy'
+
+export { CANARY_GATE_OWNER, CANARY_RECEIPT_MAX_AGE_HOURS } from './deploy-policy'
 
 const COMMIT_SHA_RE = /^(?:[0-9a-f]{7,40}|pending|unspecified)$/i
 const DEPLOYMENT_SELECT = `id, project_id, commit_sha, deployment_id, url, status, dispatched_by, flight_id, created_at`
@@ -13,6 +16,7 @@ export type ProjectDeployError =
   | 'repo_required'
   | 'invalid_commit_sha'
   | 'receipt_failed'
+  | DeployPolicyError
 
 export type ProjectDeployResult =
   | {
@@ -27,6 +31,22 @@ export type ProjectDeployResult =
 export interface DeployProjectInput {
   commit_sha?: unknown
   prompt?: unknown
+  // Policy rule 5 (src/projects/deploy-policy.ts): required for a seed-attached project, ignored
+  // otherwise. A caller cannot switch the check off; it is evaluated inside deployProject.
+  canary_receipt?: unknown
+  rollback?: unknown
+}
+
+/** Refusal codes that come from the deploy policy, for callers that map errors to a status. */
+export function isDeployPolicyError(error: ProjectDeployError): boolean {
+  return error.startsWith('canary_receipt_') || error === 'rollback_required'
+}
+
+/** HTTP status for a deploy refusal; the one mapping every caller shares. */
+export function deployErrorStatus(error: ProjectDeployError): 400 | 404 | 409 {
+  if (error === 'project_not_found') return 404
+  if (error === 'receipt_failed' || isDeployPolicyError(error)) return 409
+  return 400
 }
 
 function actorId(auth: AuthContext): string {
@@ -60,14 +80,20 @@ export async function listProjectDeployments(
 export async function recordProjectDeployment(
   env: Env,
   receipt: Omit<ProjectDeployment, 'created_at'> & { created_at?: string },
+  // Set for a deploy backed by a canary: the INSERT itself refuses when that canary already backed a
+  // deploy of this project, so two concurrent deploys cannot both claim one canary.
+  canaryClaim?: string,
 ): Promise<ProjectDeployment | null> {
   const createdAt = receipt.created_at ?? new Date().toISOString()
   const row: ProjectDeployment = { ...receipt, created_at: createdAt }
+  const claimPrefix = canaryClaim ? `${CANARY_DEPLOYMENT_PREFIX}${canaryClaim}:` : null
   try {
     const result = await env.DB.prepare(
       `INSERT INTO project_deployments
        (id, project_id, commit_sha, deployment_id, url, status, dispatched_by, flight_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+        WHERE ?10 IS NULL OR NOT EXISTS (
+          SELECT 1 FROM project_deployments WHERE project_id = ?2 AND substr(deployment_id, 1, length(?10)) = ?10)`,
     ).bind(
       row.id,
       row.project_id,
@@ -78,6 +104,7 @@ export async function recordProjectDeployment(
       row.dispatched_by,
       row.flight_id,
       row.created_at,
+      claimPrefix,
     ).run()
     if (Number(result.meta?.changes ?? 0) < 1) return null
   } catch {
@@ -101,6 +128,7 @@ async function dispatchDeployFlight(
   auth: AuthContext,
   project: Project,
   prompt: string,
+  policy: { canaryReceipt: string; rollback: string } | null,
 ): Promise<string | null> {
   const squadId = project.assigned_squad_id
   if (!squadId || !project.repo_url) return null
@@ -130,6 +158,8 @@ async function dispatchDeployFlight(
         project.live_url ? `live: ${project.live_url}` : null,
         project.worker_name ? `worker: ${project.worker_name}` : null,
         `dispatched_by: ${auth.email || auth.userId}`,
+        policy ? `canary_receipt: ${policy.canaryReceipt}` : null,
+        policy ? `rollback: ${policy.rollback}` : null,
         'source: project-worker-deploy',
       ].filter((line) => line !== null).join('\n'),
       done_when: 'Feature flight lands with a reviewable receipt against the project repo.',
@@ -157,7 +187,7 @@ async function dispatchDeployFlight(
       task_ids: [task.id],
       done_when: ['Feature flight lands with a reviewable receipt against the project repo.'],
       artifact_refs: [project.repo_url],
-      receipt_refs: [],
+      receipt_refs: policy ? [policy.canaryReceipt] : [],
       confidentiality: 'internal',
       publication_target: 'none',
       parent_flight_id: null,
@@ -181,6 +211,10 @@ export async function deployProject(
     return { ok: false, error: 'invalid_commit_sha' }
   }
 
+  // Policy rule 5, before anything is written (no deploy_status flip, task or flight on a refusal).
+  const policy = await checkDeployPolicy(env, project, auth, input)
+  if (!policy.ok) return { ok: false, error: policy.error }
+
   const prompt = typeof input.prompt === 'string' && input.prompt.trim()
     ? input.prompt.trim()
     : `Dispatch a feature flight for ${project.name} against ${githubRepoSlug(project.repo_url) ?? project.repo_url}`
@@ -189,7 +223,7 @@ export async function deployProject(
 
   let flightId: string | null = null
   try {
-    flightId = await dispatchDeployFlight(env, auth, project, prompt)
+    flightId = await dispatchDeployFlight(env, auth, project, prompt, policy.seedAttached ? { canaryReceipt: policy.canaryReceipt, rollback: policy.rollback } : null)
   } catch (error) {
     console.error('project deploy flight dispatch failed (receipt still written)', {
       project_id: project.id,
@@ -197,7 +231,7 @@ export async function deployProject(
     })
   }
 
-  const deploymentId = crypto.randomUUID()
+  const deploymentId = policy.seedAttached ? canaryDeploymentId(policy.canaryReceipt, crypto.randomUUID()) : crypto.randomUUID()
   const receipt = await recordProjectDeployment(env, {
     id: crypto.randomUUID(),
     project_id: project.id,
@@ -207,7 +241,7 @@ export async function deployProject(
     status: 'deploying',
     dispatched_by: actorId(auth),
     flight_id: flightId,
-  })
+  }, policy.seedAttached ? policy.canaryReceipt : undefined)
   if (!receipt) return { ok: false, error: 'receipt_failed' }
 
   const updated = await getProject(env, project.id)

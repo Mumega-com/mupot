@@ -93,7 +93,7 @@ function makeEnv(opts: { task: Task | null; charter?: string | null; updateChang
 // tests/artifact-verification.test.ts and tests/helpers/
 // artifact-verify-local.ts for that), so every existing okModel(...) call site
 // keeps testing what it always tested without each needing its own edit.
-const WITH_ARTIFACT_EVIDENCE = '\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + 'a'.repeat(64)
+const WITH_ARTIFACT_EVIDENCE = '\nArtifact: /tmp/fixture-marker.txt\nSHA256: ' + '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 const okModel = (out: string): ModelPort => ({ chat: vi.fn(async () => out + WITH_ARTIFACT_EVIDENCE) })
 const throwingModel = (msg: string): ModelPort => ({
   chat: vi.fn(async () => {
@@ -462,7 +462,7 @@ describe('runTaskExecution — cross-pot (source_pot) task end-to-end hardening 
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
       }),
     }
 
@@ -489,7 +489,7 @@ describe('runTaskExecution — cross-pot (source_pot) task end-to-end hardening 
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Here is the intro.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        return 'Here is the intro.\nArtifact: /tmp/fixture-marker.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
       }),
     }
 
@@ -532,7 +532,7 @@ describe('runTaskExecution — content-intent short-circuit skipped for source_p
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled as an ordinary model turn, not a content-publish proposal.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        return 'Handled as an ordinary model turn, not a content-publish proposal.\nArtifact: /tmp/fixture-marker.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
       }),
     }
 
@@ -700,7 +700,7 @@ describe('buildExecutePrompt/buildExecuteSystem — external_source (Linear) get
     const model: ModelPort = {
       chat: vi.fn(async (messages: ModelMessage[]) => {
         captured = messages
-        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        return 'Handled — no directives followed.\nArtifact: /tmp/fixture-marker.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
       }),
     }
 

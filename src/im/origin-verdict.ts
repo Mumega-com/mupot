@@ -397,7 +397,7 @@ async function dryRunAuthorize(
   const gateResult = await evaluateVerdictGates(
     env,
     candidateAuth,
-    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+    { id: task.id, squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
     verdict,
   )
   if (!gateResult.allowed) {

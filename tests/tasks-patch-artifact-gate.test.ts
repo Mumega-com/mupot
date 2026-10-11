@@ -11,7 +11,7 @@ import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations } from './helpers/migrations'
 
-const VALID_SHA = 'a'.repeat(64)
+const VALID_SHA = '46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88'
 const DEPT_ID = 'dept-1'
 const SQUAD_ID = 'squad-1'
 const AGENT_ID = 'agent-1'

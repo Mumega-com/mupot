@@ -250,7 +250,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       auth!,
-      { squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-self' },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-self' },
       'approved',
     )
     expect(result.allowed).toBe(true)
@@ -268,7 +268,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('member-with-stray-grant'),
-      { squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-other-owner' },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-other-owner' },
       'approved',
     )
     expect(result).toMatchObject({ allowed: false, code: 'no_gate_capability' })
@@ -280,7 +280,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('admin-1', 'admin'),
-      { squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-someone-elses' },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:agent-self-completion', assignee_agent_id: 'agent-someone-elses' },
       'approved',
     )
     expect(result.allowed).toBe(true)
@@ -294,7 +294,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('member-loops-only'),
-      { squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
       'approved',
     )
     expect(result).toMatchObject({ allowed: false, code: 'missing_surface_cap' })
@@ -307,7 +307,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('member-loops-reject'),
-      { squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
       'rejected',
     )
     expect(result.allowed).toBe(true)
@@ -321,7 +321,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('member-loops-full'),
-      { squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:loops', assignee_agent_id: null },
       'approved',
     )
     expect(result.allowed).toBe(true)
@@ -336,7 +336,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       auth!,
-      { squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: 'agent-assignee' },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: 'agent-assignee' },
       'approved',
     )
     expect(result).toMatchObject({ allowed: false, code: 'self_verdict' })
@@ -351,7 +351,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       auth!,
-      { squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: 'agent-someone-else' },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: 'agent-someone-else' },
       'approved',
     )
     expect(result.allowed).toBe(true)
@@ -363,7 +363,7 @@ describe('evaluateVerdictGates — mupot#1081 predicate parity, FALSE branches p
     const result = await evaluateVerdictGates(
       env,
       memberAuth('member-no-grant'),
-      { squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: null },
+      { id: 'task-under-gate', squad_id: 'squad-1', gate_owner: 'gate:outreach', assignee_agent_id: null },
       'approved',
     )
     expect(result).toMatchObject({ allowed: false, code: 'no_gate_capability' })
