@@ -90,7 +90,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
   const KNOWN_DESTRUCTIVE = [
     'revoke_agent_token', 'revoke_agent_session', 'archive_row', 'task_incident_revert', 'deactivate_agent', 'routine_archive', 'task_verdict',
     'task_verdict_reverse', 'pot_release', 'revoke_gate_capability', 'task_update', 'update_agent', 'move_agent_squad',
-    'squad_member_remove', 'project_squad_remove', 'end_agent_session', 'reveal_credential_claim', 'secret_env_request',
+    'squad_member_remove', 'project_squad_remove', 'end_agent_session', 'elevation_decide', 'reveal_credential_claim', 'secret_env_request',
     'addon_disable', 'addon_archive', 'supabase_mutate', 'office.publish_post', 'task_dispatch_lease_reset',
     'set_agent_inbox_consumer', 'team_bootstrap_release', 'loop_set_status', 'routine_run_cancel', 'register_agent_key',
   ]
@@ -138,7 +138,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   ]
   const ALL_DESTRUCTIVE = [
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
-    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
+    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'elevation_decide', 'end_agent_session', 'flight_cancel', 'flight_land',
     'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'loop_control', 'loop_set_status', 'mint_agent_token',
     'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
     'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',

@@ -25,8 +25,8 @@
 // EVERY function that reads "now" takes it as an explicit parameter (default
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
-import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env, OrgKind } from '../types'
+import { brandSquadScope, hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities, type SquadScope } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -453,6 +453,69 @@ export async function canDecideElevation(
   scopeId: string | null | undefined,
 ): Promise<boolean> {
   return decidedByHasElevationAuthority(env, isOrgAdmin(auth), capabilities ?? [], scopeType, scopeId || null)
+}
+
+/** listPendingElevationRequestsPage — one keyset-paged chunk of the tenant's LIVE pending requests
+ *  (full columns, oldest first), for callers that must apply the authority filter BEFORE their own
+ *  limit (the MCP human view). READ-ONLY: no stale sweep; the window is filtered in SQL. `after` is
+ *  the (created_at, id) of the last row of the previous chunk. */
+export async function listPendingElevationRequestsPage(
+  env: Env,
+  tenant: string,
+  nowMs: number,
+  after: { created_at: string; id: string } | null,
+  chunk: number,
+): Promise<ElevationRequestRecord[]> {
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT ${REQUEST_COLUMNS} FROM elevation_requests
+        WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
+          AND (?3 IS NULL OR created_at > ?3 OR (created_at = ?3 AND id > ?4))
+        ORDER BY created_at ASC, id ASC LIMIT ?5`,
+    )
+      .bind(tenant, new Date(nowMs).toISOString(), after?.created_at ?? null, after?.id ?? '', chunk)
+      .all<ElevationRequestRecord>()
+    return rows.results ?? []
+  } catch (err) {
+    if (isMissingTableError(err)) return []
+    throw err
+  }
+}
+
+/** loadSquadScopesByIds — ONE IN(...) query (chunked under D1's bound-variable cap) for the squads'
+ *  authz-relevant shape; the batched twin of loadSquadScope. */
+export async function loadSquadScopesByIds(env: Env, ids: string[]): Promise<Map<string, SquadScope>> {
+  const out = new Map<string, SquadScope>()
+  const uniq = Array.from(new Set(ids.filter(Boolean)))
+  for (let i = 0; i < uniq.length; i += 50) {
+    const part = uniq.slice(i, i + 50)
+    const rows = await env.DB.prepare(
+      `SELECT id, department_id, kind FROM squads WHERE id IN (${part.map((_, j) => `?${j + 1}`).join(',')})`,
+    )
+      .bind(...part)
+      .all<{ id: string; department_id: string; kind: OrgKind }>()
+    for (const r of rows.results ?? []) out.set(r.id, brandSquadScope(r))
+  }
+  return out
+}
+
+/** canDecideElevationPreloaded — canDecideElevation with the squad rows already loaded (no I/O).
+ *  The SAME two planes as decidedByHasElevationAuthority; tests/elevation-decide-mcp.test.ts pins
+ *  the two to agree row by row. A squad missing from `squads` fails closed. */
+export function canDecideElevationPreloaded(
+  auth: AuthContext,
+  capabilities: CapabilityGrant[],
+  scopeType: CapabilityScopeType,
+  scopeId: string | null,
+  squads: Map<string, SquadScope>,
+): boolean {
+  const orgPlane = isOrgAdmin(auth)
+  if (scopeType === 'org') return orgPlane || hasCapability(capabilities, 'org', null, 'admin')
+  if (scopeType === 'department') return orgPlane || (!!scopeId && hasCapability(capabilities, 'department', scopeId, 'admin'))
+  if (!scopeId) return orgPlane // mirrors decidedByOrgAdminCoversScope: a squad scope with no id is covered by the org plane only
+  const scope = squads.get(scopeId)
+  if (!scope) return false
+  return (orgPlane && planeCoversScope('org', scope)) || hasCapability(capabilities, 'squad', scope, 'admin')
 }
 
 /**

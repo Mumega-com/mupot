@@ -125,6 +125,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   check_in: ADD('recordCheckin INSERT presence ON CONFLICT UPDATE + SESSIONS.put + fleet upsert (fleet/presence.ts:213; index.ts:5194,5268)'),
   end_agent_session: MUT('revokeAgentSessionByCredential revokes the caller session (index.ts:5313)'),
   request_elevation: ADD('createElevationRequest INSERT elevation_requests (auth/elevation.ts:202)'),
+  elevation_decide: MUT('decideElevationRequest UPDATE elevation_requests status + INSERT elevation_grants + INSERT mutation_audit_entries (auth/elevation.ts:471; mcp/elevation-decide.ts)'),
   elevation_status: RO('SELECT elevation requests/grants only (index.ts:5421)'),
   status: RO('SELECTs + AgentDO /status read of storage only (index.ts:5588; agents/agent-do.ts:417); opening the DO runs an idempotent CREATE TABLE IF NOT EXISTS schema init (agent-do.ts:95), not state'),
   fleet_agent_get: RO('readFleetAgentRow SELECT only (index.ts:5612; fleet/registry.ts:625)'),
