@@ -84,6 +84,12 @@ function createSchema(sqlite: SqliteD1Harness['sqlite']): void {
     );
     -- mupot#1571: every task writer carries TASK_NOT_ARCHIVED_SQL, which reads this table.
     CREATE TABLE tasks_archive_state (task_id TEXT PRIMARY KEY);
+    -- producer receipt (migrations/0183), written by the review landing in execute.ts; hand-added like the columns above.
+    CREATE TABLE task_result_submissions (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, tenant TEXT NOT NULL, task_id TEXT NOT NULL,
+      squad_id TEXT NOT NULL, submitted_by_agent_id TEXT NOT NULL, artifact_path TEXT NOT NULL,
+      artifact_sha256 TEXT NOT NULL, result_digest TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
     -- migration 0203 loop brakes: runTaskExecution's claim UPDATE reads these (triggers omitted: hand fixture).
     CREATE TABLE execution_pauses (
       id TEXT PRIMARY KEY, tenant TEXT NOT NULL, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,

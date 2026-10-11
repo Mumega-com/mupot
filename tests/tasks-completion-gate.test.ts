@@ -150,6 +150,13 @@ function makeEnv(opts: { task: Task | null }) {
   const env = {
     TENANT_SLUG: 'test-tenant',
     DB: {
+      // The review landing writes its producer receipt in the same D1 batch as the status flip;
+      // run each statement in order, as the real batch does.
+      async batch(stmts: Array<{ run: () => Promise<unknown> }>) {
+        const out: unknown[] = []
+        for (const stmt of stmts) out.push(await stmt.run())
+        return out
+      },
       prepare(sql: string) {
         return {
           bind(...args: unknown[]) {

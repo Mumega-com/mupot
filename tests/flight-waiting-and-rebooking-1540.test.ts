@@ -372,6 +372,9 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     harness.sqlite.prepare(`UPDATE tasks SET gate_owner = 'gate:agent-self-completion' WHERE id = 'task-1'`).run()
     const id = await dispatchedId(env, ['task-1'])
     await toReview(env, 'task-1')
+    // The lane's authority is the producer of the current result: record EXEC_AGENT's submission.
+    harness.sqlite.prepare(`INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+      VALUES ('sub-1540', ?, 'task-1', ?, ?, '/tmp/task-1.txt', ?, ?)`).run(TENANT, SQUAD_ID, EXEC_AGENT, '9f'.repeat(32), '1e'.repeat(32))
     const own = await invokeTool(execAuth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved', note: 'mine' }, ORIGIN)
     expect(own.ok, JSON.stringify(own)).toBe(true)
     await close(env, 'task-1')
@@ -557,6 +560,9 @@ describe('A. running → waiting at the gate (mupot#1540)', () => {
     const reopen = await invokeTool(execAuth(), env, 'task_update', { task_id: 'task-1', status: 'in_progress' }, ORIGIN)
     expect(reopen.ok, JSON.stringify(reopen)).toBe(true)
     expect(flightRow(harness, id).status).toBe('running')
+    // Rework supersedes the rejected result: re-entering review needs a FRESH one (the worker's new submission).
+    harness.sqlite.prepare(`UPDATE tasks SET result = ? WHERE id = 'task-1'`)
+      .run('Reworked.\nArtifact: /tmp/task-1-v2.txt\nSHA256: 46409ea69826a6733ced5dd67fc0a9080601cbaaacd7a02192732356d25c0c88')
     await toReview(env, 'task-1')
     expect(flightRow(harness, id).status).toBe('waiting')
   })
