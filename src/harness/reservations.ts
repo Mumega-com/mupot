@@ -310,6 +310,7 @@ export function taskBindingStatement(
     `UPDATE tasks
      SET body = body || ?, updated_at = ?
      WHERE id = ?
+       AND ${TASK_NOT_ARCHIVED_SQL()}
        AND changes() = 1
        AND EXISTS (
          SELECT 1 FROM harness_reservations
