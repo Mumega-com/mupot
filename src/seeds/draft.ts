@@ -113,7 +113,7 @@ function normaliseRepo(raw: string, path: string, warnings: string[]): string {
     try { url = new URL(trimmed) } catch { return refuse('invalid_source', path, 'not a recognisable repository URL') }
     if (url.protocol !== 'https:') refuse('invalid_source', path, 'repository URL must be https (or scp-style user@host:owner/repo)')
     // WHATWG parsing turns `https:///o/r` into host `o`; an empty authority is a missing host, not a short one.
-    if (!/^https:\/\/[^/\s]/i.test(trimmed)) refuse('invalid_source', path, 'repository URL has no host')
+    if (!/^[a-z][a-z0-9+.-]*:\/\/[^/\s]/i.test(trimmed)) refuse('invalid_source', path, 'repository URL has no host')
     if (url.username || url.password) warnings.push(`credentials in ${path} were stripped; never put credentials in a repository URL`)
     if (url.port) refuse('invalid_source', path, 'repository URL with a non-default port is not supported')
   }
