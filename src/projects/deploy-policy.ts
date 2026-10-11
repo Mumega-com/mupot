@@ -30,6 +30,7 @@ import { findLatestVerdict } from '../tasks/service'
 import { isPlaceholderArtifactPath } from '../tasks/artifact-verification'
 import { isMemberAffiliatedWithAssigneeAgent } from '../tasks/verdict-independence'
 import { isTaskArchived } from '../hygiene/filters'
+import { githubRepoSlug } from './urls'
 
 /** The gate lane that marks a task as a canary receipt. */
 export const CANARY_GATE_OWNER = 'gate:canary'
@@ -88,6 +89,25 @@ export async function approverActsForDeployer(env: Env, decidedBy: string, auth:
   }
   if (auth.boundAgentId && (await isMemberAffiliatedWithAssigneeAgent(env, decidedBy, auth.boundAgentId))) return true
   return false
+}
+
+/**
+ * Seed-attached projects whose repository is `repoUrl`. Studio dispatches are keyed by repository,
+ * not project id, so the policy finds the project(s) the same way a human would: same GitHub
+ * owner/name (case-insensitive, `.git` and trailing slash ignored), else the same normalised URL.
+ */
+export async function seedAttachedProjectsForRepo(env: Env, repoUrl: string): Promise<string[]> {
+  const norm = (u: string): string => {
+    const slug = githubRepoSlug(u)
+    return slug ? `gh:${slug.toLowerCase()}` : `url:${u.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '')}`
+  }
+  const want = norm(repoUrl)
+  const rows = await env.DB.prepare(
+    `SELECT p.id AS id, p.repo_url AS repo_url FROM projects p
+       JOIN project_seeds s ON s.project_id = p.id AND s.tenant = ?1
+      WHERE p.repo_url IS NOT NULL`,
+  ).bind(env.TENANT_SLUG).all<{ id: string; repo_url: string }>()
+  return (rows.results ?? []).filter((r) => norm(r.repo_url) === want).map((r) => r.id)
 }
 
 export async function isSeedAttached(env: Env, projectId: string): Promise<boolean> {

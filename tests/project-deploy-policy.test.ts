@@ -321,6 +321,61 @@ describe('policy rule 5 — a seed-attached project needs a canary receipt and a
     })
   })
 
+  describe('the Studio dispatch entry points are covered too', () => {
+    const SEEDED_REPO = 'https://github.com/example-org/example-site'
+    const flightsAndTasks = () => JSON.stringify(sql('SELECT (SELECT COUNT(*) FROM flights) AS f, (SELECT COUNT(*) FROM tasks) AS t'))
+    const studio = (body: Record<string, unknown>) => dashboardApp.fetch(new Request('https://pot.test/api/studio/dispatch', {
+      method: 'POST', headers: { Origin: 'https://pot.test', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }), env)
+
+    it('POST /api/studio/dispatch on the seeded project\'s repo is refused, writing no task and no flight', async () => {
+      authState.current = deployer
+      const before = flightsAndTasks()
+      for (const repoUrl of [SEEDED_REPO, `${SEEDED_REPO}.git`, SEEDED_REPO.toUpperCase().replace('HTTPS', 'https'), `${SEEDED_REPO}/`]) {
+        const res = await studio({ prompt: 'launch', repoUrl })
+        expect(res.status, repoUrl).toBe(409)
+        expect(await res.json()).toMatchObject({ error: 'canary_receipt_required' })
+      }
+      expect(flightsAndTasks()).toBe(before)
+    })
+
+    it('with a valid canary + rollback it dispatches, and the evidence is recorded on the task and flight', async () => {
+      authState.current = deployer
+      const receipt = await canaryTask()
+      const res = await studio({ prompt: 'launch', repoUrl: SEEDED_REPO, canary_receipt: receipt, rollback: ROLLBACK })
+      expect(res.status).toBe(200)
+      expect(JSON.stringify(sql('SELECT body FROM tasks WHERE body LIKE \'%source: mupot-studio%\''))).toContain(`canary_receipt: ${receipt}`)
+      expect(JSON.stringify(sql('SELECT meta FROM flights'))).toContain(receipt)
+    })
+
+    it('a non-GitHub repository URL matches by normalised URL (case, .git, trailing slash)', async () => {
+      authState.current = deployer
+      harness.sqlite.prepare(`UPDATE projects SET repo_url = 'https://git.example.com/org/site.git' WHERE id = ?`).run(projectId)
+      const before = flightsAndTasks()
+      for (const repoUrl of ['https://git.example.com/org/site', 'https://GIT.example.com/org/site/', 'https://git.example.com/org/site.git']) {
+        expect((await studio({ prompt: 'launch', repoUrl })).status, repoUrl).toBe(409)
+      }
+      expect(flightsAndTasks()).toBe(before)
+    })
+
+    it('a repository that is not a seed-attached project\'s is unaffected', async () => {
+      authState.current = deployer
+      const res = await studio({ prompt: 'launch', repoUrl: 'https://github.com/example-org/other-repo' })
+      expect(res.status).toBe(200)
+    })
+
+    it('the dashboard dispatch-flight button shows the 409 reason instead of redirecting into an unguarded Studio dispatch', async () => {
+      authState.current = deployer
+      const before = flightsAndTasks()
+      const res = await dashboardApp.fetch(new Request(`https://pot.test/projects/${projectId}/dispatch-flight`, {
+        method: 'POST', headers: { Origin: 'https://pot.test' },
+      }), env)
+      expect(res.status).toBe(409)
+      expect(await res.text()).toContain('canary_receipt_required')
+      expect(flightsAndTasks()).toBe(before)
+    })
+  })
+
   it('CLOSED LIST: the only deploy-class tool is project_deploy; a new one must be added to this policy on purpose', () => {
     const deployClass = TOOLS.map((t) => t.name).filter((n) => /deploy|flip|go_live|canary/i.test(n)).sort()
     expect(deployClass).toEqual(['project_deploy'])

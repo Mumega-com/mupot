@@ -25,6 +25,7 @@ import { injectSevenAxisSeatDeclaration } from '../cursor/seat-identity'
 import type { AuthContext, Env } from '../types'
 import { createFlight, listFlights, type FlightRow } from '../flight/service'
 import { createTask } from '../tasks/service'
+import { checkDeployPolicy, seedAttachedProjectsForRepo, type DeployPolicyError } from '../projects/deploy-policy'
 import { peekSessionAuth } from '../auth'
 import { MUPOT_FAVICON_32_PNG_B64, MUPOT_MARK_64_PNG_B64 } from './brand-assets'
 import { readStudioChatPayload, streamStudioChat } from './copilot'
@@ -50,6 +51,9 @@ export interface StudioDispatchInput {
   prompt: string
   repoUrl?: string
   model?: string
+  // Required when repoUrl is the repository of a seed-attached project (deploy policy).
+  canary_receipt?: unknown
+  rollback?: unknown
 }
 
 export interface StudioDispatchOk {
@@ -183,13 +187,26 @@ export async function dispatchStudioFlight(
   env: Env,
   auth: AuthContext,
   input: StudioDispatchInput,
-): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 409 | 429; error: string }> {
+): Promise<{ ok: true; result: StudioDispatchOk } | { ok: false; status: 400 | 409 | 429; error: string | DeployPolicyError }> {
   const prompt = typeof input.prompt === 'string' ? input.prompt.trim() : ''
   if (!prompt) return { ok: false, status: 400, error: 'prompt_required' }
 
   const repoUrl = typeof input.repoUrl === 'string' ? input.repoUrl.trim() : ''
   if (repoUrl && !isSafeRepoUrl(repoUrl)) {
     return { ok: false, status: 400, error: 'invalid_repo_url' }
+  }
+
+  // Deploy policy: a Studio dispatch against the repository of a seed-attached project launches work
+  // (a flight, and with a cloud agent a real run) exactly like a deploy, so it needs the same canary
+  // receipt and rollback line. Checked before anything is reserved, launched or written. A dispatch
+  // for any other repository, or none, is unaffected.
+  let policyRefs: { canaryReceipt: string; rollback: string } | null = null
+  if (repoUrl) {
+    for (const projectId of await seedAttachedProjectsForRepo(env, repoUrl)) {
+      const policy = await checkDeployPolicy(env, { id: projectId }, auth, input)
+      if (!policy.ok) return { ok: false, status: 409, error: policy.error }
+      if (policy.seedAttached) policyRefs = { canaryReceipt: policy.canaryReceipt, rollback: policy.rollback }
+    }
   }
 
   const model = normalizeStudioModel(input.model)
@@ -231,6 +248,8 @@ export async function dispatchStudioFlight(
     repoUrl ? `repo: ${repoUrl}` : null,
     `dispatched_by: ${auth.email || auth.userId}`,
     'source: mupot-studio',
+    policyRefs ? `canary_receipt: ${policyRefs.canaryReceipt}` : null,
+    policyRefs ? `rollback: ${policyRefs.rollback}` : null,
     cursor ? `cursor_agent: ${cursor.agent_id}` : null,
     cursor ? `cursor_run: ${cursor.run_id}` : null,
     cursor ? `cursor_url: ${cursor.agent_url}` : null,
@@ -272,7 +291,7 @@ export async function dispatchStudioFlight(
         ...(repoUrl ? [repoUrl] : []),
         ...(cursor ? [cursor.agent_url] : []),
       ],
-      receipt_refs: [],
+      receipt_refs: policyRefs ? [policyRefs.canaryReceipt] : [],
       confidentiality: 'internal',
       publication_target: 'none',
       parent_flight_id: null,
@@ -1147,7 +1166,7 @@ studioApp.post('/dispatch', async (c) => {
       : undefined
   const model = typeof body.model === 'string' ? body.model : undefined
 
-  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model })
+  const result = await dispatchStudioFlight(c.env, resolved.auth, { prompt, repoUrl, model, canary_receipt: body.canary_receipt, rollback: body.rollback })
   if (!result.ok) return c.json({ ok: false, error: result.error }, result.status)
   return c.json(result.result)
 })

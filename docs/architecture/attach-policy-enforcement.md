@@ -20,13 +20,20 @@ characters (`deadbeef` repeated, `ab` repeated), a counting run, a `SHA256:` val
 64 hex characters (the whole token after the label is judged, so a 65-character value is refused rather
 than truncated), and an `Artifact:` that is empty or a stand-in word (`TBD`, `N/A`, `<path>`,
 `${ARTIFACT}`, `path/to/...`). Every `SHA256:` label in the body is judged, so a real digest placed after
-a placeholder does not launder it. A well-formed digest that matches nothing is still undetectable here;
+a placeholder does not launder it. Real results are not refused: a markdown link, a parenthesised path,
+backticks or a URL autolink around the artifact are unwrapped and the target is judged; a `sha256:` /
+`sha256-` prefix and a `-dirty`-style suffix on the digest are tolerated; and a `SHA256:` label is judged
+only when its value looks like a hash attempt (hex of 32+ characters, a template such as `<hash>`, or hex or
+a placeholder word on the receipt's own line-initial label). Prose (`SHA256: see above`) and a short hex on a
+non-primary label (`Commit SHA256: abc1234`) are ignored, not refused. A well-formed digest that matches nothing is still undetectable here;
 byte verification belongs to an evidence store the server can read.
 
 ## Verdict independence
 
 The parties to a task's work are its assignee (agent or human), every agent that submitted a result for
-it, and every agent or member recorded as running it. A decider is refused when it is a party
+it, and every agent or member recorded as running it. Only the stages where the work was actually run count
+(`runtime_consumed`, `completed`, `failed`); an operator's `reset_terminated` marker records the operator's
+member id but does not make them a runner, so an admin who reset a lease can still decide. A decider is refused when it is a party
 (`direct`) or acts for one (`affiliated`): a member who owns, is bound to, or holds the key of a party
 agent, or an agent owned by or bound to the human assignee.
 
@@ -64,6 +71,26 @@ A project is seed-attached when `project_seeds` holds a row for it. For such a p
   currently `approved` (or `done`) with its latest verdict an un-reversed approval, approved within the
   last 24 hours, by someone other than the caller deploying;
 - `rollback`: a non-empty line (at most 500 characters, not a placeholder word).
+
+"Someone other than the deployer" is affiliation, not raw ids: the approver is refused when they are the
+deployer, an agent owned by or bound to a deployer identity, or a member who owns, is bound to, or holds
+the key of the agent the deployer is acting through. An archived canary does not vouch. One canary backs
+one deploy: the deploy's receipt records `canary:<task id>:` in `deployment_id` (the table is append-only),
+the check refuses a canary already recorded for the project, and the receipt INSERT itself refuses a second
+claim, so two concurrent deploys cannot both use it. (A losing racer can still leave one bookkeeping task and
+flight behind; its receipt, which is the record of the deploy, is refused.) Binding the canary to a specific
+commit is not done: the canary is not recorded against a commit anywhere.
+
+Entry points covered, all through the same check:
+
+- `deployProject`: the `project_deploy` tool, `POST /api/projects/:id/deploy`, and the dashboard deploy button;
+- the dashboard "dispatch flight" button, which now shows the refusal instead of redirecting;
+- Studio dispatch (`dispatchStudioFlight`: `POST /api/studio/dispatch` and the Studio API `/dispatch`), when its
+  `repoUrl` is the repository of a seed-attached project (matched by GitHub owner/name, else by normalised URL).
+  It needs `canary_receipt` and `rollback` in the body. A Studio dispatch does not consume the canary.
+
+Not covered, by design: `task_create` and ordinary task or flight creation. The policy guards deploy entry points
+only; it does not stop a member from creating a task that describes a deploy.
 
 The check runs before anything is written: a refusal leaves no `deploy_status` flip, no task, no flight
 and no deployment receipt. The accepted evidence is recorded in the dispatched task body and the flight

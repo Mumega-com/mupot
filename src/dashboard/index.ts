@@ -295,6 +295,8 @@ import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject, isDeployPolicyError } from '../projects/deploy'
+
+const DEPLOY_POLICY_HINT = 'a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool, or POST /api/projects/:id/deploy or /api/studio/dispatch with canary_receipt and rollback.'
 import { studioDispatchPath } from '../projects/urls'
 import {
   copilotDrawerCss,
@@ -1539,7 +1541,7 @@ dashboardApp.post('/projects/:id/deploy', async (c) => {
     if (isDeployPolicyError(result.error)) {
       // A seed-attached project needs a canary receipt and a rollback line, which this one-click
       // form cannot carry: say so plainly instead of a bare code.
-      return c.html(shell(c.env, 'Projects', errorBody(`Deploy refused (${result.error}): a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool or POST /api/projects/:id/deploy with canary_receipt and rollback.`)), 409)
+      return c.html(shell(c.env, 'Projects', errorBody(`Deploy refused (${result.error}): ${DEPLOY_POLICY_HINT}`)), 409)
     }
     return c.html(shell(c.env, 'Projects', errorBody(`Deploy failed: ${result.error}`)), 400)
   }
@@ -1554,6 +1556,10 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
       prompt: `Dispatch a feature flight for ${detail.project.name}`,
     })
     if (result.ok) return c.redirect(result.studio_url, 303)
+    if (isDeployPolicyError(result.error)) {
+      // Do not swallow the policy refusal into a redirect: say why nothing was dispatched.
+      return c.html(shell(c.env, 'Projects', errorBody(`Dispatch refused (${result.error}): ${DEPLOY_POLICY_HINT}`)), 409)
+    }
   }
   if (detail.project.repo_url) return c.redirect(studioDispatchPath(detail.project.repo_url), 303)
   return c.redirect(`/projects/${encodeURIComponent(detail.project.id)}`, 303)
@@ -1562,9 +1568,9 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
 // POST /api/studio/dispatch — create a flight + task from a Studio prompt.
 dashboardApp.post('/api/studio/dispatch', async (c) => {
   const auth = getAuthContext(c)
-  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown }
+  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown; canary_receipt?: unknown; rollback?: unknown }
   try {
-    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown }
+    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown; canary_receipt?: unknown; rollback?: unknown }
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
@@ -1572,6 +1578,8 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
     repoUrl: typeof body.repoUrl === 'string' ? body.repoUrl : undefined,
     model: typeof body.model === 'string' ? body.model : undefined,
+    canary_receipt: body.canary_receipt,
+    rollback: body.rollback,
   })
   if (!result.ok) return c.json({ error: result.error }, result.status)
   return c.json(result.result)
