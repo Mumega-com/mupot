@@ -10,7 +10,7 @@ import { memberAffiliatedWithAssigneeSql } from './verdict-independence'
 
 export { memberAffiliatedWithAssigneeSql, isMemberAffiliatedWithAssigneeAgent } from './verdict-independence'
 import { verifyTaskArtifactShape } from './artifact-verification'
-import { isValidGateOwnerForm } from './service'
+import { isValidGateOwnerForm, CLEAR_REJECTED_RESULT_SQL } from './service'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import {
   dispatchBrakesClearSql, diagnoseDispatchBrake, isRetryCeilingReached, releasedSinceSql, type DispatchBrakeReason,
@@ -1351,7 +1351,7 @@ export async function recordTaskDispatchRuntimeReceipt(
     const mutation = input.stage === 'runtime_consumed'
       ? env.DB.prepare(`
           UPDATE tasks SET status = 'in_progress', execution_receipt_id = ?1,
-            execution_claim_expires_at = NULL, updated_at = ?2
+            execution_claim_expires_at = NULL, updated_at = ?2, ${CLEAR_REJECTED_RESULT_SQL}
            WHERE id = ?3 AND assignee_agent_id = ?4
              AND status IN ('open', 'blocked', 'rejected')
              AND ${TASK_NOT_ARCHIVED_SQL()}

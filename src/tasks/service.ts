@@ -312,7 +312,7 @@ export class TaskProjectError extends Error {
   }
 }
 
-export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review'
+export type TaskUpdateConflictCode = 'task_update_conflict' | 'task_archived' | 'task_project_locked' | 'detach_locked_result_present' | 'office_publish_unresolved' | 'assignee_frozen_in_review' | 'assignee_change_with_reversal'
 
 export class TaskUpdateConflictError extends Error {
   constructor(readonly code: TaskUpdateConflictCode, readonly detail?: string) {
@@ -504,10 +504,27 @@ export function assigneeChangesInReview(
   existing: Pick<Task, 'status' | 'assignee_agent_id' | 'assignee_member_id'>,
   next: Pick<Task, 'assignee_agent_id' | 'assignee_member_id'>,
 ): boolean {
-  return existing.status === 'review'
-    && ((existing.assignee_agent_id ?? null) !== (next.assignee_agent_id ?? null)
-      || (existing.assignee_member_id ?? null) !== (next.assignee_member_id ?? null))
+  return existing.status === 'review' && assigneeColumnsDiffer(existing, next)
 }
+
+/** True when `next` carries a different agent or member assignee than `existing`. */
+export function assigneeColumnsDiffer(
+  existing: Pick<Task, 'assignee_agent_id' | 'assignee_member_id'>,
+  next: Pick<Task, 'assignee_agent_id' | 'assignee_member_id'>,
+): boolean {
+  return (existing.assignee_agent_id ?? null) !== (next.assignee_agent_id ?? null)
+    || (existing.assignee_member_id ?? null) !== (next.assignee_member_id ?? null)
+}
+
+/**
+ * Rework supersedes the rejected result. A task sent back from `rejected` to `in_progress` starts a
+ * new attempt, so the rejected attempt's `result` is cleared in the same write: re-entering review
+ * then needs a fresh submission (the artifact-shape gate reads the row's result, which is empty
+ * until the new worker writes one). Without this the old, human-rejected result satisfied the gate
+ * for whoever was reassigned in between. Shared fragment: every writer that moves a task out of
+ * `rejected` into `in_progress` (generic update, execute.ts claim, runtime-receipt consume) uses it.
+ */
+export const CLEAR_REJECTED_RESULT_SQL = `result = CASE WHEN tasks.status = 'rejected' THEN NULL ELSE tasks.result END`
 
 function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1PreparedStatement {
   // mupot#1616: the ONE shared status/field UPDATE every generic writer reaches
@@ -525,7 +542,7 @@ function buildTaskUpdateStatement(env: Env, existing: Task, next: Task): D1Prepa
     : ''
   return env.DB.prepare(
     `UPDATE tasks
-        SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?
+        SET title = ?, body = ?, done_when = ?, status = ?, priority = ?, parent_task_id = ?, assignee_agent_id = ?, assignee_member_id = ?, github_issue_url = ?, gate_owner = ?, project_id = ?, completed_at = ?, updated_at = ?${next.status === 'in_progress' ? `, ${CLEAR_REJECTED_RESULT_SQL}` : ''}
       WHERE id = ? AND updated_at = ? AND project_id IS ?${officeGuard}
         AND ${TASK_NOT_ARCHIVED_SQL()}
         AND (tasks.status <> 'review' OR (tasks.assignee_agent_id IS ? AND tasks.assignee_member_id IS ?))`,
@@ -565,6 +582,8 @@ export async function persistTaskUpdate(
   }
 
   if (assigneeChangesInReview(existing, next)) throw new TaskUpdateConflictError('assignee_frozen_in_review')
+  // Mirror of CLEAR_REJECTED_RESULT_SQL on the in-memory row the caller returns.
+  if (existing.status === 'rejected' && next.status === 'in_progress') next.result = null
 
   let result
   try {
@@ -714,6 +733,13 @@ export async function markApprovedTaskDoneFromGate(
 
 export async function reverseTaskVerdict(env: Env, input: VerdictReversalInput): Promise<VerdictReversalOutcome> {
   const { existing, next, tenant, reason, actorId, actorType } = input
+  // A reversal restores the SAME work to review for a fresh verdict; it must not also choose who
+  // the assignee is (the verdict-independence rule and the self-completion lane both key on it, and
+  // review freezes it from this point). Refused BEFORE step 1 closes the gate, so nothing is
+  // half-committed.
+  if (existing.status !== 'review' && assigneeColumnsDiffer(existing, next)) {
+    throw new TaskUpdateConflictError('assignee_change_with_reversal')
+  }
   // mupot#1571: refuse BEFORE step 1 closes the gate — a reversal on an archived task would
   // otherwise stamp reversed_at and then fail step 2, a half-commit.
   if (await isTaskArchived(env, existing.id)) return { ok: false, error: 'task_archived' }
@@ -1619,10 +1645,11 @@ export interface WriteVerdictInput {
    *   'admin_supervisory' — an org owner/admin who is merely AFFILIATED with the assignee (the
    *                         existing supervisory path); never waives a direct party;
    *   'owner_override'    — the org owner's explicit, audited override_self_verdict:true.
-   * The `gate:agent-self-completion` lane exempts ONLY the task's CURRENT assignee (re-read inside
-   * the UPDATE's WHERE, together with the lane itself) and needs no waiver for that. An AGENT
-   * decider on that lane passes only as current assignee; a non-agent decider (an org admin) is
-   * judged like every other lane (e.g. an admin who is a party is refused).
+   * The `gate:agent-self-completion` lane exempts ONLY the agent that produced the task's current
+   * result while it is also the CURRENT assignee (both re-read inside the UPDATE's WHERE, together
+   * with the lane itself) and needs no waiver for that. An AGENT decider on that lane passes only
+   * as that producer-assignee; a non-agent decider (an org admin) is judged like every other lane
+   * (e.g. an admin who is a party is refused).
    */
   independenceWaiver?: VerdictIndependenceWaiver
 }
@@ -1636,14 +1663,34 @@ export class VerdictIndependenceError extends Error {
   }
 }
 
-/** True iff the task is on the self-completion lane and the decider is its assignee RIGHT NOW. */
-async function isCurrentSelfCompletionAssignee(
+/**
+ * Self-completion lane authority (policy rule 3). The lane exempts exactly ONE agent from verdict
+ * independence: the agent that PRODUCED THE CURRENT RESULT, and only while it is also the task's
+ * current assignee. "Produced" is read from the append-only task_result_submissions ledger (the
+ * execute.ts finish and task_submit_result both write a row for the submitting agent): the
+ * producer is the submitter of the LATEST row, and the task must still carry a result. The
+ * assignee column alone is not authority: it is writable by any squad member+ outside review, so
+ * an exemption keyed on it is only as narrow as whoever can write it. No ledger row, or a result
+ * cleared by rework, means NO exemption (the decider is then judged like on any other lane).
+ * `taskIdExpr` / `deciderParam` are SQL expressions; the fragment binds the decider TWICE.
+ */
+export function selfCompletionProducerSql(taskIdExpr: string): string {
+  return `(tasks.assignee_agent_id = ? AND tasks.result IS NOT NULL AND EXISTS (
+    SELECT 1 FROM task_result_submissions lane_sub
+     WHERE lane_sub.task_id = ${taskIdExpr} AND lane_sub.submitted_by_agent_id = ?
+       AND lane_sub.seq = (SELECT MAX(lane_max.seq) FROM task_result_submissions lane_max WHERE lane_max.task_id = ${taskIdExpr})
+  ))`
+}
+
+/** True iff the task is on the self-completion lane and the decider produced its current result AND is its assignee RIGHT NOW. */
+export async function isCurrentSelfCompletionProducer(
   env: Env,
   input: { task: Pick<Task, 'id' | 'gate_owner'>; decidedBy: string },
 ): Promise<boolean> {
   if (input.task.gate_owner !== 'gate:agent-self-completion') return false
-  const row = await env.DB.prepare(`SELECT 1 AS one FROM tasks WHERE id = ? AND assignee_agent_id = ? AND gate_owner = 'gate:agent-self-completion'`)
-    .bind(input.task.id, input.decidedBy).first<{ one: number }>()
+  const row = await env.DB.prepare(
+    `SELECT 1 AS one FROM tasks WHERE id = ? AND gate_owner = 'gate:agent-self-completion' AND ${selfCompletionProducerSql('tasks.id')}`,
+  ).bind(input.task.id, input.decidedBy, input.decidedBy).first<{ one: number }>()
   return row !== null
 }
 
@@ -1891,26 +1938,28 @@ export function buildVerdictStatements(
   const independence = independenceKinds.length > 0
     ? compileVerdictIndependenceSql(independenceKinds, input.decidedBy, { column: 'tasks.id' })
     : null
-  // Self-completion lane. Two facts are re-read INSIDE the UPDATE's WHERE (never trusted from the
-  // caller's snapshot):
+  // Self-completion lane. Facts re-read INSIDE the UPDATE's WHERE (never trusted from the caller's
+  // snapshot):
   //   1. the lane itself: tasks.gate_owner must STILL be the lane (an owner re-gate between the
-  //      caller's read and this write refuses the verdict outright);
-  //   2. the decider's lane authority. An AGENT holds this lane only as the CURRENT assignee, so
-  //      for an agent decider the only passing branch is `tasks.assignee_agent_id = decider`; it
-  //      does NOT fall through to NOT <conflict> (a former assignee who never submitted/ran is no
-  //      party, so that branch would admit it with no lane authority at all). The NOT <conflict>
-  //      branch is kept only for deciders that are not agents (members holding the lane by
-  //      org-admin standing, which the caller asserted), who are judged like any other lane.
+  //      caller's read and this write refuses the verdict outright). This holds for EVERY waiver,
+  //      including the org owner's explicit override;
+  //   2. the decider's lane authority. An AGENT holds this lane only as the PRODUCER of the current
+  //      result who is also the CURRENT assignee (selfCompletionProducerSql); it does NOT fall
+  //      through to NOT <conflict> (a former assignee who never submitted/ran is no party, so that
+  //      branch would admit it with no lane authority at all). The NOT <conflict> branch is kept
+  //      only for deciders that are not agents (members holding the lane by org-admin standing,
+  //      which the caller asserted), who are judged like any other lane.
+  const laneGuardSql = selfCompletionLane ? ` AND tasks.gate_owner = 'gate:agent-self-completion'` : ''
   const independenceSql = independence
     ? selfCompletionLane
-      ? ` AND tasks.gate_owner = 'gate:agent-self-completion' AND (tasks.assignee_agent_id = ? OR (NOT EXISTS (SELECT 1 FROM agents lane_agent WHERE lane_agent.id = ?) AND NOT ${independence.sql}))`
+      ? ` AND (${selfCompletionProducerSql('tasks.id')} OR (NOT EXISTS (SELECT 1 FROM agents lane_agent WHERE lane_agent.id = ?) AND NOT ${independence.sql}))`
       : ` AND NOT ${independence.sql}`
     : ''
   const independenceParams: unknown[] = independence
-    ? selfCompletionLane ? [input.decidedBy, input.decidedBy, ...independence.params] : independence.params
+    ? selfCompletionLane ? [input.decidedBy, input.decidedBy, input.decidedBy, ...independence.params] : independence.params
     : []
 
-  const guardSql = `${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
+  const guardSql = `${laneGuardSql}${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
   const guardParams = [...independenceParams, ...(extraGuard ? extraGuard.params : [])]
 
   const statements: D1PreparedStatement[] = [
@@ -2050,7 +2099,7 @@ export async function writeVerdict(
     // be satisfied) — nothing to roll back.
     if (await isTaskArchived(env, input.task.id)) throw new TaskArchivedError(input.task.id)
     // Distinguish a refused self-verdict from a lost race so the caller can say which it was.
-    if (input.independenceWaiver !== 'owner_override' && !(await isCurrentSelfCompletionAssignee(env, input))) {
+    if (input.independenceWaiver !== 'owner_override' && !(await isCurrentSelfCompletionProducer(env, input))) {
       const conflict = await findVerdictIndependenceConflict(env, input.decidedBy, input.task.id)
       if (conflict === 'direct' || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory')) {
         throw new VerdictIndependenceError(input.task.id, conflict)

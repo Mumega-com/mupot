@@ -29,7 +29,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, assigneeColumnsDiffer, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -1083,6 +1083,10 @@ tasksApp.patch('/:id', async (c) => {
   if (assigneeChangesInReview(existing, next)) {
     return c.json({ error: 'assignee_frozen_in_review', detail: 'a task in review has a frozen assignee; move it out of review first' }, 409)
   }
+  // A verdict reversal restores the same work to review; it must not also pick the assignee.
+  if (reversesVerdict && assigneeColumnsDiffer(existing, next)) {
+    return c.json({ error: 'assignee_change_with_reversal', detail: 'reverse the verdict first; the assignee cannot change in the same call' }, 409)
+  }
   // gate_owner may only be set/changed while status is open or in_progress.
   // Once a task enters review/approved/rejected/done the gate is locked, except
   // for owner/admin recovery of historical review rows created without a gate.
@@ -1663,7 +1667,14 @@ export async function evaluateVerdictGates(
   // re-reads the assignee in its WHERE). The lane also admits legacy org owner/admin principals;
   // those are judged like any other lane, so a direct party cannot ride the lane's waiver.
   let independenceWaiver: VerdictIndependenceWaiver | undefined
-  const assigneeClosingOwnTask = isSelfCompletionGate && principal.id === task.assignee_agent_id
+  // Lane authority is the PRODUCER of the current result who is also the current assignee (the
+  // same predicate the verdict write re-reads in its WHERE, isCurrentSelfCompletionProducer). A
+  // current assignee that did not produce the result is a party like any other and is refused
+  // below as self_verdict, not left to fail later as a race.
+  const assigneeClosingOwnTask = isSelfCompletionGate
+    && principal.type === 'agent'
+    && principal.id === task.assignee_agent_id
+    && await isCurrentSelfCompletionProducer(env, { task: { id: task.id, gate_owner: task.gate_owner }, decidedBy: principal.id })
   if (!assigneeClosingOwnTask) {
     // The assignee the CALLER passed is judged first (no query), then the task's whole party set
     // read from the database. Both must hold: a caller-supplied row that omits the assignee must

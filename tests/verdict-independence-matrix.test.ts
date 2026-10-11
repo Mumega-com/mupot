@@ -89,6 +89,15 @@ function seedWorld(sqlite: SqliteD1Harness['sqlite'], opts: { gateOwner?: string
   }
 }
 
+/** The agent `producer` produced the task's CURRENT result: a ledger row newer than every other, and a result on the row. */
+function producedCurrentResult(sqlite: SqliteD1Harness['sqlite'], producer: string, id = `sub-lane-${producer}`): void {
+  sqlite.prepare(
+    `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+     VALUES (?, ?, ?, ?, ?, '/tmp/lane', ?, ?)`,
+  ).run(id, TENANT, TASK, SQUAD, producer, '9f'.repeat(32), '1e'.repeat(32))
+  sqlite.prepare(`UPDATE tasks SET result = ? WHERE id = ?`).run(`Artifact: /tmp/lane\nSHA256: ${'9f'.repeat(32)}`, TASK)
+}
+
 interface Outcome { ok: boolean; status?: number; error?: string }
 
 async function decide(
@@ -208,11 +217,12 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     // (the genuine runner MR stays refused: see the REFUSED cases above, same fixture)
   })
 
-  describe('the gate:agent-self-completion lane exempts ONLY the current assignee', () => {
+  describe('the gate:agent-self-completion lane exempts ONLY the producer of the current result, who is also the current assignee', () => {
     const LANE = 'gate:agent-self-completion'
 
-    it('the current assignee closes its own task', async () => {
+    it('the current assignee that produced the result closes its own task', async () => {
       seedWorld(harness.sqlite, { gateOwner: LANE })
+      producedCurrentResult(harness.sqlite, 'A')
       const res = await decide(env, agentAuth('A'))
       expect(res.ok, JSON.stringify(res)).toBe(true)
       expect(verdictRows(harness.sqlite)).toBe(1)
@@ -226,8 +236,9 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
       expect(taskStatus(harness.sqlite)).toBe('review')
     })
 
-    it('the pre-check predicate refuses the direct-party admin on the lane and allows the assignee', async () => {
+    it('the pre-check predicate refuses the direct-party admin on the lane and allows the producer-assignee', async () => {
       seedWorld(harness.sqlite, { gateOwner: LANE })
+      producedCurrentResult(harness.sqlite, 'A')
       const gateTask = { id: TASK, squad_id: SQUAD, gate_owner: LANE, assignee_agent_id: 'A' }
       expect(await evaluateVerdictGates(env, memberAuth('MR', 'admin'), gateTask, 'approved')).toMatchObject({ allowed: false, code: 'self_verdict' })
       expect((await evaluateVerdictGates(env, agentAuth('A'), gateTask, 'approved')).allowed).toBe(true)
@@ -250,6 +261,7 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
 
     it('reassignment race: pre-check sees the decider as assignee, the task is reassigned before the write; the write refuses', async () => {
       seedWorld(harness.sqlite, { gateOwner: LANE })
+      producedCurrentResult(harness.sqlite, 'A')
       const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
       const gate = await evaluateVerdictGates(env, agentAuth('A'), { id: t.id, squad_id: t.squad_id, gate_owner: LANE, assignee_agent_id: t.assignee_agent_id }, 'approved')
       expect(gate.allowed).toBe(true)
@@ -332,6 +344,7 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     it('lane authority is re-checked at the write: a former assignee who is NOT a party is refused after a reassignment', async () => {
       seedWorld(harness.sqlite, { gateOwner: LANE })
       harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'AGENT_INDEP' WHERE id = ?`).run(TASK)
+      producedCurrentResult(harness.sqlite, 'AGENT_INDEP')
       const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
       const gate = await evaluateVerdictGates(env, agentAuth('AGENT_INDEP'), { id: t.id, squad_id: t.squad_id, gate_owner: LANE, assignee_agent_id: 'AGENT_INDEP' }, 'approved')
       expect(gate.allowed).toBe(true)
