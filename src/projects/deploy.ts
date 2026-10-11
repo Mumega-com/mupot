@@ -3,7 +3,7 @@ import { createFlight } from '../flight/service'
 import { createTask } from '../tasks/service'
 import { getProject } from './service'
 import { githubRepoSlug, studioDispatchPath } from './urls'
-import { checkDeployPolicy, type DeployPolicyError } from './deploy-policy'
+import { CANARY_DEPLOYMENT_PREFIX, canaryDeploymentId, checkDeployPolicy, type DeployPolicyError } from './deploy-policy'
 
 export { CANARY_GATE_OWNER, CANARY_RECEIPT_MAX_AGE_HOURS } from './deploy-policy'
 
@@ -80,14 +80,20 @@ export async function listProjectDeployments(
 export async function recordProjectDeployment(
   env: Env,
   receipt: Omit<ProjectDeployment, 'created_at'> & { created_at?: string },
+  // Set for a deploy backed by a canary: the INSERT itself refuses when that canary already backed a
+  // deploy of this project, so two concurrent deploys cannot both claim one canary.
+  canaryClaim?: string,
 ): Promise<ProjectDeployment | null> {
   const createdAt = receipt.created_at ?? new Date().toISOString()
   const row: ProjectDeployment = { ...receipt, created_at: createdAt }
+  const claimPrefix = canaryClaim ? `${CANARY_DEPLOYMENT_PREFIX}${canaryClaim}:` : null
   try {
     const result = await env.DB.prepare(
       `INSERT INTO project_deployments
        (id, project_id, commit_sha, deployment_id, url, status, dispatched_by, flight_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+        WHERE ?10 IS NULL OR NOT EXISTS (
+          SELECT 1 FROM project_deployments WHERE project_id = ?2 AND substr(deployment_id, 1, length(?10)) = ?10)`,
     ).bind(
       row.id,
       row.project_id,
@@ -98,6 +104,7 @@ export async function recordProjectDeployment(
       row.dispatched_by,
       row.flight_id,
       row.created_at,
+      claimPrefix,
     ).run()
     if (Number(result.meta?.changes ?? 0) < 1) return null
   } catch {
@@ -224,7 +231,7 @@ export async function deployProject(
     })
   }
 
-  const deploymentId = crypto.randomUUID()
+  const deploymentId = policy.seedAttached ? canaryDeploymentId(policy.canaryReceipt, crypto.randomUUID()) : crypto.randomUUID()
   const receipt = await recordProjectDeployment(env, {
     id: crypto.randomUUID(),
     project_id: project.id,
@@ -234,7 +241,7 @@ export async function deployProject(
     status: 'deploying',
     dispatched_by: actorId(auth),
     flight_id: flightId,
-  })
+  }, policy.seedAttached ? policy.canaryReceipt : undefined)
   if (!receipt) return { ok: false, error: 'receipt_failed' }
 
   const updated = await getProject(env, project.id)

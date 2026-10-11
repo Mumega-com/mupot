@@ -207,6 +207,74 @@ describe('policy rule 5 — a seed-attached project needs a canary receipt and a
     })
   })
 
+  describe('self-certification follows affiliation, not raw ids (both directions of agent ownership)', () => {
+    const asAgentDeployer = (agentId: string): AuthContext => ({ ...deployer, memberId: 'adm', boundAgentId: agentId })
+    beforeEach(() => {
+      harness.sqlite.exec(`
+        INSERT INTO members (id, email, display_name, status, tenant) VALUES
+          ('owner-x', 'ox@example.test', 'OX', 'active', '${TENANT}'),
+          ('key-x', 'kx@example.test', 'KX', 'active', '${TENANT}'),
+          ('stranger', 's@example.test', 'S', 'active', '${TENANT}');
+        INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id) VALUES
+          ('agent-of-adm', 'squad-a', 'agent-of-adm', 'AA', 'r', 'm', 'active', 'adm'),
+          ('agent-bound-adm', 'squad-a', 'agent-bound-adm', 'AB', 'r', 'm', 'active', NULL),
+          ('deploy-agent', 'squad-a', 'deploy-agent', 'DA', 'r', 'm', 'active', 'owner-x'),
+          ('stranger-agent', 'squad-a', 'stranger-agent', 'SA', 'r', 'm', 'active', 'stranger');
+        INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-bound-adm', 'adm', datetime('now'));
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES ('${TENANT}', 'deploy-agent', 'pk', 'key-x', unixepoch());
+      `)
+    })
+    it('the deployer approving through their OWN agent (owned by / bound to the deployer) is self-certification', async () => {
+      for (const approver of ['agent-of-adm', 'agent-bound-adm']) {
+        const id = await canaryTask({ decidedBy: approver })
+        expect(await deploy({ canary_receipt: id, rollback: ROLLBACK }), approver).toEqual({ ok: false, error: 'canary_receipt_self_certified' })
+      }
+    })
+    it('an agent deployer cannot deploy on a canary approved by the member who owns / is keyed to that agent', async () => {
+      for (const approver of ['owner-x', 'key-x']) {
+        const id = await canaryTask({ decidedBy: approver })
+        expect(await deployProject(env, projectId, asAgentDeployer('deploy-agent'), { canary_receipt: id, rollback: ROLLBACK }), approver)
+          .toEqual({ ok: false, error: 'canary_receipt_self_certified' })
+      }
+    })
+    it('unrelated approvers still pass: a stranger member, a stranger agent', async () => {
+      for (const approver of ['stranger', 'stranger-agent']) {
+        const id = await canaryTask({ decidedBy: approver })
+        expect((await deploy({ canary_receipt: id, rollback: ROLLBACK })).ok, approver).toBe(true)
+      }
+    })
+  })
+
+  it('an ARCHIVED canary task does not vouch', async () => {
+    const id = await canaryTask()
+    harness.sqlite.prepare(
+      `INSERT INTO tasks_archive_state (task_id, archived_at, archived_reason, archived_by_member_id, prior_status) VALUES (?, datetime('now'), 'cleanup', 'adm', 'approved')`,
+    ).run(id)
+    expect(await deploy({ canary_receipt: id, rollback: ROLLBACK })).toEqual({ ok: false, error: 'canary_receipt_archived' })
+  })
+
+  describe('one canary backs ONE deploy', () => {
+    it('the second deploy on the same canary is refused, and the first deploy recorded it in its receipt', async () => {
+      const id = await canaryTask()
+      expect((await deploy({ canary_receipt: id, rollback: ROLLBACK })).ok).toBe(true)
+      expect(sql<{ deployment_id: string }>('SELECT deployment_id FROM project_deployments WHERE project_id = ?', projectId)[0]?.deployment_id.startsWith(`canary:${id}:`)).toBe(true)
+      const before = writes()
+      expect(await deploy({ canary_receipt: id, rollback: ROLLBACK })).toEqual({ ok: false, error: 'canary_receipt_reused' })
+      expect(writes()).toBe(before)
+      // A different canary still deploys.
+      expect((await deploy({ canary_receipt: await canaryTask(), rollback: ROLLBACK })).ok).toBe(true)
+    })
+    it('the claim is atomic in the receipt INSERT: two receipts for one canary cannot both land', async () => {
+      const { recordProjectDeployment } = await import('../src/projects/deploy')
+      const id = await canaryTask()
+      const base = { project_id: projectId, commit_sha: 'pending', url: null, status: 'deploying' as const, dispatched_by: 'adm', flight_id: null }
+      const first = await recordProjectDeployment(env, { ...base, id: 'd1', deployment_id: `canary:${id}:u1` }, id)
+      const second = await recordProjectDeployment(env, { ...base, id: 'd2', deployment_id: `canary:${id}:u2` }, id)
+      expect(first).not.toBeNull()
+      expect(second).toBeNull()
+    })
+  })
+
   it('the freshness boundary: just inside the window passes, just outside is stale', async () => {
     const inside = await canaryTask({ decidedAgoHours: CANARY_RECEIPT_MAX_AGE_HOURS - 0.5 })
     expect((await deploy({ canary_receipt: inside, rollback: ROLLBACK })).ok).toBe(true)
