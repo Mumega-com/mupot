@@ -193,3 +193,25 @@ describe('verifyTaskArtifactShape — false-positive guard', () => {
     for (const [sha, reason] of bad) expect(verifyTaskArtifactShape(res('/tmp/out.txt', sha)), sha).toMatchObject({ verified: false, reason })
   })
 })
+
+describe('verifyTaskArtifactShape — label wrappings (bold, code span)', () => {
+  const wraps: Array<[string, (hex: string) => string]> = [
+    ['plain', (h) => `SHA256: ${h}`],
+    ['bold inside', (h) => `**SHA256:** ${h}`],
+    ['bold outside', (h) => `**SHA256**: ${h}`],
+    ['code span inside', (h) => `\`SHA256:\` ${h}`],
+    ['code span outside', (h) => `\`SHA256\`: ${h}`],
+    ['list item, bold', (h) => `- **SHA256:** ${h}`],
+  ]
+  for (const [label, wrap] of wraps) {
+    it(`${label}: a real digest is accepted, placeholders and malformed values are refused`, () => {
+      const r = (hex: string) => verifyTaskArtifactShape(`Done.\nArtifact: /tmp/out.txt\n${wrap(hex)}`)
+      expect(r(VALID_SHA), label).toMatchObject({ verified: true, sha256Claimed: VALID_SHA })
+      expect(r('0'.repeat(64)), label).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+      expect(r('deadbeef'.repeat(8)), label).toMatchObject({ verified: false, reason: 'sha256_placeholder' })
+      expect(r(VALID_SHA.slice(1)), label).toMatchObject({ verified: false, reason: 'sha256_malformed' })
+      // A short hex is judged only on the receipt's own (line-initial) label: the wrapper must not hide that.
+      expect(r('abc1234'), label).toMatchObject({ verified: false, reason: 'sha256_malformed' })
+    })
+  }
+})

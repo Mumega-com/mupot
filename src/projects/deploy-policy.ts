@@ -30,7 +30,7 @@ import { findLatestVerdict } from '../tasks/service'
 import { isPlaceholderArtifactPath } from '../tasks/artifact-verification'
 import { isMemberAffiliatedWithAssigneeAgent } from '../tasks/verdict-independence'
 import { isTaskArchived } from '../hygiene/filters'
-import { githubRepoSlug } from './urls'
+import { sameRepository } from './urls'
 
 /** The gate lane that marks a task as a canary receipt. */
 export const CANARY_GATE_OWNER = 'gate:canary'
@@ -73,19 +73,19 @@ export async function canaryAlreadyUsed(env: Env, projectId: string, canaryTaskI
  * Does `decidedBy` (the canary approver) act for, or as, the deployer? Same affiliation logic as the
  * verdict rule, in both directions of agents.owner_member_id:
  *   - the approver IS the deployer (member id, user id or bound agent id);
- *   - the approver is an AGENT owned by / bound to a deployer identity (deployer approving through
- *     their own agent);
+ *   - the approver is an AGENT owned by / bound to / keyed to a deployer identity (deployer approving
+ *     through their own agent);
  *   - the approver is a MEMBER who owns / is bound to / holds the key of the deployer's agent
  *     (deployer is an agent acting for its owner).
  */
 export async function approverActsForDeployer(env: Env, decidedBy: string, auth: AuthContext): Promise<boolean> {
   const ids = [auth.memberId, auth.userId, auth.boundAgentId].filter((v): v is string => typeof v === 'string' && v.length > 0)
   if (ids.includes(decidedBy)) return true
-  const agent = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?1').bind(decidedBy).first<{ owner_member_id: string | null }>()
-  if (agent) {
-    if (agent.owner_member_id && ids.includes(agent.owner_member_id)) return true
-    const bound = await env.DB.prepare('SELECT member_id FROM agent_member_bindings WHERE agent_id = ?1').bind(decidedBy).all<{ member_id: string }>()
-    if ((bound.results ?? []).some((b) => ids.includes(b.member_id))) return true
+  // The approver is an AGENT acting for a deployer identity: any deployer member id that owns it
+  // (agents.owner_member_id), is bound to it (agent_member_bindings) or holds its key (agent_keys.member_id).
+  // One predicate (isMemberAffiliatedWithAssigneeAgent), applied to each deployer member id.
+  for (const id of ids) {
+    if (await isMemberAffiliatedWithAssigneeAgent(env, id, decidedBy)) return true
   }
   if (auth.boundAgentId && (await isMemberAffiliatedWithAssigneeAgent(env, decidedBy, auth.boundAgentId))) return true
   return false
@@ -93,21 +93,17 @@ export async function approverActsForDeployer(env: Env, decidedBy: string, auth:
 
 /**
  * Seed-attached projects whose repository is `repoUrl`. Studio dispatches are keyed by repository,
- * not project id, so the policy finds the project(s) the same way a human would: same GitHub
- * owner/name (case-insensitive, `.git` and trailing slash ignored), else the same normalised URL.
+ * not project id. Matching uses repoIdentity (src/projects/urls.ts), which folds every spelling of one
+ * repository and errs toward MATCHING when unsure (an owner-only GitHub URL matches every repository
+ * of that owner), because the caller refuses on a match.
  */
 export async function seedAttachedProjectsForRepo(env: Env, repoUrl: string): Promise<string[]> {
-  const norm = (u: string): string => {
-    const slug = githubRepoSlug(u)
-    return slug ? `gh:${slug.toLowerCase()}` : `url:${u.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '')}`
-  }
-  const want = norm(repoUrl)
   const rows = await env.DB.prepare(
     `SELECT p.id AS id, p.repo_url AS repo_url FROM projects p
        JOIN project_seeds s ON s.project_id = p.id AND s.tenant = ?1
       WHERE p.repo_url IS NOT NULL`,
   ).bind(env.TENANT_SLUG).all<{ id: string; repo_url: string }>()
-  return (rows.results ?? []).filter((r) => norm(r.repo_url) === want).map((r) => r.id)
+  return (rows.results ?? []).filter((r) => sameRepository(r.repo_url, repoUrl)).map((r) => r.id)
 }
 
 export async function isSeedAttached(env: Env, projectId: string): Promise<boolean> {

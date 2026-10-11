@@ -296,7 +296,7 @@ export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
 import { deployProject, isDeployPolicyError } from '../projects/deploy'
 
-const DEPLOY_POLICY_HINT = 'a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool, or POST /api/projects/:id/deploy or /api/studio/dispatch with canary_receipt and rollback.'
+const DEPLOY_POLICY_HINT = 'a project created from a seed needs an approved canary receipt and a rollback line. Use the project_deploy tool, or POST /api/projects/:id/deploy with canary_receipt and rollback (Studio dispatch is refused for such a project).'
 import { studioDispatchPath } from '../projects/urls'
 import {
   copilotDrawerCss,
@@ -1568,9 +1568,9 @@ dashboardApp.post('/projects/:id/dispatch-flight', async (c) => {
 // POST /api/studio/dispatch — create a flight + task from a Studio prompt.
 dashboardApp.post('/api/studio/dispatch', async (c) => {
   const auth = getAuthContext(c)
-  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown; canary_receipt?: unknown; rollback?: unknown }
+  let body: { prompt?: unknown; repoUrl?: unknown; model?: unknown}
   try {
-    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown; canary_receipt?: unknown; rollback?: unknown }
+    body = (await c.req.json()) as { prompt?: unknown; repoUrl?: unknown; model?: unknown}
   } catch {
     return c.json({ error: 'invalid_json' }, 400)
   }
@@ -1578,8 +1578,6 @@ dashboardApp.post('/api/studio/dispatch', async (c) => {
     prompt: typeof body.prompt === 'string' ? body.prompt : '',
     repoUrl: typeof body.repoUrl === 'string' ? body.repoUrl : undefined,
     model: typeof body.model === 'string' ? body.model : undefined,
-    canary_receipt: body.canary_receipt,
-    rollback: body.rollback,
   })
   if (!result.ok) return c.json({ error: result.error }, result.status)
   return c.json(result.result)

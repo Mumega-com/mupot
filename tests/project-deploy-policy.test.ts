@@ -218,14 +218,16 @@ describe('policy rule 5 — a seed-attached project needs a canary receipt and a
         INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id) VALUES
           ('agent-of-adm', 'squad-a', 'agent-of-adm', 'AA', 'r', 'm', 'active', 'adm'),
           ('agent-bound-adm', 'squad-a', 'agent-bound-adm', 'AB', 'r', 'm', 'active', NULL),
+          ('agent-keyed-adm', 'squad-a', 'agent-keyed-adm', 'AK', 'r', 'm', 'active', NULL),
           ('deploy-agent', 'squad-a', 'deploy-agent', 'DA', 'r', 'm', 'active', 'owner-x'),
           ('stranger-agent', 'squad-a', 'stranger-agent', 'SA', 'r', 'm', 'active', 'stranger');
         INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-bound-adm', 'adm', datetime('now'));
         INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES ('${TENANT}', 'deploy-agent', 'pk', 'key-x', unixepoch());
+        INSERT INTO agent_keys (tenant, agent_id, pubkey, member_id, created_at) VALUES ('${TENANT}', 'agent-keyed-adm', 'pk2', 'adm', unixepoch());
       `)
     })
     it('the deployer approving through their OWN agent (owned by / bound to the deployer) is self-certification', async () => {
-      for (const approver of ['agent-of-adm', 'agent-bound-adm']) {
+      for (const approver of ['agent-of-adm', 'agent-bound-adm', 'agent-keyed-adm']) {
         const id = await canaryTask({ decidedBy: approver })
         expect(await deploy({ canary_receipt: id, rollback: ROLLBACK }), approver).toEqual({ ok: false, error: 'canary_receipt_self_certified' })
       }
@@ -321,39 +323,51 @@ describe('policy rule 5 — a seed-attached project needs a canary receipt and a
     })
   })
 
-  describe('the Studio dispatch entry points are covered too', () => {
+  describe('Studio dispatch is REFUSED outright for a seed-attached project\'s repository (no canary path)', () => {
     const SEEDED_REPO = 'https://github.com/example-org/example-site'
-    const flightsAndTasks = () => JSON.stringify(sql('SELECT (SELECT COUNT(*) FROM flights) AS f, (SELECT COUNT(*) FROM tasks) AS t'))
+    const REFUSAL = 'studio_dispatch_seed_attached_use_project_deploy'
+    const flightsAndTasks = () => JSON.stringify(sql('SELECT (SELECT COUNT(*) FROM flights) AS f, (SELECT COUNT(*) FROM tasks) AS t, (SELECT COUNT(*) FROM studio_dispatch_slots) AS s'))
     const studio = (body: Record<string, unknown>) => dashboardApp.fetch(new Request('https://pot.test/api/studio/dispatch', {
       method: 'POST', headers: { Origin: 'https://pot.test', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     }), env)
 
-    it('POST /api/studio/dispatch on the seeded project\'s repo is refused, writing no task and no flight', async () => {
+    it('is refused for every spelling of the repo, with or without a canary, writing nothing (no slot, task or flight)', async () => {
       authState.current = deployer
+      const receipt = await canaryTask()
       const before = flightsAndTasks()
-      for (const repoUrl of [SEEDED_REPO, `${SEEDED_REPO}.git`, SEEDED_REPO.toUpperCase().replace('HTTPS', 'https'), `${SEEDED_REPO}/`]) {
-        const res = await studio({ prompt: 'launch', repoUrl })
-        expect(res.status, repoUrl).toBe(409)
-        expect(await res.json()).toMatchObject({ error: 'canary_receipt_required' })
+      for (const repoUrl of [SEEDED_REPO, `${SEEDED_REPO}.git`, `${SEEDED_REPO}/`, `${SEEDED_REPO}.git/`, `${SEEDED_REPO}.git.git`, 'https://GitHub.com./Example-Org/Example-Site', 'https://www.github.com/example-org/example-site/tree/main', 'https://github.com/example-org/%65xample-site']) {
+        for (const extra of [{}, { canary_receipt: receipt, rollback: ROLLBACK }]) {
+          const res = await studio({ prompt: 'launch', repoUrl, ...extra })
+          expect(res.status, repoUrl).toBe(409)
+          expect(await res.json()).toMatchObject({ error: REFUSAL })
+        }
       }
       expect(flightsAndTasks()).toBe(before)
     })
 
-    it('with a valid canary + rollback it dispatches, and the evidence is recorded on the task and flight', async () => {
+    it('refuses BEFORE any cloud-agent launch or slot reservation, even with a Cursor token configured', async () => {
       authState.current = deployer
-      const receipt = await canaryTask()
-      const res = await studio({ prompt: 'launch', repoUrl: SEEDED_REPO, canary_receipt: receipt, rollback: ROLLBACK })
-      expect(res.status).toBe(200)
-      expect(JSON.stringify(sql('SELECT body FROM tasks WHERE body LIKE \'%source: mupot-studio%\''))).toContain(`canary_receipt: ${receipt}`)
-      expect(JSON.stringify(sql('SELECT meta FROM flights'))).toContain(receipt)
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+      const withCursor = { ...env, CURSOR_API_KEY: 'test-token' } as Env
+      const before = flightsAndTasks()
+      const res = await dashboardApp.fetch(new Request('https://pot.test/api/studio/dispatch', {
+        method: 'POST', headers: { Origin: 'https://pot.test', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: 'launch', repoUrl: SEEDED_REPO, model: 'cursor-cloud' }),
+      }), withCursor)
+      expect(res.status).toBe(409)
+      expect(fetchSpy).not.toHaveBeenCalled()
+      expect(flightsAndTasks()).toBe(before)
+      fetchSpy.mockRestore()
     })
 
-    it('a non-GitHub repository URL matches by normalised URL (case, .git, trailing slash)', async () => {
+    it('a non-GitHub repository URL matches by normalised URL', async () => {
       authState.current = deployer
       harness.sqlite.prepare(`UPDATE projects SET repo_url = 'https://git.example.com/org/site.git' WHERE id = ?`).run(projectId)
       const before = flightsAndTasks()
       for (const repoUrl of ['https://git.example.com/org/site', 'https://GIT.example.com/org/site/', 'https://git.example.com/org/site.git']) {
-        expect((await studio({ prompt: 'launch', repoUrl })).status, repoUrl).toBe(409)
+        const res = await studio({ prompt: 'launch', repoUrl })
+        expect(res.status, repoUrl).toBe(409)
+        expect(await res.json()).toMatchObject({ error: REFUSAL })
       }
       expect(flightsAndTasks()).toBe(before)
     })

@@ -75,7 +75,8 @@ export type ArtifactRejectionReason =
 const ARTIFACT_LABEL_RE = /[Aa]rtifact:\s*/
 const MD_LINK_RE = /^\[[^\]\n]*\]\(([^)\s]+)\)/
 const URL_SCHEME_RE = /^(?:[a-z][a-z0-9+.-]*:\/\/|mailto:)/i
-const SHA256_LABEL_RE = /SHA256:\s*(\S*)/g
+// The label may be wrapped in bold or a code span: `SHA256:`, `**SHA256:**`, `**SHA256**:`, `` `SHA256:` ``.
+const SHA256_LABEL_RE = /SHA256[`*_]*:[`*_]*\s*(\S*)/g
 const HEX64_RE = /^[0-9a-f]{64}$/i
 const HEX_RUN_RE = /^[0-9a-f]+$/i
 const SHA_PLACEHOLDER_WORDS = new Set(['tbd', 'tba', 'todo', 'wip', 'na', 'n/a', 'none', 'null', 'nil', 'undefined', 'unknown', 'pending', 'placeholder', 'xxx'])
@@ -245,7 +246,7 @@ export function verifyTaskArtifactShape(resultBody: string | null | undefined): 
   let sawMalformed = false
   for (const m of resultBody.matchAll(SHA256_LABEL_RE)) {
     const lineStart = resultBody.lastIndexOf('\n', m.index - 1) + 1
-    const primary = /^[\s>*_\-\u2022#]*$/.test(resultBody.slice(lineStart, m.index))
+    const primary = /^[\s>*_`\-\u2022#]*$/.test(resultBody.slice(lineStart, m.index))
     const j = judgeShaValue(m[1] ?? '', primary)
     if (j.kind === 'placeholder') return { verified: false, reason: 'sha256_placeholder', path: claimedPath }
     if (j.kind === 'malformed') sawMalformed = true
