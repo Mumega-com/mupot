@@ -501,7 +501,7 @@ async function projectStatusElevation(
 
 const toolProjectUpdate: ToolSpec = {
   name: 'project_update',
-  scope: 'workspace project lifecycle, including archive and restore',
+  scope: 'workspace project lifecycle, including archive and restore (an agent holding a live action:project_lifecycle elevation grant may change status only)',
   min: 'admin',
   args: '{ project_id: string, slug?: string, name?: string, description?: string, goal?: string, status?: "planned"|"active"|"paused"|"completed"|"archived", parent_project_id?: string|null, target_date?: string|null }',
   inputSchema: {

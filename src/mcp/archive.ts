@@ -213,7 +213,9 @@ export const toolUnarchiveRow: ToolSpec = {
   scope: 'org',
   min: 'admin',
   args: '{ table: "members"|"agents"|"squads"|"projects"|"tasks", id: string, reason: string }' +
-    ' -- org-admin only, operator principal only (no agent-bound caller).',
+    ' -- org-admin only, operator principal only. The one exception: an agent-bound caller holding a live' +
+    ' action:project_lifecycle elevation grant covering the org or the squad/project squad may restore' +
+    ' table=projects or table=squads (the receipt reason records the grant id); every other table stays operator-only.',
   inputSchema: {
     type: 'object',
     properties: {
