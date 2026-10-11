@@ -108,15 +108,16 @@ the dry run; apply needs more (below).
 
 - `dry_run` defaults to **true**: validate and return
   `{ok, dry_run, seed_sha256, accept_token, requests[], diffs[]}`. Nothing is written, including the
-  generic presence bump. `diffs` compares name, goal, repo and live against the existing
+  generic presence bump (an apply, unlike a dry run, refreshes presence like any mutating tool). `diffs` compares name, goal, repo and live against the existing
   project the seed would apply to (`<slug>-prj`), only if the caller can already read it.
 - `requests` is a list of `{key, kind, fields, needs, text}`: `key` is stable (`kind:` plus 12 hex of
-  the digest of the request), `fields` is the structured source of truth, `needs` is always
+  the digest of the request; a repeat of an identical request gets a `#2`, `#3` suffix so every displayed
+  request has a distinct key, e.g. a `path` and a `type` direct surface naming one target), `fields` is the structured source of truth, `needs` is always
   `human_accept`, and `text` is a rendered one-line sentence in which every author value is
   JSON-quoted (U+2028/U+2029 escaped).
 - `accept_token` is an HMAC over (seed digest, member id, issue time), valid 15 minutes, keyed with an HKDF-SHA256
-  derivation (info `mupot_seed_accept_v1`, as in `src/connectors/crypto.ts`) of the existing server secret
-  `CONNECTOR_MASTER_KEY` (no new secret; rotating it invalidates tokens, which live 15 minutes). It is `null` for an agent-bound caller
+  derivation of the existing server secret
+  `CONNECTOR_MASTER_KEY` (info string `mupot_seed_accept_v1`, empty salt; `src/connectors/crypto.ts` shares only the HKDF-SHA256 construction, it salts per connector id; no new secret; rotating it invalidates tokens, which live 15 minutes). It is `null` for an agent-bound caller
   and when the pot has no such secret. Request keys are a deterministic hash of the seed text and could be
   precomputed by an author; the token cannot, so it ties an apply to a dry run by this member of this
   exact seed. It proves the dry run happened, not that a person read it.
@@ -160,7 +161,9 @@ refuses after the fence, which needs a foreign project or squad to appear, or th
   statement; a live lease or a row whose project exists is never deleted) and claims once more.
 - recovery: if a claim another member left `applying` has lapsed while the project of that slug was
   created by THIS caller (the split a stalled apply can leave: project under one member, claim under the
-  other), the caller takes the claim over in one conditional statement and resumes. Nothing is created twice.
+  other), the caller takes the claim over in one conditional statement and resumes. Nothing is created twice. The
+  takeover re-records the recovering member's own `seed_sha256`, seed and requests on that claim and does
+  not raise `seed_digest_conflict`: the claim being replaced created nothing.
 - if a project does exist under a lapsed claim, only the same member with the same digest may resume,
   and the resume re-checks the same no-takeover predicate. `team_bootstrap` is called with
   `require_provenance`, so apply adopts a pre-existing project or squad only when the caller created it,
@@ -188,10 +191,16 @@ the raw source; `owner` is stored as a label (`owner_label`) and is never resolv
 project's goal, repo and live URL are recorded in `canonical_json` and are not copied onto the
 project row by this slice.
 
-Failures after the claim (`squad_limit_reached`, archived project, an uncaught error) are
-`409 seed_apply_failed {reason}`. The claim is **released only if no project was created**. If a project
-already exists the claim stays, with its lease expired, so only the same member with the same digest can
-resume it.
+Failures after the claim (`squad_limit_reached`, an uncaught error) are
+`409 seed_apply_failed {reason}`. The claim is **deleted unless a project of that slug was created by this
+caller** (a foreign project is not ours, so the slug is not reserved). If the caller did create one, the
+claim stays with its lease expired, so only the same member with the same digest can resume it. A caller-owned
+**archived** project or squad is refused generically at the claim. A pre-existing project-squad edge below
+ADMIN (`team_bootstrap` never raises one) is `409 seed_footprint_incompatible {existing_edge}`; the claim
+stays resumable and the row is never finalized as applied. An apply whose final flip affected no row (a
+resume or sweep replaced its claim) returns `409 seed_apply_in_progress`, never a success.
+Everything stored or passed on (project name, squad name, owner label, request fields) is built from the
+canonical form (NFC, trailing whitespace trimmed), so equivalent spellings of one seed persist identically.
 
 ### Known limits
 
@@ -200,6 +209,10 @@ resume it.
 - The squad guard and the claim use the shared `dept-projects` department only.
 - `accept_token` proves a dry run by this member, not that a person read the requests.
 - Slug existence is inferable from the generic refusal, as with any unique slug.
+- A claim left `applying` over a project whose creator never returns (for example a deactivated member) stays
+  wedged: nobody else can see the claim (its `project_id` is NULL) and the takeover needs the project's creator.
+- A different admin applying the same seed while the first apply is in flight gets `seed_slug_unavailable`, not
+  `seed_apply_in_progress` or a replay, because that admin cannot see the claim. Behaviour unchanged; tracked as an issue.
 
 ## Attach protocol
 
@@ -281,4 +294,5 @@ Each test below was written to fail when the named mutation is applied to the co
 - Store the raw source anywhere: the canary-comment test fails.
 - Let apply create a bot, agent, capability or gate: the whole-database footprint test fails.
 - Drop the receipt's `WHERE changes() = 1` flip guard: the claim-lost test fails. Drop its UNIQUE key: the crash-resume test fails.
-- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the future-skew bound, the single timestamp spelling, the race-branch provenance checks, the lease fence, the owner recovery: the round-2 tests fail.
+- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the future-skew bound, the single timestamp spelling, the race-branch provenance checks, the lease fence, the owner recovery: the round-2 tests fail. (The `created_by_member_id` clause in the takeover `UPDATE` is redundant with the no-takeover predicate and is documentation, not a tested mutation.)
+- Drop the flip row-count check, the weaker-edge refusal, the archived predicates, the provenance rule on claim release, canonical persistence, the `#n` occurrence suffix, or the dry-run-only presence rule: the round-5 tests fail.

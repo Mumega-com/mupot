@@ -5,7 +5,8 @@
 //
 // Secret: CONNECTOR_MASTER_KEY (64 hex chars), the existing server-only master key (already a deploy
 // prerequisite for connectors). The HMAC key is NOT the master key: it is derived with HKDF-SHA256,
-// info 'mupot_seed_accept_v1', the same derivation pattern as src/connectors/crypto.ts. Absent or
+// info 'mupot_seed_accept_v1', empty salt (src/connectors/crypto.ts shares only the HKDF-SHA256
+// construction; it salts per connector id). Absent or
 // malformed => no token is issued and apply fails closed (503 accept_token_unavailable). Rotating the
 // master key invalidates outstanding tokens (15 minute lifetime: harmless). No tokens exist in
 // production yet, so moving off the earlier direct-key scheme invalidates nothing.
