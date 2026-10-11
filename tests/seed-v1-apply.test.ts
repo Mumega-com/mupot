@@ -931,3 +931,83 @@ describe('round 5', () => {
     expect(count('presence')).toBe(1)
   })
 })
+
+describe('round 6', () => {
+  const dumpNoSeeds = () => JSON.stringify(tables().filter((t) => t !== 'project_seeds').map((t) => [t, harness.sqlite.prepare(`SELECT * FROM "${t}"`).all()]))
+  function ownedWithEdge(level: string): void {
+    harness.sqlite.exec(`
+      INSERT INTO departments (id, slug, name) VALUES ('dept-p', 'dept-projects', 'Projects');
+      INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-mine', 'mumega-com-prj', 'N', 'g', 'adm');
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id) VALUES ('sq-mine', 'dept-p', 'mumega-com-sqd', 'S', 'adm');
+      INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('p-mine', 'sq-mine', '${level}');`)
+  }
+
+  it('weak edge is refused BEFORE team_bootstrap commits: no receipt, and a second admin still cannot adopt', async () => {
+    ownedWithEdge('read')
+    const args = await full(adm)
+    const before = dumpNoSeeds()
+    expect(await call(adm, args)).toMatchObject({ ok: false, status: 409, error: 'seed_footprint_incompatible', detail: { existing_edge: 'read' } })
+    expect(dumpNoSeeds()).toBe(before)
+    expect(count('team_bootstrap_receipts')).toBe(0)
+    const second = await invokeTool(adm2, env, 'team_bootstrap', { slug_base: 'mumega-com', name: 'X', department: 'dept-p' }, 'https://pot.test')
+    expect(second).toMatchObject({ ok: false, error: 'project_slug_taken' })
+  })
+
+  it('a write edge is refused the same way', async () => {
+    ownedWithEdge('write')
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_footprint_incompatible', detail: { existing_edge: 'write' } })
+    expect(count('team_bootstrap_receipts')).toBe(0)
+  })
+
+  it('after an edge refusal the claim is resumable at once (no lease wait) once the edge is raised by hand', async () => {
+    ownedWithEdge('read')
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_footprint_incompatible' })
+    expect((harness.sqlite.prepare('SELECT lease_expires_at AS l FROM project_seeds').get() as { l: string }).l <= new Date().toISOString()).toBe(true)
+    harness.sqlite.exec("UPDATE project_squad_access SET access_level = 'admin'")
+    expect(okResult(await apply(adm))).toMatchObject({ ok: true, replay: false, status: 'applied' })
+  })
+
+  it('squad race: a caller-owned ARCHIVED squad that appears before our INSERT is refused', async () => {
+    const real = env.DB
+    let done = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (q: string) => {
+            if (!done && /INSERT INTO squads/.test(q)) {
+              done = true
+              harness.sqlite.exec(`INSERT INTO squads (id, department_id, slug, name, created_by_member_id, status)
+                SELECT 'sq-arch', id, 'mumega-com-sqd', 'A', 'adm', 'archived' FROM departments WHERE slug = 'dept-projects'`)
+            }
+            return target.prepare(q)
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+    expect(await apply(adm)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(done).toBe(true)
+    expect(count('project_squad_access')).toBe(0)
+  })
+
+  it('core: under require_provenance a foreign ARCHIVED project is the generic project_slug_taken, not project_archived; a caller-owned archived squad is refused', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id, status) VALUES ('p-fa', 'mumega-com-prj', 'F', 'g', 'adm2', 'archived')`)
+    const { teamBootstrap } = await import('../src/org/team-bootstrap')
+    const input = { slug_base: 'mumega-com', name: 'N', department: 'dept', bot: { enabled: false }, humans: [] }
+    expect(await teamBootstrap(env, adm, { ...input, require_provenance: true })).toMatchObject({ ok: false, error: 'project_slug_taken' })
+    expect(harness.sqlite.prepare('SELECT failure_reason AS r FROM team_bootstrap_receipts').get()).toEqual({ r: 'project_slug_taken' })
+    expect(await teamBootstrap(env, adm, input)).toMatchObject({ ok: false, error: 'project_archived' }) // flag absent: unchanged
+    harness.sqlite.exec(`DELETE FROM projects WHERE id = 'p-fa';
+      INSERT INTO squads (id, department_id, slug, name, created_by_member_id, status) VALUES ('sq-a', 'dept', 'mumega-com-sqd', 'A', 'adm', 'archived')`)
+    expect(await teamBootstrap(env, adm, { ...input, require_provenance: true })).toMatchObject({ ok: false, error: 'squad_slug_taken' })
+  })
+
+  it('takeover persists the CANONICAL owner (NFD + trailing space variant recovered by the creator)', async () => {
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-a', 'mumega-com-prj', 'N', 'g', 'adm')`)
+    await plantClaim('adm2', STALE)
+    const variant = seedText.replace('owner: site-owner', 'owner: "René "')
+    expect(okResult(await apply(adm, variant))).toMatchObject({ ok: true })
+    expect(harness.sqlite.prepare('SELECT owner_label, applied_by_member_id FROM project_seeds').get()).toEqual({ owner_label: 'René', applied_by_member_id: 'adm' })
+  })
+})

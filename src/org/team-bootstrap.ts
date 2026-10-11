@@ -627,7 +627,10 @@ export async function teamBootstrap(
   const existingProject = await findProjectBySlug(env, projectSlug)
 
   // ── project status checked BEFORE the squad is ever created (P1-1) ───────
-  if (existingProject && existingProject.status === 'archived') {
+  // Under require_provenance a project this actor did not create is never described (not even as archived):
+  // fall through to the provenance refusal below, which is the generic project_slug_taken.
+  const foreignUnderProvenance = input.require_provenance === true && existingProject?.created_by_member_id !== actorMemberId
+  if (existingProject && existingProject.status === 'archived' && !foreignUnderProvenance) {
     // P2 (kasra-review adversarial gate, 2026-09-22): this refusal used to
     // return with ZERO receipt — the only refusal in this function that
     // didn't. Receipted now, same as every other name_resolution refusal.
@@ -700,6 +703,8 @@ export async function teamBootstrap(
   }
 
   const existingSquad = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
+  // squads.status exists since migration 0173; the Squad type omits it, SELECT * returns it.
+  const isArchivedSquad = (sq: Squad): boolean => (sq as Squad & { status?: string }).status === 'archived'
 
   // ── HOME FENCE (P2-4): never adopt a home squad, even with adopt:true ────
   if (existingSquad && existingSquad.kind === 'home') {
@@ -718,6 +723,10 @@ export async function teamBootstrap(
       failureReason: 'squad_slug_taken',
     })
     return { ok: false, error: 'cannot_adopt_home_squad', detail: { squad_id: existingSquad.id, receipt_id: receiptId } }
+  }
+
+  if (existingSquad && input.require_provenance === true && isArchivedSquad(existingSquad)) {
+    return { ok: false, error: 'squad_slug_taken' }
   }
 
   let squadGround: AdoptGround | null = null
@@ -833,7 +842,7 @@ export async function teamBootstrap(
       const raced = await findSquadByDepartmentAndSlug(env, departmentId, squadSlug)
       if (!raced) return { ok: false, error: 'provisioning_failed', detail: { stage: 'squad', reason: created.error } }
       // require_provenance (seed apply): same rule as the project race above, plus the home-squad fence.
-      if (input.require_provenance === true && (raced.created_by_member_id !== actorMemberId || raced.kind === 'home')) {
+      if (input.require_provenance === true && (raced.created_by_member_id !== actorMemberId || raced.kind === 'home' || isArchivedSquad(raced))) {
         return { ok: false, error: 'squad_slug_taken' }
       }
       squad = raced

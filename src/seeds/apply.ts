@@ -271,6 +271,20 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
 
   try {
     // ── create phase: every create goes through the existing team_bootstrap core ──────────────────
+    // READ-ONLY pre-check, before team_bootstrap can commit anything (its `adopted` receipt would let any
+    // admin's team_bootstrap adopt this project later): when the caller already owns BOTH the project and the
+    // squad and the edge between them is below ADMIN, refuse now. The post-call check below stays as defence.
+    const weak = await env.DB.prepare(
+      `SELECT a.access_level AS level FROM project_squad_access a
+         JOIN projects p ON p.id = a.project_id AND p.slug = ?1 AND p.created_by_member_id = ?2
+         JOIN squads q ON q.id = a.squad_id AND q.slug = ?3 AND q.created_by_member_id = ?2
+         JOIN departments d ON d.id = q.department_id AND d.slug = ?4
+        WHERE a.access_level <> 'admin' LIMIT 1`,
+    ).bind(projectSlug, caller, squadSlug, PROJECT_SQUAD_DEPARTMENT_SLUG).first<{ level: string }>()
+    if (weak) {
+      await releaseClaim(env, claimedRowId, token, projectSlug, caller)
+      return { ok: false, status: 409, error: 'seed_footprint_incompatible', detail: { existing_edge: weak.level, needs: 'admin' } }
+    }
     const departmentId = await resolveProjectSquadDepartmentId(env, caller)
     if (!departmentId) {
       await releaseClaim(env, claimedRowId, token, projectSlug, caller)
