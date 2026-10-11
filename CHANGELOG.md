@@ -4,7 +4,7 @@
 
 > **Re-scope (2026-10-11):** `v0.32.0` is now "Agents as themselves and governed
 > autonomy": per-seat agent identity for Claude Code, Codex, and ChatGPT threads, plus
-> the loop brakes, with P0 #1565 and admin-tool disclosure (#1596, #1608, #1609) closed
+> the loop brakes, with P0 #1565 and #1608 and #1609 (the #1596 phase-1b disclosure items) closed
 > before the cut. "Compounding Project Knowledge" moves to `v0.33.0` and "Distribution
 > and Commercial Operations" to `v0.34.0`. `v0.31.1` was never a path (`release/v0.31.0`
 > was not cut). See [ROADMAP.md](ROADMAP.md) for the release contract.
@@ -1393,7 +1393,7 @@ resolved the identity/connection model into a three-tier security posture.
   MEDIUM-tier OAuth spec with 4 adversarial P0s closed (in flight, gated, not deployed).
 
 ### Fixed
-- **OAuth tenant-provisioning 503** — a stale `/home/sos` path after the mirror relocation
+- **OAuth tenant-provisioning 503** — a stale hard-coded filesystem path after the mirror relocation
   blocked ALL signups. (engine)
 - **MCP connector wrong-endpoint trap** — `/sse` rejected OAuth tokens cryptically; now
   points OAuth clients to the root URL. (mcp-dispatcher)

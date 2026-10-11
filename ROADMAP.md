@@ -32,20 +32,17 @@ auth residuals (#1583), the seat-events channel for fleet hosts and its
 hardening (#1593, #1595 — a separate, concurrent Hadi-led effort that landed
 in the same window, not originally named in this flight), an SSRF/dependency
 security fix (#1601), and the v0.31.0 version bump + native-addon identity
-backfill (#1604). Office publishing remains inert (mupot#1592, PR #1602 in
-review) and the public `/openapi.json` still discloses admin tools (PR #1603
-in review) — see CHANGELOG.md "Known limitations" for both.
+backfill (#1604). Office publishing remains inert (mupot#1592, PR #1602,
+since merged) and the public `/openapi.json` admin-tool disclosure (PR #1603, since
+merged) — see CHANGELOG.md "Known limitations" for both as they stood at the tag.
 
 Gate rule (Hadi, 2026-09-16): P0 blocks, P1 ships with a follow-up issue, two
 adversarial gate rounds maximum per artifact.
 
-This flight did not reconcile the wider `v0.31.0` capability-ledger scope
-already reserved below (canonical Mupot-to-Codex receiver, governed realtime
-push, isolated Agent Computers) — none of that shipped in it, and `v0.31.0`
-is now the tag for the Office scope above instead. The capability ledger's
-four `v0.31.0` rows further down name a version that has already shipped
-different work; reassigning them to their real target is Kasra-core's and
-Hadi's call, not made in this document.
+This flight did not reconcile the wider capability-ledger scope once reserved for
+`v0.31.0` (canonical Mupot-to-Codex receiver, governed realtime push, isolated Agent
+Computers) — none of that shipped in it. The four ledger rows were relabelled to
+`v0.33.0` on 2026-10-11; see the v0.33.0 sections and the ledger below.
 
 ### On main since v0.31.0 (not in the tag)
 
@@ -63,6 +60,8 @@ CHANGELOG; this lists what the re-scope below builds on.
   (#1819, #1822). The seat flags ship off by default.
 - Tasks: archive is an action boundary (#1778) with follow-up guards (#1781, #1789,
   #1793).
+- Public `/openapi.json` allowlist (#1603, merged 2026-09-29 after the tag): admin tools
+  are no longer disclosed to unauthenticated callers.
 - Metering: honest unmetered `flight_land` (#1737) and budget enforcement fix (#1741).
 - Harness capacity snapshots and dispatch advisory (#1766).
 - Office: write-capable connector bindings, publishing live (T2b, #1614), approval
@@ -87,8 +86,8 @@ unchanged.
 This section exists because the answer is structural, not a matter of remaining effort.
 
 The release contract in [docs/releases/next-flights.md](docs/releases/next-flights.md)
-states, correctly, that **"any merge after Flight A invalidates Flights B and C"** — the
-evidence bundle and the RC are bound to one exact SHA and no receipt rolls forward to a
+states, correctly, that any merge after the freeze invalidates the gate evidence (the
+`v0.32.0` contract, step 5) — the evidence bundle and the RC are bound to one exact SHA and no receipt rolls forward to a
 different commit. That rule is right. Evidence gathered at one commit genuinely says
 nothing about another.
 
@@ -227,8 +226,9 @@ a run of bad luck, and it should be stated as such in any estimate.
 | #1317 | Draft, held | 11 | Describes a fleet with nothing on `main` to verify the description against |
 
 
-The ordered release flights and post-stable receiver convergence are maintained in
-[docs/releases/next-flights.md](docs/releases/next-flights.md). Open #1246–#1248 and
+The ordered `v0.32.0` release steps are maintained in
+[docs/releases/next-flights.md](docs/releases/next-flights.md); receiver convergence is
+now scoped in the `v0.33.0` capability-ledger rows below. Open #1246–#1248 and
 #1253–#1254 are outside the v0.30 freeze; none may silently move the release head.
 
 **Board opinion policy:** priority ORDER is Hadi's alone — no vote, no ceremony. Board
@@ -818,21 +818,25 @@ autonomous loops run inside brakes a human controls.
 Release contract (done-when). `v0.32.0` is stable only when all six hold:
 
 1. a member's Claude Code, Codex, and ChatGPT threads each act under their own seat
-   agent with no manual token mint;
+   agent with no manual token mint, proven by the seat canary receipts recorded on the
+   flight parent (one read-only call each from Claude Code, Codex and ChatGPT under
+   `SEAT_AUTO_ENROLL=1`, seat rows read back);
 2. loop brakes (dry-run default, pause, per-task retry ceiling, human-only release) are
    deployed and covered by tests;
 3. P0 #1565 is closed;
-4. admin-tool disclosure #1596, #1608, #1609 is closed;
+4. #1608 and #1609 (the #1596 phase-1b disclosure items) are closed; #1596 itself
+   (the Cloudflare Forge adoption epic) is not required to close;
 5. one frozen SHA has two independent review lenses GREEN, CI green, and the release
-   evidence bundle;
+   evidence bundle `mupot-v032-prepublication-readiness/v1` (successor of the v0.30
+   contract; schema to be written before the freeze);
 6. `release/v0.32.0` is cut and the annotated tag and GitHub Release are published.
 
 Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
 met by the frozen SHA, not by the existence of those PRs.
 
-### v0.33.0 (with Compounding Project Knowledge): Canonical Receiver, Agent Computers, and Recovery - planned
+### v0.33.0: Compounding Project Knowledge (with the canonical receiver, realtime push, runtime receipts and Agent Computers rows) - planned
 
-Re-targeted from `v0.31.0` (which shipped as "Office") on 2026-10-11. Not required by the `v0.32.0` done-when below.
+Re-targeted from `v0.31.0` (which shipped as "Office") on 2026-10-11. Not required by the `v0.32.0` done-when above.
 
 **One promise:** Substantial flights run through one identity-bound receiver into
 isolated, recoverable computers without making one Mac, pod, receiver, or agent harness
@@ -868,7 +872,7 @@ Activation:
   after recovery and cost gates pass.
 - `reuse` and `pinned` sessions remain opt-in.
 
-### v0.33.0: Compounding Project Knowledge - planned
+#### Compounding Project Knowledge scope
 
 **One promise:** Projects improve from measured outcomes without confusing generated
 memory with evidence or allowing agents to widen their own authority.

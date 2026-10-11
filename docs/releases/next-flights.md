@@ -13,7 +13,7 @@ the v0.30 flight queue it replaces is superseded by the tags that shipped.
 | Current production | Read live `/health`; it moves independently of `main` and of tags. |
 | Latest tagged stable release | `v0.31.0` — annotated tag at `52299bab`, 2026-09-29, with GitHub Release "v0.31.0 — Office" |
 | Next stable candidate | `v0.32.0` — "Agents as themselves and governed autonomy" |
-| Branch for it | `release/v0.32.0`, not yet cut. `release/v0.31.0` was never cut; there is no `v0.31.x` patch path. |
+| Branch for it | `release/v0.32.0` (read the branch; this line does not pin it). `release/v0.31.0` was never cut; there is no `v0.31.x` patch path. |
 
 Code on `main` is not necessarily deployed; deployed code is not necessarily stable; a
 stable claim requires the exact tag, GitHub Release, deployment, release receipts, and
@@ -26,11 +26,11 @@ order and acceptance boundary. They are the release contract in ROADMAP.md.
 
 | Order | Step | Done when |
 |---|---|---|
-| 1 | Seats without manual mint | A member's Claude Code, Codex, and ChatGPT threads each act under their own seat agent with no manual token mint |
+| 1 | Seats without manual mint | A member's Claude Code, Codex, and ChatGPT threads each act under their own seat agent with no manual token mint, proven by the seat canary receipts recorded on the flight parent (one read-only call each under `SEAT_AUTO_ENROLL=1`, seat rows read back) |
 | 2 | Loop brakes | Dry-run default, pause, per-task retry ceiling, and human-only release are deployed and covered by tests |
 | 3 | Close P0 #1565 | Issue closed with the fix on `main` |
-| 4 | Close admin-tool disclosure | #1596, #1608, #1609 closed |
-| 5 | Freeze and gate | One frozen SHA; two independent review lenses GREEN; CI green; the release evidence bundle built from that SHA |
+| 4 | Close admin-tool disclosure | #1608 and #1609 (the #1596 phase-1b disclosure items) closed; #1596 itself is the Cloudflare Forge adoption epic and is not required to close |
+| 5 | Freeze and gate | One frozen SHA; two independent review lenses GREEN; CI green; the release evidence bundle `mupot-v032-prepublication-readiness/v1` built from that SHA (successor of the v0.30 contract; schema to be written before the freeze) |
 | 6 | Cut and publish | `release/v0.32.0` cut; annotated tag and GitHub Release published |
 
 Any merge after step 5 begins invalidates its evidence: land the correction through the
@@ -38,12 +38,12 @@ normal gate, re-freeze, and restart step 5.
 
 ## Evidence hygiene — read before building the aggregate bundle
 
-the host-side receipts directory for the Codex attach contains two receipts dated
+The host-side receipts directory for the Codex attach contains two receipts dated
 2026-08-30, **both `status: "fail"` with `release_sha: null`**. It is the only Host-Go-shaped
 bundle on the host, and it has neither `manifest.json` nor `cutover-gate.json`.
 
 A glob such as `*-check.json` when assembling the aggregate evidence directory **will sweep
-these in**. Exclude the path explicitly, or move it aside first. The contract's own rule —
+these in**. Exclude that directory explicitly (it holds two `status: fail` receipts with `release_sha: null`), or move it aside first. The contract's own rule —
 an unbound historical outer bundle cannot admit a bound prior bundle — means including it
 does not merely add noise, it invalidates the bundle.
 
