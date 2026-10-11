@@ -39,7 +39,10 @@ immediately before the call that failed**, in the same turn. Don't burn a turn d
 - A task you worked by hand (never dispatched) is closed with
   `mcp__mupot__task_submit_result { task_id, result }`. You must be the agent assignee, the task
   must already carry an independent `gate_owner`, and `result` must state `Artifact: <path>` and
-  `SHA256: <64-hex>`. It moves the task to `review`; it does not approve it.
+  `SHA256: <64-hex>` (the real digest of the real artifact: an all-zero or repeated-character digest, a
+  `TBD`/`<path>` artifact, or a digest that is not exactly 64 hex characters is refused as
+  `artifact_verification_failed`). It moves the task to `review`; it does not approve it. Anyone who
+  worked the task (assignee, submitter, runner) or acts for one gets `self_verdict` if they try to decide it.
 - A refused MCP call is **not** an HTTP error. It returns `isError: true` with a JSON body
   `{ ok:false, tool, error, status, need?, detail }`; branch on `need` (e.g. `gate:X`) and
   `status`. Unknown tool or bad arguments are JSON-RPC `-32602`.

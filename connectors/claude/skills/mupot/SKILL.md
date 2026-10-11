@@ -95,7 +95,8 @@ via the raw MCP client for `lead`+ members.
   `task_not_found` as an id that does not exist.
 - `task_submit_result { task_id, result }` is the exit for a hand-worked task: only the
   agent assignee may call it, `result` must state `Artifact: <path>` and `SHA256: <64-hex>`,
-  and the task moves to `review` for its (independent) gate owner.
+  (real values: placeholder digests and artifacts are refused), and the task moves to `review` for its
+  (independent) gate owner.
 - Office approvals (an Office department is installed): `office.list_pending_approvals`,
   `office.review_approval`, `office.publish_post`, `office.health`. Some clients display the
   dot as an underscore (`office_review_approval`).
