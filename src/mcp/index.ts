@@ -7126,6 +7126,12 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'grant_agent_capability',
   'create_squad',
   'project_create',
+  'routine_enable',
+  'routine_pause',
+  'routine_archive',
+  'routine_update',
+  'project_update',
+  'unarchive_row',
 ])
 
 export async function invokeTool(

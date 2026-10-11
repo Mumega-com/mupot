@@ -1,7 +1,10 @@
 import { listNeedsYou } from '../attention/service'
 import { priceUsage } from '../economy/prices'
 import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
-import { principalCanReadProject, routinePrincipal } from '../routines/access'
+import { principalCanReadProject, routinePrincipal, type RoutinePrincipal } from '../routines/access'
+import type { ElevationGrantRecord } from '../auth/elevation'
+import type { AuthContext, CapabilityGrant, Env } from '../types'
+import { memberOrElevatedAgent } from './elevated-principal'
 import { callerHoldsGateCapability } from '../tasks/index'
 import { hasCapability } from '../auth/capability'
 import { publicRoutineRun } from '../routines/public'
@@ -265,6 +268,58 @@ const routineCreate: ToolSpec = {
   },
 }
 
+type RoutinePolicyOperation = 'update' | 'enable' | 'pause' | 'archive'
+
+/**
+ * The principal a routine policy mutation (update/enable/pause/archive) runs as.
+ * A non-agent caller keeps its own principal. An agent-bound caller runs as a
+ * member-typed principal ONLY when a live action:workspace_project elevation
+ * grant covers the routine's responsible squad (an org-scope grant covers every
+ * non-home squad, exactly as hasElevatedAction defines it); the principal then
+ * carries just the standing the grant stands in for, never more. An unknown
+ * routine id and an uncovered one are refused identically, so the refusal is
+ * not an existence oracle.
+ */
+async function routinePolicyPrincipal(
+  auth: AuthContext,
+  env: Env,
+  routineId: string,
+  toolName: string,
+  operation: RoutinePolicyOperation,
+  destinationSquadId?: unknown,
+): Promise<{ ok: true; principal: RoutinePrincipal } | { ok: false; outcome: ToolOutcome }> {
+  const base = routinePrincipal(auth)
+  if (!auth.boundAgentId) return { ok: true, principal: base }
+  const row = await env.DB.prepare('SELECT responsible_squad_id FROM routines WHERE id = ?1 AND tenant = ?2 LIMIT 1')
+    .bind(routineId, env.TENANT_SLUG)
+    .first<{ responsible_squad_id: string }>()
+  const squads = [row?.responsible_squad_id ?? '']
+  if (typeof destinationSquadId === 'string' && row && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
+  let grant: ElevationGrantRecord | null = null
+  for (const squadId of squads) {
+    const acting = await memberOrElevatedAgent(auth, env, 'action:workspace_project', { type: 'squad', id: squadId }, {
+      toolName,
+      refusalCode: 'forbidden',
+      detail: { routine_id: routineId, operation, squad_id: squadId },
+    })
+    if (!acting.ok) return acting
+    if (acting.via === 'elevation') grant = grant ?? acting.grant
+  }
+  if (!grant) return { ok: false, outcome: fail(403, 'forbidden') }
+  const standing: CapabilityGrant[] = grant.scope_type === 'org'
+    ? []
+    : [{ member_id: auth.memberId ?? auth.userId, scope_type: grant.scope_type, scope_id: grant.scope_id, capability: 'admin' }]
+  return {
+    ok: true,
+    principal: {
+      ...base,
+      actor_type: 'member',
+      workspace_admin: grant.scope_type === 'org',
+      grants: [...base.grants, ...standing],
+    },
+  }
+}
+
 const routineUpdate: ToolSpec = {
   name: 'routine_update', scope: 'workspace routine policy lifecycle', min: 'admin',
   args: '{ routine_id: string, ...policy fields }',
@@ -273,9 +328,11 @@ const routineUpdate: ToolSpec = {
     const { routine_id: routineId, ...rawPolicy } = args
     const input = policy(rawPolicy, false)
     if (!validId(routineId)) return fail(404, 'routine_not_found')
-    if (routinePrincipal(auth).actor_type !== 'member') return fail(403, 'forbidden')
+    const acting = await routinePolicyPrincipal(auth, env, routineId, 'routine_update', 'update', rawPolicy.responsible_squad_id)
+    if (!acting.ok) return acting.outcome
+    if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
     if (!input) return fail(400, 'invalid_args')
-    const result = await updateRoutine(env, routinePrincipal(auth), routineId, input)
+    const result = await updateRoutine(env, acting.principal, routineId, input)
     return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
   },
 }
@@ -286,8 +343,10 @@ function lifecycle(name: 'routine_enable' | 'routine_pause' | 'routine_archive',
     inputSchema: { type: 'object', properties: { routine_id: id() }, required: ['routine_id'], additionalProperties: false },
     async run(auth, env, args) {
       if (!validId(args.routine_id)) return fail(404, 'routine_not_found')
-      if (routinePrincipal(auth).actor_type !== 'member') return fail(403, 'forbidden')
-      const result = await operation(env, routinePrincipal(auth), args.routine_id)
+      const acting = await routinePolicyPrincipal(auth, env, args.routine_id, name, name.slice('routine_'.length) as RoutinePolicyOperation) // as: name is one of the three lifecycle literals, so the suffix is a RoutinePolicyOperation
+      if (!acting.ok) return acting.outcome
+      if (acting.principal.actor_type !== 'member') return fail(403, 'forbidden')
+      const result = await operation(env, acting.principal, args.routine_id)
       return result.ok ? done({ routine: safeRoutine(result.value) }) : sourceFailure(result.error)
     },
   }

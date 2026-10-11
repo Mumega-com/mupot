@@ -36,6 +36,7 @@ import { loadProjectSituation } from '../projects/situation'
 import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
+import { memberOrElevatedAgent, type ElevationTarget } from './elevated-principal'
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
@@ -57,13 +58,14 @@ async function emitProjectMutation(
   memberId: string,
   operation: ProjectMutationOperation,
   projectId: string,
-  extra: { squad_id?: string; status?: ProjectStatus } = {},
+  extra: { squad_id?: string; status?: ProjectStatus; elevation_grant_id?: string } = {},
 ): Promise<void> {
   const event: BusEvent<{
     operation: ProjectMutationOperation
     project_id: string
     squad_id?: string
     status?: ProjectStatus
+    elevation_grant_id?: string
   }> = {
     type: 'project.mutated',
     tenant: env.TENANT_SLUG,
@@ -74,6 +76,7 @@ async function emitProjectMutation(
       project_id: projectId,
       ...(extra.squad_id ? { squad_id: extra.squad_id } : {}),
       ...(extra.status ? { status: extra.status } : {}),
+      ...(extra.elevation_grant_id ? { elevation_grant_id: extra.elevation_grant_id } : {}),
     },
     ts: new Date().toISOString(),
   }
@@ -466,6 +469,36 @@ const toolProjectContext: ToolSpec = {
   },
 }
 
+/**
+ * An agent-bound caller refused by the workspace-admin gate may change a
+ * project's STATUS (and nothing else) under a live action:project_lifecycle
+ * grant covering the org or one of the project's writable squads. Any other
+ * field, an unknown project, or a missing grant refuses with the gate's own
+ * refusal (`denied`), so nothing about the target is revealed.
+ */
+async function projectStatusElevation(
+  auth: AuthContext,
+  env: Env,
+  args: Record<string, unknown>,
+  denied: ToolOutcome,
+): Promise<{ ok: true; grantId: string } | { ok: false; outcome: ToolOutcome }> {
+  const projectId = str(args.project_id)
+  const onlyStatus = Object.keys(args).every((key) => key === 'project_id' || key === 'status')
+  if (!auth.boundAgentId || !projectId || !onlyStatus || str(args.status) === null) return { ok: false, outcome: denied }
+  const { results } = await env.DB.prepare(
+    `SELECT squad_id FROM project_squad_access WHERE project_id = ?1 AND access_level IN ('write','admin')`,
+  ).bind(projectId).all<{ squad_id: string }>()
+  const targets: ElevationTarget[] = [{ type: 'org' }, ...(results ?? []).map((r): ElevationTarget => ({ type: 'squad', id: r.squad_id }))]
+  const acting = await memberOrElevatedAgent(auth, env, 'action:project_lifecycle', targets, {
+    toolName: 'project_update',
+    refusalCode: 'forbidden',
+    detail: { project_id: projectId, status: args.status },
+  })
+  if (!acting.ok) return { ok: false, outcome: acting.outcome }
+  if (acting.via !== 'elevation') return { ok: false, outcome: denied }
+  return { ok: true, grantId: acting.grant.id }
+}
+
 const toolProjectUpdate: ToolSpec = {
   name: 'project_update',
   scope: 'workspace project lifecycle, including archive and restore',
@@ -487,8 +520,15 @@ const toolProjectUpdate: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const denied = requireWorkspaceAdmin(auth)
-    if (denied) return denied
+    const denied = requireWorkspaceAdmin(auth, 'project_update')
+    // elevationGrantId: set only when this call ran under a live
+    // action:project_lifecycle grant instead of standing workspace admin.
+    let elevationGrantId: string | undefined
+    if (denied) {
+      const elevated = await projectStatusElevation(auth, env, args, denied)
+      if (!elevated.ok) return elevated.outcome
+      elevationGrantId = elevated.grantId
+    }
     const projectId = str(args.project_id)
     if (!projectId) return fail(400, 'invalid_project_id')
     const { project_id: _projectId, ...rawInput } = args
@@ -498,6 +538,9 @@ const toolProjectUpdate: ToolSpec = {
     // Slice 3: planned→active must go through start-gate (authorize + provision).
     if (str(input.status) === 'active') {
       const existing = await getProject(env, projectId)
+      // The start gate provisions a squad and an agent; an elevated caller may
+      // change a status but never trigger that provisioning.
+      if (existing?.status === 'planned' && elevationGrantId) return denied ?? fail(403, 'forbidden')
       if (existing?.status === 'planned') {
         const started = await startProject(env, projectId, defaultStartGateDeps(auth.memberId ?? null))
         if (!started.ok) {
@@ -521,7 +564,10 @@ const toolProjectUpdate: ToolSpec = {
 
     const result = await updateProject(env, projectId, input)
     if (!result.ok) return mutationFailure(result.error)
-    await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, { status: result.value.status })
+    await emitProjectMutation(env, auth.memberId as string, 'updated', result.value.id, {
+      status: result.value.status,
+      ...(elevationGrantId ? { elevation_grant_id: elevationGrantId } : {}),
+    })
     return done({ project: result.value })
   },
 }
