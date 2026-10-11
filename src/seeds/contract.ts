@@ -11,7 +11,11 @@ export const SEED_MAX_DEPTH = 6
 export const SEED_MAX_SEATS = 8
 export const SEED_MAX_LIST = 50
 // Per-field character caps (documented in docs/architecture/seed-v1.md; a test pins doc == code).
-export const SEED_CAPS = { name: 120, goal: 1000, repo: 300, live: 300, cmd: 300, cron: 100 } as const
+export const SEED_CAPS = {
+  name: 120, goal: 1000, repo: 300, live: 300, cmd: 300, cron: 100,
+  owner: 120, receipt: 300, surfacePath: 200, surfaceType: 100, dataStore: 200,
+  tool: 300, gateField: 120, routineId: 120, listItem: 200,
+} as const
 
 export const SEED_KINDS = ['site/astro', 'site/wordpress', 'store/shopify', 'app', 'repo'] as const
 export const SEED_DEPLOY_VIA = ['cf-pages', 'wrangler', 'wp-plugin', 'shopify-cli', 'git-push-only'] as const

@@ -2,9 +2,14 @@
 // idempotency key the (later) apply step uses; it must not depend on key order,
 // YAML-vs-JSON source form, comments or whitespace.
 
+// The one text normalization: NFC, trailing whitespace trimmed (leading is NOT trimmed).
+export function canonicalText(value: string): string {
+  return value.normalize('NFC').trimEnd()
+}
+
 function sortValue(value: unknown): unknown {
   // NFC + no trailing whitespace: visually identical text must hash identically.
-  if (typeof value === 'string') return value.normalize('NFC').trimEnd()
+  if (typeof value === 'string') return canonicalText(value)
   if (Array.isArray(value)) return value.map(sortValue)
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(

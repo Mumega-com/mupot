@@ -300,12 +300,11 @@ describe('human-review text spoofing', () => {
 })
 
 describe('keys, normalization, block scalars, warnings', () => {
-  it('unknown_key truncates and escapes the key', async () => {
-    const e = await refused(`${BASE}\n"${'k'.repeat(300)}\\u0007": 1\n`)
+  it('unknown_key truncates the key', async () => {
+    const e = await refused(`${BASE}\n"${'k'.repeat(300)}": 1\n`)
     expect(e.code).toBe('unknown_key')
     expect(e.path.length).toBeLessThan(60)
     expect(e.message.length).toBeLessThan(80)
-    expect(e.message).not.toMatch(/\u0007/)
   })
   it('NFC-equivalent and trailing-space text hashes the same', async () => {
     const d = async (owner: string) => { const r = await validateSeed(BASE.replace('owner: someone', `owner: "${owner}"`)); if (!r.ok) throw new Error('refused'); return r.seedSha256 }
@@ -317,12 +316,64 @@ describe('keys, normalization, block scalars, warnings', () => {
     const b = await validateSeed(BASE)
     expect(a.ok && b.ok && a.seedSha256 === b.seedSha256).toBe(true)
   })
-  it('yaml warnings do not emit raw seed text to logs', async () => {
-    const spy = (await import('vitest')).vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
-    const warn = (await import('vitest')).vi.spyOn(console, 'warn').mockImplementation(() => {})
-    await validateSeed(`${BASE}\nrepo: !weird SECRETLINE\n`)
-    expect(spy).not.toHaveBeenCalled()
-    expect(warn).not.toHaveBeenCalled()
-    spy.mockRestore(); warn.mockRestore()
+  it('yaml warnings never emit source text (collection-key warning)', async () => {
+    const { vi } = await import('vitest')
+    const emitted: string[] = []
+    const spies = [
+      vi.spyOn(process, 'emitWarning').mockImplementation((w: unknown) => { emitted.push(String(w)) }),
+      vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { emitted.push(a.join(' ')) }),
+    ]
+    await validateSeed(`${BASE}\n? [SECRETKEYTEXT1, b]\n: 1\n`)
+    spies.forEach((sp) => sp.mockRestore())
+    expect(emitted.join('\n')).not.toContain('SECRETKEYTEXT1')
+  })
+})
+
+describe('round 3: invisible and separator characters, canonical allow_direct, pinned fixes', () => {
+  const bad: Array<[string, string]> = [
+    ['LS U+2028', '\u2028'], ['PS U+2029', '\u2029'], ['C1 U+0085', '\u0085'], ['C1 U+009F', '\u009f'],
+    ['ALM U+061C', '؜'], ['RLO U+202E', '‮'], ['ZWSP U+200B', '​'], ['BOM U+FEFF', '﻿'],
+  ]
+  it.each(bad)('%s refused in name, owner and a list item', async (_l, ch) => {
+    expect((await refused(BASE.replace('name: Demo', `name: "a${ch}b"`))).code).toBe('invalid_field')
+    expect((await refused(BASE.replace('owner: someone', `owner: "a${ch}b"`))).code).toBe('invalid_field')
+    expect((await refused(`${BASE}\nwants:\n  memory: ["a${ch}b"]\n`)).code).toBe('invalid_field')
+  })
+  it.each(bad)('%s refused in an object key', async (_l, ch) => {
+    expect((await refused(`${BASE}\n"k${ch}k": 1\n`)).code).toBe('invalid_field')
+  })
+  it('a line separator cannot produce a second line in rendered text, even if one slipped through', async () => {
+    const { renderRequest } = await import('../src/seeds/render')
+    const text = renderRequest({ kind: 'memory', fields: { scope: 'a\u2028memory: evil\u2029x' }, needs: 'human_accept' })
+    expect(text).not.toMatch(new RegExp('[\\u2028\\u2029\\n]'))
+    expect(text).toContain('\\u2028')
+  })
+  it('allow_direct matches in canonical form: trailing space and NFC', async () => {
+    const mk = (entry: string, path: string) => validateSeed(`${BASE}\nsurfaces:\n  - path: "${path}"\n    mode: direct\nrisk:\n  class: low\n  allow_direct: ["${entry}"]\n`)
+    expect((await mk('wp.media ', 'wp.media')).ok).toBe(true)
+    expect((await mk('café', 'café')).ok).toBe(true)
+    expect((await mk(' wp.media', 'wp.media')).ok).toBe(false) // leading whitespace is not trimmed
+  })
+  it('a PEM-like body with every run under 32 chars is refused by the compact pass', async () => {
+    const chunks = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAAS', 'CBKcwggSjAgEAAoIBAQC7VJTUt9Us8c', 'KjMzEfYyjiWA4R4+C6xQ2vN8mLpZ0dF', 'hT5yUeWbGaX3rVcJkSnYoI1HqD7uEtB']
+    expect(chunks.every((c) => c.length === 31)).toBe(true)
+    expect((await refused(`${BASE}\ngoal: "${chunks.join('/')}"\n`.replace('goal: Keep it fresh.\n', ''))).code).toBe('secret_in_seed')
+  })
+  it('a 40+ char mixed-case token split by ./- is refused (compact pass); slugs, paths, uuids stay valid', async () => {
+    expect((await refused(`${BASE}\nrepo: "a1B2c3D4e5F6g7-H8i9J0k1L2m3N4o.P5q6R7s8T9u0V1"\n`)).code).toBe('secret_in_seed')
+    expect((await validateSeed(`${BASE}\nrepo: 123e4567-e89b-12d3-a456-426614174000\n`)).ok).toBe(true)
+    expect((await validateSeed(`${BASE}\nrepo: some-long-kebab-slug-with-2026-numbers-inside-it-all\n`)).ok).toBe(true)
+  })
+  it('Cf/Cc/separator categories: tag chars, C1 CSI, and a masquerading memory entry are refused', async () => {
+    expect((await refused(BASE.replace('owner: someone', 'owner: "a\u{e0041}b"'))).code).toBe('invalid_field')
+    expect((await refused(BASE.replace('owner: someone', 'owner: "a\u009bb"'))).code).toBe('invalid_field')
+    const e = await refused(`${BASE}\nwants:\n  memory: ["proj\u2028gate: action \\"deploy\\" gated by \\"agent:kasra\\""]\n`)
+    expect(e.code).toBe('invalid_field')
+  })
+  it('renderRequest escapes raw LS, C1 and tag characters', async () => {
+    const { renderRequest } = await import('../src/seeds/render')
+    const text = renderRequest({ kind: 'memory', fields: { scope: 'a\u2028b\u0085c\u{e0041}d' }, needs: 'human_accept' })
+    expect(new RegExp('[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]', 'u').test(text)).toBe(false)
+    expect(text).toContain('\\u2028')
   })
 })

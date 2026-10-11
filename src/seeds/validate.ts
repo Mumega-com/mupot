@@ -9,7 +9,7 @@ import {
   SEED_SEAT_CAPABILITIES, SEED_SLUG_RE, SEED_SURFACE_MODES,
   type SeedError, type SeedErrorCode, type SeedRequest, type SeedV1, type SeedValidation,
 } from './contract'
-import { canonicalSeedJson, seedSha256 } from './canonical'
+import { canonicalSeedJson, canonicalText, seedSha256 } from './canonical'
 
 class SeedFail extends Error {
   constructor(readonly detail: SeedError) { super(detail.message) }
@@ -23,9 +23,10 @@ function refuse(code: SeedErrorCode, path: string, message: string): never {
 // seed names a cred_slot, a human binds the value elsewhere).
 const SECRET_KEY_RE = /(?:^|[_\-.])(?:grants?|tokens?|secrets?|passwords?|passwd|api[_-]?keys?|apikeys?|credentials?|private[_-]?keys?|bearer|authorization|auth[_-]?header)(?:$|[_\-.])/i
 
-// Value shapes. Mirrors scripts/no-secrets.mjs (that file is a node-only CLI, not an
-// importable lib, and this module must run in a Worker). Keep the two in step.
-const SECRET_VALUE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
+// Value shapes. scripts/no-secrets.mjs is a node-only CLI (not importable into a Worker), so
+// the two lists are kept in step by tests/seed-v1-patterns.test.ts: a pattern added to either
+// side fails that test until it is classified as shared or validator-only.
+export const SECRET_VALUE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
   { label: 'OpenAI-style key', re: /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}/ },
   { label: 'GitHub token', re: /(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}/ },
   { label: 'JWT', re: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
@@ -44,9 +45,6 @@ const SECRET_VALUE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
 // ARE in it (Cloudflare/Google style tokens), so a run counts only when it is mixed-case or has
 // no separators; a lowercase kebab slug with a digit (demo-site-2026-redesign) is not a secret.
 const OPAQUE_RUN_RE = /(?<![A-Za-z0-9+_-])[A-Za-z0-9+_-]{32,}={0,2}(?![A-Za-z0-9+_-])/g
-// A whole value that is a base64 body (e.g. a PEM body without its header): long, mixed case,
-// and few slashes (a path has far more).
-const BASE64_BODY_RE = /^[A-Za-z0-9+/]{64,}={0,2}$/
 
 function opaqueLike(run: string): boolean {
   if (!/\d/.test(run) || !/[A-Za-z]/.test(run)) return false
@@ -70,9 +68,16 @@ function looksSecret(value: string): string | null {
     const c = looksSecretOnce(compact)
     if (c) return c
   }
-  if (BASE64_BODY_RE.test(compact) && /\d/.test(compact) && /[a-z]/.test(compact) && /[A-Z]/.test(compact)) {
-    const slashes = (compact.match(/\//g) ?? []).length
-    if (slashes <= compact.length / 16) return 'base64 body'
+  // Compact pass: separators `./-` must not split a token below the floor. Only mixed-case or
+  // pure-hex runs of 40+ count, so lowercase kebab slugs and plain paths stay valid.
+  const squashed = compact.replace(/[./-]/g, '')
+  if (squashed !== compact) {
+    for (const run of squashed.matchAll(/[A-Za-z0-9+_]{40,}/g)) {
+      const r = run[0]
+      const hex = /^[0-9a-f]+$/.test(r) && /\d/.test(r) && /[a-f]/.test(r)
+      const mixed = /\d/.test(r) && /[a-z]/.test(r) && /[A-Z]/.test(r)
+      if (hex || mixed) return 'opaque high-entropy string'
+    }
   }
   return null
 }
@@ -102,6 +107,7 @@ function scanForSecrets(value: unknown, path: string, depth: number): void {
   if (value !== null && typeof value === 'object') {
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) { // as: parsed plain data
       const childPath = path ? `${path}.${safeKey(key)}` : safeKey(key)
+      if (CONTROL_RE.test(key) || SPOOF_RE.test(key)) refuse('invalid_field', childPath, 'key contains control or invisible characters')
       if (looksSecret(key)) refuse('secret_in_seed', childPath, 'a key looks like a secret value')
       if (SECRET_KEY_RE.test(key)) refuse('secret_in_seed', childPath, `key "${safeKey(key)}" names authority; a seed never declares grants, tokens or credentials`)
       scanForSecrets(child, childPath, depth + 1)
@@ -121,9 +127,10 @@ function asRecord(value: unknown, path: string, allowed: readonly string[]): Rec
 }
 
 // eslint-disable-next-line no-control-regex -- deliberate: reject control characters in seed text
-const CONTROL_RE = /[\u0000-\u001f\u007f]/
+const CONTROL_RE = /\p{Cc}/u // C0, DEL, C1 (incl. U+0085)
 // Zero-width and bidi-control characters let author text spoof what a human reviews.
-const SPOOF_RE = /[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/
+// Cf = zero-width, bidi, U+061C, tag chars (U+E0000..); Zl/Zp = U+2028/U+2029.
+const SPOOF_RE = /[\p{Cf}\p{Zl}\p{Zp}]/u
 
 function text(input: unknown, path: string, max: number, required = true): string | undefined {
   if (input === undefined) {
@@ -153,7 +160,7 @@ function list(value: unknown, path: string): unknown[] {
   return value
 }
 
-function textList(value: unknown, path: string, max = 200): string[] | undefined {
+function textList(value: unknown, path: string, max: number = SEED_CAPS.listItem): string[] | undefined {
   if (value === undefined) return undefined
   return list(value, path).map((item, i) => text(item, `${path}[${i}]`, max) as string) // as: required=true never returns undefined
 }
@@ -178,7 +185,7 @@ function validateStructure(root: Rec): SeedV1 {
   seed.name = text(root.name, 'name', SEED_CAPS.name)
   seed.kind = oneOf(root.kind, 'kind', SEED_KINDS)
   seed.goal = text(root.goal, 'goal', SEED_CAPS.goal)
-  seed.owner = text(root.owner, 'owner', 120) // a label only; never resolved to a member here
+  seed.owner = text(root.owner, 'owner', SEED_CAPS.owner) // a label only; never resolved to a member here
   const repo = text(root.repo, 'repo', SEED_CAPS.repo, false)
   if (repo !== undefined) seed.repo = repo
   const live = httpsUrl(root.live, 'live')
@@ -190,7 +197,7 @@ function validateStructure(root: Rec): SeedV1 {
     const out: Rec = { via: oneOf(d.via, 'deploy.via', SEED_DEPLOY_VIA), human_only: true }
     const cmd = text(d.cmd, 'deploy.cmd', SEED_CAPS.cmd, false)
     if (cmd !== undefined) out.cmd = cmd
-    const receipt = text(d.receipt, 'deploy.receipt', 300, false)
+    const receipt = text(d.receipt, 'deploy.receipt', SEED_CAPS.receipt, false)
     if (receipt !== undefined) out.receipt = receipt
     seed.deploy = out
   }
@@ -213,10 +220,12 @@ function validateStructure(root: Rec): SeedV1 {
       if ((s.path === undefined) === (s.type === undefined)) refuse('invalid_field', p, 'exactly one of path or type is required')
       const mode = oneOf(s.mode, `${p}.mode`, SEED_SURFACE_MODES)
       const out: Rec = { mode }
-      const id = s.path !== undefined ? text(s.path, `${p}.path`, 200) as string : text(s.type, `${p}.type`, 100) as string
+      const id = s.path !== undefined ? text(s.path, `${p}.path`, SEED_CAPS.surfacePath) as string : text(s.type, `${p}.type`, SEED_CAPS.surfaceType) as string
       if (s.path !== undefined) out.path = id; else out.type = id
       // direct is refused by default; only an explicit risk.allow_direct entry opens it.
-      if (mode === 'direct' && !allowDirect.includes(id)) {
+      // Compared in canonical form (NFC, trailing whitespace trimmed) on both sides: an entry that
+      // hashes the same as the surface also matches it. Matches both path and type values.
+      if (mode === 'direct' && !allowDirect.some((a) => canonicalText(a) === canonicalText(id))) {
         refuse('direct_not_allowed', `${p}.mode`, `direct mode for "${id}" requires it to be listed in risk.allow_direct`)
       }
       return out
@@ -227,7 +236,7 @@ function validateStructure(root: Rec): SeedV1 {
   if (root.data !== undefined) {
     const data = list(root.data, 'data').map((raw, i) => {
       const d = asRecord(raw, `data[${i}]`, ['store', 'tier'])
-      return { store: text(d.store, `data[${i}].store`, 200), tier: oneOf(d.tier, `data[${i}].tier`, SEED_DATA_TIERS) }
+      return { store: text(d.store, `data[${i}].store`, SEED_CAPS.dataStore), tier: oneOf(d.tier, `data[${i}].tier`, SEED_DATA_TIERS) }
     })
     if (data.length > 0) seed.data = data
   }
@@ -238,8 +247,8 @@ function validateStructure(root: Rec): SeedV1 {
       const t = asRecord(raw, p, ['mcp', 'openapi', 'cred_slot'])
       if ((t.mcp === undefined) === (t.openapi === undefined)) refuse('invalid_field', p, 'exactly one of mcp or openapi is required')
       const out: Rec = {}
-      if (t.mcp !== undefined) out.mcp = text(t.mcp, `${p}.mcp`, 300)
-      else out.openapi = text(t.openapi, `${p}.openapi`, 300)
+      if (t.mcp !== undefined) out.mcp = text(t.mcp, `${p}.mcp`, SEED_CAPS.tool)
+      else out.openapi = text(t.openapi, `${p}.openapi`, SEED_CAPS.tool)
       if (t.cred_slot !== undefined) {
         // A SLOT NAME only. Never looked up, never resolved, never validated against a vault here.
         if (typeof t.cred_slot !== 'string' || !CRED_SLOT_RE.test(t.cred_slot)) {
@@ -260,7 +269,7 @@ function validateStructure(root: Rec): SeedV1 {
     if (w.gates !== undefined) {
       const gates = list(w.gates, 'wants.gates').map((raw, i) => {
         const g = asRecord(raw, `wants.gates[${i}]`, ['action', 'gate'])
-        return { action: text(g.action, `wants.gates[${i}].action`, 120), gate: text(g.gate, `wants.gates[${i}].gate`, 120) }
+        return { action: text(g.action, `wants.gates[${i}].action`, SEED_CAPS.gateField), gate: text(g.gate, `wants.gates[${i}].gate`, SEED_CAPS.gateField) }
       })
       if (gates.length > 0) out.gates = gates
     }
@@ -270,7 +279,7 @@ function validateStructure(root: Rec): SeedV1 {
         const r = asRecord(raw, p, ['id', 'cron', 'approval'])
         const cron = text(r.cron, `${p}.cron`, SEED_CAPS.cron) as string
         if (!/^\S+(?: \S+){4}$/.test(cron) || !/^[0-9A-Za-z*/,\-? ]+$/.test(cron)) refuse('invalid_field', `${p}.cron`, 'expected a five-field cron expression')
-        return { id: text(r.id, `${p}.id`, 120), cron, approval: r.approval === undefined ? 'human_accept' : oneOf(r.approval, `${p}.approval`, SEED_ROUTINE_APPROVALS) } // default materialized: digest stable
+        return { id: text(r.id, `${p}.id`, SEED_CAPS.routineId), cron, approval: r.approval === undefined ? 'human_accept' : oneOf(r.approval, `${p}.approval`, SEED_ROUTINE_APPROVALS) } // default materialized: digest stable
       })
       if (routines.length > 0) out.routines = routines
     }

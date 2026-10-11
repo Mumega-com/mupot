@@ -4,7 +4,14 @@
 
 import type { SeedRequest } from './contract'
 
-const q = (v: string): string => JSON.stringify(v)
+// JSON.stringify leaves U+2028/U+2029 and C1 controls raw. Escape every control, format and
+// separator character so a rendered line can never carry an invisible or line-breaking char.
+const INVISIBLE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
+const esc = (c: string): string => {
+  const cp = c.codePointAt(0) ?? 0
+  return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`
+}
+const q = (v: string): string => JSON.stringify(v).replace(INVISIBLE_RE, esc)
 
 export function renderRequest(r: SeedRequest): string {
   const f = r.fields
