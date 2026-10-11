@@ -76,11 +76,16 @@ export async function isMemberAffiliatedWithAssigneeAgent(
  * JS pre-check (evaluateVerdictGates) and the write-time guard inside buildVerdictStatements'
  * UPDATE WHERE. `@D` / `@T` are decider / task-id markers resolved by compileVerdictIndependenceSql.
  */
+// Only stages where the agent / credential member actually RAN the work make it a party.
+// 'reset_terminated' is an operator's administrative marker (adminResetDispatchLease records the
+// operator's member id on it); counting it would lock the admin who reset a lease out of deciding.
+const RAN_STAGES = "pr.stage IN ('runtime_consumed', 'completed', 'failed')"
+
 function partyAgentSources(): Array<{ from: string; agentCol: string }> {
   return [
     { from: 'tasks pt WHERE pt.id = @T AND pt.assignee_agent_id IS NOT NULL', agentCol: 'pt.assignee_agent_id' },
     { from: 'task_result_submissions ps WHERE ps.task_id = @T', agentCol: 'ps.submitted_by_agent_id' },
-    { from: 'task_dispatch_runtime_receipts pr WHERE pr.task_id = @T', agentCol: 'pr.agent_id' },
+    { from: `task_dispatch_runtime_receipts pr WHERE pr.task_id = @T AND ${RAN_STAGES}`, agentCol: 'pr.agent_id' },
   ]
 }
 
@@ -88,7 +93,7 @@ function directConflictSqlRaw(): string {
   return `(
     EXISTS (SELECT 1 FROM tasks dt WHERE dt.id = @T AND (dt.assignee_agent_id = @D OR dt.assignee_member_id = @D))
     OR EXISTS (SELECT 1 FROM task_result_submissions ds WHERE ds.task_id = @T AND ds.submitted_by_agent_id = @D)
-    OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts dr WHERE dr.task_id = @T AND (dr.agent_id = @D OR dr.member_id = @D))
+    OR EXISTS (SELECT 1 FROM task_dispatch_runtime_receipts dr WHERE dr.task_id = @T AND dr.stage IN ('runtime_consumed', 'completed', 'failed') AND (dr.agent_id = @D OR dr.member_id = @D))
   )`
 }
 

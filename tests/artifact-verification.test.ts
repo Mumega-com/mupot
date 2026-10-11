@@ -136,3 +136,60 @@ describe('verifyTaskArtifactShape — placeholder receipts (policy rule 2)', () 
     }
   })
 })
+
+// Round 2: real results that passed before must still pass; only true placeholders are refused.
+describe('verifyTaskArtifactShape — false-positive guard', () => {
+  const HEX = VALID_SHA
+  const res = (artifact: string, shaLine: string) => `Done.\nArtifact: ${artifact}\n${shaLine}`
+
+  it('accepts a markdown link, a parenthesised path, backticks and a URL autolink, recording the TARGET', () => {
+    const cases: Array<[string, string]> = [
+      ['[report.md](docs/report.md)', 'docs/report.md'],
+      ['[my final report](docs/report.md)', 'docs/report.md'],
+      ['(docs/report.md)', 'docs/report.md'],
+      ['(docs/report.md).', 'docs/report.md'],
+      ['`docs/report.md`', 'docs/report.md'],
+      ['<https://x.example/z/report.md>', 'https://x.example/z/report.md'],
+    ]
+    for (const [written, target] of cases) {
+      expect(verifyTaskArtifactShape(res(written, `SHA256: ${HEX}`)), written).toMatchObject({ verified: true, path: target })
+    }
+  })
+
+  it('still refuses true placeholders, also when wrapped', () => {
+    for (const bad of ['<path>', '[artifact]', '{file}', '${X}', 'path/to/file.md', 'TBD', 'N/A', '(tbd)', '`TBD`', '[x](TBD)', '[x](path/to/file)', '<tbd>', '<report>', '<artifact-path>']) {
+      expect(verifyTaskArtifactShape(res(bad, `SHA256: ${HEX}`)), bad).toMatchObject({ verified: false })
+    }
+    expect(verifyTaskArtifactShape(`Done.\nArtifact:\nSHA256: ${HEX}`)).toMatchObject({ verified: false, reason: 'artifact_placeholder' })
+  })
+
+  it('tolerates prose and non-primary labels, a sha256:/sha256- prefix, a -dirty suffix, and a value on the next line', () => {
+    const ok = [
+      `SHA256: ${HEX}\nSHA256: see above`,
+      `SHA256: ${HEX}\nCommit SHA256: abc1234`,
+      `SHA256: sha256:${HEX}`,
+      `SHA256: sha256-${HEX}`,
+      `SHA256: ${HEX}-dirty`,
+      `SHA256:\n${HEX}`,
+      `SHA256: \`${HEX}\``,
+      `- SHA256: ${HEX}.`,
+    ]
+    for (const sha of ok) expect(verifyTaskArtifactShape(res('/tmp/out.txt', sha)), sha).toMatchObject({ verified: true, sha256Claimed: HEX })
+  })
+
+  it('prose alone is not a claim; hash attempts and placeholders stay refused', () => {
+    expect(verifyTaskArtifactShape(res('/tmp/out.txt', 'SHA256: see above'))).toMatchObject({ verified: false, reason: 'sha256_not_claimed' })
+    const bad: Array<[string, string]> = [
+      [`SHA256: ${'0'.repeat(64)}`, 'sha256_placeholder'],
+      [`SHA256: sha256:${'0'.repeat(64)}`, 'sha256_placeholder'],
+      [`SHA256: ${'ab'.repeat(32)}-dirty`, 'sha256_placeholder'],
+      [`SHA256: ${HEX.slice(1)}`, 'sha256_malformed'],
+      [`SHA256: ${HEX}0`, 'sha256_malformed'],
+      ['SHA256: abc1234', 'sha256_malformed'], // primary label, short hex
+      ['SHA256: TBD', 'sha256_malformed'],
+      ['SHA256: <hash>', 'sha256_malformed'],
+      [`SHA256: ${HEX}\nSHA256: ${'f'.repeat(64)}`, 'sha256_placeholder'],
+    ]
+    for (const [sha, reason] of bad) expect(verifyTaskArtifactShape(res('/tmp/out.txt', sha)), sha).toMatchObject({ verified: false, reason })
+  })
+})

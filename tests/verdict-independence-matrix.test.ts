@@ -179,6 +179,35 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     expect(note).toContain('self_verdict_override')
   })
 
+  it('an operator who RESET the dispatch lease (reset_terminated records their member id) can still decide; a real runner still cannot', async () => {
+    seedWorld(harness.sqlite)
+    harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('OPS', 'ops@test.com', 'OPS', 'active', ?)`).run(TENANT)
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO task_dispatch_runtime_receipts (id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id, stage, attempt,
+         runtime_address, runtime_receipt_hash, request_digest, result, reason, audit_entry_id, created_at)
+       VALUES ('rr-reset', ?, 'dr-1', ?, 'A', 'm', 'OPS', 'c', 'reset_terminated', 1, 'operator', ?, ?, NULL, 'operator reset', 'audit-reset', datetime('now'))`,
+    ).run(TENANT, TASK, '4e'.repeat(32), '6f'.repeat(32))
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+    const ops = await decide(env, memberAuth('OPS', 'admin'))
+    expect(ops.ok, JSON.stringify(ops)).toBe(true)
+  })
+
+  it('a non-admin holder who only appears on a reset_terminated receipt is not a runner either', async () => {
+    seedWorld(harness.sqlite)
+    harness.sqlite.prepare(`INSERT INTO members (id, email, display_name, status, tenant) VALUES ('OPS2', 'o2@test.com', 'OPS2', 'active', ?)`).run(TENANT)
+    harness.sqlite.prepare(`INSERT INTO gate_grants (id, capability, principal_type, principal_id, granted_by, created_at) VALUES ('g-ops2', ?, 'member', 'OPS2', 'granter', datetime('now'))`).run(GATE)
+    harness.sqlite.exec('PRAGMA foreign_keys = OFF')
+    harness.sqlite.prepare(
+      `INSERT INTO task_dispatch_runtime_receipts (id, tenant, dispatch_receipt_id, task_id, agent_id, message_id, member_id, credential_id, stage, attempt,
+         runtime_address, runtime_receipt_hash, request_digest, result, reason, audit_entry_id, created_at)
+       VALUES ('rr-reset2', ?, 'dr-1', ?, 'A', 'm', 'OPS2', 'c', 'reset_terminated', 1, 'operator', ?, ?, NULL, 'operator reset', 'audit-reset2', datetime('now'))`,
+    ).run(TENANT, TASK, '4e'.repeat(32), '6f'.repeat(32))
+    harness.sqlite.exec('PRAGMA foreign_keys = ON')
+    expect((await decide(env, memberAuth('OPS2'))).ok).toBe(true)
+    // (the genuine runner MR stays refused: see the REFUSED cases above, same fixture)
+  })
+
   it('the gate:agent-self-completion lane waives independence by design (the completing agent closes it)', async () => {
     seedWorld(harness.sqlite, { gateOwner: 'gate:agent-self-completion' })
     const res = await decide(env, agentAuth('A'))
