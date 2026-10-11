@@ -28,8 +28,9 @@ describe('hasRegisteredDeliverySurface (mupot#1494 round 2, P1-e)', () => {
     expect(hasRegisteredDeliverySurface(route({ presenceMode: 'poll', runtime: '', live: false }))).toBe(true)
   })
 
-  it('true for ANY declared runtime, even if currently stale (registered != live)', () => {
-    expect(hasRegisteredDeliverySurface(route({ runtime: 'claude-code', live: false }))).toBe(true)
+  it('a declared runtime counts only with live presence (S2 round 2: a seat-filled runtime must not strand a forced inbox)', () => {
+    expect(hasRegisteredDeliverySurface(route({ runtime: 'claude-code', live: false }))).toBe(false)
+    expect(hasRegisteredDeliverySurface(route({ runtime: 'claude-code', live: true }))).toBe(true)
   })
 
   it('false for presence_mode=resident with no runtime declared (a cleared/de-registered row)', () => {
@@ -75,9 +76,9 @@ describe('resolveDispatchDeliveryMode (mupot#1494)', () => {
     expect(mode).toBe('in_worker')
   })
 
-  it('forceInbox=true against a STALE-BUT-REGISTERED resident (runtime declared, not live) -> inbox — this is what force is FOR', () => {
-    const mode = resolveDispatchDeliveryMode(route({ runtime: 'claude-code', live: false }), true)
-    expect(mode).toBe('inbox')
+  it('forceInbox=true against a runtime-declared but NOT live row -> in_worker (S2 round 2: no presence, no forced inbox); with presence -> inbox', () => {
+    expect(resolveDispatchDeliveryMode(route({ runtime: 'claude-code', live: false }), true)).toBe('in_worker')
+    expect(resolveDispatchDeliveryMode(route({ runtime: 'claude-code', live: true }), true)).toBe('inbox')
   })
 
   it('forceInbox=true against a presence_mode=resident row with no runtime (cleared/de-registered) -> in_worker', () => {

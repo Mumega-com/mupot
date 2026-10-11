@@ -5649,13 +5649,15 @@ const toolCheckIn: ToolSpec = {
     // (7-axis display text) is deliberately NOT consulted. Runs before the KV debounce so every
     // call reaches it; the UPDATE is a no-op once the runtime is set.
     if (auth.seatBinding && auth.boundAgentId) {
-      const held = await loadHarness(env, auth.seatBinding.humanMemberId, auth.seatBinding.harnessId)
+      // Fail-soft (registry.ts promises it): a D1 error in the loader must never fail check_in.
+      const held = await loadHarness(env, auth.seatBinding.humanMemberId, auth.seatBinding.harnessId).catch(() => null)
       if (held) {
         await persistSeatRuntimeFromHarness(env, {
           agentId: auth.boundAgentId,
           harnessId: held.id,
           harnessMemberId: held.member_id,
           harnessKind: held.kind,
+          harnessCredentialKind: held.credential_kind,
         })
       }
     }

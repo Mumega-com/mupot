@@ -102,10 +102,15 @@ type DispatchRoute = Pick<FleetAgentRouteInfo, 'runtime' | 'live' | 'presenceMod
  * all, or one that never declared a runtime and was never poll-registered: genuinely no known
  * identity to strand a message on. This is DELIBERATELY LOOSER than "currently live" — it is
  * the eligibility test for `delivery:'inbox'` forcing (see resolveDispatchDeliveryMode), not
- * the natural (unforced) routing predicate.
+ * the natural (unforced) routing predicate. S2 round 2: a runtime without live presence no
+ * longer qualifies (see body).
  */
 export function hasRegisteredDeliverySurface(route: DispatchRoute): boolean {
-  return route.presenceMode === 'poll' || route.runtime !== ''
+  // S2 round 2 (P2-a): a filled `runtime` alone is no longer a surface. check_in now fills
+  // `runtime` from the seat's harness kind, so a seat that connected once and went quiet would
+  // otherwise be a forced-inbox target forever (a stranded task). A declared runtime counts only
+  // while the row is LIVE; a poll registration counts in any TTL state.
+  return route.presenceMode === 'poll' || (route.runtime !== '' && route.live)
 }
 
 /**

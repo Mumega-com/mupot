@@ -8,6 +8,7 @@
 import type { Env } from '../types'
 import { resolveCapabilities } from '../auth/capability'
 import { isValidRuntimeOrUnset, type RuntimeValue } from './runtimes'
+import { hasRegisteredKey } from './agent-keys'
 
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
 const STATUSES = new Set(['running', 'stopped', 'unknown'])
@@ -354,17 +355,19 @@ export async function clearPollFleetPresence(env: Env, agentId: string | null | 
  * Returns null when the kind names no runtime ('chatgpt', 'ci', 'other', unknown): the honest
  * answer is to leave `runtime` unset rather than guess (see src/fleet/runtimes.ts header).
  */
-export function harnessKindToRuntime(kind: string): RuntimeValue | null {
+export function harnessKindToRuntime(kind: string, credentialKind: 'oauth' | 'token' = 'oauth'): RuntimeValue | null {
   switch (kind) {
-    case 'claude':
+    // 'claude-code' exists only as a TOKEN harness kind (declared by the member). The OAuth
+    // classifier's 'claude' is a Claude Desktop / claude.ai guess from a client name: not Claude Code.
     case 'claude-code':
-      return 'claude-code'
+      return credentialKind === 'token' ? 'claude-code' : null
     case 'codex':
       return 'codex'
     case 'grok':
       return 'grok'
+    // OAuth cursor = the IDE; the token kind is the agent.
     case 'cursor':
-      return 'cursor-agent'
+      return credentialKind === 'oauth' ? 'cursor-ide' : 'cursor-agent'
     case 'gemini':
       return 'antigravity-cli'
     default:
@@ -382,22 +385,34 @@ export function harnessKindToRuntime(kind: string): RuntimeValue | null {
  *   - never touches status/last_reported_at (a runtime label is not a liveness claim),
  *   - re-checks the harness row inside the write (EXISTS on id+tenant+member+kind), so a harness
  *     deleted or re-kinded between the read and the write turns this into a no-op.
+ * Precedence (no runtime_source column exists; none added): fill-only means a daemon/signed-attach
+ * report that set a non-empty runtime always wins and is never overwritten here. A daemon that
+ * later reports '' would be refilled on the next seat check_in; documented, not guarded.
  * Fail-soft: a registry label must never break the check_in it rides on. Returns rows changed.
  */
 export async function persistSeatRuntimeFromHarness(
   env: Env,
-  input: { agentId: string | null | undefined; harnessId: string; harnessMemberId: string; harnessKind: string },
+  input: {
+    agentId: string | null | undefined
+    harnessId: string
+    harnessMemberId: string
+    harnessKind: string
+    harnessCredentialKind: 'oauth' | 'token'
+  },
 ): Promise<number> {
-  const runtime = harnessKindToRuntime(input.harnessKind)
+  const runtime = harnessKindToRuntime(input.harnessKind, input.harnessCredentialKind)
   if (!input.agentId || !runtime) return 0
   try {
+    // Mirrors boot-self-report: a key-registered agent's fleet row moves by signature only.
+    if (await hasRegisteredKey(env, input.agentId)) return 0
     const res = await env.DB.prepare(
       `UPDATE fleet_agents
           SET runtime = ?3, updated_at = datetime('now')
         WHERE tenant = ?1 AND agent_id = ?2 AND runtime = ''
           AND EXISTS (SELECT 1 FROM harnesses h
-                       WHERE h.id = ?4 AND h.tenant = ?1 AND h.member_id = ?5 AND h.kind = ?6)`,
-    ).bind(env.TENANT_SLUG, input.agentId, runtime, input.harnessId, input.harnessMemberId, input.harnessKind).run()
+                       WHERE h.id = ?4 AND h.tenant = ?1 AND h.member_id = ?5 AND h.kind = ?6
+                         AND h.credential_kind = ?7)`,
+    ).bind(env.TENANT_SLUG, input.agentId, runtime, input.harnessId, input.harnessMemberId, input.harnessKind, input.harnessCredentialKind).run()
     return res.meta?.changes ?? 0
   } catch {
     return 0

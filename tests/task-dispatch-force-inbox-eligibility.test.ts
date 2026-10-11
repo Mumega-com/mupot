@@ -82,7 +82,9 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     expect(Object.prototype.hasOwnProperty.call(events[0].payload as object, 'delivery')).toBe(false)
   })
 
-  it('IS honored against a STALE-but-registered resident (runtime declared, heartbeat long stale)', async () => {
+  // S2 round 2 (P2-a): check_in fills `runtime` for seats, so a runtime with NO live presence must not
+  // be a forced-inbox target (it would strand the task in a mailbox nobody is attached to).
+  it('is IGNORED against a STALE resident with a runtime filled but no live presence (S2 strand closed)', async () => {
     harness.sqlite.exec(`
       INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, last_reported_at, updated_at)
       VALUES ('${AGENT_ID}', '${TENANT}', 'Target', 'claude-code', '[]', 'on_demand', 'running', '${AGENT_ID}', 'generic',
@@ -92,8 +94,21 @@ describe('task_dispatch({ delivery: "inbox" }) synchronous eligibility (mupot#14
     const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
 
     expect(res.ok).toBe(true)
+    expect(res.result).toMatchObject({ delivery_forced_predicted: 'no_delivery_mode' })
+    expect(Object.prototype.hasOwnProperty.call(events[0].payload as object, 'delivery')).toBe(false)
+  })
+
+  it('IS honored against a LIVE resident with a runtime filled (presence present)', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO fleet_agents (agent_id, tenant, display, runtime, squads, lifecycle, status, reported_by, agent_type, last_reported_at, updated_at)
+      VALUES ('${AGENT_ID}', '${TENANT}', 'Target', 'claude-code', '[]', 'on_demand', 'running', '${AGENT_ID}', 'generic',
+              '${sqliteStamp(Date.now())}', '${sqliteStamp(Date.now())}');
+    `)
+
+    const res = await invokeTool(auth(), env, 'task_dispatch', { task_id: TASK_ID, delivery: 'inbox' }, 'https://pot.example')
+
+    expect(res.ok).toBe(true)
     expect(res.result).not.toHaveProperty('delivery_forced_predicted')
-    expect(events).toHaveLength(1)
     expect((events[0].payload as { delivery?: string }).delivery).toBe('inbox')
   })
 
