@@ -114,8 +114,9 @@ the dry run; apply needs more (below).
   the digest of the request), `fields` is the structured source of truth, `needs` is always
   `human_accept`, and `text` is a rendered one-line sentence in which every author value is
   JSON-quoted (U+2028/U+2029 escaped).
-- `accept_token` is an HMAC over (seed digest, member id, issue time), valid 15 minutes, keyed with the
-  existing server secret `CONNECTOR_MASTER_KEY` (no new secret). It is `null` for an agent-bound caller
+- `accept_token` is an HMAC over (seed digest, member id, issue time), valid 15 minutes, keyed with an HKDF-SHA256
+  derivation (info `mupot_seed_accept_v1`, as in `src/connectors/crypto.ts`) of the existing server secret
+  `CONNECTOR_MASTER_KEY` (no new secret; rotating it invalidates tokens, which live 15 minutes). It is `null` for an agent-bound caller
   and when the pot has no such secret. Request keys are a deterministic hash of the seed text and could be
   precomputed by an author; the token cannot, so it ties an apply to a dry run by this member of this
   exact seed. It proves the dry run happened, not that a person read it.
@@ -139,7 +140,12 @@ Apply is a **human act**. Required, in this order:
 Then, **insert-first**: one `project_seeds` row (UNIQUE `tenant + project_slug`) is inserted before
 anything is created. The claim INSERT itself refuses when a project `<slug>-prj`, or a squad `<slug>-sqd`
 in the shared `dept-projects` department, exists that the caller did not create (no recorded creator, or a
-home squad, counts as not theirs). Refusing there keeps a refusal from writing anything. On the UNIQUE key:
+home squad, counts as not theirs). A refusal at the claim writes nothing. Just before creating anything the
+apply re-asserts its claim (its lease token, renewing the lease) and aborts with `seed_apply_in_progress`
+if a sweep replaced it, so a stalled apply cannot create under a claim another apply now owns. The one
+write a refusal can still leave is a `failed` `team_bootstrap_receipts` row if `team_bootstrap` itself
+refuses after the fence, which needs a foreign project or squad to appear, or the apply to stall past its
+120 second lease, between the fence and `team_bootstrap`'s own reads. On the UNIQUE key:
 
 - same `seed_sha256`, applied: `replay: true`, nothing created.
 - same digest while the first apply is still running: `409 seed_apply_in_progress` (never success-shaped:
@@ -152,6 +158,9 @@ home squad, counts as not theirs). Refusing there keeps a refusal from writing a
 - a crashed apply leaves an `applying` claim with a 120 second lease. Once the lease has lapsed and **no
   project of that slug exists**, any admin's next apply deletes that stale claim (one conditional
   statement; a live lease or a row whose project exists is never deleted) and claims once more.
+- recovery: if a claim another member left `applying` has lapsed while the project of that slug was
+  created by THIS caller (the split a stalled apply can leave: project under one member, claim under the
+  other), the caller takes the claim over in one conditional statement and resumes. Nothing is created twice.
 - if a project does exist under a lapsed claim, only the same member with the same digest may resume,
   and the resume re-checks the same no-takeover predicate. `team_bootstrap` is called with
   `require_provenance`, so apply adopts a pre-existing project or squad only when the caller created it,
@@ -270,4 +279,4 @@ Each test below was written to fail when the named mutation is applied to the co
 - Store the raw source anywhere: the canary-comment test fails.
 - Let apply create a bot, agent, capability or gate: the whole-database footprint test fails.
 - Drop the receipt's `WHERE changes() = 1` flip guard: the claim-lost test fails. Drop its UNIQUE key: the crash-resume test fails.
-- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest or age: the round-2 tests fail.
+- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the lease fence, the owner recovery: the round-2 tests fail.

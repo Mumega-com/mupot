@@ -601,6 +601,16 @@ describe('round 3: fencing, recovery, token key derivation', () => {
     expect(count('mutation_audit_entries')).toBe(1)
   })
 
+  it('fence is token-bound: a claim whose lease token was replaced aborts before creating anything', async () => {
+    const args = await full(adm)
+    stallBefore(/^\s*SELECT id FROM departments WHERE slug = \?1 LIMIT 1/, async () => {
+      harness.sqlite.exec("UPDATE project_seeds SET lease_token = 'replaced'")
+    })
+    expect(await call(adm, args)).toMatchObject({ ok: false, status: 409, error: 'seed_apply_in_progress' })
+    expect(count('projects')).toBe(0)
+    expect(count('team_bootstrap_receipts')).toBe(0)
+  })
+
   it('the split state (project under A, lapsed claim under B) is recoverable by A, creating nothing twice', async () => {
     harness.sqlite.exec(`INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-a', 'mumega-com-prj', 'N', 'g', 'adm')`)
     await plantClaim('adm2', STALE)
