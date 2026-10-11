@@ -5,7 +5,9 @@
 // Mupot-native inbox dispatches and bus receipts.
 //
 // Shared invariant: Mupot reserves Task + Flight + reservation record first.
-// The dispatch wake uses idempotent request_id = `harness:${reservationId}`.
+// Grok dispatch is RECORD-ONLY: the Task + Flight + reservation are the dispatch; no inbox message is enqueued
+// here (the agent picks the task up from its board). The reservation is recorded as `recorded`, url
+// `mupot:reservation:<id>`. A real inbox wake (request_id `harness:<reservationId>`) is future work.
 
 import type { Env, Task } from '../../types'
 import { createTask } from '../../tasks/service'
@@ -13,6 +15,8 @@ import { dispatchFlight } from '../../flight/dispatch'
 import { FLIGHT_META_V1_SCHEMA } from '../../flight/meta'
 import {
   bindReservationTaskFlight,
+  blockTaskForFailedReservation,
+  releaseAttachLease,
   bindVendorExecution,
   claimAttachLease,
   computeRequestDigest,
@@ -23,7 +27,7 @@ import {
   markReservationFailed,
   type HarnessReservationRow,
 } from '../reservations'
-import { publicHarnessError } from './cursor'
+import { acceptedStateOf, publicHarnessError } from './cursor'
 import { assertExecutionNotPaused, ExecutionPausedError } from '../pause'
 import type {
   DispatchRequest,
@@ -95,7 +99,7 @@ export const grokCliAdapter: HarnessAdapter = {
 
     const replayOutcome = (row: HarnessReservationRow): DispatchOutcome => ({
       accepted: true,
-      state: row.state === 'attached' ? 'attached' : 'reserved',
+      state: acceptedStateOf(row.state),
       reservationId: row.id,
       taskId: row.task_id,
       flightId: row.flight_id,
@@ -141,7 +145,7 @@ export const grokCliAdapter: HarnessAdapter = {
       lines.push(`repo: ${req.repoUrl.trim()}`)
     }
 
-    let task: Task
+    let task: Task | undefined
     let flightGo: boolean
     try {
       task = await createTask(
@@ -197,11 +201,17 @@ export const grokCliAdapter: HarnessAdapter = {
       flightGo = flight.go
     } catch {
       await markReservationFailed(env, reservationId, 'reserve_failed')
+      if (task) {
+        // flight_id stays NULL here: the Flight row may not exist (FK), only the Task link is certain.
+        await bindReservationTaskFlight(env, reservationId, task.id, null, { held: false })
+        await blockTaskForFailedReservation(env, task.id, reservationId, 'reserve_failed')
+      }
       return { accepted: false, error: 'reserve_failed', reservationId }
     }
 
     await bindReservationTaskFlight(env, reservationId, task.id, reservedFlightId, { held: !flightGo })
     if (!flightGo) {
+      await blockTaskForFailedReservation(env, task.id, reservationId, 'flight_gate_held')
       return { accepted: false, error: 'flight_gate_held', reservationId, taskId: task.id, flightId: reservedFlightId }
     }
 
@@ -211,12 +221,22 @@ export const grokCliAdapter: HarnessAdapter = {
       const row = await getReservation(env, reservationId)
       return row ? replayOutcome(row) : { accepted: false, error: 'attach_failed', reservationId }
     }
+    // A pause may have landed since the first fence: re-check with the lease held; on pause give the lease back.
+    try {
+      await assertExecutionNotPaused(env, req.agentId)
+    } catch (error) {
+      if (error instanceof ExecutionPausedError) {
+        await releaseAttachLease(env, reservationId, leaseId)
+        return { accepted: false, error: 'execution_paused', reservationId, taskId: task.id, flightId: reservedFlightId }
+      }
+      throw error
+    }
     const runId = `run-${reservationId.slice(0, 8)}`
     const bound = await bindVendorExecution(env, reservationId, leaseId, {
       agentId: req.agentId,
       runId,
-      url: `mupot:inbox:${req.agentId}`,
-      status: 'dispatched',
+      url: `mupot:reservation:${reservationId}`,
+      status: 'recorded',
     })
     if (!bound) {
       return { accepted: false, error: 'bind_lost_lease', reservationId, taskId: task.id, flightId: reservedFlightId }
@@ -233,7 +253,7 @@ export const grokCliAdapter: HarnessAdapter = {
       replay: false,
       vendorAgentId: req.agentId,
       vendorRunId: runId,
-      vendorUrl: `mupot:inbox:${req.agentId}`,
+      vendorUrl: `mupot:reservation:${reservationId}`,
     }
   },
 
@@ -254,7 +274,7 @@ export const grokCliAdapter: HarnessAdapter = {
       reservationId,
       adapter: 'grok-cli',
       state: row?.state ?? 'attached',
-      vendorStatus: row?.last_vendor_status ?? 'dispatched',
+      vendorStatus: row?.last_vendor_status ?? 'recorded',
       vendorAgentId: row?.vendor_agent_id ?? undefined,
       vendorRunId: row?.vendor_run_id ?? undefined,
       vendorUrl: row?.vendor_url ?? undefined,

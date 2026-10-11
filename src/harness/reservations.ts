@@ -157,7 +157,7 @@ export async function bindReservationTaskFlight(
   env: Env,
   id: string,
   taskId: string,
-  flightId: string,
+  flightId: string | null,
   opts: { held: boolean },
 ): Promise<boolean> {
   const now = new Date().toISOString()
@@ -377,6 +377,28 @@ export async function markReservationFailed(
         .bind(truncatedError, now, env.TENANT_SLUG, id)
         .run()
 
+  return (result.meta?.changes ?? 0) > 0
+}
+
+/**
+ * Compensate a Task created for a reservation that then failed (dispatchFlight threw / flight gate held): one
+ * conditional UPDATE moves it to 'blocked', clears the assignee and appends the reason, so no orphan in_progress
+ * task is left claiming an agent. Only touches a task still 'in_progress'.
+ */
+export async function blockTaskForFailedReservation(
+  env: Env,
+  taskId: string,
+  reservationId: string,
+  reason: string,
+): Promise<boolean> {
+  const note = `\nreservation ${reservationId} failed: ${reason.slice(0, 500)}`
+  const result = await env.DB.prepare(
+    `UPDATE tasks
+     SET status = 'blocked', assignee_agent_id = NULL, body = body || ?, updated_at = ?
+     WHERE id = ? AND status = 'in_progress'`,
+  )
+    .bind(note, new Date().toISOString(), taskId)
+    .run()
   return (result.meta?.changes ?? 0) > 0
 }
 

@@ -430,7 +430,7 @@ describe('Grokbot Harness Adapter', () => {
     if (!outcome.accepted) return
     expect(outcome.adapter).toBe('grok-cli')
     expect(outcome.state).toBe('attached')
-    expect(outcome.vendorUrl).toContain('mupot:inbox')
+    expect(outcome.vendorUrl).toContain('mupot:reservation:')
 
     const row = await getReservation(env, outcome.reservationId)
     expect(row?.adapter).toBe('grok-cli')

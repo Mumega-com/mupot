@@ -55,6 +55,13 @@ export function publicHarnessError(raw: string | undefined | null): string {
   return PUBLIC_ERROR_CODES.has(code) ? code : 'dispatch_failed'
 }
 
+/** Report the row's real in-flight state: 'attaching' is never relabelled 'reserved'. */
+export function acceptedStateOf(state: string): 'reserved' | 'attaching' | 'attached' {
+  if (state === 'attached') return 'attached'
+  if (state === 'attaching') return 'attaching'
+  return 'reserved'
+}
+
 export const cursorCloudAdapter: HarnessAdapter = {
   kind: 'cursor-cloud',
 
@@ -138,7 +145,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
         )
         return {
           accepted: true,
-          state: reserved.state === 'attached' ? 'attached' : 'reserved', // narrowed by the ternary, no cast
+          state: acceptedStateOf(reserved.state),
           reservationId: reserved.reservationId,
           taskId: reserved.task?.id ?? reserved.row.task_id,
           flightId: reserved.flight?.id ?? reserved.row.flight_id,
@@ -164,13 +171,13 @@ export const cursorCloudAdapter: HarnessAdapter = {
       }
       return {
         accepted: true,
-        state: attached.state === 'attached' ? 'attached' : 'reserved',
+        state: acceptedStateOf(attached.state),
         reservationId: reserved.reservationId,
         taskId: reserved.task?.id ?? reserved.row.task_id,
         flightId: reserved.flight?.id ?? reserved.row.flight_id,
         adapter: 'cursor-cloud',
         idempotencyKey: req.idempotencyKey,
-        replay: attached.replay,
+        replay: reserved.replay || attached.replay,
         vendorAgentId: attached.cursor?.agentId,
         vendorRunId: attached.cursor?.runId,
         vendorUrl: attached.cursor?.agentUrl,

@@ -18,6 +18,7 @@ import { FLIGHT_META_V1_SCHEMA } from '../flight/meta'
 import { launchCursorAgent, resolveCursorApiToken } from './client'
 import {
   bindReservationTaskFlight,
+  blockTaskForFailedReservation,
   bindVendorExecutionWithTaskBinding,
   claimAttachLease,
   releaseAttachLease,
@@ -188,7 +189,7 @@ export async function reserveCursorCloudWork(
     lines.push(`model: ${input.model.trim()}`)
   }
 
-  let task: Task
+  let task: Task | undefined
   let flight: DispatchResult
   try {
     task = await createTask(
@@ -233,12 +234,20 @@ export async function reserveCursorCloudWork(
       { id: reservedFlightId },
     )
   } catch (error) {
-    // The key is ours but no Task/Flight could be created: fail the reservation (never leave it 'reserved' forever).
+    // The key is ours but no Task/Flight could be created: fail the reservation (never leave it 'reserved' forever)
+    // and, if the Task was already created, block + unassign it (no orphan in_progress task).
+    // The task is linked only on failure (never before the gate verdict: a bound-but-ungated row is leasable).
     await markReservationFailed(env, reservationId, 'reserve_failed')
+    if (task) {
+      // flight_id stays NULL here: the Flight row may not exist (FK), only the Task link is certain.
+      await bindReservationTaskFlight(env, reservationId, task.id, null, { held: false })
+      await blockTaskForFailedReservation(env, task.id, reservationId, 'reserve_failed')
+    }
     throw error
   }
 
   await bindReservationTaskFlight(env, reservationId, task.id, reservedFlightId, { held: !flight.go })
+  if (!flight.go) await blockTaskForFailedReservation(env, task.id, reservationId, 'flight_gate_held')
   const row = (await getReservation(env, reservationId)) ?? insertResult.row
 
   return {
