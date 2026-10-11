@@ -124,6 +124,30 @@ the dry run; apply needs more (below).
   exact seed. It proves the dry run happened, not that a person read it.
 - A refused seed is `400 invalid_seed` with `{code, path, message}`.
 
+### Drafting a seed (`seed_draft`)
+
+`seed_draft { source, project_name?, hints? }` writes the YAML so nobody hand-writes it. `source` is
+`{kind:"repo", url}` or `{kind:"site", url, platform?}` (`wordpress`, `astro`, `shopify`, `static`);
+`hints` carries facts the caller already read locally (`goal`, `owner`, `live_url`, `repo_url`, `kind`,
+`deploy_via`, `deploy_cmd`, `deploy_receipt`, `squad`, `gate`, `risk_class`, `surface_paths[]`,
+`tool_slots[{mcp|openapi, cred_slot}]`; unknown hints are ignored with a warning).
+
+- Member floor, **pure and read-only**: no database access, no network fetch (the URL is only parsed and
+  normalised), no project, no request filed, no `accept_token`, no presence bump.
+- Returns `{ok, seed_yaml, seed_sha, valid, requests[], warnings[], next}`. `requests` has the same shape
+  as the `seed_attach` dry run, and `seed_sha` equals that dry run's `seed_sha256` for the same text.
+- Defaults are the narrowest the contract can say: every surface is `propose` (never `direct`, so no
+  `allow_direct`), `deploy.human_only: true`, one `observer` seat, a named human gate, `risk.class: medium`.
+  A WordPress site gets the `wp-plugin` deploy shape, `wp.page`/`wp.post`/`wp.media` proposals and its
+  conventional `/wp-json/mcp` endpoint with the slot NAME `WP_SITE_API`; a human binds the credential later.
+- The draft only asks. It carries no grant, credential value or acceptance (the contract has no field for
+  one), and the output text is run through the real validator and parsed back to the intended seed before it
+  is returned. Control or invisible characters in any input are refused, not repaired.
+- Contract limits surface as warnings, not new fields: branch policy has no seed field, and there is no
+  static-site `kind` (a static site is drafted as `app`).
+
+Next steps are unchanged: `seed_attach` (dry run) with the draft, then the approve link.
+
 ### Apply (`dry_run: false`)
 
 Apply is a **human act**. Required, in this order:
@@ -265,7 +289,7 @@ Both examples are test fixtures: CI validates them (`tests/seed-v1-validate.test
 
 `src/seeds/contract.ts` (types, enums, caps), `src/seeds/validate.ts` (validator and request
 list), `src/seeds/canonical.ts` (canonical JSON, digest, request keys), `src/seeds/apply.ts` (apply),
-`src/mcp/seed.ts` (tool), `migrations/0209_project_seeds.sql`.
+`src/seeds/draft.ts` (drafter), `src/mcp/seed.ts` (tools), `migrations/0209_project_seeds.sql`.
 
 ## Mutation checks
 
@@ -283,6 +307,7 @@ Each test below was written to fail when the named mutation is applied to the co
 - Drop a secret-shaped value check for opaque tokens: the 40-character token test fails.
 - Narrow the secret scan back (drop `-`/`_` from the run class, the Google/Stripe/GitLab/query patterns, the list-join scan, the key scan): the per-shape secret tests fail.
 - Drop a `data` or `allow_direct` request: the policy-request test fails.
+- `seed_draft` (`tests/seed-draft.test.ts`): emit author text unescaped, let a draft carry `accept`, `direct` or an `allow_direct` entry, or skip the round-trip check: the hostile-input, no-accept and round-trip tests fail.
 - Allow zero-width or bidi characters, or paste author text into a sentence: the spoofing tests fail.
 - Skip NFC or trailing-whitespace normalization, or reject a block scalar's final newline: the normalization tests fail.
 - Change a documented enum or cap in only one place (either direction, exact set): `tests/seed-v1-doc.test.ts` fails.

@@ -20,6 +20,7 @@ import { readAccess, readableProject } from './projects'
 import { hasWorkspaceAdmin } from '../auth/capability'
 import { issueAcceptToken } from '../seeds/accept-token'
 import { keyRequests, applySeed, seedProjectSlug } from '../seeds/apply'
+import { draftSeed, DRAFT_PLATFORMS, type DraftInput } from '../seeds/draft'
 import { type ToolSpec, fail, done } from './index'
 
 interface SeedDiff { field: string; current: string | null; proposed: string | null }
@@ -90,4 +91,51 @@ const toolSeedAttach: ToolSpec = {
   },
 }
 
-export const SEED_TOOLS: ToolSpec[] = [toolSeedAttach]
+// seed_draft: produce a mupot.seed/v1 DRAFT from facts the agent already holds. Pure and read-only:
+// no D1 read or write, no fetch, no project, no request filed, no accept_token. The draft only asks;
+// a human accepts later through seed_attach. Contract: docs/architecture/seed-v1.md (seed_draft).
+const toolSeedDraft: ToolSpec = {
+  name: 'seed_draft',
+  scope: 'draft a mupot.seed/v1 from a repo or site URL plus optional hints; pure, read-only, no fetch, grants and accepts nothing',
+  min: 'member',
+  args: '{ source: { kind: "repo", url } | { kind: "site", url, platform?: "wordpress"|"astro"|"shopify"|"static" }, project_name?: string, hints?: { goal, owner, live_url, repo_url, kind, deploy_via, deploy_cmd, deploy_receipt, squad, gate, risk_class, surface_paths[], tool_slots[{mcp|openapi, cred_slot}] } }',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      source: {
+        type: 'object',
+        description: 'Where the project lives. The URL is only parsed and normalised; nothing is fetched.',
+        properties: {
+          kind: { type: 'string', enum: ['repo', 'site'] },
+          url: { type: 'string', description: 'https repository URL (repo) or https site URL (site).' },
+          platform: { type: 'string', enum: [...DRAFT_PLATFORMS], description: 'Site sources only.' },
+        },
+        required: ['kind', 'url'],
+        additionalProperties: false,
+      },
+      project_name: { type: 'string', description: 'Display name; the slug is derived from it. Defaults to the repository name or site host.' },
+      hints: { type: 'object', description: 'Facts the agent already read locally. Unknown keys are ignored with a warning. Never put a credential value here; name a cred_slot.' },
+    },
+    required: ['source'],
+    additionalProperties: false,
+  },
+  // Writes nothing at all, including the framework's post-call presence bump.
+  shouldTouchPresence: () => false,
+  async run(_auth, _env, args) {
+    // as: shape is checked field by field inside draftSeed (it refuses anything malformed)
+    const result = await draftSeed({ source: args.source, project_name: args.project_name, hints: args.hints } as DraftInput)
+    if (!result.ok) return fail(400, 'invalid_draft', result.error)
+    const requests = await keyRequests(result.validation.requests)
+    return done({
+      ok: true,
+      seed_yaml: result.seedYaml,
+      seed_sha: result.validation.seedSha256,
+      valid: true,
+      requests: requests.map((r) => ({ ...r, text: renderRequest(r) })),
+      warnings: result.warnings,
+      next: 'Review and edit the draft, then call seed_attach (dry run) with this seed, then seed_attach_request for the approve link. Nothing here was written or accepted.',
+    })
+  },
+}
+
+export const SEED_TOOLS: ToolSpec[] = [toolSeedAttach, toolSeedDraft]

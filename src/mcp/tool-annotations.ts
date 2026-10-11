@@ -215,6 +215,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // ── seeds ──────────────────────────────────────────────────────────────────────────────────
   seed_attach: ADD('dry_run (default) is pure + SELECT only; dry_run:false INSERTs project_seeds + projects/squads/project_squad_access via teamBootstrap + mutation_audit_entries, human org admin only, grants nothing (mcp/seed.ts, seeds/apply.ts)'),
 
+  seed_draft: RO('pure: draftSeed builds text and runs the validator; no D1, KV or fetch, presence bump suppressed (mcp/seed.ts, seeds/draft.ts)'),
+
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────
   define_circuit: ADD('defineCircuit batch INSERT circuits/nodes/edges (addons/workflow-circuits/service.ts:284-303)'),
   advance_node: MUT('advanceNode UPDATE workflow_circuit_nodes.done_state + INSERT events (workflow-circuits/service.ts:443,447)'),
