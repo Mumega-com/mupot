@@ -182,6 +182,7 @@ import {
   upsertPollFleetPresence,
   touchPollFleetPresence,
   clearPollFleetPresence,
+  persistSeatRuntimeFromHarness,
   POLL_PRESENCE_MODE,
   RESIDENT_PRESENCE_MODE,
 } from '../fleet/registry'
@@ -5640,6 +5641,25 @@ const toolCheckIn: ToolSpec = {
       // ALREADY poll-registered from an earlier check_in (cheap: touchPollFleetPresence's WHERE
       // clause makes this a no-op for every other agent, including every resident one).
       await touchPollFleetPresence(env, auth.boundAgentId)
+    }
+
+    // S2 (mumega-com#1351): persist fleet_agents.runtime for a seat-bound session from the harness
+    // row the SERVER holds for the binding (auth.seatBinding is server-derived per request;
+    // resolveAuth strips any client copy). The tool args carry no runtime, and the `harness` arg
+    // (7-axis display text) is deliberately NOT consulted. Runs before the KV debounce so every
+    // call reaches it; the UPDATE is a no-op once the runtime is set.
+    if (auth.seatBinding && auth.boundAgentId) {
+      // Fail-soft (registry.ts promises it): a D1 error in the loader must never fail check_in.
+      const held = await loadHarness(env, auth.seatBinding.humanMemberId, auth.seatBinding.harnessId).catch(() => null)
+      if (held) {
+        await persistSeatRuntimeFromHarness(env, {
+          agentId: auth.boundAgentId,
+          harnessId: held.id,
+          harnessMemberId: held.member_id,
+          harnessKind: held.kind,
+          harnessCredentialKind: held.credential_kind,
+        })
+      }
     }
 
     const seatLabel = (str(args.seat) || str(args.name) || str(args.label) || '').trim()
