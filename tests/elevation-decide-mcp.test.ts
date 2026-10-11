@@ -391,6 +391,20 @@ describe('elevation_decide — human MCP approval through the shared decision fu
     expect(capped.truncated).toBe(true)
   })
 
+  it('P2: truncated stays true when the limit stops the scan partway through a short last page', async () => {
+    const real = await request(['action:project_status'])
+    const scopeId = ((await env.DB.prepare('SELECT requested_scope_id AS s FROM elevation_requests WHERE id = ?1').bind(real).first<{ s: string }>())?.s) ?? ''
+    await cloneRequests(real, 2, `'${scopeId}'`, 'more-')
+    const view = async (limit: number): Promise<{ pending_requests: unknown[]; truncated: boolean }> =>
+      (await invokeTool(adminAuth(), env, 'elevation_status', { limit }, BASE)).result as { pending_requests: unknown[]; truncated: boolean }
+    const one = await view(1)
+    expect(one.pending_requests).toHaveLength(1)
+    expect(one.truncated).toBe(true) // two more decidable rows were never read
+    const all = await view(3)
+    expect(all.pending_requests).toHaveLength(3)
+    expect(all.truncated).toBe(false) // the limit landed on the page's last row: nothing is left
+  })
+
   it('P2: the pending view has a bounded query count (no N+1): 60 rows over 60 distinct squads cost ~the same as 3', async () => {
     const real = await request(['action:project_status'])
     const counted = async (): Promise<number> => {

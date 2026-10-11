@@ -240,7 +240,9 @@ export async function humanElevationStatus(auth: AuthContext, env: Env, args: Re
         if (decidable.length >= limit) break
       }
     }
-    if (chunk.length < PENDING_CHUNK) { exhausted = true; break }
+    // A short page means nothing lies beyond it, but only if this loop read the page to its last
+    // row; stopping early at the limit leaves unread rows behind (truncated must stay true).
+    if (chunk.length < PENDING_CHUNK) { exhausted = cursor?.id === chunk[chunk.length - 1].id; break }
   }
   const ctx = await loadViewContext(env, auth.tenant, decidable)
   return done({
