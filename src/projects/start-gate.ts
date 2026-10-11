@@ -361,7 +361,7 @@ async function findProjectSquadDepartment(env: Env): Promise<{ id: string } | nu
     .first<{ id: string }>()
 }
 
-async function resolveProjectSquadDepartmentId(env: Env, actorMemberId: string | null): Promise<string | null> {
+export async function resolveProjectSquadDepartmentId(env: Env, actorMemberId: string | null): Promise<string | null> {
   const existing = await findProjectSquadDepartment(env)
   if (existing) return existing.id
   const created = await createDepartment(env, {

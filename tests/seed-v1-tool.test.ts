@@ -20,9 +20,9 @@ function makeDb() {
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept', 'a', 'A');
-    INSERT INTO projects (id, slug, name, goal) VALUES ('proj-vis', 'mumega-com', 'Old Name', 'Old goal');
+    INSERT INTO projects (id, slug, name, goal) VALUES ('proj-vis', 'mumega-com-prj', 'Old Name', 'Old goal');
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-vis', 'squad-a', 'read');
-    INSERT INTO projects (id, slug, name, goal) VALUES ('proj-hidden', 'hidden-one', 'Hidden', 'secret goal');
+    INSERT INTO projects (id, slug, name, goal) VALUES ('proj-hidden', 'hidden-one-prj', 'Hidden', 'secret goal');
   `)
   const count = (table: string) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n
   // Whole-database snapshot: every table's row count, so a write anywhere is seen.
@@ -109,12 +109,12 @@ describe('seed_attach dry run', () => {
   })
 })
 
-describe('seed_attach apply is not built', () => {
-  it('dry_run:false returns 501 seed_apply_not_built and writes nothing', async () => {
+describe('seed_attach apply is gated', () => {
+  it('dry_run:false without accept[] is refused and writes nothing (apply coverage: seed-v1-apply.test.ts)', async () => {
     const { env, snapshot } = makeDb()
     const before = snapshot()
     const r = await call(env, orgAdmin, { seed: seedText, dry_run: false })
-    expect(r).toMatchObject({ ok: false, status: 501, error: 'seed_apply_not_built' })
+    expect(r).toMatchObject({ ok: false, status: 400, error: 'invalid_args' })
     expect(snapshot()).toBe(before)
   })
 })

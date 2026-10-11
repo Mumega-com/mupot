@@ -227,6 +227,11 @@ export interface TeamBootstrapInput {
   bot?: TeamBootstrapBotInput
   seed_memory?: string
   /**
+   * Display name for a NEWLY created squad (default: `name`). Never changes the derived slug.
+   * Not exposed on the team_bootstrap tool schema; used by seed_attach apply.
+   */
+  squad_name?: string
+  /**
    * Explicit, informed override to adopt a pre-existing project or squad
    * that this caller did not create and no prior team_bootstrap attempt
    * named (P0, see file header). Ignored unless the caller is org:admin
@@ -807,7 +812,7 @@ export async function teamBootstrap(
   let squad = existingSquad
   let squadCreated = false
   if (!squad) {
-    const created = await createSquad(env, departmentId, { slug: squadSlug, name }, { createdByMemberId: actorMemberId })
+    const created = await createSquad(env, departmentId, { slug: squadSlug, name: input.squad_name?.trim() || name }, { createdByMemberId: actorMemberId })
     if (created.ok) {
       squad = created.value
       squadCreated = true
