@@ -58,6 +58,11 @@ export interface DispatchRequest {
   idempotencyKey: string
   flightId?: string
   taskId?: string
+  /**
+   * Local (non-vendor) adapters only: anything other than an explicit `false` plans the dispatch and writes nothing
+   * (same default as router_tick, #1780/#1807). Vendor-cloud adapters are gated by their own MCP tool.
+   */
+  dryRun?: boolean
   metadata?: Record<string, unknown>
 }
 
@@ -65,8 +70,9 @@ export interface DispatchResult {
   accepted: true
   state: Extract<HarnessDispatchState, 'reserved' | 'attaching' | 'attached'>
   reservationId: string
-  taskId: string
-  flightId: string
+  /** null = reserved, not yet bound to a Task/Flight. */
+  taskId: string | null
+  flightId: string | null
   adapter: HarnessKind
   idempotencyKey: string
   replay: boolean
@@ -80,8 +86,8 @@ export interface DispatchFailure {
   error: string
   detail?: unknown
   reservationId?: string
-  taskId?: string
-  flightId?: string
+  taskId?: string | null
+  flightId?: string | null
 }
 
 export type DispatchOutcome = DispatchResult | DispatchFailure
@@ -106,6 +112,8 @@ export interface RunStatusResult {
   branch?: string | null
   result?: string | null
   error?: string | null
+  /** true = reserved/attaching for longer than RESERVATION_STUCK_MS: needs a reconcile or operator. */
+  stuck?: boolean
 }
 
 export interface ReconcileResult {

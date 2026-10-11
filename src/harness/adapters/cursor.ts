@@ -13,8 +13,12 @@ import {
 } from '../../cursor/dispatch'
 import {
   getReservation,
+  isReservationStuck,
   markReconciled,
+  markReservationFailed,
+  type HarnessReservationRow,
 } from '../reservations'
+import { ExecutionPausedError } from '../pause'
 import type {
   DispatchRequest,
   DispatchOutcome,
@@ -25,6 +29,31 @@ import type {
   RunStatusResult,
   StatusQuery,
 } from '../types'
+
+/**
+ * Public error vocabulary. Raw exception text (D1/SQL, vendor) is NEVER returned to callers: anything outside
+ * this set (after stripping a `: detail` suffix) collapses to `dispatch_failed`.
+ */
+const PUBLIC_ERROR_CODES = new Set([
+  'idempotency_key_conflict',
+  'execution_paused',
+  'flight_gate_held',
+  'launch_unconfirmed',
+  'bind_unconfirmed',
+  'bind_lost_lease',
+  'cursor_token_missing',
+  'repo_url_required',
+  'reservation_unbound',
+  'reserve_failed',
+  'task_missing',
+  'attach_failed',
+])
+
+export function publicHarnessError(raw: string | undefined | null): string {
+  if (!raw) return 'attach_failed'
+  const code = raw.split(':')[0]?.trim() ?? ''
+  return PUBLIC_ERROR_CODES.has(code) ? code : 'dispatch_failed'
+}
 
 export const cursorCloudAdapter: HarnessAdapter = {
   kind: 'cursor-cloud',
@@ -74,12 +103,13 @@ export const cursorCloudAdapter: HarnessAdapter = {
       })
 
       if (reserved.state === 'failed') {
+        // The real reason (flight gate, launch_unconfirmed, ...) lives on the row; never invent flight_gate_held.
         return {
           accepted: false,
-          error: 'flight_gate_held',
+          error: publicHarnessError(reserved.row.last_error),
           reservationId: reserved.reservationId,
-          taskId: reserved.task.id,
-          flightId: reserved.flight.id,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
         }
       }
 
@@ -88,8 +118,8 @@ export const cursorCloudAdapter: HarnessAdapter = {
           accepted: true,
           state: 'attached',
           reservationId: reserved.reservationId,
-          taskId: reserved.task.id,
-          flightId: reserved.flight.id,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
           adapter: 'cursor-cloud',
           idempotencyKey: req.idempotencyKey,
           replay: true,
@@ -108,10 +138,10 @@ export const cursorCloudAdapter: HarnessAdapter = {
         )
         return {
           accepted: true,
-          state: (reserved.state === 'attached' ? 'attached' : 'reserved') as 'reserved' | 'attached',
+          state: reserved.state === 'attached' ? 'attached' : 'reserved', // narrowed by the ternary, no cast
           reservationId: reserved.reservationId,
-          taskId: reserved.task.id,
-          flightId: reserved.flight.id,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
           adapter: 'cursor-cloud',
           idempotencyKey: req.idempotencyKey,
           replay: reserved.replay,
@@ -128,16 +158,16 @@ export const cursorCloudAdapter: HarnessAdapter = {
           accepted: false,
           error: attached.error ?? 'attach_failed',
           reservationId: reserved.reservationId,
-          taskId: reserved.task.id,
-          flightId: reserved.flight.id,
+          taskId: reserved.task?.id ?? reserved.row.task_id,
+          flightId: reserved.flight?.id ?? reserved.row.flight_id,
         }
       }
       return {
         accepted: true,
         state: attached.state === 'attached' ? 'attached' : 'reserved',
         reservationId: reserved.reservationId,
-        taskId: reserved.task.id,
-        flightId: reserved.flight.id,
+        taskId: reserved.task?.id ?? reserved.row.task_id,
+        flightId: reserved.flight?.id ?? reserved.row.flight_id,
         adapter: 'cursor-cloud',
         idempotencyKey: req.idempotencyKey,
         replay: attached.replay,
@@ -146,24 +176,23 @@ export const cursorCloudAdapter: HarnessAdapter = {
         vendorUrl: attached.cursor?.agentUrl,
       }
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error)
-      return {
-        accepted: false,
-        error: msg.startsWith('idempotency_key_conflict') ? 'idempotency_key_conflict' : msg,
-      }
+      if (error instanceof ExecutionPausedError) return { accepted: false, error: 'execution_paused' }
+      // Fixed code only: raw DB/vendor exception text must never reach the caller.
+      const msg = error instanceof Error ? error.message : ''
+      return { accepted: false, error: publicHarnessError(msg) }
     }
   },
 
   async status(env: Env, query: StatusQuery): Promise<RunStatusResult> {
     let row = query.reservationId ? await getReservation(env, query.reservationId) : null
     if (!row && query.taskId) {
-      const res = await env.DB.prepare(
+      row = await env.DB.prepare(
         `SELECT * FROM harness_reservations WHERE tenant = ? AND task_id = ?`,
       )
         .bind(env.TENANT_SLUG, query.taskId)
-        .first()
-      row = res as any
+        .first<HarnessReservationRow>()
     }
+    const stuck = row ? isReservationStuck(row) : false
 
     const token = resolveCursorApiToken(env)
     const agentId = query.vendorAgentId ?? row?.vendor_agent_id
@@ -188,6 +217,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
           vendorAgentId: agentId,
           vendorRunId: runId,
           vendorUrl: row?.vendor_url ?? `https://cursor.com/agents/${agentId}`,
+          ...(stuck ? { stuck } : {}),
           prUrl: branch?.prUrl ?? null,
           branch: branch?.branch ?? null,
           result: run.result ?? null,
@@ -201,6 +231,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
           vendorAgentId: agentId,
           vendorRunId: runId,
           vendorUrl: row?.vendor_url ?? undefined,
+          ...(stuck ? { stuck } : {}),
           error: msg,
         }
       }
@@ -214,6 +245,7 @@ export const cursorCloudAdapter: HarnessAdapter = {
       vendorRunId: runId ?? undefined,
       vendorUrl: row?.vendor_url ?? undefined,
       error: row?.last_error ?? undefined,
+      ...(stuck ? { stuck } : {}),
     }
   },
 
@@ -224,6 +256,16 @@ export const cursorCloudAdapter: HarnessAdapter = {
     }
 
     const previousState = row.state
+
+    if (row.state === 'reserved' && !row.task_id) {
+      // Insert-first crash window: the inserter died before binding Task/Flight. Past the stuck horizon the key is
+      // failed (never launched); before it, the inserter may still be working.
+      if (isReservationStuck(row)) {
+        const failed = await markReservationFailed(env, reservationId, 'reserve_failed: unbound_timeout')
+        return { reservationId, previousState, nextState: failed ? 'failed' : previousState, changed: failed }
+      }
+      return { reservationId, previousState, nextState: previousState, changed: false }
+    }
 
     if (row.state === 'reserved' || row.state === 'attaching') {
       const attached = await attachCursorCloudExecution(env, reservationId)
@@ -244,13 +286,13 @@ export const cursorCloudAdapter: HarnessAdapter = {
       const run = await getCursorRun(token, row.vendor_agent_id, row.vendor_run_id)
       const terminalStatuses = ['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED']
       if (terminalStatuses.includes(run.status)) {
-        await markReconciled(env, reservationId, run.status)
+        const changed = await markReconciled(env, reservationId, run.status)
         return {
           reservationId,
           previousState,
-          nextState: 'reconciled',
+          nextState: changed ? 'reconciled' : previousState,
           vendorStatus: run.status,
-          changed: true,
+          changed,
         }
       }
 

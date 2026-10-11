@@ -28,7 +28,7 @@ function cursorFailure(error: unknown) {
     if (error.status === 404) return fail(404, 'cursor_not_found', { code: error.code })
     if (error.status === 409) return fail(409, error.code)
     if (error.status >= 500) return fail(503, 'cursor_unavailable', { code: error.code })
-    return fail(400, 'cursor_api_error', { code: error.code, message: error.message })
+    return fail(400, 'cursor_api_error', { code: error.code })
   }
   return fail(500, 'internal_error')
 }
@@ -109,7 +109,11 @@ export const toolCursorDispatch: ToolSpec = {
       if (outcome.error === 'cursor_token_missing') {
         return fail(503, 'cursor_token_missing')
       }
-      return fail(400, 'cursor_dispatch_failed', outcome.error)
+      if (outcome.error === 'execution_paused') {
+        return fail(409, 'execution_paused')
+      }
+      // outcome.error is already a fixed public code (publicHarnessError); raw DB/vendor text never reaches here.
+      return fail(400, 'cursor_dispatch_failed', { code: outcome.error })
     }
 
     return done({
@@ -186,6 +190,7 @@ export const toolCursorRunStatus: ToolSpec = {
         result: statusResult.result ?? null,
         reservation_id: statusResult.reservationId,
         state: statusResult.state,
+        ...(statusResult.stuck ? { stuck: true } : {}),
       })
     } catch (error) {
       return cursorFailure(error)

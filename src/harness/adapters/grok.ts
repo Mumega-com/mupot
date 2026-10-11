@@ -12,13 +12,19 @@ import { createTask } from '../../tasks/service'
 import { dispatchFlight } from '../../flight/dispatch'
 import { FLIGHT_META_V1_SCHEMA } from '../../flight/meta'
 import {
+  bindReservationTaskFlight,
   bindVendorExecution,
+  claimAttachLease,
   computeRequestDigest,
   getReservation,
-  getReservationByIdempotency,
   insertReservation,
+  isReservationStuck,
   markReconciled,
+  markReservationFailed,
+  type HarnessReservationRow,
 } from '../reservations'
+import { publicHarnessError } from './cursor'
+import { assertExecutionNotPaused, ExecutionPausedError } from '../pause'
 import type {
   DispatchRequest,
   DispatchOutcome,
@@ -67,29 +73,61 @@ export const grokCliAdapter: HarnessAdapter = {
     const title = req.name.trim()
     const idempotencyKey = req.idempotencyKey.trim()
 
-    const digest = await computeRequestDigest(adapter, req)
-
-    const existing = await getReservationByIdempotency(env, adapter, idempotencyKey)
-    if (existing) {
-      if (existing.request_digest !== digest) {
-        return { accepted: false, error: 'idempotency_key_conflict' }
-      }
+    // Dry-run is the default (router_tick pattern, #1780/#1807): nothing is reserved, created or woken unless the
+    // caller passes an explicit dryRun:false.
+    if (req.dryRun !== false) {
       return {
-        accepted: true,
-        state: existing.state === 'attached' ? 'attached' : 'reserved',
-        reservationId: existing.id,
-        taskId: existing.task_id,
-        flightId: existing.flight_id,
-        adapter,
-        idempotencyKey,
-        replay: true,
-        vendorAgentId: existing.vendor_agent_id ?? undefined,
-        vendorRunId: existing.vendor_run_id ?? undefined,
-        vendorUrl: existing.vendor_url ?? undefined,
+        accepted: false,
+        error: 'dry_run',
+        detail: { adapter, would_reserve: { name: title, squadId: req.squadId, agentId: req.agentId, idempotencyKey } },
       }
     }
 
+    // Pause fence before ANY side effect (incl. the reservation INSERT).
+    try {
+      await assertExecutionNotPaused(env, req.agentId)
+    } catch (error) {
+      if (error instanceof ExecutionPausedError) return { accepted: false, error: 'execution_paused' }
+      throw error
+    }
+
+    const digest = await computeRequestDigest(adapter, req)
+
+    const replayOutcome = (row: HarnessReservationRow): DispatchOutcome => ({
+      accepted: true,
+      state: row.state === 'attached' ? 'attached' : 'reserved',
+      reservationId: row.id,
+      taskId: row.task_id,
+      flightId: row.flight_id,
+      adapter,
+      idempotencyKey,
+      replay: true,
+      vendorAgentId: row.vendor_agent_id ?? undefined,
+      vendorRunId: row.vendor_run_id ?? undefined,
+      vendorUrl: row.vendor_url ?? undefined,
+    })
+
+    // INSERT FIRST (the UNIQUE key is the lock): a racing duplicate is decided here, before any Task/Flight exists.
     const reservationId = crypto.randomUUID()
+    const insertResult = await insertReservation(env, {
+      id: reservationId,
+      adapter,
+      idempotencyKey,
+      requestDigest: digest,
+      agentId: req.agentId,
+      squadId: req.squadId,
+      actor: req.actor,
+    })
+    if (insertResult.outcome === 'conflict') {
+      return { accepted: false, error: 'idempotency_key_conflict' }
+    }
+    if (insertResult.outcome === 'replay') {
+      if (insertResult.row.state === 'failed') {
+        return { accepted: false, error: publicHarnessError(insertResult.row.last_error), reservationId: insertResult.row.id }
+      }
+      return replayOutcome(insertResult.row)
+    }
+
     const reservedTaskId = req.taskId?.trim() || crypto.randomUUID()
     const reservedFlightId = req.flightId?.trim() || crypto.randomUUID()
 
@@ -103,96 +141,86 @@ export const grokCliAdapter: HarnessAdapter = {
       lines.push(`repo: ${req.repoUrl.trim()}`)
     }
 
-    const task = await createTask(
-      env,
-      {
-        squad_id: req.squadId,
-        title,
-        body: lines.join('\n'),
-        done_when: GROK_CLI_DONE_WHEN,
-        assignee_agent_id: req.agentId,
-        status: 'in_progress',
-      },
-      {
-        id: reservedTaskId,
-        actor: req.actor,
-        skipMirror: true,
-      },
-    )
-
-    await dispatchFlight(
-      env,
-      {
-        agent: req.agentId,
-        goal: title,
-        trigger_source: 'api',
-        meta: {
-          schema: FLIGHT_META_V1_SCHEMA,
-          goal_id: `grok-cli:${reservationId}`,
-          objective_id: task.id,
-          squad_ids: [req.squadId],
-          task_ids: [task.id],
-          done_when: [GROK_CLI_DONE_WHEN],
-          artifact_refs: [],
-          receipt_refs: [],
-          confidentiality: 'internal',
-          publication_target: 'none',
-          parent_flight_id: null,
+    let task: Task
+    let flightGo: boolean
+    try {
+      task = await createTask(
+        env,
+        {
+          squad_id: req.squadId,
+          title,
+          body: lines.join('\n'),
+          done_when: GROK_CLI_DONE_WHEN,
+          assignee_agent_id: req.agentId,
+          status: 'in_progress',
         },
-      },
-      {
-        contextComplete: true,
-        toolsReachable: true,
-        budgetRemainingMicroUsd: 1_000_000,
-        budgetEstimateMicroUsd: 10_000,
-        recentProgress: 0.9,
-        progressPerStep: 0.8,
-        wastePerStep: 0.1,
-        stepSeconds: 30,
-      },
-      undefined,
-      { id: reservedFlightId },
-    )
+        {
+          id: reservedTaskId,
+          actor: req.actor,
+          skipMirror: true,
+        },
+      )
 
-    const insertResult = await insertReservation(env, {
-      id: reservationId,
-      adapter,
-      idempotencyKey,
-      requestDigest: digest,
-      taskId: task.id,
-      flightId: reservedFlightId,
-      agentId: req.agentId,
-      squadId: req.squadId,
-      actor: req.actor,
-      state: 'attached',
-    })
-
-    if (insertResult.outcome === 'conflict') {
-      return { accepted: false, error: 'idempotency_key_conflict' }
+      const flight = await dispatchFlight(
+        env,
+        {
+          agent: req.agentId,
+          goal: title,
+          trigger_source: 'api',
+          meta: {
+            schema: FLIGHT_META_V1_SCHEMA,
+            goal_id: `grok-cli:${reservationId}`,
+            objective_id: task.id,
+            squad_ids: [req.squadId],
+            task_ids: [task.id],
+            done_when: [GROK_CLI_DONE_WHEN],
+            artifact_refs: [],
+            receipt_refs: [],
+            confidentiality: 'internal',
+            publication_target: 'none',
+            parent_flight_id: null,
+          },
+        },
+        {
+          contextComplete: true,
+          toolsReachable: true,
+          budgetRemainingMicroUsd: 1_000_000,
+          budgetEstimateMicroUsd: 10_000,
+          recentProgress: 0.9,
+          progressPerStep: 0.8,
+          wastePerStep: 0.1,
+          stepSeconds: 30,
+        },
+        undefined,
+        { id: reservedFlightId },
+      )
+      flightGo = flight.go
+    } catch {
+      await markReservationFailed(env, reservationId, 'reserve_failed')
+      return { accepted: false, error: 'reserve_failed', reservationId }
     }
 
-    if (insertResult.outcome === 'replay') {
-      return {
-        accepted: true,
-        state: insertResult.row.state === 'attached' ? 'attached' : 'reserved',
-        reservationId: insertResult.row.id,
-        taskId: insertResult.row.task_id,
-        flightId: insertResult.row.flight_id,
-        adapter,
-        idempotencyKey,
-        replay: true,
-        vendorAgentId: insertResult.row.vendor_agent_id ?? undefined,
-        vendorRunId: insertResult.row.vendor_run_id ?? undefined,
-        vendorUrl: insertResult.row.vendor_url ?? undefined,
-      }
+    await bindReservationTaskFlight(env, reservationId, task.id, reservedFlightId, { held: !flightGo })
+    if (!flightGo) {
+      return { accepted: false, error: 'flight_gate_held', reservationId, taskId: task.id, flightId: reservedFlightId }
     }
 
-    await bindVendorExecution(env, reservationId, {
+    // reserved -> attaching (lease + fencing token) -> attached. Never insert as 'attached'.
+    const leaseId = await claimAttachLease(env, reservationId)
+    if (!leaseId) {
+      const row = await getReservation(env, reservationId)
+      return row ? replayOutcome(row) : { accepted: false, error: 'attach_failed', reservationId }
+    }
+    const runId = `run-${reservationId.slice(0, 8)}`
+    const bound = await bindVendorExecution(env, reservationId, leaseId, {
       agentId: req.agentId,
-      runId: `run-${reservationId.slice(0, 8)}`,
+      runId,
       url: `mupot:inbox:${req.agentId}`,
       status: 'dispatched',
     })
+    if (!bound) {
+      return { accepted: false, error: 'bind_lost_lease', reservationId, taskId: task.id, flightId: reservedFlightId }
+    }
 
     return {
       accepted: true,
@@ -204,7 +232,7 @@ export const grokCliAdapter: HarnessAdapter = {
       idempotencyKey,
       replay: false,
       vendorAgentId: req.agentId,
-      vendorRunId: `run-${reservationId.slice(0, 8)}`,
+      vendorRunId: runId,
       vendorUrl: `mupot:inbox:${req.agentId}`,
     }
   },
@@ -231,6 +259,7 @@ export const grokCliAdapter: HarnessAdapter = {
       vendorRunId: row?.vendor_run_id ?? undefined,
       vendorUrl: row?.vendor_url ?? undefined,
       result: taskResult,
+      ...(row && isReservationStuck(row) ? { stuck: true } : {}),
     }
   },
 
@@ -241,16 +270,16 @@ export const grokCliAdapter: HarnessAdapter = {
     }
 
     const previousState = row.state
-    const task = await loadTask(env, row.task_id)
+    const task = row.task_id ? await loadTask(env, row.task_id) : null
 
     if (task && (task.status === 'done' || task.status === 'review')) {
-      await markReconciled(env, reservationId, task.status)
+      const changed = await markReconciled(env, reservationId, task.status)
       return {
         reservationId,
         previousState,
-        nextState: 'reconciled',
+        nextState: changed ? 'reconciled' : previousState,
         vendorStatus: task.status,
-        changed: previousState !== 'reconciled',
+        changed,
       }
     }
 

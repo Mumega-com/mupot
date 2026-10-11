@@ -12,7 +12,8 @@
 -- 1. Mupot creates Task + Flight + harness_reservations (state='reserved') < 200ms.
 -- 2. MCP returns { accepted: true, state: 'reserved', reservation_id, task_id, flight_id }.
 -- 3. The vendor execution attaches asynchronously via ToolCtx.waitUntil or background reconcile.
--- 4. Idempotency is enforced per (tenant, adapter, idempotency_key).
+-- 4. Idempotency is enforced per (tenant, squad_id, adapter, idempotency_key): squad-scoped so one squad can
+--    never squat or probe another squad's keys.
 
 CREATE TABLE IF NOT EXISTS harness_reservations (
   id TEXT PRIMARY KEY,
@@ -29,8 +30,10 @@ CREATE TABLE IF NOT EXISTS harness_reservations (
     AND request_digest = lower(request_digest)
     AND request_digest NOT GLOB '*[^0-9a-f]*'
   ),
-  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
-  flight_id TEXT NOT NULL REFERENCES flights(id) ON DELETE RESTRICT,
+  -- NULL = "reserved, not yet bound": the reservation row is INSERTed FIRST (the UNIQUE key is the idempotency
+  -- lock) and Task + Flight are created and bound afterwards, so a racing duplicate never creates side effects.
+  task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+  flight_id TEXT REFERENCES flights(id) ON DELETE RESTRICT,
   agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
   squad_id TEXT NOT NULL,
   actor_kind TEXT NOT NULL CHECK (actor_kind IN ('member','agent')),
@@ -43,12 +46,15 @@ CREATE TABLE IF NOT EXISTS harness_reservations (
   vendor_url TEXT,
   last_vendor_status TEXT,
   attach_lease_until TEXT,
+  -- Fencing token: random per claim. Every write made by an attacher after the vendor call carries
+  -- `attach_lease_id = ?` so a stale attacher can never bind over a reclaimed lease.
+  attach_lease_id TEXT,
   last_error TEXT CHECK (last_error IS NULL OR length(last_error) BETWEEN 1 AND 2000),
   reserved_at TEXT NOT NULL,
   attached_at TEXT,
   reconciled_at TEXT,
   updated_at TEXT NOT NULL,
-  UNIQUE (tenant, adapter, idempotency_key)
+  UNIQUE (tenant, squad_id, adapter, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_harness_reservations_reconcile

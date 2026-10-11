@@ -5,7 +5,8 @@
 //    harness_reservations row in D1 (<200ms) BEFORE any vendor HTTP call.
 // 2. attachCursorCloudExecution contacts Cursor Cloud API and binds the vendor IDs
 //    asynchronously via ToolCtx.waitUntil or background reconcile.
-// 3. recordCursorCloudWork is preserved as a backward-compatible wrapper.
+// 3. The reservation row is INSERTed FIRST (its UNIQUE key is the idempotency lock); Task + Flight are created and
+//    bound only by the inserter, so a racing duplicate never leaves an orphan Task/Flight.
 
 import type { Env } from '../types'
 import { createTask } from '../tasks/service'
@@ -16,16 +17,18 @@ import type { FlightSignals } from '../flight/preflight'
 import { FLIGHT_META_V1_SCHEMA } from '../flight/meta'
 import { launchCursorAgent, resolveCursorApiToken } from './client'
 import {
+  bindReservationTaskFlight,
   bindVendorExecutionWithTaskBinding,
   claimAttachLease,
+  releaseAttachLease,
   computeRequestDigest,
   getReservation,
-  getReservationByIdempotency,
   insertReservation,
   markReservationFailed,
   type HarnessReservationRow,
 } from '../harness/reservations'
 import type { HarnessActor, HarnessDispatchState } from '../harness/types'
+import { assertExecutionNotPaused, ExecutionPausedError } from '../harness/pause'
 
 export const CURSOR_CLOUD_DONE_WHEN =
   'Cursor Cloud run finishes with a recorded result or pull request'
@@ -74,8 +77,9 @@ export interface ReserveCursorCloudWorkInput {
 
 export interface ReserveCursorCloudWorkResult {
   reservationId: string
-  task: Task
-  flight: DispatchResult
+  /** null = reserved but not yet bound to a Task (a concurrent inserter is still creating it, or it crashed). */
+  task: Task | null
+  flight: DispatchResult | null
   replay: boolean
   state: HarnessDispatchState
   row: HarnessReservationRow
@@ -84,6 +88,48 @@ export interface ReserveCursorCloudWorkResult {
 async function loadTask(env: Env, taskId: string): Promise<Task | null> {
   const result = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first<Task>()
   return result ?? null
+}
+
+interface FlightRow {
+  id: string
+  status: string
+  gate_verdict: string | null
+  gate_reason: string
+  score: number | null
+}
+
+/** The REAL flight row, mapped to a DispatchResult (replays must not fabricate a go verdict). */
+export async function loadFlightResult(env: Env, flightId: string): Promise<DispatchResult | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, status, gate_verdict, gate_reason, score FROM flights WHERE tenant = ? AND id = ?`,
+  )
+    .bind(env.TENANT_SLUG, flightId)
+    .first<FlightRow>()
+  if (!row) return null
+  const go = row.gate_verdict === 'go'
+  return {
+    id: row.id,
+    go,
+    status: row.status === 'held' || !go ? 'held' : 'running',
+    reasons: row.gate_reason ? row.gate_reason.split(',').filter(Boolean) : [],
+    score: row.score ?? 0,
+  }
+}
+
+async function replayResult(env: Env, row: HarnessReservationRow): Promise<ReserveCursorCloudWorkResult> {
+  const task = row.task_id ? await loadTask(env, row.task_id) : null
+  if (row.task_id && !task) {
+    throw new Error(`corrupt_reservation_task_missing: ${row.task_id}`)
+  }
+  const flight = row.flight_id ? await loadFlightResult(env, row.flight_id) : null
+  return {
+    reservationId: row.id,
+    task,
+    flight,
+    replay: true,
+    state: row.state,
+    row,
+  }
 }
 
 export async function reserveCursorCloudWork(
@@ -105,33 +151,29 @@ export async function reserveCursorCloudWork(
     idempotencyKey,
   })
 
-  const existing = await getReservationByIdempotency(env, adapter, idempotencyKey)
-  if (existing) {
-    if (existing.request_digest !== digest) {
-      throw new Error(`idempotency_key_conflict: ${idempotencyKey}`)
-    }
-    const existingTask = await loadTask(env, existing.task_id)
-    if (!existingTask) {
-      throw new Error(`corrupt_reservation_task_missing: ${existing.task_id}`)
-    }
-    const fakeFlight: DispatchResult = {
-      id: existing.flight_id,
-      go: true,
-      status: 'running',
-      reasons: [],
-      score: 1.0,
-    }
-    return {
-      reservationId: existing.id,
-      task: existingTask,
-      flight: fakeFlight,
-      replay: true,
-      state: existing.state,
-      row: existing,
-    }
+  // Pause fence BEFORE any side effect (including the reservation INSERT).
+  await assertExecutionNotPaused(env, input.agentId)
+
+  // INSERT FIRST. The UNIQUE (tenant, squad_id, adapter, idempotency_key) hit is decided here, before Task/Flight
+  // exist, so the loser of a race creates nothing.
+  const reservationId = crypto.randomUUID()
+  const insertResult = await insertReservation(env, {
+    id: reservationId,
+    adapter,
+    idempotencyKey,
+    requestDigest: digest,
+    agentId: input.agentId,
+    squadId: input.squadId,
+    actor: input.actor,
+  })
+
+  if (insertResult.outcome === 'conflict') {
+    throw new Error(`idempotency_key_conflict: ${idempotencyKey}`)
+  }
+  if (insertResult.outcome === 'replay') {
+    return replayResult(env, insertResult.row)
   }
 
-  const reservationId = crypto.randomUUID()
   const reservedTaskId = input.taskId?.trim() || crypto.randomUUID()
   const reservedFlightId = input.flightId?.trim() || crypto.randomUUID()
   const launchedPrompt = injectSevenAxisSeatDeclaration(input.prompt, reservedFlightId)
@@ -146,90 +188,66 @@ export async function reserveCursorCloudWork(
     lines.push(`model: ${input.model.trim()}`)
   }
 
-  const task = await createTask(
-    env,
-    {
-      squad_id: input.squadId,
-      title,
-      body: lines.join('\n'),
-      done_when: CURSOR_CLOUD_DONE_WHEN,
-      assignee_agent_id: input.agentId,
-      status: 'in_progress',
-    },
-    {
-      id: reservedTaskId,
-      actor: input.actor,
-      skipMirror: true,
-    },
-  )
-
-  const flight = await dispatchFlight(
-    env,
-    {
-      agent: input.agentId,
-      goal: title,
-      trigger_source: 'api',
-      meta: {
-        schema: FLIGHT_META_V1_SCHEMA,
-        goal_id: `cursor-cloud:${reservationId}`,
-        objective_id: task.id,
-        squad_ids: [input.squadId],
-        task_ids: [task.id],
-        done_when: [CURSOR_CLOUD_DONE_WHEN],
-        artifact_refs: [],
-        receipt_refs: [],
-        confidentiality: 'internal',
-        publication_target: 'none',
-        parent_flight_id: null,
+  let task: Task
+  let flight: DispatchResult
+  try {
+    task = await createTask(
+      env,
+      {
+        squad_id: input.squadId,
+        title,
+        body: lines.join('\n'),
+        done_when: CURSOR_CLOUD_DONE_WHEN,
+        assignee_agent_id: input.agentId,
+        status: 'in_progress',
       },
-    },
-    CURSOR_CLOUD_PREFLIGHT_SIGNALS,
-    undefined,
-    { id: reservedFlightId },
-  )
+      {
+        id: reservedTaskId,
+        actor: input.actor,
+        skipMirror: true,
+      },
+    )
 
-  const insertResult = await insertReservation(env, {
-    id: reservationId,
-    adapter,
-    idempotencyKey,
-    requestDigest: digest,
-    taskId: task.id,
-    flightId: reservedFlightId,
-    agentId: input.agentId,
-    squadId: input.squadId,
-    actor: input.actor,
-    state: flight.go ? 'reserved' : 'failed',
-  })
-
-  if (insertResult.outcome === 'conflict') {
-    throw new Error(`idempotency_key_conflict: ${idempotencyKey}`)
+    flight = await dispatchFlight(
+      env,
+      {
+        agent: input.agentId,
+        goal: title,
+        trigger_source: 'api',
+        meta: {
+          schema: FLIGHT_META_V1_SCHEMA,
+          goal_id: `cursor-cloud:${reservationId}`,
+          objective_id: task.id,
+          squad_ids: [input.squadId],
+          task_ids: [task.id],
+          done_when: [CURSOR_CLOUD_DONE_WHEN],
+          artifact_refs: [],
+          receipt_refs: [],
+          confidentiality: 'internal',
+          publication_target: 'none',
+          parent_flight_id: null,
+        },
+      },
+      CURSOR_CLOUD_PREFLIGHT_SIGNALS,
+      undefined,
+      { id: reservedFlightId },
+    )
+  } catch (error) {
+    // The key is ours but no Task/Flight could be created: fail the reservation (never leave it 'reserved' forever).
+    await markReservationFailed(env, reservationId, 'reserve_failed')
+    throw error
   }
 
-  if (insertResult.outcome === 'replay') {
-    const existingTask = await loadTask(env, insertResult.row.task_id)
-    return {
-      reservationId: insertResult.row.id,
-      task: existingTask ?? task,
-      flight: {
-        id: insertResult.row.flight_id,
-        go: true,
-        status: 'running',
-        reasons: [],
-        score: 1.0,
-      },
-      replay: true,
-      state: insertResult.row.state,
-      row: insertResult.row,
-    }
-  }
+  await bindReservationTaskFlight(env, reservationId, task.id, reservedFlightId, { held: !flight.go })
+  const row = (await getReservation(env, reservationId)) ?? insertResult.row
 
   return {
     reservationId,
     task,
     flight,
     replay: false,
-    state: insertResult.row.state,
-    row: insertResult.row,
+    state: row.state,
+    row,
   }
 }
 
@@ -239,27 +257,6 @@ export interface AttachCursorCloudExecutionResult {
   cursor?: CursorCloudRecord
   replay: boolean
   error?: string
-}
-
-export async function appendCursorCloudBinding(
-  env: Env,
-  taskId: string,
-  cursor: CursorCloudRecord,
-): Promise<void> {
-  const extra = [
-    '',
-    `cursor_agent: ${cursor.agentId}`,
-    `cursor_run: ${cursor.runId}`,
-    `cursor_url: ${cursor.agentUrl}`,
-  ].join('\n')
-
-  await env.DB.prepare(
-    `UPDATE tasks
-     SET body = body || ?, updated_at = ?
-     WHERE id = ?`,
-  )
-    .bind(extra, new Date().toISOString(), taskId)
-    .run()
 }
 
 export async function attachCursorCloudExecution(
@@ -272,13 +269,13 @@ export async function attachCursorCloudExecution(
     throw new Error(`reservation_not_found: ${reservationId}`)
   }
 
-  if (row.state === 'attached' && row.vendor_run_id) {
+  if (row.state === 'attached' && row.vendor_agent_id && row.vendor_run_id) {
     return {
       reservationId,
       state: 'attached',
       cursor: {
-        agentId: row.vendor_agent_id!,
-        runId: row.vendor_run_id!,
+        agentId: row.vendor_agent_id,
+        runId: row.vendor_run_id,
         agentUrl: row.vendor_url ?? `https://cursor.com/agents/${row.vendor_agent_id}`,
       },
       replay: true,
@@ -294,29 +291,50 @@ export async function attachCursorCloudExecution(
     }
   }
 
+  if (!row.task_id) {
+    // Reserved but not yet bound to a Task: nothing to launch (the inserter is still creating it).
+    return { reservationId, state: row.state, error: 'reservation_unbound', replay: false }
+  }
+
   const token = resolveCursorApiToken(env)
   if (!token) {
-    await markReservationFailed(env, reservationId, 'cursor_token_missing')
+    const marked = await markReservationFailed(env, reservationId, 'cursor_token_missing')
     return {
       reservationId,
-      state: 'failed',
+      state: marked ? 'failed' : row.state,
       error: 'cursor_token_missing',
       replay: false,
     }
   }
 
-  const leased = await claimAttachLease(env, reservationId)
-  if (!leased) {
+  const leaseId = await claimAttachLease(env, reservationId)
+  if (!leaseId) {
+    // Not claimed: live lease held by another attacher, or an expired lease just moved to failed
+    // (launch_unconfirmed: lease_expired). Never launch without the lease.
+    const fresh = await getReservation(env, reservationId)
+    const state = fresh?.state ?? 'attaching'
     return {
       reservationId,
-      state: 'attaching',
+      state,
+      ...(state === 'failed' && fresh?.last_error ? { error: fresh.last_error } : {}),
       replay: false,
     }
   }
 
+  // A pause may have landed between reserve and attach: re-check with the lease held, before any vendor call.
+  try {
+    await assertExecutionNotPaused(env, row.agent_id)
+  } catch (error) {
+    if (error instanceof ExecutionPausedError) {
+      await releaseAttachLease(env, reservationId, leaseId)
+      return { reservationId, state: 'reserved', error: 'execution_paused', replay: false }
+    }
+    throw error
+  }
+
   const task = await loadTask(env, row.task_id)
   if (!task) {
-    await markReservationFailed(env, reservationId, 'task_missing')
+    await markReservationFailed(env, reservationId, 'task_missing', { leaseId })
     return {
       reservationId,
       state: 'failed',
@@ -344,8 +362,9 @@ export async function attachCursorCloudExecution(
   const promptText = promptLines.join('\n').trim()
   const agentName = `mupot:${reservationId.slice(0, 8)} ${task.title}`
 
-  // #1762 tri-state: only a clean refusal (or no request sent) is a plain failure. A maybe_launched outcome may have
-  // created a real agent on the repo, so the reservation records that explicitly and the key is never re-launched.
+  // #1762 tri-state: only a clean refusal (or no request sent) is a plain failure. A maybe_launched outcome (incl. the
+  // 20s client abort) may have created a real agent on the repo, so the reservation records that explicitly and the
+  // key is never re-launched.
   const outcome = await launchCursorAgent(token, {
     name: agentName,
     repoUrl,
@@ -356,7 +375,7 @@ export async function attachCursorCloudExecution(
   if (outcome.state !== 'launched') {
     const detail = outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
     const msg = outcome.state === 'maybe_launched' ? `launch_unconfirmed: ${detail}` : detail
-    await markReservationFailed(env, reservationId, msg)
+    await markReservationFailed(env, reservationId, msg, { leaseId })
     return {
       reservationId,
       state: 'failed',
@@ -373,12 +392,13 @@ export async function attachCursorCloudExecution(
   }
 
   try {
-    // One atomic batch: the reservation flips to attached and the task body gains the vendor binding together.
-    // The task write is guarded by EXISTS on the just-flipped reservation row, so it can never land without it.
-    const binding = await bindVendorExecutionWithTaskBinding(env, reservationId, task.id, cursorRecord, launched.run.status)
+    // One atomic batch fenced on THIS attacher's lease id: the reservation flips to attached and the task body gains
+    // the vendor binding together, or neither.
+    const binding = await bindVendorExecutionWithTaskBinding(env, reservationId, leaseId, task.id, cursorRecord, launched.run.status)
     if (!binding) {
-      // Lease lost to another attacher: do not claim the vendor ids as ours.
-      return { reservationId, state: 'attaching', replay: false }
+      // Lease lost (reclaimed): do not claim the vendor ids as ours.
+      const fresh = await getReservation(env, reservationId)
+      return { reservationId, state: fresh?.state ?? 'attaching', error: 'bind_lost_lease', replay: false }
     }
     return {
       reservationId,
@@ -389,58 +409,12 @@ export async function attachCursorCloudExecution(
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error)
     // The agent exists; failing to record it must not read as a clean failure.
-    await markReservationFailed(env, reservationId, `bind_unconfirmed: ${msg}`)
+    await markReservationFailed(env, reservationId, `bind_unconfirmed: ${msg}`, { leaseId })
     return {
       reservationId,
       state: 'failed',
-      error: `bind_unconfirmed: ${msg}`,
+      error: 'bind_unconfirmed',
       replay: false,
     }
   }
-}
-
-// ── Backward-compatible wrapper ─────────────────────────────────────────────
-export interface RecordCursorCloudWorkInput {
-  name: string
-  repoUrl: string
-  prompt: string
-  squadId: string
-  agentId: string
-  actor?: { kind: 'member' | 'agent'; id: string }
-  cursor?: CursorCloudRecord
-  flightId?: string
-}
-
-export interface RecordCursorCloudWorkResult {
-  task: Task
-  flight: DispatchResult
-}
-
-export async function recordCursorCloudWork(
-  env: Env,
-  input: RecordCursorCloudWorkInput,
-): Promise<RecordCursorCloudWorkResult> {
-  const actor: HarnessActor = input.actor ?? { kind: 'agent', id: input.agentId }
-  const idempotencyKey = crypto.randomUUID()
-
-  const reserved = await reserveCursorCloudWork(env, {
-    name: input.name,
-    repoUrl: input.repoUrl,
-    prompt: input.prompt,
-    squadId: input.squadId,
-    agentId: input.agentId,
-    actor,
-    idempotencyKey,
-    flightId: input.flightId,
-  })
-
-  if (input.cursor) {
-    // The row starts 'reserved'; the bind guard requires 'attaching', so take the lease first (it was skipped
-    // before, which left this wrapper's reservation unbound).
-    if (await claimAttachLease(env, reserved.reservationId)) {
-      await bindVendorExecutionWithTaskBinding(env, reserved.reservationId, reserved.task.id, input.cursor)
-    }
-  }
-
-  return { task: reserved.task, flight: reserved.flight }
 }
