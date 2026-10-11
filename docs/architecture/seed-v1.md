@@ -103,17 +103,22 @@ spoof-resistant request text: use plain-text names.
 
 ## The tool
 
-`seed_attach { seed: string, dry_run?: boolean, accept?: string[] }` — member capability floor for
+`seed_attach { seed: string, dry_run?: boolean, accept?: string[], accept_token?: string }` — member capability floor for
 the dry run; apply needs more (below).
 
 - `dry_run` defaults to **true**: validate and return
-  `{ok, dry_run, seed_sha256, requests[], diffs[]}`. Nothing is written, including the
+  `{ok, dry_run, seed_sha256, accept_token, requests[], diffs[]}`. Nothing is written, including the
   generic presence bump. `diffs` compares name, goal, repo and live against the existing
   project the seed would apply to (`<slug>-prj`), only if the caller can already read it.
 - `requests` is a list of `{key, kind, fields, needs, text}`: `key` is stable (`kind:` plus 12 hex of
   the digest of the request), `fields` is the structured source of truth, `needs` is always
   `human_accept`, and `text` is a rendered one-line sentence in which every author value is
   JSON-quoted (U+2028/U+2029 escaped).
+- `accept_token` is an HMAC over (seed digest, member id, issue time), valid 15 minutes, keyed with the
+  existing server secret `CONNECTOR_MASTER_KEY` (no new secret). It is `null` for an agent-bound caller
+  and when the pot has no such secret. Request keys are a deterministic hash of the seed text and could be
+  precomputed by an author; the token cannot, so it ties an apply to a dry run by this member of this
+  exact seed. It proves the dry run happened, not that a person read it.
 - A refused seed is `400 invalid_seed` with `{code, path, message}`.
 
 ### Apply (`dry_run: false`)
@@ -125,31 +130,45 @@ Apply is a **human act**. Required, in this order:
 | caller is not agent-bound (any agent token, whatever it holds) | `403 human_accept_required` |
 | caller is a member with org admin standing (the `team_bootstrap` floor) | `403 forbidden` |
 | seed re-validated server-side (a prior dry run is never trusted) | `400 invalid_seed` |
-| `accept` present and every key known to this seed | `400 invalid_args`, `400 unknown_accept_keys` |
-| EVERY request key is in `accept` (nothing is auto-accepted) | `409 requests_not_accepted` `{missing:[{key,kind}]}` |
 | `slug` can derive `<slug>-prj` / `<slug>-sqd` (at most 44 chars, not ending `-prj`, `-sqd`, `-bot`) | `400 seed_slug_not_applicable` |
+| `accept` is an array of strings | `400 invalid_args` |
+| `accept_token` is a fresh token from this member's dry run of this exact seed | `409 accept_token_invalid`; `503 accept_token_unavailable` when the pot has no secret |
+| every `accept` key is one this seed produces | `400 unknown_accept_keys` |
+| EVERY request key is in `accept` (nothing is auto-accepted) | `409 requests_not_accepted {missing:[{key,kind}]}` |
 
 Then, **insert-first**: one `project_seeds` row (UNIQUE `tenant + project_slug`) is inserted before
-anything is created. The INSERT itself refuses when a project of that slug exists that the caller did
-not create (a project with no recorded creator counts as not theirs). On the UNIQUE key:
+anything is created. The claim INSERT itself refuses when a project `<slug>-prj`, or a squad `<slug>-sqd`
+in the shared `dept-projects` department, exists that the caller did not create (no recorded creator, or a
+home squad, counts as not theirs). Refusing there keeps a refusal from writing anything. On the UNIQUE key:
 
-- same `seed_sha256`, applied: `replay: true`, nothing created (also while another apply of the same
-  seed is in flight: `replay: true, status: "applying"`).
+- same `seed_sha256`, applied: `replay: true`, nothing created.
+- same digest while the first apply is still running: `409 seed_apply_in_progress` (never success-shaped:
+  the first apply may still fail).
 - different `seed_sha256`: `409 seed_digest_conflict`. A seed is never silently updated; update is a
   later feature.
-- an existing project of that slug the caller did not create, or a seed row the caller cannot see:
+- an existing project or squad of that name the caller did not create, or a seed row the caller cannot see:
   `409 seed_slug_unavailable`, **one generic body** (no id, name or creator). Use the dry run's `diffs`
   to see a project you can read.
-- an apply that crashed after the claim holds a 120 second lease; only the same member may resume it
-  after the lease lapses, and the resume creates nothing twice.
+- a crashed apply leaves an `applying` claim with a 120 second lease. Once the lease has lapsed and **no
+  project of that slug exists**, any admin's next apply deletes that stale claim (one conditional
+  statement; a live lease or a row whose project exists is never deleted) and claims once more.
+- if a project does exist under a lapsed claim, only the same member with the same digest may resume,
+  and the resume re-checks the same no-takeover predicate. `team_bootstrap` is called with
+  `require_provenance`, so apply adopts a pre-existing project or squad only when the caller created it,
+  never on a bare earlier receipt.
 
-What apply creates is **exactly**: the project (`<slug>-prj`, `created_by_member_id` = the caller),
-the squad (`<slug>-sqd`, display name from `wants.seats.squad` or `<slug>-core`) with the ADMIN
-squad-project edge (both through `team_bootstrap`'s find-or-create core, which also writes its own
-`team_bootstrap_receipts` row), the shared `dept-projects` department if this pot has none yet, the
-seat **cap** (`wants.seats.max`, recorded only), one `project_seeds` row and one audit receipt
-(`mutation_audit_entries`, handler `seed_attach`, operation `apply`, keyed `seed-apply:<row id>`,
-carrying `seed_sha256`, the caller and the accepted keys).
+What apply creates is **exactly**:
+
+- the project (`<slug>-prj`, `created_by_member_id` = the caller) and the squad (`<slug>-sqd`, named
+  `<slug>: <wants.seats.squad>`, or `<slug>: core`, so a seed cannot pose as an existing squad) with the
+  ADMIN squad-project edge, through `team_bootstrap`'s find-or-create core;
+- that core's own `team_bootstrap_receipts` row (one per apply);
+- the shared `dept-projects` department, first use only;
+- the seat **cap** (`wants.seats.max`), recorded only;
+- one `project_seeds` row;
+- one audit receipt (`mutation_audit_entries`, handler `seed_attach`, operation `apply`, keyed
+  `seed-apply:<row id>`, UNIQUE, carrying `seed_sha256`, the caller and the accepted keys), written in the
+  same batch as the status flip and only by the call that wins the flip.
 
 What apply **never** creates: gate capabilities or grants, routines, connectors or credentials,
 deploy rights, agents, tokens, invites. Every request stays in `requests_json` with status
@@ -158,8 +177,18 @@ the raw source; `owner` is stored as a label (`owner_label`) and is never resolv
 project's goal, repo and live URL are recorded in `canonical_json` and are not copied onto the
 project row by this slice.
 
-Errors from creation itself (`squad_limit_reached`, archived project, ...) are `409 seed_apply_failed`
-`{reason}`; the claim is released so a retry starts clean.
+Failures after the claim (`squad_limit_reached`, archived project, an uncaught error) are
+`409 seed_apply_failed {reason}`. The claim is **released only if no project was created**. If a project
+already exists the claim stays, with its lease expired, so only the same member with the same digest can
+resume it.
+
+### Known limits
+
+- After a partial creation (project exists, squad failed), a **different** digest for that slug is refused
+  (`seed_digest_conflict`) until an update feature exists; the same member can resume the original seed.
+- The squad guard and the claim use the shared `dept-projects` department only.
+- `accept_token` proves a dry run by this member, not that a person read the requests.
+- Slug existence is inferable from the generic refusal, as with any unique slug.
 
 ## Attach protocol
 
@@ -240,4 +269,5 @@ Each test below was written to fail when the named mutation is applied to the co
 - Compare digests loosely (or not at all) on a repeat: the digest-conflict test fails.
 - Store the raw source anywhere: the canary-comment test fails.
 - Let apply create a bot, agent, capability or gate: the whole-database footprint test fails.
-- Drop the receipt or its UNIQUE key: the footprint and concurrent-apply tests fail.
+- Drop the receipt's `WHERE changes() = 1` flip guard: the claim-lost test fails. Drop its UNIQUE key: the crash-resume test fails.
+- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest or age: the round-2 tests fail.
