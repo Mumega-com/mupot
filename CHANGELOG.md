@@ -2,6 +2,26 @@
 
 ## [Unreleased] — main since v0.31.0
 
+### Release-scope highlights after the v0.31.0 tag
+
+These entries summarize selected merged work; exact heads, tests, deployments and
+residual findings remain on the cited PRs. A merge is not a stable-release verdict.
+
+- **Autonomy brakes and recovery:** dry-run-default router, execution pause and per-task
+  retry ceiling (#1807); task-dispatch/envelope/custody fences and release policy
+  (#1811); successive brake/routine fixes (#1813, #1815, #1823); audited incident
+  recovery (#1805). Broader acceptance remains subject to the frozen release evidence.
+- **Harness seats:** records and selection (#1795), handles (#1797), explicit consent
+  (#1801), harness credentials (#1806), per-thread auto-seating (#1816), and pool
+  isolation fixes (#1819, #1822). Activation and live canary proof are separate claims.
+- **Task archiving:** action boundary (#1778) and follow-up guards (#1781, #1789, #1793).
+- **Metering:** unmetered-flight disclosure (#1737) and budget enforcement (#1741).
+- **Office publishing:** write-capable bindings (#1614), shown-payload approval binding
+  (#1602), idempotency (#1653), and health/setup tools (#1679).
+- **v0.32.0 acceptance clarification:** regenerate and bind seat canaries at the frozen
+  deployed SHA, collect fresh permission evidence, and require postpublication stable
+   deployment, integrity and final-readiness verification before declaring completion.
+
 > **Re-scope (2026-10-11):** `v0.32.0` is now "Agents as themselves and governed
 > autonomy": per-seat agent identity for Claude Code, Codex, and ChatGPT threads, plus
 > the loop brakes, with P0 #1565 and #1608 and #1609 (the #1596 phase-1b disclosure items) closed

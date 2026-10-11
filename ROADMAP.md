@@ -9,17 +9,18 @@ numbers.
 | State | Version | Meaning |
 |---|---|---|
 | Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
-| Current production version | `0.31.0` | Last recorded deploy `d954c1ab` (2026-09-29); live `/health` reported `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
+| Current production version | Read live `/health` | Version and deployed SHA move independently of `main` and tags; this roadmap does not pin current production. Historical observations remain in their release evidence records. |
 | Last tagged stable release | `v0.31.0` | "Office", annotated tag at `52299bab` (tagged 2026-09-29) with a GitHub Release of the same name; deployed 2026-09-29 (#1604, migration 0181 applied immediately after). Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). Read the tag, not a SHA copied here. |
 | Next stable candidate | `v0.32.0` | "Agents as themselves and governed autonomy" — cut from a single frozen `main` SHA onto `release/v0.32.0`, per the release contract in the v0.32.0 section below. `release/v0.31.0` was never cut, so there is no `v0.31.x` patch path; `main` has moved far past the tag. |
 | Following targets | `v0.33.0`, `v0.34.0` | `v0.33.0` "Compounding Project Knowledge" (plus the receiver/runner, runtime-receipt, and Agent Computers scope formerly labelled `v0.31.0`); `v0.34.0` "Distribution and Commercial Operations". `v1.0.0` is unchanged. |
 
-`0.31.0` is the version the source reports and the version last deployed; it is also the
-latest tag (`v0.31.0`, annotated, with a GitHub Release). `main` is far past the tag: read
+`0.31.0` is the version the source reports and the latest tagged version (`v0.31.0`,
+annotated, with a GitHub Release). Read live `/health` for production. `main` is far past the tag: read
 `git rev-list --count v0.31.0..origin/main` for the distance. Nothing on `main` after the
-tag is covered by the `v0.31.0` evidence bundle. Work shipped to `main` since the tag
-(migrations 0182 onward) is summarized under "On main since v0.31.0" below and recorded in
-[CHANGELOG.md](CHANGELOG.md) `[Unreleased]`.
+tag is covered by the `v0.31.0` evidence bundle. Selected work shipped to `main` since the
+tag (migrations 0182 onward) is summarized under "On main since v0.31.0" below;
+[CHANGELOG.md](CHANGELOG.md) `[Unreleased]` records these release-scope highlights.
+Neither summary is a complete commit ledger; the cited PRs retain their exact evidence.
 
 ## Shipped — v0.31.0 "Office" (2026-09-29)
 
@@ -50,8 +51,8 @@ Merged to `main` after the tag; unreleased until `v0.32.0` is cut. Detail lives 
 CHANGELOG; this lists what the re-scope below builds on.
 
 - Loop brakes: dry-run-default `router_tick`, execution pause, per-task retry ceiling
-  (#1807); fences at every external execution entrypoint with one release policy
-  (#1811); follow-up fixes (#1813, #1815, #1823). Audited incident recovery tool
+  (#1807); task-dispatch, inbox-envelope and runtime-custody fences with one release
+  policy (#1811); follow-up fixes (#1813, #1815, #1823). Audited incident recovery tool
   `task_incident_revert` (#1805).
 - Zero-touch seat onboarding, epic #1794: harness records and `seat_select` (W1, #1795),
   seat handles (W2, #1797), consent "Me — auto per workspace" (W3, #1801), token harness
@@ -815,21 +816,34 @@ unrestricted tool catalogs, and silent credential fallback into runtime environm
 **One promise:** A member's agent threads act under their own seat identities, and
 autonomous loops run inside brakes a human controls.
 
-Release contract (done-when). `v0.32.0` is stable only when all six hold:
+Release contract (done-when). `v0.32.0` is stable only when all seven hold:
 
 1. a member's Claude Code, Codex, and ChatGPT threads each act under their own seat
    agent with no manual token mint, proven by the seat canary receipts recorded on the
    flight parent (one read-only call each from Claude Code, Codex and ChatGPT under
-   `SEAT_AUTO_ENROLL=1`, seat rows read back);
+   `SEAT_AUTO_ENROLL=1`, seat rows read back). Regenerate all three canaries at the
+   frozen, deployed `release_sha` in step 5; earlier development canaries are not
+   final release acceptance;
 2. loop brakes (dry-run default, pause, per-task retry ceiling, human-only release) are
    deployed and covered by tests;
 3. P0 #1565 is closed;
 4. #1608 and #1609 (the #1596 phase-1b disclosure items) are closed; #1596 itself
    (the Cloudflare Forge adoption epic) is not required to close;
-5. one frozen SHA has two independent review lenses GREEN, CI green, and the release
-   evidence bundle `mupot-v032-prepublication-readiness/v1` (successor of the v0.30
-   contract; schema to be written before the freeze);
-6. `release/v0.32.0` is cut and the annotated tag and GitHub Release are published.
+5. one frozen `release_sha` has the repository-required independent gate owners/lenses
+   GREEN and CI green. Through the authorized deployment path, deploy that candidate
+   before running the final canaries; record its target/runtime endpoint and `/health`
+   readback proving the deployed SHA equals `release_sha`. Collect fresh
+   permission/installation evidence and regenerate all three seat canaries against
+   that verified runtime, binding their endpoint, actor/seat readbacks and observed
+   deployment SHA to `release_sha`. Build and pass
+   `mupot-v032-prepublication-readiness/v1` from those bound receipts (schema and checker
+   defined before the freeze);
+6. after the separate release authorization, `release/v0.32.0`, the annotated tag and
+   GitHub Release all resolve to that approved `release_sha`;
+7. stable deployment is observed at the same SHA, published tag/Release/artifact
+   evidence passes `release-integrity-check.json`, and the version-specific final
+   postpublication readiness check and independent verdict pass. Publication alone
+   does not satisfy stable completion.
 
 Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
 met by the frozen SHA, not by the existence of those PRs.
