@@ -215,6 +215,7 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { ELEVATION_DECIDE_TOOLS, humanElevationDeciderFloor, humanElevationStatus } from './elevation-decide'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -5911,7 +5912,7 @@ const toolRequestElevation: ToolSpec = {
 
 const toolElevationStatus: ToolSpec = {
   name: 'elevation_status',
-  scope: 'self (exact current agent session)',
+  scope: 'self (exact current agent session); a human org admin instead sees the pending requests they can decide',
   min: 'authenticated',
   args: '{ request_id?: string }',
   inputSchema: {
@@ -5922,7 +5923,12 @@ const toolElevationStatus: ToolSpec = {
   shouldTouchPresence: () => false,
   async run(auth, env, args) {
     const sessionContext = resolveAgentSessionContext(auth)
-    if (!sessionContext.ok) return fail(403, sessionContext.reason)
+    if (!sessionContext.ok) {
+      // A human org admin reads the pending requests (and exactly what each would grant) here, so
+      // elevation_decide is never a blind decision. Any other non-agent caller keeps the refusal.
+      if (!auth.boundAgentId && (await humanElevationDeciderFloor(auth, env)).ok) return humanElevationStatus(auth, env, args)
+      return fail(403, sessionContext.reason)
+    }
 
     const liveSession = await loadLiveAgentSessionByCredential(
       env,
@@ -6984,6 +6990,7 @@ export const TOOLS: ToolSpec[] = [
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...SEED_TOOLS,
+  ...ELEVATION_DECIDE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
