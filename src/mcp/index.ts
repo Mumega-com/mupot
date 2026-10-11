@@ -212,6 +212,7 @@ import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
+import { SEED_TOOLS } from './seed'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -786,7 +787,7 @@ function memberActor(memberId: string): { kind: 'member'; id: string } {
 // ── tool result shape ─────────────────────────────────────────────────────────
 // A tool returns either a value (→ 200 {ok:true, result}) or a typed error with
 // an HTTP status (→ that status, {ok:false, error}).
-type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 502 | 503; error: string; detail?: unknown }
+type ToolError = { status: 400 | 403 | 404 | 409 | 410 | 429 | 500 | 501 | 502 | 503; error: string; detail?: unknown }
 export type ToolOutcome = { ok: true; result: unknown } | { ok: false } & ToolError
 
 export function fail(status: ToolError['status'], error: string, detail?: unknown): ToolOutcome {
@@ -6960,6 +6961,7 @@ export const TOOLS: ToolSpec[] = [
   ...LOOP_TOOLS,
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
+  ...SEED_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,

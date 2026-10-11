@@ -1,0 +1,43 @@
+# Example seed: a WordPress site managed through a plugin; edits are proposals.
+schema: mupot.seed/v1
+slug: digid-ca
+name: Example WordPress Site
+kind: site/wordpress
+goal: Keep marketing pages current and on-brand; draft new pages for review.
+owner: site-owner
+live: https://wp.example.com
+deploy:
+  via: wp-plugin
+  receipt: change receipt recorded on the project
+  human_only: true
+surfaces:
+  - type: wp.page
+    mode: propose
+  - type: wp.post
+    mode: propose
+  - type: wp.media
+    mode: direct
+data:
+  - store: wp.pages
+    tier: public
+  - store: form entries
+    tier: private
+tools:
+  - mcp: https://wp.example.com/wp-json/mcp
+    cred_slot: WP_SITE_API
+wants:
+  memory: [project]
+  gates:
+    - action: update_page
+      gate: gate:site-owner
+  seats:
+    squad: web
+    max: 1
+signals:
+  health: [https://wp.example.com/wp-json]
+  outcome: [pages_updated_per_month]
+risk:
+  class: medium
+  forbidden: [delete_content, change_plugins]
+  human_only: [deploy, plugin_changes]
+  allow_direct: [wp.media]
