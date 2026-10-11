@@ -391,6 +391,33 @@ describe('round 2: no takeover on the resume path, no refusal that writes', () =
     expect(await teamBootstrap(env, adm, input)).toMatchObject({ ok: true })
   })
 
+  it('a foreign project that appears after the claim is never adopted on a bare receipt (require_provenance, end to end)', async () => {
+    const args = await full(adm)
+    const real = env.DB
+    let planted = false
+    env = { ...env, DB: new Proxy(real, {
+      get(target, key) {
+        if (key === 'prepare') {
+          return (sql: string) => {
+            if (!planted && /^\s*SELECT id FROM departments WHERE slug = \?1 LIMIT 1/.test(sql)) {
+              planted = true
+              harness.sqlite.exec(`
+                INSERT INTO projects (id, slug, name, goal, created_by_member_id) VALUES ('p-late', 'mumega-com-prj', 'N', 'g', 'adm2');
+                INSERT INTO team_bootstrap_receipts (id, tenant, actor_member_id, slug_base, attempt_no, project_id, squad_id, disposition, invited_count, created_at)
+                  VALUES ('r-late', '${TENANT}', 'adm2', 'mumega-com', 1, 'p-late', NULL, 'created', 0, '${STALE}');`)
+            }
+            return target.prepare(sql)
+          }
+        }
+        const v = Reflect.get(target, key)
+        return typeof v === 'function' ? v.bind(target) : v
+      },
+    }) } as Env
+    expect(await call(adm, args)).toMatchObject({ ok: false, error: 'seed_slug_unavailable' })
+    expect(count('project_squad_access')).toBe(0)
+    expect(planted).toBe(true)
+  })
+
   it('a foreign squad at <slug>-sqd is refused at the claim: generic body, whole database unchanged', async () => {
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-p', 'dept-projects', 'Projects');

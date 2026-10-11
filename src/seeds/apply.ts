@@ -180,8 +180,9 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
     let row = await loadRow()
     // A crashed apply leaves an 'applying' claim behind. Once its lease has lapsed AND no project of that
     // slug exists, nothing was created under it: delete the stale claim (one conditional statement, never a
-    // live lease, never a row whose project exists) and claim once more.
-    if (row && row.status === 'applying' && row.lease_expires_at !== null && row.lease_expires_at <= new Date().toISOString()) {
+    // live lease, never a row whose project exists) and claim once more. The DELETE's own predicate
+    // (status, lapsed lease, no project) is the only gate.
+    if (row && row.status === 'applying') {
       const swept = await env.DB.prepare(
         `DELETE FROM project_seeds WHERE id = ?1 AND status = 'applying' AND lease_expires_at <= ?2
             AND NOT EXISTS (SELECT 1 FROM projects WHERE slug = ?3)`,
