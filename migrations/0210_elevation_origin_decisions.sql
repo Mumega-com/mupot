@@ -117,3 +117,24 @@ CREATE INDEX IF NOT EXISTS idx_elevation_grants_approver
   ON elevation_grants(tenant, approved_by_web_session_hash);
 CREATE INDEX IF NOT EXISTS idx_elevation_grants_origin_receipt
   ON elevation_grants(origin_receipt_id);
+
+-- Reserve the stamping-harness token labels. `elevation_decide` trusts a human_origin only
+-- from a token whose label is in STAMPING_HARNESS_TOKEN_LABELS (src/auth/elevation-actions.ts),
+-- but several mint paths take a caller-chosen label (squad admins, agents holding an
+-- action:mint_token grant, enroll, provision). A label proves which credential was used, not
+-- that a harness stamped the call, so no path may write one. The origin door therefore stays
+-- closed until a server-set harness field replaces the label check. Keep this list in sync
+-- with STAMPING_HARNESS_TOKEN_LABELS (pinned by tests/elevation-origin-migration.test.ts).
+CREATE TRIGGER IF NOT EXISTS member_tokens_reserved_label_insert
+BEFORE INSERT ON member_tokens
+WHEN lower(trim(NEW.label)) IN ('hermes-gateway')
+BEGIN
+  SELECT RAISE(ABORT, 'member_tokens_label_reserved');
+END;
+
+CREATE TRIGGER IF NOT EXISTS member_tokens_reserved_label_update
+BEFORE UPDATE OF label ON member_tokens
+WHEN lower(trim(NEW.label)) IN ('hermes-gateway')
+BEGIN
+  SELECT RAISE(ABORT, 'member_tokens_label_reserved');
+END;

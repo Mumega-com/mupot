@@ -266,9 +266,13 @@ export const ORIGIN_DECIDABLE_ACTIONS: ReadonlySet<string> = new Set([
  *
  *  The server cannot tell a harness-stamped origin from one a model typed into the tool call. The
  *  only server-side fact that distinguishes "this call came through a stamping harness" is the
- *  CALLING TOKEN'S OWN ROW (member_tokens), written when an org admin minted the credential and
- *  never UPDATEd afterwards (no code path rewrites `label`). The caller cannot pass it per request:
- *  auth.tokenId is derived server-side from the bearer, and the label is re-read from the row.
+ *  CALLING TOKEN'S OWN ROW (member_tokens). The caller cannot pass it per request: auth.tokenId is
+ *  derived server-side from the bearer, and the label is re-read from the row. But a label proves
+ *  which credential was used, not that a harness stamped the call, and several mint paths take a
+ *  caller-chosen label (squad admins, agents holding action:mint_token, enroll, provision). So
+ *  migration 0210 RESERVES these labels with triggers on member_tokens: no insert or relabel can
+ *  write one, and the origin door stays closed until a server-set harness field replaces this
+ *  check. Keep this list in sync with those triggers (pinned by elevation-origin-migration.test).
  *
  *  member_tokens.harness_kind is NOT usable: its CHECK list has no hermes kind, and a trigger
  *  (0204) forbids it on any agent-bound token (the only kind that reaches elevation_decide).

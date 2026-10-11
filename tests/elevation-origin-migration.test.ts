@@ -7,6 +7,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { describe, expect, it } from 'vitest'
+import { STAMPING_HARNESS_TOKEN_LABELS } from '../src/auth/elevation-actions'
 
 const DIR = join(import.meta.dirname, '..', 'migrations')
 const TARGET = readdirSync(DIR).find((f) => f.includes('elevation_origin_decisions'))
@@ -67,5 +68,25 @@ describe('migration 0210 on a populated database, as one D1 transaction with FKs
     const mutated = readFileSync(join(DIR, TARGET), 'utf8').replace(/^PRAGMA defer_foreign_keys = ON;$/m, '')
     expect(mutated).not.toContain('PRAGMA defer_foreign_keys')
     expect(() => asOneTx(db, mutated)).toThrow(/FOREIGN KEY/i)
+  })
+
+  it('reserves every stamping-harness label: no insert or relabel can write one', () => {
+    const db = dbBeforeTarget()
+    seed(db)
+    asOneTx(db, readFileSync(join(DIR, TARGET), 'utf8'))
+    expect(STAMPING_HARNESS_TOKEN_LABELS.length).toBeGreaterThan(0)
+    const mint = (id: string, label: string): void => {
+      db.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, agent_id, tenant) VALUES (?, 'm1', ?, ?, 'workspace', 'x', NULL, 't')`).run(id, `h-${id}`, label)
+    }
+    for (const label of STAMPING_HARNESS_TOKEN_LABELS) {
+      for (const variant of [label, label.toUpperCase(), `  ${label} `]) {
+        expect(() => mint(`t-${variant}`, variant)).toThrow(/member_tokens_label_reserved/)
+      }
+    }
+    mint('ok', 'muvps-kayhermes')
+    for (const label of STAMPING_HARNESS_TOKEN_LABELS) {
+      expect(() => db.prepare(`UPDATE member_tokens SET label = ? WHERE id = 'ok'`).run(label)).toThrow(/member_tokens_label_reserved/)
+    }
+    expect(db.prepare(`SELECT label FROM member_tokens WHERE id = 'ok'`).get()).toEqual({ label: 'muvps-kayhermes' })
   })
 })

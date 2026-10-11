@@ -36,6 +36,11 @@ describe('elevation_decide over harness-attested human origin', () => {
   beforeEach(async () => {
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
+    // Migration 0210 reserves the stamping-harness labels, so as shipped no token can carry one
+    // and the origin door is closed (pinned in tests/elevation-origin-migration.test.ts). These
+    // tests exercise the door as it will behave once a server-set harness field issues such a
+    // credential, so they lift the reservation inside this in-memory database only.
+    harness.sqlite.exec('DROP TRIGGER member_tokens_reserved_label_insert; DROP TRIGGER member_tokens_reserved_label_update;')
     env = { TENANT_SLUG: TENANT, DB: harness.db } as unknown as Env
     await env.DB.prepare(`INSERT INTO departments (id, slug, name) VALUES (?1, 'dept', 'Dept')`).bind(DEPT).run()
     await env.DB.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES (?1, ?2, 'squad', 'Squad One')`).bind(SQUAD, DEPT).run()

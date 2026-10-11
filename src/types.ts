@@ -774,7 +774,7 @@ export interface MemberToken {
   tenant: string
   member_id: string
   token_hash: string
-  label: string // "laptop", "hermes-gateway", ...
+  label: string // "laptop", "kayhermes", ...
   channel: ConnectionChannel
   created_at: string
   expires_at?: string | null

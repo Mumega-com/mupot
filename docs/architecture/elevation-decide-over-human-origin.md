@@ -26,17 +26,31 @@ The server cannot tell a harness-stamped `human_origin` from one a model typed i
 tool call. So `elevation_decide` accepts a `human_origin` only when the **calling token's
 own row** (`member_tokens`, identified by the server-derived `auth.tokenId`) is live,
 bound to the calling agent, and its label is in `STAMPING_HARNESS_TOKEN_LABELS`
-(`src/auth/elevation-actions.ts`, currently `hermes-gateway`). The label is written when
-an org admin mints the credential and no code path rewrites it; nothing the caller passes
-in the call is consulted. The check runs at the tool door, again in the commit anchor
+(`src/auth/elevation-actions.ts`, currently `hermes-gateway`). Nothing the caller passes
+in the call is consulted.
+
+**The door ships closed.** A label proves which credential was used, not that a harness
+stamped the call, and several mint paths accept a caller-chosen label (squad admins, an
+agent holding an `action:mint_token` grant, `/enroll`, `provision_agent_connection`).
+Migration 0210 therefore reserves every label in `STAMPING_HARNESS_TOKEN_LABELS` with
+triggers on `member_tokens` (insert and relabel both abort `member_tokens_label_reserved`),
+so no token can pass the stamping check today. Opening the door needs all of:
+
+1. a server-set harness field on agent tokens, written only by an org admin acting directly
+   (not agent-bound, not via an elevation grant), replacing the label check;
+2. the harness keeps the bearer out of its model's reach, or signs calls with a key the
+   model cannot read (a harness whose model has a shell and can read its own config can
+   forge an origin with `curl`, bypassing the plugin's strip);
+3. the harness adds `elevation_decide` to the tools it stamps. The check runs at the tool door, again in the commit anchor
 (pinned to the exact token row), and again at **use** for the relaying agent (a revoked
 or relabelled credential ends the grant).
 
 `member_tokens.harness_kind` and `fleet_agents.runtime` were considered and rejected:
 `harness_kind` has no Hermes value and a trigger forbids it on any agent-bound token,
-and `runtime` can be self-reported by the bound agent. The token label is therefore the
-strongest server-set fact available today; it is only as trustworthy as who mints tokens.
-A dedicated server-set harness column on agent tokens is the proper follow-up.
+and `runtime` can be self-reported by the bound agent. The token label was the
+strongest server-set fact available, and it is not strong enough, hence the reservation
+above. The same weakness exists on `task_verdict`'s origin path, which checks no
+credential at all; that is tracked separately.
 
 Required outside this repo: the KayHermes plugin must add `elevation_decide` to its
 `HUMAN_ORIGIN_TOOL_NAMES` (today it stamps `task_verdict` only and strips `human_origin`
