@@ -246,3 +246,42 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:mint_token',
   'action:routine_archive', // irreversible
 ])
+
+/** S13: the ONLY actions a harness-attested human origin (a human decision relayed
+ *  through the human's own agent, no dashboard) may APPROVE. An explicit list, never
+ *  computed: adding an action here is a reviewed security decision.
+ *
+ *  Excluded on purpose: every SENSITIVE_STEP_UP_ACTIONS member (those need a fresh
+ *  dashboard reauth a chat message cannot prove), `action:home_access` (only the home's
+ *  own owner may decide it), and anything not enforced. DENY is never restricted by this
+ *  list: refusing a request can never widen authority. */
+export const ORIGIN_DECIDABLE_ACTIONS: ReadonlySet<string> = new Set([
+  'action:project_lifecycle',
+  'action:workspace_project',
+  'action:routine_policy',
+  'action:project_status',
+])
+
+/** S13 (P1-2): which calling credentials may SUPPLY a human_origin to elevation_decide.
+ *
+ *  The server cannot tell a harness-stamped origin from one a model typed into the tool call. The
+ *  only server-side fact that distinguishes "this call came through a stamping harness" is the
+ *  CALLING TOKEN'S OWN ROW (member_tokens). The caller cannot pass it per request: auth.tokenId is
+ *  derived server-side from the bearer, and the label is re-read from the row. But a label proves
+ *  which credential was used, not that a harness stamped the call, and several mint paths take a
+ *  caller-chosen label (squad admins, agents holding action:mint_token, enroll, provision). So
+ *  migration 0210 RESERVES these labels with triggers on member_tokens: no insert or relabel can
+ *  write one, and the origin door stays closed until a server-set harness field replaces this
+ *  check. Keep this list in sync with those triggers (pinned by elevation-origin-migration.test).
+ *
+ *  member_tokens.harness_kind is NOT usable: its CHECK list has no hermes kind, and a trigger
+ *  (0204) forbids it on any agent-bound token (the only kind that reaches elevation_decide).
+ *  fleet_agents.runtime is NOT usable: the bound agent can self-report it (boot-self-report.ts).
+ *
+ *  Exact, lowercase, trimmed match against the token label. An explicit list: adding a label is a
+ *  reviewed security decision (the harness behind it MUST really strip a model-supplied
+ *  human_origin and stamp only the human's own message; see docs). */
+export const STAMPING_HARNESS_TOKEN_LABELS: readonly string[] = ['hermes-gateway']
+
+/** One human decision per member per this window, enforced in the commit batch's anchor. */
+export const ORIGIN_DECISION_RATE_WINDOW_MS = 30 * 1000

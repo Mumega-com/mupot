@@ -3729,9 +3729,45 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_project_seeds_project" },
     ],
   },
+  {
+    file: "0210_elevation_origin_decisions.sql",
+    sha256: "571db17a5461bd2aeb714d9f21803a36f7f58e870263ee73574941f9557d85cd",
+    statements: [
+      "-- 0210_elevation_origin_decisions.sql — S13: a human decides an agent's\n-- elevation request WITHOUT the dashboard, through the harness-attested human\n-- origin channel (the same channel task_verdict uses since 0155).\n--\n-- NOT applied by this build. Branch/schema only; a human applies it.\n--\n-- WHY THE grants TABLE IS REBUILT (read before touching):\n--   elevation_grants.approved_by_web_session_hash was NOT NULL + FK to\n--   web_sessions: every grant had to bind to a dashboard web session. An origin\n--   decision has no web session, and SQLite cannot relax NOT NULL in place. A\n--   sentinel/fabricated web_sessions row was rejected (it would make a\n--   \"logout\" fact lie about a decision that never had a session). So the grant\n--   binds to ONE OF TWO anchors, enforced by a CHECK:\n--     approved_via = 'web_session'            -> web session hash set, no receipt\n--     approved_via = 'agent_attested_origin'  -> origin receipt set, no web session\n--   hasElevatedAction re-derives the matching anchor at USE time.\n--\n--   Rebuild shape: elevation_usage_log holds a (NO ACTION) FK to\n--   elevation_grants(id). D1 runs a migration in one transaction, so the DROP's\n--   implicit DELETE would fail an immediate FK check. `PRAGMA\n--   defer_foreign_keys = ON` defers it to COMMIT; the re-INSERT of every row\n--   after the DROP resolves each deferred violation before then. tests/elevation-origin-migration.test.ts\n--   replays this inside an explicit BEGIN/COMMIT with seeded grant + usage rows\n--   and foreign_keys ON (the real-D1 shape). RECOMMENDED before applying to\n--   production: rehearse on a wrangler local/staging D1 holding live rows.\n--\n-- The origin receipt is append-only (triggers below): \"receipt intact\" at use\n-- time is only meaningful if it cannot be edited.\n\nPRAGMA defer_foreign_keys = ON;",
+      "\n\nCREATE TABLE IF NOT EXISTS elevation_origin_receipts (\n  id                    TEXT PRIMARY KEY,\n  tenant                TEXT NOT NULL,\n  elevation_request_id  TEXT NOT NULL REFERENCES elevation_requests(id),\n  member_id             TEXT NOT NULL REFERENCES members(id),   -- the resolved HUMAN\n  agent_id              TEXT NOT NULL REFERENCES agents(id),    -- the calling (relaying) agent\n  channel               TEXT NOT NULL CHECK (channel = 'telegram'),\n  chat_id               TEXT NOT NULL,\n  message_id            TEXT NOT NULL,\n  message_at            TEXT NOT NULL,\n  text_hash             TEXT NOT NULL CHECK (length(text_hash) = 64),\n  decision              TEXT NOT NULL CHECK (decision IN ('approve','deny')),\n  created_at            TEXT NOT NULL,\n  UNIQUE (elevation_request_id),\n  UNIQUE (tenant, channel, chat_id, message_id)\n);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS elevation_origin_receipts_no_update\nBEFORE UPDATE ON elevation_origin_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'elevation origin receipts are append-only');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS elevation_origin_receipts_no_delete\nBEFORE DELETE ON elevation_origin_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'elevation origin receipts are append-only');\nEND;",
+      "\n\nALTER TABLE elevation_requests ADD COLUMN decided_via TEXT\n  CHECK (decided_via IS NULL OR decided_via = 'agent_attested_origin');",
+      "\nALTER TABLE elevation_requests ADD COLUMN decided_origin_receipt_id TEXT;",
+      "\n\n-- Back the rows up to a FK-free table, DROP the original (child rows in\n-- elevation_usage_log become deferred violations), recreate it under its own name,\n-- and re-INSERT: each re-inserted parent row resolves its deferred violations before\n-- COMMIT. (Copy-into-_new + DROP + RENAME does NOT work here: SQLite counts the\n-- violation at DROP and only a parent INSERT after it decrements the counter.)\nCREATE TABLE elevation_grants_bak_0210 AS SELECT * FROM elevation_grants;",
+      "\n\nDROP TABLE elevation_grants;",
+      "\n\nCREATE TABLE elevation_grants (\n  id                            TEXT PRIMARY KEY,\n  tenant                        TEXT NOT NULL,\n  elevation_request_id          TEXT NOT NULL REFERENCES elevation_requests(id) ON DELETE CASCADE,\n  agent_session_id              TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,\n  action                        TEXT NOT NULL,\n  scope_type                    TEXT NOT NULL CHECK (scope_type IN ('org','department','squad')),\n  scope_id                      TEXT NOT NULL DEFAULT '',\n  effect                        TEXT NOT NULL CHECK (effect IN ('reversible','irreversible','revocable_if_recorded')),\n  approved_by_member_id         TEXT NOT NULL REFERENCES members(id),\n  approved_by_web_session_hash  TEXT REFERENCES web_sessions(id_hash),\n  created_at                    TEXT NOT NULL,\n  expires_at                    TEXT NOT NULL,\n  revoked_at                    TEXT,\n  revoke_reason                 TEXT,\n  approved_via                  TEXT NOT NULL DEFAULT 'web_session'\n                                  CHECK (approved_via IN ('web_session','agent_attested_origin')),\n  origin_receipt_id             TEXT REFERENCES elevation_origin_receipts(id),\n  UNIQUE(agent_session_id, action, scope_type, scope_id),\n  CHECK (\n    (approved_via = 'web_session' AND approved_by_web_session_hash IS NOT NULL AND origin_receipt_id IS NULL)\n    OR\n    (approved_via = 'agent_attested_origin' AND approved_by_web_session_hash IS NULL AND origin_receipt_id IS NOT NULL)\n  )\n);",
+      "\n\nINSERT INTO elevation_grants\n  (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,\n   approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason,\n   approved_via, origin_receipt_id)\nSELECT\n  id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,\n  approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason,\n  'web_session', NULL\nFROM elevation_grants_bak_0210;",
+      "\n\nDROP TABLE elevation_grants_bak_0210;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_elevation_grants_live\n  ON elevation_grants(tenant, agent_session_id, revoked_at, expires_at);",
+      "\nCREATE INDEX IF NOT EXISTS idx_elevation_grants_request\n  ON elevation_grants(tenant, elevation_request_id);",
+      "\nCREATE INDEX IF NOT EXISTS idx_elevation_grants_approver\n  ON elevation_grants(tenant, approved_by_web_session_hash);",
+      "\nCREATE INDEX IF NOT EXISTS idx_elevation_grants_origin_receipt\n  ON elevation_grants(origin_receipt_id);",
+      "\n\n-- Reserve the stamping-harness token labels. `elevation_decide` trusts a human_origin only\n-- from a token whose label is in STAMPING_HARNESS_TOKEN_LABELS (src/auth/elevation-actions.ts),\n-- but several mint paths take a caller-chosen label (squad admins, agents holding an\n-- action:mint_token grant, enroll, provision). A label proves which credential was used, not\n-- that a harness stamped the call, so no path may write one. The origin door therefore stays\n-- closed until a server-set harness field replaces the label check. Keep this list in sync\n-- with STAMPING_HARNESS_TOKEN_LABELS (pinned by tests/elevation-origin-migration.test.ts).\nCREATE TRIGGER IF NOT EXISTS member_tokens_reserved_label_insert\nBEFORE INSERT ON member_tokens\nWHEN lower(trim(NEW.label)) IN ('hermes-gateway')\nBEGIN\n  SELECT RAISE(ABORT, 'member_tokens_label_reserved');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS member_tokens_reserved_label_update\nBEFORE UPDATE OF label ON member_tokens\nWHEN lower(trim(NEW.label)) IN ('hermes-gateway')\nBEGIN\n  SELECT RAISE(ABORT, 'member_tokens_label_reserved');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "elevation_origin_receipts" },
+      { type: "trigger", name: "elevation_origin_receipts_no_update" },
+      { type: "trigger", name: "elevation_origin_receipts_no_delete" },
+      { type: "table", name: "elevation_grants_bak_0210" },
+      { type: "table", name: "elevation_grants" },
+      { type: "index", name: "idx_elevation_grants_live" },
+      { type: "index", name: "idx_elevation_grants_request" },
+      { type: "index", name: "idx_elevation_grants_approver" },
+      { type: "index", name: "idx_elevation_grants_origin_receipt" },
+      { type: "trigger", name: "member_tokens_reserved_label_insert" },
+      { type: "trigger", name: "member_tokens_reserved_label_update" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "a32a561e484b007a5457c810451fa21b7d53e75d6af022598b69664c1310994c"
+export const SCHEMA_CHAIN_DIGEST: string = "54da03e383f8bf15cf0775298237b958a078d3268a6093cab3c4322dd59e4645"

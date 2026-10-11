@@ -214,6 +214,8 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { ELEVATION_DECIDE_TOOLS, ownerPendingView } from './elevation-decide'
+import { HUMAN_ORIGIN_SCHEMA } from '../im/origin-schema'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -2347,28 +2349,7 @@ export async function wakeGateOwnerOnReview(
 // programmatically over MCP — without it a review task can only be verdicted
 // from the browser dashboard. cap: member+ on the task's squad AND the gate
 // capability named by task.gate_owner.
-const HUMAN_ORIGIN_SCHEMA = {
-  type: 'object',
-  properties: {
-    channel: STRING_SCHEMA,
-    user_id: STRING_SCHEMA,
-    chat_id: STRING_SCHEMA,
-    message_id: STRING_SCHEMA,
-    // message_at is REQUIRED, not optional (mupot#1424 addendum): freshness
-    // cannot be checked against a timestamp the caller may omit. See
-    // src/im/origin-verdict.ts's FRESHNESS_MAX_AGE_MS/FRESHNESS_MAX_FUTURE_MS.
-    message_at: STRING_SCHEMA,
-    // text is REQUIRED (round 4 addendum, plugin gate P2-1): the human's own
-    // message, so mupot can bind the origin's INTENT server-side — the
-    // target task id must appear in it (full id, or an 8+ hex-char prefix of
-    // its own leading hex characters) or the stamp does not apply to this
-    // task at all (`task_not_named`). See taskNamedInText in
-    // src/im/origin-verdict.ts.
-    text: STRING_SCHEMA,
-  },
-  required: ['channel', 'user_id', 'chat_id', 'message_id', 'message_at', 'text'],
-  additionalProperties: false,
-}
+export { HUMAN_ORIGIN_SCHEMA }
 
 function humanOriginResponsePayload(outcome: HumanOriginResolution): Record<string, unknown> {
   if (outcome.replayed) return { applied: false, reason: 'origin_replayed' }
@@ -5901,14 +5882,17 @@ const toolElevationStatus: ToolSpec = {
   name: 'elevation_status',
   scope: 'self (exact current agent session)',
   min: 'authenticated',
-  args: '{ request_id?: string }',
+  args: '{ request_id?: string, pending_for_owner?: boolean }',
   inputSchema: {
     type: 'object',
-    properties: { request_id: STRING_SCHEMA },
+    properties: { request_id: STRING_SCHEMA, pending_for_owner: { type: 'boolean' } },
     additionalProperties: false,
   },
   shouldTouchPresence: () => false,
   async run(auth, env, args) {
+    // S13: a human's own agent asks what its OWNER could decide (read-only; the requesting
+    // agent's `reason` is returned marked untrusted, apart from the id the human must echo).
+    if (args.pending_for_owner === true) return ownerPendingView(auth, env, args)
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
@@ -6972,6 +6956,7 @@ export const TOOLS: ToolSpec[] = [
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...SEED_TOOLS,
+  ...ELEVATION_DECIDE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
