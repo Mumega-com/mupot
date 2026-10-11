@@ -15,7 +15,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
-import { buildVerdictStatements, VerdictIndependenceError, VerdictRaceError, writeVerdict } from '../src/tasks/service'
+import { buildVerdictStatements, persistTaskUpdate, TaskUpdateConflictError, VerdictIndependenceError, VerdictRaceError, writeVerdict } from '../src/tasks/service'
 import { evaluateVerdictGates } from '../src/tasks'
 import type { AuthContext, CapabilityGrant, Env, Task } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -208,10 +208,150 @@ describe('policy rule 3 — verdict independence, whole matrix through task_verd
     // (the genuine runner MR stays refused: see the REFUSED cases above, same fixture)
   })
 
-  it('the gate:agent-self-completion lane waives independence by design (the completing agent closes it)', async () => {
-    seedWorld(harness.sqlite, { gateOwner: 'gate:agent-self-completion' })
-    const res = await decide(env, agentAuth('A'))
-    expect(res.ok, JSON.stringify(res)).toBe(true)
+  describe('the gate:agent-self-completion lane exempts ONLY the current assignee', () => {
+    const LANE = 'gate:agent-self-completion'
+
+    it('the current assignee closes its own task', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, agentAuth('A'))
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+      expect(verdictRows(harness.sqlite)).toBe(1)
+    })
+
+    it('an org admin who is a direct party (ran it) but is NOT the current assignee is refused self_verdict', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, memberAuth('MR', 'admin'))
+      expect(res).toMatchObject({ ok: false, status: 409, error: 'self_verdict' })
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
+
+    it('the pre-check predicate refuses the direct-party admin on the lane and allows the assignee', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const gateTask = { id: TASK, squad_id: SQUAD, gate_owner: LANE, assignee_agent_id: 'A' }
+      expect(await evaluateVerdictGates(env, memberAuth('MR', 'admin'), gateTask, 'approved')).toMatchObject({ allowed: false, code: 'self_verdict' })
+      expect((await evaluateVerdictGates(env, agentAuth('A'), gateTask, 'approved')).allowed).toBe(true)
+    })
+
+    it('the same admin with the org owner explicit override is allowed', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await decide(env, memberAuth('MR', 'owner'), { override_self_verdict: true })
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+      expect(verdictRows(harness.sqlite)).toBe(1)
+    })
+
+    it('a former assignee that submitted a result (S) is refused on the lane too, at the write', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'S' }))
+        .rejects.toBeInstanceOf(VerdictIndependenceError)
+      expect(verdictRows(harness.sqlite)).toBe(0)
+    })
+
+    it('reassignment race: pre-check sees the decider as assignee, the task is reassigned before the write; the write refuses', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      const gate = await evaluateVerdictGates(env, agentAuth('A'), { id: t.id, squad_id: t.squad_id, gate_owner: LANE, assignee_agent_id: t.assignee_agent_id }, 'approved')
+      expect(gate.allowed).toBe(true)
+      harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'G' WHERE id = ?`).run(TASK)
+      // A is still a party (it was the assignee the stale row says), but no longer the CURRENT assignee.
+      harness.sqlite.prepare(
+        `INSERT INTO task_result_submissions (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
+         VALUES ('sub-a', ?, ?, ?, 'A', '/tmp/z', ?, ?)`,
+      ).run(TENANT, TASK, SQUAD, '9f'.repeat(32), '1e'.repeat(32))
+      await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'A' }))
+        .rejects.toBeInstanceOf(VerdictIndependenceError)
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
+  })
+
+  describe('review FREEZES the assignee: no caller can appoint itself "the current assignee"', () => {
+    const LANE = 'gate:agent-self-completion'
+    const assigneeOf = (): string | null =>
+      (harness.sqlite.prepare(`SELECT assignee_agent_id AS a FROM tasks WHERE id = ?`).get(TASK) as { a: string | null }).a
+    const update = (auth: AuthContext, args: Record<string, unknown>): Promise<Outcome> =>
+      invokeTool(auth, env, 'task_update', { task_id: TASK, ...args }, ORIGIN) as unknown as Promise<Outcome>
+
+    for (const who of ['S', 'R', 'G']) {
+      it(`${who} cannot self-assign on a review lane task, the assignee is unchanged, and its verdict is then refused`, async () => {
+        seedWorld(harness.sqlite, { gateOwner: LANE })
+        const res = await update(agentAuth(who), { assignee_agent_id: who })
+        expect(res).toMatchObject({ ok: false, status: 409, error: 'assignee_frozen_in_review' })
+        expect(assigneeOf()).toBe('A')
+        const verdict = await decide(env, agentAuth(who))
+        expect(verdict.ok).toBe(false)
+        expect(verdictRows(harness.sqlite)).toBe(0)
+        expect(taskStatus(harness.sqlite)).toBe('review')
+      })
+    }
+
+    it('a human owner cannot be installed either, and an org ADMIN is refused too (frozen for everyone)', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const live = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      await expect(persistTaskUpdate(env, live, { ...live, assignee_agent_id: null, assignee_member_id: 'MR', updated_at: new Date().toISOString() }))
+        .rejects.toBeInstanceOf(TaskUpdateConflictError)
+      expect(await update(memberAuth('ADMIN', 'admin'), { assignee_agent_id: 'G' })).toMatchObject({ ok: false, error: 'assignee_frozen_in_review' })
+      expect(await update(memberAuth('ADMIN', 'admin'), { assignee_agent_id: null })).toMatchObject({ ok: false, error: 'assignee_frozen_in_review' })
+      expect(assigneeOf()).toBe('A')
+    })
+
+    it('a no-op write of the SAME assignee is not a change', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const res = await update(agentAuth('G'), { assignee_agent_id: 'A', priority: 'P2' })
+      expect(res.error).not.toBe('assignee_frozen_in_review')
+    })
+
+    it('the UPDATE itself refuses: a stale pre-review snapshot cannot slip an assignee change into a row that is now in review', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const live = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      const stale = { ...live, status: 'in_progress' as const }   // what a racing writer read a moment earlier
+      const next = { ...stale, assignee_agent_id: 'G', updated_at: new Date().toISOString() }
+      await expect(persistTaskUpdate(env, stale, next)).rejects.toBeInstanceOf(TaskUpdateConflictError)
+      expect(assigneeOf()).toBe('A')
+    })
+
+    it('the lane name is reserved at task_update, as at task_create', async () => {
+      seedWorld(harness.sqlite)
+      harness.sqlite.prepare(`INSERT INTO tasks (id, squad_id, title, body, done_when, status, gate_owner, assignee_agent_id, created_at, updated_at)
+        VALUES ('t-open', ?, 'T', 'b', 'done', 'in_progress', NULL, 'G', datetime('now'), datetime('now'))`).run(SQUAD)
+      const res = (await invokeTool(agentAuth('G'), env, 'task_update', { task_id: 't-open', gate_owner: LANE }, ORIGIN)) as unknown as Outcome
+      expect(res).toMatchObject({ ok: false, status: 403, error: 'gate_owner_reserved' })
+      expect((harness.sqlite.prepare(`SELECT gate_owner AS g FROM tasks WHERE id = 't-open'`).get() as { g: string | null }).g).toBeNull()
+    })
+
+    it('the WRITE re-reads the lane: a stale lane snapshot after an owner re-gate is refused (assignee included)', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      const stale = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      harness.sqlite.prepare(`UPDATE tasks SET gate_owner = 'gate:review' WHERE id = ?`).run(TASK)
+      await expect(writeVerdict(env, { task: stale, verdict: 'approved', note: null, decidedBy: 'A' })).rejects.toThrow()
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
+
+    it('lane authority is re-checked at the write: a former assignee who is NOT a party is refused after a reassignment', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'AGENT_INDEP' WHERE id = ?`).run(TASK)
+      const t = harness.sqlite.prepare(`SELECT * FROM tasks WHERE id = ?`).get(TASK) as unknown as Task
+      const gate = await evaluateVerdictGates(env, agentAuth('AGENT_INDEP'), { id: t.id, squad_id: t.squad_id, gate_owner: LANE, assignee_agent_id: 'AGENT_INDEP' }, 'approved')
+      expect(gate.allowed).toBe(true)
+      harness.sqlite.prepare(`UPDATE tasks SET assignee_agent_id = 'A' WHERE id = ?`).run(TASK)   // an admin repair, outside task_update
+      await expect(writeVerdict(env, { task: t, verdict: 'approved', note: null, decidedBy: 'AGENT_INDEP' })).rejects.toThrow()
+      expect(verdictRows(harness.sqlite)).toBe(0)
+      expect(taskStatus(harness.sqlite)).toBe('review')
+    })
+
+    it('a non-party org ADMIN still closes a lane task', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      expect((await decide(env, memberAuth('ADMIN', 'admin'))).ok).toBe(true)
+    })
+
+    it('an admin who merely OWNS the assignee (admin_supervisory) closes a lane task', async () => {
+      seedWorld(harness.sqlite, { gateOwner: LANE })
+      harness.sqlite.prepare(`UPDATE agents SET owner_member_id = 'ADMIN_OWNS_A' WHERE id = 'A'`).run()
+      const res = await decide(env, memberAuth('ADMIN_OWNS_A', 'admin'))
+      expect(res.ok, JSON.stringify(res)).toBe(true)
+    })
   })
 
   describe('a task owned by a HUMAN (assignee_member_id), no assignee agent', () => {

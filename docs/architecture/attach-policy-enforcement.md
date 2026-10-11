@@ -47,7 +47,7 @@ Exemptions are explicit values on the write input, never a default:
 - `admin_supervisory`: an org owner or admin who is only *affiliated* with the assignee (the existing
   supervisory path). It never waives a direct party.
 - `owner_override`: the org owner's explicit `override_self_verdict: true`, recorded in the verdict note.
-- the `gate:agent-self-completion` lane waives the rule by construction.
+- the `gate:agent-self-completion` lane exempts only the task's current assignee closing its own task; the assignee is re-read inside the write's `WHERE`, so a reassignment after the check cannot land it. Any other decider on that lane (including an org owner or admin who is a direct party) is judged like every other lane and needs `owner_override`.
 
 Known and deliberate: two agents that share an owner may review each other's work on their own
 authority (this was already the documented behaviour of the harness-attested origin path). Tightening

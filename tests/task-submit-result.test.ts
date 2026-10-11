@@ -319,7 +319,9 @@ describe('task_submit_result (mupot#1586)', () => {
       task_id: TASK_ID,
       gate_owner: 'gate:agent-self-completion',
     }, URL)
-    expect(setGate.ok, JSON.stringify(setGate)).toBe(true)
+    // The lane name is now reserved at task_update too (only finishTask stamps it), so the
+    // exploit is closed at step 0; the downstream refusals below stay as defence in depth.
+    expect(setGate).toMatchObject({ ok: false, status: 403, error: 'gate_owner_reserved' })
 
     const res = await invokeTool(assigneeAuth(), env, 'task_submit_result', {
       task_id: TASK_ID,
