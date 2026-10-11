@@ -7,8 +7,8 @@
 // 4. Manages attach lease timeouts and status reconciliation.
 
 import type { Env } from '../types'
-import type {
 import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
+import type {
   DispatchRequest,
   HarnessActor,
   HarnessDispatchState,
