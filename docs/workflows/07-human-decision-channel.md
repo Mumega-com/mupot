@@ -31,15 +31,14 @@ relaying a message the human sent it over Telegram.
 3. `dryRunAuthorize` — **read-only**, checks every conjunct in order (agent owned by a
    member; owner active; origin is well-formed, private-chat-shaped
    (`user_id === chat_id`), and fresh — within 10 minutes past / 60 seconds future of the
-   server clock; origin resolves to (or may first-bind) that same member; no conflict of
+   server clock; origin's chat is already bound to that same member (an unbound owner is refused: `origin_chat_not_bound`); no conflict of
    interest (deciding member isn't the assignee agent's own owner in a way that self-
    verdicts); not rate-limited (one applied `human_origin` verdict per member per 30s);
    `evaluateVerdictGates` — the SAME predicate every verdict surface uses — actually
    authorizes this task+verdict; `assertVerdictWritable`'s project-evidence fence holds.
 4. `commitOriginDecision` (`src/im/origin-verdict.ts:451`) — reached only if the dry run
-   authorized — writes the reservation, the verdict, and (if needed) the first Telegram
-   bind in **one atomic `env.DB.batch()`**, anchored on the verdict row (see Receipts).
-5. Response returns `{ task, verdict, human_origin: { applied: true, bound_now } }` on
+   authorized — writes the reservation and the verdict in **one atomic `env.DB.batch()`**, anchored on the verdict row (see Receipts).
+5. Response returns `{ task, verdict, human_origin: { applied: true } }` on
    success, or `{ applied: false, reason: <conjunct> }` and falls back to the calling
    agent's own seat authority on any soft failure — never silently.
 
@@ -53,8 +52,8 @@ mupot's `/im/webhook`; parsed at `src/im/index.ts:262-270`, executed by `verdict
 Every defense that is server-checkable is enforced server-side, not merely assumed of the
 harness (`src/im/origin-verdict.ts:79-88`): agent ownership (`agents.owner_member_id`,
 settable only by an org-scope admin under a target-rank ceiling), member active,
-private-chat shape, freshness (`message_at` within window), origin resolving to/first-
-binding the correct member, no conflict of interest, per-member rate limit, the shared
+private-chat shape, freshness (`message_at` within window), origin resolving to the
+already-bound correct member, no conflict of interest, per-member rate limit, the shared
 `evaluateVerdictGates` capability check, and the project-evidence fence. Any single
 conjunct failing falls back to the agent's own authority (never a raise); only two things
 are hard call-refusals: a non-agent-bound caller supplying `human_origin` at all, and a
@@ -75,15 +74,14 @@ All landed in the **same D1 batch**, anchored on the verdict row
 - `task_verdicts` — `decided_via = 'agent_attested_origin'`, `decided_by` = the resolved
   member, `origin_agent_id` = the calling agent, bound to `proposal_id` when applicable
   (`buildVerdictStatements`, `src/tasks/service.ts`).
-- `members.telegram_chat_id` / `telegram_bound_at` — only on first bind.
-- `telegram_origin_bind_receipts` — only on first bind; columns `id, tenant, member_id,
-  agent_id, chat_id, message_id, created_at`.
+- No channel binding is written on this path. (`telegram_origin_bind_receipts` is retained
+  for historical rows only.)
 
 ## What the person sees
 
 mupot itself renders no chat text for the harness-attested path — the reply the human
 sees is composed by their own agent's harness from the JSON outcome
-(`{applied, bound_now}` or `{applied:false, reason}`). On the baseline `/im/webhook`
+(`{applied}` or `{applied:false, reason}`). On the baseline `/im/webhook`
 `/approve`/`/reject` path, mupot's own literal replies (`src/im/index.ts:676-757`)
 include: `Approved "<title>".` / `Rejected "<title>".` / `Add a rejection reason: reject
 <ref> <reason>.` / `No task named "<ref>" here.` / `You don't have permission to decide

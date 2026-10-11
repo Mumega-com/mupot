@@ -299,13 +299,12 @@ the operator-facing setup only.
    set its own `owner_member_id` (that would be a self-grant of exactly the authority
    this field carries). Pass `"owner_member_id":null` to detach.
 
-2. **No invite, no button.** If the owning member has no Telegram identity bound yet
-   (`members.telegram_chat_id IS NULL`), the FIRST natural-language message that reaches
-   `task_verdict` with a valid `human_origin` binds it automatically, in the same
-   request, before the verdict resolves — recorded in `telegram_origin_bind_receipts`
-   (append-only). If the member is already bound to a DIFFERENT chat, the origin is
-   refused (`origin_member_mismatch`) rather than silently rebinding; if another member
-   already holds that exact chat, it is refused (`chat_already_bound`).
+2. **Bind the chat first.** The owning member must already have their Telegram identity
+   bound — via `/account` → Connect Telegram (or the invite/pairing flow). Binding a
+   channel is a credential act and is not done implicitly by a `human_origin`: if the
+   member has no bound chat, `task_verdict` refuses the origin (`origin_chat_not_bound`)
+   and the call runs under the agent's own seat. If the member is bound to a DIFFERENT
+   chat, the origin is refused (`origin_member_mismatch`); nothing is ever rebound.
 
 **What the operator sees day to day:** nothing new. The member talks to their agent as
 usual; when that conversation reaches a decision, the agent's `task_verdict` call either

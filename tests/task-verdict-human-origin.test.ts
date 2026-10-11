@@ -147,7 +147,7 @@ interface VerdictOutcomeOk {
   ok: true
   result: {
     verdict: { id: string; task_id: string; decided_by: string; decided_via?: string | null; origin_agent_id?: string | null }
-    human_origin?: { applied: boolean; reason?: string; bound_now?: boolean }
+    human_origin?: { applied: boolean; reason?: string }
   }
 }
 interface VerdictOutcomeFail {
@@ -305,55 +305,69 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(member?.telegram_chat_id).toBe('1112222') // unchanged
   })
 
-  // ── conjunct: never bind over ANOTHER member's chat_id ──────────────────
-  it('chat_already_bound — origin.chat_id already belongs to a DIFFERENT member: falls back to agent auth (mupot#1425: only reachable once the dry-run gate ALSO passes for the candidate member)', async () => {
+  // ── conjunct: an origin NEVER binds a channel (credential act) ──────────
+  // The owner must already be bound to the origin's chat via /account. An
+  // unbound owner + an otherwise valid-looking origin is refused outright:
+  // no member row change, no verdict as the member, no bind receipt, no
+  // reservation. The agent's own-seat fallback is unchanged.
+  async function snapshotUnbound(memberId: string) {
+    const member = await env.DB.prepare('SELECT telegram_chat_id, telegram_bound_at FROM members WHERE id = ?')
+      .bind(memberId).first<{ telegram_chat_id: string | null; telegram_bound_at: string | null }>()
+    const memberVerdicts = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM task_verdicts WHERE decided_by = ? OR decided_via = 'agent_attested_origin'`,
+    ).bind(memberId).first<{ n: number }>()
+    const bindReceipts = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_origin_bind_receipts').first<{ n: number }>()
+    const reservations = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_webhook_receipts WHERE update_id LIKE ?')
+      .bind('origin:%').first<{ n: number }>()
+    return { member, memberVerdicts: memberVerdicts?.n, bindReceipts: bindReceipts?.n, reservations: reservations?.n }
+  }
+
+  it('origin_chat_not_bound — unbound owner + fully valid-looking origin is REFUSED: no member row change, no member verdict, no bind receipt, no reservation', async () => {
+    seedAgent(harness.sqlite, 'agent-nobind')
+    seedGateGrant(harness.sqlite, 'agent', 'agent-nobind')
+    seedMember(harness.sqlite, 'member-nobind', { telegramChatId: null })
+    setAgentOwner(harness.sqlite, 'agent-nobind', 'member-nobind')
+    // Fully authorized member otherwise — the ONLY thing missing is the bind.
+    seedSquadMemberCapability(harness.sqlite, 'member-nobind')
+    seedGateGrant(harness.sqlite, 'member', 'member-nobind')
+    seedReviewTask(harness.sqlite, 'task-nobind')
+    const before = await snapshotUnbound('member-nobind')
+    expect(before.member).toEqual({ telegram_chat_id: null, telegram_bound_at: null })
+
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-nobind'), {
+      task_id: 'task-nobind', verdict: 'approved', human_origin: origin({ text: 'approve task-nobind' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound' })
+    expect(result.verdict.decided_by).toBe('agent-nobind') // own-seat fallback only, never the member
+
+    const after = await snapshotUnbound('member-nobind')
+    expect(after.member).toEqual({ telegram_chat_id: null, telegram_bound_at: null }) // member row unchanged
+    expect(after.memberVerdicts).toBe(0) // no verdict as the member
+    expect(after.bindReceipts).toBe(0) // no bind receipt
+    expect(after.reservations).toBe(0) // the message is not burned either
+  })
+
+  it('origin_chat_not_bound — same refusal when the origin chat is bound to a DIFFERENT member (no oracle on who holds a chat)', async () => {
     seedAgent(harness.sqlite, 'agent-taken')
     seedGateGrant(harness.sqlite, 'agent', 'agent-taken')
     seedMember(harness.sqlite, 'member-owner-unbound', { telegramChatId: null })
     seedMember(harness.sqlite, 'member-holds-chat', { telegramChatId: '5551234' }) // same chat_id as origin()
     setAgentOwner(harness.sqlite, 'agent-taken', 'member-owner-unbound')
-    // mupot#1425 P0-2 fix: the dry-run authorization (squad membership +
-    // evaluateVerdictGates) now runs BEFORE any bind is even attempted, so
-    // the candidate member needs real standing to ever REACH the bind step.
     seedSquadMemberCapability(harness.sqlite, 'member-owner-unbound')
     seedGateGrant(harness.sqlite, 'member', 'member-owner-unbound')
     seedReviewTask(harness.sqlite, 'task-6')
-    const auth = harnessAuth('agent-taken', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
 
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6', verdict: 'approved', human_origin: origin({ text: 'approve task-6' }) }))
-    expect(result.human_origin).toEqual({ applied: false, reason: 'chat_already_bound' })
+    const result = expectApplied(await invokeVerdict(env, harnessAuth('agent-taken'), {
+      task_id: 'task-6', verdict: 'approved', human_origin: origin({ text: 'approve task-6' }),
+    }))
+    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_chat_not_bound' })
     expect(result.verdict.decided_by).toBe('agent-taken')
 
-    const owner = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
-      .bind('member-owner-unbound')
-      .first<{ telegram_chat_id: string | null }>()
-    expect(owner?.telegram_chat_id).toBeNull() // never bound
-
-    // mupot#1425 P0-2: the UNIQUE-constraint throw aborts the WHOLE D1
-    // batch, so the reservation itself was never committed either —
-    // "a failure reserves nothing."
-    const reservation = await env.DB.prepare(
-      `SELECT 1 FROM telegram_webhook_receipts WHERE update_id = ?`,
-    ).bind('origin:telegram:5551234:9001').first()
-    expect(reservation).toBeNull()
-  })
-
-  it('P2-6 closed as a side effect of P0-2: an UNAUTHORIZED candidate can no longer probe chat_already_bound vs. a real first-bind (the oracle never fires before the dry-run gate)', async () => {
-    seedAgent(harness.sqlite, 'agent-oracle')
-    seedGateGrant(harness.sqlite, 'agent', 'agent-oracle')
-    seedMember(harness.sqlite, 'member-oracle-owner', { telegramChatId: null })
-    seedMember(harness.sqlite, 'member-holds-chat-2', { telegramChatId: '5551234' })
-    setAgentOwner(harness.sqlite, 'agent-oracle', 'member-oracle-owner')
-    // Deliberately NO squad capability / gate grant for member-oracle-owner —
-    // this candidate is UNAUTHORIZED for the task below.
-    seedReviewTask(harness.sqlite, 'task-6b')
-    const auth = harnessAuth('agent-oracle', [{ member_id: 'member-of-harness-token', scope_type: 'squad', scope_id: SQUAD, capability: 'member' } as CapabilityGrant])
-
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-6b', verdict: 'approved', human_origin: origin({ text: 'approve task-6b' }) }))
-    // Refused at the dry-run gate, NOT with chat_already_bound — an
-    // unauthorized caller learns nothing about whether the target chat_id
-    // is already bound to someone else.
-    expect(result.human_origin).toEqual({ applied: false, reason: 'origin_not_gate_authorized' })
+    const after = await snapshotUnbound('member-owner-unbound')
+    expect(after.member).toEqual({ telegram_chat_id: null, telegram_bound_at: null })
+    expect(after.memberVerdicts).toBe(0)
+    expect(after.bindReceipts).toBe(0)
+    expect(after.reservations).toBe(0)
   })
 
   // ── conjunct: conflict of interest (agent_keys — deliberately NOT
@@ -375,41 +389,8 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(result.verdict.decided_by).toBe('agent-conflict-harness')
   })
 
-  // ── positive path 1: first-bind-by-origin (no invite, no button) ────────
-  it('applied:true, bound_now:true — owner has no telegram_chat_id yet: bound in this request, verdict decided_by the MEMBER', async () => {
-    seedAgent(harness.sqlite, 'agent-firstbind')
-    seedMember(harness.sqlite, 'member-firstbind', { telegramChatId: null })
-    setAgentOwner(harness.sqlite, 'agent-firstbind', 'member-firstbind')
-    seedSquadMemberCapability(harness.sqlite, 'member-firstbind')
-    seedGateGrant(harness.sqlite, 'member', 'member-firstbind')
-    seedReviewTask(harness.sqlite, 'task-8')
-    const auth = harnessAuth('agent-firstbind')
-
-    const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-8', verdict: 'approved', human_origin: origin({ text: 'approve task-8' }) }))
-    expect(result.human_origin).toEqual({ applied: true, bound_now: true })
-    expect(result.verdict.decided_by).toBe('member-firstbind')
-    expect(result.verdict.decided_via).toBe('agent_attested_origin')
-    expect(result.verdict.origin_agent_id).toBe('agent-firstbind')
-
-    const member = await env.DB.prepare('SELECT telegram_chat_id, telegram_bound_at FROM members WHERE id = ?')
-      .bind('member-firstbind')
-      .first<{ telegram_chat_id: string; telegram_bound_at: string | null }>()
-    expect(member?.telegram_chat_id).toBe('5551234')
-    expect(member?.telegram_bound_at).not.toBeNull()
-
-    const receipt = await env.DB.prepare(
-      'SELECT member_id, agent_id, chat_id, message_id FROM telegram_origin_bind_receipts WHERE member_id = ?',
-    ).bind('member-firstbind').first<{ member_id: string; agent_id: string; chat_id: string; message_id: string }>()
-    expect(receipt).toMatchObject({
-      member_id: 'member-firstbind',
-      agent_id: 'agent-firstbind',
-      chat_id: '5551234',
-      message_id: '9001',
-    })
-  })
-
-  // ── positive path 2: already bound, no rebind needed ────────────────────
-  it('applied:true, bound_now:false — owner already bound to this exact chat_id', async () => {
+  // ── positive path: owner already bound to this exact chat via /account ────────────────────
+  it('applied:true — owner already bound to this exact chat_id, verdict decided_by the MEMBER, no bind receipt written', async () => {
     seedAgent(harness.sqlite, 'agent-prebound')
     seedMember(harness.sqlite, 'member-prebound', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-prebound', 'member-prebound')
@@ -419,8 +400,16 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const auth = harnessAuth('agent-prebound')
 
     const result = expectApplied(await invokeVerdict(env, auth, { task_id: 'task-9', verdict: 'approved', human_origin: origin({ text: 'approve task-9' }) }))
-    expect(result.human_origin).toEqual({ applied: true, bound_now: false })
+    expect(result.human_origin).toEqual({ applied: true })
     expect(result.verdict.decided_by).toBe('member-prebound')
+    expect(result.verdict.decided_via).toBe('agent_attested_origin')
+    expect(result.verdict.origin_agent_id).toBe('agent-prebound')
+
+    const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
+      .bind('member-prebound').first<{ telegram_chat_id: string | null }>()
+    expect(member?.telegram_chat_id).toBe('5551234')
+    const bindReceipts = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_origin_bind_receipts').first<{ n: number }>()
+    expect(bindReceipts?.n).toBe(0)
   })
 
   // ── replay: one decision per origin message ─────────────────────────────
@@ -440,7 +429,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // relying on real scheduling nondeterminism.
   it('origin_replayed — a pre-existing reservation at the same (chat, message) key refuses the WHOLE call with a hard 409, no verdict, no bind', async () => {
     seedAgent(harness.sqlite, 'agent-replay')
-    seedMember(harness.sqlite, 'member-replay', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-replay', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-replay', 'member-replay')
     seedSquadMemberCapability(harness.sqlite, 'member-replay')
     seedGateGrant(harness.sqlite, 'member', 'member-replay')
@@ -471,7 +460,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-replay')
       .first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull() // no bind landed either — "a failure reserves nothing"
+    expect(member?.telegram_chat_id).toBe('5551234') // binding untouched
   })
 
   it('a DIFFERENT origin message (different message_id, different chat) is NOT a replay', async () => {
@@ -569,7 +558,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const first = expectApplied(await invokeVerdict(env, auth, {
       task_id: 'task-16', verdict: 'approved', human_origin: origin({ text: 'approve task-16', message_id: '9101' }),
     }))
-    expect(first.human_origin).toEqual({ applied: true, bound_now: false })
+    expect(first.human_origin).toEqual({ applied: true })
 
     // Same agent, same chat, a genuinely DIFFERENT (fresh, unreplayed) message
     // deciding a DIFFERENT task — the replay reservation does not catch this
@@ -691,11 +680,11 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // ── mupot#1425 P0-2 (kasra-review K6): an agent owned by a member who
   // holds NO capabilities at all must never mint a binding — the call must
   // refuse overall, and NOTHING must have landed. ─────────────────────────
-  it('P0-2: an owner with ZERO capabilities never gets bound — overall 403, telegram_chat_id stays NULL, zero receipts of any kind', async () => {
+  it('P0-2: an owner with ZERO capabilities is never authorized — overall 403, binding untouched, zero receipts of any kind', async () => {
     seedAgent(harness.sqlite, 'agent-unauthorized')
     // Deliberately NO gate grant for the agent either — the fallback must
     // ALSO fail, so the overall call result is a clean refusal to assert on.
-    seedMember(harness.sqlite, 'member-zero-caps', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-zero-caps', { telegramChatId: '424242' })
     setAgentOwner(harness.sqlite, 'agent-unauthorized', 'member-zero-caps')
     // Deliberately NO squad capability, NO gate grant for member-zero-caps.
     seedReviewTask(harness.sqlite, 'task-unauth')
@@ -709,7 +698,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-zero-caps').first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull()
+    expect(member?.telegram_chat_id).toBe('424242') // binding untouched
 
     const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_origin_bind_receipts').first<{ n: number }>()
     expect(receiptCount?.n).toBe(0)
@@ -729,7 +718,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     seedAgent(harness.sqlite, 'agent-owned-second')
     // Deliberately NO gate grant for agent-unowned-first — its fallback also
     // fails, so the task stays in 'review' for the second attempt.
-    seedMember(harness.sqlite, 'member-victim', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-victim', { telegramChatId: '909090' })
     setAgentOwner(harness.sqlite, 'agent-owned-second', 'member-victim')
     seedSquadMemberCapability(harness.sqlite, 'member-victim')
     seedGateGrant(harness.sqlite, 'member', 'member-victim')
@@ -744,7 +733,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const second = expectApplied(await invokeVerdict(env, harnessAuth('agent-owned-second'), {
       task_id: 'task-p14', verdict: 'approved', human_origin: sharedOrigin,
     }))
-    expect(second.human_origin).toEqual({ applied: true, bound_now: true })
+    expect(second.human_origin).toEqual({ applied: true })
     expect(second.verdict.decided_by).toBe('member-victim')
   })
 
@@ -756,7 +745,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   it('P0-B: the project-write fence refuses BEFORE any write — telegram_chat_id stays NULL, zero receipts, zero verdicts', async () => {
     seedAgent(harness.sqlite, 'agent-fence')
     seedGateGrant(harness.sqlite, 'agent', 'agent-fence')
-    seedMember(harness.sqlite, 'member-fence', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-fence', { telegramChatId: '515151' })
     setAgentOwner(harness.sqlite, 'agent-fence', 'member-fence')
     seedSquadMemberCapability(harness.sqlite, 'member-fence')
     seedGateGrant(harness.sqlite, 'member', 'member-fence')
@@ -789,7 +778,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-fence').first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull() // CREDENTIAL NOT MINTED
+    expect(member?.telegram_chat_id).toBe('515151') // binding untouched
 
     const receiptCount = await env.DB.prepare('SELECT COUNT(*) AS n FROM telegram_origin_bind_receipts').first<{ n: number }>()
     expect(receiptCount?.n).toBe(0)
@@ -807,10 +796,10 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // owner_member_id the instant before the batch actually runs — the same
   // interleaving the reviewer drove directly against the production
   // statement. ─────────────────────────────────────────────────────────────
-  it('P1-C: agent ownership cleared in the instant between the dry run and the commit batch — no bind, no verdict', async () => {
+  it('P1-C: agent ownership cleared in the instant between the dry run and the commit batch — no verdict as the member', async () => {
     seedAgent(harness.sqlite, 'agent-race-ownership')
     seedGateGrant(harness.sqlite, 'agent', 'agent-race-ownership')
-    seedMember(harness.sqlite, 'member-race-ownership', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-race-ownership', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-race-ownership', 'member-race-ownership')
     seedSquadMemberCapability(harness.sqlite, 'member-race-ownership')
     seedGateGrant(harness.sqlite, 'member', 'member-race-ownership')
@@ -841,7 +830,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-race-ownership').first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull() // no bind
+    expect(member?.telegram_chat_id).toBe('5551234') // binding untouched
 
     const memberVerdictCount = await env.DB.prepare(
       `SELECT COUNT(*) AS n FROM task_verdicts WHERE decided_by = ? AND decided_via = 'agent_attested_origin'`,
@@ -957,10 +946,10 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // every statement list passed to env.DB.batch() and assert there is
   // EXACTLY ONE call, and that call's own statement list contains BOTH the
   // verdict INSERT and the bind UPDATE, verdict first. ─────────────────────
-  it('round 4: the verdict INSERT and the first-bind UPDATE share ONE env.DB.batch() call — structural pin (Athena r3)', async () => {
+  it('round 4: the reservation and the verdict INSERT share ONE env.DB.batch() call, and no statement binds a channel — structural pin (Athena r3)', async () => {
     seedAgent(harness.sqlite, 'agent-batch-pin')
     seedGateGrant(harness.sqlite, 'agent', 'agent-batch-pin')
-    seedMember(harness.sqlite, 'member-batch-pin', { telegramChatId: null }) // triggers needsFirstBind
+    seedMember(harness.sqlite, 'member-batch-pin', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-batch-pin', 'member-batch-pin')
     seedSquadMemberCapability(harness.sqlite, 'member-batch-pin')
     seedGateGrant(harness.sqlite, 'member', 'member-batch-pin')
@@ -982,7 +971,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     const result = expectApplied(await invokeVerdict(pinEnv, harnessAuth('agent-batch-pin'), {
       task_id: 'task-batch-pin', verdict: 'approved', human_origin: origin({ text: 'approve task-batch-pin' }),
     }))
-    expect(result.human_origin).toEqual({ applied: true, bound_now: true })
+    expect(result.human_origin).toEqual({ applied: true })
 
     // Exactly ONE env.DB.batch() call for the whole commit — reservation,
     // task-status flip, verdict INSERT, bind UPDATE, and bind-receipt INSERT
@@ -992,23 +981,27 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     // downstream functional test green.
     expect(batchCalls).toHaveLength(1)
     const sqls = batchCalls[0].map((s) => (s as unknown as { sql: string }).sql)
+    const reservationIdx = sqls.findIndex((sql) => sql.includes('INSERT INTO telegram_webhook_receipts'))
     const verdictIdx = sqls.findIndex((sql) => sql.includes('INSERT INTO task_verdicts'))
-    const bindIdx = sqls.findIndex((sql) => sql.includes('UPDATE members') && sql.includes('telegram_chat_id'))
-    expect(verdictIdx).toBeGreaterThanOrEqual(0)
-    expect(bindIdx).toBeGreaterThan(verdictIdx) // bind is gated on the verdict's own EXISTS, so it must be later in the same array
+    expect(reservationIdx).toBeGreaterThanOrEqual(0)
+    expect(verdictIdx).toBeGreaterThan(reservationIdx)
+    // An origin never binds a channel: no statement in the commit touches
+    // members.telegram_chat_id or writes a bind receipt.
+    expect(sqls.some((sql) => sql.includes('UPDATE members'))).toBe(false)
+    expect(sqls.some((sql) => sql.includes('telegram_origin_bind_receipts'))).toBe(false)
   })
 
   // ── same Athena ask, behavioral half: force the batch to fail EXACTLY on
   // the verdict statement (a real SQLite error, not a skipped call) and
-  // prove the reservation and the first-bind — which share this same
+  // prove the reservation — which shares this same
   // statement array — roll back with it. Real D1 batch semantics: any
   // statement THROW aborts the whole transaction; this proves the
   // production code actually relies on that, rather than merely asserting
   // it in a comment. ─────────────────────────────────────────────────────
-  it('round 4: forcing a real SQLite failure on the verdict statement rolls back the reservation and the bind together', async () => {
+  it('round 4: forcing a real SQLite failure on the verdict statement rolls back the reservation together with it', async () => {
     seedAgent(harness.sqlite, 'agent-batch-throw')
     seedGateGrant(harness.sqlite, 'agent', 'agent-batch-throw')
-    seedMember(harness.sqlite, 'member-batch-throw', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-batch-throw', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-batch-throw', 'member-batch-throw')
     seedSquadMemberCapability(harness.sqlite, 'member-batch-throw')
     seedGateGrant(harness.sqlite, 'member', 'member-batch-throw')
@@ -1053,7 +1046,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     expect(reservationCount?.n).toBe(0) // rolled back together, not "reserved then abandoned"
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-batch-throw').first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull() // no bind either
+    expect(member?.telegram_chat_id).toBe('5551234') // binding untouched
   })
 
   // ── mupot#1425 round 4 (kasra-review round-3 BLOCK): the reviewer's exact
@@ -1064,10 +1057,10 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   // so if the verdict statement's own (now-identical) guard set refuses,
   // the bind cannot land either — by construction, not by a second,
   // separately-maintained guard. ─────────────────────────────────────────
-  it('round 4 P0-1 exact repro: a concurrent verdict flips task status before the commit batch — no bind, no verdict, 409 verdict_race', async () => {
+  it('round 4 P0-1 exact repro: a concurrent verdict flips task status before the commit batch — no verdict, 409 verdict_race', async () => {
     seedAgent(harness.sqlite, 'agent-p0-1')
     seedGateGrant(harness.sqlite, 'agent', 'agent-p0-1')
-    seedMember(harness.sqlite, 'member-p0-1', { telegramChatId: null })
+    seedMember(harness.sqlite, 'member-p0-1', { telegramChatId: '5551234' })
     setAgentOwner(harness.sqlite, 'agent-p0-1', 'member-p0-1')
     seedSquadMemberCapability(harness.sqlite, 'member-p0-1')
     seedGateGrant(harness.sqlite, 'member', 'member-p0-1')
@@ -1098,7 +1091,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
 
     const member = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?')
       .bind('member-p0-1').first<{ telegram_chat_id: string | null }>()
-    expect(member?.telegram_chat_id).toBeNull() // no bind landed for the loser — guard sets are now EQUAL
+    expect(member?.telegram_chat_id).toBe('5551234') // binding untouched
   })
 
   // ── mupot#1425 round 4 addendum (plugin gate P2-1): bind INTENT server-
