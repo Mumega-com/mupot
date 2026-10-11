@@ -69,6 +69,7 @@ describe('seed_attach dry run', () => {
     expect(res.seed_sha256).toMatch(/^[0-9a-f]{64}$/)
     expect(res.requests.length).toBeGreaterThan(0)
     expect(res.requests.every((q) => q.needs === 'human_accept')).toBe(true)
+    expect(res.requests.every((q) => typeof (q as { text?: unknown }).text === 'string')).toBe(true)
     expect(['projects', 'squads', 'agents', 'members', 'project_squad_access'].map(count)).toEqual(before)
   })
 

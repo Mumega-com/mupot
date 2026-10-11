@@ -33,18 +33,54 @@ const SECRET_VALUE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
   { label: 'AWS access key id', re: /(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])/ },
   { label: 'Slack token', re: /xox[abprs]-[A-Za-z0-9-]{10,}/ },
   { label: 'bearer credential', re: /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/i },
+  { label: 'Google API key', re: /AIza[0-9A-Za-z_-]{35}/ },
+  { label: 'Stripe-style key', re: /(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}/ },
+  { label: 'GitLab token', re: /glpat-[0-9A-Za-z_-]{20}/ },
+  { label: 'credential in query or assignment', re: /(?:token|key|secret|sig|password)=[A-Za-z0-9._~+/-]{32,}/i },
   { label: 'URL with embedded credentials', re: /[a-z][a-z0-9+.-]*:\/\/[^\s/@]+:[^\s/@]*@/i },
 ]
-// Long unbroken base64/hex-ish run containing both a digit and a letter.
-// `/` is deliberately NOT in the class: ordinary paths (src/content/en/blog/...) are long and slashy.
-const OPAQUE_RUN_RE = /(?<![A-Za-z0-9+])[A-Za-z0-9+]{40,}={0,2}(?![A-Za-z0-9+])/g
+// Long unbroken token-ish run (base64url/hex) with a digit and a letter. `/` is deliberately
+// NOT in the class: ordinary paths (src/content/en/blog/...) are long and slashy. `-` and `_`
+// ARE in it (Cloudflare/Google style tokens), so a run counts only when it is mixed-case or has
+// no separators; a lowercase kebab slug with a digit (demo-site-2026-redesign) is not a secret.
+const OPAQUE_RUN_RE = /(?<![A-Za-z0-9+_-])[A-Za-z0-9+_-]{32,}={0,2}(?![A-Za-z0-9+_-])/g
+// A whole value that is a base64 body (e.g. a PEM body without its header): long, mixed case,
+// and few slashes (a path has far more).
+const BASE64_BODY_RE = /^[A-Za-z0-9+/]{64,}={0,2}$/
 
-function looksSecret(value: string): string | null {
+function opaqueLike(run: string): boolean {
+  if (!/\d/.test(run) || !/[A-Za-z]/.test(run)) return false
+  const mixed = /[a-z]/.test(run) && /[A-Z]/.test(run)
+  return mixed || !/[-_]/.test(run)
+}
+
+function looksSecretOnce(value: string): string | null {
   for (const { label, re } of SECRET_VALUE_PATTERNS) if (re.test(value)) return label
   for (const run of value.matchAll(OPAQUE_RUN_RE)) {
-    if (/\d/.test(run[0]) && /[A-Za-z]/.test(run[0])) return 'opaque high-entropy string'
+    if (opaqueLike(run[0])) return 'opaque high-entropy string'
   }
   return null
+}
+
+function looksSecret(value: string): string | null {
+  const direct = looksSecretOnce(value)
+  if (direct) return direct
+  const compact = value.replace(/\s+/g, '')
+  if (compact !== value) {
+    const c = looksSecretOnce(compact)
+    if (c) return c
+  }
+  if (BASE64_BODY_RE.test(compact) && /\d/.test(compact) && /[a-z]/.test(compact) && /[A-Z]/.test(compact)) {
+    const slashes = (compact.match(/\//g) ?? []).length
+    if (slashes <= compact.length / 16) return 'base64 body'
+  }
+  return null
+}
+
+// A key is author text echoed in paths and messages: bound it and drop anything odd.
+function safeKey(key: string): string {
+  const cleaned = key.replace(/[^A-Za-z0-9_.-]/g, '?')
+  return cleaned.length > 40 ? `${cleaned.slice(0, 40)}...` : cleaned
 }
 
 function scanForSecrets(value: unknown, path: string, depth: number): void {
@@ -56,12 +92,18 @@ function scanForSecrets(value: unknown, path: string, depth: number): void {
   }
   if (Array.isArray(value)) {
     value.forEach((child, i) => scanForSecrets(child, `${path}[${i}]`, depth + 1))
+    // A secret split across list items must still be seen whole.
+    if (value.length > 1 && value.every((c) => typeof c === 'string')) {
+      const label = looksSecret((value as string[]).join('')) // as: every element checked to be a string above
+      if (label) refuse('secret_in_seed', path, `list items together look like a secret (${label}); seeds name a cred_slot, never a value`)
+    }
     return
   }
   if (value !== null && typeof value === 'object') {
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) { // as: parsed plain data
-      const childPath = path ? `${path}.${key}` : key
-      if (SECRET_KEY_RE.test(key)) refuse('secret_in_seed', childPath, `key "${key}" names authority; a seed never declares grants, tokens or credentials`)
+      const childPath = path ? `${path}.${safeKey(key)}` : safeKey(key)
+      if (looksSecret(key)) refuse('secret_in_seed', childPath, 'a key looks like a secret value')
+      if (SECRET_KEY_RE.test(key)) refuse('secret_in_seed', childPath, `key "${safeKey(key)}" names authority; a seed never declares grants, tokens or credentials`)
       scanForSecrets(child, childPath, depth + 1)
     }
   }
@@ -73,22 +115,27 @@ function asRecord(value: unknown, path: string, allowed: readonly string[]): Rec
   if (value === null || typeof value !== 'object' || Array.isArray(value)) refuse('invalid_field', path || '(root)', 'expected an object')
   const rec = value as Rec // as: narrowed to a non-array object above
   for (const key of Object.keys(rec)) {
-    if (!allowed.includes(key)) refuse('unknown_key', path ? `${path}.${key}` : key, `unknown key "${key}"`)
+    if (!allowed.includes(key)) refuse('unknown_key', path ? `${path}.${safeKey(key)}` : safeKey(key), `unknown key "${safeKey(key)}"`)
   }
   return rec
 }
 
 // eslint-disable-next-line no-control-regex -- deliberate: reject control characters in seed text
 const CONTROL_RE = /[\u0000-\u001f\u007f]/
+// Zero-width and bidi-control characters let author text spoof what a human reviews.
+const SPOOF_RE = /[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/
 
-function text(value: unknown, path: string, max: number, required = true): string | undefined {
-  if (value === undefined) {
+function text(input: unknown, path: string, max: number, required = true): string | undefined {
+  if (input === undefined) {
     if (required) refuse('missing_field', path, 'required')
     return undefined
   }
-  if (typeof value !== 'string' || value.trim().length === 0) refuse('invalid_field', path, 'expected a non-empty string')
+  if (typeof input !== 'string' || input.trim().length === 0) refuse('invalid_field', path, 'expected a non-empty string')
+  // A YAML block scalar ends in one newline; that is not content.
+  const value = input.replace(/\r?\n$/, '')
   if (value.length > max) refuse('invalid_field', path, `longer than ${max} characters`)
   if (CONTROL_RE.test(value)) refuse('invalid_field', path, 'control characters are not allowed')
+  if (SPOOF_RE.test(value)) refuse('invalid_field', path, 'zero-width and bidirectional control characters are not allowed')
   return value
 }
 
@@ -257,23 +304,26 @@ function validateStructure(root: Rec): SeedV1 {
   return seed as unknown as SeedV1 // as: every field above was checked or built by a validator in this function
 }
 
-// Every ask the seed makes, as an explicit line. Nothing here is granted by validating.
+// Every ask the seed makes, as a STRUCTURED line: author text lives only in `fields`, never
+// pasted into a pre-built sentence (see src/seeds/render.ts). Nothing here is granted.
 export function seedRequests(seed: SeedV1): SeedRequest[] {
   const out: SeedRequest[] = []
-  const req = (kind: SeedRequest['kind'], detail: string) => out.push({ kind, detail, needs: 'human_accept' })
-  for (const g of seed.wants?.gates ?? []) req('gate', `action ${g.action} gated by ${g.gate}`)
-  for (const r of seed.wants?.routines ?? []) req('routine', `routine ${r.id} at "${r.cron}" (approval: ${r.approval})`)
+  const req = (kind: SeedRequest['kind'], fields: Record<string, string>) => out.push({ kind, fields, needs: 'human_accept' })
+  for (const g of seed.wants?.gates ?? []) req('gate', { action: g.action, gate: g.gate })
+  for (const r of seed.wants?.routines ?? []) req('routine', { id: r.id, cron: r.cron, approval: r.approval })
   if (seed.wants?.seats) {
     const s = seed.wants.seats
-    req('seat', `up to ${s.max} seat(s) in squad ${s.squad} at capability ${s.capability ?? 'member'} or lower`)
+    req('seat', { squad: s.squad, max: String(s.max), capability: s.capability ?? 'member' })
   }
-  for (const m of seed.wants?.memory ?? []) req('memory', `memory scope ${m}`)
+  for (const m of seed.wants?.memory ?? []) req('memory', { scope: m })
+  for (const d of seed.data ?? []) req('data', { store: d.store, tier: d.tier })
   for (const t of seed.tools ?? []) {
-    if (t.cred_slot) req('tool_credential', `${t.mcp ?? t.openapi} needs credential slot ${t.cred_slot} bound by a human`)
+    if (t.cred_slot) req('tool_credential', { tool: (t.mcp ?? t.openapi) as string, cred_slot: t.cred_slot }) // as: exactly one of mcp/openapi is set
   }
   for (const s of seed.surfaces ?? []) {
-    if (s.mode === 'direct') req('direct_surface', `direct writes to ${s.path ?? s.type}`)
+    if (s.mode === 'direct') req('direct_surface', { target: (s.path ?? s.type) as string }) // as: exactly one of path/type is set
   }
+  for (const a of seed.risk?.allow_direct ?? []) req('allow_direct', { entry: a })
   return out
 }
 
@@ -294,7 +344,7 @@ export async function validateSeed(source: unknown): Promise<SeedValidation> {
     try {
       // Anchors and aliases are both refused below (alias expansion attacks); an alias needs an anchor;
       // duplicate keys are an error by default.
-      const doc = parseDocument(source, { schema: 'core' })
+      const doc = parseDocument(source, { schema: 'core', logLevel: 'error' })
       if (doc.errors.length > 0) throw doc.errors[0]
       let anchored = false
       visit(doc, { Node(_key, node) { if (isAlias(node) || ('anchor' in node && node.anchor)) anchored = true } })

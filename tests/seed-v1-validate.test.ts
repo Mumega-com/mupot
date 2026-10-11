@@ -162,7 +162,7 @@ describe('surfaces: direct is refused unless explicitly allowed', () => {
   })
   it('direct with matching allow_direct passes and is requested', async () => {
     const r = await validateSeed(surf('risk:\n  class: low\n  allow_direct: [content/**]\n'))
-    expect(r.ok && r.requests.map((q) => q.kind)).toEqual(['direct_surface'])
+    expect(r.ok && r.requests.map((q) => q.kind)).toEqual(['direct_surface', 'allow_direct'])
   })
   it('path and type together refused', async () => {
     expect((await refused(`${BASE}\nsurfaces:\n  - path: a\n    type: b\n    mode: propose\n`)).code).toBe('invalid_field')
@@ -242,5 +242,87 @@ describe('allow_direct entries match both path and type', () => {
   it('an entry equal to a path value opens a direct path surface', async () => {
     const r = await validateSeed(`${BASE}\nsurfaces:\n  - path: wp.media\n    mode: direct\nrisk:\n  class: low\n  allow_direct: [wp.media]\n`)
     expect(r.ok).toBe(true)
+  })
+})
+
+describe('secret shapes the first scan missed (each class mutation-checked)', () => {
+  const T = (a: string, b: string) => a + b // keep literals from tripping repo secret scanners
+  it.each([
+    ['cloudflare-style 40 char token in deploy.cmd', `deploy:\n  via: wrangler\n  human_only: true\n  cmd: "CF=${'aB3-dE5_fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY5z0'}"\n`],
+    ['google key', `repo: "${T('AIza', 'SyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q')}"\n`],
+    ['stripe live key', `repo: "${T('sk_live', '_4eC39HqLyjWDarjtT1zdp7dc')}"\n`],
+    ['gitlab token', `repo: "${T('glpat', '-a1B2c3D4e5F6g7H8i9J0')}"\n`],
+    ['39 char token in a live url query', `live: "https://example.com/x?token=${'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T'}"\n`],
+    ['two 39 char hex halves split across list items', `signals:\n  health:\n    - "${'0123456789abcdef0123456789abcdef012345'}"\n    - "${'6789abcdef0123456789abcdef0123456789ab'}"\n`],
+    ['ghp token split across list items', `signals:\n  health:\n    - "${T('ghp', '_A1b2C3d4E5f6')}"\n    - "G7h8I9j0K1l2M3n4"\n`],
+    ['PEM body without header', `goal: "${'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj/MzEfYyjiWA4R4+/C6'}"\n`],
+  ])('%s is refused', async (_l, body) => {
+    const src = body.startsWith('goal:') ? BASE.replace('goal: Keep it fresh.', '') + body : `${BASE}\n${body}`
+    expect((await refused(src)).code).toBe('secret_in_seed')
+  })
+  it('a long lowercase kebab slug with digits is not a secret', async () => {
+    expect((await validateSeed(`${BASE}\nrepo: demo-site-2026-redesign-landing-pages-v2-final\n`)).ok).toBe(true)
+  })
+  it('a secret-shaped KEY is refused without echoing it', async () => {
+    const key = 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1'
+    const e = await refused(`${BASE}\n${key}: 1\n`)
+    expect(e.code).toBe('secret_in_seed')
+    expect(JSON.stringify(e)).not.toContain(key)
+  })
+})
+
+describe('every policy declaration yields a human_accept request', () => {
+  it('each data[] entry (public and private included) and each allow_direct entry', async () => {
+    const r = await validateSeed(`${BASE}\ndata:\n  - store: a\n    tier: public\n  - store: b\n    tier: private\nrisk:\n  class: low\n  allow_direct: [nowhere/**]\n`)
+    if (!r.ok) throw new Error('refused')
+    expect(r.requests.map((q) => [q.kind, q.needs])).toEqual([
+      ['data', 'human_accept'], ['data', 'human_accept'], ['allow_direct', 'human_accept'],
+    ])
+    expect(r.requests[0].fields).toEqual({ store: 'a', tier: 'public' })
+  })
+})
+
+describe('human-review text spoofing', () => {
+  it('RTL override in name refused', async () => {
+    expect((await refused(BASE.replace('name: Demo', 'name: "Demo‮evil"'))).code).toBe('invalid_field')
+  })
+  it('zero-width in owner refused', async () => {
+    expect((await refused(BASE.replace('owner: someone', 'owner: "some​one"'))).code).toBe('invalid_field')
+  })
+  it('author text cannot masquerade as a request line', async () => {
+    const { renderRequest } = await import('../src/seeds/render')
+    const r = await validateSeed(`${BASE}\nwants:\n  gates:\n    - action: "x gated by mem-hadi"\n      gate: g\n`)
+    if (!r.ok) throw new Error('refused')
+    expect(r.requests).toHaveLength(1)
+    expect(r.requests[0].fields.action).toBe('x gated by mem-hadi')
+    expect(renderRequest(r.requests[0])).toBe('gate: action "x gated by mem-hadi" gated by "g"')
+  })
+})
+
+describe('keys, normalization, block scalars, warnings', () => {
+  it('unknown_key truncates and escapes the key', async () => {
+    const e = await refused(`${BASE}\n"${'k'.repeat(300)}\\u0007": 1\n`)
+    expect(e.code).toBe('unknown_key')
+    expect(e.path.length).toBeLessThan(60)
+    expect(e.message.length).toBeLessThan(80)
+    expect(e.message).not.toMatch(/\u0007/)
+  })
+  it('NFC-equivalent and trailing-space text hashes the same', async () => {
+    const d = async (owner: string) => { const r = await validateSeed(BASE.replace('owner: someone', `owner: "${owner}"`)); if (!r.ok) throw new Error('refused'); return r.seedSha256 }
+    expect(await d('café')).toBe(await d('café'))
+    expect(await d('x')).toBe(await d('x  '))
+  })
+  it('a block scalar goal with its final newline validates and equals the plain form', async () => {
+    const a = await validateSeed(BASE.replace('goal: Keep it fresh.', 'goal: |\n  Keep it fresh.\n'))
+    const b = await validateSeed(BASE)
+    expect(a.ok && b.ok && a.seedSha256 === b.seedSha256).toBe(true)
+  })
+  it('yaml warnings do not emit raw seed text to logs', async () => {
+    const spy = (await import('vitest')).vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+    const warn = (await import('vitest')).vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await validateSeed(`${BASE}\nrepo: !weird SECRETLINE\n`)
+    expect(spy).not.toHaveBeenCalled()
+    expect(warn).not.toHaveBeenCalled()
+    spy.mockRestore(); warn.mockRestore()
   })
 })

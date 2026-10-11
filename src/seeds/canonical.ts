@@ -3,6 +3,8 @@
 // YAML-vs-JSON source form, comments or whitespace.
 
 function sortValue(value: unknown): unknown {
+  // NFC + no trailing whitespace: visually identical text must hash identically.
+  if (typeof value === 'string') return value.normalize('NFC').trimEnd()
   if (Array.isArray(value)) return value.map(sortValue)
   if (value !== null && typeof value === 'object') {
     return Object.fromEntries(

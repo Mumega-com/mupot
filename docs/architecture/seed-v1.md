@@ -43,7 +43,7 @@ Pinned to the validator by `tests/seed-v1-doc.test.ts`: change one side and the 
 | `repo`, `live`, `deploy.cmd` | at most 300 characters each |
 | `wants.routines[].cron` | five space-separated fields, at most 100 characters |
 | `wants.seats.squad` | a kebab-case slug |
-| Any text value | no control characters |
+| Any text value | no control characters, no zero-width or bidirectional control characters; one trailing newline (block scalar) is stripped |
 
 Defaults are materialized and empty optional containers are omitted before hashing, so
 `capability: member` equals no capability, and `wants: {}` or `memory: []` equals no key.
@@ -57,7 +57,7 @@ Defaults are materialized and empty optional containers are omitted before hashi
 2. **`cred_slot` is a slot name** matching `^[A-Z][A-Z0-9_]{2,63}$`. It is never resolved,
    looked up or checked against any vault by validation.
 3. **Every ask is an explicit request.** Each `wants.gates`, `routines`, `seats`, `memory`
-   entry, each tool credential slot and each `direct` surface becomes a request line marked
+   entry, each `data[]` entry, each `risk.allow_direct` entry, each tool credential slot and each `direct` surface becomes a request line marked
    `needs: human_accept`. Validation grants none of them.
 4. **Strict and bounded**: unknown keys, oversize or too-deep input, aliases and duplicate
    keys are refused.
@@ -94,6 +94,18 @@ Defaults are materialized and empty optional containers are omitted before hashi
 | 6 | Apply: find-or-create project, squad and seats keyed by `seed_sha256` (not built yet) | member, after step 4 |
 | 7 | Deploy, DNS and production changes | **human only**, always |
 
+### Apply preconditions (normative)
+
+When apply is built it MUST:
+
+1. Store only the **canonical form** (`canonical`), never the raw source. Comments and
+   whitespace can carry secrets and still pass validation.
+2. Find-or-create by `seed_sha256` and slug, and MUST NOT take over an existing project with
+   that slug unless the caller can already read or own it.
+3. Treat `owner` as a label. It is never resolved to a member.
+4. Show requests from their structured `fields`; author text is never rendered unescaped
+   (`src/seeds/render.ts` JSON-quotes every field).
+
 Steps 4, 5 and 7 can never be performed by validation or by an agent acting alone.
 
 ## Example 1 — Astro site
@@ -129,6 +141,10 @@ Each test below was written to fail when the named mutation is applied to the co
 - Make the digest ignore a semantic change: the digest-difference tests fail.
 - Count `/` as opaque-string material again: the ordinary-path test fails.
 - Drop a secret-shaped value check for opaque tokens: the 40-character token test fails.
+- Narrow the secret scan back (drop `-`/`_` from the run class, the Google/Stripe/GitLab/query patterns, the list-join scan, the base64-body check, the key scan): the per-shape secret tests fail.
+- Drop a `data` or `allow_direct` request: the policy-request test fails.
+- Allow zero-width or bidi characters, or paste author text into a sentence: the spoofing tests fail.
+- Skip NFC or trailing-whitespace normalization, or reject a block scalar's final newline: the normalization tests fail.
 - Change a documented enum or cap in only one place: `tests/seed-v1-doc.test.ts` fails.
 - Let `seed_attach` write on a dry run, or apply on `dry_run: false`: the whole-database snapshot tests fail.
 - Lower the tool floor below `member`: the observer test (403 forbidden) fails.

@@ -11,6 +11,7 @@
 //     no diff and no signal that it exists.
 
 import { validateSeed } from '../seeds/validate'
+import { renderRequest } from '../seeds/render'
 import type { SeedV1 } from '../seeds/contract'
 import { readAccess, readableProject } from './projects'
 import { type ToolSpec, fail, done } from './index'
@@ -62,7 +63,7 @@ const toolSeedAttach: ToolSpec = {
       ok: true,
       dry_run: true,
       seed_sha256: result.seedSha256,
-      requests: result.requests,
+      requests: result.requests.map((r) => ({ ...r, text: renderRequest(r) })),
       diffs,
     })
   },

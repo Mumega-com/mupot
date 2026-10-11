@@ -73,8 +73,8 @@ export interface SeedError { code: SeedErrorCode; path: string; message: string 
 
 /** Something the seed ASKS for. Validation grants none of it. */
 export interface SeedRequest {
-  kind: 'gate' | 'routine' | 'seat' | 'memory' | 'tool_credential' | 'direct_surface'
-  detail: string
+  kind: 'gate' | 'routine' | 'seat' | 'memory' | 'data' | 'tool_credential' | 'direct_surface' | 'allow_direct'
+  fields: Record<string, string>
   needs: 'human_accept'
 }
 
