@@ -26,8 +26,8 @@
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
-import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env, OrgKind } from '../types'
+import { brandSquadScope, hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities, type SquadScope } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -36,6 +36,8 @@ import {
   resolveAgentSessionContext,
 } from './agent-sessions'
 import { evaluateWebSession, loadWebSessionByHash } from './web-sessions'
+import { stampingBinds, stampingTokenExistsSql } from './stamping-harness'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 import {
   ELEVATION_ACTIONS,
   type ElevationActionEffect,
@@ -43,6 +45,8 @@ import {
   elevationActionEffect,
   isKnownElevationAction,
   ORIGIN_DECIDABLE_ACTIONS,
+  ORIGIN_DECISION_RATE_WINDOW_MS,
+  STAMPING_HARNESS_TOKEN_LABELS,
   isRequestableElevationAction,
   isValidElevationDuration,
 } from './elevation-actions'
@@ -392,6 +396,9 @@ export interface DecideElevationInput {
 export interface AttestedOriginDecision {
   /** The agent that relayed the human's message (auth.boundAgentId). */
   callerAgentId: string
+  /** The exact token row that authenticated the relaying call (auth.tokenId, server-derived).
+   *  The commit anchor requires THIS row to be live and to name a stamping harness. */
+  callerTokenId: string
   chatId: string
   userId: string
   messageId: string
@@ -412,6 +419,7 @@ export type DecideElevationResult =
   | { ok: false; reason: 'reauth_required' }
   // S13 origin door only:
   | { ok: false; reason: 'origin_replayed' }
+  | { ok: false; reason: 'origin_rate_limited' }
   | { ok: false; reason: 'origin_action_not_permitted'; detail: string }
   | { ok: false; reason: 'origin_guard_failed' }
 
@@ -496,6 +504,69 @@ export async function canDecideElevation(
   scopeId: string | null | undefined,
 ): Promise<boolean> {
   return decidedByHasElevationAuthority(env, isOrgAdmin(auth), capabilities ?? [], scopeType, scopeId || null)
+}
+
+/** A page of pending, unexpired requests (oldest first) with every column the decider view needs,
+ *  keyset-paged. ONE query per page; no per-row reload. */
+export async function listPendingElevationRequestsPage(
+  env: Env,
+  tenant: string,
+  nowIso: string,
+  cursor: { createdAt: string; id: string } | null,
+  limit: number,
+): Promise<ElevationRequestRecord[]> {
+  try {
+    const rows = cursor
+      ? await env.DB.prepare(
+          `SELECT ${REQUEST_COLUMNS} FROM elevation_requests
+            WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
+              AND (created_at > ?3 OR (created_at = ?3 AND id > ?4))
+            ORDER BY created_at ASC, id ASC LIMIT ?5`,
+        ).bind(tenant, nowIso, cursor.createdAt, cursor.id, limit).all<ElevationRequestRecord>()
+      : await env.DB.prepare(
+          `SELECT ${REQUEST_COLUMNS} FROM elevation_requests
+            WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
+            ORDER BY created_at ASC, id ASC LIMIT ?3`,
+        ).bind(tenant, nowIso, limit).all<ElevationRequestRecord>()
+    return rows.results ?? []
+  } catch (err) {
+    if (isMissingTableError(err)) return []
+    throw err
+  }
+}
+
+const SQUAD_SCOPE_CHUNK = 90
+
+/** Load the SquadScope (id, department, kind) of every squad id in ONE query per chunk of 90 ids
+ *  (D1 binds are limited). Missing ids are simply absent from the map (fail closed downstream). */
+export async function loadSquadScopesByIds(env: Env, ids: readonly string[]): Promise<Map<string, SquadScope>> {
+  const out = new Map<string, SquadScope>()
+  const unique = Array.from(new Set(ids.filter((i) => i.length > 0)))
+  for (let i = 0; i < unique.length; i += SQUAD_SCOPE_CHUNK) {
+    const chunk = unique.slice(i, i + SQUAD_SCOPE_CHUNK)
+    const rows = await env.DB.prepare(`SELECT id, department_id, kind FROM squads WHERE id IN (${chunk.map(() => '?').join(', ')})`)
+      .bind(...chunk)
+      .all<{ id: string; department_id: string; kind: OrgKind }>()
+    for (const row of rows.results ?? []) out.set(row.id, brandSquadScope(row))
+  }
+  return out
+}
+
+/** canDecideElevation over the CAPABILITY plane only (no org-admin legacy flag), with the squad
+ *  scopes already loaded: pure, no queries. Same answer as canDecideElevation(env, null, caps, ...)
+ *  (pinned by a test) — it exists so a list of N requests costs one scope query, not N. */
+export function canDecideElevationPreloaded(
+  capabilities: CapabilityGrant[],
+  scopeType: CapabilityScopeType,
+  scopeId: string | null | undefined,
+  squadScopes: ReadonlyMap<string, SquadScope>,
+): boolean {
+  if (scopeType === 'org') return hasCapability(capabilities, 'org', null, 'admin')
+  if (!scopeId) return false
+  if (scopeType === 'department') return hasCapability(capabilities, 'department', scopeId, 'admin')
+  const scope = squadScopes.get(scopeId)
+  if (!scope) return false
+  return hasCapability(capabilities, 'squad', scope, 'admin')
 }
 
 /**
@@ -790,21 +861,29 @@ async function commitOriginDecision(
               decision_note = ?, decided_via = 'agent_attested_origin', decided_origin_receipt_id = ?
         WHERE id = ? AND tenant = ? AND status = 'pending' AND decision_expires_at > ?
           AND agent_id <> ?
+          AND member_id <> ?
           AND EXISTS (SELECT 1 FROM telegram_webhook_receipts
                        WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing')
           AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND owner_member_id = ?)
           AND EXISTS (SELECT 1 FROM members WHERE id = ? AND tenant = ? AND status = 'active' AND telegram_chat_id = ?)
+          AND NOT EXISTS (SELECT 1 FROM agent_member_bindings WHERE tenant = ? AND member_id = ?)
           AND EXISTS (SELECT 1 FROM capabilities
                        WHERE member_id = ? AND scope_type = 'org' AND capability IN ('admin', 'owner'))
-          AND EXISTS (SELECT 1 FROM agent_sessions WHERE id = elevation_requests.agent_session_id AND revoked_at IS NULL)`,
+          AND EXISTS (SELECT 1 FROM agent_sessions WHERE id = elevation_requests.agent_session_id AND revoked_at IS NULL)
+          AND NOT EXISTS (SELECT 1 FROM elevation_origin_receipts WHERE member_id = ? AND created_at > ?)
+          AND ${stampingTokenExistsSql(true)}`,
     ).bind(
       status, nowIso, input.decidedByMemberId, note, receiptId,
       request.id, input.tenant, nowIso,
       origin.callerAgentId,
+      input.decidedByMemberId,
       input.tenant, origin.reservation.updateId, origin.reservation.reservedAt, origin.reservation.digest,
       origin.callerAgentId, input.decidedByMemberId,
       input.decidedByMemberId, input.tenant, origin.chatId,
+      input.tenant, input.decidedByMemberId,
       input.decidedByMemberId,
+      input.decidedByMemberId, new Date(nowMs - ORIGIN_DECISION_RATE_WINDOW_MS).toISOString(),
+      ...stampingBinds(input.tenant, origin.callerAgentId, origin.callerTokenId, nowSqlUtc()),
     ),
     env.DB.prepare(
       `INSERT INTO elevation_origin_receipts
@@ -872,6 +951,11 @@ async function commitOriginDecision(
     await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, kind: 'elevation' }))
     const fresh = await loadElevationRequestById(env, input.tenant, request.id)
     if (fresh && fresh.status !== 'pending') return { ok: false, reason: 'already_decided', status: fresh.status }
+    // The rate window is one of the anchor's guards (atomic, so two concurrent messages cannot both
+    // land). Name it when it is the cause; any other lapsed guard stays the generic refusal.
+    const recent = await env.DB.prepare(`SELECT 1 AS x FROM elevation_origin_receipts WHERE member_id = ?1 AND created_at > ?2 LIMIT 1`)
+      .bind(input.decidedByMemberId, new Date(nowMs - ORIGIN_DECISION_RATE_WINDOW_MS).toISOString()).first<{ x: number }>()
+    if (recent) return { ok: false, reason: 'origin_rate_limited' }
     return { ok: false, reason: 'origin_guard_failed' }
   }
   // The anchor landed => every dependent statement had the SAME single-row guard. Verify
@@ -1119,9 +1203,15 @@ async function originGrantStillValid(
         AND q.decided_origin_receipt_id = r.id AND q.decided_by_member_id = r.member_id
         AND m.status = 'active' AND m.telegram_chat_id = r.chat_id
         AND a.owner_member_id = r.member_id
+        -- P1-2: the relaying agent must STILL hold a live token naming a stamping harness (a
+        -- revoked/relabelled-away credential cannot keep an origin-decided grant alive).
+        AND EXISTS (SELECT 1 FROM member_tokens t
+                     WHERE t.tenant = ?2 AND t.agent_id = r.agent_id
+                       AND ${TOKEN_LIVE_PREDICATE('?5')}
+                       AND lower(trim(t.label)) IN (${STAMPING_HARNESS_TOKEN_LABELS.map((_l, i) => `?${6 + i}`).join(', ')}))
       LIMIT 1`,
   )
-    .bind(grant.origin_receipt_id, tenant, grant.elevation_request_id, grant.approved_by_member_id)
+    .bind(grant.origin_receipt_id, tenant, grant.elevation_request_id, grant.approved_by_member_id, nowSqlUtc(), ...STAMPING_HARNESS_TOKEN_LABELS)
     .first<{ ok: number }>()
   return row !== null
 }

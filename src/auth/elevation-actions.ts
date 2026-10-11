@@ -261,3 +261,23 @@ export const ORIGIN_DECIDABLE_ACTIONS: ReadonlySet<string> = new Set([
   'action:routine_policy',
   'action:project_status',
 ])
+
+/** S13 (P1-2): which calling credentials may SUPPLY a human_origin to elevation_decide.
+ *
+ *  The server cannot tell a harness-stamped origin from one a model typed into the tool call. The
+ *  only server-side fact that distinguishes "this call came through a stamping harness" is the
+ *  CALLING TOKEN'S OWN ROW (member_tokens), written when an org admin minted the credential and
+ *  never UPDATEd afterwards (no code path rewrites `label`). The caller cannot pass it per request:
+ *  auth.tokenId is derived server-side from the bearer, and the label is re-read from the row.
+ *
+ *  member_tokens.harness_kind is NOT usable: its CHECK list has no hermes kind, and a trigger
+ *  (0204) forbids it on any agent-bound token (the only kind that reaches elevation_decide).
+ *  fleet_agents.runtime is NOT usable: the bound agent can self-report it (boot-self-report.ts).
+ *
+ *  Exact, lowercase, trimmed match against the token label. An explicit list: adding a label is a
+ *  reviewed security decision (the harness behind it MUST really strip a model-supplied
+ *  human_origin and stamp only the human's own message; see docs). */
+export const STAMPING_HARNESS_TOKEN_LABELS: readonly string[] = ['hermes-gateway']
+
+/** One human decision per member per this window, enforced in the commit batch's anchor. */
+export const ORIGIN_DECISION_RATE_WINDOW_MS = 30 * 1000

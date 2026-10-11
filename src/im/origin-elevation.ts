@@ -11,19 +11,25 @@
 //
 // Conjuncts (all re-checked per call, none cached):
 //   1. caller is agent-bound, and a human_origin is supplied (an agent without one is refused;
-//      so is a non-agent caller: the dashboard is the human's own door);
+//      so is a non-agent caller: the dashboard is the human's own door); AND the calling TOKEN's
+//      own row names a stamping harness (STAMPING_HARNESS_TOKEN_LABELS): the server cannot tell a
+//      stamped origin from a model-typed one, so a credential that is not a stamping harness may
+//      not supply one at all (origin_harness_not_stamping);
 //   2. origin is well-formed, private-chat-shaped, fresh (parseHumanOrigin, shared);
 //   3. the calling agent has an owner (agents.owner_member_id); the owner is active and ALREADY
 //      bound to that exact chat (no first-bind here: binding is a lower-stakes act than an
 //      elevation, and the stricter option costs one /account step);
-//   4. the human's text names THIS request (full id or an 8+ hex prefix) AND carries exactly one
-//      unnegated approve/deny word that matches the call's `decision` — "a claim in a message is
-//      never authorization": the model cannot choose a decision the human did not utter;
+//   4. the human's text is EXACTLY `approve|deny <request id or 8+ hex prefix>` (after NFKC, trim,
+//      whitespace collapse, lowercase; one optional trailing period) and the word equals the
+//      call's `decision`. An allow-shape, not a deny-list of hedges: "don't approve X", "approve X
+//      only if CI passes", "nope, approve X" are all refused decision_text_not_exact;
 //   5. the owner is not an agent's own member, is not the requester, and the calling agent is
 //      not the requesting agent;
 //   6. the owner holds ORG-scope admin by fresh capability rows (the legacy role plane is not
 //      consulted: memberAuth forces role 'member' for origin-resolved humans, same as task_verdict);
-//   7. per-member rate window; one decision per human message (reservation shared with task_verdict);
+//   7. per-member rate window (re-asserted as a NOT EXISTS in the commit batch's anchor: the JS
+//      read here is only for a friendly 429); one decision per human message (reservation shared
+//      with task_verdict);
 //   8. inside decideElevationRequest: scope authority, narrowing-only, action allowlist
 //      (ORIGIN_DECIDABLE_ACTIONS — no step-up action ever), and ONE atomic batch.
 //
@@ -32,13 +38,13 @@
 import type { AuthContext, Env, Member } from '../types'
 import { resolveCapabilities, hasCapability } from '../auth/capability'
 import { decideElevationRequest, loadElevationRequestById, type DecideElevationResult } from '../auth/elevation'
-import { ORIGIN_DECIDABLE_ACTIONS } from '../auth/elevation-actions'
+import { ORIGIN_DECIDABLE_ACTIONS, ORIGIN_DECISION_RATE_WINDOW_MS } from '../auth/elevation-actions'
+import { stampingBinds, stampingTokenExistsSql } from '../auth/stamping-harness'
+import { nowSqlUtc } from '../auth/token-lifecycle'
 import { canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { claimTimestamp } from '../lib/claim-timestamp'
 import { assertWritten } from '../lib/receipt'
 import { parseHumanOrigin, taskNamedInText } from './origin-verdict'
-
-const RATE_LIMIT_WINDOW_MS = 30 * 1000
 
 type OriginRefusalStatus = 403 | 404 | 409 | 429
 
@@ -55,20 +61,35 @@ export type OriginElevationOutcome =
   | { ok: true; result: Extract<DecideElevationResult, { ok: true }>; memberId: string }
   | { ok: false; status: OriginRefusalStatus; error: string; detail?: string }
 
-// Exactly one decision word, unnegated. Deliberately blunt: anything that reads as hedged
-// ("don't approve", "approve? no wait") is ambiguous and refused; the human re-sends plainly.
-const APPROVE_RE = /\b(approve|approved)\b/
-const DENY_RE = /\b(deny|denied|reject|rejected|decline|declined)\b/
-const NEGATION_RE = /(\bnot\b|n't\b|\bnever\b|\bdont\b|\bno\b|\bwait\b|\bstop\b|\bcancel\b)/
+// The ONLY accepted message shape. Allow-list, not a hedge deny-list: any extra word ("only if",
+// "actually", "nope,", "I cannot"), any punctuation inside, any other language reads as "not exact"
+// and is refused; the human re-sends the plain two-word message. Typed on a phone: `approve 1a2b3c4d`.
+const EXACT_DECISION_RE = /^(approve|deny) ([0-9a-f]{8,32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.?$/
 
-export function decisionWordIn(text: string): 'approve' | 'deny' | 'ambiguous' | null {
-  const t = text.toLowerCase()
-  const a = APPROVE_RE.test(t)
-  const d = DENY_RE.test(t)
-  if (!a && !d) return null
-  if (a && d) return 'ambiguous'
-  if (NEGATION_RE.test(t)) return 'ambiguous'
-  return a ? 'approve' : 'deny'
+export interface ExactDecision {
+  decision: 'approve' | 'deny'
+  /** The id token the human typed (prefix or full uuid), already normalised. */
+  ref: string
+}
+
+/** NFKC + trim + whitespace-collapse + lowercase, then the exact shape; null otherwise. NFKC folds
+ *  compatibility forms (fullwidth letters) to ASCII, so those read as the plain word. Visually
+ *  similar letters from other scripts (Cyrillic а) do NOT fold and are refused. */
+export function parseExactDecisionText(text: string): ExactDecision | null {
+  const t = text.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase()
+  const m = EXACT_DECISION_RE.exec(t)
+  if (!m) return null
+  return { decision: m[1] === 'approve' ? 'approve' : 'deny', ref: m[2] }
+}
+
+/** Does the CALLING token's own row (server-written at mint, re-read live here) name a stamping
+ *  harness? Never reads anything the caller passed in this call. */
+export async function callerTokenIsStampingHarness(env: Env, auth: AuthContext): Promise<boolean> {
+  if (!auth.tokenId || !auth.boundAgentId) return false
+  const row = await env.DB.prepare(`SELECT ${stampingTokenExistsSql(true)} AS ok`)
+    .bind(...stampingBinds(env.TENANT_SLUG, auth.boundAgentId, auth.tokenId, nowSqlUtc()))
+    .first<{ ok: number }>()
+  return row?.ok === 1
 }
 
 /** Audit a refusal. Floor refusals are decisions the ledger must remember too (an agent that
@@ -110,7 +131,7 @@ async function auditRefusal(
 }
 
 async function recentOriginDecisionExists(env: Env, memberId: string, nowMs: number): Promise<boolean> {
-  const cutoff = new Date(nowMs - RATE_LIMIT_WINDOW_MS).toISOString()
+  const cutoff = new Date(nowMs - ORIGIN_DECISION_RATE_WINDOW_MS).toISOString()
   const row = await env.DB.prepare(
     `SELECT 1 AS x FROM elevation_origin_receipts WHERE member_id = ?1 AND created_at > ?2 LIMIT 1`,
   )
@@ -139,6 +160,12 @@ export async function decideElevationViaOrigin(
     return refuse(403, 'human_origin_required', 'an agent cannot decide an elevation request on its own authority')
   }
 
+  // (1b) the credential must be a stamping harness. Without this the server cannot tell a harness
+  // stamp from an origin the model typed. Refuses BEFORE the origin is even parsed.
+  if (!(await callerTokenIsStampingHarness(env, auth))) {
+    return refuse(403, 'origin_harness_not_stamping', 'this credential is not a human-origin stamping harness (see docs/architecture/elevation-decide-over-human-origin.md); decide on the dashboard')
+  }
+
   // (2) origin shape + freshness.
   const parsed = parseHumanOrigin(input.humanOrigin)
   if (!parsed.ok) return refuse(403, parsed.reason)
@@ -162,12 +189,11 @@ export async function decideElevationViaOrigin(
   const request = await loadElevationRequestById(env, env.TENANT_SLUG, input.requestId)
   if (!request) return refuse(404, 'not_found')
 
-  // (4) the human's own words: this request, and one plain decision word equal to the call's.
-  if (!taskNamedInText(origin.text, request.id)) return refuse(403, 'request_not_named', 'the message must contain the request id (or its first 8+ hex characters)')
-  const word = decisionWordIn(origin.text)
-  if (word === null) return refuse(403, 'decision_word_missing', 'the message must say approve or deny')
-  if (word === 'ambiguous') return refuse(403, 'decision_word_ambiguous', 'send one plain approve or deny, not both, and not negated')
-  if (word !== input.decision) return refuse(403, 'decision_word_mismatch')
+  // (4) the human's own words: EXACTLY `approve|deny <this request's id or 8+ hex prefix>`.
+  const exact = parseExactDecisionText(origin.text)
+  if (exact === null) return refuse(403, 'decision_text_not_exact', 'the message must be exactly "approve <request id>" or "deny <request id>" (the id, or its first 8+ hex characters), nothing else')
+  if (!taskNamedInText(exact.ref, request.id)) return refuse(403, 'request_not_named', 'the message must contain this request\'s id (or its first 8+ hex characters)')
+  if (exact.decision !== input.decision) return refuse(403, 'decision_word_mismatch')
 
   // (5) parties.
   if (request.agent_id === callerAgentId || request.member_id === owner.id) {
@@ -218,6 +244,7 @@ export async function decideElevationViaOrigin(
     note: input.note ? `[via chat] ${input.note}` : '[via chat]',
     attestedOrigin: {
       callerAgentId,
+      callerTokenId: auth.tokenId ?? '',
       chatId: origin.chat_id,
       userId: origin.user_id,
       messageId: origin.message_id,
@@ -228,7 +255,7 @@ export async function decideElevationViaOrigin(
   })
 
   if (!result.ok) {
-    const status = result.reason === 'not_found' ? 404 : result.reason === 'forbidden' || result.reason === 'origin_action_not_permitted' ? 403 : 409
+    const status = result.reason === 'not_found' ? 404 : result.reason === 'origin_rate_limited' ? 429 : result.reason === 'forbidden' || result.reason === 'origin_action_not_permitted' ? 403 : 409
     return refuse(status, result.reason, 'detail' in result ? result.detail : undefined)
   }
   return { ok: true, result, memberId: owner.id }

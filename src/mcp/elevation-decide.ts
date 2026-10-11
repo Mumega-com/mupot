@@ -13,10 +13,28 @@
 
 import type { AuthContext, CapabilityGrant, Env } from '../types'
 import { hasCapability, resolveCapabilities } from '../auth/capability'
-import { canDecideElevation, loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
+import {
+  canDecideElevation,
+  canDecideElevationPreloaded,
+  listPendingElevationRequestsPage,
+  loadElevationRequestById,
+  loadSquadScopesByIds,
+  type ElevationRequestRecord,
+} from '../auth/elevation'
 import { ELEVATION_ACTIONS, ORIGIN_DECIDABLE_ACTIONS, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { decideElevationViaOrigin } from '../im/origin-elevation'
-import { type ToolOutcome, type ToolSpec, HUMAN_ORIGIN_SCHEMA, fail, done } from './index'
+import { HUMAN_ORIGIN_SCHEMA } from '../im/origin-schema'
+// TYPE-only import from ./index: a runtime import would form a cycle (index.ts imports this module's
+// tools at init). The two tiny outcome constructors are mirrored locally for the same reason.
+import type { ToolOutcome, ToolSpec } from './index'
+
+type FailStatus = Extract<ToolOutcome, { ok: false }>['status']
+function fail(status: FailStatus, error: string, detail?: unknown): ToolOutcome {
+  return { ok: false, status, error, detail }
+}
+function done(result: unknown): ToolOutcome {
+  return { ok: true, result }
+}
 
 const NOTE_MAX = 500
 const REASON_VIEW_MAX = 500
@@ -96,30 +114,24 @@ export async function ownerPendingView(auth: AuthContext, env: Env, args: Record
     return done({ view: 'owner_pending', decidable: true, pending: [describe(r, auth.boundAgentId)] })
   }
 
+  // Constant query cost per page (never per request): ONE page query + ONE squad-scope IN(...) query,
+  // then the authority filter runs in memory over the already-loaded rows. The filter still runs
+  // BEFORE the limit, so a flood of undecidable requests cannot hide a decidable one.
   const nowIso = new Date().toISOString()
   const visible: Array<Record<string, unknown>> = []
   let scanned = 0
   let cursor: { createdAt: string; id: string } | null = null
   let more = false
   while (visible.length <= VIEW_LIMIT && scanned < SCAN_CAP) {
-    const rows: { results?: Array<{ id: string; created_at: string }> } = cursor
-      ? await env.DB.prepare(
-          `SELECT id, created_at FROM elevation_requests
-            WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
-              AND (created_at > ?3 OR (created_at = ?3 AND id > ?4))
-            ORDER BY created_at ASC, id ASC LIMIT ?5`,
-        ).bind(auth.tenant, nowIso, cursor.createdAt, cursor.id, PAGE).all<{ id: string; created_at: string }>()
-      : await env.DB.prepare(
-          `SELECT id, created_at FROM elevation_requests
-            WHERE tenant = ?1 AND status = 'pending' AND decision_expires_at > ?2
-            ORDER BY created_at ASC, id ASC LIMIT ?3`,
-        ).bind(auth.tenant, nowIso, PAGE).all<{ id: string; created_at: string }>()
-    const page = rows.results ?? []
+    const page = await listPendingElevationRequestsPage(env, auth.tenant, nowIso, cursor, PAGE)
     if (page.length === 0) break
-    for (const row of page) {
+    const squadScopes = await loadSquadScopesByIds(
+      env,
+      page.filter((r) => r.requested_scope_type === 'squad' && r.requested_scope_id).map((r) => r.requested_scope_id),
+    )
+    for (const r of page) {
       scanned += 1
-      const r = await loadElevationRequestById(env, auth.tenant, row.id)
-      if (r && (await ownerCanDecide(env, capabilities, r))) visible.push(describe(r, auth.boundAgentId))
+      if (canDecideElevationPreloaded(capabilities, r.requested_scope_type, r.requested_scope_id, squadScopes)) visible.push(describe(r, auth.boundAgentId))
     }
     const last = page[page.length - 1]
     cursor = { createdAt: last.created_at, id: last.id }

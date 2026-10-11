@@ -8,9 +8,9 @@ import { invokeTool } from '../src/mcp'
 import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
-import { createElevationRequest, decideElevationRequest, hasElevatedAction } from '../src/auth/elevation'
-import { decisionWordIn } from '../src/im/origin-elevation'
-import { ORIGIN_DECIDABLE_ACTIONS, REQUESTABLE_ELEVATION_ACTION_KEYS, SENSITIVE_STEP_UP_ACTIONS } from '../src/auth/elevation-actions'
+import { canDecideElevation, canDecideElevationPreloaded, createElevationRequest, decideElevationRequest, hasElevatedAction, loadSquadScopesByIds } from '../src/auth/elevation'
+import { parseExactDecisionText } from '../src/im/origin-elevation'
+import { ORIGIN_DECIDABLE_ACTIONS, REQUESTABLE_ELEVATION_ACTION_KEYS, SENSITIVE_STEP_UP_ACTIONS, STAMPING_HARNESS_TOKEN_LABELS } from '../src/auth/elevation-actions'
 
 const TENANT = 'mumega'
 const DEPT = 'dept-1'
@@ -48,7 +48,7 @@ describe('elevation_decide over harness-attested human origin', () => {
     await env.DB.prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?1, ?2, ?3, datetime('now'))`).bind(TENANT, REQ_AGENT, REQ_MEMBER).run()
     await env.DB.prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?1, ?2, ?3, datetime('now'))`).bind(TENANT, RELAY_AGENT, RELAY_MEMBER).run()
     await env.DB.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at) VALUES ('tok-req', ?1, 'h-req', 'p', 'workspace', ?2, ?3, datetime('now'))`).bind(REQ_MEMBER, TENANT, REQ_AGENT).run()
-    await env.DB.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at) VALUES ('tok-relay', ?1, 'h-relay', 'p', 'workspace', ?2, ?3, datetime('now'))`).bind(RELAY_MEMBER, TENANT, RELAY_AGENT).run()
+    await env.DB.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at) VALUES ('tok-relay', ?1, 'h-relay', 'hermes-gateway', 'workspace', ?2, ?3, datetime('now'))`).bind(RELAY_MEMBER, TENANT, RELAY_AGENT).run()
     await env.DB.prepare(`UPDATE agents SET owner_member_id = ?1 WHERE id = ?2`).bind(HUMAN, RELAY_AGENT).run()
     await env.DB.prepare(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-org', ?1, 'org', NULL, 'admin')`).bind(HUMAN).run()
   })
@@ -188,9 +188,9 @@ describe('elevation_decide over harness-attested human origin', () => {
     const id = await request(['action:project_status'])
     const short = id.replace(/-/g, '').slice(0, 8)
     await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin('approve deadbeef') }, 403, 'request_not_named')
-    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`ok ${short}`) }, 403, 'decision_word_missing')
-    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`approve or deny ${short}`) }, 403, 'decision_word_ambiguous')
-    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`do not approve ${short}`) }, 403, 'decision_word_ambiguous')
+    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`ok ${short}`) }, 403, 'decision_text_not_exact')
+    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`approve or deny ${short}`) }, 403, 'decision_text_not_exact')
+    await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(`do not approve ${short}`) }, 403, 'decision_text_not_exact')
     await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(denyText(id)) }, 403, 'decision_word_mismatch')
     await refused(relayAuth(), { request_id: id, decision: 'deny', human_origin: origin(approveText(id)) }, 403, 'decision_word_mismatch')
   })
@@ -201,12 +201,46 @@ describe('elevation_decide over harness-attested human origin', () => {
     await refused(relayAuth(), { request_id: b, decision: 'approve', human_origin: origin(approveText(a)) }, 403, 'request_not_named')
   })
 
-  it('decisionWordIn is blunt: one plain unnegated word only', () => {
-    expect(decisionWordIn('approve abc')).toBe('approve')
-    expect(decisionWordIn('Deny abc')).toBe('deny')
-    expect(decisionWordIn('approve and reject')).toBe('ambiguous')
-    expect(decisionWordIn("don't approve")).toBe('ambiguous')
-    expect(decisionWordIn('hello')).toBeNull()
+  describe('the decision text is an EXACT shape (allow-list), not a hedge deny-list', () => {
+    it('parseExactDecisionText: accepts only `approve|deny <8+ hex | uuid>` after NFKC/trim/collapse/lowercase', () => {
+      expect(parseExactDecisionText('approve 1a2b3c4d')).toEqual({ decision: 'approve', ref: '1a2b3c4d' })
+      expect(parseExactDecisionText('  APPROVE   1A2B3C4D. ')).toEqual({ decision: 'approve', ref: '1a2b3c4d' })
+      expect(parseExactDecisionText('Deny 1a2b3c4d')).toEqual({ decision: 'deny', ref: '1a2b3c4d' })
+      expect(parseExactDecisionText('deny 11111111-2222-3333-4444-555555555555')?.decision).toBe('deny')
+      // fullwidth letters fold to ASCII under NFKC: the same plain message
+      expect(parseExactDecisionText('\uFF41\uFF50\uFF50\uFF52\uFF4F\uFF56\uFF45 1a2b3c4d')?.decision).toBe('approve')
+      for (const bad of [
+        "don\u2019t approve 1a2b3c4d", "don't approve 1a2b3c4d", "I cannot approve 1a2b3c4d", "i can\u2019t approve 1a2b3c4d",
+        'approve 1a2b3c4d only if CI passes', 'approve 1a2b3c4d \u2014 actually hold on', 'nope, approve 1a2b3c4d',
+        'approve 1a2b3c4d please', 'please approve 1a2b3c4d', 'approve 1a2b3c4d.. ', 'approve 1a2b3c4', 'approve', '1a2b3c4d approve',
+        'approve 1a2b3c4d\ndeny 1a2b3c4d', 'approve\u200b 1a2b3c4d', 'approve: 1a2b3c4d', 'approved 1a2b3c4d',
+        '\u0430pprove 1a2b3c4d', // Cyrillic a: a homoglyph NFKC does not fold
+        'appr\u043Eve 1a2b3c4d', 'approve 1a2b3c4g',
+      ]) expect(parseExactDecisionText(bad), JSON.stringify(bad)).toBeNull()
+    })
+
+    it('through the tool: every hedge / extra-word / homoglyph shape is refused decision_text_not_exact with the ledger unchanged', async () => {
+      const id = await request(['action:project_status'])
+      const short = id.replace(/-/g, '').slice(0, 8)
+      for (const text of [
+        `don\u2019t approve ${short}`, `don't approve ${short}`, `I cannot approve ${short}`, `approve ${short} only if CI passes`,
+        `approve ${short} \u2014 actually hold on`, `nope, approve ${short}`, `approve ${short} thanks`, `\u0430pprove ${short}`,
+      ]) {
+        await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(text) }, 403, 'decision_text_not_exact')
+      }
+    })
+
+    it('uppercase, padding, fullwidth, a trailing period and the full uuid are accepted; deny is accepted', async () => {
+      const a = await request(['action:project_status'])
+      const ok = await invokeTool(relayAuth(), env, 'elevation_decide', { request_id: a, decision: 'approve', human_origin: origin(`  APPROVE   ${a.replace(/-/g, '').slice(0, 10).toUpperCase()}. `) }, BASE)
+      expect(ok.ok).toBe(true)
+    })
+
+    it('deny (plain) is accepted', async () => {
+      const id = await request(['action:project_status'])
+      const res = await invokeTool(relayAuth(), env, 'elevation_decide', { request_id: id, decision: 'deny', human_origin: origin(`Deny ${id}`) }, BASE)
+      expect(res.ok).toBe(true)
+    })
   })
 
   // ── parties ──────────────────────────────────────────────────────────────
@@ -214,6 +248,7 @@ describe('elevation_decide over harness-attested human origin', () => {
   it('the requesting agent can never decide its own request, even owned by the same human with a stamp', async () => {
     const id = await request(['action:project_status'])
     await env.DB.prepare(`UPDATE agents SET owner_member_id = ?1 WHERE id = ?2`).bind(HUMAN, REQ_AGENT).run()
+    await env.DB.prepare(`UPDATE member_tokens SET label = 'hermes-gateway' WHERE id = 'tok-req'`).run()
     await refused(reqAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'requester_cannot_decide')
   })
 
@@ -254,17 +289,19 @@ describe('elevation_decide over harness-attested human origin', () => {
     await refused(relayAuth(), { request_id: mixed, decision: 'approve', actions: ['action:manage_access'], human_origin: origin(approveText(mixed)) }, 403, 'origin_action_not_permitted')
   })
 
-  it('narrowing a mixed request to its allowlisted subset is approvable; DENY of a sensitive request is allowed', async () => {
+  it('narrowing a mixed request to its allowlisted subset is approvable', async () => {
     const mixed = await request(['action:manage_access', 'action:project_status'])
     const ok = await invokeTool(relayAuth(), env, 'elevation_decide', { request_id: mixed, decision: 'approve', actions: ['action:project_status'], human_origin: origin(approveText(mixed)) }, BASE)
     expect(ok.ok).toBe(true)
     expect((await env.DB.prepare(`SELECT action FROM elevation_grants`).all<{ action: string }>()).results.map((r) => r.action)).toEqual(['action:project_status'])
-    // second human message (rate window applies per member: use the function directly for deny of a fresh sensitive one)
+  })
+
+  it('DENY of a sensitive request is allowed over the origin door', async () => {
     const sens = await request(['action:mint_token'])
     const direct = await decideElevationRequest(env, {
       tenant: TENANT, requestId: sens, decision: 'deny', decidedByMemberId: HUMAN, decidedByCapabilities: [], decidedByIsOrgAdmin: true,
       decidedByWebSessionHash: null, recentReauthOk: false,
-      attestedOrigin: { callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '77001', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:77001`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
+      attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '77001', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:77001`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
     })
     expect(direct.ok).toBe(true)
   })
@@ -276,7 +313,7 @@ describe('elevation_decide over harness-attested human origin', () => {
       tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:mint_token'], decidedByMemberId: HUMAN,
       decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
       decidedByWebSessionHash: null, recentReauthOk: true,
-      attestedOrigin: { callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '77002', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:77002`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
+      attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '77002', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:77002`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
     })
     expect(res).toMatchObject({ ok: false, reason: 'origin_action_not_permitted' })
     expect(await ledger()).toBe(before)
@@ -291,7 +328,7 @@ describe('elevation_decide over harness-attested human origin', () => {
         tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:project_status'], decidedByMemberId: HUMAN,
         decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
         decidedByWebSessionHash: null, recentReauthOk: false,
-        attestedOrigin: { callerAgentId: caller, chatId: CHAT, userId: CHAT, messageId: String(66000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${66000 + n}`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
+        attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: caller, chatId: CHAT, userId: CHAT, messageId: String(66000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${66000 + n}`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
       })
     }
     async function expectGuardFailed(n: number, caller = RELAY_AGENT): Promise<void> {
@@ -329,7 +366,7 @@ describe('elevation_decide over harness-attested human origin', () => {
         tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:project_status'], decidedByMemberId: HUMAN,
         decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
         decidedByWebSessionHash: null, recentReauthOk: false,
-        attestedOrigin: { callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '66050', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:66050`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
+        attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '66050', messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:66050`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
       })
       expect(res).toMatchObject({ ok: false, reason: 'origin_guard_failed' })
       expect(await count(`SELECT COUNT(*) n FROM elevation_grants`)).toBe(0)
@@ -339,12 +376,72 @@ describe('elevation_decide over harness-attested human origin', () => {
       // JS-side check refuses first as forbidden; the SQL clause is the backstop
       expect(res).toMatchObject({ ok: false, reason: 'forbidden' })
     })
+
+    // ── SQL backstops pinned: each test changes ONE DB fact AFTER the JS reads (a trigger fires the
+    // instant the reservation row is written, i.e. between the JS checks and the anchor UPDATE), so
+    // ONLY the matching clause of the anchor statement can refuse. Mutating that clause turns the
+    // test red (mutation results are in the PR report).
+    async function breakAfterRead(body: string, n: number): Promise<ReturnType<typeof decideElevationRequest>> {
+      const id = await request(['action:project_status'])
+      await env.DB.prepare(`CREATE TRIGGER zz_break_after_read AFTER INSERT ON telegram_webhook_receipts BEGIN ${body.replace(/:REQ/g, `'${id}'`)} END`).run()
+      const res = await decideElevationRequest(env, {
+        tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:project_status'], decidedByMemberId: HUMAN,
+        decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
+        decidedByWebSessionHash: null, recentReauthOk: false,
+        attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: String(55000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${55000 + n}`, digest: 'c'.repeat(64), reservedAt: '2026-10-11T00:00:00.000000Z' } },
+      })
+      return res
+    }
+    async function expectSqlRefused(body: string, n: number, reason: string = 'origin_guard_failed', plantedReceipts = 0): Promise<void> {
+      const res = await breakAfterRead(body, n)
+      expect(res).toMatchObject({ ok: false, reason })
+      expect(await count(`SELECT COUNT(*) n FROM elevation_grants`)).toBe(0)
+      expect(await count(`SELECT COUNT(*) n FROM elevation_origin_receipts`)).toBe(plantedReceipts)
+      expect(await audits('approve')).toBe(0)
+    }
+    it('SQL: the relay became the requesting agent after the read (agent_id <> ?)', async () => {
+      await expectSqlRefused(`UPDATE elevation_requests SET agent_id = '${RELAY_AGENT}' WHERE id = :REQ;`, 10)
+    })
+    it('SQL: the decision window lapsed after the read (decision_expires_at > ?)', async () => {
+      await expectSqlRefused(`UPDATE elevation_requests SET decision_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = :REQ;`, 11)
+    })
+    it('SQL: the approver became the request\'s member after the read (member_id <> owner)', async () => {
+      await expectSqlRefused(`UPDATE elevation_requests SET member_id = '${HUMAN}' WHERE id = :REQ;`, 12)
+    })
+    it('SQL: the approver became an agent identity after the read (NOT EXISTS agent_member_bindings)', async () => {
+      await env.DB.prepare(`INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-y', ?1, 'y', 'y', 'member', 'test', 'active')`).bind(SQUAD).run()
+      await expectSqlRefused(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES ('${TENANT}', 'agent-y', '${HUMAN}', datetime('now'));`, 13)
+    })
+    it('SQL: the org admin capability moved to a SQUAD scope after the read (scope_type = org limb)', async () => {
+      await expectSqlRefused(`UPDATE capabilities SET scope_type = 'squad', scope_id = '${SQUAD}' WHERE member_id = '${HUMAN}';`, 14)
+    })
+    it('SQL: the org capability was demoted below admin after the read (capability IN admin/owner limb)', async () => {
+      await expectSqlRefused(`UPDATE capabilities SET capability = 'member' WHERE member_id = '${HUMAN}';`, 15)
+    })
+    it('SQL: another origin decision by the same human landed after the read (rate NOT EXISTS) -> origin_rate_limited', async () => {
+      const other = await request(['action:project_status'])
+      await expectSqlRefused(
+        `INSERT INTO elevation_origin_receipts (id, tenant, elevation_request_id, member_id, agent_id, channel, chat_id, message_id, message_at, text_hash, decision, created_at) VALUES ('r-other', '${TENANT}', '${other}', '${HUMAN}', '${RELAY_AGENT}', 'telegram', '${CHAT}', 'm-other', datetime('now'), '${'d'.repeat(64)}', 'deny', '${new Date().toISOString()}');`,
+        16, 'origin_rate_limited', 1,
+      )
+    })
+    it('SQL: the calling token was revoked after the read (stamping-harness EXISTS, live)', async () => {
+      await expectSqlRefused(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = 'tok-relay';`, 17)
+    })
+    it('SQL: the calling token was a different credential (pinned to the exact token row)', async () => {
+      await env.DB.prepare(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, tenant, agent_id, created_at) VALUES ('tok-relay-2', ?1, 'h-relay-2', 'hermes-gateway', 'workspace', ?2, ?3, datetime('now'))`).bind(RELAY_MEMBER, TENANT, RELAY_AGENT).run()
+      // the call names tok-relay; the JS-side facts all hold; only the pin on t.id can see tok-relay go away
+      await expectSqlRefused(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = 'tok-relay';`, 18)
+    })
+    it('SQL: the calling token was relabelled out of the allowlist after the read (no label UPDATE path exists in code; a direct row edit must still be refused)', async () => {
+      await expectSqlRefused(`UPDATE member_tokens SET label = 'laptop' WHERE id = 'tok-relay';`, 19)
+    })
   })
 
   it('a decision carries exactly one approver anchor: origin + web hash, or neither, is invalid', async () => {
     const id = await request(['action:project_status'])
     const base = { tenant: TENANT, requestId: id, decision: 'approve' as const, decidedByMemberId: HUMAN, decidedByCapabilities: [], decidedByIsOrgAdmin: true, recentReauthOk: false }
-    const both = await decideElevationRequest(env, { ...base, decidedByWebSessionHash: 'x', attestedOrigin: { callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '1', messageAt: '', textHash: '', reservation: { updateId: 'u', digest: 'd', reservedAt: 'r' } } })
+    const both = await decideElevationRequest(env, { ...base, decidedByWebSessionHash: 'x', attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: '1', messageAt: '', textHash: '', reservation: { updateId: 'u', digest: 'd', reservedAt: 'r' } } })
     const neither = await decideElevationRequest(env, { ...base, decidedByWebSessionHash: null })
     expect(both).toMatchObject({ ok: false, reason: 'invalid_elevation_request' })
     expect(neither).toMatchObject({ ok: false, reason: 'invalid_elevation_request' })
@@ -367,7 +464,7 @@ describe('elevation_decide over harness-attested human origin', () => {
       tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:project_status'], decidedByMemberId: HUMAN,
       decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
       decidedByWebSessionHash: null, recentReauthOk: false,
-      attestedOrigin: { callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: String(88000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${88000 + n}`, digest: 'c'.repeat(64), reservedAt: `2026-10-11T00:00:00.00000${n}Z` } },
+      attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: String(88000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${88000 + n}`, digest: 'c'.repeat(64), reservedAt: `2026-10-11T00:00:00.00000${n}Z` } },
     })
     const results = await Promise.all([mk(1), mk(2), mk(3)])
     expect(results.filter((r) => r.ok)).toHaveLength(1)
@@ -398,6 +495,55 @@ describe('elevation_decide over harness-attested human origin', () => {
     expect((await invokeTool(relayAuth(), env, 'elevation_decide', { request_id: a, decision: 'approve', human_origin: origin(approveText(a)) }, BASE)).ok).toBe(true)
     const b = await request(['action:project_status'])
     await refused(relayAuth(), { request_id: b, decision: 'approve', human_origin: origin(approveText(b)) }, 429, 'origin_rate_limited')
+  })
+
+  it('rate window is ATOMIC: two concurrent decisions from two messages by the same human cannot both land', async () => {
+    const a = await request(['action:project_status'])
+    const b = await request(['action:project_status'])
+    const mk = (id: string, n: number) => decideElevationRequest(env, {
+      tenant: TENANT, requestId: id, decision: 'approve', selectedActions: ['action:project_status'], decidedByMemberId: HUMAN,
+      decidedByCapabilities: [{ member_id: HUMAN, scope_type: 'org', scope_id: null, capability: 'admin' }], decidedByIsOrgAdmin: false,
+      decidedByWebSessionHash: null, recentReauthOk: false,
+      attestedOrigin: { callerTokenId: 'tok-relay', callerAgentId: RELAY_AGENT, chatId: CHAT, userId: CHAT, messageId: String(44000 + n), messageAt: new Date().toISOString(), textHash: 'b'.repeat(64), reservation: { updateId: `origin:telegram:${CHAT}:${44000 + n}`, digest: 'c'.repeat(64), reservedAt: `2026-10-11T00:00:00.00000${n}Z` } },
+    })
+    const results = await Promise.all([mk(a, 1), mk(b, 2)])
+    expect(results.filter((r) => r.ok)).toHaveLength(1)
+    expect(results.filter((r) => !r.ok)).toEqual([{ ok: false, reason: 'origin_rate_limited' }])
+    expect(await count(`SELECT COUNT(*) n FROM elevation_origin_receipts`)).toBe(1)
+    expect(await count(`SELECT COUNT(*) n FROM elevation_grants`)).toBe(1)
+  })
+
+  describe('P1-2: only a stamping-harness credential may supply a human_origin', () => {
+    it('the allowlist is one explicit constant', () => {
+      expect([...STAMPING_HARNESS_TOKEN_LABELS]).toEqual(['hermes-gateway'])
+    })
+    it('a bound agent whose token label is not an allowlisted stamping harness is refused origin_harness_not_stamping, even with a perfect origin', async () => {
+      const id = await request(['action:project_status'])
+      await env.DB.prepare(`UPDATE member_tokens SET label = 'laptop' WHERE id = 'tok-relay'`).run()
+      await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'origin_harness_not_stamping')
+    })
+    it('a caller-supplied tokenId that is not the agent\'s own stamping token does not count', async () => {
+      const id = await request(['action:project_status'])
+      await refused({ ...relayAuth(), tokenId: 'tok-req' }, { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'origin_harness_not_stamping')
+      await refused({ ...relayAuth(), tokenId: null }, { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'origin_harness_not_stamping')
+    })
+    it('a revoked or expired stamping token is refused', async () => {
+      const id = await request(['action:project_status'])
+      await env.DB.prepare(`UPDATE member_tokens SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = 'tok-relay'`).run()
+      await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'origin_harness_not_stamping')
+    })
+    it('label match is exact after trim/lowercase: a lookalike label is refused', async () => {
+      const id = await request(['action:project_status'])
+      await env.DB.prepare(`UPDATE member_tokens SET label = 'hermes-gateway-2' WHERE id = 'tok-relay'`).run()
+      await refused(relayAuth(), { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, 403, 'origin_harness_not_stamping')
+    })
+    it('USE time: once the relaying agent holds no live stamping token, the origin-decided grant dies', async () => {
+      const id = await request(['action:project_status'])
+      expect((await invokeTool(relayAuth(), env, 'elevation_decide', { request_id: id, decision: 'approve', human_origin: origin(approveText(id)) }, BASE)).ok).toBe(true)
+      expect((await hasElevatedAction(env, reqAuth(), 'action:project_status', 'squad', SQUAD, { recordUsage: false })).granted).toBe(true)
+      await env.DB.prepare(`UPDATE member_tokens SET revoked_at = datetime('now') WHERE id = 'tok-relay'`).run()
+      expect(await hasElevatedAction(env, reqAuth(), 'action:project_status', 'squad', SQUAD, { recordUsage: false })).toEqual({ granted: false, reason: 'approver_origin_invalid' })
+    })
   })
 
   // ── atomicity ────────────────────────────────────────────────────────────
@@ -505,6 +651,40 @@ describe('elevation_decide over harness-attested human origin', () => {
       const v = res.result as { pending: unknown[]; truncated: boolean }
       expect(v.pending).toHaveLength(20)
       expect(v.truncated).toBe(true)
+    })
+
+    it('query cost is CONSTANT in the number of pending squad requests (no N+1)', async () => {
+      await invokeTool(reqAuth(), env, 'check_in', {}, BASE)
+      const sess = await env.DB.prepare(`SELECT id FROM agent_sessions LIMIT 1`).first<{ id: string }>()
+      const squads: string[] = []
+      for (let i = 0; i < 40; i++) {
+        await env.DB.prepare(`INSERT INTO squads (id, department_id, slug, name) VALUES (?1, ?2, ?3, ?3)`).bind(`sq-n${i}`, DEPT, `n${i}`).run()
+        squads.push(`sq-n${i}`)
+      }
+      const prepared: string[] = []
+      const realPrepare = env.DB.prepare.bind(env.DB)
+      env.DB.prepare = ((sql: string) => { prepared.push(sql); return realPrepare(sql) }) as typeof env.DB.prepare
+      const run = async (): Promise<number> => {
+        prepared.length = 0
+        const res = await invokeTool(relayAuth(), env, 'elevation_status', { pending_for_owner: true }, BASE)
+        expect(res.ok).toBe(true)
+        return prepared.filter((q) => /elevation_requests|FROM squads|squads WHERE|capabilities/.test(q)).length
+      }
+      for (let i = 0; i < 5; i++) await createElevationRequest(env, { tenant: TENANT, agentSessionId: sess!.id, agentId: REQ_AGENT, memberId: REQ_MEMBER, actions: ['action:project_status'], scopeType: 'squad', scopeId: squads[i], durationMinutes: 60, reason: `a${i}` }, Date.now() - 60_000 + i)
+      const small = await run()
+      for (let i = 5; i < 40; i++) await createElevationRequest(env, { tenant: TENANT, agentSessionId: sess!.id, agentId: REQ_AGENT, memberId: REQ_MEMBER, actions: ['action:project_status'], scopeType: 'squad', scopeId: squads[i], durationMinutes: 60, reason: `a${i}` }, Date.now() - 60_000 + i)
+      const large = await run()
+      expect(large).toBe(small)
+      expect(large).toBeLessThanOrEqual(6)
+    })
+
+    it('canDecideElevationPreloaded agrees with canDecideElevation for org / department / squad / home / unknown scopes', async () => {
+      await env.DB.prepare(`INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('home-9', ?1, 'home9', 'H', 'home')`).bind(DEPT).run()
+      const caps = [{ member_id: HUMAN, scope_type: 'org' as const, scope_id: null, capability: 'admin' as const }]
+      const scopes = await loadSquadScopesByIds(env, [SQUAD, 'home-9', 'ghost'])
+      for (const [t, id] of [['org', null], ['department', DEPT], ['squad', SQUAD], ['squad', 'home-9'], ['squad', 'ghost'], ['squad', null]] as const) {
+        expect(canDecideElevationPreloaded(caps, t, id, scopes), `${t}:${id}`).toBe(await canDecideElevation(env, null, caps, t, id))
+      }
     })
 
     it('an agent whose owner is not a chat-bound org admin sees nothing decidable', async () => {
