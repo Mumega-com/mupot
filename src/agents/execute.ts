@@ -28,7 +28,7 @@
 import type { Env, Agent, Task, ModelMessage, ModelPort, BusEvent , TokenUsage } from '../types'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
-import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose } from '../tasks/service'
+import { checkTransition, assertCompletableDoneWhen, assigneeSelfClose, CLEAR_REJECTED_RESULT_SQL } from '../tasks/service'
 import { verifyTaskArtifactShape } from '../tasks/artifact-verification'
 import {
   EXECUTION_PAUSED_ERROR, RETRY_CEILING_ERROR, TASK_HELD_ERROR, EXECUTION_RETRY_CEILING,
@@ -432,7 +432,7 @@ async function runTaskExecutionAttempt(
         error: 'artifact_verification_failed',
       }
     }
-    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER))) {
+    if (!(await finishTask(env, task.id, agent.id, executionReceiptId, successStatus, result, finishedAt, recordedCostMicroUsd, AGENT_SELF_COMPLETION_GATE_OWNER, { path: artifactCheck.path, sha256: artifactCheck.sha256Claimed }))) {
       await recordTokensSafe(meter.recordTokens, env, agent.id, EXECUTE_MAX_TOKENS, recordedCostMicroUsd, {
       input: chatUsage?.input,
       output: chatUsage?.output,
@@ -601,7 +601,7 @@ async function claimTaskProgress(
     ? await env.DB.prepare(
       `UPDATE tasks
           SET status = 'in_progress', assignee_agent_id = ?1, updated_at = ?2,
-              execution_receipt_id = ?3, execution_claim_expires_at = ?4
+              execution_receipt_id = ?3, execution_claim_expires_at = ?4, ${CLEAR_REJECTED_RESULT_SQL}
         WHERE id = ?5 AND squad_id = ?6 AND status = ?7 AND assignee_agent_id IS NULL
           AND assignee_member_id IS NULL
           AND ${TASK_NOT_ARCHIVED_SQL()}
@@ -618,7 +618,7 @@ async function claimTaskProgress(
     : await env.DB.prepare(
       `UPDATE tasks
           SET status = 'in_progress', updated_at = ?1, execution_receipt_id = ?2,
-              execution_claim_expires_at = ?3
+              execution_claim_expires_at = ?3, ${CLEAR_REJECTED_RESULT_SQL}
         WHERE id = ?4 AND squad_id = ?5 AND status = ?6 AND assignee_agent_id = ?7
           AND ${TASK_NOT_ARCHIVED_SQL()}
           ${executionCondition}
@@ -655,6 +655,11 @@ async function finishTask(
   // real gate_owner is never overwritten. Non-review callers (blocked path)
   // pass no fallback, so this is a no-op for them.
   gateOwnerFallback: string | null = null,
+  // The shape-verified artifact claim behind a 'review' landing. When supplied, the append-only
+  // task_result_submissions receipt (who produced this result) lands in the SAME batch as the
+  // status flip and only if that flip landed: gate:agent-self-completion's verdict authority is
+  // "the agent that produced the current result" and this row is where that is recorded.
+  submission: { path: string; sha256: string } | null = null,
 ): Promise<boolean> {
   // Structural invariant, enforced via the SHARED chokepoint (assigneeSelfClose,
   // src/tasks/service.ts): this function's own WHERE clause requires
@@ -669,7 +674,7 @@ async function finishTask(
       'agent_self_close_forbidden: execute.ts must never write a task done directly — land it in review so a different principal can verify and close (BLOCK-2, PR #417)',
     )
   }
-  const dbResult = await env.DB.prepare(
+  const updateStmt = env.DB.prepare(
     `UPDATE tasks
         SET status = ?, result = ?, completed_at = ?, updated_at = ?, cost_micro_usd = ?,
             execution_claim_expires_at = NULL, gate_owner = COALESCE(gate_owner, ?)
@@ -680,8 +685,31 @@ async function finishTask(
       status, result, completedAt, completedAt, Math.max(0, Math.round(costMicroUsd)), gateOwnerFallback,
       taskId, agentId, executionReceiptId,
     )
-    .run()
-  return dbResult.meta?.changes === 1
+  if (status !== 'review' || !submission) {
+    const dbResult = await updateStmt.run()
+    return dbResult.meta?.changes === 1
+  }
+  // One transaction: the receipt is conditioned on THIS update having landed (same updated_at,
+  // still this claim's pointer), so a review landing always has its producer record and a lost
+  // claim never leaves a receipt behind.
+  const insertStmt = env.DB.prepare(
+    `INSERT INTO task_result_submissions
+       (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+     SELECT ?, ?, t.id, t.squad_id, ?, ?, ?, ?, ?
+       FROM tasks t
+      WHERE t.id = ? AND t.status = 'review' AND t.updated_at = ? AND t.assignee_agent_id = ?
+        AND t.execution_receipt_id = ?`,
+  ).bind(
+    crypto.randomUUID(), env.TENANT_SLUG, agentId, submission.path, submission.sha256, await sha256HexOf(result), result,
+    taskId, completedAt, agentId, executionReceiptId,
+  )
+  const results = await env.DB.batch([updateStmt, insertStmt])
+  return results[0]?.meta?.changes === 1
+}
+
+async function sha256HexOf(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input))
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 // Fallback gate_owner for an agent's OWN dispatch-completion of a previously

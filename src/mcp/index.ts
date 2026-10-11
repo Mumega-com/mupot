@@ -3212,12 +3212,12 @@ const toolTaskSubmitResult: ToolSpec = {
     )
     const insertStmt = env.DB.prepare(
       `INSERT INTO task_result_submissions
-         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         (id, tenant, task_id, squad_id, submitted_by_agent_id, artifact_path, artifact_sha256, result_digest, result_text)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?10
         WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?3 AND updated_at = ?9 AND status = 'review')`,
     ).bind(
       receiptId, env.TENANT_SLUG, next.id, next.squad_id, callerAgentId,
-      artifactCheck.path, artifactCheck.sha256Claimed, resultDigest, next.updated_at,
+      artifactCheck.path, artifactCheck.sha256Claimed, resultDigest, next.updated_at, resultText,
     )
     const results = await env.DB.batch([updateStmt, insertStmt])
     if (!results[0]?.meta?.changes) {

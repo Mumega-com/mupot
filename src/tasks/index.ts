@@ -29,7 +29,7 @@ import { cursorMatchesRequest, decodeTaskCursor, fetchTaskPage, filterFingerprin
 import { canReadProjectForTasks, canReadSquadTasks, canReadTask, resolveVisibleTaskScope, visibleTaskClause } from './visibility'
 import { resolveCapabilities, hasCapability, hasSurfaceCap, isOrgAdmin, planeCoversScope, brandSquadScope } from '../auth/capability'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
-import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError } from './service'
+import { createTask, emitTaskEvent, mirrorTaskUpdate, checkTransition, writeVerdict, VerdictRaceError, TaskArchivedError, TaskEvidenceFenceError, patchToDoneBypassesGate, assertCompletableDoneWhen, isDoneWhenValid, stampTaskUpdate, TaskProjectError, TaskUpdateConflictError, persistTaskUpdate, validateTaskProjectAttribution, assigneeSelfClose, assigneeCannotMutateOwnAssignment, assigneeChangesInReview, TaskIntakeContractError, assertValidIntakeContract, evaluateTaskIntakeContract, isTaskStatus, ALL_TASK_STATUSES, NonHumanVerdictRefusedError, detectVerdictReversalRequest, reverseTaskVerdict, DedicatedGatePredicateRequiredError, VerdictIndependenceError, isCurrentSelfCompletionProducer } from './service'
 import type { TaskStatus, VerdictIndependenceWaiver } from './service'
 import { resolveTaskAssignee, resolveTaskAssigneeMember } from './assignee'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -1659,11 +1659,18 @@ export async function evaluateVerdictGates(
   //   'affiliated'  the decider only acts for a party. An org owner/admin (legacyOwnerAdmin) is the
   //                 existing supervisory path and passes with an 'admin_supervisory' waiver; this
   //                 closes the grant-only route, not the admin role.
-  // gate:agent-self-completion exempts ONLY the current assignee closing its own task (the write
-  // re-reads the assignee in its WHERE). The lane also admits legacy org owner/admin principals;
+  // gate:agent-self-completion exempts ONLY the producer of the task's current result while it is
+  // also the current assignee (the write re-reads both, and the result binding, in its WHERE). The lane also admits legacy org owner/admin principals;
   // those are judged like any other lane, so a direct party cannot ride the lane's waiver.
   let independenceWaiver: VerdictIndependenceWaiver | undefined
-  const assigneeClosingOwnTask = isSelfCompletionGate && principal.id === task.assignee_agent_id
+  // Lane authority is the PRODUCER of the current result who is also the current assignee (the
+  // same predicate the verdict write re-reads in its WHERE, isCurrentSelfCompletionProducer). A
+  // current assignee that did not produce the result is a party like any other and is refused
+  // below as self_verdict, not left to fail later as a race.
+  const assigneeClosingOwnTask = isSelfCompletionGate
+    && principal.type === 'agent'
+    && principal.id === task.assignee_agent_id
+    && await isCurrentSelfCompletionProducer(env, { task: { id: task.id, gate_owner: task.gate_owner }, decidedBy: principal.id })
   if (!assigneeClosingOwnTask) {
     // The assignee the CALLER passed is judged first (no query), then the task's whole party set
     // read from the database. Both must hold: a caller-supplied row that omits the assignee must

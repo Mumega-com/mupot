@@ -64,6 +64,9 @@ interface MakeEnvOpts {
   /** Make env.BUS.send throw on every emit, to prove a bus failure never fails
    *  the review transition (wakeGateOwnerOnReview's try/catch). */
   busThrows?: boolean
+  /** The decider produced the task's current result (the self-completion lane's verdict authority: the
+   *  latest task_result_submissions row, read through isCurrentSelfCompletionProducer). */
+  laneProducer?: boolean
 }
 
 function makeEnv(
@@ -130,6 +133,7 @@ function makeEnv(
                 }
                 if (sql.includes('FROM squads WHERE id = ?1')) return squads.get(args[0] as string) ?? null
                 if (sql.includes('FROM tasks WHERE id = ?1')) return tasks.get(args[0] as string) ?? null
+                if (sql.includes('lane_sub')) return opts.laneProducer ? { one: 1 } : null
                 // FP-01 Slice 2 v2 round 2 (P0): reverseTaskVerdict's own
                 // findLatestVerdict read — task_verdict_reverse now checks a
                 // verdict actually exists before reversing it (it never did
@@ -1640,7 +1644,7 @@ describe('task_verdict (MCP)', () => {
     // own completed ungated work (BLOCK-2, PR #417). The route authorizes by
     // assignment (assignee or org owner/admin), NOT by grant — a plain member
     // assignee can close its own task; the verdict IS written.
-    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })])
+    const { env, updates } = makeEnv([reviewTask({ assignee_agent_id: AGENT_ID, gate_owner: 'gate:agent-self-completion' })], {}, {}, { laneProducer: true })
     const res = await invokeTool(auth(), env, 'task_verdict', { task_id: 'task-1', verdict: 'approved' }, URL)
     expect(res.ok).toBe(true)
     expect(updates.some((u) => /UPDATE tasks SET status/.test(u.sql))).toBe(true)
