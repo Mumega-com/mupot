@@ -192,7 +192,9 @@ describe('/preview/* forwards no ambient credentials', () => {
   })
 
   it('a 101 upgrade is never rewrapped into a crash on either policy', () => {
-    const upgrade = { status: 101, headers: new Headers(), body: null } as unknown as Response
+    const headers = new Headers()
+    headers.append('set-cookie', 'planted=1; Domain=example.test')
+    const upgrade = { status: 101, headers, body: null } as unknown as Response
     expect(sanitizeOwnOriginResponse(upgrade)).toBe(upgrade)
     const colony = sanitizeColonyOriginResponse(upgrade, { requestUrl: 'https://x.test/preview/i/', pathPrefix: '/preview/i/' })
     expect(colony.status).toBe(501)
