@@ -112,7 +112,9 @@ interface OriginBindReceiptRow {
  * no button) landed a real credential with nothing surfacing it to the
  * member it happened to. Minimal, display-only reader: the most recent
  * receipt for this member, if any, so a silent bind is visible on the SAME
- * page that already shows "Telegram is connected". Org-admin members (who
+ * page that already shows "Telegram is connected". The origin path no longer
+ * binds a channel (a chat binds only via /account or pairing), so this now shows
+ * historical receipts only. Org-admin members (who
  * can view another member's row through the admin surfaces this file does
  * NOT touch) are unaffected — this reads only the VIEWER's own member id,
  * same self-scoping as loadSelfMember above.

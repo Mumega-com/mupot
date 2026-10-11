@@ -443,9 +443,10 @@ boundary. mupot trusts a `human_origin` stamp only because:
   the floor/ceiling and the eventual write can never see two different strings for the
   same field (round 2's exact root cause: the ceiling checked the raw value, the write
   stored the trimmed one).
-- (b) that member is bound to the exact chat the origin claims, or first-binds it, but
-  ONLY after the ENTIRE decision — reservation, bind, AND the verdict itself — is
-  proven authorized (see the ordering below); and
+- (b) that member is ALREADY bound to the exact chat the origin claims. Binding a
+  channel to a member is a credential act and is no longer done implicitly by an
+  origin: the chat must be bound first via `/account` → Connect Telegram (or the
+  invite/pairing flow). An unbound owner is refused (`origin_chat_not_bound`); and
 - (c) the message is FRESH and UNREPLAYED.
 
 mupot cannot itself tell a harness-stamped `human_origin` apart from one a MODEL typed
@@ -460,8 +461,10 @@ gates every write:
 1. **Ownership + floor + ceiling** (`agents.owner_member_id`) — re-read fresh every
    call, never self-settable by the agent itself.
 2. **Chat fence** (read-only) — the origin's `chat_id` must equal the owning member's
-   `telegram_chat_id`, or the member has none yet (a first-bind CANDIDATE — nothing is
-   written for this yet).
+   existing `telegram_chat_id`. A member with no bound chat is refused
+   (`origin_chat_not_bound`, pointing to `/account` → Connect Telegram); a member bound
+   to a different chat is refused (`origin_member_mismatch`). An origin never binds a
+   channel.
 3. **Conflict of interest** — the calling agent may not itself be the task's assignee,
    and the resolved member may not be the OWNER of the assignee agent
    (`agents.owner_member_id` again, the load-bearing check now that `agent_keys` is
@@ -488,21 +491,18 @@ gates every write:
    can stamp a fresh timestamp as easily as a real harness can.
 8. **ONLY IF everything above says "authorized"** does this module write anything —
    and, as of round 3, EVERYTHING it writes lands in ONE D1 batch
-   (`commitOriginDecision`): the replay reservation, the first-bind UPDATE + its audit
-   INSERT (when needed), AND the verdict write itself
+   (`commitOriginDecision`): the replay reservation AND the verdict write itself
    (`buildVerdictStatements`, src/tasks/service.ts). Round 2's P0-B — a refusal that
    could still fire between a commit and a verdict — is closed by construction: there
    is no such gap left to enumerate, because there is no longer a separate "then write
    the verdict" step for a harness-attested decision. Every statement that depends on
    agent ownership or member-active re-asserts BOTH as SQL `EXISTS` conditions at
    commit time (round 2's P1-C: these were read once in the dry run and never
-   re-checked — a revocation racing the call was proven to land a bind and a verdict
-   anyway). The bind's own landed-proof guard requires BOTH the reservation's
+   re-checked). The verdict statement's guard requires BOTH the reservation's
    timestamp AND its `request_digest` to match (round 2's P3-G: timestamp alone can
-   coincide across two different rows within the same millisecond). A UNIQUE-constraint
-   conflict (another member already holds this chat) aborts the WHOLE batch — the
-   reservation and the verdict are never left committed either. **A failure reserves
-   nothing.** Replay itself: one decision per origin message, keyed on `(tenant,
+   coincide across two different rows within the same millisecond), and re-asserts, in
+   SQL, that the member is already bound to exactly this chat. No statement in this
+   batch binds a channel or writes a bind receipt. **A failure reserves nothing.** Replay itself: one decision per origin message, keyed on `(tenant,
    'origin:telegram:' + chat_id + ':' + message_id)` — reuses `telegram_webhook_receipts`
    (0152) verbatim, no forked table. ANY pre-existing row at that key — exact digest
    match or not — refuses the whole call with a hard 409 `origin_replayed`; this path
@@ -556,10 +556,10 @@ gates every write:
 
 **The resulting blast radius, stated precisely:** a caller holding an agent-bound seat
 can cast, per fresh and unreplayed origin message from a chat the resolved member is
-bound to (or eligible to first-bind), exactly the verdicts that member's OWN real,
+already bound to, exactly the verdicts that member's OWN real,
 freshly-resolved capabilities would allow through `evaluateVerdictGates` — no more, no
 wider. It can never impersonate a member the floor+ceiling above would have refused to
-point that agent at. It can never mint a binding, reserve a replay slot, or write a
+point that agent at. It can never mint or change a channel binding, reserve a replay slot, or write a
 verdict for a decision that was not first proven authorized, in full, including the
 project-evidence fence. And it can never apply more than one such decision per member
 per 30-second window, regardless of how many agents that member owns. Do not describe
@@ -587,22 +587,24 @@ applied: false, reason: 'absent' }` instead of omitting the field. A non-agent-b
 principal is unchanged either way — human_origin was never applicable to it, so the
 field stays omitted entirely.
 
-**Visibility:** a first-bind-by-origin is no longer write-only. `/account`'s Telegram
-section (`src/dashboard/account.ts`, `loadLatestOriginBindReceipt`) shows, for a member
-bound this way, which agent vouched for the bind and from which message id — a silent
-credential mint is now visible to the member it happened to.
+**Binding is not an origin act.** Earlier revisions could bind an unbound owner's chat
+as a side effect of a verdict carrying an origin. That path is removed: binding a
+channel is a credential act and is no longer done implicitly by an origin. Historical
+rows in `telegram_origin_bind_receipts` remain readable (`/account`'s Telegram section,
+`src/dashboard/account.ts`, `loadLatestOriginBindReceipt`), but this path writes no new
+ones.
 
 Evidence: `tests/task-verdict-human-origin.test.ts` (every conjunct above, flipped one
 at a time, real D1 via `applyAllMigrations`, invoked through `invokeTool` — the same
-seam MCP and `/actions/task_verdict` both dispatch through — including the P0-2 proof
-that an unauthorized owner never gets bound, the P1-4 proof that an unowned agent
+seam MCP and `/actions/task_verdict` both dispatch through — including the proof
+that an unbound owner is refused with no member-row change, no verdict, no bind receipt
+and no reservation, the P1-4 proof that an unowned agent
 cannot burn a replay slot for a later authorized one, the P0-3 proof that a
 self-assigned task refuses 409 `self_verdict` with and without an origin, the P2-5
 proof that the rate limit is per-member not per-agent, the P2-7 proof that the
 task-detail timeline surfaces `decided_via`/the origin agent, the P0-B proof that a
-project-write-fence refusal leaves zero verdicts/binds/receipts, and the P1-C proof
-that an ownership revocation racing the commit batch still lands neither a bind nor a
-verdict), `tests/agent-owner-member.test.ts` (`owner_member_id` admin-only,
+project-write-fence refusal leaves zero verdicts/receipts, and the P1-C proof
+that an ownership revocation racing the commit batch lands no verdict as the member), `tests/agent-owner-member.test.ts` (`owner_member_id` admin-only,
 self-lane-forbidden, partition-invariant, the org-scope-floor proof distinct from the
 ceiling proof, self-target exemption, and the whitespace-normalization proof across
 six forms including a unicode NBSP), and `tests/dashboard-account-telegram-connect.test.ts`

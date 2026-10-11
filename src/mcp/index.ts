@@ -2372,7 +2372,7 @@ const HUMAN_ORIGIN_SCHEMA = {
 
 function humanOriginResponsePayload(outcome: HumanOriginResolution): Record<string, unknown> {
   if (outcome.replayed) return { applied: false, reason: 'origin_replayed' }
-  if (outcome.applied) return { applied: true, bound_now: outcome.boundNow }
+  if (outcome.applied) return { applied: true }
   return { applied: false, reason: outcome.reason }
 }
 
@@ -2386,7 +2386,7 @@ const toolTaskVerdict: ToolSpec = {
     ' -- human_origin (mupot#1424): the CALLING HARNESS (never the model) stamps the human message this call' +
     ' relays. Only meaningful for an agent-bound caller whose agent has agents.owner_member_id set (via' +
     ' update_agent) to the member the origin claims to be; every conjunct (ownership, member active, private-' +
-    ' chat shape, freshness, chat match or first-bind, conflict of interest, replay, rate limit) is re-checked' +
+    ' chat shape, freshness, chat already bound to the member (an origin never binds), conflict of interest, replay, rate limit) is re-checked' +
     ' at call time. message_at must be within 10 minutes in the past or 60 seconds in the future of the server' +
     ' clock (origin_stale otherwise) — mupot cannot tell a harness-stamped origin from a model-typed one, so a' +
     ' stale or reused stamp is refused server-side regardless of what stamped it. At most one APPLIED' +
@@ -2449,7 +2449,7 @@ const toolTaskVerdict: ToolSpec = {
     // not resolve, runs under the agent seat only" (Hadi, 2026-09-16).
     //
     // mupot#1425 P0-B (round 2 fix): resolveHarnessAttestedOrigin now commits
-    // the reservation, the first-bind (if needed), AND the verdict write
+    // the reservation AND the verdict write (never a channel bind)
     // itself in ONE atomic D1 batch, reached only after a read-only dry run
     // proves the exact task+verdict authorized — there is no exit between a
     // commit and a verdict left for a later refusal to land in. On

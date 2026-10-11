@@ -13,8 +13,7 @@
 // by forking a second copy:
 //   - src/members/project-invites.ts (`MEMBER_BIND_LANDED_GUARD_SQL`'s own
 //     `telegram_bound_at` stamp — the pattern's origin)
-//   - src/im/origin-verdict.ts (the replay reservation's `created_at` and
-//     the first-bind's `telegram_bound_at`)
+//   - src/im/origin-verdict.ts (the replay reservation's `created_at`)
 //   - src/tasks/service.ts (`buildVerdictStatements`' verdict-landed proof)
 export function claimTimestamp(): string {
   const iso = new Date().toISOString()

@@ -60,9 +60,9 @@
 // agent seat is owned by the resolved member (agents.owner_member_id — set
 // only by an org-scope admin who does not fail the target-rank ceiling, see
 // src/mcp/provision.ts, and re-asserted again at commit, not merely at dry
-// run), (b) the member is bound to that exact chat (or this exact request
-// first-binds it, only AFTER the ENTIRE decision — bind, reservation, and
-// verdict together — is proven authorized), and (c) the message is FRESH and
+// run), (b) the member is ALREADY bound to that exact chat (an origin never
+// binds a channel — binding is a credential act done via /account, and a
+// stamp cannot be told apart server-side from a model-authored one), and (c) the message is FRESH and
 // UNREPLAYED. mupot cannot itself distinguish a harness-stamped human_origin
 // from one a model typed into its own tool call — it never sees the raw
 // Telegram update, only the stamp — so every defense that IS server-checkable
@@ -79,7 +79,7 @@
 // Every conjunct below is re-checked at call time (no caching across calls):
 // caller is agent-bound; the agent has an owner; the owner is active; the
 // origin is a well-formed, private-chat-shaped, FRESH Telegram identity; the
-// origin resolves to (or is eligible to first-bind) that SAME member; the
+// origin resolves to that SAME already-bound member; the
 // member is not barred by conflict of interest (the calling agent IS the
 // task's assignee, OR the assignee agent's OWN owner_member_id is this same
 // member — the load-bearing check now that agent_keys is empty in prod for
@@ -110,7 +110,6 @@ import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import type { AuthContext, Env, Member, Task } from '../types'
 import { resolveCapabilities, canOnSquad } from '../auth/capability'
 import { canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
-import { MEMBER_BIND_ELIGIBLE_SQL } from '../members/project-invites'
 import { claimTimestamp } from '../lib/claim-timestamp'
 import { memberAuth, memberForChat, memberOwnsAssigneeAgent, telegramId } from './index'
 import { completeTelegramUpdate, type TelegramUpdateIdentity } from './telegram-receipts'
@@ -150,7 +149,7 @@ export type HumanOriginFailureReason =
   | 'agent_not_owned'
   | 'member_inactive'
   | 'origin_member_mismatch'
-  | 'chat_already_bound'
+  | 'origin_chat_not_bound'
   | 'member_not_eligible'
   | 'assignee_conflict'
   | 'origin_rate_limited'
@@ -160,7 +159,7 @@ export type HumanOriginFailureReason =
 
 export type HumanOriginResolution =
   | { replayed: true }
-  | { replayed: false; applied: true; member: Member; auth: AuthContext; boundNow: boolean; task: Task; verdict: TaskVerdict }
+  | { replayed: false; applied: true; member: Member; auth: AuthContext; task: Task; verdict: TaskVerdict }
   | { replayed: false; applied: false; reason: HumanOriginFailureReason }
 
 // Freshness window — a short shelf life for a captured (chat_id, message_id,
@@ -252,9 +251,12 @@ function taskNamedInText(text: string, taskId: string): boolean {
   return hexRuns.some((run) => idHexOnly.startsWith(run))
 }
 
-function isUniqueViolationOn(error: unknown, column: string): boolean {
-  return error instanceof Error && new RegExp(`UNIQUE constraint failed: .*${column}`, 'i').test(error.message)
-}
+// The chat fence, as SQL. An origin NEVER binds a channel: binding a channel to
+// a member is a credential act (done only via /account or the pairing flow),
+// so the member must ALREADY be bound to exactly this chat. Deliberately the
+// strict limb only — not MEMBER_BIND_ELIGIBLE_SQL, whose `telegram_chat_id IS
+// NULL` limb means "may be bound" and must never mean "may decide" here.
+const ORIGIN_CHAT_BOUND_SQL = "id = ? AND tenant = ? AND status = 'active' AND telegram_chat_id = ?"
 
 function rowsChanged(result: D1Result | undefined): number {
   return Number(result?.meta?.changes ?? 0)
@@ -309,7 +311,7 @@ async function hasConflictOfInterest(
 }
 
 type DryRunResult =
-  | { ok: true; owner: Member; needsFirstBind: boolean; auth: AuthContext }
+  | { ok: true; owner: Member; auth: AuthContext }
   | { ok: false; reason: HumanOriginFailureReason }
 
 /**
@@ -361,11 +363,14 @@ async function dryRunAuthorize(
     return { ok: false, reason: 'member_inactive' }
   }
 
-  // (2) chat fence — read-only. A first-bind is only a CANDIDATE at this
-  // point (`needsFirstBind`); nothing is written until authorization is
-  // proven below.
-  const needsFirstBind = owner.telegram_chat_id === null
-  if (!needsFirstBind && owner.telegram_chat_id !== origin.chat_id) {
+  // (2) chat fence — read-only. The owner must ALREADY be bound to this exact
+  // chat (via /account → Connect Telegram). An origin never binds a channel:
+  // that is a credential act, and a stamp cannot be told apart server-side from
+  // a model-authored one.
+  if (owner.telegram_chat_id === null) {
+    return { ok: false, reason: 'origin_chat_not_bound' }
+  }
+  if (owner.telegram_chat_id !== origin.chat_id) {
     return { ok: false, reason: 'origin_member_mismatch' }
   }
 
@@ -417,7 +422,7 @@ async function dryRunAuthorize(
     throw err
   }
 
-  return { ok: true, owner, needsFirstBind, auth: candidateAuth }
+  return { ok: true, owner, auth: candidateAuth }
 }
 
 /**
@@ -442,21 +447,14 @@ async function dryRunAuthorize(
  * open here (P0-2, now fixed centrally in `buildVerdictStatements`,
  * src/tasks/service.ts, for all four verdict surfaces, not just this one).
  *
- * Round 4's fix is structural, not another enumerated guard: the VERDICT
- * ROW is the ONE anchor. `buildVerdictStatements` carries the FULL guard set
- * (task status='review', ownership, chat-eligibility via the SAME
- * `MEMBER_BIND_ELIGIBLE_SQL` the bind statement itself uses — not a second
- * copy — and the reservation having landed) and is the ONLY statement that
- * REALLY decides whether this call succeeds. The bind UPDATE and the bind-
- * receipt INSERT are demoted to being PURELY conditioned on
- * `EXISTS (SELECT 1 FROM task_verdicts WHERE id = <this call's own UUID>)`
- * — a fact that can only be true if EVERY conjunct the verdict statement
- * checked already held, in the SAME transaction, with nothing else able to
- * write in between. There is no longer a second, independently-guarded path
- * to a bind: "no verdict row ⇒ nothing else lands," by construction, not by
- * enumeration. After the batch, this function reads back whether the
- * verdict itself landed — not the bind, not the reservation — as the single
- * source of truth for the outcome.
+ * The verdict row is the ONE anchor: `buildVerdictStatements` carries the FULL
+ * guard set (task status='review', ownership, the member ALREADY bound to
+ * this exact chat via `ORIGIN_CHAT_BOUND_SQL`, and the reservation having
+ * landed) and is the ONLY statement that decides whether this call succeeds.
+ * This path performs no bind of any kind (binding a channel is a credential
+ * act, never done by an origin): the batch is reservation + verdict only.
+ * After the batch, this function reads back whether the verdict itself
+ * landed as the single source of truth for the outcome.
  */
 async function commitOriginDecision(
   env: Env,
@@ -466,7 +464,6 @@ async function commitOriginDecision(
   task: Task,
   verdict: 'approved' | 'rejected',
   note: string | null,
-  needsFirstBind: boolean,
   auth: AuthContext,
 ): Promise<HumanOriginResolution> {
   const updateId = `origin:telegram:${origin.chat_id}:${origin.message_id}`
@@ -486,19 +483,12 @@ async function commitOriginDecision(
   })
   const identity: TelegramUpdateIdentity = { update_id: updateId, telegram_user_id: origin.user_id, request_digest: digest }
   const reservedAt = claimTimestamp()
-  const boundAt = needsFirstBind ? claimTimestamp() : null
 
-  // The FULL guard set — everything the verdict statement (and ONLY the
-  // verdict statement) must re-assert in SQL. `MEMBER_BIND_ELIGIBLE_SQL`
-  // (src/members/project-invites.ts) is reused verbatim, not re-derived —
-  // the SAME predicate the bind statement below uses to decide WHAT to set,
-  // now also gating WHETHER the decision itself may land. This is what
-  // makes the verdict's own guard set a strict SUPERSET of the bind's own
-  // eligibility check: if the verdict lands, the bind's WHERE (checked
-  // microseconds later, same transaction, nothing else can have written in
-  // between) is guaranteed already true.
+  // The FULL guard set — everything the verdict statement must re-assert in
+  // SQL. The chat conjunct is the STRICT one (member already bound to exactly
+  // this chat): no origin path ever binds, so there is no first-bind limb.
   const ownershipGuardSql = 'EXISTS (SELECT 1 FROM agents WHERE id = ? AND owner_member_id = ?)'
-  const chatEligibleGuardSql = `EXISTS (SELECT 1 FROM members WHERE ${MEMBER_BIND_ELIGIBLE_SQL})`
+  const chatEligibleGuardSql = `EXISTS (SELECT 1 FROM members WHERE ${ORIGIN_CHAT_BOUND_SQL})`
   const reservationLandedGuardSql =
     "EXISTS (SELECT 1 FROM telegram_webhook_receipts WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing')"
 
@@ -519,16 +509,11 @@ async function commitOriginDecision(
       sql: `${ownershipGuardSql} AND ${chatEligibleGuardSql} AND ${reservationLandedGuardSql}`,
       params: [
         boundAgentId, owner.id, // ownership
-        owner.id, env.TENANT_SLUG, origin.chat_id, // MEMBER_BIND_ELIGIBLE_SQL (id, tenant, chat_id)
+        owner.id, env.TENANT_SLUG, origin.chat_id, // ORIGIN_CHAT_BOUND_SQL (id, tenant, chat_id)
         env.TENANT_SLUG, updateId, reservedAt, digest, // reservation-landed
       ],
     },
   )
-  const verdictId = verdictBuild.verdictRow.id
-  // THE anchor every other statement depends on — see this function's own
-  // doc comment. Deliberately the ONLY guard on the statements below.
-  const verdictLandedGuardSql = 'EXISTS (SELECT 1 FROM task_verdicts WHERE id = ?)'
-
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
       `INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at)
@@ -539,37 +524,7 @@ async function commitOriginDecision(
   ]
   const verdictInsertIndex = statements.length - 1
 
-  if (needsFirstBind) {
-    statements.push(
-      env.DB.prepare(
-        `UPDATE members
-            SET telegram_chat_id = ?, telegram_bound_at = ?
-          WHERE ${MEMBER_BIND_ELIGIBLE_SQL}
-            AND ${verdictLandedGuardSql}`,
-      ).bind(origin.chat_id, boundAt, owner.id, env.TENANT_SLUG, origin.chat_id, verdictId),
-    )
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO telegram_origin_bind_receipts (id, tenant, member_id, agent_id, chat_id, message_id, created_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?
-          WHERE EXISTS (SELECT 1 FROM members WHERE id = ? AND telegram_bound_at = ?)
-            AND ${verdictLandedGuardSql}`,
-      ).bind(crypto.randomUUID(), env.TENANT_SLUG, owner.id, boundAgentId, origin.chat_id, origin.message_id, new Date().toISOString(), owner.id, boundAt, verdictId),
-    )
-  }
-  const bindStatusIndex = needsFirstBind ? verdictInsertIndex + 1 : null
-
-  let results: D1Result[]
-  try {
-    results = await env.DB.batch(statements)
-  } catch (err) {
-    if (isUniqueViolationOn(err, 'telegram_chat_id')) {
-      // Whole batch rolled back atomically — the reservation and the verdict
-      // were never committed either. Never overwrite someone else's binding.
-      return { replayed: false, applied: false, reason: 'chat_already_bound' }
-    }
-    throw err
-  }
+  const results: D1Result[] = await env.DB.batch(statements)
 
   if (rowsChanged(results[0]) !== 1) {
     // Our reservation INSERT was a no-op: a reservation already occupies
@@ -581,7 +536,7 @@ async function commitOriginDecision(
 
   // THE decisive check (round 4) — did the verdict itself land? Everything
   // else in this batch was gated on this exact row's existence, so this one
-  // read subsumes checking the bind and the reservation separately.
+  // read subsumes checking the reservation separately.
   const verdictLanded = rowsChanged(results[verdictInsertIndex]) === 1
 
   if (!verdictLanded) {
@@ -595,7 +550,7 @@ async function commitOriginDecision(
       await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason: 'agent_not_owned' }))
       return { replayed: false, applied: false, reason: 'agent_not_owned' }
     }
-    const stillEligible = await env.DB.prepare(`SELECT 1 FROM members WHERE ${MEMBER_BIND_ELIGIBLE_SQL}`)
+    const stillEligible = await env.DB.prepare(`SELECT 1 FROM members WHERE ${ORIGIN_CHAT_BOUND_SQL}`)
       .bind(owner.id, env.TENANT_SLUG, origin.chat_id).first()
     if (!stillEligible) {
       const fresh = await env.DB.prepare('SELECT telegram_chat_id, status FROM members WHERE id = ?')
@@ -603,9 +558,11 @@ async function commitOriginDecision(
       const reason: HumanOriginFailureReason =
         fresh?.status !== 'active'
           ? 'member_inactive'
-          : fresh?.telegram_chat_id && fresh.telegram_chat_id !== origin.chat_id
-            ? 'origin_member_mismatch'
-            : 'member_not_eligible'
+          : fresh?.telegram_chat_id == null
+            ? 'origin_chat_not_bound'
+            : fresh.telegram_chat_id !== origin.chat_id
+              ? 'origin_member_mismatch'
+              : 'member_not_eligible'
       await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, reason }))
       return { replayed: false, applied: false, reason }
     }
@@ -619,21 +576,9 @@ async function commitOriginDecision(
     throw new VerdictRaceError(task.id)
   }
 
-  // The verdict landed ⇒ by construction, the bind (when needed) ALSO
-  // landed — its guard is the SAME `MEMBER_BIND_ELIGIBLE_SQL` fact the
-  // verdict statement itself already re-checked, evaluated microseconds
-  // later against unchanged data (nothing else can write inside this one
-  // transaction). Confirmed, not merely assumed, via the row-count check
-  // below and the memberForChat readback after it.
-  if (bindStatusIndex !== null && rowsChanged(results[bindStatusIndex]) !== 1) {
-    // Structurally unreachable given the guard-set argument above; fail
-    // loudly rather than silently reporting success if it ever is.
-    throw new Error('origin-verdict: verdict landed but its own bind guard did not — guard sets have diverged')
-  }
-
   // Real defence in depth (confirmed live by Athena's own probe on this PR):
   // resolve via the SAME helper the IM path uses (memberForChat) — proves
-  // this bind (or pre-existing bind) reads back exactly the way /approve
+  // the existing bind reads back exactly the way /approve
   // etc. over the real Telegram webhook would see it, not merely that our
   // own write believes it landed. Kept even though the batch above already
   // proves the write landed structurally.
@@ -647,13 +592,12 @@ async function commitOriginDecision(
   const actor: TaskActor = { kind: 'member', id: owner.id }
   await emitVerdictBusEvent(env, task, { task, verdict, note, decidedBy: owner.id }, verdictBuild.newStatus, verdictBuild.now, actor)
 
-  await completeTelegramUpdate(env, identity, JSON.stringify({ applied: true, member_id: resolved.id, bound_now: needsFirstBind }))
+  await completeTelegramUpdate(env, identity, JSON.stringify({ applied: true, member_id: resolved.id }))
   return {
     replayed: false,
     applied: true,
     member: resolved,
     auth,
-    boundNow: needsFirstBind,
     task: updatedTask,
     verdict: verdictBuild.verdictRow,
   }
@@ -671,7 +615,7 @@ async function commitOriginDecision(
  * Order, load-bearing (mupot#1425 fix round 1+2): parse + freshness (no
  * reads) → dryRunAuthorize (every conjunct including the project-evidence
  * fence, ALL reads, zero writes) → ONLY IF authorized →
- * commitOriginDecision (reserve + first-bind + THE VERDICT ITSELF, one D1
+ * commitOriginDecision (reserve + THE VERDICT ITSELF, one D1
  * batch). May throw VerdictRaceError — propagate it exactly as the
  * non-origin path does (src/mcp/index.ts).
  */
@@ -698,5 +642,5 @@ export async function resolveHarnessAttestedOrigin(
   const dryRun = await dryRunAuthorize(env, boundAgentId, origin, verdict, task, gateOwner)
   if (!dryRun.ok) return { replayed: false, applied: false, reason: dryRun.reason }
 
-  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.needsFirstBind, dryRun.auth)
+  return commitOriginDecision(env, dryRun.owner, boundAgentId, origin, task, verdict, note, dryRun.auth)
 }
