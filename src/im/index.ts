@@ -699,7 +699,7 @@ async function verdictReply(
   const gateResult = await evaluateVerdictGates(
     env,
     auth,
-    { squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
+    { id: task.id, squad_id: task.squad_id, gate_owner: gateOwner, assignee_agent_id: task.assignee_agent_id },
     verdict,
   )
   if (!gateResult.allowed) {
@@ -730,7 +730,7 @@ async function verdictReply(
   try {
     await writeVerdict(
       env,
-      { task, verdict, note, decidedBy: member.id },
+      { task, verdict, note, decidedBy: member.id, ...(gateResult.independenceWaiver ? { independenceWaiver: gateResult.independenceWaiver } : {}) },
       memberActor(member.id),
     )
   } catch (err) {

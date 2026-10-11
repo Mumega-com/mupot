@@ -217,7 +217,13 @@ describe('writeVerdict — K5 landed-proof guard, one D1 batch (mupot#1425 P0-B)
     // First statement: conditional UPDATE tasks WHERE status='review'
     expect(runs[0].sql).toMatch(/UPDATE tasks SET status/)
     expect(runs[0].sql).toMatch(/AND status = 'review'/)
-    expect(runs[0].args).toEqual(['approved', result.task.updated_at, task.id])
+    // Leading params are status, updated_at, task id; the rest are the verdict-independence guard
+    // (policy rule 3) re-asserted inside this UPDATE's own WHERE, all binding the decider.
+    expect(runs[0].args.slice(0, 3)).toEqual(['approved', result.task.updated_at, task.id])
+    expect(runs[0].sql).toMatch(/AND NOT \(/)
+    expect(runs[0].sql).toMatch(/task_result_submissions/)
+    expect(runs[0].args.slice(3).length).toBeGreaterThan(0)
+    expect(runs[0].args.slice(3).every((a) => a === 'member-42')).toBe(true)
 
     // Second statement: INSERT task_verdicts, gated on the UPDATE's own
     // landed-proof (id/status/updated_at EXISTS on `tasks`) — not a bare

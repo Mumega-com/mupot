@@ -27,7 +27,7 @@
 
 import type { Env, Task, AuthContext, OrgKind } from '../types'
 import { CONTENT_GATE_OWNER } from '../agents/execute'
-import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache } from '../tasks/index'
+import { canActOnSquad, evaluateVerdictGates, createVerdictGateCache, primeVerdictIndependence } from '../tasks/index'
 import { hasDedicatedGatePredicate } from '../tasks/service'
 import { resolveGatePrincipal } from '../gates/principal'
 
@@ -178,6 +178,8 @@ const PUBLISHABLE_SELECT = `
 async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[]): Promise<ApprovalItem[]> {
   const deptCache = new Map<string, Promise<{ department_id: string; kind: OrgKind } | null>>()
   const gateCache = createVerdictGateCache()
+  // One independence read for the whole window (policy rule 3), not one per row.
+  await primeVerdictIndependence(env, auth, gateCache, rows.filter((r) => r.gate_owner).map((r) => r.id))
   return Promise.all(
     rows.map(async (row) => {
       const gateOwner = row.gate_owner
@@ -194,7 +196,7 @@ async function decorateApprovals(env: Env, auth: AuthContext, rows: ApprovalRow[
       if (hasDedicatedGatePredicate(gateOwner)) {
         return { ...row, can_verdict: false, can_approve: false, can_reject: false }
       }
-      const task = { squad_id: row.squad_id, gate_owner: gateOwner, assignee_agent_id: row.assignee_agent_id }
+      const task = { id: row.id, squad_id: row.squad_id, gate_owner: gateOwner, assignee_agent_id: row.assignee_agent_id }
       const [approveResult, rejectResult] = await Promise.all([
         evaluateVerdictGates(env, auth, task, 'approved', gateCache),
         evaluateVerdictGates(env, auth, task, 'rejected', gateCache),

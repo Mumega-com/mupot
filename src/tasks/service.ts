@@ -15,6 +15,7 @@ import { hasProjectWriteForSquads } from '../projects/access'
 import { GATE_CAPABILITY_RE } from '../gates/grants'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
 import { chunkForD1InList } from '../lib/d1-in-list'
+import { compileVerdictIndependenceSql, findVerdictIndependenceConflict, type VerdictConflictKind } from './verdict-independence'
 
 // gate_owner is used RAW as the grant capability in callerHoldsGateCapability
 // (src/tasks/index.ts): `SELECT 1 FROM gate_grants WHERE capability = <gate_owner>`.
@@ -1586,6 +1587,27 @@ export interface WriteVerdictInput {
   // resolveVerdictProposalId and pass the result straight through; writeVerdict
   // does this automatically for its own callers when omitted (see below).
   proposalId?: string | null
+  /**
+   * Policy rule 3 (nobody gives a verdict on their own task) is enforced INSIDE the verdict write
+   * (buildVerdictStatements' UPDATE ... WHERE), not only in the callers' pre-checks. Omitted, the
+   * write refuses a decider who is a party to the task or acts for one. A caller sets a waiver
+   * only for an exemption its own predicate (evaluateVerdictGates) already granted:
+   *   'admin_supervisory' — an org owner/admin who is merely AFFILIATED with the assignee (the
+   *                         existing supervisory path); never waives a direct party;
+   *   'owner_override'    — the org owner's explicit, audited override_self_verdict:true.
+   * The `gate:agent-self-completion` lane waives the rule by construction (its purpose is that the
+   * completing agent closes it) and needs no waiver here.
+   */
+  independenceWaiver?: VerdictIndependenceWaiver
+}
+
+export type VerdictIndependenceWaiver = 'admin_supervisory' | 'owner_override'
+
+export class VerdictIndependenceError extends Error {
+  constructor(taskId: string, readonly kind: VerdictConflictKind) {
+    super(`self_verdict: the decider is ${kind === 'direct' ? 'a party to' : 'acting for a party to'} task ${taskId}`)
+    this.name = 'VerdictIndependenceError'
+  }
 }
 
 export class VerdictRaceError extends Error {
@@ -1819,8 +1841,21 @@ export function buildVerdictStatements(
     reversed_at: null,
   }
 
-  const guardSql = extraGuard ? ` AND ${extraGuard.sql}` : ''
-  const guardParams = extraGuard ? extraGuard.params : []
+  // Policy rule 3, at the one chokepoint every verdict surface (HTTP, MCP, IM, harness-attested
+  // origin, office) funnels through. The conflict is re-evaluated INSIDE the UPDATE's WHERE, so a
+  // party change between a caller's pre-check and this write cannot land a self-verdict.
+  const selfCompletionLane = input.task.gate_owner === 'gate:agent-self-completion'
+  const independenceKinds: VerdictConflictKind[] = selfCompletionLane || input.independenceWaiver === 'owner_override'
+    ? []
+    : input.independenceWaiver === 'admin_supervisory' ? ['direct'] : ['direct', 'affiliated']
+  const independence = independenceKinds.length > 0
+    ? compileVerdictIndependenceSql(independenceKinds, input.decidedBy, { column: 'tasks.id' })
+    : null
+  const independenceSql = independence ? ` AND NOT ${independence.sql}` : ''
+  const independenceParams: unknown[] = independence ? independence.params : []
+
+  const guardSql = `${independenceSql}${extraGuard ? ` AND ${extraGuard.sql}` : ''}`
+  const guardParams = [...independenceParams, ...(extraGuard ? extraGuard.params : [])]
 
   const statements: D1PreparedStatement[] = [
     env.DB.prepare(
@@ -1958,6 +1993,13 @@ export async function writeVerdict(
     // batch is, by construction, also a no-op here (its EXISTS guard cannot
     // be satisfied) — nothing to roll back.
     if (await isTaskArchived(env, input.task.id)) throw new TaskArchivedError(input.task.id)
+    // Distinguish a refused self-verdict from a lost race so the caller can say which it was.
+    if (input.independenceWaiver !== 'owner_override' && input.task.gate_owner !== 'gate:agent-self-completion') {
+      const conflict = await findVerdictIndependenceConflict(env, input.decidedBy, input.task.id)
+      if (conflict === 'direct' || (conflict === 'affiliated' && input.independenceWaiver !== 'admin_supervisory')) {
+        throw new VerdictIndependenceError(input.task.id, conflict)
+      }
+    }
     throw new VerdictRaceError(input.task.id)
   }
 

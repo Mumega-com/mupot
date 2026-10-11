@@ -6,6 +6,9 @@ import type { AuthContext, Env } from '../types'
 import { DISPATCH_BRIDGE_SENDER, DISPATCH_ENVELOPE_OPTIONAL_KEYS, DISPATCH_INBOX_PREFIX, dispatchInboxRequestId } from '../bus/fleet-bridge'
 import { MAX_LEASE_SECONDS, bearerFencePredicate, LEASE_LIVE_PREDICATE } from '../agents/messages'
 import { resolveTaskAssignee } from './assignee'
+import { memberAffiliatedWithAssigneeSql } from './verdict-independence'
+
+export { memberAffiliatedWithAssigneeSql, isMemberAffiliatedWithAssigneeAgent } from './verdict-independence'
 import { verifyTaskArtifactShape } from './artifact-verification'
 import { isValidGateOwnerForm } from './service'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived } from '../hygiene/filters'
@@ -570,59 +573,6 @@ function memberStandingOnSquadSql(memberExpr: string, squadIdExpr: string): stri
          AND channel_grant.capability IN ('member', 'lead', 'admin', 'owner')
     )
   )`
-}
-
-/**
- * memberAffiliatedWithAssigneeSql (mupot#1663 P2) — TRUE iff the member is the
- * ASSIGNEE AGENT's owner (agents.owner_member_id), or bound to the assignee agent (agent_member_bindings: the
- * agent's own identity), or the member an assignee-agent key authenticates
- * as (agent_keys.member_id — the same signal memberOwnsAssigneeAgent /
- * hasConflictOfInterest use on the IM path). Such a member is not independent of the work: a
- * harness-attested human_origin verdict (mupot#1425) writes the verdict AS the
- * owner. This is THE exclusion — review entry (humanGateHolderExistsSql) and
- * every verdict writer (evaluateVerdictGates, which office_review_approval
- * also runs) call it; semantics mirror hasConflictOfInterest in
- * src/im/origin-verdict.ts. An agent with NO owner_member_id has nothing to
- * match on the owner side (falls back to the pre-existing rule).
- *
- * Deliberately NO email leg: an earlier draft also excluded "another member
- * row with the owner's email". That is a raw members.email authority match,
- * which the member-email-authority-lookup ratchet forbids outside the
- * canonical identity resolver, and the identity model (0143) binds a human to
- * a provider subject, never to an email. Known residual: one human holding two
- * member rows that share no owner/binding/key link is not excluded — tracked
- * on the follow-up issue, to be closed by a canonical same-human relation, not
- * by email.
- */
-export function memberAffiliatedWithAssigneeSql(p: { memberExpr: string; assigneeIdExpr: string }): string {
-  return `EXISTS (
-      SELECT 1
-        FROM agents assignee_agent
-       WHERE assignee_agent.id = ${p.assigneeIdExpr}
-         AND (
-           assignee_agent.owner_member_id = ${p.memberExpr}
-           OR EXISTS (
-             SELECT 1 FROM agent_member_bindings assignee_binding
-              WHERE assignee_binding.agent_id = assignee_agent.id AND assignee_binding.member_id = ${p.memberExpr}
-           )
-           OR EXISTS (
-             SELECT 1 FROM agent_keys assignee_key
-              WHERE assignee_key.agent_id = assignee_agent.id AND assignee_key.member_id = ${p.memberExpr}
-           )
-         )
-    )`
-}
-
-/** JS form of the SAME fragment, for verdict writers (one predicate, two call shapes). */
-export async function isMemberAffiliatedWithAssigneeAgent(
-  env: Env,
-  memberId: string,
-  assigneeAgentId: string,
-): Promise<boolean> {
-  const row = await env.DB.prepare(
-    `SELECT 1 WHERE ${memberAffiliatedWithAssigneeSql({ memberExpr: '?1', assigneeIdExpr: '?2' })}`,
-  ).bind(memberId, assigneeAgentId).first<{ 1: number }>()
-  return row !== null
 }
 
 /**

@@ -402,7 +402,7 @@ export async function reviewOfficeApproval(
   const gateResult = await evaluateVerdictGates(
     env,
     auth,
-    { squad_id: task.squad_id, gate_owner: task.gate_owner, assignee_agent_id: task.assignee_agent_id },
+    { id: task.id, squad_id: task.squad_id, gate_owner: task.gate_owner, assignee_agent_id: task.assignee_agent_id },
     verdict,
   )
   if (!gateResult.allowed) {
@@ -463,6 +463,7 @@ export async function reviewOfficeApproval(
       gateResult.principal.id,
       expectedPayloadSha256,
       gateResult.principal.actor as TaskActor | undefined,
+      gateResult.independenceWaiver,
     )
     return { ok: true, value: { task: written.task } }
   } catch (error) {
@@ -491,12 +492,13 @@ async function writeOfficeVerdictAndBindFreeze(
   decidedBy: string,
   expectedPayloadSha256: string | null,
   actor?: TaskActor,
+  independenceWaiver?: WriteVerdictInput['independenceWaiver'],
 ): Promise<{ task: Task; verdict: TaskVerdict }> {
   await assertVerdictWritable(env, task)
   // gate:office tasks are never routine-created (resolveVerdictProposalId only
   // ever resolves for gate:routines) — passing null explicitly rather than paying
   // for the lookup writeVerdict's own auto-resolution would otherwise perform.
-  const input: WriteVerdictInput = { task, verdict, note, decidedBy, proposalId: null }
+  const input: WriteVerdictInput = { task, verdict, note, decidedBy, proposalId: null, ...(independenceWaiver ? { independenceWaiver } : {}) }
 
   // mupot#1602 r1 P1 (check-then-write race, the SAME class NEW-3 already closed
   // on the publish claim): reviewOfficeApproval's hash compare above is a plain
