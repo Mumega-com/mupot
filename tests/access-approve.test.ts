@@ -15,6 +15,8 @@ import { approveApp } from '../src/access/routes'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest } from '../src/auth/elevation'
 import { approveUrl } from '../src/access/config'
+import { linkLoginIdentity } from '../src/auth/login-identity'
+import { claimSeedRequest } from '../src/access/seed-request'
 
 const TENANT = 'tenant-a'
 const TEAM = 'acme.cloudflareaccess.com'
@@ -241,6 +243,13 @@ describe('member resolution', () => {
     expect((await as('susp@x.test', 'sub-susp')).status).toBe(403)
     expect((await as('nobody@x.test', 'sub-nobody')).status).toBe(403)
   })
+  it('a member suspended or archived AFTER its identity was bound is refused (the join key does not outlive the member)', async () => {
+    await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: 'sub-bound-susp', verifiedEmail: 'susp@x.test', memberId: 'mem-susp' })
+    expect((await as('susp@x.test', 'sub-bound-susp')).status).toBe(403)
+    harness.sqlite.exec("UPDATE members SET archived_at = datetime('now') WHERE id = 'mem-owner'")
+    await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: 'sub-bound-arch', verifiedEmail: 'owner@x.test', memberId: 'mem-owner' })
+    expect((await as('owner@x.test', 'sub-bound-arch')).status).toBe(403)
+  })
   it('a plain member is not an org admin: seed pages read as not found', async () => {
     expect((await as('plain@x.test', 'sub-plain')).status).toBe(404)
   })
@@ -368,6 +377,15 @@ describe('approve page: seed', () => {
     expect((await hit(`/approve/seed/${id}`)).status).toBe(410)
     expect((await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })).status).toBe(409)
     expect(count('project_seeds')).toBe(0)
+  })
+
+  it('the claim itself refuses an expired or already-claimed request (race at the boundary, not just the page check)', async () => {
+    const { id } = await filed()
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(id)
+    expect(await claimSeedRequest(env, id, 'mem-owner', Date.now())).toBe(false)
+    const fresh = await filed()
+    expect(await claimSeedRequest(env, fresh.id, 'mem-owner', Date.now())).toBe(true)
+    expect(await claimSeedRequest(env, fresh.id, 'mem-owner', Date.now())).toBe(false)
   })
 
   it('a tampered stored seed is refused (digest no longer matches) and nothing is applied', async () => {
