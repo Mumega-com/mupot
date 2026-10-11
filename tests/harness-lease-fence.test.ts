@@ -4,7 +4,9 @@ import { grokCliAdapter } from '../src/harness/adapters/grok'
 import { attachCursorCloudExecution, reserveCursorCloudWork } from '../src/cursor/dispatch'
 import { launchCursorAgent } from '../src/cursor/client'
 import {
+  bindVendorExecution,
   bindVendorExecutionWithTaskBinding,
+  markReservationFailed,
   claimAttachLease,
   getReservation,
   insertReservation,
@@ -135,6 +137,19 @@ describe('attach lease is a lock, not a timer (P1-a)', () => {
     expect(taskBody(harness, r.task!.id)).not.toContain('cursor_run')
     expect(await bindVendorExecutionWithTaskBinding(env, r.reservationId, fresh!, r.task!.id, cursor)).toBe(true)
     expect(rowOf(harness, r.reservationId).state).toBe('attached')
+  })
+
+  it('a stale attacher can neither bind (plain) nor fail the row; the lease holder can', async () => {
+    const { harness, env } = setup()
+    const r = await reserveCursorCloudWork(env, req)
+    const stale = await claimAttachLease(env, r.reservationId)
+    await releaseAttachLease(env, r.reservationId, stale!)
+    const fresh = await claimAttachLease(env, r.reservationId)
+    expect(await bindVendorExecution(env, r.reservationId, stale!, { agentId: 'a', runId: 'r' })).toBe(false)
+    expect(await markReservationFailed(env, r.reservationId, 'stale_says_failed', { leaseId: stale! })).toBe(false)
+    expect(await markReservationFailed(env, r.reservationId, 'no_lease_cannot_fail_attaching')).toBe(false)
+    expect(rowOf(harness, r.reservationId).state).toBe('attaching')
+    expect(await bindVendorExecution(env, r.reservationId, fresh!, { agentId: 'a', runId: 'r' })).toBe(true)
   })
 
   it('a bind repeated with the same lease and run id appends the task body once', async () => {
