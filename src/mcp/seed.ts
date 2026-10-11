@@ -133,7 +133,7 @@ const toolSeedDraft: ToolSpec = {
       valid: true,
       requests: requests.map((r) => ({ ...r, text: renderRequest(r) })),
       warnings: result.warnings,
-      next: 'Review and edit the draft, then call seed_attach (dry run) with this seed, then seed_attach_request for the approve link. Nothing here was written or accepted.',
+      next: 'Review and edit the draft, then call seed_attach (dry run) with this seed; a human org admin then accepts. Nothing here was written or accepted.',
     })
   },
 }

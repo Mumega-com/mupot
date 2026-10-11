@@ -18,7 +18,6 @@ import {
   CRED_SLOT_RE, SEED_CAPS, SEED_DEPLOY_VIA, SEED_KINDS, SEED_MAX_LIST, SEED_RISK_CLASSES, SEED_SCHEMA, SEED_SLUG_RE,
   type SeedDeployVia, type SeedKind, type SeedRiskClass, type SeedValidation,
 } from './contract'
-import { canonicalSeedJson } from './canonical'
 import { validateSeed } from './validate'
 import { repoIdentity, slugFromProjectName } from '../projects/urls'
 
@@ -38,6 +37,10 @@ export interface DraftInput {
 export type DraftErrorCode = 'invalid_args' | 'invalid_source' | 'invalid_hint' | 'draft_rejected'
 export interface DraftError { code: DraftErrorCode; path: string; message: string }
 
+/** Turns the intended seed object into YAML text. Injectable so a test can plug in a broken emitter. */
+export type SeedEmitter = (seed: Record<string, unknown>) => string
+export interface DraftOptions { emit?: SeedEmitter }
+
 export type DraftResult =
   | { ok: true; seedYaml: string; validation: Extract<SeedValidation, { ok: true }>; warnings: string[] }
   | { ok: false; error: DraftError }
@@ -53,6 +56,8 @@ function refuse(code: DraftErrorCode, path: string, message: string): never {
 // generic validator path. Author text is never echoed in a message.
 const CONTROL_RE = /\p{Cc}/u
 const SPOOF_RE = /[\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}⠀]/u
+// A lone UTF-16 surrogate is not valid text and does not survive UTF-8 encoding of the seed.
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
 
 const HINT_KEYS = [
   'goal', 'owner', 'live_url', 'repo_url', 'kind', 'deploy_via', 'deploy_cmd', 'deploy_receipt',
@@ -69,6 +74,7 @@ function str(value: unknown, path: string, max: number): string {
   if (value.length > max) refuse('invalid_args', path, `longer than ${max} characters`)
   if (CONTROL_RE.test(value)) refuse('invalid_args', path, 'control characters are not allowed')
   if (SPOOF_RE.test(value)) refuse('invalid_args', path, 'invisible or formatting characters are not allowed')
+  if (LONE_SURROGATE_RE.test(value)) refuse('invalid_args', path, 'unpaired surrogate characters are not allowed')
   return value.trim()
 }
 
@@ -88,17 +94,49 @@ function parseHttps(raw: string, path: string): URL {
   return url
 }
 
-/** Normalised https repo URL: any spelling of one repository folds to one https form. */
-function normaliseRepo(raw: string, path: string): string {
-  const id = repoIdentity(raw)
+const SCP_RE = /^[^/@\s]+@([^:/\s]+):(?!\/\/)(.+)$/
+
+/**
+ * Normalised https repo URL: any accepted spelling of one repository folds to one https form, with the
+ * ORIGINAL owner/repo case kept (hosts are lowercased) so it compares equal to an existing row.
+ * repoIdentity is used only to validate and to confirm the rebuilt URL names the same repository.
+ * Only https URLs and scp-style `user@host:owner/repo` are accepted; a non-default port is refused
+ * (a seed repo URL has nowhere to carry it); embedded credentials are stripped with a warning.
+ */
+function normaliseRepo(raw: string, path: string, warnings: string[]): string {
+  const trimmed = raw.trim()
+  const scp = SCP_RE.exec(trimmed)
+  let url: URL
+  if (scp) {
+    try { url = new URL(`ssh://${scp[1]}/${scp[2]}`) } catch { return refuse('invalid_source', path, 'not a recognisable repository URL') }
+  } else {
+    try { url = new URL(trimmed) } catch { return refuse('invalid_source', path, 'not a recognisable repository URL') }
+    if (url.protocol !== 'https:') refuse('invalid_source', path, 'repository URL must be https (or scp-style user@host:owner/repo)')
+    // WHATWG parsing turns `https:///o/r` into host `o`; an empty authority is a missing host, not a short one.
+    if (!/^https:\/\/[^/\s]/i.test(trimmed)) refuse('invalid_source', path, 'repository URL has no host')
+    if (url.username || url.password) warnings.push(`credentials in ${path} were stripped; never put credentials in a repository URL`)
+    if (url.port) refuse('invalid_source', path, 'repository URL with a non-default port is not supported')
+  }
+  if (!url.hostname) refuse('invalid_source', path, 'repository URL has no host')
+  const id = repoIdentity(trimmed)
   if (!id) return refuse('invalid_source', path, 'not a recognisable repository URL')
   if (id.kind === 'github-unsure' || id.kind === 'url-unsure') refuse('invalid_source', path, 'repository URL has an undecodable segment')
+  const host = url.hostname.toLowerCase().replace(/\.+$/, '')
+  const segments = url.pathname.split('/').filter((x) => x !== '' && x !== '.')
+  const stripGit = (x: string): string => { let t = x; while (/\.git$/i.test(t)) t = t.slice(0, -4); return t }
   if (id.kind === 'github') {
     if (!id.repo) refuse('invalid_source', path, 'repository URL must name owner and repository')
+    const parts = host === 'api.github.com' && segments[0]?.toLowerCase() === 'repos' ? segments.slice(1) : segments
+    const owner = parts[0] ?? ''
+    const repoName = stripGit(parts[1] ?? '')
+    // Keep the original spelling only when it is the very repository repoIdentity resolved.
+    if (owner.toLowerCase() === id.owner && repoName.toLowerCase() === id.repo) return `https://github.com/${owner}/${repoName}`
     return `https://github.com/${id.owner}/${id.repo}`
   }
   if (!id.key.includes('/')) refuse('invalid_source', path, 'repository URL must include a path')
-  return `https://${id.key}`
+  const last = segments.length - 1
+  const rebuilt = `${host}/${segments.map((seg, i) => (i === last ? stripGit(seg) : seg)).join('/')}`
+  return `https://${rebuilt.toLowerCase() === id.key ? rebuilt : id.key}`
 }
 
 function repoDisplayName(repoUrl: string): string {
@@ -109,6 +147,9 @@ function repoDisplayName(repoUrl: string): string {
 // Minimal YAML writer for the fixed shape the drafter builds. Keys are code literals; every
 // scalar string is a JSON double-quoted string, which is a valid YAML scalar for any content.
 type Emittable = string | number | boolean | Emittable[] | { [key: string]: Emittable | undefined }
+export function emitSeedYaml(seed: Record<string, unknown>): string {
+  return `${emit(seed as Emittable, 0).join('\n')}\n` // as: the drafter builds `seed` from Emittable parts only
+}
 function emit(value: Emittable, indent: number): string[] {
   const pad = '  '.repeat(indent)
   if (Array.isArray(value)) {
@@ -171,9 +212,15 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
   const { source } = input
   const hints = input.hints ?? {}
   if (hints === null || typeof hints !== 'object' || Array.isArray(hints)) refuse('invalid_args', 'hints', 'expected an object')
+  const unknownHints: string[] = []
   for (const key of Object.keys(hints)) {
     if (key === 'branches') warnings.push('hint "branches" ignored: mupot.seed/v1 has no field for branch policy')
-    else if (!(HINT_KEYS as readonly string[]).includes(key)) warnings.push(`hint "${cleanKey(key)}" ignored: not a field the drafter understands`)
+    else if (!(HINT_KEYS as readonly string[]).includes(key)) unknownHints.push(cleanKey(key))
+  }
+  if (unknownHints.length > 0) {
+    const shown = unknownHints.slice(0, 10).map((k) => `"${k}"`).join(', ')
+    const more = unknownHints.length > 10 ? ` and ${unknownHints.length - 10} more` : ''
+    warnings.push(`${unknownHints.length} hint(s) ignored, not fields the drafter understands: ${shown}${more}`)
   }
 
   let repo: string | undefined
@@ -183,7 +230,7 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
   let baseName: string
 
   if (source.kind === 'repo') {
-    repo = normaliseRepo(str(source.url, 'source.url', SEED_CAPS.repo), 'source.url')
+    repo = normaliseRepo(str(source.url, 'source.url', SEED_CAPS.repo), 'source.url', warnings)
     kind = 'repo'
     baseName = repoDisplayName(repo)
   } else {
@@ -198,10 +245,11 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
   }
 
   if (hints.kind !== undefined) kind = oneOf(hints.kind, 'hints.kind', SEED_KINDS)
-  if (hints.repo_url !== undefined) repo = normaliseRepo(str(hints.repo_url, 'hints.repo_url', SEED_CAPS.repo), 'hints.repo_url')
+  if (hints.repo_url !== undefined) repo = normaliseRepo(str(hints.repo_url, 'hints.repo_url', SEED_CAPS.repo), 'hints.repo_url', warnings)
   if (hints.live_url !== undefined) live = parseHttps(str(hints.live_url, 'hints.live_url', SEED_CAPS.live), 'hints.live_url').origin
 
-  const name = input.project_name === undefined ? baseName : str(input.project_name, 'project_name', SEED_CAPS.name)
+  // The derived default goes through the same text checks as an explicit name.
+  const name = str(input.project_name === undefined ? baseName : input.project_name, input.project_name === undefined ? 'source.url' : 'project_name', SEED_CAPS.name)
   const slug = slugFromProjectName(name)
   if (!slug || !SEED_SLUG_RE.test(slug)) refuse('invalid_args', 'project_name', 'no usable slug can be derived from the name')
 
@@ -227,6 +275,7 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
     ? oneOf(hints.deploy_via, 'hints.deploy_via', SEED_DEPLOY_VIA)
     : kind === 'site/wordpress' ? 'wp-plugin' : hints.deploy_cmd !== undefined ? 'git-push-only' : undefined
   if (hints.deploy_cmd !== undefined && hints.deploy_via === undefined) warnings.push('deploy_cmd given without deploy_via: via set to "git-push-only"')
+  if (hints.deploy_receipt !== undefined && !via) warnings.push('hint "deploy_receipt" ignored: no deploy is declared (pass deploy_via or deploy_cmd)')
   if (via) {
     const deploy: { [key: string]: Emittable } = { via }
     if (hints.deploy_cmd !== undefined) deploy.cmd = str(hints.deploy_cmd, 'hints.deploy_cmd', SEED_CAPS.cmd)
@@ -240,6 +289,7 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
 
   // surfaces: propose only. A draft never asks for direct writes, so it never needs allow_direct.
   if (kind === 'site/wordpress') {
+    if (hints.surface_paths !== undefined) warnings.push('hint "surface_paths" ignored for a WordPress site: surfaces are wp.page, wp.post and wp.media')
     seed.surfaces = [{ type: 'wp.page', mode: 'propose' }, { type: 'wp.post', mode: 'propose' }, { type: 'wp.media', mode: 'propose' }]
   } else {
     const paths = hints.surface_paths !== undefined ? stringList(hints.surface_paths, 'hints.surface_paths', SEED_CAPS.surfacePath) : ['**']
@@ -247,16 +297,20 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
     seed.surfaces = paths.map((path) => ({ path, mode: 'propose' }))
   }
 
-  // tools: only slot NAMES. A WordPress site gets its conventional MCP endpoint with one slot.
+  // tools: only slot NAMES. A WordPress site gets the MCPWP default endpoint with one slot.
   let tools: ToolSlot[] | undefined
   if (hints.tool_slots !== undefined) tools = toolSlots(hints.tool_slots)
-  else if (kind === 'site/wordpress' && live) tools = [{ mcp: `${live}/wp-json/mcp`, cred_slot: 'WP_SITE_API' }]
+  else if (kind === 'site/wordpress' && live) tools = [{ mcp: `${live}/wp-json/mcpwp/v1/mcp`, cred_slot: 'WP_SITE_API' }]
   if (tools) seed.tools = tools.map((t) => ({ ...t }))
-  if (kind === 'site/wordpress' && hints.tool_slots === undefined) warnings.push('tool endpoint /wp-json/mcp is the conventional default: confirm it, a human binds the credential for slot WP_SITE_API')
+  if (kind === 'site/wordpress' && hints.tool_slots === undefined) warnings.push('tool endpoint /wp-json/mcpwp/v1/mcp is the MCPWP default endpoint; confirm before binding (a human binds the credential for slot WP_SITE_API)')
 
   const gate = hints.gate === undefined ? 'gate:owner' : str(hints.gate, 'hints.gate', SEED_CAPS.gateField)
   if (hints.gate === undefined) warnings.push('gate defaults to "gate:owner": name the human who holds the gate')
-  const squad = hints.squad === undefined ? slug.slice(0, 63) : str(hints.squad, 'hints.squad', 63)
+  let squad = slug.slice(0, 63)
+  if (hints.squad !== undefined) {
+    squad = str(hints.squad, 'hints.squad', 63)
+    if (!SEED_SLUG_RE.test(squad)) refuse('invalid_hint', 'hints.squad', 'expected a kebab-case squad slug')
+  }
   seed.wants = {
     gates: [{ action: 'publish_change', gate }],
     // One observer seat: the narrowest the contract allows. A human can raise it when accepting.
@@ -275,7 +329,7 @@ function buildSeed(input: DraftInput, warnings: string[]): Record<string, Emitta
   return seed
 }
 
-export async function draftSeed(input: DraftInput): Promise<DraftResult> {
+export async function draftSeed(input: DraftInput, options: DraftOptions = {}): Promise<DraftResult> {
   try {
     if (input === null || typeof input !== 'object') refuse('invalid_args', '(root)', 'expected an object')
     const source: unknown = input.source
@@ -292,8 +346,10 @@ export async function draftSeed(input: DraftInput): Promise<DraftResult> {
       hints: input.hints,
     }
     const warnings: string[] = ['no network fetch was made: fields come from the URL and the hints only']
+    const extraSource = Object.keys(src).filter((k) => !['kind', 'url', 'platform'].includes(k)).map(cleanKey)
+    if (extraSource.length > 0) warnings.push(`${extraSource.length} extra key(s) under source ignored: ${extraSource.slice(0, 10).map((k) => `"${k}"`).join(', ')}${extraSource.length > 10 ? ` and ${extraSource.length - 10} more` : ''}`)
     const intended = buildSeed(normalised, warnings)
-    const seedYaml = `${emit(intended, 0).join('\n')}\n`
+    const seedYaml = (options.emit ?? emitSeedYaml)(intended)
 
     // The real validator is the judge. A refusal here is a drafter bug or hostile input.
     const validation = await validateSeed(seedYaml)
@@ -301,7 +357,7 @@ export async function draftSeed(input: DraftInput): Promise<DraftResult> {
     // Round trip: the text must parse back to exactly what was intended. A string that escaped its
     // scalar (and so changed or added a field) shows up as a digest mismatch, never as another seed.
     const reparsed = await validateSeed(JSON.stringify(intended))
-    if (!reparsed.ok || reparsed.canonical !== validation.canonical || canonicalSeedJson(validation.seed) !== validation.canonical) {
+    if (!reparsed.ok || reparsed.canonical !== validation.canonical) {
       refuse('draft_rejected', '(root)', 'drafted text did not round-trip to the intended seed')
     }
     return { ok: true, seedYaml, validation, warnings }

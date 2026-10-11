@@ -126,27 +126,38 @@ the dry run; apply needs more (below).
 
 ### Drafting a seed (`seed_draft`)
 
-`seed_draft { source, project_name?, hints? }` writes the YAML so nobody hand-writes it. `source` is
-`{kind:"repo", url}` or `{kind:"site", url, platform?}` (`wordpress`, `astro`, `shopify`, `static`);
+`seed_draft { source, project_name?, hints? }` writes a first-pass YAML so nobody starts from a blank file.
+`source` is `{kind:"repo", url}` or `{kind:"site", url, platform?}` (`wordpress`, `astro`, `shopify`, `static`);
 `hints` carries facts the caller already read locally (`goal`, `owner`, `live_url`, `repo_url`, `kind`,
 `deploy_via`, `deploy_cmd`, `deploy_receipt`, `squad`, `gate`, `risk_class`, `surface_paths[]`,
-`tool_slots[{mcp|openapi, cred_slot}]`; unknown hints are ignored with a warning).
+`tool_slots[{mcp|openapi, cred_slot}]`). Unknown hints and unknown keys under `source` are ignored with one
+warning each (at most 10 names plus a count); other ignored hints (`surface_paths` on WordPress,
+`deploy_receipt` with no deploy) also warn.
 
 - Member floor, **pure and read-only**: no database access, no network fetch (the URL is only parsed and
   normalised), no project, no request filed, no `accept_token`, no presence bump.
+- Repo URLs: https or scp-style `user@host:owner/repo` only; other schemes, an empty host and a non-default
+  port are refused (`invalid_source`); embedded credentials are stripped with a warning. The emitted `repo`
+  keeps the original owner/repo case (hosts are lowercased), so it compares equal to an existing row.
 - Returns `{ok, seed_yaml, seed_sha, valid, requests[], warnings[], next}`. `requests` has the same shape
   as the `seed_attach` dry run, and `seed_sha` equals that dry run's `seed_sha256` for the same text.
-- Defaults are the narrowest the contract can say: every surface is `propose` (never `direct`, so no
-  `allow_direct`), `deploy.human_only: true`, one `observer` seat, a named human gate, `risk.class: medium`.
-  A WordPress site gets the `wp-plugin` deploy shape, `wp.page`/`wp.post`/`wp.media` proposals and its
-  conventional `/wp-json/mcp` endpoint with the slot NAME `WP_SITE_API`; a human binds the credential later.
+  `next` is: call `seed_attach` (dry run) with the seed; a human org admin then accepts.
+- Defaults, exactly as drafted: every surface is `propose` (a repo gets `**`; WordPress gets `wp.page`,
+  `wp.post`, `wp.media`), never `direct`, so no `allow_direct`; `deploy.human_only: true` (WordPress gets
+  `wp-plugin`; any other kind only when a deploy hint is given); one `observer` seat in a squad named after
+  the slug; one gate `publish_change` held by `gate:owner`; `risk.class: medium`, `human_only: [deploy]` and a
+  short `forbidden` list; `signals.health` is the live URL when there is one. A WordPress site also gets the
+  MCPWP default endpoint `<origin>/wp-json/mcpwp/v1/mcp` with the slot NAME `WP_SITE_API`; confirm the endpoint
+  before binding, a human binds the credential later. These are starting values, not a security review.
 - The draft only asks. It carries no grant, credential value or acceptance (the contract has no field for
   one), and the output text is run through the real validator and parsed back to the intended seed before it
-  is returned. Control or invisible characters in any input are refused, not repaired.
+  is returned (a mismatch is `draft_rejected`). Control, invisible and unpaired-surrogate characters in any
+  input are refused, not repaired.
+- Add by hand after drafting, when they apply: `data[]`, `wants.memory`, `wants.routines`,
+  `signals.outcome`, the real gate `action`, seat `max` and `capability`, and further `risk` items
+  (`forbidden`, `human_only`).
 - Contract limits surface as warnings, not new fields: branch policy has no seed field, and there is no
   static-site `kind` (a static site is drafted as `app`).
-
-Next steps are unchanged: `seed_attach` (dry run) with the draft, then the approve link.
 
 ### Apply (`dry_run: false`)
 
@@ -307,7 +318,7 @@ Each test below was written to fail when the named mutation is applied to the co
 - Drop a secret-shaped value check for opaque tokens: the 40-character token test fails.
 - Narrow the secret scan back (drop `-`/`_` from the run class, the Google/Stripe/GitLab/query patterns, the list-join scan, the key scan): the per-shape secret tests fail.
 - Drop a `data` or `allow_direct` request: the policy-request test fails.
-- `seed_draft` (`tests/seed-draft.test.ts`): emit author text unescaped, let a draft carry `accept`, `direct` or an `allow_direct` entry, or skip the round-trip check: the hostile-input, no-accept and round-trip tests fail.
+- `seed_draft` (`tests/seed-draft.test.ts`), each kills the named mutation: emit string scalars unquoted (hostile-input test); drop the control, invisible or surrogate refusal (refusal tests); make a surface `direct` or a seat `member` (no-accept and default tests); drop the round-trip comparison (the injecting-emitter test returns `draft_rejected` only through it); accept a non-https scheme, an empty host or a port, or keep credentials (repo URL tests); lowercase the owner/repo (case test); skip the squad check (`invalid_hint` test); drop the unknown-hint collapse or an ignored-hint warning (warning tests).
 - Allow zero-width or bidi characters, or paste author text into a sentence: the spoofing tests fail.
 - Skip NFC or trailing-whitespace normalization, or reject a block scalar's final newline: the normalization tests fail.
 - Change a documented enum or cap in only one place (either direction, exact set): `tests/seed-v1-doc.test.ts` fails.
