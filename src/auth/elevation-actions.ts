@@ -105,10 +105,21 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
   'action:routine_policy': {
     key: 'action:routine_policy',
     enforced: true,
-    label: 'Enable, pause, archive or update routines',
-    description: 'Enable, pause, archive or update routines of a squad you have been granted.',
+    label: 'Enable, pause or update routines',
+    description: 'Enable, pause or update routines of a squad you have been granted. Does NOT include archiving.',
     effect: 'reversible',
-    effectNote: 'A routine can be re-enabled, paused, restored or edited again by standing authority after expiry.',
+    effectNote: 'A routine can be re-enabled, paused or edited again by standing authority after expiry.',
+  },
+  // Archive is split from routine_policy: it cannot be undone (no restore path;
+  // transitionRoutine/updateRoutine return routine_archived), so it must not
+  // ride a grant whose label says "reversible".
+  'action:routine_archive': {
+    key: 'action:routine_archive',
+    enforced: true,
+    label: 'Archive a routine permanently (cannot be restored)',
+    description: 'Archive a routine of a squad you have been granted. An archived routine cannot be restored.',
+    effect: 'irreversible',
+    effectNote: 'There is no restore path for an archived routine; expiry of the grant does not undo it.',
   },
   'action:project_status': {
     key: 'action:project_status',

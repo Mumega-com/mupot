@@ -145,7 +145,7 @@ describe('every elevation action is enforced exactly as it is declared', () => {
   it('S14 F1: routine policy and project status are their OWN enforced actions, consumed by literal call sites', () => {
     // Folding these powers into action:workspace_project / action:project_lifecycle
     // (creation-only labels) would widen every live grant approved under those labels.
-    for (const action of ['action:routine_policy', 'action:project_status']) {
+    for (const action of ['action:routine_policy', 'action:routine_archive', 'action:project_status']) {
       expect(ELEVATION_ACTIONS[action].enforced).toBe(true)
       expect(REQUESTABLE_ELEVATION_ACTION_KEYS).toContain(action)
       expect(consumersOf(action)).toContain(join('mcp', 'elevated-principal.ts'))
@@ -153,6 +153,10 @@ describe('every elevation action is enforced exactly as it is declared', () => {
     expect(ELEVATION_ACTIONS['action:project_lifecycle'].label).toBe('Create/update squads')
     expect(ELEVATION_ACTIONS['action:workspace_project'].label).toBe('Create/update workspace projects')
     expect(ELEVATION_ACTIONS['action:routine_policy'].label).toMatch(/routines/i)
+    expect(ELEVATION_ACTIONS['action:routine_policy'].effect).toBe('reversible')
+    expect(ELEVATION_ACTIONS['action:routine_policy'].label).not.toMatch(/archive/i)
+    expect(ELEVATION_ACTIONS['action:routine_archive'].effect).toBe('irreversible')
+    expect(ELEVATION_ACTIONS['action:routine_archive'].label).toBe('Archive a routine permanently (cannot be restored)')
     expect(ELEVATION_ACTIONS['action:project_status'].description).toMatch(/status/i)
   })
 })

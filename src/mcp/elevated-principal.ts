@@ -25,10 +25,10 @@ import {
 import { beginElevationReceipt, finishElevationReceipt } from '../auth/elevation-receipt'
 import { fail, type ToolOutcome } from './index'
 
-/** The only two actions this gate answers for. A union (not `string`) so the
+/** The only actions this gate answers for. A union (not `string`) so the
  *  hasElevatedAction call sites below keep naming their action as a literal —
  *  tests/elevation-actions-enforced.test.ts scans for exactly that. */
-export type LifecycleElevationAction = 'action:routine_policy' | 'action:project_status'
+export type LifecycleElevationAction = 'action:routine_policy' | 'action:routine_archive' | 'action:project_status'
 
 export type ElevationTarget = { type: 'org' } | { type: 'squad'; id: string }
 
@@ -61,6 +61,9 @@ async function checkAction(
   // Literal action at each call site (see LifecycleElevationAction).
   if (action === 'action:routine_policy') {
     return hasElevatedAction(env, auth, 'action:routine_policy', target.type, scopeId, callOpts)
+  }
+  if (action === 'action:routine_archive') {
+    return hasElevatedAction(env, auth, 'action:routine_archive', target.type, scopeId, callOpts)
   }
   return hasElevatedAction(env, auth, 'action:project_status', target.type, scopeId, callOpts)
 }

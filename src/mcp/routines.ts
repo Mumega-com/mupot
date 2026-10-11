@@ -273,7 +273,7 @@ type RoutinePolicyOperation = 'update' | 'enable' | 'pause' | 'archive'
 /**
  * The principal a routine policy mutation (update/enable/pause/archive) runs as.
  * A non-agent caller keeps its own principal. An agent-bound caller runs as a
- * member-typed principal ONLY when a live action:routine_policy elevation
+ * member-typed principal ONLY when a live action:routine_policy (action:routine_archive for archive) elevation
  * grant covers the routine's responsible squad (an org-scope grant covers every
  * non-home squad, exactly as hasElevatedAction defines it); the principal then
  * carries just the standing the grant stands in for, never more. An unknown
@@ -300,12 +300,16 @@ async function routinePolicyPrincipal(
   if (typeof destinationSquadId === 'string' && destinationSquadId !== row.responsible_squad_id) squads.push(destinationSquadId)
   let grant: ElevationGrantRecord | null = null
   for (const squadId of squads) {
-    const acting = await memberOrElevatedAgent(auth, env, 'action:routine_policy', { type: 'squad', id: squadId }, {
+    const policyOpts = {
       toolName,
       refusalCode: 'forbidden',
       detail: { routine_id: routineId, operation, squad_id: squadId },
       recordUsage: false,
-    })
+    }
+    // Archive is irreversible and has its OWN action; the rest stay routine_policy.
+    const acting = operation === 'archive'
+      ? await memberOrElevatedAgent(auth, env, 'action:routine_archive', { type: 'squad', id: squadId }, policyOpts)
+      : await memberOrElevatedAgent(auth, env, 'action:routine_policy', { type: 'squad', id: squadId }, policyOpts)
     if (!acting.ok) return acting
     if (acting.via === 'elevation') grant = grant ?? acting.grant
   }
