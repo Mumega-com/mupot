@@ -261,6 +261,14 @@ export interface Env {
   // Value: 64-char hex string (32 bytes / 256-bit, e.g. `openssl rand -hex 32`).
   // Fail-closed: if absent, resolveConnector() returns null and addConnector() throws.
   CONNECTOR_MASTER_KEY?: string
+  // Access approve page (docs/architecture/access-approve-page.md). Feature flag OFF unless
+  // ACCESS_APPROVE_ENABLED is '1' or 'true': every /approve/* route answers 404 and the request tools
+  // return no approve_url. All four below are required once enabled; any missing => fail closed 503.
+  ACCESS_APPROVE_ENABLED?: string
+  ACCESS_TEAM_DOMAIN?: string      // <team>.cloudflareaccess.com (scheme optional)
+  ACCESS_AUD?: string              // the Access application's AUD tag (exact match)
+  ACCESS_CANONICAL_HOST?: string   // the only Host the approve page answers on, e.g. mupot.example.com
+  ACCESS_MAX_JWT_AGE_SECONDS?: string // iat freshness window, default 60, max 300
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].

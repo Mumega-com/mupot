@@ -215,6 +215,7 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { approveUrl } from '../access/config'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -5905,6 +5906,9 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
+      // Present only when the Access approve page is enabled: the link a human opens to decide. This tool
+      // decides nothing.
+      ...(approveUrl(env, 'elevation', result.request.id) ? { approve_url: approveUrl(env, 'elevation', result.request.id) } : {}),
     })
   },
 }

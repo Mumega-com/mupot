@@ -215,6 +215,8 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   // ── seeds ──────────────────────────────────────────────────────────────────────────────────
   seed_attach: ADD('dry_run (default) is pure + SELECT only; dry_run:false INSERTs project_seeds + projects/squads/project_squad_access via teamBootstrap + mutation_audit_entries, human org admin only, grants nothing (mcp/seed.ts, seeds/apply.ts)'),
 
+  seed_attach_request: ADD('INSERT seed_attach_requests (pending, single-use, 24h, per-requester cap); applies nothing and grants nothing; a human decides on the Access approve page (mcp/seed.ts, access/seed-request.ts)'),
+
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────
   define_circuit: ADD('defineCircuit batch INSERT circuits/nodes/edges (addons/workflow-circuits/service.ts:284-303)'),
   advance_node: MUT('advanceNode UPDATE workflow_circuit_nodes.done_state + INSERT events (workflow-circuits/service.ts:443,447)'),

@@ -82,6 +82,7 @@ import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
+import { approveApp } from './access/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -254,6 +255,11 @@ app.route('/', platformApp)
 // passes through dashboardApp's requireAuth / capability-floor middleware —
 // mounted before the dashboard '/' catch-all like every other public prefix.
 app.route('/invite', inviteApp)
+
+// Human-verified approval page behind Cloudflare Access (docs/architecture/access-approve-page.md).
+// Feature-flagged OFF: every /approve/* path answers 404 unless ACCESS_APPROVE_ENABLED. Before the
+// dashboard '/' catch-all so it is never shadowed.
+app.route('/approve', approveApp)
 
 app.route(ROUTES.dashboard, dashboardApp)
 

@@ -20,6 +20,8 @@ import { readAccess, readableProject } from './projects'
 import { hasWorkspaceAdmin } from '../auth/capability'
 import { issueAcceptToken } from '../seeds/accept-token'
 import { keyRequests, applySeed, seedProjectSlug } from '../seeds/apply'
+import { createSeedRequest, SEED_REQUEST_TTL_MS } from '../access/seed-request'
+import { approveUrl } from '../access/config'
 import { type ToolSpec, fail, done } from './index'
 
 interface SeedDiff { field: string; current: string | null; proposed: string | null }
@@ -90,4 +92,46 @@ const toolSeedAttach: ToolSpec = {
   },
 }
 
-export const SEED_TOOLS: ToolSpec[] = [toolSeedAttach]
+// seed_attach_request — "the agent prepares". Validates the seed exactly like the seed_attach dry run, stores it
+// as a pending, single-use, 24h request, and returns the link a HUMAN opens behind Cloudflare Access to
+// approve it. It decides nothing and grants nothing: there is no apply path here, no accept_token, and no
+// way for any bearer (agent or human) to complete the request over MCP. Docs: access-approve-page.md.
+const toolSeedAttachRequest: ToolSpec = {
+  name: 'seed_attach_request',
+  scope: 'file a pending request to attach a mupot.seed/v1; returns approve_url for a human to open (decides nothing, grants nothing)',
+  min: 'member',
+  args: '{ seed: string (YAML or JSON) }',
+  inputSchema: {
+    type: 'object',
+    properties: { seed: { type: 'string', description: 'mupot.seed/v1 document as YAML or JSON (max 32 KiB).' } },
+    required: ['seed'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    if (!auth.memberId) return fail(403, 'forbidden', 'a member principal is required to file a request')
+    // Check the flag/config BEFORE writing anything: a request nobody can approve is noise.
+    if (approveUrl(env, 'seed', 'probe') === null) return fail(409, 'access_approve_not_enabled', 'the Access approve page is not enabled on this pot')
+    const result = await validateSeed(args.seed)
+    if (!result.ok) return fail(400, 'invalid_seed', result.error)
+    const requests = await keyRequests(result.requests)
+    const created = await createSeedRequest(env, {
+      requesterMemberId: auth.memberId,
+      requesterAgentId: auth.boundAgentId ?? null,
+      validated: { seed: result.seed, canonical: result.canonical, seedSha256: result.seedSha256, requests },
+    })
+    if (!created.ok) return fail(429, 'too_many_pending_requests', 'close or wait out your pending seed requests first')
+    return done({
+      ok: true,
+      request_id: created.id,
+      approve_url: approveUrl(env, 'seed', created.id),
+      expires_at: created.expiresAt,
+      ttl_seconds: SEED_REQUEST_TTL_MS / 1000,
+      reused: created.reused,
+      seed_sha256: result.seedSha256,
+      requests: requests.map((r) => ({ key: r.key, kind: r.kind, text: renderRequest(r) })),
+      note: 'Pending. Only a human can approve it, at approve_url behind Cloudflare Access. Nothing is created or granted until then.',
+    })
+  },
+}
+
+export const SEED_TOOLS: ToolSpec[] = [toolSeedAttach, toolSeedAttachRequest]

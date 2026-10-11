@@ -134,7 +134,15 @@ async function releaseClaim(env: Env, rowId: string, token: string, projectSlug:
   ).bind(rowId, token, new Date(0).toISOString()).run()
 }
 
-export async function applySeed(env: Env, auth: AuthContext, caller: string, v: ValidatedSeed, acceptRaw: unknown, acceptToken: unknown): Promise<SeedApplyOutcome> {
+/** The acceptance proof for an apply decided on the Access approve page (src/access/routes.ts): the human's
+ *  Access-verified, CSRF-protected POST stands in for the dry-run accept_token. Constructed ONLY server-side
+ *  after the JWT, member and org-admin checks; MCP args are JSON and can never carry it. Recorded in the receipt. */
+export interface AccessAcceptAttestation { via: 'access_passkey'; requestId: string; accessSub: string }
+
+export async function applySeed(
+  env: Env, auth: AuthContext, caller: string, v: ValidatedSeed, acceptRaw: unknown, acceptToken: unknown,
+  attestation?: AccessAcceptAttestation,
+): Promise<SeedApplyOutcome> {
   const slug = v.seed.slug
   if (!isValidSlugBase(slug)) {
     return { ok: false, status: 400, error: 'seed_slug_not_applicable',
@@ -142,7 +150,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
   }
   const parsed = parseAccept(acceptRaw)
   if (!parsed.ok) return parsed.outcome
-  const tokenCheck = await verifyAcceptToken(env, caller, v.seedSha256, acceptToken)
+  const tokenCheck = attestation ? 'ok' : await verifyAcceptToken(env, caller, v.seedSha256, acceptToken)
   if (tokenCheck === 'unavailable') return { ok: false, status: 503, error: 'accept_token_unavailable', detail: 'this pot has no server secret configured for accept tokens' }
   if (tokenCheck === 'invalid') {
     return { ok: false, status: 409, error: 'accept_token_invalid', detail: 'accept_token must come from a dry run of this exact seed by this member in the last 15 minutes' }
@@ -323,6 +331,7 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
     const evidence = JSON.stringify({
       seed_sha256: v.seedSha256, accepted_keys: [...accepted].sort(), project_slug: projectSlug,
       squad_id: squadId, seat_cap: seatCap, grants: 'none',
+      ...(attestation ? { via: attestation.via, access_request_id: attestation.requestId } : {}),
     })
     const flip = await env.DB.batch([
       env.DB.prepare(
@@ -334,10 +343,10 @@ export async function applySeed(env: Env, auth: AuthContext, caller: string, v: 
         `INSERT INTO mutation_audit_entries (
            id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
            target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-         SELECT ?1, ?2, 'member', ?3, ?3, 'mcp', 'seed_attach', 'apply', 'project', ?4, ?5, ?6, ?7, ?8
+         SELECT ?1, ?2, 'member', ?3, ?3, ?9, 'seed_attach', 'apply', 'project', ?4, ?5, ?6, ?7, ?8
           WHERE changes() = 1
          ON CONFLICT DO NOTHING`,
-      ).bind(crypto.randomUUID(), tenant, caller, projectId, `seed-apply:${claimedRowId}`, v.seedSha256, evidence, appliedAt),
+      ).bind(crypto.randomUUID(), tenant, caller, projectId, `seed-apply:${claimedRowId}`, v.seedSha256, evidence, appliedAt, attestation ? 'admin_ui' : 'mcp'),
     ])
     // The guarded UPDATE is the only proof this call won. 0 rows = fenced out (a resume or sweep replaced
     // our claim): never present as the winner, whatever a later read of the row shows.
