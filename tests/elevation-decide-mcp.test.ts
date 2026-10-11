@@ -7,7 +7,8 @@ import type { AuthContext, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { createWebSession, revokeWebSession } from '../src/auth/web-sessions'
-import { hasElevatedAction } from '../src/auth/elevation'
+import { createElevationRequest, hasElevatedAction } from '../src/auth/elevation'
+import { createHomeForMember } from '../src/org/service'
 
 const TENANT = 'mumega'
 const DEPT = 'dept-1'
@@ -247,5 +248,30 @@ describe('elevation_decide — human MCP approval through the shared decision fu
     const one = await invokeTool(adminAuth(), env, 'elevation_status', { request_id: id }, BASE)
     expect((one.result as { request: { status: string } }).request.status).toBe('expired')
     expect(await ledger()).toBe(before)
+  })
+
+  it('a bound agent flag on an otherwise-human token is refused on its own (independent of the agent-member check)', async () => {
+    const id = await request(['action:project_status'])
+    await refused({ ...adminAuth(), boundAgentId: AGENT_ID }, { request_id: id, decision: 'approve' }, 403, 'human_accept_required')
+  })
+
+  it('a request on a member\'s HOME squad is invisible and undecidable to an org admin who holds nothing on it (rank ceiling guards the target)', async () => {
+    await adminWebSession()
+    const checkin = await invokeTool(agentAuth(), env, 'check_in', {}, BASE)
+    const sessionId = (checkin.result as { agent_session: { id: string } }).agent_session.id
+    const home = await createHomeForMember(env, SQUAD_ADMIN)
+    if (!home.ok) throw new Error('home setup failed')
+    const created = await createElevationRequest(env, {
+      tenant: TENANT, agentSessionId: sessionId, agentId: AGENT_ID, memberId: AGENT_MEMBER,
+      actions: ['action:home_access'], scopeType: 'squad', scopeId: home.squad.id, durationMinutes: 60, reason: 'visit',
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok) return
+    const list = await invokeTool(adminAuth(), env, 'elevation_status', {}, BASE)
+    expect((list.result as { pending_requests: unknown[] }).pending_requests).toHaveLength(0)
+    const one = await invokeTool(adminAuth(), env, 'elevation_status', { request_id: created.request.id }, BASE)
+    expect((one.result as { request: unknown }).request).toBeNull()
+    await refused(adminAuth(), { request_id: created.request.id, decision: 'approve' }, 404, 'not_found')
+    await refused(adminAuth(), { request_id: created.request.id, decision: 'deny' }, 404, 'not_found')
   })
 })
