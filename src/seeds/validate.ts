@@ -68,17 +68,6 @@ function looksSecret(value: string): string | null {
     const c = looksSecretOnce(compact)
     if (c) return c
   }
-  // Compact pass: separators `./-` must not split a token below the floor. Only mixed-case or
-  // pure-hex runs of 40+ count, so lowercase kebab slugs and plain paths stay valid.
-  const squashed = compact.replace(/[./-]/g, '')
-  if (squashed !== compact) {
-    for (const run of squashed.matchAll(/[A-Za-z0-9+_]{40,}/g)) {
-      const r = run[0]
-      const hex = /^[0-9a-f]+$/.test(r) && /\d/.test(r) && /[a-f]/.test(r)
-      const mixed = /\d/.test(r) && /[a-z]/.test(r) && /[A-Z]/.test(r)
-      if (hex || mixed) return 'opaque high-entropy string'
-    }
-  }
   return null
 }
 
@@ -130,7 +119,9 @@ function asRecord(value: unknown, path: string, allowed: readonly string[]): Rec
 const CONTROL_RE = /\p{Cc}/u // C0, DEL, C1 (incl. U+0085)
 // Zero-width and bidi-control characters let author text spoof what a human reviews.
 // Cf = zero-width, bidi, U+061C, tag chars (U+E0000..); Zl/Zp = U+2028/U+2029.
-const SPOOF_RE = /[\p{Cf}\p{Zl}\p{Zp}]/u
+// Default_Ignorable_Code_Point adds the Hangul fillers (U+3164, U+115F), U+034F, variation selectors
+// (U+FE0F) etc.; U+2800 (braille blank) is a visible-blank lookalike. mupot#1840.
+const SPOOF_RE = /[\p{Cf}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\u2800]/u
 
 function text(input: unknown, path: string, max: number, required = true): string | undefined {
   if (input === undefined) {

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   SEED_CAPS, SEED_DATA_TIERS, SEED_DEPLOY_VIA, SEED_KINDS, SEED_MAX_LIST, SEED_MAX_SEATS,
-  SEED_RISK_CLASSES, SEED_ROUTINE_APPROVALS, SEED_SEAT_CAPABILITIES, SEED_SURFACE_MODES,
+  SEED_REQUEST_KINDS, SEED_RISK_CLASSES, SEED_ROUTINE_APPROVALS, SEED_SEAT_CAPABILITIES, SEED_SURFACE_MODES,
 } from '../src/seeds/contract'
 
 const doc = readFileSync(join(__dirname, '..', 'docs', 'architecture', 'seed-v1.md'), 'utf8')
@@ -62,5 +62,14 @@ describe('seed-v1 doc caps equal SEED_CAPS', () => {
   })
   it('documents the request shape in the tool section', () => {
     expect(doc).toContain('{kind, fields, needs, text}')
+  })
+})
+
+describe('attach protocol step 4 lists exactly the SeedRequest kinds', () => {
+  it('doc request list equals SEED_REQUEST_KINDS', () => {
+    const line = doc.split('\n').find((l) => l.startsWith('| 4 |')) ?? ''
+    const inner = /\(([^)]*)\)/.exec(line)?.[1] ?? ''
+    const norm = (w: string) => w.trim().toLowerCase().replace(/ /g, '_').replace(/s$/, '')
+    expect(inner.split(',').map(norm).sort()).toEqual(SEED_REQUEST_KINDS.map(norm).sort())
   })
 })

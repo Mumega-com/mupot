@@ -57,13 +57,20 @@ Pinned to the validator by `tests/seed-v1-doc.test.ts`: change one side and the 
 | String list items | at most 200 characters each |
 | `wants.routines[].cron` | five space-separated fields, at most 100 characters |
 | `wants.seats.squad` | a kebab-case slug |
-| Any text value or key | no Unicode control (Cc: C0, DEL, C1), format (Cf: zero-width, bidirectional, U+061C, U+FEFF, tag characters) or line/paragraph separator (U+2028, U+2029) characters; one trailing newline (block scalar) is stripped |
+| Any text value or key | no Unicode control (Cc: C0, DEL, C1), format (Cf: zero-width, bidirectional, U+061C, U+FEFF, tag characters), default-ignorable (Hangul fillers U+3164/U+115F, U+034F, variation selectors), U+2800 or line/paragraph separator (U+2028, U+2029) characters; one trailing newline (block scalar) is stripped |
 
 Canonical text rule: strings are NFC-normalized and trailing whitespace is trimmed before hashing
 and before `allow_direct` matching; leading whitespace is NOT trimmed.
 
 Defaults are materialized and empty optional containers are omitted before hashing, so
 `capability: member` equals no capability, and `wants: {}` or `memory: []` equals no key.
+
+## Known limits
+
+The secret scan is an **accidental-paste guard, not an adversarial filter**. A secret deliberately
+split by separators (`. / - : , ~ =`) into short runs is NOT detected. The real controls are
+structural: apply stores only the canonical form (never raw source), and credentials are named
+slots bound by a human, never values in a seed.
 
 ## Rules the validator enforces
 
@@ -161,7 +168,7 @@ Each test below was written to fail when the named mutation is applied to the co
 - Make the digest ignore a semantic change: the digest-difference tests fail.
 - Count `/` as opaque-string material again: the ordinary-path test fails.
 - Drop a secret-shaped value check for opaque tokens: the 40-character token test fails.
-- Narrow the secret scan back (drop `-`/`_` from the run class, the Google/Stripe/GitLab/query patterns, the list-join scan, the compact pass, the key scan): the per-shape secret tests fail.
+- Narrow the secret scan back (drop `-`/`_` from the run class, the Google/Stripe/GitLab/query patterns, the list-join scan, the key scan): the per-shape secret tests fail.
 - Drop a `data` or `allow_direct` request: the policy-request test fails.
 - Allow zero-width or bidi characters, or paste author text into a sentence: the spoofing tests fail.
 - Skip NFC or trailing-whitespace normalization, or reject a block scalar's final newline: the normalization tests fail.

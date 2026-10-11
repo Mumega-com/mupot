@@ -331,7 +331,8 @@ describe('keys, normalization, block scalars, warnings', () => {
 
 describe('round 3: invisible and separator characters, canonical allow_direct, pinned fixes', () => {
   const bad: Array<[string, string]> = [
-    ['LS U+2028', '\u2028'], ['PS U+2029', '\u2029'], ['C1 U+0085', '\u0085'], ['C1 U+009F', '\u009f'],
+    ['Hangul filler U+3164', '\u3164'], ['Hangul choseong filler U+115F', '\u115f'], ['braille blank U+2800', '\u2800'],
+      ['CGJ U+034F', '\u034f'], ['VS16 U+FE0F', '\ufe0f'], ['LS U+2028', '\u2028'], ['PS U+2029', '\u2029'], ['C1 U+0085', '\u0085'], ['C1 U+009F', '\u009f'],
     ['ALM U+061C', '؜'], ['RLO U+202E', '‮'], ['ZWSP U+200B', '​'], ['BOM U+FEFF', '﻿'],
   ]
   it.each(bad)('%s refused in name, owner and a list item', async (_l, ch) => {
@@ -348,21 +349,32 @@ describe('round 3: invisible and separator characters, canonical allow_direct, p
     expect(text).not.toMatch(new RegExp('[\\u2028\\u2029\\n]'))
     expect(text).toContain('\\u2028')
   })
+  it('allow_direct does not match a different case or a full-width lookalike', async () => {
+    const mk = (entry: string) => validateSeed(`${BASE}\nsurfaces:\n  - path: "SRC/x"\n    mode: direct\nrisk:\n  class: low\n  allow_direct: ["${entry}"]\n`)
+    expect((await mk('src/x')).ok).toBe(false)
+    expect((await mk('\uff33\uff32\uff23/x')).ok).toBe(false)
+    expect((await mk('SRC/x')).ok).toBe(true)
+  })
   it('allow_direct matches in canonical form: trailing space and NFC', async () => {
     const mk = (entry: string, path: string) => validateSeed(`${BASE}\nsurfaces:\n  - path: "${path}"\n    mode: direct\nrisk:\n  class: low\n  allow_direct: ["${entry}"]\n`)
     expect((await mk('wp.media ', 'wp.media')).ok).toBe(true)
     expect((await mk('café', 'café')).ok).toBe(true)
     expect((await mk(' wp.media', 'wp.media')).ok).toBe(false) // leading whitespace is not trimmed
   })
-  it('a PEM-like body with every run under 32 chars is refused by the compact pass', async () => {
-    const chunks = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAAS', 'CBKcwggSjAgEAAoIBAQC7VJTUt9Us8c', 'KjMzEfYyjiWA4R4+C6xQ2vN8mLpZ0dF', 'hT5yUeWbGaX3rVcJkSnYoI1HqD7uEtB']
-    expect(chunks.every((c) => c.length === 31)).toBe(true)
-    expect((await refused(`${BASE}\ngoal: "${chunks.join('/')}"\n`.replace('goal: Keep it fresh.\n', ''))).code).toBe('secret_in_seed')
+  it('ordinary values the scan must ACCEPT (no false positives)', async () => {
+    const UUID = '123e4567-e89b-12d3-a456-426614174000'
+    const ok = async (extra: string) => expect((await validateSeed(`${BASE}\n${extra}\n`)).ok, extra).toBe(true)
+    await ok('surfaces:\n  - path: src/components/Dashboard/ProjectOverview2/TaskBoardColumn.tsx\n    mode: propose')
+    await ok('repo: https://github.com/Mumega-com/mupot-plugin-ExampleRepo2026')
+    await ok(`repo: ${UUID}/${UUID}`)
+    await ok(`repo: ${UUID}`)
+    await ok('repo: some-long-kebab-slug-with-2026-numbers-inside-it-all')
+    await ok('repo: src/content/en/blog/posts2026/drafts/archive')
+    await ok('repo: src/Content/En/Blog/Posts2026/Drafts/Archive/Index')
   })
-  it('a 40+ char mixed-case token split by ./- is refused (compact pass); slugs, paths, uuids stay valid', async () => {
-    expect((await refused(`${BASE}\nrepo: "a1B2c3D4e5F6g7-H8i9J0k1L2m3N4o.P5q6R7s8T9u0V1"\n`)).code).toBe('secret_in_seed')
-    expect((await validateSeed(`${BASE}\nrepo: 123e4567-e89b-12d3-a456-426614174000\n`)).ok).toBe(true)
-    expect((await validateSeed(`${BASE}\nrepo: some-long-kebab-slug-with-2026-numbers-inside-it-all\n`)).ok).toBe(true)
+  it('separator-split secrets are a documented known limit (accidental-paste guard only)', async () => {
+    // pinned so a future change to this behaviour is a conscious one; see "Known limits" in the doc
+    expect((await validateSeed(`${BASE}\nrepo: "a1B2c3D4e5F6g7-H8i9J0k1L2m3N4o.P5q6R7s8T9u0V1"\n`)).ok).toBe(true)
   })
   it('Cf/Cc/separator categories: tag chars, C1 CSI, and a masquerading memory entry are refused', async () => {
     expect((await refused(BASE.replace('owner: someone', 'owner: "a\u{e0041}b"'))).code).toBe('invalid_field')
@@ -372,8 +384,8 @@ describe('round 3: invisible and separator characters, canonical allow_direct, p
   })
   it('renderRequest escapes raw LS, C1 and tag characters', async () => {
     const { renderRequest } = await import('../src/seeds/render')
-    const text = renderRequest({ kind: 'memory', fields: { scope: 'a\u2028b\u0085c\u{e0041}d' }, needs: 'human_accept' })
-    expect(new RegExp('[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]', 'u').test(text)).toBe(false)
+    const text = renderRequest({ kind: 'memory', fields: { scope: 'a\u2028b\u0085c\u{e0041}d\u3164\u2800\ufe0f' }, needs: 'human_accept' })
+    expect(new RegExp('[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\\p{Default_Ignorable_Code_Point}\\u2800]', 'u').test(text)).toBe(false)
     expect(text).toContain('\\u2028')
   })
 })

@@ -75,9 +75,12 @@ export type SeedErrorCode =
 
 export interface SeedError { code: SeedErrorCode; path: string; message: string }
 
+export const SEED_REQUEST_KINDS = ['gate', 'routine', 'seat', 'memory', 'data', 'tool_credential', 'direct_surface', 'allow_direct'] as const
+export type SeedRequestKind = (typeof SEED_REQUEST_KINDS)[number]
+
 /** Something the seed ASKS for. Validation grants none of it. */
 export interface SeedRequest {
-  kind: 'gate' | 'routine' | 'seat' | 'memory' | 'data' | 'tool_credential' | 'direct_surface' | 'allow_direct'
+  kind: SeedRequestKind
   fields: Record<string, string>
   needs: 'human_accept'
 }

@@ -26,6 +26,11 @@ const VALIDATOR_ONLY = ['AWS access key id', 'Slack token', 'bearer credential',
 const VALIDATOR_SHARED = ['OpenAI-style key', 'GitHub token', 'JWT', 'private key block']
 
 describe('validator and no-secrets patterns stay in step', () => {
+  it('`rules` is defined once and never mutated after the literal', () => {
+    expect(src.match(/\brules\b\s*=/g)?.length).toBe(1)
+    expect(src).not.toMatch(/\brules\s*\.\s*(push|unshift|splice|pop|shift|length)|\brules\s*\[[^\]]*\]\s*=/)
+    expect(src.match(/const rules = \[/g)?.length).toBe(1)
+  })
   it('parsed the no-secrets rules', () => expect(rules.length).toBeGreaterThanOrEqual(5))
   it('every validator pattern is classified (new pattern => fail until classified)', () => {
     expect(SECRET_VALUE_PATTERNS.map((p) => p.label).sort()).toEqual([...VALIDATOR_SHARED, ...VALIDATOR_ONLY].sort())
