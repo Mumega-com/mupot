@@ -64,7 +64,7 @@ describe('the full /mcp tools/list response includes them', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { tools: Array<{ name: string; annotations?: Record<string, unknown> }> } }
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select').length)
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request').length)
     for (const t of body.result.tools) {
       expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
       expect(Object.keys(t.annotations ?? {}).sort(), t.name).toEqual(['destructiveHint', 'openWorldHint', 'readOnlyHint'])

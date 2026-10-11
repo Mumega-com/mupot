@@ -215,6 +215,7 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { approveUrl, accessApproveEnabled } from '../access/config'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -5905,6 +5906,9 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
+      // Present only when the Access approve page is enabled: the link a human opens to decide. This tool
+      // decides nothing.
+      ...(approveUrl(env, 'elevation', result.request.id) ? { approve_url: approveUrl(env, 'elevation', result.request.id) } : {}),
     })
   },
 }
@@ -7006,8 +7010,13 @@ const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 // tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
 // drift from the others.
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL'>): ToolSpec[] {
-  return seatAutoEnrollEnabled(env) ? TOOLS : TOOLS.filter((t) => !SEAT_FLAG_TOOLS.has(t.name))
+// Access approve page (ACCESS_APPROVE_ENABLED): seed_attach_request is not advertised while the page is not usable.
+const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED'>): ToolSpec[] {
+  const seat = seatAutoEnrollEnabled(env)
+  const access = accessApproveEnabled(env)
+  if (seat && access) return TOOLS
+  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {

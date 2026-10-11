@@ -1608,7 +1608,7 @@ export class AmbiguousUserEmailError extends Error {
  * throws AmbiguousUserEmailError on more than one — see that class's doc
  * comment for why an ORDER BY + LIMIT 1 pick is exactly the bug this closes.
  */
-async function findUserByEmail(env: Env, email: string | null): Promise<{ id: string; role: OrgRole } | null> {
+export async function findUserByEmail(env: Env, email: string | null): Promise<{ id: string; role: OrgRole } | null> {
   const normEmail = email ? email.trim().toLowerCase() : null
   if (!normEmail) return null
   // lower(email) — NOT a plain `email = ?1` — because `users.email`'s UNIQUE constraint

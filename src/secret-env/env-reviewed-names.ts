@@ -14,6 +14,12 @@
 // from the refusal set on purpose, never by omission.
 
 export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
+  'ACCESS_APPROVE_ENABLED',
+  'ACCESS_AUD',
+  'ACCESS_CANONICAL_HOST',
+  'ACCESS_MAX_JWT_AGE_SECONDS',
+  'ACCESS_REQUIRED_AMR',
+  'ACCESS_TEAM_DOMAIN',
   'AGENT',
   'AGENT_COMMIT_EMAIL_DOMAIN',
   'AI',

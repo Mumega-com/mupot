@@ -82,6 +82,8 @@ import { platformApp } from './platform/routes'
 import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
+import { approveApp } from './access/routes'
+import { approvalHostGate } from './access/host-gate'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -255,6 +257,12 @@ app.route('/', platformApp)
 // mounted before the dashboard '/' catch-all like every other public prefix.
 app.route('/invite', inviteApp)
 
+// Human-verified approval page behind Cloudflare Access (docs/architecture/access-approve-page.md).
+// Feature-flagged OFF: every /approve/* path answers 404 unless ACCESS_APPROVE_ENABLED. Before the
+// dashboard '/' catch-all so it is never shadowed.
+app.route('/approve', approveApp)
+const approvalHostApp = new Hono<{ Bindings: Env }>().route('/approve', approveApp)
+
 app.route(ROUTES.dashboard, dashboardApp)
 
 // ── OAuthProvider wrapper (S-MUPOT-OAUTH) ────────────────────────────────────
@@ -358,6 +366,14 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
+    // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
+    // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
+    const gated = approvalHostGate(req, env)
+    // On the approval host, /approve/* goes straight to the approve app: no tenant routing, hostname dispatch or
+    // any other handler runs, so nothing on this host can forward the Access cookie into a user Worker.
+    if (gated === 'approve') return approvalHostApp.fetch(req, env, ctx)
+    if (gated) return gated
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
     //
     // PATH IS THE TENANT ADDRESS: `mupot.mumega.com/t/{tenant}/{interface}`, e.g. `/t/gaf/mcp`.

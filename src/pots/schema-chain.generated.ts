@@ -3737,9 +3737,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
     objects: [],
   },
+  {
+    file: "0211_seed_attach_requests.sql",
+    sha256: "d76f66ea37262bf3b14b3c7f23f3b7b3a591d9d2e148648b1ad41cf1285d7bef",
+    statements: [
+      "-- 0211_seed_attach_requests.sql — pending, single-use, expiring request to apply a mupot.seed/v1,\n-- created by an agent (MCP seed_attach_request) and decided ONLY by a human on the Access-protected\n-- approve page (docs/architecture/access-approve-page.md). Additive.\n--\n-- Stores the CANONICAL seed form + its digest + the keyed request list (what the human is shown), never\n-- the raw source. Approval re-validates canonical_json and refuses unless the digest and every request\n-- key still match, then applies through the existing applySeed. The request is consumed by ONE guarded\n-- UPDATE ... WHERE status = 'pending' AND expires_at > now (replay and cross-tab safe).\n-- status: pending -> applying -> applied | failed ; pending -> denied ; pending -> expired (written lazily\n-- when the same requester files the same seed again; a pending row past expiry is never claimable either way).\n-- At most ONE pending row per (tenant, requester, seed digest): a partial UNIQUE index, so two concurrent\n-- filings of the same seed collapse to one request instead of racing past a read-then-insert check.\nCREATE TABLE IF NOT EXISTS seed_attach_requests (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  requester_member_id TEXT NOT NULL,\n  requester_agent_id TEXT,\n  seed_sha256 TEXT NOT NULL CHECK (\n    length(seed_sha256) = 64 AND seed_sha256 = lower(seed_sha256) AND seed_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  canonical_json TEXT NOT NULL CHECK (json_valid(canonical_json)),\n  requests_json TEXT NOT NULL CHECK (json_valid(requests_json)),\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applying', 'applied', 'denied', 'failed', 'expired')),\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  decided_at TEXT,\n  decided_by_member_id TEXT,\n  decided_via TEXT CHECK (decided_via IS NULL OR decided_via IN ('access_passkey')),\n  decision_error TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_seed_attach_requests_requester\n  ON seed_attach_requests(tenant, requester_member_id, status, expires_at);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_seed_attach_requests_pending_identity\n  ON seed_attach_requests(tenant, requester_member_id, seed_sha256)\n  WHERE status = 'pending';",
+    ],
+    objects: [
+      { type: "table", name: "seed_attach_requests" },
+      { type: "index", name: "idx_seed_attach_requests_requester" },
+      { type: "index", name: "uq_seed_attach_requests_pending_identity" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "9a1dab70cc8e7e613b4179da084ffd27d47649dfd5439f242eafc108eba6b8f5"
+export const SCHEMA_CHAIN_DIGEST: string = "daf9c278de6e978a2af9d210d916fd2da30d1a20f516c0764bd89b4ce04c13e8"

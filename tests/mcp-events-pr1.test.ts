@@ -193,8 +193,8 @@ describe('flag-off / legacy surface is byte-identical to main', () => {
   })
 
   it('tools/list tool NAMES are unchanged, flag off and on (derived from the registry, not a frozen body)', async () => {
-    // SEAT_AUTO_ENROLL is unset in this env: flag-gated seat_select (mupot#1794) is not advertised.
-    const expected = TOOLS.filter((t) => t.name !== 'seat_select').map((t) => t.name)
+    // SEAT_AUTO_ENROLL / ACCESS_APPROVE_ENABLED are unset in this env: flag-gated seat_select (mupot#1794) and seed_attach_request are not advertised.
+    const expected = TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request').map((t) => t.name)
     for (const flag of [undefined, 'true']) {
       const { text } = await rawRpc('tools/list', undefined, { events: flag })
       const names = (parse(text).result?.tools as { name: string }[]).map((t) => t.name)
