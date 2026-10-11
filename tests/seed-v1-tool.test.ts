@@ -24,8 +24,13 @@ function makeDb() {
     INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('proj-vis', 'squad-a', 'read');
     INSERT INTO projects (id, slug, name, goal) VALUES ('proj-hidden', 'hidden-one', 'Hidden', 'secret goal');
   `)
-  const count = (table: string) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n
-  return { env: { DB: harness.db, TENANT_SLUG: TENANT } as Env, count, harness }
+  const count = (table: string) => (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n
+  // Whole-database snapshot: every table's row count, so a write anywhere is seen.
+  const snapshot = () => JSON.stringify(
+    (harness.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>)
+      .map((t) => [t.name, count(t.name)]),
+  )
+  return { env: { DB: harness.db, TENANT_SLUG: TENANT } as Env, count, harness, snapshot }
 }
 
 function grant(capability: CapabilityGrant['capability'], scope_type = 'org', scope_id: string | null = null): CapabilityGrant {
@@ -49,7 +54,7 @@ describe('seed_attach registration', () => {
   it('an observer is refused at the capability floor', async () => {
     const { env } = makeDb()
     const r = await call(env, observer, { seed: seedText })
-    expect(r.ok).toBe(false)
+    expect(r).toMatchObject({ ok: false, status: 403, error: 'forbidden' })
   })
 })
 
@@ -68,11 +73,7 @@ describe('seed_attach dry run', () => {
   })
 
   it('explicit dry_run:true writes nothing at the whole-database level', async () => {
-    const { env, harness } = makeDb()
-    const snapshot = () => JSON.stringify(
-      (harness.sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>)
-        .map((t) => [t.name, (harness.sqlite.prepare(`SELECT COUNT(*) AS n FROM "${t.name}"`).get() as { n: number }).n]),
-    )
+    const { env, snapshot } = makeDb()
     const before = snapshot()
     expect((await call(env, orgAdmin, { seed: seedText, dry_run: true })).ok).toBe(true)
     expect(snapshot()).toBe(before)
@@ -109,10 +110,10 @@ describe('seed_attach dry run', () => {
 
 describe('seed_attach apply is not built', () => {
   it('dry_run:false returns 501 seed_apply_not_built and writes nothing', async () => {
-    const { env, count } = makeDb()
-    const before = ['projects', 'squads', 'agents'].map(count)
+    const { env, snapshot } = makeDb()
+    const before = snapshot()
     const r = await call(env, orgAdmin, { seed: seedText, dry_run: false })
     expect(r).toMatchObject({ ok: false, status: 501, error: 'seed_apply_not_built' })
-    expect(['projects', 'squads', 'agents'].map(count)).toEqual(before)
+    expect(snapshot()).toBe(before)
   })
 })

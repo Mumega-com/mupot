@@ -10,7 +10,7 @@ Status: contract + validator + `seed_attach` dry run. Applying a seed is a later
 ## Document shape
 
 YAML or JSON (JSON is valid YAML). Max 32 KiB, nesting depth at most 6, no YAML anchors or
-aliases, no duplicate keys, **unknown keys are refused**.
+aliases (both refused), no duplicate keys, **unknown keys are refused**.
 
 | Key | Required | Notes |
 |---|---|---|
@@ -24,9 +24,29 @@ aliases, no duplicate keys, **unknown keys are refused**.
 | `surfaces[]` | no | `{path` or `type, mode}`; `mode` is `propose` or `direct` |
 | `data[]` | no | `{store, tier}`; tier is `private`, `squad`, `project`, `role`, `entity` or `public` |
 | `tools[]` | no | `{mcp` or `openapi, cred_slot?}`; `cred_slot` is a slot NAME |
-| `wants` | no | `{memory[], gates[{action,gate}], routines[{id,cron,approval}], seats{squad,max}}` |
+| `wants` | no | `{memory[], gates[{action,gate}], routines[{id,cron,approval}], seats{squad,max,capability?}}` |
 | `signals` | no | `{health[], outcome[]}` |
 | `risk` | no | `{class, forbidden[], human_only[], allow_direct[]}`; class is `low`, `medium` or `high` |
+
+## Enums and limits
+
+Pinned to the validator by `tests/seed-v1-doc.test.ts`: change one side and the test fails.
+
+| Field | Allowed values / limit |
+|---|---|
+| `wants.seats.capability` | `observer`, `member` (default `member`; anything higher is refused) |
+| `wants.routines[].approval` | `human_accept`, `per_run` (default `human_accept`) |
+| `wants.seats.max` | integer 1 to 8 |
+| List length | at most 50 entries per list |
+| `name` | at most 120 characters |
+| `goal` | at most 1000 characters |
+| `repo`, `live`, `deploy.cmd` | at most 300 characters each |
+| `wants.routines[].cron` | five space-separated fields, at most 100 characters |
+| `wants.seats.squad` | a kebab-case slug |
+| Any text value | no control characters |
+
+Defaults are materialized and empty optional containers are omitted before hashing, so
+`capability: member` equals no capability, and `wants: {}` or `memory: []` equals no key.
 
 ## Rules the validator enforces
 
@@ -48,7 +68,8 @@ aliases, no duplicate keys, **unknown keys are refused**.
    `true`.
 7. **Seats are capped.** `wants.seats.max` is an integer from 1 to 8, and a seat may not ask
    for a capability above `member`. `surfaces[].mode: direct` is refused unless that path or
-   type is listed in `risk.allow_direct`.
+   type is listed in `risk.allow_direct`. An `allow_direct` entry is compared as an exact string
+   against both `path` and `type` values, so one entry opens whichever surface carries that string.
 
 ## The tool
 
@@ -93,3 +114,22 @@ Both examples are test fixtures: CI validates them (`tests/seed-v1-validate.test
 
 `src/seeds/contract.ts` (types, enums, caps), `src/seeds/validate.ts` (validator and request
 list), `src/seeds/canonical.ts` (canonical JSON and digest), `src/mcp/seed.ts` (tool).
+
+## Mutation checks
+
+Each test below was written to fail when the named mutation is applied to the code:
+
+- Drop the secret-key scan or the value patterns: the `secret_in_seed` tests fail.
+- Echo the offending value in a refusal: the no-echo test fails.
+- Allow YAML aliases or anchors (raise `maxAliasCount`, drop the anchor visit): the alias and anchor tests fail.
+- Let `deploy.human_only` be anything but literal `true`: the deploy tests fail.
+- Skip the `risk.allow_direct` check on a `direct` surface: the direct tests fail.
+- Raise the seat cap or accept a capability above `member`: the seat tests fail.
+- Stop omitting empty containers or stop materializing defaults: the digest-equivalence tests fail.
+- Make the digest ignore a semantic change: the digest-difference tests fail.
+- Count `/` as opaque-string material again: the ordinary-path test fails.
+- Drop a secret-shaped value check for opaque tokens: the 40-character token test fails.
+- Change a documented enum or cap in only one place: `tests/seed-v1-doc.test.ts` fails.
+- Let `seed_attach` write on a dry run, or apply on `dry_run: false`: the whole-database snapshot tests fail.
+- Lower the tool floor below `member`: the observer test (403 forbidden) fails.
+- Change how `allow_direct` matches `path` and `type`: the allow_direct matching test fails.

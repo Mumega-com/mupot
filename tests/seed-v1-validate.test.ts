@@ -182,3 +182,65 @@ describe('rule 7: seats are capped and never above member', () => {
   })
   it('capability member passes', async () => expect((await validateSeed(seats('    max: 1\n    capability: member\n'))).ok).toBe(true))
 })
+
+describe('anchors and aliases are both refused (doc: "no YAML anchors or aliases")', () => {
+  it('an anchor alone is refused', async () => {
+    expect((await refused(`${BASE}\nrepo: &a x\n`)).code).toBe('seed_unparseable')
+  })
+  it('an alias is refused', async () => {
+    expect((await refused(`${BASE}\nrepo: &a x\nlive: *a\n`)).code).toBe('seed_unparseable')
+  })
+})
+
+describe('digest is stable across equivalent seeds and moves on semantic change', () => {
+  const digest = async (extra: string) => {
+    const r = await validateSeed(`${BASE}${extra}`)
+    if (!r.ok) throw new Error(`refused: ${r.error.code} ${r.error.path}`)
+    return r.seedSha256
+  }
+  const seats = (cap: string) => `\nwants:\n  seats:\n    squad: web\n    max: 2\n${cap}`
+  it('explicit capability member equals omitted', async () => {
+    expect(await digest(seats('    capability: member\n'))).toBe(await digest(seats('')))
+  })
+  it('observer differs from member', async () => {
+    expect(await digest(seats('    capability: observer\n'))).not.toBe(await digest(seats('')))
+  })
+  it('wants: {} equals no wants; signals: {} equals no signals', async () => {
+    expect(await digest('\nwants: {}\n')).toBe(await digest(''))
+    expect(await digest('\nsignals: {}\n')).toBe(await digest(''))
+  })
+  it('empty lists equal omitted lists', async () => {
+    expect(await digest('\nwants:\n  memory: []\n  gates: []\nsurfaces: []\ndata: []\ntools: []\nsignals:\n  health: []\n')).toBe(await digest(''))
+    expect(await digest('\nrisk:\n  class: low\n  forbidden: []\n')).toBe(await digest('\nrisk:\n  class: low\n'))
+  })
+  const routine = (approval: string) => `\nwants:\n  routines:\n    - id: r\n      cron: "0 9 * * 1"\n${approval}`
+  it('routine approval default human_accept equals explicit; per_run differs', async () => {
+    expect(await digest(routine(''))).toBe(await digest(routine('      approval: human_accept\n')))
+    expect(await digest(routine('      approval: per_run\n'))).not.toBe(await digest(routine('')))
+  })
+  it('any semantic change moves the digest', async () => {
+    expect(await digest('\nrepo: a\n')).not.toBe(await digest('\nrepo: b\n'))
+    expect(await digest('\nwants:\n  memory: [project]\n')).not.toBe(await digest(''))
+  })
+})
+
+describe('opaque-string rule does not refuse ordinary paths', () => {
+  it('a long slashy path validates', async () => {
+    const r = await validateSeed(`${BASE}\nsurfaces:\n  - path: src/content/en/blog/posts2026/drafts/archive\n    mode: propose\n`)
+    expect(r.ok).toBe(true)
+  })
+  it('a 40-char opaque token is still refused', async () => {
+    expect((await refused(`${BASE}\nrepo: "x/a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8s9T0u1"\n`)).code).toBe('secret_in_seed')
+  })
+})
+
+describe('allow_direct entries match both path and type', () => {
+  it('an entry equal to a type value opens a direct type surface', async () => {
+    const r = await validateSeed(`${BASE}\nsurfaces:\n  - type: wp.media\n    mode: direct\nrisk:\n  class: low\n  allow_direct: [wp.media]\n`)
+    expect(r.ok).toBe(true)
+  })
+  it('an entry equal to a path value opens a direct path surface', async () => {
+    const r = await validateSeed(`${BASE}\nsurfaces:\n  - path: wp.media\n    mode: direct\nrisk:\n  class: low\n  allow_direct: [wp.media]\n`)
+    expect(r.ok).toBe(true)
+  })
+})

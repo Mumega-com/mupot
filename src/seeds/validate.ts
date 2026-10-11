@@ -2,10 +2,10 @@
 // Validation grants NOTHING — it parses, refuses, canonicalises and lists the
 // requests the seed makes. Strict by construction: unknown keys are refused.
 
-import { parse as parseYaml } from 'yaml'
+import { isAlias, parseDocument, visit } from 'yaml'
 import {
   CRED_SLOT_RE, SEED_DATA_TIERS, SEED_DEPLOY_VIA, SEED_KINDS, SEED_MAX_BYTES, SEED_MAX_DEPTH,
-  SEED_MAX_LIST, SEED_MAX_SEATS, SEED_RISK_CLASSES, SEED_ROUTINE_APPROVALS, SEED_SCHEMA,
+  SEED_CAPS, SEED_MAX_LIST, SEED_MAX_SEATS, SEED_RISK_CLASSES, SEED_ROUTINE_APPROVALS, SEED_SCHEMA,
   SEED_SEAT_CAPABILITIES, SEED_SLUG_RE, SEED_SURFACE_MODES,
   type SeedError, type SeedErrorCode, type SeedRequest, type SeedV1, type SeedValidation,
 } from './contract'
@@ -36,7 +36,8 @@ const SECRET_VALUE_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
   { label: 'URL with embedded credentials', re: /[a-z][a-z0-9+.-]*:\/\/[^\s/@]+:[^\s/@]*@/i },
 ]
 // Long unbroken base64/hex-ish run containing both a digit and a letter.
-const OPAQUE_RUN_RE = /(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/])/g
+// `/` is deliberately NOT in the class: ordinary paths (src/content/en/blog/...) are long and slashy.
+const OPAQUE_RUN_RE = /(?<![A-Za-z0-9+])[A-Za-z0-9+]{40,}={0,2}(?![A-Za-z0-9+])/g
 
 function looksSecret(value: string): string | null {
   for (const { label, re } of SECRET_VALUE_PATTERNS) if (re.test(value)) return label
@@ -111,7 +112,7 @@ function textList(value: unknown, path: string, max = 200): string[] | undefined
 }
 
 function httpsUrl(value: unknown, path: string): string | undefined {
-  const raw = text(value, path, 300, false)
+  const raw = text(value, path, SEED_CAPS.live, false)
   if (raw === undefined) return undefined
   let url: URL
   try { url = new URL(raw) } catch { return refuse('invalid_field', path, 'expected an https URL') }
@@ -127,11 +128,11 @@ function validateStructure(root: Rec): SeedV1 {
   const slug = text(root.slug, 'slug', 63) as string
   if (!SEED_SLUG_RE.test(slug)) refuse('invalid_field', 'slug', 'expected kebab-case [a-z0-9-], at most 63 characters')
   seed.slug = slug
-  seed.name = text(root.name, 'name', 120)
+  seed.name = text(root.name, 'name', SEED_CAPS.name)
   seed.kind = oneOf(root.kind, 'kind', SEED_KINDS)
-  seed.goal = text(root.goal, 'goal', 1000)
+  seed.goal = text(root.goal, 'goal', SEED_CAPS.goal)
   seed.owner = text(root.owner, 'owner', 120) // a label only; never resolved to a member here
-  const repo = text(root.repo, 'repo', 300, false)
+  const repo = text(root.repo, 'repo', SEED_CAPS.repo, false)
   if (repo !== undefined) seed.repo = repo
   const live = httpsUrl(root.live, 'live')
   if (live !== undefined) seed.live = live
@@ -140,7 +141,7 @@ function validateStructure(root: Rec): SeedV1 {
     const d = asRecord(root.deploy, 'deploy', ['via', 'cmd', 'receipt', 'human_only'])
     if (d.human_only !== true) refuse('deploy_not_human_only', 'deploy.human_only', 'deploy.human_only must be literally true')
     const out: Rec = { via: oneOf(d.via, 'deploy.via', SEED_DEPLOY_VIA), human_only: true }
-    const cmd = text(d.cmd, 'deploy.cmd', 300, false)
+    const cmd = text(d.cmd, 'deploy.cmd', SEED_CAPS.cmd, false)
     if (cmd !== undefined) out.cmd = cmd
     const receipt = text(d.receipt, 'deploy.receipt', 300, false)
     if (receipt !== undefined) out.receipt = receipt
@@ -153,13 +154,13 @@ function validateStructure(root: Rec): SeedV1 {
     const out: Rec = { class: oneOf(risk.class, 'risk.class', SEED_RISK_CLASSES) }
     for (const key of ['forbidden', 'human_only', 'allow_direct'] as const) {
       const v = textList(risk[key], `risk.${key}`)
-      if (v) out[key] = v
+      if (v && v.length > 0) out[key] = v
     }
     seed.risk = out
   }
 
   if (root.surfaces !== undefined) {
-    seed.surfaces = list(root.surfaces, 'surfaces').map((raw, i) => {
+    const surfaces = list(root.surfaces, 'surfaces').map((raw, i) => {
       const p = `surfaces[${i}]`
       const s = asRecord(raw, p, ['path', 'type', 'mode'])
       if ((s.path === undefined) === (s.type === undefined)) refuse('invalid_field', p, 'exactly one of path or type is required')
@@ -173,17 +174,19 @@ function validateStructure(root: Rec): SeedV1 {
       }
       return out
     })
+    if (surfaces.length > 0) seed.surfaces = surfaces
   }
 
   if (root.data !== undefined) {
-    seed.data = list(root.data, 'data').map((raw, i) => {
+    const data = list(root.data, 'data').map((raw, i) => {
       const d = asRecord(raw, `data[${i}]`, ['store', 'tier'])
       return { store: text(d.store, `data[${i}].store`, 200), tier: oneOf(d.tier, `data[${i}].tier`, SEED_DATA_TIERS) }
     })
+    if (data.length > 0) seed.data = data
   }
 
   if (root.tools !== undefined) {
-    seed.tools = list(root.tools, 'tools').map((raw, i) => {
+    const tools = list(root.tools, 'tools').map((raw, i) => {
       const p = `tools[${i}]`
       const t = asRecord(raw, p, ['mcp', 'openapi', 'cred_slot'])
       if ((t.mcp === undefined) === (t.openapi === undefined)) refuse('invalid_field', p, 'exactly one of mcp or openapi is required')
@@ -199,27 +202,30 @@ function validateStructure(root: Rec): SeedV1 {
       }
       return out
     })
+    if (tools.length > 0) seed.tools = tools
   }
 
   if (root.wants !== undefined) {
     const w = asRecord(root.wants, 'wants', ['memory', 'gates', 'routines', 'seats'])
     const out: Rec = {}
     const memory = textList(w.memory, 'wants.memory')
-    if (memory) out.memory = memory
+    if (memory && memory.length > 0) out.memory = memory
     if (w.gates !== undefined) {
-      out.gates = list(w.gates, 'wants.gates').map((raw, i) => {
+      const gates = list(w.gates, 'wants.gates').map((raw, i) => {
         const g = asRecord(raw, `wants.gates[${i}]`, ['action', 'gate'])
         return { action: text(g.action, `wants.gates[${i}].action`, 120), gate: text(g.gate, `wants.gates[${i}].gate`, 120) }
       })
+      if (gates.length > 0) out.gates = gates
     }
     if (w.routines !== undefined) {
-      out.routines = list(w.routines, 'wants.routines').map((raw, i) => {
+      const routines = list(w.routines, 'wants.routines').map((raw, i) => {
         const p = `wants.routines[${i}]`
         const r = asRecord(raw, p, ['id', 'cron', 'approval'])
-        const cron = text(r.cron, `${p}.cron`, 100) as string
+        const cron = text(r.cron, `${p}.cron`, SEED_CAPS.cron) as string
         if (!/^\S+(?: \S+){4}$/.test(cron) || !/^[0-9A-Za-z*/,\-? ]+$/.test(cron)) refuse('invalid_field', `${p}.cron`, 'expected a five-field cron expression')
-        return { id: text(r.id, `${p}.id`, 120), cron, approval: oneOf(r.approval, `${p}.approval`, SEED_ROUTINE_APPROVALS) }
+        return { id: text(r.id, `${p}.id`, 120), cron, approval: r.approval === undefined ? 'human_accept' : oneOf(r.approval, `${p}.approval`, SEED_ROUTINE_APPROVALS) } // default materialized: digest stable
       })
+      if (routines.length > 0) out.routines = routines
     }
     if (w.seats !== undefined) {
       const s = asRecord(w.seats, 'wants.seats', ['squad', 'max', 'capability'])
@@ -232,11 +238,10 @@ function validateStructure(root: Rec): SeedV1 {
       if (s.max > SEED_MAX_SEATS) refuse('seat_cap_exceeded', 'wants.seats.max', `at most ${SEED_MAX_SEATS} seats`)
       const squad = text(s.squad, 'wants.seats.squad', 63) as string
       if (!SEED_SLUG_RE.test(squad)) refuse('invalid_field', 'wants.seats.squad', 'expected a kebab-case squad slug')
-      const seats: Rec = { squad, max: s.max }
-      if (s.capability !== undefined) seats.capability = s.capability
-      out.seats = seats
+      // Default materialized so `capability: member` and an omitted capability share one digest.
+      out.seats = { squad, max: s.max, capability: s.capability ?? 'member' }
     }
-    seed.wants = out
+    if (Object.keys(out).length > 0) seed.wants = out
   }
 
   if (root.signals !== undefined) {
@@ -244,9 +249,9 @@ function validateStructure(root: Rec): SeedV1 {
     const out: Rec = {}
     const health = textList(s.health, 'signals.health')
     const outcome = textList(s.outcome, 'signals.outcome')
-    if (health) out.health = health
-    if (outcome) out.outcome = outcome
-    seed.signals = out
+    if (health && health.length > 0) out.health = health
+    if (outcome && outcome.length > 0) out.outcome = outcome
+    if (Object.keys(out).length > 0) seed.signals = out
   }
 
   return seed as unknown as SeedV1 // as: every field above was checked or built by a validator in this function
@@ -287,9 +292,16 @@ export async function validateSeed(source: unknown): Promise<SeedValidation> {
     if (new TextEncoder().encode(source).length > SEED_MAX_BYTES) refuse('seed_too_large', '(root)', `seed exceeds ${SEED_MAX_BYTES} bytes`)
     let parsed: unknown
     try {
-      // maxAliasCount 0: no anchors/aliases (expansion attacks); duplicate keys are an error by default.
-      parsed = parseYaml(source, { maxAliasCount: 0, schema: 'core' })
+      // Anchors and aliases are both refused below (alias expansion attacks); an alias needs an anchor;
+      // duplicate keys are an error by default.
+      const doc = parseDocument(source, { schema: 'core' })
+      if (doc.errors.length > 0) throw doc.errors[0]
+      let anchored = false
+      visit(doc, { Node(_key, node) { if (isAlias(node) || ('anchor' in node && node.anchor)) anchored = true } })
+      if (anchored) return refuse('seed_unparseable', '(root)', 'YAML anchors and aliases are not allowed')
+      parsed = doc.toJS({ maxAliasCount: 0 })
     } catch (err) {
+      if (err instanceof SeedFail) throw err
       return refuse('seed_unparseable', '(root)', err instanceof Error ? err.message.split('\n')[0].slice(0, 200) : 'parse error')
     }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) refuse('seed_not_object', '(root)', 'seed must be a mapping')
