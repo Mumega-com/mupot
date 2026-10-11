@@ -33,10 +33,16 @@ Org owner or admin only (`isOrgOwnerAdmin(auth)`) — never a plain member, neve
      request is ordinary and untouched by this path.
 3. On `reversalKind !== 'none'` (the `reversalKind !== 'none'` branch of `toolTaskUpdate` in `src/mcp/index.ts` / the PATCH handler in `src/tasks/index.ts`):
    `isOrgOwnerAdmin(auth)` gate, mandatory non-empty reversal reason, then
-   `reverseTaskVerdict` (`src/tasks/service.ts:585`, shared by both write surfaces) —
+   `reverseTaskVerdict` (`src/tasks/service.ts`, shared by both write surfaces) —
    called from `toolTaskUpdate` (`src/mcp/index.ts`) and the PATCH handler (`src/tasks/index.ts`).
 4. `reverseTaskVerdict` runs three steps, **in this order, non-negotiably**:
-   1. `markVerdictReversed` — stamps `task_verdicts.reversed_at` on the latest verdict row.
+   1. `markVerdictReversed` — stamps `task_verdicts.reversed_at` on the exact latest
+      verdict row selected for this request. Its write requires that same ID, task ID,
+      unreversed state, and current-latest position; a retry whose selected verdict is
+      already reversed never stamps another verdict and completes any remaining guarded
+      task-update or receipt step. It never reverses an older
+      rejected/reworked verdict. A fresh selection that loses latest ownership stops before
+      its task or receipt write; a retry with stale selection refuses its receipt.
       This is the gate-closing write: `executeRoutineAction`'s `resolveProposalVerdict`
       filters on `reversed_at IS NULL`, so once this lands a routine can never replay a
       grant off this verdict again, regardless of what happens next.
@@ -52,6 +58,13 @@ Org owner or admin only (`isOrgOwnerAdmin(auth)`) — never a plain member, neve
 A non-empty `reversal_reason` (or `reason`) is mandatory; missing it is
 `400 verdict_reversal_reason_required`. There is no agent-authority path here at all —
 unlike `task_verdict`'s `human_origin` fallback, reversal has no non-human branch.
+
+## Rework is not reversal
+
+A normal rejected task is reworked through `rejected → in_progress → review`, with a
+new submission and a new verdict. The earlier rejection remains history; it is not
+reversed merely because later work earns approval. Reversal is reserved for undoing a
+mistaken approved or rejected decision.
 
 ## Receipt(s) written
 
