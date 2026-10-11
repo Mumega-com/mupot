@@ -38,7 +38,7 @@ normal gate, re-freeze, and restart step 5.
 
 ## Evidence hygiene — read before building the aggregate bundle
 
-`/home/mumega/.fleet/receipts/mumega-vps-codex-attach/` contains two receipts dated
+the host-side receipts directory for the Codex attach contains two receipts dated
 2026-08-30, **both `status: "fail"` with `release_sha: null`**. It is the only Host-Go-shaped
 bundle on the host, and it has neither `manifest.json` nor `cutover-gate.json`.
 
