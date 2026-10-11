@@ -2,6 +2,13 @@
 
 ## [Unreleased] — main since v0.31.0
 
+> **Re-scope (2026-10-11):** `v0.32.0` is now "Agents as themselves and governed
+> autonomy": per-seat agent identity for Claude Code, Codex, and ChatGPT threads, plus
+> the loop brakes, with P0 #1565 and admin-tool disclosure (#1596, #1608, #1609) closed
+> before the cut. "Compounding Project Knowledge" moves to `v0.33.0` and "Distribution
+> and Commercial Operations" to `v0.34.0`. `v0.31.1` was never a path (`release/v0.31.0`
+> was not cut). See [ROADMAP.md](ROADMAP.md) for the release contract.
+
 - **task_get** (`kasra/task-get-read-tool`) - new member-tier MCP read tool
   `task_get { task_id }`: one task row plus its latest `task_verdicts` row and latest
   dispatch receipt (id + derived status). Row gate is `canReadTask` from the shared

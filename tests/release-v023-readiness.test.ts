@@ -121,9 +121,10 @@ describe('v0.23.0 Trusted Runtime release gate', () => {
     // 2026-09-26: v0.30.0 was tagged from release/v0.30.0 (ROADMAP option 2), so the
     // stable-tag row now names the API version and the next candidate is a patch on
     // the release branch, never a re-cut of main. 2026-09-28: v0.31.0 "Office" follows
-    // the same pattern — release/v0.31.0 cut and frozen, tag pending at merge.
+    // the same pattern. 2026-10-11: release/v0.31.0 was never cut, so there is no v0.31.x
+    // path; the next stable candidate is v0.32.0, cut from one frozen main SHA.
     expect(roadmap).toContain(`Last tagged stable release | \`v${MUPOT_PUBLIC_API_VERSION}\``)
-    expect(roadmap).toContain('Next stable candidate | `v0.31.1`')
+    expect(roadmap).toContain('Next stable candidate | `v0.32.0`')
     // Stabilization deliberately removed broad product scope from the v0.30 contract.
     // A later roadmap change must assign a new target before implementation resumes.
     expect(roadmap).toContain(

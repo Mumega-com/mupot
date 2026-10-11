@@ -10,16 +10,16 @@ numbers.
 |---|---|---|
 | Current source version | `0.31.0` | On `main`; preview. Read the commit with `git rev-parse origin/main` — this table does not pin it. Bumped from `0.30.0` in #1604. |
 | Current production version | `0.31.0` | Last recorded deploy `d954c1ab` (2026-09-29); live `/health` reported `{"version":"0.31.0","commit":"d954c1ab951a7fe8859eed05bdbc4c38763638c0","clean":true}` at verification time and remains the authoritative source. `main` and production may already have diverged again — both move independently. |
-| Last tagged stable release | `v0.31.0` | Deployed 2026-09-29 (#1604, code first as Cloudflare version `6d1d7c6c`, migration 0181 applied immediately after — 0 identity drift, 0 generation/binding split on the post-deploy check). **The annotated git tag itself is pending**: Kasra-core cuts `release/v0.31.0` and pushes `v0.31.0` against this commit range next — no tag object exists as of this commit, so read the tag, not a SHA copied in here, once it lands. Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). |
-| Next stable candidate | `v0.31.1` | P0 cherry-picks onto `release/v0.31.0` only, once cut — never a re-cut from wherever `main` happens to be. |
-| Future development target | `v0.32.0` | "Compounding Project Knowledge." The receiver/governed-push/Agent-Computers capability-ledger rows further down are still labelled `v0.31.0`; that predates this release and has not been reconciled to a real target — Kasra-core's/Hadi's call, not decided in this document. |
+| Last tagged stable release | `v0.31.0` | "Office", annotated tag at `52299bab` (tagged 2026-09-29) with a GitHub Release of the same name; deployed 2026-09-29 (#1604, migration 0181 applied immediately after). Prior tag: `v0.30.0` (2026-09-26, `release/v0.30.0` at `09ea48f6`). Read the tag, not a SHA copied here. |
+| Next stable candidate | `v0.32.0` | "Agents as themselves and governed autonomy" — cut from a single frozen `main` SHA onto `release/v0.32.0`, per the release contract in the v0.32.0 section below. `release/v0.31.0` was never cut, so there is no `v0.31.x` patch path; `main` has moved far past the tag. |
+| Following targets | `v0.33.0`, `v0.34.0` | `v0.33.0` "Compounding Project Knowledge" (plus the receiver/runner, runtime-receipt, and Agent Computers scope formerly labelled `v0.31.0`); `v0.34.0` "Distribution and Commercial Operations". `v1.0.0` is unchanged. |
 
-`0.31.0` is the version the source reports as of this commit, and (as of 2026-09-29) the
-version live in production too — the source version string and the deployed version
-agree for the first time since `v0.30.0`. `v0.30.0` remains the only version with a real
-git tag and release branch (`release/v0.30.0` at `09ea48f6`, 2026-09-26) until
-`v0.31.0`'s annotated tag is cut. `main` continues past `d954c1ab` as preview; nothing on
-`main` after it is covered by whatever evidence bundle the `v0.31.0` tag ends up bound to.
+`0.31.0` is the version the source reports and the version last deployed; it is also the
+latest tag (`v0.31.0`, annotated, with a GitHub Release). `main` is far past the tag: read
+`git rev-list --count v0.31.0..origin/main` for the distance. Nothing on `main` after the
+tag is covered by the `v0.31.0` evidence bundle. Work shipped to `main` since the tag
+(migrations 0182 onward) is summarized under "On main since v0.31.0" below and recorded in
+[CHANGELOG.md](CHANGELOG.md) `[Unreleased]`.
 
 ## Shipped — v0.31.0 "Office" (2026-09-29)
 
@@ -46,6 +46,28 @@ is now the tag for the Office scope above instead. The capability ledger's
 four `v0.31.0` rows further down name a version that has already shipped
 different work; reassigning them to their real target is Kasra-core's and
 Hadi's call, not made in this document.
+
+### On main since v0.31.0 (not in the tag)
+
+Merged to `main` after the tag; unreleased until `v0.32.0` is cut. Detail lives in the
+CHANGELOG; this lists what the re-scope below builds on.
+
+- Loop brakes: dry-run-default `router_tick`, execution pause, per-task retry ceiling
+  (#1807); fences at every external execution entrypoint with one release policy
+  (#1811); follow-up fixes (#1813, #1815, #1823). Audited incident recovery tool
+  `task_incident_revert` (#1805).
+- Zero-touch seat onboarding, epic #1794: harness records and `seat_select` (W1, #1795),
+  seat handles (W2, #1797), consent "Me — auto per workspace" (W3, #1801), token harness
+  credentials (W4, #1806, migration 0204), per-thread auto-seat from the client session
+  key, ChatGPT first (W5a, #1816, migration 0205), and pool-isolation fixes
+  (#1819, #1822). The seat flags ship off by default.
+- Tasks: archive is an action boundary (#1778) with follow-up guards (#1781, #1789,
+  #1793).
+- Metering: honest unmetered `flight_land` (#1737) and budget enforcement fix (#1741).
+- Harness capacity snapshots and dispatch advisory (#1766).
+- Office: write-capable connector bindings, publishing live (T2b, #1614), approval
+  bound to the shown payload (#1602), idempotent publish (#1653), `office_health` and
+  `addon_setup` (#1679).
 
 ### After v0.31.0
 
@@ -714,7 +736,7 @@ Original proposed scope (not committed to the `v0.30.0` stable contract):
 - AI visibility collection, recommendation review, approved action, and outcome receipt;
 - **guest-credential precursor:** the scoped, no-raw-secret credential path is the
   same governance family as the Operated Presence guest token (least-privilege,
-  capability-ceiling, expiry) — prove it before v0.33 Operated Presence rides the primitive.
+  capability-ceiling, expiry) — prove it before v0.34 Operated Presence rides the primitive.
 
 **Also proposed — Console consolidation.** Complete the Project pivot's navigation
 consequence under [#584](https://github.com/Mumega-com/mupot/issues/584):
@@ -788,7 +810,29 @@ Activation:
 Regardless of its future target, this scope excludes accounting, payments,
 unrestricted tool catalogs, and silent credential fallback into runtime environments.
 
-### v0.31.0: Canonical Receiver, Agent Computers, and Recovery - planned
+### v0.32.0: Agents as themselves and governed autonomy - planned
+
+**One promise:** A member's agent threads act under their own seat identities, and
+autonomous loops run inside brakes a human controls.
+
+Release contract (done-when). `v0.32.0` is stable only when all six hold:
+
+1. a member's Claude Code, Codex, and ChatGPT threads each act under their own seat
+   agent with no manual token mint;
+2. loop brakes (dry-run default, pause, per-task retry ceiling, human-only release) are
+   deployed and covered by tests;
+3. P0 #1565 is closed;
+4. admin-tool disclosure #1596, #1608, #1609 is closed;
+5. one frozen SHA has two independent review lenses GREEN, CI green, and the release
+   evidence bundle;
+6. `release/v0.32.0` is cut and the annotated tag and GitHub Release are published.
+
+Much of (1) and (2) is already on `main` (see "On main since v0.31.0"); the contract is
+met by the frozen SHA, not by the existence of those PRs.
+
+### v0.33.0 (with Compounding Project Knowledge): Canonical Receiver, Agent Computers, and Recovery - planned
+
+Re-targeted from `v0.31.0` (which shipped as "Office") on 2026-10-11. Not required by the `v0.32.0` done-when below.
 
 **One promise:** Substantial flights run through one identity-bound receiver into
 isolated, recoverable computers without making one Mac, pod, receiver, or agent harness
@@ -824,7 +868,7 @@ Activation:
   after recovery and cost gates pass.
 - `reuse` and `pinned` sessions remain opt-in.
 
-### v0.32.0: Compounding Project Knowledge - planned
+### v0.33.0: Compounding Project Knowledge - planned
 
 **One promise:** Projects improve from measured outcomes without confusing generated
 memory with evidence or allowing agents to widen their own authority.
@@ -847,7 +891,7 @@ Activation:
 - Promotion and policy changes: human approval required.
 - Automated Project prioritization: opt-in only after held-out evaluation.
 
-### v0.33.0: Distribution and Commercial Operations - planned
+### v0.34.0: Distribution and Commercial Operations - planned
 
 **One promise:** A customer can install, operate, upgrade, and commercially license a
 Mupot without Mumega performing hidden manual steps.
@@ -889,13 +933,10 @@ study. Feature count alone cannot satisfy the GA gate.
 
 ## Capability ledger
 
-**2026-09-29 note:** `v0.31.0` shipped and deployed (see "Shipped — v0.31.0
-'Office'" above) for the Office addon + auth-residuals + seat-events scope.
-The four rows below still labelled `v0.31.0` (receiver/runner, realtime
-push, runtime receipts, Agent Computers) did **not** ship in it — none of
-that work has started. They keep the `v0.31.0` label only until Kasra-core/
-Hadi assign them a real target version; read it as "not yet targeted," not
-as a claim about what the tagged `v0.31.0` contains.
+**2026-10-11 note:** `v0.31.0` shipped as "Office". The four rows formerly labelled
+`v0.31.0` (receiver/runner, realtime push, runtime receipts, Agent Computers) did not ship
+in it and are not required by the `v0.32.0` done-when (seat onboarding does not depend on
+the receiver), so they are relabelled `v0.33.0`.
 
 | Capability | Release state | Activation |
 |---|---|---|
@@ -911,15 +952,16 @@ as a claim about what the tagged `v0.31.0` contains.
 | Governed connector actions | `preview; post-v0.30 target required` | Connector and grant required |
 | Unified principals + token-scoped access | `planned; post-v0.30 target required` | Additive migration; fail-closed transition required |
 | Marketing & CRO addon | `preview; post-v0.30 target required` | Opt-in per Project |
-| Canonical Mupot-to-Codex receiver and runner | `v0.31.0` | Default-disabled until synthetic live canary passes |
-| Governed realtime push subscription | `v0.31.0` | Polling fallback retained; default-on only after soak |
-| Exact runtime consumption, ACK, and artifact receipts | `v0.31.0` | Enforced for the canonical receiver |
-| Isolated Agent Computers | `v0.31.0` | Initially opt-in |
-| Memory dreamer worker | `v0.32.0` | Proposal-only; promotion gated |
-| Reviewed knowledge and coherence evaluation | `v0.32.0` | Promotion gated |
-| Commercial installation and operations | `v0.33.0` | License/entitlement dependent |
-| Operated Presence (metered guest check-in/out) | `v0.33.0` | Owner opt-in per engagement, fail-closed, revocable |
-| Commercial tiers and support entitlements | `v0.33.0` | Payment-gated support; free = public updates only |
+| Agents as themselves and governed autonomy (seat onboarding, loop brakes) | `v0.32.0` | Seat flags default-off until the release gate; brakes dry-run by default |
+| Canonical Mupot-to-Codex receiver and runner | `v0.33.0` | Default-disabled until synthetic live canary passes |
+| Governed realtime push subscription | `v0.33.0` | Polling fallback retained; default-on only after soak |
+| Exact runtime consumption, ACK, and artifact receipts | `v0.33.0` | Enforced for the canonical receiver |
+| Isolated Agent Computers | `v0.33.0` | Initially opt-in |
+| Memory dreamer worker | `v0.33.0` | Proposal-only; promotion gated |
+| Reviewed knowledge and coherence evaluation | `v0.33.0` | Promotion gated |
+| Commercial installation and operations | `v0.34.0` | License/entitlement dependent |
+| Operated Presence (metered guest check-in/out) | `v0.34.0` | Owner opt-in per engagement, fail-closed, revocable |
+| Commercial tiers and support entitlements | `v0.34.0` | Payment-gated support; free = public updates only |
 | Governed business loop GA | `v1.0.0` | Stable supported product |
 
 ## Scope-control rules
