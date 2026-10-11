@@ -164,7 +164,9 @@ refuses after the fence, which needs a foreign project or squad to appear, or th
 - if a project does exist under a lapsed claim, only the same member with the same digest may resume,
   and the resume re-checks the same no-takeover predicate. `team_bootstrap` is called with
   `require_provenance`, so apply adopts a pre-existing project or squad only when the caller created it,
-  never on a bare earlier receipt.
+  never on a bare earlier receipt, never through the org-admin `adopt` override, and also when the row
+  appears between the lookup and the insert (the slug-taken race branches of both the project and the
+  squad, where a home squad is refused outright). A refused race leaves the claim resumable.
 
 What apply creates is **exactly**:
 
@@ -279,4 +281,4 @@ Each test below was written to fail when the named mutation is applied to the co
 - Store the raw source anywhere: the canary-comment test fails.
 - Let apply create a bot, agent, capability or gate: the whole-database footprint test fails.
 - Drop the receipt's `WHERE changes() = 1` flip guard: the claim-lost test fails. Drop its UNIQUE key: the crash-resume test fails.
-- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the lease fence, the owner recovery: the round-2 tests fail.
+- Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the future-skew bound, the single timestamp spelling, the race-branch provenance checks, the lease fence, the owner recovery: the round-2 tests fail.
