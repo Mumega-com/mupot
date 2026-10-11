@@ -6,8 +6,10 @@
 -- the raw source. Approval re-validates canonical_json and refuses unless the digest and every request
 -- key still match, then applies through the existing applySeed. The request is consumed by ONE guarded
 -- UPDATE ... WHERE status = 'pending' AND expires_at > now (replay and cross-tab safe).
--- status: pending -> applying -> applied | failed ; pending -> denied. 'expired' is derived from
--- expires_at (a pending row past expiry is never claimable), not written.
+-- status: pending -> applying -> applied | failed ; pending -> denied ; pending -> expired (written lazily
+-- when the same requester files the same seed again; a pending row past expiry is never claimable either way).
+-- At most ONE pending row per (tenant, requester, seed digest): a partial UNIQUE index, so two concurrent
+-- filings of the same seed collapse to one request instead of racing past a read-then-insert check.
 CREATE TABLE IF NOT EXISTS seed_attach_requests (
   id TEXT PRIMARY KEY,
   tenant TEXT NOT NULL,
@@ -18,7 +20,7 @@ CREATE TABLE IF NOT EXISTS seed_attach_requests (
   ),
   canonical_json TEXT NOT NULL CHECK (json_valid(canonical_json)),
   requests_json TEXT NOT NULL CHECK (json_valid(requests_json)),
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applying', 'applied', 'denied', 'failed')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applying', 'applied', 'denied', 'failed', 'expired')),
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   decided_at TEXT,
@@ -29,3 +31,7 @@ CREATE TABLE IF NOT EXISTS seed_attach_requests (
 
 CREATE INDEX IF NOT EXISTS idx_seed_attach_requests_requester
   ON seed_attach_requests(tenant, requester_member_id, status, expires_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_seed_attach_requests_pending_identity
+  ON seed_attach_requests(tenant, requester_member_id, seed_sha256)
+  WHERE status = 'pending';

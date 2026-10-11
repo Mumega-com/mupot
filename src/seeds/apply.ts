@@ -331,7 +331,7 @@ export async function applySeed(
     const evidence = JSON.stringify({
       seed_sha256: v.seedSha256, accepted_keys: [...accepted].sort(), project_slug: projectSlug,
       squad_id: squadId, seat_cap: seatCap, grants: 'none',
-      ...(attestation ? { via: attestation.via, access_request_id: attestation.requestId } : {}),
+      ...(attestation ? { via: attestation.via, access_request_id: attestation.requestId, access_sub: attestation.accessSub } : {}),
     })
     const flip = await env.DB.batch([
       env.DB.prepare(

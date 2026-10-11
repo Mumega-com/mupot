@@ -21,7 +21,7 @@ import { hasWorkspaceAdmin } from '../auth/capability'
 import { issueAcceptToken } from '../seeds/accept-token'
 import { keyRequests, applySeed, seedProjectSlug } from '../seeds/apply'
 import { createSeedRequest, SEED_REQUEST_TTL_MS } from '../access/seed-request'
-import { approveUrl } from '../access/config'
+import { approveUrl, accessApproveStatus } from '../access/config'
 import { type ToolSpec, fail, done } from './index'
 
 interface SeedDiff { field: string; current: string | null; proposed: string | null }
@@ -110,7 +110,10 @@ const toolSeedAttachRequest: ToolSpec = {
   async run(auth, env, args) {
     if (!auth.memberId) return fail(403, 'forbidden', 'a member principal is required to file a request')
     // Check the flag/config BEFORE writing anything: a request nobody can approve is noise.
-    if (approveUrl(env, 'seed', 'probe') === null) return fail(409, 'access_approve_not_enabled', 'the Access approve page is not enabled on this pot')
+    const status = accessApproveStatus(env)
+    if (status.state !== 'on') {
+      return fail(409, 'access_approve_not_enabled', status.state === 'off' ? 'the Access approve page is not enabled on this pot' : `the Access approve page is misconfigured: ${status.reason}`)
+    }
     const result = await validateSeed(args.seed)
     if (!result.ok) return fail(400, 'invalid_seed', result.error)
     const requests = await keyRequests(result.requests)

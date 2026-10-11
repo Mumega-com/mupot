@@ -2,9 +2,10 @@
 // human taps once." Contract: docs/architecture/access-approve-page.md.
 //
 // FLOW OF TRUST (every request, GET and POST, runs the whole chain):
-//   flag on -> config complete -> Host is the canonical host -> Access JWT verifies (RS256 / team JWKS /
-//   iss / exact aud / exp / iat fresh) -> the Access identity resolves to an ACTIVE HUMAN member through
-//   the existing human-identity path -> the member holds the authority the decision needs.
+//   flag on -> config complete + dedicated host (host-gate.ts already refused every other host/path) -> Host is the canonical host -> Access JWT verifies (RS256 / team JWKS /
+//   iss / exact aud / exp / iat fresh [/ amr]) -> the Access identity resolves, via an EXISTING explicit
+//   human_login_identities row (never auto-linked), to an ACTIVE HUMAN member -> the member holds the
+//   authority the decision needs -> only then is any session/row written.
 // POST adds: same-origin Origin header, and a CSRF token bound to this login. Nothing is decided over
 // MCP, Telegram or any bearer: those channels only carry the link.
 //
@@ -16,10 +17,10 @@
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Env } from '../types'
-import { accessApproveEnabled, loadAccessApproveConfig, type AccessApproveConfig } from './config'
+import { accessApproveStatus, colonyHostnames, type AccessApproveConfig } from './config'
 import { verifyAccessJwt, type AccessClaims, type AccessJwtFailure } from './jwt'
 import { issueCsrfToken, verifyCsrfToken } from './csrf'
-import { resolveApproverReadOnly, startApproverSession, type ApproverFailure } from './identity'
+import { resolveApprover, mintApproverSession, type ApproverFailure } from './identity'
 import { escapeHtml, messagePage, renderPage, untrustedBox } from './page'
 import { claimSeedRequest, denySeedRequest, finishSeedRequest, loadSeedRequest, seedRequestIsLive, type SeedRequestRow, type StoredRequest } from './seed-request'
 import { hasWorkspaceAdmin, resolveCapabilities } from '../auth/capability'
@@ -41,10 +42,13 @@ type AppEnv = { Bindings: Env; Variables: { access: Ctx } }
 export const approveApp = new Hono<AppEnv>()
 
 const VIA = 'access_passkey'
+// same-origin, NOT no-referrer: under no-referrer browsers send `Origin: null` on form POSTs, which the POST guard
+// (rightly) refuses, so every real tap would fail. same-origin sends the page's own origin to itself and nothing cross-site.
+export const REFERRER_POLICY = 'same-origin'
 
 function secure(c: Context<AppEnv>): void {
   c.header('Cache-Control', 'no-store')
-  c.header('Referrer-Policy', 'no-referrer')
+  c.header('Referrer-Policy', REFERRER_POLICY)
   c.header('X-Content-Type-Options', 'nosniff')
   c.header('X-Frame-Options', 'DENY')
   c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
@@ -58,6 +62,9 @@ function page(c: Context<AppEnv>, status: 200 | 400 | 403 | 404 | 409 | 410 | 50
 const NOT_FOUND = (c: Context<AppEnv>): Response => page(c, 404, 'Not found', 'There is nothing here for you.')
 
 function jwtMessage(reason: AccessJwtFailure): string {
+  if (reason === 'amr_required') {
+    return 'This sign-in did not carry the required authentication method. Sign out of Access and sign in again with the required method.'
+  }
   if (reason === 'stale') {
     return 'Your Access sign-in is older than the approval freshness window. Sign out of Access (/cdn-cgi/access/logout), then open the approval link again and approve right after signing in.'
   }
@@ -66,23 +73,25 @@ function jwtMessage(reason: AccessJwtFailure): string {
 
 function approverMessage(reason: ApproverFailure, claims: AccessClaims): string {
   if (reason === 'not_linked') {
-    return `This Access identity (subject ${claims.sub}) is not linked to a member of this workspace. Ask the workspace owner to link it once (see docs/architecture/access-approve-page.md).`
+    return `This Access identity (subject ${claims.sub}) is not linked to a member of this workspace. Nothing is linked automatically: ask the workspace owner to link it explicitly (see docs/architecture/access-approve-page.md).`
   }
-  if (reason === 'link_refused') return 'This Access identity could not be linked to a member (another credential already controls that member).'
   return 'The member behind this Access identity cannot approve (not an active human member).'
 }
 
 // ── gate: flag, config, host, JWT ───────────────────────────────────────────────────────────────
 approveApp.use('*', async (c, next) => {
+  const status = accessApproveStatus(c.env)
   // Flag off: the route does not exist. Nothing else (config, JWT, host) is even looked at.
-  if (!accessApproveEnabled(c.env)) return NOT_FOUND(c)
-  const cfg = loadAccessApproveConfig(c.env)
-  if (!cfg) return page(c, 503, 'Not configured', 'The approval page is enabled but not fully configured.')
-  if (new URL(c.req.url).host.toLowerCase() !== cfg.canonicalHost) {
-    return page(c, 403, 'Wrong host', 'This page answers only on its canonical host.')
+  if (status.state === 'off') return NOT_FOUND(c)
+  const host = new URL(c.req.url).host.toLowerCase()
+  // Defence in depth behind host-gate.ts: a host that is not the dedicated approval host (or is a colony host) is not found.
+  if (status.state === 'misconfigured') {
+    return colonyHostnames(c.env).has(host.replace(/:\d{1,5}$/, '')) ? NOT_FOUND(c) : page(c, 503, 'Not configured', 'The approval page is enabled but not fully configured.')
   }
+  const cfg = status.cfg
+  if (host !== cfg.canonicalHost) return NOT_FOUND(c)
   const verified = await verifyAccessJwt(c.req.header('cf-access-jwt-assertion'), {
-    teamHost: cfg.teamHost, aud: cfg.aud, maxAgeSeconds: cfg.maxJwtAgeSeconds,
+    teamHost: cfg.teamHost, aud: cfg.aud, maxAgeSeconds: cfg.maxJwtAgeSeconds, requiredAmr: cfg.requiredAmr,
   })
   if (!verified.ok) return page(c, 403, 'Access denied', jwtMessage(verified.reason))
   c.set('access', { cfg, claims: verified.claims })
@@ -131,7 +140,7 @@ async function agentName(env: Env, agentId: string | null): Promise<string | nul
 
 async function seedActor(c: Context<AppEnv>): Promise<{ ok: true; memberId: string; auth: import('../types').AuthContext } | { ok: false; res: Response }> {
   const { claims } = c.get('access')
-  const who = await resolveApproverReadOnly(c.env, claims)
+  const who = await resolveApprover(c.env, claims)
   if (!who.ok) return { ok: false, res: page(c, 403, 'Not allowed', approverMessage(who.reason, claims)) }
   // Accepting a seed's requests is an org-admin act (the same floor as seed_attach apply).
   if (!hasWorkspaceAdmin(who.approver.auth)) return { ok: false, res: NOT_FOUND(c) }
@@ -209,14 +218,24 @@ approveApp.post('/seed/:id', async (c) => {
   if (!(await claimSeedRequest(c.env, row.id, actor.memberId, now))) {
     return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
   }
-  const outcome = await applySeed(
-    c.env, actor.auth, actor.memberId,
-    { seed: v.seed, canonical: v.canonical, seedSha256: v.seedSha256, requests: keyed },
-    keyed.map((r) => r.key), undefined,
-    { via: VIA, requestId: row.id, accessSub: claims.sub },
-  )
+  let outcome: Awaited<ReturnType<typeof applySeed>>
+  try {
+    outcome = await applySeed(
+      c.env, actor.auth, actor.memberId,
+      { seed: v.seed, canonical: v.canonical, seedSha256: v.seedSha256, requests: keyed },
+      keyed.map((r) => r.key), undefined,
+      { via: VIA, requestId: row.id, accessSub: claims.sub },
+    )
+  } catch {
+    // Claimed but the apply threw: the row must not sit in 'applying' forever. Guarded UPDATE status='applying' -> 'failed'.
+    await finishSeedRequest(c.env, row.id, { ok: false, error: 'apply_threw' })
+    return page(c, 409, 'Not applied', 'The seed could not be applied (apply_threw). The request is closed; ask the agent to file a new one.')
+  }
   await finishSeedRequest(c.env, row.id, outcome.ok ? { ok: true } : { ok: false, error: outcome.error })
   if (!outcome.ok) return page(c, 409, 'Not applied', `The seed could not be applied (${outcome.error}). The request is closed; ask the agent to file a new one.`)
+  if (outcome.result.replay === true) {
+    return page(c, 200, 'Already applied', 'This seed had already been applied earlier; nothing new was created. Nothing was granted: every request in the seed is still pending.', 'ok')
+  }
   return page(c, 200, 'Approved', 'The project was created. Nothing was granted: every request in the seed is still pending.', 'ok')
 })
 
@@ -233,7 +252,7 @@ function parseActions(req: ElevationRequestRecord): string[] {
 
 approveApp.get('/elevation/:id', async (c) => {
   const { claims } = c.get('access')
-  const who = await resolveApproverReadOnly(c.env, claims)
+  const who = await resolveApprover(c.env, claims)
   if (!who.ok) return page(c, 403, 'Not allowed', approverMessage(who.reason, claims))
   const req = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
   // Unknown id and out-of-authority read identically.
@@ -289,8 +308,20 @@ approveApp.post('/elevation/:id', async (c) => {
   const decision = one(guard.form.decision)
   if (decision !== 'approve' && decision !== 'deny') return page(c, 400, 'Bad request', 'decision must be approve or deny.')
   const { claims } = c.get('access')
-  const session = await startApproverSession(c.env, claims)
-  if (!session.ok) return page(c, 403, 'Not allowed', approverMessage(session.reason, claims))
+  const who = await resolveApprover(c.env, claims)
+  if (!who.ok) return page(c, 403, 'Not allowed', approverMessage(who.reason, claims))
+  // Authority BEFORE any write: unknown id and out-of-authority read identically, and a closed request is refused,
+  // all before an approver web session exists. (decideElevationRequest re-checks everything atomically.)
+  const pre = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, id)
+  if (!pre || !(await canDecideElevation(c.env, who.approver.auth, who.approver.auth.capabilities, pre.requested_scope_type, pre.requested_scope_id))) {
+    return NOT_FOUND(c)
+  }
+  if (pre.status !== 'pending' || Date.parse(pre.decision_expires_at) <= Date.now()) {
+    return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
+  }
+  // The grant (and the decision row) binds to a web session for this login, so it is minted now, after the checks,
+  // for approve and deny alike (the decision row records the session that decided it).
+  const session = await mintApproverSession(c.env, who.approver)
   const { approver } = session
 
   const rawActions = guard.form.actions

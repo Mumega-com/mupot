@@ -267,8 +267,9 @@ export interface Env {
   ACCESS_APPROVE_ENABLED?: string
   ACCESS_TEAM_DOMAIN?: string      // <team>.cloudflareaccess.com (scheme optional)
   ACCESS_AUD?: string              // the Access application's AUD tag (exact match)
-  ACCESS_CANONICAL_HOST?: string   // the only Host the approve page answers on, e.g. mupot.example.com
+  ACCESS_CANONICAL_HOST?: string   // DEDICATED approval hostname, distinct from the colony host: answers ONLY /approve/*
   ACCESS_MAX_JWT_AGE_SECONDS?: string // iat freshness window, default 60, max 300
+  ACCESS_REQUIRED_AMR?: string     // optional comma list: the token's amr claim must contain one of these
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].

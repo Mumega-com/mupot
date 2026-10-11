@@ -14,9 +14,13 @@ import { verifyAccessJwt, resetAccessJwksCache, type AccessJwtConfig } from '../
 import { approveApp } from '../src/access/routes'
 import { createAgentSession } from '../src/auth/agent-sessions'
 import { createElevationRequest } from '../src/auth/elevation'
-import { approveUrl } from '../src/access/config'
+import { approveUrl, accessApproveStatus } from '../src/access/config'
 import { linkLoginIdentity } from '../src/auth/login-identity'
-import { claimSeedRequest } from '../src/access/seed-request'
+import { claimSeedRequest, createSeedRequest } from '../src/access/seed-request'
+import { issueCsrfToken, verifyCsrfToken } from '../src/access/csrf'
+import { REFERRER_POLICY } from '../src/access/routes'
+import { advertisedTools } from '../src/mcp/index'
+import * as seedApply from '../src/seeds/apply'
 
 const TENANT = 'tenant-a'
 const TEAM = 'acme.cloudflareaccess.com'
@@ -127,6 +131,36 @@ describe('verifyAccessJwt', () => {
   it('fails closed when the JWKS cannot be fetched', async () => {
     expect(await verifyAccessJwt(await sign(), cfg, { fetchImpl: async () => new Response('no', { status: 500 }) })).toEqual({ ok: false, reason: 'jwks_unavailable' })
   })
+  it('requires a non-empty sub (a token with no subject names no human)', async () => {
+    expect(await verifyAccessJwt(await sign({ sub: undefined }), cfg, deps())).toEqual({ ok: false, reason: 'missing_claims' })
+    expect(await verifyAccessJwt(await sign({ sub: '' }), cfg, deps())).toEqual({ ok: false, reason: 'missing_claims' })
+  })
+  it('honours nbf: a future nbf is refused, a past one accepted', async () => {
+    expect(await verifyAccessJwt(await sign({ nbf: nowS() + 120 }), cfg, deps())).toEqual({ ok: false, reason: 'not_yet_valid' })
+    expect((await verifyAccessJwt(await sign({ nbf: nowS() - 10 }), cfg, deps())).ok).toBe(true)
+  })
+  it('stale JWKS fallback is bounded: a failed refetch keeps cached keys for at most 24h, then fails closed', async () => {
+    const t0 = Date.now()
+    let healthy = true
+    const fetchImpl = async () => (healthy ? jwksResponse([key]) : new Response('down', { status: 500 }))
+    expect((await verifyAccessJwt(await sign(), cfg, { fetchImpl, nowMs: t0 })).ok).toBe(true)
+    healthy = false
+    // 2h later: cache expired (1h TTL), refetch fails, keys under 24h old still verify.
+    const at = (ms: number) => sign({ iat: Math.floor(ms / 1000), exp: Math.floor(ms / 1000) + 600 })
+    expect((await verifyAccessJwt(await at(t0 + 2 * 3600_000), cfg, { fetchImpl, nowMs: t0 + 2 * 3600_000 })).ok).toBe(true)
+    // 25h later: refetch fails and the cached set is older than 24h: refused.
+    const late = await verifyAccessJwt(await at(t0 + 25 * 3600_000), cfg, { fetchImpl, nowMs: t0 + 25 * 3600_000 })
+    expect(late).toEqual({ ok: false, reason: 'jwks_unavailable' })
+  })
+  it('ACCESS_REQUIRED_AMR: refuses a token without the method, accepts one carrying it (case-insensitive), fails closed when amr is absent', async () => {
+    const strict: AccessJwtConfig = { ...cfg, requiredAmr: ['hwk', 'swk'] }
+    expect(await verifyAccessJwt(await sign({}), strict, deps())).toEqual({ ok: false, reason: 'amr_required' })
+    expect(await verifyAccessJwt(await sign({ amr: ['pwd'] }), strict, deps())).toEqual({ ok: false, reason: 'amr_required' })
+    expect(await verifyAccessJwt(await sign({ amr: 'hwk' }), strict, deps())).toEqual({ ok: false, reason: 'amr_required' })
+    expect(await verifyAccessJwt(await sign({ amr: ['pwd', 'HWK'] }), strict, deps())).toMatchObject({ ok: true })
+    // Unset: not enforced.
+    expect((await verifyAccessJwt(await sign({}), cfg, deps())).ok).toBe(true)
+  })
 })
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
@@ -162,7 +196,16 @@ function setupDb(): void {
   `)
   env = baseEnv()
 }
-beforeEach(setupDb)
+async function link(sub: string, memberId: string, email: string): Promise<void> {
+  const r = await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: sub, verifiedEmail: email, memberId })
+  if (!r.ok) throw new Error(`link failed ${JSON.stringify(r)}`)
+}
+// Access identities are linked EXPLICITLY (the page never links anything); the fixture does what the owner's one-time ceremony does.
+beforeEach(async () => {
+  setupDb()
+  await link('sub-owner', 'mem-owner', 'owner@x.test')
+  await link('sub-plain', 'mem-plain', 'plain@x.test')
+})
 afterEach(() => { harness.close(); vi.unstubAllGlobals() })
 
 function stubJwks(keys: TestKey[] = [key]): void {
@@ -214,11 +257,28 @@ describe('gates', () => {
     expect((await hit('/approve/seed/x', {}, baseEnv({ ACCESS_AUD: undefined }))).status).toBe(503)
     expect((await hit('/approve/seed/x', {}, baseEnv({ ACCESS_TEAM_DOMAIN: 'evil.example.com' }))).status).toBe(503)
   })
+  it('refuses to enable on a colony host: no ACCESS_CANONICAL_HOST, or one equal to PUBLIC_ORIGIN / the built-in colony host', async () => {
+    for (const bad of [{ ACCESS_CANONICAL_HOST: undefined }, { ACCESS_CANONICAL_HOST: 'colony.example.test', PUBLIC_ORIGIN: 'https://colony.example.test' }, { ACCESS_CANONICAL_HOST: 'mupot.mumega.com' }, { ACCESS_CANONICAL_HOST: 'Colony.Example.Test:8443', PUBLIC_ORIGIN: 'https://colony.example.test' }]) {
+      const e = baseEnv(bad)
+      expect(accessApproveStatus(e).state).toBe('misconfigured')
+      expect(approveUrl(e, 'seed', 'x')).toBeNull()
+      expect((await fileSeed(seedText, agentAuth(), e)).ok).toBe(false)
+      const host = (bad.ACCESS_CANONICAL_HOST ?? 'colony.example.test').toLowerCase()
+      expect((await hit('/approve/seed/x', { host }, e)).status).not.toBe(200)
+    }
+    expect(count('seed_attach_requests')).toBe(0)
+    expect(accessApproveStatus(baseEnv({ PUBLIC_ORIGIN: 'https://colony.example.test' })).state).toBe('on')
+  })
+  it('seed_attach_request is not advertised while the flag is off and is when it is on', () => {
+    expect(advertisedTools(baseEnv({ ACCESS_APPROVE_ENABLED: undefined })).map((t) => t.name)).not.toContain('seed_attach_request')
+    expect(advertisedTools(baseEnv()).map((t) => t.name)).toContain('seed_attach_request')
+  })
   it('missing / bad JWT => 403; wrong host => 403 even with a valid JWT', async () => {
     expect((await hit('/approve/seed/x', { jwt: null })).status).toBe(403)
     expect((await hit('/approve/seed/x', { jwt: await sign({}, { key: otherKey }) })).status).toBe(403)
-    expect((await hit('/approve/seed/x', { host: 'mupot.workers.dev' })).status).toBe(403)
-    expect((await hit('/approve/seed/x', { host: `${HOST}.evil.test` })).status).toBe(403)
+    // Any other host (even with a valid JWT): not found, the page does not exist there.
+    expect((await hit('/approve/seed/x', { host: 'mupot.workers.dev' })).status).toBe(404)
+    expect((await hit('/approve/seed/x', { host: `${HOST}.evil.test` })).status).toBe(404)
   })
   it('a stale iat is refused with guidance', async () => {
     const res = await hit('/approve/seed/x', { jwt: await sign({ iat: nowS() - 300 }) })
@@ -230,35 +290,57 @@ describe('gates', () => {
 // ── member resolution ────────────────────────────────────────────────────────────────────────────
 describe('member resolution', () => {
   const as = async (email: string, sub: string) => hit('/approve/seed/none', { jwt: await sign({ email, sub }) })
-  it('an active human org admin reaches the page (unknown id is a plain 404, not a refusal)', async () => {
+  const sessions = () => count('web_sessions')
+  it('an active human org admin with an explicit identity row reaches the page (unknown id is a plain 404, not a refusal)', async () => {
     expect((await as('owner@x.test', 'sub-owner')).status).toBe(404)
   })
-  it('refuses an agent-welded member row even though its email matches', async () => {
+  it('NO auto-link: an unlinked Access identity whose email matches a member is refused, shows its sub, and writes NOTHING (GET and POST)', async () => {
+    const before = count('human_login_identities')
+    const res = await as('owner@x.test', 'sub-first-login')
+    expect(res.status).toBe(403)
+    const html = await res.text()
+    expect(html).toContain('sub-first-login')
+    expect(html).toContain('not linked')
+    const post = await hit('/approve/elevation/none', { jwt: await sign({ email: 'owner@x.test', sub: 'sub-first-login' }), method: 'POST', form: { csrf: await issueCsrfToken(env, 'elevation', 'none', 'sub-first-login', loginIat) ?? '', decision: 'deny' } })
+    expect(post.status).toBe(403)
+    expect(count('human_login_identities')).toBe(before)
+    expect(sessions()).toBe(0)
+  })
+  it('refuses an agent-welded member row even when explicitly linked', async () => {
+    await link('sub-agent', 'mem-agent', 'agent@x.test')
     const res = await as('agent@x.test', 'sub-agent')
     expect(res.status).toBe(403)
     expect(await res.text()).toContain('cannot approve')
-    expect(count('human_login_identities')).toBe(0)
   })
   it('refuses a suspended member and an unknown identity', async () => {
+    await link('sub-susp', 'mem-susp', 'susp@x.test')
     expect((await as('susp@x.test', 'sub-susp')).status).toBe(403)
     expect((await as('nobody@x.test', 'sub-nobody')).status).toBe(403)
   })
   it('a member suspended or archived AFTER its identity was bound is refused (the join key does not outlive the member)', async () => {
-    await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: 'sub-bound-susp', verifiedEmail: 'susp@x.test', memberId: 'mem-susp' })
-    expect((await as('susp@x.test', 'sub-bound-susp')).status).toBe(403)
     harness.sqlite.exec("UPDATE members SET archived_at = datetime('now') WHERE id = 'mem-owner'")
-    await linkLoginIdentity(env, { tenant: TENANT, provider: 'cloudflare-access', providerSubject: 'sub-bound-arch', verifiedEmail: 'owner@x.test', memberId: 'mem-owner' })
-    expect((await as('owner@x.test', 'sub-bound-arch')).status).toBe(403)
+    expect((await as('owner@x.test', 'sub-owner')).status).toBe(403)
   })
   it('a plain member is not an org admin: seed pages read as not found', async () => {
     expect((await as('plain@x.test', 'sub-plain')).status).toBe(404)
   })
-  it('an identity already bound to member A cannot be used by an email that names member B', async () => {
-    // First login binds sub-owner to mem-owner via the guarded attach; a second login with the same sub
-    // and a different email still resolves to mem-owner (the join key wins), never to the emailed member.
-    await hit('/approve/elevation/none', { jwt: await sign({ email: 'owner@x.test', sub: 'sub-owner' }), method: 'POST', form: { decision: 'deny' } })
-    const res = await as('plain@x.test', 'sub-owner')
-    expect(res.status).toBe(404) // mem-owner (admin) resolved, unknown id
+  it('role comes from the RESOLVED member\'s email, not the JWT email: a plain member presenting the owner\'s email gains no admin', async () => {
+    // sub-plain is bound to mem-plain; the JWT claims owner@x.test. Authority must stay plain-member: seed pages 404 via not-admin,
+    // and the legacy owner role (users.role by email) must not attach.
+    const { id } = await filed()
+    const res = await hit(`/approve/seed/${id}`, { jwt: await sign({ email: 'owner@x.test', sub: 'sub-plain' }) })
+    expect(res.status).toBe(404)
+    expect(count('seed_attach_requests', "status = 'pending'")).toBe(1)
+  })
+  it('an identity bound to member A cannot be used by an email that names member B (reaches the join with a valid CSRF)', async () => {
+    const id = await pendingElevation(['action:project_status'], 60)
+    const jwt = await sign({ email: 'plain@x.test', sub: 'sub-owner' }) // bound to mem-owner, email names mem-plain
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`, { jwt })).text())
+    const res = await hit(`/approve/elevation/${id}`, { jwt, method: 'POST', form: { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' } })
+    expect(res.status).toBe(200)
+    const g = harness.sqlite.prepare('SELECT approved_by_member_id FROM elevation_grants').all() as Array<{ approved_by_member_id: string }>
+    expect(g).toEqual([{ approved_by_member_id: 'mem-owner' }])
+    expect(count('web_sessions', "member_id = 'mem-plain'")).toBe(0)
   })
 })
 
@@ -339,7 +421,7 @@ describe('approve page: seed', () => {
     expect(audit).toBe(1)
     const row = harness.sqlite.prepare("SELECT origin, evidence_json FROM mutation_audit_entries WHERE handler = 'seed_attach'").get() as { origin: string; evidence_json: string }
     expect(row.origin).toBe('admin_ui')
-    expect(JSON.parse(row.evidence_json)).toMatchObject({ via: 'access_passkey', access_request_id: id, grants: 'none' })
+    expect(JSON.parse(row.evidence_json)).toMatchObject({ via: 'access_passkey', access_request_id: id, access_sub: 'sub-owner', grants: 'none' })
     const req = harness.sqlite.prepare('SELECT status, decided_by_member_id, decided_via FROM seed_attach_requests WHERE id = ?').get(id)
     expect(req).toEqual({ status: 'applied', decided_by_member_id: 'mem-owner', decided_via: 'access_passkey' })
 
@@ -491,7 +573,7 @@ describe('approve page: elevation', () => {
     const rec = harness.sqlite.prepare("SELECT origin, evidence_json FROM mutation_audit_entries WHERE handler = 'access_approve'").get() as { origin: string; evidence_json: string }
     expect(rec.origin).toBe('admin_ui')
     expect(JSON.parse(rec.evidence_json)).toMatchObject({ via: 'access_passkey', decision: 'approve', actions: ['action:manage_access'] })
-    expect(count('human_login_identities', "provider = 'cloudflare-access'")).toBe(1)
+    expect(count('human_login_identities', "provider = 'cloudflare-access'")).toBe(2) // only the two the fixture linked; the flow wrote none
   })
 
   it('cannot widen: an unrequested action or a longer duration is refused and the request stays pending', async () => {
@@ -543,5 +625,136 @@ describe('approve page: elevation', () => {
     expect(res.status).toBe(404)
     expect(count('elevation_grants')).toBe(0)
     expect(harness.sqlite.prepare('SELECT status FROM elevation_requests WHERE id = ?').get(id)).toEqual({ status: 'pending' })
+  })
+})
+
+// ── round 2 ──────────────────────────────────────────────────────────────────────────────────────
+// What a browser puts in `Origin` on a same-origin form POST, given the Referrer-Policy the page itself emitted
+// (Fetch spec, "append a request Origin header": policy no-referrer => the serialized origin is replaced by 'null').
+const browserOriginFor = (policy: string | null, pageOrigin: string): string => (policy === 'no-referrer' ? 'null' : pageOrigin)
+
+describe('Referrer-Policy and the same-origin tap', () => {
+  it('the emitted header is same-origin, and the Origin a browser sends under THAT policy is accepted; null and foreign origins are not', async () => {
+    const { id } = await filed()
+    const get = await hit(`/approve/seed/${id}`)
+    const policy = get.headers.get('referrer-policy')
+    expect(policy).toBe(REFERRER_POLICY)
+    expect(policy).toBe('same-origin')
+    const csrf = csrfOf(await get.text())
+    const origin = browserOriginFor(policy, `https://${HOST}`)
+    expect(origin).toBe(`https://${HOST}`) // a real tap is not 'null'
+    for (const bad of ['null', 'https://evil.example']) {
+      expect((await hit(`/approve/seed/${id}`, { method: 'POST', origin: bad, form: { csrf, decision: 'approve' } })).status).toBe(403)
+    }
+    expect(count('project_seeds')).toBe(0)
+    expect((await hit(`/approve/seed/${id}`, { method: 'POST', origin, form: { csrf, decision: 'approve' } })).status).toBe(200)
+    expect(count('project_seeds', "status = 'applied'")).toBe(1)
+  })
+  it('every response (page, refusal, 404) carries the same policy header', async () => {
+    for (const r of [await hit('/approve/seed/none'), await hit('/approve/seed/x', { jwt: null }), await hit('/approve/seed/x', { host: 'other.test' })]) {
+      expect(r.headers.get('referrer-policy')).toBe('same-origin')
+    }
+  })
+})
+
+describe('CSRF binds the Access subject', () => {
+  it('a token minted for sub A fails for sub B with the same kind, id and iat', async () => {
+    const t = await issueCsrfToken(env, 'seed', 'req-1', 'sub-A', 1000)
+    if (!t) throw new Error('no token')
+    expect(await verifyCsrfToken(env, 'seed', 'req-1', 'sub-A', 1000, t)).toBe('ok')
+    expect(await verifyCsrfToken(env, 'seed', 'req-1', 'sub-B', 1000, t)).toBe('invalid')
+    expect(await verifyCsrfToken(env, 'elevation', 'req-1', 'sub-A', 1000, t)).toBe('invalid')
+    expect(await verifyCsrfToken(env, 'seed', 'req-2', 'sub-A', 1000, t)).toBe('invalid')
+    expect(await verifyCsrfToken(env, 'seed', 'req-1', 'sub-A', 1001, t)).toBe('invalid')
+  })
+})
+
+describe('seed apply failure and replay', () => {
+  it('applySeed throwing after the claim moves the row to failed (guarded), a retry is refused, nothing half-applied', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const spy = vi.spyOn(seedApply, 'applySeed').mockRejectedValueOnce(new Error('boom'))
+    try {
+      const res = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })
+      expect(res.status).toBe(409)
+      expect(await res.text()).toContain('apply_threw')
+    } finally {
+      spy.mockRestore()
+    }
+    expect(harness.sqlite.prepare('SELECT status, decision_error FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'failed', decision_error: 'apply_threw' })
+    expect((await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })).status).toBe(409)
+    expect(count('project_seeds')).toBe(0)
+  })
+  it('a seed that was already applied says so (not "created") and creates nothing new', async () => {
+    const { id } = await filed()
+    const owner: AuthContext = { userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'dashboard', memberId: 'mem-owner' }
+    const dry = await invokeTool(owner, env, 'seed_attach', { seed: seedText }, 'https://pot.test')
+    if (!dry.ok) throw new Error(JSON.stringify(dry))
+    const d = dry.result as { accept_token: string; requests: Array<{ key: string }> }
+    const applied = await invokeTool(owner, env, 'seed_attach', { seed: seedText, dry_run: false, accept: d.requests.map((r) => r.key), accept_token: d.accept_token }, 'https://pot.test')
+    expect(applied.ok).toBe(true)
+    const projects = count('projects')
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const res = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toContain('already been applied')
+    expect(html).not.toContain('The project was created')
+    expect(count('projects')).toBe(projects)
+  })
+})
+
+describe('duplicate filing race', () => {
+  it('the partial UNIQUE index refuses a second pending row for the same requester + seed digest', async () => {
+    await filed()
+    const row = harness.sqlite.prepare('SELECT * FROM seed_attach_requests').get() as Record<string, string>
+    expect(() => harness.sqlite.prepare(
+      `INSERT INTO seed_attach_requests (id, tenant, requester_member_id, seed_sha256, canonical_json, requests_json, status, created_at, expires_at)
+       VALUES ('dup', ?, ?, ?, '{}', '[]', 'pending', 'a', 'b')`,
+    ).run(row.tenant, row.requester_member_id, row.seed_sha256)).toThrow(/UNIQUE/)
+    // A non-pending twin is allowed (the index is partial on status = 'pending').
+    harness.sqlite.prepare(
+      `INSERT INTO seed_attach_requests (id, tenant, requester_member_id, seed_sha256, canonical_json, requests_json, status, created_at, expires_at)
+       VALUES ('done', ?, ?, ?, '{}', '[]', 'denied', 'a', 'b')`,
+    ).run(row.tenant, row.requester_member_id, row.seed_sha256)
+  })
+  it('concurrent identical filings collapse to ONE row and one id; an expired pending row does not wedge a re-filing', async () => {
+    const [a, b, c] = await Promise.all([fileSeed(), fileSeed(), fileSeed()])
+    const ids = [a, b, c].map((r) => (r.ok ? (r.result as { request_id: string }).request_id : 'fail'))
+    expect(new Set(ids).size).toBe(1)
+    expect(count('seed_attach_requests')).toBe(1)
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET expires_at = '2000-01-01T00:00:00.000Z'").run()
+    const again = await fileSeed()
+    expect(again.ok).toBe(true)
+    expect(count('seed_attach_requests', "status = 'pending'")).toBe(1)
+    expect(count('seed_attach_requests', "status = 'expired'")).toBe(1)
+  })
+  it('createSeedRequest at the cap still returns the existing request for the same seed', async () => {
+    const first = await filed()
+    for (let i = 0; i < 9; i++) await fileSeed(seedText.replace(/^slug: .*$/m, `slug: cap-${i}`))
+    expect(count('seed_attach_requests', "status = 'pending'")).toBe(10)
+    const again = await filed()
+    expect(again.id).toBe(first.id)
+    expect(typeof createSeedRequest).toBe('function')
+  })
+})
+
+describe('authority before any write', () => {
+  it('a member with no authority on the scope POSTs: not found, and NO web session or identity row is written', async () => {
+    const id = await pendingElevation(['action:project_status'], 60)
+    harness.sqlite.exec("DELETE FROM capabilities WHERE id = 'cap-p'")
+    const t = await issueCsrfToken(env, 'elevation', id, 'sub-plain', loginIat)
+    const res = await hit(`/approve/elevation/${id}`, { jwt: await sign({ email: 'plain@x.test', sub: 'sub-plain' }), method: 'POST', form: { csrf: t ?? '', decision: 'deny' } })
+    expect(res.status).toBe(404)
+    expect(count('web_sessions')).toBe(0)
+    expect(count('elevation_grants')).toBe(0)
+  })
+  it('a closed request is refused before a session is minted', async () => {
+    const id = await pendingElevation(['action:project_status'], 60)
+    harness.sqlite.prepare("UPDATE elevation_requests SET status = 'denied' WHERE id = ?").run(id)
+    const t = await issueCsrfToken(env, 'elevation', id, 'sub-owner', loginIat)
+    const res = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf: t ?? '', decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' } })
+    expect(res.status).toBe(409)
+    expect(count('web_sessions')).toBe(0)
   })
 })

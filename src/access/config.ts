@@ -14,8 +14,10 @@ export function accessApproveEnabled(env: Pick<Env, 'ACCESS_APPROVE_ENABLED'>): 
 export interface AccessApproveConfig {
   teamHost: string // <team>.cloudflareaccess.com
   aud: string
-  canonicalHost: string // lower-case host[:port]
+  canonicalHost: string // lower-case host[:port]; a DEDICATED approval hostname, never a colony host
   maxJwtAgeSeconds: number
+  /** Optional: the token's `amr` claim must contain at least one of these (lower-case). Empty = not enforced. */
+  requiredAmr: string[]
 }
 
 const TEAM_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/
@@ -27,21 +29,68 @@ export function normalizeTeamHost(raw: string): string | null {
   return TEAM_HOST_RE.test(t) ? t : null
 }
 
-/** Null when the flag is on but any required variable is missing/malformed (caller answers 503: fail closed). */
+const DEFAULT_COLONY_HOST = 'mupot.mumega.com' // the same fallback src/index.ts uses for the root host
+
+function hostnameOf(hostPort: string): string {
+  return hostPort.replace(/:\d{1,5}$/, '')
+}
+
+/** Every host the colony itself answers on (PUBLIC_ORIGIN, or the built-in default when unset), lower-case, hostname only. */
+export function colonyHostnames(env: Pick<Env, 'PUBLIC_ORIGIN'>): Set<string> {
+  const out = new Set<string>([DEFAULT_COLONY_HOST])
+  const raw = env.PUBLIC_ORIGIN?.trim()
+  if (raw) {
+    try {
+      out.add(new URL(raw).hostname.toLowerCase())
+    } catch {
+      // malformed PUBLIC_ORIGIN: the default above still protects the built-in colony host
+    }
+  }
+  return out
+}
+
+/** The dedicated approval hostname if it is set, well-formed and DISTINCT from every colony host; else null. */
+export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | 'PUBLIC_ORIGIN'>): string | null {
+  const host = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase()
+  if (!host || !HOST_RE.test(host)) return null
+  if (colonyHostnames(env).has(hostnameOf(host))) return null
+  return host
+}
+
+export type AccessApproveStatus =
+  | { state: 'off' }
+  | { state: 'misconfigured'; reason: string }
+  | { state: 'on'; cfg: AccessApproveConfig }
+
+/** Single source for "is the page usable": off, misconfigured (fail closed, with the reason), or on. */
+export function accessApproveStatus(env: Env): AccessApproveStatus {
+  if (!accessApproveEnabled(env)) return { state: 'off' }
+  const raw = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase()
+  if (!raw) return { state: 'misconfigured', reason: 'ACCESS_CANONICAL_HOST is not set (the approval page needs its own dedicated hostname)' }
+  if (!dedicatedApprovalHost(env)) {
+    return { state: 'misconfigured', reason: 'ACCESS_CANONICAL_HOST is malformed or equals a colony host; it must be a dedicated hostname distinct from the colony host' }
+  }
+  const cfg = loadAccessApproveConfig(env)
+  if (!cfg) return { state: 'misconfigured', reason: 'ACCESS_TEAM_DOMAIN or ACCESS_AUD is missing or malformed' }
+  return { state: 'on', cfg }
+}
+
+/** Null when any required variable is missing/malformed or the host is not dedicated (caller fails closed). */
 export function loadAccessApproveConfig(env: Env): AccessApproveConfig | null {
   const teamHost = env.ACCESS_TEAM_DOMAIN ? normalizeTeamHost(env.ACCESS_TEAM_DOMAIN) : null
   const aud = env.ACCESS_AUD?.trim()
-  const canonicalHost = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase()
-  if (!teamHost || !aud || !canonicalHost || !HOST_RE.test(canonicalHost)) return null
+  const canonicalHost = dedicatedApprovalHost(env)
+  if (!teamHost || !aud || !canonicalHost) return null
+  const requiredAmr = (env.ACCESS_REQUIRED_AMR ?? '').split(',').map((v) => v.trim().toLowerCase()).filter((v) => v.length > 0)
   const rawAge = env.ACCESS_MAX_JWT_AGE_SECONDS ? Number(env.ACCESS_MAX_JWT_AGE_SECONDS) : DEFAULT_MAX_JWT_AGE_SECONDS
   const maxJwtAgeSeconds = Number.isFinite(rawAge) && rawAge >= 1 ? Math.min(Math.floor(rawAge), MAX_JWT_AGE_SECONDS) : DEFAULT_MAX_JWT_AGE_SECONDS
-  return { teamHost, aud, canonicalHost, maxJwtAgeSeconds }
+  return { teamHost, aud, canonicalHost, maxJwtAgeSeconds, requiredAmr }
 }
 
 /** The link an agent hands the human. Null while the feature is off or not fully configured. */
 export function approveUrl(env: Env, kind: 'seed' | 'elevation', id: string): string | null {
-  if (!accessApproveEnabled(env)) return null
-  const cfg = loadAccessApproveConfig(env)
-  if (!cfg) return null
+  const status = accessApproveStatus(env)
+  if (status.state !== 'on') return null
+  const cfg = status.cfg
   return `https://${cfg.canonicalHost}/approve/${kind}/${encodeURIComponent(id)}`
 }

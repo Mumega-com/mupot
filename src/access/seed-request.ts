@@ -17,7 +17,7 @@ export interface SeedRequestRow {
   seed_sha256: string
   canonical_json: string
   requests_json: string
-  status: 'pending' | 'applying' | 'applied' | 'denied' | 'failed'
+  status: 'pending' | 'applying' | 'applied' | 'denied' | 'failed' | 'expired'
   created_at: string
   expires_at: string
   decided_at: string | null
@@ -42,30 +42,38 @@ export async function createSeedRequest(
 ): Promise<CreateSeedRequestResult> {
   const tenant = env.TENANT_SLUG
   const nowIso = new Date(nowMs).toISOString()
-  // The same requester asking again for the same seed gets the SAME live request (idempotent, no flood).
-  const existing = await env.DB.prepare(
-    `SELECT id, expires_at FROM seed_attach_requests
-      WHERE tenant = ?1 AND requester_member_id = ?2 AND seed_sha256 = ?3 AND status = 'pending' AND expires_at > ?4
-      LIMIT 1`,
-  ).bind(tenant, input.requesterMemberId, input.validated.seedSha256, nowIso).first<{ id: string; expires_at: string }>()
-  if (existing) return { ok: true, id: existing.id, expiresAt: existing.expires_at, reused: true }
+  // A pending row past its expiry must not hold the single pending slot for this (requester, seed).
+  await env.DB.prepare(
+    `UPDATE seed_attach_requests SET status = 'expired'
+      WHERE tenant = ?1 AND requester_member_id = ?2 AND seed_sha256 = ?3 AND status = 'pending' AND expires_at <= ?4`,
+  ).bind(tenant, input.requesterMemberId, input.validated.seedSha256, nowIso).run()
 
   const id = crypto.randomUUID()
   const expiresAt = new Date(nowMs + SEED_REQUEST_TTL_MS).toISOString()
   const stored: StoredRequest[] = input.validated.requests.map((r) => ({ key: r.key, kind: r.kind, fields: r.fields }))
+  // One statement: the partial UNIQUE index (tenant, requester, seed digest WHERE pending) makes a concurrent
+  // duplicate filing lose with DO NOTHING; the cap is the SELECT's WHERE. 0 rows = duplicate OR over the cap.
   const res = await env.DB.prepare(
     `INSERT INTO seed_attach_requests
        (id, tenant, requester_member_id, requester_agent_id, seed_sha256, canonical_json, requests_json,
         status, created_at, expires_at)
      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9
       WHERE (SELECT COUNT(*) FROM seed_attach_requests
-              WHERE tenant = ?2 AND requester_member_id = ?3 AND status = 'pending' AND expires_at > ?8) < ?10`,
+              WHERE tenant = ?2 AND requester_member_id = ?3 AND status = 'pending' AND expires_at > ?8) < ?10
+     ON CONFLICT DO NOTHING`,
   ).bind(
     id, tenant, input.requesterMemberId, input.requesterAgentId, input.validated.seedSha256,
     input.validated.canonical, JSON.stringify(stored), nowIso, expiresAt, SEED_REQUEST_MAX_PENDING,
   ).run()
-  if (res.meta.changes !== 1) return { ok: false, reason: 'too_many_pending' }
-  return { ok: true, id, expiresAt, reused: false }
+  if (res.meta.changes === 1) return { ok: true, id, expiresAt, reused: false }
+  // Not inserted: the existing live pending row for the same identity wins (idempotent), else the cap refused.
+  const existing = await env.DB.prepare(
+    `SELECT id, expires_at FROM seed_attach_requests
+      WHERE tenant = ?1 AND requester_member_id = ?2 AND seed_sha256 = ?3 AND status = 'pending' AND expires_at > ?4
+      LIMIT 1`,
+  ).bind(tenant, input.requesterMemberId, input.validated.seedSha256, nowIso).first<{ id: string; expires_at: string }>()
+  if (existing) return { ok: true, id: existing.id, expiresAt: existing.expires_at, reused: true }
+  return { ok: false, reason: 'too_many_pending' }
 }
 
 export async function loadSeedRequest(env: Env, id: string): Promise<SeedRequestRow | null> {

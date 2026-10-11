@@ -13,12 +13,17 @@
 export type AccessJwtFailure =
   | 'missing' | 'malformed' | 'unsupported_alg' | 'unknown_key' | 'bad_signature'
   | 'bad_issuer' | 'bad_audience' | 'expired' | 'not_yet_valid' | 'stale'
-  | 'missing_claims' | 'jwks_unavailable'
+  | 'missing_claims' | 'jwks_unavailable' | 'amr_required'
 
-export interface AccessClaims { email: string; sub: string; iat: number; exp: number }
+export interface AccessClaims { email: string; sub: string; iat: number; exp: number; amr: string[] }
 export type AccessJwtResult = { ok: true; claims: AccessClaims } | { ok: false; reason: AccessJwtFailure }
 
-export interface AccessJwtConfig { teamHost: string; aud: string; maxAgeSeconds: number }
+export interface AccessJwtConfig {
+  teamHost: string; aud: string; maxAgeSeconds: number
+  /** When non-empty the token's `amr` claim (RFC 8176 values; Cloudflare adds them for some identity
+   *  providers) must contain at least one of these, lower-case. A token with no amr is refused: fail closed. */
+  requiredAmr?: string[]
+}
 export interface AccessJwtDeps {
   nowMs?: number
   /** Test seam; production uses global fetch. */
@@ -27,6 +32,8 @@ export interface AccessJwtDeps {
 
 const JWKS_TTL_MS = 60 * 60 * 1000
 const JWKS_REFETCH_MIN_MS = 30 * 1000
+/** A cached key set older than this is never trusted when the refetch fails (fail closed, not stale-open). */
+const JWKS_MAX_STALE_MS = 24 * 60 * 60 * 1000
 const CLOCK_SKEW_S = 5
 
 interface JwksEntry { keys: Map<string, CryptoKey>; fetchedAt: number; lastAttemptAt: number }
@@ -108,6 +115,10 @@ async function keyFor(kid: string, cfg: AccessJwtConfig, deps: AccessJwtDeps, no
       entry = next
     } else if (entry) {
       entry.lastAttemptAt = nowMs
+      if (nowMs - entry.fetchedAt > JWKS_MAX_STALE_MS) {
+        jwksCache.delete(cfg.teamHost)
+        return 'unavailable'
+      }
     }
   }
   if (!entry) return 'unavailable'
@@ -156,5 +167,9 @@ export async function verifyAccessJwt(
   if (typeof email !== 'string' || email.length === 0 || email.length > 254 || typeof sub !== 'string' || sub.length === 0 || sub.length > 200) {
     return { ok: false, reason: 'missing_claims' }
   }
-  return { ok: true, claims: { email, sub, iat, exp } }
+  const rawAmr = payload.amr
+  const amr = Array.isArray(rawAmr) ? rawAmr.filter((v): v is string => typeof v === 'string').map((v) => v.toLowerCase()) : []
+  const required = cfg.requiredAmr ?? []
+  if (required.length > 0 && !required.some((r) => amr.includes(r))) return { ok: false, reason: 'amr_required' }
+  return { ok: true, claims: { email, sub, iat, exp, amr } }
 }

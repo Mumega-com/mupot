@@ -83,6 +83,7 @@ import { maybeHandleHostnameDispatch } from './platform/dispatcher'
 import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
+import { approvalHostGate } from './access/host-gate'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -364,6 +365,11 @@ function reportUnmatchedCron(scheduledAt: Date): void {
 
 export default {
   fetch: async (req: Request, env: Env, ctx: ExecutionContext) => {
+    // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
+    // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
+    // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
+    const gated = approvalHostGate(req, env)
+    if (gated) return gated
     // ── Cloudflare Workers for Platforms (WFP) Sovereign Tenant Routing ──
     //
     // PATH IS THE TENANT ADDRESS: `mupot.mumega.com/t/{tenant}/{interface}`, e.g. `/t/gaf/mcp`.
