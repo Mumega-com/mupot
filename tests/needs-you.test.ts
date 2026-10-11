@@ -42,7 +42,7 @@ function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): Sqli
       // exercising the degrade-to-empty path this test is actually about.
       // 0172 (mupot#1540) likewise references routine_runs (its tasks.status triggers and
       // backfill leave routine control flights to their routine), so it joins this group.
-      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_') || file.startsWith('0172_'))
+      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_') || file.startsWith('0172_') || file.startsWith('0207_'))
     ) {
       continue
     }

@@ -39,6 +39,7 @@
 // checked ahead of time — a change between the pre-read and the write
 // converges to a clean, re-derived refusal instead of a corrupted write.
 
+import { appliedReceiptStatement } from '../auth/elevation-receipt'
 import type { AuthContext, Env } from '../types'
 import { assertWritten, rowsWritten } from '../lib/receipt'
 import { revokeAllWebSessions } from '../auth/web-sessions'
@@ -72,6 +73,9 @@ export interface UnarchiveInput {
   id: string
   reason: string
   actorMemberId: string
+  /** Elevated callers only (PR #1831 F2): the pending elevation_usage_log row to flip
+   *  to 'applied' inside the restore's own batch (squads, projects). */
+  elevationReceiptId?: string
 }
 
 export type ArchiveOutcome =
@@ -705,6 +709,9 @@ async function unarchiveSimple(
         WHERE changes() = 1`,
     ).bind(receiptId, env.TENANT_SLUG, table, input.id, input.reason, input.actorMemberId, opts.statusColumn ? 'archived' : null, now),
   ]
+  // The elevation receipt flip rides this batch; guarded on the unarchive receipt row
+  // existing, so a 0-row restore never flips it. A failing flip rolls the restore back.
+  if (input.elevationReceiptId) stmts.push(appliedReceiptStatement(env, input.elevationReceiptId, 'SELECT 1 FROM archive_receipts WHERE id = ?3', [receiptId]))
   const results = await env.DB.batch(stmts)
   if (rowsWritten(results[0]) === 0) return { ok: true, status: 'not_archived' }
   assertWritten(results[1], `unarchive_row.${table}.receipt`, 1)
@@ -778,6 +785,7 @@ async function unarchiveProject(env: Env, input: UnarchiveInput): Promise<Unarch
         WHERE changes() = 1`,
     ).bind(receiptId, env.TENANT_SLUG, input.id, input.reason, input.actorMemberId, now),
   ]
+  if (input.elevationReceiptId) stmts.push(appliedReceiptStatement(env, input.elevationReceiptId, 'SELECT 1 FROM archive_receipts WHERE id = ?3', [receiptId]))
   const results = await env.DB.batch(stmts)
   if (rowsWritten(results[0]) === 0) return { ok: true, status: 'not_archived' }
   assertWritten(results[1], 'unarchive_row.projects.receipt', 1)

@@ -15,10 +15,12 @@
 // unarchive_row/archive_plan_expand — applying a plan requires an unbound
 // org-admin bearer or an operator dashboard session, not an agent seat.
 
-import type { AuthContext } from '../types'
+import type { AuthContext, Env } from '../types'
 import { chunkForD1InList } from '../lib/d1-in-list'
 import { isTaskStatus, ALL_TASK_STATUSES } from '../tasks/service'
-import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
+import { type ToolSpec, type ToolOutcome, fail, done, str, hasWorkspaceAdmin } from './index'
+import type { ElevationGrantRecord } from '../auth/elevation'
+import { memberOrElevatedAgent, withElevationReceipt, type ElevationTarget } from './elevated-principal'
 import {
   archiveRow,
   unarchiveRow,
@@ -160,12 +162,60 @@ export const toolArchiveRow: ToolSpec = {
   },
 }
 
+// Tables an elevated agent may restore. Members/agents/tasks stay operator-only:
+// a member restore is rank-sensitive and a task is not a project-lifecycle object.
+const ELEVATED_UNARCHIVE_TABLES: readonly string[] = ['projects', 'squads']
+
+// Marker appended to the receipt reason so the archive_receipts row names the
+// elevation grant that authorized the restore (no schema change).
+const ELEVATION_REASON_SUFFIX_MAX = 80
+
+/**
+ * An agent-bound unarchive_row caller (refused by requireOperatorOrgAdmin) may
+ * restore a squad under a live action:project_status grant covering that
+ * squad (an org grant covers non-home squads only), or a project under an
+ * ORG-scope grant only. A covered table with no covering grant returns the
+ * helper's refusal (with the request_elevation hint); any other table or no
+ * member identity returns `null` and the caller falls through to the unchanged
+ * refusal.
+ */
+async function elevatedUnarchive(
+  auth: AuthContext,
+  env: Env,
+  args: Record<string, unknown>,
+): Promise<{ grant: ElevationGrantRecord; table: ArchivableTable; id: string; reason: string } | { refusal: ToolOutcome } | null> {
+  if (!auth.boundAgentId || !auth.memberId) return null
+  if (typeof args.table !== 'string' || !ELEVATED_UNARCHIVE_TABLES.includes(args.table) || !isArchivableTable(args.table)) return null
+  const id = str(args.id)
+  const reason = str(args.reason)
+  if (!id || !reason) return null
+  if (reason.length > 2000 - ELEVATION_REASON_SUFFIX_MAX) {
+    return { refusal: fail(400, 'invalid_reason', 'reason must be 1-2000 characters') }
+  }
+  // Target is exactly the row's own scope. A squad: ONLY {squad,id} (never {org}
+  // first) so hasElevatedAction's home-squad fence runs; an org grant still covers
+  // a non-home squad through it. A project: ORG scope only — a squad-scoped grant
+  // (a squad admin's approval) never restores a project, same as project_create.
+  const target: ElevationTarget = args.table === 'squads' ? { type: 'squad', id } : { type: 'org' }
+  const acting = await memberOrElevatedAgent(auth, env, 'action:project_status', target, {
+    toolName: 'unarchive_row',
+    refusalCode: 'operator_principal_required',
+    detail: { table: args.table, id },
+    recordUsage: false,
+  })
+  if (!acting.ok) return { refusal: acting.outcome }
+  if (acting.via !== 'elevation') return null
+  return { grant: acting.grant, table: args.table, id, reason: `${reason} [elevation_grant:${acting.grant.id}]` }
+}
+
 export const toolUnarchiveRow: ToolSpec = {
   name: 'unarchive_row',
   scope: 'org',
   min: 'admin',
   args: '{ table: "members"|"agents"|"squads"|"projects"|"tasks", id: string, reason: string }' +
-    ' -- org-admin only, operator principal only (no agent-bound caller).',
+    ' -- org-admin only, operator principal only. The one exception: an agent-bound caller holding a live' +
+    ' action:project_status elevation grant covering the squad (squads) or the org (projects) may restore' +
+    ' table=projects or table=squads (the receipt reason records the grant id); every other table stays operator-only.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -178,7 +228,26 @@ export const toolUnarchiveRow: ToolSpec = {
   },
   async run(auth, env, args) {
     const gateFail = requireOperatorOrgAdmin(auth)
-    if (gateFail) return gateFail
+    if (gateFail) {
+      const elevated = await elevatedUnarchive(auth, env, args)
+      if (!elevated) return gateFail
+      if ('refusal' in elevated) return elevated.refusal
+      const receipted = await withElevationReceipt(
+        env, auth, elevated.grant, 'unarchive_row', { table: elevated.table, id: elevated.id },
+        (receiptId) => unarchiveRow(env, auth, {
+          table: elevated.table,
+          id: elevated.id,
+          reason: elevated.reason,
+          actorMemberId: auth.memberId as string, // as: elevatedUnarchive returns null unless auth.memberId is set
+          elevationReceiptId: receiptId,
+        }),
+        (o) => (o.ok && o.status === 'unarchived' ? { applied: true } : { applied: false, code: o.ok ? 'noop_not_archived' : o.error }),
+        { inBatch: true },
+      )
+      if (!receipted.began) return receipted.outcome
+      const outcome = receipted.value
+      return unarchiveOutcomeToResult(outcome)
+    }
 
     if (!isArchivableTable(args.table)) {
       return fail(400, 'invalid_args', `table must be one of ${ARCHIVABLE_TABLES.join(', ')}`)

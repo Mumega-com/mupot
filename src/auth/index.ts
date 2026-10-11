@@ -49,6 +49,7 @@ import {
   decideElevationRequest,
   listActiveElevationGrants,
   listElevationUsage,
+  elevationUsageOutcomeLabel,
   listPendingElevationRequests,
   loadElevationGrantById,
   revokeElevationGrant,
@@ -1562,6 +1563,10 @@ authApp.get('/elevation/:id/usage', requireAuthMw(), async (c) => {
       tool_name: u.tool_name,
       detail: u.detail_json ? JSON.parse(u.detail_json) : null,
       occurred_at: u.occurred_at,
+      status: u.status,
+      error_code: u.error_code,
+      resolved_at: u.resolved_at,
+      outcome: elevationUsageOutcomeLabel(u),
     })),
   })
 })

@@ -96,6 +96,39 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Created/updated records can be edited or removed by standing authority after expiry.',
   },
+  // S14 (PR #1831 review F1, consent scope): the routine-policy and
+  // project-status powers get their OWN keys. Grants persist only the action
+  // string, and the labels of action:workspace_project / action:project_lifecycle
+  // are creation-only ("Create/update workspace projects", "Create/update
+  // squads") — a live grant approved under those labels must never acquire
+  // these powers, so they are not folded into either.
+  'action:routine_policy': {
+    key: 'action:routine_policy',
+    enforced: true,
+    label: 'Enable, pause or update routines',
+    description: 'Enable, pause or update routines of a squad you have been granted. Does NOT include archiving.',
+    effect: 'reversible',
+    effectNote: 'A routine can be re-enabled, paused or edited again by standing authority after expiry.',
+  },
+  // Archive is split from routine_policy: it cannot be undone (no restore path;
+  // transitionRoutine/updateRoutine return routine_archived), so it must not
+  // ride a grant whose label says "reversible".
+  'action:routine_archive': {
+    key: 'action:routine_archive',
+    enforced: true,
+    label: 'Archive a routine permanently (cannot be restored)',
+    description: 'Archive a routine of a squad you have been granted. An archived routine cannot be restored.',
+    effect: 'irreversible',
+    effectNote: 'There is no restore path for an archived routine; expiry of the grant does not undo it.',
+  },
+  'action:project_status': {
+    key: 'action:project_status',
+    enforced: true,
+    label: 'Change project status or restore archived rows',
+    description: 'Change a project\'s status, or restore an archived project or squad.',
+    effect: 'reversible',
+    effectNote: 'A status change or restore can be reverted by standing authority after expiry.',
+  },
   'action:mint_token': {
     key: 'action:mint_token',
     enforced: true,

@@ -1,4 +1,5 @@
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
+import { appliedReceiptStatement } from '../auth/elevation-receipt'
 import type { Env, Project, ProjectAccessLevel, ProjectSquadAccess, ProjectStatus } from '../types'
 import { isNonEmptyString, isValidSlug } from '../org/service'
 import { projectSelectSql } from './columns'
@@ -378,6 +379,7 @@ export async function updateProject(
   env: Env,
   id: string,
   input: UpdateProjectInput,
+  opts: { elevationReceiptId?: string } = {},
 ): Promise<ProjectMutationResult<Project>> {
   const existing = await getProject(env, id)
   if (!existing) return { ok: false, error: 'project_not_found' }
@@ -507,7 +509,7 @@ export async function updateProject(
   try {
     // Compare-and-set on (id, updated_at, status) closes the check-then-write
     // TOCTOU: a concurrent status flip between getProject and this UPDATE loses.
-    const result = await env.DB.prepare(
+    const updateStatement = env.DB.prepare(
       `UPDATE projects SET slug = ?, name = ?, description = ?, goal = ?, status = ?, parent_project_id = ?,
        target_date = ?, completion_proposed_by = ?,
        repo_url = ?, worker_name = ?, live_url = ?, assigned_squad_id = ?,
@@ -521,7 +523,18 @@ export async function updateProject(
       updated.cycle_boundary_at,
       updated.updated_at,
       updated.id, existing.updated_at, existing.status,
-    ).run()
+    )
+    // An elevated caller's receipt flip rides the SAME batch as the write: if the flip
+    // cannot be written the status change rolls back with it. The guard is THIS
+    // statement's own change count (changes() right after the UPDATE), never the
+    // resulting updated_at: a losing compare-and-set whose winner left the same
+    // millisecond timestamp would otherwise flip its own receipt 'applied'.
+    const result = opts.elevationReceiptId
+      ? (await env.DB.batch([
+        updateStatement,
+        appliedReceiptStatement(env, opts.elevationReceiptId, 'SELECT 1 WHERE changes() = 1', []),
+      ]))[0]
+      : await updateStatement.run()
     if (!wrote(result)) {
       const current = await getProject(env, id)
       if (!current) return { ok: false, error: 'project_not_found' }

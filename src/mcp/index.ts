@@ -73,6 +73,7 @@ import {
   boundAgentHasAnyLiveElevationGrant,
   elevationHint,
 } from '../auth/elevation'
+import { listStuckReceipts } from '../auth/elevation-receipt'
 import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, REQUESTABLE_ELEVATION_ACTION_KEYS } from '../auth/elevation-actions'
 import { createBus } from '../bus'
 import { createMemory } from '../memory'
@@ -5928,9 +5929,19 @@ const toolElevationStatus: ToolSpec = {
     }
 
     const liveGrants = await loadLiveElevationGrantsForSession(env, env.TENANT_SLUG, liveSession.id)
+    // Reconciler read: receipts written before an elevated mutation that never
+    // resolved (neither applied nor failed) within 10 minutes.
+    const stuckReceipts = await listStuckReceipts(env, env.TENANT_SLUG, liveSession.id)
     return done({
       session_id: liveSession.id,
       request: requestView,
+      stuck_receipts: stuckReceipts.map((r) => ({
+        id: r.id,
+        elevation_grant_id: r.elevation_grant_id,
+        tool: r.tool_name,
+        detail: r.detail_json,
+        occurred_at: r.occurred_at,
+      })),
       active_elevations: liveGrants.map((g) => ({
         id: g.id,
         action: g.action,
@@ -7126,6 +7137,12 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'grant_agent_capability',
   'create_squad',
   'project_create',
+  'routine_enable',
+  'routine_pause',
+  'routine_archive',
+  'routine_update',
+  'project_update',
+  'unarchive_row',
 ])
 
 export async function invokeTool(

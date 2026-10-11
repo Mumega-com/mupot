@@ -3696,9 +3696,30 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_harness_reservations_vendor" },
     ],
   },
+  {
+    file: "0207_routines_last_elevation_grant.sql",
+    sha256: "20d927131bde97038c93142527d1bdd19ce0f1e587861c848e68bec3a8a641b4",
+    statements: [
+      "-- S14: a routine mutation made by an agent under a live elevation grant names\n-- that grant on the routine revision it produced (NULL = made by a member).\n-- Mirrors projects.created_via_elevation_grant / archive receipts.\nALTER TABLE routines ADD COLUMN last_elevation_grant_id TEXT;",
+    ],
+    objects: [],
+  },
+  {
+    file: "0208_elevation_usage_receipt_status.sql",
+    sha256: "d2e6a97dbc46b7bd8eabdb81ac0740cb60df69cd3fd4fe3975e64361ac22cda1",
+    statements: [
+      "-- S14 (PR #1831 review F2): elevation_usage_log becomes a durable two-phase\n-- receipt. A row is INSERTed 'pending' BEFORE an elevated mutation, then flipped\n-- to 'applied' (in the same D1 batch as the mutation where the write path is a\n-- prepared statement) or 'failed' with an error code. Rows that exist already\n-- were written after the effect committed, so they are 'applied'. A row still\n-- 'pending' after 10 minutes is reported by elevation_status as stuck_receipts.\nALTER TABLE elevation_usage_log ADD COLUMN status TEXT NOT NULL DEFAULT 'applied'\n  CHECK (status IN ('pending', 'applied', 'failed'));",
+      "\nALTER TABLE elevation_usage_log ADD COLUMN error_code TEXT;",
+      "\nALTER TABLE elevation_usage_log ADD COLUMN resolved_at TEXT;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_elevation_usage_log_pending\n  ON elevation_usage_log(tenant, status, occurred_at);",
+    ],
+    objects: [
+      { type: "index", name: "idx_elevation_usage_log_pending" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "585096097d05622ea0d915e33baa45a6baa4138193c1064bbfee09dd4d55ff5b"
+export const SCHEMA_CHAIN_DIGEST: string = "d02d6749e6bdc966b431b518dea7270fba7a7f3d29c757045e26a26f46031afc"

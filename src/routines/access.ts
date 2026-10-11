@@ -17,6 +17,9 @@ export interface RoutinePrincipal {
   legacy_owner_admin?: boolean
   org_owner?: boolean
   grants: CapabilityGrant[]
+  /** Set only when an agent runs as a member under a live elevation grant;
+   *  the service stamps it on the routine as last_elevation_grant_id. */
+  elevation_grant_id?: string
   project_read: ProjectReadAccess
 }
 
