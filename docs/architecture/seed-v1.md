@@ -196,8 +196,10 @@ Failures after the claim (`squad_limit_reached`, an uncaught error) are
 caller** (a foreign project is not ours, so the slug is not reserved). If the caller did create one, the
 claim stays with its lease expired, so only the same member with the same digest can resume it. A caller-owned
 **archived** project or squad is refused generically at the claim. A pre-existing project-squad edge below
-ADMIN (`team_bootstrap` never raises one) is `409 seed_footprint_incompatible {existing_edge}`; the claim
-stays resumable and the row is never finalized as applied. An apply whose final flip affected no row (a
+ADMIN (`team_bootstrap` never raises one) is `409 seed_footprint_incompatible {existing_edge}`. It is read-only
+checked BEFORE `team_bootstrap` runs (when the caller owns both rows), so no `team_bootstrap_receipts` row is
+written and no other admin's `team_bootstrap` can adopt on one; a post-call check remains as defence. The claim
+is resumable at once and the row is never finalized as applied. An apply whose final flip affected no row (a
 resume or sweep replaced its claim) returns `409 seed_apply_in_progress`, never a success.
 Everything stored or passed on (project name, squad name, owner label, request fields) is built from the
 canonical form (NFC, trailing whitespace trimmed), so equivalent spellings of one seed persist identically.
@@ -209,6 +211,8 @@ canonical form (NFC, trailing whitespace trimmed), so equivalent spellings of on
 - The squad guard and the claim use the shared `dept-projects` department only.
 - `accept_token` proves a dry run by this member, not that a person read the requests.
 - Slug existence is inferable from the generic refusal, as with any unique slug.
+- A claim refused for a weaker edge stays busy until someone raises the edge to ADMIN by hand; other admins cannot see
+  the claim.
 - A claim left `applying` over a project whose creator never returns (for example a deactivated member) stays
   wedged: nobody else can see the claim (its `project_id` is NULL) and the takeover needs the project's creator.
 - A different admin applying the same seed while the first apply is in flight gets `seed_slug_unavailable`, not
@@ -296,3 +300,4 @@ Each test below was written to fail when the named mutation is applied to the co
 - Drop the receipt's `WHERE changes() = 1` flip guard: the claim-lost test fails. Drop its UNIQUE key: the crash-resume test fails.
 - Drop the stale-claim sweep's no-project or lapsed-lease predicate, the resume guard, `require_provenance`, the squad guard, the `accept_token` binding to member, digest, age or HKDF key, the future-skew bound, the single timestamp spelling, the race-branch provenance checks, the lease fence, the owner recovery: the round-2 tests fail. (The `created_by_member_id` clause in the takeover `UPDATE` is redundant with the no-takeover predicate and is documentation, not a tested mutation.)
 - Drop the flip row-count check, the weaker-edge refusal, the archived predicates, the provenance rule on claim release, canonical persistence, the `#n` occurrence suffix, or the dry-run-only presence rule: the round-5 tests fail.
+- Drop the weak-edge pre-check (a second admin then adopts through the receipt), its `write` case, or the lease expiry on that refusal: the round-6 tests fail. Drop the archived-squad refusals (race and lookup), the foreign-before-archived ordering, or the canonical owner on takeover: the round-6 tests fail.
