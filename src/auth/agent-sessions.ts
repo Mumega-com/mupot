@@ -177,6 +177,26 @@ export async function loadAgentSessionById(env: Env, tenant: string, id: string)
   }
 }
 
+/** loadAgentSessionsByIds — the batched twin of loadAgentSessionById (one IN query per 50 ids). */
+export async function loadAgentSessionsByIds(env: Env, tenant: string, ids: string[]): Promise<Map<string, AgentSessionRecord>> {
+  const out = new Map<string, AgentSessionRecord>()
+  const uniq = Array.from(new Set(ids.filter(Boolean)))
+  try {
+    for (let i = 0; i < uniq.length; i += 50) {
+      const part = uniq.slice(i, i + 50)
+      const rows = await env.DB.prepare(
+        `SELECT ${SELECT_COLUMNS} FROM agent_sessions WHERE tenant = ?1 AND id IN (${part.map((_, j) => `?${j + 2}`).join(',')})`,
+      )
+        .bind(tenant, ...part)
+        .all<AgentSessionRecord>()
+      for (const r of rows.results ?? []) out.set(r.id, r)
+    }
+  } catch (err) {
+    if (!isMissingTableError(err)) throw err
+  }
+  return out
+}
+
 /** loadLiveAgentSessionByCredential — the row the partial unique index
  *  guarantees is at most one per (tenant, auth_kind, credential_id). */
 export async function loadLiveAgentSessionByCredential(

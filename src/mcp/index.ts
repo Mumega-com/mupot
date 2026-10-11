@@ -5914,10 +5914,10 @@ const toolElevationStatus: ToolSpec = {
   name: 'elevation_status',
   scope: 'self (exact current agent session); a human org admin instead sees the pending requests they can decide',
   min: 'authenticated',
-  args: '{ request_id?: string }',
+  args: '{ request_id?: string, limit?: number (human view only: max pending rows, default 50, max 100) }',
   inputSchema: {
     type: 'object',
-    properties: { request_id: STRING_SCHEMA },
+    properties: { request_id: STRING_SCHEMA, limit: { type: 'number' } },
     additionalProperties: false,
   },
   shouldTouchPresence: () => false,
