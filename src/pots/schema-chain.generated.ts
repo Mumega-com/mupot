@@ -3696,9 +3696,17 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "idx_harness_reservations_vendor" },
     ],
   },
+  {
+    file: "0207_routines_last_elevation_grant.sql",
+    sha256: "20d927131bde97038c93142527d1bdd19ce0f1e587861c848e68bec3a8a641b4",
+    statements: [
+      "-- S14: a routine mutation made by an agent under a live elevation grant names\n-- that grant on the routine revision it produced (NULL = made by a member).\n-- Mirrors projects.created_via_elevation_grant / archive receipts.\nALTER TABLE routines ADD COLUMN last_elevation_grant_id TEXT;",
+    ],
+    objects: [],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "585096097d05622ea0d915e33baa45a6baa4138193c1064bbfee09dd4d55ff5b"
+export const SCHEMA_CHAIN_DIGEST: string = "9f2d40f7b2088358b0f4a24e27644d837b8096d33d06391e30d593b327628b31"
