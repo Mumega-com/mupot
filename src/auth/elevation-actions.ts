@@ -246,3 +246,18 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:mint_token',
   'action:routine_archive', // irreversible
 ])
+
+/** S13: the ONLY actions a harness-attested human origin (a human decision relayed
+ *  through the human's own agent, no dashboard) may APPROVE. An explicit list, never
+ *  computed: adding an action here is a reviewed security decision.
+ *
+ *  Excluded on purpose: every SENSITIVE_STEP_UP_ACTIONS member (those need a fresh
+ *  dashboard reauth a chat message cannot prove), `action:home_access` (only the home's
+ *  own owner may decide it), and anything not enforced. DENY is never restricted by this
+ *  list: refusing a request can never widen authority. */
+export const ORIGIN_DECIDABLE_ACTIONS: ReadonlySet<string> = new Set([
+  'action:project_lifecycle',
+  'action:workspace_project',
+  'action:routine_policy',
+  'action:project_status',
+])

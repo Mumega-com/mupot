@@ -183,7 +183,7 @@ const RATE_LIMIT_WINDOW_MS = 30 * 1000
 // private-chat invariant `/im/webhook` assumes (message.from.id ===
 // message.chat.id). message_at is REQUIRED (not optional) — freshness
 // cannot be checked against a timestamp the caller may omit.
-type ParsedOrigin =
+export type ParsedOrigin =
   | { ok: true; value: HumanOriginInput }
   | { ok: false; reason: 'invalid_origin_shape' | 'text_required' | 'origin_stale' }
 
@@ -193,7 +193,7 @@ type ParsedOrigin =
 // string is already generous.
 const TEXT_MAX_LEN = 2048
 
-function parseHumanOrigin(raw: unknown, now: number = Date.now()): ParsedOrigin {
+export function parseHumanOrigin(raw: unknown, now: number = Date.now()): ParsedOrigin {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, reason: 'invalid_origin_shape' }
   }
@@ -243,7 +243,7 @@ function parseHumanOrigin(raw: unknown, now: number = Date.now()): ParsedOrigin 
  * `f9408956-...`. A run shorter than 8 hex characters never counts: too
  * short to be a meaningful task reference rather than an accidental match.
  */
-function taskNamedInText(text: string, taskId: string): boolean {
+export function taskNamedInText(text: string, taskId: string): boolean {
   const lowerText = text.toLowerCase()
   const lowerId = taskId.toLowerCase()
   if (lowerText.includes(lowerId)) return true

@@ -81,7 +81,7 @@ describe('guard: tools that write are never readOnly; tools that destroy are des
     'presence_register', 'presence_heartbeat', 'presence_deregister', 'check_in', 'mint_agent_token', 'revoke_agent_token',
     'archive_row', 'unarchive_row', 'task_incident_revert', 'flight_dispatch', 'flight_land', 'office.health', 'office.publish_post',
     'secret_env_request', 'supabase_mutate', 'create_agent', 'deactivate_agent', 'routine_create', 'routine_run_now',
-    'request_elevation', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
+    'request_elevation', 'elevation_decide', 'grant_gate_capability', 'cursor_dispatch', 'pot_provision',
   ]
   it.each(KNOWN_WRITERS)('%s is not readOnly', (name) => {
     expect(TOOL_ANNOTATION_ROWS[name]?.readOnlyHint, name).toBe(false)

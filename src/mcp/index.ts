@@ -214,6 +214,7 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { ELEVATION_DECIDE_TOOLS, ownerPendingView } from './elevation-decide'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -2347,7 +2348,7 @@ export async function wakeGateOwnerOnReview(
 // programmatically over MCP — without it a review task can only be verdicted
 // from the browser dashboard. cap: member+ on the task's squad AND the gate
 // capability named by task.gate_owner.
-const HUMAN_ORIGIN_SCHEMA = {
+export const HUMAN_ORIGIN_SCHEMA = {
   type: 'object',
   properties: {
     channel: STRING_SCHEMA,
@@ -5901,14 +5902,17 @@ const toolElevationStatus: ToolSpec = {
   name: 'elevation_status',
   scope: 'self (exact current agent session)',
   min: 'authenticated',
-  args: '{ request_id?: string }',
+  args: '{ request_id?: string, pending_for_owner?: boolean }',
   inputSchema: {
     type: 'object',
-    properties: { request_id: STRING_SCHEMA },
+    properties: { request_id: STRING_SCHEMA, pending_for_owner: { type: 'boolean' } },
     additionalProperties: false,
   },
   shouldTouchPresence: () => false,
   async run(auth, env, args) {
+    // S13: a human's own agent asks what its OWNER could decide (read-only; the requesting
+    // agent's `reason` is returned marked untrusted, apart from the id the human must echo).
+    if (args.pending_for_owner === true) return ownerPendingView(auth, env, args)
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 
@@ -6972,6 +6976,7 @@ export const TOOLS: ToolSpec[] = [
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...SEED_TOOLS,
+  ...ELEVATION_DECIDE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,

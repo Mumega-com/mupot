@@ -25,8 +25,9 @@
 // EVERY function that reads "now" takes it as an explicit parameter (default
 // Date.now()) — the same house rule migrations 0144/0147's modules follow.
 
+import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, CapabilityGrant, CapabilityScopeType, Env } from '../types'
-import { hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
+import { hasCapability, hasCapabilityOnDynamicScope, isOrgAdmin, loadSquadScope, planeCoversScope, resolveCapabilities } from './capability'
 import {
   type AgentAuthKind,
   evaluateAgentSession,
@@ -41,10 +42,12 @@ import {
   SENSITIVE_STEP_UP_ACTIONS,
   elevationActionEffect,
   isKnownElevationAction,
+  ORIGIN_DECIDABLE_ACTIONS,
   isRequestableElevationAction,
   isValidElevationDuration,
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
+import { completeTelegramUpdate } from '../im/telegram-receipts'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
 
@@ -75,6 +78,9 @@ export interface ElevationRequestRecord {
   decided_by_member_id: string | null
   decided_by_web_session_hash: string | null
   decision_note: string | null
+  /** S13 (0210): 'agent_attested_origin' when decided over the harness-attested human origin channel. */
+  decided_via: 'agent_attested_origin' | null
+  decided_origin_receipt_id: string | null
 }
 
 export interface ElevationGrantRecord {
@@ -87,19 +93,25 @@ export interface ElevationGrantRecord {
   scope_id: string
   effect: ElevationActionEffect
   approved_by_member_id: string
-  approved_by_web_session_hash: string
+  /** NULL exactly when approved_via = 'agent_attested_origin' (0210 CHECK). */
+  approved_by_web_session_hash: string | null
   created_at: string
   expires_at: string
   revoked_at: string | null
   revoke_reason: string | null
+  approved_via: 'web_session' | 'agent_attested_origin'
+  /** Set exactly when approved_via = 'agent_attested_origin'. */
+  origin_receipt_id: string | null
 }
 
 const REQUEST_COLUMNS = `id, tenant, agent_session_id, agent_id, member_id, requested_actions_json,
   requested_scope_type, requested_scope_id, requested_duration_minutes, reason, status,
-  created_at, decision_expires_at, decided_at, decided_by_member_id, decided_by_web_session_hash, decision_note`
+  created_at, decision_expires_at, decided_at, decided_by_member_id, decided_by_web_session_hash, decision_note,
+  decided_via, decided_origin_receipt_id`
 
 const GRANT_COLUMNS = `id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id,
-  effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason`
+  effect, approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, revoked_at, revoke_reason,
+  approved_via, origin_receipt_id`
 
 // ── create request (agent-initiated) ────────────────────────────────────────
 
@@ -241,6 +253,8 @@ export async function createElevationRequest(
       decided_by_member_id: null,
       decided_by_web_session_hash: null,
       decision_note: null,
+      decided_via: null,
+      decided_origin_receipt_id: null,
     },
   }
 }
@@ -354,12 +368,37 @@ export interface DecideElevationInput {
    *  fresh (resolveCapabilities) immediately before calling; never accept a
    *  cached/stale set here. */
   decidedByCapabilities: CapabilityGrant[]
-  decidedByWebSessionHash: string
+  /** The approver's dashboard web session. REQUIRED (non-empty) on the dashboard path;
+   *  MUST be null on the attested-origin path (see `attestedOrigin`). */
+  decidedByWebSessionHash: string | null
+  /** S13: set ONLY by the harness-attested human origin door (src/im/origin-elevation.ts).
+   *  This is a strictly NARROWER door through the same function, never a relaxation:
+   *    - approve is limited to ORIGIN_DECIDABLE_ACTIONS (no step-up action, ever);
+   *    - the approver must hold ORG-scope admin (checked in SQL inside the decision batch);
+   *    - the calling agent may not be the requesting agent;
+   *    - the decision, the origin receipt, every grant and the audit row land in ONE
+   *      D1 batch anchored on the request flip (no flip => nothing else lands).
+   *  Absent => the dashboard path, which requires a real web session hash. */
+  attestedOrigin?: AttestedOriginDecision
   /** Whether the approver's web session proved a fresh (<=5min) reauth
    *  round-trip — required when any selected action is in
    *  SENSITIVE_STEP_UP_ACTIONS (design Approval Flow step 5). */
   recentReauthOk: boolean
   note?: string
+}
+
+/** Everything the origin door proved BEFORE calling (read-only dry run) plus the
+ *  reservation it wants committed with the decision. */
+export interface AttestedOriginDecision {
+  /** The agent that relayed the human's message (auth.boundAgentId). */
+  callerAgentId: string
+  chatId: string
+  userId: string
+  messageId: string
+  messageAt: string
+  textHash: string
+  /** telegram_webhook_receipts reservation, written in the SAME batch as the decision. */
+  reservation: { updateId: string; digest: string; reservedAt: string }
 }
 
 export type DecideElevationResult =
@@ -371,6 +410,10 @@ export type DecideElevationResult =
   | { ok: false; reason: 'invalid_elevation_request'; detail: string }
   | { ok: false; reason: 'forbidden'; need: 'admin'; scope: { type: CapabilityScopeType; id: string } }
   | { ok: false; reason: 'reauth_required' }
+  // S13 origin door only:
+  | { ok: false; reason: 'origin_replayed' }
+  | { ok: false; reason: 'origin_action_not_permitted'; detail: string }
+  | { ok: false; reason: 'origin_guard_failed' }
 
 /** resolveScopeDepartmentId — squads inherit a department grant (mirrors
  *  hasCapability's own department→squad inheritance); org/department scope
@@ -500,6 +543,15 @@ export async function decideElevationRequest(
 
   const nowIso = new Date(nowMs).toISOString()
 
+  // ── which door: exactly one approver anchor, never both, never neither ──
+  const origin = input.attestedOrigin
+  if (origin && input.decidedByWebSessionHash) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'an attested-origin decision carries no web session' }
+  }
+  if (!origin && !input.decidedByWebSessionHash) {
+    return { ok: false, reason: 'invalid_elevation_request', detail: 'a dashboard decision requires a web session' }
+  }
+
   // ── authority, checked BEFORE either terminal decision ────────────────
   //
   // Approve and deny are two writes to the SAME authority ledger, and this
@@ -546,7 +598,16 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id } }
   }
 
+  // The relaying agent is never the requesting agent: a request is not approved by
+  // the very principal that asked, even with a human's words in its mouth.
+  if (origin && request.agent_id === origin.callerAgentId) {
+    return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id } }
+  }
+
   if (input.decision === 'deny') {
+    if (origin) {
+      return commitOriginDecision(env, request, input, origin, 'denied', [], request.requested_duration_minutes, nowMs)
+    }
     const result = await env.DB.prepare(
       `UPDATE elevation_requests
           SET status = 'denied', decided_at = ?1, decided_by_member_id = ?2,
@@ -591,6 +652,17 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
   }
 
+  if (origin) {
+    // The origin door can never approve a step-up action (a chat message cannot prove a
+    // fresh reauth) and only the explicit narrow set. recentReauthOk is IGNORED here: a
+    // caller-supplied boolean must not be able to widen this door.
+    const refused = selected.filter((a) => !ORIGIN_DECIDABLE_ACTIONS.has(a) || SENSITIVE_STEP_UP_ACTIONS.has(a))
+    if (refused.length > 0) {
+      return { ok: false, reason: 'origin_action_not_permitted', detail: `dashboard-only: ${refused.join(', ')}` }
+    }
+    return commitOriginDecision(env, request, input, origin, 'approved', selected, durationMinutes, nowMs)
+  }
+
   const needsStepUp = selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
   if (needsStepUp && !input.recentReauthOk) {
     return { ok: false, reason: 'reauth_required' }
@@ -622,6 +694,8 @@ export async function decideElevationRequest(
     expires_at: expiresAt,
     revoked_at: null,
     revoke_reason: null,
+    approved_via: 'web_session' as const,
+    origin_receipt_id: null,
   }))
 
   const batchResults = await env.DB.batch(
@@ -651,6 +725,165 @@ export async function decideElevationRequest(
 
   const updatedRequest = await loadElevationRequestById(env, input.tenant, request.id)
   return { ok: true, request: updatedRequest ?? { ...request, status: 'approved' }, grants }
+}
+
+/**
+ * S13 — the origin door's write. ONE D1 batch, anchored on the request flip:
+ *
+ *   [0] reservation   INSERT telegram_webhook_receipts (one decision per human message,
+ *                     shared key space with task_verdict's origin reservation)
+ *   [1] THE ANCHOR    UPDATE elevation_requests ... WHERE <every guard, in SQL, at write time>
+ *   [2] receipt       INSERT elevation_origin_receipts   ... WHERE the flip landed
+ *   [3..] grants      INSERT elevation_grants            ... WHERE the flip landed (approve)
+ *   [n] audit         INSERT mutation_audit_entries      ... WHERE the flip landed
+ *
+ * D1 batches roll back on a THROW, never on a 0-row statement, so nothing after [1] carries
+ * its own guard set: each depends solely on "my flip row exists" (its fresh receipt id), the
+ * same single-anchor discipline as origin-verdict.ts. No flip => no receipt, no grant, no audit.
+ */
+async function commitOriginDecision(
+  env: Env,
+  request: ElevationRequestRecord,
+  input: DecideElevationInput,
+  origin: AttestedOriginDecision,
+  status: 'approved' | 'denied',
+  selected: string[],
+  durationMinutes: number,
+  nowMs: number,
+): Promise<DecideElevationResult> {
+  const nowIso = new Date(nowMs).toISOString()
+  const receiptId = crypto.randomUUID()
+  const expiresAt = new Date(nowMs + durationMinutes * 60 * 1000).toISOString()
+  const decisionWord = status === 'approved' ? 'approve' : 'deny'
+  const note = input.note ?? null
+  const landed = `EXISTS (SELECT 1 FROM elevation_requests WHERE id = ? AND tenant = ? AND decided_origin_receipt_id = ? AND status = ?)`
+  const landedParams = [request.id, input.tenant, receiptId, status]
+
+  const grants: ElevationGrantRecord[] = selected.map((action) => ({
+    id: crypto.randomUUID(),
+    tenant: input.tenant,
+    elevation_request_id: request.id,
+    agent_session_id: request.agent_session_id,
+    action,
+    scope_type: request.requested_scope_type,
+    scope_id: request.requested_scope_id,
+    effect: elevationActionEffect(action) as ElevationActionEffect, // selected were validated against the registry above
+    approved_by_member_id: input.decidedByMemberId,
+    approved_by_web_session_hash: null,
+    created_at: nowIso,
+    expires_at: expiresAt,
+    revoked_at: null,
+    revoke_reason: null,
+    approved_via: 'agent_attested_origin',
+    origin_receipt_id: receiptId,
+  }))
+
+  const statements: D1PreparedStatement[] = [
+    env.DB.prepare(
+      `INSERT INTO telegram_webhook_receipts (tenant, update_id, telegram_user_id, request_digest, state, created_at)
+       VALUES (?, ?, ?, ?, 'processing', ?)
+       ON CONFLICT (tenant, update_id) DO NOTHING`,
+    ).bind(input.tenant, origin.reservation.updateId, origin.userId, origin.reservation.digest, origin.reservation.reservedAt),
+    env.DB.prepare(
+      `UPDATE elevation_requests
+          SET status = ?, decided_at = ?, decided_by_member_id = ?, decided_by_web_session_hash = NULL,
+              decision_note = ?, decided_via = 'agent_attested_origin', decided_origin_receipt_id = ?
+        WHERE id = ? AND tenant = ? AND status = 'pending' AND decision_expires_at > ?
+          AND agent_id <> ?
+          AND EXISTS (SELECT 1 FROM telegram_webhook_receipts
+                       WHERE tenant = ? AND update_id = ? AND created_at = ? AND request_digest = ? AND state = 'processing')
+          AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND owner_member_id = ?)
+          AND EXISTS (SELECT 1 FROM members WHERE id = ? AND tenant = ? AND status = 'active' AND telegram_chat_id = ?)
+          AND EXISTS (SELECT 1 FROM capabilities
+                       WHERE member_id = ? AND scope_type = 'org' AND capability IN ('admin', 'owner'))
+          AND EXISTS (SELECT 1 FROM agent_sessions WHERE id = elevation_requests.agent_session_id AND revoked_at IS NULL)`,
+    ).bind(
+      status, nowIso, input.decidedByMemberId, note, receiptId,
+      request.id, input.tenant, nowIso,
+      origin.callerAgentId,
+      input.tenant, origin.reservation.updateId, origin.reservation.reservedAt, origin.reservation.digest,
+      origin.callerAgentId, input.decidedByMemberId,
+      input.decidedByMemberId, input.tenant, origin.chatId,
+      input.decidedByMemberId,
+    ),
+    env.DB.prepare(
+      `INSERT INTO elevation_origin_receipts
+         (id, tenant, elevation_request_id, member_id, agent_id, channel, chat_id, message_id, message_at, text_hash, decision, created_at)
+       SELECT ?, ?, ?, ?, ?, 'telegram', ?, ?, ?, ?, ?, ?
+        WHERE ${landed}`,
+    ).bind(
+      receiptId, input.tenant, request.id, input.decidedByMemberId, origin.callerAgentId,
+      origin.chatId, origin.messageId, origin.messageAt, origin.textHash, decisionWord, nowIso,
+      ...landedParams,
+    ),
+    ...grants.map((g) =>
+      env.DB.prepare(
+        `INSERT INTO elevation_grants
+           (id, tenant, elevation_request_id, agent_session_id, action, scope_type, scope_id, effect,
+            approved_by_member_id, approved_by_web_session_hash, created_at, expires_at, approved_via, origin_receipt_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'agent_attested_origin', ?
+          WHERE ${landed}`,
+      ).bind(
+        g.id, g.tenant, g.elevation_request_id, g.agent_session_id, g.action, g.scope_type, g.scope_id, g.effect,
+        g.approved_by_member_id, g.created_at, g.expires_at, receiptId,
+        ...landedParams,
+      ),
+    ),
+    env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (
+         id, tenant, principal_kind, principal_id, member_id, agent_id, origin, handler, operation,
+         target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
+       SELECT ?, ?, 'member', ?, ?, ?, 'mcp', 'elevation_decide', ?, 'elevation_request', ?, ?, ?, ?, ?
+        WHERE ${landed}`,
+    ).bind(
+      crypto.randomUUID(), input.tenant, input.decidedByMemberId, input.decidedByMemberId, origin.callerAgentId,
+      decisionWord, request.id, `elevation-decide:${request.id}`, `elevation-decide:${request.id}`,
+      JSON.stringify({
+        decision: decisionWord,
+        via: 'agent_attested_origin',
+        origin_receipt_id: receiptId,
+        chat_id: origin.chatId,
+        message_id: origin.messageId,
+        requester_agent_id: request.agent_id,
+        requester_session_id: request.agent_session_id,
+        grants: grants.map((g) => ({ id: g.id, action: g.action, scope_type: g.scope_type, scope_id: g.scope_id, expires_at: g.expires_at })),
+      }),
+      nowIso,
+      ...landedParams,
+    ),
+  ]
+
+  const results = await env.DB.batch(statements)
+  const changes = (i: number): number => Number(results[i]?.meta?.changes ?? 0)
+  const identity = {
+    update_id: origin.reservation.updateId,
+    telegram_user_id: origin.userId,
+    request_digest: origin.reservation.digest,
+  }
+
+  if (changes(0) !== 1) {
+    // The reservation key was already occupied: this human message already spent its one
+    // decision. The anchor required OUR reservation, so nothing else could have landed.
+    return { ok: false, reason: 'origin_replayed' }
+  }
+  if (changes(1) !== 1) {
+    // Reservation is ours but the anchor did not land: the message is spent (reservation
+    // completed) and the call is refused. Distinguish a lost race from a lapsed guard.
+    await completeTelegramUpdate(env, identity, JSON.stringify({ applied: false, kind: 'elevation' }))
+    const fresh = await loadElevationRequestById(env, input.tenant, request.id)
+    if (fresh && fresh.status !== 'pending') return { ok: false, reason: 'already_decided', status: fresh.status }
+    return { ok: false, reason: 'origin_guard_failed' }
+  }
+  // The anchor landed => every dependent statement had the SAME single-row guard. Verify
+  // loudly: a mismatch here is a bug that must never be reported as success.
+  const expected = 1 + 1 + grants.length + 1
+  const landedCount = changes(2) + grants.reduce((n, _g, i) => n + changes(3 + i), 0) + changes(statements.length - 1)
+  if (landedCount !== expected - 1) {
+    throw new Error('elevation origin decision: anchor landed but a dependent write did not')
+  }
+  await completeTelegramUpdate(env, identity, JSON.stringify({ applied: true, kind: 'elevation', request_id: request.id }))
+  const updated = await loadElevationRequestById(env, input.tenant, request.id)
+  return { ok: true, request: updated ?? { ...request, status }, grants }
 }
 
 // ── grants: evaluate / list / revoke ────────────────────────────────────────
@@ -841,6 +1074,7 @@ export type ElevatedActionDenyReason =
   | 'no_matching_grant'
   | 'approver_authority_lost'
   | 'approver_session_ended'
+  | 'approver_origin_invalid'
 
 export type HasElevatedActionResult =
   | { granted: true; grant: ElevationGrantRecord }
@@ -857,6 +1091,39 @@ export interface HasElevatedActionOptions {
   recordUsage?: boolean
   toolName?: string
   detail?: unknown
+}
+
+/** S13 — USE-time re-verification of an origin-decided grant. Every conjunct re-derived
+ *  from live rows; none cached from decision time:
+ *    receipt exists, is an APPROVE, names this request and this approver (tenant-scoped);
+ *    the request still reads approved-via-this-receipt;
+ *    approver still active, still bound to the chat that spoke, still ORG admin (fresh caps);
+ *    the relaying agent is still owned by the approver. */
+async function originGrantStillValid(
+  env: Env,
+  tenant: string,
+  grant: ElevationGrantRecord,
+  approverCapabilities: CapabilityGrant[],
+): Promise<boolean> {
+  if (!grant.origin_receipt_id) return false
+  if (!hasCapability(approverCapabilities, 'org', null, 'admin')) return false
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok
+       FROM elevation_origin_receipts r
+       JOIN elevation_requests q ON q.id = r.elevation_request_id AND q.tenant = r.tenant
+       JOIN members m ON m.id = r.member_id AND m.tenant = r.tenant
+       JOIN agents a ON a.id = r.agent_id
+      WHERE r.id = ?1 AND r.tenant = ?2 AND r.decision = 'approve'
+        AND r.elevation_request_id = ?3 AND r.member_id = ?4
+        AND q.status = 'approved' AND q.decided_via = 'agent_attested_origin'
+        AND q.decided_origin_receipt_id = r.id AND q.decided_by_member_id = r.member_id
+        AND m.status = 'active' AND m.telegram_chat_id = r.chat_id
+        AND a.owner_member_id = r.member_id
+      LIMIT 1`,
+  )
+    .bind(grant.origin_receipt_id, tenant, grant.elevation_request_id, grant.approved_by_member_id)
+    .first<{ ok: number }>()
+  return row !== null
 }
 
 /**
@@ -970,9 +1237,19 @@ export async function hasElevatedAction(
     return { granted: false, reason: 'approver_authority_lost' }
   }
 
-  const approverSession = await loadWebSessionByHash(env, tenant, match.approved_by_web_session_hash)
-  if (!approverSession || !evaluateWebSession(approverSession, nowMs).ok) {
-    return { granted: false, reason: 'approver_session_ended' }
+  if (match.approved_via === 'agent_attested_origin') {
+    // The grant has no web session. Its anchor is the append-only origin receipt, and
+    // "pre-authorization ages": the WHOLE decision is re-verified at USE, not trusted
+    // because the row exists.
+    if (!(await originGrantStillValid(env, tenant, match, approverCapabilities))) {
+      return { granted: false, reason: 'approver_origin_invalid' }
+    }
+  } else {
+    if (!match.approved_by_web_session_hash) return { granted: false, reason: 'approver_session_ended' }
+    const approverSession = await loadWebSessionByHash(env, tenant, match.approved_by_web_session_hash)
+    if (!approverSession || !evaluateWebSession(approverSession, nowMs).ok) {
+      return { granted: false, reason: 'approver_session_ended' }
+    }
   }
 
   if (opts.recordUsage !== false) {
@@ -1086,6 +1363,7 @@ const ELEVATION_DENY_REMEDY: Record<ElevatedActionDenyReason, string> = {
   no_matching_grant: 'no live elevation grant covers this action and scope for this exact session — ask an org/department/squad admin to approve request_elevation for it',
   approver_authority_lost: 'the human who approved this grant no longer holds the required capability on this scope — ask a current admin to approve a fresh elevation',
   approver_session_ended: 'the human who approved this grant is no longer signed in — ask a current admin to approve a fresh elevation',
+  approver_origin_invalid: 'the chat approval behind this grant no longer verifies (approver, chat binding, org-admin standing or agent ownership changed) — ask a current admin to approve a fresh elevation',
 }
 
 /** Tools that consult an elevation action, and the action key each consults.
