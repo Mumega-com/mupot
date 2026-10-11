@@ -525,12 +525,14 @@ export async function updateProject(
       updated.id, existing.updated_at, existing.status,
     )
     // An elevated caller's receipt flip rides the SAME batch as the write: if the flip
-    // cannot be written the status change rolls back with it. The EXISTS guard keeps a
-    // lost compare-and-set (0 rows written) from flipping the receipt to 'applied'.
+    // cannot be written the status change rolls back with it. The guard is THIS
+    // statement's own change count (changes() right after the UPDATE), never the
+    // resulting updated_at: a losing compare-and-set whose winner left the same
+    // millisecond timestamp would otherwise flip its own receipt 'applied'.
     const result = opts.elevationReceiptId
       ? (await env.DB.batch([
         updateStatement,
-        appliedReceiptStatement(env, opts.elevationReceiptId, 'SELECT 1 FROM projects WHERE id = ?3 AND updated_at = ?4', [updated.id, updated.updated_at]),
+        appliedReceiptStatement(env, opts.elevationReceiptId, 'SELECT 1 WHERE changes() = 1', []),
       ]))[0]
       : await updateStatement.run()
     if (!wrote(result)) {

@@ -20,6 +20,8 @@ import {
   type ElevationGrantRecord,
 } from '../src/auth/elevation'
 import { createWebSession } from '../src/auth/web-sessions'
+import { beginElevationReceipt } from '../src/auth/elevation-receipt'
+import { updateProject } from '../src/projects/service'
 
 const TENANT = 'tenant-elevlife'
 const ORIGIN = 'https://pot.test'
@@ -363,5 +365,26 @@ describe('F2: durable two-phase elevation receipt', () => {
       const stuck = (res.result as { stuck_receipts: Array<{ id: string }> }).stuck_receipts
       expect(stuck.map((s) => s.id)).toEqual(['old-pending'])
     }
+  })
+
+  it('P1-C: two competing elevated project_update calls (same read version, same ms updated_at) -> exactly ONE applied; the loser fails and its status is never recorded applied', async () => {
+    const sessionId = await checkIn()
+    const grant = await approve(sessionId, 'action:project_status', ORG, 60, Date.now())
+    const r1 = await beginElevationReceipt(env, TENANT, grant, 'project_update', { status: 'paused' })
+    const r2 = await beginElevationReceipt(env, TENANT, grant, 'project_update', { status: 'archived' })
+    // Pin the clock so both competitors compute the SAME updated_at (the winner's
+    // timestamp then equals the loser's, which is what defeated a timestamp guard).
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 60_000 })
+    const [a, b] = await Promise.all([
+      updateProject(env, 'proj-target', { status: 'paused' }, { elevationReceiptId: r1 }),
+      updateProject(env, 'proj-target', { status: 'archived' }, { elevationReceiptId: r2 }),
+    ])
+    expect([a.ok, b.ok].filter(Boolean)).toHaveLength(1)
+    const winnerReceipt = a.ok ? r1 : r2
+    const loserReceipt = a.ok ? r2 : r1
+    const status = async (id: string) => (await env.DB.prepare('SELECT status FROM elevation_usage_log WHERE id = ?1').bind(id).first<{ status: string }>())?.status
+    expect(await status(winnerReceipt)).toBe('applied')
+    expect(await status(loserReceipt)).toBe('pending') // never 'applied' for a statement that changed 0 rows
+    expect(await projectStatus('proj-target')).toBe(a.ok ? 'paused' : 'archived')
   })
 })
