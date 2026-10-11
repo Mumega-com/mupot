@@ -8,6 +8,7 @@
 
 import type { Env } from '../types'
 import type {
+import { TASK_NOT_ARCHIVED_SQL } from '../hygiene/filters'
   DispatchRequest,
   HarnessActor,
   HarnessDispatchState,
@@ -395,7 +396,7 @@ export async function blockTaskForFailedReservation(
   const result = await env.DB.prepare(
     `UPDATE tasks
      SET status = 'blocked', assignee_agent_id = NULL, body = body || ?, updated_at = ?
-     WHERE id = ? AND status = 'in_progress'`,
+     WHERE id = ? AND status = 'in_progress' AND ${TASK_NOT_ARCHIVED_SQL()}`,
   )
     .bind(note, new Date().toISOString(), taskId)
     .run()
