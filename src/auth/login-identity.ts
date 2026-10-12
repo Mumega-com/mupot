@@ -20,6 +20,7 @@
 
 import type { Env } from '../types'
 import { revokeMemberPasskeys } from '../secure-moments/store'
+import { revokeWebSessionsForLoginIdentity } from './web-sessions'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 import {
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
@@ -277,9 +278,13 @@ export async function listLoginIdentities(
 
 /**
  * revokeLoginIdentity — set revoked_at on exactly one identity, scoped to
- * tenant + owning member. Idempotent: already-revoked is a no-op
- * ({ revoked: false }), never an error. A revoked identity will not resolve
- * and will not silently re-link (identity_revoked).
+ * tenant + owning member, and cut off everything that identity issued. The
+ * identity write is idempotent (already revoked => { revoked: false }), and the
+ * dependent cutoff runs whenever the identity IS revoked, not only on the call
+ * that revoked it: web sessions bound to it first, then passkeys enrolled under
+ * it. So a transient failure part-way (e.g. the passkey UPDATE) is repaired by
+ * simply retrying, and can never leave the identity's sessions usable. A revoked
+ * identity will not resolve and will not silently re-link (identity_revoked).
  */
 export async function revokeLoginIdentity(
   env: Env,
@@ -287,7 +292,7 @@ export async function revokeLoginIdentity(
   memberId: string,
   identityId: string,
   nowMs: number = Date.now(),
-): Promise<{ revoked: boolean; identity: LoginIdentityRecord | null }> {
+): Promise<{ revoked: boolean; identity: LoginIdentityRecord | null; sessionsRevoked: number }> {
   const nowIso = new Date(nowMs).toISOString()
   const result = await env.DB.prepare(
     `UPDATE human_login_identities SET revoked_at = ?1
@@ -296,8 +301,6 @@ export async function revokeLoginIdentity(
     .bind(nowIso, identityId, tenant, memberId)
     .run()
   const changes = Number(result.meta?.changes ?? 0)
-  // Passkeys enrolled under this identity die with it (the decision path also refuses a passkey whose identity is not live).
-  if (changes > 0) await revokeMemberPasskeys(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
   const identity = await env.DB.prepare(
     `SELECT id, tenant, provider, provider_subject, verified_email, member_id,
             linked_by_member_id, created_at, revoked_at
@@ -307,5 +310,12 @@ export async function revokeLoginIdentity(
   )
     .bind(identityId, tenant, memberId)
     .first<LoginIdentityRecord>()
-  return { revoked: changes > 0, identity: identity ?? null }
+  let sessionsRevoked = 0
+  if (identity && identity.revoked_at) {
+    // Sessions FIRST: they are the live door. Then passkeys (the decision path also refuses a passkey whose identity
+    // is not live). Both are idempotent, so a retry after any partial failure finishes the cutoff.
+    sessionsRevoked = (await revokeWebSessionsForLoginIdentity(env, tenant, memberId, identityId, 'identity_revoked', nowMs)).revokedCount
+    await revokeMemberPasskeys(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
+  }
+  return { revoked: changes > 0, identity: identity ?? null, sessionsRevoked }
 }
