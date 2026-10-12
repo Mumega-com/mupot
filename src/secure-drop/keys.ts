@@ -75,9 +75,13 @@ export function keyAssurance(h: HostKeyHistory, nowMs: number): KeyAssurance {
   const lines = [`This host key was registered ${age} (${h.liveCreatedAt}).`]
   let warn = false
   if (h.replacedCount > 0) lines.push(`It replaced ${h.replacedCount} earlier key${h.replacedCount === 1 ? '' : 's'} for this agent.`)
-  if (h.replacedCount >= 1 && ageMs < 24 * 3_600_000) {
+  if (ageMs < 24 * 3_600_000) {
+    // Any key younger than a day warns, first registration included: an agent with no key yet is exactly what a stolen
+    // agent token would register first (gate finding on #1863), so "new" is itself the signal, not only "changed".
     warn = true
-    lines.push('WARNING: this agent\'s key CHANGED in the last 24 hours. If nobody on the host side did that, a stolen agent token may have re-keyed it.')
+    lines.push(h.replacedCount >= 1
+      ? 'WARNING: this agent\'s key CHANGED in the last 24 hours. If nobody on the host side did that, a stolen agent token may have re-keyed it.'
+      : 'WARNING: this agent\'s key was registered in the last 24 hours. If nobody on the host side just set it up, a stolen agent token may have registered it.')
   }
   if (h.replacedCount >= 2) {
     warn = true

@@ -1109,9 +1109,11 @@ describe('P1-3: key changes are visible to the human and to the governors', () =
     expect(html).toContain('WARNING: this agent has been re-keyed 2 times')
     expect(html).not.toContain('CHANGED in the last 24 hours')
   })
-  it('keyAssurance is pure and bounded: first fresh key = no warning; rotation <24h = warning; >=2 rotations = warning', () => {
+  it('keyAssurance is pure and bounded: ANY key under 24h warns (first registration included); an old single rotation does not; >=2 rotations warn', () => {
     const now = Date.parse('2026-10-12T12:00:00.000Z')
-    expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 0 }, now).warn).toBe(false)
+    expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 0 }, now).warn).toBe(true)
+    expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 0 }, now).lines.join(' ')).toContain('registered in the last 24 hours')
+    expect(keyAssurance({ liveCreatedAt: '2026-10-05T11:30:00.000Z', replacedCount: 0 }, now).warn).toBe(false)
     expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 1 }, now).warn).toBe(true)
     expect(keyAssurance({ liveCreatedAt: '2026-10-10T11:30:00.000Z', replacedCount: 1 }, now).warn).toBe(false)
     expect(keyAssurance({ liveCreatedAt: '2026-10-01T11:30:00.000Z', replacedCount: 2 }, now).warn).toBe(true)

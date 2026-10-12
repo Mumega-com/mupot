@@ -671,6 +671,13 @@ export async function pull({ home, env, pot, api, fetch: fetchFn, out }) {
 
 export async function register({ home, env, pot, api, agent, fetch: fetchFn, out }) {
   const hostKey = loadHostKey(home)
+  // A host already pinned to an agent must not register (and so rotate the server-side key) for another one: check the
+  // pin BEFORE calling the server. A pinned host needs --agent naming that same pin; the server's answer is re-checked.
+  if (lstatExists(agentPinPath(home))) {
+    const pinned = loadAgentPin(home)
+    if (agent === undefined) throw new DropError(`this host is pinned to agent ${pinned}; pass --agent ${pinned} to re-register its key`)
+    if (agent !== pinned) throw new DropError(`this host is pinned to agent ${pinned}; refusing to register it for ${agent}`)
+  }
   const target = resolveTarget({ home, env, pot, api })
   const res = await callTool({ fetch: fetchFn }, target, 'host_key_register', { public_key: hostKey.publicB64u })
   const agentId = validateAgentId(res && res.agent_id)

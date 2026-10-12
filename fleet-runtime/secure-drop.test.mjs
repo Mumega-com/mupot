@@ -322,11 +322,16 @@ test('register pins the host to the agent id the server names; a different agent
     assert.equal(drop.loadAgentPin(home), 'agent-x')
     assert.match(out.text(), /governors notified: 2/)
     assert.equal(statSync(join(home, '.mupot', 'agent.json')).mode & 0o777, 0o600)
-    const other = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: 'agent-y' }) })
+    // A pinned host refuses BEFORE calling the server (the server-side key must not rotate for another agent).
+    let calls = 0
+    const other = fakeMcp({ host_key_register: () => { calls++; return { ok: true, agent_id: 'agent-y' } } })
     const out2 = lines()
     assert.equal(await drop.main(['register'], { home, env: {}, fetch: other, out: out2 }), 1)
     assert.match(out2.text(), /pinned to agent agent-x/)
-    assert.equal(await drop.main(['register', '--agent', 'agent-z'], { home, env: {}, fetch, out: lines() }), 1)
+    assert.equal(await drop.main(['register', '--agent', 'agent-z'], { home, env: {}, fetch: other, out: lines() }), 1)
+    assert.equal(calls, 0)
+    // Re-registering the SAME pinned agent with --agent works (key rotation on the host it belongs to).
+    assert.equal(await drop.main(['register', '--agent', 'agent-x'], { home, env: {}, fetch, out: lines() }), 0)
     for (const bad of ['../x', 'a/b', '', 'a'.repeat(65), 5]) {
       const f = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: bad }) })
       const un = await setup({ pin: false })
@@ -718,7 +723,8 @@ test('register sends ONLY the public key', async () => {
   try {
     const fetch = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: 'agent-x', rotated: false }) })
     const out = lines()
-    assert.equal(await drop.main(['register'], { home, env: {}, fetch, out }), 0)
+    // setup() pins the host to agent-x, so a re-register must name that pin
+    assert.equal(await drop.main(['register', '--agent', 'agent-x'], { home, env: {}, fetch, out }), 0)
     assert.deepEqual(fetch.calls[0].args, { public_key: key.publicB64u })
     const jwk = JSON.parse(readFileSync(join(home, '.mupot', 'host-key.json'), 'utf8'))
     assert.ok(!JSON.stringify(fetch.calls).includes(jwk.d), 'the private key never leaves the host')

@@ -94,7 +94,7 @@ const toolCredentialRequest: ToolSpec = {
   inputSchema: {
     type: 'object',
     properties: {
-      name: { type: 'string', description: 'Lower-case slug [a-z0-9_-], up to 63 characters, starting with a letter or digit. The file is written to ~/.sos/keys/<name> on the agent host.' },
+      name: { type: 'string', description: 'Lower-case slug [a-z0-9_-], up to 63 characters, starting with a letter or digit. The file is written to ~/.mupot/secrets/<agent id>/<name> on the agent host.' },
       purpose: { type: 'string', description: 'Why the credential is needed (shown to the human in an untrusted box; up to 280 characters). Never put a secret here.' },
       scope_hint: { type: 'string', description: 'Optional: the scope or permission the credential should carry (up to 200 characters).' },
       ttl_minutes: { type: 'number', description: 'How long the link stays open: 5 to 1440 minutes, default 60.' },
@@ -193,7 +193,7 @@ const toolSecureDropRevoke: ToolSpec = {
   inputSchema: {
     type: 'object',
     properties: {
-      name: { type: 'string', description: 'The credential name (the file name under ~/.sos/keys).' },
+      name: { type: 'string', description: 'The credential name (the file name under ~/.mupot/secrets/<agent id>/ on the agent host).' },
       agent_id: { type: 'string', description: 'Only when the same name exists for more than one agent you govern.' },
     },
     required: ['name'],

@@ -15,7 +15,7 @@ export function credentialViewInner(input: { drop: DropRow; agent: AgentRow; hos
 <form id="drop-form" data-csrf="${input.csrf}" data-agent-id="${escapeHtml(agent.id)}" data-name="${escapeHtml(drop.name)}" data-drop-id="${escapeHtml(drop.id)}" data-pub="${escapeHtml(hostKey.public_key_b64u)}" data-fp="${escapeHtml(hostKey.fingerprint)}">
 <dl><dt>Agent</dt><dd>${escapeHtml(agent.name)} <span class="muted">(${escapeHtml(agent.slug)})</span></dd>
 <dt>Name</dt><dd><code>${escapeHtml(drop.name)}</code></dd>
-<dt>Written to</dt><dd><code>~/.sos/keys/${escapeHtml(drop.name)}</code> on the agent's host</dd></dl>
+<dt>Written to</dt><dd><code>~/.mupot/secrets/${escapeHtml(agent.id)}/${escapeHtml(drop.name)}</code> on the agent's host</dd></dl>
 ${untrustedBox('Why it wants this credential.', drop.purpose)}${drop.scope_hint ? untrustedBox('Scope it asked for.', drop.scope_hint) : ''}
 <div class="card ${assurance.warn ? 'status-bad' : 'status-warn'}"><p><strong>Host key fingerprint</strong></p>
 <p class="fp" id="fp-shown">${escapeHtml(groupFingerprint(hostKey.fingerprint))}</p>
