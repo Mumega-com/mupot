@@ -269,6 +269,22 @@ describe('2025-11-25: -32042 URLElicitationRequiredError', () => {
   })
 })
 
+describe('2025-11-25 elevation retry is principal-scoped', () => {
+  it('another agent making the identical ask gets its own new request, never the first agent\'s state', async () => {
+    const env = makeEnv()
+    await checkIn(env)
+    await checkIn(env, 'tok-y')
+    const sid = (await initWithUrl(env)) ?? ''
+    const a = await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs() }, { headers: { 'mcp-session-id': sid } })
+    expect(a.json.error?.code).toBe(-32042)
+    harness.sqlite.exec(`UPDATE elevation_requests SET status='approved', decided_at='${new Date().toISOString()}'`)
+    const b = await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs() }, { bearer: 'tok-y', headers: { 'mcp-session-id': sid } })
+    expect(b.json.error?.code).toBe(-32042)
+    expect(count('elevation_requests')).toBe(2)
+    expect(count('elevation_requests', "agent_id = 'agent-y' AND status = 'pending'")).toBe(1)
+  })
+})
+
 describe('2026-07-28: MRTR input_required', () => {
   const callModern = (env: Env, name: string, args: unknown, extra: Record<string, unknown> = {}, bearer = 'tok-x', caps: unknown = URL_CAPS) =>
     rpc(env, 'tools/call', { name, arguments: args, _meta: modernMeta(caps), ...extra }, { bearer, headers: modernHeaders })

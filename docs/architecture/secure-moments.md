@@ -76,7 +76,7 @@ The secure host sets no cookies. There is no session on it, so there is nothing 
 - ES256 only. Authenticators that can only produce RSA keys cannot enrol.
 - Attestation is not verified (requested as `none`). A passkey says "the same authenticator again", nothing about the make of the device.
 - A moment has no named decider: any member whose authority passes the check at decision time may decide. The column exists for a later wave.
-- Only two kinds of moment. Other secure requests (credential drop, Telegram Mini App, MCP URL-mode elicitation) are later waves.
+- Only two kinds of moment. Other secure requests (credential drop, Telegram Mini App) are later waves; MCP URL-mode elicitation is W3, below.
 - An org admin cannot yet mint an enrolment link for another member.
 - There is no rate limit on the link beyond the unguessable token and a cap on outstanding challenges per moment.
 - Recovery from a lost passkey is: sign in to the dashboard and add a new one. It never runs through an agent.
@@ -232,3 +232,54 @@ Token rules are the CLI's (`cli/mupot.mjs`): the bearer token comes from a 0600 
 - The credential password field opts out of password managers (`autocomplete="new-password"`, `data-1p-ignore`, `data-lpignore`, `data-bwignore`) and the form is left in place after success, so it does not look like a login that a manager should offer to save. Managers may still ignore these hints; the field is never submitted as a form field (the page script seals it and posts JSON).
 - Revoke goes through a human **bearer** token over MCP (authority is checked, but there is no passkey step-up on revoke). Revoking is the safe direction: it only removes access.
 - Clock-based expiry is lazy: expired rows are closed on the next request or pull, and an expired moment is never decidable in between.
+
+## W3: MCP URL-mode elicitation
+
+When a request tool has just filed a request and minted a secure-moment link, the MCP layer can offer that link as a native MCP URL-mode elicitation, so a capable client opens it with a consent prompt instead of leaving it to the model to relay a string. **The plain link in the tool result stays the guaranteed path**: a client that did not declare support gets the tool result unchanged, byte for byte.
+
+Code: `src/mcp/url-elicitation.ts`, wired in `handleJsonRpc` (`src/mcp/index.ts`) and `invokeTool` (an optional `ToolCtx.shortCircuit`). Tests: `tests/mcp-url-elicitation.test.ts`.
+
+### Switches
+
+`MCP_URL_ELICITATION` is `1` or `true`, off by default. It is inert unless secure moments are also usable (`SECURE_MOMENTS` on, a valid `SECURE_MOMENTS_HOST`) and `CONNECTOR_MASTER_KEY` is a 64-hex key (it signs the retry state and the capability session id; no key, no feature). With the flag off nothing here runs: no header on `initialize`, no new branch on any `tools/call`.
+
+When the flag is on, a 2026-07-28 request (`MCP-Protocol-Version` or `_meta` naming 2026-07-28) gets `resultType: "complete"` on every result, as that version requires. Before, that stamping needed `EVENTS_ENABLED`; now either flag turns it on.
+
+### Which tools, which link
+
+Only `seed_attach_request` and `request_elevation`. After the tool succeeds, the layer reads the result's `approve_url` and offers it only if all hold: https, the host is exactly `SECURE_MOMENTS_HOST` (no port, no userinfo), no query or fragment, path exactly `/m/<moment id>/<token>`, and the moment row is pending, of the kind that tool mints, and filed for this caller's bound agent. Anything else leaves the plain result alone. The URL is the W1 one-time link: its token authorises nothing; the human still proves themselves with a passkey on the secure host. A future tool (W2 `credential_request`) joins by adding a row to `URL_ELICITATION_TOOLS` and a case in `readOutcome`.
+
+An elicitation answer (`accept`, `decline`, `cancel`) is consent to open the page, never a decision. No form mode is ever used, nothing secret is put in a message, and the server never sends a mid-call `elicitation/create` (the Worker is stateless).
+
+### Capability detection
+
+mupot has no session store, so a declaration has to arrive with the request:
+
+| Client | Where it declares | Response |
+| --- | --- | --- |
+| 2026-07-28 (no `initialize`) | `_meta["io.modelcontextprotocol/clientCapabilities"].elicitation.url` is an object, on a request that names 2026-07-28 | `resultType: "input_required"` with `inputRequests.secure_moment = {method: "elicitation/create", params: {mode: "url", url, message}}` and a `requestState` |
+| 2025-11-25 | `capabilities.elicitation.url` in `initialize` | `initialize` returns a signed `Mcp-Session-Id` (`mce1.<payload>.<hmac>`, HKDF label `mupot_mcp_url_elicitation_session_v1`) holding only "declared url" and an issue time. The client echoes it on every later request, which is what proves the declaration. A `tools/call` carrying a valid id gets JSON-RPC error `-32042` with `data.elicitations = [{mode: "url", elicitationId, url, message}]`; `elicitationId` is the moment id |
+| either, fallback | the same `_meta` key on a request that does not name 2026-07-28 | `-32042` |
+
+A modern client never gets `-32042` (removed in 2026-07-28) and never gets `input_required` without declaring `url`. The `-32042` message text also carries the plain link, so a client that ignores the code still shows it. The session id identifies nobody and authorises nothing; forging it only opts the forger into a link they could read anyway. It expires after 7 days (then the client falls back to the plain result until it re-initialises).
+
+### Retry is read-only
+
+The elicitation has already filed the request and minted the moment. A retry must not file a second request and must not rotate the link: `createMoment` rotates a pending moment's token, which would kill the page the human just opened, and `request_elevation` has no de-duplication. So a matching retry short-circuits `invokeTool` after every capability and schema gate and instead of the tool body, and reports the request's current state (`pending`, `approved`, `denied`, `expired`, `applied`, ...) with `retry: true`. It writes nothing.
+
+- **2026-07-28**: the client echoes `requestState` (plus `inputResponses`). The state is `mus1.<payload>.<hmac>`, HMAC-SHA256 under a key derived from `CONNECTOR_MASTER_KEY` with HKDF label `mupot_mcp_url_elicitation_state_v1`. It carries the principal (member and bound agent), tool name, a digest of the arguments, moment id and kind, request id, and an expiry (the moment's, at most 24h). It is attacker-controlled: the MAC is checked first, then every binding. A bad state is refused with `-32602 invalid_request_state:<reason>` (`malformed`, `integrity`, `tool`, `expired`, `principal`, `args`) and never falls through to running the tool. The state is not single-use; the retry only reads.
+- **2025-11-25**: nothing travels, so "the same ask" is found by natural key, among this caller's own requests that were issued through a secure moment: `seed_attach_request` by (member, seed digest), `request_elevation` by (bound agent, actions as a set, scope, duration, reason). A matching request counts as a retry while it is pending and younger than 10 minutes, or was decided in the last 10 minutes. Anything older, or different, is a new ask and a new elicitation. An older pending seed request is re-asked through the tool, which reuses the request and rotates the link, exactly as without elicitation.
+
+### Client support (as of 2026-10-12)
+
+| Client | URL-mode elicitation |
+| --- | --- |
+| Claude Code | confirmed declares `url` (docs); its docs say nothing about `-32042` or `input_required` handling, so the retry behaviour is unverified |
+| VS Code Copilot | confirmed `url` (1.107) |
+| Claude Desktop, claude.ai, ChatGPT, Codex, Cursor | unknown: no documentation found; Codex and Cursor are documented for form mode only |
+
+Because most clients are unknown, nothing depends on the elicitation: the plain `approve_url` is always in the result for a client that did not declare support.
+
+### Not verified
+
+No real client has been driven through either flow; the tests speak the wire shapes directly. The 2026-07-28 field names (`inputResponses`, `requestState` as `tools/call` params, the `input_required` result) follow the SEP-2322 text as recorded in research, not a client implementation. Whether a given client echoes `Mcp-Session-Id` after `initialize` through the OAuth wrapper in front of `/mcp` is unmeasured, as is how a client that gets a session id reacts to the absence of `DELETE /mcp` handling.
