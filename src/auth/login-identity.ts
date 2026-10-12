@@ -19,6 +19,7 @@
 // subject) → member_id join once a member already exists to bind to.
 
 import type { Env } from '../types'
+import { revokeMemberPasskeys } from '../secure-moments/store'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 import {
   PROVISIONING_EXEMPT_DIRECTORY_CHANNEL,
@@ -295,6 +296,8 @@ export async function revokeLoginIdentity(
     .bind(nowIso, identityId, tenant, memberId)
     .run()
   const changes = Number(result.meta?.changes ?? 0)
+  // Passkeys enrolled under this identity die with it (the decision path also refuses a passkey whose identity is not live).
+  if (changes > 0) await revokeMemberPasskeys(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
   const identity = await env.DB.prepare(
     `SELECT id, tenant, provider, provider_subject, verified_email, member_id,
             linked_by_member_id, created_at, revoked_at

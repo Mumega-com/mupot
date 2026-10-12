@@ -73,13 +73,23 @@ export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | '
 }
 
 /** The shared dedicated-host rule (approve host, secure-moments host): well-formed, not a colony host, not under one or the pot suffix. */
+/** True when either hostname is the same as, or a subdomain of, the other (ports ignored). */
+export function hostsRelated(a: string, b: string): boolean {
+  const x = hostnameOf(a.trim().toLowerCase().replace(/\.$/, ''))
+  const y = hostnameOf(b.trim().toLowerCase().replace(/\.$/, ''))
+  return isSameOrSubdomain(x, y) || isSameOrSubdomain(y, x)
+}
+
 export function dedicatedHost(env: Pick<Env, 'PUBLIC_ORIGIN' | 'DEFAULT_POT_HOST_SUFFIX'>, rawHost: string | undefined): string | null {
   const host = rawHost?.trim().toLowerCase().replace(/\.$/, '')
   if (!host || !HOST_RE.test(host)) return null
   const name = hostnameOf(host)
-  for (const colony of colonyHostnames(env)) if (isSameOrSubdomain(name, colony)) return null
+  // Both directions: a host at or BELOW a colony/pot domain is reached by tenant/project routing; a host that is a PARENT
+  // of one (approval host example.com, colony colony.example.com) can scope its cookies over every colony/project
+  // subdomain, where agent-deployable Workers run. Siblings (approve.mumega.com vs mupot.mumega.com) are fine.
+  for (const colony of colonyHostnames(env)) if (isSameOrSubdomain(name, colony) || isSameOrSubdomain(colony, name)) return null
   const potSuffix = trimDots(env.DEFAULT_POT_HOST_SUFFIX?.trim().toLowerCase() ?? '')
-  if (potSuffix && isSameOrSubdomain(name, potSuffix)) return null
+  if (potSuffix && (isSameOrSubdomain(name, potSuffix) || isSameOrSubdomain(potSuffix, name))) return null
   return host
 }
 

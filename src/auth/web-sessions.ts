@@ -21,6 +21,7 @@
 
 import type { Env } from '../types'
 import { sha256Hex } from '../members/service'
+import { revokeMemberPasskeys } from '../secure-moments/store'
 
 // ── tunables (design v1 policy) ──────────────────────────────────────────────
 
@@ -425,6 +426,10 @@ export async function revokeAllWebSessions(
       )
         .bind(nowIso, reason, tenant, memberId)
         .run()
+  // A passkey is a second door: every "cut this human off" lever closes it too (both the full sign-out and the
+  // "other devices" variant; the member re-enrols from /account, which needs a fresh re-authentication). Sessions are
+  // revoked FIRST, so a failure here can never leave every session live; it still surfaces to the caller.
+  await revokeMemberPasskeys(env, memberId, `sessions_revoked:${reason}`, {}, nowMs)
   return { revokedCount: Number(result.meta?.changes ?? 0) }
 }
 

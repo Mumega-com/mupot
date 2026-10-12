@@ -2,7 +2,7 @@
 // every /m/* route answers 404 on every host and the request tools issue no secure link.
 // Contract: docs/architecture/secure-moments.md.
 import type { Env } from '../types'
-import { dedicatedApprovalHost, dedicatedHost } from '../access/config'
+import { dedicatedApprovalHost, dedicatedHost, hostsRelated } from '../access/config'
 
 export function secureMomentsEnabled(env: Pick<Env, 'SECURE_MOMENTS'>): boolean {
   const v = env.SECURE_MOMENTS?.trim().toLowerCase()
@@ -19,11 +19,15 @@ type HostEnv = Pick<Env, 'SECURE_MOMENTS_HOST' | 'ACCESS_CANONICAL_HOST' | 'PUBL
 export function dedicatedSecureHost(env: HostEnv): string | null {
   const host = dedicatedHost(env, env.SECURE_MOMENTS_HOST)
   if (!host) return null
+  // The host is the WebAuthn RP ID and the exact origin we verify: a port belongs to neither, so a port is refused.
+  if (/:\d{1,5}$/.test(host)) return null
   // Compare against the RAW normalised Access host as well as the validated one: a misconfigured Access host
   // must not become a way to share a host with the secure page.
   const rawAccess = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase().replace(/\.$/, '')
   if (rawAccess && rawAccess === host) return null
   if (dedicatedApprovalHost(env) === host) return null
+  // Neither may be a parent or child of the other: a cookie scoped to one would reach the other.
+  if (rawAccess && hostsRelated(rawAccess, host)) return null
   return host
 }
 
@@ -40,7 +44,7 @@ export function secureMomentsStatus(env: Env): SecureMomentsStatus {
   }
   const host = dedicatedSecureHost(env)
   if (!host) {
-    return { state: 'misconfigured', reason: 'SECURE_MOMENTS_HOST is malformed, equals or sits under a colony host or the pot host domain, or equals ACCESS_CANONICAL_HOST; it must be a dedicated hostname outside them' }
+    return { state: 'misconfigured', reason: 'SECURE_MOMENTS_HOST is malformed, carries a port, equals or sits under a colony host or the pot host domain, or equals ACCESS_CANONICAL_HOST; it must be a dedicated hostname outside them' }
   }
   return { state: 'on', host }
 }

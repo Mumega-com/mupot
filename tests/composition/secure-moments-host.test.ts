@@ -170,8 +170,9 @@ describe('enrol and decide through the real worker on the workerd D1 simulator',
     const assertion = await a.assert({ rpId: SECURE, origin, challenge: ch.publicKey.challenge })
     const first = await post(`${path}/decide`, { decision: 'approve', csrf: dcsrf, credential: assertion })
     expect(await first.json()).toMatchObject({ ok: true, title: 'Approved' })
-    const ch2 = (await (await hit(SECURE, path)).status) // closed now
-    expect(ch2).toBe(410)
+    const reload = await hit(SECURE, path) // an applied seed reads as approved on reload, not closed (mupot#1860)
+    expect(reload.status).toBe(200)
+    expect(await reload.text()).toContain('already approved')
     const row = await loadSeedRequest(e, created.id)
     expect(row).toMatchObject({ status: 'applied', decided_via: 'webauthn' })
     expect(await loadMoment(e, m.id)).toMatchObject({ status: 'consumed', decision: 'approve' })

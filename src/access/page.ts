@@ -1,4 +1,4 @@
-// mupot — approve page HTML. Server-rendered, NO script. Every value is HTML-escaped; agent-authored text
+// mupot — approve page HTML. Server-rendered; the only script is the optional nonce'd double-submit guard below. Every value is HTML-escaped; agent-authored text
 // goes ONLY inside the "untrusted" box, control/invisible characters made visible and length capped, so it
 // can never pass as the page's own words. Colours are CSS custom properties (light + dark), no literals
 // outside the token block.
@@ -51,3 +51,20 @@ select{font:inherit;padding:.4rem;background:var(--surface);color:var(--text);bo
 export function messagePage(title: string, message: string, status: 'ok' | 'warn' | 'bad'): string {
   return renderPage(title, `<h1>${escapeHtml(title)}</h1><div class="card status-${status}"><p>${escapeHtml(message)}</p></div>`)
 }
+
+/**
+ * The decision form's double-submit guard (mupot#1860): the first submit keeps the pressed button's value (a
+ * disabled submitter would not be sent), then every button is disabled SYNCHRONOUSLY, before the browser builds the
+ * entry list, so the pressed button is not sent a second time beside its hidden copy (a doubled `decision` field
+ * parses as an array). A progress line replaces the buttons' promise. A second tap can no longer race the first. No network, no secrets, no server text.
+ */
+export const SUBMIT_ONCE_SCRIPT = `(function(){
+document.addEventListener('submit',function(e){
+ var f=e.target;if(!f||f.getAttribute('data-once')!=='1')return;
+ if(f.getAttribute('data-sent')==='1'){e.preventDefault();return}
+ f.setAttribute('data-sent','1');
+ var s=e.submitter;if(s&&s.name){var h=document.createElement('input');h.type='hidden';h.name=s.name;h.value=s.value;f.appendChild(h)}
+ var p=document.getElementById('progress');if(p)p.textContent='Working. Do not reload or tap again; this page updates when it is done.';
+ var bs=f.querySelectorAll('button');for(var i=0;i<bs.length;i++)bs[i].disabled=true;
+});
+})();`

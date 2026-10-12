@@ -12,14 +12,19 @@ import { applyAllMigrations, migrationFiles } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { SoftAuthenticator } from './helpers/webauthn-authenticator'
 import { momentsApp } from '../src/secure-moments/routes'
+import { dedicatedApprovalHost } from '../src/access/config'
 import { dedicatedSecureHost, momentUrl, secureMomentsStatus } from '../src/secure-moments/config'
 import { secureMomentsHostGate } from '../src/secure-moments/host-gate'
-import { createMoment, consumeMoment, mintEnrolmentToken, mintDecideChallenge, consumeDecideChallenge, advancePasskeyCounter, tokenHash } from '../src/secure-moments/store'
+import { revokeOwnPasskey, createMoment, consumeMoment, mintEnrolmentToken, mintDecideChallenge, consumeDecideChallenge, advancePasskeyCounter, tokenHash } from '../src/secure-moments/store'
 import { mintEnrolmentLink } from '../src/secure-moments/enrol-mint'
 import { issueMomentLink } from '../src/secure-moments/issue'
 import { b64uEncode, derToP1363, decodeCbor, verifyAssertion, verifyRegistration } from '../src/secure-moments/webauthn'
 import { linkLoginIdentity } from '../src/auth/login-identity'
-import { createWebSession, markRecentReauth } from '../src/auth/web-sessions'
+import { createWebSession, markRecentReauth, revokeAllWebSessions } from '../src/auth/web-sessions'
+import { revokeLoginIdentity } from '../src/auth/login-identity'
+import { decideElevation, decideSeed } from '../src/access/decision-core'
+import { loadSeedRequest } from '../src/access/seed-request'
+import { createAgentSession, revokeAgentSessionById } from '../src/auth/agent-sessions'
 import { loadElevationRequestById } from '../src/auth/elevation'
 
 const TENANT = 'tenant-a'
@@ -81,7 +86,7 @@ beforeEach(async () => {
 afterEach(() => { harness.close(); vi.unstubAllGlobals() })
 
 // ── request helpers ──────────────────────────────────────────────────────────────────────────────
-interface Req { method?: string; json?: unknown; origin?: string | null; host?: string; headers?: Record<string, string> }
+interface Req { method?: string; json?: unknown; origin?: string | null; host?: string; headers?: Record<string, string>; ctx?: ExecutionContext }
 async function hit(path: string, r: Req = {}, e: Env = env): Promise<Response> {
   const headers = new Headers(r.headers)
   const method = r.method ?? 'GET'
@@ -92,7 +97,7 @@ async function hit(path: string, r: Req = {}, e: Env = env): Promise<Response> {
     headers.set('content-type', 'application/json')
     body = JSON.stringify(r.json ?? {})
   }
-  return momentsApp.fetch(new Request(`https://${r.host ?? HOST}${path}`, { method, headers, body }), e)
+  return momentsApp.fetch(new Request(`https://${r.host ?? HOST}${path}`, { method, headers, body }), e, r.ctx)
 }
 const csrfOf = (html: string): string => {
   const m = /data-csrf="([0-9a-f]{64})"/.exec(html)
@@ -582,7 +587,9 @@ describe('seed decision on the secure page', () => {
     const projects = count('projects')
     expect((await decide(m, owner, { decision: 'approve' }, { csrf, challenge: c2 })).status).toBe(409)
     expect((await decide(m, owner, { decision: 'deny' }, { csrf, challenge: c3 })).status).toBe(409)
-    expect((await hit(m.path)).status).toBe(410)
+    const reload = await hit(m.path)
+    expect(reload.status).toBe(200) // an applied seed reads as approved on reload, not "closed" (mupot#1860)
+    expect(await reload.text()).toContain('already approved')
     expect((await hit(`${m.path}/challenge`, { method: 'POST', json: { decision: 'approve', csrf } })).status).toBe(409)
     expect(count('projects')).toBe(projects)
     expect(count('secure_moments', "status = 'consumed'")).toBe(1)
@@ -1018,6 +1025,12 @@ describe('migration 0212', () => {
       return m
     }
     const now = Date.now()
+    // consumeMoment also requires the passkey to be unrevoked and bound to a LIVE login identity of the member.
+    const planted = (id: string, member: string, identity: string | null): void => {
+      harness.sqlite.prepare(`INSERT INTO member_passkeys (id, tenant, member_id, login_identity_id, credential_id, public_key, created_at) VALUES (?, ?, ?, ?, ?, 'x', 'now')`).run(id, TENANT, member, identity, `cred-${id}`)
+    }
+    planted('k', 'mem-owner', identities.owner)
+    planted('k2', 'mem-sqadmin', identities.sqadmin)
     const a = await mk('a')
     expect(await consumeMoment(env, { id: a.id, token: 'not-the-token', decision: 'approve', memberId: 'mem-owner', passkeyId: 'k' }, now)).toBe(false)
     expect(await consumeMoment(env, { id: a.id, token: a.token, decision: 'approve', memberId: 'mem-owner', passkeyId: 'k' }, now + 2 * 24 * 3600_000)).toBe(false) // expired
@@ -1027,7 +1040,7 @@ describe('migration 0212', () => {
     const b = await mk('b')
     harness.sqlite.prepare("UPDATE secure_moments SET decider_member_id = 'mem-sqadmin' WHERE id = ?").run(b.id)
     expect(await consumeMoment(env, { id: b.id, token: b.token, decision: 'approve', memberId: 'mem-owner', passkeyId: 'k' }, now)).toBe(false)
-    expect(await consumeMoment(env, { id: b.id, token: b.token, decision: 'deny', memberId: 'mem-sqadmin', passkeyId: 'k' }, now)).toBe(true)
+    expect(await consumeMoment(env, { id: b.id, token: b.token, decision: 'deny', memberId: 'mem-sqadmin', passkeyId: 'k2' }, now)).toBe(true)
     expect(status(b.id)).toBe('denied')
   })
   it('store guards, directly: consumeDecideChallenge needs the exact binding; advancePasskeyCounter is forward-only', async () => {
@@ -1049,5 +1062,295 @@ describe('migration 0212', () => {
     expect(await advancePasskeyCounter(env, 'k', 4, now)).toBe(false)
     expect(await advancePasskeyCounter(env, 'k', 0, now)).toBe(false) // a reset to 0 after counting is a regression
     expect(await advancePasskeyCounter(env, 'k', 6, now)).toBe(true)
+  })
+})
+
+// ═══ round 2 (mupot#1861 P1-1 / P1-2, #1860) ═════════════════════════════════════════════════════════
+describe('round 2 P1-1: nothing refusable after the link is consumed', () => {
+  const sessions = (): number => count('web_sessions')
+  const pendingAndClean = (m: Moment): void => {
+    expect(status(m.id)).toBe('pending')
+    expect(one<{ decision: string | null }>('SELECT decision FROM secure_moments WHERE id = ?', m.id)?.decision).toBeNull()
+    expect(count('elevation_grants')).toBe(0)
+    expect(sessions()).toBe(0)
+    expect(one<{ status: string }>('SELECT status FROM elevation_requests WHERE id = ?', m.subject)?.status).toBe('pending')
+  }
+  it('every refusal of decideElevationRequest (empty selection, bad/longer duration, unrequested action) leaves the link live, no session, request pending; the link then still works', async () => {
+    const sq = await enrol('mem-sqadmin', identities.sqadmin)
+    const m = await fileElevation(['action:project_status'], 15)
+    const refused: Choice[] = [
+      { decision: 'approve', actions: [], duration_minutes: 15 },
+      { decision: 'approve', actions: ['action:project_status'], duration_minutes: 7 },
+      { decision: 'approve', actions: ['action:project_status'], duration_minutes: 60 },
+      { decision: 'approve', actions: ['action:manage_access'], duration_minutes: 15 },
+    ]
+    for (const c of refused) {
+      const res = await decide(m, sq, c)
+      expect(res.status, JSON.stringify(c)).toBe(409)
+      pendingAndClean(m)
+    }
+    expect((await decide(m, sq, { decision: 'approve', actions: ['action:project_status'], duration_minutes: 15 })).status).toBe(200)
+    expect(status(m.id)).toBe('consumed')
+  })
+  it('a dead agent session refuses before the gate: link live, no session', async () => {
+    const sq = await enrol('mem-sqadmin', identities.sqadmin)
+    const m = await fileElevation(['action:project_status'], 15)
+    const sess = one<{ agent_session_id: string }>('SELECT agent_session_id FROM elevation_requests WHERE id = ?', m.subject)
+    await revokeAgentSessionById(env, TENANT, 'agent-x', sess?.agent_session_id ?? '', 'test')
+    const res = await decide(m, sq, { decision: 'approve', actions: ['action:project_status'], duration_minutes: 15 })
+    expect(res.status).toBe(409)
+    expect((await jbody(res)).message).toContain('agent_session_ended')
+    expect(status(m.id)).toBe('pending')
+    expect(sessions()).toBe(0)
+  })
+  it('the core runs every refusal BEFORE the gate: the gate is never invoked for a refused decision (incl. self-approval)', async () => {
+    const m = await fileElevation(['action:project_status'], 15)
+    const req = await loadElevationRequestById(env, TENANT, m.subject)
+    if (!req) throw new Error('setup')
+    const gate = vi.fn(async () => true)
+    const mint = vi.fn(async () => { throw new Error('must not mint') })
+    const base = { id: req.id, decision: 'approve' as const, durationMinutes: 15, mintSession: mint, gate }
+    const ownerAuth = { userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'dashboard', memberId: 'mem-owner' } as AuthContext
+    const sqAuth = { userId: 'mem-sqadmin', email: 'sqadmin@x.test', role: 'member', tenant: TENANT, channel: 'dashboard', memberId: 'mem-sqadmin',
+      capabilities: [{ member_id: 'mem-sqadmin', scope_type: 'squad', scope_id: 'squad-a', capability: 'admin' } as CapabilityGrant] } as AuthContext
+    // empty selection
+    expect((await decideElevation(env, { ...base, selectedActions: [], auth: ownerAuth, proof: { memberId: 'mem-owner', via: 'webauthn', evidence: {} } })).status).toBe(409)
+    // self-approval: the decider IS the request's own member
+    expect((await decideElevation(env, { ...base, selectedActions: ['action:project_status'], auth: { ...sqAuth, memberId: req.member_id }, proof: { memberId: req.member_id, via: 'webauthn', evidence: {} } })).status).toBe(404)
+    expect(gate).not.toHaveBeenCalled()
+    expect(mint).not.toHaveBeenCalled()
+  })
+  it('seed: a stored seed whose slug can never be applied is refused before the gate (link and request untouched)', async () => {
+    const m = await fileSeed()
+    const row = await loadSeedRequest(env, m.subject)
+    if (!row) throw new Error('setup')
+    const gate = vi.fn(async () => true)
+    // the same canonical seed with a slug ending -prj (validateSeed accepts it; applySeed refuses it AFTER the claim)
+    const canonical = JSON.stringify({ ...(JSON.parse(row.canonical_json) as Record<string, unknown>), slug: 'abc-prj' })
+    const { validateSeed } = await import('../src/seeds/validate')
+    const v = await validateSeed(canonical)
+    if (!v.ok) throw new Error('setup: seed must validate to prove the pre-check')
+    const keyed = await (await import('../src/seeds/apply')).keyRequests(v.requests)
+    const fake = { ...row, canonical_json: v.canonical, seed_sha256: v.seedSha256, requests_json: JSON.stringify(keyed.map((r) => ({ key: r.key, kind: r.kind, fields: r.fields }))) }
+    const out = await decideSeed(env, { row: fake, decision: 'approve', auth: { userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'dashboard', memberId: 'mem-owner' } as AuthContext,
+      proof: { memberId: 'mem-owner', via: 'webauthn', evidence: {} }, gate }, Date.now())
+    expect(out.status).toBe(409)
+    expect(out.message).toContain('seed_slug_not_applicable')
+    expect(gate).not.toHaveBeenCalled()
+    expect(status(m.id)).toBe('pending')
+  })
+  it('a session minted for a decision that lost a race is revoked (concurrent approves: one live session)', async () => {
+    const sq = await enrol('mem-sqadmin', identities.sqadmin)
+    const sq2 = await enrol('mem-sqadmin', identities.sqadmin)
+    const m = await fileElevation(['action:project_status'], 15)
+    const csrf = await getCsrf(m)
+    const choice: Choice = { decision: 'approve', actions: ['action:project_status'], duration_minutes: 15 }
+    const [c1, c2] = await Promise.all([challenge(m, csrf, choice), challenge(m, csrf, choice)])
+    await Promise.all([decide(m, sq, choice, { csrf, challenge: c1 }), decide(m, sq2, choice, { csrf, challenge: c2 })])
+    expect(count('elevation_grants')).toBe(1)
+    expect(count('web_sessions', 'revoked_at IS NULL')).toBe(1)
+  })
+})
+
+describe('round 2 P1-2: a passkey cannot outlive the levers that cut a human off', () => {
+  const live = (): number => count('member_passkeys', 'revoked_at IS NULL')
+  it('revoking the login identity revokes its passkeys, and the passkey then decides nothing (seed)', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const m = await fileSeed()
+    expect(live()).toBe(1)
+    expect((await revokeLoginIdentity(env, TENANT, 'mem-owner', identities.owner)).revoked).toBe(true)
+    expect(live()).toBe(0)
+    const res = await decide(m, owner, { decision: 'approve' })
+    expect(res.status).toBe(403)
+    expect(status(m.id)).toBe('pending')
+    expect(count('projects')).toBe(0)
+  })
+  it('sign-out-all-devices (both variants) revokes the member\'s passkeys; other members keep theirs', async () => {
+    await enrol('mem-owner', identities.owner)
+    await enrol('mem-sqadmin', identities.sqadmin)
+    await revokeAllWebSessions(env, TENANT, 'mem-owner', 'human_revoke_all', 'some-current-session')
+    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(0)
+    expect(count('member_passkeys', "member_id = 'mem-sqadmin' AND revoked_at IS NULL")).toBe(1)
+    await enrol('mem-owner', identities.owner)
+    await revokeAllWebSessions(env, TENANT, 'mem-owner', 'human_revoke_all')
+    expect(count('member_passkeys', "member_id = 'mem-owner' AND revoked_at IS NULL")).toBe(0)
+  })
+  it('the decision itself requires a live identity, independent of any revoke hook (raw revoke: seed AND elevation, approve AND deny)', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const sq = await enrol('mem-sqadmin', identities.sqadmin)
+    const seed = await fileSeed()
+    const elev = await fileElevation(['action:project_status'], 15)
+    harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id IN (?, ?)").run(identities.owner, identities.sqadmin)
+    for (const d of ['approve', 'deny'] as const) {
+      const a = await decide(seed, owner, { decision: d })
+      expect(a.status).toBe(409)
+      expect((await jbody(a)).message).toContain('live login identity')
+      expect((await decide(elev, sq, d === 'approve' ? { decision: d, actions: ['action:project_status'], duration_minutes: 15 } : { decision: d })).status).toBe(409)
+    }
+    expect(status(seed.id)).toBe('pending')
+    expect(status(elev.id)).toBe('pending')
+    expect(count('projects')).toBe(0)
+  })
+  it('a passkey with no login identity at all cannot decide a seed or a deny (null identity)', async () => {
+    const orphan = await enrol('mem-owner', null)
+    const m = await fileSeed()
+    expect((await decide(m, orphan, { decision: 'approve' })).status).toBe(409)
+    expect((await decide(m, orphan, { decision: 'deny' })).status).toBe(409)
+    expect(status(m.id)).toBe('pending')
+  })
+  it('consumeMoment itself refuses a passkey whose identity was revoked after the route check (guard is inside the write)', async () => {
+    await enrol('mem-owner', identities.owner)
+    const pk = one<{ id: string }>("SELECT id FROM member_passkeys WHERE member_id = 'mem-owner'")
+    const a = await createMoment(env, { kind: 'seed_attach', subjectId: 'z', requesterAgentId: null, subjectExpiresAtIso: new Date(Date.now() + 3600_000).toISOString() })
+    if (!a || !pk) throw new Error('setup')
+    harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
+    expect(await consumeMoment(env, { id: a.id, token: a.token, decision: 'approve', memberId: 'mem-owner', passkeyId: pk.id }, Date.now())).toBe(false)
+    expect(status(a.id)).toBe('pending')
+  })
+})
+
+describe('round 2 #1860: durable decisions on the secure page and the lazy reconcile', () => {
+  const waitCtx = (): { ctx: ExecutionContext; registered: Promise<unknown>[] } => {
+    const registered: Promise<unknown>[] = []
+    return { registered, ctx: { waitUntil: (p: Promise<unknown>) => { registered.push(p) }, passThroughOnException: () => undefined } as unknown as ExecutionContext }
+  }
+  it('seed and elevation decisions run under ctx.waitUntil (the consume-to-finish work is registered)', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const sq = await enrol('mem-sqadmin', identities.sqadmin)
+    const seed = await fileSeed()
+    const elev = await fileElevation(['action:project_status'], 15)
+    const w1 = waitCtx()
+    const csrf1 = await getCsrf(seed)
+    const ch1 = await challenge(seed, csrf1, { decision: 'approve' })
+    const cred1 = await owner.assert({ rpId: HOST, origin: ORIGIN, challenge: ch1 })
+    expect((await hit(`${seed.path}/decide`, { method: 'POST', ctx: w1.ctx, json: { decision: 'approve', csrf: csrf1, credential: cred1 } })).status).toBe(200)
+    expect(w1.registered.length).toBe(1)
+    await Promise.all(w1.registered)
+    expect((await loadSeedRequest(env, seed.subject))?.status).toBe('applied')
+    const w2 = waitCtx()
+    const choice: Choice = { decision: 'approve', actions: ['action:project_status'], duration_minutes: 15 }
+    const csrf2 = await getCsrf(elev)
+    const ch2 = await challenge(elev, csrf2, choice)
+    const cred2 = await sq.assert({ rpId: HOST, origin: ORIGIN, challenge: ch2 })
+    expect((await hit(`${elev.path}/decide`, { method: 'POST', ctx: w2.ctx, json: { ...choice, csrf: csrf2, credential: cred2 } })).status).toBe(200)
+    expect(w2.registered.length).toBe(1)
+    await Promise.all(w2.registered)
+    expect(count('elevation_grants')).toBe(1)
+  })
+  it('an abandoned handler (client gone) still applies the seed, finishes the request and marks the moment', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const m = await fileSeed()
+    const w = waitCtx()
+    const csrf = await getCsrf(m)
+    const ch = await challenge(m, csrf, { decision: 'approve' })
+    const cred = await owner.assert({ rpId: HOST, origin: ORIGIN, challenge: ch })
+    void hit(`${m.path}/decide`, { method: 'POST', ctx: w.ctx, json: { decision: 'approve', csrf, credential: cred } }) // never awaited
+    for (let i = 0; i < 400 && w.registered.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+    expect(w.registered.length).toBe(1)
+    await Promise.all(w.registered)
+    expect((await loadSeedRequest(env, m.subject))?.status).toBe('applied')
+    expect(status(m.id)).toBe('consumed')
+    expect(count('projects')).toBeGreaterThan(0)
+  })
+  it('reload of an applied seed link says Approved (also when the final status write was lost and reconciles), never "closed"', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const m = await fileSeed()
+    expect((await decide(m, owner, { decision: 'approve' })).status).toBe(200)
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'applying' WHERE id = ?").run(m.subject) // the lost UPDATE
+    const reload = await hit(m.path)
+    expect(reload.status).toBe(200)
+    const html = await reload.text()
+    expect(html).toContain('Approved')
+    expect(html).not.toContain('Link closed')
+    expect(one<{ status: string }>('SELECT status FROM seed_attach_requests WHERE id = ?', m.subject)?.status).toBe('applied')
+  })
+  it('reload of a denied/expired link still reads as closed (reconcile only ever shows applied)', async () => {
+    const owner = await enrol('mem-owner', identities.owner)
+    const m = await fileSeed()
+    expect((await decide(m, owner, { decision: 'deny' })).status).toBe(200)
+    const reload = await hit(m.path)
+    expect(reload.status).toBe(410)
+    expect(await reload.text()).toContain('Link closed')
+  })
+})
+
+describe('round 2 P2/P3', () => {
+  it('passkey enrol and owner revoke each write a mutation_audit_entries row (identity surface)', async () => {
+    await enrol('mem-owner', identities.owner)
+    const pk = one<{ id: string }>("SELECT id FROM member_passkeys WHERE member_id = 'mem-owner'")
+    expect(count('mutation_audit_entries', "operation = 'passkey_enrol' AND target_kind = 'member_passkey' AND member_id = 'mem-owner'")).toBe(1)
+    expect(await revokeOwnPasskey(env, 'mem-owner', pk?.id ?? '')).toBe(true)
+    const row = one<{ evidence_json: string; target_id: string }>("SELECT evidence_json, target_id FROM mutation_audit_entries WHERE operation = 'passkey_revoke'")
+    expect(row?.target_id).toBe(pk?.id)
+    expect(JSON.parse(row?.evidence_json ?? '{}')).toMatchObject({ reason: 'owner_revoke' })
+    expect(await revokeOwnPasskey(env, 'mem-owner', pk?.id ?? '')).toBe(false)
+    expect(count('mutation_audit_entries', "operation = 'passkey_revoke'")).toBe(1) // a no-op revoke writes nothing
+  })
+  it('identity revoke and sign-out-all receipt the passkeys they kill (count in evidence)', async () => {
+    await enrol('mem-owner', identities.owner)
+    await revokeLoginIdentity(env, TENANT, 'mem-owner', identities.owner)
+    const row = one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'passkey_revoke'")
+    expect(JSON.parse(row?.evidence_json ?? '{}')).toMatchObject({ reason: 'login_identity_revoked', count: '1', login_identity_id: identities.owner })
+  })
+  it('a port in SECURE_MOMENTS_HOST is refused (RP ID and origin carry none)', () => {
+    for (const h of [`${HOST}:8443`, `${HOST}:443`, 'localhost:8787']) {
+      expect(dedicatedSecureHost(baseEnv({ SECURE_MOMENTS_HOST: h }))).toBeNull()
+      const st = secureMomentsStatus(baseEnv({ SECURE_MOMENTS_HOST: h }))
+      expect(st.state).toBe('misconfigured')
+    }
+    expect(dedicatedSecureHost(baseEnv())).toBe(HOST)
+  })
+  it('request_elevation returns access_approve_url beside the secure approve_url when both channels are on (and only then)', async () => {
+    const both = baseEnv({ ACCESS_APPROVE_ENABLED: '1', ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test' })
+    await invokeTool(agentAuth(), both, 'check_in', {}, 'https://pot.test')
+    const r = await invokeTool(agentAuth(), both, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'x' }, 'https://pot.test')
+    expect(r.ok).toBe(true)
+    const res = r.result as { approve_url: string; access_approve_url?: string; request: { id: string } }
+    expect(res.approve_url.startsWith(`${ORIGIN}/m/`)).toBe(true)
+    expect(res.access_approve_url).toBe(`https://approve.example.test/approve/elevation/${res.request.id}`)
+    // secure only: no Access link key; Access only: approve_url is the Access link, no duplicate key
+    const only = await invokeTool(agentAuth(), env, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'y' }, 'https://pot.test')
+    expect((only.result as Record<string, unknown>).access_approve_url).toBeUndefined()
+    const accessOnly = baseEnv({ SECURE_MOMENTS: undefined, ACCESS_APPROVE_ENABLED: '1', ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test' })
+    const a = await invokeTool(agentAuth(), accessOnly, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-a', duration_minutes: 15, reason: 'z' }, 'https://pot.test')
+    expect((a.result as Record<string, unknown>).access_approve_url).toBeUndefined()
+    expect((a.result as { approve_url: string }).approve_url).toMatch(/^https:\/\/approve\.example\.test\/approve\/elevation\//)
+  })
+  it('the decision page has no inline onsubmit handler (CSP would block it) and Enter cannot submit the form', async () => {
+    const m = await fileSeed()
+    const html = await (await hit(m.path)).text()
+    expect(html).not.toMatch(/\sonsubmit=/i)
+    expect(html).toContain('<form id="decision-form"')
+    expect(html).toContain("form.addEventListener('submit',function(ev){ev.preventDefault()})")
+  })
+})
+
+describe('round 2 (#1853 P1): a dedicated host may not be a PARENT of a colony or pot host, nor of/under the other dedicated host', () => {
+  const colonyEnv = (over: Partial<Env>): Env => baseEnv({ PUBLIC_ORIGIN: 'https://colony.example.com', DEFAULT_POT_HOST_SUFFIX: 'pots.example.com', ...over })
+  it('secure host: parent of the colony or of the pot suffix is refused; the same, a child, a sibling-of-colony and unrelated hosts behave as before', () => {
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'example.com' }))).toBeNull() // parent of colony AND of pot suffix
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'colony.example.com' }))).toBeNull()
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'x.colony.example.com' }))).toBeNull()
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'pots.example.com' }))).toBeNull()
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'secure.example.com' }))).toBe('secure.example.com') // sibling: fine
+    expect(dedicatedSecureHost(colonyEnv({ SECURE_MOMENTS_HOST: 'secure.example.net' }))).toBe('secure.example.net')
+    // only the pot suffix is a child of the candidate
+    expect(dedicatedSecureHost(baseEnv({ PUBLIC_ORIGIN: 'https://colony.other.test', DEFAULT_POT_HOST_SUFFIX: 'pots.example.com', SECURE_MOMENTS_HOST: 'example.com' }))).toBeNull()
+  })
+  it('the Access approval host follows the same rule (shared dedicatedHost), and prod siblings approve.mumega.com / mupot.mumega.com stay accepted', () => {
+    const prod = { PUBLIC_ORIGIN: 'https://mupot.mumega.com', DEFAULT_POT_HOST_SUFFIX: undefined }
+    expect(dedicatedApprovalHost({ ...prod, ACCESS_CANONICAL_HOST: 'approve.mumega.com' })).toBe('approve.mumega.com')
+    expect(dedicatedApprovalHost({ ...prod, ACCESS_CANONICAL_HOST: 'mumega.com' })).toBeNull()
+    expect(dedicatedApprovalHost({ ...prod, ACCESS_CANONICAL_HOST: 'mupot.mumega.com' })).toBeNull()
+    expect(dedicatedApprovalHost({ PUBLIC_ORIGIN: 'https://colony.example.com', DEFAULT_POT_HOST_SUFFIX: undefined, ACCESS_CANONICAL_HOST: 'example.com' })).toBeNull()
+    expect(dedicatedApprovalHost({ PUBLIC_ORIGIN: 'https://colony.example.com', DEFAULT_POT_HOST_SUFFIX: 'pots.example.com', ACCESS_CANONICAL_HOST: 'example.com' })).toBeNull()
+    expect(dedicatedApprovalHost({ PUBLIC_ORIGIN: 'https://colony.example.com', DEFAULT_POT_HOST_SUFFIX: 'pots.example.com', ACCESS_CANONICAL_HOST: 'approve.example.com' })).toBe('approve.example.com')
+  })
+  it('the two dedicated hosts may not be parent/child of each other (either direction); siblings are fine', () => {
+    const e = (access: string, secure: string): Env => baseEnv({ PUBLIC_ORIGIN: 'https://mupot.mumega.com', ACCESS_CANONICAL_HOST: access, SECURE_MOMENTS_HOST: secure })
+    expect(dedicatedSecureHost(e('approve.mumega.com', 'secure.approve.mumega.com'))).toBeNull() // secure is a child of approve
+    expect(dedicatedSecureHost(e('x.secure.mumega.com', 'secure.mumega.com'))).toBeNull() // secure is a parent of approve
+    expect(dedicatedSecureHost(e('approve.mumega.com', 'secure.mumega.com'))).toBe('secure.mumega.com')
+    expect(secureMomentsStatus(e('approve.mumega.com', 'secure.approve.mumega.com')).state).toBe('misconfigured')
   })
 })
