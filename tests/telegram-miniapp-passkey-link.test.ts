@@ -281,6 +281,10 @@ describe('passkey-link: the rate limit and the secrets', () => {
     expect(tokenSha(m.id)).toBe(humanHash)
     expect(receipts(m.id)).toBe(1)
     expect((await momentsApp.fetch(new Request(`https://${HOST}/m/${m.id}/${parseLink(human.url ?? '').token}`), env)).status).toBe(200)
+    // still suppressed just inside the window (pins the window length, not only its existence)
+    vi.setSystemTime(t0 + 9 * 60_000 + 30_000) // literal: the window is 10 minutes
+    expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('human_active')
+    expect(tokenSha(m.id)).toBe(humanHash)
     vi.setSystemTime(t0 + HUMAN_CEREMONY_WINDOW_MS + 1000)
     expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('ok')
   })
@@ -433,7 +437,7 @@ describe('passkey-link: the client (the real page script on a fake DOM)', () => 
     await Promise.all(taps)
     expect(c.fetches.filter((p) => p.endsWith('/passkey-link'))).toHaveLength(1)
   })
-  it('after a link is issued, an "Open the passkey page" button is rendered IN #app (not #status) and opens the browser on a fresh click with try_browser; the URL is never rendered as text', async () => {
+  it('after a link is issued, an "Open the passkey page" button is rendered IN #app (not #status) and opens the browser on a fresh click; the URL is never rendered as text', async () => {
     const url = 'https://secure.example.test/m/abc/tok-secret-value'
     const c = runClient({ biometricAvailable: true, passkeyUrl: url })
     await c.settle()
@@ -446,7 +450,7 @@ describe('passkey-link: the client (the real page script on a fake DOM)', () => 
     await c.click(open)
     expect(c.opened.length).toBe(before + 1)
     expect(c.opened.at(-1)).toBe(url)
-    expect(c.openOpts.at(-1)).toEqual({ try_browser: true })
+    expect(c.openOpts.at(-1)).toBeUndefined()
     const everyText = [c.out.textContent, ...c.app.children.flatMap((e) => [e.textContent, ...Object.values(e.attrs)])].join(' ')
     expect(everyText).not.toContain('tok-secret-value')
     expect(c.status()).toContain('This replaces any earlier link; nothing is decided until you confirm with your passkey.')

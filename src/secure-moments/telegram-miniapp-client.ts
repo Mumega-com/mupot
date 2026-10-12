@@ -19,8 +19,7 @@ function bmAuth(reason){return new Promise(function(res){try{bm.authenticate({re
 function settingsHelp(){var b=document.createElement('button');b.type='button';b.textContent='Open Telegram biometric settings';b.addEventListener('click',function(){try{bm.openSettings()}catch(e){}});out.appendChild(b)}
 function authFailure(r){if(r.noToken){show('Set this phone up again','No saved device secret was found on this phone (it was removed or never saved). Go to My Account on the dashboard, Telegram device, Set up this phone.',false)}else{show('Not confirmed','The biometric check was cancelled or failed. Nothing was decided.',false)}}
 var curMoment=null,linkBusy=false,pendingUrl=null,openBtn=null;
-function openOpts(){return(tg.isVersionAtLeast&&tg.isVersionAtLeast('7.0'))?{try_browser:true}:undefined}
-function tryOpen(){try{tg.openLink(pendingUrl,openOpts());return true}catch(e){show('Could not open your browser','Ask for a new passkey link and try again.',false);return false}}
+function tryOpen(){try{tg.openLink(pendingUrl);return true}catch(e){show('Could not open your browser','Ask for a new passkey link and try again.',false);return false}}
 function showOpenButton(){
  // The link is kept in memory only (never rendered as text) and opened on a FRESH click, which every client allows.
  if(!openBtn){openBtn=document.createElement('button');openBtn.type='button';openBtn.className='primary';openBtn.setAttribute('data-act','open-passkey');openBtn.textContent='Open the passkey page';openBtn.addEventListener('click',function(){if(pendingUrl)tryOpen()});app.appendChild(openBtn)}
