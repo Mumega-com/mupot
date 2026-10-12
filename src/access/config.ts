@@ -69,7 +69,12 @@ function isSameOrSubdomain(hostname: string, parent: string): boolean {
  * cookie is scoped to the domain and its subdomains.
  */
 export function dedicatedApprovalHost(env: Pick<Env, 'ACCESS_CANONICAL_HOST' | 'PUBLIC_ORIGIN' | 'DEFAULT_POT_HOST_SUFFIX'>): string | null {
-  const host = env.ACCESS_CANONICAL_HOST?.trim().toLowerCase().replace(/\.$/, '')
+  return dedicatedHost(env, env.ACCESS_CANONICAL_HOST)
+}
+
+/** The shared dedicated-host rule (approve host, secure-moments host): well-formed, not a colony host, not under one or the pot suffix. */
+export function dedicatedHost(env: Pick<Env, 'PUBLIC_ORIGIN' | 'DEFAULT_POT_HOST_SUFFIX'>, rawHost: string | undefined): string | null {
+  const host = rawHost?.trim().toLowerCase().replace(/\.$/, '')
   if (!host || !HOST_RE.test(host)) return null
   const name = hostnameOf(host)
   for (const colony of colonyHostnames(env)) if (isSameOrSubdomain(name, colony)) return null
