@@ -15,7 +15,7 @@
 // calls.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { authApp } from '../src/auth'
-import { linkLoginIdentity } from '../src/auth/login-identity'
+import { linkLoginIdentity, revokeLoginIdentity } from '../src/auth/login-identity'
 import type { Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -296,6 +296,48 @@ describe('web-session registry — integration through authApp (real D1)', () =>
       .first<{ revoked_at: string | null }>()
     expect(row?.revoked_at).not.toBeNull()
     expect((await me(env, cookie)).status).toBe(401)
+  })
+
+  it('identity revoke stays retryable: a transient passkey failure never leaves the identity\'s sessions usable, and a retry finishes the cutoff', async () => {
+    const env = makeEnv('owner@x.test')
+    env.DB = harness.db
+    await seedMember(env, 'm1', 'owner@x.test')
+    const cookie = await devLogin(env)
+    const listed = (await (await authApp.request('/identities', { headers: { cookie: `mupot_session=${cookie}` } }, env)).json()) as { identities: Array<{ id: string }> }
+    const identityId = listed.identities[0]!.id
+    // A live passkey enrolled under this identity (the cutoff must reach it too).
+    harness.sqlite.prepare(
+      `INSERT INTO member_passkeys (id, tenant, member_id, login_identity_id, credential_id, public_key, sign_count, created_at)
+       VALUES ('pk1', ?, 'm1', ?, 'cred-1', 'spki', 0, datetime('now'))`,
+    ).run(TENANT, identityId)
+
+    // Inject a transient failure on the passkey UPDATE only (first call), as D1 might.
+    const realPrepare = harness.db.prepare.bind(harness.db)
+    let failOnce = true
+    const flaky = {
+      ...harness.db,
+      prepare: (sql: string) => {
+        const stmt = realPrepare(sql)
+        if (failOnce && /UPDATE member_passkeys SET revoked_at/.test(sql)) {
+          failOnce = false
+          return { ...stmt, bind: (...a: unknown[]) => ({ ...stmt.bind(...a), run: async () => { throw new Error('D1_ERROR: transient') } }) }
+        }
+        return stmt
+      },
+    }
+    env.DB = flaky as unknown as Env['DB']
+    const first = await authApp.request(`/identities/${identityId}/revoke`, { method: 'POST', headers: { cookie: `mupot_session=${cookie}` } }, env)
+    expect(first.status).toBe(500)
+    env.DB = harness.db
+    // Even though the call failed, the sessions bound to the identity are already dead (sessions are cut first).
+    expect((await me(env, cookie)).status).toBe(401)
+    expect(harness.sqlite.prepare("SELECT revoked_at FROM member_passkeys WHERE id = 'pk1'").get()).toEqual({ revoked_at: null })
+
+    // A retry (identity already revoked) still runs the dependent cutoff and finishes it.
+    // (the revoked identity cannot sign in again, so the retry goes through the same chokepoint the route calls)
+    const retry = await revokeLoginIdentity(env, TENANT, 'm1', identityId)
+    expect(retry.revoked).toBe(false)
+    expect((harness.sqlite.prepare("SELECT revoked_at FROM member_passkeys WHERE id = 'pk1'").get() as { revoked_at: string | null }).revoked_at).not.toBeNull()
   })
 
   it('a member can NEVER revoke a DIFFERENT member\'s identity by naming its id', async () => {

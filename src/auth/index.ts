@@ -41,7 +41,6 @@ import {
   revokeAllWebSessions,
   revokeWebSession,
   revokeWebSessionByHash,
-  revokeWebSessionsForLoginIdentity,
   touchWebSession,
 } from './web-sessions'
 import {
@@ -1479,24 +1478,15 @@ authApp.post('/identities/:id/revoke', requireAuthMw(), async (c) => {
   const auth = c.get('auth')
   if (!auth.webSessionMemberId) return c.json({ error: 'forbidden' }, 403)
   const identityId = c.req.param('id')
-  const { revoked, identity } = await revokeLoginIdentity(
+  // revokeLoginIdentity is the one chokepoint for the cutoff (identity, then its sessions, then its passkeys), and it
+  // re-runs the dependent cutoff on every call for a revoked identity, so a retry after a partial failure completes it.
+  const { revoked, sessionsRevoked } = await revokeLoginIdentity(
     c.env,
     c.env.TENANT_SLUG,
     auth.webSessionMemberId,
     identityId,
   )
-  let sessions_revoked = 0
-  if (revoked && identity) {
-    const killed = await revokeWebSessionsForLoginIdentity(
-      c.env,
-      c.env.TENANT_SLUG,
-      auth.webSessionMemberId,
-      identity.id,
-      'identity_revoked',
-    )
-    sessions_revoked = killed.revokedCount
-  }
-  return c.json({ revoked, sessions_revoked })
+  return c.json({ revoked, sessions_revoked: sessionsRevoked })
 })
 
 // GET /auth/elevation/active → every LIVE grant the caller has admin
