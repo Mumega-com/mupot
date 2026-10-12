@@ -155,7 +155,7 @@ export async function parseDeviceSetup(
 
 // ── decide: authorise ───────────────────────────────────────────────────────────────────────────────
 export type PwAuth =
-  | { ok: true; device: TgDeviceRow & { login_identity_id: string }; proof: 'secret' | 'trust'; presentedSha256: string }
+  | { ok: true; device: TgDeviceRow & { login_identity_id: string }; proof: 'secret' | 'trust'; factor: 'trust' | 'pin' | 'biometric'; presentedSha256: string }
   | { ok: false; status: 403; title: string; message: string; extra: Record<string, unknown> }
 
 const refuse = (title: string, message: string, code: string, extra: Record<string, unknown> = {}): PwAuth => ({ ok: false, status: 403, title, message, extra: { code, ...extra } })
@@ -194,23 +194,21 @@ async function checkPin(env: Env, device: PwDevice, pin: unknown, nowMs: number)
   if (!pinFormatOk(pin)) return refuse('PIN needed', 'Enter your 6-digit PIN.', 'pin_required')
   const reserved = await env.DB.prepare(
     `UPDATE tg_miniapp_devices SET pin_failed_attempts = pin_failed_attempts + 1
-      WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL AND unlock_mode = 'pin' AND pin_failed_attempts < ?3`,
-  ).bind(device.id, env.TENANT_SLUG, PIN_MAX_WRONG).run()
-  if (reserved.meta.changes !== 1) {
-    await lockIfCapped(env, device.id, device.member_id, nowMs)
-    return LOCKED
-  }
+      WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL AND unlock_mode = 'pin' AND pin_failed_attempts < ?3
+      RETURNING pin_failed_attempts AS n`,
+  ).bind(device.id, env.TENANT_SLUG, PIN_MAX_WRONG).first<{ n: number }>()
+  if (!reserved) return LOCKED // no slot left: the request that took the fifth one revokes the device
+  const mine = reserved.n // THIS request's own slot number
   const got = await derivePinHash(pin, device.pin_salt, { deviceId: device.id, memberId: device.member_id, telegramUserId: device.telegram_user_id }, device.pin_iterations)
   if (timingSafeEqual(got, device.pin_hash)) {
-    await env.DB.prepare(`UPDATE tg_miniapp_devices SET pin_failed_attempts = 0 WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL`).bind(device.id, env.TENANT_SLUG).run()
+    // The counter is reset ONLY inside the winning consume batch (consumeMomentTelegramPw): a right PIN that then fails the nonce
+    // or loses the race resets nothing.
     await recordTgAudit(env, { operation: 'tg_device_pin_attempt', memberId: device.member_id, deviceId: device.id, evidence: { outcome: 'ok' } }, nowMs)
     return null
   }
-  const after = await env.DB.prepare(`SELECT pin_failed_attempts AS n FROM tg_miniapp_devices WHERE id = ?1 AND tenant = ?2`).bind(device.id, env.TENANT_SLUG).first<{ n: number }>()
-  const used = after?.n ?? PIN_MAX_WRONG
-  await recordTgAudit(env, { operation: 'tg_device_pin_attempt', memberId: device.member_id, deviceId: device.id, evidence: { outcome: 'wrong', failed_attempts: String(used) } }, nowMs)
-  if (await lockIfCapped(env, device.id, device.member_id, nowMs)) return LOCKED
-  const left = Math.max(0, PIN_MAX_WRONG - used)
+  await recordTgAudit(env, { operation: 'tg_device_pin_attempt', memberId: device.member_id, deviceId: device.id, evidence: { outcome: 'wrong', failed_attempts: String(mine) } }, nowMs)
+  if (mine >= PIN_MAX_WRONG && await lockIfCapped(env, device.id, device.member_id, nowMs)) return LOCKED
+  const left = Math.max(0, PIN_MAX_WRONG - mine)
   return refuse('Wrong PIN', left > 0 ? `That PIN is not right. ${left} ${left === 1 ? 'try' : 'tries'} left before this phone is removed.` : 'That PIN is not right.', 'pin_wrong', { attempts_left: left })
 }
 
@@ -267,9 +265,9 @@ export async function pwAuthorize(
     if (t.kind !== 'live' || !t.device.login_identity_id) return NOT_RECOGNISED
     if (!input.routine) return refuse('Confirm again', 'This kind of request always needs a fresh fingerprint, face or PIN.', 'prompt_required')
     const parsed = parseDeviceToken(body.trust_token)
-    return { ok: true, device: { ...t.device, login_identity_id: t.device.login_identity_id }, proof: 'trust', presentedSha256: await tokenHash(parsed?.secret ?? '') }
+    return { ok: true, device: { ...t.device, login_identity_id: t.device.login_identity_id }, proof: 'trust', factor: 'trust', presentedSha256: await tokenHash(parsed?.secret ?? '') }
   }
-  const resolved = await resolveDeviceForDecision(env, body.device_token, who)
+  const resolved = await resolveDeviceForDecision(env, body.device_token, who, { allowPinMode: true })
   if (resolved.kind === 'stale') return STALE
   if (resolved.kind !== 'ok' || !resolved.device.login_identity_id) return NOT_RECOGNISED
   const device = await loadActivePwDevice(env, resolved.device.id)
@@ -278,7 +276,7 @@ export async function pwAuthorize(
     const refusal = await checkPin(env, device, body.pin, nowMs)
     if (refusal) return refusal
   }
-  return { ok: true, device: { ...device, login_identity_id: device.login_identity_id }, proof: 'secret', presentedSha256: device.secret_sha256 }
+  return { ok: true, device: { ...device, login_identity_id: device.login_identity_id }, proof: 'secret', factor: device.unlock_mode === 'pin' ? 'pin' : 'biometric', presentedSha256: device.secret_sha256 }
 }
 
 // ── the consuming statement (W4.2 form) ─────────────────────────────────────────────────────────────
@@ -312,7 +310,7 @@ export async function consumeMomentTelegramPw(
     : 'd.trust_secret_sha256 = ?8 AND d.trusted_until IS NOT NULL AND d.trusted_until > ?3'
   const decided = `EXISTS (SELECT 1 FROM tg_miniapp_decisions WHERE moment_id = ?1 AND device_id = ?2 AND decided_at = ?3)`
   const update = input.proof === 'secret'
-    ? `UPDATE tg_miniapp_devices SET last_used_at = ?3, secret_sha256 = ?4,
+    ? `UPDATE tg_miniapp_devices SET last_used_at = ?3, secret_sha256 = ?4, pin_failed_attempts = 0,
          trust_secret_sha256 = CASE WHEN trust_window_seconds > 0 THEN ?5 ELSE NULL END,
          trusted_until = CASE WHEN trust_window_seconds > 0 THEN ${ISO_PLUS_WINDOW} ELSE NULL END
        WHERE id = ?2 AND ${decided}`
@@ -366,6 +364,14 @@ export async function consumeMomentTelegramPw(
 }
 
 // ── /account: change the window ─────────────────────────────────────────────────────────────────────
+/** A live device's current window, or null (not this member's, not live): lets the route tell a shortening from a lengthening. */
+export async function currentTrustWindow(env: Env, memberId: string, deviceId: string): Promise<number | null> {
+  const row = await env.DB.prepare(
+    `SELECT trust_window_seconds AS w FROM tg_miniapp_devices WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND confirmed_at IS NOT NULL AND revoked_at IS NULL`,
+  ).bind(deviceId, env.TENANT_SLUG, memberId).first<{ w: number }>()
+  return row ? row.w : null
+}
+
 export type ChangeWindowResult = { ok: true; from: number; to: number } | { ok: false; reason: 'bad_window' | 'not_found' }
 
 /**

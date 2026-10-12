@@ -14,7 +14,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { initData, newTestKey, type InitDataSpec } from './helpers/telegram-initdata'
 import { momentsApp } from '../src/secure-moments/routes'
 import { makeAccountApp } from '../src/dashboard/account'
-import { mintTgEnrolmentToken, revokeOwnTgDevice } from '../src/secure-moments/telegram-miniapp-store'
+import { consumeMomentTelegram, mintTgEnrolmentToken, revokeOwnTgDevice } from '../src/secure-moments/telegram-miniapp-store'
 import { tokenHash } from '../src/secure-moments/store'
 import {
   PIN_MAX_WRONG, TRUST_WINDOW_MAX_SECONDS, TRUST_WINDOW_PRESETS, changeTrustWindow, consumeMomentTelegramPw, derivePinHash, parseTrustWindow, pinFormatOk, pinIsTooEasy, pinWindowOn,
@@ -190,8 +190,8 @@ const advance = (ms: number): void => { vi.setSystemTime(Date.now() + ms) }
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 describe('the migration (real schema chain)', () => {
   it('adds the columns with safe defaults to existing rows, and the database itself enforces the 7-day cap and the 5-attempt cap', async () => {
-    const p = await setup('mem-owner', TG.owner, identities.owner, { omitWindow: true })
-    expect(devRow(p)).toMatchObject({ unlock_mode: 'biometric', pin_hash: null, pin_salt: null, pin_failed_attempts: 0, trust_window_seconds: 1800, trust_secret_sha256: null, trusted_until: null })
+    const p = await setup('mem-owner', TG.owner, identities.owner, { omitWindow: true, e: offEnv() }) // a device that never chose a window
+    expect(devRow(p)).toMatchObject({ unlock_mode: 'biometric', pin_hash: null, pin_salt: null, pin_failed_attempts: 0, trust_window_seconds: 0, trust_secret_sha256: null, trusted_until: null })
     const id = deviceId(p)
     const bad = (sql: string): void => expect(() => harness.sqlite.exec(sql)).toThrow()
     bad(`UPDATE tg_miniapp_devices SET trust_window_seconds = ${TRUST_WINDOW_MAX_SECONDS + 1} WHERE id = '${id}'`)
@@ -214,20 +214,60 @@ describe('the migration (real schema chain)', () => {
 })
 
 describe('flag off: W4.1 behaviour exactly', () => {
-  it('pin, mode and window fields at setup are ignored; the device is a plain biometric device and no trust is ever issued', async () => {
+  it('window fields at setup are ignored and no trust is ever issued; a device enrolled flag-off never silently gets a window, even once the flag turns on', async () => {
     const off = offEnv()
     expect(pinWindowOn(off)).toBe(false)
-    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin', window: 604800, e: off })
-    expect(devRow(p)).toMatchObject({ unlock_mode: 'biometric', pin_hash: null, trust_window_seconds: 1800 })
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { window: 604800, e: off })
+    expect(devRow(p)).toMatchObject({ unlock_mode: 'biometric', pin_hash: null, trust_window_seconds: 0 })
     const { m, action } = await elevation()
     const r = await go(p, m, approve(action), { e: off })
     expect(r.status).toBe(200)
     const j = await jbody(r)
     expect(j.device_token_next).toBeTruthy()
     expect(j.trust_token_next).toBeUndefined()
-    expect(j.trusted_until).toBeUndefined()
+    expect(devRow(p)).toMatchObject({ trusted_until: null, trust_secret_sha256: null })
+    // the flag turns ON: the pre-existing device still gets no trust (its window is its off value, 0)
+    const m2 = await elevation()
+    const r2 = await go(p, m2.m, approve(m2.action))
+    expect(r2.status).toBe(200)
+    expect((await jbody(r2)).trust_token_next).toBeUndefined()
     expect(devRow(p)).toMatchObject({ trusted_until: null, trust_secret_sha256: null })
     expect(count('mutation_audit_entries', "operation IN ('tg_device_pin_set','tg_device_pin_attempt','tg_device_window_change')")).toBe(0)
+  })
+  it('FAILS CLOSED: a PIN device enrolled with the flag on cannot decide with the flag off (initData + stored secret alone is refused), and the challenge says set up', async () => {
+    const off = offEnv()
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const { m, action } = await elevation()
+    const nonce = await nonceFor(m, p.tg, approve(action))
+    for (const pin of [null, PIN, WRONG]) {
+      const r = await go(p, m, approve(action), { e: off, nonce, pin })
+      expect(r.status, String(pin)).toBe(403)
+    }
+    expect(momentStatus(m.id)).toBe('pending')
+    expect(devRow(p).pin_failed_attempts).toBe(0)
+    const ch = await hit('/m/tg/challenge', { init_data: init(p.tg), moment_id: m.id, ...approve(action) }, off)
+    expect(ch.status).toBe(409)
+    expect(await jbody(ch)).toMatchObject({ title: 'Set up this device' })
+    // flag back on: the same device works with its PIN
+    expect((await go(p, m, approve(action), { nonce })).status).toBe(200)
+  })
+  it('consumeMomentTelegram (the W4 consume) refuses a PIN device in its own WHERE, whatever the caller read earlier', async () => {
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const { m } = await elevation()
+    const secret = await tokenHash(p.deviceToken.split('.')[1])
+    const r = await consumeMomentTelegram(env, { momentId: m.id, decision: 'deny', memberId: 'mem-sqadmin', telegramUserId: String(TG.sqadmin), deviceId: deviceId(p), secretSha256: secret }, Date.now())
+    expect(r.won).toBe(false)
+    expect(momentStatus(m.id)).toBe('pending')
+  })
+  it('the enrol race: a client that started under the flag and confirms as a PIN device after it flipped off is refused, not saved as a biometric device', async () => {
+    const off = offEnv()
+    const { token } = await mintTgEnrolmentToken(env, 'mem-owner', identities.owner)
+    const start = await hit(`/m/tg/enrol/${token}/start`, { init_data: init(TG.owner) })
+    const dt = (await jbody(start)).device_token
+    const fin = await hit(`/m/tg/enrol/${token}/confirm`, { init_data: init(TG.owner), device_token: dt, unlock_mode: 'pin', pin: PIN, trust_window_seconds: 1800 }, off)
+    expect(fin.status).toBe(409)
+    expect(count('tg_miniapp_devices', 'confirmed_at IS NOT NULL')).toBe(0)
+    expect(count('tg_miniapp_enrolment_tokens', 'consumed_at IS NULL')).toBeGreaterThan(0)
   })
   it('a trust token is just an unknown credential, and the decision path never reads the PIN: an invalid body field is not even looked at', async () => {
     const off = offEnv()
@@ -738,6 +778,64 @@ describe('stale-secret replay still revokes the device and clears the window', (
   })
 })
 
+describe('fix pass: proof provenance and the attempt counter', () => {
+  const proofOf = (momentId: string): string | undefined => {
+    const rows = harness.sqlite.prepare("SELECT evidence_json FROM mutation_audit_entries WHERE evidence_json LIKE '%tg_device_id%' AND evidence_json LIKE ?").all(`%${momentId}%`) as Array<{ evidence_json: string }>
+    return rows.map((r) => (JSON.parse(r.evidence_json) as { tg_proof?: string }).tg_proof).find((x) => x !== undefined)
+  }
+  it('every decision receipt names the factor that carried it: biometric, pin or trust', async () => {
+    const bio = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    const pin = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const a = await elevation()
+    expect((await go(bio, a.m, approve(a.action))).status).toBe(200)
+    expect(proofOf(a.m.id)).toBe('biometric')
+    const b = await elevation()
+    expect((await go(pin, b.m, approve(b.action))).status).toBe(200)
+    expect(proofOf(b.m.id)).toBe('pin')
+    const c = await elevation()
+    expect((await go(pin, c.m, approve(c.action), { via: 'trust' })).status).toBe(200)
+    expect(proofOf(c.m.id)).toBe('trust')
+  })
+  it('flag off adds no tg_proof (W4.1 evidence is unchanged)', async () => {
+    const off = offEnv()
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { e: off })
+    const a = await elevation()
+    expect((await go(p, a.m, approve(a.action), { e: off })).status).toBe(200)
+    expect(proofOf(a.m.id)).toBeUndefined()
+  })
+  it('the counter resets only in the WINNING consume: a right PIN with a bad nonce resets nothing; a winning decision resets it', async () => {
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const { m, action } = await elevation()
+    const nonce = await nonceFor(m, p.tg, approve(action))
+    await go(p, m, approve(action), { nonce, pin: WRONG })
+    await go(p, m, approve(action), { nonce, pin: WRONG })
+    expect(devRow(p).pin_failed_attempts).toBe(2)
+    const bad = await go(p, m, approve(action), { nonce: 'A'.repeat(43) })
+    expect(bad.status).toBe(403)
+    expect(devRow(p).pin_failed_attempts).toBe(3) // the right PIN took a slot and, with no win, gave nothing back
+    expect((await go(p, m, approve(action), { nonce })).status).toBe(200)
+    expect(devRow(p).pin_failed_attempts).toBe(0)
+  })
+  it('only the request whose own slot was the fifth locks: a request refused for lack of a slot revokes nothing', async () => {
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const { m, action } = await elevation()
+    const nonce = await nonceFor(m, p.tg, approve(action))
+    harness.sqlite.prepare('UPDATE tg_miniapp_devices SET pin_failed_attempts = 5 WHERE id = ?').run(deviceId(p))
+    const r = await go(p, m, approve(action), { nonce })
+    expect(r.status).toBe(403)
+    expect((await jbody(r)).code).toBe('pin_lockout')
+    expect(devRow(p).revoked_at).toBeNull()
+    expect(count('mutation_audit_entries', "operation = 'tg_device_pin_lockout'")).toBe(0)
+  })
+  it('the PIN setup success copy names the PIN', async () => {
+    const { token } = await mintTgEnrolmentToken(env, 'mem-owner', identities.owner)
+    const start = await hit(`/m/tg/enrol/${token}/start`, { init_data: init(TG.owner) })
+    const fin = await hit(`/m/tg/enrol/${token}/confirm`, { init_data: init(TG.owner), device_token: (await jbody(start)).device_token, unlock_mode: 'pin', pin: PIN, trust_window_seconds: 1800 })
+    expect((await jbody(fin)).message).toMatch(/PIN/)
+    expect((await jbody(fin)).message).not.toMatch(/fingerprint/)
+  })
+})
+
 describe('the window ends with the device', () => {
   it('owner removal, sign-out-everywhere and a lockout all clear it', async () => {
     const mk = async (): Promise<Phone> => {
@@ -836,16 +934,18 @@ describe('changing the window (changeTrustWindow and the /account route)', () =>
     expect(await changeTrustWindow(env, 'mem-sqadmin', deviceId(p), 0)).toEqual({ ok: false, reason: 'not_found' })
   })
 
-  describe('the /account route needs the SAME fresh session as enrolment', () => {
+  describe('the /account route: lengthening needs the SAME fresh session as enrolment, shortening only a real session', () => {
     const post = (app: Hono<{ Bindings: Env; Variables: { auth: AuthContext } }>, id: string, body: unknown, origin = 'http://localhost'): Promise<Response> =>
       Promise.resolve(app.request(`/account/telegram-device/${id}/window`, { method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: JSON.stringify(body) }, env))
-    it('refuses a stale session (reauth_required), an agent/bearer caller, another member, a cross-origin post and a bad value; accepts a fresh own session', async () => {
-      const p = await warmDevice()
+    it('stale session: lengthening and re-saving are reauth_required, shortening works; agent, cross-origin, bad values and other members are refused; a fresh session may lengthen', async () => {
+      const p = await warmDevice() // 86400
       const { app, setAuth } = accountApp(env)
       setAuth(await webAuth('mem-sqadmin', identities.sqadmin, false))
-      const stale = await post(app, deviceId(p), { seconds: 0 })
-      expect(stale.status).toBe(403)
-      expect(await stale.json()).toMatchObject({ error: 'reauth_required' })
+      for (const longer of [TRUST_WINDOW_MAX_SECONDS, 86400]) {
+        const r = await post(app, deviceId(p), { seconds: longer })
+        expect(r.status, String(longer)).toBe(403)
+        expect(await r.json()).toMatchObject({ error: 'reauth_required' })
+      }
       expect(devRow(p).trust_window_seconds).toBe(86400)
       setAuth(agentAuth())
       expect((await post(app, deviceId(p), { seconds: 0 })).status).toBe(403)
@@ -855,14 +955,20 @@ describe('changing the window (changeTrustWindow and the /account route)', () =>
       expect((await post(app, deviceId(p), 'junk')).status).toBe(400)
       expect(devRow(p).trust_window_seconds).toBe(86400)
       expect(count('mutation_audit_entries', "operation = 'tg_device_window_change'")).toBe(0)
-      const okRes = await post(app, deviceId(p), { seconds: 7200 })
-      expect(okRes.status).toBe(200)
+      // shortening with a STALE session (no fresh re-auth): allowed, immediate, receipted
+      setAuth(await webAuth('mem-sqadmin', identities.sqadmin, false))
+      const short = await post(app, deviceId(p), { seconds: 7200 })
+      expect(short.status).toBe(200)
       expect(devRow(p).trust_window_seconds).toBe(7200)
       expect(count('mutation_audit_entries', "operation = 'tg_device_window_change'")).toBe(1)
+      // lengthening with a fresh session: allowed
+      setAuth(await webAuth('mem-sqadmin', identities.sqadmin, true))
+      expect((await post(app, deviceId(p), { seconds: 28800 })).status).toBe(200)
+      expect(devRow(p).trust_window_seconds).toBe(28800)
       // another member's fresh session cannot touch it
       setAuth(await webAuth('mem-owner', identities.owner, true))
       expect((await post(app, deviceId(p), { seconds: 0 })).status).toBe(404)
-      expect(devRow(p).trust_window_seconds).toBe(7200)
+      expect(devRow(p).trust_window_seconds).toBe(28800)
     })
   })
 })

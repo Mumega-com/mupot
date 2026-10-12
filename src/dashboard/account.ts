@@ -50,7 +50,7 @@ import { checkEnrolmentSession, mintEnrolmentLink } from '../secure-moments/enro
 import { requestEnrolDelivery } from '../secure-moments/telegram-miniapp-enrol-delivery'
 import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
 import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
-import { changeTrustWindow, listMemberTgDevicesPw, pinWindowOn, TRUST_WINDOW_PRESETS } from '../secure-moments/telegram-miniapp-pin-window'
+import { changeTrustWindow, currentTrustWindow, listMemberTgDevicesPw, parseTrustWindow, pinWindowOn, TRUST_WINDOW_PRESETS } from '../secure-moments/telegram-miniapp-pin-window'
 import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
 
 type ShellFn = (
@@ -639,14 +639,14 @@ export function makeAccountApp(shell: ShellFn) {
       : c.json({ error: 'not_found' }, 404)
   })
 
-  // Change a phone's trusted-device window (W4.2, flag TELEGRAM_MINIAPP_PIN_WINDOW). Same bar as enrolment: a real web
-  // session re-authenticated within five minutes (checkEnrolmentSession, the ONE shared rule). The value must be a preset.
+  // Change a phone's trusted-device window (W4.2, flag TELEGRAM_MINIAPP_PIN_WINDOW). LENGTHENING (or re-saving the same value) is
+  // an enrolment-grade change: a real web session re-authenticated within five minutes (checkEnrolmentSession, the ONE shared
+  // rule). SHORTENING only reduces trust, so any real web session of the owner may do it (the revoke-device bar), with no
+  // fresh re-auth: a stolen session cookie can only make the phone ask more often. The value must be a preset.
   app.post('/account/telegram-device/:id/window', async (c) => {
     if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
     c.header('Cache-Control', 'no-store')
     if (!pinWindowOn(c.env)) return c.json({ error: 'not_enabled' }, 404)
-    const session = await checkEnrolmentSession(c.env, c.get('auth'))
-    if (!session.ok) return c.json({ error: session.error }, session.status)
     let seconds: unknown
     try {
       const body: unknown = await c.req.json()
@@ -654,7 +654,20 @@ export function makeAccountApp(shell: ShellFn) {
     } catch {
       return c.json({ error: 'bad_request' }, 400)
     }
-    const r = await changeTrustWindow(c.env, session.memberId, c.req.param('id'), seconds)
+    const to = parseTrustWindow(seconds)
+    if (to === null) return c.json({ error: 'bad_window' }, 400)
+    const auth = c.get('auth')
+    // Self only: the member behind THIS web session, never a member id from the request.
+    if (!auth.webSessionIdHash || !auth.webSessionMemberId || !auth.memberId || auth.webSessionMemberId !== auth.memberId) {
+      return c.json({ error: 'not_a_web_session' }, 403)
+    }
+    const current = await currentTrustWindow(c.env, auth.memberId, c.req.param('id'))
+    if (current === null) return c.json({ error: 'not_found' }, 404)
+    if (to >= current) {
+      const session = await checkEnrolmentSession(c.env, auth)
+      if (!session.ok) return c.json({ error: session.error }, session.status)
+    }
+    const r = await changeTrustWindow(c.env, auth.memberId, c.req.param('id'), to)
     if (!r.ok) return r.reason === 'bad_window' ? c.json({ error: 'bad_window' }, 400) : c.json({ error: 'not_found' }, 404)
     return c.json({ saved: true, seconds: r.to })
   })

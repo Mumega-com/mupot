@@ -178,12 +178,14 @@ export type DeviceResolution = { kind: 'ok'; device: TgDeviceRow } | { kind: 'st
  */
 export async function resolveDeviceForDecision(
   env: Env, deviceToken: unknown, who: { memberId: string; telegramUserId: string },
+  /** W4.2: only the PIN-aware caller (TELEGRAM_MINIAPP_PIN_WINDOW on) may resolve a PIN-mode device; every other caller fails closed on one. */
+  opts: { allowPinMode?: boolean } = {},
 ): Promise<DeviceResolution> {
   const parsed = parseDeviceToken(deviceToken)
   if (!parsed) return { kind: 'none' }
   const row = await env.DB.prepare(
     `SELECT ${DEVICE_COLUMNS} FROM tg_miniapp_devices
-      WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL LIMIT 1`,
+      WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL${opts.allowPinMode ? '' : " AND unlock_mode = 'biometric'"} LIMIT 1`,
   ).bind(parsed.deviceId, env.TENANT_SLUG).first<TgDeviceRow>()
   if (!row) return { kind: 'none' }
   // Bound to exactly this member and Telegram user BEFORE anything else: a secret presented by anyone else is simply
@@ -221,11 +223,11 @@ export async function resolveActiveDevice(
   return r.kind === 'ok' ? r.device : null
 }
 
-export async function memberHasActiveDevice(env: Env, memberId: string, telegramUserId: string): Promise<boolean> {
+export async function memberHasActiveDevice(env: Env, memberId: string, telegramUserId: string, opts: { allowPinMode?: boolean } = {}): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT 1 AS ok FROM tg_miniapp_devices d
        JOIN human_login_identities i ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id AND i.revoked_at IS NULL
-      WHERE d.tenant = ?1 AND d.member_id = ?2 AND d.telegram_user_id = ?3 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL LIMIT 1`,
+      WHERE d.tenant = ?1 AND d.member_id = ?2 AND d.telegram_user_id = ?3 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL${opts.allowPinMode ? '' : " AND d.unlock_mode = 'biometric'"} LIMIT 1`,
   ).bind(env.TENANT_SLUG, memberId, telegramUserId).first<{ ok: number }>()
   return row !== null
 }
@@ -325,7 +327,8 @@ export async function consumeMomentTelegram(
                           ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id AND i.revoked_at IS NULL
                         JOIN members m ON m.id = d.member_id AND m.tenant = d.tenant AND m.telegram_chat_id = d.telegram_user_id AND m.status = 'active'
                        WHERE d.id = ?6 AND d.tenant = ?2 AND d.member_id = ?5 AND d.telegram_user_id = ?7
-                         AND d.secret_sha256 = ?8 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL)`,
+                         AND d.secret_sha256 = ?8 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL
+                         AND d.unlock_mode = 'biometric')`,
     ).bind(input.momentId, tenant, nowIso, input.decision, input.memberId, input.deviceId, input.telegramUserId, input.secretSha256),
     env.DB.prepare(
       `INSERT INTO tg_miniapp_decisions (moment_id, tenant, member_id, telegram_user_id, device_id, decision, decided_at)

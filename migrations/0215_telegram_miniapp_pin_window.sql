@@ -24,9 +24,10 @@ ALTER TABLE tg_miniapp_devices ADD COLUMN pin_iterations INTEGER
 ALTER TABLE tg_miniapp_devices ADD COLUMN pin_failed_attempts INTEGER NOT NULL DEFAULT 0
   CHECK (pin_failed_attempts >= 0 AND pin_failed_attempts <= 5);
 
--- The trusted-device window, chosen per device by its owner. 0 = prompt every time. 604800 (7 days) is the hard cap,
+-- The trusted-device window, chosen per device by its owner. 0 = prompt every time, and 0 is the column default on purpose:
+-- a device enrolled before this wave never chose a window, so it never silently gets one (new setups write their choice explicitly). 604800 (7 days) is the hard cap,
 -- enforced here as well as in code.
-ALTER TABLE tg_miniapp_devices ADD COLUMN trust_window_seconds INTEGER NOT NULL DEFAULT 1800
+ALTER TABLE tg_miniapp_devices ADD COLUMN trust_window_seconds INTEGER NOT NULL DEFAULT 0
   CHECK (trust_window_seconds >= 0 AND trust_window_seconds <= 604800);
 
 -- While now < trusted_until a routine decision needs initData plus the CURRENT trust secret (a second, rotating secret the

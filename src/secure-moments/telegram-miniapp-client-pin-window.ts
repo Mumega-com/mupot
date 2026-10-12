@@ -103,8 +103,10 @@ async function moment(id){
    if(trust&&(curKind==='elevation'||decision==='deny')){
     var tp=Object.assign({},p);tp.trust_token=trust.t;
     var tr=await post('/m/tg/decide',tp);
-    if(tr.status===200||tr.json.code==='device_removed'){var pr=await remember(tr.json);if(tr.json.code==='device_removed'){await sDel(TRUST_KEY)}finish(tr,pr);return}
-    await sDel(TRUST_KEY); // expired, void or not for this kind: fall through to the full prompt on the SAME challenge (a refusal never burns it)
+    var pr=await remember(tr.json); // a rotated trust token is kept from ANY response that carries it
+    var fall=(tr.json.code==='window_expired'||tr.json.code==='prompt_required'||tr.json.code==='device_not_recognised');
+    if(!fall){if(tr.json.code==='device_removed'){await sDel(TRUST_KEY)}finish(tr,pr);return} // anything else (a spent nonce, a lost race, a won decision) is shown, never retried
+    await sDel(TRUST_KEY); // the server refused the TRUST proof before touching the nonce: answer the SAME challenge with the full prompt
    }
    // 2. The full proof: a PIN device sends its secret and the PIN; a biometric device unlocks its secret with fingerprint or face.
    var pinDevice=await sGet(DEV_KEY);

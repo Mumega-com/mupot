@@ -354,7 +354,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (!p) return fail(c, 400, 'Invalid decision parameters.', 'Bad request')
     const policy = telegramPolicyRefusal(l.d.m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
-    if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId))) {
+    if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId, { allowPinMode: pinWindowOn(c.env) }))) {
       return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard, or use Approve with passkey in your browser.', 'Set up this device', { needs_enrol: true })
     }
     const nonce = await mintTgNonce(c.env, { momentId: l.d.m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) })
@@ -387,6 +387,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     let identityId: string
     let proofUsed: 'secret' | 'trust' = 'secret'
     let presentedSha256 = ''
+    let tgProof: 'trust' | 'pin' | 'biometric' | null = null
     if (pw) {
       const au = await pwAuthorize(c.env, { body: g.body, who: { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId }, routine: m.kind === 'elevation' || p.decision === 'deny' }, Date.now())
       if (!au.ok) return fail(c, au.status, au.message, au.title, au.extra)
@@ -394,6 +395,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
       identityId = au.device.login_identity_id
       proofUsed = au.proof
       presentedSha256 = au.presentedSha256
+      tgProof = au.factor
     } else {
       const resolved = await resolveDeviceForDecision(c.env, g.body.device_token, { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId })
       if (resolved.kind === 'stale') {
@@ -412,7 +414,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     // 3. The core, under the channel's single-use gate (every refusable check already ran above or inside the core, before it).
     const proof: HumanProof = {
       memberId: a.id.memberId, via: 'telegram_miniapp',
-      evidence: { moment_id: m.id, telegram_user_id: a.id.telegramUserId, tg_device_id: device.id, tg_auth_method: a.id.method },
+      evidence: { moment_id: m.id, telegram_user_id: a.id.telegramUserId, tg_device_id: device.id, tg_auth_method: a.id.method, ...(tgProof ? { tg_proof: tgProof } : {}) },
     }
     // The consume ROTATES the device secret in the same batch; whatever the core then does, if the consume won the client must
     // receive the next secret (the old one is retired), so it rides on every response after a won gate.
@@ -512,6 +514,11 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const deviceToken = String(e.body.device_token ?? '')
     // W4.2 (sub-flag): the unlock method, the PIN and the trusted window are validated here and written in the SAME guarded UPDATE that activates the device.
     let setup: Awaited<ReturnType<typeof parseDeviceSetup>> | null = null
+    // A client that started under the sub-flag and keeps its secret in device storage must never be saved as a plain biometric
+    // device because the flag flipped off before this confirm: refuse, leaving the link unspent.
+    if (!pinWindowOn(c.env) && e.body.unlock_mode === 'pin') {
+      return fail(c, 409, 'PIN setup is not available right now. Start again from a fresh setup link.', 'Not set up')
+    }
     if (pinWindowOn(c.env)) {
       setup = await parseDeviceSetup(e.body, deviceToken, e.id.memberId, e.id.telegramUserId)
       if (!setup.ok) return fail(c, 400, setup.message, 'Bad request')
@@ -524,6 +531,11 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (setup?.ok && setup.setup.pin) {
       await recordTgAudit(c.env, { operation: 'tg_device_pin_set', memberId: e.id.memberId, deviceId: r.deviceId, evidence: { iterations: String(setup.setup.pin.iterations) } })
     }
-    return jsonOut(c, 200, { ok: true, title: 'Device set up', message: 'Decisions on this phone now need your fingerprint or face. You can close this page.' })
+    return jsonOut(c, 200, {
+      ok: true, title: 'Device set up',
+      message: setup?.ok && setup.setup.unlockMode === 'pin'
+        ? 'Decisions on this phone now need your 6-digit PIN. You can close this page.'
+        : 'Decisions on this phone now need your fingerprint or face. You can close this page.',
+    })
   }))
 }
