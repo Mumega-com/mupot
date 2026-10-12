@@ -3857,9 +3857,27 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "index", name: "uq_seed_attach_requests_pending_identity" },
     ],
   },
+  {
+    file: "0215_telegram_miniapp_pin_window.sql",
+    sha256: "249ff92a2573246aab9e6666d755d5f9a43252603d4f491419b325a4240f8b5e",
+    statements: [
+      "-- 0215_telegram_miniapp_pin_window.sql — secure moments, wave W4.2: PIN fallback + a user-chosen trusted-device window\n-- for the Telegram Mini App (docs/architecture/secure-moments.md, \"W4.2\"). Additive only: every column is NULL or has a\n-- constant default, and nothing reads them unless TELEGRAM_MINIAPP_PIN_WINDOW is on.\n--\n-- Neither the PIN nor the window grants authority. They are two more ways a device proves \"it is the same human again\";\n-- sensitive elevations and home_access stay passkey-only, decided before any of this is consulted.\n\n-- unlock_mode: where the device secret lives on the phone. 'biometric' = inside Telegram's BiometricManager (the W4 path);\n-- 'pin' = in the Mini App's device storage, with the 6-digit PIN as the second factor the SERVER verifies.\nALTER TABLE tg_miniapp_devices ADD COLUMN unlock_mode TEXT NOT NULL DEFAULT 'biometric'\n  CHECK (unlock_mode IN ('biometric', 'pin'));",
+      "\n\n-- The PIN is never stored: only PBKDF2-HMAC-SHA256(pin, per-device random salt + device/member/telegram-user binding).\n-- pin_iterations is kept per row so the cost can be raised later without invalidating existing PINs.\nALTER TABLE tg_miniapp_devices ADD COLUMN pin_salt TEXT\n  CHECK (pin_salt IS NULL OR (length(pin_salt) = 32 AND pin_salt = lower(pin_salt) AND pin_salt NOT GLOB '*[^0-9a-f]*'));",
+      "\nALTER TABLE tg_miniapp_devices ADD COLUMN pin_hash TEXT\n  CHECK (pin_hash IS NULL OR (length(pin_hash) = 64 AND pin_hash = lower(pin_hash) AND pin_hash NOT GLOB '*[^0-9a-f]*'));",
+      "\nALTER TABLE tg_miniapp_devices ADD COLUMN pin_iterations INTEGER\n  CHECK (pin_iterations IS NULL OR (pin_iterations >= 1 AND pin_iterations <= 100000));",
+      "\n\n-- Wrong-PIN counter. An attempt RESERVES a slot with a guarded UPDATE (... WHERE pin_failed_attempts < 5) BEFORE the hash\n-- is computed, so concurrent guesses cannot exceed the cap; the CHECK makes the cap a database fact, not just code.\nALTER TABLE tg_miniapp_devices ADD COLUMN pin_failed_attempts INTEGER NOT NULL DEFAULT 0\n  CHECK (pin_failed_attempts >= 0 AND pin_failed_attempts <= 5);",
+      "\n\n-- The trusted-device window, chosen per device by its owner. 0 = prompt every time. 604800 (7 days) is the hard cap,\n-- enforced here as well as in code.\nALTER TABLE tg_miniapp_devices ADD COLUMN trust_window_seconds INTEGER NOT NULL DEFAULT 1800\n  CHECK (trust_window_seconds >= 0 AND trust_window_seconds <= 604800);",
+      "\n\n-- While now < trusted_until a routine decision needs initData plus the CURRENT trust secret (a second, rotating secret the\n-- phone caches outside BiometricManager for the window only; stored as sha256). It is void the moment trusted_until passes,\n-- so \"an expired window prompts again\" is enforced here, not by the client.\nALTER TABLE tg_miniapp_devices ADD COLUMN trust_secret_sha256 TEXT\n  CHECK (trust_secret_sha256 IS NULL OR (length(trust_secret_sha256) = 64 AND trust_secret_sha256 = lower(trust_secret_sha256) AND trust_secret_sha256 NOT GLOB '*[^0-9a-f]*'));",
+      "\nALTER TABLE tg_miniapp_devices ADD COLUMN trusted_until TEXT;",
+      "\n\n-- Whatever revokes a device (owner removal, sign-out-everywhere, identity revoke, stale-secret replay, PIN lockout) ends its\n-- window in the same statement. Revoked devices are already refused everywhere; this keeps the row honest.\nCREATE TRIGGER IF NOT EXISTS tg_miniapp_devices_revoke_ends_window\n  AFTER UPDATE OF revoked_at ON tg_miniapp_devices\n  WHEN NEW.revoked_at IS NOT NULL AND (NEW.trusted_until IS NOT NULL OR NEW.trust_secret_sha256 IS NOT NULL)\nBEGIN\n  UPDATE tg_miniapp_devices SET trusted_until = NULL, trust_secret_sha256 = NULL WHERE id = NEW.id;\nEND;",
+    ],
+    objects: [
+      { type: "trigger", name: "tg_miniapp_devices_revoke_ends_window" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "b7febcca0b1f9e188b4eafa4e8ad9b24ed74c101868998653dfa205aec4e05e5"
+export const SCHEMA_CHAIN_DIGEST: string = "537348ec0a074c47c2f89034d6858ea1eb3781adc2df7ca164ecc48f6eb54663"

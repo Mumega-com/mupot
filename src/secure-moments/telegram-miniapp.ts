@@ -36,10 +36,12 @@ import {
 } from './telegram-miniapp-config'
 import {
   confirmDeviceEnrolment, consumeMomentTelegram, consumeTgNonce, loadTgEnrolmentToken, memberHasActiveDevice, mintTgNonce, recordTgAudit,
-  resolveDeviceForDecision, startDeviceEnrolment, tgEnrolmentTokenIsLive, type TgEnrolmentTokenRow,
+  resolveDeviceForDecision, startDeviceEnrolment, tgEnrolmentTokenIsLive, type TgDeviceRow, type TgEnrolmentTokenRow,
 } from './telegram-miniapp-store'
 import { resolveTelegramMember } from './telegram-miniapp-binding'
 import { TG_SCRIPT } from './telegram-miniapp-client'
+import { TG_SCRIPT_PIN_WINDOW } from './telegram-miniapp-client-pin-window'
+import { consumeMomentTelegramPw, parseDeviceSetup, pinWindowOn, pwAuthorize, type PwConsumeResult } from './telegram-miniapp-pin-window'
 
 // Structurally identical to routes.ts's AppEnv (not imported: routes.ts imports THIS module to mount it).
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
@@ -274,7 +276,8 @@ function shell(c: C, mode: 'launch' | 'moment' | 'enrol', ref: string): Response
 <div id="app" class="card" data-mode="${mode}" data-ref="${escapeHtml(ref)}"><p class="muted">Checking with Telegram…</p></div>
 <div id="status" role="status" class="muted"></div>`
   pageHeaders(c)
-  return c.html(renderPage(title, body, { nonce: c.get('nonce'), code: TG_SCRIPT }))
+  // W4.2 sub-flag: the PIN + trusted-window page script. Off serves the W4.1 script byte for byte.
+  return c.html(renderPage(title, body, { nonce: c.get('nonce'), code: pinWindowOn(c.env) ? TG_SCRIPT_PIN_WINDOW : TG_SCRIPT }))
 }
 
 /** Routing is static, so the flag is checked per request: anything but 'on' falls through to the pre-W4 routing untouched (a true no-op). */
@@ -377,15 +380,31 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     // 1. The step-up FIRST (read-only): the biometric-unlocked device secret of exactly this member and Telegram user, on a
     //    live identity. A bad secret therefore never burns the nonce. A RETIRED secret (a copy of one a rotation replaced)
     //    revokes the device and is reported as such.
-    const resolved = await resolveDeviceForDecision(c.env, g.body.device_token, { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId })
-    if (resolved.kind === 'stale') {
-      return fail(c, 403, 'This device presented an out-of-date secret, so it was removed for your safety. Set it up again (My Account, Telegram device).', 'Device removed')
+    // W4.2 (sub-flag): the same door plus the PIN for a PIN device, or the trust secret inside a live window. The policy above
+    // already refused every sensitive kind, so neither can carry one; `routine` = a deny or an elevation approve, never a seed approve.
+    const pw = pinWindowOn(c.env)
+    let device: TgDeviceRow
+    let identityId: string
+    let proofUsed: 'secret' | 'trust' = 'secret'
+    let presentedSha256 = ''
+    if (pw) {
+      const au = await pwAuthorize(c.env, { body: g.body, who: { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId }, routine: m.kind === 'elevation' || p.decision === 'deny' }, Date.now())
+      if (!au.ok) return fail(c, au.status, au.message, au.title, au.extra)
+      device = au.device
+      identityId = au.device.login_identity_id
+      proofUsed = au.proof
+      presentedSha256 = au.presentedSha256
+    } else {
+      const resolved = await resolveDeviceForDecision(c.env, g.body.device_token, { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId })
+      if (resolved.kind === 'stale') {
+        return fail(c, 403, 'This device presented an out-of-date secret, so it was removed for your safety. Set it up again (My Account, Telegram device).', 'Device removed')
+      }
+      if (resolved.kind !== 'ok' || !resolved.device.login_identity_id) {
+        return fail(c, 403, 'This device is not recognised for decisions. Set it up again from My Account (Telegram device) on the dashboard.', 'Device not recognised')
+      }
+      device = resolved.device
+      identityId = resolved.device.login_identity_id
     }
-    if (resolved.kind !== 'ok' || !resolved.device.login_identity_id) {
-      return fail(c, 403, 'This device is not recognised for decisions. Set it up again from My Account (Telegram device) on the dashboard.', 'Device not recognised')
-    }
-    const device = resolved.device
-    const identityId = resolved.device.login_identity_id
     // 2. The nonce: single use, live, bound to THIS moment + decision + parameters + member + Telegram user.
     if (!(await consumeTgNonce(c.env, nonce, { momentId: m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) }, Date.now()))) {
       return fail(c, 403, 'The confirmation is invalid, expired, already used, or was issued for a different decision. Reopen the request and try again.')
@@ -398,7 +417,17 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     // The consume ROTATES the device secret in the same batch; whatever the core then does, if the consume won the client must
     // receive the next secret (the old one is retired), so it rides on every response after a won gate.
     let nextDeviceToken: string | null = null
+    let trustOut: Pick<PwConsumeResult, 'nextTrustToken' | 'trustedUntil'> = { nextTrustToken: null, trustedUntil: null }
     const gate = async (): Promise<boolean> => {
+      if (pw) {
+        const r = await consumeMomentTelegramPw(c.env, {
+          momentId: m.id, decision: p.decision, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId,
+          deviceId: device.id, presentedSha256, proof: proofUsed,
+        }, Date.now())
+        nextDeviceToken = r.nextDeviceToken
+        trustOut = r
+        return r.won
+      }
       const r = await consumeMomentTelegram(c.env, {
         momentId: m.id, decision: p.decision, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId,
         deviceId: device.id, secretSha256: device.secret_sha256,
@@ -410,6 +439,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const now = Date.now()
     const withRotation = (o: Outcome): Response => jsonOut(c, o.status, {
       ok: o.status === 200, title: o.title, message: o.message, ...(nextDeviceToken ? { device_token_next: nextDeviceToken } : {}),
+      ...(trustOut.nextTrustToken ? { trust_token_next: trustOut.nextTrustToken, trusted_until: trustOut.trustedUntil } : {}),
     })
     if (subject.kind === 'seed_attach') {
       return withRotation(await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))
@@ -479,11 +509,21 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
   app.post('/m/tg/enrol/:token/confirm', guarded(async (c) => {
     const e = await enrolContext(c)
     if (!e.ok) return e.res
-    const r = await confirmDeviceEnrolment(c.env, { token: e.token, deviceToken: String(e.body.device_token ?? ''), telegramUserId: e.id.telegramUserId }, Date.now())
+    const deviceToken = String(e.body.device_token ?? '')
+    // W4.2 (sub-flag): the unlock method, the PIN and the trusted window are validated here and written in the SAME guarded UPDATE that activates the device.
+    let setup: Awaited<ReturnType<typeof parseDeviceSetup>> | null = null
+    if (pinWindowOn(c.env)) {
+      setup = await parseDeviceSetup(e.body, deviceToken, e.id.memberId, e.id.telegramUserId)
+      if (!setup.ok) return fail(c, 400, setup.message, 'Bad request')
+    }
+    const r = await confirmDeviceEnrolment(c.env, { token: e.token, deviceToken, telegramUserId: e.id.telegramUserId, ...(setup?.ok ? { setup: setup.setup } : {}) }, Date.now())
     if (!r.ok) {
       return fail(c, 409, r.reason === 'token_spent' ? 'This setup link was already used.' : 'The device could not be confirmed. Start again from the link.', 'Not set up')
     }
-    await recordTgAudit(c.env, { operation: 'tg_device_enrol', memberId: e.id.memberId, deviceId: r.deviceId, evidence: { telegram_user_id: e.id.telegramUserId, login_identity_id: e.token.login_identity_id ?? '' } })
+    await recordTgAudit(c.env, { operation: 'tg_device_enrol', memberId: e.id.memberId, deviceId: r.deviceId, evidence: { telegram_user_id: e.id.telegramUserId, login_identity_id: e.token.login_identity_id ?? '', ...(setup?.ok ? { unlock_mode: setup.setup.unlockMode, trust_window_seconds: String(setup.setup.trustWindowSeconds) } : {}) } })
+    if (setup?.ok && setup.setup.pin) {
+      await recordTgAudit(c.env, { operation: 'tg_device_pin_set', memberId: e.id.memberId, deviceId: r.deviceId, evidence: { iterations: String(setup.setup.pin.iterations) } })
+    }
     return jsonOut(c, 200, { ok: true, title: 'Device set up', message: 'Decisions on this phone now need your fingerprint or face. You can close this page.' })
   }))
 }

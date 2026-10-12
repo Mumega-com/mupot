@@ -286,6 +286,8 @@ export interface Env {
   TELEGRAM_MINIAPP_BOT_TOKEN?: string         // REQUIRED worker SECRET (wrangler secret put) of the DEDICATED Mini App bot: used ONLY to send the web_app button, never to validate initData
   TELEGRAM_MINIAPP_MAX_AGE_SECONDS?: string   // initData auth_date freshness, default 300, cap 3600
   TELEGRAM_MINIAPP_EXTRA_PUBKEYS?: string     // staging only: extra Ed25519 keys (64-hex, comma separated); production accepts Telegram's production key alone
+  // W4.2 sub-flag: PIN fallback + user-chosen trusted-device window. OFF unless '1' or 'true' AND the Mini App channel is on; off = W4.1 behaviour.
+  TELEGRAM_MINIAPP_PIN_WINDOW?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].

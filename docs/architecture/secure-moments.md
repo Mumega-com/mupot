@@ -342,6 +342,7 @@ What remains: whoever controls the dedicated bot's token, or code running in the
 | `TELEGRAM_MINIAPP_BOT_ID` | Numeric id of the **dedicated** Mini App bot. It goes into the string Telegram's signature is checked against, so data signed for any other bot is refused. Required. |
 | `TELEGRAM_MINIAPP_BOT_TOKEN` | **Required worker secret** (`wrangler secret put`) of the same bot, used only to send the button. It must start with `<TELEGRAM_MINIAPP_BOT_ID>:`; if it is missing, malformed, names another bot, or matches `TELEGRAM_BOT_TOKEN`, the channel stays off (everything answers 404). |
 | `TELEGRAM_MINIAPP_MAX_AGE_SECONDS` | How old the launch data's `auth_date` may be. Default 300, hard cap 3600; zero, negative or unparseable means the default. |
+| `TELEGRAM_MINIAPP_PIN_WINDOW` | W4.2 sub-flag: PIN fallback and the user-chosen trusted-device window. Off unless `1` or `true` AND the Mini App channel is itself on. Off is exactly W4.1: the W4.1 page script is served, the new columns are never read, `/account` shows no window control. Needs migration 0215. |
 | `TELEGRAM_MINIAPP_EXTRA_PUBKEYS` | Staging only: comma-separated extra Ed25519 public keys (64 hex). Production leaves this unset and accepts Telegram's production key alone. |
 
 The names are in the reviewed-names list.
@@ -439,6 +440,33 @@ Telegram Desktop has no `BiometricManager`, so the Mini App used to dead-end at 
 - **Side effect**: rotating kills the previous link of that moment, including one an agent relayed. That is intended and the same as W3.1.
 - **Human link survival**: a Telegram rotation suppresses machine (MCP fallback) rotations of that moment for 10 minutes (`human_active`), checked inside the same atomic reservation. A human rotation is never blocked by a machine one.
 - **Per-member sub-cap**: one member may use at most 2 of the 5 slots per moment through Telegram (`member_capped`, 409 "No more links"), so the agent path keeps its share. On a moment any authorised member may decide, several members together can still spend the shared cap; that is bounded and accepted.
+
+### W4.2: a PIN fallback and a trusted-device window
+
+Hadi's direction: set up a PIN, do not frustrate people, keep the device that passed biometrics trusted for a while, and let the user choose how long. Flag `TELEGRAM_MINIAPP_PIN_WINDOW` (off = W4.1 exactly), migration `0215_telegram_miniapp_pin_window.sql` (additive columns on `tg_miniapp_devices` plus one trigger).
+
+**Neither the PIN nor the window grants authority.** They are two more ways a device proves "the same human again". Every sensitive elevation and `action:home_access` is refused by `telegramPolicyRefusal` (the existing passkey-only logic) before the credential is even read, so no PIN and no window can carry one. A *seed approve* is also not "routine": it always needs a fresh biometric or PIN. Only a deny or a non-sensitive elevation approve can ride the window.
+
+**Unlock method, chosen at setup, per device.** `unlock_mode = 'biometric'` is the W4 path (device secret inside BiometricManager). `unlock_mode = 'pin'` is for Telegram Desktop/web (no BiometricManager) or a user who prefers it: the device secret lives in the Mini App's device storage and the decision needs a 6-digit PIN the **server** verifies. A PIN device with no stored hash fails closed.
+
+**The PIN.**
+- Exactly six ASCII digits; a repeated digit or a straight run (`111111`, `123456`) is refused at setup.
+- The server stores only `PBKDF2-HMAC-SHA256(pin, salt)`: a per-device random 16-byte salt, with the device id, member id and Telegram user id mixed into the salt, so a hash copied onto another device row never verifies there. `pin_iterations` is stored per row.
+- **100,000 iterations**: the most Cloudflare Workers' WebCrypto accepts (it throws above that), tens of milliseconds of CPU per attempt. Honest limit: a 6-digit PIN has 10^6 values, so against a leaked database the hash only slows an attacker. The protection is the lockout, and a guess is only counted after valid signed initData and the device secret.
+- A decision with a PIN device needs: signed initData, the device secret (rotating as in W4), and the PIN. The PIN is never logged, stored in clear, put in a receipt or echoed. Comparison is `timingSafeEqual` on the hex digests.
+- **Lockout.** An attempt first reserves a slot with a guarded `UPDATE ... SET pin_failed_attempts = pin_failed_attempts + 1 WHERE ... pin_failed_attempts < 5`, then hashes. Concurrent guesses can therefore trigger at most five verifications. The fifth wrong PIN revokes the device (`revoked_reason = 'pin_lockout'`). A correct PIN resets the consecutive-wrong counter. The database also CHECKs the counter at 5. Re-setup is from `/account` (Set up this phone).
+- **Receipts** (`mutation_audit_entries`, never the PIN): `tg_device_pin_set`, `tg_device_pin_attempt` (outcome and count), `tg_device_pin_lockout`, `tg_device_window_change`.
+
+**The trusted-device window.** Per device, chosen at setup and changeable on `/account`. Presets only: every time (0), 30 minutes (default), 2 hours, 8 hours, 24 hours, 7 days. Seven days is a hard cap enforced in code (anything that is not exactly a preset is refused, at setup and on change) and by a CHECK in the database.
+- After any successful biometric or PIN decision, the consuming statement sets `trusted_until = now + trust_window_seconds` (the window is read from the ROW inside the statement, so a window shortened a moment earlier wins) and issues a **trust secret**.
+- While `now < trusted_until`, a routine decision needs only signed initData plus the current trust secret: no biometric, no PIN. The window is never extended by being used.
+- **Deviation worth knowing:** the trust secret is a *second*, rotating secret (stored as a sha256, retired digests kept), not the device secret itself. To skip the prompt the phone has to cache something outside BiometricManager; if that were the device secret, an expired window could be turned back into "no prompt" by anyone holding the cache. As a separate secret that the server voids at `trusted_until`, "an expired window prompts again" is enforced server-side, not by the client. The device secret still rotates on every secret-path decision; the trust secret rotates on every window-path decision.
+- Bound to the device AND the Telegram user: the token names a device, which must belong to the member the signed initData resolves to, on the same Telegram user id; the consume re-checks both inside its WHERE.
+- **Ends** on: device revoke (owner removal, sign-out everywhere, identity revoke), stale-secret replay (either secret), PIN lockout. A trigger clears `trusted_until` and the trust secret in the same statement as any `revoked_at` write. A retired trust secret presented again is a harvested copy: the device is revoked and a suspicious receipt written.
+- **Changing it** (`POST /account/telegram-device/:id/window`) needs the same fresh session as enrolment (`checkEnrolmentSession`: web session, re-authenticated within five minutes). *Shortening takes effect immediately* (`trusted_until` clamps to now + the new window; 0 also voids the trust secret). Lengthening never extends a window already running; it applies from the next decision. Each change writes a receipt with from and to.
+- The phone caches the trust token only for the window it was given (`trusted_until`), in `DeviceStorage` (else `localStorage`). While trusted, that token is a bearer for routine decisions from that phone, which is exactly what "trusted" means; choose "Every time" if that is not acceptable.
+
+Needs a real phone (not verified against a live client): `Telegram.WebApp.DeviceStorage` behaviour on Desktop/web and whether the webview keeps `localStorage` between launches.
 
 ### Accepted limits
 
