@@ -455,28 +455,17 @@ export async function canDecideElevation(
   return decidedByHasElevationAuthority(env, isOrgAdmin(auth), capabilities ?? [], scopeType, scopeId || null)
 }
 
-/**
- * decideElevationRequest — THE single-decision transaction. Security
- * Invariant 6 ("Approval is single-decision and atomic. Concurrent
- * Allow/Deny or double-Allow yields one terminal decision and one grant
- * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
- * — SQLite serializes it, so at most one concurrent caller ever observes
- * `changes === 1`; every other concurrent/later caller sees 0 and returns
- * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
- * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
- * mid-batch D1 failure leaves the request 'approved' with zero grants
- * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
- * silent extra authority).
- */
-export async function decideElevationRequest(
+/** Every REFUSAL a decision can meet, in one READ-ONLY function. decideElevationRequest runs it first; a channel
+ *  that burns a single-use token before deciding (secure moments, via decision-core.ts) runs the very same function
+ *  BEFORE it consumes the token, so a refused decision can never spend the link. One predicate set, no second copy:
+ *  expiry/status, agent-session liveness, authority, self-approval, and (approve) a non-empty subset of the requested
+ *  actions, an unchanged scope, a valid and not-widened duration, and the step-up. `request` is the already-loaded row. */
+export async function findElevationDecisionRefusal(
   env: Env,
   input: DecideElevationInput,
+  request: ElevationRequestRecord,
   nowMs: number = Date.now(),
-): Promise<DecideElevationResult> {
-  await expireStaleElevationRequests(env, input.tenant, nowMs)
-
-  const request = await loadElevationRequestById(env, input.tenant, input.requestId)
-  if (!request) return { ok: false, reason: 'not_found' }
+): Promise<Exclude<DecideElevationResult, { ok: true }> | null> {
   // A pending row whose decision window already lapsed reads as
   // 'request_expired' even if the sweep above (or an earlier reader) already
   // flipped its stored status to 'expired' — that is a maintenance detail,
@@ -489,16 +478,8 @@ export async function decideElevationRequest(
 
   const agentSession = await loadAgentSessionById(env, input.tenant, request.agent_session_id)
   if (!agentSession || !evaluateAgentSession(agentSession, nowMs).ok) {
-    await env.DB.prepare(
-      `UPDATE elevation_requests SET status = 'denied', decided_at = ?1, decision_note = 'agent_session_ended'
-        WHERE id = ?2 AND tenant = ?3 AND status = 'pending'`,
-    )
-      .bind(new Date(nowMs).toISOString(), request.id, input.tenant)
-      .run()
     return { ok: false, reason: 'agent_session_ended' }
   }
-
-  const nowIso = new Date(nowMs).toISOString()
 
   // ── authority, checked BEFORE either terminal decision ────────────────
   //
@@ -546,6 +527,82 @@ export async function decideElevationRequest(
     return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: request.requested_scope_type as CapabilityScopeType, id: request.requested_scope_id } }
   }
 
+  if (input.decision === 'approve') {
+    const requested: string[] = JSON.parse(request.requested_actions_json)
+    const selected = Array.from(new Set(input.selectedActions ?? []))
+    if (selected.length === 0) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'at least one selected action required' }
+    }
+    for (const action of selected) {
+      if (!requested.includes(action)) {
+        return { ok: false, reason: 'invalid_elevation_request', detail: `"${action}" was not requested` }
+      }
+    }
+
+    const scopeType = input.scopeType ?? request.requested_scope_type
+    const scopeId = input.scopeId ?? request.requested_scope_id
+    if (scopeType !== request.requested_scope_type || scopeId !== request.requested_scope_id) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'scope cannot be widened or changed, only the action set narrowed' }
+    }
+
+    const durationMinutes = input.durationMinutes ?? request.requested_duration_minutes
+    if (!isValidElevationDuration(durationMinutes) || durationMinutes > request.requested_duration_minutes) {
+      return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid or widened duration_minutes' }
+    }
+
+    // scopeType/scopeId are already proven identical to the request's own scope
+    // above, so this re-check is over the same scope the hoisted gate cleared. It
+    // stays as defence in depth and must honour the SAME two planes, or an owner
+    // clears the first gate and is refused by the second.
+    if (!(await decidedByHasElevationAuthority(env, input.decidedByIsOrgAdmin, input.decidedByCapabilities, scopeType, scopeId || null))) {
+      return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
+    }
+
+    const needsStepUp = selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
+    if (needsStepUp && !input.recentReauthOk) {
+      return { ok: false, reason: 'reauth_required' }
+    }
+  }
+  return null
+}
+
+/**
+ * decideElevationRequest — THE single-decision transaction. Security
+ * Invariant 6 ("Approval is single-decision and atomic. Concurrent
+ * Allow/Deny or double-Allow yields one terminal decision and one grant
+ * set."): the status flip is one guarded UPDATE (`WHERE status = 'pending'`)
+ * — SQLite serializes it, so at most one concurrent caller ever observes
+ * `changes === 1`; every other concurrent/later caller sees 0 and returns
+ * 'already_decided' WITHOUT inserting any grant. The grant-row insert is
+ * one `.batch()` call, which is all-or-nothing (assertBatchWritten) — a
+ * mid-batch D1 failure leaves the request 'approved' with zero grants
+ * rather than a PARTIAL grant set (a detectable data-integrity gap, never a
+ * silent extra authority).
+ */
+export async function decideElevationRequest(
+  env: Env,
+  input: DecideElevationInput,
+  nowMs: number = Date.now(),
+): Promise<DecideElevationResult> {
+  await expireStaleElevationRequests(env, input.tenant, nowMs)
+
+  const request = await loadElevationRequestById(env, input.tenant, input.requestId)
+  if (!request) return { ok: false, reason: 'not_found' }
+  const refusal = await findElevationDecisionRefusal(env, input, request, nowMs)
+  if (refusal) {
+    if (refusal.reason === 'agent_session_ended') {
+      await env.DB.prepare(
+        `UPDATE elevation_requests SET status = 'denied', decided_at = ?1, decision_note = 'agent_session_ended'
+          WHERE id = ?2 AND tenant = ?3 AND status = 'pending'`,
+      )
+        .bind(new Date(nowMs).toISOString(), request.id, input.tenant)
+        .run()
+    }
+    return refusal
+  }
+
+  const nowIso = new Date(nowMs).toISOString()
+
   if (input.decision === 'deny') {
     const result = await env.DB.prepare(
       `UPDATE elevation_requests
@@ -560,41 +617,11 @@ export async function decideElevationRequest(
     return { ok: true, request: updated ?? { ...request, status: 'denied' }, grants: [] }
   }
 
-  // ── approve ──────────────────────────────────────────────────────────
-  const requested: string[] = JSON.parse(request.requested_actions_json)
+  // ── approve ── (every refusal was already cleared by findElevationDecisionRefusal above)
   const selected = Array.from(new Set(input.selectedActions ?? []))
-  if (selected.length === 0) {
-    return { ok: false, reason: 'invalid_elevation_request', detail: 'at least one selected action required' }
-  }
-  for (const action of selected) {
-    if (!requested.includes(action)) {
-      return { ok: false, reason: 'invalid_elevation_request', detail: `"${action}" was not requested` }
-    }
-  }
-
   const scopeType = input.scopeType ?? request.requested_scope_type
   const scopeId = input.scopeId ?? request.requested_scope_id
-  if (scopeType !== request.requested_scope_type || scopeId !== request.requested_scope_id) {
-    return { ok: false, reason: 'invalid_elevation_request', detail: 'scope cannot be widened or changed, only the action set narrowed' }
-  }
-
   const durationMinutes = input.durationMinutes ?? request.requested_duration_minutes
-  if (!isValidElevationDuration(durationMinutes) || durationMinutes > request.requested_duration_minutes) {
-    return { ok: false, reason: 'invalid_elevation_request', detail: 'invalid or widened duration_minutes' }
-  }
-
-  // scopeType/scopeId are already proven identical to the request's own scope
-  // above, so this re-check is over the same scope the hoisted gate cleared. It
-  // stays as defence in depth and must honour the SAME two planes, or an owner
-  // clears the first gate and is refused by the second.
-  if (!(await decidedByHasElevationAuthority(env, input.decidedByIsOrgAdmin, input.decidedByCapabilities, scopeType, scopeId || null))) {
-    return { ok: false, reason: 'forbidden', need: 'admin', scope: { type: scopeType, id: scopeId } }
-  }
-
-  const needsStepUp = selected.some((a) => SENSITIVE_STEP_UP_ACTIONS.has(a))
-  if (needsStepUp && !input.recentReauthOk) {
-    return { ok: false, reason: 'reauth_required' }
-  }
 
   const flip = await env.DB.prepare(
     `UPDATE elevation_requests

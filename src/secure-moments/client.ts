@@ -15,6 +15,7 @@ export const DECIDE_SCRIPT = `${COMMON}
 (function(){
 if(!window.PublicKeyCredential){show('Passkeys not available','This browser cannot use passkeys. Open the link in a browser that can.',false);lock(true);return}
 var form=document.getElementById('decision-form');
+form.addEventListener('submit',function(ev){ev.preventDefault()});
 function params(decision){var fd=new FormData(form);return{decision:decision,actions:fd.getAll('actions'),duration_minutes:fd.get('duration_minutes'),csrf:form.getAttribute('data-csrf')}}
 async function decide(decision){
  lock(true);show('Waiting for your passkey','Confirm on this device. Nothing has been decided yet.',true);

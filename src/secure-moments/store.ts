@@ -104,7 +104,9 @@ export function momentIsLive(row: MomentRow, nowMs: number): boolean {
 
 /**
  * THE consuming statement. True iff THIS call won it: still pending, unexpired, the link hash still the one
- * presented, and (when the moment names a decider) the deciding member is that member.
+ * presented, (when the moment names a decider) the deciding member is that member, and the passkey is unrevoked
+ * AND bound to a LIVE login identity of that member (so revoking the identity cuts the passkey off even between
+ * the route's own check and this consume).
  */
 export async function consumeMoment(
   env: Env,
@@ -117,7 +119,11 @@ export async function consumeMoment(
         SET status = CASE WHEN ?4 = 'deny' THEN 'denied' ELSE 'consumed' END,
             decided_at = ?3, decision = ?4, decided_via = 'webauthn', decided_by_member_id = ?5, decided_passkey_id = ?6
       WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3
-        AND link_token_sha256 = ?7 AND (decider_member_id IS NULL OR decider_member_id = ?5)`,
+        AND link_token_sha256 = ?7 AND (decider_member_id IS NULL OR decider_member_id = ?5)
+        AND EXISTS (SELECT 1 FROM member_passkeys p
+                      JOIN human_login_identities i
+                        ON i.id = p.login_identity_id AND i.tenant = p.tenant AND i.member_id = p.member_id AND i.revoked_at IS NULL
+                     WHERE p.id = ?6 AND p.tenant = ?2 AND p.member_id = ?5 AND p.revoked_at IS NULL)`,
   ).bind(input.id, env.TENANT_SLUG, nowIso, input.decision, input.memberId, input.passkeyId, await tokenHash(input.token)).run()
   return r.meta.changes === 1
 }
@@ -221,7 +227,62 @@ export async function revokeOwnPasskey(env: Env, memberId: string, passkeyId: st
   const r = await env.DB.prepare(
     `UPDATE member_passkeys SET revoked_at = ?4 WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
   ).bind(passkeyId, env.TENANT_SLUG, memberId, new Date(nowMs).toISOString()).run()
+  if (r.meta.changes === 1) await recordPasskeyAudit(env, { operation: 'passkey_revoke', memberId, passkeyId, evidence: { reason: 'owner_revoke' } }, nowMs)
   return r.meta.changes === 1
+}
+
+/**
+ * "Cut this human off" levers kill the passkeys too: every unrevoked passkey of the member (all of them), or only
+ * those enrolled under one login identity. Called from revokeAllWebSessions and revokeLoginIdentity so a passkey
+ * can never be the surviving door. Receipted once per call when anything was revoked.
+ */
+export async function revokeMemberPasskeys(
+  env: Env, memberId: string, reason: string, opts: { loginIdentityId?: string } = {}, nowMs: number = Date.now(),
+): Promise<number> {
+  const nowIso = new Date(nowMs).toISOString()
+  const tenant = env.TENANT_SLUG
+  let r: Awaited<ReturnType<ReturnType<Env['DB']['prepare']>['run']>>
+  try {
+    r = opts.loginIdentityId
+      ? await env.DB.prepare(
+          `UPDATE member_passkeys SET revoked_at = ?4 WHERE tenant = ?1 AND member_id = ?2 AND login_identity_id = ?3 AND revoked_at IS NULL`,
+        ).bind(tenant, memberId, opts.loginIdentityId, nowIso).run()
+      : await env.DB.prepare(
+          `UPDATE member_passkeys SET revoked_at = ?3 WHERE tenant = ?1 AND member_id = ?2 AND revoked_at IS NULL`,
+        ).bind(tenant, memberId, nowIso).run()
+  } catch (err) {
+    // A pot that has not applied migration 0212 has no passkeys to revoke; sign-out and identity revoke must still work.
+    if (err instanceof Error && /no such table/i.test(err.message)) return 0
+    throw err
+  }
+  const n = Number(r.meta?.changes ?? 0)
+  if (n > 0) await recordPasskeyAudit(env, { operation: 'passkey_revoke', memberId, passkeyId: null, evidence: { reason, count: String(n), ...(opts.loginIdentityId ? { login_identity_id: opts.loginIdentityId } : {}) } }, nowMs)
+  return n
+}
+
+/**
+ * Passkey enrol/revoke are identity-surface writes: each leaves a mutation_audit_entries row. Best effort by
+ * design (a failed receipt must not undo or block a revoke, which is the safe direction); returns whether it landed.
+ */
+export async function recordPasskeyAudit(
+  env: Env,
+  input: { operation: 'passkey_enrol' | 'passkey_revoke'; memberId: string; passkeyId: string | null; evidence: Record<string, string> },
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  try {
+    const id = crypto.randomUUID()
+    await env.DB.prepare(
+      `INSERT INTO mutation_audit_entries (
+         id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
+         target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
+       VALUES (?1, ?2, 'member', ?3, ?3, 'admin_ui', 'secure_moment', ?4, 'member_passkey', ?5, ?1, ?1, ?6, ?7)
+       ON CONFLICT DO NOTHING`,
+    ).bind(id, env.TENANT_SLUG, input.memberId, input.operation, input.passkeyId ?? input.memberId,
+      JSON.stringify({ ...input.evidence, passkey_id: input.passkeyId }), new Date(nowMs).toISOString()).run()
+    return true
+  } catch {
+    return false
+  }
 }
 
 // ── enrolment tokens ────────────────────────────────────────────────────────────────────────────────

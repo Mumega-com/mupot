@@ -21,12 +21,13 @@ import { accessApproveStatus, colonyHostnames, type AccessApproveConfig } from '
 import { verifyAccessJwt, type AccessClaims, type AccessJwtFailure } from './jwt'
 import { issueCsrfToken, verifyCsrfToken } from './csrf'
 import { resolveApprover, mintApproverSession, type ApproverFailure } from './identity'
-import { escapeHtml, messagePage, renderPage } from './page'
+import { escapeHtml, messagePage, renderPage, SUBMIT_ONCE_SCRIPT } from './page'
 import { loadSeedRequest, seedRequestIsLive } from './seed-request'
+import { b64uEncode } from '../secure-moments/webauthn'
 import { loadElevationRequestById } from '../auth/elevation'
 import {
-  decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
-  NOT_FOUND_OUTCOME, seedViewInner, type HumanProof, type Outcome,
+  closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
+  NOT_FOUND_OUTCOME, seedViewInner, type HumanProof, type Outcome, type WaitUntil,
 } from './decision-core'
 
 interface Ctx {
@@ -42,12 +43,23 @@ const VIA = 'access_passkey'
 // (rightly) refuses, so every real tap would fail. same-origin sends the page's own origin to itself and nothing cross-site.
 export const REFERRER_POLICY = 'same-origin'
 
-function secure(c: Context<AppEnv>): void {
+/** The hosting request's waitUntil, when there is one (a bare `app.fetch(req, env)` in a test has no ExecutionContext). */
+function waitUntilOf(c: Context<AppEnv>): WaitUntil | undefined {
+  try {
+    const ctx = c.executionCtx
+    return (p) => ctx.waitUntil(p)
+  } catch {
+    return undefined
+  }
+}
+
+function secure(c: Context<AppEnv>, nonce?: string): void {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', REFERRER_POLICY)
   c.header('X-Content-Type-Options', 'nosniff')
   c.header('X-Frame-Options', 'DENY')
-  c.header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+  const script = nonce ? `script-src 'nonce-${nonce}'; ` : ''
+  c.header('Content-Security-Policy', `default-src 'none'; ${script}style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`)
 }
 
 function page(c: Context<AppEnv>, status: 200 | 400 | 403 | 404 | 409 | 410 | 503, title: string, message: string, tone: 'ok' | 'warn' | 'bad' = 'bad'): Response {
@@ -120,10 +132,10 @@ async function formHtml(c: Context<AppEnv>, kind: string, id: string, inner: str
   const { claims } = c.get('access')
   const csrf = await issueCsrfToken(c.env, kind, id, claims.sub, claims.iat)
   if (!csrf) return null
-  return `<form method="post" action="/approve/${kind}/${encodeURIComponent(id)}">
+  return `<form method="post" data-once="1" action="/approve/${kind}/${encodeURIComponent(id)}">
 <input type="hidden" name="csrf" value="${csrf}">${inner}
 <div class="row"><button class="primary" type="submit" name="decision" value="approve">${escapeHtml(approveLabel)}</button>
-<button class="danger" type="submit" name="decision" value="deny">Deny</button></div></form>`
+<button class="danger" type="submit" name="decision" value="deny">Deny</button></div><p id="progress" class="muted" role="status"></p></form>`
 }
 
 // ── seed ────────────────────────────────────────────────────────────────────────────────────────
@@ -147,14 +159,16 @@ approveApp.get('/seed/:id', async (c) => {
   if (!row) return NOT_FOUND(c)
   const now = Date.now()
   if (!seedRequestIsLive(row, now)) {
-    return page(c, 410, 'Request closed', row.status === 'pending' ? 'This request has expired.' : `This request is already ${row.status}.`, 'warn')
+    const o = closedSeedOutcome(row)
+    return outcomePage(c, o.status === 409 ? { ...o, status: 410 } : o) // a GET of a dead link is 410 Gone; a reconciled success stays 200
   }
   const view = await seedViewInner(c.env, row)
   if (!view.ok) return outcomePage(c, view.outcome)
   const form = await formHtml(c, 'seed', row.id, view.inner, 'Approve and create')
   if (!form) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for approvals.')
-  secure(c)
-  return c.html(renderPage('Approve project seed', `<h1>Approve project seed</h1>${form}`))
+  const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(16)))
+  secure(c, nonce)
+  return c.html(renderPage('Approve project seed', `<h1>Approve project seed</h1>${form}`, { nonce, code: SUBMIT_ONCE_SCRIPT }))
 })
 
 approveApp.post('/seed/:id', async (c) => {
@@ -169,9 +183,9 @@ approveApp.post('/seed/:id', async (c) => {
   const row = await loadSeedRequest(c.env, id)
   if (!row) return NOT_FOUND(c)
   const now = Date.now()
-  if (!seedRequestIsLive(row, now)) return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
+  if (!seedRequestIsLive(row, now)) return outcomePage(c, closedSeedOutcome(row))
   const proof: HumanProof = { memberId: actor.memberId, via: VIA, evidence: { access_sub: claims.sub } }
-  return outcomePage(c, await decideSeed(c.env, { row, decision, auth: actor.auth, proof }, now))
+  return outcomePage(c, await decideSeed(c.env, { row, decision, auth: actor.auth, proof, waitUntil: waitUntilOf(c) }, now))
 })
 
 // ── elevation ───────────────────────────────────────────────────────────────────────────────────
@@ -190,8 +204,9 @@ approveApp.get('/elevation/:id', async (c) => {
 <p class="muted">Approving counts as your fresh step-up. The grant is bound to a session created for this sign-in and ends when it does.</p>`
   const form = await formHtml(c, 'elevation', req.id, inner, 'Approve selected')
   if (!form) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for approvals.')
-  secure(c)
-  return c.html(renderPage('Approve elevation', `<h1>Approve elevation</h1>${form}`))
+  const nonce = b64uEncode(crypto.getRandomValues(new Uint8Array(16)))
+  secure(c, nonce)
+  return c.html(renderPage('Approve elevation', `<h1>Approve elevation</h1>${form}`, { nonce, code: SUBMIT_ONCE_SCRIPT }))
 })
 
 approveApp.post('/elevation/:id', async (c) => {
@@ -210,7 +225,7 @@ approveApp.post('/elevation/:id', async (c) => {
   const duration = durationRaw !== undefined && /^\d{1,5}$/.test(durationRaw) ? Number(durationRaw) : undefined
   const proof: HumanProof = { memberId: who.approver.memberId, via: VIA, evidence: { access_sub: claims.sub } }
   const outcome = await decideElevation(c.env, {
-    id, decision, selectedActions: selected, durationMinutes: duration, auth: who.approver.auth, proof,
+    id, decision, selectedActions: selected, durationMinutes: duration, auth: who.approver.auth, proof, waitUntil: waitUntilOf(c),
     // The grant binds to a web session for this login: minted by the core only after its checks passed.
     mintSession: async () => {
       const session = await mintApproverSession(c.env, who.approver)

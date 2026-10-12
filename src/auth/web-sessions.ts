@@ -21,6 +21,7 @@
 
 import type { Env } from '../types'
 import { sha256Hex } from '../members/service'
+import { revokeMemberPasskeys } from '../secure-moments/store'
 
 // ── tunables (design v1 policy) ──────────────────────────────────────────────
 
@@ -412,6 +413,9 @@ export async function revokeAllWebSessions(
   nowMs: number = Date.now(),
 ): Promise<{ revokedCount: number }> {
   const nowIso = new Date(nowMs).toISOString()
+  // A passkey is a second door: every "cut this human off" lever closes it too (both the full sign-out and the
+  // "other devices" variant; the member re-enrols from /account, which needs a fresh re-authentication).
+  await revokeMemberPasskeys(env, memberId, `sessions_revoked:${reason}`, {}, nowMs)
   const result = exceptIdHash
     ? await env.DB.prepare(
         `UPDATE web_sessions SET revoked_at = ?1, revoke_reason = ?2

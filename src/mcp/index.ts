@@ -5898,7 +5898,8 @@ const toolRequestElevation: ToolSpec = {
     const moment = await issueMomentLink(env, {
       kind: 'elevation', subjectId: result.request.id, requesterAgentId: sessionContext.context.agentId, subjectExpiresAtIso: result.request.decision_expires_at,
     })
-    const elevationLink = moment?.url ?? approveUrl(env, 'elevation', result.request.id)
+    const accessLink = approveUrl(env, 'elevation', result.request.id)
+    const elevationLink = moment?.url ?? accessLink
 
     return done({
       request: {
@@ -5916,6 +5917,8 @@ const toolRequestElevation: ToolSpec = {
       // Present only when a human-proof channel is enabled: the link a human opens to decide (secure moment
       // first, else the Access approve page). This tool decides nothing.
       ...(elevationLink ? { approve_url: elevationLink } : {}),
+      // Both channels on: the Access link stays available beside the secure one (same shape as seed_attach_request).
+      ...(moment && accessLink ? { access_approve_url: accessLink } : {}),
     })
   },
 }

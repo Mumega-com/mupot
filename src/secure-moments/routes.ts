@@ -18,14 +18,14 @@ import { buildAuth, memberIsActiveHuman, mintApproverSession } from '../access/i
 import { escapeHtml, messagePage, renderPage } from '../access/page'
 import { loadSeedRequest, seedRequestIsLive, type SeedRequestRow } from '../access/seed-request'
 import {
-  decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideSeed, seedViewInner,
-  type HumanProof, type Outcome,
+  closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideSeed, seedViewInner,
+  type HumanProof, type Outcome, type WaitUntil,
 } from '../access/decision-core'
 import { loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
 import {
   advancePasskeyCounter, consumeDecideChallenge, consumeEnrolChallenge, consumeMoment, finishEnrolment, listMemberPasskeys,
   loadEnrolmentToken, loadMoment, loadPasskeyByCredential, mintDecideChallenge, mintEnrolChallenge, momentIsLive, momentLinkMatches,
-  tokenHash, type EnrolmentTokenRow, type MomentRow,
+  recordPasskeyAudit, tokenHash, type EnrolmentTokenRow, type MomentRow,
 } from './store'
 import { b64uDecode, b64uEncode, hex, sha256, verifyAssertion, verifyRegistration } from './webauthn'
 import { DECIDE_SCRIPT, ENROL_SCRIPT } from './client'
@@ -33,6 +33,16 @@ import { DECIDE_SCRIPT, ENROL_SCRIPT } from './client'
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
 
 export const momentsApp = new Hono<AppEnv>()
+
+/** The hosting request's waitUntil, when there is one (a bare `app.fetch(req, env)` in a test has no ExecutionContext). */
+function waitUntilOf(c: Context<AppEnv>): WaitUntil | undefined {
+  try {
+    const ctx = c.executionCtx
+    return (p) => ctx.waitUntil(p)
+  } catch {
+    return undefined
+  }
+}
 
 const CSRF_INFO = 'mupot_secure_moment_csrf_v1'
 const MAX_BODY_BYTES = 16 * 1024
@@ -142,6 +152,25 @@ async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<S
   return req && elevationIsLive(req, nowMs) ? { kind: 'elevation', req } : null
 }
 
+/** The request behind a link is no longer live: a seed that was APPLIED reads as approved, never as "closed". */
+async function closedSeed(env: Env, m: MomentRow): Promise<Outcome | null> {
+  if (m.kind !== 'seed_attach') return null
+  const row = await loadSeedRequest(env, m.subject_id)
+  return row && row.status === 'applied' ? closedSeedOutcome(row) : null
+}
+
+async function closedSubjectPage(c: Context<AppEnv>, m: MomentRow): Promise<Response> {
+  const o = await closedSeed(c.env, m)
+  if (o) return page(c, o.status, o.title, o.message, o.tone)
+  return page(c, 410, 'Request closed', 'The request behind this link is no longer pending.', 'warn')
+}
+
+async function closedSubjectJson(c: Context<AppEnv>, m: MomentRow): Promise<Response> {
+  const o = await closedSeed(c.env, m)
+  if (o) return outcomeJson(c, o)
+  return fail(c, 409, 'The request behind this link is no longer pending.', 'Request closed')
+}
+
 interface Params {
   decision: 'approve' | 'deny'
   actions: string[]
@@ -179,10 +208,17 @@ async function resolveMoment(c: Context<AppEnv>, requireLive: boolean): Promise<
   if (!m || !(await momentLinkMatches(m, token))) return { ok: false, res: NOT_FOUND(c) }
   if (requireLive && !momentIsLive(m, Date.now())) {
     return { ok: false, res: c.req.method === 'GET'
-      ? page(c, 410, 'Link closed', m.status === 'pending' ? 'This link has expired.' : `This request is already ${m.status}.`, 'warn')
+      ? await closedMomentPage(c, m)
       : fail(c, 409, 'This link is no longer usable.', 'Link closed') }
   }
   return { ok: true, r: { m, token, linkHash: await tokenHash(token) } }
+}
+
+/** A consumed/expired link: a seed that was APPLIED through it reads as approved, anything else as closed. */
+async function closedMomentPage(c: Context<AppEnv>, m: MomentRow): Promise<Response> {
+  const o = await closedSeed(c.env, m)
+  if (o) return page(c, o.status, o.title, o.message, o.tone)
+  return page(c, 410, 'Link closed', m.status === 'pending' ? 'This link has expired.' : `This request is already ${m.status}.`, 'warn')
 }
 
 // ── enrolment ───────────────────────────────────────────────────────────────────────────────────
@@ -281,6 +317,7 @@ momentsApp.post('/m/enrol/:token/finish', async (c) => {
         : 'This enrolment link was already used.'
     return fail(c, 409, msg, 'Not registered')
   }
+  await recordPasskeyAudit(c.env, { operation: 'passkey_enrol', memberId: e.t.member_id, passkeyId: done.passkeyId, evidence: { login_identity_id: e.t.login_identity_id ?? '' } })
   return json(c, 200, { ok: true, title: 'Passkey registered', message: 'You can close this page. Approvals you are asked to confirm will use this passkey.' })
 })
 
@@ -289,7 +326,7 @@ momentsApp.get('/m/:id/:token', async (c) => {
   const r = await resolveMoment(c, true)
   if (!r.ok) return r.res
   const subject = await loadLiveSubject(c.env, r.r.m, Date.now())
-  if (!subject) return page(c, 410, 'Request closed', 'The request behind this link is no longer pending.', 'warn')
+  if (!subject) return closedSubjectPage(c, r.r.m)
   let inner: string
   let title: string
   let approveLabel: string
@@ -308,7 +345,7 @@ momentsApp.get('/m/:id/:token', async (c) => {
   const csrf = await issueBoundToken(c.env, CSRF_INFO, momentCsrfMessage(r.r.m.id, r.r.linkHash))
   if (!csrf) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for secure moments.')
   const body = `<h1>${escapeHtml(title)}</h1>
-<form id="decision-form" data-csrf="${csrf}" onsubmit="return false">${inner}
+<form id="decision-form" data-csrf="${csrf}">${inner}
 <p class="muted">Deciding needs your passkey. Opening this page decided nothing.</p>
 <div class="row"><button class="primary" type="button" data-act="approve">${escapeHtml(approveLabel)} with passkey</button>
 <button class="danger" type="button" data-act="deny">Deny with passkey</button></div></form>
@@ -386,20 +423,22 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   const proof: HumanProof = { memberId: passkey.member_id, via: 'webauthn', evidence: { moment_id: m.id, passkey_id: passkey.id } }
   const gate = (): Promise<boolean> => consumeMoment(c.env, { id: m.id, token, decision: p.decision, memberId: passkey.member_id, passkeyId: passkey.id }, Date.now())
   const subject = await loadLiveSubject(c.env, m, now)
-  if (!subject) return fail(c, 409, 'The request behind this link is no longer pending.', 'Request closed')
+  if (!subject) return closedSubjectJson(c, m)
+  // EVERY decision (seed or elevation, approve or deny) needs the login identity the passkey was enrolled under to
+  // be live: revoking the identity cuts the passkey off. Checked here, before the gate (a refusal never burns the
+  // link), and again inside consumeMoment's own WHERE (a revoke between here and the gate still refuses).
+  const identityId = await liveIdentityFor(c.env, passkey.member_id, passkey.login_identity_id)
+  if (!identityId) {
+    return fail(c, 409, 'This passkey is not bound to a live login identity, so it cannot decide. Sign in and add a passkey again.', 'Not decided')
+  }
+  const waitUntil = waitUntilOf(c)
 
   if (subject.kind === 'seed_attach') {
     if (!mayDecideSeed(auth)) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')
-    return outcomeJson(c, await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate }, now))
-  }
-  // Elevation: the grant binds to a web session, which needs a LIVE login identity of this member (the one the
-  // passkey was enrolled under). Checked before the gate so a refusal never burns the link.
-  const identityId = await liveIdentityFor(c.env, passkey.member_id, passkey.login_identity_id)
-  if (!identityId) {
-    return fail(c, 409, 'This passkey is not bound to a live login identity, so it cannot decide an elevation. Sign in and add a passkey again.', 'Not decided')
+    return outcomeJson(c, await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))
   }
   return outcomeJson(c, await decideElevation(c.env, {
-    id: subject.req.id, decision: p.decision, selectedActions: p.actions, durationMinutes: p.duration, auth, proof, gate,
+    id: subject.req.id, decision: p.decision, selectedActions: p.actions, durationMinutes: p.duration, auth, proof, gate, waitUntil,
     mintSession: async () => {
       const s = await mintApproverSession(c.env, { memberId: passkey.member_id, auth, identityId })
       return { auth: s.approver.auth, webSessionHash: s.webSessionHash }

@@ -79,9 +79,29 @@ export async function createSeedRequest(
   return { ok: false, reason: 'too_many_pending' }
 }
 
+/**
+ * Lazy reconcile (mupot#1860): a request claimed ('applying') whose seed digest has an APPLIED project_seeds row
+ * was applied; only the final status write was lost (client gone, runtime stopped). One guarded UPDATE moves it to
+ * 'applied'; every other state is untouched. True iff THIS call made the transition.
+ */
+export async function reconcileSeedRequest(env: Env, id: string): Promise<boolean> {
+  const r = await env.DB.prepare(
+    `UPDATE seed_attach_requests SET status = 'applied', decision_error = NULL
+      WHERE id = ?1 AND tenant = ?2 AND status = 'applying'
+        AND EXISTS (SELECT 1 FROM project_seeds ps
+                     WHERE ps.tenant = ?2 AND ps.seed_sha256 = seed_attach_requests.seed_sha256 AND ps.status = 'applied')`,
+  ).bind(id, env.TENANT_SLUG).run()
+  return r.meta.changes === 1
+}
+
+const SELECT_ONE = `SELECT ${COLUMNS} FROM seed_attach_requests WHERE id = ?1 AND tenant = ?2 LIMIT 1`
+
+/** Every read of a request goes through here, so a stranded 'applying' row is repaired wherever it is first seen. */
 export async function loadSeedRequest(env: Env, id: string): Promise<SeedRequestRow | null> {
-  const row = await env.DB.prepare(`SELECT ${COLUMNS} FROM seed_attach_requests WHERE id = ?1 AND tenant = ?2 LIMIT 1`)
-    .bind(id, env.TENANT_SLUG).first<SeedRequestRow>()
+  const row = await env.DB.prepare(SELECT_ONE).bind(id, env.TENANT_SLUG).first<SeedRequestRow>()
+  if (row && row.status === 'applying' && (await reconcileSeedRequest(env, id))) {
+    return (await env.DB.prepare(SELECT_ONE).bind(id, env.TENANT_SLUG).first<SeedRequestRow>()) ?? null
+  }
   return row ?? null
 }
 

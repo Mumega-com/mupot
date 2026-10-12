@@ -7,9 +7,16 @@
 // seed apply, canDecideElevation for an elevation) and calls the existing decision machinery. A proof never
 // grants authority.
 //
-// `gate` is the channel's own single-use consume (the secure moment's guarded UPDATE). It runs AFTER every
-// read-only check and immediately BEFORE the first write of the decision, so a refused decision never burns
-// the one-time link, and a decision that proceeds is the one that consumed it.
+// `gate` is the channel's own single-use consume (the secure moment's guarded UPDATE). RULE: nothing that can be
+// refused may be checked after the gate. Every refusable check runs BEFORE it, using the SAME predicates the
+// downstream transaction uses (findElevationDecisionRefusal is exported from auth/elevation.ts and is what
+// decideElevationRequest itself runs), so a refused decision never burns the one-time link or records an
+// approve; only a genuine race (another channel deciding in the same instant) can still lose after the gate.
+//
+// DURABILITY: everything from the gate to the final status write runs as ONE promise handed to `waitUntil`
+// (and still awaited), so a client that reloads or disconnects mid-decision cannot strand a request in
+// 'applying' or a moment consumed with nothing applied. A lazy reconcile (reconcileSeedRequest) repairs the
+// remaining crash window on the next read.
 import type { AuthContext, Env } from '../types'
 import { hasWorkspaceAdmin, resolveCapabilities } from '../auth/capability'
 import { validateSeed } from '../seeds/validate'
@@ -17,8 +24,11 @@ import { keyRequests, applySeed } from '../seeds/apply'
 import { renderRequest } from '../seeds/render'
 import type { SeedRequest, SeedV1 } from '../seeds/contract'
 import {
-  canDecideElevation, decideElevationRequest, loadElevationRequestById, type ElevationRequestRecord,
+  canDecideElevation, decideElevationRequest, findElevationDecisionRefusal, loadElevationRequestById,
+  type DecideElevationInput, type DecideElevationResult, type ElevationRequestRecord,
 } from '../auth/elevation'
+import { revokeWebSession } from '../auth/web-sessions'
+import { isValidSlugBase } from '../org/team-bootstrap'
 import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
 import {
@@ -41,6 +51,30 @@ export interface Outcome {
 
 export const NOT_FOUND_OUTCOME: Outcome = { status: 404, title: 'Not found', message: 'There is nothing here for you.', tone: 'bad' }
 const CLOSED: Outcome = { status: 409, title: 'Request closed', message: 'This request is no longer pending.', tone: 'warn' }
+
+/** `ctx.waitUntil` of the hosting request, when there is one (tests and some callers have none). */
+export type WaitUntil = (p: Promise<unknown>) => void
+
+/**
+ * Run `fn` to completion even if the client goes away: the promise is registered with waitUntil (errors swallowed
+ * THERE, not in the returned promise) and the caller still awaits it for the response.
+ */
+export function durably<T>(waitUntil: WaitUntil | undefined, fn: () => Promise<T>): Promise<T> {
+  const p = fn()
+  if (waitUntil) waitUntil(p.then(() => undefined, () => undefined))
+  return p
+}
+
+/** What a human sees for a seed request that is not pending any more. 'applied' is success, never "closed". */
+export function closedSeedOutcome(row: SeedRequestRow): Outcome {
+  if (row.status === 'applied') {
+    return { status: 200, title: 'Approved', message: 'This request was already approved and the project was created. Nothing was granted: every request in the seed is still pending.', tone: 'ok' }
+  }
+  if (row.status === 'applying') {
+    return { status: 409, title: 'Applying', message: 'This request is being applied right now. Reload in a moment.', tone: 'warn' }
+  }
+  return { status: 409, title: 'Request closed', message: row.status === 'pending' ? 'This request has expired.' : `This request is already ${row.status}.`, tone: 'warn' }
+}
 
 /** A single-use consume supplied by the channel; true iff THIS call consumed it. */
 export type Gate = () => Promise<boolean>
@@ -89,17 +123,19 @@ export async function seedViewInner(env: Env, row: SeedRequestRow): Promise<{ ok
 /** The caller has already established liveness and that `auth` may decide seeds. */
 export async function decideSeed(
   env: Env,
-  input: { row: SeedRequestRow; decision: 'approve' | 'deny'; auth: AuthContext; proof: HumanProof; gate?: Gate },
+  input: { row: SeedRequestRow; decision: 'approve' | 'deny'; auth: AuthContext; proof: HumanProof; gate?: Gate; waitUntil?: WaitUntil },
   nowMs: number,
 ): Promise<Outcome> {
   const { row, decision, auth, proof } = input
   const consume = input.gate ?? (async () => true)
   if (decision === 'deny') {
-    if (!(await consume())) return CLOSED
-    const denied = await denySeedRequest(env, row, proof.memberId, proof.via, proof.evidence, nowMs)
-    return denied
-      ? { status: 200, title: 'Denied', message: 'The request was denied. Nothing was created.', tone: 'ok' }
-      : CLOSED
+    return durably(input.waitUntil, async () => {
+      if (!(await consume())) return CLOSED
+      const denied = await denySeedRequest(env, row, proof.memberId, proof.via, proof.evidence, nowMs)
+      return denied
+        ? { status: 200, title: 'Denied', message: 'The request was denied. Nothing was created.', tone: 'ok' } satisfies Outcome
+        : CLOSED
+    })
   }
 
   // Re-validate BEFORE consuming: the row must still be exactly what the human was shown.
@@ -113,31 +149,42 @@ export async function decideSeed(
   if (keys.length !== stored.length || keys.some((k, i) => k !== stored[i])) {
     return { status: 409, title: 'Invalid request', message: 'The seed no longer produces the requests that were shown.', tone: 'bad' }
   }
+  // The pure refusal applySeed would otherwise raise AFTER the claim (same predicate): a seed whose slug can never
+  // be applied must not burn the link or close the request.
+  if (!isValidSlugBase(v.seed.slug)) {
+    return { status: 409, title: 'Not applied', message: 'This seed cannot be applied (seed_slug_not_applicable). Nothing was consumed; ask the agent to file a corrected seed.', tone: 'bad' }
+  }
 
-  if (!(await consume())) return CLOSED
-  // The ONE consuming UPDATE on the request row. Losing it means another tab/tap/channel decided first.
-  if (!(await claimSeedRequest(env, row.id, proof.memberId, nowMs, proof.via))) return CLOSED
-  let outcome: Awaited<ReturnType<typeof applySeed>>
-  try {
-    outcome = await applySeed(
-      env, auth, proof.memberId,
-      { seed: v.seed, canonical: v.canonical, seedSha256: v.seedSha256, requests: keyed },
-      keyed.map((r) => r.key), undefined,
-      { via: proof.via, requestId: row.id, accessSub: proof.evidence.access_sub, momentId: proof.evidence.moment_id },
-    )
-  } catch {
-    // Claimed but the apply threw: the row must not sit in 'applying' forever. Guarded UPDATE status='applying' -> 'failed'.
-    await finishSeedRequest(env, row.id, { ok: false, error: 'apply_threw' })
-    return { status: 409, title: 'Not applied', message: 'The seed could not be applied (apply_threw). The request is closed; ask the agent to file a new one.', tone: 'bad' }
-  }
-  await finishSeedRequest(env, row.id, outcome.ok ? { ok: true } : { ok: false, error: outcome.error })
-  if (!outcome.ok) {
-    return { status: 409, title: 'Not applied', message: `The seed could not be applied (${outcome.error}). The request is closed; ask the agent to file a new one.`, tone: 'bad' }
-  }
-  if (outcome.result.replay === true) {
-    return { status: 200, title: 'Already applied', message: 'This seed had already been applied earlier; nothing new was created. Nothing was granted: every request in the seed is still pending.', tone: 'ok' }
-  }
-  return { status: 200, title: 'Approved', message: 'The project was created. Nothing was granted: every request in the seed is still pending.', tone: 'ok' }
+  return durably(input.waitUntil, async (): Promise<Outcome> => {
+    if (!(await consume())) return CLOSED
+    // The ONE consuming UPDATE on the request row. Losing it means another tab/tap/channel decided first.
+    if (!(await claimSeedRequest(env, row.id, proof.memberId, nowMs, proof.via))) return CLOSED
+    let outcome: Awaited<ReturnType<typeof applySeed>>
+    try {
+      outcome = await applySeed(
+        env, auth, proof.memberId,
+        { seed: v.seed, canonical: v.canonical, seedSha256: v.seedSha256, requests: keyed },
+        keyed.map((r) => r.key), undefined,
+        { via: proof.via, requestId: row.id, accessSub: proof.evidence.access_sub, momentId: proof.evidence.moment_id },
+      )
+    } catch {
+      // Claimed but the apply threw: the row must not sit in 'applying' forever. Guarded UPDATE status='applying' -> 'failed'.
+      await finishSeedRequest(env, row.id, { ok: false, error: 'apply_threw' })
+      return { status: 409, title: 'Not applied', message: 'The seed could not be applied (apply_threw). The request is closed; ask the agent to file a new one.', tone: 'bad' }
+    }
+    try {
+      await finishSeedRequest(env, row.id, outcome.ok ? { ok: true } : { ok: false, error: outcome.error })
+    } catch {
+      // The apply is done and receipted; only the status write failed. reconcileSeedRequest closes it on the next read.
+    }
+    if (!outcome.ok) {
+      return { status: 409, title: 'Not applied', message: `The seed could not be applied (${outcome.error}). The request is closed; ask the agent to file a new one.`, tone: 'bad' }
+    }
+    if (outcome.result.replay === true) {
+      return { status: 200, title: 'Already applied', message: 'This seed had already been applied earlier; nothing new was created. Nothing was granted: every request in the seed is still pending.', tone: 'ok' }
+    }
+    return { status: 200, title: 'Approved', message: 'The project was created. Nothing was granted: every request in the seed is still pending.', tone: 'ok' }
+  })
 }
 
 // ── elevation ───────────────────────────────────────────────────────────────────────────────────
@@ -201,10 +248,16 @@ async function writeElevationReceipt(
   }
 }
 
-/** The approver's web session: the grant binds to it and ends when it does. Null = the channel cannot mint one. */
+/** The approver's web session: the grant binds to it and ends when it does. */
 export interface ApproverSession {
   auth: AuthContext
   webSessionHash: string
+}
+
+function refusalOutcome(result: Exclude<DecideElevationResult, { ok: true }>): Outcome {
+  if (result.reason === 'not_found' || result.reason === 'forbidden') return NOT_FOUND_OUTCOME
+  const detail = 'detail' in result ? ` (${result.detail})` : ''
+  return { status: 409, title: 'Not decided', message: `The decision was not recorded: ${result.reason}${detail}.`, tone: 'warn' }
 }
 
 export async function decideElevation(
@@ -216,8 +269,10 @@ export async function decideElevation(
     durationMinutes: number | undefined
     auth: AuthContext
     proof: HumanProof
-    mintSession: () => Promise<ApproverSession | null>
+    /** Mints the approver's web session. Called ONLY after the gate, so no session exists for a refused decision. */
+    mintSession: () => Promise<ApproverSession>
     gate?: Gate
+    waitUntil?: WaitUntil
   },
 ): Promise<Outcome> {
   const { id, decision, proof } = input
@@ -226,39 +281,49 @@ export async function decideElevation(
   const pre = await loadElevationRequestById(env, env.TENANT_SLUG, id)
   if (!pre || !(await mayDecideElevation(env, input.auth, pre))) return NOT_FOUND_OUTCOME
   if (!elevationIsLive(pre, Date.now())) return CLOSED
-  if (input.gate && !(await input.gate())) return CLOSED
-  // The grant (and the decision row) binds to a web session for this proof, minted now, after the checks,
-  // for approve and deny alike (the decision row records the session that decided it).
-  const session = await input.mintSession()
-  if (!session) {
-    return { status: 409, title: 'Not decided', message: 'No session could be bound to this decision. Nothing was granted.', tone: 'warn' }
-  }
-  const result = await decideElevationRequest(env, {
+
+  // Every refusable check, BEFORE the gate, through the very function decideElevationRequest runs. The session
+  // hash is a placeholder here (the real one does not exist yet and no refusal reads it).
+  const capabilities = input.auth.capabilities ?? (await resolveCapabilities(env, proof.memberId))
+  const decideInput = (webSessionHash: string, caps: DecideElevationInput['decidedByCapabilities'], admin: boolean): DecideElevationInput => ({
     tenant: env.TENANT_SLUG,
     requestId: id,
     decision,
     selectedActions: decision === 'approve' ? input.selectedActions : undefined,
     durationMinutes: decision === 'approve' ? input.durationMinutes : undefined,
     decidedByMemberId: proof.memberId,
-    decidedByCapabilities: session.auth.capabilities ?? (await resolveCapabilities(env, proof.memberId)),
-    decidedByIsOrgAdmin: hasWorkspaceAdmin(session.auth),
-    decidedByWebSessionHash: session.webSessionHash,
+    decidedByCapabilities: caps,
+    decidedByIsOrgAdmin: admin,
+    decidedByWebSessionHash: webSessionHash,
     // The channel's fresh human proof (a just-completed Access login, a just-completed UV assertion) IS the step-up.
     recentReauthOk: true,
     note: `via:${proof.via}`,
   })
-  if (!result.ok) {
-    if (result.reason === 'not_found' || result.reason === 'forbidden') return NOT_FOUND_OUTCOME
-    const detail = 'detail' in result ? ` (${result.detail})` : ''
-    return { status: 409, title: 'Not decided', message: `The decision was not recorded: ${result.reason}${detail}.`, tone: 'warn' }
-  }
-  const receipted = await writeElevationReceipt(env, proof, id, decision === 'approve' ? 'elevation_approve' : 'elevation_deny', {
-    request_id: id, decision,
-    actions: result.grants.map((g) => g.action), scope_type: result.request.requested_scope_type, scope_id: result.request.requested_scope_id,
-    expires_at: result.grants[0]?.expires_at ?? null,
+  const refusal = await findElevationDecisionRefusal(env, decideInput('', capabilities, hasWorkspaceAdmin(input.auth)), pre)
+  if (refusal) return refusalOutcome(refusal)
+
+  return durably(input.waitUntil, async (): Promise<Outcome> => {
+    if (input.gate && !(await input.gate())) return CLOSED
+    // The grant (and the decision row) binds to a web session for this proof, minted now (after the gate; the
+    // refusals are already cleared) for approve and deny alike.
+    const session = await input.mintSession()
+    const result = await decideElevationRequest(
+      env, decideInput(session.webSessionHash, session.auth.capabilities ?? (await resolveCapabilities(env, proof.memberId)), hasWorkspaceAdmin(session.auth)),
+    )
+    if (!result.ok) {
+      // Only a genuine race lands here (another channel decided between the checks and the write). The session
+      // minted for it must not outlive a decision that never happened.
+      await revokeWebSession(env, env.TENANT_SLUG, proof.memberId, session.webSessionHash, 'decision_not_recorded').catch(() => undefined)
+      return refusalOutcome(result)
+    }
+    const receipted = await writeElevationReceipt(env, proof, id, decision === 'approve' ? 'elevation_approve' : 'elevation_deny', {
+      request_id: id, decision,
+      actions: result.grants.map((g) => g.action), scope_type: result.request.requested_scope_type, scope_id: result.request.requested_scope_id,
+      expires_at: result.grants[0]?.expires_at ?? null,
+    })
+    const tail = receipted ? '' : ' The decision stands, but its audit receipt could not be written; tell the operator.'
+    return decision === 'approve'
+      ? { status: 200, title: 'Approved', message: `Granted ${result.grants.length} action${result.grants.length === 1 ? '' : 's'} until ${result.grants[0]?.expires_at ?? ''}.${tail}`, tone: 'ok' }
+      : { status: 200, title: 'Denied', message: `The request was denied.${tail}`, tone: 'ok' }
   })
-  const tail = receipted ? '' : ' The decision stands, but its audit receipt could not be written; tell the operator.'
-  return decision === 'approve'
-    ? { status: 200, title: 'Approved', message: `Granted ${result.grants.length} action${result.grants.length === 1 ? '' : 's'} until ${result.grants[0]?.expires_at ?? ''}.${tail}`, tone: 'ok' }
-    : { status: 200, title: 'Denied', message: `The request was denied.${tail}`, tone: 'ok' }
 }

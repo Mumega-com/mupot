@@ -214,7 +214,7 @@ function stubJwks(keys: TestKey[] = [key]): void {
 }
 
 interface Req { method?: string; jwt?: string | null; origin?: string | null; host?: string; form?: Record<string, string | string[]>; extra?: Record<string, string> }
-async function hit(path: string, r: Req = {}, e: Env = env): Promise<Response> {
+async function hit(path: string, r: Req = {}, e: Env = env, ctx?: ExecutionContext): Promise<Response> {
   stubJwks()
   const headers = new Headers(r.extra)
   const jwt = r.jwt === undefined ? await sign() : r.jwt
@@ -228,7 +228,7 @@ async function hit(path: string, r: Req = {}, e: Env = env): Promise<Response> {
     for (const [k, v] of Object.entries(r.form ?? {})) for (const x of Array.isArray(v) ? v : [v]) body.append(k, x)
     headers.set('content-type', 'application/x-www-form-urlencoded')
   }
-  return root.fetch(new Request(`https://${r.host ?? HOST}${path}`, { method, headers, body }), e)
+  return root.fetch(new Request(`https://${r.host ?? HOST}${path}`, { method, headers, body }), e, ctx)
 }
 const csrfOf = (html: string): string => {
   const m = /name="csrf" value="([0-9a-f]{64})"/.exec(html)
@@ -407,7 +407,10 @@ describe('approve page: seed', () => {
     expect(html).toContain('Untrusted. Written by the agent')
     expect(html).toContain('grants nothing')
     expect(res.headers.get('content-security-policy')).toContain("default-src 'none'")
-    expect(html).not.toContain('<script')
+    // The only script on the page is the nonce'd double-submit guard; the agent's own <script> text is escaped above.
+    expect(html.match(/<script/g)?.length).toBe(1)
+    expect(html).toMatch(/<script nonce="[^"]+">\(function\(\)\{\ndocument\.addEventListener\('submit'/)
+    expect(res.headers.get('content-security-policy')).toMatch(/script-src 'nonce-[^']+'/)
   })
 
   it('POST approve applies exactly once; a second POST is refused and nothing is created twice', async () => {
@@ -426,8 +429,10 @@ describe('approve page: seed', () => {
     const req = harness.sqlite.prepare('SELECT status, decided_by_member_id, decided_via FROM seed_attach_requests WHERE id = ?').get(id)
     expect(req).toEqual({ status: 'applied', decided_by_member_id: 'mem-owner', decided_via: 'access_passkey' })
 
+    // A second tap on an APPLIED request reads as the success it is, never "Request closed" (mupot#1860).
     const second = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })
-    expect(second.status).toBe(409)
+    expect(second.status).toBe(200)
+    expect(await second.text()).toContain('already approved')
     expect([count('projects'), count('squads'), count('mutation_audit_entries', "handler = 'seed_attach'")]).toEqual([projects, squads, audit])
   })
 
@@ -787,5 +792,104 @@ describe('approvalHostGate (the first statement of the worker fetch)', () => {
     const off = baseEnv({ ACCESS_APPROVE_ENABLED: undefined })
     expect(g(HOST, '/mcp', off)).toBeNull()
     expect(g(HOST, '/approve/seed/x', off)).toBeNull()
+  })
+})
+
+// ═══ round 2 (mupot#1860 / #1861): refusals before any session, durable decisions, lazy reconcile ═══
+describe('round 2: nothing refusable after the point of no return (Access page)', () => {
+  it('a REFUSED elevation approve (no action ticked, invalid duration, not-requested action) mints no web session and leaves the request pending', async () => {
+    const id = await pendingElevation(['action:project_status'], 15)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const bad: Array<Record<string, string | string[]>> = [
+      { csrf, decision: 'approve', duration_minutes: '15' }, // every action unticked
+      { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '7' }, // not a preset
+      { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '60' }, // longer than asked
+      { csrf, decision: 'approve', actions: ['action:routine_policy'], duration_minutes: '15' }, // not requested
+    ]
+    for (const form of bad) {
+      expect((await hit(`/approve/elevation/${id}`, { method: 'POST', form })).status).toBe(409)
+      expect(count('web_sessions')).toBe(0)
+      expect(count('elevation_grants')).toBe(0)
+      expect(harness.sqlite.prepare('SELECT status FROM elevation_requests WHERE id = ?').get(id)).toEqual({ status: 'pending' })
+    }
+    // the same request is still decidable with a valid choice
+    const ok = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '15' } })
+    expect(ok.status).toBe(200)
+    expect(count('web_sessions')).toBe(1)
+  })
+  it('a session minted for a decision that then lost a race is revoked (no orphan live session)', async () => {
+    const id = await pendingElevation(['action:project_status'], 15)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const form = { csrf, decision: 'approve', actions: ['action:project_status'], duration_minutes: '15' }
+    const results = await Promise.all([hit(`/approve/elevation/${id}`, { method: 'POST', form }), hit(`/approve/elevation/${id}`, { method: 'POST', form })])
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409])
+    expect(count('elevation_grants')).toBe(1)
+    expect(count('web_sessions', 'revoked_at IS NULL')).toBe(1) // only the winner's session stays live
+  })
+})
+
+describe('round 2: durable decisions and the lazy reconcile (Access page)', () => {
+  it('the seed decision runs under ctx.waitUntil (a client that goes away cannot strand it)', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const registered: Promise<unknown>[] = []
+    const ctx = { waitUntil: (p: Promise<unknown>) => { registered.push(p) }, passThroughOnException: () => undefined } as unknown as ExecutionContext
+    const res = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } }, env, ctx)
+    expect(res.status).toBe(200)
+    expect(registered.length).toBe(1)
+    await Promise.all(registered)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applied' })
+  })
+  it('the work finishes with nobody awaiting the response (abandoned handler)', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const registered: Promise<unknown>[] = []
+    const ctx = { waitUntil: (p: Promise<unknown>) => { registered.push(p) }, passThroughOnException: () => undefined } as unknown as ExecutionContext
+    void hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } }, env, ctx) // never awaited: the client is gone
+    for (let i = 0; i < 400 && registered.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+    expect(registered.length).toBe(1)
+    await Promise.all(registered)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applied' })
+    expect(count('projects')).toBeGreaterThan(0)
+  })
+  it('reconcile: a request stranded in applying whose seed digest is APPLIED reads as Approved (GET and POST) and is moved to applied', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    expect((await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })).status).toBe(200)
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'applying' WHERE id = ?").run(id) // the lost final UPDATE
+    const get = await hit(`/approve/seed/${id}`)
+    expect(get.status).toBe(200)
+    const html = await get.text()
+    expect(html).toContain('Approved')
+    expect(html).not.toContain('Request closed')
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applied' })
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'applying' WHERE id = ?").run(id)
+    const post = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: 'approve' } })
+    expect(post.status).toBe(200)
+    expect(await post.text()).toContain('Approved')
+  })
+  it('reconcile is guarded: applying with NO applied project_seeds row for the digest stays applying and reads as in progress', async () => {
+    const { id } = await filed()
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'applying' WHERE id = ?").run(id)
+    const get = await hit(`/approve/seed/${id}`)
+    expect(get.status).toBe(410)
+    expect(await get.text()).toContain('being applied')
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applying' })
+    // an applying project_seeds row (not applied) does not reconcile it either
+    harness.sqlite.prepare("INSERT INTO project_seeds (id, tenant, project_slug, seed_sha256, canonical_json, requests_json, owner_label, applied_by_member_id, applied_at, status) SELECT 'ps', tenant, 'x-prj', seed_sha256, '{}', '[]', 'o', 'mem-owner', 'now', 'applying' FROM seed_attach_requests WHERE id = ?").run(id)
+    await hit(`/approve/seed/${id}`)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applying' })
+  })
+  it('the form disables itself after the first press (nonce script, kept submitter value) and the CSP allows only that nonce', async () => {
+    const { id } = await filed()
+    const res = await hit(`/approve/seed/${id}`)
+    const html = await res.text()
+    expect(html).toContain('<form method="post" data-once="1"')
+    expect(html).toContain('id="progress"')
+    expect(html).toContain('e.submitter')
+    expect(html).toContain('bs[i].disabled=true')
+    const nonce = /<script nonce="([^"]+)"/.exec(html)?.[1]
+    expect(nonce).toBeTruthy()
+    expect(res.headers.get('content-security-policy')).toContain(`script-src 'nonce-${nonce}'`)
   })
 })
