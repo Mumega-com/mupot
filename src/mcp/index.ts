@@ -235,7 +235,7 @@ import {
   negotiateProtocolVersion,
   serverDiscoverResult,
 } from './events'
-import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
+import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_PROTOCOL_VERSION, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
@@ -7404,15 +7404,22 @@ async function handleJsonRpc(
         instructions: mcpInitializeInstructions(c.env),
       })
     }
+    // W3: a client that asks for 2025-11-25 AND declares elicitation.url gets 2025-11-25 and a signed capability
+    // session id (null otherwise: every other client keeps the legacy answer, byte for byte). 2025-11-25's only
+    // server-side deltas for what mupot serves (initialize, tools/list, tools/call) are SEP-1303 (handled on the
+    // tools/call path above) and the Origin/GET clarifications (GET and DELETE answer 405 below while the flag is on).
+    const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
+    const initVersion = capSession ? URL_ELICITATION_PROTOCOL_VERSION : '2025-06-18' // the session id is only issued for a client that asked for exactly this version
     const legacyInit = ok(id, {
-      protocolVersion: '2025-06-18',
+      protocolVersion: initVersion,
       capabilities: { tools: {} },
       serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
       instructions: mcpInitializeInstructions(c.env),
     })
-    // W3: a client that declared elicitation.url gets a signed capability session id (null, and no header, otherwise).
-    const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
-    if (capSession) legacyInit.headers.set('mcp-session-id', capSession)
+    if (capSession) {
+      legacyInit.headers.set('mcp-session-id', capSession)
+      legacyInit.headers.set('access-control-expose-headers', 'Mcp-Session-Id')
+    }
     return legacyInit
   }
 
@@ -7501,12 +7508,11 @@ async function handleJsonRpc(
     // W3 (MCP_URL_ELICITATION): only the two request tools, only with the flag, secure moments and signing key on.
     let elicitPrep: ElicitationPrep | null = null
     if (urlElicitOn && typeof params.name === 'string' && URL_ELICITATION_TOOLS.has(params.name)) {
-      const prepared = await prepareUrlElicitation(c.env, auth, {
-        toolName: params.name, args: toolArguments ?? {}, params, modern, sessionId: c.req.header('mcp-session-id'),
+      elicitPrep = await prepareUrlElicitation(c.env, auth, {
+        toolName: params.name, params, modern, sessionId: c.req.header('mcp-session-id'), protocolVersionHeader: c.req.header('mcp-protocol-version'),
       })
-      if (prepared.kind === 'refuse') return rpcError(id, -32602, prepared.message)
-      elicitPrep = prepared.prep
-      ctx.shortCircuit = elicitPrep.shortCircuit
+      // A refusal of a bad requestState happens INSIDE invokeTool (after its authz gates), via this hook.
+      if (elicitPrep) ctx.shortCircuit = elicitPrep.shortCircuit
     }
     const outcome = await invokeTool(auth, c.env, params.name, toolArguments, ctx)
     if (outcome.ok && elicitPrep?.mode && !elicitPrep.answeredByRetry()) {
@@ -7524,6 +7530,13 @@ async function handleJsonRpc(
     // Protocol-level failures stay JSON-RPC errors (HTTP 200 at the transport; only auth is a 4xx):
     // unknown tool, malformed request and inputSchema/args validation are -32602 Invalid params per
     // the MCP spec. Only authorization/business refusals from the tool pipeline become isError.
+    // W3: a requestState the layer refuses is a protocol-level invalid-params error (it is not a tool argument).
+    if (outcome.error === 'invalid_request_state') return rpcError(id, -32602, outcome.error, outcome.detail)
+    // 2025-11-25 (SEP-1303): input validation errors are Tool Execution Errors so the model can self-correct. Only
+    // for a session that negotiated that version through the URL-elicitation path (flag on); everything else keeps -32602.
+    if (outcome.error === 'invalid_args' && urlElicitOn && c.req.header('mcp-protocol-version') === URL_ELICITATION_PROTOCOL_VERSION) {
+      return ok(id, mcpToolRefusalResult(outcome.tool as string, outcome.status, outcome.error, outcome.detail))
+    }
     if (outcome.error === 'unknown_tool' || outcome.error === 'invalid_args' || outcome.error === 'invalid_request') {
       return rpcError(id, -32602, outcome.error, outcome.detail)
     }
@@ -7603,6 +7616,14 @@ async function handleJsonRpc(
 // ── app ───────────────────────────────────────────────────────────────────────
 export const mcpApp = new Hono<AppEnv>()
 export const mcpActionsApp = new Hono<AppEnv>()
+
+// W3: while MCP_URL_ELICITATION is active the server issues an Mcp-Session-Id, and per the Streamable HTTP rules a
+// 404 on a request carrying one means "session terminated". There is no GET stream and no session to delete, so
+// both answer 405 (the spec's own "no GET stream here" answer). Flag off: falls through to the unchanged 404.
+mcpApp.on(['GET', 'DELETE'], '/', async (c, next) => {
+  if (!urlElicitationActive(c.env)) return next()
+  return c.body(null, 405, { Allow: 'POST' })
+})
 
 mcpApp.get('/health', (c) => c.json({ ok: true, component: 'mcp', tenant: c.env.TENANT_SLUG }))
 
