@@ -141,7 +141,8 @@ export async function parseDeviceSetup(
 ): Promise<SetupParse> {
   const mode = body.unlock_mode === undefined ? 'biometric' : body.unlock_mode
   if (mode !== 'biometric' && mode !== 'pin') return { ok: false, message: 'Unknown unlock method.' }
-  const window = body.trust_window_seconds === undefined ? TRUST_WINDOW_DEFAULT_SECONDS : parseTrustWindow(body.trust_window_seconds)
+  // A missing field means the page never offered a choice (e.g. a W4.1 page loaded before the flag came on): no window.
+  const window = body.trust_window_seconds === undefined ? 0 : parseTrustWindow(body.trust_window_seconds)
   if (window === null) return { ok: false, message: 'That trusted-device window is not one of the allowed choices (the longest is 7 days).' }
   if (mode === 'biometric') return { ok: true, setup: { unlockMode: 'biometric', pin: null, trustWindowSeconds: window } }
   if (!pinFormatOk(body.pin)) return { ok: false, message: 'The PIN must be exactly 6 digits.' }
@@ -197,10 +198,20 @@ async function checkPin(env: Env, device: PwDevice, pin: unknown, nowMs: number)
       WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL AND unlock_mode = 'pin' AND pin_failed_attempts < ?3
       RETURNING pin_failed_attempts AS n`,
   ).bind(device.id, env.TENANT_SLUG, PIN_MAX_WRONG).first<{ n: number }>()
-  if (!reserved) return LOCKED // no slot left: the request that took the fifth one revokes the device
+  if (!reserved) {
+    // No slot left: the cap is reached. Normally the slot-5 request already revoked the device; if it died first, revoke now
+    // (idempotent). Fails safe: at worst a concurrent correct PIN loses its consume and the phone is set up again.
+    await lockIfCapped(env, device.id, device.member_id, nowMs)
+    return LOCKED
+  }
   const mine = reserved.n // THIS request's own slot number
   const got = await derivePinHash(pin, device.pin_salt, { deviceId: device.id, memberId: device.member_id, telegramUserId: device.telegram_user_id }, device.pin_iterations)
   if (timingSafeEqual(got, device.pin_hash)) {
+    // A right PIN must not cost one of the five tries: give back THIS request's slot (never below 0, never another's).
+    await env.DB.prepare(
+      `UPDATE tg_miniapp_devices SET pin_failed_attempts = pin_failed_attempts - 1
+        WHERE id = ?1 AND tenant = ?2 AND revoked_at IS NULL AND pin_failed_attempts > 0`,
+    ).bind(device.id, env.TENANT_SLUG).run()
     // The counter is reset ONLY inside the winning consume batch (consumeMomentTelegramPw): a right PIN that then fails the nonce
     // or loses the race resets nothing.
     await recordTgAudit(env, { operation: 'tg_device_pin_attempt', memberId: device.member_id, deviceId: device.id, evidence: { outcome: 'ok' } }, nowMs)
@@ -224,6 +235,9 @@ async function resolveTrust(env: Env, trustToken: unknown, who: { memberId: stri
   const presented = await tokenHash(parsed.secret)
   if (row.trust_secret_sha256 !== null && timingSafeEqual(row.trust_secret_sha256, presented)) {
     if (row.trusted_until === null || !(Date.parse(row.trusted_until) > nowMs)) return { kind: 'expired' }
+    // Hadi 2026-10-12: the window stops at the PIN cap too. A device stuck at the cap (the slot-5 request died before it
+    // could revoke) must not keep deciding through its trust token; it falls back to a prompt, where the PIN gate refuses.
+    if (row.pin_failed_attempts >= PIN_MAX_WRONG) return { kind: 'expired' }
     return (await identityIsLive(env, row)) ? { kind: 'live', device: row } : { kind: 'none' }
   }
   // A digest this device already retired (a rotated trust or device secret): a harvested copy is being replayed.
@@ -307,7 +321,7 @@ export async function consumeMomentTelegramPw(
   const nextTrustSha = await tokenHash(nextTrust)
   const proofCond = input.proof === 'secret'
     ? 'd.secret_sha256 = ?8'
-    : 'd.trust_secret_sha256 = ?8 AND d.trusted_until IS NOT NULL AND d.trusted_until > ?3'
+    : `d.trust_secret_sha256 = ?8 AND d.trusted_until IS NOT NULL AND d.trusted_until > ?3 AND d.pin_failed_attempts < ${PIN_MAX_WRONG}`
   const decided = `EXISTS (SELECT 1 FROM tg_miniapp_decisions WHERE moment_id = ?1 AND device_id = ?2 AND decided_at = ?3)`
   const update = input.proof === 'secret'
     ? `UPDATE tg_miniapp_devices SET last_used_at = ?3, secret_sha256 = ?4, pin_failed_attempts = 0,

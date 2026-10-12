@@ -501,9 +501,9 @@ async function challengeOk(p: Phone, m: Moment): Promise<Response> {
 }
 
 describe('the trusted window: set at setup, recorded after a decision, used without a prompt', () => {
-  it('the default window is 30 minutes; every preset is accepted; a window of 0 issues no trust at all', async () => {
+  it('a setup that never chose a window gets NONE (an older page); every preset is accepted; a window of 0 issues no trust at all', async () => {
     const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { omitWindow: true })
-    expect(devRow(p).trust_window_seconds).toBe(1800)
+    expect(devRow(p).trust_window_seconds).toBe(0)
     expect(TRUST_WINDOW_PRESETS.map((x) => x.seconds)).toEqual([0, 1800, 7200, 28800, 86400, 604800])
     for (const w of TRUST_WINDOW_PRESETS) {
       const q = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { window: w.seconds, mode: 'biometric' })
@@ -596,6 +596,27 @@ describe('the trusted window: set at setup, recorded after a decision, used with
     harness.sqlite.prepare("UPDATE tg_miniapp_devices SET trusted_until = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(deviceId(p))
     const r = await consumeMomentTelegramPw(env, { momentId: b.m.id, decision: 'deny', memberId: 'mem-sqadmin', telegramUserId: String(TG.sqadmin), deviceId: deviceId(p), presentedSha256: presented, proof: 'trust' }, Date.now())
     expect(r.won).toBe(false)
+    expect(momentStatus(b.m.id)).toBe('pending')
+    expect(count('tg_miniapp_decisions', `moment_id = '${b.m.id}'`)).toBe(0)
+  })
+})
+
+describe('the window stops at the PIN cap (Hadi 2026-10-12)', () => {
+  it('a device stuck at the cap but not revoked cannot decide through its trust token: refused at the door and inside the consume', async () => {
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    const a = await elevation()
+    expect((await go(p, a.m, approve(a.action))).status).toBe(200)
+    expect(p.trustToken).toBeTruthy()
+    // the slot-5 request died before revoking: counter at the cap, device still active, window still live
+    harness.sqlite.prepare('UPDATE tg_miniapp_devices SET pin_failed_attempts = 5 WHERE id = ?').run(deviceId(p))
+    const b = await elevation()
+    const r = await go(p, b.m, { decision: 'deny' }, { via: 'trust' })
+    expect(r.status).not.toBe(200)
+    expect(momentStatus(b.m.id)).toBe('pending')
+    // and the consume itself refuses, even with a live trust digest (no check-then-act gap)
+    const presented = await tokenHash((p.trustToken ?? '').split('.')[1])
+    const c = await consumeMomentTelegramPw(env, { momentId: b.m.id, decision: 'deny', memberId: 'mem-sqadmin', telegramUserId: String(TG.sqadmin), deviceId: deviceId(p), presentedSha256: presented, proof: 'trust' }, Date.now())
+    expect(c.won).toBe(false)
     expect(momentStatus(b.m.id)).toBe('pending')
     expect(count('tg_miniapp_decisions', `moment_id = '${b.m.id}'`)).toBe(0)
   })
@@ -803,7 +824,7 @@ describe('fix pass: proof provenance and the attempt counter', () => {
     expect((await go(p, a.m, approve(a.action), { e: off })).status).toBe(200)
     expect(proofOf(a.m.id)).toBeUndefined()
   })
-  it('the counter resets only in the WINNING consume: a right PIN with a bad nonce resets nothing; a winning decision resets it', async () => {
+  it('the counter resets only in the WINNING consume: a right PIN with a bad nonce resets nothing but costs no slot; a winning decision resets it', async () => {
     const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
     const { m, action } = await elevation()
     const nonce = await nonceFor(m, p.tg, approve(action))
@@ -812,11 +833,11 @@ describe('fix pass: proof provenance and the attempt counter', () => {
     expect(devRow(p).pin_failed_attempts).toBe(2)
     const bad = await go(p, m, approve(action), { nonce: 'A'.repeat(43) })
     expect(bad.status).toBe(403)
-    expect(devRow(p).pin_failed_attempts).toBe(3) // the right PIN took a slot and, with no win, gave nothing back
+    expect(devRow(p).pin_failed_attempts).toBe(2) // the right PIN gave its own slot back: no reset of the earlier wrong ones, and no extra cost
     expect((await go(p, m, approve(action), { nonce })).status).toBe(200)
     expect(devRow(p).pin_failed_attempts).toBe(0)
   })
-  it('only the request whose own slot was the fifth locks: a request refused for lack of a slot revokes nothing', async () => {
+  it('a device stuck at the cap (the slot-5 request died) is revoked by the next attempt, which finds no slot (idempotent self-heal)', async () => {
     const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
     const { m, action } = await elevation()
     const nonce = await nonceFor(m, p.tg, approve(action))
@@ -824,8 +845,12 @@ describe('fix pass: proof provenance and the attempt counter', () => {
     const r = await go(p, m, approve(action), { nonce })
     expect(r.status).toBe(403)
     expect((await jbody(r)).code).toBe('pin_lockout')
-    expect(devRow(p).revoked_at).toBeNull()
-    expect(count('mutation_audit_entries', "operation = 'tg_device_pin_lockout'")).toBe(0)
+    expect(devRow(p).revoked_at).not.toBeNull()
+    expect(devRow(p).revoked_reason).toBe('pin_lockout')
+    expect(count('mutation_audit_entries', "operation = 'tg_device_pin_lockout'")).toBe(1)
+    // a second slotless attempt revokes nothing more (idempotent)
+    await go(p, m, approve(action), { nonce })
+    expect(count('mutation_audit_entries', "operation = 'tg_device_pin_lockout'")).toBe(1)
   })
   it('the PIN setup success copy names the PIN', async () => {
     const { token } = await mintTgEnrolmentToken(env, 'mem-owner', identities.owner)

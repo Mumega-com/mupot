@@ -307,7 +307,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (!g.ok) return g.res
     const a = await authenticateTelegram(c, g.body)
     if (!a.ok) return a.res
-    const hasDevice = await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId)
+    const hasDevice = await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId, { allowPinMode: pinWindowOn(c.env) })
     const momentId = g.body.moment_id
     if (momentId === undefined) {
       return jsonOut(c, 200, { ok: true, state: 'idle', title: 'Nothing to decide', message: 'No request is attached to this launch.', device_enrolled: hasDevice })
