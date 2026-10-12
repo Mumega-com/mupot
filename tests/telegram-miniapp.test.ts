@@ -792,6 +792,10 @@ describe('decisions: elevation and the step-up policy', () => {
     expect(p(['action:not_a_real_action'])).toBe(PASSKEY_REQUIRED_MESSAGE)
     expect(p(['toString'])).toBe(PASSKEY_REQUIRED_MESSAGE)
     expect(p(['__proto__'])).toBe(PASSKEY_REQUIRED_MESSAGE)
+    expect(p(['action:home_access'])).toBe(PASSKEY_REQUIRED_MESSAGE) // known, not in SENSITIVE_STEP_UP_ACTIONS: Telegram's own passkey-only addition
+    expect(p(['action:project_status', 'action:home_access'])).toBe(PASSKEY_REQUIRED_MESSAGE)
+    expect([...TELEGRAM_PASSKEY_ONLY_EXTRA]).toEqual(['action:home_access'])
+    expect(SENSITIVE_STEP_UP_ACTIONS.has('action:home_access')).toBe(false)
     expect(p([])).toMatch(/at least one/)
     expect(p(['action:project_status'])).toBeNull()
     expect(p(['action:manage_access'], 'deny')).toBeNull()
@@ -1013,6 +1017,18 @@ describe('device secret rotation: a harvested copy dies at the next real use and
     expect(one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'tg_device_revoke'")?.evidence_json).toContain('"presented_by_member_id":"mem-owner"')
     expect(momentStatus(m.id)).toBe('pending')
   })
+  it('another device\'s RETIRED secret presented under this device\'s id is just refused: it revokes neither device', async () => {
+    const { dev: devA, id: idA } = await ready()
+    const devB = await enrolDevice('mem-owner', TG.owner, identities.owner)
+    const oldA = devA.split('.')[1]
+    expect((await approveOne(devA)).res.status).toBe(200)
+    const m = await fileSeed()
+    const nonce = await nonceFor(m, TG.owner, { decision: 'approve' })
+    const r = await post('/m/tg/decide', { init_data: init(TG.owner), moment_id: m.id, nonce, device_token: `${devB.split('.')[0]}.${oldA}`, decision: 'approve' })
+    expect((await jbody(r)).title).toBe('Device not recognised')
+    expect(count('tg_miniapp_devices', 'revoked_at IS NOT NULL')).toBe(0)
+    expect(idA).toBeTruthy()
+  })
   it('a secret that was NEVER issued for a real device id is just refused: it does not revoke anything', async () => {
     const { dev, id } = await ready()
     const m = await fileElevation(['action:project_status'])
@@ -1156,6 +1172,13 @@ describe('the delivery helper (moment_miniapp_link): the worker sends, the calle
     harness.sqlite.exec('PRAGMA ignore_check_constraints = OFF')
     expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'kind_not_supported' })
     expect(calls).toHaveLength(0)
+  })
+  it('the rate limit counts only the last ten minutes: older deliveries do not lock a member out', async () => {
+    stubBotApi()
+    const m = await fileSeed()
+    const old = new Date(Date.now() - 3600 * 1000).toISOString()
+    for (let i = 0; i < 6; i++) harness.sqlite.prepare("INSERT INTO tg_miniapp_deliveries (id, tenant, kind, subject_id, member_id, requested_by, status, created_at) VALUES (?, ?, 'moment', 'x', 'mem-owner', 'agent-x', 'sent', ?)").run(`old-${i}`, TENANT, old)
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: true })
   })
   it('is rate limited per member, and a failing Bot API is a failed receipt with no secret in it', async () => {
     const calls = stubBotApi()
