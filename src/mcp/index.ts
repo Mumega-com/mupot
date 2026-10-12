@@ -7512,7 +7512,7 @@ async function handleJsonRpc(
     if (outcome.ok && elicitPrep?.mode && !elicitPrep.answeredByRetry()) {
       const offered = await buildElicitation(c.env, auth, { toolName: outcome.tool as string, args: toolArguments ?? {}, mode: elicitPrep.mode, result: outcome.result })
       if (offered?.kind === 'error') return rpcError(id, offered.code, offered.message, offered.data)
-      if (offered?.kind === 'result') return rpcResult(id, offered.result)
+      if (offered?.kind === 'result') return ok(id, offered.result) // ok() keeps the result's own resultType: 'input_required'
     }
     if (outcome.ok) return ok(id, mcpCallResult(outcome.tool as string, outcome.result))
 
