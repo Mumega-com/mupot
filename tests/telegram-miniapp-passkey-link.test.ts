@@ -2,6 +2,7 @@
 // "Approve with passkey in your browser" fallback. Real migrated schema and the REAL routes. Telegram proves only WHO
 // ASKED for the link; the W1 passkey page still decides. Contract: docs/architecture/secure-moments.md (W4.1).
 import { readFileSync } from 'node:fs'
+import vm from 'node:vm'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { invokeTool } from '../src/mcp/index' // first: the mcp/seeds modules form an import cycle that only resolves from mcp/index
@@ -9,6 +10,7 @@ import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { initData, newTestKey, type InitDataSpec } from './helpers/telegram-initdata'
+import { TG_SCRIPT } from '../src/secure-moments/telegram-miniapp-client'
 import { momentsApp } from '../src/secure-moments/routes'
 import { reserveRotation, ROTATE_MAX_PER_MOMENT, ROTATE_MIN_INTERVAL_MS } from '../src/secure-moments/rotate'
 import { linkLoginIdentity } from '../src/auth/login-identity'
@@ -285,6 +287,22 @@ describe('passkey-link: the rate limit and the secrets', () => {
   })
 })
 
+describe('passkey-link: failing closed', () => {
+  it('when the receipt cannot be written, no link is issued and the old token still stands (503)', async () => {
+    const m = await fileSeed()
+    const before = tokenSha(m.id)
+    const failing = new Proxy(harness.db, {
+      get(target, prop, recv) {
+        if (prop === 'prepare') return (sql: string) => { if (/INSERT INTO mutation_audit_entries/.test(sql)) throw new Error('audit down'); return target.prepare(sql) }
+        return Reflect.get(target, prop, recv) as unknown
+      },
+    })
+    const r = await plink(m.id, { init_data: init(TG.owner) }, baseEnv({ DB: failing }))
+    expect(r.status).toBe(503)
+    expect(tokenSha(m.id)).toBe(before)
+  })
+})
+
 describe('passkey-link: flag off', () => {
   it('is a 404 (falls through), rotates nothing, writes nothing', async () => {
     const m = await fileSeed()
@@ -292,20 +310,108 @@ describe('passkey-link: flag off', () => {
     const off = baseEnv({ TELEGRAM_MINIAPP: undefined })
     const r = await plink(m.id, { init_data: init(TG.owner) }, off)
     expect(r.status).toBe(404)
-    expect(await r.text()).not.toContain('url')
+    expect(r.headers.get('content-type') ?? '').not.toContain('json') // the adapter (JSON) did not answer: the pre-W4 routing did
     expect(tokenSha(m.id)).toBe(before)
     expect(receipts(m.id)).toBe(0)
   })
 })
 
-describe('passkey-link: the client', () => {
-  it('the page script offers the passkey button in the form and in the biometrics-unavailable branch, opens the link with openLink, and keeps the submit-once pattern', async () => {
-    const m = await fileSeed()
-    const html = await (await momentsApp.fetch(new Request(`https://${HOST}/m/tg/${m.id}`), env)).text()
-    expect(html).toContain('Approve with passkey in your browser')
-    expect(html).toContain("/passkey-link")
-    expect(html).toContain('tg.openLink(')
-    expect(html).toMatch(/Use your passkey in your browser instead/)
-    expect(html).toMatch(/linkBusy=true;b\.disabled=true/)
+// A just-enough fake DOM to run the REAL page script (no jsdom in the repo): elements, attributes, listeners, a tree.
+interface FakeEl {
+  tag: string; attrs: Record<string, string>; children: FakeEl[]; listeners: Record<string, Array<() => unknown>>
+  disabled: boolean; hidden: boolean; className: string; textContent: string; type: string; href: string; rel: string; target: string
+  setAttribute(k: string, v: string): void; getAttribute(k: string): string | null; appendChild(c: FakeEl): FakeEl
+  addEventListener(t: string, f: () => unknown): void; querySelectorAll(sel: string): FakeEl[]; querySelector(sel: string): FakeEl | null
+  innerHTML: string
+}
+function runClient(opts: { biometricAvailable: boolean; passkeyUrl?: string; linkStatus?: number }): {
+  fetches: string[]; opened: string[]; status: () => string; buttons: () => FakeEl[]; click: (el: FakeEl) => Promise<void>; settle: () => Promise<void>
+} {
+  const registry: Record<string, FakeEl> = {}
+  const mk = (tag: string): FakeEl => {
+    const el: FakeEl = {
+      tag, attrs: {}, children: [], listeners: {}, disabled: false, hidden: false, className: '', textContent: '', type: '', href: '', rel: '', target: '',
+      setAttribute(k, v) { el.attrs[k] = v }, getAttribute(k) { return k in el.attrs ? el.attrs[k] : null },
+      appendChild(c) { el.children.push(c); return c },
+      addEventListener(t, f) { (el.listeners[t] ??= []).push(f) },
+      querySelectorAll(sel) { return all(el).filter((x) => matches(x, sel)) },
+      querySelector(sel) { return all(el).find((x) => matches(x, sel)) ?? null },
+      get innerHTML() { return '' },
+      set innerHTML(v: string) {
+        el.children = []
+        if (v.includes('id="decision-form"')) { const f = mk('div'); registry['decision-form'] = f; el.children.push(f) }
+      },
+    }
+    return el
+  }
+  const all = (el: FakeEl): FakeEl[] => el.children.flatMap((c) => [c, ...all(c)])
+  const matches = (el: FakeEl, sel: string): boolean => {
+    if (sel === 'button[data-act]') return el.tag === 'button' && 'data-act' in el.attrs
+    if (sel === 'button[data-act=passkey]') return el.tag === 'button' && el.attrs['data-act'] === 'passkey'
+    return false // inputs / selects of the server-rendered form: none in this fake
+  }
+  const app = mk('div'); app.attrs['data-mode'] = 'moment'; app.attrs['data-ref'] = '55555555-5555-4555-8555-555555555555'
+  const out = mk('div'); registry.app = app; registry.status = out
+  const document = {
+    getElementById: (id: string) => registry[id] ?? null, createElement: (t: string) => mk(t),
+    querySelectorAll: (sel: string) => [...all(app), ...all(out)].filter((x) => matches(x, sel)),
+    querySelector: (sel: string) => [...all(app), ...all(out)].find((x) => matches(x, sel)) ?? null,
+  }
+  const fetches: string[] = []
+  const opened: string[] = []
+  const fetchStub = async (path: string): Promise<{ status: number; json: () => Promise<unknown> }> => {
+    fetches.push(path)
+    if (path === '/m/tg/view') return { status: 200, json: async () => ({ ok: true, state: 'moment', moment_id: '55555555-5555-4555-8555-555555555555', view_html: '', approve_label: 'Approve', passkey_only_actions: [] }) }
+    if (path.endsWith('/passkey-link')) return { status: opts.linkStatus ?? 200, json: async () => (opts.linkStatus && opts.linkStatus !== 200 ? { ok: false, title: 'Try later', message: 'wait' } : { ok: true, url: opts.passkeyUrl ?? 'https://secure.example.test/m/x/y' }) }
+    if (path === '/m/tg/challenge') return { status: 200, json: async () => ({ ok: true, nonce: 'n'.repeat(43) }) }
+    return { status: 404, json: async () => ({}) }
+  }
+  const tg = {
+    initData: 'signed', ready() {}, expand() {}, isVersionAtLeast: () => true, openLink: (u: string) => { opened.push(u) },
+    BiometricManager: { isInited: true, isBiometricAvailable: opts.biometricAvailable, isAccessGranted: true },
+  }
+  const sandbox = { document, window: { Telegram: { WebApp: tg } }, fetch: fetchStub, JSON, encodeURIComponent, Promise, setTimeout }
+  vm.runInNewContext(TG_SCRIPT, sandbox)
+  const settle = async (): Promise<void> => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)) }
+  return {
+    fetches, opened, settle,
+    status: () => [out.textContent, ...all(out).map((e) => e.textContent)].join(' '),
+    buttons: () => [...all(app), ...all(out)].filter((x) => x.tag === 'button'),
+    click: async (el) => { for (const f of el.listeners.click ?? []) await f(); await settle() },
+  }
+}
+
+describe('passkey-link: the client (the real page script on a fake DOM)', () => {
+  it('shows the passkey button beside Approve/Deny even where biometrics exist; clicking asks the server once and opens the REAL browser via openLink; a second click is ignored (submit-once)', async () => {
+    const c = runClient({ biometricAvailable: true, passkeyUrl: 'https://secure.example.test/m/abc/tok' })
+    await c.settle()
+    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey')
+    expect(pk?.textContent).toBe('Approve with passkey in your browser')
+    await c.click(pk as FakeEl)
+    await c.click(pk as FakeEl)
+    expect(c.fetches.filter((p) => p.endsWith('/passkey-link'))).toEqual(['/m/tg/55555555-5555-4555-8555-555555555555/passkey-link'])
+    expect(c.opened).toEqual(['https://secure.example.test/m/abc/tok'])
+    expect(pk?.disabled).toBe(true)
+  })
+  it('with no biometrics, Approve does not dead-end: the message points at the passkey, the button stays available, and it works', async () => {
+    const c = runClient({ biometricAvailable: false })
+    await c.settle()
+    const approve = c.buttons().find((b) => b.attrs['data-act'] === 'approve')
+    await c.click(approve as FakeEl)
+    expect(c.status()).toContain('Biometrics unavailable')
+    expect(c.status()).toContain('Use your passkey in your browser instead.')
+    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey')
+    expect(pk?.disabled).toBe(false)
+    await c.click(pk as FakeEl)
+    expect(c.opened).toHaveLength(1)
+  })
+  it('a refused or throttled link request opens nothing and re-enables the button', async () => {
+    const c = runClient({ biometricAvailable: true, linkStatus: 409 })
+    await c.settle()
+    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey') as FakeEl
+    await c.click(pk)
+    expect(c.opened).toHaveLength(0)
+    expect(pk.disabled).toBe(false)
+    expect(c.status()).toContain('Try later')
   })
 })
