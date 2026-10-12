@@ -15,7 +15,7 @@ export const CREDENTIAL_SCRIPT = `${COMMON}
 if(!window.PublicKeyCredential||!window.MupotHpke||!window.crypto||!crypto.subtle){show('Not available','This browser cannot seal and confirm here. Open the link in a current browser.',false);lock(true);return}
 var form=document.getElementById('drop-form');
 var secretEl=document.getElementById('secret');
-var pub=form.getAttribute('data-pub'),dropId=form.getAttribute('data-drop-id'),fpServer=form.getAttribute('data-fp');
+var pub=form.getAttribute('data-pub'),dropId=form.getAttribute('data-drop-id'),fpServer=form.getAttribute('data-fp'),agentId=form.getAttribute('data-agent-id'),dropName=form.getAttribute('data-name');
 var MAX=${DROP_MAX_PLAINTEXT_BYTES};
 var fpOk=null;
 form.addEventListener('submit',function(ev){ev.preventDefault()});
@@ -36,7 +36,7 @@ async function act(decision){
    var bytes=new TextEncoder().encode(v);
    if(bytes.length>MAX){bytes.fill(0);show('Too large','The secret is larger than '+MAX+' bytes.',false);lock(false);return}
    show('Sealing','Encrypting in this browser to the host key. Nothing readable leaves this page.',true);
-   var sealed=await MupotHpke.seal(pub,'mupot-secure-drop/v1|'+dropId+'|'+fpOk,dropId,bytes);
+   var sealed=await MupotHpke.seal(pub,'mupot-secure-drop/v2|'+agentId+'|'+dropId+'|'+dropName+'|'+fpOk,dropId,bytes);
    bytes.fill(0);
    p.enc=sealed.enc;p.ct=sealed.ct;
   }
@@ -49,7 +49,7 @@ async function act(decision){
   p.credential={id:cred.id,rawId:bufToB64u(cred.rawId),type:cred.type,response:{clientDataJSON:bufToB64u(cred.response.clientDataJSON),authenticatorData:bufToB64u(cred.response.authenticatorData),signature:bufToB64u(cred.response.signature)}};
   var res=await post('/decide',p);
   show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
-  if(res.status===200){secretEl.value='';form.hidden=true}else{lock(false)}
+  if(res.status===200){secretEl.value='';secretEl.disabled=true}else{lock(false)}
  }catch(e){show('Not sent',explain(e),false);lock(false)}
 }
 var bs=form.querySelectorAll('button[data-act]');

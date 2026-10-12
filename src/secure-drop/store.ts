@@ -11,7 +11,7 @@ import type { Env } from '../types'
 import { b64uDecode, b64uEncode, hex, sha256 } from '../secure-moments/webauthn'
 import { tokenHash } from '../secure-moments/store'
 import { DROP_MAX_OPEN_PER_AGENT, DROP_RETAIN_MS } from './config'
-import type { ParsedHostKey } from './keys'
+import type { HostKeyHistory, ParsedHostKey } from './keys'
 
 export interface HostKeyRow {
   id: string
@@ -178,6 +178,25 @@ export async function purgeExpiredDrops(env: Env, nowMs: number = Date.now()): P
     `UPDATE secure_drops SET status = 'expired', enc_b64u = NULL, ct_b64u = NULL
       WHERE tenant = ?1 AND ((status = 'requested' AND expires_at <= ?2) OR (status = 'ready' AND retain_until <= ?2))`,
   ).bind(env.TENANT_SLUG, nowIso).run()
+  // A revoke instruction whose name has since been re-delivered (the host acked the newer drop, so the new file replaced
+  // the old one) is finished: it is closed, never left pending to shred the new credential. Only a DELIVERED successor
+  // closes it: a successor that is merely 'ready' might still expire, and then the old file still needs its shred.
+  await env.DB.prepare(
+    `UPDATE secure_drops AS r SET status = 'revoked', revoke_acked_at = ?2
+      WHERE r.tenant = ?1 AND r.status = 'delivered' AND r.revoke_requested_at IS NOT NULL AND r.revoke_acked_at IS NULL
+        AND ${NEWER_LIVE_DROP_SQL.replace('STATUSES', "'delivered'")}`,
+  ).bind(env.TENANT_SLUG, nowIso).run()
+}
+
+/** The agent's host-key history for the credential page: when the live key arrived and how many it replaced. */
+export async function loadHostKeyHistory(env: Env, agentId: string): Promise<HostKeyHistory | null> {
+  const rows = await env.DB.prepare(
+    `SELECT created_at, revoked_at FROM host_keys WHERE tenant = ?1 AND agent_id = ?2 ORDER BY created_at ASC, id ASC`,
+  ).bind(env.TENANT_SLUG, agentId).all<{ created_at: string; revoked_at: string | null }>()
+  const all = rows.results ?? []
+  const live = all.filter((r) => r.revoked_at === null)
+  if (live.length !== 1) return null
+  return { liveCreatedAt: live[0].created_at, replacedCount: all.length - 1 }
 }
 
 export async function createDropRequest(
@@ -329,7 +348,7 @@ export async function decideDrop(env: Env, i: DecideDropInput, nowMs: number): P
 }
 
 // ── the host's pull / ack ───────────────────────────────────────────────────────────────────────────
-export interface PendingDrop { id: string; name: string; enc: string; ct: string; host_key_fingerprint: string }
+export interface PendingDrop { id: string; agent_id: string; name: string; enc: string; ct: string; host_key_fingerprint: string }
 export interface PendingRevoke { id: string; name: string }
 
 /**
@@ -338,7 +357,7 @@ export interface PendingRevoke { id: string; name: string }
  */
 export async function listPendingDrops(env: Env, agentId: string, nowMs: number = Date.now()): Promise<PendingDrop[]> {
   const rows = await env.DB.prepare(
-    `SELECT d.id AS id, d.name AS name, d.enc_b64u AS enc, d.ct_b64u AS ct, k.fingerprint AS host_key_fingerprint
+    `SELECT d.id AS id, d.agent_id AS agent_id, d.name AS name, d.enc_b64u AS enc, d.ct_b64u AS ct, k.fingerprint AS host_key_fingerprint
        FROM secure_drops d
        JOIN host_keys k ON k.id = d.host_key_id AND k.tenant = d.tenant AND k.agent_id = d.agent_id AND k.revoked_at IS NULL
       WHERE d.tenant = ?1 AND d.agent_id = ?2 AND d.status = 'ready' AND d.retain_until > ?3
@@ -348,11 +367,21 @@ export async function listPendingDrops(env: Env, agentId: string, nowMs: number 
   return rows.results ?? []
 }
 
+/**
+ * SQL fragment: "drop `r` has been superseded by a newer drop of the same name that is ready or delivered and not itself
+ * being revoked". A shred ordered for the OLD drop must never reach the file the NEW one now owns (same name, same path).
+ */
+const NEWER_LIVE_DROP_SQL = `EXISTS (SELECT 1 FROM secure_drops n
+    WHERE n.tenant = r.tenant AND n.agent_id = r.agent_id AND n.name = r.name AND n.id <> r.id
+      AND n.status IN (STATUSES) AND n.revoke_requested_at IS NULL AND n.provided_at > r.provided_at)`
+
+/** Revoke instructions the host should act on: NOT for a name that has a newer ready/delivered drop (rotation). */
 export async function listPendingRevokes(env: Env, agentId: string): Promise<PendingRevoke[]> {
   const rows = await env.DB.prepare(
-    `SELECT id, name FROM secure_drops
-      WHERE tenant = ?1 AND agent_id = ?2 AND status = 'delivered' AND revoke_requested_at IS NOT NULL AND revoke_acked_at IS NULL
-      ORDER BY revoke_requested_at ASC LIMIT 20`,
+    `SELECT r.id AS id, r.name AS name FROM secure_drops r
+      WHERE r.tenant = ?1 AND r.agent_id = ?2 AND r.status = 'delivered' AND r.revoke_requested_at IS NOT NULL AND r.revoke_acked_at IS NULL
+        AND NOT ${NEWER_LIVE_DROP_SQL.replace('STATUSES', "'ready', 'delivered'")}
+      ORDER BY r.revoke_requested_at ASC LIMIT 20`,
   ).bind(env.TENANT_SLUG, agentId).all<PendingRevoke>()
   return rows.results ?? []
 }

@@ -5,6 +5,7 @@
 // printed, never re-aimed), ack ordering (only after the file is durable) and shredding that really overwrites.
 import assert from 'node:assert/strict'
 import { createHash, createCipheriv, webcrypto } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import {
   chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs'
@@ -62,9 +63,10 @@ function fakeMcp(handlers) {
   return fetch
 }
 
-async function makeDrop(hostKey, { name = 'github-token', id = crypto.randomUUID(), secret = SECRET, fingerprint = hostKey.fingerprint } = {}) {
-  const s = await bundle.seal(hostKey.publicB64u, drop.INFO_PREFIX + id + '|' + hostKey.fingerprint, id, new TextEncoder().encode(secret))
-  return { id, name, enc: s.enc, ct: s.ct, host_key_fingerprint: fingerprint }
+const AGENT = 'agent-x'
+async function makeDrop(hostKey, { name = 'github-token', id = crypto.randomUUID(), secret = SECRET, fingerprint = hostKey.fingerprint, agent = AGENT, sealName = name, sealAgent = agent } = {}) {
+  const s = await bundle.seal(hostKey.publicB64u, drop.dropInfo(sealAgent, id, sealName, hostKey.fingerprint), id, new TextEncoder().encode(secret))
+  return { id, agent_id: agent, name, enc: s.enc, ct: s.ct, host_key_fingerprint: fingerprint }
 }
 
 // ── RFC 9180 Appendix A.1 ──────────────────────────────────────────────────────────────────────────────
@@ -162,23 +164,27 @@ test('the vendored browser bundle seals; this script opens (and nothing else doe
     const key = drop.loadHostKey(home)
     assert.equal(await bundle.fingerprint(key.publicB64u), key.fingerprint)
     const id = crypto.randomUUID()
-    const s = await bundle.seal(key.publicB64u, `${drop.INFO_PREFIX}${id}|${key.fingerprint}`, id, new TextEncoder().encode(SECRET))
-    const open = (otherId, fp) => drop.hpkeOpen({
-      privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(`${drop.INFO_PREFIX}${otherId}|${fp}`),
-      aad: Buffer.from(otherId), ct: Buffer.from(s.ct, 'base64url'),
+    const s = await bundle.seal(key.publicB64u, drop.dropInfo(AGENT, id, 'github-token', key.fingerprint), id, new TextEncoder().encode(SECRET))
+    const open = ({ agent = AGENT, dropId = id, name = 'github-token', fp = key.fingerprint } = {}) => drop.hpkeOpen({
+      privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(drop.dropInfo(agent, dropId, name, fp)),
+      aad: Buffer.from(dropId), ct: Buffer.from(s.ct, 'base64url'),
     })
-    assert.equal(open(id, key.fingerprint).toString(), SECRET)
-    assert.throws(() => open(crypto.randomUUID(), key.fingerprint))
-    assert.throws(() => open(id, 'f'.repeat(64)))
+    assert.equal(open().toString(), SECRET)
+    assert.throws(() => open({ dropId: crypto.randomUUID() }))
+    assert.throws(() => open({ fp: 'f'.repeat(64) }))
+    assert.throws(() => open({ name: 'other-name' }), 'the NAME is bound into the ciphertext')
+    assert.throws(() => open({ agent: 'agent-y' }), 'the AGENT is bound into the ciphertext')
   } finally { cleanup(home) }
 })
 
 // ── pull ───────────────────────────────────────────────────────────────────────────────────────────────
-async function setup() {
+async function setup({ pin = true } = {}) {
   const home = tmpHome()
   await drop.main(['keygen'], { home, env: {}, out: lines() })
-  return { home, key: drop.loadHostKey(home), keys: join(home, '.sos', 'keys') }
+  if (pin) drop.pinAgent(home, AGENT)
+  return { home, key: drop.loadHostKey(home), keys: join(home, '.mupot', 'secrets', AGENT) }
 }
+const ensureKeys = (home) => drop.ensureSecretsDir(home, AGENT)
 const pullWith = (home, fetch, out = lines(), extra = []) => drop.main(['pull', ...extra], { home, env: {}, fetch, out })
 
 test('pull: opens, writes ~/.sos/keys/<name> 0600 atomically, THEN acks; token only in the Authorization header; no secret printed', async () => {
@@ -199,8 +205,11 @@ test('pull: opens, writes ~/.sos/keys/<name> 0600 atomically, THEN acks; token o
     assert.equal(await pullWith(home, fetch, out), 0)
     assert.deepEqual(acked, [d.id])
     assert.equal(statSync(join(keys, 'github-token')).mode & 0o777, 0o600)
-    assert.deepEqual(readdirSync(keys), ['github-token'], 'no temp file is left behind')
+    assert.deepEqual(readdirSync(keys).sort(), ['.manifest.json', 'github-token'], 'only the secret and the manifest; no temp file is left behind')
+    assert.equal(statSync(join(keys, '.manifest.json')).mode & 0o777, 0o600)
+    assert.equal(statSync(keys).mode & 0o777, 0o700)
     assert.ok(!out.text().includes(SECRET))
+    assert.ok(!readFileSync(join(keys, '.manifest.json'), 'utf8').includes(SECRET), 'the manifest holds hashes, never the secret')
     assert.ok(!out.text().includes(TOKEN))
     assert.equal(fetch.calls[0].url, 'https://mupot.mumega.com/mcp')
     assert.equal(fetch.calls[0].headers.authorization, `Bearer ${TOKEN}`)
@@ -212,24 +221,125 @@ test('pull: opens, writes ~/.sos/keys/<name> 0600 atomically, THEN acks; token o
   } finally { cleanup(home) }
 })
 
-test('pull replaces an existing regular file atomically (new content, still 0600)', async () => {
+test('pull replaces its OWN earlier file atomically (manifest hash match): new content, still 0600', async () => {
   const { home, key, keys } = await setup()
   try {
-    mkdirSync(keys, { recursive: true, mode: 0o700 })
-    writeFileSync(join(keys, 'github-token'), 'old-value', { mode: 0o644 })
-    const d = await makeDrop(key)
-    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: () => ({ ok: true }) })
+    const d1 = await makeDrop(key, { secret: 'first-version' })
+    const d2 = await makeDrop(key, { secret: 'second-version' })
+    let n = 0
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [n++ === 0 ? d1 : d2], revokes: [] }), secure_drop_ack: () => ({ ok: true }) })
     assert.equal(await pullWith(home, fetch), 0)
-    assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), SECRET)
+    assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), 'first-version')
+    assert.equal(await pullWith(home, fetch), 0)
+    assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), 'second-version')
     assert.equal(statSync(join(keys, 'github-token')).mode & 0o777, 0o600)
+    const m = JSON.parse(readFileSync(join(keys, '.manifest.json'), 'utf8'))
+    assert.equal(m.files['github-token'].drop_id, d2.id)
+    assert.equal(m.files['github-token'].hashes.length, 1)
   } finally { cleanup(home) }
 })
 
-test('PATH TRAVERSAL: a server-supplied name that is not a safe slug is refused; nothing is written outside the keys dir, nothing is acked', async () => {
+test('P1-2: a file secure-drop did NOT create is never replaced (no manifest entry), nor one edited since; nothing is acked', async () => {
   const { home, key, keys } = await setup()
   try {
-    mkdirSync(keys, { recursive: true, mode: 0o700 })
-    const names = ['../escape', '..', '.', '.env', 'a/b', '/etc/cron.d/x', 'A', 'a b', '', 'a'.repeat(64), '-lead', 'a\u0000b', 'a.b', '..%2fx']
+    ensureKeys(home)
+    writeFileSync(join(keys, 'github-token'), 'operator-or-other-agent-file', { mode: 0o600 })
+    const acks = []
+    const d = await makeDrop(key)
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: (a) => { acks.push(a.id); return {} } })
+    const out = lines()
+    assert.equal(await pullWith(home, fetch, out), 1)
+    assert.match(out.text(), /did not create/)
+    assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), 'operator-or-other-agent-file')
+    assert.deepEqual(acks, [])
+    // after a legitimate write, an edit by anyone else makes the next replacement refuse
+    rmSync(join(keys, 'github-token'))
+    assert.equal(await pullWith(home, fetch), 0)
+    writeFileSync(join(keys, 'github-token'), 'edited-by-someone', { mode: 0o600 })
+    const out2 = lines()
+    const d3 = await makeDrop(key)
+    assert.equal(await pullWith(home, fakeMcp({ secure_drop_pull: () => ({ drops: [d3], revokes: [] }), secure_drop_ack: () => ({}) }), out2), 1)
+    assert.match(out2.text(), /changed since secure-drop wrote it/)
+    assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), 'edited-by-someone')
+  } finally { cleanup(home) }
+})
+
+test('P1-2: it never writes outside its own tree: ~/.sos/keys is untouched, even when it holds a file of the same name', async () => {
+  const { home, key } = await setup()
+  try {
+    mkdirSync(join(home, '.sos', 'keys'), { recursive: true, mode: 0o700 })
+    writeFileSync(join(home, '.sos', 'keys', 'github-token'), 'another-tool-key', { mode: 0o600 })
+    const d = await makeDrop(key)
+    const f2 = fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [{ id: crypto.randomUUID(), name: 'github-token' }] }), secure_drop_ack: () => ({}) })
+    assert.equal(await pullWith(home, f2), 0)
+    assert.equal(readFileSync(join(home, '.sos', 'keys', 'github-token'), 'utf8'), 'another-tool-key')
+    assert.equal(await drop.main(['revoke', 'github-token'], { home, env: {}, out: lines() }), 0)
+    assert.equal(readFileSync(join(home, '.sos', 'keys', 'github-token'), 'utf8'), 'another-tool-key')
+  } finally { cleanup(home) }
+})
+
+test('P1-2: a relabelled drop (another name, another agent id in the ciphertext) does not open: no file, no ack', async () => {
+  const { home, key, keys } = await setup()
+  try {
+    const acks = []
+    const relabelled = [
+      await makeDrop(key, { name: 'prod-db', sealName: 'dev-db' }), // server says prod-db, human sealed dev-db
+      await makeDrop(key, { sealAgent: 'agent-y' }), // server says agent-x, human sealed for agent-y
+    ]
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: relabelled, revokes: [] }), secure_drop_ack: (a) => { acks.push(a.id); return {} } })
+    const out = lines()
+    assert.equal(await pullWith(home, fetch, out), 1)
+    assert.equal(out.out.filter((l) => /decryption failed/.test(l)).length, 2)
+    assert.deepEqual(acks, [])
+    assert.ok(!existsSync(join(keys, 'prod-db')) && !existsSync(join(keys, 'github-token')))
+  } finally { cleanup(home) }
+})
+
+test('P1-2: a drop naming another agent is refused whatever the ciphertext says; an unpinned host refuses to pull at all', async () => {
+  const { home, key } = await setup()
+  try {
+    const d = await makeDrop(key, { agent: 'agent-y' })
+    const out = lines()
+    assert.equal(await pullWith(home, fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: () => ({}) }), out), 1)
+    assert.match(out.text(), /different agent/)
+  } finally { cleanup(home) }
+  const un = await setup({ pin: false })
+  try {
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [], revokes: [] }) })
+    const out = lines()
+    assert.equal(await pullWith(un.home, fetch, out), 1)
+    assert.match(out.text(), /not pinned to an agent yet/)
+    assert.equal(fetch.calls.length, 0)
+  } finally { cleanup(un.home) }
+})
+
+test('register pins the host to the agent id the server names; a different agent can never re-pin it; --agent must match', async () => {
+  const { home } = await setup({ pin: false })
+  try {
+    const fetch = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: 'agent-x', rotated: false, governors_notified: 2 }) })
+    const out = lines()
+    assert.equal(await drop.main(['register'], { home, env: {}, fetch, out }), 0)
+    assert.equal(drop.loadAgentPin(home), 'agent-x')
+    assert.match(out.text(), /governors notified: 2/)
+    assert.equal(statSync(join(home, '.mupot', 'agent.json')).mode & 0o777, 0o600)
+    const other = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: 'agent-y' }) })
+    const out2 = lines()
+    assert.equal(await drop.main(['register'], { home, env: {}, fetch: other, out: out2 }), 1)
+    assert.match(out2.text(), /pinned to agent agent-x/)
+    assert.equal(await drop.main(['register', '--agent', 'agent-z'], { home, env: {}, fetch, out: lines() }), 1)
+    for (const bad of ['../x', 'a/b', '', 'a'.repeat(65), 5]) {
+      const f = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: bad }) })
+      const un = await setup({ pin: false })
+      try { assert.equal(await drop.main(['register'], { home: un.home, env: {}, fetch: f, out: lines() }), 1) } finally { cleanup(un.home) }
+    }
+  } finally { cleanup(home) }
+})
+
+test('PATH TRAVERSAL: a server-supplied name that is not a safe slug is refused; nothing is written outside the secrets dir, nothing is acked', async () => {
+  const { home, key, keys } = await setup()
+  try {
+    ensureKeys(home)
+    const names = ['../escape', '..', '.', '.env', '.manifest.json', 'a/b', '/etc/cron.d/x', 'A', 'a b', '', 'a'.repeat(64), '-lead', 'a\u0000b', 'a.b', '..%2fx']
     const acks = []
     for (const name of names) {
       const d = await makeDrop(key, { name })
@@ -247,7 +357,7 @@ test('PATH TRAVERSAL: a server-supplied name that is not a safe slug is refused;
 test('SYMLINK: a symlink (or directory) at the target is never overwritten or followed; no ack; the link target is untouched', async () => {
   const { home, key, keys } = await setup()
   try {
-    mkdirSync(keys, { recursive: true, mode: 0o700 })
+    ensureKeys(home)
     const victim = join(home, 'victim.txt')
     writeFileSync(victim, 'victim-original', { mode: 0o600 })
     symlinkSync(victim, join(keys, 'github-token'))
@@ -267,12 +377,12 @@ test('SYMLINK: a symlink (or directory) at the target is never overwritten or fo
   } finally { cleanup(home) }
 })
 
-test('the keys directory itself must be a plain directory owned by us and not group/world writable', async () => {
+test('the secrets tree is a plain 0700 directory we own: a symlinked or group-readable one is refused', async () => {
   const { home, key, keys } = await setup()
   try {
     const real = join(home, 'elsewhere')
     mkdirSync(real, { mode: 0o700 })
-    mkdirSync(join(home, '.sos'), { mode: 0o700 })
+    mkdirSync(join(home, '.mupot', 'secrets'), { mode: 0o700 })
     symlinkSync(real, keys)
     const d = await makeDrop(key)
     const acks = []
@@ -283,12 +393,46 @@ test('the keys directory itself must be a plain directory owned by us and not gr
     assert.deepEqual(readdirSync(real), [])
     rmSync(keys)
     mkdirSync(keys, { mode: 0o700 })
-    chmodSync(keys, 0o777)
+    chmodSync(keys, 0o750)
     out = lines()
     assert.equal(await pullWith(home, fetch, out), 1)
-    assert.match(out.text(), /group\/world writable/)
+    assert.match(out.text(), /accessible by group\/others/)
     assert.deepEqual(readdirSync(keys), [])
     assert.deepEqual(acks, [])
+  } finally { cleanup(home) }
+})
+
+test('P2: a shared host with a 0770 ~/.mupot (default ACL) still works: only the dirs WE create are mode-checked, and files are explicitly 0600', async () => {
+  const home = tmpHome()
+  const oldUmask = process.umask(0)
+  try {
+    mkdirSync(join(home, '.mupot'), { mode: 0o770 })
+    chmodSync(join(home, '.mupot'), 0o770)
+    assert.equal(await drop.main(['keygen'], { home, env: {}, out: lines() }), 0)
+    drop.pinAgent(home, AGENT)
+    const key = drop.loadHostKey(home)
+    const d = await makeDrop(key)
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: () => ({}) })
+    assert.equal(await pullWith(home, fetch), 0)
+    const keys = join(home, '.mupot', 'secrets', AGENT)
+    for (const f of [join(home, '.mupot', 'host-key.json'), join(home, '.mupot', 'agent.json'), join(keys, 'github-token'), join(keys, '.manifest.json')]) {
+      assert.equal(statSync(f).mode & 0o777, 0o600, f)
+    }
+    assert.equal(statSync(join(home, '.mupot', 'secrets')).mode & 0o777, 0o700)
+    assert.equal(statSync(keys).mode & 0o777, 0o700)
+    assert.equal(statSync(join(home, '.mupot')).mode & 0o777, 0o770, 'the operator\'s own directory is left as it was')
+  } finally { process.umask(oldUmask); cleanup(home) }
+})
+
+test('isMain works when the script is invoked through a symlink', () => {
+  const home = tmpHome()
+  try {
+    const link = join(home, 'secure-drop-link.mjs')
+    symlinkSync(join(here, 'secure-drop.mjs'), link)
+    const r = spawnSync(process.execPath, [link, 'keygen'], { env: { ...process.env, HOME: home }, encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /^public_key: /m)
+    assert.ok(existsSync(join(home, '.mupot', 'host-key.json')))
   } finally { cleanup(home) }
 })
 
@@ -318,7 +462,7 @@ test('a drop sealed to ANOTHER key (server fingerprint spoofed to ours) fails to
       assert.equal(await pullWith(home, fetch, out), 1)
       assert.match(out.text(), /decryption failed/)
       assert.deepEqual(acks, [])
-      assert.ok(!existsSync(keys) || readdirSync(keys).length === 0)
+      assert.ok(!existsSync(join(keys, 'github-token')))
     } finally { cleanup(other.home) }
   } finally { cleanup(home) }
 })
@@ -346,7 +490,7 @@ test('tampered ciphertext, wrong drop id, oversized ciphertext and malformed fie
     assert.equal(await pullWith(home, fetch, out), 1)
     assert.equal(out.out.filter((l) => l.startsWith('skipped')).length, bad.length)
     assert.deepEqual(acks, [])
-    assert.ok(!existsSync(keys) || readdirSync(keys).length === 0)
+    assert.ok(!existsSync(join(keys, 'github-token')))
     assert.ok(!out.text().includes(SECRET))
   } finally { cleanup(home) }
 })
@@ -359,6 +503,8 @@ test('if the ack fails after the file is written the run reports failure and exi
     const out = lines()
     assert.equal(await pullWith(home, fetch, out), 1)
     assert.equal(readFileSync(join(keys, 'github-token'), 'utf8'), SECRET)
+    // the re-offered drop (same drop id, same bytes) overwrites its own file: the manifest knows this version
+    assert.equal(await pullWith(home, fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: () => ({}) })), 0)
   } finally { cleanup(home) }
 })
 
@@ -372,54 +518,112 @@ test('nothing pending is not an error', async () => {
 })
 
 // ── revoke / shred ─────────────────────────────────────────────────────────────────────────────────────
-test('revoke <name> overwrites the file IN PLACE with random bytes of the same length, then unlinks it', async () => {
-  const { home, keys } = await setup()
+async function seedFile(home, key, name, secret = SECRET) {
+  const d = await makeDrop(key, { name, secret })
+  assert.equal(await pullWith(home, fakeMcp({ secure_drop_pull: () => ({ drops: [d], revokes: [] }), secure_drop_ack: () => ({}) })), 0)
+  return d
+}
+
+test('revoke <name> overwrites the file IN PLACE with random bytes of the same length, then unlinks it and forgets it', async () => {
+  const { home, key, keys } = await setup()
   try {
-    mkdirSync(keys, { recursive: true, mode: 0o700 })
-    const original = `${SECRET}${'x'.repeat(5000)}`
-    writeFileSync(join(keys, 'old-key'), original, { mode: 0o600 })
+    await seedFile(home, key, 'old-key', `${SECRET}${'x'.repeat(5000)}`)
     const witness = join(home, 'witness-hardlink') // same inode: survives the unlink and shows what was left on disk
     linkSync(join(keys, 'old-key'), witness)
     const out = lines()
     assert.equal(await drop.main(['revoke', 'old-key'], { home, env: {}, out }), 0)
     assert.ok(!existsSync(join(keys, 'old-key')))
     const left = readFileSync(witness)
-    assert.equal(left.length, Buffer.byteLength(original))
+    assert.equal(left.length, Buffer.byteLength(`${SECRET}${'x'.repeat(5000)}`))
     assert.ok(!left.toString('latin1').includes('ghp_SuperSecret'), 'the old bytes were overwritten, not just unlinked')
     assert.match(out.text(), /^shredded old-key/m)
-    // already gone is fine; a traversal name and a symlink are refused
-    assert.equal(await drop.main(['revoke', 'old-key'], { home, env: {}, out: lines() }), 0)
+    assert.equal(JSON.parse(readFileSync(join(keys, '.manifest.json'), 'utf8')).files['old-key'], undefined)
+    assert.equal(await drop.main(['revoke', 'old-key'], { home, env: {}, out: lines() }), 0) // already gone is fine
     const bad = lines()
     assert.equal(await drop.main(['revoke', '../victim'], { home, env: {}, out: bad }), 1)
     assert.match(bad.text(), /invalid drop name/)
-    writeFileSync(join(home, 'victim'), 'v', { mode: 0o600 })
-    symlinkSync(join(home, 'victim'), join(keys, 'linked'))
-    assert.equal(await drop.main(['revoke', 'linked'], { home, env: {}, out: lines() }), 1)
-    assert.equal(readFileSync(join(home, 'victim'), 'utf8'), 'v')
-    assert.ok(lstatSync(join(keys, 'linked')).isSymbolicLink())
   } finally { cleanup(home) }
 })
 
-test('pull acts on revoke instructions: shreds the file, then acks; a symlink is refused and not acked', async () => {
-  const { home, keys } = await setup()
+test('P1-2: revoke/shred refuses a symlink, a file it did not create, and a file edited since; those files survive', async () => {
+  const { home, key, keys } = await setup()
   try {
-    mkdirSync(keys, { recursive: true, mode: 0o700 })
-    writeFileSync(join(keys, 'cloud-key'), SECRET, { mode: 0o600 })
+    await seedFile(home, key, 'mine')
+    ensureKeys(home)
+    writeFileSync(join(keys, 'foreign'), 'not-ours', { mode: 0o600 })
+    writeFileSync(join(home, 'victim'), 'v', { mode: 0o600 })
+    symlinkSync(join(home, 'victim'), join(keys, 'linked'))
+    for (const n of ['foreign', 'linked']) {
+      const out = lines()
+      assert.equal(await drop.main(['revoke', n], { home, env: {}, out }), 1, n)
+    }
+    assert.equal(readFileSync(join(keys, 'foreign'), 'utf8'), 'not-ours')
+    assert.equal(readFileSync(join(home, 'victim'), 'utf8'), 'v')
+    writeFileSync(join(keys, 'mine'), 'edited-by-operator', { mode: 0o600 })
+    const out = lines()
+    assert.equal(await drop.main(['revoke', 'mine'], { home, env: {}, out }), 1)
+    assert.match(out.text(), /changed since secure-drop wrote it/)
+    assert.equal(readFileSync(join(keys, 'mine'), 'utf8'), 'edited-by-operator')
+  } finally { cleanup(home) }
+})
+
+test('pull acts on revoke instructions: shreds our file, then acks; a foreign file or symlink is refused and not acked', async () => {
+  const { home, key, keys } = await setup()
+  try {
+    const owned = await seedFile(home, key, 'cloud-key')
+    writeFileSync(join(keys, 'foreign-key'), 'not-ours', { mode: 0o600 })
     writeFileSync(join(home, 'victim'), 'v', { mode: 0o600 })
     symlinkSync(join(home, 'victim'), join(keys, 'linked-key'))
-    const r1 = crypto.randomUUID()
     const r2 = crypto.randomUUID()
     const r3 = crypto.randomUUID()
+    const r4 = crypto.randomUUID()
     const acks = []
     const fetch = fakeMcp({
-      secure_drop_pull: () => ({ drops: [], revokes: [{ id: r1, name: 'cloud-key' }, { id: r2, name: 'linked-key' }, { id: r3, name: '../bad' }] }),
+      secure_drop_pull: () => ({ drops: [], revokes: [{ id: owned.id, name: 'cloud-key' }, { id: r2, name: 'foreign-key' }, { id: r3, name: 'linked-key' }, { id: r4, name: '../bad' }] }),
       secure_drop_ack: (a) => { acks.push(a.id); return { ok: true, result: 'revoke_acked' } },
     })
     const out = lines()
     assert.equal(await pullWith(home, fetch, out), 1)
-    assert.deepEqual(acks, [r1])
+    assert.deepEqual(acks, [owned.id])
     assert.ok(!existsSync(join(keys, 'cloud-key')))
+    assert.equal(readFileSync(join(keys, 'foreign-key'), 'utf8'), 'not-ours')
     assert.equal(readFileSync(join(home, 'victim'), 'utf8'), 'v')
+  } finally { cleanup(home) }
+})
+
+test('P1-1: one pull with a NEW drop for name N and a pending revoke for an OLDER drop of N: the new credential survives', async () => {
+  const { home, key, keys } = await setup()
+  try {
+    const old = await seedFile(home, key, 'rotating', 'old-credential')
+    const fresh = await makeDrop(key, { name: 'rotating', secret: 'new-credential' })
+    const order = []
+    const fetch = fakeMcp({
+      // a server (or an older mupot) that still lists the stale revoke next to the new drop
+      secure_drop_pull: () => ({ drops: [fresh], revokes: [{ id: old.id, name: 'rotating' }] }),
+      secure_drop_ack: (a) => { order.push(a.id); return {} },
+    })
+    const out = lines()
+    assert.equal(await pullWith(home, fetch, out), 0)
+    assert.equal(readFileSync(join(keys, 'rotating'), 'utf8'), 'new-credential', 'the new credential must survive the stale revoke')
+    assert.deepEqual(order, [old.id, fresh.id], 'revokes are processed BEFORE drops')
+    const lineAt = (re) => out.out.findIndex((l) => re.test(l))
+    assert.ok(lineAt(/^(shredded|absent|superseded) rotating/) < lineAt(/^delivered rotating/))
+    assert.equal(JSON.parse(readFileSync(join(keys, '.manifest.json'), 'utf8')).files.rotating.drop_id, fresh.id)
+  } finally { cleanup(home) }
+})
+
+test('P1-1: a revoke for an OLDER drop never shreds a file that now belongs to a newer drop (superseded), and is acked', async () => {
+  const { home, key, keys } = await setup()
+  try {
+    const old = await seedFile(home, key, 'rotating', 'old-credential')
+    await seedFile(home, key, 'rotating', 'new-credential')
+    const acks = []
+    const fetch = fakeMcp({ secure_drop_pull: () => ({ drops: [], revokes: [{ id: old.id, name: 'rotating' }] }), secure_drop_ack: (a) => { acks.push(a.id); return {} } })
+    const out = lines()
+    assert.equal(await pullWith(home, fetch, out), 0)
+    assert.match(out.text(), /superseded rotating/)
+    assert.equal(readFileSync(join(keys, 'rotating'), 'utf8'), 'new-credential')
+    assert.deepEqual(acks, [old.id])
   } finally { cleanup(home) }
 })
 
@@ -512,7 +716,7 @@ test('a tool error is reported by code only; a 401 is an auth error; neither pri
 test('register sends ONLY the public key', async () => {
   const { home, key } = await setup()
   try {
-    const fetch = fakeMcp({ host_key_register: () => ({ ok: true, rotated: false }) })
+    const fetch = fakeMcp({ host_key_register: () => ({ ok: true, agent_id: 'agent-x', rotated: false }) })
     const out = lines()
     assert.equal(await drop.main(['register'], { home, env: {}, fetch, out }), 0)
     assert.deepEqual(fetch.calls[0].args, { public_key: key.publicB64u })

@@ -5,15 +5,23 @@
 // key and mupot stores ciphertext only. This script is the only thing that can open it:
 //
 //   keygen            create ~/.mupot/host-key.json (mode 0600, X25519 private key as a JWK); print the public key
-//                     and its fingerprint (sha256 of the raw 32-byte public key) to compare with the secure page.
-//   register          call the mupot MCP tool host_key_register with the agent's own token (public key only).
-//   pull              fetch pending drops, open each one, write ~/.sos/keys/<name> (0600, atomic), then ack; act on
-//                     revoke instructions (shred) and ack them.
-//   revoke <name>     shred ~/.sos/keys/<name> locally (overwrite + unlink).
+//                     and its fingerprint (sha256 of the raw 32-byte public key). Hand the fingerprint to the human
+//                     OUT OF BAND (not through the agent) so they can compare it with the secure page.
+//   register          call the mupot MCP tool host_key_register with the agent's own token (public key only) and
+//                     PIN this host to the agent id the server names (~/.mupot/agent.json, never re-pinned).
+//   pull              fetch revoke instructions and pending drops; revokes FIRST (shred), then drops: open each one,
+//                     write ~/.mupot/secrets/<agent id>/<name> (0600, atomic), then ack.
+//   revoke <name>     shred that file locally (overwrite + unlink).
+//   path <name>       print where <name> lives (a consumer reads it, or symlinks to it from its own config).
+//
+// FILES: this script writes ONLY inside ~/.mupot/secrets/<agent id>/, a directory it creates 0700. It never touches
+// ~/.sos/keys or any other path, and it never replaces or shreds a file it did not create: a 0600 manifest records the
+// drop id and sha256 of every version it wrote, and a file missing from it (or edited since) is refused.
 //
 // SUITE (exactly one, no negotiation): HPKE base mode, DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM
 // (kem 0x0020, kdf 0x0001, aead 0x0001), hand-rolled from RFC 9180 section 4 / 5.1 on node:crypto only.
-//   info = "mupot-secure-drop/v1|" + drop id + "|" + host key fingerprint (lowercase hex, computed from OWN key)
+//   info = "mupot-secure-drop/v2|" + agent id + "|" + drop id + "|" + name + "|" + host key fingerprint
+//          (lowercase hex, computed from OWN key; agent id from the pin; name chooses the file, so it is bound in)
 //   aad  = drop id
 // The fingerprint a drop is opened under is recomputed from this host's OWN key, never taken from the server;
 // a server-supplied fingerprint that differs refuses the drop (a key-substitution signal).
@@ -23,14 +31,16 @@
 // Zero npm dependencies. Node >= 20.
 import { createHmac, createPrivateKey, createPublicKey, createDecipheriv, createHash, diffieHellman, generateKeyPairSync, randomBytes } from 'node:crypto'
 import {
-  closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync,
-  unlinkSync, writeSync,
+  chmodSync, closeSync, constants, fchmodSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync,
+  renameSync, unlinkSync, writeSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const INFO_PREFIX = 'mupot-secure-drop/v1|'
+export const INFO_PREFIX = 'mupot-secure-drop/v2|'
+/** info = prefix + agent id + "|" + drop id + "|" + name + "|" + fingerprint: everything the human saw on the page is bound in. */
+export const dropInfo = (agentId, dropId, name, fingerprintHex) => `${INFO_PREFIX}${agentId}|${dropId}|${name}|${fingerprintHex}`
 const DEFAULT_API = 'https://mupot.mumega.com'
 const DEFAULT_POT = 'mumega'
 /** A drop name is a safe filename slug: the ONLY form that is ever joined to a directory path. */
@@ -157,9 +167,22 @@ export function privateKeyFromRaw(raw32) {
   return createPrivateKey({ key: Buffer.concat([PKCS8_X25519_PREFIX, raw32]), format: 'der', type: 'pkcs8' })
 }
 
-// ------------------------------------------------------------------ the host key file
-export function hostKeyPath(home) {
-  return join(home, '.mupot', 'host-key.json')
+// ------------------------------------------------------------------ files and directories
+function lstatOrNull(p) {
+  try { return lstatSync(p) } catch (e) { if (e && e.code === 'ENOENT') return null; throw e }
+}
+const lstatExists = (p) => lstatOrNull(p) !== null
+
+/** Open a file without following a symlink at the final component. */
+function openNoFollow(path, flags, mode) {
+  return openSync(path, flags | (constants.O_NOFOLLOW ?? 0), mode)
+}
+
+/** A file this script creates: exclusive, never through a symlink, and EXPLICITLY mode 0600 (a umask or a default ACL cannot widen it). */
+function createFile0600(path) {
+  const fd = openNoFollow(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+  fchmodSync(fd, 0o600)
+  return fd
 }
 
 function mode600Regular(fd, where) {
@@ -169,9 +192,83 @@ function mode600Regular(fd, where) {
   if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new DropError(`${where} is not owned by this user`)
 }
 
-/** Open a file without following a symlink at the final component. */
-function openNoFollow(path, flags, mode) {
-  return openSync(path, flags | (constants.O_NOFOLLOW ?? 0), mode)
+function ownedByUs(st) {
+  return typeof process.getuid !== 'function' || st.uid === process.getuid()
+}
+
+/**
+ * A directory THIS script owns (the secrets tree): created 0700 with an explicit chmod (a umask or a default ACL cannot
+ * widen it), and refused if it is a symlink, not ours, or has any group/other bit.
+ */
+function ensureOwnDir(path, what) {
+  if (!lstatExists(path)) {
+    mkdirSync(path, { mode: 0o700 })
+    chmodSync(path, 0o700)
+  }
+  const st = lstatSync(path)
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new DropError(`${what} is not a plain directory`)
+  if (!ownedByUs(st)) throw new DropError(`${what} is not owned by this user`)
+  if (st.mode & 0o077) throw new DropError(`${what} is accessible by group/others; refusing to use it (chmod 700)`)
+}
+
+/**
+ * A parent directory the operator may already have (~/.mupot): created 0700 if absent, otherwise only required to be a
+ * real directory we own. Its group bits are NOT checked (a shared host may give it a default ACL); everything secret in it
+ * is a 0600 file we own, or lives in a subdirectory we created 0700.
+ */
+function ensureParentDir(path, what) {
+  if (!lstatExists(path)) {
+    mkdirSync(path, { mode: 0o700 })
+    chmodSync(path, 0o700)
+  }
+  const st = lstatSync(path)
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new DropError(`${what} is not a plain directory`)
+  if (!ownedByUs(st)) throw new DropError(`${what} is not owned by this user`)
+}
+
+function fsyncDir(path) {
+  let fd
+  try {
+    fd = openSync(path, constants.O_RDONLY)
+    fsyncSync(fd)
+  } catch {
+    // best effort: directory fsync is not supported everywhere
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
+function writeAll(fd, bytes) {
+  let off = 0
+  while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off)
+}
+
+/** tmp file (0600) + fsync + rename: the target is never half-written. */
+function replaceFileAtomic0600(dir, finalName, bytes, beforeRename) {
+  const tmp = join(dir, `.${finalName}.${randomBytes(8).toString('hex')}.tmp`)
+  let fd
+  try {
+    fd = createFile0600(tmp)
+    writeAll(fd, bytes)
+    fsyncSync(fd)
+    closeSync(fd)
+    fd = undefined
+    if (beforeRename) beforeRename()
+    renameSync(tmp, join(dir, finalName))
+    fsyncDir(dir)
+  } catch (e) {
+    if (fd !== undefined) closeSync(fd)
+    try { unlinkSync(tmp) } catch { /* already gone */ }
+    throw e
+  }
+}
+
+// ------------------------------------------------------------------ the host key file
+export function mupotDir(home) {
+  return join(home, '.mupot')
+}
+export function hostKeyPath(home) {
+  return join(mupotDir(home), 'host-key.json')
 }
 
 export function loadHostKey(home) {
@@ -203,73 +300,167 @@ export function loadHostKey(home) {
   }
 }
 
-function ensureDir(path, what) {
-  if (!existsSync(path)) mkdirSync(path, { recursive: true, mode: 0o700 })
-  const st = lstatSync(path)
-  if (st.isSymbolicLink() || !st.isDirectory()) throw new DropError(`${what} is not a plain directory`)
-  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw new DropError(`${what} is not owned by this user`)
-  if (st.mode & 0o022) throw new DropError(`${what} is group/world writable; refusing to use it`)
+export function keygen(home, { rotate = false } = {}) {
+  const path = hostKeyPath(home)
+  ensureParentDir(mupotDir(home), '~/.mupot')
+  if (lstatExists(path) && !rotate) {
+    throw new DropError(`a host key already exists at ${path}; pass --rotate to replace it (drops sealed to the old key become unreadable)`)
+  }
+  const { privateKey } = generateKeyPairSync('x25519')
+  const jwk = privateKey.export({ format: 'jwk' })
+  const body = Buffer.from(`${JSON.stringify({ kty: 'OKP', crv: 'X25519', d: jwk.d, x: jwk.x })}\n`)
+  replaceFileAtomic0600(mupotDir(home), 'host-key.json', body, () => {
+    const st = lstatOrNull(path)
+    if (st && st.isSymbolicLink()) throw new DropError('refusing to replace a symlink')
+  })
+  return loadHostKey(home)
 }
 
-function fsyncDir(path) {
+// ------------------------------------------------------------------ the pinned agent (which agent this host serves)
+export const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
+export function validateAgentId(v) {
+  if (typeof v !== 'string' || !AGENT_ID_RE.test(v)) throw new DropError('invalid agent id')
+  return v
+}
+export function agentPinPath(home) {
+  return join(mupotDir(home), 'agent.json')
+}
+/** The agent id this host is pinned to (written once, by `register`, from the answer to the agent's OWN token). */
+export function loadAgentPin(home) {
+  const path = agentPinPath(home)
   let fd
   try {
-    fd = openSync(path, constants.O_RDONLY)
-    fsyncSync(fd)
-  } catch {
-    // best effort: directory fsync is not supported everywhere
+    fd = openNoFollow(path, constants.O_RDONLY)
+  } catch (e) {
+    if (e && e.code === 'ENOENT') throw new DropError('this host is not pinned to an agent yet; run register first')
+    throw new DropError(`cannot open the agent pin (${e && e.code ? e.code : 'error'})`)
+  }
+  try {
+    mode600Regular(fd, 'agent pin')
+    let j
+    try { j = JSON.parse(readFileSync(fd, 'utf8')) } catch { throw new DropError('agent pin is not valid JSON') }
+    return validateAgentId(j && j.agent_id)
   } finally {
-    if (fd !== undefined) closeSync(fd)
+    closeSync(fd)
   }
 }
-
-/** Write bytes to dir/name atomically (tmp + rename), mode 0600, never through a symlink. */
-export function writeFileAtomic0600(dir, name, bytes) {
-  validateName(name)
-  const target = join(dir, name)
-  const refuseUnsafeTarget = () => {
-    let st
-    try {
-      st = lstatSync(target)
-    } catch (e) {
-      if (e && e.code === 'ENOENT') return
-      throw e
-    }
-    if (st.isSymbolicLink()) throw new DropError('refusing to overwrite a symlink')
-    if (!st.isFile()) throw new DropError('refusing to overwrite a non-regular file')
+export function pinAgent(home, agentId) {
+  validateAgentId(agentId)
+  ensureParentDir(mupotDir(home), '~/.mupot')
+  const path = agentPinPath(home)
+  if (lstatExists(path)) {
+    const pinned = loadAgentPin(home)
+    if (pinned !== agentId) throw new DropError(`this host is pinned to agent ${pinned}; refusing to re-pin it to ${agentId}`)
+    return
   }
-  refuseUnsafeTarget()
-  const tmp = join(dir, `.${name}.${randomBytes(8).toString('hex')}.tmp`)
+  replaceFileAtomic0600(mupotDir(home), 'agent.json', Buffer.from(`${JSON.stringify({ v: 1, agent_id: agentId })}\n`))
+}
+
+// ------------------------------------------------------------------ the secrets tree and its manifest
+// Everything this script writes lives in ~/.mupot/secrets/<agent id>/ , a directory IT creates 0700. It never touches
+// ~/.sos/keys or any other file, and it will not replace or shred a file it did not create: a 0600 manifest records, per
+// name, the drop id and the sha256 of every version it wrote. A file absent from the manifest, or whose hash differs, is
+// someone else's (or was edited) and is refused. (All agents on a shared host run as one Unix user; the manifest is
+// what keeps one agent's governor from replacing or shredding another agent's, or an operator's, files.)
+export function secretsDir(home, agentId) {
+  return join(mupotDir(home), 'secrets', validateAgentId(agentId))
+}
+export function ensureSecretsDir(home, agentId) {
+  ensureParentDir(mupotDir(home), '~/.mupot')
+  ensureOwnDir(join(mupotDir(home), 'secrets'), '~/.mupot/secrets')
+  const dir = secretsDir(home, agentId)
+  ensureOwnDir(dir, `~/.mupot/secrets/${agentId}`)
+  return dir
+}
+const MANIFEST = '.manifest.json'
+const sha256Hex = (buf) => createHash('sha256').update(buf).digest('hex')
+
+function loadManifest(dir) {
+  const path = join(dir, MANIFEST)
   let fd
   try {
-    fd = openNoFollow(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
-    let off = 0
-    while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off)
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    refuseUnsafeTarget() // again, as late as possible; rename itself never follows a symlink at the target
-    renameSync(tmp, target)
-    fsyncDir(dir)
+    fd = openNoFollow(path, constants.O_RDONLY)
   } catch (e) {
-    if (fd !== undefined) closeSync(fd)
-    try { unlinkSync(tmp) } catch { /* already gone */ }
-    throw e
+    if (e && e.code === 'ENOENT') return { v: 1, files: {} }
+    throw new DropError(`cannot open the manifest (${e && e.code ? e.code : 'error'})`)
+  }
+  try {
+    mode600Regular(fd, 'manifest')
+    let j
+    try { j = JSON.parse(readFileSync(fd, 'utf8')) } catch { throw new DropError('manifest is not valid JSON') }
+    if (!j || j.v !== 1 || typeof j.files !== 'object' || j.files === null || Array.isArray(j.files)) throw new DropError('manifest has an unknown shape')
+    const files = Object.create(null)
+    for (const [name, e] of Object.entries(j.files)) {
+      if (!NAME_RE.test(name) || !e || typeof e.drop_id !== 'string' || !Array.isArray(e.hashes) || !e.hashes.every((h) => typeof h === 'string' && /^[0-9a-f]{64}$/.test(h))) {
+        throw new DropError('manifest has a malformed entry')
+      }
+      files[name] = { drop_id: e.drop_id, hashes: e.hashes, written_at: typeof e.written_at === 'string' ? e.written_at : '' }
+    }
+    return { v: 1, files }
+  } finally {
+    closeSync(fd)
   }
 }
-
-/** Overwrite with random bytes (same length), fsync, unlink. A missing file is already shredded. */
-export function shredFile(dir, name) {
-  validateName(name)
-  const target = join(dir, name)
-  let st
+function saveManifest(dir, manifest) {
+  replaceFileAtomic0600(dir, MANIFEST, Buffer.from(`${JSON.stringify({ v: 1, files: manifest.files })}\n`))
+}
+function hashFileNoFollow(path) {
+  const fd = openNoFollow(path, constants.O_RDONLY)
   try {
-    st = lstatSync(target)
-  } catch (e) {
-    if (e && e.code === 'ENOENT') return 'absent'
-    throw e
+    return sha256Hex(readFileSync(fd))
+  } finally {
+    closeSync(fd)
   }
-  if (st.isSymbolicLink() || !st.isFile()) throw new DropError('refusing to shred a symlink or non-regular file')
+}
+/** Refuse unless dir/name is absent or a regular file this script wrote (manifest hash match). Returns the manifest entry, if any. */
+function assertOursOrAbsent(dir, name, manifest) {
+  const target = join(dir, name)
+  const st = lstatOrNull(target)
+  if (!st) return null
+  if (st.isSymbolicLink()) throw new DropError('refusing to overwrite a symlink')
+  if (!st.isFile()) throw new DropError('refusing to overwrite a non-regular file')
+  const entry = manifest.files[name]
+  if (!entry) throw new DropError('refusing to replace a file secure-drop did not create')
+  if (!entry.hashes.includes(hashFileNoFollow(target))) throw new DropError('refusing to replace a file that changed since secure-drop wrote it')
+  return entry
+}
+
+/** Write a secret into the secrets dir: only over its own earlier version, atomically, 0600, manifest first (crash-safe). */
+export function writeSecret(dir, name, dropId, bytes) {
+  validateName(name)
+  const manifest = loadManifest(dir)
+  const prior = assertOursOrAbsent(dir, name, manifest)
+  const hash = sha256Hex(bytes)
+  const writtenAt = new Date().toISOString()
+  // 1. the manifest learns the new hash BEFORE the file changes, so a crash between the steps never orphans our own file.
+  manifest.files[name] = { drop_id: dropId, hashes: [...new Set([...(prior ? prior.hashes : []), hash])], written_at: writtenAt }
+  saveManifest(dir, manifest)
+  // 2. the file, atomically; the target is re-checked as late as possible (rename itself never follows a symlink).
+  replaceFileAtomic0600(dir, name, bytes, () => assertOursOrAbsent(dir, name, manifest))
+  // 3. only the new version is current.
+  manifest.files[name] = { drop_id: dropId, hashes: [hash], written_at: writtenAt }
+  saveManifest(dir, manifest)
+}
+
+/**
+ * Shred dir/name: overwrite in place with random bytes of the same length, fsync, unlink, forget it. Only a file this
+ * script wrote and that is unchanged. With `dropId`, a file that now belongs to a DIFFERENT (newer) drop is left alone
+ * ('superseded'): a stale revoke can never destroy a newer credential. A missing file is already shredded ('absent').
+ */
+export function shredSecret(dir, name, { dropId } = {}) {
+  validateName(name)
+  const manifest = loadManifest(dir)
+  const target = join(dir, name)
+  const st = lstatOrNull(target)
+  if (!st) {
+    if (manifest.files[name] && (!dropId || manifest.files[name].drop_id === dropId)) {
+      delete manifest.files[name]
+      saveManifest(dir, manifest)
+    }
+    return 'absent'
+  }
+  const entry = assertOursOrAbsent(dir, name, manifest)
+  if (dropId && entry.drop_id !== dropId) return 'superseded'
   const fd = openNoFollow(target, constants.O_WRONLY)
   try {
     const size = fstatSync(fd).size
@@ -284,44 +475,9 @@ export function shredFile(dir, name) {
   }
   unlinkSync(target)
   fsyncDir(dir)
+  delete manifest.files[name]
+  saveManifest(dir, manifest)
   return 'shredded'
-}
-
-export function keysDir(home) {
-  return join(home, '.sos', 'keys')
-}
-
-// ------------------------------------------------------------------ keygen
-export function keygen(home, { rotate = false } = {}) {
-  const path = hostKeyPath(home)
-  const dir = join(home, '.mupot')
-  ensureDir(dir, '~/.mupot')
-  if (existsSync(path) || lstatExists(path)) {
-    if (!rotate) throw new DropError(`a host key already exists at ${path}; pass --rotate to replace it (drops sealed to the old key become unreadable)`)
-  }
-  const { privateKey } = generateKeyPairSync('x25519')
-  const jwk = privateKey.export({ format: 'jwk' })
-  const body = Buffer.from(`${JSON.stringify({ kty: 'OKP', crv: 'X25519', d: jwk.d, x: jwk.x })}\n`)
-  const tmp = join(dir, `.host-key.${randomBytes(8).toString('hex')}.tmp`)
-  let fd
-  try {
-    fd = openNoFollow(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
-    writeSync(fd, body, 0, body.length)
-    fsyncSync(fd)
-    closeSync(fd)
-    fd = undefined
-    if (lstatExists(path) && lstatSync(path).isSymbolicLink()) throw new DropError('refusing to replace a symlink')
-    renameSync(tmp, path)
-    fsyncDir(dir)
-  } catch (e) {
-    if (fd !== undefined) closeSync(fd)
-    try { unlinkSync(tmp) } catch { /* already gone */ }
-    throw e
-  }
-  return loadHostKey(home)
-}
-function lstatExists(p) {
-  try { lstatSync(p); return true } catch { return false }
 }
 
 // ------------------------------------------------------------------ token + transport (same rules as cli/mupot.mjs)
@@ -384,7 +540,7 @@ export function resolveTarget({ home, env, pot: potFlag, api: apiFlag }) {
   const bound = parseApi(entry && typeof entry.api === 'string' ? entry.api : DEFAULT_API)
   const url = apiFlag !== undefined ? parseApi(apiFlag) : bound
   const defPath = join(home, '.config', 'mupot', `${pot}.token`)
-  const ownPath = entry && typeof entry.token_file === 'string' ? expandHome(home, entry.token_file) : existsSync(defPath) ? defPath : undefined
+  const ownPath = entry && typeof entry.token_file === 'string' ? expandHome(home, entry.token_file) : lstatExists(defPath) ? defPath : undefined
   let token = null
   if (ownPath !== undefined) {
     // A pot's own credential is bound to the origin its config declares and is never re-aimed.
@@ -444,10 +600,12 @@ async function callTool(io, target, name, args) {
 }
 
 // ------------------------------------------------------------------ pull
-function openDrop(hostKey, drop) {
+function openDrop(hostKey, agentId, drop) {
   if (!drop || typeof drop !== 'object') throw new DropError('malformed drop')
   const name = validateName(drop.name)
   if (typeof drop.id !== 'string' || !UUID_RE.test(drop.id)) throw new DropError('malformed drop id')
+  // A drop for another agent is not ours, whatever the server says; the agent id is also bound into the HPKE info below.
+  if (drop.agent_id !== agentId) throw new DropError('drop belongs to a different agent than this host is pinned to')
   // The fingerprint is OURS. A server that names a different one is substituting keys or is confused: refuse.
   if (typeof drop.host_key_fingerprint !== 'string' || drop.host_key_fingerprint.replace(/\s+/g, '').toLowerCase() !== hostKey.fingerprint) {
     throw new DropError('drop was sealed to a different host key than this host holds')
@@ -455,47 +613,33 @@ function openDrop(hostKey, drop) {
   const enc = b64uDecode(drop.enc, 'enc')
   const ct = b64uDecode(drop.ct, 'ct')
   if (ct.length > MAX_CT_BYTES) throw new DropError('ciphertext too large')
-  const info = Buffer.from(`${INFO_PREFIX}${drop.id}|${hostKey.fingerprint}`)
+  // agent id + drop id + NAME + fingerprint are all inside the HPKE info: a relabelled drop (another name, another agent)
+  // does not open, so the name that picks the file is cryptographically the one the human saw.
+  const info = Buffer.from(dropInfo(agentId, drop.id, name, hostKey.fingerprint))
   const plaintext = hpkeOpen({ privateKey: hostKey.privateKey, enc, info, aad: Buffer.from(drop.id), ct })
   return { name, plaintext }
 }
 
 export async function pull({ home, env, pot, api, fetch: fetchFn, out }) {
   const hostKey = loadHostKey(home)
+  const agentId = loadAgentPin(home)
   const target = resolveTarget({ home, env, pot, api })
   const io = { fetch: fetchFn }
-  const dir = keysDir(home)
   const res = await callTool(io, target, 'secure_drop_pull', {})
   const drops = Array.isArray(res.drops) ? res.drops : []
   const revokes = Array.isArray(res.revokes) ? res.revokes : []
   let failed = 0
-  for (const drop of drops) {
-    const idForLog = drop && typeof drop.id === 'string' && UUID_RE.test(drop.id) ? drop.id : '(invalid id)'
-    let plaintext
-    try {
-      const opened = openDrop(hostKey, drop)
-      plaintext = opened.plaintext
-      ensureDir(join(home, '.sos'), '~/.sos')
-      ensureDir(dir, '~/.sos/keys')
-      writeFileAtomic0600(dir, opened.name, plaintext)
-      // The file is durable (fsynced + renamed): only now is the drop acknowledged, which deletes the ciphertext.
-      await callTool(io, target, 'secure_drop_ack', { id: drop.id })
-      out(`delivered ${opened.name} (${plaintext.length} bytes) -> ${join(dir, opened.name)}`)
-    } catch (e) {
-      failed += 1
-      out(`skipped ${idForLog}: ${e instanceof DropError ? e.message : 'unexpected error'}`)
-    } finally {
-      if (plaintext) plaintext.fill(0)
-    }
-  }
+  let dir
+  const ready = () => { dir = dir ?? ensureSecretsDir(home, agentId); return dir }
+  // REVOKES FIRST. A rotation delivers a new credential under the same name as an older revoked one; processing the
+  // shred after the write would destroy the new file. (The manifest's drop id is a second guard: a revoke for an older
+  // drop never touches a file that now belongs to a newer one.)
   for (const rv of revokes) {
     const idForLog = rv && typeof rv.id === 'string' && UUID_RE.test(rv.id) ? rv.id : '(invalid id)'
     try {
       const name = validateName(rv && rv.name)
       if (typeof rv.id !== 'string' || !UUID_RE.test(rv.id)) throw new DropError('malformed revoke id')
-      ensureDir(join(home, '.sos'), '~/.sos')
-      ensureDir(dir, '~/.sos/keys')
-      const r = shredFile(dir, name)
+      const r = shredSecret(ready(), name, { dropId: rv.id })
       await callTool(io, target, 'secure_drop_ack', { id: rv.id })
       out(`${r} ${name} (revoked)`)
     } catch (e) {
@@ -503,24 +647,47 @@ export async function pull({ home, env, pot, api, fetch: fetchFn, out }) {
       out(`skipped revoke ${idForLog}: ${e instanceof DropError ? e.message : 'unexpected error'}`)
     }
   }
+  for (const drop of drops) {
+    const idForLog = drop && typeof drop.id === 'string' && UUID_RE.test(drop.id) ? drop.id : '(invalid id)'
+    let plaintext
+    try {
+      const opened = openDrop(hostKey, agentId, drop)
+      plaintext = opened.plaintext
+      const d = ready()
+      writeSecret(d, opened.name, drop.id, plaintext)
+      // The file is durable (fsynced + renamed, manifest updated): only now is the drop acknowledged, which deletes the ciphertext.
+      await callTool(io, target, 'secure_drop_ack', { id: drop.id })
+      out(`delivered ${opened.name} (${plaintext.length} bytes) -> ${join(d, opened.name)}`)
+    } catch (e) {
+      failed += 1
+      out(`skipped ${idForLog}: ${e instanceof DropError ? e.message : 'unexpected error'}`)
+    } finally {
+      if (plaintext) plaintext.fill(0)
+    }
+  }
   if (drops.length === 0 && revokes.length === 0) out('nothing pending')
   return failed === 0 ? 0 : 1
 }
 
-export async function register({ home, env, pot, api, fetch: fetchFn, out }) {
+export async function register({ home, env, pot, api, agent, fetch: fetchFn, out }) {
   const hostKey = loadHostKey(home)
   const target = resolveTarget({ home, env, pot, api })
   const res = await callTool({ fetch: fetchFn }, target, 'host_key_register', { public_key: hostKey.publicB64u })
-  out(`registered host key ${groupFingerprint(hostKey.fingerprint)}${res && res.rotated ? ' (rotated; the previous key is revoked)' : ''}`)
+  const agentId = validateAgentId(res && res.agent_id)
+  if (agent !== undefined && agent !== agentId) throw new DropError(`the server says this token is agent ${agentId}, not ${agent}`)
+  pinAgent(home, agentId)
+  out(`registered host key ${groupFingerprint(hostKey.fingerprint)} for agent ${agentId}${res && res.rotated ? ' (rotated; the previous key is revoked)' : ''}`)
+  if (res && typeof res.governors_notified === 'number') out(`governors notified: ${res.governors_notified}`)
   return 0
 }
 
 // ------------------------------------------------------------------ CLI
 const USAGE = `usage: secure-drop.mjs <command> [options]
   keygen [--rotate]      create ~/.mupot/host-key.json and print the public key + fingerprint
-  register               register the host public key with mupot (uses the agent's token file)
-  pull                   fetch pending drops, write ~/.sos/keys/<name> (0600), ack; act on revokes
-  revoke <name>          shred ~/.sos/keys/<name>
+  register [--agent id]  register the host public key with mupot (uses the agent's token file) and pin this host to that agent
+  pull                   fetch pending drops, write ~/.mupot/secrets/<agent id>/<name> (0600), ack; act on revokes first
+  revoke <name>          shred ~/.mupot/secrets/<agent id>/<name> (only a file this script wrote)
+  path <name>            print where <name> is written (never its content)
 options: --pot <name>  --api <url>   (the token is read from a 0600 file; it is never accepted on the command line)`
 
 export async function main(argv, io = {}) {
@@ -533,7 +700,7 @@ export async function main(argv, io = {}) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--rotate') opts.rotate = true
-    else if (a === '--pot' || a === '--api') {
+    else if (a === '--pot' || a === '--api' || a === '--agent') {
       if (i + 1 >= argv.length) { out(`${a} needs a value`); return 2 }
       opts[a.slice(2)] = argv[++i]
     } else if (/^--(token|bearer|secret|password)/i.test(a)) {
@@ -547,16 +714,19 @@ export async function main(argv, io = {}) {
       const k = keygen(home, { rotate: opts.rotate === true })
       out(`public_key: ${k.publicB64u}`)
       out(`fingerprint: ${groupFingerprint(k.fingerprint)}`)
-      out('Compare this fingerprint with the one the secure page shows before pasting a secret.')
+      out('Give this fingerprint to whoever will paste the secret OUT OF BAND (not through the agent). They compare it with the secure page.')
       return 0
     }
-    if (cmd === 'register' && rest.length === 0) return await register({ home, env, pot: opts.pot, api: opts.api, fetch: fetchFn, out })
+    if (cmd === 'register' && rest.length === 0) return await register({ home, env, pot: opts.pot, api: opts.api, agent: opts.agent, fetch: fetchFn, out })
     if (cmd === 'pull' && rest.length === 0) return await pull({ home, env, pot: opts.pot, api: opts.api, fetch: fetchFn, out })
     if (cmd === 'revoke' && rest.length === 1) {
       const name = validateName(rest[0])
-      ensureDir(join(home, '.sos'), '~/.sos')
-      ensureDir(keysDir(home), '~/.sos/keys')
-      out(`${shredFile(keysDir(home), name)} ${name}`)
+      const dir = ensureSecretsDir(home, loadAgentPin(home))
+      out(`${shredSecret(dir, name)} ${name}`)
+      return 0
+    }
+    if (cmd === 'path' && rest.length === 1) {
+      out(join(secretsDir(home, loadAgentPin(home)), validateName(rest[0])))
       return 0
     }
   } catch (e) {
@@ -569,7 +739,7 @@ export async function main(argv, io = {}) {
 
 function isMain() {
   try {
-    return process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
   } catch {
     return false
   }

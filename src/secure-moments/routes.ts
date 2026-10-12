@@ -30,7 +30,7 @@ import {
 import { b64uDecode, b64uEncode, hex, sha256, verifyAssertion, verifyRegistration } from './webauthn'
 import { DECIDE_SCRIPT, ENROL_SCRIPT } from './client'
 import { secureDropStatus, DROP_ENC_BYTES, DROP_MAX_CIPHERTEXT_BYTES, DROP_MAX_PLAINTEXT_BYTES } from '../secure-drop/config'
-import { decideDrop, decodeSealed, loadDrop, loadHostKeyById, sealedDigest, type DropRow } from '../secure-drop/store'
+import { decideDrop, decodeSealed, loadDrop, loadHostKeyById, loadHostKeyHistory, sealedDigest, type DropRow } from '../secure-drop/store'
 import { loadAgent, mayGovernAgent } from '../secure-drop/authority'
 import { credentialViewInner } from '../secure-drop/page'
 import { CREDENTIAL_SCRIPT, HPKE_ASSET } from '../secure-drop/client'
@@ -381,13 +381,13 @@ momentsApp.get('/m/:id/:token', async (c) => {
   if (subject.kind === 'credential') {
     const hostKey = await loadHostKeyById(c.env, subject.drop.host_key_id)
     const agent = await loadAgent(c.env, subject.drop.agent_id)
-    if (!hostKey || hostKey.revoked_at !== null || hostKey.agent_id !== subject.drop.agent_id || !agent) {
+    if (!hostKey || hostKey.revoked_at !== null || hostKey.agent_id !== subject.drop.agent_id || !agent || agent.status !== 'active') {
       return page(c, 410, 'Request closed', "The agent's host key changed after this request was made. Ask the agent to request the credential again.", 'warn')
     }
     const csrf = await issueBoundToken(c.env, CSRF_INFO, momentCsrfMessage(r.r.m.id, r.r.linkHash))
     if (!csrf) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for secure moments.')
     secure(c, true, true)
-    return c.html(renderPage('Provide a credential', `${credentialViewInner({ drop: subject.drop, agent, hostKey, csrf, maxBytes: DROP_MAX_PLAINTEXT_BYTES })}`,
+    return c.html(renderPage('Provide a credential', `${credentialViewInner({ drop: subject.drop, agent, hostKey, history: await loadHostKeyHistory(c.env, subject.drop.agent_id), nowMs: Date.now(), csrf, maxBytes: DROP_MAX_PLAINTEXT_BYTES })}`,
       { nonce: c.get('nonce'), code: CREDENTIAL_SCRIPT, srcs: [HPKE_ASSET] }))
   }
   let inner: string
@@ -535,6 +535,7 @@ async function decideCredential(
 ): Promise<Response> {
   const agent = await loadAgent(c.env, i.subject.agent_id)
   if (!agent) return fail(c, 409, 'The agent behind this request no longer exists.', 'Request closed')
+  if (agent.status !== 'active') return fail(c, 409, 'The agent behind this request is not active.', 'Request closed')
   if (!(await mayGovernAgent(c.env, i.auth, agent))) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')
   const hostKey = await loadHostKeyById(c.env, i.subject.host_key_id)
   if (i.p.decision === 'provide' && (!hostKey || hostKey.revoked_at !== null || hostKey.agent_id !== i.subject.agent_id)) {

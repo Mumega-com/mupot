@@ -5,7 +5,8 @@
 // Real migrated schema (sqlite-d1 harness); the browser bundle runs for real in a vm; the host opens with the real
 // fleet-runtime/secure-drop.mjs. Contract: docs/architecture/secure-moments.md ("W2: secure drops").
 import { createHash, generateKeyPairSync, webcrypto, type KeyObject } from 'node:crypto'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import vm from 'node:vm'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -20,6 +21,7 @@ import { linkLoginIdentity } from '../src/auth/login-identity'
 import { secureDropStatus } from '../src/secure-drop/config'
 import { DROP_NAME_RE, groupFingerprint, hpkeInfo, parseHostPublicKey } from '../src/secure-drop/keys'
 import { decideDrop, loadDrop, sealedDigest } from '../src/secure-drop/store'
+import { keyAssurance } from '../src/secure-drop/keys'
 import { HPKE_BUNDLE_JS, HPKE_BUNDLE_SHA256, HPKE_BUNDLE_SRI } from '../src/secure-drop/hpke-bundle.generated'
 // @ts-expect-error the host script is plain ESM JavaScript with no declaration file
 import * as hostScript from '../fleet-runtime/secure-drop.mjs'
@@ -126,12 +128,18 @@ function loadBundle(src: string = HPKE_BUNDLE_JS): Sealer {
   return sandbox.__out as Sealer
 }
 const bundle = loadBundle()
-async function sealFor(key: HostKey, dropId: string, plaintext: string = SECRET): Promise<{ enc: string; ct: string }> {
-  return bundle.seal(key.pub, hpkeInfo(dropId, key.fingerprint), dropId, new TextEncoder().encode(plaintext))
+/** agent id and name come from the stored request, exactly as the page's data attributes carry them. */
+function dropBinding(dropId: string): { agent: string; name: string } {
+  const r = one<{ agent_id: string; name: string }>('SELECT agent_id, name FROM secure_drops WHERE id = ?', dropId)
+  return { agent: r?.agent_id ?? 'agent-x', name: r?.name ?? 'bound-name' }
+}
+async function sealFor(key: HostKey, dropId: string, plaintext: string = SECRET, over: { agent?: string; name?: string } = {}): Promise<{ enc: string; ct: string }> {
+  const b = dropBinding(dropId)
+  return bundle.seal(key.pub, hpkeInfo(over.agent ?? b.agent, dropId, over.name ?? b.name, key.fingerprint), dropId, new TextEncoder().encode(plaintext))
 }
 const openWith = (key: HostKey, dropId: string, s: { enc: string; ct: string }): string =>
   Buffer.from(hostScript.hpkeOpen({
-    privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(hpkeInfo(dropId, key.fingerprint)),
+    privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(hpkeInfo(dropBinding(dropId).agent, dropId, dropBinding(dropId).name, key.fingerprint)),
     aad: Buffer.from(dropId), ct: Buffer.from(s.ct, 'base64url'),
   })).toString('utf8')
 
@@ -920,7 +928,7 @@ describe('the vendored browser bundle', () => {
     const flipped = Buffer.from(s.ct, 'base64url')
     flipped[0] ^= 1
     expect(() => openWith(key, id, { enc: s.enc, ct: flipped.toString('base64url') })).toThrow()
-    expect(() => hostScript.hpkeOpen({ privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(hpkeInfo(id, other.fingerprint)), aad: Buffer.from(id), ct: Buffer.from(s.ct, 'base64url') })).toThrow()
+    expect(() => hostScript.hpkeOpen({ privateKey: key.privateKey, enc: Buffer.from(s.enc, 'base64url'), info: Buffer.from(hpkeInfo(dropBinding(id).agent, id, dropBinding(id).name, other.fingerprint)), aad: Buffer.from(id), ct: Buffer.from(s.ct, 'base64url') })).toThrow()
   })
   it('every seal is a fresh sender context: same key, same secret, different enc and ciphertext', async () => {
     const key = newHostKey()
@@ -934,8 +942,311 @@ describe('the vendored browser bundle', () => {
     const key = newHostKey()
     expect(await bundle.fingerprint(key.pub)).toBe(key.fingerprint)
     expect(groupFingerprint(key.fingerprint)).toBe(hostScript.groupFingerprint(key.fingerprint))
-    expect(hpkeInfo('d', 'f')).toBe(`${hostScript.INFO_PREFIX}d|f`)
+    expect(hpkeInfo('a', 'd', 'n', 'f')).toBe(hostScript.dropInfo('a', 'd', 'n', 'f'))
+    expect(hpkeInfo('a', 'd', 'n', 'f')).toBe(`${hostScript.INFO_PREFIX}a|d|n|f`)
     // One name rule on both sides of the wire (and in the table CHECK).
     expect(hostScript.NAME_RE.source).toBe(DROP_NAME_RE.source)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// Round 2: rotation end to end, name/agent binding, key-change signals, pinned guards
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/** The real host script talking to the real tools: JSON-RPC in, invokeTool out, the same result shapes /mcp returns. */
+function bridge(which: 'x' | 'y' = 'x'): typeof fetch {
+  return (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { id: number; params: { name: string; arguments: Record<string, unknown> } }
+    const r = await invokeTool(agentAuth(which), env, body.params.name, body.params.arguments, 'https://pot.test')
+    const result = r.ok
+      ? { content: [{ type: 'text', text: JSON.stringify({ ok: true, result: r.result }) }], structuredContent: r.result }
+      : { isError: true, content: [], structuredContent: { ok: false, error: r.error } }
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }), { status: 200 })
+  }) as typeof fetch
+}
+
+interface Host { home: string; key: HostKey; secrets: string; out: string[]; pull: () => Promise<number> }
+async function hostFor(which: 'x' | 'y' = 'x'): Promise<Host> {
+  const home = mkdtempSync(join(tmpdir(), 'secure-drop-e2e-'))
+  const cfg = join(home, '.config', 'mupot')
+  rmSync(cfg, { recursive: true, force: true })
+  const { mkdirSync } = await import('node:fs')
+  mkdirSync(cfg, { recursive: true, mode: 0o700 })
+  writeFileSync(join(cfg, 'mumega.token'), 'tok_e2e_0123456789abcdef\n', { mode: 0o600 })
+  chmodSync(join(cfg, 'mumega.token'), 0o600)
+  const out: string[] = []
+  const sink = (l: string) => { out.push(l) }
+  expect(await hostScript.main(['keygen'], { home, env: {}, out: sink })).toBe(0)
+  expect(await hostScript.main(['register'], { home, env: {}, fetch: bridge(which), out: sink })).toBe(0)
+  const k = hostScript.loadHostKey(home) as { privateKey: KeyObject; publicB64u: string; fingerprint: string }
+  const agent = which === 'x' ? 'agent-x' : 'agent-y'
+  return {
+    home, out, key: { privateKey: k.privateKey, pub: k.publicB64u, fingerprint: k.fingerprint }, secrets: join(home, '.mupot', 'secrets', agent),
+    pull: () => hostScript.main(['pull'], { home, env: {}, fetch: bridge(which), out: sink }) as Promise<number>,
+  }
+}
+
+describe('P1-1: rotation end to end (real host script, real tools, real page ceremony)', () => {
+  it('revoke -> re-request -> provide -> ONE pull: the new credential survives and the old revoke resolves', async () => {
+    const host = await hostFor()
+    try {
+      const a = await enrol('mem-owner', identities.owner)
+      const m1 = await request('cloud-key')
+      expect((await decide(m1, a, { decision: 'provide', ...(await sealFor(host.key, m1.dropId, 'credential-v1')) })).status).toBe(200)
+      expect(await host.pull()).toBe(0)
+      expect(readFileSync(join(host.secrets, 'cloud-key'), 'utf8')).toBe('credential-v1')
+      expect(dropStatus(m1.dropId)).toBe('delivered')
+      // the human revokes v1, then the agent asks again and the human provides v2
+      expect((await tool(ownerAuth(), 'secure_drop_revoke', { name: 'cloud-key' })).ok).toBe(true)
+      const m2 = await request('cloud-key')
+      expect((await decide(m2, a, { decision: 'provide', ...(await sealFor(host.key, m2.dropId, 'credential-v2')) })).status).toBe(200)
+      // the server omits the stale revoke while a newer drop of that name is ready
+      const listed = await tool(agentAuth(), 'secure_drop_pull', {})
+      expect(listed.result?.revokes).toEqual([])
+      expect((listed.result?.drops as unknown[]).length).toBe(1)
+      expect(await host.pull()).toBe(0)
+      expect(readFileSync(join(host.secrets, 'cloud-key'), 'utf8')).toBe('credential-v2')
+      expect(dropStatus(m2.dropId)).toBe('delivered')
+      // the next pull closes v1's revoke (its file was replaced by v2), and still leaves v2 alone
+      expect(await host.pull()).toBe(0)
+      expect(dropStatus(m1.dropId)).toBe('revoked')
+      expect(readFileSync(join(host.secrets, 'cloud-key'), 'utf8')).toBe('credential-v2')
+      expect((await tool(agentAuth(), 'secure_drop_pull', {})).result?.revokes).toEqual([])
+    } finally { rmSync(host.home, { recursive: true, force: true }) }
+  })
+  it('if the newer drop expires unpulled, the OLD revoke comes back (the old file still needs its shred)', async () => {
+    const host = await hostFor()
+    try {
+      const a = await enrol('mem-owner', identities.owner)
+      const m1 = await request('cloud-key')
+      expect((await decide(m1, a, { decision: 'provide', ...(await sealFor(host.key, m1.dropId, 'credential-v1')) })).status).toBe(200)
+      expect(await host.pull()).toBe(0)
+      expect((await tool(ownerAuth(), 'secure_drop_revoke', { name: 'cloud-key' })).ok).toBe(true)
+      const m2 = await request('cloud-key')
+      expect((await decide(m2, a, { decision: 'provide', ...(await sealFor(host.key, m2.dropId, 'credential-v2')) })).status).toBe(200)
+      expect((await tool(agentAuth(), 'secure_drop_pull', {})).result?.revokes).toEqual([])
+      harness.sqlite.prepare("UPDATE secure_drops SET retain_until = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(m2.dropId)
+      const after = await tool(agentAuth(), 'secure_drop_pull', {})
+      expect(after.result?.drops).toEqual([])
+      expect(after.result?.revokes).toEqual([{ id: m1.dropId, name: 'cloud-key' }])
+      expect(await host.pull()).toBe(0)
+      expect(readdirSync(host.secrets).includes('cloud-key')).toBe(false)
+    } finally { rmSync(host.home, { recursive: true, force: true }) }
+  })
+})
+
+describe('P1-2: name and agent are bound into the ciphertext; the host writes only its own files', () => {
+  it('the page carries the agent id and name the sealer binds, and the script builds the v2 info', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request('db-pass')
+    const html = await (await hit(m.path)).text()
+    expect(html).toContain('data-agent-id="agent-x"')
+    expect(html).toContain('data-name="db-pass"')
+    expect(html).toContain(`data-drop-id="${m.dropId}"`)
+    expect(html).toContain("'mupot-secure-drop/v2|'+agentId+'|'+dropId+'|'+dropName+'|'+fpOk")
+    expect(html).not.toContain('mupot-secure-drop/v1')
+  })
+  it('a drop RELABELLED in the database (another name) does not open on the host: no file, no ack, still pullable', async () => {
+    const host = await hostFor()
+    try {
+      const a = await enrol('mem-owner', identities.owner)
+      const m = await request('dev-db')
+      expect((await decide(m, a, { decision: 'provide', ...(await sealFor(host.key, m.dropId, 'dev-secret')) })).status).toBe(200)
+      harness.sqlite.prepare("UPDATE secure_drops SET name = 'prod-db' WHERE id = ?").run(m.dropId) // a compromised D1 writer
+      expect(await host.pull()).toBe(1)
+      expect(host.out.join('\n')).toMatch(/decryption failed/)
+      expect(existsSync(host.secrets) ? readdirSync(host.secrets).filter((f) => !f.startsWith('.')) : []).toEqual([])
+      expect(dropStatus(m.dropId)).toBe('ready')
+    } finally { rmSync(host.home, { recursive: true, force: true }) }
+  })
+  it('a server-ordered shred of a file the host did not create is refused (shared host, one Unix user)', async () => {
+    const host = await hostFor()
+    try {
+      const a = await enrol('mem-owner', identities.owner)
+      const m = await request('victim-key')
+      expect((await decide(m, a, { decision: 'provide', ...(await sealFor(host.key, m.dropId)) })).status).toBe(200)
+      expect(await host.pull()).toBe(0)
+      // another agent's / the operator's file with the same name in the same tree would be refused: simulate by editing ours
+      writeFileSync(join(host.secrets, 'victim-key'), 'replaced-by-someone-else', { mode: 0o600 })
+      expect((await tool(ownerAuth(), 'secure_drop_revoke', { name: 'victim-key' })).ok).toBe(true)
+      expect(await host.pull()).toBe(1)
+      expect(readFileSync(join(host.secrets, 'victim-key'), 'utf8')).toBe('replaced-by-someone-else')
+    } finally { rmSync(host.home, { recursive: true, force: true }) }
+  })
+})
+
+describe('P1-3: key changes are visible to the human and to the governors', () => {
+  const pageText = async (m: Request): Promise<string> => (await hit(m.path)).text()
+  it('the page shows when the key was registered, says to compare OUT OF BAND, and does not cry wolf for an old first key', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    harness.sqlite.prepare("UPDATE host_keys SET created_at = datetime('now', '-10 days')").run()
+    const m = await request()
+    const html = await pageText(m)
+    expect(html).toMatch(/This host key was registered 10 days ago/)
+    expect(html).toMatch(/host operator, out of band/)
+    expect(html).toMatch(/Do NOT take the reference from the agent/)
+    expect(html).not.toContain('WARNING')
+    expect(html).not.toContain('class="card status-bad"')
+  })
+  it('a key that CHANGED in the last 24 hours gets a prominent warning', async () => {
+    await registerKey(newHostKey())
+    await registerKey(newHostKey())
+    const m = await request()
+    const html = await pageText(m)
+    expect(html).toContain('WARNING: this agent&#39;s key CHANGED in the last 24 hours')
+    expect(html).toContain('It replaced 1 earlier key')
+    expect(html).toContain('class="card status-bad"')
+  })
+  it('an agent re-keyed more than once is warned about even when the last change is old', async () => {
+    await registerKey(newHostKey())
+    await registerKey(newHostKey())
+    await registerKey(newHostKey())
+    harness.sqlite.prepare("UPDATE host_keys SET created_at = datetime('now', '-5 days')").run()
+    const m = await request()
+    const html = await pageText(m)
+    expect(html).toContain('WARNING: this agent has been re-keyed 2 times')
+    expect(html).not.toContain('CHANGED in the last 24 hours')
+  })
+  it('keyAssurance is pure and bounded: first fresh key = no warning; rotation <24h = warning; >=2 rotations = warning', () => {
+    const now = Date.parse('2026-10-12T12:00:00.000Z')
+    expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 0 }, now).warn).toBe(false)
+    expect(keyAssurance({ liveCreatedAt: '2026-10-12T11:30:00.000Z', replacedCount: 1 }, now).warn).toBe(true)
+    expect(keyAssurance({ liveCreatedAt: '2026-10-10T11:30:00.000Z', replacedCount: 1 }, now).warn).toBe(false)
+    expect(keyAssurance({ liveCreatedAt: '2026-10-01T11:30:00.000Z', replacedCount: 2 }, now).warn).toBe(true)
+  })
+  it('every registration and rotation notifies the governors\' inbox (agents owned by squad/org admins), and writes a receipt', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status, owner_member_id) VALUES
+        ('agent-gov', 'squad-a', 'agent-gov', 'Governor Assistant', 'r', 'm', 'active', 'mem-sqadmin'),
+        ('agent-plain', 'squad-a', 'agent-plain', 'Plain Assistant', 'r', 'm', 'active', 'mem-plain'),
+        ('agent-gov-b', 'squad-b', 'agent-gov-b', 'Other Squad Assistant', 'r', 'm', 'active', 'mem-sqadmin-b');
+    `)
+    const inbox = (to: string): Array<{ body: string; from_agent: string; kind: string }> =>
+      all('SELECT body, from_agent, kind FROM agent_messages WHERE to_agent = ? ORDER BY seq', to)
+    const k1 = newHostKey()
+    const r1 = await tool(agentAuth(), 'host_key_register', { public_key: k1.pub })
+    expect(r1.result).toMatchObject({ governors_found: 1, governors_notified: 1 })
+    expect(inbox('agent-gov')).toHaveLength(1)
+    expect(inbox('agent-gov')[0].body).toContain(groupFingerprint(k1.fingerprint))
+    expect(inbox('agent-gov')[0].body).toMatch(/registered/)
+    expect(inbox('agent-gov')[0].body).toMatch(/OUT OF BAND/)
+    expect(inbox('agent-gov')[0].from_agent).toBe('mupot-secure-drop')
+    expect(inbox('agent-plain')).toHaveLength(0) // a plain member is not a governor
+    expect(inbox('agent-gov-b')).toHaveLength(0) // admin of ANOTHER squad is not a governor of this agent
+    // the same key again says nothing
+    await tool(agentAuth(), 'host_key_register', { public_key: k1.pub })
+    expect(inbox('agent-gov')).toHaveLength(1)
+    // a rotation says ROTATED
+    const k2 = newHostKey()
+    await tool(agentAuth(), 'host_key_register', { public_key: k2.pub })
+    expect(inbox('agent-gov')).toHaveLength(2)
+    expect(inbox('agent-gov')[1].body).toMatch(/ROTATED/)
+    expect(inbox('agent-gov')[1].body).toContain(groupFingerprint(k2.fingerprint))
+    expect(count('mutation_audit_entries', "operation = 'host_key_register'")).toBe(2)
+  })
+  it('a governor with no inbox agent is found but not reachable: the registration still works and the result says so', async () => {
+    const r = await tool(agentAuth(), 'host_key_register', { public_key: newHostKey().pub })
+    expect(r.ok).toBe(true)
+    expect(r.result).toMatchObject({ governors_found: 1, governors_notified: 0 }) // mem-sqadmin governs squad-a but owns no agent
+  })
+})
+
+describe('P2s', () => {
+  it('the password field is not a login form: new-password, password-manager opt-outs, and success does not hide the form', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request()
+    const html = await (await hit(m.path)).text()
+    expect(html).toMatch(/<input id="secret" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true"/)
+    expect(html).not.toContain('autocomplete="off"')
+    expect(html).not.toContain('form.hidden')
+    expect(html).not.toMatch(/hidden=true/)
+  })
+  it('a paused agent cannot be provided for: the page closes and a decision is refused without burning the link', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request()
+    const a = await enrol('mem-owner', identities.owner)
+    const s = await sealFor(key, m.dropId)
+    const csrf = await getCsrf(m)
+    const ch = await challenge(m, csrf, { decision: 'provide', ...s })
+    harness.sqlite.prepare("UPDATE agents SET status = 'paused' WHERE id = 'agent-x'").run()
+    expect((await hit(m.path)).status).not.toBe(200)
+    const res = await decide(m, a, { decision: 'provide', ...s }, { challenge: ch, csrf })
+    expect(res.status).toBe(409)
+    expect(momentStatus(m.momentId)).toBe('pending')
+    expect(dropStatus(m.dropId)).toBe('requested')
+  })
+})
+
+describe('batch guards pinned with tests that bypass the route pre-checks', () => {
+  async function setupDecide(): Promise<{ key: HostKey; m: Request; passkeyId: string; sealed: { encB64u: string; ctB64u: string; digestHex: string } }> {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request()
+    await enrol('mem-owner', identities.owner)
+    const passkeyId = one<{ id: string }>("SELECT id FROM member_passkeys WHERE member_id = 'mem-owner'")!.id
+    const s = await sealFor(key, m.dropId)
+    return { key, m, passkeyId, sealed: { encB64u: s.enc, ctB64u: s.ct, digestHex: await sealedDigest(Buffer.from(s.enc, 'base64url'), Buffer.from(s.ct, 'base64url')) } }
+  }
+  const direct = async (g: Awaited<ReturnType<typeof setupDecide>>, over: { token?: string } = {}): Promise<boolean> =>
+    decideDrop(env, {
+      momentId: g.m.momentId, token: over.token ?? g.m.token, drop: (await loadDrop(env, g.m.dropId))!, decision: 'provide', memberId: 'mem-owner',
+      passkeyId: g.passkeyId, sealed: g.sealed, fingerprint: g.key.fingerprint,
+    }, Date.now())
+  const untouched = (g: Awaited<ReturnType<typeof setupDecide>>): void => {
+    expect(momentStatus(g.m.momentId)).toBe('pending')
+    expect(dropStatus(g.m.dropId)).toBe('requested')
+    expect(one<{ ct_b64u: string | null }>('SELECT ct_b64u FROM secure_drops WHERE id = ?', g.m.dropId)?.ct_b64u).toBeNull()
+  }
+  it('the consume query checks the LINK HASH: a wrong link token consumes nothing and stores nothing', async () => {
+    const g = await setupDecide()
+    expect(await direct(g, { token: 'not-the-link-token' })).toBe(false)
+    untouched(g)
+    expect(await direct(g)).toBe(true)
+  })
+  it('the consume query checks the PASSKEY is unrevoked', async () => {
+    const g = await setupDecide()
+    harness.sqlite.prepare("UPDATE member_passkeys SET revoked_at = datetime('now') WHERE id = ?").run(g.passkeyId)
+    expect(await direct(g)).toBe(false)
+    untouched(g)
+  })
+  it('the consume query checks the passkey\'s LOGIN IDENTITY is live', async () => {
+    const g = await setupDecide()
+    harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
+    expect(await direct(g)).toBe(false)
+    untouched(g)
+  })
+  it('the consume query checks the moment is unexpired and the request is open', async () => {
+    const g = await setupDecide()
+    harness.sqlite.prepare("UPDATE secure_moments SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(g.m.momentId)
+    expect(await direct(g)).toBe(false)
+    expect(dropStatus(g.m.dropId)).toBe('requested')
+  })
+  it('ack checks the drop\'s OWN agent even when the host-key join would pass (inconsistent row: key of agent-y on agent-x\'s drop)', async () => {
+    const kx = newHostKey()
+    await registerKey(kx, 'x')
+    const m = await request()
+    const a = await enrol('mem-owner', identities.owner)
+    expect((await decide(m, a, { decision: 'provide', ...(await sealFor(kx, m.dropId)) })).status).toBe(200)
+    await registerKey(newHostKey(), 'y')
+    const yKey = one<{ id: string }>("SELECT id FROM host_keys WHERE agent_id = 'agent-y' AND revoked_at IS NULL")!.id
+    harness.sqlite.prepare('UPDATE secure_drops SET host_key_id = ? WHERE id = ?').run(yKey, m.dropId)
+    // agent-y's live key now "matches" the drop's host_key_id: only the drop's agent_id stands between y and the ack
+    expect(await tool(agentAuth('y'), 'secure_drop_ack', { id: m.dropId })).toMatchObject({ ok: false, error: 'nothing_to_ack' })
+    expect(dropStatus(m.dropId)).toBe('ready')
+  })
+  it('revoke refuses an agent-bound token even when its member row passes the active-human check', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request('cloud-key')
+    const a = await enrol('mem-owner', identities.owner)
+    expect((await decide(m, a, { decision: 'provide', ...(await sealFor(key, m.dropId)) })).status).toBe(200)
+    // a token whose member row IS a human (memberIsActiveHuman passes) but which is welded to an agent: only boundAgentId refuses it
+    const bound: AuthContext = { userId: 'u-owner', email: 'owner@x.test', role: 'owner', tenant: TENANT, channel: 'workspace', memberId: 'mem-owner', tokenId: 'tok-1', boundAgentId: 'agent-x' }
+    expect(await tool(bound, 'secure_drop_revoke', { name: 'cloud-key' })).toMatchObject({ ok: false, error: 'human_required' })
+    expect(dropStatus(m.dropId)).toBe('ready')
   })
 })

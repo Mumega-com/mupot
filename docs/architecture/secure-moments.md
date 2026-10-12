@@ -99,8 +99,9 @@ credential_request   --------> secure_drops(requested) + a 'credential' moment
                                                                     POST {enc, ciphertext} + passkey assertion
                                verifies passkey + authority,
                                ONE batch: consume moment + store ciphertext
-pull  <------------------------ {id, name, enc, ct, fingerprint}
-open with own key, write ~/.sos/keys/<name> (0600, atomic)
+pull  <------------------------ {revokes, drops: [{id, agent_id, name, enc, ct, fingerprint}]}
+shred revoked files FIRST, then open with own key,
+write ~/.mupot/secrets/<agent id>/<name> (0600, atomic)
 ack   ------------------------> ciphertext DELETED
 ```
 
@@ -121,7 +122,10 @@ What this protects: the chat, the model, the bot transcript, D1 backups, logs an
 
 What it does **not** protect against, by design:
 
-- **A compromised Worker.** The browser runs the sealer that the Worker serves, and it gets the host public key from the Worker. A Worker that serves a malicious page can seal to the attacker's key. The check that catches this is the **fingerprint**: the page shows the host key's fingerprint (and recomputes it in the browser from the key it would use), and the human compares it with the one `secure-drop.mjs keygen` printed on the host. Do the comparison. mupot cannot do it for you, because the page is the thing under suspicion.
+- **A compromised Worker.** The browser runs the sealer that the Worker serves, and it gets the host public key from the Worker. A Worker that serves a malicious page can seal to the attacker's key. The check that catches this is the **fingerprint**: the page shows the host key's fingerprint (and recomputes it in the browser from the key it would use), and the human compares it with a reference.
+
+  **The reference must come from the host operator, out of band.** It is the fingerprint `secure-drop.mjs keygen` printed on the host, handed over by whoever runs the host (in person, a separate channel, a ticket). It must **not** come from the agent or from the chat that carried the link: whoever can talk as the agent can also have registered a different key. mupot cannot make this comparison for you, because both the page and the agent are things under suspicion. With no independent reference, do not paste a secret.
+- **A stolen agent token.** It can call `host_key_register` and silently re-key the agent. W2 makes that visible rather than impossible: every registration or rotation is receipted, lands in the inbox of the agent's governors (below), and the credential page shows when the key was registered, how many keys it replaced, and a prominent warning when it changed in the last 24 hours or the agent has been re-keyed more than once. Requiring a passkey for key registration is a follow-up (see Limits).
 - **A compromised host.** Whoever controls the host reads its files. Revoke shreds the file; it cannot un-leak.
 - **A compromised passkey device or a human who pastes into the wrong page.**
 
@@ -131,7 +135,7 @@ HPKE RFC 9180, base mode: **DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-G
 
 - Host key: X25519. The wire form is the raw 32-byte public key as base64url without padding (43 characters). Small-order points are refused at registration.
 - Fingerprint: lowercase hex `sha256(raw 32-byte public key)`. Shown to humans as 16 groups of four hex digits.
-- `info = "mupot-secure-drop/v1|" + drop id + "|" + fingerprint (hex)`; `aad = drop id`. A ciphertext therefore opens only for that drop id and that host key.
+- `info = "mupot-secure-drop/v2|" + agent id + "|" + drop id + "|" + name + "|" + fingerprint (hex)`; `aad = drop id`. Everything the human saw on the page is inside the ciphertext: a ciphertext opens only for that agent, that request, that **name** and that host key. A drop relabelled by a compromised Worker or D1 writer (another name, another agent) does not open on the host, so the name that picks the file on the host is cryptographically the one the human approved. The page script builds this string from `data-agent-id` and `data-name`, which the server renders from the stored request; the host builds it from its pinned agent id and the drop's fields.
 - One sender context per secret, sealed once (sequence 0). Each attempt in the browser makes a fresh context and a fresh ephemeral key.
 - The host recomputes the fingerprint from **its own key** to build `info`. It never trusts a fingerprint the server names: a drop whose `host_key_fingerprint` differs from the host's own is refused (a key-substitution signal).
 - The WebAuthn challenge for a provide is bound server-side to `moment id + decision 'provide' + sha256(enc || ciphertext)` (raw bytes). The same bytes are digested again when the decision arrives, so a ciphertext swapped after the assertion consumes no challenge and stores nothing.
@@ -157,9 +161,9 @@ All agent tools take the agent id from the token (`auth.boundAgentId`), never fr
 
 | Tool | Caller | What it does |
 |---|---|---|
-| `host_key_register { public_key }` | the agent itself (agent-bound token) | Registers the host's public key. One live key per agent (partial UNIQUE index). The same key again is a no-op; a different key **rotates**: the old key is revoked and open requests and unpulled ciphertext sealed to it are closed in the same batch. A revoked key is never accepted again. |
+| `host_key_register { public_key }` | the agent itself (agent-bound token) | Registers the host's public key. One live key per agent (partial UNIQUE index). The same key again is a no-op; a different key **rotates**: the old key is revoked and open requests and unpulled ciphertext sealed to it are closed in the same batch. A revoked key is never accepted again. A new key or a rotation notifies the agent's governors (see below). |
 | `credential_request { name, purpose, scope_hint?, ttl_minutes? }` | the agent | Needs a live host key. Creates a `secure_drops` row and a `credential` moment; returns the one-time link, the request id and the grouped fingerprint. `name` is a filename slug `[a-z0-9][a-z0-9_-]{0,62}` (no dots, no slashes); `ttl_minutes` is 5 to 1440 (default 60). A re-request for the same name supersedes the open one; ciphertext still waiting for a pull blocks a new request; at most 10 open requests per agent. It never returns or accepts a secret. |
-| `secure_drop_pull {}` | the agent | Lazily purges expired rows, then returns `{drops: [{id, name, enc, ct, host_key_fingerprint}], revokes: [{id, name}]}` for **this agent's own drops sealed to its current live host key**. A drop sealed to a rotated key is never listed. |
+| `secure_drop_pull {}` | the agent | Lazily purges expired rows, then returns `{drops: [{id, agent_id, name, enc, ct, host_key_fingerprint}], revokes: [{id, name}]}` for **this agent's own drops sealed to its current live host key**. A drop sealed to a rotated key is never listed. |
 | `secure_drop_ack { id }` | the agent | A `ready` drop becomes `delivered` and `enc`/`ct` are set to NULL in the same statement (guarded; a replay changes nothing). A delivered drop with a pending revoke instruction becomes `revoked`. Another agent's id, an expired or unknown id are refused identically (`nothing_to_ack`). |
 | `secure_drop_revoke { name, agent_id? }` | a human (not agent-bound) who is org admin or admin on the agent's squad | An open request is cancelled and its link dies; unpulled ciphertext is deleted at once; a delivered credential gets a revoke instruction that the host acts on at its next pull (it shreds the file, then acks). A name that exists for several agents the caller governs needs `agent_id`. A caller with no authority gets the same `not_found` as for an unknown name. |
 
@@ -188,10 +192,30 @@ Then **one batch**: a guarded `UPDATE` consumes the moment (and repeats checks 2
 
 | Command | Does |
 |---|---|
-| `keygen [--rotate]` | Writes `~/.mupot/host-key.json` (mode 0600, X25519 private key as a JWK, atomic, refuses to replace an existing key without `--rotate`) and prints the public key and the fingerprint to compare with the page. |
-| `register` | Calls `host_key_register` with the agent's own token and **only the public key**. |
-| `pull` | Calls `secure_drop_pull`; for each drop validates the name (same slug rule) and the id, refuses it if the server-named fingerprint differs from the host's own, opens it with a hand-rolled RFC 9180 base-mode receiver, writes `~/.sos/keys/<name>` (tmp file, mode 0600, fsync, rename; refuses to overwrite a symlink or a non-regular file; refuses a keys directory that is a symlink or group/world writable), and only then calls `secure_drop_ack`. Revoke instructions shred the file and ack. It prints names and byte counts, never a secret. |
-| `revoke <name>` | Overwrites the file with random bytes of the same length, fsyncs and unlinks it. |
+| `keygen [--rotate]` | Writes `~/.mupot/host-key.json` (mode 0600, X25519 private key as a JWK, atomic, refuses to replace an existing key without `--rotate`) and prints the public key and the fingerprint. Give that fingerprint to the human out of band. |
+| `register [--agent id]` | Calls `host_key_register` with the agent's own token and **only the public key**, then **pins** this host to the agent id the server names (`~/.mupot/agent.json`, 0600). A host is never re-pinned to a different agent; `--agent` must match what the server says. |
+| `pull` | Needs the pin. Processes **revoke instructions first**, then drops. For each drop it validates the name (same slug rule) and the id, requires `agent_id` to equal the pinned agent, refuses it if the server-named fingerprint differs from the host's own, opens it with a hand-rolled RFC 9180 base-mode receiver (info as above), writes the file, updates the manifest, and only then calls `secure_drop_ack`. It prints names and byte counts, never a secret. |
+| `revoke <name>` | Overwrites the file with random bytes of the same length, fsyncs, unlinks it and forgets it (only a file this script wrote and that is unchanged). |
+| `path <name>` | Prints where `<name>` lives. |
+
+### Where the files go, and how a consumer reads them
+
+All agents on a host usually run as one Unix user, so a name picked by a server-side value must never reach a path the script does not own. secure-drop writes **only** into `~/.mupot/secrets/<agent id>/`, a directory it creates itself with mode 0700 (explicit `chmod`, so a umask or a default ACL cannot widen it; only the directories it created are mode-checked, `~/.mupot` itself may be shared). It never writes into `~/.sos/keys` or any other path. Every file it creates is opened exclusively without following symlinks and set to 0600 with an explicit `fchmod`.
+
+`~/.mupot/secrets/<agent id>/.manifest.json` (0600) records, per name, the drop id and the sha256 of every version the script wrote (the manifest learns the new hash before the file changes, so a crash never orphans the script's own file). The script refuses to **replace or shred** any file that is absent from the manifest, is a symlink or a non-regular file, or whose hash differs from what it wrote. So an operator's file, another tool's file, or a file edited since can never be overwritten or destroyed by a drop or a revoke instruction, however the name was chosen.
+
+A consumer reads `~/.mupot/secrets/<agent id>/<name>` directly (`secure-drop.mjs path <name>` prints the path), or points a symlink **at** that path from its own configuration (a symlink into the secrets tree is safe; the script only refuses symlinks inside it). A step that copies a secret to some other target path is deliberately not part of W2.
+
+### Revoke ordering and rotation
+
+A rotation is: revoke the old credential, ask again, provide the new one, under the same name. Two guards make that safe:
+
+- the **server** omits a revoke instruction for a name that has a newer drop (ready or delivered, not itself being revoked) for the same agent, and closes the stale instruction once the newer drop has been delivered. If the newer drop expires unpulled, the old revoke comes back, because the old file still needs its shred;
+- the **host** processes revokes before drops, and a revoke carries the drop id it was ordered for: if the file now belongs to a newer drop (manifest drop id differs) the revoke is acknowledged as `superseded` and the file is left alone.
+
+### Who is told about a key change
+
+`host_key_register` (new key or rotation; an unchanged key says nothing) writes the receipt, emits the `org.provisioned` bus event the other in-band provisioning writes use (`host_key_registered` / `host_key_rotated`), and delivers an inbox message through the same system-sender `sendAgentMessage` seam the wake router uses. The recipients are the **governors** of the agent: active human members with admin or owner capability on the agent's squad, its department or the org (the `capabilities` table, as `listOrgOwnerMemberIds` reads it), reached through the agents they own (`agents.owner_member_id`). The tool result reports `governors_found` and `governors_notified`. A governor who owns no agent, and an org owner who holds only the legacy role (no capability row), are not reachable this way; the bus event and the receipt still exist.
 
 Token rules are the CLI's (`cli/mupot.mjs`): the bearer token comes from a 0600 regular file (`~/.config/mupot/<pot>.token`, the pot's `token_file`, or `MUPOT_TOKEN_FILE` for the default pot), is never accepted on argv (`--token` and friends are refused), is never printed, and is sent only to the pot's own https origin (http only for loopback; redirects are refused).
 
@@ -202,6 +226,9 @@ Token rules are the CLI's (`cli/mupot.mjs`): the bearer token comes from a 0600 
 - One host key per agent. Two hosts for one agent are not supported (the second registration rotates the first).
 - No human can see the secret again once sent; there is no reveal. Revoke shreds the host file on the host's next pull, not synchronously.
 - A single sealed secret is limited to 8 KiB of plaintext.
-- The fingerprint comparison is a human step. If a human skips it, a compromised Worker defeats confidentiality (see the threat model).
+- The fingerprint comparison is a human step, and its reference must come from the host operator out of band. If a human skips it or takes the reference from the agent, a compromised Worker or a stolen agent token defeats confidentiality (see the threat model).
+- **Follow-up (not built):** registering or rotating a host key is authorised by the agent's own token alone. Gating it with a passkey (the key would be `pending` until a governor confirms it on the secure page) would remove the stolen-token re-key. W2 only makes the change visible; tracked as a follow-up issue on the PR.
+- A governor who owns no agent, and an owner with only the legacy role plane, are not reached by the inbox notice.
+- The credential password field opts out of password managers (`autocomplete="new-password"`, `data-1p-ignore`, `data-lpignore`, `data-bwignore`) and the form is left in place after success, so it does not look like a login that a manager should offer to save. Managers may still ignore these hints; the field is never submitted as a form field (the page script seals it and posts JSON).
 - Revoke goes through a human **bearer** token over MCP (authority is checked, but there is no passkey step-up on revoke). Revoking is the safe direction: it only removes access.
 - Clock-based expiry is lazy: expired rows are closed on the next request or pull, and an expired moment is never decidable in between.

@@ -15,6 +15,7 @@ import { memberIsActiveHuman } from '../access/identity'
 import { secureDropStatus, DROP_TTL_DEFAULT_MINUTES, DROP_TTL_MAX_MINUTES, DROP_TTL_MIN_MINUTES } from '../secure-drop/config'
 import { groupFingerprint, isValidDropName, parseHostPublicKey } from '../secure-drop/keys'
 import { loadAgent, mayGovernAgent, type AgentRow } from '../secure-drop/authority'
+import { notifyGovernorsOfHostKey } from '../secure-drop/notify'
 import {
   abandonRequest, ackDrop, attachMoment, createDropRequest, findRevokeCandidates, listPendingDrops, listPendingRevokes, loadLiveHostKey,
   purgeExpiredDrops, registerHostKey, revokeDrop,
@@ -65,14 +66,22 @@ const toolHostKeyRegister: ToolSpec = {
         ? fail(409, 'host_key_was_revoked', 'this key was registered and revoked before; generate a new one')
         : fail(409, 'host_key_conflict', 'another registration for this agent landed first; retry')
     }
+    // A new or rotated key tells the agent's governors (the stolen-token re-key signal). An unchanged key says nothing.
+    const notice = r.unchanged
+      ? { governors: 0, delivered: 0 }
+      : await notifyGovernorsOfHostKey(env, { agent: who.agent, byMemberId: who.memberId, fingerprint: r.fingerprint, rotated: r.rotated, keyId: r.id })
     return done({
       ok: true,
+      agent_id: who.agent.id,
+      agent_slug: who.agent.slug,
       host_key_id: r.id,
+      governors_found: notice.governors,
+      governors_notified: notice.delivered,
       fingerprint: r.fingerprint,
       fingerprint_grouped: groupFingerprint(r.fingerprint),
       rotated: r.rotated,
       unchanged: r.unchanged,
-      note: r.rotated ? 'The previous key is revoked; open requests and unpulled ciphertext sealed to it were closed.' : 'Compare this fingerprint with the one secure-drop.mjs keygen printed.',
+      note: r.rotated ? 'The previous key is revoked; open requests and unpulled ciphertext sealed to it were closed. The agent\'s governors were notified.' : 'Compare this fingerprint with the one secure-drop.mjs keygen printed. Humans must compare against a value from the host operator out of band, never one the agent relays.',
     })
   },
 }
