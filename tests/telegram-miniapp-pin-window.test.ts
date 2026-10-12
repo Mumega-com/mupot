@@ -982,8 +982,8 @@ function accountApp(e: Env): { app: Hono<{ Bindings: Env; Variables: { auth: Aut
   return { app, setAuth: (a) => { current = a } }
 }
 async function webAuth(memberId: string, identityId: string, reauth: boolean): Promise<AuthContext> {
-  await createWebSession(env, `raw-${memberId}-${reauth}-${Math.random()}`, { tenant: TENANT, memberId, loginIdentityId: identityId })
-  const hash = one<{ id_hash: string }>('SELECT id_hash FROM web_sessions WHERE member_id = ? ORDER BY created_at DESC', memberId)?.id_hash ?? ''
+  const created = await createWebSession(env, `raw-${memberId}-${reauth}-${Math.random()}`, { tenant: TENANT, memberId, loginIdentityId: identityId })
+  const hash = created.id_hash // by the row just created (several sessions of one member can share a created_at)
   if (reauth) await markRecentReauth(env, hash)
   return { userId: memberId, email: null, role: 'member', tenant: TENANT, channel: 'dashboard', memberId, webSessionMemberId: memberId, webSessionIdHash: hash } as AuthContext
 }
