@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { reissueMomentLink } from '../src/secure-moments/issue'
 import { mcpApp } from '../src/mcp'
 import { sha256Hex } from '../src/members/service'
 import type { AuthContext, Env } from '../src/types'
@@ -807,5 +808,271 @@ describe('round 2 survivors pinned', () => {
     const again = await call()
     expect(again.json.error?.code).toBe(-32042)
     expect(count('seed_attach_requests')).toBe(1) // the tool reused the request
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// W3.1: the plain-link fallback survives a client that declines or cancels the elicitation
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+describe('W3.1 plain-link fallback', () => {
+  const call = (env: Env, name: string, args: unknown, extra: Record<string, unknown>, bearer = 'tok-x') =>
+    rpc(env, 'tools/call', { name, arguments: args, _meta: modernMeta(), ...extra }, { bearer, headers: modernHeaders })
+  const first = async (env: Env, name = 'seed_attach_request', args: unknown = { seed: seedText }): Promise<string> =>
+    ((await call(env, name, args, {})).json.result as { requestState: string }).requestState
+  const act = (action: string) => ({ inputResponses: { secure_moment: { action } } })
+  const hashOf = (): string => one<{ link_token_sha256: string }>('SELECT link_token_sha256 FROM secure_moments')?.link_token_sha256 ?? ''
+  const audits = (): number => count('mutation_audit_entries', "operation = 'moment_link_rotate'")
+  const ACCESS = { ACCESS_APPROVE_ENABLED: '1', ACCESS_TEAM_DOMAIN: 'acme.cloudflareaccess.com', ACCESS_AUD: 'aud', ACCESS_CANONICAL_HOST: 'approve.example.test' } as Partial<Env>
+
+  async function expectFreshLink(r: Rpc, oldHash: string, action: string): Promise<string> {
+    expect(r.json.error).toBeUndefined()
+    const res = structured(r)
+    expect(res).toMatchObject({ ok: true, retry: true, status: 'pending', elicitation_action: action, link_reissue: 'ok' })
+    const url = String(res.approve_url)
+    expect(url).toMatch(new RegExp(`^https://${HOST}/m/[0-9a-f-]{36}/[A-Za-z0-9_-]+$`))
+    expect(String(res.note)).toMatch(/give approve_url to the human/)
+    const newHash = hashOf()
+    expect(newHash).not.toBe(oldHash) // the discarded link is dead
+    expect(await sha256Hex(url.split('/').at(-1) ?? '')).toBe(newHash) // and the returned one is the live one
+    expect(count('secure_moments')).toBe(1) // same moment, rotated, not a second one
+    return url
+  }
+
+  it.each(['cancel', 'decline'])('%s while pending: the agent gets a fresh approve_url, nothing new is filed', async (action) => {
+    const env = makeEnv()
+    const state = await first(env)
+    const old = hashOf()
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act(action) })
+    await expectFreshLink(r, old, action)
+    expect(count('seed_attach_requests')).toBe(1)
+    expect(structured(r).access_approve_url).toBeUndefined()
+    expect(audits()).toBe(1)
+  })
+
+  it.each([['missing inputResponses', {}], ['empty responses', { inputResponses: {} }], ['unrecognised action', act('approve')], ['wrong key', { inputResponses: { other: { action: 'accept' } } }]] as Array<[string, Record<string, unknown>]>)(
+    'anything but an explicit accept (%s) is treated as not accepted', async (_n, extra) => {
+      const env = makeEnv()
+      const state = await first(env)
+      const old = hashOf()
+      const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...extra })
+      expect(structured(r).link_reissue).toBe('ok')
+      expect(hashOf()).not.toBe(old)
+    })
+
+  it('elevation: cancel returns a fresh link for the same request', async () => {
+    const env = makeEnv()
+    await checkIn(env)
+    const state = await first(env, 'request_elevation', elevArgs())
+    const old = hashOf()
+    const r = await call(env, 'request_elevation', elevArgs(), { requestState: state, ...act('cancel') })
+    await expectFreshLink(r, old, 'cancel')
+    expect(count('elevation_requests')).toBe(1)
+  })
+
+  it('Access channel on: access_approve_url rides beside the secure link', async () => {
+    const env = makeEnv(ACCESS)
+    const state = await first(env)
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    const res = structured(r)
+    expect(res.approve_url).toMatch(new RegExp(`^https://${HOST}/m/`))
+    expect(res.access_approve_url).toMatch(/^https:\/\/approve\.example\.test\/approve\/seed\//)
+  })
+
+  it('the rotation receipt names the AGENT that rotated (principal_kind agent, agent_id set), not only the human member', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    const row = one<{ principal_kind: string; principal_id: string; agent_id: string | null; member_id: string }>("SELECT principal_kind, principal_id, agent_id, member_id FROM mutation_audit_entries WHERE operation = 'moment_link_rotate'")
+    expect(row?.principal_kind).toBe('agent')
+    expect(row?.agent_id).toBeTruthy()
+    expect(row?.principal_id).toBe(row?.agent_id)
+    expect(row?.member_id).toBeTruthy()
+  })
+
+  it('race: re-issue on a moment that closed meanwhile changes nothing and NEVER creates a new pending moment', async () => {
+    const env = makeEnv()
+    await first(env)
+    const m = one<{ id: string }>('SELECT id FROM secure_moments')
+    harness.sqlite.exec("UPDATE secure_moments SET status = 'consumed'")
+    const before = hashOf()
+    expect(await reissueMomentLink(env, m?.id ?? '')).toBeNull()
+    expect(count('secure_moments')).toBe(1)
+    expect(count('secure_moments', "status = 'pending'")).toBe(0)
+    expect(hashOf()).toBe(before)
+  })
+
+  it('accept while pending stays read-only: no link, no rotation, no audit row', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    const old = hashOf()
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('accept') })
+    expect(structured(r)).toMatchObject({ retry: true, status: 'pending', elicitation_action: 'accept' })
+    expect(structured(r).approve_url).toBeUndefined()
+    expect(structured(r).link_reissue).toBeUndefined()
+    expect(hashOf()).toBe(old)
+    expect(audits()).toBe(0)
+  })
+
+  it('decided requests return the outcome with no link and no rotation, whatever the action', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    const old = hashOf()
+    for (const status of ['applied', 'denied', 'failed']) {
+      harness.sqlite.exec(`UPDATE seed_attach_requests SET status='${status}', decided_at='${new Date().toISOString()}'`)
+      for (const action of ['cancel', 'decline', 'accept']) {
+        const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act(action) })
+        expect(structured(r)).toMatchObject({ retry: true, status })
+        expect(structured(r).approve_url).toBeUndefined()
+      }
+    }
+    expect(hashOf()).toBe(old)
+    expect(audits()).toBe(0)
+  })
+
+  it('a request that has lapsed reports expired and is not re-linked', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+    const env = makeEnv()
+    await checkIn(env)
+    const state = await first(env, 'request_elevation', elevArgs())
+    const old = hashOf()
+    vi.setSystemTime(new Date('2026-09-01T00:09:30Z')) // still inside the state, past nothing yet
+    harness.sqlite.exec("UPDATE elevation_requests SET status='expired'")
+    const r = await call(env, 'request_elevation', elevArgs(), { requestState: state, ...act('cancel') })
+    expect(structured(r)).toMatchObject({ status: 'expired' })
+    expect(structured(r).approve_url).toBeUndefined()
+    expect(hashOf()).toBe(old)
+  })
+
+  it('a moment that is no longer pending is not re-linked even when the request still reads pending', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    harness.sqlite.exec("UPDATE secure_moments SET status='expired'")
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    expect(structured(r).approve_url).toBeUndefined()
+    expect(audits()).toBe(0)
+  })
+
+  it('a moment past its expiry (row still marked pending) is not re-linked and no second moment is minted', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    harness.sqlite.exec("UPDATE secure_moments SET expires_at = '2020-01-01T00:00:00.000Z'")
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    expect(structured(r).approve_url).toBeUndefined()
+    expect(count('secure_moments')).toBe(1)
+    expect(audits()).toBe(0)
+  })
+
+  it('2025-11-25: a retry carries no action, so it is consent: read-only, no rotation (the -32042 message already carried the link)', async () => {
+    const env = makeEnv()
+    const sid = (await initWithUrl(env)) ?? ''
+    const a = await rpc(env, 'tools/call', { name: 'seed_attach_request', arguments: { seed: seedText } }, { headers: sh(sid) })
+    expect(a.json.error?.code).toBe(-32042)
+    expect(String(a.json.error?.message)).toMatch(new RegExp(`Link: https://${HOST}/m/`)) // the plain link survives the first response
+    const old = hashOf()
+    const b = await rpc(env, 'tools/call', { name: 'seed_attach_request', arguments: { seed: seedText } }, { headers: sh(sid) })
+    expect(structured(b)).toMatchObject({ retry: true, status: 'pending' })
+    expect(structured(b).approve_url).toBeUndefined()
+    expect(hashOf()).toBe(old)
+    expect(audits()).toBe(0)
+  })
+
+  describe('rotation is bounded', () => {
+    it('one rotation per minute: a second cancel inside the minute gets no new link and writes nothing', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+      const env = makeEnv()
+      const state = await first(env)
+      const r1 = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(structured(r1).link_reissue).toBe('ok')
+      const afterFirst = hashOf()
+      vi.setSystemTime(new Date('2026-09-01T00:00:30Z'))
+      const r2 = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(structured(r2)).toMatchObject({ status: 'pending', link_reissue: 'throttled' })
+      expect(structured(r2).approve_url).toBeUndefined()
+      expect(hashOf()).toBe(afterFirst)
+      expect(audits()).toBe(1)
+      vi.setSystemTime(new Date('2026-09-01T00:01:01Z'))
+      const r3 = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('decline') })
+      expect(structured(r3).link_reissue).toBe('ok')
+      expect(hashOf()).not.toBe(afterFirst)
+      expect(audits()).toBe(2)
+    })
+
+    it('at most 5 rotations per moment however long the client waits', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      let t = Date.parse('2026-09-01T00:00:00Z')
+      vi.setSystemTime(t)
+      const env = makeEnv()
+      const state = await first(env)
+      const seen: unknown[] = []
+      for (let i = 0; i < 7; i++) {
+        t += 61_000
+        vi.setSystemTime(t)
+        const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+        seen.push(structured(r).link_reissue)
+      }
+      expect(seen).toEqual(['ok', 'ok', 'ok', 'ok', 'ok', 'capped', 'capped'])
+      expect(audits()).toBe(5)
+      const last = hashOf()
+      t += 61_000
+      vi.setSystemTime(t)
+      await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(hashOf()).toBe(last)
+    })
+
+    it('the bound is per moment, not per caller', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+      const env = makeEnv()
+      const s1 = await first(env)
+      const s2 = await first(env, 'seed_attach_request', { seed: seedText.replace('name: Mumega.com', 'name: Mumega.com Two') })
+      const r1 = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: s1, ...act('cancel') })
+      const r2 = await call(env, 'seed_attach_request', { seed: seedText.replace('name: Mumega.com', 'name: Mumega.com Two') }, { requestState: s2, ...act('cancel') })
+      expect([structured(r1).link_reissue, structured(r2).link_reissue]).toEqual(['ok', 'ok'])
+    })
+
+    it('fails closed: if the receipt cannot be written, nothing is rotated', async () => {
+      const env = makeEnv()
+      const state = await first(env)
+      const old = hashOf()
+      harness.sqlite.exec("CREATE TRIGGER block_rotate BEFORE INSERT ON mutation_audit_entries WHEN NEW.operation = 'moment_link_rotate' BEGIN SELECT RAISE(ABORT, 'no'); END")
+      const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(structured(r)).toMatchObject({ status: 'pending', link_reissue: 'error' })
+      expect(structured(r).approve_url).toBeUndefined()
+      expect(hashOf()).toBe(old)
+    })
+  })
+
+  it('principal-bound as before: another principal\'s state still gets no link and no rotation', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    const old = hashOf()
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') }, 'tok-y')
+    expect(r.json.error?.data).toBe('principal')
+    expect(hashOf()).toBe(old)
+    expect(audits()).toBe(0)
+  })
+
+  it('credential_request is never elicited (it is not in the tool map, with any carrier)', async () => {
+    const env = makeEnv({ SECURE_DROP: '1' })
+    harness.sqlite.exec(`INSERT INTO host_keys (id, tenant, agent_id, public_key_b64u, fingerprint, created_at)
+      VALUES ('hk-1', '${TENANT}', 'agent-x', '${'A'.repeat(43)}', '${'a'.repeat(64)}', '${T0}')`)
+    const args = { name: 'my-token', purpose: 'deploy' }
+    const sid = (await initWithUrl(env)) ?? ''
+    const m = await rpc(env, 'tools/call', { name: 'credential_request', arguments: args, _meta: modernMeta() }, { headers: modernHeaders })
+    const v25 = await rpc(env, 'tools/call', { name: 'credential_request', arguments: { ...args, name: 'my-token-2' } }, { headers: sh(sid) })
+    const meta25 = await rpc(env, 'tools/call', { name: 'credential_request', arguments: { ...args, name: 'my-token-3' }, _meta: { [META]: URL_CAPS } }, { headers: { 'mcp-protocol-version': '2025-11-25' } })
+    for (const r of [m, v25, meta25]) {
+      expect(r.json.error).toBeUndefined()
+      expect(r.json.result?.resultType).not.toBe('input_required')
+      expect(r.text.slice(0, 300)).toContain('approve_url')
+      expect(structured(r).approve_url).toMatch(new RegExp(`^https://${HOST}/m/`))
+    }
+    // and a requestState for it is not honoured
+    const state = await first(env)
+    const forged = await rpc(env, 'tools/call', { name: 'credential_request', arguments: { ...args, name: 'my-token-4' }, requestState: state, _meta: modernMeta() }, { headers: modernHeaders })
+    expect(forged.json.error).toBeUndefined()
+    expect(structured(forged).retry).toBeUndefined()
   })
 })

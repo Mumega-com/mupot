@@ -24,6 +24,9 @@ import type { ToolOutcome } from './index'
 import { issueBoundToken, verifyBoundToken } from '../access/csrf'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { loadMoment, type MomentKind, type MomentRow } from '../secure-moments/store'
+import { reissueMomentLink } from '../secure-moments/issue'
+import { reserveRotation } from '../secure-moments/rotate'
+import { approveUrl } from '../access/config'
 import { loadElevationRequestById, REQUEST_DECISION_WINDOW_MS } from '../auth/elevation'
 import { loadSeedRequest } from '../access/seed-request'
 import { loadLiveAgentSessionByCredential, resolveAgentSessionContext } from '../auth/agent-sessions'
@@ -276,8 +279,42 @@ function retryNote(status: unknown): string {
   return 'This is the current state of the request you filed earlier. This retry created nothing and changed nothing.'
 }
 
-function outcomeResult(outcome: Record<string, unknown>, extra: Record<string, unknown> = {}): ToolOutcome {
-  return { ok: true, result: { ok: true, ...outcome, ...extra, retry: true, note: retryNote(outcome.status) } }
+function outcomeResult(outcome: Record<string, unknown>, extra: Record<string, unknown> = {}, note?: string): ToolOutcome {
+  return { ok: true, result: { ok: true, ...outcome, ...extra, retry: true, note: note ?? retryNote(outcome.status) } }
+}
+
+/**
+ * The plain-link fallback (W3.1). A client that DECLINED or CANCELLED the elicitation (a headless client cancels
+ * on its own) discarded the link, and the link is stored only as a hash, so the only way to give the agent
+ * something to relay is to rotate the pending moment's token and return the new link in the tool result. Bounded
+ * by reserveRotation. Only called for a still-pending request whose moment is still pending and live; the old
+ * link dies, which is intended (the client that held it dropped it). An ACCEPT never reaches here: the human has
+ * the link open and rotating would break the page.
+ */
+async function plainLinkFallback(
+  env: Env, auth: AuthContext, kind: MomentKind, moment: MomentRow, outcome: Record<string, unknown>, action: string | null, nowMs: number,
+): Promise<ToolOutcome> {
+  const actionNote = action ? { elicitation_action: action } : {}
+  if (!auth.memberId) return outcomeResult(outcome, actionNote)
+  const reserved = await reserveRotation(env, { momentId: moment.id, memberId: auth.memberId, agentId: auth.boundAgentId ?? null, reason: `elicitation_${action ?? 'not_accepted'}` }, nowMs)
+  if (reserved !== 'ok') {
+    const why = reserved === 'throttled'
+      ? 'A fresh link was issued for this request a moment ago; wait about a minute before asking again.'
+      : reserved === 'capped'
+        ? 'This request has used all its link re-issues; file the request again to get a new one.'
+        : 'A fresh link could not be issued right now.'
+    return outcomeResult(outcome, { ...actionNote, link_reissue: reserved }, `${retryNote('pending')} ${why}`)
+  }
+  const link = await reissueMomentLink(env, moment.id)
+  if (!link || link.momentId !== moment.id) {
+    return outcomeResult(outcome, { ...actionNote, link_reissue: 'error' }, `${retryNote('pending')} A fresh link could not be issued right now.`)
+  }
+  const access = approveUrl(env, kind === 'seed_attach' ? 'seed' : 'elevation', moment.subject_id)
+  return outcomeResult(
+    outcome,
+    { ...actionNote, approve_url: link.url, ...(access ? { access_approve_url: access } : {}), link_reissue: 'ok' },
+    'Your client did not take up the in-protocol prompt, so here is the link again: give approve_url to the human to open (a one-time link; they decide with their passkey). The previous link no longer works. Nothing is decided until they do.',
+  )
 }
 
 /** A moment row is only ever offered to the principal that filed it, on the kind this tool mints. */
@@ -336,6 +373,11 @@ export async function prepareUrlElicitation(
         if (!outcome) return refuseState('not_found')
         answered = true
         const action = readAction(input.params.inputResponses)
+        // Anything but an explicit accept (decline, cancel, a missing or unrecognised answer) while the request AND
+        // its moment are still open: the client did not show the human the link, so hand the agent a fresh one.
+        if (action !== 'accept' && outcome.status === 'pending' && moment.status === 'pending' && Date.parse(moment.expires_at) > nowMs) {
+          return plainLinkFallback(env, auth, st.k, moment, outcome, action, nowMs)
+        }
         return outcomeResult(outcome, action ? { elicitation_action: action } : {})
       }
       // 2025-11-25 retry: no state travels, so find "the same ask" by its natural key, but only among this

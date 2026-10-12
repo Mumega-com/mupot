@@ -360,3 +360,21 @@ export async function finishEnrolment(
   }
   return { ok: true, passkeyId }
 }
+
+/**
+ * Rotate the link token of ONE existing moment, by id, in a single guarded UPDATE (W3.1). It never inserts: if the
+ * moment was decided or expired in the meantime, nothing changes and null comes back, so a race can never leave a
+ * fresh pending moment for a closed subject. The old token dies; the new one is returned once and stored as a hash.
+ */
+export async function rotatePendingMomentToken(env: Env, momentId: string, nowMs: number = Date.now()): Promise<{ id: string; token: string; expiresAt: string } | null> {
+  const token = randomToken()
+  const hash = await tokenHash(token)
+  const nowIso = new Date(nowMs).toISOString()
+  const r = await env.DB.prepare(
+    `UPDATE secure_moments SET link_token_sha256 = ?3
+      WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?4`,
+  ).bind(momentId, env.TENANT_SLUG, hash, nowIso).run()
+  if (r.meta.changes !== 1) return null
+  const row = await env.DB.prepare(`SELECT expires_at FROM secure_moments WHERE id = ?1 AND tenant = ?2`).bind(momentId, env.TENANT_SLUG).first<{ expires_at: string }>()
+  return row ? { id: momentId, token, expiresAt: row.expires_at } : null
+}
