@@ -1979,7 +1979,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
         } catch {
           // label lookup is cosmetic; the harness is keyed on client_id alone.
         }
-        const harness = await upsertHarness(env, pending.memberId, clientId, clientName)
+        // WORKSPACES on: the harness is keyed on THIS consent's grant (its freshly minted token id).
+        const harness = await upsertHarness(env, pending.memberId, clientId, clientName, tokenId)
         harnessId = harness?.id ?? null
       } catch (err) {
         console.error('[oauth-authorize] harness upsert failed (non-fatal):', redactSecretPatterns(err instanceof Error ? err.message : String(err)))

@@ -13,6 +13,8 @@
 // WHAT A HARNESS SESSION (no seat handle) MAY DO — exactly this, nothing else:
 //   - tool `seat_select`   find-or-create the seat agent for a workspace key, receive a seat handle
 //   - tool `boot_context`  read-only identity: who you are, the harness, the identity receipt, hints
+//   - tool `worktree_open` find-or-create a project workspace record (WORKSPACES flag); authorised against
+//                          the underlying HUMAN's live project write access, never this session's empty capabilities
 //   - JSON-RPC `initialize`, `notifications/initialized`, `tools/list` (no tool runs)
 // Everything else — every other tool (connect, bootstrap_self, reveal_credential_claim, recall,
 // remember, ...), /actions/:tool, the legacy {tool,args} body, events/*, and the profile door — is
@@ -23,7 +25,7 @@ import type { Env } from '../types'
 import { loadHarnessForToken, seatAutoEnrollEnabled } from './harness'
 
 /** The tools a harness-token session without an applied seat handle may call. */
-export const HARNESS_SESSION_ALLOWED_TOOLS: ReadonlySet<string> = new Set(['seat_select', 'boot_context'])
+export const HARNESS_SESSION_ALLOWED_TOOLS: ReadonlySet<string> = new Set(['seat_select', 'boot_context', 'worktree_open'])
 
 export const HARNESS_SESSION_SEAT_REQUIRED = 'harness_session_seat_required'
 export const HARNESS_SESSION_SEAT_REQUIRED_MESSAGE =

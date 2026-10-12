@@ -218,6 +218,8 @@ import { SEED_TOOLS } from './seed'
 import { SECURE_DROP_TOOLS } from './secure-drop'
 import { secureDropFlag } from '../secure-drop/config'
 import { TELEGRAM_MINIAPP_TOOLS } from './telegram-miniapp'
+import { WORKTREE_TOOLS } from './worktrees'
+import { workspacesEnabled } from '../workspaces/flag'
 import { telegramMiniappFlag } from '../secure-moments/telegram-miniapp-config'
 import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
@@ -7009,6 +7011,7 @@ export const TOOLS: ToolSpec[] = [
   ...SEED_TOOLS,
   ...SECURE_DROP_TOOLS,
   ...TELEGRAM_MINIAPP_TOOLS,
+  ...WORKTREE_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
@@ -7039,13 +7042,16 @@ const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_req
 const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.map((t) => t.name))
 // Secure moments W4: moment_miniapp_link is advertised only while TELEGRAM_MINIAPP is on (flag off => tools/list unchanged).
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP'>): ToolSpec[] {
+// Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
+const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
   const tgMiniapp = telegramMiniappFlag(env)
-  if (seat && access && drop && tgMiniapp) return TOOLS
-  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)))
+  const workspaces = workspacesEnabled(env)
+  if (seat && access && drop && tgMiniapp && workspaces) return TOOLS
+  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -7246,6 +7252,11 @@ export async function invokeTool(
   // pot never reveals the tool's argument schema through an invalid_args response.
   if (SEAT_FLAG_TOOLS.has(spec.name) && !seatAutoEnrollEnabled(env)) {
     return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
+  }
+
+  // Workspaces W1: refuse before args handling, so a flag-off pot never reveals the schema.
+  if (WORKSPACES_FLAG_TOOLS.has(spec.name) && !workspacesEnabled(env)) {
+    return { ...fail(403, 'workspaces_disabled', 'Workspaces are not enabled on this pot.'), tool: spec.name }
   }
 
   if (SECURE_DROP_FLAG_TOOLS.has(spec.name) && !secureDropFlag(env)) {
