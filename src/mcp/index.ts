@@ -235,6 +235,7 @@ import {
   negotiateProtocolVersion,
   serverDiscoverResult,
 } from './events'
+import { buildElicitation, prepareUrlElicitation, sessionIdForInitialize, urlElicitationActive, URL_ELICITATION_TOOLS, type ElicitationPrep } from './url-elicitation'
 import { callerFloorOk, eventsSubscribe, eventsUnsubscribe } from './events-subscriptions'
 import { RUNNER_TOOLS } from './runners'
 import { HARNESS_CAPACITY_TOOLS } from './harness-capacity'
@@ -829,6 +830,10 @@ export type ToolCtx = {
    *  leave NO session side effect — no presence bump, no poll-mode last-seen refresh, no fleet
    *  self-report. Absent on every other door, where behavior is byte-for-byte unchanged. */
   sideEffectFree?: boolean
+  /** Set ONLY by the MCP URL-elicitation layer (MCP_URL_ELICITATION, src/mcp/url-elicitation.ts) on a retry of a
+   *  request tool. Runs AFTER every authz/schema gate in invokeTool, in place of the tool body; a non-null answer
+   *  is returned as the outcome (read-only: it must never write). Absent everywhere else: behavior unchanged. */
+  shortCircuit?: (args: Record<string, unknown>) => Promise<ToolOutcome | null>
 }
 
 export interface ToolSpec {
@@ -7212,6 +7217,7 @@ export async function invokeTool(
         seat: originOrCtx?.seat,
         source: originOrCtx?.source,
         sideEffectFree: originOrCtx?.sideEffectFree,
+        shortCircuit: originOrCtx?.shortCircuit,
       }
 
   if (typeof toolName !== 'string' || toolName.length === 0) {
@@ -7293,7 +7299,7 @@ export async function invokeTool(
   // return a generic internal_error — never echo an arbitrary throw (leak guard).
   let outcome: ToolOutcome
   try {
-    outcome = await spec.run(auth, env, args, ctx)
+    outcome = (ctx.shortCircuit ? await ctx.shortCircuit(args) : null) ?? await spec.run(auth, env, args, ctx)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (msg.startsWith('receipt_failed')) {
@@ -7380,7 +7386,10 @@ async function handleJsonRpc(
   // through `ok`, which stamps it when this request is modern (initialize asking for 2026-07-28, or any
   // request carrying MCP-Protocol-Version / _meta protocolVersion 2026-07-28). Legacy requests and
   // flag-off requests are byte-identical. JSON-RPC errors are not results and carry no resultType.
-  const modern = isModernProtocolRequest(eventsOn, c.req.header('mcp-protocol-version'), body.params) ||
+  // MCP_URL_ELICITATION (W3) also needs the 2026-07-28 request shape recognised (its MRTR result is a spec
+  // 2026-07-28 result); flag off => urlElicitOn is false and this is exactly `eventsOn`.
+  const urlElicitOn = profile === undefined && urlElicitationActive(c.env)
+  const modern = isModernProtocolRequest(eventsOn || urlElicitOn, c.req.header('mcp-protocol-version'), body.params) ||
     (method === 'initialize' && negotiateProtocolVersion(body.params, eventsOn) === EVENTS_PROTOCOL_VERSION)
   const ok = (rid: unknown, result: unknown): Response => rpcResult(rid, modern ? withResultType(result) : result)
 
@@ -7395,12 +7404,16 @@ async function handleJsonRpc(
         instructions: mcpInitializeInstructions(c.env),
       })
     }
-    return ok(id, {
+    const legacyInit = ok(id, {
       protocolVersion: '2025-06-18',
       capabilities: { tools: {} },
       serverInfo: { name: `mupot-${c.env.TENANT_SLUG}`, version: MUPOT_PUBLIC_API_VERSION },
       instructions: mcpInitializeInstructions(c.env),
     })
+    // W3: a client that declared elicitation.url gets a signed capability session id (null, and no header, otherwise).
+    const capSession = urlElicitOn ? await sessionIdForInitialize(c.env, body.params) : null
+    if (capSession) legacyInit.headers.set('mcp-session-id', capSession)
+    return legacyInit
   }
 
   if (method === 'notifications/initialized') {
@@ -7485,7 +7498,22 @@ async function handleJsonRpc(
       // Profile mode = no session side effects (see ToolCtx.sideEffectFree).
       ...(profile === 'needs-you' ? { sideEffectFree: true } : {}),
     }
+    // W3 (MCP_URL_ELICITATION): only the two request tools, only with the flag, secure moments and signing key on.
+    let elicitPrep: ElicitationPrep | null = null
+    if (urlElicitOn && typeof params.name === 'string' && URL_ELICITATION_TOOLS.has(params.name)) {
+      const prepared = await prepareUrlElicitation(c.env, auth, {
+        toolName: params.name, args: toolArguments ?? {}, params, modern, sessionId: c.req.header('mcp-session-id'),
+      })
+      if (prepared.kind === 'refuse') return rpcError(id, -32602, prepared.message)
+      elicitPrep = prepared.prep
+      ctx.shortCircuit = elicitPrep.shortCircuit
+    }
     const outcome = await invokeTool(auth, c.env, params.name, toolArguments, ctx)
+    if (outcome.ok && elicitPrep?.mode && !elicitPrep.answeredByRetry()) {
+      const offered = await buildElicitation(c.env, auth, { toolName: outcome.tool as string, args: toolArguments ?? {}, mode: elicitPrep.mode, result: outcome.result })
+      if (offered?.kind === 'error') return rpcError(id, offered.code, offered.message, offered.data)
+      if (offered?.kind === 'result') return rpcResult(id, offered.result)
+    }
     if (outcome.ok) return ok(id, mcpCallResult(outcome.tool as string, outcome.result))
 
     // mupot#1667: a tool-level refusal is an EXECUTION error, not a transport/protocol error. Per the

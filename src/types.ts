@@ -277,6 +277,9 @@ export interface Env {
   // SECURE_DROP is '1' or 'true' AND secure moments are themselves on; off is a true no-op (no route, no tool, no write).
   SECURE_DROP?: string
   SECURE_MOMENTS_HOST?: string     // DEDICATED hostname for /m/* and the WebAuthn RP ID; never a colony host, pot host, or ACCESS_CANONICAL_HOST
+  // MCP URL-mode elicitation of secure-moment links (docs/architecture/secure-moments.md, W3). OFF unless '1' or 'true';
+  // inert unless SECURE_MOMENTS is also usable and CONNECTOR_MASTER_KEY is set.
+  MCP_URL_ELICITATION?: string
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].
