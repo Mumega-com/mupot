@@ -21,6 +21,7 @@
 // meta.changes. The PIN is never logged, stored, echoed or put in a receipt.
 import type { Env } from '../types'
 import { timingSafeEqual } from '../lib/crypto'
+import { pbkdf2Sha256Hex } from '../lib/pbkdf2'
 import { randomToken, tokenHash } from './store'
 import { telegramMiniappStatus } from './telegram-miniapp-config'
 import {
@@ -98,9 +99,7 @@ export async function derivePinHash(pin: string, saltHex: string, bind: PinBindi
   const salt = new Uint8Array(prefix.length + rand.length)
   salt.set(prefix, 0)
   salt.set(rand, prefix.length)
-  const key = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveBits'])
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: Math.min(Math.max(1, iterations), PIN_ITERATIONS) }, key, 256)
-  return toHex(new Uint8Array(bits))
+  return pbkdf2Sha256Hex(pin, salt, Math.min(Math.max(1, iterations), PIN_ITERATIONS))
 }
 
 // ── per-device columns (kept apart from the W4 store so flag-off never selects a W4.2 column) ───────
