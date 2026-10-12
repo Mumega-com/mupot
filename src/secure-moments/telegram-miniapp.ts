@@ -26,6 +26,8 @@ import {
 } from '../access/decision-core'
 import { loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
 import { ELEVATION_ACTIONS, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
+import { reserveRotation } from './rotate'
+import { reissueMomentLink } from './issue'
 import { loadMoment, momentIsLive, type MomentRow } from './store'
 import { hex, sha256 } from './webauthn'
 import { verifyInitData } from './telegram-initdata'
@@ -350,7 +352,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const policy = telegramPolicyRefusal(l.d.m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
     if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId))) {
-      return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard.', 'Set up this device', { needs_enrol: true })
+      return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard, or use Approve with passkey in your browser.', 'Set up this device', { needs_enrol: true })
     }
     const nonce = await mintTgNonce(c.env, { momentId: l.d.m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) })
     if (!nonce) return fail(c, 409, 'Too many unfinished attempts on this request. Wait a few minutes.', 'Try later')
@@ -419,6 +421,31 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
         return { auth: s.approver.auth, webSessionHash: s.webSessionHash }
       },
     }))
+  }))
+
+  // passkey-link (W4.1): the fallback for a client that cannot use BiometricManager (Telegram Desktop), and always a second
+  // option. Telegram proves ONLY who asked for the link (verified initData -> bound, active, human member who may decide THIS
+  // moment: authenticateTelegram + loadDecidable, the same functions as view/challenge/decide). The link decides nothing: the W1
+  // passkey page still needs that member's WebAuthn passkey. Rotation is the existing guarded one (by id; the old link dies),
+  // bounded by the existing reserveRotation, which writes the receipt. The fresh URL is returned once and never logged or stored.
+  app.post('/m/tg/:id/passkey-link', guarded(async (c) => {
+    const g = await jsonGuard(c)
+    if (!g.ok) return g.res
+    const a = await authenticateTelegram(c, g.body)
+    if (!a.ok) return a.res
+    const l = await loadDecidable(c, a.id.memberId, c.req.param('id'))
+    if (!l.ok) return l.res
+    const reserved = await reserveRotation(c.env, {
+      momentId: l.d.m.id, memberId: a.id.memberId, agentId: null, reason: 'telegram_passkey_link',
+      channel: { origin: 'admin_ui', handler: 'secure_moment', via: 'telegram_initdata' },
+    })
+    if (reserved === 'throttled') return fail(c, 409, 'A fresh link was issued a moment ago. Wait about a minute, then try again.', 'Try later')
+    if (reserved === 'member_capped') return fail(c, 409, 'You have already asked for the maximum number of browser links for this request. Use the last one, or ask for the request to be filed again.', 'No more links')
+    if (reserved === 'capped') return fail(c, 409, 'This request has used all its link re-issues. Ask for the request to be filed again.', 'No more links')
+    if (reserved !== 'ok') return fail(c, 503, 'A fresh link could not be issued right now.', 'Try later')
+    const issued = await reissueMomentLink(c.env, l.d.m.id)
+    if (!issued || issued.momentId !== l.d.m.id) return fail(c, 409, 'This request is no longer pending.', 'Request closed')
+    return jsonOut(c, 200, { ok: true, url: issued.url, expires_at: issued.expiresAt })
   }))
 
   // device enrolment: needs a fresh initData of the member the link names AND the link itself.

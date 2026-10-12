@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { reissueMomentLink } from '../src/secure-moments/issue'
+import { HUMAN_CEREMONY_WINDOW_MS, reserveRotation } from '../src/secure-moments/rotate'
 import { mcpApp } from '../src/mcp'
 import { sha256Hex } from '../src/members/service'
 import type { AuthContext, Env } from '../src/types'
@@ -978,6 +979,54 @@ describe('W3.1 plain-link fallback', () => {
   })
 
   describe('rotation is bounded', () => {
+    it('a human (Telegram) rotation protects the link the human just opened: an MCP retry inside the ceremony window gets pending and NO rotation; after the window it rotates again', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+      const env = makeEnv()
+      const state = await first(env)
+      const momentId = one<{ id: string }>('SELECT id FROM secure_moments')?.id ?? ''
+      // What POST /m/tg/<id>/passkey-link does (it is covered end to end in telegram-miniapp-passkey-link.test.ts)
+      expect(await reserveRotation(env, { momentId, memberId: 'mem-1', agentId: null, reason: 'telegram_passkey_link', channel: { origin: 'admin_ui', handler: 'secure_moment', via: 'telegram_initdata' } })).toBe('ok')
+      const humanLink = await reissueMomentLink(env, momentId)
+      expect(humanLink).not.toBeNull()
+      const humanHash = hashOf()
+      // two minutes later (past the 1/min throttle, well inside a hybrid/QR passkey ceremony) the agent polls
+      vi.setSystemTime(new Date('2026-09-01T00:02:00Z'))
+      const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(structured(r)).toMatchObject({ status: 'pending', link_reissue: 'human_active' })
+      expect(structured(r).approve_url).toBeUndefined()
+      expect(String(structured(r).note)).toMatch(/Telegram/)
+      expect(hashOf()).toBe(humanHash) // the human's link is still the live one
+      expect(audits()).toBe(1)
+      // just inside the window: still suppressed; just past it: the agent may rotate again
+      vi.setSystemTime(new Date(Date.parse('2026-09-01T00:00:00Z') + HUMAN_CEREMONY_WINDOW_MS - 1000))
+      expect(structured(await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })).link_reissue).toBe('human_active')
+      vi.setSystemTime(new Date(Date.parse('2026-09-01T00:00:00Z') + HUMAN_CEREMONY_WINDOW_MS + 1000))
+      const later = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      expect(structured(later).link_reissue).toBe('ok')
+      expect(hashOf()).not.toBe(humanHash)
+      expect(audits()).toBe(2)
+    })
+    it('a machine rotation does NOT suppress a human one (the human can always ask)', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+      const env = makeEnv()
+      const state = await first(env)
+      const momentId = one<{ id: string }>('SELECT id FROM secure_moments')?.id ?? ''
+      expect(structured(await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })).link_reissue).toBe('ok')
+      vi.setSystemTime(new Date('2026-09-01T00:02:00Z'))
+      expect(await reserveRotation(env, { momentId, memberId: 'mem-1', agentId: null, reason: 'telegram_passkey_link', channel: { origin: 'admin_ui', handler: 'secure_moment', via: 'telegram_initdata' } })).toBe('ok')
+    })
+    it('the MCP-fallback receipt is pinned: origin mcp, handler mcp_url_elicitation, principal agent, evidence exactly {moment_id, reason} (no via)', async () => {
+      const env = makeEnv()
+      const state = await first(env)
+      const momentId = one<{ id: string }>('SELECT id FROM secure_moments')?.id ?? ''
+      await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+      const row = one<{ origin: string; handler: string; principal_kind: string; principal_id: string; agent_id: string; evidence_json: string }>(
+        "SELECT origin, handler, principal_kind, principal_id, agent_id, evidence_json FROM mutation_audit_entries WHERE operation = 'moment_link_rotate'")
+      expect(row).toMatchObject({ origin: 'mcp', handler: 'mcp_url_elicitation', principal_kind: 'agent', principal_id: 'agent-x', agent_id: 'agent-x' })
+      expect(JSON.parse(row?.evidence_json ?? '')).toEqual({ moment_id: momentId, reason: 'elicitation_cancel' })
+    })
     it('one rotation per minute: a second cancel inside the minute gets no new link and writes nothing', async () => {
       vi.useFakeTimers({ toFake: ['Date'] })
       vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))

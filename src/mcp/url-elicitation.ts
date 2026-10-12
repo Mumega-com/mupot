@@ -300,6 +300,8 @@ async function plainLinkFallback(
   if (reserved !== 'ok') {
     const why = reserved === 'throttled'
       ? 'A fresh link was issued for this request a moment ago; wait about a minute before asking again.'
+      : reserved === 'human_active'
+        ? 'The human already opened a fresh link for this request from Telegram and may be mid-passkey, so no new link was issued (it would break theirs). Do not retry for about ten minutes; nothing is decided until they confirm.'
       : reserved === 'capped'
         ? 'This request has used all its link re-issues; file the request again to get a new one.'
         : 'A fresh link could not be issued right now.'

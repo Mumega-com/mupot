@@ -286,7 +286,7 @@ A headless client (Claude Code in print mode was measured) cancels a URL elicita
 - It rotates the pending moment's link (the same `createMoment` rotation, same moment id; the old link stops working) and returns the new `approve_url` in the tool result, plus `access_approve_url` when the Access channel is on, with a note telling the agent to give the link to the human. The result still has `retry: true` and `elicitation_action`.
 - `accept` while pending stays read-only (no rotation, no link): the human has the link open and rotating would break the page.
 - A decided, expired or no-longer-pending request returns its outcome with no link and no rotation.
-- Rotation is bounded per moment: at most one per minute and five in total, enforced by one atomic insert into `mutation_audit_entries` (operation `moment_link_rotate`, no token in the evidence) that is both the receipt and the counter. A throttled or capped call returns the pending outcome with `link_reissue: "throttled"` or `"capped"` and no link; if the receipt cannot be written (`link_reissue: "error"`) nothing is rotated.
+- Rotation is bounded per moment: at most one per minute and five in total, enforced by one atomic insert into `mutation_audit_entries` (operation `moment_link_rotate`, no token in the evidence) that is both the receipt and the counter. A throttled or capped call returns the pending outcome with `link_reissue: "throttled"` or `"capped"` and no link. For 10 minutes after a human rotation through Telegram (W4.1) the machine path is suppressed: the retry returns the pending outcome with `link_reissue: "human_active"`, no link, and a note not to retry for about ten minutes, so the link the human just opened survives a slow passkey ceremony; if the receipt cannot be written (`link_reissue: "error"`) nothing is rotated.
 - It stays principal-bound: the same state checks as any retry (principal, tool, arguments, moment ownership) run first.
 
 The 2025-11-25 retry carries no answer at all, so it is read as consent and stays read-only; that path's plain link is already in the `-32042` message text of the first response. `credential_request` is not in the tool map and is never elicited (tested with every carrier).
@@ -427,6 +427,18 @@ The page gates on `Telegram.WebApp.isVersionAtLeast('8.0')` with a clear message
 3. `wrangler secret put TELEGRAM_MINIAPP_BOT_TOKEN` (the new bot's token, held by the worker alone) and set `TELEGRAM_MINIAPP_BOT_ID` (its numeric id) and `TELEGRAM_MINIAPP=1`.
 4. Each member opens a private chat with that bot once (Telegram refuses to let a bot message someone who never started it), and has Telegram connected to their member (My Account, Connect Telegram).
 5. Then My Account, Telegram device, **Set up this phone**, on a phone with Telegram 8.0 or newer and biometrics enabled.
+
+### W4.1: "Approve with passkey in your browser"
+
+Telegram Desktop has no `BiometricManager`, so the Mini App used to dead-end at "Biometrics unavailable". The Mini App now always offers a second option, and shows it in place of the dead end: **Approve with passkey in your browser**.
+
+`POST /m/tg/<moment id>/passkey-link` (same flag, same host, same-origin JSON) takes the Mini App `init_data` and runs the SAME door as view/challenge/decide: the existing Ed25519 verifier (pinned bot id, freshness, private chat), `resolveTelegramMember` (bound, active, human), then `loadDecidable` (moment pending, unexpired, a kind the Mini App supports, addressed to this member, and the member's current authority over it). A bound member without authority reads as 404, exactly like an unknown moment. It then rotates the moment's link token with the existing guarded rotation (`reserveRotation` then `reissueMomentLink`, by moment id) and returns `https://<secure host>/m/<id>/<token>` once. The client opens it with `Telegram.WebApp.openLink`, in the user's real browser, where the unchanged W1 passkey page decides.
+
+- **The link alone grants nothing.** The decision still needs the member's WebAuthn passkey. Telegram proves only who asked for the link.
+- **Bounded by the same ledger as the MCP plain-link fallback**: one rotation per moment per minute, five per moment in total, shared between both callers. The receipt is a `mutation_audit_entries` row (`moment_link_rotate`, handler `secure_moment`, evidence `{moment_id, reason: telegram_passkey_link, via: telegram_initdata}`) written by the reservation itself. The token and the initData are never logged or stored in a receipt.
+- **Side effect**: rotating kills the previous link of that moment, including one an agent relayed. That is intended and the same as W3.1.
+- **Human link survival**: a Telegram rotation suppresses machine (MCP fallback) rotations of that moment for 10 minutes (`human_active`), checked inside the same atomic reservation. A human rotation is never blocked by a machine one.
+- **Per-member sub-cap**: one member may use at most 2 of the 5 slots per moment through Telegram (`member_capped`, 409 "No more links"), so the agent path keeps its share. On a moment any authorised member may decide, several members together can still spend the shared cap; that is bounded and accepted.
 
 ### Accepted limits
 
