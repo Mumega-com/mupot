@@ -126,8 +126,15 @@ export type ConfirmEnrolmentResult = { ok: true; deviceId: string } | { ok: fals
  * issued to, and its login identity is live; then consume the link. One batch: the link UPDATE is guarded by the
  * device UPDATE having changed a row, so a refusal on either side leaves the link unspent.
  */
+/** W4.2 (TELEGRAM_MINIAPP_PIN_WINDOW): how the device unlocks, its PIN hash and its trusted window, written in the SAME guarded UPDATE that activates it. */
+export interface DeviceSetup {
+  unlockMode: 'biometric' | 'pin'
+  pin: { saltHex: string; hashHex: string; iterations: number } | null
+  trustWindowSeconds: number
+}
+
 export async function confirmDeviceEnrolment(
-  env: Env, input: { token: TgEnrolmentTokenRow; deviceToken: string; telegramUserId: string }, nowMs: number,
+  env: Env, input: { token: TgEnrolmentTokenRow; deviceToken: string; telegramUserId: string; setup?: DeviceSetup }, nowMs: number,
 ): Promise<ConfirmEnrolmentResult> {
   const parsed = parseDeviceToken(input.deviceToken)
   if (!parsed) return { ok: false, reason: 'bad_device' }
@@ -135,7 +142,7 @@ export async function confirmDeviceEnrolment(
   const nowIso = new Date(nowMs).toISOString()
   const out = await env.DB.batch([
     env.DB.prepare(
-      `UPDATE tg_miniapp_devices SET confirmed_at = ?4
+      `UPDATE tg_miniapp_devices SET confirmed_at = ?4${input.setup ? ', unlock_mode = ?8, pin_salt = ?9, pin_hash = ?10, pin_iterations = ?11, trust_window_seconds = ?12' : ''}
         WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND confirmed_at IS NULL AND revoked_at IS NULL
           AND enrolment_token_id = ?5 AND telegram_user_id = ?6 AND secret_sha256 = ?7
           AND EXISTS (SELECT 1 FROM tg_miniapp_enrolment_tokens t
@@ -143,7 +150,8 @@ export async function confirmDeviceEnrolment(
           AND EXISTS (SELECT 1 FROM human_login_identities i
                        WHERE i.id = tg_miniapp_devices.login_identity_id AND i.tenant = ?2 AND i.member_id = ?3 AND i.revoked_at IS NULL)
           AND EXISTS (SELECT 1 FROM members m WHERE m.id = ?3 AND m.tenant = ?2 AND m.telegram_chat_id = ?6 AND m.status = 'active')`,
-    ).bind(parsed.deviceId, tenant, input.token.member_id, nowIso, input.token.id, input.telegramUserId, await tokenHash(parsed.secret)),
+    ).bind(parsed.deviceId, tenant, input.token.member_id, nowIso, input.token.id, input.telegramUserId, await tokenHash(parsed.secret),
+      ...(input.setup ? [input.setup.unlockMode, input.setup.pin?.saltHex ?? null, input.setup.pin?.hashHex ?? null, input.setup.pin?.iterations ?? null, input.setup.trustWindowSeconds] : [])),
     env.DB.prepare(
       `UPDATE tg_miniapp_enrolment_tokens SET consumed_at = ?3
         WHERE id = ?1 AND tenant = ?2 AND consumed_at IS NULL AND expires_at > ?3 AND changes() = 1`,
@@ -170,12 +178,14 @@ export type DeviceResolution = { kind: 'ok'; device: TgDeviceRow } | { kind: 'st
  */
 export async function resolveDeviceForDecision(
   env: Env, deviceToken: unknown, who: { memberId: string; telegramUserId: string },
+  /** W4.2: only the PIN-aware caller (TELEGRAM_MINIAPP_PIN_WINDOW on) may resolve a PIN-mode device; every other caller fails closed on one. */
+  opts: { allowPinMode?: boolean } = {},
 ): Promise<DeviceResolution> {
   const parsed = parseDeviceToken(deviceToken)
   if (!parsed) return { kind: 'none' }
   const row = await env.DB.prepare(
     `SELECT ${DEVICE_COLUMNS} FROM tg_miniapp_devices
-      WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL LIMIT 1`,
+      WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL${opts.allowPinMode ? '' : " AND unlock_mode = 'biometric'"} LIMIT 1`,
   ).bind(parsed.deviceId, env.TENANT_SLUG).first<TgDeviceRow>()
   if (!row) return { kind: 'none' }
   // Bound to exactly this member and Telegram user BEFORE anything else: a secret presented by anyone else is simply
@@ -213,11 +223,11 @@ export async function resolveActiveDevice(
   return r.kind === 'ok' ? r.device : null
 }
 
-export async function memberHasActiveDevice(env: Env, memberId: string, telegramUserId: string): Promise<boolean> {
+export async function memberHasActiveDevice(env: Env, memberId: string, telegramUserId: string, opts: { allowPinMode?: boolean } = {}): Promise<boolean> {
   const row = await env.DB.prepare(
     `SELECT 1 AS ok FROM tg_miniapp_devices d
        JOIN human_login_identities i ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id AND i.revoked_at IS NULL
-      WHERE d.tenant = ?1 AND d.member_id = ?2 AND d.telegram_user_id = ?3 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL LIMIT 1`,
+      WHERE d.tenant = ?1 AND d.member_id = ?2 AND d.telegram_user_id = ?3 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL${opts.allowPinMode ? '' : " AND d.unlock_mode = 'biometric'"} LIMIT 1`,
   ).bind(env.TENANT_SLUG, memberId, telegramUserId).first<{ ok: number }>()
   return row !== null
 }
@@ -268,7 +278,7 @@ export async function revokeMemberTgDevices(
 /** Device enrol/revoke are identity-surface writes: each leaves a mutation_audit_entries row (best effort, like passkeys). */
 export async function recordTgAudit(
   env: Env,
-  input: { operation: 'tg_device_enrol' | 'tg_device_revoke' | 'tg_device_rotate'; memberId: string; deviceId: string | null; evidence: Record<string, string> },
+  input: { operation: 'tg_device_enrol' | 'tg_device_revoke' | 'tg_device_rotate' | 'tg_device_pin_set' | 'tg_device_pin_attempt' | 'tg_device_pin_lockout' | 'tg_device_window_change'; memberId: string; deviceId: string | null; evidence: Record<string, string> },
   nowMs: number = Date.now(),
 ): Promise<boolean> {
   try {
@@ -317,7 +327,8 @@ export async function consumeMomentTelegram(
                           ON i.id = d.login_identity_id AND i.tenant = d.tenant AND i.member_id = d.member_id AND i.revoked_at IS NULL
                         JOIN members m ON m.id = d.member_id AND m.tenant = d.tenant AND m.telegram_chat_id = d.telegram_user_id AND m.status = 'active'
                        WHERE d.id = ?6 AND d.tenant = ?2 AND d.member_id = ?5 AND d.telegram_user_id = ?7
-                         AND d.secret_sha256 = ?8 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL)`,
+                         AND d.secret_sha256 = ?8 AND d.confirmed_at IS NOT NULL AND d.revoked_at IS NULL
+                         AND d.unlock_mode = 'biometric')`,
     ).bind(input.momentId, tenant, nowIso, input.decision, input.memberId, input.deviceId, input.telegramUserId, input.secretSha256),
     env.DB.prepare(
       `INSERT INTO tg_miniapp_decisions (moment_id, tenant, member_id, telegram_user_id, device_id, decision, decided_at)

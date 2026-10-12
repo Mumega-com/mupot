@@ -46,10 +46,11 @@ import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 import { secureMomentsStatus } from '../secure-moments/config'
-import { mintEnrolmentLink } from '../secure-moments/enrol-mint'
+import { checkEnrolmentSession, mintEnrolmentLink } from '../secure-moments/enrol-mint'
 import { requestEnrolDelivery } from '../secure-moments/telegram-miniapp-enrol-delivery'
 import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
 import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
+import { changeTrustWindow, currentTrustWindow, listMemberTgDevicesPw, parseTrustWindow, pinWindowOn, TRUST_WINDOW_PRESETS } from '../secure-moments/telegram-miniapp-pin-window'
 import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
 
 type ShellFn = (
@@ -514,10 +515,52 @@ function telegramDeviceScript(): Html {
     </script>`)
 }
 
+function telegramDeviceWindowScript(): Html {
+  return raw(`
+    <script>
+      (function () {
+        var status = document.getElementById('tgd-status');
+        var sv = document.querySelectorAll('button[data-tgd-window-save]');
+        for (var i = 0; i < sv.length; i++) sv[i].addEventListener('click', async function (ev) {
+          var id = ev.currentTarget.getAttribute('data-tgd-window-save');
+          var sel = document.querySelector('select[data-tgd-window="' + id + '"]');
+          if (!sel) return;
+          if (status) status.textContent = 'saving…';
+          try {
+            var res = await fetch('/account/telegram-device/' + encodeURIComponent(id) + '/window', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ seconds: parseInt(sel.value, 10) }) });
+            var data = await res.json().catch(function () { return {}; });
+            if (res.ok) { if (status) status.textContent = 'Saved. A shorter time takes effect immediately.'; }
+            else if (data.error === 'reauth_required') {
+              if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and save again.')); }
+            } else if (status) { status.textContent = 'Could not save (' + (data.error || res.status) + ').'; }
+          } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
+        });
+      })();
+    </script>`)
+}
+
 /** The Telegram device section: only while the Mini App channel is on; adds no authority (docs/architecture/secure-moments.md, W4). */
 export async function telegramDeviceSectionBody(env: Env, auth: AuthContext): Promise<Html | null> {
   if (telegramMiniappStatus(env).state !== 'on') return null
   if (!auth.memberId) return null
+  // W4.2 sub-flag: each phone also shows how it unlocks and its trusted-device window, which its owner can change here.
+  if (pinWindowOn(env)) {
+    const pwDevices = await listMemberTgDevicesPw(env, auth.memberId)
+    return html`
+    <p class="ui-sub">A set-up phone lets you approve requests inside Telegram with your fingerprint, face or a 6-digit PIN. After you confirm, the phone stays trusted for the time you choose, so routine approvals do not nag you. It is weaker than a passkey, so sensitive grants always need a passkey. It adds no permissions: it only proves it is you.</p>
+    ${pwDevices.length === 0
+      ? html`<p class="ui-sub" style="margin-top:8px;">${pill('No phone set up', 'dim')}</p>`
+      : html`<ul style="margin-top:8px;">${pwDevices.map((d) => html`<li>Set up ${formatWhen(d.confirmed_at ?? d.created_at)} · ${d.unlock_mode === 'pin' ? 'PIN' : 'fingerprint or face'}${d.last_used_at ? html` · last used ${formatWhen(d.last_used_at)}` : ''}
+          <label>Trusted for
+            <select data-tgd-window="${d.id}">${TRUST_WINDOW_PRESETS.map((w) => html`<option value="${String(w.seconds)}" ${w.seconds === d.trust_window_seconds ? raw('selected') : ''}>${w.label}</option>`)}</select></label>
+          <button class="btn" data-tgd-window-save="${d.id}">Save</button>
+          <button class="btn danger" data-tgd-revoke="${d.id}">Remove</button></li>`)}</ul>`}
+    <button class="btn" id="tgd-add" style="margin-top:10px;">Set up this phone</button>
+    <div class="status-line" id="tgd-status"></div>
+    ${telegramDeviceScript()}
+    ${telegramDeviceWindowScript()}
+  `
+  }
   const devices = await listMemberTgDevices(env, auth.memberId)
   return html`
     <p class="ui-sub">A set-up phone lets you approve requests inside Telegram with your fingerprint or face. It is weaker than a passkey, so sensitive grants still need a passkey. It adds no permissions: it only proves it is you.</p>
@@ -594,6 +637,39 @@ export function makeAccountApp(shell: ShellFn) {
     return (await revokeOwnTgDevice(c.env, auth.memberId, c.req.param('id')))
       ? c.json({ revoked: true })
       : c.json({ error: 'not_found' }, 404)
+  })
+
+  // Change a phone's trusted-device window (W4.2, flag TELEGRAM_MINIAPP_PIN_WINDOW). LENGTHENING (or re-saving the same value) is
+  // an enrolment-grade change: a real web session re-authenticated within five minutes (checkEnrolmentSession, the ONE shared
+  // rule). SHORTENING only reduces trust, so any real web session of the owner may do it (the revoke-device bar), with no
+  // fresh re-auth: a stolen session cookie can only make the phone ask more often. The value must be a preset.
+  app.post('/account/telegram-device/:id/window', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    c.header('Cache-Control', 'no-store')
+    if (!pinWindowOn(c.env)) return c.json({ error: 'not_enabled' }, 404)
+    let seconds: unknown
+    try {
+      const body: unknown = await c.req.json()
+      seconds = typeof body === 'object' && body !== null ? (body as { seconds?: unknown }).seconds : undefined // as: just narrowed to an object; the one field is validated as a preset below
+    } catch {
+      return c.json({ error: 'bad_request' }, 400)
+    }
+    const to = parseTrustWindow(seconds)
+    if (to === null) return c.json({ error: 'bad_window' }, 400)
+    const auth = c.get('auth')
+    // Self only: the member behind THIS web session, never a member id from the request.
+    if (!auth.webSessionIdHash || !auth.webSessionMemberId || !auth.memberId || auth.webSessionMemberId !== auth.memberId) {
+      return c.json({ error: 'not_a_web_session' }, 403)
+    }
+    const current = await currentTrustWindow(c.env, auth.memberId, c.req.param('id'))
+    if (current === null) return c.json({ error: 'not_found' }, 404)
+    if (to >= current) {
+      const session = await checkEnrolmentSession(c.env, auth)
+      if (!session.ok) return c.json({ error: session.error }, session.status)
+    }
+    const r = await changeTrustWindow(c.env, auth.memberId, c.req.param('id'), to)
+    if (!r.ok) return r.reason === 'bad_window' ? c.json({ error: 'bad_window' }, 400) : c.json({ error: 'not_found' }, 404)
+    return c.json({ saved: true, seconds: r.to })
   })
 
   app.post('/account/passkey/:id/revoke', async (c) => {
