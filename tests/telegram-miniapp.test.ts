@@ -548,7 +548,8 @@ describe('device enrolment', () => {
       expect(count('tg_miniapp_enrolment_tokens')).toBe(0)
       harness.sqlite.exec(`UPDATE members SET telegram_chat_id = '${TG.owner}' WHERE id = 'mem-owner'`)
       stubBotApi(403)
-      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, error: 'send_failed' })
+      // Telegram refusing the chat (member never pressed Start on the approvals bot) is reported as such, not as a generic failure
+      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, status: 409, error: 'chat_unreachable' })
       expect(one<{ status: string; error: string }>("SELECT status, error FROM tg_miniapp_deliveries WHERE status = 'failed'")).toMatchObject({ error: 'chat_unreachable' })
     })
     it('delivery is rate limited per member', async () => {
@@ -1005,7 +1006,7 @@ describe('device secret rotation: a harvested copy dies at the next real use and
     const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: first, decision: 'approve', actions: [a2] })
     expect((await jbody(r)).title).toBe('Device removed')
   })
-  it('a stale secret presented under ANOTHER member\'s initData still kills the device it came from (and says who presented it)', async () => {
+  it('a stale secret presented under ANOTHER member\'s initData is just refused: it revokes nothing (a third party holding an old copy cannot knock the device out)', async () => {
     const { dev, id } = await ready()
     await enrolDevice('mem-owner', TG.owner, identities.owner)
     expect((await approveOne(dev)).res.status).toBe(200)
@@ -1013,8 +1014,9 @@ describe('device secret rotation: a harvested copy dies at the next real use and
     const nonce = await nonceFor(m, TG.owner, { decision: 'approve' })
     const r = await post('/m/tg/decide', { init_data: init(TG.owner), moment_id: m.id, nonce, device_token: dev, decision: 'approve' })
     expect(r.status).toBe(403)
-    expect(one<{ revoked_reason: string }>('SELECT revoked_reason FROM tg_miniapp_devices WHERE id = ?', id)?.revoked_reason).toBe('stale_secret_replayed')
-    expect(one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'tg_device_revoke'")?.evidence_json).toContain('"presented_by_member_id":"mem-owner"')
+    expect((await jbody(r)).title).toBe('Device not recognised')
+    expect(one<{ revoked_at: string | null }>('SELECT revoked_at FROM tg_miniapp_devices WHERE id = ?', id)?.revoked_at).toBeNull()
+    expect(count('mutation_audit_entries', "operation = 'tg_device_revoke'")).toBe(0)
     expect(momentStatus(m.id)).toBe('pending')
   })
   it('another device\'s RETIRED secret presented under this device\'s id is just refused: it revokes neither device', async () => {
@@ -1179,6 +1181,22 @@ describe('the delivery helper (moment_miniapp_link): the worker sends, the calle
     const old = new Date(Date.now() - 3600 * 1000).toISOString()
     for (let i = 0; i < 6; i++) harness.sqlite.prepare("INSERT INTO tg_miniapp_deliveries (id, tenant, kind, subject_id, member_id, requested_by, status, created_at) VALUES (?, ?, 'moment', 'x', 'mem-owner', 'agent-x', 'sent', ?)").run(`old-${i}`, TENANT, old)
     expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: true })
+  })
+  it('the rate limit holds under CONCURRENCY: 20 parallel requests send at most the cap (slot reserved atomically before sending)', async () => {
+    const calls = stubBotApi()
+    const m = await fileSeed()
+    const results = await Promise.all(Array.from({ length: 20 }, () => requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')))
+    expect(results.filter((r) => r.ok)).toHaveLength(5)
+    expect(results.filter((r) => !r.ok && r.error === 'rate_limited')).toHaveLength(15)
+    expect(calls).toHaveLength(5)
+    expect(count('tg_miniapp_deliveries')).toBe(5)
+    expect(count('tg_miniapp_deliveries', "status = 'reserved'")).toBe(0)
+  })
+  it('Telegram refusing the chat is chat_unreachable (409), so the caller can tell the member to press Start on the bot', async () => {
+    stubBotApi(403)
+    const m = await fileSeed()
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, status: 409, error: 'chat_unreachable' })
+    expect(one<{ status: string; error: string }>('SELECT status, error FROM tg_miniapp_deliveries')).toMatchObject({ status: 'failed', error: 'chat_unreachable' })
   })
   it('is rate limited per member, and a failing Bot API is a failed receipt with no secret in it', async () => {
     const calls = stubBotApi()

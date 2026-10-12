@@ -425,3 +425,5 @@ The page gates on `Telegram.WebApp.isVersionAtLeast('8.0')` with a clear message
 - Whoever controls a member's Telegram account and unlocked phone controls their Telegram approvals (the W1 accepted risk).
 - `readParams` and `loadLiveSubject` are small copies of the same-named private functions in `routes.ts` (importing them would make a cycle with the mount); keep them in step until they are extracted.
 - Needs a real phone: `BiometricManager` behaviour, the `web_app` button delivery by the dedicated bot, the CSP in Telegram's real webview, and whether the webview sends `Origin` on same-origin fetch have not been exercised against a live client.
+
+**Before first use, each member presses Start on the approvals bot.** Telegram does not let a bot message someone who never started it; the worker reports that as `chat_unreachable` and the account page and `moment_miniapp_link` say so. Deliveries reserve their slot atomically before sending (5 per member per 10 minutes, shared by enrolment and moment buttons). A retired device secret revokes the device only when it is presented by that same member and Telegram user; from anyone else it is simply unknown.

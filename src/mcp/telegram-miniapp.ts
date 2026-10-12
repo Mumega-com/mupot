@@ -38,6 +38,7 @@ const toolMomentMiniappLink: ToolSpec = {
         case 'member_required': return fail(409, 'member_required', 'name the member who should decide it (member_id)')
         case 'target_not_reachable': return fail(409, 'target_not_reachable', 'that member cannot be reached through Telegram for this decision')
         case 'rate_limited': return fail(429, 'rate_limited', 'too many Mini App messages to that member just now; wait a few minutes')
+        case 'chat_unreachable': return fail(409, 'chat_unreachable', 'Telegram refused the chat: the member must open the approvals bot and press Start once')
         default: return fail(502, 'send_failed', 'Telegram did not accept the message')
       }
     }

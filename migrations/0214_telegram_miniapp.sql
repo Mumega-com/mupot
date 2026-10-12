@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS tg_miniapp_deliveries (
   subject_id TEXT NOT NULL,
   member_id TEXT NOT NULL,
   requested_by TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('sent', 'failed')),
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'sent', 'failed')),
   error TEXT,
   telegram_message_id TEXT,
   created_at TEXT NOT NULL

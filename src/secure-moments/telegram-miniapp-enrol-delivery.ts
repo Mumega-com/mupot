@@ -6,7 +6,7 @@ import { checkEnrolmentSession, type EnrolmentSessionRefusal } from './enrol-min
 import { telegramMiniappStatus } from './telegram-miniapp-config'
 import { sendMiniappButton, type FetchFn } from './telegram-miniapp-send'
 import { privateChatOf } from './telegram-miniapp-binding'
-import { mintTgEnrolmentToken, recentDeliveryCount, recordDelivery, TG_DELIVERY_MAX_PER_WINDOW } from './telegram-miniapp-store'
+import { finishDelivery, mintTgEnrolmentToken, reserveDelivery } from './telegram-miniapp-store'
 
 export interface DeliveryReceipt {
   delivery_id: string
@@ -17,7 +17,7 @@ export interface DeliveryReceipt {
 export type EnrolDeliveryResult =
   | ({ ok: true } & DeliveryReceipt)
   | EnrolmentSessionRefusal
-  | { ok: false; status: 409 | 429 | 502; error: 'telegram_not_bound' | 'rate_limited' | 'send_failed' }
+  | { ok: false; status: 409 | 429 | 502; error: 'telegram_not_bound' | 'rate_limited' | 'chat_unreachable' | 'send_failed' }
 
 /**
  * "Set up this phone": the SAME session rules as the passkey link (checkEnrolmentSession), then the WORKER mints the
@@ -29,13 +29,14 @@ export async function requestEnrolDelivery(env: Env, auth: AuthContext, fetchFn?
   if (!checked.ok) return checked
   const chatId = await privateChatOf(env, checked.memberId)
   if (!chatId) return { ok: false, status: 409, error: 'telegram_not_bound' }
-  if ((await recentDeliveryCount(env, checked.memberId, nowMs)) >= TG_DELIVERY_MAX_PER_WINDOW) return { ok: false, status: 429, error: 'rate_limited' }
+  const receipt = await reserveDelivery(env, { kind: 'enrol', subjectId: checked.memberId, memberId: checked.memberId, requestedBy: checked.memberId }, nowMs)
+  if (!receipt) return { ok: false, status: 429, error: 'rate_limited' }
   const minted = await mintTgEnrolmentToken(env, checked.memberId, checked.identityId, nowMs)
   const sent = await sendMiniappButton(env, {
     chatId, path: `/m/tg/enrol/${encodeURIComponent(minted.token)}`, buttonText: 'Set up this phone',
     text: 'Set up this phone for approvals. Open the button below within 10 minutes and confirm with your fingerprint or face. If you did not ask for this, ignore it.',
   }, fetchFn)
-  const receipt = await recordDelivery(env, { kind: 'enrol', subjectId: checked.memberId, memberId: checked.memberId, requestedBy: checked.memberId, status: sent.ok ? 'sent' : 'failed', error: sent.ok ? null : sent.error, messageId: sent.ok ? sent.messageId : null }, nowMs)
-  if (!sent.ok) return { ok: false, status: 502, error: 'send_failed' }
+  await finishDelivery(env, receipt.id, { status: sent.ok ? 'sent' : 'failed', error: sent.ok ? null : sent.error, messageId: sent.ok ? sent.messageId : null })
+  if (!sent.ok) return sent.error === 'chat_unreachable' ? { ok: false, status: 409, error: 'chat_unreachable' } : { ok: false, status: 502, error: 'send_failed' }
   return { ok: true, delivery_id: receipt.id, status: 'sent', sent_at: receipt.createdAt }
 }

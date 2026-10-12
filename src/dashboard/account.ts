@@ -498,6 +498,7 @@ function telegramDeviceScript(): Html {
               if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
             } else if (data.error === 'telegram_not_bound') { if (status) status.textContent = 'Connect Telegram in the section above first; the setup button is sent to that private chat.'; }
             else if (data.error === 'rate_limited') { if (status) status.textContent = 'Too many messages just now. Wait a few minutes.'; }
+            else if (data.error === 'chat_unreachable') { if (status) status.textContent = 'Telegram would not deliver it: open the approvals bot in Telegram and press Start once, then try again.'; }
             else if (status) { status.textContent = 'Could not send (' + (data.error || res.status) + ').'; }
           } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
           add.disabled = false;

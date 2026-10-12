@@ -178,6 +178,9 @@ export async function resolveDeviceForDecision(
       WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL LIMIT 1`,
   ).bind(parsed.deviceId, env.TENANT_SLUG).first<TgDeviceRow>()
   if (!row) return { kind: 'none' }
+  // Bound to exactly this member and Telegram user BEFORE anything else: a secret presented by anyone else is simply
+  // unknown, so a harvested retired secret cannot be used by a third party to revoke someone's device (gate finding).
+  if (row.member_id !== who.memberId || row.telegram_user_id !== who.telegramUserId) return { kind: 'none' }
   const presented = await tokenHash(parsed.secret)
   if (!timingSafeEqual(row.secret_sha256, presented)) {
     const retired = await env.DB.prepare(
@@ -195,7 +198,6 @@ export async function resolveDeviceForDecision(
     }
     return { kind: 'stale', deviceId: row.id }
   }
-  if (row.member_id !== who.memberId || row.telegram_user_id !== who.telegramUserId) return { kind: 'none' }
   if (!row.login_identity_id) return { kind: 'none' }
   const identity = await env.DB.prepare(
     `SELECT id FROM human_login_identities WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
@@ -376,16 +378,32 @@ export async function recentDeliveryCount(env: Env, memberId: string, nowMs: num
   return row?.n ?? 0
 }
 
-export async function recordDelivery(
+/**
+ * Reserve a delivery slot ATOMICALLY: one INSERT ... SELECT whose WHERE counts this member's rows in the window, so
+ * concurrent callers cannot all pass a read-then-write check (gate finding on #1868: 20 parallel calls sent 20). The
+ * row starts 'reserved' (it counts against the cap); finishDelivery marks it sent or failed after the Bot API call.
+ * Null = the member's window is full.
+ */
+export async function reserveDelivery(
   env: Env,
-  input: { kind: 'moment' | 'enrol'; subjectId: string; memberId: string; requestedBy: string; status: 'sent' | 'failed'; error: string | null; messageId: string | null },
+  input: { kind: 'moment' | 'enrol'; subjectId: string; memberId: string; requestedBy: string },
   nowMs: number = Date.now(),
-): Promise<{ id: string; createdAt: string }> {
+): Promise<{ id: string; createdAt: string } | null> {
   const id = crypto.randomUUID()
   const createdAt = new Date(nowMs).toISOString()
-  await env.DB.prepare(
+  const r = await env.DB.prepare(
     `INSERT INTO tg_miniapp_deliveries (id, tenant, kind, subject_id, member_id, requested_by, status, error, telegram_message_id, created_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
-  ).bind(id, env.TENANT_SLUG, input.kind, input.subjectId, input.memberId, input.requestedBy, input.status, input.error, input.messageId, createdAt).run()
-  return { id, createdAt }
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'reserved', NULL, NULL, ?7
+      WHERE (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND member_id = ?5 AND created_at > ?8) < ?9`,
+  ).bind(id, env.TENANT_SLUG, input.kind, input.subjectId, input.memberId, input.requestedBy, createdAt,
+    new Date(nowMs - TG_DELIVERY_WINDOW_MS).toISOString(), TG_DELIVERY_MAX_PER_WINDOW).run()
+  return r.meta.changes === 1 ? { id, createdAt } : null
+}
+
+export async function finishDelivery(
+  env: Env, id: string, outcome: { status: 'sent' | 'failed'; error: string | null; messageId: string | null },
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE tg_miniapp_deliveries SET status = ?3, error = ?4, telegram_message_id = ?5 WHERE id = ?1 AND tenant = ?2 AND status = 'reserved'`,
+  ).bind(id, env.TENANT_SLUG, outcome.status, outcome.error, outcome.messageId).run()
 }

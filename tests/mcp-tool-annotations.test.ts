@@ -132,7 +132,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
     'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
-    'message_get', 'moment_miniapp_link', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
+    'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
     'project_wiki', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
     'routine_run_list', 'runner_list', 'secret_env_status', 'seed_draft', 'squad_member_list', 'squad_recall', 'status',
@@ -152,7 +152,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'update_agent', 'update_squad',
   ]
   const ALL_OPEN_WORLD = [
-    'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'office.health',
+    'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',
     'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki',
     'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
     'task_submit_result', 'task_update', 'wake_agent',
