@@ -929,6 +929,16 @@ describe('W3.1 plain-link fallback', () => {
     expect(audits()).toBe(0)
   })
 
+  it('a moment past its expiry (row still marked pending) is not re-linked and no second moment is minted', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    harness.sqlite.exec("UPDATE secure_moments SET expires_at = '2020-01-01T00:00:00.000Z'")
+    const r = await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    expect(structured(r).approve_url).toBeUndefined()
+    expect(count('secure_moments')).toBe(1)
+    expect(audits()).toBe(0)
+  })
+
   it('2025-11-25: a retry carries no action, so it is consent: read-only, no rotation (the -32042 message already carried the link)', async () => {
     const env = makeEnv()
     const sid = (await initWithUrl(env)) ?? ''
