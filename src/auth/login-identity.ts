@@ -20,6 +20,7 @@
 
 import type { Env } from '../types'
 import { revokeMemberPasskeys } from '../secure-moments/store'
+import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 import { revokeWebSessionsForLoginIdentity } from './web-sessions'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 import {
@@ -316,6 +317,7 @@ export async function revokeLoginIdentity(
     // is not live). Both are idempotent, so a retry after any partial failure finishes the cutoff.
     sessionsRevoked = (await revokeWebSessionsForLoginIdentity(env, tenant, memberId, identityId, 'identity_revoked', nowMs)).revokedCount
     await revokeMemberPasskeys(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
+    await revokeMemberTgDevices(env, memberId, 'login_identity_revoked', { loginIdentityId: identityId }, nowMs)
   }
   return { revoked: changes > 0, identity: identity ?? null, sessionsRevoked }
 }

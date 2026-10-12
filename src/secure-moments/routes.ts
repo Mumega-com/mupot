@@ -36,6 +36,7 @@ import { credentialViewInner } from '../secure-drop/page'
 import { CREDENTIAL_SCRIPT, HPKE_ASSET } from '../secure-drop/client'
 import { HPKE_BUNDLE_JS } from '../secure-drop/hpke-bundle.generated'
 import { groupFingerprint } from '../secure-drop/keys'
+import { mountTelegramMiniapp } from './telegram-miniapp'
 
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
 
@@ -98,6 +99,10 @@ momentsApp.use('*', async (c, next) => {
   c.set('nonce', b64uEncode(crypto.getRandomValues(new Uint8Array(16))))
   await next()
 })
+
+// Telegram Mini App adapter (W4): registered HERE, before every /m/:id/:token route (`/m/tg/<id>` is not moment "tg").
+// Each of its handlers falls through untouched unless TELEGRAM_MINIAPP is on, so flag off changes nothing.
+mountTelegramMiniapp(momentsApp)
 
 // ── shared request guards ───────────────────────────────────────────────────────────────────────
 type JsonBody = Record<string, unknown>

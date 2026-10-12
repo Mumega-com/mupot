@@ -138,11 +138,11 @@ async function releaseClaim(env: Env, rowId: string, token: string, projectSlug:
  *  or a secure moment, src/secure-moments/routes.ts): the human's verified, CSRF-protected POST stands in for the dry-run accept_token. Constructed ONLY server-side
  *  after the JWT, member and org-admin checks; MCP args are JSON and can never carry it. Recorded in the receipt. */
 export interface AccessAcceptAttestation {
-  via: 'access_passkey' | 'webauthn'
+  via: 'access_passkey' | 'webauthn' | 'telegram_miniapp'
   requestId: string
   /** The Cloudflare Access `sub` (via access_passkey only). */
   accessSub?: string
-  /** The secure moment that carried the decision (via webauthn only). */
+  /** The secure moment that carried the decision (via webauthn / telegram_miniapp). */
   momentId?: string
 }
 

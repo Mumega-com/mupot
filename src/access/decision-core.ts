@@ -32,7 +32,7 @@ import { isValidSlugBase } from '../org/team-bootstrap'
 import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { escapeHtml, untrustedBox } from './page'
 import {
-  claimSeedRequest, denySeedRequest, finishSeedRequest, type DecisionVia, type SeedRequestRow, type StoredRequest,
+  claimSeedRequest, denySeedRequest, finishSeedRequest, receiptHandlerFor, type DecisionVia, type SeedRequestRow, type StoredRequest,
 } from './seed-request'
 
 /** Who decided and over which channel. `evidence` lands verbatim in the receipts (e.g. access_sub, moment_id). */
@@ -240,7 +240,7 @@ async function writeElevationReceipt(
     ).bind(
       crypto.randomUUID(), env.TENANT_SLUG, proof.memberId, operation, requestId, `access-elevation:${requestId}`,
       JSON.stringify({ via: proof.via, ...proof.evidence, ...evidence }), nowIso,
-      proof.via === 'webauthn' ? 'secure_moment' : 'access_approve',
+      receiptHandlerFor(proof.via),
     ).run()
     return true
   } catch {

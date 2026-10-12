@@ -47,6 +47,9 @@ import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { mintEnrolmentLink } from '../secure-moments/enrol-mint'
+import { mintTgEnrolmentLink } from '../secure-moments/telegram-miniapp-launch'
+import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
+import { revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
 import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
 
 type ShellFn = (
@@ -512,6 +515,29 @@ export function makeAccountApp(shell: ShellFn) {
     const r = await mintEnrolmentLink(c.env, c.get('auth'))
     c.header('Cache-Control', 'no-store')
     return r.ok ? c.json({ url: r.url, expires_at: r.expiresAt }) : c.json({ error: r.error }, r.status)
+  })
+
+  // "Set up Telegram device" (secure moments W4, flag TELEGRAM_MINIAPP): the SAME session rules as the passkey link
+  // (checkEnrolmentSession). Returns the link plus the web_app button a gateway can send into the member's own
+  // private chat; the link alone enrols nothing (the Telegram user that opens it must BE this member).
+  app.post('/account/telegram-device/enrol', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const r = await mintTgEnrolmentLink(c.env, c.get('auth'))
+    c.header('Cache-Control', 'no-store')
+    return r.ok ? c.json({ url: r.url, expires_at: r.expires_at, web_app_button: r.launch.web_app_button, reply_markup: r.launch.reply_markup, t_me_link: r.launch.t_me_link }) : c.json({ error: r.error }, r.status)
+  })
+
+  app.post('/account/telegram-device/:id/revoke', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const auth = c.get('auth')
+    if (telegramMiniappStatus(c.env).state !== 'on') return c.json({ error: 'not_enabled' }, 404)
+    // Self only: the member behind THIS web session, never a member id from the request.
+    if (!auth.webSessionIdHash || !auth.webSessionMemberId || auth.webSessionMemberId !== auth.memberId || !auth.memberId) {
+      return c.json({ error: 'not_a_web_session' }, 403)
+    }
+    return (await revokeOwnTgDevice(c.env, auth.memberId, c.req.param('id')))
+      ? c.json({ revoked: true })
+      : c.json({ error: 'not_found' }, 404)
   })
 
   app.post('/account/passkey/:id/revoke', async (c) => {

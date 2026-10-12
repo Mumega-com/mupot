@@ -66,7 +66,7 @@ describe('the full /mcp tools/list response includes them', () => {
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
     // SECURE_DROP is unset as well: the five secure-drop tools (W2) are not advertised either.
     const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !DROP.includes(t.name)).length)
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
       expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
       expect(Object.keys(t.annotations ?? {}).sort(), t.name).toEqual(['destructiveHint', 'openWorldHint', 'readOnlyHint'])
@@ -132,7 +132,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
     'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
-    'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
+    'message_get', 'moment_miniapp_link', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
     'project_wiki', 'recall', 'resolve_agent', 'routine_get', 'routine_list', 'routine_run_get',
     'routine_run_list', 'runner_list', 'secret_env_status', 'seed_draft', 'squad_member_list', 'squad_recall', 'status',

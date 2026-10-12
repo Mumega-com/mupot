@@ -292,3 +292,109 @@ Because most clients are unknown, nothing depends on the elicitation: the plain 
 ### Not verified
 
 No real client has been driven through either flow; the tests speak the wire shapes directly. The 2026-07-28 field names (`inputResponses`, `requestState` as `tools/call` params, the `input_required` result) follow the SEP-2322 text as recorded in research, not a client implementation. Whether a given client echoes `Mcp-Session-Id` after `initialize` through the OAuth wrapper in front of `/mcp` is unmeasured. The wrapper's own CORS block does not set `Expose-Headers`; the `initialize` response sets it itself and the wrapper copies response headers, which the tests do not exercise.
+
+## W4: the Telegram Mini App
+
+Status: wave W4, behind its own flag `TELEGRAM_MINIAPP` (off by default; needs `SECURE_MOMENTS`). With the flag off, every `/m/tg*` path falls through to the routing that existed before W4 and answers what it always answered (404); the helper tool is not advertised; no table is read or written.
+
+The Mini App is a second way to prove "this human decided": a page on the secure host that Telegram opens inside the app. It decides through the same shared decision core as the passkey page (`src/access/decision-core.ts`) with `HumanProof { via: 'telegram_miniapp' }`.
+
+**It is weaker than a passkey, and says so.** A WebAuthn passkey is verified by mupot against a public key. The Telegram step-up is a *biometric-unlocked device secret attested by the Telegram client*: the server issues a random secret, the Mini App stores it with Telegram's `BiometricManager.updateBiometricToken`, and Telegram only releases it after a successful fingerprint or face check. mupot cannot see or verify the biometric; it can only see that a client that holds the secret presented it together with fresh Telegram-signed launch data. A compromised Telegram client, or script running in the Mini App origin, can read the secret after the human unlocks it once. That is why the policy below keeps sensitive grants on passkeys.
+
+### Configuration
+
+| Variable | Meaning |
+|---|---|
+| `TELEGRAM_MINIAPP` | `1` or `true` turns the adapter on. |
+| `TELEGRAM_MINIAPP_BOT_ID` | Numeric id of the bot that launches the Mini App. It goes into the string Telegram's signature is checked against, so data signed for any other bot is refused. Required. |
+| `TELEGRAM_MINIAPP_MAX_AGE_SECONDS` | How old the launch data's `auth_date` may be. Default 300, hard cap 3600; zero, negative or unparseable means the default. |
+| `TELEGRAM_MINIAPP_BOT_TOKEN` | Optional worker **secret** (`wrangler secret put`). Enables the classic HMAC check for clients that send no `signature`. It must start with `<TELEGRAM_MINIAPP_BOT_ID>:` or it is ignored. Without it only Telegram's Ed25519 signature is accepted. |
+| `TELEGRAM_MINIAPP_EXTRA_PUBKEYS` | Staging only: comma-separated extra Ed25519 public keys (64 hex). Production leaves this unset and accepts Telegram's production key alone. Telegram's published test key is listed below and is deliberately not in the default set. |
+| `TELEGRAM_MINIAPP_BOT_USERNAME`, `TELEGRAM_MINIAPP_APP_SHORTNAME` | Optional. Lets the launch helper also return a `https://t.me/<bot>/<app>?startapp=...` direct link. The direct-link app must be registered with the bot by a human (BotFather); this worker never configures a bot. |
+
+The names are in the reviewed-names list.
+
+### Verifying the launch data (no bot token needed)
+
+Telegram signs the data a Mini App is launched with. mupot uses the third-party method:
+
+1. Parse the `initData` query string strictly: every segment is `key=value`, keys are plain and unique, no empty segments, no control characters or whitespace (a raw line feed could forge a data-check-string line). A duplicate key, including a second `signature` or `user`, is refused.
+2. Build the data-check-string: `<bot_id>:WebAppData`, a line feed, then every received field **except `hash` and `signature`**, sorted alphabetically, as `key=<value>` lines joined by line feeds. The bot id comes from `TELEGRAM_MINIAPP_BOT_ID`, never from the payload.
+3. Verify the base64url `signature` as an Ed25519 signature over the UTF-8 bytes with Telegram's published public key. A bad signature is final: it never falls back to the HMAC path.
+4. Only then check `auth_date` (a positive integer, not older than the window, not more than 60 seconds in the future) and read the user id (a positive safe integer).
+
+Source: <https://core.telegram.org/bots/webapps#validating-data-for-third-party-use> (read 2026-10-12). Telegram publishes no worked test vector, so the tests sign with `node:crypto` keys, an implementation independent of the WebCrypto verifier, and build the signed string in the test from the documented rules.
+
+| Environment | Ed25519 public key (hex) | Accepted by default |
+|---|---|---|
+| Production | `e7bf03a2fa4602af4580703d88dda5bb59f32ed8b02a56c187fe7d34caed242d` | yes |
+| Test | `40055058a4ee38156a06562e52eece92a771bcd8346a8c4615cb7376eddf72ec` | **no**, only via `TELEGRAM_MINIAPP_EXTRA_PUBKEYS` |
+
+The classic path (`hash` = HMAC-SHA256 of the data-check-string, which here keeps `signature` in and drops only `hash`, keyed by HMAC-SHA256 of the token with the constant `WebAppData`) exists only when the optional token is configured and the payload carries no `signature`.
+
+Launch data is a bearer for a few minutes: whoever has it can read a request they are entitled to see. It cannot decide anything on its own (see the step-up below).
+
+### Who is this Telegram user
+
+The signed Telegram user id is compared with `members.telegram_chat_id`, the one binding the codebase has between a Telegram account and a member. It is set only by My Account, Connect Telegram, the invite bind and the pairing flow, never by the Mini App. In a private chat the chat id equals the user id, which is the private-chat rule the harness-attested verdict path (#1425) relies on.
+
+- No member bound to that id, in this tenant: refused with "this Telegram account is not linked", with the way to link it.
+- A bound member who is archived, suspended or welded to an agent (`memberIsActiveHuman`): refused as not eligible.
+- A launch whose `chat_type` is `group`, `supergroup` or `channel` is refused whoever signed it. `sender`, `private` and an absent `chat_type` are accepted.
+- The member comes from the signed id only; nothing in the request body can name one.
+
+### Device enrolment
+
+A device is enrolled once per phone:
+
+1. The member, signed in on the dashboard with a fresh re-authentication, asks for a device setup link (`POST /account/telegram-device/enrol`). The rules are exactly those of the passkey enrolment link (`checkEnrolmentSession`: a real web session of an active human, recent re-auth, live login identity), single-use and ten minutes. The response carries the link, a `web_app` button and, if configured, the `t.me` link; mupot sends nothing itself.
+2. The harness puts the button in the member's own private chat with the bot. Opening it inside Telegram loads `/m/tg/enrol/<token>`.
+3. `start`: fresh launch data, and the Telegram user must be bound to **the member the link names**, otherwise refused. The server issues `<device id>.<random secret>` and stores only the secret's sha256 in a pending row bound to the member, the Telegram user id and the login identity of the dashboard session. A second `start` under the same link supersedes the first.
+4. The Mini App stores the secret with `updateBiometricToken`, then reads it back through `authenticate` (a biometric prompt).
+5. `confirm`: the secret read back must hash to the stored digest, for the same member and Telegram user, with a live login identity. One batch activates the device and spends the link; a refusal on either side leaves the link unspent.
+
+At most five active devices per member. Enrolment adds no authority.
+
+**Not built in this wave:** enrolment by a mupot passkey assertion from inside the Mini App. Telegram's in-app browsers do not reliably support WebAuthn, and the challenge table's `purpose` CHECK would need a rebuild that collides with the W2 migration. The dashboard link is the stronger existing proof the brief allowed in its place.
+
+### Deciding
+
+1. The page (`/m/tg` or `/m/tg/<moment id>`) loads Telegram's script and POSTs `Telegram.WebApp.initData` to `/m/tg/view`. The moment comes from the path, the body, or the signed `start_param` (`m_<id>`). It is shown only to a member who may decide it (same predicates as the other channels, re-derived now) and when it is addressed to that member or to anyone; unknown, out of authority and another tenant's moment all read as the same 404. A credential moment is refused with "open on a browser with a passkey": the Mini App never carries a secret.
+2. `/m/tg/challenge`: fresh launch data, the policy below, and a single-use nonce bound to the moment, the decision, the exact parameters, the member **and** the Telegram user id. The member must already have an active device, otherwise the answer is "set up this device".
+3. The Mini App unlocks the device secret with a biometric prompt and POSTs `/m/tg/decide` with fresh launch data, the nonce and the secret.
+4. The server re-runs steps 1 to 2, consumes the nonce, and checks the secret against the stored digest in constant time, for exactly this member and Telegram user, on a live login identity. Then the shared core runs with the channel's one guarded `UPDATE` as its gate. Every refusal the core could raise (closed request, duration, selection, authority) runs **before** the gate, exactly as in W1.
+5. The gate re-checks inside its own `WHERE` that the moment is pending, unexpired, of a kind the Mini App may decide, addressed to this member or anyone, and that the device is still active for this member and Telegram user with this digest, on a live identity, with the Telegram binding still in place. The decision row (`tg_miniapp_decisions`) lands in the same batch.
+6. Receipts carry `via: telegram_miniapp`, the moment id, the Telegram user id and the device id. `secure_moments.decided_via` stays NULL for a Telegram decision (its CHECK allows only `webauthn` and that table is not rebuilt here); `tg_miniapp_decisions` is the channel record. `seed_attach_requests.decided_via` is `telegram_miniapp` (migration 0214 rebuilds that table once more).
+
+### The step-up policy
+
+| Decision | Telegram | Passkey |
+|---|---|---|
+| Seed attach, approve or deny | accepted | accepted |
+| Deny of anything | accepted | accepted |
+| Elevation approve, every selected action known and not in `SENSITIVE_STEP_UP_ACTIONS` | accepted | accepted |
+| Elevation approve containing any `SENSITIVE_STEP_UP_ACTIONS` member, or any unknown action | **refused**: "untick the sensitive actions, or open on a browser with a passkey" | required |
+
+The classification is the existing one (`src/auth/elevation-actions.ts`), reused, not copied. The policy is an allowlist: an action the registry does not know is refused too. It is applied to the actions the human **selected** (narrowing a request to its non-sensitive part is allowed), at challenge and again at decide. The page disables the sensitive checkboxes.
+
+### Revocation
+
+A device is revoked by the same levers as a passkey: sign out everywhere (`revokeAllWebSessions`) and revoking a login identity (`revokeLoginIdentity`, only the devices enrolled under it), and by the owner (`POST /account/telegram-device/<id>/revoke`). A device on a revoked identity is also refused at use and inside the consume `WHERE`, so a direct row update cannot leave it as a surviving door. Moving or clearing `members.telegram_chat_id` ends the channel for that Telegram user at once, and a device never works for a different Telegram user id.
+
+### Launching it
+
+`moment_miniapp_link { moment_id }` (MCP, advertised only while the flag is on) returns `{ url, web_app_button, reply_markup, t_me_link }` for a pending moment you filed (or an org admin). The harness that owns the bot sends the button into the member's own **private** chat (Telegram only allows `web_app` buttons there). The worker makes no Bot API call. The payload never contains the passkey link token; the moment id in the URL is not a bearer.
+
+### CSP
+
+The Mini App pages (`/m/tg`, `/m/tg/<id>`, `/m/tg/enrol/<token>`) allow exactly one extra script source, `https://telegram.org/js/telegram-web-app.js`, beside the per-response nonce. Every other page and every JSON response keeps the W1 policy with no Telegram origin. The page is not frameable (`frame-ancestors 'none'`, `X-Frame-Options: DENY`): Telegram Web, which embeds Mini Apps in an iframe, is not supported, which costs nothing because BiometricManager is not available there either. The script is not pinned with Subresource Integrity because Telegram updates the file in place; the CSP path source is the pin.
+
+### Accepted limits
+
+- The device secret is client-attested. Anything that can run in the Mini App origin after a human unlocks it can read it for that session. The secret is bound to a Telegram user and a member and useless without fresh launch data, but it is not a hardware-bound key.
+- The secret is sent in clear inside TLS on every decision (the server stores only a hash, so it cannot verify a keyed response). A later wave could rotate it on every use.
+- Launch data cannot be refreshed in place: a human who leaves the Mini App open past the window must reopen it.
+- Whoever controls a member's Telegram account and unlocked phone controls their Telegram approvals (the W1 accepted risk).
+- `readParams` and `loadLiveSubject` are small copies of the same-named private functions in `routes.ts` (importing them would make a cycle with the mount); keep them in step until they are extracted.
+- Migration 0214 creates only its own tables and rebuilds `seed_attach_requests` (widening `decided_via`); it runs after 0213 (secure drops), which rebuilt `secure_moments`.
+- Needs a real phone: BiometricManager behaviour, the direct-link `startapp` flow, the web_app button delivery by the gateway, and the CSP on Telegram's real webview have not been exercised against a live client.

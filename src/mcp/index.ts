@@ -217,6 +217,8 @@ import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
 import { SECURE_DROP_TOOLS } from './secure-drop'
 import { secureDropFlag } from '../secure-drop/config'
+import { TELEGRAM_MINIAPP_TOOLS } from './telegram-miniapp'
+import { telegramMiniappFlag } from '../secure-moments/telegram-miniapp-config'
 import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
@@ -7006,6 +7008,7 @@ export const TOOLS: ToolSpec[] = [
   ...PRESENCE_TOOLS,
   ...SEED_TOOLS,
   ...SECURE_DROP_TOOLS,
+  ...TELEGRAM_MINIAPP_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
@@ -7034,12 +7037,15 @@ const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_req
 // Secure drops (W2): the five drop tools are not advertised while SECURE_DROP is off, and a direct call refuses
 // in invokeTool before argument handling (so a flag-off pot never reveals their schemas).
 const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP'>): ToolSpec[] {
+// Secure moments W4: moment_miniapp_link is advertised only while TELEGRAM_MINIAPP is on (flag off => tools/list unchanged).
+const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
-  if (seat && access && drop) return TOOLS
-  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)))
+  const tgMiniapp = telegramMiniappFlag(env)
+  if (seat && access && drop && tgMiniapp) return TOOLS
+  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
