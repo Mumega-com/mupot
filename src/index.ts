@@ -84,6 +84,8 @@ import { supabaseWebhookApp } from './connectors/supabase-webhook'
 import { routerApp } from './router/routes'
 import { approveApp } from './access/routes'
 import { approvalHostGate } from './access/host-gate'
+import { secureMomentsHostGate } from './secure-moments/host-gate'
+import { momentsApp } from './secure-moments/routes'
 
 // Durable Object classes — implemented in src/agents/.
 export { AgentDO } from './agents/agent-do'
@@ -262,6 +264,7 @@ app.route('/invite', inviteApp)
 // dashboard '/' catch-all so it is never shadowed.
 app.route('/approve', approveApp)
 const approvalHostApp = new Hono<{ Bindings: Env }>().route('/approve', approveApp)
+// The secure-moments app is reachable ONLY through secureMomentsHostGate (never mounted on the main app).
 
 app.route(ROUTES.dashboard, dashboardApp)
 
@@ -369,6 +372,10 @@ export default {
     // HOST GATE, FIRST: the dedicated approval hostname serves ONLY /approve/*; /approve/* answers on no other
     // host. Runs before tenant routing, hostname dispatch, OAuth, MCP, preview and the dashboard so no
     // less-trusted route can ever share a host with the Access cookie (src/access/host-gate.ts).
+    // Secure moments gate: the dedicated secure host serves ONLY /m/*; /m/* answers on no other host (src/secure-moments/host-gate.ts).
+    const momentsGated = secureMomentsHostGate(req, env)
+    if (momentsGated === 'moments') return momentsApp.fetch(req, env, ctx)
+    if (momentsGated) return momentsGated
     const gated = approvalHostGate(req, env)
     // On the approval host, /approve/* goes straight to the approve app: no tenant routing, hostname dispatch or
     // any other handler runs, so nothing on this host can forward the Access cookie into a user Worker.

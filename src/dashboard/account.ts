@@ -45,6 +45,9 @@ import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
 import { MEMBER_BIND_MINT_FLOOR } from '../members/project-invites'
 import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
+import { secureMomentsStatus } from '../secure-moments/config'
+import { mintEnrolmentLink } from '../secure-moments/enrol-mint'
+import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
 
 type ShellFn = (
   env: Env,
@@ -428,6 +431,58 @@ export async function telegramSectionBody(env: Env, auth: AuthContext): Promise<
   `
 }
 
+function passkeyScript(): Html {
+  return raw(`
+    <script>
+      (function () {
+        var add = document.getElementById('pk-add');
+        var status = document.getElementById('pk-status');
+        if (add) add.addEventListener('click', async function () {
+          add.disabled = true;
+          if (status) status.textContent = 'preparing…';
+          try {
+            var res = await fetch('/account/passkey/enrol', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
+            var data = await res.json().catch(function () { return {}; });
+            if (res.ok && data.url) { window.location.assign(data.url); return; }
+            if (data.error === 'reauth_required') {
+              if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
+            } else if (status) { status.textContent = 'Could not start (' + (data.error || res.status) + ').'; }
+          } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
+          add.disabled = false;
+        });
+        var rm = document.querySelectorAll('button[data-pk-revoke]');
+        for (var i = 0; i < rm.length; i++) rm[i].addEventListener('click', async function (ev) {
+          if (!window.confirm('Remove this passkey? You will no longer be able to approve with it.')) return;
+          var id = ev.currentTarget.getAttribute('data-pk-revoke');
+          var res = await fetch('/account/passkey/' + encodeURIComponent(id) + '/revoke', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
+          if (res.ok) window.location.reload(); else if (status) status.textContent = 'Could not remove (' + res.status + ').';
+        });
+      })();
+    </script>`)
+}
+
+/** The Passkeys section: only while secure moments are on; adds no authority (docs/architecture/secure-moments.md). */
+export async function passkeySectionBody(env: Env, auth: AuthContext): Promise<Html | null> {
+  if (secureMomentsStatus(env).state !== 'on') return null
+  if (!auth.memberId) return null
+  const keys = await listMemberPasskeys(env, auth.memberId)
+  return html`
+    <p class="ui-sub">A passkey lets you confirm approvals on a separate secure page with your fingerprint, face or device PIN. It adds no permissions: it only proves it is you.</p>
+    ${keys.length === 0
+      ? html`<p class="ui-sub" style="margin-top:8px;">${pill('None registered', 'dim')}</p>`
+      : html`<ul style="margin-top:8px;">${keys.map((k) => html`<li>Registered ${formatWhen(k.created_at)}${k.last_used_at ? html` · last used ${formatWhen(k.last_used_at)}` : ''}
+          <button class="btn danger" data-pk-revoke="${k.id}">Remove</button></li>`)}</ul>`}
+    <button class="btn" id="pk-add" style="margin-top:10px;">Add passkey</button>
+    <div class="status-line" id="pk-status"></div>
+    ${passkeyScript()}
+  `
+}
+
+async function passkeyPanel(env: Env, auth: AuthContext): Promise<Html> {
+  const body = await passkeySectionBody(env, auth)
+  return body ? sectionPanel({ title: 'Passkeys', body }) : html``
+}
+
 async function accountPageBody(env: Env, auth: AuthContext): Promise<Html> {
   return html`
     ${pageHeader({
@@ -436,6 +491,7 @@ async function accountPageBody(env: Env, auth: AuthContext): Promise<Html> {
       sub: 'Your identity in this pot and the channels connected to it.',
     })}
     ${sectionPanel({ title: 'Telegram', body: await telegramSectionBody(env, auth) })}
+    ${await passkeyPanel(env, auth)}
   `
 }
 
@@ -447,6 +503,28 @@ export function makeAccountApp(shell: ShellFn) {
   app.get('/account', async (c) => {
     const body = await accountPageBody(c.env, c.get('auth'))
     return c.html(shell(c.env, 'My Account', body))
+  })
+
+  // "Add passkey": mints a single-use enrolment link (secure moments). Same-origin only; a real, freshly
+  // re-authenticated web session only; adds no authority.
+  app.post('/account/passkey/enrol', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const r = await mintEnrolmentLink(c.env, c.get('auth'))
+    c.header('Cache-Control', 'no-store')
+    return r.ok ? c.json({ url: r.url, expires_at: r.expiresAt }) : c.json({ error: r.error }, r.status)
+  })
+
+  app.post('/account/passkey/:id/revoke', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const auth = c.get('auth')
+    if (secureMomentsStatus(c.env).state !== 'on') return c.json({ error: 'not_enabled' }, 404)
+    // Self only: the member behind THIS web session, never a member id from the request.
+    if (!auth.webSessionIdHash || !auth.webSessionMemberId || auth.webSessionMemberId !== auth.memberId || !auth.memberId) {
+      return c.json({ error: 'not_a_web_session' }, 403)
+    }
+    return (await revokeOwnPasskey(c.env, auth.memberId, c.req.param('id')))
+      ? c.json({ revoked: true })
+      : c.json({ error: 'not_found' }, 404)
   })
 
   return app

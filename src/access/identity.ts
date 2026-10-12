@@ -42,7 +42,7 @@ export async function memberIsActiveHuman(env: Env, memberId: string): Promise<b
   return row !== null
 }
 
-async function buildAuth(env: Env, memberId: string, webSession?: { idHash: string }): Promise<AuthContext> {
+export async function buildAuth(env: Env, memberId: string, webSession?: { idHash: string }): Promise<AuthContext> {
   // The resolved member's OWN email (not the JWT's) names the legacy role plane, via the shared chokepoint.
   const m = await env.DB.prepare('SELECT email FROM members WHERE id = ?1 AND tenant = ?2 LIMIT 1')
     .bind(memberId, env.TENANT_SLUG).first<{ email: string | null }>()

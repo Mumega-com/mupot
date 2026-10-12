@@ -216,6 +216,8 @@ import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
 import { approveUrl, accessApproveEnabled } from '../access/config'
+import { secureMomentsEnabled } from '../secure-moments/config'
+import { issueMomentLink } from '../secure-moments/issue'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -5893,6 +5895,11 @@ const toolRequestElevation: ToolSpec = {
     })
     if (!result.ok) return fail(400, result.reason, result.detail)
 
+    const moment = await issueMomentLink(env, {
+      kind: 'elevation', subjectId: result.request.id, requesterAgentId: sessionContext.context.agentId, subjectExpiresAtIso: result.request.decision_expires_at,
+    })
+    const elevationLink = moment?.url ?? approveUrl(env, 'elevation', result.request.id)
+
     return done({
       request: {
         id: result.request.id,
@@ -5906,9 +5913,9 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
-      // Present only when the Access approve page is enabled: the link a human opens to decide. This tool
-      // decides nothing.
-      ...(approveUrl(env, 'elevation', result.request.id) ? { approve_url: approveUrl(env, 'elevation', result.request.id) } : {}),
+      // Present only when a human-proof channel is enabled: the link a human opens to decide (secure moment
+      // first, else the Access approve page). This tool decides nothing.
+      ...(elevationLink ? { approve_url: elevationLink } : {}),
     })
   },
 }
@@ -7010,11 +7017,12 @@ const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 // tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
 // drift from the others.
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
-// Access approve page (ACCESS_APPROVE_ENABLED): seed_attach_request is not advertised while the page is not usable.
+// Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
+// (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
-  const access = accessApproveEnabled(env)
+  const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   if (seat && access) return TOOLS
   return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)))
 }

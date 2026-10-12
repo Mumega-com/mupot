@@ -22,6 +22,8 @@ import { issueAcceptToken } from '../seeds/accept-token'
 import { keyRequests, applySeed, seedProjectSlug } from '../seeds/apply'
 import { createSeedRequest, SEED_REQUEST_TTL_MS } from '../access/seed-request'
 import { approveUrl, accessApproveStatus } from '../access/config'
+import { secureMomentsStatus } from '../secure-moments/config'
+import { issueMomentLink } from '../secure-moments/issue'
 import { draftSeed, DRAFT_PLATFORMS, type DraftInput } from '../seeds/draft'
 import { type ToolSpec, fail, done } from './index'
 
@@ -110,10 +112,14 @@ const toolSeedAttachRequest: ToolSpec = {
   },
   async run(auth, env, args) {
     if (!auth.memberId) return fail(403, 'forbidden', 'a member principal is required to file a request')
-    // Check the flag/config BEFORE writing anything: a request nobody can approve is noise.
+    // Check the flags/config BEFORE writing anything: a request nobody can approve is noise. Either human-proof
+    // channel being usable is enough (secure moments are independent of the Access approve page).
     const status = accessApproveStatus(env)
-    if (status.state !== 'on') {
-      return fail(409, 'access_approve_not_enabled', status.state === 'off' ? 'the Access approve page is not enabled on this pot' : `the Access approve page is misconfigured: ${status.reason}`)
+    const secure = secureMomentsStatus(env)
+    if (status.state !== 'on' && secure.state !== 'on') {
+      const reason = secure.state === 'misconfigured' ? `secure moments are misconfigured: ${secure.reason}`
+        : status.state === 'misconfigured' ? `the Access approve page is misconfigured: ${status.reason}` : null
+      return fail(409, 'access_approve_not_enabled', reason ?? 'no human approval page is enabled on this pot')
     }
     const result = await validateSeed(args.seed)
     if (!result.ok) return fail(400, 'invalid_seed', result.error)
@@ -124,16 +130,22 @@ const toolSeedAttachRequest: ToolSpec = {
       validated: { seed: result.seed, canonical: result.canonical, seedSha256: result.seedSha256, requests },
     })
     if (!created.ok) return fail(429, 'too_many_pending_requests', 'close or wait out your pending seed requests first')
+    // Secure moment first (when on): its link is the approve_url; the Access link, if also on, stays available.
+    const moment = await issueMomentLink(env, {
+      kind: 'seed_attach', subjectId: created.id, requesterAgentId: auth.boundAgentId ?? null, subjectExpiresAtIso: created.expiresAt,
+    })
+    const accessUrl = approveUrl(env, 'seed', created.id)
     return done({
       ok: true,
       request_id: created.id,
-      approve_url: approveUrl(env, 'seed', created.id),
+      approve_url: moment?.url ?? accessUrl,
+      ...(moment && accessUrl ? { access_approve_url: accessUrl } : {}),
       expires_at: created.expiresAt,
       ttl_seconds: SEED_REQUEST_TTL_MS / 1000,
       reused: created.reused,
       seed_sha256: result.seedSha256,
       requests: requests.map((r) => ({ key: r.key, kind: r.kind, text: renderRequest(r) })),
-      note: 'Pending. Only a human can approve it, at approve_url behind Cloudflare Access. Nothing is created or granted until then.',
+      note: 'Pending. Only a human can approve it, at approve_url (a one-time link; passkey or Cloudflare Access). Nothing is created or granted until then.',
     })
   },
 }

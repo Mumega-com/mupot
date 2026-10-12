@@ -9,7 +9,7 @@
 // POST adds: same-origin Origin header, and a CSRF token bound to this login. Nothing is decided over
 // MCP, Telegram or any bearer: those channels only carry the link.
 //
-// DECISIONS reuse existing machinery, nothing parallel:
+// DECISIONS live in decision-core.ts (shared with secure moments; this file only establishes the human proof):
 //   seed      -> applySeed (the human's Access-verified POST stands in for the dry-run accept_token; the
 //                receipt records via: access_passkey) consumed by ONE guarded UPDATE on seed_attach_requests;
 //   elevation -> decideElevationRequest, the fresh Access login counted as the step-up and the grant bound
@@ -21,17 +21,13 @@ import { accessApproveStatus, colonyHostnames, type AccessApproveConfig } from '
 import { verifyAccessJwt, type AccessClaims, type AccessJwtFailure } from './jwt'
 import { issueCsrfToken, verifyCsrfToken } from './csrf'
 import { resolveApprover, mintApproverSession, type ApproverFailure } from './identity'
-import { escapeHtml, messagePage, renderPage, untrustedBox } from './page'
-import { claimSeedRequest, denySeedRequest, finishSeedRequest, loadSeedRequest, seedRequestIsLive, type SeedRequestRow, type StoredRequest } from './seed-request'
-import { hasWorkspaceAdmin, resolveCapabilities } from '../auth/capability'
-import { validateSeed } from '../seeds/validate'
-import { keyRequests, applySeed } from '../seeds/apply'
-import { renderRequest } from '../seeds/render'
-import type { SeedRequest, SeedV1 } from '../seeds/contract'
+import { escapeHtml, messagePage, renderPage } from './page'
+import { loadSeedRequest, seedRequestIsLive } from './seed-request'
+import { loadElevationRequestById } from '../auth/elevation'
 import {
-  canDecideElevation, decideElevationRequest, loadElevationRequestById, type ElevationRequestRecord,
-} from '../auth/elevation'
-import { ELEVATION_ACTIONS, ELEVATION_DURATION_PRESETS_MINUTES, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
+  decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
+  NOT_FOUND_OUTCOME, seedViewInner, type HumanProof, type Outcome,
+} from './decision-core'
 
 interface Ctx {
   cfg: AccessApproveConfig
@@ -130,30 +126,18 @@ async function formHtml(c: Context<AppEnv>, kind: string, id: string, inner: str
 <button class="danger" type="submit" name="decision" value="deny">Deny</button></div></form>`
 }
 
-async function agentName(env: Env, agentId: string | null): Promise<string | null> {
-  if (!agentId) return null
-  const row = await env.DB.prepare('SELECT name FROM agents WHERE id = ?1').bind(agentId).first<{ name: string }>()
-  return row?.name ?? null
-}
-
 // ── seed ────────────────────────────────────────────────────────────────────────────────────────
+
+function outcomePage(c: Context<AppEnv>, o: Outcome): Response {
+  return page(c, o.status, o.title, o.message, o.tone)
+}
 
 async function seedActor(c: Context<AppEnv>): Promise<{ ok: true; memberId: string; auth: import('../types').AuthContext } | { ok: false; res: Response }> {
   const { claims } = c.get('access')
   const who = await resolveApprover(c.env, claims)
   if (!who.ok) return { ok: false, res: page(c, 403, 'Not allowed', approverMessage(who.reason, claims)) }
-  // Accepting a seed's requests is an org-admin act (the same floor as seed_attach apply).
-  if (!hasWorkspaceAdmin(who.approver.auth)) return { ok: false, res: NOT_FOUND(c) }
+  if (!mayDecideSeed(who.approver.auth)) return { ok: false, res: NOT_FOUND(c) }
   return { ok: true, memberId: who.approver.memberId, auth: who.approver.auth }
-}
-
-function storedKeys(row: SeedRequestRow): string[] {
-  try {
-    const parsed: unknown = JSON.parse(row.requests_json)
-    return Array.isArray(parsed) ? parsed.map((r: StoredRequest) => r.key).sort() : []
-  } catch {
-    return []
-  }
 }
 
 approveApp.get('/seed/:id', async (c) => {
@@ -165,21 +149,9 @@ approveApp.get('/seed/:id', async (c) => {
   if (!seedRequestIsLive(row, now)) {
     return page(c, 410, 'Request closed', row.status === 'pending' ? 'This request has expired.' : `This request is already ${row.status}.`, 'warn')
   }
-  const v = await validateSeed(row.canonical_json)
-  if (!v.ok) return page(c, 409, 'Invalid request', 'The stored seed no longer validates.')
-  const requests = await keyRequests(v.requests)
-  const s: SeedV1 = v.seed
-  const requester = await agentName(c.env, row.requester_agent_id)
-  const items = requests.map((r) => `<li><code>${escapeHtml(r.key)}</code>: ${escapeHtml(renderRequest(r as SeedRequest))}</li>`).join('')
-  const info = `<dl><dt>Project slug</dt><dd><code>${escapeHtml(s.slug)}</code></dd><dt>Kind</dt><dd>${escapeHtml(s.kind)}</dd>
-<dt>Repo</dt><dd>${s.repo ? `<code>${escapeHtml(s.repo)}</code>` : 'none'}</dd><dt>Live URL</dt><dd>${s.live ? `<code>${escapeHtml(s.live)}</code>` : 'none'}</dd>
-<dt>Seats requested</dt><dd>${s.wants?.seats ? escapeHtml(String(s.wants.seats.max)) : 'none'}</dd>
-<dt>Filed by</dt><dd>${requester ? escapeHtml(requester) : 'a member'} (<code>${escapeHtml(row.requester_member_id)}</code>)</dd>
-<dt>Expires</dt><dd>${escapeHtml(row.expires_at)}</dd><dt>Digest</dt><dd><code>${escapeHtml(row.seed_sha256)}</code></dd></dl>`
-  const inner = `${info}<h2>What approving does</h2><p>Creates the project, its squad and seat cap. It <strong>grants nothing</strong>: every request below stays pending a separate human step.</p>
-<h2>Requests the seed makes (${requests.length})</h2>${requests.length ? `<ul>${items}</ul>` : '<p class="muted">None.</p>'}
-<h2>Written by the agent</h2>${untrustedBox('Project name', s.name)}${untrustedBox('Goal', s.goal)}`
-  const form = await formHtml(c, 'seed', row.id, inner, 'Approve and create')
+  const view = await seedViewInner(c.env, row)
+  if (!view.ok) return outcomePage(c, view.outcome)
+  const form = await formHtml(c, 'seed', row.id, view.inner, 'Approve and create')
   if (!form) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for approvals.')
   secure(c)
   return c.html(renderPage('Approve project seed', `<h1>Approve project seed</h1>${form}`))
@@ -198,57 +170,11 @@ approveApp.post('/seed/:id', async (c) => {
   if (!row) return NOT_FOUND(c)
   const now = Date.now()
   if (!seedRequestIsLive(row, now)) return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
-
-  if (decision === 'deny') {
-    const denied = await denySeedRequest(c.env, row, actor.memberId, claims.sub, now)
-    return denied ? page(c, 200, 'Denied', 'The request was denied. Nothing was created.', 'ok') : page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
-  }
-
-  // Re-validate BEFORE consuming: the row must still be exactly what the human was shown.
-  const v = await validateSeed(row.canonical_json)
-  if (!v.ok || v.seedSha256 !== row.seed_sha256) return page(c, 409, 'Invalid request', 'The stored seed no longer matches its digest.')
-  const keyed = await keyRequests(v.requests)
-  const keys = keyed.map((r) => r.key).sort()
-  const stored = storedKeys(row)
-  if (keys.length !== stored.length || keys.some((k, i) => k !== stored[i])) {
-    return page(c, 409, 'Invalid request', 'The seed no longer produces the requests that were shown.')
-  }
-
-  // The ONE consuming UPDATE. Losing it means another tab/tap decided first.
-  if (!(await claimSeedRequest(c.env, row.id, actor.memberId, now))) {
-    return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
-  }
-  let outcome: Awaited<ReturnType<typeof applySeed>>
-  try {
-    outcome = await applySeed(
-      c.env, actor.auth, actor.memberId,
-      { seed: v.seed, canonical: v.canonical, seedSha256: v.seedSha256, requests: keyed },
-      keyed.map((r) => r.key), undefined,
-      { via: VIA, requestId: row.id, accessSub: claims.sub },
-    )
-  } catch {
-    // Claimed but the apply threw: the row must not sit in 'applying' forever. Guarded UPDATE status='applying' -> 'failed'.
-    await finishSeedRequest(c.env, row.id, { ok: false, error: 'apply_threw' })
-    return page(c, 409, 'Not applied', 'The seed could not be applied (apply_threw). The request is closed; ask the agent to file a new one.')
-  }
-  await finishSeedRequest(c.env, row.id, outcome.ok ? { ok: true } : { ok: false, error: outcome.error })
-  if (!outcome.ok) return page(c, 409, 'Not applied', `The seed could not be applied (${outcome.error}). The request is closed; ask the agent to file a new one.`)
-  if (outcome.result.replay === true) {
-    return page(c, 200, 'Already applied', 'This seed had already been applied earlier; nothing new was created. Nothing was granted: every request in the seed is still pending.', 'ok')
-  }
-  return page(c, 200, 'Approved', 'The project was created. Nothing was granted: every request in the seed is still pending.', 'ok')
+  const proof: HumanProof = { memberId: actor.memberId, via: VIA, evidence: { access_sub: claims.sub } }
+  return outcomePage(c, await decideSeed(c.env, { row, decision, auth: actor.auth, proof }, now))
 })
 
 // ── elevation ───────────────────────────────────────────────────────────────────────────────────
-
-function parseActions(req: ElevationRequestRecord): string[] {
-  try {
-    const parsed: unknown = JSON.parse(req.requested_actions_json)
-    return Array.isArray(parsed) ? parsed.filter((a): a is string => typeof a === 'string') : []
-  } catch {
-    return []
-  }
-}
 
 approveApp.get('/elevation/:id', async (c) => {
   const { claims } = c.get('access')
@@ -256,50 +182,17 @@ approveApp.get('/elevation/:id', async (c) => {
   if (!who.ok) return page(c, 403, 'Not allowed', approverMessage(who.reason, claims))
   const req = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, c.req.param('id'))
   // Unknown id and out-of-authority read identically.
-  if (!req || !(await canDecideElevation(c.env, who.approver.auth, who.approver.auth.capabilities, req.requested_scope_type, req.requested_scope_id))) {
-    return NOT_FOUND(c)
-  }
-  if (req.status !== 'pending' || Date.parse(req.decision_expires_at) <= Date.now()) {
+  if (!req || !(await mayDecideElevation(c.env, who.approver.auth, req))) return NOT_FOUND(c)
+  if (!elevationIsLive(req, Date.now())) {
     return page(c, 410, 'Request closed', req.status === 'pending' ? 'This request has expired.' : `This request is already ${req.status}.`, 'warn')
   }
-  const agent = await agentName(c.env, req.agent_id)
-  const actions = parseActions(req)
-  const boxes = actions.map((a) => {
-    const def = ELEVATION_ACTIONS[a]
-    const label = def?.label ?? a
-    const note = def ? `${escapeHtml(def.description)} <span class="muted">(effect: ${escapeHtml(def.effect)}. ${escapeHtml(def.effectNote)})</span>` : ''
-    return `<li><label><input type="checkbox" name="actions" value="${escapeHtml(a)}" checked> <strong>${escapeHtml(label)}</strong>${SENSITIVE_STEP_UP_ACTIONS.has(a) ? ' (sensitive)' : ''}<br>${note}</label></li>`
-  }).join('')
-  const durations = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= req.requested_duration_minutes)
-    .map((m) => `<option value="${m}"${m === req.requested_duration_minutes ? ' selected' : ''}>${m} minutes</option>`).join('')
-  const inner = `<dl><dt>Agent</dt><dd>${agent ? escapeHtml(agent) : '<span class="muted">unknown</span>'} (<code>${escapeHtml(req.agent_id)}</code>)</dd>
-<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
-<dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
-<h2>Actions (untick to narrow)</h2><ul style="list-style:none;padding-left:0">${boxes}</ul>
-<h2>Duration (you can only shorten)</h2><select name="duration_minutes">${durations}</select>
-<h2>Why the agent says it needs this</h2>${untrustedBox('Reason', req.reason)}
+  const inner = `${await elevationViewInner(c.env, req)}
 <p class="muted">Approving counts as your fresh step-up. The grant is bound to a session created for this sign-in and ends when it does.</p>`
   const form = await formHtml(c, 'elevation', req.id, inner, 'Approve selected')
   if (!form) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for approvals.')
   secure(c)
   return c.html(renderPage('Approve elevation', `<h1>Approve elevation</h1>${form}`))
 })
-
-async function writeElevationReceipt(env: Env, memberId: string, requestId: string, operation: string, evidence: Record<string, unknown>): Promise<boolean> {
-  try {
-    const nowIso = new Date().toISOString()
-    await env.DB.prepare(
-      `INSERT INTO mutation_audit_entries (
-         id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
-         target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-       VALUES (?1, ?2, 'member', ?3, ?3, 'admin_ui', 'access_approve', ?4, 'elevation_request', ?5, ?6, ?6, ?7, ?8)
-       ON CONFLICT DO NOTHING`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, operation, requestId, `access-elevation:${requestId}`, JSON.stringify({ via: VIA, ...evidence }), nowIso).run()
-    return true
-  } catch {
-    return false
-  }
-}
 
 approveApp.post('/elevation/:id', async (c) => {
   const id = c.req.param('id')
@@ -310,54 +203,21 @@ approveApp.post('/elevation/:id', async (c) => {
   const { claims } = c.get('access')
   const who = await resolveApprover(c.env, claims)
   if (!who.ok) return page(c, 403, 'Not allowed', approverMessage(who.reason, claims))
-  // Authority BEFORE any write: unknown id and out-of-authority read identically, and a closed request is refused,
-  // all before an approver web session exists. (decideElevationRequest re-checks everything atomically.)
-  const pre = await loadElevationRequestById(c.env, c.env.TENANT_SLUG, id)
-  if (!pre || !(await canDecideElevation(c.env, who.approver.auth, who.approver.auth.capabilities, pre.requested_scope_type, pre.requested_scope_id))) {
-    return NOT_FOUND(c)
-  }
-  if (pre.status !== 'pending' || Date.parse(pre.decision_expires_at) <= Date.now()) {
-    return page(c, 409, 'Request closed', 'This request is no longer pending.', 'warn')
-  }
-  // The grant (and the decision row) binds to a web session for this login, so it is minted now, after the checks,
-  // for approve and deny alike (the decision row records the session that decided it).
-  const session = await mintApproverSession(c.env, who.approver)
-  const { approver } = session
 
   const rawActions = guard.form.actions
   const selected = (Array.isArray(rawActions) ? rawActions : rawActions === undefined ? [] : [rawActions]).filter((a): a is string => typeof a === 'string')
   const durationRaw = one(guard.form.duration_minutes)
   const duration = durationRaw !== undefined && /^\d{1,5}$/.test(durationRaw) ? Number(durationRaw) : undefined
-
-  const result = await decideElevationRequest(c.env, {
-    tenant: c.env.TENANT_SLUG,
-    requestId: id,
-    decision,
-    selectedActions: decision === 'approve' ? selected : undefined,
-    durationMinutes: decision === 'approve' ? duration : undefined,
-    decidedByMemberId: approver.memberId,
-    decidedByCapabilities: approver.auth.capabilities ?? (await resolveCapabilities(c.env, approver.memberId)),
-    decidedByIsOrgAdmin: hasWorkspaceAdmin(approver.auth),
-    decidedByWebSessionHash: session.webSessionHash,
-    // The Access login just completed IS the step-up (verified fresh by iat above).
-    recentReauthOk: true,
-    note: `via:${VIA}`,
+  const proof: HumanProof = { memberId: who.approver.memberId, via: VIA, evidence: { access_sub: claims.sub } }
+  const outcome = await decideElevation(c.env, {
+    id, decision, selectedActions: selected, durationMinutes: duration, auth: who.approver.auth, proof,
+    // The grant binds to a web session for this login: minted by the core only after its checks passed.
+    mintSession: async () => {
+      const session = await mintApproverSession(c.env, who.approver)
+      return { auth: session.approver.auth, webSessionHash: session.webSessionHash }
+    },
   })
-  if (!result.ok) {
-    const missing = result.reason === 'not_found' || result.reason === 'forbidden'
-    if (missing) return NOT_FOUND(c)
-    const detail = 'detail' in result ? ` (${result.detail})` : ''
-    return page(c, 409, 'Not decided', `The decision was not recorded: ${result.reason}${detail}.`, 'warn')
-  }
-  const receipted = await writeElevationReceipt(c.env, approver.memberId, id, decision === 'approve' ? 'elevation_approve' : 'elevation_deny', {
-    request_id: id, access_sub: claims.sub, decision,
-    actions: result.grants.map((g) => g.action), scope_type: result.request.requested_scope_type, scope_id: result.request.requested_scope_id,
-    expires_at: result.grants[0]?.expires_at ?? null,
-  })
-  const tail = receipted ? '' : ' The decision stands, but its audit receipt could not be written; tell the operator.'
-  return decision === 'approve'
-    ? page(c, 200, 'Approved', `Granted ${result.grants.length} action${result.grants.length === 1 ? '' : 's'} until ${result.grants[0]?.expires_at ?? ''}.${tail}`, 'ok')
-    : page(c, 200, 'Denied', `The request was denied.${tail}`, 'ok')
+  return outcome.status === 404 && outcome === NOT_FOUND_OUTCOME ? NOT_FOUND(c) : outcomePage(c, outcome)
 })
 
 // Anything else under /approve is not a page.

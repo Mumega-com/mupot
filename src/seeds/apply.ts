@@ -134,10 +134,17 @@ async function releaseClaim(env: Env, rowId: string, token: string, projectSlug:
   ).bind(rowId, token, new Date(0).toISOString()).run()
 }
 
-/** The acceptance proof for an apply decided on the Access approve page (src/access/routes.ts): the human's
- *  Access-verified, CSRF-protected POST stands in for the dry-run accept_token. Constructed ONLY server-side
+/** The acceptance proof for an apply decided on a human-verified page (the Access approve page, src/access/routes.ts,
+ *  or a secure moment, src/secure-moments/routes.ts): the human's verified, CSRF-protected POST stands in for the dry-run accept_token. Constructed ONLY server-side
  *  after the JWT, member and org-admin checks; MCP args are JSON and can never carry it. Recorded in the receipt. */
-export interface AccessAcceptAttestation { via: 'access_passkey'; requestId: string; accessSub: string }
+export interface AccessAcceptAttestation {
+  via: 'access_passkey' | 'webauthn'
+  requestId: string
+  /** The Cloudflare Access `sub` (via access_passkey only). */
+  accessSub?: string
+  /** The secure moment that carried the decision (via webauthn only). */
+  momentId?: string
+}
 
 export async function applySeed(
   env: Env, auth: AuthContext, caller: string, v: ValidatedSeed, acceptRaw: unknown, acceptToken: unknown,
@@ -331,7 +338,7 @@ export async function applySeed(
     const evidence = JSON.stringify({
       seed_sha256: v.seedSha256, accepted_keys: [...accepted].sort(), project_slug: projectSlug,
       squad_id: squadId, seat_cap: seatCap, grants: 'none',
-      ...(attestation ? { via: attestation.via, access_request_id: attestation.requestId, access_sub: attestation.accessSub } : {}),
+      ...(attestation ? { via: attestation.via, access_request_id: attestation.requestId, access_sub: attestation.accessSub, moment_id: attestation.momentId } : {}),
     })
     const flip = await env.DB.batch([
       env.DB.prepare(

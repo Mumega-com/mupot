@@ -5,6 +5,9 @@
 import type { Env } from '../types'
 import type { ValidatedSeed } from '../seeds/apply'
 
+/** Which human-proof channel carried a decision (migration 0212 widened the CHECK to both). */
+export type DecisionVia = 'access_passkey' | 'webauthn'
+
 export const SEED_REQUEST_TTL_MS = 24 * 60 * 60 * 1000
 /** Live pending requests one requester may hold: a flood cap, so an agent cannot bury the real ask. */
 export const SEED_REQUEST_MAX_PENDING = 10
@@ -87,13 +90,13 @@ export function seedRequestIsLive(row: SeedRequestRow, nowMs: number): boolean {
 }
 
 /** The ONLY transition into 'applying'. True iff THIS call won it. */
-export async function claimSeedRequest(env: Env, id: string, memberId: string, nowMs: number): Promise<boolean> {
+export async function claimSeedRequest(env: Env, id: string, memberId: string, nowMs: number, via: DecisionVia = 'access_passkey'): Promise<boolean> {
   const nowIso = new Date(nowMs).toISOString()
   const r = await env.DB.prepare(
     `UPDATE seed_attach_requests
-        SET status = 'applying', decided_at = ?3, decided_by_member_id = ?4, decided_via = 'access_passkey'
+        SET status = 'applying', decided_at = ?3, decided_by_member_id = ?4, decided_via = ?5
       WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3`,
-  ).bind(id, env.TENANT_SLUG, nowIso, memberId).run()
+  ).bind(id, env.TENANT_SLUG, nowIso, memberId, via).run()
   return r.meta.changes === 1
 }
 
@@ -104,23 +107,23 @@ export async function finishSeedRequest(env: Env, id: string, outcome: { ok: tru
 }
 
 /** Deny: one guarded flip + its receipt in one batch (the receipt lands only if the flip did). */
-export async function denySeedRequest(env: Env, row: SeedRequestRow, memberId: string, accessSub: string, nowMs: number): Promise<boolean> {
+export async function denySeedRequest(env: Env, row: SeedRequestRow, memberId: string, via: DecisionVia, proofEvidence: Record<string, string>, nowMs: number): Promise<boolean> {
   const nowIso = new Date(nowMs).toISOString()
-  const evidence = JSON.stringify({ via: 'access_passkey', seed_sha256: row.seed_sha256, access_request_id: row.id, decision: 'deny', access_sub: accessSub })
+  const evidence = JSON.stringify({ via, seed_sha256: row.seed_sha256, access_request_id: row.id, decision: 'deny', ...proofEvidence })
   const out = await env.DB.batch([
     env.DB.prepare(
       `UPDATE seed_attach_requests
-          SET status = 'denied', decided_at = ?3, decided_by_member_id = ?4, decided_via = 'access_passkey'
+          SET status = 'denied', decided_at = ?3, decided_by_member_id = ?4, decided_via = ?5
         WHERE id = ?1 AND tenant = ?2 AND status = 'pending' AND expires_at > ?3`,
-    ).bind(row.id, env.TENANT_SLUG, nowIso, memberId),
+    ).bind(row.id, env.TENANT_SLUG, nowIso, memberId, via),
     env.DB.prepare(
       `INSERT INTO mutation_audit_entries (
          id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
          target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-       SELECT ?1, ?2, 'member', ?3, ?3, 'admin_ui', 'access_approve', 'seed_request_deny', 'seed_attach_request', ?4, ?5, ?6, ?7, ?8
+       SELECT ?1, ?2, 'member', ?3, ?3, 'admin_ui', ?9, 'seed_request_deny', 'seed_attach_request', ?4, ?5, ?6, ?7, ?8
         WHERE changes() = 1
        ON CONFLICT DO NOTHING`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, row.id, `access-seed-deny:${row.id}`, row.seed_sha256, evidence, nowIso),
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, row.id, `access-seed-deny:${row.id}`, row.seed_sha256, evidence, nowIso, via === 'webauthn' ? 'secure_moment' : 'access_approve'),
   ])
   return out[0].meta.changes === 1
 }
