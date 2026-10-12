@@ -4,6 +4,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { reissueMomentLink } from '../src/secure-moments/issue'
 import { mcpApp } from '../src/mcp'
 import { sha256Hex } from '../src/members/service'
 import type { AuthContext, Env } from '../src/types'
@@ -875,6 +876,29 @@ describe('W3.1 plain-link fallback', () => {
     const res = structured(r)
     expect(res.approve_url).toMatch(new RegExp(`^https://${HOST}/m/`))
     expect(res.access_approve_url).toMatch(/^https:\/\/approve\.example\.test\/approve\/seed\//)
+  })
+
+  it('the rotation receipt names the AGENT that rotated (principal_kind agent, agent_id set), not only the human member', async () => {
+    const env = makeEnv()
+    const state = await first(env)
+    await call(env, 'seed_attach_request', { seed: seedText }, { requestState: state, ...act('cancel') })
+    const row = one<{ principal_kind: string; principal_id: string; agent_id: string | null; member_id: string }>("SELECT principal_kind, principal_id, agent_id, member_id FROM mutation_audit_entries WHERE operation = 'moment_link_rotate'")
+    expect(row?.principal_kind).toBe('agent')
+    expect(row?.agent_id).toBeTruthy()
+    expect(row?.principal_id).toBe(row?.agent_id)
+    expect(row?.member_id).toBeTruthy()
+  })
+
+  it('race: re-issue on a moment that closed meanwhile changes nothing and NEVER creates a new pending moment', async () => {
+    const env = makeEnv()
+    await first(env)
+    const m = one<{ id: string }>('SELECT id FROM secure_moments')
+    harness.sqlite.exec("UPDATE secure_moments SET status = 'consumed'")
+    const before = hashOf()
+    expect(await reissueMomentLink(env, m?.id ?? '')).toBeNull()
+    expect(count('secure_moments')).toBe(1)
+    expect(count('secure_moments', "status = 'pending'")).toBe(0)
+    expect(hashOf()).toBe(before)
   })
 
   it('accept while pending stays read-only: no link, no rotation, no audit row', async () => {

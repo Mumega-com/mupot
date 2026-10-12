@@ -24,7 +24,7 @@ import type { ToolOutcome } from './index'
 import { issueBoundToken, verifyBoundToken } from '../access/csrf'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { loadMoment, type MomentKind, type MomentRow } from '../secure-moments/store'
-import { issueMomentLink } from '../secure-moments/issue'
+import { reissueMomentLink } from '../secure-moments/issue'
 import { reserveRotation } from '../secure-moments/rotate'
 import { approveUrl } from '../access/config'
 import { loadElevationRequestById, REQUEST_DECISION_WINDOW_MS } from '../auth/elevation'
@@ -296,8 +296,7 @@ async function plainLinkFallback(
 ): Promise<ToolOutcome> {
   const actionNote = action ? { elicitation_action: action } : {}
   if (!auth.memberId) return outcomeResult(outcome, actionNote)
-  const subjectExpiresAtIso = String(kind === 'seed_attach' ? outcome.expires_at : outcome.decision_expires_at)
-  const reserved = await reserveRotation(env, { momentId: moment.id, memberId: auth.memberId, reason: `elicitation_${action ?? 'not_accepted'}` }, nowMs)
+  const reserved = await reserveRotation(env, { momentId: moment.id, memberId: auth.memberId, agentId: auth.boundAgentId ?? null, reason: `elicitation_${action ?? 'not_accepted'}` }, nowMs)
   if (reserved !== 'ok') {
     const why = reserved === 'throttled'
       ? 'A fresh link was issued for this request a moment ago; wait about a minute before asking again.'
@@ -306,7 +305,7 @@ async function plainLinkFallback(
         : 'A fresh link could not be issued right now.'
     return outcomeResult(outcome, { ...actionNote, link_reissue: reserved }, `${retryNote('pending')} ${why}`)
   }
-  const link = await issueMomentLink(env, { kind, subjectId: moment.subject_id, requesterAgentId: moment.requester_agent_id, subjectExpiresAtIso })
+  const link = await reissueMomentLink(env, moment.id)
   if (!link || link.momentId !== moment.id) {
     return outcomeResult(outcome, { ...actionNote, link_reissue: 'error' }, `${retryNote('pending')} A fresh link could not be issued right now.`)
   }

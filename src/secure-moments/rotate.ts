@@ -15,7 +15,7 @@ export type RotationReservation = 'ok' | 'throttled' | 'capped' | 'error'
 /** Reserve one rotation slot for this moment, atomically. 'ok' means the caller MAY rotate now. */
 export async function reserveRotation(
   env: Env,
-  input: { momentId: string; memberId: string; reason: string },
+  input: { momentId: string; memberId: string; agentId: string | null; reason: string },
   nowMs: number = Date.now(),
 ): Promise<RotationReservation> {
   const id = crypto.randomUUID()
@@ -25,15 +25,15 @@ export async function reserveRotation(
   try {
     const r = await env.DB.prepare(
       `INSERT INTO mutation_audit_entries (
-         id, tenant, principal_kind, principal_id, member_id, origin, handler, operation,
+         id, tenant, principal_kind, principal_id, member_id, agent_id, origin, handler, operation,
          target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-       SELECT ?1, ?2, 'member', ?3, ?3, 'mcp', 'mcp_url_elicitation', ?4, 'secure_moment', ?5, ?1, ?1, ?6, ?7
+       SELECT ?1, ?2, CASE WHEN ?10 IS NULL THEN 'member' ELSE 'agent' END, COALESCE(?10, ?3), ?3, ?10, 'mcp', 'mcp_url_elicitation', ?4, 'secure_moment', ?5, ?1, ?1, ?6, ?7
         WHERE (SELECT COUNT(*) FROM mutation_audit_entries WHERE ${where} AND recorded_at > ?8) = 0
           AND (SELECT COUNT(*) FROM mutation_audit_entries WHERE ${where}) < ?9
        ON CONFLICT DO NOTHING`,
     ).bind(
       id, env.TENANT_SLUG, input.memberId, ROTATE_OPERATION, input.momentId,
-      JSON.stringify({ moment_id: input.momentId, reason: input.reason }), nowIso, sinceIso, ROTATE_MAX_PER_MOMENT,
+      JSON.stringify({ moment_id: input.momentId, reason: input.reason }), nowIso, sinceIso, ROTATE_MAX_PER_MOMENT, input.agentId,
     ).run()
     if (r.meta.changes === 1) return 'ok'
     const total = await env.DB.prepare(`SELECT COUNT(*) AS n FROM mutation_audit_entries WHERE ${where}`)
