@@ -18,7 +18,13 @@ function bmAccess(reason){return new Promise(function(res){if(bm.isAccessGranted
 function bmAuth(reason){return new Promise(function(res){try{bm.authenticate({reason:reason},function(ok,token){if(!ok){res({cancelled:true});return}if(typeof token!=='string'||!token){res({noToken:true});return}res({token:token})})}catch(e){res({cancelled:true})}})}
 function settingsHelp(){var b=document.createElement('button');b.type='button';b.textContent='Open Telegram biometric settings';b.addEventListener('click',function(){try{bm.openSettings()}catch(e){}});out.appendChild(b)}
 function authFailure(r){if(r.noToken){show('Set this phone up again','No saved device secret was found on this phone (it was removed or never saved). Go to My Account on the dashboard, Telegram device, Set up this phone.',false)}else{show('Not confirmed','The biometric check was cancelled or failed. Nothing was decided.',false)}}
-var curMoment=null,linkBusy=false;
+var curMoment=null,linkBusy=false,pendingUrl=null,openBtn=null;
+function openOpts(){return(tg.isVersionAtLeast&&tg.isVersionAtLeast('7.0'))?{try_browser:true}:undefined}
+function tryOpen(){try{tg.openLink(pendingUrl,openOpts());return true}catch(e){show('Could not open your browser','Ask for a new passkey link and try again.',false);return false}}
+function showOpenButton(){
+ // The link is kept in memory only (never rendered as text) and opened on a FRESH click, which every client allows.
+ if(!openBtn){openBtn=document.createElement('button');openBtn.type='button';openBtn.className='primary';openBtn.setAttribute('data-act','open-passkey');openBtn.textContent='Open the passkey page';openBtn.addEventListener('click',function(){if(pendingUrl)tryOpen()});app.appendChild(openBtn)}
+ openBtn.hidden=false}
 function passkeyButton(parent){
  if(!curMoment)return;
  var b=document.createElement('button');b.type='button';b.setAttribute('data-act','passkey');b.textContent='Approve with passkey in your browser';
@@ -26,15 +32,17 @@ function passkeyButton(parent){
   if(linkBusy)return;linkBusy=true;b.disabled=true;
   try{
    var r=await post('/m/tg/'+encodeURIComponent(curMoment)+'/passkey-link',{});
-   if(!r.json.ok||typeof r.json.url!=='string'){show(r.json.title||'No link',r.json.message||'A browser link could not be made now.',false);linkBusy=false;b.disabled=false;return}
-   show('Opening your browser','Decide there with your passkey. This link works once; nothing is decided until you do.',true);
-   try{tg.openLink(r.json.url)}catch(e){var a=document.createElement('a');a.href=r.json.url;a.rel='noopener noreferrer';a.target='_blank';a.textContent='Open the passkey page';out.appendChild(a)}
-  }catch(e){show('No link','Something went wrong. Nothing was decided.',false);linkBusy=false;b.disabled=false}
+   if(!r.json.ok||typeof r.json.url!=='string'){show(r.json.title||'No link',r.json.message||'A browser link could not be made now.',false);return}
+   pendingUrl=r.json.url;
+   show('Open the passkey page','This replaces any earlier link; nothing is decided until you confirm with your passkey.',true);
+   showOpenButton();tryOpen()
+  }catch(e){show('No link','Something went wrong. Nothing was decided.',false)}
+  finally{linkBusy=false;b.disabled=false}
  });
  parent.appendChild(b)}
 function bmStore(token){return new Promise(function(res){try{bm.updateBiometricToken(token,function(ok){res(!!ok)})}catch(e){res(false)}})}
 async function ready(){
- if(!(await bmInit())||!bm.isBiometricAvailable){show('Biometrics unavailable','This phone or Telegram client cannot unlock a device secret with fingerprint or face. Use your passkey in your browser instead.',false);if(!document.querySelector('button[data-act=passkey]'))passkeyButton(out);return false}
+ if(!(await bmInit())||!bm.isBiometricAvailable){show('Biometrics unavailable','This phone or Telegram client cannot unlock a device secret with fingerprint or face. Use your passkey in your browser instead.',false);return false}
  if(!(await bmAccess('Confirm decisions in this workspace'))){show('Permission needed','Allow Telegram to use biometrics for this bot, then try again.',false);settingsHelp();return false}
  return true}
 var mode=app.getAttribute('data-mode'),ref=app.getAttribute('data-ref');

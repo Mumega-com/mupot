@@ -352,7 +352,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const policy = telegramPolicyRefusal(l.d.m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
     if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId))) {
-      return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard.', 'Set up this device', { needs_enrol: true })
+      return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard, or use Approve with passkey in your browser.', 'Set up this device', { needs_enrol: true })
     }
     const nonce = await mintTgNonce(c.env, { momentId: l.d.m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) })
     if (!nonce) return fail(c, 409, 'Too many unfinished attempts on this request. Wait a few minutes.', 'Try later')
@@ -440,6 +440,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
       channel: { origin: 'admin_ui', handler: 'secure_moment', via: 'telegram_initdata' },
     })
     if (reserved === 'throttled') return fail(c, 409, 'A fresh link was issued a moment ago. Wait about a minute, then try again.', 'Try later')
+    if (reserved === 'member_capped') return fail(c, 409, 'You have already asked for the maximum number of browser links for this request. Use the last one, or ask for the request to be filed again.', 'No more links')
     if (reserved === 'capped') return fail(c, 409, 'This request has used all its link re-issues. Ask for the request to be filed again.', 'No more links')
     if (reserved !== 'ok') return fail(c, 503, 'A fresh link could not be issued right now.', 'Try later')
     const issued = await reissueMomentLink(c.env, l.d.m.id)

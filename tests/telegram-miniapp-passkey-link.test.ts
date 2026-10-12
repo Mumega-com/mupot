@@ -12,7 +12,7 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { initData, newTestKey, type InitDataSpec } from './helpers/telegram-initdata'
 import { TG_SCRIPT } from '../src/secure-moments/telegram-miniapp-client'
 import { momentsApp } from '../src/secure-moments/routes'
-import { reserveRotation, ROTATE_MAX_PER_MOMENT, ROTATE_MIN_INTERVAL_MS } from '../src/secure-moments/rotate'
+import { HUMAN_CEREMONY_WINDOW_MS, HUMAN_MAX_PER_MEMBER, reserveRotation, ROTATE_MAX_PER_MOMENT, ROTATE_MIN_INTERVAL_MS } from '../src/secure-moments/rotate'
 import { linkLoginIdentity } from '../src/auth/login-identity'
 
 const TENANT = 'tenant-a'
@@ -114,8 +114,6 @@ async function fileElevation(actions = ['action:project_status']): Promise<Momen
 }
 const tokenSha = (id: string): string => one<{ s: string }>('SELECT link_token_sha256 AS s FROM secure_moments WHERE id = ?', id)?.s ?? ''
 const receipts = (id: string): number => count('mutation_audit_entries', `operation = 'moment_link_rotate' AND target_id = '${id}'`)
-/** Move the clock past the per-minute throttle (receipts are append-only, so the clock moves, not the rows). */
-const advanceClock = (): void => { vi.setSystemTime(Date.now() + 2 * ROTATE_MIN_INTERVAL_MS) }
 
 describe('passkey-link: the happy path', () => {
   it('a bound human member who may decide gets a fresh link for a seed moment; the old link dies, the new one opens the W1 page; the receipt says telegram_initdata', async () => {
@@ -133,10 +131,10 @@ describe('passkey-link: the happy path', () => {
     expect((await momentsApp.fetch(new Request(`https://${HOST}/m/${m.id}/${m.token}`), env)).status).not.toBe(200)
     expect((await momentsApp.fetch(new Request(`https://${HOST}/m/${m.id}/${fresh.token}`), env)).status).toBe(200)
     // the receipt: member principal, the moment id, via telegram_initdata
-    const row = one<{ principal_kind: string; member_id: string; agent_id: string | null; evidence_json: string; target_id: string }>(
-      "SELECT principal_kind, member_id, agent_id, evidence_json, target_id FROM mutation_audit_entries WHERE operation = 'moment_link_rotate'")
-    expect(row).toMatchObject({ principal_kind: 'member', member_id: 'mem-owner', agent_id: null, target_id: m.id })
-    expect(JSON.parse(row?.evidence_json ?? '{}')).toMatchObject({ moment_id: m.id, via: 'telegram_initdata' })
+    const row = one<{ origin: string; handler: string; principal_kind: string; member_id: string; agent_id: string | null; evidence_json: string; target_id: string }>(
+      "SELECT origin, handler, principal_kind, member_id, agent_id, evidence_json, target_id FROM mutation_audit_entries WHERE operation = 'moment_link_rotate'")
+    expect(row).toMatchObject({ origin: 'admin_ui', handler: 'secure_moment', principal_kind: 'member', member_id: 'mem-owner', agent_id: null, target_id: m.id })
+    expect(JSON.parse(row?.evidence_json ?? '{}')).toEqual({ moment_id: m.id, reason: 'telegram_passkey_link', via: 'telegram_initdata' })
   })
   it('works for an elevation moment too (decided by a passkey on the page, not by this call)', async () => {
     const m = await fileElevation()
@@ -251,25 +249,57 @@ describe('passkey-link: the rate limit and the secrets', () => {
     expect((await momentsApp.fetch(new Request(`https://${HOST}/m/${m.id}/${parseLink(first.url ?? '').token}`), env)).status).toBe(200)
   })
   it('parallel calls rotate at most once', async () => {
+    // The guarantee comes from the ONE atomic INSERT ... SELECT ... WHERE statement in reserveRotation (the throttle is part of
+    // the statement that writes the receipt), not from this test's timing: whichever call runs first wins, the rest see its row.
     const m = await fileSeed()
     const rs = await Promise.all(Array.from({ length: 8 }, () => plink(m.id, { init_data: init(TG.owner) })))
     expect(rs.filter((r) => r.status === 200)).toHaveLength(1)
     expect(receipts(m.id)).toBe(1)
   })
-  it('the lifetime cap holds, and the cap is SHARED with the MCP fallback (same receipts)', async () => {
+  it('the lifetime cap holds and is SHARED with the MCP fallback (same receipts)', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     const m = await fileSeed()
-    // one slot is spent by the MCP plain-link fallback (default channel), the rest by Telegram
+    const t0 = Date.now()
+    // Interleave so neither the human sub-cap nor the ceremony window is the guard that fires: 3 machine, 2 human, then a human attempt.
+    const clock = (k: number): void => vi.setSystemTime(t0 + k * (HUMAN_CEREMONY_WINDOW_MS + 1000))
+    for (let k = 0; k < 3; k++) { clock(k); expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('ok') }
+    for (let k = 3; k < 3 + HUMAN_MAX_PER_MEMBER; k++) { clock(k); expect((await plink(m.id, { init_data: init(TG.owner) })).status).toBe(200) }
+    expect(receipts(m.id)).toBe(ROTATE_MAX_PER_MOMENT)
+    clock(10)
+    expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('capped')
+    expect(receipts(m.id)).toBe(ROTATE_MAX_PER_MOMENT)
+  })
+  it('after a Telegram rotation the MCP fallback is suppressed for the ceremony window (real route, then the machine reservation), and recovers after it', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const m = await fileSeed()
+    const t0 = Date.now()
+    const human = await jbody(await plink(m.id, { init_data: init(TG.owner) }))
+    expect(human.ok).toBe(true)
+    const humanHash = tokenSha(m.id)
+    vi.setSystemTime(t0 + 2 * ROTATE_MIN_INTERVAL_MS)
+    expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('human_active')
+    expect(tokenSha(m.id)).toBe(humanHash)
+    expect(receipts(m.id)).toBe(1)
+    expect((await momentsApp.fetch(new Request(`https://${HOST}/m/${m.id}/${parseLink(human.url ?? '').token}`), env)).status).toBe(200)
+    vi.setSystemTime(t0 + HUMAN_CEREMONY_WINDOW_MS + 1000)
     expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('ok')
-    for (let i = 1; i < ROTATE_MAX_PER_MOMENT; i++) {
-      advanceClock()
+  })
+  it('a Telegram member may use only HUMAN_MAX_PER_MEMBER of the slots, leaving the rest to the agent path', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    const m = await fileSeed()
+    const t0 = Date.now()
+    for (let i = 0; i < HUMAN_MAX_PER_MEMBER; i++) {
+      vi.setSystemTime(t0 + i * 2 * ROTATE_MIN_INTERVAL_MS)
       expect((await plink(m.id, { init_data: init(TG.owner) })).status).toBe(200)
     }
-    advanceClock()
+    vi.setSystemTime(t0 + 4 * ROTATE_MIN_INTERVAL_MS)
     const r = await plink(m.id, { init_data: init(TG.owner) })
     expect(r.status).toBe(409)
     expect((await jbody(r)).title).toBe('No more links')
-    expect(receipts(m.id)).toBe(ROTATE_MAX_PER_MOMENT)
+    expect(receipts(m.id)).toBe(HUMAN_MAX_PER_MEMBER)
+    // the machine path still has its share (once the ceremony window has passed)
+    vi.setSystemTime(t0 + HUMAN_CEREMONY_WINDOW_MS + 5 * ROTATE_MIN_INTERVAL_MS)
+    expect(await reserveRotation(env, { momentId: m.id, memberId: 'mem-owner', agentId: 'agent-x', reason: 'elicitation_cancel' })).toBe('ok')
   })
   it('no token, link, or initData appears in any receipt, any console output, or any stored column', async () => {
     const spies = [vi.spyOn(console, 'log'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error'), vi.spyOn(console, 'info'), vi.spyOn(console, 'debug')]
@@ -284,6 +314,15 @@ describe('passkey-link: the rate limit and the secrets', () => {
       for (const s of spies) expect(JSON.stringify(s.mock.calls)).not.toContain(secret)
     }
     expect(JSON.stringify(harness.sqlite.prepare('SELECT * FROM secure_moments').all())).not.toContain(token)
+  })
+})
+
+describe('passkey-link: the not-enrolled message', () => {
+  it('a member with no enrolled device is told about the passkey option too', async () => {
+    const m = await fileSeed()
+    const r = await hit('/m/tg/challenge', { init_data: init(TG.owner), moment_id: m.id, decision: 'deny' })
+    expect(r.status).toBe(409)
+    expect((await jbody(r)).message).toContain('Approve with passkey in your browser')
   })
 })
 
@@ -325,7 +364,7 @@ interface FakeEl {
   innerHTML: string
 }
 function runClient(opts: { biometricAvailable: boolean; passkeyUrl?: string; linkStatus?: number }): {
-  fetches: string[]; opened: string[]; status: () => string; buttons: () => FakeEl[]; click: (el: FakeEl) => Promise<void>; settle: () => Promise<void>
+  fetches: string[]; opened: string[]; openOpts: unknown[]; app: FakeEl; out: FakeEl; status: () => string; buttons: () => FakeEl[]; click: (el: FakeEl) => Promise<void>; settle: () => Promise<void>
 } {
   const registry: Record<string, FakeEl> = {}
   const mk = (tag: string): FakeEl => {
@@ -359,6 +398,7 @@ function runClient(opts: { biometricAvailable: boolean; passkeyUrl?: string; lin
   }
   const fetches: string[] = []
   const opened: string[] = []
+  const openOpts: unknown[] = []
   const fetchStub = async (path: string): Promise<{ status: number; json: () => Promise<unknown> }> => {
     fetches.push(path)
     if (path === '/m/tg/view') return { status: 200, json: async () => ({ ok: true, state: 'moment', moment_id: '55555555-5555-4555-8555-555555555555', view_html: '', approve_label: 'Approve', passkey_only_actions: [] }) }
@@ -367,14 +407,15 @@ function runClient(opts: { biometricAvailable: boolean; passkeyUrl?: string; lin
     return { status: 404, json: async () => ({}) }
   }
   const tg = {
-    initData: 'signed', ready() {}, expand() {}, isVersionAtLeast: () => true, openLink: (u: string) => { opened.push(u) },
+    initData: 'signed', ready() {}, expand() {}, isVersionAtLeast: () => true,
+    openLink: (u: string, o?: unknown) => { opened.push(u); openOpts.push(o) },
     BiometricManager: { isInited: true, isBiometricAvailable: opts.biometricAvailable, isAccessGranted: true },
   }
   const sandbox = { document, window: { Telegram: { WebApp: tg } }, fetch: fetchStub, JSON, encodeURIComponent, Promise, setTimeout }
   vm.runInNewContext(TG_SCRIPT, sandbox)
   const settle = async (): Promise<void> => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)) }
   return {
-    fetches, opened, settle,
+    fetches, opened, openOpts, app, out, settle,
     status: () => [out.textContent, ...all(out).map((e) => e.textContent)].join(' '),
     buttons: () => [...all(app), ...all(out)].filter((x) => x.tag === 'button'),
     click: async (el) => { for (const f of el.listeners.click ?? []) await f(); await settle() },
@@ -382,36 +423,54 @@ function runClient(opts: { biometricAvailable: boolean; passkeyUrl?: string; lin
 }
 
 describe('passkey-link: the client (the real page script on a fake DOM)', () => {
-  it('shows the passkey button beside Approve/Deny even where biometrics exist; clicking asks the server once and opens the REAL browser via openLink; a second click is ignored (submit-once)', async () => {
-    const c = runClient({ biometricAvailable: true, passkeyUrl: 'https://secure.example.test/m/abc/tok' })
+  const find = (c: ReturnType<typeof runClient>, act: string): FakeEl | undefined => c.buttons().find((b) => b.attrs['data-act'] === act)
+  it('shows the passkey button beside Approve/Deny even where biometrics exist; a double tap while the request is in flight asks the server once', async () => {
+    const c = runClient({ biometricAvailable: true })
     await c.settle()
-    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey')
-    expect(pk?.textContent).toBe('Approve with passkey in your browser')
-    await c.click(pk as FakeEl)
-    await c.click(pk as FakeEl)
-    expect(c.fetches.filter((p) => p.endsWith('/passkey-link'))).toEqual(['/m/tg/55555555-5555-4555-8555-555555555555/passkey-link'])
-    expect(c.opened).toEqual(['https://secure.example.test/m/abc/tok'])
-    expect(pk?.disabled).toBe(true)
+    const pk = find(c, 'passkey') as FakeEl
+    expect(pk.textContent).toBe('Approve with passkey in your browser')
+    const taps = [c.click(pk), c.click(pk)]
+    await Promise.all(taps)
+    expect(c.fetches.filter((p) => p.endsWith('/passkey-link'))).toHaveLength(1)
   })
-  it('with no biometrics, Approve does not dead-end: the message points at the passkey, the button stays available, and it works', async () => {
-    const c = runClient({ biometricAvailable: false })
+  it('after a link is issued, an "Open the passkey page" button is rendered IN #app (not #status) and opens the browser on a fresh click with try_browser; the URL is never rendered as text', async () => {
+    const url = 'https://secure.example.test/m/abc/tok-secret-value'
+    const c = runClient({ biometricAvailable: true, passkeyUrl: url })
     await c.settle()
-    const approve = c.buttons().find((b) => b.attrs['data-act'] === 'approve')
-    await c.click(approve as FakeEl)
-    expect(c.status()).toContain('Biometrics unavailable')
-    expect(c.status()).toContain('Use your passkey in your browser instead.')
-    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey')
-    expect(pk?.disabled).toBe(false)
-    await c.click(pk as FakeEl)
-    expect(c.opened).toHaveLength(1)
+    await c.click(find(c, 'passkey') as FakeEl)
+    const open = find(c, 'open-passkey') as FakeEl
+    expect(open.textContent).toBe('Open the passkey page')
+    expect(c.app.children.includes(open)).toBe(true)
+    expect(c.out.children.includes(open)).toBe(false)
+    const before = c.opened.length
+    await c.click(open)
+    expect(c.opened.length).toBe(before + 1)
+    expect(c.opened.at(-1)).toBe(url)
+    expect(c.openOpts.at(-1)).toEqual({ try_browser: true })
+    const everyText = [c.out.textContent, ...c.app.children.flatMap((e) => [e.textContent, ...Object.values(e.attrs)])].join(' ')
+    expect(everyText).not.toContain('tok-secret-value')
+    expect(c.status()).toContain('This replaces any earlier link; nothing is decided until you confirm with your passkey.')
   })
-  it('a refused or throttled link request opens nothing and re-enables the button', async () => {
+  it('if the opened page failed, the human can re-request a link (the server throttle message is shown), and a fresh link replaces the one in memory', async () => {
     const c = runClient({ biometricAvailable: true, linkStatus: 409 })
     await c.settle()
-    const pk = c.buttons().find((b) => b.attrs['data-act'] === 'passkey') as FakeEl
+    const pk = find(c, 'passkey') as FakeEl
     await c.click(pk)
     expect(c.opened).toHaveLength(0)
     expect(pk.disabled).toBe(false)
     expect(c.status()).toContain('Try later')
+    expect(find(c, 'open-passkey')).toBeUndefined()
+  })
+  it('with no biometrics, Approve does not dead-end: the message points at the passkey, the button stays available, and it works', async () => {
+    const c = runClient({ biometricAvailable: false })
+    await c.settle()
+    await c.click(find(c, 'approve') as FakeEl)
+    expect(c.status()).toContain('Biometrics unavailable')
+    expect(c.status()).toContain('Use your passkey in your browser instead.')
+    const pk = find(c, 'passkey') as FakeEl
+    expect(pk.disabled).toBe(false)
+    await c.click(pk)
+    expect(c.opened).toHaveLength(1)
+    expect(c.buttons().filter((b) => b.attrs['data-act'] === 'passkey')).toHaveLength(1)
   })
 })
