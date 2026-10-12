@@ -837,6 +837,15 @@ describe('fix pass: proof provenance and the attempt counter', () => {
     expect((await go(p, m, approve(action), { nonce })).status).toBe(200)
     expect(devRow(p).pin_failed_attempts).toBe(0)
   })
+  it('five CORRECT PINs that do not win (bad nonce) cost no tries: the counter stays at 0 and the next real decision works', async () => {
+    const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
+    const { m, action } = await elevation()
+    const nonce = await nonceFor(m, p.tg, approve(action))
+    for (let i = 0; i < 6; i++) expect((await go(p, m, approve(action), { nonce: 'A'.repeat(43) })).status).toBe(403)
+    expect(devRow(p).pin_failed_attempts).toBe(0)
+    expect(devRow(p).revoked_at).toBeNull()
+    expect((await go(p, m, approve(action), { nonce })).status).toBe(200)
+  })
   it('a device stuck at the cap (the slot-5 request died) is revoked by the next attempt, which finds no slot (idempotent self-heal)', async () => {
     const p = await setup('mem-sqadmin', TG.sqadmin, identities.sqadmin, { mode: 'pin' })
     const { m, action } = await elevation()
