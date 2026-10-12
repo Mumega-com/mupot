@@ -10,15 +10,20 @@ export const ROTATE_MIN_INTERVAL_MS = 60_000
 export const ROTATE_MAX_PER_MOMENT = 5
 export const ROTATE_OPERATION = 'moment_link_rotate'
 
+/** Who is asking for the rotation, as the receipt records it. Default (omitted) is the MCP plain-link fallback (W3.1). */
+export interface RotationChannel { origin: 'mcp' | 'admin_ui'; handler: string; via?: string }
+const MCP_CHANNEL: RotationChannel = { origin: 'mcp', handler: 'mcp_url_elicitation' }
+
 export type RotationReservation = 'ok' | 'throttled' | 'capped' | 'error'
 
 /** Reserve one rotation slot for this moment, atomically. 'ok' means the caller MAY rotate now. */
 export async function reserveRotation(
   env: Env,
-  input: { momentId: string; memberId: string; agentId: string | null; reason: string },
+  input: { momentId: string; memberId: string; agentId: string | null; reason: string; channel?: RotationChannel },
   nowMs: number = Date.now(),
 ): Promise<RotationReservation> {
   const id = crypto.randomUUID()
+  const channel = input.channel ?? MCP_CHANNEL
   const nowIso = new Date(nowMs).toISOString()
   const sinceIso = new Date(nowMs - ROTATE_MIN_INTERVAL_MS).toISOString()
   const where = `tenant = ?2 AND operation = ?4 AND target_kind = 'secure_moment' AND target_id = ?5`
@@ -27,13 +32,14 @@ export async function reserveRotation(
       `INSERT INTO mutation_audit_entries (
          id, tenant, principal_kind, principal_id, member_id, agent_id, origin, handler, operation,
          target_kind, target_id, request_id, idempotency_key, evidence_json, recorded_at)
-       SELECT ?1, ?2, CASE WHEN ?10 IS NULL THEN 'member' ELSE 'agent' END, COALESCE(?10, ?3), ?3, ?10, 'mcp', 'mcp_url_elicitation', ?4, 'secure_moment', ?5, ?1, ?1, ?6, ?7
+       SELECT ?1, ?2, CASE WHEN ?10 IS NULL THEN 'member' ELSE 'agent' END, COALESCE(?10, ?3), ?3, ?10, ?11, ?12, ?4, 'secure_moment', ?5, ?1, ?1, ?6, ?7
         WHERE (SELECT COUNT(*) FROM mutation_audit_entries WHERE ${where} AND recorded_at > ?8) = 0
           AND (SELECT COUNT(*) FROM mutation_audit_entries WHERE ${where}) < ?9
        ON CONFLICT DO NOTHING`,
     ).bind(
       id, env.TENANT_SLUG, input.memberId, ROTATE_OPERATION, input.momentId,
-      JSON.stringify({ moment_id: input.momentId, reason: input.reason }), nowIso, sinceIso, ROTATE_MAX_PER_MOMENT, input.agentId,
+      JSON.stringify({ moment_id: input.momentId, reason: input.reason, ...(channel.via ? { via: channel.via } : {}) }), nowIso, sinceIso, ROTATE_MAX_PER_MOMENT, input.agentId,
+      channel.origin, channel.handler,
     ).run()
     if (r.meta.changes === 1) return 'ok'
     const total = await env.DB.prepare(`SELECT COUNT(*) AS n FROM mutation_audit_entries WHERE ${where}`)

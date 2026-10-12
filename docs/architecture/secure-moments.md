@@ -428,6 +428,16 @@ The page gates on `Telegram.WebApp.isVersionAtLeast('8.0')` with a clear message
 4. Each member opens a private chat with that bot once (Telegram refuses to let a bot message someone who never started it), and has Telegram connected to their member (My Account, Connect Telegram).
 5. Then My Account, Telegram device, **Set up this phone**, on a phone with Telegram 8.0 or newer and biometrics enabled.
 
+### W4.1: "Approve with passkey in your browser"
+
+Telegram Desktop has no `BiometricManager`, so the Mini App used to dead-end at "Biometrics unavailable". The Mini App now always offers a second option, and shows it in place of the dead end: **Approve with passkey in your browser**.
+
+`POST /m/tg/<moment id>/passkey-link` (same flag, same host, same-origin JSON) takes the Mini App `init_data` and runs the SAME door as view/challenge/decide: the existing Ed25519 verifier (pinned bot id, freshness, private chat), `resolveTelegramMember` (bound, active, human), then `loadDecidable` (moment pending, unexpired, a kind the Mini App supports, addressed to this member, and the member's current authority over it). A bound member without authority reads as 404, exactly like an unknown moment. It then rotates the moment's link token with the existing guarded rotation (`reserveRotation` then `reissueMomentLink`, by moment id) and returns `https://<secure host>/m/<id>/<token>` once. The client opens it with `Telegram.WebApp.openLink`, in the user's real browser, where the unchanged W1 passkey page decides.
+
+- **The link alone grants nothing.** The decision still needs the member's WebAuthn passkey. Telegram proves only who asked for the link.
+- **Bounded by the same ledger as the MCP plain-link fallback**: one rotation per moment per minute, five per moment in total, shared between both callers. The receipt is a `mutation_audit_entries` row (`moment_link_rotate`, handler `secure_moment`, evidence `{moment_id, reason: telegram_passkey_link, via: telegram_initdata}`) written by the reservation itself. The token and the initData are never logged or stored in a receipt.
+- **Side effect**: rotating kills the previous link of that moment, including one an agent relayed. That is intended and the same as W3.1.
+
 ### Accepted limits
 
 - The device secret is client-attested. Anything that can run in the Mini App origin after a human unlocks it can read it for that session. It is bound to a Telegram user and a member and useless without fresh launch data, but it is not a hardware-bound key.
