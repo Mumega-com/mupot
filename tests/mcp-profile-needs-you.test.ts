@@ -79,6 +79,9 @@ const EXPECTED_NAMES = [
   'boot_context', 'needs_you_list', 'orient', 'project_get', 'project_list', 'project_wiki', 'task_board', 'task_list',
 ]
 
+// SECURE_DROP is unset in this env: the five secure-drop tools (W2) are not advertised.
+const SECURE_DROP_NOT_LISTED = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
+
 describe('profile tools/list', () => {
   it('returns exactly the profile allowlist, each with read-only annotations', async () => {
     const { status, json } = await rpc(PROFILE, 'tools/list', undefined, header(), makeEnv())
@@ -114,7 +117,7 @@ describe('/mcp is unchanged (regression guard)', () => {
     const { json } = await rpc('/', 'tools/list', undefined, {}, makeEnv())
     const tools = json!.result.tools as Array<{ name: string; annotations?: unknown }>
     // SEAT_AUTO_ENROLL is unset in this env: the flag-gated seat_select (mupot#1794) is not advertised.
-    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request').map((t) => t.name))
+    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => t.name))
     expect(tools.length).toBeGreaterThan(NEEDS_YOU_PROFILE.length * 5)
     // mupot#1709: every /mcp entry now ALSO carries `annotations` (tests/mcp-tool-annotations.test.ts pins
     // their values). Deliberate update: the pre-#1709 shape had none. Everything else is unchanged.

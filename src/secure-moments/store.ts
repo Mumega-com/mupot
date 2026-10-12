@@ -12,7 +12,7 @@ export const ENROLMENT_TTL_MS = 10 * 60 * 1000
 export const CHALLENGE_MAX_OUTSTANDING_PER_MOMENT = 20
 export const PASSKEY_MAX_PER_MEMBER = 10
 
-export type MomentKind = 'seed_attach' | 'elevation'
+export type MomentKind = 'seed_attach' | 'elevation' | 'credential'
 
 export interface MomentRow {
   id: string
@@ -26,7 +26,7 @@ export interface MomentRow {
   created_at: string
   expires_at: string
   decided_at: string | null
-  decision: 'approve' | 'deny' | null
+  decision: 'approve' | 'deny' | 'provide' | null
 }
 
 const MOMENT_COLUMNS = `id, tenant, kind, subject_id, requester_agent_id, decider_member_id, link_token_sha256,
@@ -129,7 +129,7 @@ export async function consumeMoment(
 }
 
 // ── challenges ──────────────────────────────────────────────────────────────────────────────────────
-export interface DecideBinding { momentId: string; decision: 'approve' | 'deny'; payloadSha256: string }
+export interface DecideBinding { momentId: string; decision: 'approve' | 'deny' | 'provide'; payloadSha256: string }
 
 /** Mint a decide challenge bound to (moment, decision, parameter digest). Null when the outstanding cap is hit. */
 export async function mintDecideChallenge(env: Env, b: DecideBinding, nowMs: number = Date.now()): Promise<string | null> {

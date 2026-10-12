@@ -2,7 +2,7 @@
 // They only call navigator.credentials and POST JSON to the same page's own sub-paths; they hold no secret.
 // Server-supplied text is only ever written with textContent.
 
-const COMMON = `
+export const COMMON = `
 function b64uToBuf(s){var p=s.replace(/-/g,'+').replace(/_/g,'/');while(p.length%4)p+='=';var b=atob(p),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u.buffer}
 function bufToB64u(b){var u=new Uint8Array(b),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')}
 async function post(path,body){var r=await fetch(location.pathname+path,{method:'POST',credentials:'omit',headers:{'content-type':'application/json'},body:JSON.stringify(body)});var j={};try{j=await r.json()}catch(e){}return{status:r.status,json:j}}

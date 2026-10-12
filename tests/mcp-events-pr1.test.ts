@@ -158,6 +158,9 @@ async function captureGolden(events: string | undefined, onlyInvariant = false):
   return out
 }
 
+// SECURE_DROP is unset in this env: the five secure-drop tools (W2) are not advertised.
+const SECURE_DROP_NOT_LISTED = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
+
 describe('flag-off / legacy surface is byte-identical to main', () => {
   // Golden generated from origin/main (BEFORE this change) with GEN_MCP_SNAPSHOT=1.
   if (process.env.GEN_MCP_SNAPSHOT === '1') {
@@ -194,7 +197,7 @@ describe('flag-off / legacy surface is byte-identical to main', () => {
 
   it('tools/list tool NAMES are unchanged, flag off and on (derived from the registry, not a frozen body)', async () => {
     // SEAT_AUTO_ENROLL / ACCESS_APPROVE_ENABLED are unset in this env: flag-gated seat_select (mupot#1794) and seed_attach_request are not advertised.
-    const expected = TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request').map((t) => t.name)
+    const expected = TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => t.name)
     for (const flag of [undefined, 'true']) {
       const { text } = await rawRpc('tools/list', undefined, { events: flag })
       const names = (parse(text).result?.tools as { name: string }[]).map((t) => t.name)

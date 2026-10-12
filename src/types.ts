@@ -273,6 +273,9 @@ export interface Env {
   // Secure moments (docs/architecture/secure-moments.md). Feature flag OFF unless SECURE_MOMENTS is '1' or 'true':
   // /m/* answers 404 on every host and the request tools return no secure link.
   SECURE_MOMENTS?: string
+  // Secure drops (W2, docs/architecture/secure-moments.md): sealed credential delivery to an agent host. OFF unless
+  // SECURE_DROP is '1' or 'true' AND secure moments are themselves on; off is a true no-op (no route, no tool, no write).
+  SECURE_DROP?: string
   SECURE_MOMENTS_HOST?: string     // DEDICATED hostname for /m/* and the WebAuthn RP ID; never a colony host, pot host, or ACCESS_CANONICAL_HOST
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
