@@ -20,6 +20,7 @@ import { linkLoginIdentity } from '../src/auth/login-identity'
 import { claimSeedRequest, createSeedRequest } from '../src/access/seed-request'
 import { issueCsrfToken, verifyCsrfToken } from '../src/access/csrf'
 import { REFERRER_POLICY } from '../src/access/routes'
+import { SUBMIT_ONCE_SCRIPT } from '../src/access/page'
 import { advertisedTools } from '../src/mcp/index'
 import * as seedApply from '../src/seeds/apply'
 
@@ -436,6 +437,33 @@ describe('approve page: seed', () => {
     expect([count('projects'), count('squads'), count('mutation_audit_entries', "handler = 'seed_attach'")]).toEqual([projects, squads, audit])
   })
 
+  it('the body a real browser sends (submitter + its hidden copy = decision twice) is accepted; a conflicting pair is refused', async () => {
+    // Chromium posts `decision=approve&decision=approve` when the submit guard copies the pressed button into a hidden
+    // input (gate finding on #1862, reproduced with Playwright). That must decide, not 400.
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const conflict = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: ['approve', 'deny'] } })
+    expect(conflict.status).toBe(400)
+    expect(count('project_seeds', "status = 'applied'")).toBe(0)
+    const doubled = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: ['approve', 'approve'] } })
+    expect(doubled.status).toBe(200)
+    expect(count('project_seeds', "status = 'applied'")).toBe(1)
+  })
+
+  it('a browser-shaped doubled deny (decision=deny twice) denies', async () => {
+    const { id } = await filed()
+    const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
+    const deny = await hit(`/approve/seed/${id}`, { method: 'POST', form: { csrf, decision: ['deny', 'deny'] } })
+    expect(deny.status).toBe(200)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'denied' })
+    expect(count('project_seeds')).toBe(0)
+  })
+
+  it('the submit guard disables the buttons synchronously (before the entry list is built), never in a timer', () => {
+    expect(SUBMIT_ONCE_SCRIPT).not.toContain('setTimeout')
+    expect(SUBMIT_ONCE_SCRIPT).toMatch(/f\.appendChild\(h\)\}\n[^\n]*\n var bs=f\.querySelectorAll\('button'\);for\(var i=0;i<bs\.length;i\+\+\)bs\[i\]\.disabled=true;/)
+  })
+
   it('two concurrent approvals: exactly one applies', async () => {
     const { id } = await filed()
     const csrf = csrfOf(await (await hit(`/approve/seed/${id}`)).text())
@@ -558,6 +586,17 @@ describe('approve page: elevation', () => {
     expect(html).toContain('value="15"')
     expect(html).toContain('value="60"')
     expect(html).not.toContain('value="240"')
+  })
+
+  it('elevation: the browser-shaped doubled decision approves; a conflicting pair is refused and grants nothing', async () => {
+    const id = await pendingElevation(['action:project_status'], 60)
+    const csrf = csrfOf(await (await hit(`/approve/elevation/${id}`)).text())
+    const conflict = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf, decision: ['deny', 'approve'], actions: ['action:project_status'], duration_minutes: '60' } })
+    expect(conflict.status).toBe(400)
+    expect(count('elevation_grants')).toBe(0)
+    const res = await hit(`/approve/elevation/${id}`, { method: 'POST', form: { csrf, decision: ['approve', 'approve'], actions: ['action:project_status'], duration_minutes: '60' } })
+    expect(res.status).toBe(200)
+    expect(count('elevation_grants')).toBe(1)
   })
 
   it('approve with narrowing: subset of actions + shorter duration; grant bound to a fresh web session; receipt written', async () => {
@@ -879,6 +918,18 @@ describe('round 2: durable decisions and the lazy reconcile (Access page)', () =
     harness.sqlite.prepare("INSERT INTO project_seeds (id, tenant, project_slug, seed_sha256, canonical_json, requests_json, owner_label, applied_by_member_id, applied_at, status) SELECT 'ps', tenant, 'x-prj', seed_sha256, '{}', '[]', 'o', 'mem-owner', 'now', 'applying' FROM seed_attach_requests WHERE id = ?").run(id)
     await hit(`/approve/seed/${id}`)
     expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applying' })
+  })
+  it('reconcile is pinned: an applied digest in ANOTHER tenant does not reconcile, and a FAILED request is never flipped to applied', async () => {
+    const { id } = await filed()
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'applying' WHERE id = ?").run(id)
+    harness.sqlite.prepare("INSERT INTO project_seeds (id, tenant, project_slug, seed_sha256, canonical_json, requests_json, owner_label, applied_by_member_id, applied_at, status) SELECT 'ps-other', 'other-tenant', 'x-prj', seed_sha256, '{}', '[]', 'o', 'mem-owner', 'now', 'applied' FROM seed_attach_requests WHERE id = ?").run(id)
+    await hit(`/approve/seed/${id}`)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'applying' })
+    // same tenant, applied digest, but the request is FAILED: stays failed
+    harness.sqlite.prepare("INSERT INTO project_seeds (id, tenant, project_slug, seed_sha256, canonical_json, requests_json, owner_label, applied_by_member_id, applied_at, status) SELECT 'ps-same', tenant, 'y-prj', seed_sha256, '{}', '[]', 'o', 'mem-owner', 'now', 'applied' FROM seed_attach_requests WHERE id = ?").run(id)
+    harness.sqlite.prepare("UPDATE seed_attach_requests SET status = 'failed' WHERE id = ?").run(id)
+    await hit(`/approve/seed/${id}`)
+    expect(harness.sqlite.prepare('SELECT status FROM seed_attach_requests WHERE id = ?').get(id)).toEqual({ status: 'failed' })
   })
   it('the form disables itself after the first press (nonce script, kept submitter value) and the CSP allows only that nonce', async () => {
     const { id } = await filed()

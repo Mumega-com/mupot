@@ -54,8 +54,9 @@ export function messagePage(title: string, message: string, status: 'ok' | 'warn
 
 /**
  * The decision form's double-submit guard (mupot#1860): the first submit keeps the pressed button's value (a
- * disabled submitter would not be sent), then every button is disabled and a progress line replaces the buttons'
- * promise. A second tap can no longer race the first. No network, no secrets, no server text.
+ * disabled submitter would not be sent), then every button is disabled SYNCHRONOUSLY, before the browser builds the
+ * entry list, so the pressed button is not sent a second time beside its hidden copy (a doubled `decision` field
+ * parses as an array). A progress line replaces the buttons' promise. A second tap can no longer race the first. No network, no secrets, no server text.
  */
 export const SUBMIT_ONCE_SCRIPT = `(function(){
 document.addEventListener('submit',function(e){
@@ -64,6 +65,6 @@ document.addEventListener('submit',function(e){
  f.setAttribute('data-sent','1');
  var s=e.submitter;if(s&&s.name){var h=document.createElement('input');h.type='hidden';h.name=s.name;h.value=s.value;f.appendChild(h)}
  var p=document.getElementById('progress');if(p)p.textContent='Working. Do not reload or tap again; this page updates when it is done.';
- setTimeout(function(){var bs=f.querySelectorAll('button');for(var i=0;i<bs.length;i++)bs[i].disabled=true},0);
+ var bs=f.querySelectorAll('button');for(var i=0;i<bs.length;i++)bs[i].disabled=true;
 });
 })();`

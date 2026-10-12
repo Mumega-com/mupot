@@ -127,6 +127,13 @@ async function postGuard(c: Context<AppEnv>, kind: string, id: string): Promise<
 }
 
 const one = (v: string | string[] | undefined): string | undefined => (typeof v === 'string' ? v : undefined)
+/** A single choice field. A browser may send the same field twice (a submitter plus its hidden copy); identical
+ *  repeats collapse to that value, any disagreement is refused (undefined). */
+const choice = (v: string | string[] | undefined): string | undefined => {
+  if (typeof v === 'string') return v
+  if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' && x === v[0])) return v[0]
+  return undefined
+}
 
 async function formHtml(c: Context<AppEnv>, kind: string, id: string, inner: string, approveLabel: string): Promise<string | null> {
   const { claims } = c.get('access')
@@ -175,7 +182,7 @@ approveApp.post('/seed/:id', async (c) => {
   const id = c.req.param('id')
   const guard = await postGuard(c, 'seed', id)
   if (!guard.ok) return guard.res
-  const decision = one(guard.form.decision)
+  const decision = choice(guard.form.decision)
   if (decision !== 'approve' && decision !== 'deny') return page(c, 400, 'Bad request', 'decision must be approve or deny.')
   const { claims } = c.get('access')
   const actor = await seedActor(c)
@@ -213,7 +220,7 @@ approveApp.post('/elevation/:id', async (c) => {
   const id = c.req.param('id')
   const guard = await postGuard(c, 'elevation', id)
   if (!guard.ok) return guard.res
-  const decision = one(guard.form.decision)
+  const decision = choice(guard.form.decision)
   if (decision !== 'approve' && decision !== 'deny') return page(c, 400, 'Bad request', 'decision must be approve or deny.')
   const { claims } = c.get('access')
   const who = await resolveApprover(c.env, claims)
