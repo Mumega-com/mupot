@@ -1,6 +1,6 @@
 # Secure moments
 
-Status: wave W1, behind a feature flag (off by default).
+Status: wave W1, behind a feature flag (off by default). Wave W2 (secure drops, sealed credential delivery) is at the end of this document.
 
 A high-stakes approval should never pass through a chat or a model. With secure moments, an agent asks for a decision through a tool and gets back a one-time link. The human opens the link on a dedicated mupot host and confirms with a passkey. The chat only carries the link and, afterwards, the outcome.
 
@@ -80,3 +80,128 @@ The secure host sets no cookies. There is no session on it, so there is nothing 
 - An org admin cannot yet mint an enrolment link for another member.
 - There is no rate limit on the link beyond the unguessable token and a cap on outstanding challenges per moment.
 - Recovery from a lost passkey is: sign in to the dashboard and add a new one. It never runs through an agent.
+
+# W2: secure drops
+
+Status: wave W2, behind a second feature flag (off by default). Branch work; not deployed.
+
+An agent that needs a credential (an API token, an SSH key) must never receive it through a chat or a model, and mupot must never hold it in the clear. A secure drop seals the secret **in the human's browser** to a key that only the agent's host holds. mupot stores ciphertext and a digest, and has no code that can open it.
+
+```
+agent host                     mupot (Worker + D1)                  human's browser (secure host)
+keygen -> host-key.json
+register public key  --------> host_keys (public key, fingerprint)
+credential_request   --------> secure_drops(requested) + a 'credential' moment
+        <-------- one-time link + fingerprint
+                                                     link ------->  page shows agent, name, purpose (untrusted),
+                                                                    host key FINGERPRINT
+                                                                    password field -> HPKE seal in the browser
+                                                                    POST {enc, ciphertext} + passkey assertion
+                               verifies passkey + authority,
+                               ONE batch: consume moment + store ciphertext
+pull  <------------------------ {id, name, enc, ct, fingerprint}
+open with own key, write ~/.sos/keys/<name> (0600, atomic)
+ack   ------------------------> ciphertext DELETED
+```
+
+## Configuration
+
+| Variable | Meaning |
+|---|---|
+| `SECURE_DROP` | `1` or `true` turns secure drops on. It also needs `SECURE_MOMENTS` on and a valid `SECURE_MOMENTS_HOST`. Anything else: off. |
+
+The name is in the reviewed-names list. With the flag off (or secure moments unusable) secure drops are a true no-op:
+
+- the five tools are not advertised and refuse in `invokeTool` before argument handling (so a flag-off pot does not reveal their schemas);
+- `/m/assets/hpke-seal.v1.js` is a 404, a credential moment cannot be viewed or decided, and no row is created in `host_keys`, `secure_drops`, `secure_moments` or `mutation_audit_entries`.
+
+## Threat model
+
+What this protects: the chat, the model, the bot transcript, D1 backups, logs and receipts never contain the secret. A stolen database yields ciphertext sealed to host keys.
+
+What it does **not** protect against, by design:
+
+- **A compromised Worker.** The browser runs the sealer that the Worker serves, and it gets the host public key from the Worker. A Worker that serves a malicious page can seal to the attacker's key. The check that catches this is the **fingerprint**: the page shows the host key's fingerprint (and recomputes it in the browser from the key it would use), and the human compares it with the one `secure-drop.mjs keygen` printed on the host. Do the comparison. mupot cannot do it for you, because the page is the thing under suspicion.
+- **A compromised host.** Whoever controls the host reads its files. Revoke shreds the file; it cannot un-leak.
+- **A compromised passkey device or a human who pastes into the wrong page.**
+
+## Cryptography (exactly one suite, no negotiation)
+
+HPKE RFC 9180, base mode: **DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 / AES-128-GCM** (kem `0x0020`, kdf `0x0001`, aead `0x0001`).
+
+- Host key: X25519. The wire form is the raw 32-byte public key as base64url without padding (43 characters). Small-order points are refused at registration.
+- Fingerprint: lowercase hex `sha256(raw 32-byte public key)`. Shown to humans as 16 groups of four hex digits.
+- `info = "mupot-secure-drop/v1|" + drop id + "|" + fingerprint (hex)`; `aad = drop id`. A ciphertext therefore opens only for that drop id and that host key.
+- One sender context per secret, sealed once (sequence 0). Each attempt in the browser makes a fresh context and a fresh ephemeral key.
+- The host recomputes the fingerprint from **its own key** to build `info`. It never trusts a fingerprint the server names: a drop whose `host_key_fingerprint` differs from the host's own is refused (a key-substitution signal).
+- The WebAuthn challenge for a provide is bound server-side to `moment id + decision 'provide' + sha256(enc || ciphertext)` (raw bytes). The same bytes are digested again when the decision arrives, so a ciphertext swapped after the assertion consumes no challenge and stores nothing.
+
+### The vendored browser bundle
+
+The sealer is one pre-bundled, minified IIFE (global `MupotHpke`), served by the secure host itself from `/m/assets/hpke-seal.v1.js`. There is no CDN. The credential page loads it under `script-src 'self' 'nonce-...'` and a subresource-integrity hash; no other moment page allows `'self'` scripts.
+
+| | |
+|---|---|
+| File | `src/secure-drop/vendor/hpke-seal.v1.js` (also embedded for the Worker in `src/secure-drop/hpke-bundle.generated.ts`) |
+| Libraries | `@hpke/core 1.9.0`, `@hpke/dhkem-x25519 1.8.0` (pulls `@hpke/common 1.10.1`), bundled with `esbuild 0.25.5` |
+| Size | 39,448 bytes (about 11.5 KB gzip) |
+| sha256 | `c230e6c2f6a2e26eba963b36212ec1c184f05539d9a225e3193cc02f16d53a83` |
+| SRI | `sha384-aSUuqGLqcAtBkgSHdpmylaxN19P7a9O8PojPxceonRUxrGSDc7iRWLrVqQLPCXMF` |
+| Source / rebuild | `scripts/vendor/hpke-seal.entry.mjs`; `scripts/build-hpke-bundle.mjs <dir>` (see its header). The build is reproducible: the same pins give the same bytes. |
+
+`tests/secure-drop.test.ts` pins the sha256 and the SRI to this document, checks that the TS copy equals the file byte for byte, and checks the bundle contains no `eval`, `new Function`, `fetch`, `XMLHttpRequest`, `WebSocket`, `sendBeacon` or storage access. Its only dynamic `import()` is the Node-only `crypto` fallback, taken when `globalThis.crypto` is absent (never in a browser). A changed bundle fails CI until this table is updated. `package.json` has no HPKE dependency: the library exists only as that vendored browser file.
+
+## Tools
+
+All agent tools take the agent id from the token (`auth.boundAgentId`), never from arguments.
+
+| Tool | Caller | What it does |
+|---|---|---|
+| `host_key_register { public_key }` | the agent itself (agent-bound token) | Registers the host's public key. One live key per agent (partial UNIQUE index). The same key again is a no-op; a different key **rotates**: the old key is revoked and open requests and unpulled ciphertext sealed to it are closed in the same batch. A revoked key is never accepted again. |
+| `credential_request { name, purpose, scope_hint?, ttl_minutes? }` | the agent | Needs a live host key. Creates a `secure_drops` row and a `credential` moment; returns the one-time link, the request id and the grouped fingerprint. `name` is a filename slug `[a-z0-9][a-z0-9_-]{0,62}` (no dots, no slashes); `ttl_minutes` is 5 to 1440 (default 60). A re-request for the same name supersedes the open one; ciphertext still waiting for a pull blocks a new request; at most 10 open requests per agent. It never returns or accepts a secret. |
+| `secure_drop_pull {}` | the agent | Lazily purges expired rows, then returns `{drops: [{id, name, enc, ct, host_key_fingerprint}], revokes: [{id, name}]}` for **this agent's own drops sealed to its current live host key**. A drop sealed to a rotated key is never listed. |
+| `secure_drop_ack { id }` | the agent | A `ready` drop becomes `delivered` and `enc`/`ct` are set to NULL in the same statement (guarded; a replay changes nothing). A delivered drop with a pending revoke instruction becomes `revoked`. Another agent's id, an expired or unknown id are refused identically (`nothing_to_ack`). |
+| `secure_drop_revoke { name, agent_id? }` | a human (not agent-bound) who is org admin or admin on the agent's squad | An open request is cancelled and its link dies; unpulled ciphertext is deleted at once; a delivered credential gets a revoke instruction that the host acts on at its next pull (it shreds the file, then acks). A name that exists for several agents the caller governs needs `agent_id`. A caller with no authority gets the same `not_found` as for an unknown name. |
+
+`SECURE_DROP` also drives advertising: with it off none of the five appear in `tools/list`.
+
+## The decision
+
+The credential page is a moment of kind `credential`. Opening it consumes nothing. The human chooses **Seal and send with passkey** or **Deny with passkey**. The same ceremony as W1 runs (single-use challenge, WebAuthn assertion with user verification, counter forward-only), then, before anything is consumed:
+
+1. the passkey's member must be an **active human** (an agent's welded member row never decides);
+2. the passkey's login identity must be live;
+3. that member must hold **authority over this agent**: org admin, or admin on the agent's squad (`hasWorkspaceAdmin`, `canOnSquadAuth`, the predicates the other channels use, re-derived now);
+4. the request must still be open and bound to this moment, and for a provide the host key must still be the live one.
+
+Then **one batch**: a guarded `UPDATE` consumes the moment (and repeats checks 2 and 4 in its `WHERE`), an `UPDATE` stores `enc`/`ct`/`ct_sha256` only `WHERE changes() = 1`, and the receipt is inserted only `WHERE changes() = 1`. A refusal never burns the link; a stored ciphertext always has a consumed moment behind it; the result is read back before success is reported.
+
+`secure_drops.status`: `requested -> ready | denied | expired`, `ready -> delivered | expired | revoked`, `delivered -> revoked`. Check constraints make ciphertext outside `ready` unrepresentable, so a code path that leaves it behind fails instead of leaking.
+
+## Receipts
+
+`mutation_audit_entries` gets a row (`handler secure_drop`) for `host_key_register`, `credential_request`, `secure_drop_provide`, `secure_drop_deny`, `secure_drop_deliver`, `secure_drop_revoke` and `secure_drop_revoke_ack`. Evidence is short scalars only: names, ids, the fingerprint, the host key id and the ciphertext **digest** (`ct_sha256`). The helper drops any value that is not a short plain scalar, and the tests assert no receipt contains the plaintext, `enc` or `ct`. For provide and deny the principal is the human member who decided (`origin admin_ui`); for the agent tools it is the agent.
+
+## The host script
+
+`fleet-runtime/secure-drop.mjs` (Node 20 or later, `node:crypto` only, no npm dependencies):
+
+| Command | Does |
+|---|---|
+| `keygen [--rotate]` | Writes `~/.mupot/host-key.json` (mode 0600, X25519 private key as a JWK, atomic, refuses to replace an existing key without `--rotate`) and prints the public key and the fingerprint to compare with the page. |
+| `register` | Calls `host_key_register` with the agent's own token and **only the public key**. |
+| `pull` | Calls `secure_drop_pull`; for each drop validates the name (same slug rule) and the id, refuses it if the server-named fingerprint differs from the host's own, opens it with a hand-rolled RFC 9180 base-mode receiver, writes `~/.sos/keys/<name>` (tmp file, mode 0600, fsync, rename; refuses to overwrite a symlink or a non-regular file; refuses a keys directory that is a symlink or group/world writable), and only then calls `secure_drop_ack`. Revoke instructions shred the file and ack. It prints names and byte counts, never a secret. |
+| `revoke <name>` | Overwrites the file with random bytes of the same length, fsyncs and unlinks it. |
+
+Token rules are the CLI's (`cli/mupot.mjs`): the bearer token comes from a 0600 regular file (`~/.config/mupot/<pot>.token`, the pot's `token_file`, or `MUPOT_TOKEN_FILE` for the default pot), is never accepted on argv (`--token` and friends are refused), is never printed, and is sent only to the pot's own https origin (http only for loopback; redirects are refused).
+
+`node --test fleet-runtime/secure-drop.test.mjs` covers the RFC 9180 Appendix A.1 vector (the suite above: key schedule outputs and the sequence-0 ciphertext), interoperability with the vendored browser bundle, and every refusal named above.
+
+## Limits of W2
+
+- One host key per agent. Two hosts for one agent are not supported (the second registration rotates the first).
+- No human can see the secret again once sent; there is no reveal. Revoke shreds the host file on the host's next pull, not synchronously.
+- A single sealed secret is limited to 8 KiB of plaintext.
+- The fingerprint comparison is a human step. If a human skips it, a compromised Worker defeats confidentiality (see the threat model).
+- Revoke goes through a human **bearer** token over MCP (authority is checked, but there is no passkey step-up on revoke). Revoking is the safe direction: it only removes access.
+- Clock-based expiry is lazy: expired rows are closed on the next request or pull, and an expired moment is never decidable in between.

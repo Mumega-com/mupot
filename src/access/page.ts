@@ -23,8 +23,11 @@ export function untrustedBox(label: string, text: string): string {
   return `<div class="untrusted" role="note"><p class="tag">Untrusted. Written by the agent, not by this system. ${escapeHtml(label)}</p><pre>${escapeHtml(sanitizeUntrusted(text))}</pre></div>`
 }
 
-/** `script`, when given, is the page's ONE inline script, emitted under the caller's CSP nonce. */
-export function renderPage(title: string, body: string, script?: { nonce: string; code: string }): string {
+/**
+ * `script`, when given, is the page's ONE inline script, emitted under the caller's CSP nonce. `srcs` are same-origin
+ * script files loaded first (each with a subresource-integrity hash, nonce'd as well): the secure-drop sealer.
+ */
+export function renderPage(title: string, body: string, script?: { nonce: string; code: string; srcs?: ReadonlyArray<{ src: string; integrity: string }> }): string {
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex"><title>${escapeHtml(title)}</title>
@@ -45,7 +48,9 @@ button{font:inherit;padding:.6rem 1.1rem;border-radius:8px;border:1px solid var(
 button.primary{background:var(--accent);color:var(--accent-text);border-color:var(--accent)}button.danger{color:var(--danger);border-color:var(--danger)}
 select{font:inherit;padding:.4rem;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px}
 .muted{color:var(--muted)}label{display:block}
-</style></head><body><main>${body}</main>${script ? `<script nonce="${escapeHtml(script.nonce)}">${script.code}</script>` : ''}</body></html>`
+input[type=password],input[type=text]{font:inherit;width:100%;box-sizing:border-box;padding:.5rem;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px}
+.fp{font:1.05rem/1.6 ui-monospace,monospace;letter-spacing:.04em;word-break:break-word}
+</style></head><body><main>${body}</main>${script ? `${(script.srcs ?? []).map((f) => `<script nonce="${escapeHtml(script.nonce)}" src="${escapeHtml(f.src)}" integrity="${escapeHtml(f.integrity)}" crossorigin="anonymous"></script>`).join('')}<script nonce="${escapeHtml(script.nonce)}">${script.code}</script>` : ''}</body></html>`
 }
 
 export function messagePage(title: string, message: string, status: 'ok' | 'warn' | 'bad'): string {

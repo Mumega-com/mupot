@@ -64,7 +64,9 @@ describe('the full /mcp tools/list response includes them', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { result: { tools: Array<{ name: string; annotations?: Record<string, unknown> }> } }
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request').length)
+    // SECURE_DROP is unset as well: the five secure-drop tools (W2) are not advertised either.
+    const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
       expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
       expect(Object.keys(t.annotations ?? {}).sort(), t.name).toEqual(['destructiveHint', 'openWorldHint', 'readOnlyHint'])
@@ -138,13 +140,13 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   ]
   const ALL_DESTRUCTIVE = [
     'addon_archive', 'addon_configure', 'addon_disable', 'addon_setup', 'advance_node', 'agent_lifecycle',
-    'approve_gate_edge', 'archive_row', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
-    'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'loop_control', 'loop_set_status', 'mint_agent_token',
+    'approve_gate_edge', 'archive_row', 'credential_request', 'deactivate_agent', 'end_agent_session', 'flight_cancel', 'flight_land',
+    'flight_reap_stalled', 'grant_agent_capability', 'harness_capacity_report', 'host_key_register', 'loop_control', 'loop_set_status', 'mint_agent_token',
     'move_agent_squad', 'office.publish_post', 'office.reconcile_stalled_publish', 'office.review_approval',
     'pot_release', 'presence_deregister', 'project_recommit', 'project_squad_remove', 'project_squad_set',
     'project_update', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
-    'routine_update', 'runner_record', 'secret_env_request', 'set_agent_inbox_consumer',
+    'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
     'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
     'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
     'update_agent', 'update_squad',

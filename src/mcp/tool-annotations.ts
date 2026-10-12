@@ -218,6 +218,13 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   seed_draft: RO('pure: draftSeed builds text and runs the validator; no D1, KV or fetch, presence bump suppressed (mcp/seed.ts, seeds/draft.ts)'),
   seed_attach_request: ADD('INSERT seed_attach_requests (pending, single-use, 24h, per-requester cap); applies nothing and grants nothing; a human decides on the Access approve page (mcp/seed.ts, access/seed-request.ts)'),
 
+  // ── secure drops (W2) ──────────────────────────────────────────────────────────────────────
+  host_key_register: MUT('registerHostKey batch: INSERT host_keys + on rotation UPDATE host_keys revoked_at, UPDATE secure_drops (open/ready -> expired, ciphertext cleared), UPDATE secure_moments + INSERT mutation_audit_entries (secure-drop/store.ts)'),
+  credential_request: MUT('createDropRequest INSERT secure_drops (+ supersedes an open same-name request: UPDATE secure_drops/secure_moments to expired) + INSERT secure_moments via issueMomentLink + audit row; returns a link, never a secret (mcp/secure-drop.ts)'),
+  secure_drop_pull: MUT('lazily expires stale requests/ciphertext (UPDATE secure_drops enc/ct cleared, UPDATE secure_moments) then SELECTs ciphertext for the caller own live host key (secure-drop/store.ts)'),
+  secure_drop_ack: MUT('ackDrop batch: UPDATE secure_drops ready -> delivered and DELETES enc/ct (or delivered -> revoked) + INSERT mutation_audit_entries (secure-drop/store.ts)'),
+  secure_drop_revoke: MUT('revokeDrop: UPDATE secure_drops (cancel / delete ciphertext / mark delivered credential for shredding) + UPDATE secure_moments + INSERT mutation_audit_entries (secure-drop/store.ts)'),
+
   // ── workflow circuits ──────────────────────────────────────────────────────────────────────
   define_circuit: ADD('defineCircuit batch INSERT circuits/nodes/edges (addons/workflow-circuits/service.ts:284-303)'),
   advance_node: MUT('advanceNode UPDATE workflow_circuit_nodes.done_state + INSERT events (workflow-circuits/service.ts:443,447)'),

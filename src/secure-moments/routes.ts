@@ -29,6 +29,13 @@ import {
 } from './store'
 import { b64uDecode, b64uEncode, hex, sha256, verifyAssertion, verifyRegistration } from './webauthn'
 import { DECIDE_SCRIPT, ENROL_SCRIPT } from './client'
+import { secureDropStatus, DROP_ENC_BYTES, DROP_MAX_CIPHERTEXT_BYTES, DROP_MAX_PLAINTEXT_BYTES } from '../secure-drop/config'
+import { decideDrop, decodeSealed, loadDrop, loadHostKeyById, sealedDigest, type DropRow } from '../secure-drop/store'
+import { loadAgent, mayGovernAgent } from '../secure-drop/authority'
+import { credentialViewInner } from '../secure-drop/page'
+import { CREDENTIAL_SCRIPT, HPKE_ASSET } from '../secure-drop/client'
+import { HPKE_BUNDLE_JS } from '../secure-drop/hpke-bundle.generated'
+import { groupFingerprint } from '../secure-drop/keys'
 
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
 
@@ -46,15 +53,18 @@ function waitUntilOf(c: Context<AppEnv>): WaitUntil | undefined {
 
 const CSRF_INFO = 'mupot_secure_moment_csrf_v1'
 const MAX_BODY_BYTES = 16 * 1024
+/** A sealed credential (up to 8 KiB of secret) rides base64url twice, plus the assertion: larger than the other bodies. */
+const MAX_DROP_BODY_BYTES = 48 * 1024
 export const REFERRER_POLICY = 'same-origin' // the link token is in the path: never sent cross-site; same-origin keeps fetch's Origin header
 
-function secure(c: Context<AppEnv>, withScript: boolean): void {
+function secure(c: Context<AppEnv>, withScript: boolean, withSelf = false): void {
   c.header('Cache-Control', 'no-store')
   c.header('Referrer-Policy', REFERRER_POLICY)
   c.header('X-Content-Type-Options', 'nosniff')
   c.header('X-Frame-Options', 'DENY')
   c.header('Permissions-Policy', 'publickey-credentials-get=(self), publickey-credentials-create=(self)')
-  const script = withScript ? `script-src 'nonce-${c.get('nonce')}'` : "script-src 'none'"
+  // 'self' only on the credential page: it loads the vendored sealer from this very host (integrity-pinned, no CDN).
+  const script = withScript ? `script-src ${withSelf ? "'self' " : ''}'nonce-${c.get('nonce')}'` : "script-src 'none'"
   c.header('Content-Security-Policy', `default-src 'none'; ${script}; style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'`)
 }
 
@@ -93,7 +103,7 @@ momentsApp.use('*', async (c, next) => {
 type JsonBody = Record<string, unknown>
 
 /** POST preconditions: same-origin (exact Origin), JSON body, bounded size. */
-async function jsonGuard(c: Context<AppEnv>): Promise<{ ok: true; body: JsonBody } | { ok: false; res: Response }> {
+async function jsonGuard(c: Context<AppEnv>, maxBytes = MAX_BODY_BYTES): Promise<{ ok: true; body: JsonBody; size: number } | { ok: false; res: Response }> {
   const origin = c.req.header('origin')
   const site = c.req.header('sec-fetch-site')
   if (origin !== secureOrigin(c.get('host')) || (site !== undefined && site !== 'same-origin')) {
@@ -103,11 +113,11 @@ async function jsonGuard(c: Context<AppEnv>): Promise<{ ok: true; body: JsonBody
     return { ok: false, res: fail(c, 400, 'Expected a JSON body.', 'Bad request') }
   }
   const text = await c.req.text()
-  if (text.length > MAX_BODY_BYTES) return { ok: false, res: fail(c, 400, 'Body too large.', 'Bad request') }
+  if (text.length > maxBytes) return { ok: false, res: fail(c, 400, 'Body too large.', 'Bad request') }
   try {
     const parsed: unknown = JSON.parse(text)
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not an object')
-    return { ok: true, body: parsed as JsonBody } // as: just narrowed to a plain object; every field is read as unknown below
+    return { ok: true, body: parsed as JsonBody, size: text.length } // as: just narrowed to a plain object; every field is read as unknown below
   } catch {
     return { ok: false, res: fail(c, 400, 'Unreadable body.', 'Bad request') }
   }
@@ -141,9 +151,16 @@ function challengeOf(clientDataJSON: unknown): string | null {
 type Subject =
   | { kind: 'seed_attach'; row: SeedRequestRow }
   | { kind: 'elevation'; req: ElevationRequestRecord }
+  | { kind: 'credential'; drop: DropRow }
 
 /** The request this moment stands for, only while IT is still live (a closed request is not decidable here). */
 async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<Subject | null> {
+  if (m.kind === 'credential') {
+    // Secure drops (W2): a credential moment is decidable only while SECURE_DROP is on and the request is still open.
+    if (secureDropStatus(env).state !== 'on') return null
+    const drop = await loadDrop(env, m.subject_id)
+    return drop && drop.status === 'requested' && drop.moment_id === m.id && Date.parse(drop.expires_at) > nowMs ? { kind: 'credential', drop } : null
+  }
   if (m.kind === 'seed_attach') {
     const row = await loadSeedRequest(env, m.subject_id)
     return row && seedRequestIsLive(row, nowMs) ? { kind: 'seed_attach', row } : null
@@ -172,9 +189,11 @@ async function closedSubjectJson(c: Context<AppEnv>, m: MomentRow): Promise<Resp
 }
 
 interface Params {
-  decision: 'approve' | 'deny'
+  decision: 'approve' | 'deny' | 'provide'
   actions: string[]
   duration: number | undefined
+  /** credential provide only: the sealed strings as submitted, validated and canonical. */
+  sealed?: { encB64u: string; ctB64u: string; digestHex: string }
   /** sha256 hex of the canonical decision: the digest the challenge is bound to. */
   payload: string
 }
@@ -182,7 +201,19 @@ interface Params {
 /** What the human chose, canonicalised: a deny carries no parameters; an elevation approve carries the narrowed grant. */
 async function readParams(m: MomentRow, body: JsonBody): Promise<Params | null> {
   const decision = body.decision
-  if (decision !== 'approve' && decision !== 'deny') return null
+  if (m.kind === 'credential') {
+    if (decision === 'deny') {
+      const d = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision })))
+      return { decision, actions: [], duration: undefined, payload: d }
+    }
+    if (decision !== 'provide') return null
+    const parts = decodeSealed(body.enc, body.ct, { encBytes: DROP_ENC_BYTES, ctMin: 17, ctMax: DROP_MAX_CIPHERTEXT_BYTES })
+    if (!parts) return null
+    // The challenge is bound to sha256(enc || ciphertext): the digest of exactly the bytes that will be stored.
+    const digestHex = await sealedDigest(parts.enc, parts.ct)
+    return { decision, actions: [], duration: undefined, payload: digestHex, sealed: { encB64u: parts.encB64u, ctB64u: parts.ctB64u, digestHex } }
+  }
+  if (decision !== 'approve' && decision !== 'deny') return null // 'provide' belongs to credential moments only
   let actions: string[] = []
   let duration: number | undefined
   if (m.kind === 'elevation' && decision === 'approve') {
@@ -321,12 +352,44 @@ momentsApp.post('/m/enrol/:token/finish', async (c) => {
   return json(c, 200, { ok: true, title: 'Passkey registered', message: 'You can close this page. Approvals you are asked to confirm will use this passkey.' })
 })
 
+// ── the vendored sealer (secure drops) ──────────────────────────────────────────────────────────
+// ONE pinned pre-bundled file served from this host itself: the credential page loads it under script-src 'self'
+// plus a nonce and a subresource-integrity hash. Registered BEFORE /m/:id/:token (which would otherwise match it).
+// Off (SECURE_DROP unset) it is a 404 like every other drop surface.
+momentsApp.get(HPKE_ASSET.src, (c) => {
+  if (secureDropStatus(c.env).state !== 'on') return NOT_FOUND(c)
+  // The literal spelling only (the router decodes %-escapes; the secure host serves nothing under another spelling).
+  if (new URL(c.req.url).pathname !== HPKE_ASSET.src) return NOT_FOUND(c)
+  return new Response(HPKE_BUNDLE_JS, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'",
+      'Cross-Origin-Resource-Policy': 'same-origin',
+    },
+  })
+})
+
 // ── moments ─────────────────────────────────────────────────────────────────────────────────────
 momentsApp.get('/m/:id/:token', async (c) => {
   const r = await resolveMoment(c, true)
   if (!r.ok) return r.res
   const subject = await loadLiveSubject(c.env, r.r.m, Date.now())
   if (!subject) return closedSubjectPage(c, r.r.m)
+  if (subject.kind === 'credential') {
+    const hostKey = await loadHostKeyById(c.env, subject.drop.host_key_id)
+    const agent = await loadAgent(c.env, subject.drop.agent_id)
+    if (!hostKey || hostKey.revoked_at !== null || hostKey.agent_id !== subject.drop.agent_id || !agent) {
+      return page(c, 410, 'Request closed', "The agent's host key changed after this request was made. Ask the agent to request the credential again.", 'warn')
+    }
+    const csrf = await issueBoundToken(c.env, CSRF_INFO, momentCsrfMessage(r.r.m.id, r.r.linkHash))
+    if (!csrf) return page(c, 503, 'Unavailable', 'This workspace has no server secret configured for secure moments.')
+    secure(c, true, true)
+    return c.html(renderPage('Provide a credential', `${credentialViewInner({ drop: subject.drop, agent, hostKey, csrf, maxBytes: DROP_MAX_PLAINTEXT_BYTES })}`,
+      { nonce: c.get('nonce'), code: CREDENTIAL_SCRIPT, srcs: [HPKE_ASSET] }))
+  }
   let inner: string
   let title: string
   let approveLabel: string
@@ -355,15 +418,24 @@ momentsApp.get('/m/:id/:token', async (c) => {
 })
 
 momentsApp.post('/m/:id/:token/challenge', async (c) => {
-  const g = await jsonGuard(c)
+  const g = await jsonGuard(c, MAX_DROP_BODY_BYTES)
   if (!g.ok) return g.res
   const r = await resolveMoment(c, true)
   if (!r.ok) return r.res
+  if (r.r.m.kind !== 'credential' && g.size > MAX_BODY_BYTES) return fail(c, 400, 'Body too large.', 'Bad request')
   const bad = await checkCsrf(c, momentCsrfMessage(r.r.m.id, r.r.linkHash), g.body.csrf)
   if (bad) return bad
   const p = await readParams(r.r.m, g.body)
   if (!p) return fail(c, 400, 'Invalid decision parameters.', 'Bad request')
-  if (!(await loadLiveSubject(c.env, r.r.m, Date.now()))) return fail(c, 409, 'The request behind this link is no longer pending.', 'Request closed')
+  const live = await loadLiveSubject(c.env, r.r.m, Date.now())
+  if (!live) return fail(c, 409, 'The request behind this link is no longer pending.', 'Request closed')
+  if (live.kind === 'credential' && p.decision === 'provide') {
+    // Nothing is sealed to a key that is gone: refuse before a passkey prompt is even shown.
+    const hk = await loadHostKeyById(c.env, live.drop.host_key_id)
+    if (!hk || hk.revoked_at !== null || hk.agent_id !== live.drop.agent_id) {
+      return fail(c, 409, "The agent's host key changed after this request was made. Ask the agent to request the credential again.", 'Request closed')
+    }
+  }
   const challenge = await mintDecideChallenge(c.env, { momentId: r.r.m.id, decision: p.decision, payloadSha256: p.payload })
   if (!challenge) return fail(c, 409, 'Too many unfinished attempts on this link. Wait a few minutes.', 'Try later')
   let allow: Array<{ type: 'public-key'; id: string }> = []
@@ -377,11 +449,12 @@ momentsApp.post('/m/:id/:token/challenge', async (c) => {
 })
 
 momentsApp.post('/m/:id/:token/decide', async (c) => {
-  const g = await jsonGuard(c)
+  const g = await jsonGuard(c, MAX_DROP_BODY_BYTES)
   if (!g.ok) return g.res
   const r = await resolveMoment(c, true)
   if (!r.ok) return r.res
   const { m, token } = r.r
+  if (m.kind !== 'credential' && g.size > MAX_BODY_BYTES) return fail(c, 400, 'Body too large.', 'Bad request')
   const bad = await checkCsrf(c, momentCsrfMessage(m.id, r.r.linkHash), g.body.csrf)
   if (bad) return bad
   const p = await readParams(m, g.body)
@@ -421,7 +494,9 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   // 6. Authority, re-derived NOW from the member's own current standing (the proof above is only identity).
   const auth = await buildAuth(c.env, passkey.member_id)
   const proof: HumanProof = { memberId: passkey.member_id, via: 'webauthn', evidence: { moment_id: m.id, passkey_id: passkey.id } }
-  const gate = (): Promise<boolean> => consumeMoment(c.env, { id: m.id, token, decision: p.decision, memberId: passkey.member_id, passkeyId: passkey.id }, Date.now())
+  // A credential moment decides 'provide' or 'deny' (handled in decideCredential); the shared cores only know approve/deny.
+  const classic: 'approve' | 'deny' = p.decision === 'deny' ? 'deny' : 'approve'
+  const gate = (): Promise<boolean> => consumeMoment(c.env, { id: m.id, token, decision: classic, memberId: passkey.member_id, passkeyId: passkey.id }, Date.now())
   const subject = await loadLiveSubject(c.env, m, now)
   if (!subject) return closedSubjectJson(c, m)
   // EVERY decision (seed or elevation, approve or deny) needs the login identity the passkey was enrolled under to
@@ -433,6 +508,8 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
   }
   const waitUntil = waitUntilOf(c)
 
+  if (subject.kind === 'credential') return decideCredential(c, { m, token, p, subject: subject.drop, auth, passkeyId: passkey.id, memberId: passkey.member_id })
+  if (p.decision === 'provide') return fail(c, 400, 'Invalid decision parameters.', 'Bad request') // provide exists only for credential moments
   if (subject.kind === 'seed_attach') {
     if (!mayDecideSeed(auth)) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')
     return outcomeJson(c, await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))
@@ -445,6 +522,36 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
     },
   }))
 })
+
+/**
+ * A credential moment decided with a verified passkey. EVERY refusal happens before the one batch that consumes the
+ * moment and stores the ciphertext (a refusal never burns the link): the decider must hold authority over THIS agent
+ * (admin on its squad, or org admin), the request must still be open, and for a provide the host key must still be
+ * the live one. The server stores ciphertext only; there is no code here that could open it.
+ */
+async function decideCredential(
+  c: Context<AppEnv>,
+  i: { m: MomentRow; token: string; p: Params; subject: DropRow; auth: Awaited<ReturnType<typeof buildAuth>>; passkeyId: string; memberId: string },
+): Promise<Response> {
+  const agent = await loadAgent(c.env, i.subject.agent_id)
+  if (!agent) return fail(c, 409, 'The agent behind this request no longer exists.', 'Request closed')
+  if (!(await mayGovernAgent(c.env, i.auth, agent))) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')
+  const hostKey = await loadHostKeyById(c.env, i.subject.host_key_id)
+  if (i.p.decision === 'provide' && (!hostKey || hostKey.revoked_at !== null || hostKey.agent_id !== i.subject.agent_id)) {
+    return fail(c, 409, "The agent's host key changed after this request was made. Ask the agent to request the credential again.", 'Request closed')
+  }
+  if (!hostKey) return fail(c, 409, 'The host key behind this request no longer exists.', 'Request closed')
+  const decision = i.p.decision === 'provide' ? 'provide' : 'deny'
+  if (decision === 'provide' && !i.p.sealed) return fail(c, 400, 'Invalid decision parameters.', 'Bad request')
+  const landed = await decideDrop(c.env, {
+    momentId: i.m.id, token: i.token, drop: i.subject, decision, memberId: i.memberId, passkeyId: i.passkeyId,
+    sealed: i.p.sealed, fingerprint: hostKey.fingerprint,
+  }, Date.now())
+  if (!landed) return fail(c, 409, 'This request was already decided, closed, or could not be completed. Nothing was stored.', 'Not sent')
+  return decision === 'provide'
+    ? json(c, 200, { ok: true, title: 'Credential sealed and sent', message: `Stored encrypted for the host with key ${groupFingerprint(hostKey.fingerprint)}. Only that host can open it, and it is deleted from here once the host collects it.` })
+    : json(c, 200, { ok: true, title: 'Request denied', message: 'The agent will not receive this credential.' })
+}
 
 async function liveIdentityFor(env: Env, memberId: string, identityId: string | null): Promise<string | null> {
   if (!identityId) return null

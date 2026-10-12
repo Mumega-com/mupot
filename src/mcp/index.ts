@@ -215,6 +215,8 @@ import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
+import { SECURE_DROP_TOOLS } from './secure-drop'
+import { secureDropFlag } from '../secure-drop/config'
 import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
@@ -6998,6 +7000,7 @@ export const TOOLS: ToolSpec[] = [
   ...SECRET_ENV_TOOLS,
   ...PRESENCE_TOOLS,
   ...SEED_TOOLS,
+  ...SECURE_DROP_TOOLS,
   ...WORKFLOW_CIRCUIT_TOOLS,
   ...OFFICE_TOOLS,
   ...ROUTINE_TOOLS,
@@ -7023,11 +7026,15 @@ const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) =
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
 // (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS'>): ToolSpec[] {
+// Secure drops (W2): the five drop tools are not advertised while SECURE_DROP is off, and a direct call refuses
+// in invokeTool before argument handling (so a flag-off pot never reveals their schemas).
+const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.map((t) => t.name))
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
-  if (seat && access) return TOOLS
-  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)))
+  const drop = secureDropFlag(env)
+  if (seat && access && drop) return TOOLS
+  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -7227,6 +7234,10 @@ export async function invokeTool(
   // pot never reveals the tool's argument schema through an invalid_args response.
   if (SEAT_FLAG_TOOLS.has(spec.name) && !seatAutoEnrollEnabled(env)) {
     return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
+  }
+
+  if (SECURE_DROP_FLAG_TOOLS.has(spec.name) && !secureDropFlag(env)) {
+    return { ...fail(403, 'secure_drop_disabled', 'Secure drops are not enabled on this pot.'), tool: spec.name }
   }
 
   let args: Record<string, unknown>
