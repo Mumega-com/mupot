@@ -514,6 +514,18 @@ describe('provide: sealing in the browser, deciding with the passkey', () => {
     expect(momentStatus(m.momentId)).toBe('pending')
     expect(one<{ ct_b64u: string | null }>('SELECT ct_b64u FROM secure_drops WHERE id = ?', m.dropId)?.ct_b64u).toBeNull()
   })
+  it('swapping ONLY the ciphertext (same enc) after the assertion is refused too: the digest covers both parts', async () => {
+    const key = newHostKey()
+    await registerKey(key)
+    const m = await request()
+    const a = await enrol('mem-owner', identities.owner)
+    const honest = await sealFor(key, m.dropId, 'honest-secret')
+    const evil = await sealFor(key, m.dropId, 'attacker-chosen')
+    const res = await decide(m, a, { decision: 'provide', ...honest }, { send: { decision: 'provide', enc: honest.enc, ct: evil.ct } })
+    expect(res.status).toBe(403)
+    expect(dropStatus(m.dropId)).toBe('requested')
+    expect(momentStatus(m.momentId)).toBe('pending')
+  })
   it('a challenge minted for provide cannot carry a deny, and one for a deny cannot carry a provide', async () => {
     const key = newHostKey()
     await registerKey(key)

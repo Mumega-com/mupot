@@ -443,7 +443,8 @@ test('the token is never accepted on argv (any spelling), and a missing token fi
     for (const argv of [['pull', '--token', TOKEN], ['pull', '--token=' + TOKEN], ['pull', '--bearer', TOKEN], ['register', '--secret', 'x'], ['pull', '--password', 'x']]) {
       const out = lines()
       assert.equal(await drop.main(argv, { home, env: {}, fetch: fakeMcp({}), out }), 2)
-      assert.match(out.text(), /never accepted on the command line/)
+      assert.match(out.text(), /^credentials are never accepted on the command line/m)
+      assert.ok(!out.text().includes('usage:'), 'refused as a credential, not misread as a stray positional')
       assert.ok(!out.text().includes(TOKEN))
     }
     rmSync(join(home, '.config', 'mupot', 'mumega.token'))
