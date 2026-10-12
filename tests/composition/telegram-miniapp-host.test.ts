@@ -6,7 +6,7 @@ import { applyD1Migrations, env as cfEnv } from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
 import worker from '../../src/index'
 import { linkLoginIdentity } from '../../src/auth/login-identity'
-import { consumeMomentTelegram, mintTgEnrolmentToken } from '../../src/secure-moments/telegram-miniapp-store'
+import { consumeMomentTelegram, mintTgEnrolmentToken, resolveDeviceForDecision } from '../../src/secure-moments/telegram-miniapp-store'
 import { tokenHash } from '../../src/secure-moments/store'
 import type { Env } from '../../src/types'
 
@@ -47,7 +47,7 @@ function env(over: Record<string, unknown> = {}) {
     PUBLIC_ORIGIN: `https://${COLONY}`,
     SESSIONS: kv(), OAUTH_KV: kv(), DB: testEnv.MUPOT_DB,
     SECURE_MOMENTS: '1', SECURE_MOMENTS_HOST: SECURE,
-    TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_EXTRA_PUBKEYS: pubHex,
+    TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_BOT_TOKEN: `${BOT}:AAEhqMY-dedicated-test-token`, TELEGRAM_MINIAPP_EXTRA_PUBKEYS: pubHex,
     ...over,
   } as never
 }
@@ -127,9 +127,21 @@ describe('telegram miniapp (real worker)', () => {
       `INSERT INTO secure_moments (id, tenant, kind, subject_id, link_token_sha256, status, created_at, expires_at) VALUES ('${momentId}', 'mumega', 'seed_attach', 'x', '${'e'.repeat(64)}', 'pending', '2026-01-01T00:00:00.000Z', '2999-01-01T00:00:00.000Z')`,
     )
     const input = { momentId, decision: 'approve' as const, memberId: 'mem-tg', telegramUserId: String(TG_USER), deviceId: deviceToken.split('.')[0], secretSha256: await tokenHash(deviceToken.split('.')[1]) }
-    expect(await consumeMomentTelegram(e as unknown as Env, { ...input, secretSha256: 'f'.repeat(64) }, Date.now())).toBe(false)
-    expect(await consumeMomentTelegram(e as unknown as Env, input, Date.now())).toBe(true)
-    expect(await consumeMomentTelegram(e as unknown as Env, input, Date.now())).toBe(false)
+    const E = e as unknown as Env
+    expect((await consumeMomentTelegram(E, { ...input, secretSha256: 'f'.repeat(64) }, Date.now())).won).toBe(false)
+    const won = await consumeMomentTelegram(E, input, Date.now())
+    expect(won.won).toBe(true)
+    expect(await consumeMomentTelegram(E, input, Date.now())).toEqual({ won: false, nextDeviceToken: null })
+    // The rotation chain (decision row -> retire old digest -> new digest, each guarded by changes() = 1) landed on real D1:
+    // the next secret resolves, the old one is recognised as STALE (and revokes the device).
+    const who = { memberId: 'mem-tg', telegramUserId: String(TG_USER) }
+    expect(won.nextDeviceToken).toBeTruthy()
+    expect(await resolveDeviceForDecision(E, won.nextDeviceToken, who)).toMatchObject({ kind: 'ok' })
+    expect(await resolveDeviceForDecision(E, deviceToken, who)).toMatchObject({ kind: 'stale' })
+    expect(await resolveDeviceForDecision(E, won.nextDeviceToken, who)).toMatchObject({ kind: 'none' }) // revoked by the stale replay
+    await expect(testEnv.MUPOT_DB.exec(
+      `INSERT INTO tg_miniapp_retired_secrets (secret_sha256, tenant, device_id, retired_at) VALUES ('${input.secretSha256}', 'mumega', 'x', 'now')`,
+    )).rejects.toThrow()
     // The decision row exists (inserted in the same batch, only because the consume won): a second INSERT of it collides.
     await expect(testEnv.MUPOT_DB.exec(
       `INSERT INTO tg_miniapp_decisions (moment_id, tenant, member_id, telegram_user_id, device_id, decision, decided_at) VALUES ('${momentId}', 'mumega', 'mem-tg', '${TG_USER}', 'x', 'approve', 'now')`,

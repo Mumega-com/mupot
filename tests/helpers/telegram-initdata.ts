@@ -1,7 +1,7 @@
 // Test helper: builds Telegram-shaped initData signed with node:crypto, an implementation INDEPENDENT of the WebCrypto
 // verifier under test (src/secure-moments/telegram-initdata.ts) and of its data-check-string builder: the signed string
 // is assembled here from Telegram's documented rules (https://core.telegram.org/bots/webapps#validating-data-for-third-party-use).
-import { createHmac, generateKeyPairSync, sign as nodeSign, type KeyObject } from 'node:crypto'
+import { generateKeyPairSync, sign as nodeSign, type KeyObject } from 'node:crypto'
 
 export interface TestKey { privateKey: KeyObject; publicKeyHex: string }
 
@@ -22,9 +22,10 @@ export interface InitDataSpec {
   key?: TestKey
   /** Bot id placed in the SIGNED string (default: botId). Lets a test sign for one bot and present for another. */
   signedBotId?: string
-  /** Emit no signature (classic clients); with hmacToken a valid hash is added. */
+  /** Emit no signature (a client older than Bot API 8.0). */
   omitSignature?: boolean
-  hmacToken?: string
+  /** Re-encode the signature (e.g. with '=' padding) before emitting. */
+  encodeSignature?: (b64u: string) => string
   /** Replace the signed string wholesale (signature over the WRONG string). */
   signedString?: (fields: Record<string, string>) => string
   /** Rewrite fields AFTER signing (tamper). */
@@ -32,8 +33,6 @@ export interface InitDataSpec {
   /** Emit the pairs in this key order (default sorted reversed, to prove order does not matter). */
   order?: 'sorted' | 'reversed' | 'signature-first'
   userJson?: string
-  /** With omitSignature + hmacToken: put THIS (invalid) signature in the payload BEFORE the HMAC is computed, so the hash is valid over it. */
-  invalidSignatureUnderValidHash?: string
 }
 
 const b64u = (b: Buffer): string => b.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -57,12 +56,8 @@ export function initData(spec: InitDataSpec, defaultKey: TestKey, nowMs: number 
     const key = spec.key ?? defaultKey
     const signed = spec.signedString ? spec.signedString(fields) : dataCheckStringFor(spec.signedBotId ?? botId, fields)
     fields.signature = b64u(nodeSign(null, Buffer.from(signed, 'utf8'), key.privateKey))
+    if (spec.encodeSignature) fields.signature = spec.encodeSignature(fields.signature)
     fields.hash = 'f'.repeat(64) // Telegram sends a hash too; the third-party path must ignore it
-  } else if (spec.hmacToken) {
-    if (spec.invalidSignatureUnderValidHash !== undefined) fields.signature = spec.invalidSignatureUnderValidHash
-    const secret = createHmac('sha256', 'WebAppData').update(spec.hmacToken).digest()
-    const dcs = Object.keys(fields).sort().map((k) => `${k}=${fields[k]}`).join('\n')
-    fields.hash = createHmac('sha256', secret).update(dcs).digest('hex')
   }
   spec.tamper?.(fields)
   let keys = Object.keys(fields)

@@ -2,13 +2,15 @@
 //
 // FLOW OF TRUST (every JSON request):
 //   flag on + dedicated host (the host gate and routes.ts's gate already ran) -> same-origin JSON ->
-//   `init_data` verified (Ed25519 third-party signature over "<our bot id>:WebAppData\n...", or the optional classic
-//   HMAC when the operator configured the bot token), fresh, private-chat -> the signed Telegram user id maps to an
+//   `init_data` verified (Ed25519 third-party signature over "<our bot id>:WebAppData\n..."; no bot token is involved
+//   in validation), fresh, private-chat -> the signed Telegram user id maps to an
 //   ACTIVE HUMAN member through members.telegram_chat_id (never an agent's welded row; never bound here) ->
 //   moment live + kind the Mini App may decide + that member's CURRENT authority re-derived -> step-up policy
 //   (a sensitive elevation action needs a passkey, not Telegram) -> a single-use server nonce bound to
 //   (moment, decision, parameters, member, Telegram user) -> the biometric-unlocked DEVICE SECRET of exactly that
-//   member and Telegram user -> ONE guarded consume -> the shared decision core (via 'telegram_miniapp').
+//   member and Telegram user (verified BEFORE the nonce is spent; a retired secret revokes the device) -> ONE guarded consume
+//   that also ROTATES the secret -> the shared decision core (via 'telegram_miniapp').
+// The Mini App bot is DEDICATED and only the worker holds its token: the worker itself sends the button (telegram-miniapp-send.ts).
 // initData alone decides nothing; the device secret alone decides nothing; the moment id is not a bearer.
 // No cookie is ever set. No secret is ever taken from Telegram chat text (credential moments are refused here).
 import type { Context, Next } from 'hono'
@@ -24,15 +26,15 @@ import {
 } from '../access/decision-core'
 import { loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
 import { ELEVATION_ACTIONS, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
-import { consumeDecideChallenge, loadMoment, mintDecideChallenge, momentIsLive, type MomentRow } from './store'
+import { loadMoment, momentIsLive, type MomentRow } from './store'
 import { hex, sha256 } from './webauthn'
 import { verifyInitData } from './telegram-initdata'
 import {
-  acceptedPublicKeys, miniappHmacToken, miniappMaxAgeSeconds, telegramMiniappStatus, TELEGRAM_WEBAPP_SCRIPT_URL,
+  acceptedPublicKeys, miniappMaxAgeSeconds, telegramMiniappStatus, TELEGRAM_WEBAPP_SCRIPT_URL,
 } from './telegram-miniapp-config'
 import {
-  confirmDeviceEnrolment, consumeMomentTelegram, loadTgEnrolmentToken, memberHasActiveDevice, recordTgAudit,
-  resolveActiveDevice, startDeviceEnrolment, tgEnrolmentTokenIsLive, type TgEnrolmentTokenRow,
+  confirmDeviceEnrolment, consumeMomentTelegram, consumeTgNonce, loadTgEnrolmentToken, memberHasActiveDevice, mintTgNonce, recordTgAudit,
+  resolveDeviceForDecision, startDeviceEnrolment, tgEnrolmentTokenIsLive, type TgEnrolmentTokenRow,
 } from './telegram-miniapp-store'
 import { resolveTelegramMember } from './telegram-miniapp-binding'
 import { TG_SCRIPT } from './telegram-miniapp-client'
@@ -110,13 +112,13 @@ interface TgIdentity {
   memberId: string
   telegramUserId: string
   startParam: string | null
-  method: 'ed25519' | 'hmac'
+  method: 'ed25519'
 }
 
 const INITDATA_MESSAGES: Record<string, string> = {
   stale: 'This Telegram session is too old. Close this page and open it again from the bot.',
   future: 'This Telegram session is dated in the future. Check your device clock, then open it again from the bot.',
-  signature_required: 'This Telegram client did not sign the launch data. Update Telegram and open this page again from the bot.',
+  signature_required: 'This Telegram client did not sign the launch data (it needs Telegram with Bot API 8.0 or newer). Update Telegram and open this page again from the bot.',
 }
 
 /** Verify the signed launch data and resolve the member; the ONLY door to every other handler. */
@@ -126,7 +128,6 @@ async function authenticateTelegram(c: C, body: JsonBody): Promise<{ ok: true; i
   const v = await verifyInitData(body.init_data, {
     botId: status.botId,
     publicKeysHex: acceptedPublicKeys(c.env),
-    hmacBotToken: miniappHmacToken(c.env),
     nowMs: Date.now(),
     maxAgeSeconds: miniappMaxAgeSeconds(c.env),
   })
@@ -150,11 +151,11 @@ async function authenticateTelegram(c: C, body: JsonBody): Promise<{ ok: true; i
 }
 
 // ── moments: what is decidable, by whom ─────────────────────────────────────────────────────────────
-type Subject =
+export type Subject =
   | { kind: 'seed_attach'; row: SeedRequestRow }
   | { kind: 'elevation'; req: ElevationRequestRecord }
 
-async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<Subject | null> {
+export async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<Subject | null> {
   if (m.kind === 'seed_attach') {
     const row = await loadSeedRequest(env, m.subject_id)
     return row && seedRequestIsLive(row, nowMs) ? { kind: 'seed_attach', row } : null
@@ -227,6 +228,19 @@ function readParams(m: MomentRow, body: JsonBody): Params | null {
 export const PASSKEY_REQUIRED_MESSAGE = 'Granting a sensitive action needs a passkey, which is stronger than Telegram. Untick the sensitive actions here, or open this request on a browser with a passkey.'
 
 /**
+ * Telegram's OWN additions to the passkey-only list, beside SENSITIVE_STEP_UP_ACTIONS (which the dashboard uses for its
+ * recent-reauth rule and which this channel must not redefine). `action:home_access` reaches a member's private home
+ * squad: the dashboard does not demand a fresh reauth for it, but a client-attested device secret is too weak a proof
+ * for it, so the Mini App refuses it and sends the human to a passkey.
+ */
+export const TELEGRAM_PASSKEY_ONLY_EXTRA: ReadonlySet<string> = new Set(['action:home_access'])
+
+/** True when this action must NOT be granted through Telegram: sensitive, Telegram-extra, or not a known action at all. */
+function passkeyOnly(action: string): boolean {
+  return !Object.prototype.hasOwnProperty.call(ELEVATION_ACTIONS, action) || SENSITIVE_STEP_UP_ACTIONS.has(action) || TELEGRAM_PASSKEY_ONLY_EXTRA.has(action)
+}
+
+/**
  * THE step-up policy. Telegram's biometric-unlocked device secret is attested only by the Telegram client, so it is
  * accepted for a seed attach, for any DENY, and for an elevation APPROVE whose every selected action is KNOWN and not
  * in SENSITIVE_STEP_UP_ACTIONS (the existing sensitivity classification). An unknown action is refused here too
@@ -236,7 +250,7 @@ export function telegramPolicyRefusal(kind: MomentRow['kind'], p: Params): strin
   if (kind === 'seed_attach' || p.decision === 'deny') return null
   if (p.actions.length === 0) return 'Select at least one action to grant.'
   for (const a of p.actions) {
-    if (!Object.prototype.hasOwnProperty.call(ELEVATION_ACTIONS, a) || SENSITIVE_STEP_UP_ACTIONS.has(a)) return PASSKEY_REQUIRED_MESSAGE
+    if (passkeyOnly(a)) return PASSKEY_REQUIRED_MESSAGE
   }
   return null
 }
@@ -289,9 +303,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const a = await authenticateTelegram(c, g.body)
     if (!a.ok) return a.res
     const hasDevice = await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId)
-    // The moment comes from the body, else from the SIGNED start_param (`m_<uuid>` from a t.me direct link).
-    const fromStart = a.id.startParam?.startsWith('m_') ? a.id.startParam.slice(2) : undefined
-    const momentId = g.body.moment_id ?? fromStart
+    const momentId = g.body.moment_id
     if (momentId === undefined) {
       return jsonOut(c, 200, { ok: true, state: 'idle', title: 'Nothing to decide', message: 'No request is attached to this launch.', device_enrolled: hasDevice })
     }
@@ -314,7 +326,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
       approveLabel = 'Approve selected'
       try {
         const parsed: unknown = JSON.parse(subject.req.requested_actions_json)
-        sensitive = Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && (SENSITIVE_STEP_UP_ACTIONS.has(x) || !Object.prototype.hasOwnProperty.call(ELEVATION_ACTIONS, x))) : []
+        sensitive = Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && passkeyOnly(x)) : []
       } catch {
         sensitive = []
       }
@@ -338,9 +350,9 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const policy = telegramPolicyRefusal(l.d.m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
     if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId))) {
-      return fail(c, 409, 'This device is not set up for decisions yet. Ask for a device setup link from My Account on the dashboard.', 'Set up this device', { needs_enrol: true })
+      return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard.', 'Set up this device', { needs_enrol: true })
     }
-    const nonce = await mintDecideChallenge(c.env, { momentId: l.d.m.id, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) })
+    const nonce = await mintTgNonce(c.env, { momentId: l.d.m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) })
     if (!nonce) return fail(c, 409, 'Too many unfinished attempts on this request. Wait a few minutes.', 'Try later')
     return jsonOut(c, 200, { ok: true, nonce })
   }))
@@ -360,31 +372,47 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (policy) return fail(c, 403, policy, 'Use a passkey')
     const nonce = g.body.nonce
     if (typeof nonce !== 'string' || !TOKEN_RE.test(nonce)) return fail(c, 400, 'Missing nonce.', 'Bad request')
-    // 1. The nonce: single use, live, bound to THIS moment + decision + parameters + member + Telegram user.
-    if (!(await consumeDecideChallenge(c.env, nonce, { momentId: m.id, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) }, Date.now()))) {
+    // 1. The step-up FIRST (read-only): the biometric-unlocked device secret of exactly this member and Telegram user, on a
+    //    live identity. A bad secret therefore never burns the nonce. A RETIRED secret (a copy of one a rotation replaced)
+    //    revokes the device and is reported as such.
+    const resolved = await resolveDeviceForDecision(c.env, g.body.device_token, { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId })
+    if (resolved.kind === 'stale') {
+      return fail(c, 403, 'This device presented an out-of-date secret, so it was removed for your safety. Set it up again (My Account, Telegram device).', 'Device removed')
+    }
+    if (resolved.kind !== 'ok' || !resolved.device.login_identity_id) {
+      return fail(c, 403, 'This device is not recognised for decisions. Set it up again from My Account (Telegram device) on the dashboard.', 'Device not recognised')
+    }
+    const device = resolved.device
+    const identityId = resolved.device.login_identity_id
+    // 2. The nonce: single use, live, bound to THIS moment + decision + parameters + member + Telegram user.
+    if (!(await consumeTgNonce(c.env, nonce, { momentId: m.id, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId, decision: p.decision, payloadSha256: await bindingDigest(l.d, p, a.id) }, Date.now()))) {
       return fail(c, 403, 'The confirmation is invalid, expired, already used, or was issued for a different decision. Reopen the request and try again.')
     }
-    // 2. The step-up: the biometric-unlocked device secret of exactly this member and Telegram user, on a live identity.
-    const device = await resolveActiveDevice(c.env, g.body.device_token, { memberId: a.id.memberId, telegramUserId: a.id.telegramUserId })
-    if (!device || !device.login_identity_id) {
-      return fail(c, 403, 'This device is not recognised for decisions. Set it up again from My Account on the dashboard.', 'Device not recognised')
-    }
-    const identityId = device.login_identity_id
     // 3. The core, under the channel's single-use gate (every refusable check already ran above or inside the core, before it).
     const proof: HumanProof = {
       memberId: a.id.memberId, via: 'telegram_miniapp',
       evidence: { moment_id: m.id, telegram_user_id: a.id.telegramUserId, tg_device_id: device.id, tg_auth_method: a.id.method },
     }
-    const gate = (): Promise<boolean> => consumeMomentTelegram(c.env, {
-      momentId: m.id, decision: p.decision, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId,
-      deviceId: device.id, secretSha256: device.secret_sha256,
-    }, Date.now())
+    // The consume ROTATES the device secret in the same batch; whatever the core then does, if the consume won the client must
+    // receive the next secret (the old one is retired), so it rides on every response after a won gate.
+    let nextDeviceToken: string | null = null
+    const gate = async (): Promise<boolean> => {
+      const r = await consumeMomentTelegram(c.env, {
+        momentId: m.id, decision: p.decision, memberId: a.id.memberId, telegramUserId: a.id.telegramUserId,
+        deviceId: device.id, secretSha256: device.secret_sha256,
+      }, Date.now())
+      nextDeviceToken = r.nextDeviceToken
+      return r.won
+    }
     const waitUntil = waitUntilOf(c)
     const now = Date.now()
+    const withRotation = (o: Outcome): Response => jsonOut(c, o.status, {
+      ok: o.status === 200, title: o.title, message: o.message, ...(nextDeviceToken ? { device_token_next: nextDeviceToken } : {}),
+    })
     if (subject.kind === 'seed_attach') {
-      return outcomeJson(c, await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))
+      return withRotation(await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))
     }
-    return outcomeJson(c, await decideElevation(c.env, {
+    return withRotation(await decideElevation(c.env, {
       id: subject.req.id, decision: p.decision, selectedActions: p.actions, durationMinutes: p.duration, auth, proof, gate, waitUntil,
       mintSession: async () => {
         const s = await mintApproverSession(c.env, { memberId: a.id.memberId, auth, identityId })
@@ -402,7 +430,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     const raw = c.req.param('token') ?? ''
     const token = TOKEN_RE.test(raw) ? await loadTgEnrolmentToken(c.env, raw) : null
     if (!token) return { ok: false, res: notFound(c) }
-    if (!tgEnrolmentTokenIsLive(token, Date.now())) return { ok: false, res: fail(c, 409, 'This setup link was already used or has expired. Ask for a new one from My Account.', 'Link closed') }
+    if (!tgEnrolmentTokenIsLive(token, Date.now())) return { ok: false, res: fail(c, 409, 'This setup link was already used or has expired. Send a new one from My Account (Telegram device).', 'Link closed') }
     if (token.member_id !== a.id.memberId) {
       return { ok: false, res: fail(c, 403, 'This setup link was made for a different account.', 'Wrong account') }
     }
@@ -414,7 +442,7 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (!e.ok) return e.res
     const r = await startDeviceEnrolment(c.env, { token: e.token, telegramUserId: e.id.telegramUserId }, Date.now())
     if (!r.ok) {
-      const msg = r.reason === 'too_many_devices' ? 'You already have the maximum number of devices. Remove one from My Account first.'
+      const msg = r.reason === 'too_many_devices' ? 'You already have the maximum number of devices. Remove one from My Account (Telegram device) first.'
         : r.reason === 'token_spent' ? 'This setup link was already used or has expired.' : 'Could not start setup. Try again.'
       return fail(c, 409, msg, 'Not started')
     }

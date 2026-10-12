@@ -159,29 +159,56 @@ export async function confirmDeviceEnrolment(
   return { ok: true, deviceId: parsed.deviceId }
 }
 
+export type DeviceResolution = { kind: 'ok'; device: TgDeviceRow } | { kind: 'stale'; deviceId: string } | { kind: 'none' }
+
 /**
  * The step-up check: the presented token names an ACTIVE device of exactly this member and this Telegram user, its
- * secret hashes to the stored digest, and its login identity is live. Read-only; consumeMomentTelegram re-checks the
- * very same conditions inside its own WHERE.
+ * secret hashes to the stored digest, and its login identity is live. A RETIRED secret of an active device (the digest
+ * a rotation replaced) is a harvested copy being replayed: the device is revoked on the spot and a receipt written
+ * ('stale'). Anything else is 'none' (indistinguishable from an unknown device). consumeMomentTelegram re-checks the
+ * same conditions for the CURRENT secret inside its own WHERE.
  */
-export async function resolveActiveDevice(
+export async function resolveDeviceForDecision(
   env: Env, deviceToken: unknown, who: { memberId: string; telegramUserId: string },
-): Promise<TgDeviceRow | null> {
+): Promise<DeviceResolution> {
   const parsed = parseDeviceToken(deviceToken)
-  if (!parsed) return null
+  if (!parsed) return { kind: 'none' }
   const row = await env.DB.prepare(
     `SELECT ${DEVICE_COLUMNS} FROM tg_miniapp_devices
       WHERE id = ?1 AND tenant = ?2 AND confirmed_at IS NOT NULL AND revoked_at IS NULL LIMIT 1`,
   ).bind(parsed.deviceId, env.TENANT_SLUG).first<TgDeviceRow>()
-  if (!row) return null
-  // Compare the digest first and constant-time; then the bindings.
-  if (!timingSafeEqual(row.secret_sha256, await tokenHash(parsed.secret))) return null
-  if (row.member_id !== who.memberId || row.telegram_user_id !== who.telegramUserId) return null
-  if (!row.login_identity_id) return null
+  if (!row) return { kind: 'none' }
+  const presented = await tokenHash(parsed.secret)
+  if (!timingSafeEqual(row.secret_sha256, presented)) {
+    const retired = await env.DB.prepare(
+      `SELECT 1 AS ok FROM tg_miniapp_retired_secrets WHERE secret_sha256 = ?1 AND tenant = ?2 AND device_id = ?3 LIMIT 1`,
+    ).bind(presented, env.TENANT_SLUG, row.id).first<{ ok: number }>()
+    if (!retired) return { kind: 'none' }
+    const r = await env.DB.prepare(
+      `UPDATE tg_miniapp_devices SET revoked_at = ?2, revoked_reason = 'stale_secret_replayed' WHERE id = ?1 AND revoked_at IS NULL`,
+    ).bind(row.id, new Date().toISOString()).run()
+    if (r.meta.changes === 1) {
+      await recordTgAudit(env, {
+        operation: 'tg_device_revoke', memberId: row.member_id, deviceId: row.id,
+        evidence: { reason: 'stale_secret_replayed', suspicious: '1', presented_by_member_id: who.memberId, presented_by_telegram_user_id: who.telegramUserId },
+      })
+    }
+    return { kind: 'stale', deviceId: row.id }
+  }
+  if (row.member_id !== who.memberId || row.telegram_user_id !== who.telegramUserId) return { kind: 'none' }
+  if (!row.login_identity_id) return { kind: 'none' }
   const identity = await env.DB.prepare(
     `SELECT id FROM human_login_identities WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
   ).bind(row.login_identity_id, env.TENANT_SLUG, row.member_id).first<{ id: string }>()
-  return identity ? row : null
+  return identity ? { kind: 'ok', device: row } : { kind: 'none' }
+}
+
+/** Convenience for callers that only need the live device (tests, enrolment checks). */
+export async function resolveActiveDevice(
+  env: Env, deviceToken: unknown, who: { memberId: string; telegramUserId: string },
+): Promise<TgDeviceRow | null> {
+  const r = await resolveDeviceForDecision(env, deviceToken, who)
+  return r.kind === 'ok' ? r.device : null
 }
 
 export async function memberHasActiveDevice(env: Env, memberId: string, telegramUserId: string): Promise<boolean> {
@@ -239,7 +266,7 @@ export async function revokeMemberTgDevices(
 /** Device enrol/revoke are identity-surface writes: each leaves a mutation_audit_entries row (best effort, like passkeys). */
 export async function recordTgAudit(
   env: Env,
-  input: { operation: 'tg_device_enrol' | 'tg_device_revoke'; memberId: string; deviceId: string | null; evidence: Record<string, string> },
+  input: { operation: 'tg_device_enrol' | 'tg_device_revoke' | 'tg_device_rotate'; memberId: string; deviceId: string | null; evidence: Record<string, string> },
   nowMs: number = Date.now(),
 ): Promise<boolean> {
   try {
@@ -260,18 +287,21 @@ export async function recordTgAudit(
 
 // ── the consuming statement ─────────────────────────────────────────────────────────────────────────
 /**
- * THE consuming statement for a Telegram decision. True iff THIS call won it: the moment is still pending, unexpired,
- * of a kind the Mini App may decide (never a credential moment), addressed to this member (or to anyone), AND the
- * device is still an active one of this member and Telegram user with the presented secret, on a live login identity,
- * with the Telegram binding still in place. The decision row lands in the same batch (only if the consume won).
+ * THE consuming statement for a Telegram decision. `won` is true iff THIS call won it: the moment is still pending,
+ * unexpired, of a kind the Mini App may decide (never a credential moment), addressed to this member (or to anyone),
+ * AND the device is still an active one of this member and Telegram user with the presented secret, on a live login
+ * identity, with the Telegram binding still in place. In the SAME batch (each statement guarded by `changes() = 1`
+ * from the one before): the decision row lands, the presented secret is RETIRED and the device's secret becomes
+ * `nextSecretSha256`. `nextDeviceToken` is non-null only when the whole chain landed, i.e. the client must now store it.
  */
 export async function consumeMomentTelegram(
   env: Env,
   input: { momentId: string; decision: 'approve' | 'deny'; memberId: string; telegramUserId: string; deviceId: string; secretSha256: string },
   nowMs: number,
-): Promise<boolean> {
+): Promise<{ won: boolean; nextDeviceToken: string | null }> {
   const nowIso = new Date(nowMs).toISOString()
   const tenant = env.TENANT_SLUG
+  const nextSecret = randomToken()
   const out = await env.DB.batch([
     env.DB.prepare(
       `UPDATE secure_moments
@@ -291,7 +321,71 @@ export async function consumeMomentTelegram(
       `INSERT INTO tg_miniapp_decisions (moment_id, tenant, member_id, telegram_user_id, device_id, decision, decided_at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE changes() = 1`,
     ).bind(input.momentId, tenant, input.memberId, input.telegramUserId, input.deviceId, input.decision, nowIso),
-    env.DB.prepare(`UPDATE tg_miniapp_devices SET last_used_at = ?2 WHERE id = ?1 AND changes() = 1`).bind(input.deviceId, nowIso),
+    env.DB.prepare(
+      `INSERT INTO tg_miniapp_retired_secrets (secret_sha256, tenant, device_id, retired_at)
+       SELECT secret_sha256, tenant, id, ?2 FROM tg_miniapp_devices WHERE id = ?1 AND changes() = 1`,
+    ).bind(input.deviceId, nowIso),
+    env.DB.prepare(
+      `UPDATE tg_miniapp_devices SET last_used_at = ?2, secret_sha256 = ?3 WHERE id = ?1 AND changes() = 1`,
+    ).bind(input.deviceId, nowIso, await tokenHash(nextSecret)),
   ])
-  return out[0].meta.changes === 1
+  const won = out[0].meta.changes === 1
+  return { won, nextDeviceToken: won && out[3].meta.changes === 1 ? `${input.deviceId}.${nextSecret}` : null }
+}
+
+// ── the Telegram channel's own decision nonces ──────────────────────────────────────────────────────
+export const TG_NONCE_TTL_MS = 5 * 60 * 1000
+/** Live nonces one member may hold on one moment: the Telegram channel's own flood cap (passkey_challenges is not touched). */
+export const TG_NONCE_MAX_OUTSTANDING = 5
+
+export interface TgNonceBinding { momentId: string; memberId: string; telegramUserId: string; decision: 'approve' | 'deny'; payloadSha256: string }
+
+/** Mint a nonce bound to (moment, member, Telegram user, decision, parameter digest); null when this member's cap is hit. */
+export async function mintTgNonce(env: Env, b: TgNonceBinding, nowMs: number = Date.now()): Promise<string | null> {
+  const nonce = randomToken()
+  const nowIso = new Date(nowMs).toISOString()
+  const r = await env.DB.prepare(
+    `INSERT INTO tg_miniapp_nonces
+       (id, tenant, nonce_sha256, moment_id, member_id, telegram_user_id, decision, payload_sha256, created_at, expires_at)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+      WHERE (SELECT COUNT(*) FROM tg_miniapp_nonces
+              WHERE tenant = ?2 AND moment_id = ?4 AND member_id = ?5 AND consumed_at IS NULL AND expires_at > ?9) < ?11`,
+  ).bind(crypto.randomUUID(), env.TENANT_SLUG, await tokenHash(nonce), b.momentId, b.memberId, b.telegramUserId, b.decision, b.payloadSha256,
+    nowIso, new Date(nowMs + TG_NONCE_TTL_MS).toISOString(), TG_NONCE_MAX_OUTSTANDING).run()
+  return r.meta.changes === 1 ? nonce : null
+}
+
+/** Consume a nonce (single use) only if it is live AND bound to exactly this ceremony. A mismatch consumes nothing. */
+export async function consumeTgNonce(env: Env, nonce: string, b: TgNonceBinding, nowMs: number): Promise<boolean> {
+  const r = await env.DB.prepare(
+    `UPDATE tg_miniapp_nonces SET consumed_at = ?2
+      WHERE tenant = ?1 AND nonce_sha256 = ?3 AND consumed_at IS NULL AND expires_at > ?2
+        AND moment_id = ?4 AND member_id = ?5 AND telegram_user_id = ?6 AND decision = ?7 AND payload_sha256 = ?8`,
+  ).bind(env.TENANT_SLUG, new Date(nowMs).toISOString(), await tokenHash(nonce), b.momentId, b.memberId, b.telegramUserId, b.decision, b.payloadSha256).run()
+  return r.meta.changes === 1
+}
+
+// ── delivery receipts (the worker sends the button) ─────────────────────────────────────────────────
+export const TG_DELIVERY_WINDOW_MS = 10 * 60 * 1000
+export const TG_DELIVERY_MAX_PER_WINDOW = 5
+
+export async function recentDeliveryCount(env: Env, memberId: string, nowMs: number = Date.now()): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM tg_miniapp_deliveries WHERE tenant = ?1 AND member_id = ?2 AND created_at > ?3`,
+  ).bind(env.TENANT_SLUG, memberId, new Date(nowMs - TG_DELIVERY_WINDOW_MS).toISOString()).first<{ n: number }>()
+  return row?.n ?? 0
+}
+
+export async function recordDelivery(
+  env: Env,
+  input: { kind: 'moment' | 'enrol'; subjectId: string; memberId: string; requestedBy: string; status: 'sent' | 'failed'; error: string | null; messageId: string | null },
+  nowMs: number = Date.now(),
+): Promise<{ id: string; createdAt: string }> {
+  const id = crypto.randomUUID()
+  const createdAt = new Date(nowMs).toISOString()
+  await env.DB.prepare(
+    `INSERT INTO tg_miniapp_deliveries (id, tenant, kind, subject_id, member_id, requested_by, status, error, telegram_message_id, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+  ).bind(id, env.TENANT_SLUG, input.kind, input.subjectId, input.memberId, input.requestedBy, input.status, input.error, input.messageId, createdAt).run()
+  return { id, createdAt }
 }

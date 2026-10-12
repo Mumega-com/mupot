@@ -1,12 +1,12 @@
 // tests/telegram-initdata.test.ts — Telegram Mini App initData verification (src/secure-moments/telegram-initdata.ts),
 // pure: forgery, replay (freshness), wrong bot, signed-over-the-wrong-string, query ordering/encoding, duplicate keys,
-// the production key pin, and the optional classic HMAC path. Signatures come from node:crypto (tests/helpers).
+// the production key pin, and the removal of the classic HMAC path. Signatures come from node:crypto (tests/helpers).
 import { describe, expect, it } from 'vitest'
 import {
-  classicDataCheckString, INITDATA_FUTURE_SKEW_SECONDS, parseInitData, TELEGRAM_PROD_PUBKEY_HEX, TELEGRAM_TEST_PUBKEY_HEX,
+  INITDATA_FUTURE_SKEW_SECONDS, parseInitData, TELEGRAM_PROD_PUBKEY_HEX, TELEGRAM_TEST_PUBKEY_HEX,
   thirdPartyDataCheckString, verifyInitData, type VerifyOptions,
 } from '../src/secure-moments/telegram-initdata'
-import { acceptedPublicKeys, miniappHmacToken, miniappMaxAgeSeconds } from '../src/secure-moments/telegram-miniapp-config'
+import { acceptedPublicKeys, miniappMaxAgeSeconds } from '../src/secure-moments/telegram-miniapp-config'
 import { dataCheckStringFor, initData, newTestKey } from './helpers/telegram-initdata'
 
 const BOT = '123456789'
@@ -50,7 +50,6 @@ describe('third-party (Ed25519) path', () => {
   it('the data-check-string is bot_id:WebAppData, LF, then sorted key=value lines without hash and signature', () => {
     const fields = new Map([['user', '{"id":1}'], ['auth_date', '5'], ['hash', 'h'], ['signature', 's'], ['query_id', 'q']])
     expect(thirdPartyDataCheckString('42424', fields)).toBe('42424:WebAppData\nauth_date=5\nquery_id=q\nuser={"id":1}')
-    expect(classicDataCheckString(fields)).toBe('auth_date=5\nquery_id=q\nsignature=s\nuser={"id":1}')
     expect(thirdPartyDataCheckString(BOT, new Map([['b', '1'], ['a', '2']]))).toBe(dataCheckStringFor(BOT, { b: '1', a: '2' }))
   })
   it('query-string order does not matter (the string is sorted before signing)', async () => {
@@ -80,19 +79,11 @@ describe('third-party (Ed25519) path', () => {
     expect(await reason(make({ tamper: (f) => { f.start_param = 'm_evil' } }))).toBe('bad_signature')
     expect(await reason(make({ tamper: (f) => { delete f.query_id } }))).toBe('bad_signature')
   })
-  it('a garbage, truncated, padded or wrong-length signature is refused, and a bad signature NEVER falls back to HMAC', async () => {
+  it('a garbage, truncated, padded or wrong-length signature is refused, and there is no fallback path', async () => {
     expect(await reason(make({ tamper: (f) => { f.signature = 'AAAA' } }))).toBe('bad_signature')
     expect(await reason(make({ tamper: (f) => { f.signature = '!!!' } }))).toBe('bad_signature')
     expect(await reason(make({ tamper: (f) => { f.signature = f.signature.slice(0, 40) } }))).toBe('bad_signature')
     expect(await reason(make({ tamper: (f) => { f.signature = '' } }), opts())).toBe('bad_signature')
-    // A payload whose HMAC is VALID (computed over the signature it carries) but whose signature is not: the HMAC path
-    // must not rescue it, because `signature` present means the third-party path decides.
-    const token = `${BOT}:AAEhqMY-test`
-    const rescued = make({ hmacToken: token, omitSignature: true, invalidSignatureUnderValidHash: 'AAAA' })
-    expect(await reason(rescued, opts({ hmacBotToken: token, publicKeysHex: [] }))).toBe('bad_signature')
-    expect(await reason(rescued, opts({ hmacBotToken: token }))).toBe('bad_signature')
-    // control: the same hmac token with NO signature field at all is accepted
-    expect(await reason(make({ hmacToken: token, omitSignature: true }), opts({ hmacBotToken: token }))).toBe('ok')
   })
   it('the third-party path ignores the hash field (Telegram sends one beside the signature)', async () => {
     expect(await reason(make({ tamper: (f) => { f.hash = '0'.repeat(64) } }))).toBe('ok')
@@ -179,31 +170,42 @@ describe('the user', () => {
   })
 })
 
-describe('classic HMAC path (optional, needs the bot token)', () => {
-  const token = `${BOT}:AAEhqMY-classic-test-token`
-  const classic = (spec: Parameters<typeof initData>[0] = {}): string => make({ omitSignature: true, hmacToken: token, ...spec })
-  it('is closed without the token: a payload with no signature reads as signature_required', async () => {
-    expect(await reason(classic())).toBe('signature_required')
+describe('Ed25519 only: the classic HMAC path is gone', () => {
+  it('a payload with no signature (a client older than Bot API 8.0) is refused, whatever else it carries', async () => {
+    expect(await reason(make({ omitSignature: true }))).toBe('signature_required')
+    // Even a payload carrying a well-formed hash: there is no hash path at all.
+    expect(await reason(make({ omitSignature: true, tamper: (f) => { f.hash = 'a'.repeat(64) } }))).toBe('signature_required')
   })
-  it('verifies with the token, then enforces freshness and the user as usual', async () => {
-    const r = await verifyInitData(classic(), opts({ hmacBotToken: token }))
-    expect(r).toMatchObject({ ok: true, data: { method: 'hmac', userId: '1001' } })
-    expect(await reason(classic({ authDate: 1 }), opts({ hmacBotToken: token }))).toBe('stale')
+  it('the verifier has no bot-token input and the config module has no HMAC token reader', async () => {
+    const mod = await import('../src/secure-moments/telegram-miniapp-config')
+    expect(Object.keys(mod)).not.toContain('miniappHmacToken')
+    expect(await reason(make({ omitSignature: true }), { ...opts(), ...({ hmacBotToken: `${BOT}:AAEhqMY-classic-test-token` } as object) })).toBe('signature_required')
   })
-  it('refuses a tampered payload, a wrong token, and a token that names another bot', async () => {
-    expect(await reason(classic({ tamper: (f) => { f.user = JSON.stringify({ id: 1002 }) } }), opts({ hmacBotToken: token }))).toBe('bad_hash')
-    expect(await reason(classic(), opts({ hmacBotToken: `${BOT}:other-secret` }))).toBe('bad_hash')
-    const foreign = `555555555:AAEhqMY-foreign`
-    expect(await reason(classic({ hmacToken: foreign }), opts({ hmacBotToken: foreign }))).toBe('bad_hash')
+})
+
+describe('signature encoding and decoded control characters', () => {
+  it('accepts Telegram\'s unpadded base64url and the same bytes with = padding; refuses malformed padding', async () => {
+    expect(await reason(make({ encodeSignature: (b) => b }))).toBe('ok')
+    expect(await reason(make({ encodeSignature: (b) => `${b}==` }))).toBe('ok') // 64 bytes => 86 chars; padding is 2
+    expect(await reason(make({ encodeSignature: (b) => `${b}===` }))).toBe('bad_signature')
+    expect(await reason(make({ encodeSignature: (b) => `${b.slice(0, 40)}=${b.slice(40)}` }))).toBe('bad_signature')
+    expect(await reason(make({ encodeSignature: (b) => `${b}==x` }))).toBe('bad_signature')
   })
-  it('refuses a missing or malformed hash', async () => {
-    expect(await reason(classic({ tamper: (f) => { delete f.hash } }), opts({ hmacBotToken: token }))).toBe('bad_hash')
-    expect(await reason(classic({ tamper: (f) => { f.hash = 'xyz' } }), opts({ hmacBotToken: token }))).toBe('bad_hash')
+  it('a control character that only appears AFTER percent-decoding is refused in every field (the %0A folding probe)', async () => {
+    // Signed over the folded string, so only the decode-then-reject rule can refuse it.
+    for (const value of ['q\nchat_type=sender', 'q\rx', 'q\u0000x', 'q\u007fx']) {
+      const fields = { query_id: value }
+      expect(await reason(make({ chatType: 'group', extra: fields }))).toBe('bad_format')
+    }
+    expect(await reason(make({ startParam: 'a\nb' }))).toBe('bad_format')
+    expect(await reason(make({ userJson: '{"id":1001,"first_name":"A\nB"}' }))).toBe('bad_format')
+    // The folded payload would otherwise present chat_type=sender to the fence while Telegram signed chat_type=group:
+    const raw = make({ chatType: 'group', extra: { query_id: 'q\nchat_type=sender' } })
+    expect(raw).toContain('%0A')
+    expect(parseInitData(raw)).toEqual({ ok: false, reason: 'bad_format' })
   })
-  it('the configured token is only used when it names the configured bot', () => {
-    expect(miniappHmacToken({ TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_BOT_TOKEN: token })).toBe(token)
-    expect(miniappHmacToken({ TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_BOT_TOKEN: '555555555:x' })).toBeUndefined()
-    expect(miniappHmacToken({ TELEGRAM_MINIAPP_BOT_ID: BOT })).toBeUndefined()
+  it('ordinary escaped text inside JSON still verifies (the JSON text has no raw control characters)', async () => {
+    expect(await reason(make({ userJson: JSON.stringify({ id: 1001, first_name: 'line1\nline2\t\u2028x' }) }))).toBe('ok')
   })
 })
 

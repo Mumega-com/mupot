@@ -20,3 +20,12 @@ export async function resolveTelegramMember(env: Env, telegramUserId: string): P
   return { ok: true, memberId: row.id }
 }
 
+
+/** The bound private chat id of an ACTIVE HUMAN member, or null (unbound, ineligible: the same null, no oracle). */
+export async function privateChatOf(env: Env, memberId: string): Promise<string | null> {
+  if (!(await memberIsActiveHuman(env, memberId))) return null
+  const row = await env.DB.prepare('SELECT telegram_chat_id FROM members WHERE id = ?1 AND tenant = ?2').bind(memberId, env.TENANT_SLUG)
+    .first<{ telegram_chat_id: string | null }>()
+  return row?.telegram_chat_id ?? null
+}
+

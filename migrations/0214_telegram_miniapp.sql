@@ -64,6 +64,60 @@ CREATE TABLE IF NOT EXISTS tg_miniapp_decisions (
   decided_at TEXT NOT NULL
 );
 
+-- Device secrets ROTATE on every successful decision: the old digest moves here. A retired digest presented later is a
+-- harvested copy being replayed: the device is revoked on the spot and a receipt written (the genuine client already
+-- holds the next secret, so only a copy can present a retired one).
+CREATE TABLE IF NOT EXISTS tg_miniapp_retired_secrets (
+  secret_sha256 TEXT PRIMARY KEY CHECK (
+    length(secret_sha256) = 64 AND secret_sha256 = lower(secret_sha256) AND secret_sha256 NOT GLOB '*[^0-9a-f]*'
+  ),
+  tenant TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  retired_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_miniapp_retired_secrets_device
+  ON tg_miniapp_retired_secrets(tenant, device_id);
+
+-- The Telegram channel's OWN single-use decision nonces (separate from passkey_challenges so a flood on one channel
+-- cannot exhaust the other's cap). Bound to moment + member + Telegram user + decision + parameter digest. Only sha256 stored.
+CREATE TABLE IF NOT EXISTS tg_miniapp_nonces (
+  id TEXT PRIMARY KEY,
+  tenant TEXT NOT NULL,
+  nonce_sha256 TEXT NOT NULL UNIQUE CHECK (
+    length(nonce_sha256) = 64 AND nonce_sha256 = lower(nonce_sha256) AND nonce_sha256 NOT GLOB '*[^0-9a-f]*'
+  ),
+  moment_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  telegram_user_id TEXT NOT NULL,
+  decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),
+  payload_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_miniapp_nonces_open
+  ON tg_miniapp_nonces(tenant, moment_id, member_id, consumed_at);
+
+-- Delivery receipts: the WORKER sends the Mini App button (Bot API sendMessage, web_app button) from the dedicated bot.
+-- One row per attempt; it is also the rate-limit ledger. No URL or token is stored.
+CREATE TABLE IF NOT EXISTS tg_miniapp_deliveries (
+  id TEXT PRIMARY KEY,
+  tenant TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('moment', 'enrol')),
+  subject_id TEXT NOT NULL,
+  member_id TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('sent', 'failed')),
+  error TEXT,
+  telegram_message_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tg_miniapp_deliveries_member
+  ON tg_miniapp_deliveries(tenant, member_id, created_at);
+
 -- 0212 allowed decided_via IN ('access_passkey', 'webauthn'). SQLite cannot alter a CHECK, so seed_attach_requests
 -- is rebuilt once more to also allow 'telegram_miniapp': same columns, constraints, rows and both indexes.
 CREATE TABLE seed_attach_requests_new (

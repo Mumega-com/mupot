@@ -27,6 +27,7 @@
 //    minted for another pot can never touch this one.
 
 import { Hono } from 'hono'
+import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 import type { Context, MiddlewareHandler } from 'hono'
 import type {
   Env,
@@ -1548,6 +1549,9 @@ membersApp.delete(
     // future constraint silently no-opping the row) rather than reporting
     // telegram_unbound: true over an unrecorded revocation.
     assertWritten(insert, 'telegram_unbind_receipts.insert')
+    // A Mini App device is bound to the Telegram user id this member WAS linked to: unlinking ends that device too (it would
+    // also be refused at use, since the binding is re-checked, but a re-link to another account must never find it live).
+    await revokeMemberTgDevices(c.env, memberId, 'telegram_unbound')
 
     return c.json({ member_id: memberId, telegram_unbound: true })
   },

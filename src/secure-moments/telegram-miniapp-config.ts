@@ -21,6 +21,12 @@ export type MiniappStatus =
   | { state: 'misconfigured'; reason: string }
   | { state: 'on'; host: string; botId: string }
 
+/** The numeric bot id a token names (`<id>:<secret>`), or null. */
+export function botIdOfToken(token: string | undefined): string | null {
+  const m = /^([1-9][0-9]{4,15}):[A-Za-z0-9_-]{20,}$/.exec(token?.trim() ?? '')
+  return m ? m[1] : null
+}
+
 const BOT_ID_RE = /^[1-9][0-9]{4,15}$/
 
 /** off / misconfigured (fail closed, with the reason) / on. Requires secure moments to be on. */
@@ -30,7 +36,17 @@ export function telegramMiniappStatus(env: Env): MiniappStatus {
   if (secure.state === 'off') return { state: 'misconfigured', reason: 'TELEGRAM_MINIAPP needs SECURE_MOMENTS' }
   if (secure.state === 'misconfigured') return { state: 'misconfigured', reason: `secure moments are misconfigured: ${secure.reason}` }
   const botId = env.TELEGRAM_MINIAPP_BOT_ID?.trim() ?? ''
-  if (!BOT_ID_RE.test(botId)) return { state: 'misconfigured', reason: 'TELEGRAM_MINIAPP_BOT_ID must be the numeric id of the bot that launches the Mini App' }
+  if (!BOT_ID_RE.test(botId)) return { state: 'misconfigured', reason: 'TELEGRAM_MINIAPP_BOT_ID must be the numeric id of the DEDICATED bot that launches the Mini App' }
+  // The bot token is REQUIRED: the WORKER sends every Mini App button itself, so no harness ever handles a launch URL, and
+  // only a bot whose token the worker alone holds can be the root of trust for initData. It must name the configured bot.
+  const token = env.TELEGRAM_MINIAPP_BOT_TOKEN?.trim()
+  if (!token) return { state: 'misconfigured', reason: 'TELEGRAM_MINIAPP_BOT_TOKEN (worker secret of the dedicated Mini App bot) is required' }
+  if (botIdOfToken(token) !== botId) return { state: 'misconfigured', reason: 'TELEGRAM_MINIAPP_BOT_TOKEN does not belong to TELEGRAM_MINIAPP_BOT_ID' }
+  // Never the bot the worker already uses for notifications/IM: that bot is shared with other surfaces by design.
+  const shared = [env.TELEGRAM_BOT_TOKEN]
+  if (shared.some((t) => t !== undefined && (botIdOfToken(t) === botId || t.trim() === token))) {
+    return { state: 'misconfigured', reason: 'the Mini App bot must be a DEDICATED bot, not the notification/IM bot (TELEGRAM_BOT_TOKEN)' }
+  }
   return { state: 'on', host: secure.host, botId }
 }
 
@@ -58,11 +74,10 @@ export function acceptedPublicKeys(env: Pick<Env, 'TELEGRAM_MINIAPP_EXTRA_PUBKEY
   return keys
 }
 
-/** The optional classic-HMAC bot token, only when it names the configured bot. */
-export function miniappHmacToken(env: Pick<Env, 'TELEGRAM_MINIAPP_BOT_TOKEN' | 'TELEGRAM_MINIAPP_BOT_ID'>): string | undefined {
-  const token = env.TELEGRAM_MINIAPP_BOT_TOKEN?.trim()
-  const botId = env.TELEGRAM_MINIAPP_BOT_ID?.trim()
-  return token && botId && token.startsWith(`${botId}:`) ? token : undefined
+/** The dedicated bot's token, ONLY for sending the Mini App button (never for validating initData). */
+export function miniappBotToken(env: Pick<Env, 'TELEGRAM_MINIAPP_BOT_TOKEN'>): string | null {
+  const t = env.TELEGRAM_MINIAPP_BOT_TOKEN?.trim()
+  return t ? t : null
 }
 
 /** The Telegram Mini App script, pinned to this ONE URL. The page's CSP allows exactly this source for script-src. */

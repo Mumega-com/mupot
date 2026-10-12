@@ -10,15 +10,18 @@ function lock(on){var bs=document.querySelectorAll('button[data-act]');for(var i
 var tg=window.Telegram&&window.Telegram.WebApp;
 if(!tg||!tg.initData){app.textContent='';show('Open this from Telegram','This page only works inside the Telegram app, opened from the bot.',false);return}
 try{tg.ready();tg.expand()}catch(e){}
+if(!(tg.isVersionAtLeast&&tg.isVersionAtLeast('8.0'))){app.textContent='';show('Update Telegram','This needs Telegram with Bot API 8.0 or newer (it signs the launch data and can unlock a device secret). Update the app and open this page again from the bot.',false);return}
 var bm=tg.BiometricManager;
 async function post(path,body){body.init_data=tg.initData;var r=await fetch(path,{method:'POST',credentials:'omit',headers:{'content-type':'application/json'},body:JSON.stringify(body)});var j={};try{j=await r.json()}catch(e){}return{status:r.status,json:j}}
 function bmInit(){return new Promise(function(res){if(!bm){res(false);return}if(bm.isInited){res(true);return}try{bm.init(function(){res(!!bm.isInited)})}catch(e){res(false)}})}
 function bmAccess(reason){return new Promise(function(res){if(bm.isAccessGranted){res(true);return}try{bm.requestAccess({reason:reason},function(ok){res(!!ok)})}catch(e){res(false)}})}
-function bmAuth(reason){return new Promise(function(res){try{bm.authenticate({reason:reason},function(ok,token){res(ok&&typeof token==='string'&&token?token:null)})}catch(e){res(null)}})}
+function bmAuth(reason){return new Promise(function(res){try{bm.authenticate({reason:reason},function(ok,token){if(!ok){res({cancelled:true});return}if(typeof token!=='string'||!token){res({noToken:true});return}res({token:token})})}catch(e){res({cancelled:true})}})}
+function settingsHelp(){var b=document.createElement('button');b.type='button';b.textContent='Open Telegram biometric settings';b.addEventListener('click',function(){try{bm.openSettings()}catch(e){}});out.appendChild(b)}
+function authFailure(r){if(r.noToken){show('Set this phone up again','No saved device secret was found on this phone (it was removed or never saved). Go to My Account on the dashboard, Telegram device, Set up this phone.',false)}else{show('Not confirmed','The biometric check was cancelled or failed. Nothing was decided.',false)}}
 function bmStore(token){return new Promise(function(res){try{bm.updateBiometricToken(token,function(ok){res(!!ok)})}catch(e){res(false)}})}
 async function ready(){
  if(!(await bmInit())||!bm.isBiometricAvailable){show('Biometrics unavailable','This phone or Telegram client cannot unlock a device secret with fingerprint or face. Open the request on a browser with a passkey instead.',false);return false}
- if(!(await bmAccess('Confirm decisions in this workspace'))){show('Permission needed','Allow Telegram to use biometrics for this bot, then try again.',false);return false}
+ if(!(await bmAccess('Confirm decisions in this workspace'))){show('Permission needed','Allow Telegram to use biometrics for this bot, then try again.',false);settingsHelp();return false}
  return true}
 var mode=app.getAttribute('data-mode'),ref=app.getAttribute('data-ref');
 async function moment(id){
@@ -45,11 +48,13 @@ async function moment(id){
    var ch=await post('/m/tg/challenge',p);
    if(!ch.json.ok){show(ch.json.title||'Not started',ch.json.message||'This request cannot be decided now.',false);lock(false);return}
    if(!(await ready())){lock(false);return}
-   var token=await bmAuth('Confirm: '+(decision==='approve'?'approve':'deny')+' this request');
-   if(!token){show('Not confirmed','The biometric check was cancelled or failed.',false);lock(false);return}
-   p.nonce=ch.json.nonce;p.device_token=token;
+   var au=await bmAuth('Confirm: '+(decision==='approve'?'approve':'deny')+' this request');
+   if(!au.token){authFailure(au);lock(false);return}
+   p.nonce=ch.json.nonce;p.device_token=au.token;
    var res=await post('/m/tg/decide',p);
    show(res.json.title||'Result',res.json.message||'No message.',res.status===200);
+   // The device secret ROTATES on every won decision: store the next one now, or the next decision needs a new setup.
+   if(res.json.device_token_next){var saved=await bmStore(res.json.device_token_next);if(!saved){show(res.json.title||'Result',(res.json.message||'')+' But this phone could not save its next device secret, so set it up again from My Account (Telegram device) before the next decision.',false)}}
    if(res.status===200){f.hidden=true}else{lock(false)}
   }catch(e){show('Not decided','Something went wrong. Nothing was decided.',false);lock(false)}
  }
@@ -70,8 +75,8 @@ async function enrol(token){
    if(!(await ready())){lock(false);return}
    if(!(await bmStore(s.json.device_token))){show('Not saved','Telegram could not store the device secret.',false);lock(false);return}
    var back=await bmAuth('Confirm this device');
-   if(!back){show('Not confirmed','The biometric check was cancelled or failed.',false);lock(false);return}
-   var c=await post(base+'/confirm',{device_token:back});
+   if(!back.token){authFailure(back);lock(false);return}
+   var c=await post(base+'/confirm',{device_token:back.token});
    show(c.json.title||'Result',c.json.message||'No message.',c.status===200);
    if(c.status!==200)lock(false);else b.hidden=true;
   }catch(e){show('Not set up','Something went wrong.',false);lock(false)}
@@ -79,10 +84,6 @@ async function enrol(token){
 }
 if(mode==='enrol'){enrol(ref)}
 else if(mode==='moment'){moment(ref)}
-else{
- var sp=tg.initDataUnsafe&&tg.initDataUnsafe.start_param;
- var m=/^m_([0-9a-f-]{36})$/.exec(sp||''),e=/^e_([A-Za-z0-9_-]{43})$/.exec(sp||'');
- if(m){moment(m[1])}else if(e){enrol(e[1])}else{moment('')}
-}
+else{moment('')}
 })();
 `

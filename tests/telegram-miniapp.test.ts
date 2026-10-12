@@ -14,11 +14,13 @@ import { SoftAuthenticator } from './helpers/webauthn-authenticator'
 import { initData, newTestKey, type InitDataSpec } from './helpers/telegram-initdata'
 import { momentsApp } from '../src/secure-moments/routes'
 import { mintDecideChallenge, mintEnrolmentToken, tokenHash } from '../src/secure-moments/store'
-import { confirmDeviceEnrolment, loadTgEnrolmentToken, mintTgEnrolmentToken, consumeMomentTelegram, resolveActiveDevice, revokeOwnTgDevice, TG_DEVICES_MAX_PER_MEMBER } from '../src/secure-moments/telegram-miniapp-store'
-import { mintTgEnrolmentLink, momentMiniappLaunch } from '../src/secure-moments/telegram-miniapp-launch'
+import { confirmDeviceEnrolment, consumeTgNonce, loadTgEnrolmentToken, mintTgEnrolmentToken, mintTgNonce, consumeMomentTelegram, TG_NONCE_MAX_OUTSTANDING, resolveActiveDevice, revokeOwnTgDevice, TG_DEVICES_MAX_PER_MEMBER } from '../src/secure-moments/telegram-miniapp-store'
+import { requestMomentDelivery } from '../src/secure-moments/telegram-miniapp-launch'
+import { requestEnrolDelivery } from '../src/secure-moments/telegram-miniapp-enrol-delivery'
+import { sendMiniappButton } from '../src/secure-moments/telegram-miniapp-send'
 import { telegramMiniappStatus } from '../src/secure-moments/telegram-miniapp-config'
-import { PASSKEY_REQUIRED_MESSAGE, telegramPolicyRefusal } from '../src/secure-moments/telegram-miniapp'
-import { SENSITIVE_STEP_UP_ACTIONS } from '../src/auth/elevation-actions'
+import { PASSKEY_REQUIRED_MESSAGE, TELEGRAM_PASSKEY_ONLY_EXTRA, telegramPolicyRefusal } from '../src/secure-moments/telegram-miniapp'
+import { ELEVATION_ACTIONS, isRequestableElevationAction, SENSITIVE_STEP_UP_ACTIONS } from '../src/auth/elevation-actions'
 import { linkLoginIdentity, revokeLoginIdentity } from '../src/auth/login-identity'
 import { createWebSession, markRecentReauth, revokeAllWebSessions } from '../src/auth/web-sessions'
 
@@ -28,6 +30,7 @@ const ORIGIN = `https://${HOST}`
 const COLONY = 'colony.example.test'
 const MASTER = 'a1'.repeat(32)
 const BOT = '123456789'
+const BOT_TOKEN = `${BOT}:AAEhqMY-dedicated-miniapp-test-token`
 const key = newTestKey()
 const seedText = readFileSync(join(__dirname, '..', 'docs', 'examples', 'seeds', 'mumega-com.seed.yaml'), 'utf8')
 // Telegram user ids (the members.telegram_chat_id of a private chat).
@@ -40,7 +43,7 @@ function baseEnv(over: Partial<Env> = {}): Env {
   return {
     DB: harness.db, TENANT_SLUG: TENANT, CONNECTOR_MASTER_KEY: MASTER, PUBLIC_ORIGIN: `https://${COLONY}`,
     SECURE_MOMENTS: '1', SECURE_MOMENTS_HOST: HOST,
-    TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_EXTRA_PUBKEYS: key.publicKeyHex,
+    TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_BOT_TOKEN: BOT_TOKEN, TELEGRAM_MINIAPP_EXTRA_PUBKEYS: key.publicKeyHex,
     ...over,
   } as Env
 }
@@ -49,6 +52,21 @@ const count = (t: string, where = '1=1'): number => (harness.sqlite.prepare(`SEL
 const one = <T>(sql: string, ...p: unknown[]): T | undefined => harness.sqlite.prepare(sql).get(...p) as T | undefined
 
 const identities: Record<string, string> = {}
+/** consumeMomentTelegram returns { won, nextDeviceToken }; most guards only care whether THIS call won. */
+const consumeWon = async (...a: Parameters<typeof consumeMomentTelegram>): Promise<boolean> => (await consumeMomentTelegram(...a)).won
+
+// The Bot API, stubbed: every sendMessage the worker makes lands here (no network, and never the real bot).
+interface BotCall { url: string; body: { chat_id: string; text: string; protect_content?: boolean; reply_markup: { inline_keyboard: Array<Array<{ text: string; web_app: { url: string } }>> } } }
+function stubBotApi(status = 200): BotCall[] {
+  const calls: BotCall[] = []
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    calls.push({ url, body: JSON.parse(String(init.body)) as BotCall['body'] })
+    return new Response(JSON.stringify(status === 200 ? { ok: true, result: { message_id: 777 } } : { ok: false }), { status })
+  })
+  return calls
+}
+/** The device token a client holds NOW: a won decision rotates it, so tests follow the rotation like a real client. */
+const rotated = new Map<string, string>()
 async function link(sub: string, memberId: string, email: string): Promise<string> {
   const r = await linkLoginIdentity(env, { tenant: TENANT, provider: 'google', providerSubject: sub, verifiedEmail: email, memberId })
   if (!r.ok) throw new Error(`link failed ${JSON.stringify(r)}`)
@@ -56,6 +74,7 @@ async function link(sub: string, memberId: string, email: string): Promise<strin
 }
 
 beforeEach(async () => {
+  rotated.clear()
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
@@ -153,7 +172,11 @@ async function nonceFor(m: Moment, tg: number, c: Choice): Promise<string> {
 }
 async function decide(m: Moment, tg: number, device: string, c: Choice, over: { nonce?: string; init?: string; send?: Record<string, unknown>; deviceToken?: unknown } = {}): Promise<Response> {
   const nonce = over.nonce ?? (await nonceFor(m, tg, c))
-  return post('/m/tg/decide', { init_data: over.init ?? init(tg), moment_id: m.id, nonce, device_token: 'deviceToken' in over ? over.deviceToken : device, ...(over.send ?? c) })
+  const current = rotated.get(device.split('.')[0]) ?? device
+  const res = await post('/m/tg/decide', { init_data: over.init ?? init(tg), moment_id: m.id, nonce, device_token: 'deviceToken' in over ? over.deviceToken : current, ...(over.send ?? c) })
+  const next = ((await res.clone().json().catch(() => ({}))) as { device_token_next?: string }).device_token_next
+  if (next) rotated.set(device.split('.')[0], next)
+  return res
 }
 const momentStatus = (id: string): string => one<{ status: string }>('SELECT status FROM secure_moments WHERE id = ?', id)?.status ?? 'missing'
 
@@ -174,14 +197,18 @@ describe('flag off is a true no-op', () => {
     }
     expect(count('tg_miniapp_devices') + count('tg_miniapp_decisions') + count('tg_miniapp_enrolment_tokens')).toBe(0)
   })
-  it('the helper tool is not advertised and refuses a direct call; no launch payload exists', async () => {
+  it('the helper tool is not advertised and refuses a direct call; nothing is sent and no delivery row exists', async () => {
+    const calls = stubBotApi()
     expect(advertisedTools(off()).map((t) => t.name)).not.toContain('moment_miniapp_link')
     expect(advertisedTools(env).map((t) => t.name)).toContain('moment_miniapp_link')
     const m = await fileSeed(off())
-    const r = await invokeTool(agentAuth(), off(), 'moment_miniapp_link', { moment_id: m.id }, 'https://pot.test')
+    const r = await invokeTool(agentAuth(), off(), 'moment_miniapp_link', { moment_id: m.id, member_id: 'mem-owner' }, 'https://pot.test')
     expect(r.ok).toBe(false)
-    expect(await momentMiniappLaunch(off(), agentAuth(), m.id)).toMatchObject({ ok: false, error: 'not_enabled' })
-    expect(await mintTgEnrolmentLink(off(), agentAuth())).toMatchObject({ ok: false, error: 'not_enabled' })
+    expect(await requestMomentDelivery(off(), agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'not_enabled' })
+    expect(await requestEnrolDelivery(off(), agentAuth())).toMatchObject({ ok: false, error: 'not_enabled' })
+    expect(await sendMiniappButton(off(), { chatId: '1001', path: '/m/tg/x', buttonText: 'x', text: 'x' })).toMatchObject({ ok: false, error: 'not_enabled' })
+    expect(calls).toHaveLength(0)
+    expect(count('tg_miniapp_deliveries')).toBe(0)
   })
   it('W1 passkey pages are unchanged by the flag either way (no Telegram origin in their CSP)', async () => {
     const m = await fileSeed()
@@ -199,8 +226,18 @@ describe('flag off is a true no-op', () => {
     expect(telegramMiniappStatus(baseEnv({ TELEGRAM_MINIAPP_BOT_ID: 'bot' })).state).toBe('misconfigured')
     expect(telegramMiniappStatus(baseEnv({ SECURE_MOMENTS_HOST: COLONY })).state).toBe('misconfigured')
     expect(telegramMiniappStatus(env)).toEqual({ state: 'on', host: HOST, botId: BOT })
+    // The dedicated bot's token is REQUIRED, must name the configured bot, and must not be the notification/IM bot.
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: undefined }))).toMatchObject({ state: 'misconfigured', reason: expect.stringContaining('required') })
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: '555555555:AAEhqMY-some-other-bot-token' }))).toMatchObject({ state: 'misconfigured', reason: expect.stringContaining('does not belong') })
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: 'garbage' })).state).toBe('misconfigured')
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_BOT_TOKEN: BOT_TOKEN }))).toMatchObject({ state: 'misconfigured', reason: expect.stringContaining('DEDICATED') })
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_BOT_TOKEN: `${BOT}:AAEhqMY-another-secret-of-same-bot` }))).toMatchObject({ state: 'misconfigured' })
+    expect(telegramMiniappStatus(baseEnv({ TELEGRAM_BOT_TOKEN: '777777777:AAEhqMY-notification-bot-token' })).state).toBe('on')
     expect((await hit('/m/tg', {}, baseEnv({ TELEGRAM_MINIAPP_BOT_ID: undefined }))).status).toBe(404)
     expect((await hit('/m/tg/view', { method: 'POST', json: { init_data: init(TG.owner) } }, baseEnv({ TELEGRAM_MINIAPP_BOT_ID: undefined }))).status).toBe(404)
+    // No token => the whole channel is off (404 everywhere), not a channel that validates but cannot send.
+    expect((await hit('/m/tg', {}, baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: undefined }))).status).toBe(404)
+    expect((await post('/m/tg/view', { init_data: init(TG.owner) }, baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: undefined }))).status).toBe(404)
   })
 })
 
@@ -289,12 +326,11 @@ describe('identity: initData -> Telegram user -> member', () => {
     expect(r.status).toBe(403)
     expect((await jbody(r)).title).toBe('Telegram sign-in failed')
   })
-  it('the optional classic HMAC path works only when the worker secret is configured and names the bot', async () => {
-    const token = `${BOT}:AAEhqMY-classic-test-token`
-    const raw = init(TG.owner, { omitSignature: true, hmacToken: token })
-    expect((await post('/m/tg/view', { init_data: raw })).status).toBe(403)
-    expect((await post('/m/tg/view', { init_data: raw }, baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: token }))).status).toBe(200)
-    expect((await post('/m/tg/view', { init_data: raw }, baseEnv({ TELEGRAM_MINIAPP_BOT_TOKEN: '555555555:other' }))).status).toBe(403)
+  it('there is no HMAC path: a payload with no signature is refused even with the bot token configured, and the token is never used to validate', async () => {
+    const raw = init(TG.owner, { omitSignature: true })
+    const r = await post('/m/tg/view', { init_data: raw })
+    expect(r.status).toBe(403)
+    expect((await jbody(r)).message).toMatch(/Bot API 8\.0/)
   })
   it('same-origin and JSON are required on every POST', async () => {
     const body = { init_data: init(TG.owner) }
@@ -339,12 +375,10 @@ describe('view', () => {
     harness.sqlite.prepare('UPDATE secure_moments SET decider_member_id = ? WHERE id = ?').run('mem-sqadmin', m.id)
     expect((await post('/m/tg/view', { init_data: init(TG.owner), moment_id: m.id })).status).toBe(404)
   })
-  it('the moment can arrive in the SIGNED start_param (t.me direct link), not just the body', async () => {
+  it('start_param does not select a moment (the moment comes only from the page the worker sent): a launch without one is idle', async () => {
     const m = await fileSeed()
     const j = await jbody(await post('/m/tg/view', { init_data: init(TG.owner, { startParam: `m_${m.id}` }) }))
-    expect(j).toMatchObject({ ok: true, state: 'moment' })
-    const none = await jbody(await post('/m/tg/view', { init_data: init(TG.owner) }))
-    expect(none.state).toBe('idle')
+    expect(j.state).toBe('idle')
   })
   it('a closed request: applied reads as approved; a consumed moment reads as closed', async () => {
     const m = await fileSeed()
@@ -462,7 +496,7 @@ describe('device enrolment', () => {
     harness.sqlite.exec("UPDATE members SET telegram_chat_id = '2001' WHERE id = 'mem-owner'")
     expect((await post(`/m/tg/enrol/${token}/start`, { init_data: init(TG.owner) })).status).toBe(403)
   })
-  describe('dashboard "Set up Telegram device" mint', () => {
+  describe('dashboard "Set up this phone": the WORKER mints and sends the button', () => {
     const webAuth = (hash: string, memberId = 'mem-owner'): AuthContext => ({ userId: memberId, email: null, role: 'member', tenant: TENANT, channel: 'dashboard', memberId, webSessionMemberId: memberId, webSessionIdHash: hash } as AuthContext)
     async function session(memberId: string, identityId: string, reauth: boolean): Promise<string> {
       await createWebSession(env, `raw-${memberId}-${reauth}`, { tenant: TENANT, memberId, loginIdentityId: identityId })
@@ -470,40 +504,65 @@ describe('device enrolment', () => {
       if (reauth) await markRecentReauth(env, hash)
       return hash
     }
-    it('uses the SAME rules as the passkey link: a real web session, fresh re-auth, live identity, active human', async () => {
+    it('uses the SAME rules as the passkey link: a real web session, fresh re-auth, live identity, active human; refused callers send nothing', async () => {
+      const calls = stubBotApi()
       const stale = await session('mem-owner', identities.owner, false)
-      expect(await mintTgEnrolmentLink(env, webAuth(stale))).toMatchObject({ ok: false, error: 'reauth_required' })
-      expect(await mintTgEnrolmentLink(env, agentAuth())).toMatchObject({ ok: false, error: 'not_a_web_session' })
-      expect(await mintTgEnrolmentLink(env, { ...webAuth(stale), memberId: 'mem-plain' })).toMatchObject({ ok: false, error: 'not_a_web_session' })
+      expect(await requestEnrolDelivery(env, webAuth(stale))).toMatchObject({ ok: false, error: 'reauth_required' })
+      expect(await requestEnrolDelivery(env, agentAuth())).toMatchObject({ ok: false, error: 'not_a_web_session' })
+      expect(await requestEnrolDelivery(env, { ...webAuth(stale), memberId: 'mem-plain' })).toMatchObject({ ok: false, error: 'not_a_web_session' })
       expect(count('tg_miniapp_enrolment_tokens')).toBe(0)
+      expect(calls).toHaveLength(0)
       harness.sqlite.exec('DELETE FROM web_sessions')
       const fresh = await session('mem-owner', identities.owner, true)
-      const r = await mintTgEnrolmentLink(env, webAuth(fresh))
-      expect(r.ok).toBe(true)
-      if (r.ok) {
-        expect(r.url.startsWith(`${ORIGIN}/m/tg/enrol/`)).toBe(true)
-        expect(r.launch.web_app_button.web_app.url).toBe(r.url)
-        expect(r.launch.reply_markup.inline_keyboard[0][0]).toEqual(r.launch.web_app_button)
-      }
+      const r = await requestEnrolDelivery(env, webAuth(fresh))
+      expect(r).toMatchObject({ ok: true, status: 'sent' })
       expect(one<{ login_identity_id: string }>('SELECT login_identity_id FROM tg_miniapp_enrolment_tokens')?.login_identity_id).toBe(identities.owner)
       harness.sqlite.prepare("UPDATE human_login_identities SET revoked_at = datetime('now') WHERE id = ?").run(identities.owner)
-      expect(await mintTgEnrolmentLink(env, webAuth(fresh))).toMatchObject({ ok: false, error: 'session_identity_unavailable' })
+      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, error: 'session_identity_unavailable' })
+    })
+    it('the worker sends ONE web_app button to the member\'s own bound private chat from the dedicated bot; the link is never returned', async () => {
+      const calls = stubBotApi()
+      const fresh = await session('mem-owner', identities.owner, true)
+      const r = await requestEnrolDelivery(env, webAuth(fresh))
+      expect(JSON.stringify(r)).not.toMatch(/https?:|enrol|token/i)
+      expect(calls).toHaveLength(1)
+      expect(calls[0].url).toBe(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`)
+      expect(calls[0].body.chat_id).toBe(String(TG.owner))
+      expect(calls[0].body.protect_content).toBe(true)
+      const button = calls[0].body.reply_markup.inline_keyboard[0][0]
+      expect(calls[0].body.reply_markup.inline_keyboard).toHaveLength(1)
+      expect(button.web_app.url).toMatch(new RegExp(`^${ORIGIN}/m/tg/enrol/[A-Za-z0-9_-]{43}$`))
+      expect(calls[0].body.text).not.toContain(button.web_app.url)
+      // The link the worker sent is the one that was minted (hash matches), single-use, 10 minutes.
+      const token = button.web_app.url.split('/').pop() ?? ''
+      expect(one<{ token_sha256: string }>('SELECT token_sha256 FROM tg_miniapp_enrolment_tokens')?.token_sha256).toBe(await tokenHash(token))
+      expect(one<{ kind: string; status: string; member_id: string; telegram_message_id: string }>('SELECT * FROM tg_miniapp_deliveries')).toMatchObject({ kind: 'enrol', status: 'sent', member_id: 'mem-owner', telegram_message_id: '777' })
+      expect(JSON.stringify(harness.sqlite.prepare('SELECT * FROM tg_miniapp_deliveries').all())).not.toContain(token)
+    })
+    it('an unbound member gets telegram_not_bound and nothing is minted or sent; a failing Bot API leaves a failed receipt', async () => {
+      const calls = stubBotApi()
+      harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
+      const fresh = await session('mem-owner', identities.owner, true)
+      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, error: 'telegram_not_bound' })
+      expect(calls).toHaveLength(0)
+      expect(count('tg_miniapp_enrolment_tokens')).toBe(0)
+      harness.sqlite.exec(`UPDATE members SET telegram_chat_id = '${TG.owner}' WHERE id = 'mem-owner'`)
+      stubBotApi(403)
+      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, error: 'send_failed' })
+      expect(one<{ status: string; error: string }>("SELECT status, error FROM tg_miniapp_deliveries WHERE status = 'failed'")).toMatchObject({ error: 'chat_unreachable' })
+    })
+    it('delivery is rate limited per member', async () => {
+      const calls = stubBotApi()
+      const fresh = await session('mem-owner', identities.owner, true)
+      for (let i = 0; i < 5; i++) expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: true })
+      expect(await requestEnrolDelivery(env, webAuth(fresh))).toMatchObject({ ok: false, status: 429, error: 'rate_limited' })
+      expect(calls).toHaveLength(5)
     })
     it('a passkey enrolment link is NOT a device enrolment link (separate tables, separate tokens)', async () => {
       const { token } = await mintEnrolmentToken(env, 'mem-owner', identities.owner)
       expect((await post(`/m/tg/enrol/${token}/start`, { init_data: init(TG.owner) })).status).toBe(404)
       const t = await mintTgEnrolmentToken(env, 'mem-owner', identities.owner)
       expect((await hit(`/m/enrol/${t.token}`)).status).toBe(404)
-    })
-    it('the t.me link appears only when the bot username and app short name are configured', async () => {
-      const fresh = await session('mem-owner', identities.owner, true)
-      const plain = await mintTgEnrolmentLink(env, webAuth(fresh))
-      expect(plain.ok && plain.launch.t_me_link).toBeNull()
-      const cfg = baseEnv({ TELEGRAM_MINIAPP_BOT_USERNAME: '@kayhermes_mubot', TELEGRAM_MINIAPP_APP_SHORTNAME: 'approve' })
-      const r = await mintTgEnrolmentLink(cfg, webAuth(fresh))
-      expect(r.ok && /^https:\/\/t\.me\/kayhermes_mubot\/approve\?startapp=e_[A-Za-z0-9_-]{43}$/.test(r.launch.t_me_link ?? '')).toBe(true)
-      const bad = await mintTgEnrolmentLink(baseEnv({ TELEGRAM_MINIAPP_BOT_USERNAME: 'x', TELEGRAM_MINIAPP_APP_SHORTNAME: 'a b' }), webAuth(fresh))
-      expect(bad.ok && bad.launch.t_me_link).toBeNull()
     })
   })
 })
@@ -552,12 +611,14 @@ describe('decisions: seed attach', () => {
   it('initData is NOT enough: no device token, a garbage one, or none of the member\'s => refused, link unspent', async () => {
     const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
     const m = await fileSeed()
+    // ONE nonce for all the bad attempts: the device is verified BEFORE the nonce is consumed, so none of them burns it.
+    const nonce = await nonceFor(m, TG.owner, { decision: 'approve' })
     for (const bad of [undefined, '', 'garbage', `${crypto.randomUUID()}.${'A'.repeat(43)}`, `${dev.split('.')[0]}.${'B'.repeat(43)}`, 5, {}]) {
-      const r = await decide(m, TG.owner, dev, { decision: 'approve' }, { deviceToken: bad })
+      const r = await decide(m, TG.owner, dev, { decision: 'approve' }, { nonce, deviceToken: bad })
       expect(r.status).toBe(403)
     }
     expect(momentStatus(m.id)).toBe('pending')
-    expect((await decide(m, TG.owner, dev, { decision: 'approve' })).status).toBe(200)
+    expect((await decide(m, TG.owner, dev, { decision: 'approve' }, { nonce })).status).toBe(200)
   })
   it('the device token alone is NOT enough: a stale, forged or other-member initData is refused', async () => {
     const dev = await enrolDevice('mem-owner', TG.owner, identities.owner)
@@ -698,11 +759,11 @@ describe('decisions: elevation and the step-up policy', () => {
   it('SENSITIVE actions need a passkey: every member of SENSITIVE_STEP_UP_ACTIONS is refused at challenge AND at decide, nothing consumed', async () => {
     const { dev } = await ready()
     const m = await fileElevation(['action:project_status', 'action:manage_access'])
-    for (const a of SENSITIVE_STEP_UP_ACTIONS) {
+    const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    for (const a of [...SENSITIVE_STEP_UP_ACTIONS, ...TELEGRAM_PASSKEY_ONLY_EXTRA]) {
       const c = await challenge(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status', a] })
       expect(c.status).toBe(403)
       expect((await jbody(c)).message).toBe(PASSKEY_REQUIRED_MESSAGE)
-      const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
       const d = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: dev, decision: 'approve', actions: ['action:project_status', a] })
       expect(d.status).toBe(403)
     }
@@ -718,7 +779,7 @@ describe('decisions: elevation and the step-up policy', () => {
     const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({
       v: 'tg1', kind: 'elevation', subject: m.subject, decision: 'approve', actions, duration: null, member: 'mem-sqadmin', tg_user: String(TG.sqadmin),
     }))))].map((b) => b.toString(16).padStart(2, '0')).join('')
-    const nonce = await mintDecideChallenge(env, { momentId: m.id, decision: 'approve', payloadSha256: digest })
+    const nonce = await mintTgNonce(env, { momentId: m.id, memberId: 'mem-sqadmin', telegramUserId: String(TG.sqadmin), decision: 'approve', payloadSha256: digest })
     expect(nonce).toBeTruthy()
     const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: dev, decision: 'approve', actions })
     expect(r.status).toBe(403)
@@ -817,7 +878,7 @@ describe('revocation and the cut-off levers', () => {
     expect((await decide(m, TG.owner, dev, { decision: 'approve' }, { nonce })).status).toBe(403)
     const deviceId = dev.split('.')[0]
     const secret = await tokenHash(dev.split('.')[1])
-    expect(await consumeMomentTelegram(env, { momentId: m.id, decision: 'approve', memberId: 'mem-owner', telegramUserId: String(TG.owner), deviceId, secretSha256: secret }, Date.now())).toBe(false)
+    expect(await consumeWon(env, { momentId: m.id, decision: 'approve', memberId: 'mem-owner', telegramUserId: String(TG.owner), deviceId, secretSha256: secret }, Date.now())).toBe(false)
     expect(momentStatus(m.id)).toBe('pending')
   })
   it('consumeMomentTelegram itself refuses: wrong member, wrong Telegram user, wrong secret, revoked device, unbound member, decider mismatch, expired moment', async () => {
@@ -826,24 +887,24 @@ describe('revocation and the cut-off levers', () => {
     const secretSha256 = await tokenHash(dev.split('.')[1])
     const base = { momentId: m.id, decision: 'approve' as const, memberId: 'mem-owner', telegramUserId: String(TG.owner), deviceId, secretSha256 }
     const now = Date.now()
-    expect(await consumeMomentTelegram(env, { ...base, memberId: 'mem-sqadmin' }, now)).toBe(false)
-    expect(await consumeMomentTelegram(env, { ...base, telegramUserId: '5555' }, now)).toBe(false)
-    expect(await consumeMomentTelegram(env, { ...base, secretSha256: 'f'.repeat(64) }, now)).toBe(false)
-    expect(await consumeMomentTelegram(env, { ...base, deviceId: crypto.randomUUID() }, now)).toBe(false)
+    expect(await consumeWon(env, { ...base, memberId: 'mem-sqadmin' }, now)).toBe(false)
+    expect(await consumeWon(env, { ...base, telegramUserId: '5555' }, now)).toBe(false)
+    expect(await consumeWon(env, { ...base, secretSha256: 'f'.repeat(64) }, now)).toBe(false)
+    expect(await consumeWon(env, { ...base, deviceId: crypto.randomUUID() }, now)).toBe(false)
     harness.sqlite.prepare('UPDATE secure_moments SET decider_member_id = ? WHERE id = ?').run('mem-sqadmin', m.id)
-    expect(await consumeMomentTelegram(env, base, now)).toBe(false)
+    expect(await consumeWon(env, base, now)).toBe(false)
     harness.sqlite.prepare('UPDATE secure_moments SET decider_member_id = NULL WHERE id = ?').run(m.id)
-    expect(await consumeMomentTelegram(env, base, now + 3 * 24 * 3600 * 1000)).toBe(false)
+    expect(await consumeWon(env, base, now + 3 * 24 * 3600 * 1000)).toBe(false)
     harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
-    expect(await consumeMomentTelegram(env, base, now)).toBe(false)
+    expect(await consumeWon(env, base, now)).toBe(false)
     harness.sqlite.exec(`UPDATE members SET telegram_chat_id = '${TG.owner}' WHERE id = 'mem-owner'`)
     harness.sqlite.prepare("UPDATE tg_miniapp_devices SET revoked_at = datetime('now')").run()
-    expect(await consumeMomentTelegram(env, base, now)).toBe(false)
+    expect(await consumeWon(env, base, now)).toBe(false)
     expect(momentStatus(m.id)).toBe('pending')
     expect(count('tg_miniapp_decisions')).toBe(0)
     harness.sqlite.prepare('UPDATE tg_miniapp_devices SET revoked_at = NULL').run()
-    expect(await consumeMomentTelegram(env, base, now)).toBe(true)
-    expect(await consumeMomentTelegram(env, base, now)).toBe(false) // single use
+    expect(await consumeWon(env, base, now)).toBe(true)
+    expect(await consumeWon(env, base, now)).toBe(false) // single use
     expect(count('tg_miniapp_decisions')).toBe(1)
   })
   it('the consume itself refuses a credential-kind moment (W2) even with a perfectly valid device', async () => {
@@ -854,10 +915,10 @@ describe('revocation and the cut-off levers', () => {
       VALUES ('${credId}', '${TENANT}', 'credential', 'x', '${'d'.repeat(64)}', 'pending', datetime('now'), '2999-01-01T00:00:00.000Z')`)
     harness.sqlite.exec('PRAGMA ignore_check_constraints = OFF')
     const input = { momentId: credId, decision: 'approve' as const, memberId: 'mem-owner', telegramUserId: String(TG.owner), deviceId: dev.split('.')[0], secretSha256: await tokenHash(dev.split('.')[1]) }
-    expect(await consumeMomentTelegram(env, input, Date.now())).toBe(false)
+    expect(await consumeWon(env, input, Date.now())).toBe(false)
     expect(momentStatus(credId)).toBe('pending')
     harness.sqlite.prepare("UPDATE secure_moments SET kind = 'seed_attach' WHERE id = ?").run(credId)
-    expect(await consumeMomentTelegram(env, input, Date.now())).toBe(true) // control: only the kind was in the way
+    expect(await consumeWon(env, input, Date.now())).toBe(true) // control: only the kind was in the way
   })
   it('the passkey consume path is untouched: a Telegram decision leaves no passkey fields behind', async () => {
     const { dev, m } = await ready()
@@ -873,40 +934,250 @@ describe('revocation and the cut-off levers', () => {
   })
 })
 
-describe('the launch helper (moment_miniapp_link)', () => {
-  it('returns the url, the web_app button and a ready reply_markup for the agent that filed the moment, and never the link token', async () => {
+describe('device secret rotation: a harvested copy dies at the next real use and its later use is detected', () => {
+  async function ready(): Promise<{ dev: string; id: string }> {
+    const dev = await enrolDevice('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    return { dev, id: dev.split('.')[0] }
+  }
+  // One grant per (agent session, action, scope) can exist, so every moment asks for a DIFFERENT non-sensitive action.
+  const freeActions = Object.keys(ELEVATION_ACTIONS).filter((k) => !SENSITIVE_STEP_UP_ACTIONS.has(k) && !TELEGRAM_PASSKEY_ONLY_EXTRA.has(k) && isRequestableElevationAction(k))
+  let nextAction = 0
+  const act = (): string => freeActions[nextAction++ % freeActions.length]
+  const approveOne = async (dev: string, c: Partial<Choice> = {}): Promise<{ res: Response; m: Moment; action: string }> => {
+    const action = act()
+    const m = await fileElevation([action])
+    return { res: await decide(m, TG.sqadmin, dev, { decision: 'approve', actions: [action], duration_minutes: 15, ...c }), m, action }
+  }
+  it('a won decision returns the NEXT secret, stores only its hash, and retires the old digest in the same batch', async () => {
+    const { dev, id } = await ready()
+    const oldSecret = dev.split('.')[1]
+    const { res, m } = await approveOne(dev)
+    expect(res.status).toBe(200)
+    const body = (await res.clone().json()) as { device_token_next?: string }
+    const next = body.device_token_next ?? ''
+    expect(next.split('.')[0]).toBe(id)
+    expect(next.split('.')[1]).toMatch(/^[A-Za-z0-9_-]{43}$/)
+    expect(next.split('.')[1]).not.toBe(oldSecret)
+    expect(one<{ secret_sha256: string }>('SELECT secret_sha256 FROM tg_miniapp_devices WHERE id = ?', id)?.secret_sha256).toBe(await tokenHash(next.split('.')[1]))
+    expect(one<{ device_id: string }>('SELECT device_id FROM tg_miniapp_retired_secrets WHERE secret_sha256 = ?', await tokenHash(oldSecret))?.device_id).toBe(id)
+    expect(JSON.stringify(harness.sqlite.prepare('SELECT * FROM tg_miniapp_devices').all())).not.toContain(next.split('.')[1])
+    expect(momentStatus(m.id)).toBe('consumed')
+  })
+  it('the rotated secret works for the next decision, and a deny rotates too', async () => {
+    const { dev } = await ready()
+    expect((await approveOne(dev)).res.status).toBe(200)
+    const second = await approveOne(dev, { decision: 'deny', actions: undefined })
+    expect(second.res.status).toBe(200)
+    expect(((await second.res.clone().json()) as { device_token_next?: string }).device_token_next).toBeTruthy()
+    expect((await approveOne(dev)).res.status).toBe(200) // third decision, third secret
+    expect(count('tg_miniapp_retired_secrets')).toBe(3)
+  })
+  it('a STALE secret (the one a rotation replaced) is refused, revokes the device on the spot, and leaves a suspicious receipt', async () => {
+    const { dev, id } = await ready()
+    expect((await approveOne(dev)).res.status).toBe(200)
+    const a2 = act()
+    const m = await fileElevation([a2])
+    const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: [a2] })
+    const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: dev, decision: 'approve', actions: [a2] })
+    expect(r.status).toBe(403)
+    expect((await jbody(r)).title).toBe('Device removed')
+    expect(one<{ revoked_at: string | null; revoked_reason: string }>('SELECT revoked_at, revoked_reason FROM tg_miniapp_devices WHERE id = ?', id)).toMatchObject({ revoked_reason: 'stale_secret_replayed' })
+    expect(one<{ revoked_at: string | null }>('SELECT revoked_at FROM tg_miniapp_devices WHERE id = ?', id)?.revoked_at).toBeTruthy()
+    const receipt = one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'tg_device_revoke' ORDER BY recorded_at DESC LIMIT 1")
+    expect(JSON.parse(receipt?.evidence_json ?? '{}')).toMatchObject({ reason: 'stale_secret_replayed', suspicious: '1', device_id: id })
+    expect(momentStatus(m.id)).toBe('pending')
+    // The genuine client's CURRENT secret died with the device: it must set up again.
+    const next = rotated.get(dev.split('.')[0]) ?? dev
+    expect((await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: next, decision: 'approve', actions: [a2] })).status).toBe(403)
+    expect((await challenge(m, TG.sqadmin, { decision: 'approve', actions: [a2] })).status).toBe(409)
+  })
+  it('a copy that is TWO or more generations old is still detected (every retired digest is kept)', async () => {
+    const { dev } = await ready()
+    const first = dev
+    for (let i = 0; i < 3; i++) expect((await approveOne(dev)).res.status).toBe(200)
+    const a2 = act()
+    const m = await fileElevation([a2])
+    const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: [a2] })
+    const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: first, decision: 'approve', actions: [a2] })
+    expect((await jbody(r)).title).toBe('Device removed')
+  })
+  it('a stale secret presented under ANOTHER member\'s initData still kills the device it came from (and says who presented it)', async () => {
+    const { dev, id } = await ready()
+    await enrolDevice('mem-owner', TG.owner, identities.owner)
+    expect((await approveOne(dev)).res.status).toBe(200)
     const m = await fileSeed()
-    const r = await invokeTool(agentAuth(), env, 'moment_miniapp_link', { moment_id: m.id }, 'https://pot.test')
+    const nonce = await nonceFor(m, TG.owner, { decision: 'approve' })
+    const r = await post('/m/tg/decide', { init_data: init(TG.owner), moment_id: m.id, nonce, device_token: dev, decision: 'approve' })
+    expect(r.status).toBe(403)
+    expect(one<{ revoked_reason: string }>('SELECT revoked_reason FROM tg_miniapp_devices WHERE id = ?', id)?.revoked_reason).toBe('stale_secret_replayed')
+    expect(one<{ evidence_json: string }>("SELECT evidence_json FROM mutation_audit_entries WHERE operation = 'tg_device_revoke'")?.evidence_json).toContain('"presented_by_member_id":"mem-owner"')
+    expect(momentStatus(m.id)).toBe('pending')
+  })
+  it('a secret that was NEVER issued for a real device id is just refused: it does not revoke anything', async () => {
+    const { dev, id } = await ready()
+    const m = await fileElevation(['action:project_status'])
+    const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: `${id}.${'Z'.repeat(43)}`, decision: 'approve', actions: ['action:project_status'] })
+    expect(r.status).toBe(403)
+    expect((await jbody(r)).title).toBe('Device not recognised')
+    expect(one<{ revoked_at: string | null }>('SELECT revoked_at FROM tg_miniapp_devices WHERE id = ?', id)?.revoked_at).toBeNull()
+    expect((await decide(m, TG.sqadmin, dev, { decision: 'approve', actions: ['action:project_status'] }, { nonce })).status).toBe(200)
+  })
+  it('a decision that LOSES the gate does not rotate: no next secret, the presented one stays valid', async () => {
+    const { dev, id } = await ready()
+    const m = await fileElevation(['action:project_status'])
+    const n1 = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    const n2 = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    const rs = await Promise.all([
+      post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce: n1, device_token: dev, decision: 'approve', actions: ['action:project_status'] }),
+      post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce: n2, device_token: dev, decision: 'approve', actions: ['action:project_status'] }),
+    ])
+    const bodies = await Promise.all(rs.map(async (r) => ({ status: r.status, next: ((await r.json()) as { device_token_next?: string }).device_token_next })))
+    expect(bodies.filter((b) => b.status === 200)).toHaveLength(1)
+    expect(bodies.filter((b) => b.next)).toHaveLength(1)
+    expect(bodies.find((b) => b.status !== 200)?.next).toBeUndefined()
+    expect(count('tg_miniapp_retired_secrets', `device_id = '${id}'`)).toBe(1)
+  })
+  it('a refusal before the gate (the policy) does not rotate either', async () => {
+    const { dev, id } = await ready()
+    const m = await fileElevation(['action:project_status', 'action:manage_access'])
+    const nonce = await nonceFor(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    const r = await post('/m/tg/decide', { init_data: init(TG.sqadmin), moment_id: m.id, nonce, device_token: dev, decision: 'approve', actions: ['action:manage_access'] })
+    expect(r.status).toBe(403)
+    expect(((await r.json()) as { device_token_next?: string }).device_token_next).toBeUndefined()
+    expect(count('tg_miniapp_retired_secrets', `device_id = '${id}'`)).toBe(0)
+  })
+})
+
+describe('the Telegram channel has its OWN nonce store and cap', () => {
+  it('a member holds at most TG_NONCE_MAX_OUTSTANDING live nonces per moment; the next challenge is refused, and passkey_challenges is never touched', async () => {
+    await enrolDevice('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    const m = await fileElevation(['action:project_status'])
+    for (let i = 0; i < TG_NONCE_MAX_OUTSTANDING; i++) expect((await challenge(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })).status).toBe(200)
+    const over = await challenge(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    expect(over.status).toBe(409)
+    expect((await jbody(over)).title).toBe('Try later')
+    expect(count('tg_miniapp_nonces')).toBe(TG_NONCE_MAX_OUTSTANDING)
+    expect(count('passkey_challenges')).toBe(0)
+  })
+  it('flooding the Telegram channel cannot exhaust the passkey channel\'s cap on the same moment (and the reverse)', async () => {
+    await enrolDevice('mem-sqadmin', TG.sqadmin, identities.sqadmin)
+    const m = await fileElevation(['action:project_status'])
+    for (let i = 0; i < TG_NONCE_MAX_OUTSTANDING; i++) await challenge(m, TG.sqadmin, { decision: 'approve', actions: ['action:project_status'] })
+    expect(await mintDecideChallenge(env, { momentId: m.id, decision: 'approve', payloadSha256: 'a'.repeat(64) })).toBeTruthy()
+    for (let i = 0; i < 25; i++) await mintDecideChallenge(env, { momentId: m.id, decision: 'approve', payloadSha256: `${i}`.padStart(64, '0') })
+    expect(await mintTgNonce(env, { momentId: m.id, memberId: 'mem-owner', telegramUserId: String(TG.owner), decision: 'approve', payloadSha256: 'b'.repeat(64) })).toBeTruthy()
+  })
+  it('the cap is per member: one member filling theirs does not lock another member out of the same moment', async () => {
+    const b = { momentId: 'm1', telegramUserId: '1', decision: 'approve' as const, payloadSha256: 'c'.repeat(64) }
+    for (let i = 0; i < TG_NONCE_MAX_OUTSTANDING; i++) expect(await mintTgNonce(env, { ...b, memberId: 'mem-a' })).toBeTruthy()
+    expect(await mintTgNonce(env, { ...b, memberId: 'mem-a' })).toBeNull()
+    expect(await mintTgNonce(env, { ...b, memberId: 'mem-b' })).toBeTruthy()
+  })
+  it('a nonce is bound to moment, member, Telegram user, decision and digest, expires, and is single-use', async () => {
+    const b = { momentId: 'm1', memberId: 'mem-a', telegramUserId: '1', decision: 'approve' as const, payloadSha256: 'd'.repeat(64) }
+    const nonce = await mintTgNonce(env, b)
+    expect(nonce).toBeTruthy()
+    const n = nonce ?? ''
+    const now = Date.now()
+    for (const wrong of [{ ...b, momentId: 'm2' }, { ...b, memberId: 'mem-b' }, { ...b, telegramUserId: '2' }, { ...b, decision: 'deny' as const }, { ...b, payloadSha256: 'e'.repeat(64) }]) {
+      expect(await consumeTgNonce(env, n, wrong, now)).toBe(false)
+    }
+    expect(await consumeTgNonce(env, n, b, now + 6 * 60 * 1000)).toBe(false) // expired
+    expect(await consumeTgNonce(env, n, b, now)).toBe(true)
+    expect(await consumeTgNonce(env, n, b, now)).toBe(false) // single use
+    expect(await consumeTgNonce(env, 'A'.repeat(43), b, now)).toBe(false)
+    expect(JSON.stringify(harness.sqlite.prepare('SELECT * FROM tg_miniapp_nonces').all())).not.toContain(n)
+  })
+})
+
+describe('the delivery helper (moment_miniapp_link): the worker sends, the caller gets a receipt', () => {
+  it('sends the button for a moment the agent filed to the named member\'s bound private chat, and returns ONLY a receipt', async () => {
+    const calls = stubBotApi()
+    const m = await fileSeed()
+    const r = await invokeTool(agentAuth(), env, 'moment_miniapp_link', { moment_id: m.id, member_id: 'mem-owner' }, 'https://pot.test')
     expect(r.ok).toBe(true)
-    const res = r.result as { url: string; web_app_button: { text: string; web_app: { url: string } }; reply_markup: { inline_keyboard: unknown[][] }; t_me_link: string | null; moment_id: string }
-    expect(res.url).toBe(`${ORIGIN}/m/tg/${m.id}`)
-    expect(res.web_app_button.web_app.url).toBe(res.url)
-    expect(res.reply_markup.inline_keyboard[0][0]).toEqual(res.web_app_button)
-    expect(res.t_me_link).toBeNull()
+    const res = r.result as Record<string, unknown>
+    expect(Object.keys(res).sort()).toEqual(['delivery_id', 'expires_at', 'moment_id', 'note', 'ok', 'sent_at', 'status'])
+    expect(JSON.stringify(res)).not.toMatch(/https?:|web_app|reply_markup/)
     expect(JSON.stringify(res)).not.toContain(m.token)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].body.chat_id).toBe(String(TG.owner))
+    expect(calls[0].body.reply_markup.inline_keyboard[0][0].web_app.url).toBe(`${ORIGIN}/m/tg/${m.id}`)
+    expect(JSON.stringify(calls[0])).not.toContain(m.token)
+    expect(one('SELECT * FROM tg_miniapp_deliveries')).toMatchObject({ kind: 'moment', subject_id: m.id, member_id: 'mem-owner', requested_by: 'agent-x', status: 'sent' })
   })
-  it('adds a t.me direct link only when the username and short name are configured', async () => {
-    const m = await fileSeed()
-    const cfg = baseEnv({ TELEGRAM_MINIAPP_BOT_USERNAME: 'kayhermes_mubot', TELEGRAM_MINIAPP_APP_SHORTNAME: 'approve' })
-    const r = await invokeTool(agentAuth(), cfg, 'moment_miniapp_link', { moment_id: m.id }, 'https://pot.test')
-    expect((r.result as { t_me_link: string }).t_me_link).toBe(`https://t.me/kayhermes_mubot/approve?startapp=m_${m.id}`)
-  })
-  it('refuses a caller that did not file it, a closed moment, a missing id and a junk id (the first reads as not found)', async () => {
+  it('refuses a caller that did not file it, a closed or junk moment, and sends nothing (the first reads as not found)', async () => {
+    const calls = stubBotApi()
     const m = await fileSeed()
     const other = { ...agentAuth(), boundAgentId: 'someone-else', memberId: 'mem-plain', userId: 'mem-plain' } as AuthContext
-    expect(await momentMiniappLaunch(env, other, m.id)).toMatchObject({ ok: false, error: 'not_found' })
-    expect(await momentMiniappLaunch(env, agentAuth(), crypto.randomUUID())).toMatchObject({ ok: false, error: 'not_found' })
-    expect(await momentMiniappLaunch(env, agentAuth(), 'x'.repeat(200))).toMatchObject({ ok: false, error: 'not_found' })
-    harness.sqlite.exec("UPDATE secure_moments SET status = 'consumed'")
-    expect(await momentMiniappLaunch(env, agentAuth(), m.id)).toMatchObject({ ok: false, error: 'moment_closed' })
-    const r = await invokeTool(agentAuth(), env, 'moment_miniapp_link', {}, 'https://pot.test')
-    expect(r.ok).toBe(false)
-  })
-  it('an agent with no bound identity matches no moment (a null requester is never "the filer")', async () => {
-    const m = await fileSeed()
-    harness.sqlite.exec('UPDATE secure_moments SET requester_agent_id = NULL')
+    expect(await requestMomentDelivery(env, other, m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'not_found' })
+    expect(await requestMomentDelivery(env, agentAuth(), crypto.randomUUID(), 'mem-owner')).toMatchObject({ ok: false, error: 'not_found' })
+    expect(await requestMomentDelivery(env, agentAuth(), 'x'.repeat(200), 'mem-owner')).toMatchObject({ ok: false, error: 'not_found' })
     const unbound = { ...agentAuth(), boundAgentId: undefined } as AuthContext
-    expect(await momentMiniappLaunch(env, unbound, m.id)).toMatchObject({ ok: false, error: 'not_found' })
+    harness.sqlite.exec('UPDATE secure_moments SET requester_agent_id = NULL')
+    expect(await requestMomentDelivery(env, unbound, m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'not_found' })
+    harness.sqlite.exec("UPDATE secure_moments SET requester_agent_id = 'agent-x', status = 'consumed'")
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'moment_closed' })
+    expect((await invokeTool(agentAuth(), env, 'moment_miniapp_link', {}, 'https://pot.test')).ok).toBe(false)
+    expect(calls).toHaveLength(0)
+    expect(count('tg_miniapp_deliveries')).toBe(0)
+  })
+  it('the target must be an active human bound to Telegram AND able to decide this moment: otherwise nothing is sent', async () => {
+    const calls = stubBotApi()
+    const m = await fileSeed()
+    const to = (id: string | undefined) => requestMomentDelivery(env, agentAuth(), m.id, id)
+    expect(await to(undefined)).toMatchObject({ ok: false, error: 'member_required' })
+    expect(await to('mem-plain')).toMatchObject({ ok: false, error: 'target_not_reachable' })   // bound, but no authority over a seed
+    expect(await to('mem-agent')).toMatchObject({ ok: false, error: 'target_not_reachable' })   // agent-welded
+    expect(await to('mem-other')).toMatchObject({ ok: false, error: 'target_not_reachable' })   // another tenant
+    expect(await to('no-such-member')).toMatchObject({ ok: false, error: 'target_not_reachable' })
+    harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-owner'")
+    expect(await to('mem-owner')).toMatchObject({ ok: false, error: 'target_not_reachable' })   // unbound
+    expect(calls).toHaveLength(0)
+    harness.sqlite.exec(`UPDATE members SET telegram_chat_id = '${TG.owner}' WHERE id = 'mem-owner'`)
+    harness.sqlite.prepare('UPDATE secure_moments SET decider_member_id = ?').run('mem-sqadmin')
+    expect(await to('mem-owner')).toMatchObject({ ok: false, error: 'member_required' })       // the moment names another decider
+    expect(calls).toHaveLength(0)
+  })
+  it('an elevation goes only to a member whose scope-local authority covers it', async () => {
+    const calls = stubBotApi()
+    const m = await fileElevation(['action:project_status'])
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-plain')).toMatchObject({ ok: false, error: 'target_not_reachable' })
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-sqadmin')).toMatchObject({ ok: true })
+    expect(calls).toHaveLength(1)
+    expect(calls[0].body.chat_id).toBe(String(TG.sqadmin))
+  })
+  it('a credential moment (W2) is refused: the Mini App never carries a secret', async () => {
+    const calls = stubBotApi()
+    const m = await fileSeed()
+    harness.sqlite.exec('PRAGMA ignore_check_constraints = ON')
+    harness.sqlite.exec("UPDATE secure_moments SET kind = 'credential'")
+    harness.sqlite.exec('PRAGMA ignore_check_constraints = OFF')
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, error: 'kind_not_supported' })
+    expect(calls).toHaveLength(0)
+  })
+  it('is rate limited per member, and a failing Bot API is a failed receipt with no secret in it', async () => {
+    const calls = stubBotApi()
+    const m = await fileSeed()
+    for (let i = 0; i < 5; i++) expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: true })
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, status: 429, error: 'rate_limited' })
+    expect(calls).toHaveLength(5)
+    harness.sqlite.exec('DELETE FROM tg_miniapp_deliveries')
+    stubBotApi(500)
+    expect(await requestMomentDelivery(env, agentAuth(), m.id, 'mem-owner')).toMatchObject({ ok: false, status: 502, error: 'send_failed' })
+    expect(JSON.stringify(harness.sqlite.prepare('SELECT * FROM tg_miniapp_deliveries').all())).not.toContain(BOT_TOKEN)
+  })
+  it('sendMiniappButton never sends to a group chat id or a malformed chat id, and never puts the token in an error', async () => {
+    const calls = stubBotApi()
+    for (const chatId of ['-100123', '0', '1e3', '12 3', '', 'abc']) {
+      expect(await sendMiniappButton(env, { chatId, path: '/m/tg/x', buttonText: 'b', text: 't' })).toEqual({ ok: false, error: 'chat_unreachable' })
+    }
+    expect(calls).toHaveLength(0)
+    vi.stubGlobal('fetch', async () => { throw new Error(`boom ${BOT_TOKEN}`) })
+    const r = await sendMiniappButton(env, { chatId: '1001', path: '/m/tg/x', buttonText: 'b', text: 't' })
+    expect(r).toEqual({ ok: false, error: 'send_failed' })
+    expect(JSON.stringify(r)).not.toContain(BOT_TOKEN)
   })
 })
 
