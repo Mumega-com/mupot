@@ -117,7 +117,7 @@ describe('/mcp is unchanged (regression guard)', () => {
     const { json } = await rpc('/', 'tools/list', undefined, {}, makeEnv())
     const tools = json!.result.tools as Array<{ name: string; annotations?: unknown }>
     // SEAT_AUTO_ENROLL is unset in this env: the flag-gated seat_select (mupot#1794) is not advertised.
-    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => t.name))
+    expect(tools.map((t) => t.name)).toEqual(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && !SECURE_DROP_NOT_LISTED.includes(t.name)).map((t) => t.name))
     expect(tools.length).toBeGreaterThan(NEEDS_YOU_PROFILE.length * 5)
     // mupot#1709: every /mcp entry now ALSO carries `annotations` (tests/mcp-tool-annotations.test.ts pins
     // their values). Deliberate update: the pre-#1709 shape had none. Everything else is unchanged.

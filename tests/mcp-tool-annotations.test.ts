@@ -66,7 +66,7 @@ describe('the full /mcp tools/list response includes them', () => {
     // SEAT_AUTO_ENROLL is unset here: flag-gated seat_select (mupot#1794) is not advertised.
     // SECURE_DROP is unset as well: the five secure-drop tools (W2) are not advertised either.
     const DROP = ['host_key_register', 'credential_request', 'secure_drop_pull', 'secure_drop_ack', 'secure_drop_revoke']
-    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && !DROP.includes(t.name)).length)
+    expect(body.result.tools.length).toBe(TOOLS.filter((t) => t.name !== 'seat_select' && t.name !== 'seed_attach_request' && t.name !== 'moment_miniapp_link' && !DROP.includes(t.name)).length)
     for (const t of body.result.tools) {
       expect(t.annotations, t.name).toEqual(toolAnnotations(t.name))
       expect(Object.keys(t.annotations ?? {}).sort(), t.name).toEqual(['destructiveHint', 'openWorldHint', 'readOnlyHint'])
@@ -152,7 +152,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'update_agent', 'update_squad',
   ]
   const ALL_OPEN_WORLD = [
-    'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'office.health',
+    'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',
     'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki',
     'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
     'task_submit_result', 'task_update', 'wake_agent',

@@ -5,8 +5,13 @@
 import type { Env } from '../types'
 import type { ValidatedSeed } from '../seeds/apply'
 
-/** Which human-proof channel carried a decision (migration 0212 widened the CHECK to both). */
-export type DecisionVia = 'access_passkey' | 'webauthn'
+/** Which human-proof channel carried a decision (0212 widened the CHECK to webauthn, 0214 to telegram_miniapp). */
+export type DecisionVia = 'access_passkey' | 'webauthn' | 'telegram_miniapp'
+
+/** The audit `handler` for a decision channel: every secure-moments channel is 'secure_moment', the Access page 'access_approve'. */
+export function receiptHandlerFor(via: DecisionVia): 'secure_moment' | 'access_approve' {
+  return via === 'access_passkey' ? 'access_approve' : 'secure_moment'
+}
 
 export const SEED_REQUEST_TTL_MS = 24 * 60 * 60 * 1000
 /** Live pending requests one requester may hold: a flood cap, so an agent cannot bury the real ask. */
@@ -143,7 +148,7 @@ export async function denySeedRequest(env: Env, row: SeedRequestRow, memberId: s
        SELECT ?1, ?2, 'member', ?3, ?3, 'admin_ui', ?9, 'seed_request_deny', 'seed_attach_request', ?4, ?5, ?6, ?7, ?8
         WHERE changes() = 1
        ON CONFLICT DO NOTHING`,
-    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, row.id, `access-seed-deny:${row.id}`, row.seed_sha256, evidence, nowIso, via === 'webauthn' ? 'secure_moment' : 'access_approve'),
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, row.id, `access-seed-deny:${row.id}`, row.seed_sha256, evidence, nowIso, receiptHandlerFor(via)),
   ])
   return out[0].meta.changes === 1
 }

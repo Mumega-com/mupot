@@ -47,6 +47,9 @@ import { SETTINGS_KEYS, getSetting, isValidBotUsername } from './settings'
 import { pageHeader, sectionPanel, pill, emptyState, type Html } from './ui'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { mintEnrolmentLink } from '../secure-moments/enrol-mint'
+import { requestEnrolDelivery } from '../secure-moments/telegram-miniapp-enrol-delivery'
+import { telegramMiniappStatus } from '../secure-moments/telegram-miniapp-config'
+import { listMemberTgDevices, revokeOwnTgDevice } from '../secure-moments/telegram-miniapp-store'
 import { listMemberPasskeys, revokeOwnPasskey } from '../secure-moments/store'
 
 type ShellFn = (
@@ -478,6 +481,61 @@ export async function passkeySectionBody(env: Env, auth: AuthContext): Promise<H
   `
 }
 
+function telegramDeviceScript(): Html {
+  return raw(`
+    <script>
+      (function () {
+        var add = document.getElementById('tgd-add');
+        var status = document.getElementById('tgd-status');
+        if (add) add.addEventListener('click', async function () {
+          add.disabled = true;
+          if (status) status.textContent = 'sending…';
+          try {
+            var res = await fetch('/account/telegram-device/enrol', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
+            var data = await res.json().catch(function () { return {}; });
+            if (res.ok && data.sent) { if (status) status.textContent = 'Sent. Open the new message from the approvals bot in Telegram on your phone and tap the button (it is valid for 10 minutes).'; }
+            else if (data.error === 'reauth_required') {
+              if (status) { status.textContent = ''; var a = document.createElement('a'); a.href = '/auth/reauth'; a.textContent = 'Confirm it is you first'; status.appendChild(a); status.appendChild(document.createTextNode(', then come back and try again.')); }
+            } else if (data.error === 'telegram_not_bound') { if (status) status.textContent = 'Connect Telegram in the section above first; the setup button is sent to that private chat.'; }
+            else if (data.error === 'rate_limited') { if (status) status.textContent = 'Too many messages just now. Wait a few minutes.'; }
+            else if (data.error === 'chat_unreachable') { if (status) status.textContent = 'Telegram would not deliver it: open the approvals bot in Telegram and press Start once, then try again.'; }
+            else if (status) { status.textContent = 'Could not send (' + (data.error || res.status) + ').'; }
+          } catch (e) { if (status) status.textContent = 'Network error — try again.'; }
+          add.disabled = false;
+        });
+        var rm = document.querySelectorAll('button[data-tgd-revoke]');
+        for (var i = 0; i < rm.length; i++) rm[i].addEventListener('click', async function (ev) {
+          if (!window.confirm('Remove this phone? Decisions from it will stop working until you set it up again.')) return;
+          var id = ev.currentTarget.getAttribute('data-tgd-revoke');
+          var res = await fetch('/account/telegram-device/' + encodeURIComponent(id) + '/revoke', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' } });
+          if (res.ok) window.location.reload(); else if (status) status.textContent = 'Could not remove (' + res.status + ').';
+        });
+      })();
+    </script>`)
+}
+
+/** The Telegram device section: only while the Mini App channel is on; adds no authority (docs/architecture/secure-moments.md, W4). */
+export async function telegramDeviceSectionBody(env: Env, auth: AuthContext): Promise<Html | null> {
+  if (telegramMiniappStatus(env).state !== 'on') return null
+  if (!auth.memberId) return null
+  const devices = await listMemberTgDevices(env, auth.memberId)
+  return html`
+    <p class="ui-sub">A set-up phone lets you approve requests inside Telegram with your fingerprint or face. It is weaker than a passkey, so sensitive grants still need a passkey. It adds no permissions: it only proves it is you.</p>
+    ${devices.length === 0
+      ? html`<p class="ui-sub" style="margin-top:8px;">${pill('No phone set up', 'dim')}</p>`
+      : html`<ul style="margin-top:8px;">${devices.map((d) => html`<li>Set up ${formatWhen(d.confirmed_at ?? d.created_at)}${d.last_used_at ? html` · last used ${formatWhen(d.last_used_at)}` : ''}
+          <button class="btn danger" data-tgd-revoke="${d.id}">Remove</button></li>`)}</ul>`}
+    <button class="btn" id="tgd-add" style="margin-top:10px;">Set up this phone</button>
+    <div class="status-line" id="tgd-status"></div>
+    ${telegramDeviceScript()}
+  `
+}
+
+async function telegramDevicePanel(env: Env, auth: AuthContext): Promise<Html> {
+  const body = await telegramDeviceSectionBody(env, auth)
+  return body ? sectionPanel({ title: 'Telegram device', body }) : html``
+}
+
 async function passkeyPanel(env: Env, auth: AuthContext): Promise<Html> {
   const body = await passkeySectionBody(env, auth)
   return body ? sectionPanel({ title: 'Passkeys', body }) : html``
@@ -492,6 +550,7 @@ async function accountPageBody(env: Env, auth: AuthContext): Promise<Html> {
     })}
     ${sectionPanel({ title: 'Telegram', body: await telegramSectionBody(env, auth) })}
     ${await passkeyPanel(env, auth)}
+    ${await telegramDevicePanel(env, auth)}
   `
 }
 
@@ -512,6 +571,29 @@ export function makeAccountApp(shell: ShellFn) {
     const r = await mintEnrolmentLink(c.env, c.get('auth'))
     c.header('Cache-Control', 'no-store')
     return r.ok ? c.json({ url: r.url, expires_at: r.expiresAt }) : c.json({ error: r.error }, r.status)
+  })
+
+  // "Set up this phone" (secure moments W4, flag TELEGRAM_MINIAPP): the SAME session rules as the passkey link
+  // (checkEnrolmentSession). The WORKER mints the single-use link and sends it as a web_app button to this member's own bound
+  // private chat; no link or URL is ever returned here. Same-origin only.
+  app.post('/account/telegram-device/enrol', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const r = await requestEnrolDelivery(c.env, c.get('auth'))
+    c.header('Cache-Control', 'no-store')
+    return r.ok ? c.json({ sent: true, delivery_id: r.delivery_id, sent_at: r.sent_at }) : c.json({ error: r.error }, r.status)
+  })
+
+  app.post('/account/telegram-device/:id/revoke', async (c) => {
+    if (c.req.header('origin') !== new URL(c.req.url).origin) return c.json({ error: 'cross_origin' }, 403)
+    const auth = c.get('auth')
+    if (telegramMiniappStatus(c.env).state !== 'on') return c.json({ error: 'not_enabled' }, 404)
+    // Self only: the member behind THIS web session, never a member id from the request.
+    if (!auth.webSessionIdHash || !auth.webSessionMemberId || auth.webSessionMemberId !== auth.memberId || !auth.memberId) {
+      return c.json({ error: 'not_a_web_session' }, 403)
+    }
+    return (await revokeOwnTgDevice(c.env, auth.memberId, c.req.param('id')))
+      ? c.json({ revoked: true })
+      : c.json({ error: 'not_found' }, 404)
   })
 
   app.post('/account/passkey/:id/revoke', async (c) => {

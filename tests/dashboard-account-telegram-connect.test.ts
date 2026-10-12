@@ -21,6 +21,7 @@ import {
   capabilityAtRank,
   loadConnectableSquads,
   loadSelfMember,
+  telegramDeviceSectionBody,
   telegramSectionBody,
 } from '../src/dashboard/account'
 import { createProjectInvite, redeemTelegramProjectInvite } from '../src/members/project-invites'
@@ -388,6 +389,11 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     // test exercises it directly (same SESSIONS KV + cookie as the dashboard
     // request above) rather than through the top-level app, mirroring how
     // tests/telegram-project-onboarding.test.ts already exercises membersApp.
+    // A Mini App device (secure moments W4) is bound to the Telegram account this member was linked to.
+    harness.sqlite.prepare(
+      `INSERT INTO tg_miniapp_devices (id, tenant, member_id, telegram_user_id, login_identity_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+       VALUES ('dev-1', ?, 'member-admin', '9500001', 'ident-member-admin', 'tok-1', ?, datetime('now'), datetime('now'))`,
+    ).run(TENANT, 'a'.repeat(64))
     const unbindRes = await membersApp.request(
       '/members/member-admin/telegram',
       // The exact headers account.ts's disconnectScript() sends (content-type
@@ -400,6 +406,8 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
     const unbindBody = await unbindRes.json() as { member_id: string; telegram_unbound: boolean }
     expect(unbindBody).toEqual({ member_id: 'member-admin', telegram_unbound: true })
 
+    // Unlinking Telegram ends the phone bound to it, and says why.
+    expect(harness.sqlite.prepare("SELECT revoked_reason FROM tg_miniapp_devices WHERE id = 'dev-1' AND revoked_at IS NOT NULL").get()).toEqual({ revoked_reason: 'telegram_unbound' })
     const row = harness.sqlite.prepare(
       `SELECT telegram_chat_id, telegram_bound_at FROM members WHERE id = 'member-admin'`,
     ).get() as { telegram_chat_id: string | null; telegram_bound_at: string | null }
@@ -640,5 +648,38 @@ describe('dashboard My Account — Telegram connect/disconnect (integration thro
       capabilities: [{ member_id: 'member-plain', scope_type: 'squad', scope_id: 'squad-a', capability: 'member' }],
     }
     await expect(telegramSectionBody(env, plain)).resolves.toBeDefined()
+  })
+
+  describe('Telegram device section (secure moments W4)', () => {
+    const flagged = (extra: Record<string, string> = {}): Env => ({
+      DB: harness.db, TENANT_SLUG: TENANT, SECURE_MOMENTS: '1', SECURE_MOMENTS_HOST: 'secure.example.test',
+      TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: '123456789', TELEGRAM_MINIAPP_BOT_TOKEN: '123456789:AAEhqMY-dedicated-test-token', ...extra,
+    }) as unknown as Env
+    const admin: AuthContext = { userId: 'admin-user', email: 'admin@x.test', role: 'member', tenant: TENANT, memberId: 'member-admin' }
+
+    it('renders nothing while the channel is off or misconfigured, and for a caller with no member', async () => {
+      expect(await telegramDeviceSectionBody(flagged({ TELEGRAM_MINIAPP: '' }), admin)).toBeNull()
+      expect(await telegramDeviceSectionBody(flagged({ TELEGRAM_MINIAPP_BOT_TOKEN: '' }), admin)).toBeNull()
+      expect(await telegramDeviceSectionBody(flagged(), { userId: 'x', email: null, role: 'member', tenant: TENANT })).toBeNull()
+    })
+    it('lists the member\'s own active devices with a Remove button each, and a Set up this phone button that sends (no URL)', async () => {
+      harness.sqlite.exec(`
+        INSERT INTO tg_miniapp_devices (id, tenant, member_id, telegram_user_id, login_identity_id, enrolment_token_id, secret_sha256, created_at, confirmed_at)
+        VALUES ('dev-mine', '${TENANT}', 'member-admin', '9500001', 'x', 't1', '${'a'.repeat(64)}', datetime('now'), datetime('now')),
+               ('dev-theirs', '${TENANT}', 'member-plain', '9500002', 'x', 't2', '${'b'.repeat(64)}', datetime('now'), datetime('now')),
+               ('dev-gone', '${TENANT}', 'member-admin', '9500001', 'x', 't3', '${'c'.repeat(64)}', datetime('now'), datetime('now'));
+        UPDATE tg_miniapp_devices SET revoked_at = datetime('now') WHERE id = 'dev-gone';`)
+      const html = String(await telegramDeviceSectionBody(flagged(), admin))
+      expect(html).toContain('data-tgd-revoke="dev-mine"')
+      expect(html).not.toContain('dev-theirs')
+      expect(html).not.toContain('dev-gone')
+      expect(html).toContain('id="tgd-add"')
+      expect(html).toContain('Set up this phone')
+      expect(html).toContain('/account/telegram-device/enrol')
+      expect(html).not.toMatch(/\/m\/tg\/enrol|secure\.example\.test/) // the page never learns a link
+    })
+    it('an empty list says so', async () => {
+      expect(String(await telegramDeviceSectionBody(flagged(), admin))).toContain('No phone set up')
+    })
   })
 })

@@ -280,6 +280,12 @@ export interface Env {
   // MCP URL-mode elicitation of secure-moment links (docs/architecture/secure-moments.md, W3). OFF unless '1' or 'true';
   // inert unless SECURE_MOMENTS is also usable and CONNECTOR_MASTER_KEY is set.
   MCP_URL_ELICITATION?: string
+  // Telegram Mini App adapter for secure moments (W4). OFF unless TELEGRAM_MINIAPP is '1' or 'true' AND SECURE_MOMENTS is on.
+  TELEGRAM_MINIAPP?: string
+  TELEGRAM_MINIAPP_BOT_ID?: string            // numeric id of the DEDICATED bot (its token only the worker holds); part of the signed string
+  TELEGRAM_MINIAPP_BOT_TOKEN?: string         // REQUIRED worker SECRET (wrangler secret put) of the DEDICATED Mini App bot: used ONLY to send the web_app button, never to validate initData
+  TELEGRAM_MINIAPP_MAX_AGE_SECONDS?: string   // initData auth_date freshness, default 300, cap 3600
+  TELEGRAM_MINIAPP_EXTRA_PUBKEYS?: string     // staging only: extra Ed25519 keys (64-hex, comma separated); production accepts Telegram's production key alone
   // Secret-env taker: CF Workers Secrets API bootstrap (fail-closed when incomplete).
   // Deploy setup: wrangler.example.toml (SECRET_ENV_CF_* block).
   // SECRET_ENV_CF_API_TOKEN MUST be set via `wrangler secret put` — never in [vars].

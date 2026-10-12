@@ -22,6 +22,7 @@
 import type { Env } from '../types'
 import { sha256Hex } from '../members/service'
 import { revokeMemberPasskeys } from '../secure-moments/store'
+import { revokeMemberTgDevices } from '../secure-moments/telegram-miniapp-store'
 
 // ── tunables (design v1 policy) ──────────────────────────────────────────────
 
@@ -430,6 +431,8 @@ export async function revokeAllWebSessions(
   // "other devices" variant; the member re-enrols from /account, which needs a fresh re-authentication). Sessions are
   // revoked FIRST, so a failure here can never leave every session live; it still surfaces to the caller.
   await revokeMemberPasskeys(env, memberId, `sessions_revoked:${reason}`, {}, nowMs)
+  // The Telegram Mini App device secret (secure moments W4) is the same kind of second door: same lever, same moment.
+  await revokeMemberTgDevices(env, memberId, `sessions_revoked:${reason}`, {}, nowMs)
   return { revokedCount: Number(result.meta?.changes ?? 0) }
 }
 

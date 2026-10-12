@@ -3816,9 +3816,50 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "passkey_challenges_new" },
     ],
   },
+  {
+    file: "0214_telegram_miniapp.sql",
+    sha256: "5ea59f50ebb10006b88f485f4b5f986ce7f042b84d9b917a33bbcc373cbbf916",
+    statements: [
+      "-- 0214_telegram_miniapp.sql — secure moments, wave W4: the Telegram Mini App adapter\n-- (docs/architecture/secure-moments.md, \"W4\"). Self-contained: it touches only the tables below and rebuilds\n-- seed_attach_requests (widening decided_via to telegram_miniapp); 0213 (secure drops) does not touch that table.\n--\n-- A Telegram \"device\" is a biometric-unlocked secret the Mini App keeps in Telegram's BiometricManager storage.\n-- It is attested only by the Telegram client (weaker than a WebAuthn passkey) and is therefore bound to a member\n-- AND a Telegram user id AND a live login identity, stored only as a sha256, and revoked by the same levers as a\n-- passkey. It proves a second factor on top of initData; it never grants authority.\n\n-- Single-use, 10-minute link minted from a live dashboard session (same rules as the passkey enrolment link).\n-- Opening it inside the Mini App enrols a device for the member it names, and only if the Telegram user that opens\n-- it IS that member (through the existing members.telegram_chat_id binding).\nCREATE TABLE IF NOT EXISTS tg_miniapp_enrolment_tokens (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,\n  login_identity_id TEXT,\n  token_sha256 TEXT NOT NULL UNIQUE CHECK (\n    length(token_sha256) = 64 AND token_sha256 = lower(token_sha256) AND token_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  consumed_at TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_tg_miniapp_enrolment_tokens_member\n  ON tg_miniapp_enrolment_tokens(tenant, member_id, consumed_at);",
+      "\n\n-- Pending = confirmed_at IS NULL (issued, not yet proven to round-trip through BiometricManager); active = confirmed\n-- and not revoked. At most ONE pending device per enrolment link.\nCREATE TABLE IF NOT EXISTS tg_miniapp_devices (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,\n  telegram_user_id TEXT NOT NULL CHECK (telegram_user_id NOT GLOB '*[^0-9]*' AND telegram_user_id GLOB '[1-9]*'),\n  login_identity_id TEXT,\n  enrolment_token_id TEXT NOT NULL,\n  secret_sha256 TEXT NOT NULL CHECK (\n    length(secret_sha256) = 64 AND secret_sha256 = lower(secret_sha256) AND secret_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  created_at TEXT NOT NULL,\n  confirmed_at TEXT,\n  last_used_at TEXT,\n  revoked_at TEXT,\n  revoked_reason TEXT\n);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_tg_miniapp_devices_pending_token\n  ON tg_miniapp_devices(enrolment_token_id)\n  WHERE confirmed_at IS NULL AND revoked_at IS NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_tg_miniapp_devices_member\n  ON tg_miniapp_devices(tenant, member_id, revoked_at);",
+      "\n\n-- Which channel decided a moment: secure_moments.decided_via only allows 'webauthn', and that table is not rebuilt\n-- here, so a Telegram decision leaves decided_via NULL and lands one row here in the SAME batch as the consume.\nCREATE TABLE IF NOT EXISTS tg_miniapp_decisions (\n  moment_id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  member_id TEXT NOT NULL,\n  telegram_user_id TEXT NOT NULL,\n  device_id TEXT NOT NULL,\n  decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),\n  decided_at TEXT NOT NULL\n);",
+      "\n\n-- Device secrets ROTATE on every successful decision: the old digest moves here. A retired digest presented later is a\n-- harvested copy being replayed: the device is revoked on the spot and a receipt written (the genuine client already\n-- holds the next secret, so only a copy can present a retired one).\nCREATE TABLE IF NOT EXISTS tg_miniapp_retired_secrets (\n  secret_sha256 TEXT PRIMARY KEY CHECK (\n    length(secret_sha256) = 64 AND secret_sha256 = lower(secret_sha256) AND secret_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  tenant TEXT NOT NULL,\n  device_id TEXT NOT NULL,\n  retired_at TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_tg_miniapp_retired_secrets_device\n  ON tg_miniapp_retired_secrets(tenant, device_id);",
+      "\n\n-- The Telegram channel's OWN single-use decision nonces (separate from passkey_challenges so a flood on one channel\n-- cannot exhaust the other's cap). Bound to moment + member + Telegram user + decision + parameter digest. Only sha256 stored.\nCREATE TABLE IF NOT EXISTS tg_miniapp_nonces (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  nonce_sha256 TEXT NOT NULL UNIQUE CHECK (\n    length(nonce_sha256) = 64 AND nonce_sha256 = lower(nonce_sha256) AND nonce_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  moment_id TEXT NOT NULL,\n  member_id TEXT NOT NULL,\n  telegram_user_id TEXT NOT NULL,\n  decision TEXT NOT NULL CHECK (decision IN ('approve', 'deny')),\n  payload_sha256 TEXT NOT NULL,\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  consumed_at TEXT\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_tg_miniapp_nonces_open\n  ON tg_miniapp_nonces(tenant, moment_id, member_id, consumed_at);",
+      "\n\n-- Delivery receipts: the WORKER sends the Mini App button (Bot API sendMessage, web_app button) from the dedicated bot.\n-- One row per attempt; it is also the rate-limit ledger. No URL or token is stored.\nCREATE TABLE IF NOT EXISTS tg_miniapp_deliveries (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  kind TEXT NOT NULL CHECK (kind IN ('moment', 'enrol')),\n  subject_id TEXT NOT NULL,\n  member_id TEXT NOT NULL,\n  requested_by TEXT NOT NULL,\n  status TEXT NOT NULL CHECK (status IN ('reserved', 'sent', 'failed')),\n  error TEXT,\n  telegram_message_id TEXT,\n  created_at TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_tg_miniapp_deliveries_member\n  ON tg_miniapp_deliveries(tenant, member_id, created_at);",
+      "\n\n-- 0212 allowed decided_via IN ('access_passkey', 'webauthn'). SQLite cannot alter a CHECK, so seed_attach_requests\n-- is rebuilt once more to also allow 'telegram_miniapp': same columns, constraints, rows and both indexes.\nCREATE TABLE seed_attach_requests_new (\n  id TEXT PRIMARY KEY,\n  tenant TEXT NOT NULL,\n  requester_member_id TEXT NOT NULL,\n  requester_agent_id TEXT,\n  seed_sha256 TEXT NOT NULL CHECK (\n    length(seed_sha256) = 64 AND seed_sha256 = lower(seed_sha256) AND seed_sha256 NOT GLOB '*[^0-9a-f]*'\n  ),\n  canonical_json TEXT NOT NULL CHECK (json_valid(canonical_json)),\n  requests_json TEXT NOT NULL CHECK (json_valid(requests_json)),\n  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applying', 'applied', 'denied', 'failed', 'expired')),\n  created_at TEXT NOT NULL,\n  expires_at TEXT NOT NULL,\n  decided_at TEXT,\n  decided_by_member_id TEXT,\n  decided_via TEXT CHECK (decided_via IS NULL OR decided_via IN ('access_passkey', 'webauthn', 'telegram_miniapp')),\n  decision_error TEXT\n);",
+      "\n\nINSERT INTO seed_attach_requests_new\n  (id, tenant, requester_member_id, requester_agent_id, seed_sha256, canonical_json, requests_json,\n   status, created_at, expires_at, decided_at, decided_by_member_id, decided_via, decision_error)\nSELECT id, tenant, requester_member_id, requester_agent_id, seed_sha256, canonical_json, requests_json,\n       status, created_at, expires_at, decided_at, decided_by_member_id, decided_via, decision_error\n  FROM seed_attach_requests;",
+      "\n\nDROP TABLE seed_attach_requests;",
+      "\n\nALTER TABLE seed_attach_requests_new RENAME TO seed_attach_requests;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_seed_attach_requests_requester\n  ON seed_attach_requests(tenant, requester_member_id, status, expires_at);",
+      "\n\nCREATE UNIQUE INDEX IF NOT EXISTS uq_seed_attach_requests_pending_identity\n  ON seed_attach_requests(tenant, requester_member_id, seed_sha256)\n  WHERE status = 'pending';",
+    ],
+    objects: [
+      { type: "table", name: "tg_miniapp_enrolment_tokens" },
+      { type: "index", name: "idx_tg_miniapp_enrolment_tokens_member" },
+      { type: "table", name: "tg_miniapp_devices" },
+      { type: "index", name: "uq_tg_miniapp_devices_pending_token" },
+      { type: "index", name: "idx_tg_miniapp_devices_member" },
+      { type: "table", name: "tg_miniapp_decisions" },
+      { type: "table", name: "tg_miniapp_retired_secrets" },
+      { type: "index", name: "idx_tg_miniapp_retired_secrets_device" },
+      { type: "table", name: "tg_miniapp_nonces" },
+      { type: "index", name: "idx_tg_miniapp_nonces_open" },
+      { type: "table", name: "tg_miniapp_deliveries" },
+      { type: "index", name: "idx_tg_miniapp_deliveries_member" },
+      { type: "table", name: "seed_attach_requests_new" },
+      { type: "index", name: "idx_seed_attach_requests_requester" },
+      { type: "index", name: "uq_seed_attach_requests_pending_identity" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "052ef8ecdc14fa1ba5984b91ea8cfb24fa84c65dd4a7cbec949b7d0cb577b6c5"
+export const SCHEMA_CHAIN_DIGEST: string = "b7febcca0b1f9e188b4eafa4e8ad9b24ed74c101868998653dfa205aec4e05e5"
