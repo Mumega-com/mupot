@@ -772,3 +772,40 @@ describe('P2-6: scope_id normalisation matches request_elevation storage', () =>
     expect(count('elevation_requests')).toBe(1)
   })
 })
+
+describe('round 2 survivors pinned', () => {
+  it('findSameAsk (elevation): the AGENT filter alone (session and moment owner both say yes)', async () => {
+    const env = makeEnv()
+    await checkIn(env)
+    const sid = (await initWithUrl(env)) ?? ''
+    await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs() }, { headers: sh(sid) })
+    const session = sessionOf('tok-1')
+    harness.sqlite.exec("UPDATE secure_moments SET requester_agent_id = 'agent-y'")
+    expect(await findSameAsk(env, authFor({ boundAgentId: 'agent-y' }), 'elevation', elevArgs(), session, Date.now())).toBeNull()
+    expect(await findSameAsk(env, authFor(), 'elevation', elevArgs(), session, Date.now())).toBeNull() // moment owner now differs for the true agent
+  })
+
+  it('a valid elevation state with no live agent session is refused (principal), never run', async () => {
+    const env = makeEnv()
+    await checkIn(env)
+    const first = await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs(), _meta: modernMeta() }, { headers: modernHeaders })
+    const state = (first.json.result as { requestState: string }).requestState
+    harness.sqlite.exec("UPDATE agent_sessions SET revoked_at = datetime('now')")
+    const r = await rpc(env, 'tools/call', { name: 'request_elevation', arguments: elevArgs(), requestState: state, _meta: modernMeta() }, { headers: modernHeaders })
+    expect(r.json.error?.code).toBe(-32602)
+    expect(r.json.error?.data).toBe('principal')
+  })
+
+  it('a pending seed ask older than the retry window is re-asked through the tool (reuse + fresh elicitation), not answered as a retry', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-01T00:00:00Z'))
+    const env = makeEnv()
+    const sid = (await initWithUrl(env)) ?? ''
+    const call = () => rpc(env, 'tools/call', { name: 'seed_attach_request', arguments: { seed: seedText } }, { headers: sh(sid) })
+    expect((await call()).json.error?.code).toBe(-32042)
+    vi.setSystemTime(new Date('2026-09-01T00:30:00Z'))
+    const again = await call()
+    expect(again.json.error?.code).toBe(-32042)
+    expect(count('seed_attach_requests')).toBe(1) // the tool reused the request
+  })
+})
