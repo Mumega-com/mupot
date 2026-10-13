@@ -16,18 +16,17 @@ export const SELECT_SEARCH_SCRIPT = `
           box.style.display = 'block'; box.style.width = '100%'; box.style.maxWidth = '420px'; box.style.marginBottom = '4px';
           sel.parentNode.insertBefore(box, sel);
           box.addEventListener('input', function () {
-            // Filter only. Never auto-pick an option and never fire 'change':
-            // the human clicks the one they mean (review on #1881).
+            // Filter only. Never auto-pick, never fire 'change', and never hide
+            // the current choice: what will be submitted always stays visible
+            // (review on #1881).
             var q = box.value.trim().toLowerCase();
             var shown = 0;
             for (var i = 0; i < sel.options.length; i++) {
               var o = sel.options[i];
-              var hit = !q || o.text.toLowerCase().indexOf(q) !== -1;
+              var hit = !q || o.selected || o.text.toLowerCase().indexOf(q) !== -1;
               o.hidden = !hit;
               if (hit) shown++;
             }
-            var cur = sel.options[sel.selectedIndex];
-            if (cur && cur.hidden) sel.selectedIndex = -1;
             sel.size = q ? Math.min(Math.max(shown, 2), 8) : 0;
           });
           box.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); sel.focus(); } });
