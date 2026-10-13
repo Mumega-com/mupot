@@ -1387,6 +1387,11 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       seedAuthorizedOwner('agent-d', 'member-d', 'task-d')
       await expectRefusedClean({ ...harnessAuth('agent-d'), channel: 'directory' } as AuthContext, 'task-d')
     })
+    it('missing or non-workspace channel fails closed (allowlist, not denylist)', async () => {
+      seedAuthorizedOwner('agent-nc', 'member-nc', 'task-nc')
+      await expectRefusedClean({ ...harnessAuth('agent-nc'), channel: undefined } as AuthContext, 'task-nc')
+      await expectRefusedClean({ ...harnessAuth('agent-nc'), channel: 'im' } as AuthContext, 'task-nc')
+    })
     it('consentedByMemberId alone is refused', async () => {
       seedAuthorizedOwner('agent-c', 'member-c', 'task-c')
       await expectRefusedClean({ ...harnessAuth('agent-c'), consentedByMemberId: 'member-c' } as AuthContext, 'task-c')

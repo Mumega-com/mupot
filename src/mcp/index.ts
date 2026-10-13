@@ -2500,7 +2500,7 @@ const toolTaskVerdict: ToolSpec = {
       if (
         !auth.boundAgentId ||
         !isHumanOriginAttestorAgent(env, auth.boundAgentId) ||
-        auth.channel === 'directory' ||
+        auth.channel !== 'workspace' || // allowlist: unknown/missing channel fails closed; mint_agent_token issues 'workspace' (members/service.ts)
         auth.consentedByMemberId ||
         auth.seatBinding ||
         auth.harnessCredential
