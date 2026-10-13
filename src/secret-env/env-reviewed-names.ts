@@ -149,6 +149,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'STUDIO_DISPATCH_WINDOW_MINUTES',
   'SUPABASE_WEBHOOK_SECRET',
   'TASK_ARCHIVE_ENABLED', // mupot#1778: opt-in flag for task archiving (non-secret)
+  'DELEGATED_OPERATORS', // mumega-com#1386 W0: opt-in flag for delegated operators (non-secret)
   'TASK_WORKFLOW',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_BRIDGE_URL',

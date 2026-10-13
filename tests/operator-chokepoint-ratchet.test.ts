@@ -73,7 +73,7 @@ describe('ratchet 1: every MCP structural tool asks the chokepoint for its own a
       'bootstrap_self', 'connect', 'seat_select', 'addon_install', 'addon_activate', 'addon_configure', 'addon_disable',
       'addon_archive', 'addon_setup', 'create_department', 'secret_env_request',
     ])
-    const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|project_squad_access|gate_grants)\b/
+    const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|project_squad_access|gate_grants|project_repos)\b/
     const offenders: string[] = []
     for (const src of mcpSources) {
       if (!writes.test(src.text)) continue
@@ -103,7 +103,7 @@ describe('ratchet 1: every MCP structural tool asks the chokepoint for its own a
       'grant_gate_capability', 'revoke_gate_capability', 'mint_agent_token', 'revoke_agent_token', 'list_agent_tokens',
       'register_agent_key', 'provision_agent_connection', 'deactivate_agent', 'update_agent', 'update_squad',
       'create_department', 'mint_member_token', 'revoke_member_token', 'suspend_member', 'unbind_member_telegram',
-      'create_invite', 'manage_delegations', 'team_bootstrap',
+      'create_invite', 'manage_delegations', 'team_bootstrap', 'project_repo_set', 'project_repo_remove',
     ]) {
       const policy = STRUCTURAL_ACTIONS[forbidden as keyof typeof STRUCTURAL_ACTIONS]
       expect(policy, forbidden).toBeDefined()
@@ -174,7 +174,7 @@ describe('ratchet 3: the census of files that write structural tables can only s
     'src/org/team-bootstrap.ts', 'src/pots/service.ts', 'src/projects/client-bootstrap.ts', 'src/projects/service.ts',
     // W0 itself: the delegation tables are not structural, but the chokepoint receipts/lookups name them
   ])
-  const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|squads|departments|project_squad_access|gate_grants)\b/
+  const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|squads|departments|project_squad_access|gate_grants|project_repos)\b/
 
   it('no source file outside the reviewed set writes a structural table', () => {
     const found = walk(join(ROOT, 'src'))

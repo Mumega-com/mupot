@@ -3876,36 +3876,6 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
     ],
   },
   {
-    file: "0216_agent_operator_delegations.sql",
-    sha256: "c3e65731d122163ead6491ae3297ad87b1c6df6e11408ae4865c27436706f2fb",
-    statements: [
-      "-- 0216_agent_operator_delegations.sql — Operators + Admission, wave W0: delegated operators (mupot task 65b11e48,\n-- mumega-com#1386). Additive only; nothing reads these tables unless DELEGATED_OPERATORS is on (the HTTP-door fix\n-- for #1357 does not depend on them).\n--\n-- A delegation is a HUMAN's standing permission for ONE agent to organise structure inside ONE scope. It is not a\n-- capability grant and it never makes the agent an admin: max_grant is a CHECK-bounded ceiling of 'member' or 'lead'.\n-- The authority is re-derived on every request from the delegator's live rank (src/operators/chokepoint.ts), so a\n-- delegation whose delegator lost admin is inert even though this row is still live.\n\nCREATE TABLE IF NOT EXISTS agent_operator_delegations (\n  id                    TEXT PRIMARY KEY,\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL,\n  delegator_member_id   TEXT NOT NULL,\n  scope_type            TEXT NOT NULL CHECK (scope_type IN ('org', 'department', 'squad', 'project')),\n  -- NULL for org scope; a non-empty id for the other three. Enforced here, not only in code.\n  scope_id              TEXT,\n  max_grant             TEXT NOT NULL CHECK (max_grant IN ('member', 'lead')),\n  created_by_member_id  TEXT NOT NULL,\n  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  revoked_at            TEXT,\n  CHECK ((scope_type = 'org' AND scope_id IS NULL) OR (scope_type <> 'org' AND scope_id IS NOT NULL AND length(trim(scope_id)) > 0)),\n  -- The human who creates a delegation is the delegator: nobody delegates on someone else's authority.\n  CHECK (created_by_member_id = delegator_member_id)\n);",
-      "\n\n-- At most ONE live row per (agent, scope). Re-delegating after a revoke is a NEW row, so the history is never rewritten.\nCREATE UNIQUE INDEX IF NOT EXISTS uq_operator_delegation_live\n  ON agent_operator_delegations(tenant, agent_id, scope_type, COALESCE(scope_id, ''))\n  WHERE revoked_at IS NULL;",
-      "\n\nCREATE INDEX IF NOT EXISTS idx_operator_delegation_agent\n  ON agent_operator_delegations(tenant, agent_id) WHERE revoked_at IS NULL;",
-      "\nCREATE INDEX IF NOT EXISTS idx_operator_delegation_delegator\n  ON agent_operator_delegations(tenant, delegator_member_id);",
-      "\n\n-- A row is immutable except for the one-way NULL -> timestamp revoke. Nothing can un-revoke, widen max_grant, move the\n-- scope, or swap the delegator: those are all \"revoke and create a new row\", which is a human act with its own receipt.\nCREATE TRIGGER IF NOT EXISTS agent_operator_delegations_immutable\nBEFORE UPDATE ON agent_operator_delegations\nWHEN NOT (\n  OLD.revoked_at IS NULL\n  AND NEW.revoked_at IS NOT NULL\n  AND NEW.id = OLD.id AND NEW.tenant = OLD.tenant AND NEW.agent_id = OLD.agent_id\n  AND NEW.delegator_member_id = OLD.delegator_member_id\n  AND NEW.scope_type = OLD.scope_type AND COALESCE(NEW.scope_id, '') = COALESCE(OLD.scope_id, '')\n  AND NEW.max_grant = OLD.max_grant\n  AND NEW.created_by_member_id = OLD.created_by_member_id AND NEW.created_at = OLD.created_at\n)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_operator_delegations: only a one-way revoke is allowed');\nEND;",
-      "\n\nCREATE TRIGGER IF NOT EXISTS agent_operator_delegations_no_delete\nBEFORE DELETE ON agent_operator_delegations\nBEGIN\n  SELECT RAISE(ABORT, 'agent_operator_delegations: rows are never deleted');\nEND;",
-      "\n\n-- Every structural write an agent makes under a delegation leaves one row here BEFORE the write is attempted: \"agent X\n-- on behalf of member Y, under delegation Z, did act A on target T\". An authorization receipt, so an act that then fails\n-- downstream still leaves a row, and no applied write can exist without one. No foreign keys, on purpose (same reasoning\n-- as agent_audit, #857): the record must outlive the agent, the member and the delegation it names.\nCREATE TABLE IF NOT EXISTS operator_delegation_receipts (\n  seq                  INTEGER PRIMARY KEY AUTOINCREMENT,\n  id                   TEXT NOT NULL UNIQUE,\n  tenant               TEXT NOT NULL,\n  delegation_id        TEXT NOT NULL,\n  agent_id             TEXT NOT NULL,\n  delegator_member_id  TEXT NOT NULL,\n  action               TEXT NOT NULL,\n  surface              TEXT NOT NULL CHECK (surface IN ('mcp', 'http')),\n  target_scope_type    TEXT,\n  target_scope_id      TEXT,\n  detail               TEXT NOT NULL DEFAULT '{}',\n  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
-      "\n\nCREATE INDEX IF NOT EXISTS idx_operator_receipts_delegation ON operator_delegation_receipts(delegation_id, seq DESC);",
-      "\nCREATE INDEX IF NOT EXISTS idx_operator_receipts_agent ON operator_delegation_receipts(tenant, agent_id, seq DESC);",
-      "\n\nCREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_update\nBEFORE UPDATE ON operator_delegation_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only');\nEND;",
-      "\n\nCREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_delete\nBEFORE DELETE ON operator_delegation_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only');\nEND;",
-    ],
-    objects: [
-      { type: "table", name: "agent_operator_delegations" },
-      { type: "index", name: "uq_operator_delegation_live" },
-      { type: "index", name: "idx_operator_delegation_agent" },
-      { type: "index", name: "idx_operator_delegation_delegator" },
-      { type: "trigger", name: "agent_operator_delegations_immutable" },
-      { type: "trigger", name: "agent_operator_delegations_no_delete" },
-      { type: "table", name: "operator_delegation_receipts" },
-      { type: "index", name: "idx_operator_receipts_delegation" },
-      { type: "index", name: "idx_operator_receipts_agent" },
-      { type: "trigger", name: "operator_delegation_receipts_no_update" },
-      { type: "trigger", name: "operator_delegation_receipts_no_delete" },
-    ],
-  },
-  {
     file: "0216_workspaces.sql",
     sha256: "ae1ba5e58440eb9126f18c726925f7dd2121e59ead5d60f361794ea84124d6b8",
     statements: [
@@ -3937,9 +3907,39 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "table", name: "project_repos" },
     ],
   },
+  {
+    file: "0217_agent_operator_delegations.sql",
+    sha256: "605e4e2d30c38ff2b08f6f4dfcb8fbe3fdced07376207abe8b27d55fa3d44248",
+    statements: [
+      "-- 0217_agent_operator_delegations.sql — Operators + Admission, wave W0: delegated operators (mupot task 65b11e48,\n-- mumega-com#1386). Additive only; nothing reads these tables unless DELEGATED_OPERATORS is on (the HTTP-door fix\n-- for #1357 does not depend on them).\n--\n-- A delegation is a HUMAN's standing permission for ONE agent to organise structure inside ONE scope. It is not a\n-- capability grant and it never makes the agent an admin: max_grant is a CHECK-bounded ceiling of 'member' or 'lead'.\n-- The authority is re-derived on every request from the delegator's live rank (src/operators/chokepoint.ts), so a\n-- delegation whose delegator lost admin is inert even though this row is still live.\n\nCREATE TABLE IF NOT EXISTS agent_operator_delegations (\n  id                    TEXT PRIMARY KEY,\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL,\n  delegator_member_id   TEXT NOT NULL,\n  scope_type            TEXT NOT NULL CHECK (scope_type IN ('org', 'department', 'squad', 'project')),\n  -- NULL for org scope; a non-empty id for the other three. Enforced here, not only in code.\n  scope_id              TEXT,\n  max_grant             TEXT NOT NULL CHECK (max_grant IN ('member', 'lead')),\n  created_by_member_id  TEXT NOT NULL,\n  created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),\n  revoked_at            TEXT,\n  CHECK ((scope_type = 'org' AND scope_id IS NULL) OR (scope_type <> 'org' AND scope_id IS NOT NULL AND length(trim(scope_id)) > 0)),\n  -- The human who creates a delegation is the delegator: nobody delegates on someone else's authority.\n  CHECK (created_by_member_id = delegator_member_id)\n);",
+      "\n\n-- At most ONE live row per (agent, scope). Re-delegating after a revoke is a NEW row, so the history is never rewritten.\nCREATE UNIQUE INDEX IF NOT EXISTS uq_operator_delegation_live\n  ON agent_operator_delegations(tenant, agent_id, scope_type, COALESCE(scope_id, ''))\n  WHERE revoked_at IS NULL;",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_operator_delegation_agent\n  ON agent_operator_delegations(tenant, agent_id) WHERE revoked_at IS NULL;",
+      "\nCREATE INDEX IF NOT EXISTS idx_operator_delegation_delegator\n  ON agent_operator_delegations(tenant, delegator_member_id);",
+      "\n\n-- A row is immutable except for the one-way NULL -> timestamp revoke. Nothing can un-revoke, widen max_grant, move the\n-- scope, or swap the delegator: those are all \"revoke and create a new row\", which is a human act with its own receipt.\nCREATE TRIGGER IF NOT EXISTS agent_operator_delegations_immutable\nBEFORE UPDATE ON agent_operator_delegations\nWHEN NOT (\n  OLD.revoked_at IS NULL\n  AND NEW.revoked_at IS NOT NULL\n  AND NEW.id = OLD.id AND NEW.tenant = OLD.tenant AND NEW.agent_id = OLD.agent_id\n  AND NEW.delegator_member_id = OLD.delegator_member_id\n  AND NEW.scope_type = OLD.scope_type AND COALESCE(NEW.scope_id, '') = COALESCE(OLD.scope_id, '')\n  AND NEW.max_grant = OLD.max_grant\n  AND NEW.created_by_member_id = OLD.created_by_member_id AND NEW.created_at = OLD.created_at\n)\nBEGIN\n  SELECT RAISE(ABORT, 'agent_operator_delegations: only a one-way revoke is allowed');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS agent_operator_delegations_no_delete\nBEFORE DELETE ON agent_operator_delegations\nBEGIN\n  SELECT RAISE(ABORT, 'agent_operator_delegations: rows are never deleted');\nEND;",
+      "\n\n-- Every structural write an agent makes under a delegation leaves one row here BEFORE the write is attempted: \"agent X\n-- on behalf of member Y, under delegation Z, did act A on target T\". An authorization receipt, so an act that then fails\n-- downstream still leaves a row, and no applied write can exist without one. No foreign keys, on purpose (same reasoning\n-- as agent_audit, #857): the record must outlive the agent, the member and the delegation it names.\nCREATE TABLE IF NOT EXISTS operator_delegation_receipts (\n  seq                  INTEGER PRIMARY KEY AUTOINCREMENT,\n  id                   TEXT NOT NULL UNIQUE,\n  tenant               TEXT NOT NULL,\n  delegation_id        TEXT NOT NULL,\n  agent_id             TEXT NOT NULL,\n  delegator_member_id  TEXT NOT NULL,\n  action               TEXT NOT NULL,\n  surface              TEXT NOT NULL CHECK (surface IN ('mcp', 'http')),\n  target_scope_type    TEXT,\n  target_scope_id      TEXT,\n  detail               TEXT NOT NULL DEFAULT '{}',\n  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_operator_receipts_delegation ON operator_delegation_receipts(delegation_id, seq DESC);",
+      "\nCREATE INDEX IF NOT EXISTS idx_operator_receipts_agent ON operator_delegation_receipts(tenant, agent_id, seq DESC);",
+      "\n\nCREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_update\nBEFORE UPDATE ON operator_delegation_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only');\nEND;",
+      "\n\nCREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_delete\nBEFORE DELETE ON operator_delegation_receipts\nBEGIN\n  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only');\nEND;",
+    ],
+    objects: [
+      { type: "table", name: "agent_operator_delegations" },
+      { type: "index", name: "uq_operator_delegation_live" },
+      { type: "index", name: "idx_operator_delegation_agent" },
+      { type: "index", name: "idx_operator_delegation_delegator" },
+      { type: "trigger", name: "agent_operator_delegations_immutable" },
+      { type: "trigger", name: "agent_operator_delegations_no_delete" },
+      { type: "table", name: "operator_delegation_receipts" },
+      { type: "index", name: "idx_operator_receipts_delegation" },
+      { type: "index", name: "idx_operator_receipts_agent" },
+      { type: "trigger", name: "operator_delegation_receipts_no_update" },
+      { type: "trigger", name: "operator_delegation_receipts_no_delete" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f971141178ba9e49c007d25a573389b420c8c27a617e702d97d41980a4ae9651"
+export const SCHEMA_CHAIN_DIGEST: string = "659878021e5240770d78735bc6c68ec0e32bf761385f2ddce1b48a34f486d573"

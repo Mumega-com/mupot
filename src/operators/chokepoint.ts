@@ -74,6 +74,10 @@ export type StructuralAction =
   // changing or even reading who may act for whom is a human act: an agent never creates, extends, revokes or lists
   // delegations, its own or anyone's
   | 'manage_delegations'
+  // W1 (#1875) adds project_repos, whose writes are structural. It adds no write tool; when one lands it MUST ask the
+  // chokepoint for one of these (refuse-lane for agents until a wave decides otherwise).
+  | 'project_repo_set'
+  | 'project_repo_remove'
 
 export interface StructuralPolicy {
   /** A live delegation can authorise this act (flag on). */
@@ -125,6 +129,8 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   unbind_member_telegram: { delegable: false, agentLane: 'refuse' },
   create_invite: { delegable: false, agentLane: 'refuse' },
   manage_delegations: { delegable: false, agentLane: 'refuse' },
+  project_repo_set: { delegable: false, agentLane: 'refuse' },
+  project_repo_remove: { delegable: false, agentLane: 'refuse' },
 }
 
 /** MCP tool name -> the action it must ask the chokepoint about. The ratchet test walks this against the source. */

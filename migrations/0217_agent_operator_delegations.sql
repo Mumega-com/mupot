@@ -1,4 +1,4 @@
--- 0216_agent_operator_delegations.sql — Operators + Admission, wave W0: delegated operators (mupot task 65b11e48,
+-- 0217_agent_operator_delegations.sql — Operators + Admission, wave W0: delegated operators (mupot task 65b11e48,
 -- mumega-com#1386). Additive only; nothing reads these tables unless DELEGATED_OPERATORS is on (the HTTP-door fix
 -- for #1357 does not depend on them).
 --
