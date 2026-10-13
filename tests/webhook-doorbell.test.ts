@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sendAgentMessage } from '../src/agents/messages'
 import {
+  fireWebhookDoorbell,
   getAgentWebhookDoorbell,
   setAgentWebhookDoorbell,
 } from '../src/agents/webhook-doorbell'
@@ -461,6 +462,19 @@ describe('Grok Bot webhook doorbell', () => {
     expect(res.ok).toBe(true)
     expect(calls).toBe(0)
     expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbell_receipts').get()).toEqual({ n: 0 })
+  })
+
+  it('fireWebhookDoorbell itself is flag-gated (not only the scheduler in front of it)', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A, webhookUrl: 'https://webhook.example/ceo', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    let calls = 0
+    await fireWebhookDoorbell(
+      { ...env, WEBHOOK_DOORBELL: undefined } as unknown as Env,
+      { type: 'mupot.task.assigned', agent_id: AGENT_A, task_id: 't-1' },
+      { fetch: (async () => { calls += 1; return new Response('ok') }) as typeof fetch },
+    )
+    expect(calls).toBe(0)
   })
 
   it.each([
