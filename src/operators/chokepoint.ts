@@ -28,12 +28,13 @@
 
 import type { AuthContext, Capability, Env } from '../types'
 import { boundAgentHasAnyLiveGrantForAction } from '../auth/elevation'
-import { capabilityRank, currentMemberRankOnScope } from '../auth/capability'
+import { capabilityRank, currentMemberRankOnScope, targetMaxRankAcrossScopes } from '../auth/capability'
 import {
   capabilityScopeForDelegation,
   delegatedOperatorsEnabled,
   listLiveDelegationsForAgent,
   memberIsAgentSeat,
+  memberLooksAgentBound,
   type DelegationRow,
 } from './delegations'
 
@@ -76,6 +77,9 @@ export type StructuralAction =
   | 'manage_delegations'
   // W1 (#1875) adds project_repos, whose writes are structural. It adds no write tool; when one lands it MUST ask the
   // chokepoint for one of these (refuse-lane for agents until a wave decides otherwise).
+  | 'grant_agent_membership'
+  | 'project_create'
+  | 'project_start'
   | 'project_repo_set'
   | 'project_repo_remove'
 
@@ -102,6 +106,9 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   move_agent_squad: { delegable: true, agentLane: 'refuse' },
   project_squad_set: { delegable: true, agentLane: 'capability' },
   project_squad_remove: { delegable: true, agentLane: 'capability' },
+  // POST /api/org/agents/:id/memberships: the HTTP twin of squad_member_add / grant_agent_capability, WITHOUT the MCP
+  // manage_access elevation lane (main refuses every bound agent on this route; only a delegation opens it).
+  grant_agent_membership: { delegable: true, agentLane: 'refuse' },
   member_capability_grant: { delegable: true, agentLane: 'refuse' },
   member_capability_revoke: { delegable: true, agentLane: 'refuse' },
 
@@ -129,6 +136,10 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   unbind_member_telegram: { delegable: false, agentLane: 'refuse' },
   create_invite: { delegable: false, agentLane: 'refuse' },
   manage_delegations: { delegable: false, agentLane: 'refuse' },
+  // project_create attaches the creator's own squad edge; project_start (planned -> active) provisions a department, squad,
+  // agent, an admin edge and grants. Neither is delegable: an agent keeps exactly its pre-W0 lane (flag on or off).
+  project_create: { delegable: false, agentLane: 'capability', elevationAction: 'action:workspace_project' },
+  project_start: { delegable: false, agentLane: 'capability' },
   project_repo_set: { delegable: false, agentLane: 'refuse' },
   project_repo_remove: { delegable: false, agentLane: 'refuse' },
 }
@@ -154,6 +165,8 @@ export const STRUCTURAL_MCP_TOOLS: Readonly<Record<string, StructuralAction>> = 
   squad_member_remove: 'squad_member_remove',
   project_squad_set: 'project_squad_set',
   project_squad_remove: 'project_squad_remove',
+  project_create: 'project_create',
+  project_update: 'project_start',
   grant_gate_capability: 'grant_gate_capability',
   revoke_gate_capability: 'revoke_gate_capability',
   team_bootstrap: 'team_bootstrap',
@@ -186,6 +199,8 @@ export interface StructuralTarget {
   /** The rank the act confers; null/undefined = the act confers none. */
   capability?: Capability | null
   projectAccessLevel?: ProjectAccessLevel
+  /** create_agent: the slug being created; a collision with ANY agent in the tenant is refused under delegation. */
+  slug?: string
   /** Free-form, ends up in the receipt. Never put a secret in here. */
   detail?: Record<string, unknown>
 }
@@ -254,7 +269,7 @@ async function delegatorIsLive(env: Env, d: DelegationRow): Promise<boolean> {
     .bind(d.delegator_member_id, env.TENANT_SLUG)
     .first<{ status: string }>()
   if (!member || member.status !== 'active') return false
-  if (await memberIsAgentSeat(env, d.delegator_member_id)) return false
+  if (await memberLooksAgentBound(env, d.delegator_member_id)) return false
   const cap = capabilityScopeForDelegation(d.scope_type, d.scope_id)
   const rank = await currentMemberRankOnScope(env, d.delegator_member_id, cap.type, cap.id)
   return rank >= capabilityRank('admin')
@@ -265,43 +280,106 @@ type Element =
   | { type: 'department'; id: string }
   | { type: 'project'; id: string }
 
-async function delegationCovers(env: Env, d: DelegationRow, el: Element): Promise<boolean> {
+/**
+ * Does this delegation cover this element? A delegation covers ONLY what its own scope names, and nothing that any
+ * agent act can change at runtime. In particular a PROJECT delegation covers the project's own edge-management acts and
+ * no squad at all: "squads linked to the project" is mutable state (project_squad_set, or a human link later), so
+ * counting it would let a delegation widen its own scope (gate round 1, P0).
+ */
+async function delegationCovers(_env: Env, d: DelegationRow, el: Element): Promise<boolean> {
   if (d.scope_type === 'org') return true
   if (el.type === 'department') return d.scope_type === 'department' && d.scope_id === el.id
   if (el.type === 'project') return d.scope_type === 'project' && d.scope_id === el.id
-  // squad element
   if (d.scope_type === 'squad') return d.scope_id === el.squad.id
   if (d.scope_type === 'department') return d.scope_id === el.squad.department_id
-  // project scope covers the squads linked to that project
-  const edge = await env.DB.prepare(
-    'SELECT 1 AS one FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2 LIMIT 1',
-  )
-    .bind(d.scope_id, el.squad.id)
-    .first<{ one: number }>()
-  return edge != null
+  return false
 }
 
-/** The target agent's standing on a squad across BOTH planes (memberships and the capabilities row of its seat). */
-async function agentStandingOnSquad(env: Env, agentId: string, squadId: string): Promise<number> {
-  const [m, c] = await Promise.all([
-    env.DB.prepare('SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1')
-      .bind(agentId, squadId)
-      .first<{ capability: Capability }>(),
-    env.DB.prepare(
-      `SELECT c.capability FROM capabilities c
-         JOIN agent_member_bindings b ON b.member_id = c.member_id AND b.tenant = ?3
-        WHERE b.agent_id = ?1 AND c.scope_type = 'squad' AND c.scope_id = ?2 LIMIT 1`,
-    )
-      .bind(agentId, squadId, env.TENANT_SLUG)
-      .first<{ capability: Capability }>(),
-  ])
-  return Math.max(m ? capabilityRank(m.capability) : 0, c ? capabilityRank(c.capability) : 0)
+/**
+ * The target agent's HIGHEST live standing anywhere: its seat's capabilities across org, department and squad scopes plus
+ * the legacy role plane (targetMaxRankAcrossScopes, the #1411 rank-ceiling rule), and every membership row of the agent.
+ * Standing is global, not per squad: an org-admin agent is not a lead-capped delegate's to demote or move just because it
+ * holds nothing on the squad being touched.
+ */
+async function agentStandingGlobal(env: Env, agentId: string): Promise<number> {
+  const seat = await env.DB.prepare(
+    'SELECT member_id FROM agent_member_bindings WHERE tenant = ?1 AND agent_id = ?2 LIMIT 1',
+  )
+    .bind(env.TENANT_SLUG, agentId)
+    .first<{ member_id: string }>()
+  const seatRank = seat ? await targetMaxRankAcrossScopes(env, seat.member_id) : 0
+  const mem = await env.DB.prepare('SELECT capability FROM memberships WHERE agent_id = ?1')
+    .bind(agentId)
+    .all<{ capability: Capability }>()
+  let membershipRank = 0
+  for (const m of mem.results ?? []) membershipRank = Math.max(membershipRank, capabilityRank(m.capability))
+  return Math.max(seatRank, membershipRank)
 }
 
 const LEVEL_TO_CAPABILITY: Record<ProjectAccessLevel, Capability> = {
   read: 'observer',
   write: 'member',
   admin: 'admin',
+}
+
+type ReceiptOutcome = 'attempted' | 'applied' | 'refused'
+
+async function insertReceipt(
+  env: Env,
+  auth: AuthContext,
+  delegation: DelegationRow,
+  action: StructuralAction,
+  surface: 'mcp' | 'http',
+  target: StructuralTarget,
+  outcome: ReceiptOutcome,
+  extra: Record<string, unknown>,
+): Promise<string> {
+  const receiptId = crypto.randomUUID()
+  const scopeType = target.squadId ? 'squad' : target.departmentId ? 'department' : target.projectId ? 'project' : null
+  const scopeId = target.squadId ?? target.departmentId ?? target.projectId ?? null
+  await env.DB.prepare(
+    `INSERT INTO operator_delegation_receipts
+       (id, tenant, delegation_id, agent_id, delegator_member_id, action, surface,
+        target_scope_type, target_scope_id, detail, outcome)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+  )
+    .bind(
+      receiptId,
+      env.TENANT_SLUG,
+      delegation.id,
+      auth.boundAgentId as string, // a bound-agent caller is the only path into this function
+      delegation.delegator_member_id,
+      action,
+      surface,
+      scopeType,
+      scopeId,
+      JSON.stringify({
+        agent_member_id: auth.memberId ?? null,
+        target_agent_id: target.agentId ?? null,
+        target_member_id: target.memberId ?? null,
+        from_squad_id: target.fromSquadId ?? null,
+        capability: target.capability ?? null,
+        ...(target.detail ?? {}),
+        ...extra,
+      }),
+      outcome,
+    )
+    .run()
+  return receiptId
+}
+
+/**
+ * Close a delegated act's receipt: 'applied' when the write landed, 'refused' when a later check inside the site refused
+ * it. A site calls this once, right after the write result is known; a crash in between leaves the row 'attempted',
+ * which is itself the honest record ("authorised, outcome unknown"). One-way by trigger, only from 'attempted'.
+ */
+export async function finishDelegatedReceipt(env: Env, verdict: StructuralVerdict, applied: boolean): Promise<void> {
+  if (verdict.kind !== 'delegated') return
+  await env.DB.prepare(
+    "UPDATE operator_delegation_receipts SET outcome = ?1 WHERE id = ?2 AND outcome = 'attempted'",
+  )
+    .bind(applied ? 'applied' : 'refused', verdict.receiptId)
+    .run()
 }
 
 async function evaluateDelegated(
@@ -325,8 +403,10 @@ async function evaluateDelegated(
   }
 
   // ── what the act touches ────────────────────────────────────────────────────────────────────────────────────
+  const isProjectEdge = action === 'project_squad_set' || action === 'project_squad_remove'
   const elements: Element[] = []
   const squadIds: string[] = []
+  let attachedSquad: SquadFacts | null = null
   if (target.departmentId) {
     const dep = await env.DB.prepare('SELECT kind FROM departments WHERE id = ?1 LIMIT 1')
       .bind(target.departmentId)
@@ -344,9 +424,12 @@ async function evaluateDelegated(
     const sq = await loadSquad(env, id)
     if (!sq) return refuse(404, 'squad_not_found')
     if (sq.kind === 'home') return refuse(403, 'home_scope_not_grantable')
-    // A project edge is authorised by the PROJECT being in scope; the squad it names is the thing being attached to
-    // that project (it may well be outside the delegation), so it is checked for existence and home-ness only.
-    if (action === 'project_squad_set' || action === 'project_squad_remove') continue
+    if (isProjectEdge) {
+      // The squad a project edge names is the thing being ATTACHED. It is not what authorises the act, but a delegation
+      // must not be able to widen its own reach by attaching it (see below).
+      attachedSquad = sq
+      continue
+    }
     elements.push({ type: 'squad', squad: sq })
   }
   if (elements.length === 0) return refuse(403, 'outside_delegation_scope', { act: action })
@@ -375,16 +458,46 @@ async function evaluateDelegated(
       : refuse(403, 'outside_delegation_scope', { act: action })
   }
 
+  // From here a delegation is known to cover the act, so every refusal leaves a 'refused' receipt (who asked, under what).
+  const refusedWith = async (r: StructuralRefusal, confersNow: Capability | null): Promise<StructuralRefusal> => {
+    await insertReceipt(env, auth, covering, action, surface, target, 'refused', {
+      refusal: r.error,
+      reason: r.detail?.reason ?? null,
+      capability: confersNow,
+    })
+    return r
+  }
+
+  // project_squad_set under delegation: the ATTACHED squad must itself be covered by a NON-project delegation scope
+  // (org, department or squad) whose delegator is still live. A project delegation alone can never link a squad and then
+  // act there.
+  let ceilingMaxGrant = covering.max_grant
+  if (action === 'project_squad_set' && attachedSquad) {
+    let squadCover: DelegationRow | null = null
+    for (const d of delegations) {
+      if (d.scope_type === 'project') continue
+      if (!(await delegationCovers(env, d, { type: 'squad', squad: attachedSquad }))) continue
+      if (await delegatorIsLive(env, d)) {
+        squadCover = d
+        break
+      }
+    }
+    if (!squadCover) {
+      return refusedWith(refuse(403, 'outside_delegation_scope', { act: action, reason: 'attached_squad_not_covered' }), null)
+    }
+    if (capabilityRank(squadCover.max_grant) < capabilityRank(ceilingMaxGrant)) ceilingMaxGrant = squadCover.max_grant
+  }
+
   // ── the ceiling: min(max_grant, delegator's live rank, agent's own live rank) ───────────────────────────────
   let confers: Capability | null = target.capability ?? null
   if (target.projectAccessLevel) confers = LEVEL_TO_CAPABILITY[target.projectAccessLevel]
-  const maxGrantRank = capabilityRank(covering.max_grant)
-  const evidence: Record<string, unknown> = { max_grant: covering.max_grant }
+  const maxGrantRank = capabilityRank(ceilingMaxGrant)
+  const evidence: Record<string, unknown> = { max_grant: ceilingMaxGrant }
   let ceilingRank = maxGrantRank
   let binding: 'above_max_grant' | 'above_delegator_rank' | 'above_agent_rank' = 'above_max_grant'
-  // Only an act that CONFERS a rank on a squad is bounded by the two humans'-and-agent's own standing; creating
-  // structure (create_squad / create_agent) confers nothing the agent could not already create inside the scope,
-  // and a project edge is bounded by max_grant alone (a project has no capability scope of its own).
+  // An act that CONFERS a rank on a squad (including create_agent, which writes a member-rank membership) is bounded by
+  // the delegator's and the agent's own live standing there. A project edge is bounded by max_grant alone (a project has
+  // no capability scope of its own).
   if (confers && target.squadId && !target.projectAccessLevel) {
     const delegatorRank = await currentMemberRankOnScope(env, covering.delegator_member_id, 'squad', target.squadId)
     const agentRank = auth.memberId
@@ -403,57 +516,41 @@ async function evaluateDelegated(
   }
   evidence.ceiling_rank = ceilingRank
   if (confers && capabilityRank(confers) > ceilingRank) {
-    return requiresHumanApproval(action, binding, covering, {
+    return refusedWith(requiresHumanApproval(action, binding, covering, {
       requested: { capability: confers },
       ...evidence,
-    })
+    }), confers)
   }
-  // An existing standing ABOVE the ceiling is not the agent's to overwrite, remove or move.
-  if (target.agentId && (action === 'squad_member_add' || action === 'squad_member_remove' || action === 'grant_agent_capability' || action === 'member_capability_grant' || action === 'member_capability_revoke' || action === 'move_agent_squad')) {
-    const standingSquads = action === 'move_agent_squad' ? [target.fromSquadId, target.squadId] : [target.squadId]
-    for (const sid of standingSquads) {
-      if (!sid) continue
-      const standing = await agentStandingOnSquad(env, target.agentId, sid)
-      if (standing > capabilityRank(covering.max_grant)) {
-        return requiresHumanApproval(action, 'target_outranks_delegation', covering, {
-          target_standing_rank: standing,
-          ...evidence,
-        })
-      }
+
+  // An agent created under delegation must not collide with ANY existing agent slug in the tenant: a duplicate makes
+  // slug resolution ambiguous for every human who names it (a denial of service on resolve).
+  if (action === 'create_agent' && typeof target.slug === 'string') {
+    const dupe = await env.DB.prepare('SELECT 1 AS one FROM agents WHERE slug = ?1 LIMIT 1')
+      .bind(target.slug)
+      .first<{ one: number }>()
+    if (dupe) return refusedWith(refuse(409, 'slug_taken', { act: action }), confers)
+  }
+
+  // A target whose standing ANYWHERE is above max_grant is not the agent's to touch at all.
+  if (
+    target.agentId
+    && (action === 'squad_member_add' || action === 'squad_member_remove' || action === 'grant_agent_capability'
+      || action === 'member_capability_grant' || action === 'member_capability_revoke' || action === 'move_agent_squad')
+  ) {
+    const standing = await agentStandingGlobal(env, target.agentId)
+    if (standing > capabilityRank(ceilingMaxGrant)) {
+      return refusedWith(requiresHumanApproval(action, 'target_outranks_delegation', covering, {
+        target_standing_rank: standing,
+        ...evidence,
+      }), confers)
     }
   }
 
-  // ── authorization receipt, BEFORE the write: agent + delegator + delegation id ──────────────────────────────
-  const receiptId = crypto.randomUUID()
-  const scopeTypeForReceipt = target.squadId ? 'squad' : target.departmentId ? 'department' : target.projectId ? 'project' : null
-  const scopeIdForReceipt = target.squadId ?? target.departmentId ?? target.projectId ?? null
-  await env.DB.prepare(
-    `INSERT INTO operator_delegation_receipts
-       (id, tenant, delegation_id, agent_id, delegator_member_id, action, surface,
-        target_scope_type, target_scope_id, detail)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
-  )
-    .bind(
-      receiptId,
-      env.TENANT_SLUG,
-      covering.id,
-      auth.boundAgentId as string, // a bound-agent caller is the only path into this function
-      covering.delegator_member_id,
-      action,
-      surface,
-      scopeTypeForReceipt,
-      scopeIdForReceipt,
-      JSON.stringify({
-        agent_member_id: auth.memberId ?? null,
-        target_agent_id: target.agentId ?? null,
-        target_member_id: target.memberId ?? null,
-        from_squad_id: target.fromSquadId ?? null,
-        capability: confers,
-        ceiling_rank: ceilingRank,
-        ...(target.detail ?? {}),
-      }),
-    )
-    .run()
+  // ── authorization receipt, BEFORE the write: agent + delegator + delegation id, outcome 'attempted' ──────────
+  const receiptId = await insertReceipt(env, auth, covering, action, surface, target, 'attempted', {
+    ceiling_rank: ceilingRank,
+    capability: confers,
+  })
   return { kind: 'delegated', delegation: covering, ceilingRank, receiptId }
 }
 

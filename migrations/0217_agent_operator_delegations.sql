@@ -59,7 +59,7 @@ END;
 
 -- Every structural write an agent makes under a delegation leaves one row here BEFORE the write is attempted: "agent X
 -- on behalf of member Y, under delegation Z, did act A on target T". An authorization receipt, so an act that then fails
--- downstream still leaves a row, and no applied write can exist without one. No foreign keys, on purpose (same reasoning
+-- downstream still leaves a row (outcome says what happened), and no applied write can exist without one. No foreign keys, on purpose (same reasoning
 -- as agent_audit, #857): the record must outlive the agent, the member and the delegation it names.
 CREATE TABLE IF NOT EXISTS operator_delegation_receipts (
   seq                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,16 +73,28 @@ CREATE TABLE IF NOT EXISTS operator_delegation_receipts (
   target_scope_type    TEXT,
   target_scope_id      TEXT,
   detail               TEXT NOT NULL DEFAULT '{}',
+  -- attempted: authorised, write not yet confirmed (also what a crash leaves behind); applied: the write landed;
+  -- refused: a covering delegation existed but the act was refused (ceiling, target standing, slug, a later site check).
+  outcome              TEXT NOT NULL DEFAULT 'attempted' CHECK (outcome IN ('attempted', 'applied', 'refused')),
   created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_operator_receipts_delegation ON operator_delegation_receipts(delegation_id, seq DESC);
 CREATE INDEX IF NOT EXISTS idx_operator_receipts_agent ON operator_delegation_receipts(tenant, agent_id, seq DESC);
 
-CREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_update
+-- Append-only, with ONE allowed transition: outcome 'attempted' -> 'applied' | 'refused', every other column unchanged.
+CREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_outcome_only
 BEFORE UPDATE ON operator_delegation_receipts
+WHEN NOT (
+  OLD.outcome = 'attempted' AND NEW.outcome IN ('applied', 'refused')
+  AND NEW.seq = OLD.seq AND NEW.id = OLD.id AND NEW.tenant = OLD.tenant AND NEW.delegation_id = OLD.delegation_id
+  AND NEW.agent_id = OLD.agent_id AND NEW.delegator_member_id = OLD.delegator_member_id AND NEW.action = OLD.action
+  AND NEW.surface = OLD.surface AND NEW.detail = OLD.detail AND NEW.created_at = OLD.created_at
+  AND COALESCE(NEW.target_scope_type, '') = COALESCE(OLD.target_scope_type, '')
+  AND COALESCE(NEW.target_scope_id, '') = COALESCE(OLD.target_scope_id, '')
+)
 BEGIN
-  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only');
+  SELECT RAISE(ABORT, 'operator_delegation_receipts is append-only (outcome may only move attempted -> applied|refused)');
 END;
 
 CREATE TRIGGER IF NOT EXISTS operator_delegation_receipts_no_delete

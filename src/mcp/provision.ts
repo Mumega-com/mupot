@@ -91,6 +91,7 @@ import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import {
   authorizeStructuralWrite,
+  finishDelegatedReceipt,
   type StructuralAction,
   type StructuralRefusal,
   type StructuralTargetThunk,
@@ -484,6 +485,7 @@ const toolCreateSquad: ToolSpec = {
       },
       { createdByMemberId: auth.memberId ?? undefined, createdViaElevationGrant },
     )
+    await finishDelegatedReceipt(env, squadGate, result.ok)
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'squad', result.value.id, {
       squad_id: result.value.id,
@@ -533,7 +535,8 @@ const toolCreateAgent: ToolSpec = {
     const agentGate = await structuralGate(env, auth, 'create_agent', async () => {
       const r = await resolveSquadRef(env, squadRef)
       if (!r.ok) return thunkRefusal(r.reason === 'ambiguous' ? 409 : 404, r.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
-      return { squadId: r.value.id, detail: { slug: str(args.slug) } }
+      // create_agent writes a member-rank membership: it CONFERS 'member', so it meets the same ceiling as a grant
+      return { squadId: r.value.id, capability: 'member', slug: str(args.slug) ?? undefined }
     })
     if (agentGate.kind === 'refused') return structuralFail(agentGate)
 
@@ -575,6 +578,7 @@ const toolCreateAgent: ToolSpec = {
       qnft_ref: args.qnft_ref,
       death_condition: args.death_condition,
     })
+    await finishDelegatedReceipt(env, agentGate, result.ok)
     if (!result.ok) return createErrorToFail(result.error)
     await emitProvisioned(env, auth.memberId as string, 'agent', result.value.id, {
       squad_id: squad.id,
@@ -1658,6 +1662,7 @@ export const toolGrantAgentCapability: ToolSpec = {
       squadId: squad.id,
       capability: capability as AgentAccessCapability,
     })
+    await finishDelegatedReceipt(env, grantGate, outcome.ok)
     if (!outcome.ok) {
       if (outcome.error === 'agent_not_found') return fail(404, outcome.error)
       if (outcome.error === 'squad_not_found') return fail(404, outcome.error)
@@ -2446,6 +2451,7 @@ export const toolMoveAgentSquad: ToolSpec = {
       actor,
       reason,
     })
+    await finishDelegatedReceipt(env, moveGate, result.ok)
     if (!result.ok) {
       if (result.error === 'not_found') return fail(404, 'agent_not_found', { agent: agentRef })
       if (result.error === 'squad_not_found') return fail(404, 'squad_not_found', { squad: toSquadRef })
@@ -2837,6 +2843,7 @@ const toolSquadMemberAdd: ToolSpec = {
       capability,
       delegated: addGate.kind === 'delegated' ? addGate : undefined,
     })
+    await finishDelegatedReceipt(env, addGate, outcome.ok)
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 
     await emitProvisioned(env, auth.memberId as string, 'membership', squadResult.value.id, {
@@ -2899,6 +2906,7 @@ const toolSquadMemberRemove: ToolSpec = {
       squad: squadResult.value,
       delegated: removeGate.kind === 'delegated' ? removeGate : undefined,
     })
+    await finishDelegatedReceipt(env, removeGate, outcome.ok)
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 
     if (outcome.result === 'removed') {

@@ -40,7 +40,7 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
-import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
+import { authorizeStructuralWrite, finishDelegatedReceipt, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
 import {
   setAgentSquadAccess,
@@ -246,6 +246,7 @@ orgApp.post('/departments/:id/squads', async (c) => {
     },
     { createdByMemberId: auth.memberId ?? undefined },
   )
+  await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
@@ -284,7 +285,16 @@ orgApp.post('/squads/:id/agents', async (c) => {
     c.env,
     c.get('auth'),
     'create_agent',
-    { squadId, detail: { via: 'http' } },
+    async () => {
+      // create_agent writes a member-rank membership: it CONFERS 'member', so it meets the same ceiling as a grant
+      let raw: { slug?: unknown } | null = null
+      try {
+        raw = (await c.req.json()) as { slug?: unknown }
+      } catch {
+        return { kind: 'refused' as const, status: 400 as const, error: 'invalid_json' }
+      }
+      return { squadId, capability: 'member' as const, slug: typeof raw?.slug === 'string' ? raw.slug : undefined, detail: { via: 'http' } }
+    },
     { surface: 'http' },
   )
   if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
@@ -302,6 +312,7 @@ orgApp.post('/squads/:id/agents', async (c) => {
   }
 
   const result = await createAgent(c.env, squadId, body)
+  await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) {
     return c.json({ error: result.error }, result.error === 'slug_taken' ? 409 : 400)
   }
@@ -322,7 +333,7 @@ orgApp.post('/agents/:id/memberships', async (c) => {
   const gate = await authorizeStructuralWrite(
     c.env,
     auth,
-    'grant_agent_capability',
+    'grant_agent_membership',
     async () => {
       let raw: CreateMembershipBody
       try {
@@ -382,6 +393,7 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     squadId: squad.id,
     capability,
   })
+  await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) {
     const status = result.error === 'agent_not_found' || result.error === 'squad_not_found'
       ? 404

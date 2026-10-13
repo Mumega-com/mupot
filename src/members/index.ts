@@ -218,6 +218,7 @@ export const INVITER_ACTIVE_MEMBER_SQL = (idParam: string, tenantParam: string):
 
 import {
   authorizeStructuralWrite,
+  finishDelegatedReceipt,
   structuralRefusalBody,
   type StructuralAction,
   type StructuralTarget,
@@ -1733,6 +1734,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
         memberId,
         squadId: scopeId as string,
       })
+      await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok)
       if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
       return c.json({
         member_id: memberId,
@@ -1784,6 +1786,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
       squadId: scopeId as string,
       capability: agentCapability,
     })
+    await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok)
     if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
     return c.json({
       grant: outcome.grant,

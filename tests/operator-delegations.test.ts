@@ -261,16 +261,49 @@ describe('a delegated agent can do the in-scope acts, with receipts naming agent
     }
   })
 
-  it('project_squad_set / remove under a project delegation, mapped to the ceiling (read<=member ok, admin not)', async () => {
+  it('project_squad_set / remove: the project edge needs the project AND a non-project delegation over the attached squad', async () => {
     await delegate('project', 'P1', 'member')
+    // a second, NON-project delegation that covers S2 only
+    const sqDel = await invokeTool(hadi(), env, 'operator_delegate', { agent: 'agent-A', scope_type: 'squad', scope_id: 'S2', max_grant: 'member' }, ORIGIN)
+    expect(sqDel.ok).toBe(true)
     const a = operator()
     expect(await call(a, 'project_squad_set', { project_id: 'P1', squad_id: 'S2', access_level: 'write' })).toMatchObject({ ok: true })
-    const r = refusal(await call(a, 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'admin' }))
-    expect(r.error).toBe('requires_human_approval')
-    expect(r.detail.act).toBe('project_squad_set')
-    const other = refusal(await call(a, 'project_squad_set', { project_id: 'P2', squad_id: 'S2', access_level: 'read' }))
-    expect(other.error).toBe('outside_delegation_scope')
+    // S3 is covered by NO non-project delegation: the project delegation alone can never attach it
+    const attach = refusal(await call(a, 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'read' }))
+    expect(attach.error).toBe('outside_delegation_scope')
+    expect(attach.detail.reason).toBe('attached_squad_not_covered')
+    const adm = refusal(await call(a, 'project_squad_set', { project_id: 'P1', squad_id: 'S2', access_level: 'admin' }))
+    expect(adm.error).toBe('requires_human_approval')
+    expect(adm.detail.act).toBe('project_squad_set')
+    expect(refusal(await call(a, 'project_squad_set', { project_id: 'P2', squad_id: 'S2', access_level: 'read' })).error).toBe('outside_delegation_scope')
     expect((await call(a, 'project_squad_remove', { project_id: 'P1', squad_id: 'S2' })).ok).toBe(true)
+    expect(rows("SELECT 1 FROM project_squad_access WHERE project_id = 'P1' AND squad_id = 'S3'")).toHaveLength(0)
+  })
+
+  it('P0: a project delegation cannot widen its own scope — attach-then-act is refused (agent link, then human link)', async () => {
+    await delegate('project', 'P1', 'lead')
+    const a = operator()
+    // the agent cannot link a squad on a project delegation alone ...
+    expect(refusal(await call(a, 'project_squad_set', { project_id: 'P1', squad_id: 'S3', access_level: 'write' })).error).toBe('outside_delegation_scope')
+    // ... and acting on a squad ALREADY linked to the project is out of scope too: S1 is linked, nothing covers it
+    for (const [tool, args] of [
+      ['squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'member' }],
+      ['grant_agent_capability', { agent: 'agent-B', squad: 'S1', capability: 'member' }],
+      ['create_agent', { squad: 'S1', slug: 'p0-agt', name: 'P0' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      expect(refusal(await call(a, tool, args)).error, tool).toBe('outside_delegation_scope')
+    }
+    // a LATER human link must not widen anything either
+    harness.sqlite.prepare("INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('P1', 'S3', 'write')").run()
+    for (const [tool, args] of [
+      ['squad_member_add', { agent: 'agent-C', squad: 'S3', capability: 'member' }],
+      ['move_agent_squad', { agent: 'agent-B', to_squad: 'S3', capability: 'member' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      expect(refusal(await call(a, tool, args)).error, tool).toBe('outside_delegation_scope')
+    }
+    const http1 = await http(orgApp, a, 'POST', '/agents/agent-C/memberships', { squad_id: 'S3', capability: 'member' })
+    expect(http1.body.error).toBe('outside_delegation_scope')
+    expect(membership('agent-C', 'S3')).toBeNull()
   })
 })
 
@@ -298,13 +331,6 @@ describe('out of scope is refused', () => {
     // agent-B lives in S3 (D2): moving it OUT of D2 touches an uncovered squad
     expect(refusal(await call(a, 'move_agent_squad', { agent: 'agent-B', to_squad: 'S1', capability: 'member' })).error).toBe('outside_delegation_scope')
     expect(rows<{ squad_id: string }>("SELECT squad_id FROM agents WHERE id = 'agent-B'")[0].squad_id).toBe('S3')
-  })
-
-  it('a project delegation covers the squads linked to that project', async () => {
-    await delegate('project', 'P1', 'lead')
-    const a = operator()
-    expect((await call(a, 'squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'member' })).ok).toBe(true)
-    expect(refusal(await call(a, 'squad_member_add', { agent: 'agent-B', squad: 'S2', capability: 'member' })).error).toBe('outside_delegation_scope')
   })
 
   it('a home squad is never reachable, even under an org delegation', async () => {
@@ -340,7 +366,7 @@ describe('the rank ceiling', () => {
     // the same on HTTP
     const h = await http(orgApp, a, 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'lead' })
     expect(h.status).toBe(403)
-    expect(h.body).toMatchObject({ error: 'requires_human_approval', act: 'grant_agent_capability', requires_human_approval: true })
+    expect(h.body).toMatchObject({ error: 'requires_human_approval', act: 'grant_agent_membership', requires_human_approval: true })
   })
 
   it('never above the agent\'s OWN live rank, even when max_grant allows it', async () => {
@@ -621,14 +647,19 @@ describe('flag off: MCP is unchanged and HTTP now matches it', () => {
 })
 
 describe('HTTP project squad edges under a delegation', () => {
-  it('a project delegation covers PUT/DELETE /:id/squads/:squadId on its own project only', async () => {
-    const id = await delegate('project', 'P1', 'member')
+  it('PUT/DELETE /:id/squads/:squadId needs the project delegation AND a non-project one over the attached squad', async () => {
+    await delegate('project', 'P1', 'member')
+    await invokeTool(hadi(), env, 'operator_delegate', { agent: 'agent-A', scope_type: 'squad', scope_id: 'S2', max_grant: 'member' }, ORIGIN)
     const a = operator()
     expect((await http(projectsApp, a, 'PUT', '/P1/squads/S2', { access_level: 'write' })).status).toBe(200)
-    expect((await http(projectsApp, a, 'PUT', '/P1/squads/S3', { access_level: 'admin' })).body).toMatchObject({ error: 'requires_human_approval', act: 'project_squad_set' })
+    expect((await http(projectsApp, a, 'PUT', '/P1/squads/S3', { access_level: 'read' })).body.error).toBe('outside_delegation_scope')
+    expect((await http(projectsApp, a, 'PUT', '/P1/squads/S2', { access_level: 'admin' })).body).toMatchObject({ error: 'requires_human_approval', act: 'project_squad_set' })
     expect((await http(projectsApp, a, 'PUT', '/P2/squads/S2', { access_level: 'read' })).body.error).toBe('outside_delegation_scope')
     expect((await http(projectsApp, a, 'DELETE', '/P1/squads/S2')).status).toBe(204)
-    expect(rows<{ surface: string }>('SELECT surface FROM operator_delegation_receipts WHERE delegation_id = ?', id).every((r) => r.surface === 'http')).toBe(true)
+    const rs = rows<{ surface: string; outcome: string }>("SELECT surface, outcome FROM operator_delegation_receipts WHERE action LIKE 'project_squad_%' ORDER BY seq")
+    expect(rs.every((r) => r.surface === 'http')).toBe(true)
+    // the P2 attempt has no covering delegation, so it leaves no receipt: only covered attempts are receipted
+    expect(rs.map((r) => r.outcome)).toEqual(['applied', 'refused', 'refused', 'applied'])
   })
 
   it('an undelegated org-admin agent is refused on the project twin when the flag is on', async () => {
@@ -662,5 +693,99 @@ describe('the writers refuse an agent on their own, not only behind the tool gat
     harness.sqlite.prepare("UPDATE members SET status = 'suspended' WHERE id = 'mem-hadi'").run()
     const out = await createDelegation(env, hadi(), { agentId: 'agent-A', scopeType: 'org', scopeId: null, maxGrant: 'member' })
     expect(out).toEqual({ ok: false, error: 'human_principal_required' })
+  })
+})
+
+describe('gate round 1 fixes', () => {
+  it('P1: a target whose standing is high ANYWHERE is not touched (org-admin target, department-admin target, from-squad admin)', async () => {
+    await delegate('org', null, 'lead')
+    const a = operator()
+    // org-admin agent B: held nothing on S1 itself, but outranks max_grant globally
+    addCap('seat-agent-B', 'admin', 'org', null)
+    for (const [tool, args] of [
+      ['squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'member' }],
+      ['squad_member_remove', { agent: 'agent-B', squad: 'S1' }],
+      ['grant_agent_capability', { agent: 'agent-B', squad: 'S1', capability: 'member' }],
+      ['move_agent_squad', { agent: 'agent-B', to_squad: 'S1', capability: 'member' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const r = refusal(await call(a, tool, args))
+      expect(r.error, tool).toBe('requires_human_approval')
+      expect(r.detail.reason, tool).toBe('target_outranks_delegation')
+    }
+    expect(membership('agent-B', 'S1')).toBeNull()
+    expect(rows<{ squad_id: string }>("SELECT squad_id FROM agents WHERE id = 'agent-B'")[0].squad_id).toBe('S3')
+    harness.sqlite.prepare("DELETE FROM capabilities WHERE member_id = 'seat-agent-B'").run()
+    // department-admin target, acted on from INSIDE that department
+    addCap('seat-agent-C', 'admin', 'department', 'D1')
+    const d = refusal(await call(a, 'squad_member_add', { agent: 'agent-C', squad: 'S2', capability: 'member' }))
+    expect(d.detail.reason).toBe('target_outranks_delegation')
+    harness.sqlite.prepare("DELETE FROM capabilities WHERE member_id = 'seat-agent-C'").run()
+    // the move's FROM-squad standing: an admin membership held only on the squad being left
+    harness.sqlite.prepare("INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('m-B-S3', 'agent-B', 'S3', 'admin')").run()
+    const mv = refusal(await call(a, 'move_agent_squad', { agent: 'agent-B', to_squad: 'S1', capability: 'member' }))
+    expect(mv.detail.reason).toBe('target_outranks_delegation')
+    // the HTTP twins agree
+    const h = await http(membersApp, a, 'POST', '/members/seat-agent-B/capabilities', { action: 'revoke', scope_type: 'squad', scope_id: 'S3' })
+    expect(h.body.error).toBe('requires_human_approval')
+  })
+
+  it('P2: create_agent CONFERS member standing: it meets the ceiling and refuses a colliding slug (MCP and HTTP)', async () => {
+    await delegate('org', null, 'lead')
+    const a = operator() // lead on S1/S2, nothing on S3
+    const none = refusal(await call(a, 'create_agent', { squad: 'S3', slug: 'rank0-agt', name: 'R0' }))
+    expect(none.error).toBe('requires_human_approval')
+    expect(none.detail.reason).toBe('above_agent_rank')
+    expect((await http(orgApp, a, 'POST', '/squads/S3/agents', { slug: 'rank0-agt', name: 'R0' })).body.error).toBe('requires_human_approval')
+    expect(rows("SELECT 1 FROM agents WHERE slug = 'rank0-agt'")).toHaveLength(0)
+    // a slug that already exists ANYWHERE in the tenant (agent-b lives in S3) would make resolve ambiguous for humans
+    const dupe = refusal(await call(a, 'create_agent', { squad: 'S1', slug: 'agent-b', name: 'Dup' }))
+    expect(dupe.status).toBe(409)
+    expect(dupe.error).toBe('slug_taken')
+    expect((await http(orgApp, a, 'POST', '/squads/S1/agents', { slug: 'agent-b', name: 'Dup' })).body.error).toBe('slug_taken')
+    expect(rows("SELECT 1 FROM agents WHERE slug = 'agent-b'")).toHaveLength(1)
+    // a delegation whose max_grant is below member cannot exist; a fresh slug in a covered squad still works
+    expect((await call(a, 'create_agent', { squad: 'S1', slug: 'fresh-agt', name: 'F' })).ok).toBe(true)
+  })
+
+  it('receipts carry an outcome: attempted before, applied after the write, refused when a covered act is refused', async () => {
+    await delegate('org', null, 'member')
+    const a = operator()
+    expect((await call(a, 'squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'member' })).ok).toBe(true)
+    refusal(await call(a, 'squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'lead' }))
+    const rs = rows<{ outcome: string; detail: string }>('SELECT outcome, detail FROM operator_delegation_receipts ORDER BY seq')
+    expect(rs.map((r) => r.outcome)).toEqual(['applied', 'refused'])
+    expect(JSON.parse(rs[1].detail)).toMatchObject({ refusal: 'requires_human_approval', reason: 'above_max_grant' })
+    // the only legal transition is attempted -> applied|refused
+    expect(() => harness.sqlite.prepare("UPDATE operator_delegation_receipts SET outcome = 'attempted'").run()).toThrow(/append-only/)
+    expect(() => harness.sqlite.prepare('DELETE FROM operator_delegation_receipts').run()).toThrow(/append-only/)
+  })
+
+  it('a delegation whose delegator is an agent SEAT is inert (the delegator must be human)', async () => {
+    addCap('seat-agent-C', 'admin', 'org', null)
+    harness.sqlite
+      .prepare("INSERT INTO agent_operator_delegations (id, tenant, agent_id, delegator_member_id, scope_type, scope_id, max_grant, created_by_member_id) VALUES ('seatdel', ?, 'agent-A', 'seat-agent-C', 'org', NULL, 'lead', 'seat-agent-C')")
+      .run(TENANT)
+    expect(refusal(await call(operator(), 'squad_member_add', { agent: 'agent-B', squad: 'S1', capability: 'member' })).error).toBe('delegator_authority_lost')
+  })
+
+  it('a home department is never a delegation target for create_squad', async () => {
+    await delegate('org', null, 'lead')
+    expect(refusal(await call(operator(), 'create_squad', { department: 'DH', slug: 'inhome-sqd', name: 'H' })).error).toBe('home_scope_not_grantable')
+    expect(rows("SELECT 1 FROM squads WHERE slug = 'inhome-sqd'")).toHaveLength(0)
+  })
+
+  it('operator_list shows a department admin only the delegations over scopes they administer', async () => {
+    await delegate('org', null, 'member')
+    await invokeTool(dana(), env, 'operator_delegate', { agent: 'agent-A', scope_type: 'department', scope_id: 'D1', max_grant: 'member' }, ORIGIN)
+    const all = await call(hadi(), 'operator_list', {})
+    expect(all.ok && (all.result as { count: number }).count).toBe(2)
+    const mine = await call(dana(), 'operator_list', {})
+    expect(mine.ok && (mine.result as { count: number; delegations: Array<{ scope_type: string }> }).delegations.map((d) => d.scope_type)).toEqual(['department'])
+  })
+
+  it('the HTTP memberships route keeps main\'s refusal for a bound agent with no delegation, elevation or not', async () => {
+    const r = await http(orgApp, adminOperator(), 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'admin' })
+    expect(r.status).toBe(403)
+    expect(r.body.error).toBe('operator_principal_required')
   })
 })

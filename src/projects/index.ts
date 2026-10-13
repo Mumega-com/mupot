@@ -3,7 +3,7 @@ import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin, resolveCapabilities, sessionMemberId } from '../auth/capability'
-import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
+import { authorizeStructuralWrite, finishDelegatedReceipt, structuralRefusalBody } from '../operators/chokepoint'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -368,6 +368,8 @@ projectsApp.get('/', async (c) => {
 
 projectsApp.post('/', async (c) => {
   const auth = c.get('auth')
+  const createGate = await authorizeStructuralWrite(c.env, auth, 'project_create', {}, { surface: 'http' })
+  if (createGate.kind === 'refused') return c.json(structuralRefusalBody(createGate), createGate.status)
   const access = await projectReadAccess(c.env, auth)
   // isOrgAdmin is the documented admin plane. workspaceAdmin is the project
   // create floor and still fail-closes restricted capability sets (#530).
@@ -459,6 +461,8 @@ projectsApp.patch('/:id', async (c) => {
   if (safeBody.status === 'active') {
     const existing = await getProject(c.env, c.req.param('id'))
     if (existing?.status === 'planned') {
+      const startGate = await authorizeStructuralWrite(c.env, c.get('auth'), 'project_start', {}, { surface: 'http' })
+      if (startGate.kind === 'refused') return c.json(structuralRefusalBody(startGate), startGate.status)
       const started = await startProject(c.env, existing.id, defaultStartGateDeps(c.get('auth').memberId ?? null))
       if (!started.ok) {
         const status = started.error === 'project_not_found' ? 404 : 409
@@ -563,6 +567,7 @@ projectsApp.put('/:id/squads/:squadId', async (c) => {
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await upsertProjectSquadAccess(c.env, c.req.param('id'), c.req.param('squadId'), body.access_level)
+  await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.json({ squad: result.value })
 })
@@ -586,6 +591,7 @@ projectsApp.delete('/:id/squads/:squadId', async (c) => {
   ).bind(projectId, squadId).first()
   if (!edge) return c.json({ error: 'project_squad_access_not_found' }, 404)
   const result = await removeProjectSquadAccess(c.env, projectId, squadId)
+  await finishDelegatedReceipt(c.env, gate, result.ok)
   if (!result.ok) return c.json({ error: result.error }, mutationStatus(result.error))
   return c.body(null, 204)
 })

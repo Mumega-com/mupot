@@ -38,7 +38,7 @@ import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
-import { authorizeStructuralWrite } from '../operators/chokepoint'
+import { authorizeStructuralWrite, finishDelegatedReceipt } from '../operators/chokepoint'
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
@@ -226,6 +226,10 @@ const toolProjectCreate: ToolSpec = {
     // a squad-scoped grant and deliberately so: the approver is choosing the
     // scope, and an org-scoped grant that expires on its own clock is still
     // strictly narrower than the standing workspace admin it replaces.
+    // The ONE structural chokepoint: project_create attaches the creator's own squad edge. Not delegable; an agent keeps
+    // its pre-W0 lane exactly (workspace admin or the org-scoped action:workspace_project elevation), flag on or off.
+    const createGate = await authorizeStructuralWrite(env, auth, 'project_create', {})
+    if (createGate.kind === 'refused') return fail(createGate.status, createGate.error, createGate.detail)
     const denied = requireWorkspaceAdmin(auth, 'project_create')
     // createdViaElevationGrant: the elevation_grants.id that authorized this create,
     // when this call ran under a bounded elevation rather than standing
@@ -543,6 +547,10 @@ const toolProjectUpdate: ToolSpec = {
       // change a status but never trigger that provisioning.
       if (existing?.status === 'planned' && elevationGrant) return denied ?? fail(403, 'forbidden')
       if (existing?.status === 'planned') {
+        // planned -> active provisions a department, squad and agent plus an admin edge and grants: a structural side
+        // effect. Not delegable (no delegation scope can cover a NEW department); the pre-W0 lane is unchanged.
+        const startGate = await authorizeStructuralWrite(env, auth, 'project_start', {})
+        if (startGate.kind === 'refused') return fail(startGate.status, startGate.error, startGate.detail)
         const started = await startProject(env, projectId, defaultStartGateDeps(auth.memberId ?? null))
         if (!started.ok) {
           const code = started.error === 'project_not_found' ? 404 : 409
@@ -719,6 +727,7 @@ const toolProjectSquadSet: ToolSpec = {
     // repopulated by granting it project access.
     if (await isSquadArchived(env, squadId)) return fail(409, 'squad_archived')
     const result = await upsertProjectSquadAccess(env, projectId, squadId, args.access_level)
+    await finishDelegatedReceipt(env, gate, result.ok)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'squad_access_set', projectId, { squad_id: squadId })
     return done({ squad: result.value })
@@ -757,6 +766,7 @@ const toolProjectSquadRemove: ToolSpec = {
     ).bind(projectId, squadId).first()
     if (!edge) return fail(404, 'project_squad_access_not_found')
     const result = await removeProjectSquadAccess(env, projectId, squadId)
+    await finishDelegatedReceipt(env, gate, result.ok)
     if (!result.ok) return mutationFailure(result.error)
     await emitProjectMutation(env, auth.memberId as string, 'squad_access_removed', projectId, { squad_id: squadId })
     return done({ project_id: projectId, squad_id: squadId, removed: true })

@@ -33,7 +33,10 @@ deleted. Created and revoked only by `operator_delegate` / `operator_revoke` (hu
 session, with the writers re-checking "human" themselves). `operator_list` reads them.
 
 A project has no capability scope of its own, so admin over a project means org admin (as everywhere else in project
-structure). A project delegation covers the project and the squads linked to it.
+structure). A PROJECT delegation covers the project's own edge-management acts and NO squad: "squads linked to the project"
+is mutable state, so counting it would let a delegation widen itself (attach a squad, then act there; or a later human link).
+`project_squad_set` under delegation needs the project covered AND the ATTACHED squad covered by a NON-project delegation
+scope (org, department or squad) whose delegator is still live. `project_squad_remove` needs the project only.
 
 ## The ceiling
 
@@ -46,8 +49,11 @@ structure). A project delegation covers the project and the squads linked to it.
   "delegation_id": "...", "requested": { "capability": "lead" }, "max_grant": "member", "ceiling_rank": 2 }
 ```
 
-A later wave can turn that into a secure moment. An existing standing above `max_grant` on the target agent (an admin
-membership, say) is not the agent's to overwrite, remove or move either.
+A later wave can turn that into a secure moment. A target agent whose standing ANYWHERE (seat capabilities across org,
+department and squad scopes, the legacy role plane, and any membership) is above `max_grant` is not the agent's to touch at
+all: standing is global, the #1411 rank-ceiling rule. `create_agent` writes a member-rank membership, so it CONFERS `member`
+and meets the same ceiling (the agent must itself hold member or better on that squad), and a slug that collides with any
+existing agent in the tenant is refused (`slug_taken`) so a delegate cannot make slug resolution ambiguous for humans.
 
 ## Never, delegation or not
 
@@ -64,10 +70,12 @@ suspended delegator, or a revoked delegator seat bite on the next request.
 ## Receipts
 
 Every delegated structural write writes `operator_delegation_receipts` BEFORE the write: agent, the agent's seat member,
-delegator, delegation id, action, surface (`mcp`|`http`), target scope, ceiling. It is an authorization receipt: an act
-that then fails downstream still leaves a row, and no applied delegated write exists without one. Append-only by trigger,
-no foreign keys (the record outlives agent, member and delegation). The existing `membership_receipts` rows for
-`squad_member_add/remove` still record the agent as actor.
+delegator, delegation id, action, surface (`mcp`|`http`), target scope, ceiling, and `outcome = 'attempted'`. The site closes
+it after the write: `applied` when it landed, `refused` when a later check refused it. A covered act that the chokepoint
+itself refuses (ceiling, target standing, slug, attached squad) leaves an `outcome = 'refused'` row. A crash between the
+write and the close leaves `attempted`, which honestly means "authorised, outcome unknown". The only legal UPDATE is
+`attempted -> applied|refused`; no deletes; no foreign keys (the record outlives agent, member and delegation). The existing
+`membership_receipts` rows for `squad_member_add/remove` still record the agent as actor.
 
 ## Flag semantics
 
@@ -76,3 +84,24 @@ no foreign keys (the record outlives agent, member and delegation). The existing
 - On: a bound agent may also act inside a live delegation. For the DELEGABLE acts that previously accepted an agent by its
   own capability grants (`create_squad`, `create_agent`, `project_squad_set/remove`), the capability lane is closed: the
   delegation replaces it. Non-delegable acts keep their pre-W0 lane.
+
+## Flag-INDEPENDENT tightenings (these ship even with the flag off)
+
+- The HTTP doors apply the chokepoint, closing #1357: an org-admin AGENT is refused (`operator_principal_required`) on
+  `POST /api/members/members/:id/capabilities`, `POST/DELETE .../tokens`, `PATCH .../members/:id` (suspend),
+  `DELETE .../telegram`, `POST /api/members/invites` (refused for ALL agents, project invites included), and
+  `POST /api/org/agents/:id/memberships` (main's refusal kept: no manage_access elevation lane over HTTP, and no
+  `isOrgAdmin` shortcut that could grant admin).
+- Gate grants: `grant_gate_capability` / `revoke_gate_capability` (MCP) and `POST/DELETE /api/gates/grants` refuse every
+  agent-bound caller. This REMOVES org-admin agents' ability to grant or revoke gate authority, Kasra's seat included. Use a
+  human session or the human-only path.
+- `project_create` and the planned->active start (`project_update`, `PATCH /api/projects/:id`) are routed through the chokepoint
+  as non-delegable actions with the pre-W0 lane, so an agent behaves exactly as before; the structural side effect (a new
+  department, squad and agent) is never delegable because no delegation scope can cover a NEW department.
+
+## Human-only check (`memberLooksAgentBound`)
+
+Who may delegate, and who may be a delegator, uses the fail-closed union: bound in `agent_member_bindings` OR holding any
+`member_tokens` row welded to an agent. The TARGET rule ("an act on a human member is refused") still uses the binding
+table alone (a wrong "agent" answer there would be the unsafe one). It was NOT verified against production data that no
+human row carries a legacy binding; the union makes the creation side over-refuse rather than under-refuse.

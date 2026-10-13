@@ -7,6 +7,7 @@
 
 import { authorizeStructuralWrite } from '../operators/chokepoint'
 import {
+  capabilityScopeForDelegation,
   createDelegation,
   delegatedOperatorsEnabled,
   listDelegations,
@@ -14,7 +15,8 @@ import {
   type DelegationError,
 } from '../operators/delegations'
 import { resolveAgentRef } from '../org/resolve'
-import { done, fail, str, type ToolSpec } from './index'
+import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
+import { done, fail, hasWorkspaceAdmin, str, type ToolSpec } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 
@@ -106,7 +108,7 @@ const toolOperatorRevoke: ToolSpec = {
 
 const toolOperatorList: ToolSpec = {
   name: 'operator_list',
-  scope: 'org (a human admin reads who may act for whom)',
+  scope: 'delegations the caller made or administers the scope of (a workspace admin sees all)',
   min: 'admin',
   args: '{ agent?: string (id|slug), include_revoked?: boolean }',
   inputSchema: {
@@ -125,7 +127,18 @@ const toolOperatorList: ToolSpec = {
       if (!agent.ok) return fail(404, 'agent_not_found')
       agentId = agent.value.id
     }
-    const delegations = await listDelegations(env, { agentId, includeRevoked: args.include_revoked === true })
+    const all = await listDelegations(env, { agentId, includeRevoked: args.include_revoked === true })
+    // Visible to a workspace admin, or filtered to the delegations the caller made or administers the scope of: a plain
+    // member must not be able to enumerate who may act for whom.
+    const delegations = []
+    for (const d of all) {
+      if (hasWorkspaceAdmin(auth) || d.delegator_member_id === auth.memberId) {
+        delegations.push(d)
+        continue
+      }
+      const cap = capabilityScopeForDelegation(d.scope_type, d.scope_id)
+      if ((await actorRankOnScopeFor(env, auth, cap.type, cap.id)) >= capabilityRank('admin')) delegations.push(d)
+    }
     return done({ delegations, count: delegations.length })
   },
 }

@@ -47,6 +47,22 @@ export async function memberIsAgentSeat(env: Env, memberId: string): Promise<boo
   return row != null
 }
 
+/**
+ * Fail-closed sibling of memberIsAgentSeat for the HUMAN-ONLY checks (who may delegate, who may be a delegator): a member is
+ * treated as non-human when it is bound in agent_member_bindings OR holds any member_tokens row welded to an agent. The
+ * binding table is the authority, but a legacy seat could predate it, and for these checks over-refusing is the safe error.
+ * (memberIsAgentSeat alone is still used for the TARGET rule, where a wrong "agent" answer would be the unsafe one.)
+ */
+export async function memberLooksAgentBound(env: Env, memberId: string): Promise<boolean> {
+  if (await memberIsAgentSeat(env, memberId)) return true
+  const row = await env.DB.prepare(
+    'SELECT 1 AS one FROM member_tokens WHERE member_id = ?1 AND agent_id IS NOT NULL LIMIT 1',
+  )
+    .bind(memberId)
+    .first<{ one: number }>()
+  return row != null
+}
+
 /** Live delegations for one agent, read fresh on every call. Never cached: revocation must bite on the next request. */
 export async function listLiveDelegationsForAgent(env: Env, agentId: string): Promise<DelegationRow[]> {
   const rows = await env.DB.prepare(
@@ -106,7 +122,7 @@ async function requireHuman(
   if (auth.tenant !== env.TENANT_SLUG) return { ok: false, error: 'tenant_scope' }
   const memberId = sessionMemberId(auth)
   if (!memberId) return { ok: false, error: 'member_identity_required' }
-  if (await memberIsAgentSeat(env, memberId)) return { ok: false, error: 'operator_principal_required' }
+  if (await memberLooksAgentBound(env, memberId)) return { ok: false, error: 'operator_principal_required' }
   const member = await env.DB.prepare(
     "SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1",
   )

@@ -68,7 +68,7 @@ describe('ratchet 1: every MCP structural tool asks the chokepoint for its own a
     // reviewed non-structural list below. Heuristic on purpose: it forces a human decision when a tool starts to write
     // org structure, instead of letting it ride in with its own inline rule.
     const reviewedNonStructural = new Set<string>([
-      'unarchive_row', 'archive_row', 'project_create', 'project_update', 'pot_provision', 'pot_release',
+      'unarchive_row', 'archive_row', 'pot_provision', 'pot_release',
       'team_bootstrap', 'agent_lifecycle', 'task_create', 'task_update', 'project_recommit', 'project_deploy',
       'bootstrap_self', 'connect', 'seat_select', 'addon_install', 'addon_activate', 'addon_configure', 'addon_disable',
       'addon_archive', 'addon_setup', 'create_department', 'secret_env_request',
@@ -125,6 +125,8 @@ describe('ratchet 2: every HTTP structural route carries the gate', () => {
     ['src/members/index.ts', "'/members/:id/telegram'"],
     ['src/members/index.ts', "membersApp.post('/members/:id/capabilities'"],
     ['src/members/index.ts', "'/invites',\n  parseInvite"],
+    ['src/projects/index.ts', "projectsApp.post('/', async"],
+    ['src/projects/index.ts', "projectsApp.patch('/:id'"],
     ['src/projects/index.ts', "projectsApp.put('/:id/squads/:squadId'"],
     ['src/projects/index.ts', "projectsApp.delete('/:id/squads/:squadId'"],
     ['src/tasks/index.ts', "gatesApp.post('/grants'"],
@@ -135,7 +137,7 @@ describe('ratchet 2: every HTTP structural route carries the gate', () => {
     const text = read(file)
     const at = text.indexOf(anchor)
     expect(at, `route anchor not found: ${anchor}`).toBeGreaterThanOrEqual(0)
-    const window = text.slice(at, at + 1400)
+    const window = text.slice(at, at + 2200)
     expect(GATE_TOKENS.some((t) => window.includes(t)), `${file} ${anchor} has no chokepoint gate within its first lines`).toBe(true)
   })
 
@@ -170,11 +172,11 @@ describe('ratchet 3: the census of files that write structural tables can only s
   const BASELINE = new Set([
     'src/addons/service.ts', 'src/auth/sso.ts', 'src/departments/registry.ts', 'src/gates/grants.ts', 'src/hygiene/archive.ts',
     'src/members/agent-access.ts', 'src/members/bootstrap-self.ts', 'src/members/index.ts', 'src/members/project-invites.ts',
-    'src/members/service.ts', 'src/members/squad-seed.ts', 'src/onboarding/doors.ts', 'src/org/service.ts',
+    'src/members/service.ts', 'src/members/squad-seed.ts', 'src/onboarding/doors.ts', 'src/org/service.ts', 'src/agents/river-lead.ts',
     'src/org/team-bootstrap.ts', 'src/pots/service.ts', 'src/projects/client-bootstrap.ts', 'src/projects/service.ts',
     // W0 itself: the delegation tables are not structural, but the chokepoint receipts/lookups name them
   ])
-  const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|squads|departments|project_squad_access|gate_grants|project_repos)\b/
+  const writes = /(INSERT( OR [A-Z]+)? INTO|UPDATE|DELETE FROM) +(capabilities|memberships|squads|departments|project_squad_access|gate_grants|project_repos)\b|INSERT( OR [A-Z]+)? INTO +agents\b|UPDATE +agents +SET[^;`]*squad_id/
 
   it('no source file outside the reviewed set writes a structural table', () => {
     const found = walk(join(ROOT, 'src'))
@@ -184,6 +186,40 @@ describe('ratchet 3: the census of files that write structural tables can only s
     expect(unreviewed, 'a NEW file writes a structural table; review it and route its agent-reachable callers through the chokepoint').toEqual([])
     const stale = [...BASELINE].filter((f) => !found.includes(f))
     expect(stale, 'a baselined file no longer writes a structural table; remove it so the census only shrinks').toEqual([])
+  })
+})
+
+describe('ratchet 3b: the census of files that CALL a structural service writer can only shrink', () => {
+  // Raw-SQL scans cannot see a caller that goes through a service (createSquad, setAgentSquadAccess, startProject ...).
+  // Every file that calls one is reviewed here: human-only (dashboard cookie routes, bootstrap, onboarding, consent flows)
+  // or an agent-reachable door that asks authorizeStructuralWrite. A NEW caller fails until it is added with that review.
+  const WRITERS = [
+    'createDepartment', 'createSquad', 'createAgent', 'setAgentSquadAccess', 'removeAgentSquadAccess', 'commitAgentSquadAccess',
+    'commitRemoveAgentSquadAccess', 'addSquadMember', 'removeSquadMember', 'upsertProjectSquadAccess', 'removeProjectSquadAccess',
+    'startProject', 'grantGateCapability', 'revokeGateCapability', 'upsertCapabilityGrant', 'moveAgentSquad',
+  ]
+  const CALLERS = new Set([
+    // agent-reachable doors, each gated by the chokepoint
+    'src/mcp/gates.ts', 'src/mcp/projects.ts', 'src/mcp/provision.ts', 'src/members/index.ts', 'src/org/index.ts',
+    'src/projects/index.ts', 'src/tasks/index.ts',
+    // services and human-only or consent-bound callers (reviewed 2026-10-13)
+    'src/dashboard/agent-access-panel.ts', 'src/dashboard/index.ts', 'src/dashboard/join-agent.ts', 'src/dashboard/wizard.ts',
+    'src/gates/grants.ts', 'src/mcp/oauth-authorize.ts', 'src/members/agent-access.ts', 'src/members/bootstrap-self.ts',
+    'src/members/service.ts', 'src/members/squad-membership.ts', 'src/org/service.ts', 'src/org/team-bootstrap.ts',
+    'src/projects/client-bootstrap.ts', 'src/projects/service.ts', 'src/projects/start-gate.ts',
+  ])
+  const call = new RegExp(`\\b(${WRITERS.join('|')})\\(`)
+
+  it('no source file outside the reviewed set calls a structural service writer', () => {
+    const found = walk(join(ROOT, 'src')).filter((f) => !f.endsWith('.generated.ts')).filter((f) => call.test(code(f)))
+    expect(found.filter((f) => !CALLERS.has(f)), 'a NEW file calls a structural service writer; review it and gate its agent-reachable callers').toEqual([])
+    expect([...CALLERS].filter((f) => !found.includes(f)), 'a baselined caller no longer calls a writer; remove it').toEqual([])
+  })
+
+  it('every agent-reachable door file in the set references the chokepoint', () => {
+    for (const f of ['src/mcp/gates.ts', 'src/mcp/projects.ts', 'src/mcp/provision.ts', 'src/members/index.ts', 'src/org/index.ts', 'src/projects/index.ts', 'src/tasks/index.ts']) {
+      expect(code(f).includes('authorizeStructuralWrite') || code(f).includes('structuralGate'), f).toBe(true)
+    }
   })
 })
 
@@ -252,7 +288,7 @@ describe('ratchet 4: the runtime sweep — an org-admin agent with NO delegation
     expect(out.ok, `${tool} accepted an undelegated agent`).toBe(false)
     if (!out.ok) {
       expect(out.status, tool).toBe(403)
-      expect(['operator_principal_required', 'forbidden'], `${tool} -> ${out.error}`).toContain(out.error)
+      expect(out.error, `${tool} -> ${out.error}`).toBe('operator_principal_required')
     }
     expect(harness.sqlite.prepare('SELECT count(*) AS n FROM memberships WHERE squad_id = ?').get('S2')).toEqual({ n: 0 })
     expect(harness.sqlite.prepare('SELECT count(*) AS n FROM gate_grants').get()).toEqual({ n: 0 })
