@@ -666,6 +666,12 @@ describe('HTTP project squad edges under a delegation', () => {
     const r = await http(projectsApp, adminOperator(), 'PUT', '/P1/squads/S2', { access_level: 'read' })
     expect(r.status).toBe(403)
     expect(r.body.error).toBe('operator_principal_required')
+    // and with the flag OFF it is main's refusal too (no capability lane, no elevation lane over HTTP)
+    env = { ...env, DELEGATED_OPERATORS: undefined } as Env
+    const off = await http(orgApp, adminOperator(), 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'admin' })
+    expect(off.status).toBe(403)
+    expect(off.body.error).toBe('operator_principal_required')
+    expect(membership('agent-B', 'S1')).toBeNull()
   })
 })
 
@@ -787,5 +793,11 @@ describe('gate round 1 fixes', () => {
     const r = await http(orgApp, adminOperator(), 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'admin' })
     expect(r.status).toBe(403)
     expect(r.body.error).toBe('operator_principal_required')
+    // and with the flag OFF it is main's refusal too (no capability lane, no elevation lane over HTTP)
+    env = { ...env, DELEGATED_OPERATORS: undefined } as Env
+    const off = await http(orgApp, adminOperator(), 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'admin' })
+    expect(off.status).toBe(403)
+    expect(off.body.error).toBe('operator_principal_required')
+    expect(membership('agent-B', 'S1')).toBeNull()
   })
 })
