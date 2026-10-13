@@ -2486,7 +2486,21 @@ const toolTaskVerdict: ToolSpec = {
     // it directly rather than calling writeVerdict a second time.
     let originFailure: HumanOriginResolution | null = null
     if (args.human_origin !== undefined) {
-      if (!auth.boundAgentId) {
+      // mupot#1889: human_origin is the HARNESS'S attestation, so only a real harness
+      // runtime may carry it: an agent-bound NON-directory (workspace/im/dashboard)
+      // credential, i.e. what mint_agent_token issues (provision.ts channel 'workspace')
+      // and the KayHermes gateway presents as MUPOT_AGENT_TOKEN. Refused for every
+      // session where the "agent" is a chat model reading untrusted content or the
+      // origin cannot be harness-stamped: OAuth connector sessions (directory channel,
+      // consentedByMemberId set), seat sessions (seatBinding) and harness-credential
+      // sessions. Hard refusal, never a fallback, same as the unbound case.
+      if (
+        !auth.boundAgentId ||
+        auth.channel === 'directory' ||
+        auth.consentedByMemberId ||
+        auth.seatBinding ||
+        auth.harnessCredential
+      ) {
         return fail(400, 'human_origin_not_applicable')
       }
       try {
