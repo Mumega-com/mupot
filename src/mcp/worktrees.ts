@@ -25,6 +25,8 @@ function refusal(error: string, detail?: unknown): ToolOutcome {
       return fail(403, error, detail)
     case 'harness_required':
       return fail(403, error, 'A thread workspace needs a verified harness on this connection.')
+    case 'worktree_cap_reached':
+      return fail(409, error, 'Too many workspaces created by this member on this project; archive some or reuse existing ones.')
     case 'worktree_archived':
       return fail(409, error, detail)
     default:
@@ -45,7 +47,7 @@ const toolWorktreeOpen: ToolSpec = {
       repo: { type: 'string', description: 'git_branch: the repository URL in any spelling. Must be the project\'s repo or one on its allow-list.' },
       branch: { type: 'string', description: 'git_branch: the branch (refs/heads/x or x). A detached HEAD has no workspace identity.' },
       slug: { type: 'string', description: 'folder: a human-chosen name (a-z 0-9 . _ -). Never a machine path.' },
-      thread: { type: 'string', description: 'thread: the thread id inside this harness.' },
+      thread: { type: 'string', description: 'thread: the thread id inside this harness. Needs a verified harness (SEAT_AUTO_ENROLL on); only its owner can list it.' },
       head_sha: { type: 'string', description: 'Optional current HEAD, recorded for display only. Never authority.' },
     },
     required: ['project'],
@@ -74,20 +76,22 @@ const toolWorktreeList: ToolSpec = {
   name: 'worktree_list',
   scope: 'project workspaces (read); filtered through the project visibility chokepoint',
   min: 'authenticated',
-  args: '{ project: string, include_archived?: boolean }',
+  args: '{ project: string, include_archived?: boolean, limit?: number, cursor?: string }',
   inputSchema: {
     type: 'object',
     properties: {
       project: { type: 'string', description: 'Project id or slug.' },
       include_archived: { type: 'boolean' },
+      limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Page size (default 100). Branches are listed first, then folders, then your own threads.' },
+      cursor: { type: 'string', description: 'next_cursor from the previous page.' },
     },
     required: ['project'],
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const r = await listWorktrees(env, auth, { project: args.project, include_archived: args.include_archived })
+    const r = await listWorktrees(env, auth, { project: args.project, include_archived: args.include_archived, limit: args.limit, cursor: args.cursor })
     if (!r.ok) return refusal(r.error, 'detail' in r ? r.detail : undefined)
-    return done({ project_id: r.project_id, worktrees: r.worktrees })
+    return done({ project_id: r.project_id, worktrees: r.worktrees, next_cursor: r.next_cursor })
   },
 }
 

@@ -52,10 +52,21 @@ BEGIN
   SELECT RAISE(ABORT, 'harness_grant_shape');
 END;
 
+-- A grant is immutable EXCEPT for one move: an OAuth harness whose consent token is REVOKED may be
+-- re-pointed at the same member's next consent (reuseRevokedHarness, src/members/harness.ts), so a
+-- re-consent after revoke does not mint a fresh harness every time and burn seats toward the lifetime
+-- cap. The old grant must be 'oauth:' + a token that is revoked; the new one must be 'oauth:' + a token of
+-- the SAME member that is live. Anything else is refused.
 CREATE TRIGGER IF NOT EXISTS harnesses_grant_immutable
 BEFORE UPDATE OF grant_id ON harnesses
 FOR EACH ROW
 WHEN OLD.grant_id IS NOT NULL AND NEW.grant_id IS NOT OLD.grant_id
+ AND NOT (
+      OLD.credential_kind = 'oauth' AND OLD.grant_id LIKE 'oauth:%' AND NEW.grant_id LIKE 'oauth:%'
+  AND EXISTS (SELECT 1 FROM member_tokens t WHERE t.id = substr(OLD.grant_id, 7) AND t.revoked_at IS NOT NULL)
+  AND EXISTS (SELECT 1 FROM member_tokens n WHERE n.id = substr(NEW.grant_id, 7) AND n.member_id = OLD.member_id
+                 AND n.tenant = OLD.tenant AND n.revoked_at IS NULL)
+ )
 BEGIN
   SELECT RAISE(ABORT, 'harness_grant_immutable');
 END;
@@ -103,6 +114,32 @@ WHEN NEW.id IS NOT OLD.id OR NEW.tenant IS NOT OLD.tenant OR NEW.project_id IS N
   OR NEW.created_by_member_id IS NOT OLD.created_by_member_id OR NEW.created_at IS NOT OLD.created_at
 BEGIN
   SELECT RAISE(ABORT, 'worktree_identity_immutable');
+END;
+
+-- Creation cap, per member per project, INSIDE the inserting statement (so it holds under concurrency):
+-- folder + thread rows 200, git_branch rows 1000. Reopening an existing workspace never inserts, so it
+-- is never refused by the cap.
+CREATE TRIGGER IF NOT EXISTS worktrees_creation_cap
+BEFORE INSERT ON worktrees
+FOR EACH ROW
+WHEN (NEW.kind = 'git_branch'
+      AND (SELECT COUNT(*) FROM worktrees w WHERE w.tenant = NEW.tenant AND w.project_id = NEW.project_id
+              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind = 'git_branch') >= 1000)
+  OR (NEW.kind <> 'git_branch'
+      AND (SELECT COUNT(*) FROM worktrees w WHERE w.tenant = NEW.tenant AND w.project_id = NEW.project_id
+              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind <> 'git_branch') >= 200)
+BEGIN
+  SELECT RAISE(ABORT, 'worktree_cap_reached');
+END;
+
+-- harness_id is '' for non-thread rows, so it cannot carry a FOREIGN KEY. Instead a harness that a
+-- thread worktree names cannot be deleted out from under it.
+CREATE TRIGGER IF NOT EXISTS harnesses_worktree_delete_guard
+BEFORE DELETE ON harnesses
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM worktrees w WHERE w.harness_id = OLD.id)
+BEGIN
+  SELECT RAISE(ABORT, 'harness_has_worktrees');
 END;
 
 -- A thread worktree names a REAL harness of the same tenant.

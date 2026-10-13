@@ -76,14 +76,14 @@ afterEach(() => { h.close(); vi.unstubAllGlobals() })
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────
 
-async function mintHarness(env: Env, memberId: string): Promise<{ raw: string; harnessId: string }> {
+async function mintHarness(env: Env, memberId: string): Promise<{ raw: string; harnessId: string; tokenId: string }> {
   const res = await membersApp.request(`/members/${memberId}/tokens`, {
     method: 'POST', headers: { cookie: 'mupot_session=admin-sid', 'content-type': 'application/json' },
     body: JSON.stringify({ label: 'ci', harness_kind: 'ci' }),
   }, env)
-  const j = (await res.json()) as { token: { raw: string }; harness: { id: string } }
+  const j = (await res.json()) as { token: { raw: string; id: string }; harness: { id: string } }
   if (res.status !== 201) throw new Error(`mint ${res.status} ${JSON.stringify(j)}`)
-  return { raw: j.token.raw, harnessId: j.harness.id }
+  return { raw: j.token.raw, harnessId: j.harness.id, tokenId: j.token.id }
 }
 
 async function rpc(env: Env, raw: string, name: string, args: Record<string, unknown>): Promise<{ status: number; text: string; sc: Record<string, unknown> }> {
@@ -97,10 +97,17 @@ async function rpc(env: Env, raw: string, name: string, args: Record<string, unk
 }
 
 /** A harness-shaped context: ZERO capabilities by design, a harness pointer, no agent. */
-function harnessAuth(memberId: string, harnessId: string | null = null): AuthContext {
+function harnessAuth(memberId: string, harnessId?: string | null, tokenId?: string): AuthContext {
+  let hid: string | null
+  if (harnessId === undefined) {
+    // a REAL harness row for this member (the door verifies it live)
+    hid = `hx-${memberId}`
+    h.sqlite.exec(`INSERT OR IGNORE INTO harnesses (id, tenant, member_id, oauth_client_id) VALUES ('${hid}', '${TENANT}', '${memberId}', 'client-${memberId}')`)
+  } else hid = harnessId
   return {
     userId: memberId, email: null, role: 'member', tenant: TENANT, memberId, channel: 'directory',
-    capabilities: [], latentCapabilities: [], boundAgentId: null, harnessId, harnessCredential: true,
+    capabilities: [], latentCapabilities: [], boundAgentId: null, harnessId: hid, harnessCredential: true,
+    ...(tokenId ? { tokenId } : {}),
   }
 }
 
@@ -310,7 +317,7 @@ describe('visibility and isolation', () => {
     await open(env, harnessAuth(W), { branch: 'b' })
     const asW = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
     const asR = await listWorktrees(env, harnessAuth(R), { project: 'P1' })
-    expect(asW.ok && asW.worktrees.map((w) => w.ref_name)).toEqual(['a', 'b'])
+    expect(asW.ok && asW.worktrees.map((w) => w.ref_name).sort()).toEqual(['a', 'b'])
     expect(asR.ok && asR.worktrees).toHaveLength(2)
     expect(await listWorktrees(env, harnessAuth(X), { project: 'P1' })).toMatchObject({ ok: false, error: 'project_not_found' })
     expect(await listWorktrees(env, harnessAuth(X), { project: 'mupot' })).toMatchObject({ ok: false, error: 'project_not_found' })
@@ -381,9 +388,9 @@ describe('kinds: folder and thread, kept minimal', () => {
     const env = envFor()
     const m1 = await mintHarness(env, W)
     const m2 = await mintHarness(env, W)
-    const a = await openWorktree(env, harnessAuth(W, m1.harnessId), { project: 'P1', kind: 'thread', thread: 'th-1' })
-    const a2 = await openWorktree(env, harnessAuth(W, m1.harnessId), { project: 'P1', kind: 'thread', thread: 'th-1' })
-    const b = await openWorktree(env, harnessAuth(W, m2.harnessId), { project: 'P1', kind: 'thread', thread: 'th-1' })
+    const a = await openWorktree(env, harnessAuth(W, m1.harnessId, m1.tokenId), { project: 'P1', kind: 'thread', thread: 'th-1' })
+    const a2 = await openWorktree(env, harnessAuth(W, m1.harnessId, m1.tokenId), { project: 'P1', kind: 'thread', thread: 'th-1' })
+    const b = await openWorktree(env, harnessAuth(W, m2.harnessId, m2.tokenId), { project: 'P1', kind: 'thread', thread: 'th-1' })
     expect(a.ok && a2.ok && b.ok).toBe(true)
     expect(a.ok && a2.ok && a.worktree.id === a2.worktree.id).toBe(true)
     expect(a.ok && b.ok && a.worktree.id !== b.worktree.id).toBe(true)
@@ -394,10 +401,14 @@ describe('kinds: folder and thread, kept minimal', () => {
     const env = envFor()
     const mine = await mintHarness(env, W)
     const theirs = await mintHarness(env, R)
-    expect(await openWorktree(env, harnessAuth(W, null), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'harness_required' })
-    expect(await openWorktree(env, harnessAuth(W, theirs.harnessId), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'harness_required' })
-    expect(await openWorktree(env, harnessAuth(W, 'no-such'), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'harness_required' })
-    expect(await openWorktree(env, harnessAuth(W, mine.harnessId), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: true })
+    // the harness door verifies the pointer live: absent, someone else's, or unknown all fail closed
+    expect(await openWorktree(env, harnessAuth(W, null), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await openWorktree(env, harnessAuth(W, theirs.harnessId, theirs.tokenId), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await openWorktree(env, harnessAuth(W, 'no-such'), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'principal_required' })
+    // a seat-shaped caller that claims a harness it does not own is refused at the thread step
+    const seatLike = { ...agentAuth('agent-member-1', [{ squad: 'SQ_W', cap: 'member' }]), seatBinding: { seatId: 's', label: 'l', harnessId: theirs.harnessId, grantTokenId: 'g', humanMemberId: W, source: 'handle' as const } }
+    expect(await openWorktree(env, seatLike, { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: false, error: 'harness_required' })
+    expect(await openWorktree(env, harnessAuth(W, mine.harnessId, mine.tokenId), { project: 'P1', kind: 'thread', thread: 't' })).toMatchObject({ ok: true })
   })
 
   it('the schema itself refuses a mis-shaped row, an identity edit, and a thread on an unknown harness', () => {
@@ -585,5 +596,302 @@ describe('backfill (migration 0216 over a populated pre-0216 schema)', () => {
       pre.sqlite.exec(`INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, grant_id) VALUES ('hn','${TENANT}','m1','shared-client#oauth:new','oauth:new')`)
       expect(Number(pre.sqlite.prepare('SELECT COUNT(*) AS n FROM harnesses').get()!.n)).toBe(5)
     } finally { pre.close() }
+  })
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// Gate round 1 fix pass
+// ════════════════════════════════════════════════════════════════════════════
+describe('FIX 1: the human-authority branch is the VERIFIED harness door only', () => {
+  it('a plain unbound directory session with capabilities [] is refused like project_get, even though the human could write', async () => {
+    const env = envFor()
+    const plain: AuthContext = { userId: W, email: null, role: 'member', tenant: TENANT, memberId: W, channel: 'directory', capabilities: [], boundAgentId: null }
+    expect(await open(env, plain)).toMatchObject({ ok: false, error: 'project_not_found' })
+    expect(await listWorktrees(env, plain, { project: 'P1' })).toMatchObject({ ok: false, error: 'project_not_found' })
+    const viaTool = await invokeTool(plain, env, 'worktree_open', { project: 'P1', repo: REPO, branch: 'main' })
+    expect(viaTool).toMatchObject({ ok: false })
+    expect(wtRows()).toBe(0)
+  })
+
+  it('a consent-bound session whose capabilities were zeroed (the human was demoted) is refused, not revived with anything wider', async () => {
+    const env = envFor()
+    // the agent's dedicated member holds a raw write grant; the consent session's capabilities are zeroed
+    member('agent-dedicated'); grant('agent-dedicated', 'SQ_W', 'admin')
+    const demoted: AuthContext = {
+      userId: 'agent-dedicated', email: null, role: 'member', tenant: TENANT, memberId: 'agent-dedicated', channel: 'directory',
+      capabilities: [], boundAgentId: null, consentedByMemberId: W,
+    }
+    expect(await open(env, demoted)).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await listWorktrees(env, demoted, { project: 'P1' })).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(wtRows()).toBe(0)
+  })
+
+  it('the session\'s own capabilities are used as they are: a plain session WITH a write grant opens', async () => {
+    const own: AuthContext = {
+      userId: W, email: null, role: 'member', tenant: TENANT, memberId: W, channel: 'directory', boundAgentId: null,
+      capabilities: [{ member_id: W, scope_type: 'squad', scope_id: 'SQ_W', capability: 'member' }],
+    }
+    expect(await open(envFor(), own)).toMatchObject({ ok: true })
+  })
+
+  it('the harness session still works (verified harness row), by OAuth harness and by token harness', async () => {
+    const env = envFor()
+    expect(await open(env, harnessAuth(W))).toMatchObject({ ok: true })
+    const m = await mintHarness(env, W)
+    expect(await open(env, harnessAuth(W, m.harnessId, m.tokenId), { branch: 'tok' })).toMatchObject({ ok: true })
+  })
+
+  it('a forged or mismatched harness pointer is refused: another member\'s harness, unknown id, wrong token for a token harness', async () => {
+    const env = envFor()
+    const mine = await mintHarness(env, W)
+    const theirs = await mintHarness(env, R)
+    expect(await open(env, harnessAuth(W, theirs.harnessId, theirs.tokenId))).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await open(env, harnessAuth(W, 'ghost'))).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await open(env, harnessAuth(W, mine.harnessId, 'some-other-token'))).toMatchObject({ ok: false, error: 'principal_required' })
+    expect(await open(env, harnessAuth(W, mine.harnessId))).toMatchObject({ ok: false, error: 'principal_required' }) // token harness with no token
+    expect(wtRows()).toBe(0)
+  })
+
+  it('a harness-flagged context that is ALSO agent-bound uses its own capabilities, never the human\'s', async () => {
+    const env = envFor()
+    const both = { ...harnessAuth(W), boundAgentId: 'agent-x' }
+    expect(await open(env, both)).toMatchObject({ ok: false }) // own capabilities are []
+    expect(wtRows()).toBe(0)
+  })
+})
+
+describe('FIX 2: one write predicate, one project reader', () => {
+  it('resolves by id before slug: a project whose slug equals another project\'s id never shadows it', async () => {
+    h.sqlite.exec(`INSERT INTO projects (id, slug, name, status, repo_url) VALUES ('P4','P1','Decoy','active','${REPO}'); INSERT INTO project_squad_access (project_id, squad_id, access_level) VALUES ('P4','SQ_W','write');`)
+    const r = await open(envFor(), harnessAuth(W))
+    expect(r.ok && r.worktree.project_id).toBe('P1')
+    const bySlug = await openWorktree(envFor(), harnessAuth(W), { project: 'norepo', kind: 'folder', slug: 'x' })
+    expect(bySlug.ok && bySlug.worktree.project_id).toBe('P3')
+  })
+
+  it('a department-only grant matches project_remember (no new, wider predicate)', async () => {
+    h.sqlite.exec(`DELETE FROM capabilities WHERE member_id = '${W}'; INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-dept', '${W}', 'department', 'd1', 'member')`)
+    // project_remember's predicate reads access.squadIds only (departments are not expanded), so a
+    // department grant alone is not project write. This tool answers the same.
+    expect(await open(envFor(), harnessAuth(W))).toMatchObject({ ok: false })
+  })
+})
+
+describe('FIX 3: thread rows belong to their owner', () => {
+  it('another writer and a project reader never see (or get ids of) someone else\'s thread rows; the owner does', async () => {
+    member('member-writer2'); grant('member-writer2', 'SQ_W', 'member')
+    const env = envFor()
+    const t = await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'thread', thread: 'secret-thread-1' })
+    expect(t.ok).toBe(true)
+    await open(env, harnessAuth(W))
+    await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: 'shared-notes' })
+    const own = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
+    expect(own.ok && own.worktrees.map((x) => x.kind).sort()).toEqual(['folder', 'git_branch', 'thread'])
+    for (const who of ['member-writer2', R]) {
+      const other = await listWorktrees(env, harnessAuth(who), { project: 'P1' })
+      expect(other.ok && other.worktrees.map((x) => x.kind).sort(), who).toEqual(['folder', 'git_branch'])
+      expect(JSON.stringify(other), who).not.toContain('secret-thread-1')
+      expect(JSON.stringify(other), who).not.toContain('hx-' + W)
+    }
+    // a seat/agent caller reads only the threads of the human behind it
+    const seatOfW = { ...agentAuth('agent-member-1', [{ squad: 'SQ_W', cap: 'member' }]), seatBinding: { seatId: 's', label: 'l', harnessId: 'hx-' + W, grantTokenId: 'g', humanMemberId: W, source: 'handle' as const } }
+    const viaSeat = await listWorktrees(env, seatOfW, { project: 'P1' })
+    expect(viaSeat.ok && viaSeat.worktrees.some((x) => x.kind === 'thread')).toBe(true)
+    const plainAgent = await listWorktrees(env, agentAuth('agent-member-2', [{ squad: 'SQ_W', cap: 'member' }]), { project: 'P1' })
+    expect(plainAgent.ok && plainAgent.worktrees.some((x) => x.kind === 'thread')).toBe(false)
+  })
+})
+
+describe('FIX 4: creation caps and cursor pagination', () => {
+  const seed = (member_id: string, kind: 'folder' | 'git_branch', count: number, tag: string): void => {
+    for (let i = 0; i < count; i += 1) {
+      if (kind === 'folder') {
+        h.sqlite.exec(`INSERT INTO worktrees (id, tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name, created_by_member_id) VALUES ('${tag}-${i}', '${TENANT}', 'P1', 'folder', '', '', 'slug', '${tag}-${i}', '${member_id}')`)
+      } else {
+        h.sqlite.exec(`INSERT INTO worktrees (id, tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name, created_by_member_id) VALUES ('${tag}-${i}', '${TENANT}', 'P1', 'git_branch', 'github:mumega-com/mupot', '', 'branch', '${tag}-${i}', '${member_id}')`)
+      }
+    }
+  }
+
+  it('folder + thread rows are capped at 200 per member per project, atomically, and a reopen at the cap still works', async () => {
+    const env = envFor()
+    seed(W, 'folder', 199, 'f')
+    expect(await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: 'the-200th' })).toMatchObject({ ok: true, created: true })
+    expect(await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: 'the-201st' })).toMatchObject({ ok: false, error: 'worktree_cap_reached' })
+    expect(await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: 'the-200th' })).toMatchObject({ ok: true, created: false })
+    expect(await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'thread', thread: 'th' })).toMatchObject({ ok: false, error: 'worktree_cap_reached' })
+    expect(n(`SELECT COUNT(*) AS n FROM worktrees WHERE created_by_member_id = ?`, W)).toBe(200)
+    // per member and per project: another member, and a branch by the same member, are unaffected
+    member('member-writer2'); grant('member-writer2', 'SQ_W', 'member')
+    expect(await openWorktree(env, harnessAuth('member-writer2'), { project: 'P1', kind: 'folder', slug: 'ok' })).toMatchObject({ ok: true })
+    expect(await open(env, harnessAuth(W))).toMatchObject({ ok: true })
+    expect(await openWorktree(env, harnessAuth(W), { project: 'P3', kind: 'folder', slug: 'other-project' })).toMatchObject({ ok: true })
+  })
+
+  it('branches are capped at 1000 per member per project', async () => {
+    const env = envFor()
+    seed(W, 'git_branch', 1000, 'b')
+    expect(await open(env, harnessAuth(W), { branch: 'one-too-many' })).toMatchObject({ ok: false, error: 'worktree_cap_reached' })
+    expect(await open(env, harnessAuth(W), { branch: 'b-5' })).toMatchObject({ ok: true, created: false })
+  })
+
+  it('concurrent creations cannot overshoot the cap', async () => {
+    const env = envFor()
+    seed(W, 'folder', 195, 'f')
+    const rs = await Promise.all(Array.from({ length: 12 }, (_, i) => openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: `race-${i}` })))
+    expect(rs.filter((r) => r.ok)).toHaveLength(5)
+    expect(n(`SELECT COUNT(*) AS n FROM worktrees WHERE created_by_member_id = ?`, W)).toBe(200)
+  })
+
+  it('list is branch-first and paginated by an opaque cursor with no gaps or repeats', async () => {
+    const env = envFor()
+    const a = harnessAuth(W)
+    await openWorktree(env, a, { project: 'P1', kind: 'thread', thread: 't-1' })
+    for (const f of ['f1', 'f2', 'f3']) await openWorktree(env, a, { project: 'P1', kind: 'folder', slug: f })
+    for (const b of ['b1', 'b2', 'b3', 'b4']) await open(env, a, { branch: b })
+    const seen: string[] = []
+    let cursor: string | null = null
+    let pages = 0
+    do {
+      const page: Awaited<ReturnType<typeof listWorktrees>> = await listWorktrees(env, a, { project: 'P1', limit: 3, ...(cursor ? { cursor } : {}) })
+      if (!page.ok) throw new Error('list failed')
+      expect(page.worktrees.length).toBeLessThanOrEqual(3)
+      seen.push(...page.worktrees.map((x) => `${x.kind}:${x.ref_name}`))
+      cursor = page.next_cursor
+      pages += 1
+    } while (cursor && pages < 10)
+    expect(pages).toBe(3)
+    expect(new Set(seen).size).toBe(8)
+    expect(seen.slice(0, 4).every((x) => x.startsWith('git_branch:'))).toBe(true)
+    expect(seen.slice(4, 7).every((x) => x.startsWith('folder:'))).toBe(true)
+    expect(seen[7]).toBe('thread:t-1')
+  })
+
+  it('bad limit and forged cursors are refused', async () => {
+    const env = envFor()
+    for (const limit of [0, -1, 201, 1.5, '5']) expect(await listWorktrees(env, harnessAuth(W), { project: 'P1', limit })).toMatchObject({ ok: false, error: 'invalid_args' })
+    for (const cursor of ['x', '9|a|b', '1|2', 5, '%E0|a|b']) expect(await listWorktrees(env, harnessAuth(W), { project: 'P1', cursor })).toMatchObject({ ok: false, error: 'invalid_args' })
+  })
+})
+
+describe('FIX 5: re-consent churn', () => {
+  const tok = (id: string, memberId: string, revokedDaysAgo: number | null): void => {
+    h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant, revoked_at)
+                   VALUES ('${id}', '${memberId}', 'hash-${id}', 'oauth:x', 'directory', '2026-10-01', '${TENANT}', ${revokedDaysAgo === null ? 'NULL' : `strftime('%Y-%m-%d %H:%M:%S', 'now', '-${revokedDaysAgo} days')`})`)
+  }
+  const grantOf = (id: string): string => String(h.sqlite.prepare('SELECT grant_id AS g FROM harnesses WHERE id = ?').get(id)!.g)
+
+  it('a re-consent after the prior grant was revoked ADOPTS the harness (same id, grant moves) and its seat survives', async () => {
+    const env = envFor()
+    tok('tA', W, null); tok('tB', W, null)
+    const first = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'tA')
+    const seat1 = await seatSelect(env, { channel: 'directory', boundAgentId: null, memberId: W, harnessId: first!.id, tokenId: 'tA' }, { project: 'p', folder: '/f' })
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now') WHERE id = 'tA'`)
+    const second = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'tB')
+    expect(second?.id).toBe(first?.id)
+    expect(grantOf(first!.id)).toBe('oauth:tB')
+    expect(n('SELECT COUNT(*) AS n FROM harnesses')).toBe(1)
+    const seat2 = await seatSelect(env, { channel: 'directory', boundAgentId: null, memberId: W, harnessId: second!.id, tokenId: 'tB' }, { project: 'p', folder: '/f' })
+    expect(seat1.ok && seat2.ok && seat1.seat.id === seat2.seat.id).toBe(true)
+    expect(n('SELECT COUNT(*) AS n FROM agent_seats')).toBe(1)
+  })
+
+  it('repeated revoke + re-consent never grows harnesses or seats', async () => {
+    const env = envFor()
+    let prev = 'g0'
+    tok(prev, W, null)
+    const h0 = await upsertHarness(env, W, 'client-1', 'ChatGPT', prev)
+    for (let i = 1; i <= 6; i += 1) {
+      h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now') WHERE id = '${prev}'`)
+      const next = `g${i}`
+      tok(next, W, null)
+      const again = await upsertHarness(env, W, 'client-1', 'ChatGPT', next)
+      expect(again?.id).toBe(h0?.id)
+      prev = next
+    }
+    expect(n('SELECT COUNT(*) AS n FROM harnesses')).toBe(1)
+  })
+
+  it('a still-LIVE prior grant (a second machine) is never adopted: two installs stay two harnesses', async () => {
+    const env = envFor()
+    tok('tA', W, null); tok('tB', W, null)
+    const a = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'tA')
+    const b = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'tB')
+    expect(a?.id).not.toBe(b?.id)
+    expect(grantOf(a!.id)).toBe('oauth:tA')
+  })
+
+  it('outside the window, another client, another member, or a legacy row: a fresh harness', async () => {
+    const env = envFor()
+    tok('old', W, 45); tok('c2', W, null); tok('c3', W, null); tok('c4', R, null)
+    const a = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'old')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now','-45 days') WHERE id = 'old'`)
+    expect((await upsertHarness(env, W, 'client-1', 'ChatGPT', 'c2'))?.id).not.toBe(a?.id) // 45 days: expired window
+    tok('rv', W, 1)
+    const b = await upsertHarness(env, W, 'client-9', 'Cursor', 'rv')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now') WHERE id = 'rv'`)
+    expect((await upsertHarness(env, W, 'client-OTHER', 'Cursor', 'c3'))?.id).not.toBe(b?.id) // different client
+    expect((await upsertHarness(env, R, 'client-9', 'Cursor', 'c4'))?.id).not.toBe(b?.id) // different member
+    const legacy = await upsertHarness(envFor({ WORKSPACES: undefined }), W, 'client-L', 'Cursor')
+    tok('c5', W, null)
+    expect((await upsertHarness(env, W, 'client-L', 'Cursor', 'c5'))?.id).not.toBe(legacy?.id)
+  })
+
+  it('concurrent consents after a revoke: exactly one adopts the harness, the other gets its own (no two live grants on one harness)', async () => {
+    const env = envFor()
+    tok('tA', W, null); tok('tB', W, null); tok('tC', W, null)
+    const a = await upsertHarness(env, W, 'client-1', 'ChatGPT', 'tA')
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now') WHERE id = 'tA'`)
+    const [b, c] = await Promise.all([upsertHarness(env, W, 'client-1', 'ChatGPT', 'tB'), upsertHarness(env, W, 'client-1', 'ChatGPT', 'tC')])
+    expect([b?.id, c?.id].filter((x) => x === a?.id)).toHaveLength(1)
+    expect(new Set([b?.id, c?.id]).size).toBe(2)
+    const grants = h.sqlite.prepare('SELECT grant_id AS g FROM harnesses').all().map((r) => r.g)
+    expect(new Set(grants).size).toBe(grants.length)
+  })
+
+  it('the schema permits the grant move ONLY from a revoked grant to a live grant of the same member', () => {
+    tok('tA', W, null); tok('tB', W, null); tok('tR', R, null)
+    h.sqlite.exec(`INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, grant_id) VALUES ('hh', '${TENANT}', '${W}', 'c#oauth:tA', 'oauth:tA')`)
+    expect(() => h.sqlite.exec(`UPDATE harnesses SET grant_id = 'oauth:tB' WHERE id = 'hh'`)).toThrow(/harness_grant_immutable/) // old grant still live
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = strftime('%Y-%m-%d %H:%M:%S','now') WHERE id = 'tA'`)
+    expect(() => h.sqlite.exec(`UPDATE harnesses SET grant_id = 'oauth:tR' WHERE id = 'hh'`)).toThrow(/harness_grant_immutable/) // someone else's token
+    expect(() => h.sqlite.exec(`UPDATE harnesses SET grant_id = 'oauth:nope' WHERE id = 'hh'`)).toThrow(/harness_grant_immutable/) // no such token
+    expect(() => h.sqlite.exec(`UPDATE harnesses SET grant_id = 'legacy:hh' WHERE id = 'hh'`)).toThrow(/harness_grant_immutable/) // not an oauth grant
+    h.sqlite.exec(`UPDATE harnesses SET grant_id = 'oauth:tB' WHERE id = 'hh'`)
+    expect(grantOf('hh')).toBe('oauth:tB')
+  })
+})
+
+describe('P3s', () => {
+  it('repo keys: network repos only; non-GitHub path case is preserved; GitHub still folds', () => {
+    for (const bad of ['file:///srv/repos/mupot.git', '/srv/repos/mupot', './mupot', '../mupot', '~/mupot', 'C:\\work\\mupot', 'C:/work/mupot', 'mupot', '']) {
+      expect(repoKeyFromUrl(bad), bad).toBeNull()
+    }
+    expect(repoKeyFromUrl('https://git.example.test/Team/Repo.git')).toBe('url:git.example.test/Team/Repo')
+    expect(repoKeyFromUrl('git@GIT.example.test:Team/Repo.git')).toBe('url:git.example.test/Team/Repo')
+    expect(repoKeyFromUrl('https://git.example.test/team/repo')).not.toBe(repoKeyFromUrl('https://git.example.test/Team/Repo'))
+    expect(repoKeyFromUrl('https://GitHub.com/Mumega-Com/Mupot.git')).toBe('github:mumega-com/mupot')
+  })
+
+  it('two repos differing only by path case on a self-hosted forge never collide', async () => {
+    h.sqlite.exec(`INSERT INTO project_repos (project_id, repo_key) VALUES ('P1','url:git.example.test/Team/Repo'), ('P1','url:git.example.test/team/repo')`)
+    const env = envFor()
+    const a = await open(env, harnessAuth(W), { repo: 'https://git.example.test/Team/Repo.git' })
+    const b = await open(env, harnessAuth(W), { repo: 'https://git.example.test/team/repo.git' })
+    expect(a.ok && b.ok && a.worktree.id !== b.worktree.id).toBe(true)
+  })
+
+  it('a file:// repo is refused as invalid_args even if someone allow-listed a look-alike', async () => {
+    const r = await open(envFor(), harnessAuth(W), { repo: 'file:///srv/repos/mupot.git' })
+    expect(r).toMatchObject({ ok: false, error: 'invalid_args' })
+  })
+
+  it('a harness that a thread worktree names cannot be deleted out from under it', async () => {
+    const env = envFor()
+    const a = harnessAuth(W)
+    await openWorktree(env, a, { project: 'P1', kind: 'thread', thread: 'th' })
+    expect(() => h.sqlite.exec(`DELETE FROM harnesses WHERE id = 'hx-${W}'`)).toThrow(/harness_has_worktrees/)
+    h.sqlite.exec(`DELETE FROM worktrees WHERE harness_id = 'hx-${W}'`)
+    h.sqlite.exec(`DELETE FROM harnesses WHERE id = 'hx-${W}'`)
   })
 })

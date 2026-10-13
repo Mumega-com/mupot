@@ -3,27 +3,31 @@
 // runs a read or a write.
 //
 // AUTHORITY. worktree_open is reachable from a harness session, which has an EMPTY capability set by
-// design. The harness's own capabilities are therefore never consulted. The principal is:
-//   * an agent-bound caller (a seat or an agent token): its OWN live context (auth.capabilities), the
-//     same ceiling every other tool sees, so it can open workspaces only on projects its squad writes;
-//   * anyone else (the human behind a harness, or a plain directory session): the UNDERLYING HUMAN,
-//     with grants re-read live from D1 (resolveCapabilities), the same derivation seat_select uses.
-// Visibility is the existing chokepoint (projectReadAccessFromGrants + projectVisibilityClause);
-// writability is the existing resolveAccessibleSquadIds(min 'member') + anySquadHasProjectWrite. No new
-// predicate is written here.
+// design. The harness's own capabilities are therefore never consulted, but ONLY for a VERIFIED harness
+// session (isHarnessCredentialSession + a live harnesses row for this member, and for a token harness
+// the very token that IS it). For that one door the principal is the UNDERLYING HUMAN, with grants
+// re-read live from D1 (resolveCapabilities), the same derivation seat_select uses.
+// EVERY OTHER caller (a seat, an agent token, a plain directory session, a consent-bound session) acts
+// with its own auth.capabilities exactly as they are: a plain directory context with capabilities [] is
+// refused here as it is by project_get, and a consent-bound session whose capabilities were zeroed is
+// refused outright (it must never fall back to anything wider).
+// Visibility = readableProject (mcp/projects.ts); writability = the predicate project_remember uses:
+// org admin, or a directly granted squad (member rank or above) holding write/admin on the project
+// (anySquadHasProjectWrite). This module adds no authority predicate of its own.
+//
+// THREAD kind needs a verified harness, which exists only while SEAT_AUTO_ENROLL is on (an OAuth
+// harness is created at consent behind it; a harness token is refused by the bearer doors without it).
+// With SEAT_AUTO_ENROLL off, `thread` always answers harness_required; git_branch and folder do not
+// depend on it.
 //
 // last_head_sha / last_seen_at are DISPLAY ONLY: written on open, read by nothing that decides.
 
 import type { AuthContext, Env, Project } from '../types'
-import { resolveAccessibleSquadIds } from '../projects/readable-squads'
-import { resolveCapabilities } from '../auth/capability'
-import {
-  anySquadHasProjectWrite,
-  projectReadAccessFromGrants,
-  projectVisibilityClause,
-} from '../projects/access'
-import { projectSelectSql } from '../projects/columns'
+import { capabilityRank, resolveCapabilities } from '../auth/capability'
+import { anySquadHasProjectWrite } from '../projects/access'
 import { loadHarness } from '../members/harness'
+import { isHarnessCredentialSession } from '../members/harness-credential'
+import { readAccess, readableProject } from '../mcp/projects'
 import { repoKeyFromUrl } from './repo-key'
 import { workspacesEnabled } from './flag'
 
@@ -101,41 +105,61 @@ interface Principal {
 async function resolvePrincipal(env: Env, auth: AuthContext): Promise<Principal | null> {
   const memberId = auth.memberId
   if (!memberId) return null
-  const claimedHarness = auth.seatBinding?.harnessId ?? auth.harnessId ?? null
-  if (auth.boundAgentId) {
-    // An agent-bound caller acts with its own (already clamped, per-request re-derived) context.
-    return { authz: auth, memberId, humanMemberId: auth.seatBinding?.humanMemberId ?? memberId, harnessId: claimedHarness }
+
+  // THE HARNESS DOOR (the only place the human's grants stand in for the session's own).
+  if (isHarnessCredentialSession(auth) && !auth.boundAgentId) {
+    const harnessId = auth.harnessId
+    if (typeof harnessId !== 'string' || harnessId.length === 0) return null
+    const harness = await loadHarness(env, memberId, harnessId)
+    if (!harness) return null
+    // A token harness is valid only for the very credential that IS it.
+    if (harness.credential_kind === 'token' && harness.token_id !== auth.tokenId) return null
+    const member = await env.DB.prepare(
+      `SELECT id FROM members WHERE id = ?1 AND status = 'active' AND tenant = ?2 LIMIT 1`,
+    ).bind(memberId, env.TENANT_SLUG).first<{ id: string }>()
+    if (!member) return null
+    // The HUMAN's live grants, never auth.capabilities (empty for a harness by design).
+    const grants = await resolveCapabilities(env, memberId)
+    const authz: AuthContext = {
+      userId: memberId,
+      email: null,
+      role: 'member',
+      tenant: env.TENANT_SLUG,
+      memberId,
+      channel: 'directory',
+      capabilities: grants,
+    }
+    return { authz, memberId, humanMemberId: memberId, harnessId: harness.id }
   }
-  const member = await env.DB.prepare(
-    `SELECT id FROM members WHERE id = ?1 AND status = 'active' AND tenant = ?2 LIMIT 1`,
-  ).bind(memberId, env.TENANT_SLUG).first<{ id: string }>()
-  if (!member) return null
-  // The HUMAN's live grants, never auth.capabilities (empty for a harness by design).
-  const grants = await resolveCapabilities(env, memberId)
-  const authz: AuthContext = {
-    userId: memberId,
-    email: null,
-    role: 'member',
-    tenant: env.TENANT_SLUG,
+
+  // Everyone else: the caller's OWN context, untouched. A consent-bound session (consentedByMemberId)
+  // whose capabilities were zeroed (the human was demoted) is refused: nothing wider may replace them.
+  if (auth.consentedByMemberId && (auth.capabilities?.length ?? 0) === 0) return null
+  return {
+    authz: auth,
     memberId,
-    channel: 'directory',
-    capabilities: grants,
+    humanMemberId: auth.seatBinding?.humanMemberId ?? memberId,
+    harnessId: auth.seatBinding?.harnessId ?? auth.harnessId ?? null,
   }
-  return { authz, memberId, humanMemberId: memberId, harnessId: claimedHarness }
 }
 
+/** Resolve a project by id (preferred) or slug, through the ONE project-read chokepoint. */
 async function findProject(env: Env, ref: string, authz: AuthContext): Promise<Project | null> {
-  const access = projectReadAccessFromGrants(authz, authz.capabilities ?? [])
-  const visibility = projectVisibilityClause(access)
-  return env.DB.prepare(
-    `SELECT ${projectSelectSql('p')} FROM projects p WHERE (p.id = ? OR p.slug = ?) AND ${visibility.sql} LIMIT 1`,
-  ).bind(ref, ref, ...visibility.binds).first<Project>()
+  const access = readAccess(authz)
+  const byId = await readableProject(env, ref, access)
+  if (byId) return byId
+  const bySlug = await env.DB.prepare('SELECT id FROM projects WHERE slug = ?1 LIMIT 1').bind(ref).first<{ id: string }>()
+  return bySlug ? readableProject(env, bySlug.id, access) : null
 }
 
+/** The write predicate project_remember uses (org admin, or a directly granted squad with write/admin on
+ *  the project), at member rank: an observer-rank grant never writes. */
 async function principalCanWriteProject(env: Env, authz: AuthContext, projectId: string): Promise<boolean> {
-  const squads = await resolveAccessibleSquadIds(env, authz, 'member')
-  if (squads === null) return true // org-scope authority at member rank or above
-  return anySquadHasProjectWrite(env, projectId, squads)
+  const floored = authz.capabilities === undefined
+    ? undefined
+    : authz.capabilities.filter((g) => capabilityRank(g.capability) >= capabilityRank('member'))
+  const access = readAccess({ ...authz, capabilities: floored })
+  return access.workspaceAdmin || anySquadHasProjectWrite(env, projectId, access.squadIds)
 }
 
 // ── worktree_open ───────────────────────────────────────────────────────────────────────
@@ -159,6 +183,7 @@ export type OpenFailure =
   | { ok: false; error: 'repo_not_in_project'; detail: string }
   | { ok: false; error: 'harness_required' }
   | { ok: false; error: 'worktree_archived'; detail: { worktree_id: string } }
+  | { ok: false; error: 'worktree_cap_reached' }
   | { ok: false; error: 'write_failed' }
 
 export type OpenResult = { ok: true; created: boolean; worktree: WorktreeRow } | OpenFailure
@@ -241,21 +266,29 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
     harnessId = harness.id
   }
 
-  const id = crypto.randomUUID()
   const identityBinds = [env.TENANT_SLUG, project.id, kind, repoKey, harnessId, refKind, refName] as const
-  // Find-or-create on the UNIQUE identity: two machines / two spellings race to ONE row.
-  const insert = await env.DB.prepare(
-    `INSERT INTO worktrees (id, tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name, created_by_member_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-     ON CONFLICT (tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name) DO NOTHING`,
-  ).bind(id, ...identityBinds, principal.memberId).run()
-  const created = (insert.meta?.changes ?? 0) > 0
-
-  const found = await env.DB.prepare(
-    `SELECT ${WORKTREE_COLUMNS} FROM worktrees
+  const findSql = `SELECT ${WORKTREE_COLUMNS} FROM worktrees
       WHERE tenant = ?1 AND project_id = ?2 AND kind = ?3 AND repo_key = ?4 AND harness_id = ?5 AND ref_kind = ?6 AND ref_name = ?7
-      LIMIT 1`,
-  ).bind(...identityBinds).first<WorktreeRow>()
+      LIMIT 1`
+  // Find first: reopening an existing workspace must keep working at the creation cap.
+  let found = await env.DB.prepare(findSql).bind(...identityBinds).first<WorktreeRow>()
+  let created = false
+  if (!found) {
+    // Create on the UNIQUE identity: two machines / two spellings race to ONE row. The per-member cap is a
+    // BEFORE INSERT trigger (migration 0216), so it holds under concurrency.
+    try {
+      const insert = await env.DB.prepare(
+        `INSERT INTO worktrees (id, tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name, created_by_member_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT (tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name) DO NOTHING`,
+      ).bind(crypto.randomUUID(), ...identityBinds, principal.memberId).run()
+      created = (insert.meta?.changes ?? 0) > 0
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('worktree_cap_reached')) return { ok: false, error: 'worktree_cap_reached' }
+      throw err
+    }
+    found = await env.DB.prepare(findSql).bind(...identityBinds).first<WorktreeRow>()
+  }
   if (!found) return { ok: false, error: 'write_failed' }
   if (found.archived_at !== null) return { ok: false, error: 'worktree_archived', detail: { worktree_id: found.id } }
 
@@ -271,25 +304,80 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
 
 // ── worktree_list ───────────────────────────────────────────────────────────────────────
 
+export const LIST_DEFAULT_LIMIT = 100
+export const LIST_MAX_LIMIT = 200
+
 export type ListResult =
-  | { ok: true; project_id: string; worktrees: WorktreeRow[] }
+  | { ok: true; project_id: string; worktrees: WorktreeRow[]; next_cursor: string | null }
   | { ok: false; error: 'workspaces_disabled' | 'principal_required' | 'project_not_found' }
   | { ok: false; error: 'invalid_args'; detail: string }
 
-export async function listWorktrees(env: Env, auth: AuthContext, args: { project: unknown; include_archived?: unknown }): Promise<ListResult> {
+const KIND_RANK_SQL = `CASE kind WHEN 'git_branch' THEN 0 WHEN 'folder' THEN 1 ELSE 2 END`
+
+/** Keyset cursor: `<kind rank>|<created_at>|<id>`, URI-encoded per part. Opaque to callers. */
+function encodeCursor(rank: number, createdAt: string, id: string): string {
+  return [String(rank), createdAt, id].map(encodeURIComponent).join('|')
+}
+function decodeCursor(raw: string): { rank: number; createdAt: string; id: string } | null {
+  const parts = raw.split('|')
+  if (parts.length !== 3) return null
+  try {
+    const [r, createdAt, id] = parts.map(decodeURIComponent)
+    const rank = Number(r)
+    if (!Number.isInteger(rank) || rank < 0 || rank > 2 || !createdAt || !id) return null
+    return { rank, createdAt, id }
+  } catch {
+    return null
+  }
+}
+
+export async function listWorktrees(
+  env: Env,
+  auth: AuthContext,
+  args: { project: unknown; include_archived?: unknown; limit?: unknown; cursor?: unknown },
+): Promise<ListResult> {
   if (!workspacesEnabled(env)) return { ok: false, error: 'workspaces_disabled' }
   const projectRef = typeof args.project === 'string' ? args.project.trim() : ''
   if (!projectRef || projectRef.length > 200) return { ok: false, error: 'invalid_args', detail: 'project required' }
+  let limit = LIST_DEFAULT_LIMIT
+  if (args.limit !== undefined && args.limit !== null) {
+    if (typeof args.limit !== 'number' || !Number.isInteger(args.limit) || args.limit < 1 || args.limit > LIST_MAX_LIMIT) {
+      return { ok: false, error: 'invalid_args', detail: `limit must be an integer 1..${LIST_MAX_LIMIT}` }
+    }
+    limit = args.limit
+  }
+  let cursor: { rank: number; createdAt: string; id: string } | null = null
+  if (args.cursor !== undefined && args.cursor !== null) {
+    cursor = typeof args.cursor === 'string' ? decodeCursor(args.cursor) : null
+    if (!cursor) return { ok: false, error: 'invalid_args', detail: 'cursor is not one this tool returned' }
+  }
   const principal = await resolvePrincipal(env, auth)
   if (!principal) return { ok: false, error: 'principal_required' }
-  // READ gate = the existing visibility chokepoint; a project the principal cannot see is not found.
+  // READ gate = the existing project-read chokepoint; a project the principal cannot see is not found.
   const project = await findProject(env, projectRef, principal.authz)
   if (!project) return { ok: false, error: 'project_not_found' }
   const includeArchived = args.include_archived === true
+  // THREAD rows belong to the human who owns the harness they name: nobody else sees them, even a
+  // project reader (a thread id is a chat-thread identifier, not project metadata).
   const rows = await env.DB.prepare(
-    `SELECT ${WORKTREE_COLUMNS} FROM worktrees
-      WHERE tenant = ?1 AND project_id = ?2 ${includeArchived ? '' : 'AND archived_at IS NULL'}
-      ORDER BY created_at, id LIMIT 500`,
-  ).bind(env.TENANT_SLUG, project.id).all<WorktreeRow>()
-  return { ok: true, project_id: project.id, worktrees: rows.results ?? [] }
+    `SELECT ${WORKTREE_COLUMNS} FROM (
+       SELECT ${WORKTREE_COLUMNS}, ${KIND_RANK_SQL} AS rk FROM worktrees w
+        WHERE w.tenant = ?1 AND w.project_id = ?2
+          ${includeArchived ? '' : 'AND w.archived_at IS NULL'}
+          AND (w.kind <> 'thread'
+               OR EXISTS (SELECT 1 FROM harnesses h WHERE h.id = w.harness_id AND h.tenant = w.tenant AND h.member_id = ?3))
+     )
+     WHERE (?4 IS NULL OR (rk, created_at, id) > (?4, ?5, ?6))
+     ORDER BY rk, created_at, id
+     LIMIT ?7`,
+  ).bind(env.TENANT_SLUG, project.id, principal.humanMemberId, cursor?.rank ?? null, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1)
+    .all<WorktreeRow>()
+  const page = rows.results ?? []
+  const more = page.length > limit
+  const out = more ? page.slice(0, limit) : page
+  const last = out.at(-1)
+  const next = more && last
+    ? encodeCursor(last.kind === 'git_branch' ? 0 : last.kind === 'folder' ? 1 : 2, last.created_at, last.id)
+    : null
+  return { ok: true, project_id: project.id, worktrees: out, next_cursor: next }
 }

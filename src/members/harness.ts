@@ -18,6 +18,9 @@ export function seatAutoEnrollEnabled(env: Pick<Env, 'SEAT_AUTO_ENROLL'>): boole
   return env.SEAT_AUTO_ENROLL === '1'
 }
 
+/** A revoked grant's harness may be adopted by the same member's next consent on that client within this many days. */
+export const HARNESS_REUSE_DAYS = 30
+
 export interface HarnessRow {
   id: string
   tenant: string
@@ -102,6 +105,37 @@ export async function upsertHarness(
     const grant = `oauth:${grantId}`
     // The label keeps the grant suffix whole; the client id part yields if the column's 512 cap needs it.
     const label = `${clientId.slice(0, 512 - grant.length - 1)}#${grant}`
+    // RE-CONSENT CHURN (design note, W1 fix pass): without this, every re-consent on one client would mint
+    // a fresh harness and burn seats toward the lifetime cap (SEAT_TOTAL_MAX). When this member's PRIOR
+    // grant on the SAME client was REVOKED within HARNESS_REUSE_DAYS, the new consent adopts that harness
+    // (its grant_id moves to the new consent token, compare-and-set) instead of creating another. A
+    // still-live prior grant (a second machine) is never adopted, so 4.0's one-install-one-harness holds.
+    // The seat handles of the old grant are bound to its token and are dead; seat_select re-issues a handle
+    // for the adopted seat under the new grant.
+    const existing = await env.DB.prepare(
+      'SELECT id FROM harnesses WHERE tenant = ?1 AND member_id = ?2 AND grant_id = ?3 LIMIT 1',
+    ).bind(env.TENANT_SLUG, memberId, grant).first<{ id: string }>()
+    if (!existing && clientId.length <= 400) {
+      const reusable = await env.DB.prepare(
+        `SELECT h.id AS id, h.grant_id AS grant_id FROM harnesses h
+          WHERE h.tenant = ?1 AND h.member_id = ?2 AND h.credential_kind = 'oauth' AND h.grant_id LIKE 'oauth:%'
+            AND substr(h.oauth_client_id, 1, ?3) = ?4
+            AND EXISTS (SELECT 1 FROM member_tokens t
+                         WHERE t.id = substr(h.grant_id, 7) AND t.revoked_at IS NOT NULL
+                           AND julianday(t.revoked_at) > julianday('now', ?5))
+          ORDER BY h.created_at DESC, h.id LIMIT 1`,
+      ).bind(env.TENANT_SLUG, memberId, clientId.length + 7, `${clientId}#oauth:`, `-${HARNESS_REUSE_DAYS} days`)
+        .first<{ id: string; grant_id: string }>()
+      if (reusable) {
+        const moved = await env.DB.prepare(
+          `UPDATE harnesses SET grant_id = ?1, client_name = ?2, kind = ?3
+            WHERE id = ?4 AND grant_id = ?5 AND tenant = ?6 AND member_id = ?7`,
+        ).bind(grant, clientName, kind, reusable.id, reusable.grant_id, env.TENANT_SLUG, memberId).run()
+        if ((moved.meta?.changes ?? 0) > 0) {
+          return env.DB.prepare(`SELECT ${HARNESS_COLUMNS} FROM harnesses WHERE id = ?1 LIMIT 1`).bind(reusable.id).first<HarnessRow>()
+        }
+      }
+    }
     await env.DB.prepare(
       `INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, kind, grant_id)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
