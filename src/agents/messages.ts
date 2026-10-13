@@ -227,6 +227,10 @@ interface Opts {
   fetch?: typeof fetch
   /** Worker waitUntil so the doorbell POST can outlive the send response. */
   waitUntil?: (promise: Promise<unknown>) => void
+  /** Shared doorbell correlation with another wake for the same event (see webhook-doorbell DoorbellFireOpts). */
+  doorbellCorrelation?: string
+  /** Fan-out callers (broadcast): the recipients that have a doorbell, resolved ONCE; others skip the doorbell path entirely. */
+  doorbellRecipients?: ReadonlySet<string>
 }
 
 function isRef(v: string): boolean {
@@ -665,7 +669,12 @@ export async function sendAgentMessage(
       await scheduleWebhookDoorbell(
         env,
         { type: INBOX_WAKE_TYPE, agent_id: input.toAgent, seq, message_id: id, kind },
-        { fetch: opts.fetch, waitUntil: opts.waitUntil },
+        {
+          fetch: opts.fetch,
+          waitUntil: opts.waitUntil,
+          correlation: opts.doorbellCorrelation,
+          recipients: opts.doorbellRecipients,
+        },
       )
     }
 

@@ -6,6 +6,7 @@ import { bearerToken, resolveMemberByToken } from '../auth/member-bearer'
 import type { AuthContext, Env } from '../types'
 import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from './actions'
 import { routinePrincipal } from './access'
+import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { publicRoutineRun, type PublicRoutineRun } from './public'
 import {
   archiveRoutine,
@@ -333,6 +334,6 @@ routinesApp.post('/routine-runs/:runId/proposal', routineEndpoint, routineSessio
     && typeof (action as JsonObject).key === 'string' && (action as JsonObject).key !== key) {
     return failure(c, 'idempotency_key_mismatch')
   }
-  const result = await submitRoutineProposal(c.env, routinePrincipal(c.get('auth')), parsed.body)
+  const result = await submitRoutineProposal(c.env, routinePrincipal(c.get('auth')), parsed.body, { waitUntil: waitUntilFromContext(c) })
   return result.ok ? c.json(result) : failure(c, result.error)
 })

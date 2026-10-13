@@ -20,6 +20,7 @@
 
 import type { Env } from '../types'
 import { sendAgentMessage, MAX_BODY_CHARS } from '../agents/messages'
+import { dispatchDoorbellCorrelation } from '../agents/webhook-doorbell'
 import type { DispatchBrakeReason } from '../agents/execution-brake-sql'
 
 // Sender identity for a bridged dispatch message. This is NOT a welded agent — task_dispatch is
@@ -271,6 +272,8 @@ export async function deliverDispatchToInbox(env: Env, input: DispatchBridgeInpu
     reason: 'target is the internally-resolved task assignee (input.agentId), not attacker input',
   }, {
     systemProjectAttribution: input.projectId != null,
+    // Same correlation as task_dispatch's task.assigned ring for this receipt: one doorbell POST, not two.
+    doorbellCorrelation: dispatchDoorbellCorrelation(input.receiptId),
     ...(input.receiverFenceAgentId ? { receiverNotStopped: { agentId: input.receiverFenceAgentId } } : {}),
     ...(input.brakeFenceAgentId ? { dispatchBrakeFence: { agentId: input.brakeFenceAgentId, taskId: input.taskId } } : {}),
   })

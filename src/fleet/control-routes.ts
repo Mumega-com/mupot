@@ -21,6 +21,7 @@ import { reportFleetAgents, getAgentView } from './registry'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import { panelPublicJwk } from './control-request'
 import { redactSecretPatterns } from '../lib/redact'
+import { waitUntilFromContext } from '../agents/webhook-doorbell'
 
 export const fleetControlApp = new Hono<{ Bindings: Env }>()
 const FLEET_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -74,6 +75,7 @@ fleetControlApp.post('/control', async (c) => {
       c.env,
       { squad_id: body.squad_id as string, verb: body.verb },
       { memberId: id.memberId, boundAgentId: id.boundAgentId },
+      { waitUntil: waitUntilFromContext(c) },
     )
     if (!res.ok) {
       const code = res.reason === 'unconfigured' ? 503 : res.reason === 'invalid_input' ? 400 : 502
@@ -86,6 +88,7 @@ fleetControlApp.post('/control', async (c) => {
     c.env,
     { agent_id: body.agent_id as string, verb: body.verb },
     { memberId: id.memberId, boundAgentId: id.boundAgentId },
+    { waitUntil: waitUntilFromContext(c) },
   )
   if (!res.ok) {
     const code = res.reason === 'unconfigured' ? 503 : res.reason === 'invalid_input' ? 400 : 502

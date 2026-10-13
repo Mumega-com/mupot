@@ -246,7 +246,7 @@ export async function runRouterTick(
     }
     await createBus(env).emit(wake)
     // Doorbell (mupot#1882): an auto-assigned task rings the assignee's webhook doorbell (flag-gated, fail-open).
-    await scheduleTaskAssignedDoorbell(env, candidate.id, task.id, { waitUntil: opts.waitUntil })
+    await scheduleTaskAssignedDoorbell(env, candidate.id, task.id, { waitUntil: opts.waitUntil, assignment: now })
     assigned += 1
     decisions.push({ task_id: task.id, outcome: 'assigned', agent_id: candidate.id })
   }

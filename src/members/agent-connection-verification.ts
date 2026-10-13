@@ -4,6 +4,7 @@ import {
   sendAgentMessage,
 } from '../agents/messages'
 import { mcpEndpoint, requiredCanonicalOrigin } from '../dashboard/connect'
+import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { rowsWritten } from '../lib/receipt'
 import { buildOrient } from '../orient/service'
 import type { Env } from '../types'
@@ -439,6 +440,7 @@ export async function verifyAgentConnection(
   input: { receiptId: string; challenge: string },
   now = new Date(),
   dependencyOverrides: Partial<AgentConnectionVerificationDeps> = {},
+  opts: { waitUntil?: DoorbellWaitUntil } = {},
 ): Promise<AgentConnectionVerificationOutcome> {
   const deps = { ...DEFAULT_DEPS, ...dependencyOverrides }
   if (
@@ -551,6 +553,7 @@ export async function verifyAgentConnection(
         system: true,
         reason: 'agent connection verification self-loopback target is receipt-bound',
       },
+      { waitUntil: opts.waitUntil },
     )
     if (!sent.ok) {
       checks.send = { status: 'fail', error: 'send_failed' }
