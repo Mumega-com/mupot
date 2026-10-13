@@ -20,9 +20,9 @@ Pot → Grok Bot **doorbell**. When agent A `send`s to agent B and B has a regis
 
 ## Storage pattern
 
-`agent_webhook_doorbells` (`migrations/0147_agent_webhook_doorbells.sql`): `(tenant, agent_id) → webhook_url + auth_ciphertext + auth_last4`.
+`agent_webhook_doorbells` (`migrations/0219_agent_webhook_doorbells.sql`): `(tenant, agent_id) → webhook_url + auth_ciphertext + auth_last4`.
 
-The bearer is **not** D1 plaintext. It is AES-GCM-256 under the existing Worker secret `CONNECTOR_MASTER_KEY`, HKDF info `mupot_doorbell_v1`, salt = `agent_id` (`encryptDomainSecret` in `src/connectors/crypto.ts`). Same vault as connectors; domain-separated so a leaked connector ciphertext cannot decrypt a doorbell.
+The bearer is **not** D1 plaintext. It is AES-GCM-256 under the existing Worker secret `CONNECTOR_MASTER_KEY`, vault domain `agent_doorbell` (HKDF info `mupot_connector_agent_doorbell_v1`), salt = `agent_id`, AAD `doorbell:<agent_id>` (`encryptConnectorSecret` in `src/connectors/crypto.ts`). Same vault as connectors; domain-separated so a leaked connector ciphertext cannot decrypt a doorbell.
 
 `get_agent_webhook_doorbell` returns URL with query/hash stripped + `auth_last4`. Never ciphertext, never bearer. Logs carry `agent_id`, `message_id`, `seq`, HTTP status / reason — never the Authorization header.
 
@@ -44,29 +44,38 @@ Header: `Authorization: Bearer <doorbell key>`. Timeout ~3s. Fire-and-forget via
 
 Routine-fenced dispatch envelopes (`routineRunFence` on `sendAgentMessage`) do **not** ring the doorbell. The project-routines cron already runs scheduler + dispatch in one invocation under the D1 50-statement cap; an extra SELECT there overflows the budget. Routine dispatch has its own wake. This doorbell is for agent/human `send`.
 
-## Operator — register ceo / staff (mumega)
+## Safety (flag `WEBHOOK_DOORBELL`, default OFF)
 
-1. In Grok Bot, create a webhook / routine that **peeks** pot (`inbox({ peek: true })`). Copy the https URL and the webhook secret.
-2. On tenant mumega, as that agent (self) or as org-admin:
+- Off: no register, no POST, no D1 read on the send path. Set `WEBHOOK_DOORBELL=1` (or `true`) to enable. Clear and remove keep working with the flag off.
+- URL: https only, public host only (`src/lib/ssrf.ts`: loopback, RFC1918, link-local, metadata, ULA, NAT64 refused), port 443 only, no embedded credentials. Re-asserted at fire time.
+- Redirects are never followed (`redirect: 'manual'`); a 3xx is a failed attempt. ~3s timeout inside `waitUntil`.
+- One row per attempt in `agent_webhook_doorbell_receipts`: event type, agent, ref id, outcome, HTTP status, short reason. Never the URL, the query, the bearer or ciphertext.
+- Who may set / clear / test: the agent itself, or a human with admin over the agent's squad (org admin covers all). An agent-bound caller aiming at another agent is refused through the W0 chokepoint (`set_agent_webhook_doorbell`, not delegable).
 
+## Wake bodies (ids only, never a message body)
+
+```json
+{ "type": "mupot.inbox.wake", "agent_id": "…", "seq": 0, "message_id": "…", "kind": "message" }
+{ "type": "mupot.task.assigned", "agent_id": "…", "task_id": "…" }
+{ "type": "mupot.doorbell.test", "agent_id": "…" }
 ```
-set_agent_webhook_doorbell({
-  agent: "grokbot-ceo",
-  webhook_url: "https://…",
-  bearer: "<webhook secret>"
-})
-```
 
-Same for `grokbot-staff` (and any other Bot seat). Confirm with `get_agent_webhook_doorbell({ agent: "grokbot-ceo" })` — URL + last4 only.
+`mupot.task.assigned` rings when a task is assigned to an agent with a doorbell (MCP `task_create` / `task_update`, REST `POST /tasks` / `PATCH /tasks/:id`); not for `dispatch:false` backlog creates and not when the assignee did not change (mupot#1882).
 
-3. `send` to that agent. Bot should wake and peek. If the webhook is down, send still returns 200 and the letter is in pot.
+## Operator — register an agent (primary path: dashboard)
 
-Clear: `set_agent_webhook_doorbell({ agent: "grokbot-ceo", clear: true })`.
+1. In Grok Bot, create a webhook **routine** that peeks pot (`inbox({ peek: true })`). Copy its public HTTPS URL and choose the sender key.
+2. Open **Doorbells** in the dashboard (`/doorbells`) as an admin over the agent's squad (signed in within the last 5 minutes), pick the agent, paste the URL and the key, Save. The key is write-only: stored encrypted, shown as its last four characters.
+3. Press **Send test ping**: the pot POSTs `mupot.doorbell.test` and shows the HTTP status.
+4. **Remove** revokes it.
 
-Do not paste bearers into git, Slack, or this wiki. Do not point this at a customer pot. Do not merge this scaffold without Kasra + Athena.
+The MCP tools `set_agent_webhook_doorbell` / `get_agent_webhook_doorbell` remain (same authz), but they put the key in tool args; prefer the dashboard.
+
+Do not paste bearers into git, Slack, or this wiki. Do not point this at a customer pot.
 
 ## Code
 
 - Service: `src/agents/webhook-doorbell.ts`
+- Dashboard: `src/dashboard/doorbells.ts` (`/doorbells`)
 - MCP: `set_agent_webhook_doorbell` / `get_agent_webhook_doorbell` (`src/mcp/webhook-doorbell.ts`)
 - Fire site: `sendAgentMessage` after a real INSERT (`src/agents/messages.ts`) — same “row landed” point as `message.created`, fail-open, not on the Queue consumer
