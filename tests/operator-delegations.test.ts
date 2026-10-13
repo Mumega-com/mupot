@@ -652,6 +652,12 @@ describe('the writers refuse an agent on their own, not only behind the tool gat
     expect(rows('SELECT 1 FROM agent_operator_delegations WHERE revoked_at IS NOT NULL')).toHaveLength(0)
   })
 
+  it('a session that CLAIMS a bound agent but carries a human member id is still refused by the writer itself', async () => {
+    const spoof = { ...hadi(), boundAgentId: 'agent-A' }
+    expect(await createDelegation(env, spoof, { agentId: 'agent-A', scopeType: 'org', scopeId: null, maxGrant: 'member' })).toEqual({ ok: false, error: 'operator_principal_required' })
+    expect(rows('SELECT 1 FROM agent_operator_delegations')).toHaveLength(0)
+  })
+
   it('a suspended human cannot delegate, and a human cannot delegate to their own seat', async () => {
     harness.sqlite.prepare("UPDATE members SET status = 'suspended' WHERE id = 'mem-hadi'").run()
     const out = await createDelegation(env, hadi(), { agentId: 'agent-A', scopeType: 'org', scopeId: null, maxGrant: 'member' })

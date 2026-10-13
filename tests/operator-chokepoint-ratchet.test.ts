@@ -55,7 +55,12 @@ describe('ratchet 1: every MCP structural tool asks the chokepoint for its own a
     const call = new RegExp(`(structuralGate|authorizeStructuralWrite)\\([^)]*'${action}'`)
     const owner = mcpSources.find((s) => s.text.includes(`name: '${tool}'`))
     expect(owner, `no source file defines tool ${tool}`).toBeDefined()
-    expect(call.test(owner?.text ?? ''), `${owner?.file} defines ${tool} but never asks the chokepoint for '${action}'`).toBe(true)
+    // scope the scan to THIS tool's own block (up to the next tool's `name:`), so a sibling's call cannot vouch for it
+    const text = owner?.text ?? ''
+    const start = text.indexOf(`name: '${tool}'`)
+    const next = text.indexOf("\n  name: '", start + 10)
+    const block = text.slice(start, next === -1 ? undefined : next)
+    expect(call.test(block), `${owner?.file} defines ${tool} but its block never asks the chokepoint for '${action}'`).toBe(true)
   })
 
   it('a NEW write-shaped tool that is not in the registry fails (the registry is the allowlist of structural tools)', () => {
