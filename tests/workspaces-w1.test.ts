@@ -423,6 +423,9 @@ describe('flag WORKSPACES off: no change', () => {
       expect(out, String(v)).toMatchObject({ ok: false, error: 'workspaces_disabled' })
       expect(await invokeTool(agentAuth('a', [{ squad: 'SQ_W', cap: 'admin' }]), env, 'worktree_list', { project: 'P1' })).toMatchObject({ ok: false, error: 'workspaces_disabled' })
       expect(await open(env, harnessAuth(W))).toMatchObject({ ok: false, error: 'workspaces_disabled' })
+      // refused BEFORE schema validation: a flag-off pot never reveals the argument schema
+      expect(await invokeTool(harnessAuth(W), env, 'worktree_open', {})).toMatchObject({ ok: false, error: 'workspaces_disabled' })
+      expect(await invokeTool(agentAuth('a', [{ squad: 'SQ_W', cap: 'admin' }]), env, 'worktree_open', { bogus: 1 })).toMatchObject({ ok: false, error: 'workspaces_disabled' })
       expect(wtRows()).toBe(before)
       const names = advertisedTools(env).map((t) => t.name)
       expect(names).not.toContain('worktree_open')
