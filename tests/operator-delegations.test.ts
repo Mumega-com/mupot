@@ -29,6 +29,7 @@ const { membersApp } = await import('../src/members')
 const { orgApp } = await import('../src/org')
 const { gatesApp } = await import('../src/tasks')
 const { projectsApp } = await import('../src/projects')
+const { createDelegation, revokeDelegation } = await import('../src/operators/delegations')
 
 const TENANT = 'tenant-a'
 const ORIGIN = 'https://pot.test'
@@ -634,5 +635,26 @@ describe('HTTP project squad edges under a delegation', () => {
     const r = await http(projectsApp, adminOperator(), 'PUT', '/P1/squads/S2', { access_level: 'read' })
     expect(r.status).toBe(403)
     expect(r.body.error).toBe('operator_principal_required')
+  })
+})
+
+describe('the writers refuse an agent on their own, not only behind the tool gate (defence in depth)', () => {
+  it('createDelegation / revokeDelegation called directly with an agent-bound or seat-member principal write nothing', async () => {
+    const id = await delegate('squad', 'S1', 'member')
+    const seatNoBinding = humanAuth('seat-agent-C', [grant('seat-agent-C', 'admin')])
+    for (const who of [adminOperator(), seatNoBinding]) {
+      const made = await createDelegation(env, who, { agentId: 'agent-A', scopeType: 'org', scopeId: null, maxGrant: 'lead' })
+      expect(made).toEqual({ ok: false, error: 'operator_principal_required' })
+      const revoked = await revokeDelegation(env, who, id)
+      expect(revoked).toEqual({ ok: false, error: 'operator_principal_required' })
+    }
+    expect(rows('SELECT 1 FROM agent_operator_delegations')).toHaveLength(1)
+    expect(rows('SELECT 1 FROM agent_operator_delegations WHERE revoked_at IS NOT NULL')).toHaveLength(0)
+  })
+
+  it('a suspended human cannot delegate, and a human cannot delegate to their own seat', async () => {
+    harness.sqlite.prepare("UPDATE members SET status = 'suspended' WHERE id = 'mem-hadi'").run()
+    const out = await createDelegation(env, hadi(), { agentId: 'agent-A', scopeType: 'org', scopeId: null, maxGrant: 'member' })
+    expect(out).toEqual({ ok: false, error: 'human_principal_required' })
   })
 })
