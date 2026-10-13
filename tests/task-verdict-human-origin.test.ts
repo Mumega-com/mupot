@@ -18,7 +18,8 @@
 
 import type { D1PreparedStatement, D1Result } from '@cloudflare/workers-types'
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
-import { invokeTool } from '../src/mcp/index'
+import { invokeTool, mcpApp } from '../src/mcp/index'
+import { mintMemberToken } from '../src/members/service'
 import { listTaskDispatchReceiptTimeline } from '../src/tasks/runtime-receipts'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
@@ -29,8 +30,17 @@ const ORIGIN = 'https://pot.test'
 const SQUAD = 'squad-1'
 const GATE = 'gate:outreach'
 
+// mupot#1889: the operator's HUMAN_ORIGIN_ATTESTOR_AGENT_IDS allowlist. seedAgent adds every agent it
+// seeds (these fixtures model "the operator allowlisted this harness agent"); the #1889 tests remove
+// an agent to model an owned agent whose workspace token must NOT be able to attest. The env reads it
+// live through a getter, exactly as the helper reads the real var.
+const attestors = new Set<string>()
 function makeEnv(harness: SqliteD1Harness): Env {
-  return { TENANT_SLUG: TENANT, DB: harness.db } as unknown as Env
+  return {
+    TENANT_SLUG: TENANT,
+    DB: harness.db,
+    get HUMAN_ORIGIN_ATTESTOR_AGENT_IDS() { return [...attestors].join(',') },
+  } as unknown as Env
 }
 
 function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
@@ -41,6 +51,7 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
 }
 
 function seedAgent(sqlite: SqliteD1Harness['sqlite'], id: string, status: 'active' | 'paused' = 'active'): void {
+  attestors.add(id)
   sqlite
     .prepare(
       `INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES (?, ?, ?, ?, 'member', 'test', ?)`,
@@ -195,6 +206,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
   let env: Env
 
   beforeEach(() => {
+    attestors.clear()
     harness = createSqliteD1()
     applyAllMigrations(harness.sqlite)
     seedBase(harness.sqlite)
@@ -1305,6 +1317,68 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
         seatBinding: { seatId: 's-1', label: 'seat', harnessId: 'h-1', grantTokenId: 'tok-1', humanMemberId: 'member-seat', source: 'handle' },
       } as AuthContext
       await expectRefusedClean(auth, 'task-seat')
+    })
+
+    // The allowlist is the real boundary: a workspace token has KayHermes's exact shape for every
+    // owned agent (Claude Code, Cursor, Custom GPT Actions), so shape alone proves nothing.
+    it('owned agent NOT on the attestor allowlist (plain workspace token) is refused', async () => {
+      seedAuthorizedOwner('agent-owned-not-listed', 'member-nl', 'task-nl')
+      attestors.delete('agent-owned-not-listed')
+      attestors.add('some-other-agent')
+      await expectRefusedClean(harnessAuth('agent-owned-not-listed'), 'task-nl')
+    })
+    it('empty / absent allowlist refuses every human_origin, even for the real harness shape', async () => {
+      seedAuthorizedOwner('agent-empty', 'member-empty', 'task-empty')
+      attestors.clear()
+      await expectRefusedClean(harnessAuth('agent-empty'), 'task-empty')
+      await expectRefusedClean(harnessAuth('agent-empty'), 'task-empty') // idempotent: still nothing written
+      delete (env as { HUMAN_ORIGIN_ATTESTOR_AGENT_IDS?: string }).HUMAN_ORIGIN_ATTESTOR_AGENT_IDS
+    })
+    it('allowlist parsing tolerates spaces and an empty entry', async () => {
+      seedAuthorizedOwner('agent-ws', 'member-ws', 'task-ws')
+      attestors.add('') // joins as ",agent-ws" shape via the getter
+      const res = expectApplied(await invokeVerdict(env, harnessAuth('agent-ws'), { task_id: 'task-ws', verdict: 'approved', human_origin: origin({ text: 'approve task-ws' }) }))
+      expect(res.human_origin).toEqual({ applied: true })
+    })
+
+    // Production-shaped hop: a REAL minted workspace bearer (mintMemberToken, the writer behind
+    // mint_agent_token) through the real Authorization -> authenticateMember -> tools/call path.
+    async function bearerFor(agentId: string, agentMemberId: string): Promise<string> {
+      seedMember(harness.sqlite, agentMemberId)
+      seedSquadMemberCapability(harness.sqlite, agentMemberId)
+      harness.sqlite
+        .prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, ?, ?, datetime('now'))`)
+        .run(TENANT, agentId, agentMemberId)
+      const minted = await mintMemberToken(env, agentMemberId, `tok-${agentId}`, 'workspace', agentId)
+      return minted.raw
+    }
+    async function postVerdict(raw: string, taskId: string): Promise<{ status: number; sc: Record<string, unknown>; text: string }> {
+      const res = await mcpApp.fetch(new Request('https://pot.test/', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${raw}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'task_verdict', arguments: { task_id: taskId, verdict: 'approved', human_origin: origin({ text: `approve ${taskId}` }) } } }),
+      }), env)
+      const text = await res.text()
+      const body = JSON.parse(text) as { result?: { structuredContent?: Record<string, unknown> } }
+      return { status: res.status, sc: body.result?.structuredContent ?? {}, text }
+    }
+    it('POST bearer hop: allowlisted agent minted workspace token applies; same shape not on the list is refused', async () => {
+      seedAuthorizedOwner('agent-wire-ok', 'member-wire-ok', 'task-wire-ok')
+      // second owner has no bound chat (members.telegram_chat_id is UNIQUE); it must be refused before that matters
+      seedAgent(harness.sqlite, 'agent-wire-no')
+      seedMember(harness.sqlite, 'member-wire-no')
+      setAgentOwner(harness.sqlite, 'agent-wire-no', 'member-wire-no')
+      seedReviewTask(harness.sqlite, 'task-wire-no')
+      attestors.delete('agent-wire-no')
+      const okRaw = await bearerFor('agent-wire-ok', 'amem-ok')
+      const noRaw = await bearerFor('agent-wire-no', 'amem-no')
+
+      const ok = await postVerdict(okRaw, 'task-wire-ok')
+      expect(ok.text).toContain('agent_attested_origin')
+      const no = await postVerdict(noRaw, 'task-wire-no')
+      expect(no.text).toContain('human_origin_not_applicable')
+      const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'task-wire-no'`).first<{ n: number }>()
+      expect(n?.n).toBe(0)
     })
 
     // Isolated conjuncts: each flips ONE marker on the otherwise-valid workspace shape, so

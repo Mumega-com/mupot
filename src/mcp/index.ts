@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { isHumanOriginAttestorAgent } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
 import {
   persistGateWakeNotice,
@@ -2487,15 +2488,18 @@ const toolTaskVerdict: ToolSpec = {
     let originFailure: HumanOriginResolution | null = null
     if (args.human_origin !== undefined) {
       // mupot#1889: human_origin is the HARNESS'S attestation, so only a real harness
-      // runtime may carry it: an agent-bound NON-directory (workspace/im/dashboard)
-      // credential, i.e. what mint_agent_token issues (provision.ts channel 'workspace')
-      // and the KayHermes gateway presents as MUPOT_AGENT_TOKEN. Refused for every
+      // runtime may carry it. A workspace token (what mint_agent_token issues) has the same
+      // shape for the KayHermes gateway and for any prompt-injectable Claude Code / Cursor /
+      // Custom GPT session, so the shape cannot decide: the agent must be on the operator's
+      // HUMAN_ORIGIN_ATTESTOR_AGENT_IDS allowlist (empty = refuse all), AND be agent-bound
+      // non-directory. Also refused for every
       // session where the "agent" is a chat model reading untrusted content or the
       // origin cannot be harness-stamped: OAuth connector sessions (directory channel,
       // consentedByMemberId set), seat sessions (seatBinding) and harness-credential
       // sessions. Hard refusal, never a fallback, same as the unbound case.
       if (
         !auth.boundAgentId ||
+        !isHumanOriginAttestorAgent(env, auth.boundAgentId) ||
         auth.channel === 'directory' ||
         auth.consentedByMemberId ||
         auth.seatBinding ||

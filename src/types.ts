@@ -83,6 +83,10 @@ export interface Env {
   // without this, a non-owner tenant with an internal_adapter posthog binding would read the
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
+  // mupot#1889: comma-separated agent ids (agents.id) allowed to carry task_verdict `human_origin`
+  // (harness-attested human decisions, e.g. the KayHermes gateway's agent). Empty/absent = refuse
+  // every human_origin. Read only via src/im/origin-attestors.ts.
+  HUMAN_ORIGIN_ATTESTOR_AGENT_IDS?: string
   BRAND: string
   // Gate-stall watchdog (mupot#1705): minutes a task may sit in review with no verdict before the
   // gate wake is re-sent (default 30), and the max re-wakes per review episode (default 3).
