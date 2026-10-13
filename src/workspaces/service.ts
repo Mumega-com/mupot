@@ -300,8 +300,12 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
       ).bind(crypto.randomUUID(), ...identityBinds, principal.memberId).run()
       created = (insert.meta?.changes ?? 0) > 0
     } catch (err) {
-      if (err instanceof Error && err.message.includes('worktree_cap_reached')) return { ok: false, error: 'worktree_cap_reached' }
-      throw err
+      if (err instanceof Error && err.message.includes('worktree_cap_reached')) {
+        // A concurrent open of the SAME identity may have inserted it between our lookup and this insert: the
+        // BEFORE INSERT cap fires before ON CONFLICT can see the row. That is a reopen, not a new workspace.
+        const raced = await env.DB.prepare(findSql).bind(...identityBinds).first<WorktreeRow>()
+        if (!raced) return { ok: false, error: 'worktree_cap_reached' }
+      } else throw err
     }
     found = await env.DB.prepare(findSql).bind(...identityBinds).first<WorktreeRow>()
   }

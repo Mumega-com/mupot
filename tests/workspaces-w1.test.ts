@@ -152,6 +152,15 @@ async function humanCtx(env: Env, memberId: string): Promise<AuthContext> {
 const wtRows = (): number => n('SELECT COUNT(*) AS n FROM worktrees')
 const open = (env: Env, auth: AuthContext, a: Record<string, unknown>) => openWorktree(env, auth, { project: 'P1', repo: REPO, branch: 'main', ...a })
 
+describe('review-thread fixes (Kasra, pre-merge)', () => {
+  it('a non-default port is part of the repo key; default ports fold away', () => {
+    expect(repoKeyFromUrl('https://git.example.com:8443/team/repo.git')).toBe('url:git.example.com:8443/team/repo')
+    expect(repoKeyFromUrl('https://git.example.com:9443/team/repo.git')).toBe('url:git.example.com:9443/team/repo')
+    expect(repoKeyFromUrl('https://git.example.com:443/team/repo.git')).toBe('url:git.example.com/team/repo')
+    expect(repoKeyFromUrl('https://git.example.com/team/repo.git')).toBe('url:git.example.com/team/repo')
+  })
+})
+
 // ════════════════════════════════════════════════════════════════════════════
 describe('identity: one row per project + repo + branch, never a path', () => {
   it('the same branch from two machines (two harness tokens) and five spellings of the repo URL is ONE row', async () => {

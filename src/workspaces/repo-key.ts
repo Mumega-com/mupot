@@ -50,5 +50,7 @@ export function repoKeyFromUrl(repoUrl: string | null | undefined): string | nul
   if (segments.length === 0) return null
   segments[segments.length - 1] = segments[segments.length - 1]!.replace(GIT_SUFFIX_RE, '')
   if (segments.some((s) => s === '' || s === '..')) return null
-  return `url:${host}/${segments.join('/')}`
+  // A non-default port is part of the identity: two services on one hostname are two repositories.
+  const port = url.port && !(url.protocol === 'https:' && url.port === '443') && !(url.protocol === 'http:' && url.port === '80') && !(url.protocol === 'ssh:' && url.port === '22') ? `:${url.port}` : ''
+  return `url:${host}${port}/${segments.join('/')}`
 }
