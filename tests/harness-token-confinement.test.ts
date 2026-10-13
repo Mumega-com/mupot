@@ -234,8 +234,8 @@ describe('1b. harness delete guard (DB)', () => {
 
 // ════════════════════════════════════════════════════════════════════════════
 describe('2. ONE allowlist chokepoint (invokeTool)', () => {
-  it('the allowlist is exactly seat_select + boot_context, and both are real tools', () => {
-    expect([...HARNESS_SESSION_ALLOWED_TOOLS].sort()).toEqual(['boot_context', 'seat_select'])
+  it('the allowlist is exactly seat_select + boot_context + worktree_open, and all are real tools', () => {
+    expect([...HARNESS_SESSION_ALLOWED_TOOLS].sort()).toEqual(['boot_context', 'seat_select', 'worktree_open'])
     const names = new Set(TOOLS.map((t) => t.name))
     for (const a of HARNESS_SESSION_ALLOWED_TOOLS) expect(names.has(a)).toBe(true)
   })

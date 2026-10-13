@@ -163,6 +163,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'TORIVERS_SECRET',
   'TYPESAFE_API_KEY',
   'VEC',
+  'WORKSPACES', // workspaces W1: opt-in flag (non-secret)
 ])
 
 /** Dynamic-prefix names the worker derives at runtime (per-loop secrets LOOP_SECRET_<REF>_HOST; per-agent DISCORD_BOT_TOKEN_<AGENT>). */

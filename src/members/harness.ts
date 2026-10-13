@@ -10,12 +10,16 @@
 // has no flag logic except the one shared predicate below.
 
 import type { Env } from '../types'
+import { workspacesEnabled } from '../workspaces/flag'
 
 /** The one definition of "is zero-touch seat enrolment on". Strict '1' — unset/anything else
  *  is off, so a typo'd or empty var can never enable an auth-adjacent write path. */
 export function seatAutoEnrollEnabled(env: Pick<Env, 'SEAT_AUTO_ENROLL'>): boolean {
   return env.SEAT_AUTO_ENROLL === '1'
 }
+
+/** A revoked grant's harness may be adopted by the same member's next consent on that client within this many days. */
+export const HARNESS_REUSE_DAYS = 30
 
 export interface HarnessRow {
   id: string
@@ -30,6 +34,9 @@ export interface HarnessRow {
   credential_kind: 'oauth' | 'token'
   /** The member_tokens row that IS the credential (token kind only; null for oauth). */
   token_id: string | null
+  /** Workspaces W1 (migration 0216): the identity of ONE installation. OAuth: 'oauth:<consent token id>'
+   *  (one consent = one refresh-token family); token: 'token:<token id>'; pre-0216 rows 'legacy:<id>'. */
+  grant_id: string | null
 }
 
 /** The harness kinds a TOKEN harness may declare (migration 0202 CHECKs the same list). Display
@@ -41,7 +48,7 @@ export function isHarnessTokenKind(v: unknown): v is HarnessTokenKind {
   return typeof v === 'string' && (HARNESS_TOKEN_KINDS as readonly string[]).includes(v)
 }
 
-const HARNESS_COLUMNS = 'id, tenant, member_id, oauth_client_id, client_name, kind, created_at, credential_kind, token_id'
+const HARNESS_COLUMNS = 'id, tenant, member_id, oauth_client_id, client_name, kind, created_at, credential_kind, token_id, grant_id'
 
 // Label-only classifier. Unknown names fall to 'other'; this is display text, not policy.
 const KIND_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
@@ -67,21 +74,81 @@ export function sanitizeLabel(raw: unknown, max: number): string {
 }
 
 /**
- * Find-or-create the harness row for (tenant, member, oauth_client_id) and return it. A
- * re-consent through the same client refreshes the display labels only. Returns null on any
- * failure — the caller treats the harness as best-effort (a session without a harness id simply
- * cannot call seat_select; it can never gain anything from a failed upsert).
+ * Find-or-create the harness row and return it.
+ *
+ * Flag off, or no grantId (the pre-WORKSPACES behaviour, unchanged): keyed on
+ * (tenant, member, oauth_client_id); a re-consent through the same client refreshes the display
+ * labels only.
+ *
+ * WORKSPACES on with a grantId (design §4.0): keyed on the GRANT, (tenant, member, grant_id). One
+ * consent = one harness row, so two installs of a shared client_id (claude.ai, ChatGPT) are two
+ * harnesses and their seat keys, caps and audit never collapse. oauth_client_id is a LABEL there: it
+ * is stored as '<client_id>#<grant_id>' so the legacy UNIQUE (tenant, member_id, oauth_client_id)
+ * (which a RESTRICT-parent table cannot shed, see migration 0216) is satisfied per grant.
+ *
+ * Returns null on any failure: the caller treats the harness as best-effort (a session without a
+ * harness id simply cannot call seat_select; it can never gain anything from a failed upsert).
  */
 export async function upsertHarness(
   env: Env,
   memberId: string,
   oauthClientId: string,
   clientNameRaw: unknown,
+  grantId?: string | null,
 ): Promise<HarnessRow | null> {
   const clientId = typeof oauthClientId === 'string' ? oauthClientId.trim() : ''
   if (!clientId || clientId.length > 512) return null
   const clientName = sanitizeLabel(clientNameRaw, 120)
   const kind = classifyHarnessKind(clientName)
+  if (workspacesEnabled(env) && typeof grantId === 'string' && grantId.length > 0) {
+    if (grantId.length > 100) return null
+    const grant = `oauth:${grantId}`
+    // The label keeps the grant suffix whole; the client id part yields if the column's 512 cap needs it.
+    const label = `${clientId.slice(0, 512 - grant.length - 1)}#${grant}`
+    // RE-CONSENT CHURN (design note, W1 fix pass): without this, every re-consent on one client would mint
+    // a fresh harness and burn seats toward the lifetime cap (SEAT_TOTAL_MAX). When this member's PRIOR
+    // grant on the SAME client was REVOKED within HARNESS_REUSE_DAYS, the new consent adopts that harness
+    // (its grant_id moves to the new consent token, compare-and-set) instead of creating another. A
+    // still-live prior grant (a second machine) is never adopted, so 4.0's one-install-one-harness holds.
+    // The seat handles of the old grant are bound to its token and are dead; seat_select re-issues a handle
+    // for the adopted seat under the new grant.
+    const existing = await env.DB.prepare(
+      'SELECT id FROM harnesses WHERE tenant = ?1 AND member_id = ?2 AND grant_id = ?3 LIMIT 1',
+    ).bind(env.TENANT_SLUG, memberId, grant).first<{ id: string }>()
+    if (!existing && clientId.length <= 400) {
+      const reusable = await env.DB.prepare(
+        `SELECT h.id AS id, h.grant_id AS grant_id FROM harnesses h
+          WHERE h.tenant = ?1 AND h.member_id = ?2 AND h.credential_kind = 'oauth' AND h.grant_id LIKE 'oauth:%'
+            AND substr(h.oauth_client_id, 1, ?3) = ?4
+            AND EXISTS (SELECT 1 FROM member_tokens t
+                         WHERE t.id = substr(h.grant_id, 7) AND t.revoked_at IS NOT NULL
+                           AND julianday(t.revoked_at) > julianday('now', ?5))
+          ORDER BY h.created_at DESC, h.id LIMIT 1`,
+      ).bind(env.TENANT_SLUG, memberId, clientId.length + 7, `${clientId}#oauth:`, `-${HARNESS_REUSE_DAYS} days`)
+        .first<{ id: string; grant_id: string }>()
+      if (reusable) {
+        const moved = await env.DB.prepare(
+          `UPDATE harnesses SET grant_id = ?1, client_name = ?2, kind = ?3
+            WHERE id = ?4 AND grant_id = ?5 AND tenant = ?6 AND member_id = ?7`,
+        ).bind(grant, clientName, kind, reusable.id, reusable.grant_id, env.TENANT_SLUG, memberId).run()
+        if ((moved.meta?.changes ?? 0) > 0) {
+          return env.DB.prepare(`SELECT ${HARNESS_COLUMNS} FROM harnesses WHERE id = ?1 LIMIT 1`).bind(reusable.id).first<HarnessRow>()
+        }
+      }
+    }
+    await env.DB.prepare(
+      `INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, kind, grant_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+       ON CONFLICT (tenant, member_id, grant_id)
+       DO UPDATE SET client_name = excluded.client_name, kind = excluded.kind`,
+    ).bind(crypto.randomUUID(), env.TENANT_SLUG, memberId, label, clientName, kind, grant).run()
+    return env.DB.prepare(
+      `SELECT ${HARNESS_COLUMNS}
+         FROM harnesses
+        WHERE tenant = ?1 AND member_id = ?2 AND grant_id = ?3 AND credential_kind = 'oauth'
+        LIMIT 1`,
+    ).bind(env.TENANT_SLUG, memberId, grant).first<HarnessRow>()
+  }
   await env.DB.prepare(
     `INSERT INTO harnesses (id, tenant, member_id, oauth_client_id, client_name, kind)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
