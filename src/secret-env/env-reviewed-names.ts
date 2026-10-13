@@ -42,6 +42,7 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'DEFAULT_CPU_MS',
   'DEFAULT_POT_HOST_SUFFIX',
   'DEFAULT_SUBREQUESTS',
+  'DELEGATED_OPERATORS', // mumega-com#1386 W0: opt-in flag for delegated operators (non-secret)
   'DISCORD_ADMIN_AGENT',
   'DISCORD_ADMIN_BOT_TOKEN',
   'DISCORD_BOT_TOKEN',
@@ -149,7 +150,6 @@ export const ENV_REVIEWED_BINDING_NAMES: ReadonlySet<string> = new Set([
   'STUDIO_DISPATCH_WINDOW_MINUTES',
   'SUPABASE_WEBHOOK_SECRET',
   'TASK_ARCHIVE_ENABLED', // mupot#1778: opt-in flag for task archiving (non-secret)
-  'DELEGATED_OPERATORS', // mumega-com#1386 W0: opt-in flag for delegated operators (non-secret)
   'TASK_WORKFLOW',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_BRIDGE_URL',

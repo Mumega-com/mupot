@@ -472,7 +472,6 @@ export async function authorizeStructuralWrite(
   if (!auth.boundAgentId) return { kind: 'principal' }
   const policy = STRUCTURAL_ACTIONS[action]
   const surface = options.surface ?? 'mcp'
-  if (auth.tenant !== env.TENANT_SLUG) return refuse(403, 'forbidden', { reason: 'tenant_scope' })
 
   const flagOn = delegatedOperatorsEnabled(env)
   let sawDelegation = false
@@ -480,6 +479,8 @@ export async function authorizeStructuralWrite(
     const delegations = await listLiveDelegationsForAgent(env, auth.boundAgentId)
     sawDelegation = delegations.length > 0
     if (sawDelegation) {
+      // Only the delegated path is tenant-fenced here: the legacy lanes keep their own (pre-W0) behaviour exactly.
+      if (auth.tenant !== env.TENANT_SLUG) return refuse(403, 'forbidden', { reason: 'tenant_scope' })
       const resolved = typeof target === 'function' ? await target() : target
       if (isRefusal(resolved)) return resolved
       const verdict = await evaluateDelegated(env, auth, action, resolved, delegations, surface)
