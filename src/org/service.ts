@@ -1723,6 +1723,8 @@ export type MoveAgentSquadError =
   | 'agent_identity_conflict'
   | 'squad_not_found'
   | 'receipt_failed'
+  // the agent's squad was no longer the caller's `fromSquadId` when the write ran (nothing was written)
+  | 'source_squad_changed'
 
 export interface MoveGrantImpact {
   no_longer_applies: Array<{
@@ -1849,7 +1851,18 @@ export async function moveAgentSquad(
     reason: input.reason ?? null,
   })
 
-  const writes = await env.DB.batch([
+  // W0.1 (gate P2, TOCTOU): the move is bound to the SOURCE squad the caller authorised. The guard below is the batch's
+  // first statement and raises (malformed JSON) unless the agent still sits in `fromSquadId`, which aborts and rolls back
+  // the whole batch, so a move that landed after the caller's own checks writes NOTHING (the per-statement WHERE clauses
+  // alone were not enough: the DELETE and destination-grant statements are not conditional on the UPDATE's row count).
+  let writes: D1Result[]
+  try {
+    writes = (await env.DB.batch([
+    env.DB.prepare(
+      `SELECT json_extract(
+         CASE WHEN EXISTS (SELECT 1 FROM agents WHERE id = ? AND squad_id = ?) THEN '{}' ELSE 'source_squad_changed' END,
+         '$')`,
+    ).bind(input.agentId, input.fromSquadId),
     env.DB.prepare(
       `INSERT INTO agent_audit
          (id, agent_id, actor_id, actor_type, action, fields_changed, before_state, after_state)
@@ -1880,7 +1893,14 @@ export async function moveAgentSquad(
           SET after_state = (SELECT ${AGENT_SNAPSHOT_JSON} FROM agents WHERE id = ?)
         WHERE id = ?`,
     ).bind(input.agentId, auditId),
-  ])
+    ])).slice(1)
+  } catch (err) {
+    const now = await env.DB.prepare('SELECT squad_id FROM agents WHERE id = ? LIMIT 1')
+      .bind(input.agentId)
+      .first<{ squad_id: string }>()
+    if (now && now.squad_id !== input.fromSquadId) return { ok: false, error: 'source_squad_changed' }
+    throw err
+  }
 
   try {
     assertWritten(writes[0]!, 'move_agent_squad.audit_insert')

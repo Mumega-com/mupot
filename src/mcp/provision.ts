@@ -91,6 +91,7 @@ import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
 import {
   authorizeStructuralWrite,
+  delegatedTargetDrift,
   finishDelegatedReceipt,
   type StructuralAction,
   type StructuralRefusal,
@@ -1662,7 +1663,7 @@ export const toolGrantAgentCapability: ToolSpec = {
       squadId: squad.id,
       capability: capability as AgentAccessCapability,
     })
-    await finishDelegatedReceipt(env, grantGate, outcome.ok)
+    await finishDelegatedReceipt(env, grantGate, outcome.ok && outcome.result !== 'unchanged')
     if (!outcome.ok) {
       if (outcome.error === 'agent_not_found') return fail(404, outcome.error)
       if (outcome.error === 'squad_not_found') return fail(404, outcome.error)
@@ -2297,11 +2298,20 @@ export const toolMoveAgentSquad: ToolSpec = {
       'SELECT id, department_id FROM squads WHERE id = ?1 LIMIT 1',
     ).bind(toSquad.id).first<{ id: string; department_id: string }>()
     if (!destRow) return fail(404, 'squad_not_found', { squad: toSquadRef })
+
+    // TOCTOU (gate P2): under delegation the gate authorised ONE (agent, from-squad, to-squad). The references were
+    // resolved again above; if any of the three moved in between, the write is one the gate never saw, so refuse. The
+    // gate's source squad is then bound into the write itself (moveAgentSquad's UPDATE ... WHERE squad_id = from, and a
+    // zero-row result is a receipt_failed refusal), so a move that lands between this check and the write cannot take
+    // effect on a different source either.
+    const drift = delegatedTargetDrift(moveGate, { agentId: agent.id, squadId: destRow.id, fromSquadId: agent.squad_id })
+    if (drift) return structuralFail(drift)
+    const fromSquadId = moveGate.kind === 'delegated' ? (moveGate.target.fromSquadId ?? agent.squad_id) : agent.squad_id
     // mupot#1496 Round 3 (adversarial P1-C): an archived squad cannot be
     // repopulated by moving an agent into it.
     if (await isSquadArchived(env, destRow.id)) return fail(409, 'squad_archived')
 
-    if (agent.squad_id === destRow.id) {
+    if (fromSquadId === destRow.id) {
       return fail(400, 'same_squad', {
         agent: agent.id,
         squad: toSquad.id,
@@ -2311,7 +2321,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     // Yank: admin on the agent's CURRENT home. memberCanOnSquadAuth sees both
     // planes (legacy role + grants); org admin inherits down. No separate
     // hasWorkspaceAdmin disjunct — same R3 reasoning as update_agent.
-    if (!moveDelegated && !(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
+    if (!moveDelegated && !(await memberCanOnSquadAuth(env, auth, fromSquadId, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'from' })
     }
 
@@ -2391,7 +2401,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     const severed = await listMoveGrantImpact(env, {
       agentId: agent.id,
       memberId: binding.memberId,
-      fromSquadId: agent.squad_id,
+      fromSquadId: fromSquadId,
     })
     const severedGates = [...new Set(
       severed
@@ -2408,7 +2418,7 @@ export const toolMoveAgentSquad: ToolSpec = {
             WHERE squad_id = ?1
               AND status != 'done'
               AND gate_owner IN (${placeholders})`,
-        ).bind(agent.squad_id, ...chunk).all<{
+        ).bind(fromSquadId, ...chunk).all<{
           id: string
           gate_owner: string
           assignee_agent_id: string | null
@@ -2444,7 +2454,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     const actor: AuditActor = { id: auth.memberId as string, type: 'user' }
     const result = await moveAgentSquad(env, {
       agentId: agent.id,
-      fromSquadId: agent.squad_id,
+      fromSquadId: fromSquadId,
       toSquadId: destRow.id,
       memberId: binding.memberId,
       capability,
@@ -2469,13 +2479,13 @@ export const toolMoveAgentSquad: ToolSpec = {
       capability,
       reason,
       changed: {
-        squad_id: { from: agent.squad_id, to: destRow.id },
+        squad_id: { from: fromSquadId, to: destRow.id },
       },
     })
 
     return done({
       agent: { id: agent.id, squad_id: destRow.id },
-      from_squad: { id: agent.squad_id },
+      from_squad: { id: fromSquadId },
       to_squad: { id: destRow.id },
       member_id: binding.memberId,
       capability,
@@ -2843,7 +2853,7 @@ const toolSquadMemberAdd: ToolSpec = {
       capability,
       delegated: addGate.kind === 'delegated' ? addGate : undefined,
     })
-    await finishDelegatedReceipt(env, addGate, outcome.ok)
+    await finishDelegatedReceipt(env, addGate, outcome.ok && outcome.result !== 'unchanged')
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 
     await emitProvisioned(env, auth.memberId as string, 'membership', squadResult.value.id, {
@@ -2906,7 +2916,7 @@ const toolSquadMemberRemove: ToolSpec = {
       squad: squadResult.value,
       delegated: removeGate.kind === 'delegated' ? removeGate : undefined,
     })
-    await finishDelegatedReceipt(env, removeGate, outcome.ok)
+    await finishDelegatedReceipt(env, removeGate, outcome.ok && outcome.result !== 'unchanged')
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 
     if (outcome.result === 'removed') {

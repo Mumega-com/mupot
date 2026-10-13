@@ -65,6 +65,7 @@ import {
 import { listAddonBindings, validateBindingInputs } from '../addons/bindings'
 import { OFFICE_ADDON_KEY, probeOfficeHealth } from '../addons/office/service'
 import { hasCapability } from '../auth/capability'
+import { authorizeStructuralWrite } from '../operators/chokepoint'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -238,6 +239,10 @@ const toolAddonActivate: ToolSpec = {
   args: '{ key: string }',
   inputSchema: KEY_SCHEMA,
   async run(auth, env, args) {
+    // W0.1: activating an addon creates its department and squads (activateDepartment), so it asks the structural chokepoint.
+    // Same lane as create_department: an agent keeps exactly its pre-W0 capability lane, never a delegation.
+    const gate = await authorizeStructuralWrite(env, auth, 'activate_addon', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     const resolved = await resolveAdminEntry(auth, args)
     if (!resolved.ok) return resolved.outcome
     // activateAddon is idempotent on an already-'active' installation (materializes any
@@ -304,6 +309,9 @@ const toolAddonSetup: ToolSpec = {
   args: '{ key: string, bindings?: Array<{ slot: string, adapter: string, bindingKind: "internal_adapter"|"vault_connector", connectorId?: string }> }',
   inputSchema: toolAddonConfigure.inputSchema,
   async run(auth, env, args) {
+    // W0.1: the activate step creates departments and squads: ask the structural chokepoint (see addon_activate).
+    const gate = await authorizeStructuralWrite(env, auth, 'activate_addon', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     const resolved = await resolveAdminEntry(auth, args)
     if (!resolved.ok) return resolved.outcome
 

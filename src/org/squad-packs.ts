@@ -7,7 +7,8 @@
 // service functions the dashboard + JSON API use — full validation, no D1 bypass.
 // The dashboard route that calls it is owner/admin-gated like every other org write.
 
-import type { Effort, Autonomy, Env, Squad, Agent } from '../types'
+import type { AuthContext, Effort, Autonomy, Env, Squad, Agent } from '../types'
+import { authorizeStructuralWrite, finishDelegatedReceipt } from '../operators/chokepoint'
 import { createSquad, createAgent } from './service'
 import type { CreateResult } from './service'
 
@@ -129,15 +130,26 @@ export interface SeedPackDeps {
  * the whole seed is refused (idempotent-ish: re-running does not duplicate). An
  * individual agent slug collision is recorded in agentErrors and skipped, never
  * aborting the rest (so a partial re-run can fill in missing agents).
+ *
+ * W0.1: this writes org structure (a squad and agents), so it asks the structural chokepoint like every other writer.
+ * Seeding a pack is a HUMAN owner act (a dashboard cookie route), so anything but a non-agent caller is refused: an agent,
+ * delegated or not, never reaches it.
  */
 export async function seedSquadPack(
   env: Env,
+  auth: AuthContext,
   departmentId: string,
   packKey: string,
   deps: SeedPackDeps = {},
 ): Promise<SeedPackResult> {
   const pack = getSquadPack(packKey)
   if (!pack) return { ok: false, error: 'unknown_pack', agents: [], agentErrors: [] }
+
+  const gate = await authorizeStructuralWrite(env, auth, 'create_squad', { departmentId, slug: pack.key }, { surface: 'http' })
+  if (gate.kind !== 'principal') {
+    await finishDelegatedReceipt(env, gate, false) // a delegated verdict opened a receipt; this surface never lets it through
+    return { ok: false, error: gate.kind === 'refused' ? gate.error : 'operator_principal_required', agents: [], agentErrors: [] }
+  }
 
   const doCreateSquad = deps.createSquad ?? createSquad
   const doCreateAgent = deps.createAgent ?? createAgent

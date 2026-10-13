@@ -197,6 +197,9 @@ describe('ratchet 3b: the census of files that CALL a structural service writer 
     'createDepartment', 'createSquad', 'createAgent', 'setAgentSquadAccess', 'removeAgentSquadAccess', 'commitAgentSquadAccess',
     'commitRemoveAgentSquadAccess', 'addSquadMember', 'removeSquadMember', 'upsertProjectSquadAccess', 'removeProjectSquadAccess',
     'startProject', 'grantGateCapability', 'revokeGateCapability', 'upsertCapabilityGrant', 'moveAgentSquad',
+    // W0.1: activating an addon materializes its department (and squads) through activateDepartment; seedSquadPack
+    // creates a squad and its agents through an injected alias of createSquad / createAgent.
+    'activateAddon', 'activateDepartment', 'seedSquadPack', 'seedOutreachLoop',
   ]
   const CALLERS = new Set([
     // agent-reachable doors, each gated by the chokepoint
@@ -207,13 +210,29 @@ describe('ratchet 3b: the census of files that CALL a structural service writer 
     'src/gates/grants.ts', 'src/mcp/oauth-authorize.ts', 'src/members/agent-access.ts', 'src/members/bootstrap-self.ts',
     'src/members/service.ts', 'src/members/squad-membership.ts', 'src/org/service.ts', 'src/org/team-bootstrap.ts',
     'src/projects/client-bootstrap.ts', 'src/projects/service.ts', 'src/projects/start-gate.ts',
+    // W0.1: addon activation (MCP tools + HTTP route ask 'activate_addon'; the service and registry are the writers) and
+    // squad-pack seeding (human dashboard route; seedSquadPack itself asks 'create_squad' and refuses any agent)
+    'src/addons/routes.ts', 'src/addons/service.ts', 'src/mcp/addons.ts',
+    'src/org/squad-packs.ts', 'src/loops/outreach-pack.ts', 'src/loops/routes.ts',
   ])
-  const call = new RegExp(`\\b(${WRITERS.join('|')})\\(`)
+  // A writer is found by NAME ANYWHERE in the code, not only as `name(`: an aliased import (`createSquad as makeSquad`), a
+  // default-injected reference (`deps.createSquad ?? createSquad`; src/loops/outreach-pack.ts hid behind one too), a namespace member, or `typeof createSquad` all name it,
+  // and each of those evaded the old call-shaped match (src/org/squad-packs.ts did, with a W0 write nobody gated).
+  const call = new RegExp(`\\b(${WRITERS.join('|')})\\b`)
 
   it('no source file outside the reviewed set calls a structural service writer', () => {
-    const found = walk(join(ROOT, 'src')).filter((f) => !f.endsWith('.generated.ts')).filter((f) => call.test(code(f)))
+    const found = walk(join(ROOT, 'src'))
+      .filter((f) => !f.endsWith('.generated.ts') && f !== 'src/mcp/tool-annotations.ts')
+      .filter((f) => call.test(code(f)))
     expect(found.filter((f) => !CALLERS.has(f)), 'a NEW file calls a structural service writer; review it and gate its agent-reachable callers').toEqual([])
     expect([...CALLERS].filter((f) => !found.includes(f)), 'a baselined caller no longer calls a writer; remove it').toEqual([])
+  })
+
+  it('the census sees an aliased import and a default-injected reference (the shapes that evaded it)', () => {
+    expect(call.test("import { createSquad as makeSquad } from './service'\nawait makeSquad(env)")).toBe(true)
+    expect(call.test('const doCreate = deps.createSquad ?? createSquad')).toBe(true)
+    expect(call.test("import * as svc from './service'\nsvc.setAgentSquadAccess(env)")).toBe(true)
+    expect(call.test('const unrelated = createSquadLabel')).toBe(false)
   })
 
   it('every agent-reachable door file in the set references the chokepoint', () => {

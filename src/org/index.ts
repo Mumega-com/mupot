@@ -40,7 +40,7 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
-import { authorizeStructuralWrite, finishDelegatedReceipt, structuralRefusalBody } from '../operators/chokepoint'
+import { authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
 import {
   setAgentSquadAccess,
@@ -124,6 +124,13 @@ orgApp.get('/health', (c) => c.json({ ok: true, component: 'org', tenant: c.env.
 // skips CORS preflight. hono/csrf guards the three CORS-simple content types only —
 // its coverage depends on this Worker having NO cors() anywhere. Same convention as tasksApp.
 orgApp.use('*', csrf())
+// W0.1: close every delegated-operator receipt a route in this app opened and left at 'attempted' (any early return after
+// the chokepoint gate). Structural: a route cannot forget it. 5xx leaves them 'attempted' (outcome unknown).
+orgApp.use('*', async (c, next) => {
+  await next()
+  await settleOpenDelegatedReceipts(c.env, c.get('auth'), c.res.status)
+})
+
 orgApp.use('*', requireAuth)
 orgApp.use('*', async (c, next) => {
   const auth = c.get('auth')
@@ -404,7 +411,7 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     squadId: squad.id,
     capability,
   })
-  await finishDelegatedReceipt(c.env, gate, result.ok)
+  await finishDelegatedReceipt(c.env, gate, result.ok && result.result !== 'unchanged')
   if (!result.ok) {
     const status = result.error === 'agent_not_found' || result.error === 'squad_not_found'
       ? 404

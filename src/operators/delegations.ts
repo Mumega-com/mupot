@@ -48,6 +48,21 @@ export async function memberIsAgentSeat(env: Env, memberId: string): Promise<boo
 }
 
 /**
+ * The agent a seat member is welded to, WHATEVER the member's status. This is the authorisation-side resolver: a suspended
+ * seat member still IS that agent's identity, so a rank guard that reads the target must keep seeing it
+ * (resolveBoundAgentForMember joins members.status = 'active' and returns null for a suspended seat, which silently
+ * dropped the target's standing from the guard: gate P1 on W0). null = not an agent seat (a human or an unknown id).
+ */
+export async function agentIdForSeatMember(env: Env, memberId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    'SELECT agent_id FROM agent_member_bindings WHERE tenant = ?1 AND member_id = ?2 LIMIT 1',
+  )
+    .bind(env.TENANT_SLUG, memberId)
+    .first<{ agent_id: string }>()
+  return row?.agent_id ?? null
+}
+
+/**
  * Fail-closed sibling of memberIsAgentSeat for the HUMAN-ONLY checks (who may delegate, who may be a delegator): a member is
  * treated as non-human when it is bound in agent_member_bindings OR holds any member_tokens row welded to an agent. The
  * binding table is the authority, but a legacy seat could predate it, and for these checks over-refusing is the safe error.

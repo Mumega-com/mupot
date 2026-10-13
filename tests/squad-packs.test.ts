@@ -12,10 +12,12 @@ import {
   seedSquadPack,
 } from '../src/org/squad-packs'
 import { isEffort, isAutonomy } from '../src/types'
-import type { Env, Squad, Agent } from '../src/types'
+import type { AuthContext, Env, Squad, Agent } from '../src/types'
 import type { CreateResult } from '../src/org/service'
 
 const ENV = {} as Env
+const HUMAN = { userId: 'u', email: null, role: 'owner', tenant: 't', channel: 'dashboard', memberId: 'm', capabilities: [], boundAgentId: null } as unknown as AuthContext
+const AGENT = { ...HUMAN, boundAgentId: 'agent-x' } as unknown as AuthContext
 
 describe('SQUAD_PACKS — shape validity', () => {
   it('every pack + every agent uses valid effort/autonomy enums', () => {
@@ -50,13 +52,22 @@ describe('SQUAD_PACKS — shape validity', () => {
 })
 
 describe('seedSquadPack', () => {
+  it('an agent-bound caller never seeds a pack (W0.1: asks the chokepoint, refused without a delegation lane)', async () => {
+    const createSquad = vi.fn()
+    const createAgent = vi.fn()
+    const r = await seedSquadPack({ TENANT_SLUG: 't' } as Env, AGENT, 'dept-1', 'shabrang', { createSquad, createAgent })
+    expect(r.ok).toBe(false)
+    expect(r.error).toBe('operator_principal_required')
+    expect(createSquad).not.toHaveBeenCalled()
+  })
+
   const mkSquad = (id: string): Squad => ({ id } as unknown as Squad)
   const mkAgent = (id: string): Agent => ({ id } as unknown as Agent)
 
   it('unknown pack → ok:false, nothing created', async () => {
     const createSquad = vi.fn()
     const createAgent = vi.fn()
-    const r = await seedSquadPack(ENV, 'dept-1', 'nope', { createSquad, createAgent })
+    const r = await seedSquadPack(ENV, HUMAN, 'dept-1', 'nope', { createSquad, createAgent })
     expect(r.ok).toBe(false)
     expect(r.error).toBe('unknown_pack')
     expect(createSquad).not.toHaveBeenCalled()
@@ -66,7 +77,7 @@ describe('seedSquadPack', () => {
     const createSquad = vi.fn(async (): Promise<CreateResult<Squad>> => ({ ok: true, value: mkSquad('sq-1') }))
     const createAgent = vi.fn(async (): Promise<CreateResult<Agent>> => ({ ok: true, value: mkAgent('ag') }))
 
-    const r = await seedSquadPack(ENV, 'dept-1', 'shabrang', { createSquad, createAgent })
+    const r = await seedSquadPack(ENV, HUMAN, 'dept-1', 'shabrang', { createSquad, createAgent })
 
     const pack = getSquadPack('shabrang')!
     expect(r.ok).toBe(true)
@@ -83,7 +94,7 @@ describe('seedSquadPack', () => {
     const createSquad = vi.fn(async (): Promise<CreateResult<Squad>> => ({ ok: false, error: 'slug_taken' }))
     const createAgent = vi.fn()
 
-    const r = await seedSquadPack(ENV, 'dept-1', 'shabrang', { createSquad, createAgent })
+    const r = await seedSquadPack(ENV, HUMAN, 'dept-1', 'shabrang', { createSquad, createAgent })
 
     expect(r.ok).toBe(false)
     expect(r.error).toBe('slug_taken')
@@ -99,7 +110,7 @@ describe('seedSquadPack', () => {
       return call === 1 ? { ok: false, error: 'slug_taken' } : { ok: true, value: mkAgent(`ag-${call}`) }
     })
 
-    const r = await seedSquadPack(ENV, 'dept-1', 'shabrang', { createSquad, createAgent })
+    const r = await seedSquadPack(ENV, HUMAN, 'dept-1', 'shabrang', { createSquad, createAgent })
 
     const pack = getSquadPack('shabrang')!
     expect(r.ok).toBe(true)

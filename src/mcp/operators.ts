@@ -87,7 +87,11 @@ const toolOperatorDelegate: ToolSpec = {
 const toolOperatorRevoke: ToolSpec = {
   name: 'operator_revoke',
   scope: 'the delegated scope (the delegator, or a human with admin over it)',
-  min: 'admin',
+  // 'authenticated', NOT 'admin' (W0.1): the dispatcher's admin floor would stop a delegator who has since been demoted
+  // from withdrawing their own delegation, which must always work. The authority check is revokeDelegation's own: a HUMAN
+  // (never an agent: the chokepoint above refuses every agent-bound caller first), and either the original delegator or
+  // someone holding admin over the delegation's scope.
+  min: 'authenticated',
   args: '{ delegation_id: string } -- takes effect on the agent\'s very next request.',
   inputSchema: {
     type: 'object',
