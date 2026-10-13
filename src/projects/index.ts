@@ -3,7 +3,7 @@ import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin, resolveCapabilities, sessionMemberId } from '../auth/capability'
-import { authorizeStructuralWrite, finishDelegatedReceipt, structuralRefusalBody } from '../operators/chokepoint'
+import { authorizeStructuralWrite, finishDelegatedReceipt, settleOpenDelegatedReceipts, structuralRefusalBody } from '../operators/chokepoint'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -302,6 +302,13 @@ async function jsonObject(c: { req: { json: () => Promise<unknown> } }): Promise
 export const projectsApp = new Hono<AppEnv>()
 
 projectsApp.use('*', csrf())
+// W0.1: close every delegated-operator receipt a route in this app opened and left at 'attempted' (any early return after
+// the chokepoint gate). Structural: a route cannot forget it. 5xx leaves them 'attempted' (outcome unknown).
+projectsApp.use('*', async (c, next) => {
+  await next()
+  await settleOpenDelegatedReceipts(c.env, c.get('auth'), c.res.status)
+})
+
 projectsApp.use('*', async (c, next) => {
   if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(c.req.method)) {
     const origin = c.req.header('origin')

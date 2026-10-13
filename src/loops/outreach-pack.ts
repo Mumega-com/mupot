@@ -6,7 +6,8 @@
 // gated path, so no channel ResourceRef is needed). Uses the canonical createSquad /
 // createLoop services (full validation incl. the CASL backstop).
 
-import type { Env, Squad } from '../types'
+import type { AuthContext, Env, Squad } from '../types'
+import { authorizeStructuralWrite, finishDelegatedReceipt } from '../operators/chokepoint'
 import { createSquad } from '../org/service'
 import { createLoop } from './service'
 import type { LoopManifest } from './manifest'
@@ -24,13 +25,21 @@ export interface SeedOutreachResult {
   loop?: LoopManifest
 }
 
-export async function seedOutreachLoop(env: Env, deps: SeedOutreachDeps = {}): Promise<SeedOutreachResult> {
+export async function seedOutreachLoop(env: Env, auth: AuthContext, deps: SeedOutreachDeps = {}): Promise<SeedOutreachResult> {
   const doCreateSquad = deps.createSquad ?? createSquad
   const doCreateLoop = deps.createLoop ?? createLoop
   const resolveDept = deps.resolveDepartmentId ?? defaultResolveDepartmentId
 
   const departmentId = await resolveDept(env)
   if (!departmentId) return { ok: false, error: 'no_department' }
+
+  // W0.1: this creates a squad, so it asks the structural chokepoint like every other writer. Seeding the outreach loop is a
+  // human owner act: an agent-bound caller (delegated or not) is refused.
+  const gate = await authorizeStructuralWrite(env, auth, 'create_squad', { departmentId, slug: 'outreach' }, { surface: 'http' })
+  if (gate.kind !== 'principal') {
+    await finishDelegatedReceipt(env, gate, false) // a delegated verdict opened a receipt; this surface never lets it through
+    return { ok: false, error: gate.kind === 'refused' ? gate.error : 'operator_principal_required' }
+  }
 
   const OKR = 'Book qualified meetings via compliant grant-diagnostic outreach'
 

@@ -1,22 +1,32 @@
 // tests/outreach-pack.test.ts — one-click outreach seeder (P5, #36).
 import { describe, expect, it, vi } from 'vitest'
 import { seedOutreachLoop } from '../src/loops/outreach-pack'
-import type { Env, Squad } from '../src/types'
+import type { AuthContext, Env, Squad } from '../src/types'
 
 const ENV = { TENANT_SLUG: 't' } as unknown as Env
+const HUMAN = { userId: 'u', email: null, role: 'owner', tenant: 't', channel: 'dashboard', memberId: 'm', capabilities: [], boundAgentId: null } as unknown as AuthContext
+const AGENT = { ...HUMAN, boundAgentId: 'agent-x' } as unknown as AuthContext
 const okSquad = vi.fn(async () => ({ ok: true as const, value: { id: 'sq-1' } as Squad }))
 const resolveDepartmentId = vi.fn(async () => 'dept-1')
 
 describe('seedOutreachLoop', () => {
+  it('an agent-bound caller never seeds the outreach squad (W0.1: asks the chokepoint)', async () => {
+    const createSquad = vi.fn()
+    const r = await seedOutreachLoop(ENV, AGENT, { createSquad, resolveDepartmentId })
+    expect(r.ok).toBe(false)
+    expect(r.error).toBe('operator_principal_required')
+    expect(createSquad).not.toHaveBeenCalled()
+  })
+
   it('fails when there is no department', async () => {
-    const r = await seedOutreachLoop(ENV, { resolveDepartmentId: vi.fn(async () => null) })
+    const r = await seedOutreachLoop(ENV, HUMAN, { resolveDepartmentId: vi.fn(async () => null) })
     expect(r.ok).toBe(false)
     expect(r.error).toBe('no_department')
   })
 
   it('creates the Outreach squad + a GATED outreach loop (queue source, no channels)', async () => {
     const createLoop = vi.fn(async () => ({ ok: true as const, value: { id: 'loop-1' } as never }))
-    const r = await seedOutreachLoop(ENV, { createSquad: okSquad, createLoop, resolveDepartmentId })
+    const r = await seedOutreachLoop(ENV, HUMAN, { createSquad: okSquad, createLoop, resolveDepartmentId })
     expect(r.ok).toBe(true)
     expect(r.squad?.id).toBe('sq-1')
     expect(r.loop?.id).toBe('loop-1')
@@ -30,7 +40,7 @@ describe('seedOutreachLoop', () => {
 
   it('aborts before the loop when the squad create fails', async () => {
     const createLoop = vi.fn()
-    const r = await seedOutreachLoop(ENV, {
+    const r = await seedOutreachLoop(ENV, HUMAN, {
       createSquad: vi.fn(async () => ({ ok: false as const, error: 'slug_taken' })),
       createLoop, resolveDepartmentId,
     })
@@ -41,7 +51,7 @@ describe('seedOutreachLoop', () => {
 
   it('reports a loop-create failure but returns the created squad', async () => {
     const createLoop = vi.fn(async () => ({ ok: false as const, error: 'invalid_okr' }))
-    const r = await seedOutreachLoop(ENV, { createSquad: okSquad, createLoop, resolveDepartmentId })
+    const r = await seedOutreachLoop(ENV, HUMAN, { createSquad: okSquad, createLoop, resolveDepartmentId })
     expect(r.ok).toBe(false)
     expect(r.error).toBe('invalid_okr')
     expect(r.squad?.id).toBe('sq-1')

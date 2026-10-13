@@ -43,7 +43,7 @@ loopsApp.get('/:id', async (c) => {
 // outreach loop. The dogfood path to a live loop. Idempotent-ish: a second call fails
 // at the squad slug (already exists) and reports it.
 loopsApp.post('/seed-outreach', async (c) => {
-  const r = await seedOutreachLoop(c.env)
+  const r = await seedOutreachLoop(c.env, c.get('auth'))
   if (!r.ok) return c.json({ error: r.error }, 400)
   return c.json({ ok: true, squad: r.squad, loop: r.loop }, 201)
 })

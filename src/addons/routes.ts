@@ -4,6 +4,7 @@ import type { Context } from 'hono'
 import type { Env, AuthContext } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin } from '../auth/capability'
+import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refusal'
 import { resolveOrgAdmin } from '../auth/member-bearer'
 import './modules'
@@ -389,6 +390,11 @@ function mutationError(result: Extract<AddonMutationResult, { ok: false }>) {
 async function mutate(c: Context<AppEnv>, action: LifecycleAction) {
   const auth = c.get('auth')
   if (!isOrgAdmin(auth)) return c.json(orgAdminForbiddenPayload('Addon lifecycle changes', auth, ORG_ADMIN_REFUSAL_LINKS), 403)
+  if (action === 'activate') {
+    // W0.1: activation creates the addon's department and squads: the structural chokepoint decides an agent-bound caller.
+    const gate = await authorizeStructuralWrite(c.env, auth, 'activate_addon', {}, { surface: 'http' })
+    if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
+  }
 
   const key = c.req.param('key')
   if (!key) return c.json({ error: 'addon_not_registered' }, 404)

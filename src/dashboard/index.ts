@@ -3062,7 +3062,7 @@ dashboardApp.post('/squads/packs/:key', async (c) => {
     )
   }
 
-  const result = await seedSquadPack(c.env, departmentId, key)
+  const result = await seedSquadPack(c.env, auth, departmentId, key)
   if (!result.ok) {
     return c.html(
       shell(c.env, 'Overview', errorBody(`Could not seed pack: ${result.error}.`)),

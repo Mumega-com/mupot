@@ -219,6 +219,7 @@ export const INVITER_ACTIVE_MEMBER_SQL = (idParam: string, tenantParam: string):
 import {
   authorizeStructuralWrite,
   finishDelegatedReceipt,
+  settleOpenDelegatedReceipts,
   structuralRefusalBody,
   type StructuralAction,
   type StructuralTarget,
@@ -788,6 +789,13 @@ membersApp.post('/invites/:id/accept', async (c) => {
 // Registered AFTER /invites/:id/accept on purpose: that route is public token
 // redemption (no session), so CSRF is not its threat model and CLI redeems keep working.
 membersApp.use('*', csrf())
+// W0.1: close every delegated-operator receipt a route in this app opened and left at 'attempted' (any early return after
+// the chokepoint gate). Structural: a route cannot forget it. 5xx leaves them 'attempted' (outcome unknown).
+membersApp.use('*', async (c, next) => {
+  await next()
+  await settleOpenDelegatedReceipts(c.env, c.get('auth'), c.res.status)
+})
+
 membersApp.use('*', requireAuth)
 membersApp.use('*', async (c, next) => {
   const auth = c.get('auth')
@@ -1631,12 +1639,13 @@ async function capabilityTarget(c: Context<AppEnv>): Promise<StructuralTarget | 
   if (typeof raw.scope_id !== 'string' || raw.scope_id.trim().length === 0) {
     return { kind: 'refused', status: 400, error: 'invalid_scope_id' }
   }
-  const bound = await resolveBoundAgentForMember(c.env, memberId)
+  // No agent id here ON PURPOSE: the chokepoint resolves the target's agent from the binding table whatever the seat
+  // member's status. Resolving it here with resolveBoundAgentForMember (active members only) returned null for a
+  // SUSPENDED seat and skipped the global-standing guard (gate P1).
   const capability = raw.action === 'revoke' ? null : isCapability(raw.capability) ? raw.capability : null
   if (raw.action !== 'revoke' && capability === null) return { kind: 'refused', status: 400, error: 'invalid_capability' }
   return {
     memberId,
-    agentId: bound?.agentId,
     squadId: raw.scope_id.trim(),
     capability,
     detail: { via: 'http' },
@@ -1723,6 +1732,10 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
   }
 
   const boundAgent = await resolveBoundAgentForMember(c.env, memberId)
+  // A delegated write was authorised against an AGENT seat. If that seat's member is no longer active the agent writer
+  // cannot run, and falling through to the plain human capability write below would land a raw capabilities row on the
+  // seat outside every agent guard: refuse instead.
+  if (delegatedWrite && !boundAgent) return c.json({ error: 'agent_identity_inactive' }, 409)
   if (boundAgent && scopeType !== 'squad') {
     return c.json({ error: 'agent_capability_scope_unsupported' }, 409)
   }
@@ -1734,7 +1747,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
         memberId,
         squadId: scopeId as string,
       })
-      await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok)
+      await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok && outcome.result !== 'unchanged')
       if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
       return c.json({
         member_id: memberId,
@@ -1786,7 +1799,7 @@ membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
       squadId: scopeId as string,
       capability: agentCapability,
     })
-    await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok)
+    await finishDelegatedReceipt(c.env, c.get('structuralVerdict') ?? { kind: 'principal' }, outcome.ok && outcome.result !== 'unchanged')
     if (!outcome.ok) return agentAccessErrorResponse(c, outcome.error)
     return c.json({
       grant: outcome.grant,

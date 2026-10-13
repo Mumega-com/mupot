@@ -194,6 +194,7 @@ import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
 import { OPERATOR_TOOLS } from './operators'
 import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
+import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
@@ -7352,6 +7353,11 @@ export async function invokeTool(
     }
     return { ...fail(500, 'internal_error'), tool: spec.name }
   }
+
+  // W0.1: close every delegated-operator receipt this call opened and the site left at 'attempted' (any early return
+  // after the chokepoint gate). Structural, so a new delegated site cannot forget it. A throw (above) leaves them
+  // 'attempted' on purpose: outcome unknown.
+  await settleOpenDelegatedReceipts(env, auth, outcome.ok ? 200 : outcome.status)
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
