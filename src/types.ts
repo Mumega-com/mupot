@@ -381,6 +381,11 @@ export interface Env {
   // tasks return 409 not_supported, as before #1778. Must not be set until #1780 lands. Read via
   // taskArchiveEnabled() in src/hygiene/archive.ts.
   TASK_ARCHIVE_ENABLED?: string
+  // Operators + Admission W0 (mumega-com#1386): delegated operators. OFF unless exactly "1" or "true". Off =>
+  // an agent-bound caller gets exactly the pre-W0 lane on every structural write (the HTTP doors now match MCP).
+  // On => a bound agent may ALSO act inside a live agent_operator_delegations row, through the single
+  // chokepoint src/operators/chokepoint.ts. Read via delegatedOperatorsEnabled().
+  DELEGATED_OPERATORS?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
   // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
   // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.

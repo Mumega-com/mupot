@@ -199,6 +199,9 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   addon_setup: MUTX('composite install+configure+activate (configure overwrites) + probeOfficeHealth external fetch (mcp/addons.ts:301)'),
 
   // ── gates / loops / secrets ────────────────────────────────────────────────────────────────
+  operator_delegate: ADD('createDelegation INSERT agent_operator_delegations (operators/delegations.ts)'),
+  operator_revoke: MUT('revokeDelegation UPDATE agent_operator_delegations.revoked_at (operators/delegations.ts)'),
+  operator_list: RO('listDelegations SELECT only (operators/delegations.ts)'),
   grant_gate_capability: ADD('grantGateCapability INSERT OR IGNORE gate_grants (gates/grants.ts:67)'),
   grant_list_gate_capabilities: RO('listGateCapabilities SELECT only (gates/grants.ts:96)'),
   revoke_gate_capability: MUT('revokeGateCapability DELETE FROM gate_grants (gates/grants.ts:134)'),
