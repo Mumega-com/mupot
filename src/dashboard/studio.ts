@@ -12,6 +12,7 @@
 // launches a Cursor Cloud agent. Chat is always-on: admin/owner sessions
 // get full tool-calling; member / guest sessions stay read-only.
 
+import { SELECT_SEARCH_SCRIPT } from './select-search'
 import { reserveStudioSlot, settleStudioSlot, type StudioSlot } from './studio-limits'
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
@@ -513,6 +514,7 @@ export function studioPageHtml(data: StudioViewData): HtmlEscapedString | Promis
       </footer>
     </div>
     <script>${raw(STUDIO_SCRIPT)}</script>
+    <script>${raw(SELECT_SEARCH_SCRIPT)}</script>
   </body>
 </html>`
 }
