@@ -16,23 +16,33 @@ export const SELECT_SEARCH_SCRIPT = `
           box.style.display = 'block'; box.style.width = '100%'; box.style.maxWidth = '420px'; box.style.marginBottom = '4px';
           sel.parentNode.insertBefore(box, sel);
           box.addEventListener('input', function () {
+            // Filter only. Never auto-pick an option and never fire 'change':
+            // the human clicks the one they mean (review on #1881).
             var q = box.value.trim().toLowerCase();
-            var first = null, shown = 0;
+            var shown = 0;
             for (var i = 0; i < sel.options.length; i++) {
               var o = sel.options[i];
-              var hit = !q || (o.text + ' ' + o.value).toLowerCase().indexOf(q) !== -1;
+              var hit = !q || o.text.toLowerCase().indexOf(q) !== -1;
               o.hidden = !hit;
-              if (hit) { shown++; if (!first) first = o; }
+              if (hit) shown++;
             }
             var cur = sel.options[sel.selectedIndex];
-            if (first && (!cur || cur.hidden)) { first.selected = true; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+            if (cur && cur.hidden) sel.selectedIndex = -1;
             sel.size = q ? Math.min(Math.max(shown, 2), 8) : 0;
           });
-          box.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); box.blur(); sel.size = 0; } });
+          box.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); sel.focus(); } });
           sel.addEventListener('change', function () { if (box.value) sel.size = 0; });
         }
         function scan(root) { var all = (root || document).querySelectorAll('select'); for (var i = 0; i < all.length; i++) enhance(all[i]); }
         scan();
-        new MutationObserver(function () { scan(); }).observe(document.body, { childList: true, subtree: true });
+        var queued = false;
+        new MutationObserver(function (records) {
+          if (queued) return;
+          for (var r = 0; r < records.length; r++) if (records[r].addedNodes.length) {
+            queued = true;
+            requestAnimationFrame(function () { queued = false; scan(); });
+            return;
+          }
+        }).observe(document.body, { childList: true, subtree: true });
       })();
 `
