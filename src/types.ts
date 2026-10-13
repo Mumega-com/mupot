@@ -386,6 +386,8 @@ export interface Env {
   // On => a bound agent may ALSO act inside a live agent_operator_delegations row, through the single
   // chokepoint src/operators/chokepoint.ts. Read via delegatedOperatorsEnabled().
   DELEGATED_OPERATORS?: string
+  /** Opt-in ("1"/"true"): outbound Grok Bot webhook doorbell (src/agents/webhook-doorbell.ts). Default off. */
+  WEBHOOK_DOORBELL?: string
   // mupot#1618 PR 2: exact-hostname allowlist (comma list) of MCP Events webhook callback hosts.
   // Unset or empty (the default) refuses EVERY callback URL (`callback_host_not_allowed`), so
   // subscribing cannot reach any host until an operator names one. IP literals/wildcards ignored.

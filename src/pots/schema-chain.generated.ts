@@ -3937,9 +3937,23 @@ export const SCHEMA_CHAIN: readonly SchemaChainFile[] = [
       { type: "trigger", name: "operator_delegation_receipts_no_delete" },
     ],
   },
+  {
+    file: "0219_agent_webhook_doorbells.sql",
+    sha256: "90253c4fcf814faace28ec0a062cd13efab34191bfd57437894ebd73f978c955",
+    statements: [
+      "-- 0219_agent_webhook_doorbells.sql — per-agent Grok Bot webhook doorbell.\n--\n-- Chair (Hadi): when agent A `send`s to agent B, if B has a registered doorbell,\n-- the pot POSTs B's webhook so B's Grok Bot routine wakes and peeks pot. The\n-- inbox row stays the letter / source of truth. The POST is a hint only.\n--\n-- WHY A NEW TABLE, NOT wake_contract.emit_url\n--\n-- mint_agent_token's wake_contract.emit_url is INBOUND: POST <origin>/bus/emit\n-- with type agent.wake and an operator bearer, to wake AgentDO inside the pot.\n-- A Grok Bot doorbell is OUTBOUND: the pot POSTs an external https URL that\n-- belongs to the recipient's Bot. Reusing emit_url would point the Bot at the\n-- pot and invert the direction.\n--\n-- WHY NOT the Hermes message.created consumer\n--\n-- src/bus/hermes-delivery.ts is pot-wide, HMAC-signed, and THROWS on 5xx so\n-- the Queue retries / DLQ. A Bot 500 on that path would retry Hermes too.\n-- The doorbell fires fail-open from sendAgentMessage after the INSERT, with\n-- its own short timeout, and never fails the send.\n--\n-- SECRET PATTERN (house vault, not D1 plaintext)\n--\n-- The doorbell bearer is AES-GCM-256 under CONNECTOR_MASTER_KEY (Worker\n-- secret), HKDF info `mupot_connector_agent_doorbell_v1`, salt = agent_id, AAD\n-- `doorbell:<agent_id>`. Same primitive as connectors (src/connectors/crypto.ts encryptConnectorSecret). D1 stores only\n-- ciphertext + last4. Get/list/logs never see the bearer. Fail-closed on set\n-- if the master key is missing. This is not a new Worker secret name — one\n-- pot-level key, domain-separated info string (VaultDomain 'agent_doorbell').\n--\n-- Behind the WEBHOOK_DOORBELL flag (default off). The receipts table below holds\n-- one row per delivery attempt: status code and a short reason only, never the\n-- URL, its query, the bearer or the ciphertext.\n--\n-- Renumbered from 0147 to 0219 when #1344 was superseded (main was at 0217).\n\nCREATE TABLE IF NOT EXISTS agent_webhook_doorbells (\n  tenant                TEXT NOT NULL,\n  agent_id              TEXT NOT NULL,\n  webhook_url           TEXT NOT NULL,\n  auth_ciphertext       TEXT NOT NULL,\n  auth_last4            TEXT NOT NULL,\n  created_by_member_id  TEXT NOT NULL,\n  updated_at            TEXT NOT NULL,\n  PRIMARY KEY (tenant, agent_id),\n  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE\n);",
+      "\n\nCREATE TABLE IF NOT EXISTS agent_webhook_doorbell_receipts (\n  id            TEXT PRIMARY KEY,\n  tenant        TEXT NOT NULL,\n  agent_id      TEXT NOT NULL,\n  event_type    TEXT NOT NULL CHECK (event_type IN ('mupot.inbox.wake', 'mupot.task.assigned', 'mupot.doorbell.test')),\n  ref_id        TEXT NOT NULL,\n  -- 'claimed' is the coalescing window row, finalized in place to posted/failed/skipped after the POST\n  outcome       TEXT NOT NULL CHECK (outcome IN ('claimed', 'posted', 'failed', 'skipped')),\n  http_status   INTEGER,\n  reason        TEXT,\n  attempted_at  TEXT NOT NULL\n);",
+      "\n\nCREATE INDEX IF NOT EXISTS idx_agent_webhook_doorbell_receipts_agent\n  ON agent_webhook_doorbell_receipts (tenant, agent_id, attempted_at);",
+    ],
+    objects: [
+      { type: "table", name: "agent_webhook_doorbells" },
+      { type: "table", name: "agent_webhook_doorbell_receipts" },
+      { type: "index", name: "idx_agent_webhook_doorbell_receipts_agent" },
+    ],
+  },
 ]
 
 // Bump history and rationale: scripts/gen-schema-chain.mjs, next to this constant.
 export const SCHEMA_CHAIN_SPLITTER_VERSION: number = 3
 
-export const SCHEMA_CHAIN_DIGEST: string = "f32b151fedd2223ca862e6555cb86351355b3c83deb332dcf6be3f368b8c0135"
+export const SCHEMA_CHAIN_DIGEST: string = "7ec2614016fde423c9ca9d2db220446b74003876eb7fd5210d4363b34cda7b80"

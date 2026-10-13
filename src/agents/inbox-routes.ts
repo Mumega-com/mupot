@@ -29,6 +29,8 @@ import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
 import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from './seat-events'
 
+import { waitUntilFromContext } from './webhook-doorbell'
+
 const MAX_BODY_BYTES = 8192
 
 // ── inbox stream (SSE) ────────────────────────────────────────────────────────────────────
@@ -388,6 +390,7 @@ inboxApp.post('/send', async (c) => {
       targetSeat,
     },
     { isAdmin, grants },
+    { waitUntil: waitUntilFromContext(c) },
   )
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).

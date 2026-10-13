@@ -25,6 +25,7 @@ import { receiverNotStoppedSql } from '../fleet/registry'
 import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedAtSql, executionPausedSql } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
+import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -222,6 +223,10 @@ interface Opts {
    * Only for a task-dispatch envelope; agentId MUST be agents.id (pauses key on it), not a slug.
    */
   dispatchBrakeFence?: { agentId: string; taskId: string }
+  /** Test-injected fetch for the outbound Grok Bot doorbell POST. */
+  fetch?: typeof fetch
+  /** Worker waitUntil so the doorbell POST can outlive the send response. */
+  waitUntil?: (promise: Promise<unknown>) => void
 }
 
 function isRef(v: string): boolean {
@@ -643,6 +648,24 @@ export async function sendAgentMessage(
         'published; a subscriber will not learn of it until the inbox is read: %s',
         id,
         emitErr instanceof Error ? emitErr.message : String(emitErr),
+      )
+    }
+
+    // Grok Bot doorbell: outbound POST to the recipient's registered webhook.
+    // Same "row landed" point as message.created — not on an idempotent duplicate,
+    // not on the Hermes Queue consumer (a Bot 500 must not retry Hermes).
+    // Fail-open: a 5xx / timeout / missing mapping never fails this send.
+    //
+    // Skip routine-fenced envelopes: the cron invocation already runs
+    // runRoutineScheduler + dispatchRoutineRun under the D1 free-tier 50-statement
+    // cap (MAX_SCHEDULER_DB_STATEMENTS + dispatch). A doorbell SELECT here is the
+    // 33rd dispatch statement and overflows that shared budget. Routine dispatch
+    // has its own wake; this doorbell is for agent/human send.
+    if (!opts.routineRunFence) {
+      await scheduleWebhookDoorbell(
+        env,
+        { type: INBOX_WAKE_TYPE, agent_id: input.toAgent, seq, message_id: id, kind },
+        { fetch: opts.fetch, waitUntil: opts.waitUntil },
       )
     }
 

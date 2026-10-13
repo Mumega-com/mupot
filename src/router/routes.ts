@@ -1,3 +1,4 @@
+import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { Hono } from 'hono'
 import { requireAuth } from '../auth'
 import { csrf } from 'hono/csrf'
@@ -54,7 +55,7 @@ routerApp.post('/tick', async (c) => {
       squadId: body.squad_id,
       dryRun,
       limit: body.limit,
-    }, { memberId: auth.memberId })
+    }, { memberId: auth.memberId }, { waitUntil: waitUntilFromContext(c) })
     return c.json({ ok: true, result })
   } catch {
     return c.json({ error: 'router_unavailable' }, 503)
