@@ -1,47 +1,58 @@
 // Progressive enhancement shared by every server-rendered page: any single
-// <select> with 6+ options gets a type-to-search box above it. Client-side only
-// (it hides options, never adds values), so server validation is unchanged.
+// <select> with 6+ options gets a type-to-search box right after it. The box
+// NEVER touches the select's options (no hidden/disabled writes, no auto-pick):
+// it lists matching visible, enabled options as buttons, and only a human click
+// sets the select's value. Pages keep full control of their own options.
 // Opt out per element with data-no-filter. Hadi 2026-10-13: "human first".
 export const SELECT_SEARCH_SCRIPT = `
       (function () {
         var MIN = 6;
-        function apply(sel, box) {
-          // Filter only. Never auto-pick, never fire 'change', never hide the
-          // current choice, and never un-hide an option the page itself hid
-          // (we only toggle options we hid, marked data-ss-hidden). #1881.
-          var q = box.value.trim().toLowerCase();
-          var shown = 0;
-          for (var i = 0; i < sel.options.length; i++) {
-            var o = sel.options[i];
-            var hit = !q || o.selected || o.text.toLowerCase().indexOf(q) !== -1;
-            if (hit && o.dataset.ssHidden) { o.hidden = false; delete o.dataset.ssHidden; }
-            else if (!hit && !o.hidden) { o.hidden = true; o.dataset.ssHidden = '1'; }
-            if (!o.hidden) shown++;
-          }
-          sel.size = q ? Math.min(Math.max(shown, 2), 8) : 0;
-        }
         function enhance(sel) {
-          if (sel.multiple || sel.hasAttribute('data-no-filter')) return;
-          if (sel.__ssBox) { apply(sel, sel.__ssBox); return; }
-          if (sel.options.length < MIN) return;
+          if (sel.__ssBox || sel.multiple || sel.hasAttribute('data-no-filter') || sel.options.length < MIN) return;
+          var wrap = document.createElement('span');
+          wrap.style.display = 'block'; wrap.style.maxWidth = '420px'; wrap.style.marginTop = '4px';
           var box = document.createElement('input');
           box.type = 'search';
           box.autocomplete = 'off';
-          box.placeholder = 'Type to search ' + sel.options.length + ' options';
-          box.setAttribute('aria-label', 'Search the list below');
-          box.style.display = 'block'; box.style.width = '100%'; box.style.maxWidth = '420px'; box.style.marginBottom = '4px';
-          // Keep an implicit <label> wrapping the select pointing at the select.
-          var anchor = sel.closest('label') || sel;
-          anchor.parentNode.insertBefore(box, anchor);
+          box.placeholder = 'Search this list';
+          box.setAttribute('aria-label', 'Search the list above');
+          box.style.display = 'block'; box.style.width = '100%';
+          var list = document.createElement('span');
+          list.setAttribute('role', 'listbox');
+          list.style.display = 'none';
+          wrap.appendChild(box); wrap.appendChild(list);
+          // After the select (inside the same parent), so a wrapping <label> still
+          // labels the select and a hidden group hides the search with it.
+          sel.parentNode.insertBefore(wrap, sel.nextSibling);
           sel.__ssBox = box;
-          box.addEventListener('input', function () { apply(sel, box); });
-          box.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); sel.focus(); }
-          });
-          sel.addEventListener('change', function () { if (box.value) sel.size = 0; });
-          if (sel.form) sel.form.addEventListener('reset', function () {
-            setTimeout(function () { box.value = ''; apply(sel, box); }, 0);
-          });
+          function render() {
+            var q = box.value.trim().toLowerCase();
+            while (list.firstChild) list.removeChild(list.firstChild);
+            if (!q) { list.style.display = 'none'; return; }
+            var n = 0;
+            for (var i = 0; i < sel.options.length && n < 8; i++) {
+              var o = sel.options[i];
+              if (o.hidden || o.disabled || o.text.toLowerCase().indexOf(q) === -1) continue;
+              var b = document.createElement('button');
+              b.type = 'button';
+              b.className = 'btn';
+              b.setAttribute('role', 'option');
+              b.textContent = o.text + (o.selected ? '  (selected)' : '');
+              b.style.display = 'block'; b.style.width = '100%'; b.style.textAlign = 'left'; b.style.marginTop = '2px';
+              b.addEventListener('click', (function (opt) { return function () {
+                if (opt.hidden || opt.disabled || opt.parentNode === null) { render(); return; }
+                sel.value = opt.value;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                box.value = ''; render(); sel.focus();
+              }; })(o));
+              list.appendChild(b); n++;
+            }
+            if (n === 0) { var none = document.createElement('span'); none.className = 'ui-sub'; none.textContent = 'No match'; list.appendChild(none); }
+            list.style.display = 'block';
+          }
+          box.addEventListener('input', render);
+          box.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.isComposing) e.preventDefault(); });
+          if (sel.form) sel.form.addEventListener('reset', function () { setTimeout(function () { box.value = ''; render(); }, 0); });
         }
         function scan() { var all = document.querySelectorAll('select'); for (var i = 0; i < all.length; i++) enhance(all[i]); }
         scan();
