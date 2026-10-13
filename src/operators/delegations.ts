@@ -93,11 +93,12 @@ export async function listLiveDelegationsForAgent(env: Env, agentId: string): Pr
   return rows.results ?? []
 }
 
-export async function agentHasLiveDelegation(env: Env, agentId: string): Promise<boolean> {
+/** `onlyDelegator` (W2): an ATTACHED seat counts only the delegations its attaching human gave, never another human's. */
+export async function agentHasLiveDelegation(env: Env, agentId: string, onlyDelegator?: string): Promise<boolean> {
   const row = await env.DB.prepare(
-    'SELECT 1 AS one FROM agent_operator_delegations WHERE tenant = ?1 AND agent_id = ?2 AND revoked_at IS NULL LIMIT 1',
+    'SELECT 1 AS one FROM agent_operator_delegations WHERE tenant = ?1 AND agent_id = ?2 AND revoked_at IS NULL AND (?3 IS NULL OR delegator_member_id = ?3) LIMIT 1',
   )
-    .bind(env.TENANT_SLUG, agentId)
+    .bind(env.TENANT_SLUG, agentId, onlyDelegator ?? null)
     .first<{ one: number }>()
   return row != null
 }

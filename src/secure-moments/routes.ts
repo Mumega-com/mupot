@@ -15,7 +15,7 @@ import type { Env } from '../types'
 import { secureMomentsStatus, secureOrigin } from './config'
 import { issueBoundToken, verifyBoundToken } from '../access/csrf'
 import { buildAuth, memberIsActiveHuman, mintApproverSession } from '../access/identity'
-import { escapeHtml, messagePage, renderPage } from '../access/page'
+import { escapeHtml, messagePage, renderPage, untrustedBox } from '../access/page'
 import { loadSeedRequest, seedRequestIsLive, type SeedRequestRow } from '../access/seed-request'
 import {
   closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideSeed, seedViewInner,
@@ -37,6 +37,8 @@ import { CREDENTIAL_SCRIPT, HPKE_ASSET } from '../secure-drop/client'
 import { HPKE_BUNDLE_JS } from '../secure-drop/hpke-bundle.generated'
 import { groupFingerprint } from '../secure-drop/keys'
 import { mountTelegramMiniapp } from './telegram-miniapp'
+import { isAttachCeiling, type AttachCeiling } from '../auth/attached-ceiling'
+import { admissionIsPendingLive, admissionView, decideSeatAdmission, loadAdmission, seatAttachEnabled, type AdmissionRow } from '../members/seat-attach'
 
 type AppEnv = { Bindings: Env; Variables: { host: string; nonce: string } }
 
@@ -157,6 +159,7 @@ type Subject =
   | { kind: 'seed_attach'; row: SeedRequestRow }
   | { kind: 'elevation'; req: ElevationRequestRecord }
   | { kind: 'credential'; drop: DropRow }
+  | { kind: 'seat_admit'; adm: AdmissionRow }
 
 /** The request this moment stands for, only while IT is still live (a closed request is not decidable here). */
 async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<Subject | null> {
@@ -165,6 +168,12 @@ async function loadLiveSubject(env: Env, m: MomentRow, nowMs: number): Promise<S
     if (secureDropStatus(env).state !== 'on') return null
     const drop = await loadDrop(env, m.subject_id)
     return drop && drop.status === 'requested' && drop.moment_id === m.id && Date.parse(drop.expires_at) > nowMs ? { kind: 'credential', drop } : null
+  }
+  if (m.kind === 'seat_admit') {
+    // W2: decidable only while SEAT_ATTACH is on and the admission is still pending and unexpired.
+    if (!seatAttachEnabled(env)) return null
+    const adm = await loadAdmission(env, m.subject_id)
+    return adm && admissionIsPendingLive(adm, nowMs) ? { kind: 'seat_admit', adm } : null
   }
   if (m.kind === 'seed_attach') {
     const row = await loadSeedRequest(env, m.subject_id)
@@ -199,6 +208,8 @@ interface Params {
   duration: number | undefined
   /** credential provide only: the sealed strings as submitted, validated and canonical. */
   sealed?: { encB64u: string; ctB64u: string; digestHex: string }
+  /** seat_admit approve only: the ceiling the human chose (bound into the challenge digest). */
+  ceiling?: AttachCeiling
   /** sha256 hex of the canonical decision: the digest the challenge is bound to. */
   payload: string
 }
@@ -229,6 +240,15 @@ async function readParams(m: MomentRow, body: JsonBody): Promise<Params | null> 
     if (typeof d === 'number' && Number.isInteger(d) && d > 0 && d < 100000) duration = d
     else if (typeof d === 'string' && /^\d{1,5}$/.test(d) && Number(d) > 0) duration = Number(d)
     else if (d !== undefined && d !== null) return null
+  }
+  if (m.kind === 'seat_admit' && decision === 'approve') {
+    // The admission CEILING is chosen at the tap and bound into the challenge: a challenge minted for `member` cannot
+    // be replayed to approve `full`. Absent = the default; anything unknown is refused.
+    const raw = body.ceiling
+    const ceiling: AttachCeiling | null = raw === undefined || raw === null || raw === '' ? 'member' : isAttachCeiling(raw) ? raw : null
+    if (ceiling === null) return null
+    const d = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, ceiling })))
+    return { decision, actions, duration, ceiling, payload: d }
   }
   const digest = hex(await sha256(JSON.stringify({ v: 1, kind: m.kind, subject: m.subject_id, decision, actions, duration: duration ?? null })))
   return { decision, actions, duration, payload: digest }
@@ -398,7 +418,20 @@ momentsApp.get('/m/:id/:token', async (c) => {
   let inner: string
   let title: string
   let approveLabel: string
-  if (subject.kind === 'seed_attach') {
+  if (subject.kind === 'seat_admit') {
+    const v = await admissionView(c.env, subject.adm)
+    inner = `<dl><dt>Agent</dt><dd>${escapeHtml(v.agentName)} <code>${escapeHtml(v.agentSlug)}</code></dd>
+<dt>App</dt><dd>${untrustedBox('Connected app', `${v.harnessName} (${v.harnessKind})`)}</dd>
+<dt>Asked by thread</dt><dd>${escapeHtml(v.seatLabel ?? 'a thread')}</dd>
+<dt>Expires</dt><dd>${escapeHtml(subject.adm.expires_at ?? '')}</dd></dl>
+<h2>How much may those threads do as this agent?</h2>
+<label class="row"><input type="radio" name="ceiling" value="member" checked> <strong>Member</strong>: everyday work (the default)</label>
+<label class="row"><input type="radio" name="ceiling" value="lead"> <strong>Lead</strong>: also lead-level work on what the agent leads</label>
+<label class="row"><input type="radio" name="ceiling" value="full"> <strong>Full</strong>: everything this agent itself may do, never more than you may</label>
+<h2>What approving does</h2><p>Lets threads from <strong>this connected app</strong> act as <strong>${escapeHtml(v.agentName)}</strong>, now and for later threads, until you revoke it on your Connections page. Whatever you choose, they never hold this agent's approval gates, and never more than you yourself may do. To change the level later you revoke and approve again.</p>`
+    title = 'Let a thread act as an agent'
+    approveLabel = 'Admit'
+  } else if (subject.kind === 'seed_attach') {
     const view = await seedViewInner(c.env, subject.row)
     if (!view.ok) return page(c, view.outcome.status, view.outcome.title, view.outcome.message, view.outcome.tone)
     inner = view.inner
@@ -515,6 +548,9 @@ momentsApp.post('/m/:id/:token/decide', async (c) => {
 
   if (subject.kind === 'credential') return decideCredential(c, { m, token, p, subject: subject.drop, auth, passkeyId: passkey.id, memberId: passkey.member_id })
   if (p.decision === 'provide') return fail(c, 400, 'Invalid decision parameters.', 'Bad request') // provide exists only for credential moments
+  if (subject.kind === 'seat_admit') {
+    return outcomeJson(c, await decideSeatAdmission(c.env, { adm: subject.adm, decision: p.decision, proof, gate, waitUntil, ceiling: p.ceiling }, now))
+  }
   if (subject.kind === 'seed_attach') {
     if (!mayDecideSeed(auth)) return fail(c, 403, 'This passkey belongs to a member who may not decide this request.', 'Not allowed')
     return outcomeJson(c, await decideSeed(c.env, { row: subject.row, decision: p.decision, auth, proof, gate, waitUntil }, now))

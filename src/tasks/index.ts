@@ -40,6 +40,7 @@ import { hasIndependentRuntimeGate, isMemberAffiliatedWithAssigneeAgent, listTas
 import { findVerdictIndependenceConflict, findVerdictIndependenceConflicts, type VerdictConflictKind } from './verdict-independence'
 import { hasActiveGateGrant, loadGateWakeNotices } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
+import { attachedAuthority } from '../auth/attached-ceiling'
 export { resolveTaskAssignee as resolveAssignee } from './assignee'
 import { createBus } from '../bus'
 import type { BusEvent } from '../types'
@@ -1408,6 +1409,10 @@ export async function callerHoldsGateCapability(
   _squadId: string,
   gateOwner: string,
 ): Promise<boolean> {
+  // W2 (SEAT_ATTACH): a thread attached to an EXISTING agent acts as that agent but holds NONE of its gate
+  // authority (admission.gates is fixed at 0). Refused before every other rule, including the org escape below.
+  if (attachedAuthority(auth)) return false
+
   // Org owners/admins always pass (same escape used throughout tasks).
   if (legacyOwnerAdmin(auth)) return true
 
@@ -1590,6 +1595,8 @@ async function holdsTaskGateLane(
   task: Omit<VerdictGateTask, 'id'>,
   cache?: VerdictGateCache,
 ): Promise<boolean> {
+  // W2: an attached seat holds no gate lane at all, including the self-completion assignee shortcut below.
+  if (attachedAuthority(auth)) return false
   const principal = verdictPrincipal(auth)
   if (task.gate_owner === 'gate:agent-self-completion') {
     return principal.id === task.assignee_agent_id || legacyOwnerAdmin(auth)

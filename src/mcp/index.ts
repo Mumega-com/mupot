@@ -49,6 +49,8 @@ import {
 import { isChannel } from '../members/service'
 import { findExistingBootstrap } from '../members/bootstrap-self'
 import { loadHarness, seatAutoEnrollEnabled } from '../members/harness'
+import { connectionName, seatAttachEnabled } from '../members/seat-attach'
+import { attachedAuthority } from '../auth/attached-ceiling'
 import {
   decideHarnessBearer, HARNESS_SESSION_ALLOWED_TOOLS, HARNESS_SESSION_SEAT_REQUIRED, HARNESS_SESSION_SEAT_REQUIRED_MESSAGE,
   isHarnessCredentialSession,
@@ -199,6 +201,7 @@ import { settleOpenDelegatedReceipts } from '../operators/chokepoint'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
+import { SEAT_ATTACH_TOOLS } from './seat-attach'
 import { CREDENTIAL_CLAIM_TOOLS } from './credential-claim'
 import { AGENT_CONNECTION_TOOLS } from './agent-connection'
 import { PROJECT_TOOLS, readAccess, readableProject } from './projects'
@@ -2441,7 +2444,7 @@ const toolTaskVerdict: ToolSpec = {
     ' false falls back to the calling agent\'s own authority, unchanged from omitting human_origin — see the' +
     ' human_origin field on the response. A caller that is not an allowlisted harness credential (not' +
     ' agent-bound; a token not on the operator\'s HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS; a non-workspace channel;' +
-    ' an OAuth connector, seat or harness-credential session) gets 400 human_origin_not_applicable; a' +
+    ' an OAuth connector, a seat session (auto, selected or attached to an existing agent) or harness-credential session) gets 400 human_origin_not_applicable; a' +
     ' replayed origin message gets 409 origin_replayed (the whole call' +
     ' refused in both cases, no fallback). For an agent-bound caller, the outcome is ALWAYS visible in the' +
     ' response: human_origin: {applied:false, reason:"<conjunct>"} when one was supplied and refused,' +
@@ -2524,6 +2527,12 @@ const toolTaskVerdict: ToolSpec = {
         auth.seatBinding ||
         auth.harnessCredential
       ) {
+        return fail(400, 'human_origin_not_applicable')
+      }
+      // W2: a harness-attested origin resolves the calling agent's OWNER (agents.owner_member_id) and verdicts AS that
+      // owner. That is authority keyed on the agent's identity, which no seat session (an auto/select seat or a thread
+      // attached to an existing agent) is entitled to: refused for every seat, whatever the agent's owner is.
+      if (auth.seatBinding) {
         return fail(400, 'human_origin_not_applicable')
       }
       try {
@@ -5742,7 +5751,8 @@ const toolCheckIn: ToolSpec = {
     // resolveAuth strips any client copy). The tool args carry no runtime, and the `harness` arg
     // (7-axis display text) is deliberately NOT consulted. Runs before the KV debounce so every
     // call reaches it; the UPDATE is a no-op once the runtime is set.
-    if (auth.seatBinding && auth.boundAgentId) {
+    // W2: an ATTACHED seat acts as a pre-existing agent; the harness must not relabel that agent's runtime.
+    if (auth.seatBinding && auth.boundAgentId && !auth.seatBinding.attached) {
       // Fail-soft (registry.ts promises it): a D1 error in the loader must never fail check_in.
       const held = await loadHarness(env, auth.seatBinding.humanMemberId, auth.seatBinding.harnessId).catch(() => null)
       if (held) {
@@ -6400,9 +6410,11 @@ async function buildIdentityReceipt(
   // mupot#1794 W2: a seat-handle session is bound by the SERVER (applySeatHandle set seatBinding);
   // it is distinct from a legacy /oauth/consent binding even though both are directory + bound.
   const seat = boundAgentId !== null ? auth.seatBinding ?? null : null
-  const bindingSource: 'seat_handle' | 'auto_seat' | 'legacy_consent' | 'workspace_token' | 'none' =
+  const bindingSource: 'seat_handle' | 'auto_seat' | 'attached_seat' | 'legacy_consent' | 'workspace_token' | 'none' =
     boundAgentId === null
       ? 'none'
+      : seat?.attached
+        ? 'attached_seat'
       : seat
         ? (seat.source === 'auto:openai_session' || seat.source === 'auto:codex_thread' ? 'auto_seat' : 'seat_handle')
         : consented ? 'legacy_consent' : 'workspace_token'
@@ -6464,6 +6476,18 @@ async function buildIdentityReceipt(
     // Hints are presence booleans only: openai/session, openai/subject and Codex threadId never
     // select a seat. seat_handle_rejected = a handle was presented and did NOT resolve.
     seat: seat ? { id: seat.seatId, label: seat.label, source: seat.source } : null,
+    // W2: "acting as <agent> via <connection name>". Server-derived from the seat the request was bound to (the human's own
+    // label, else the app's registered name + the seat label); a label only, never authority. Only with SEAT_ATTACH on.
+    ...(seat && seatAttachEnabled(env)
+      ? await connectionName(env, seat.humanMemberId, seat.seatId).then((name) => (name ? { connection: { name } } : {})).catch(() => ({}))
+      : {}),
+    // W2 (SEAT_ATTACH): set when this thread acts as a pre-existing agent, with the admission that allows it
+    // and the seat agent it would otherwise be.
+    // Spread only when set, so a flag-off receipt keeps exactly its pre-W2 keys.
+    ...(seat?.attached
+      ? { attachment: { id: seat.attached.attachmentId, admission_id: seat.attached.admissionId, agent_id: seat.attached.agentId, seat_agent_id: seat.attached.seatAgentId } }
+      : {}),
+    ...(auth.seatInputs?.attachRefused ? { attach_refused: auth.seatInputs.attachRefused } : {}),
     hints: auth.seatInputs?.hints ?? { openai_session: false, openai_subject: false, codex_thread_id: false },
     seat_handle_rejected: auth.seatInputs?.handleRejected ?? false,
     // W5a: an auto-seat was attempted from a client key and refused (reason code); null otherwise.
@@ -6676,7 +6700,9 @@ const toolBootContext: ToolSpec = {
     if (identityReceipt && auth.seatBinding) {
       const agent = identityReceipt.agent as { slug?: unknown; name?: unknown } | null
       const who = typeof agent?.slug === 'string' ? agent.slug : typeof agent?.name === 'string' ? agent.name : String(auth.boundAgentId)
-      nextStepOut = auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
+      nextStepOut = auth.seatBinding.attached
+        ? `you are acting as agent ${who} via connection "${(identityReceipt.connection as { name?: string } | undefined)?.name ?? auth.seatBinding.label}" (seat ${auth.seatBinding.seatId}), ATTACHED to this existing agent by your human (identity_receipt.attachment names the admission; binding_source attached_seat). Your authority is the human's, clamped to member level and to this agent's own grants, and you hold none of this agent's approval gates. The human can detach you on their Connections page at any time. Call orient (no args) to receive your basin-drop packet.`
+        : auth.seatBinding.source === 'auto:openai_session' || auth.seatBinding.source === 'auto:codex_thread'
         ? `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (seat.source ${auth.seatBinding.source}: this conversation is its own seat agent, bound automatically from the client's per-thread session key; no seat_select and no handle needed; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet.`
         : `you are acting as agent ${who} through seat ${auth.seatBinding.seatId} (binding_source seat_handle; see identity_receipt for the human, harness and effective authority). Call orient (no args) to receive your basin-drop packet; it runs as this seat agent only while you keep sending the seat handle (X-Mupot-Seat header or _meta["mupot/seat"]) on every request.`
     }
@@ -7059,6 +7085,7 @@ export const TOOLS: ToolSpec[] = [
   toolAgentLifecycle,
   ...BOOTSTRAP_TOOLS,
   ...SEAT_SELECT_TOOLS,
+  ...SEAT_ATTACH_TOOLS,
   ...CREDENTIAL_CLAIM_TOOLS,
   ...ADDON_TOOLS,
   ...GATE_GRANT_TOOLS,
@@ -7092,6 +7119,8 @@ const TOOL_BY_NAME = new Map<string, ToolSpec>(TOOLS.map((t) => [t.name, t]))
 // tool, which refuses on its own flag check. One list, one filter, so no discovery surface can
 // drift from the others.
 const SEAT_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_SELECT_TOOLS.map((t) => t.name))
+// W2: seat_attach is advertised only while SEAT_ATTACH (and SEAT_AUTO_ENROLL) is on (flag off => tools/list unchanged).
+const SEAT_ATTACH_FLAG_TOOLS: ReadonlySet<string> = new Set(SEAT_ATTACH_TOOLS.map((t) => t.name))
 // Human-proof approval channels: seed_attach_request is not advertised while neither the Access approve page
 // (ACCESS_APPROVE_ENABLED) nor secure moments (SECURE_MOMENTS) is usable.
 const ACCESS_APPROVE_FLAG_TOOLS: ReadonlySet<string> = new Set(['seed_attach_request'])
@@ -7102,14 +7131,15 @@ const SECURE_DROP_FLAG_TOOLS: ReadonlySet<string> = new Set(SECURE_DROP_TOOLS.ma
 const TELEGRAM_MINIAPP_FLAG_TOOLS: ReadonlySet<string> = new Set(TELEGRAM_MINIAPP_TOOLS.map((t) => t.name))
 // Workspaces W1: worktree_open / worktree_list are advertised only while WORKSPACES is on (flag off => tools/list unchanged).
 const WORKSPACES_FLAG_TOOLS: ReadonlySet<string> = new Set(WORKTREE_TOOLS.map((t) => t.name))
-export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): ToolSpec[] {
+export function advertisedTools(env: Pick<Env, 'SEAT_AUTO_ENROLL' | 'SEAT_ATTACH' | 'ACCESS_APPROVE_ENABLED' | 'SECURE_MOMENTS' | 'SECURE_DROP' | 'TELEGRAM_MINIAPP' | 'WORKSPACES'>): ToolSpec[] {
   const seat = seatAutoEnrollEnabled(env)
   const access = accessApproveEnabled(env) || secureMomentsEnabled(env)
   const drop = secureDropFlag(env)
   const tgMiniapp = telegramMiniappFlag(env)
   const workspaces = workspacesEnabled(env)
-  if (seat && access && drop && tgMiniapp && workspaces) return TOOLS
-  return TOOLS.filter((t) => (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
+  const attach = seatAttachEnabled(env)
+  if (seat && access && drop && tgMiniapp && workspaces && attach) return TOOLS
+  return TOOLS.filter((t) => (attach || !SEAT_ATTACH_FLAG_TOOLS.has(t.name)) && (seat || !SEAT_FLAG_TOOLS.has(t.name)) && (access || !ACCESS_APPROVE_FLAG_TOOLS.has(t.name)) && (drop || !SECURE_DROP_FLAG_TOOLS.has(t.name)) && (tgMiniapp || !TELEGRAM_MINIAPP_FLAG_TOOLS.has(t.name)) && (workspaces || !WORKSPACES_FLAG_TOOLS.has(t.name)))
 }
 
 interface JsonRpcRequest {
@@ -7329,6 +7359,10 @@ export async function invokeTool(
     return { ...fail(403, 'seat_auto_enroll_disabled', 'Zero-touch seat enrolment is not enabled on this pot.'), tool: spec.name }
   }
 
+  if (SEAT_ATTACH_FLAG_TOOLS.has(spec.name) && !seatAttachEnabled(env)) {
+    return { ...fail(403, 'seat_attach_disabled', 'Attaching a thread to an existing agent is not enabled on this pot.'), tool: spec.name }
+  }
+
   // Workspaces W1: refuse before args handling, so a flag-off pot never reveals the schema.
   if (WORKSPACES_FLAG_TOOLS.has(spec.name) && !workspacesEnabled(env)) {
     return { ...fail(403, 'workspaces_disabled', 'Workspaces are not enabled on this pot.'), tool: spec.name }
@@ -7382,7 +7416,7 @@ export async function invokeTool(
       auth.boundAgentId != null &&
       DELEGATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
       delegatedOperatorsEnabled(env) &&
-      (await agentHasLiveDelegation(env, auth.boundAgentId))
+      (await agentHasLiveDelegation(env, auth.boundAgentId, attachedAuthority(auth)?.humanMemberId))
     if (!mayBeElevated && !mayBeDelegated) {
       const hint = elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }

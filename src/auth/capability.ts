@@ -24,6 +24,7 @@ import type { Context, MiddlewareHandler } from 'hono'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, OrgKind } from '../types'
 import { hasActiveGateGrant } from '../gates/grants'
 import { resolveGatePrincipal } from '../gates/principal'
+import { attachedAuthority } from './attached-ceiling'
 
 // ── squad scope (mupot#1452 round 2 successor, G-FP1b point 1) ────────────────
 //
@@ -1149,6 +1150,9 @@ export function currentMemberRankAtLeastSql(
  * Owner / admin roles bypass the check (rank is sufficient for them).
  */
 export async function hasSurfaceCap(env: Env, auth: AuthContext, surface: string): Promise<boolean> {
+  // W2: surface grants live in gate_grants and are the agent's, not the attaching human's admission's. An attached seat
+  // holds none at any ceiling, and the org-admin rank bypass below must not rescue it either (a `full` ceiling can carry org admin).
+  if (attachedAuthority(auth)) return false
   if (isOrgAdmin(auth)) return true
   const principal = resolveGatePrincipal(auth)
   if (!principal) return false

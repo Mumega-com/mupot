@@ -26,6 +26,7 @@
 // changing a delegation, money / deploy / publish. These are `delegable: false` in STRUCTURAL_ACTIONS, and the
 // self/human target rules below apply to every delegated act regardless.
 
+import { attachedAuthority, ceilingCapability } from '../auth/attached-ceiling'
 import type { AuthContext, Capability, Env } from '../types'
 import { boundAgentHasAnyLiveGrantForAction } from '../auth/elevation'
 import { capabilityRank, currentMemberRankOnScope, targetMaxRankAcrossScopes } from '../auth/capability'
@@ -750,6 +751,15 @@ async function evaluateDelegated(
   }
 }
 
+function clampDelegationsForAttached(auth: AuthContext, all: DelegationRow[]): DelegationRow[] {
+  const att = attachedAuthority(auth)
+  if (!att) return all
+  const cap = ceilingCapability(att.ceiling)
+  return all
+    .filter((d) => d.delegator_member_id === att.humanMemberId)
+    .map((d) => (cap !== null && capabilityRank(d.max_grant) > capabilityRank(cap) ? { ...d, max_grant: cap as DelegationRow['max_grant'] } : d)) // as: cap is 'member' | 'lead', both valid max_grant values
+}
+
 /**
  * THE chokepoint. Call it from every structural write on MCP and HTTP, as the FIRST statement that reads `auth`.
  * `target` may be a thunk: it is invoked only when a live delegation could apply, so an agent with no delegation is
@@ -769,7 +779,9 @@ export async function authorizeStructuralWrite(
   const flagOn = delegatedOperatorsEnabled(env)
   let sawDelegation = false
   if (flagOn && policy.delegable) {
-    const delegations = await listLiveDelegationsForAgent(env, auth.boundAgentId)
+    // W2: a thread ATTACHED to this agent acts for the attaching human only. Another human's delegation to the same agent
+    // is the agent's authority, not the thread's, and every delegation is clamped to the admission ceiling.
+    const delegations = clampDelegationsForAttached(auth, await listLiveDelegationsForAgent(env, auth.boundAgentId))
     sawDelegation = delegations.length > 0
     if (sawDelegation) {
       // Only the delegated path is tenant-fenced here: the legacy lanes keep their own (pre-W0) behaviour exactly.
