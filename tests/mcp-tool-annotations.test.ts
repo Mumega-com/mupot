@@ -130,7 +130,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   const ALL_READ_ONLY = [
     'archive_plan_expand', 'athena_review_pr', 'cursor_run_status', 'elevation_status',
     'execution_meter_status', 'execution_receipt_get', 'fleet_agent_get', 'flight_get', 'flight_list',
-    'get_agent_profile', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
+    'get_agent_profile', 'get_agent_webhook_doorbell', 'get_circuit_state', 'grant_list_gate_capabilities', 'harness_capacity_list', 'inbox_consumer_status',
     'inbox_dead_letters', 'kanban_board', 'list_agent_sessions', 'list_agent_tokens', 'loop_list',
     'message_get', 'needs_you_list', 'objective_get', 'office.list_pending_approvals', 'operator_list', 'peers', 'pot_list',
     'presence_list', 'project_context', 'project_get', 'project_list', 'project_memory_get', 'project_recall', 'project_squad_list',
@@ -147,7 +147,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'project_update', 'register_agent_key', 'reveal_credential_claim', 'revoke_agent_session',
     'revoke_agent_token', 'revoke_gate_capability', 'router_tick', 'routine_archive', 'routine_run_cancel',
     'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
-    'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
+    'set_agent_webhook_doorbell', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
     'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
     'update_agent', 'update_squad',
   ]
