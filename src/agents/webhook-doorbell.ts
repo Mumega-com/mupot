@@ -29,6 +29,7 @@ import { assertPublicHttpsUrl } from '../lib/ssrf'
 export const DOORBELL_TIMEOUT_MS = 3000
 export const INBOX_WAKE_TYPE = 'mupot.inbox.wake'
 export const TASK_ASSIGNED_TYPE = 'mupot.task.assigned'
+export const DOORBELL_TEST_TYPE = 'mupot.doorbell.test'
 
 /** Opt-in flag (`"1"` or `"true"`; unset = off). Off: no set, no POST, no DB read on the send path. */
 export function webhookDoorbellEnabled(env: Env): boolean {
@@ -47,6 +48,7 @@ const MAX_BEARER_CHARS = 2048
 export type WebhookDoorbellWake =
   | { type: typeof INBOX_WAKE_TYPE; agent_id: string; seq: number; message_id: string; kind: string }
   | { type: typeof TASK_ASSIGNED_TYPE; agent_id: string; task_id: string }
+  | { type: typeof DOORBELL_TEST_TYPE; agent_id: string }
 
 export type PublicWebhookDoorbell = {
   configured: true
@@ -78,7 +80,7 @@ async function recordReceipt(
   detail: { http_status?: number; reason?: string },
 ): Promise<void> {
   // Safe fields only. Never webhook_url, never Authorization, never the bearer.
-  const ref = wake.type === INBOX_WAKE_TYPE ? wake.message_id : wake.task_id
+  const ref = wake.type === INBOX_WAKE_TYPE ? wake.message_id : wake.type === TASK_ASSIGNED_TYPE ? wake.task_id : 'test'
   const line = {
     event_type: wake.type,
     agent_id: wake.agent_id,
@@ -233,33 +235,41 @@ export async function clearAgentWebhookDoorbell(env: Env, agentId: string): Prom
   return (result.meta?.changes ?? 0) > 0
 }
 
-export async function fireWebhookDoorbell(
+export type DoorbellDelivery = {
+  /** `no_doorbell` / `disabled`: nothing was attempted (no receipt). Otherwise the attempt's receipt outcome. */
+  outcome: ReceiptStatus | 'no_doorbell' | 'disabled'
+  http_status?: number
+  reason?: string
+}
+
+/** One delivery attempt: guard, decrypt, POST (no redirects, short timeout), one receipt row. Never throws. */
+async function deliverDoorbell(
   env: Env,
   wake: WebhookDoorbellWake,
-  opts: DoorbellFireOpts = {},
-): Promise<void> {
-  if (!webhookDoorbellEnabled(env)) return
+  opts: DoorbellFireOpts,
+): Promise<DoorbellDelivery> {
+  if (!webhookDoorbellEnabled(env)) return { outcome: 'disabled' }
   const tenant = requireTenant(env)
-  if (!tenant) return
+  if (!tenant) return { outcome: 'no_doorbell' }
 
   const row = await env.DB.prepare(
     `SELECT webhook_url, auth_ciphertext
        FROM agent_webhook_doorbells
       WHERE tenant = ?1 AND agent_id = ?2`,
   ).bind(tenant, wake.agent_id).first<{ webhook_url: string; auth_ciphertext: string }>()
-  if (!row) return
+  if (!row) return { outcome: 'no_doorbell' }
 
   // Re-assert the guard at fire time: a row written before a rule tightened must not be trusted.
   const url = validateHttpsWebhookUrl(row.webhook_url)
   if (!url.ok) {
     await recordReceipt(env, tenant, wake, 'skipped', { reason: 'invalid_url' })
-    return
+    return { outcome: 'skipped', reason: 'invalid_url' }
   }
 
   const master = requireMasterKey(env)
   if (!master) {
     await recordReceipt(env, tenant, wake, 'skipped', { reason: 'crypto_unavailable' })
-    return
+    return { outcome: 'skipped', reason: 'crypto_unavailable' }
   }
 
   let bearer: string
@@ -269,7 +279,7 @@ export async function fireWebhookDoorbell(
     )
   } catch {
     await recordReceipt(env, tenant, wake, 'skipped', { reason: 'decrypt_failed' })
-    return
+    return { outcome: 'skipped', reason: 'decrypt_failed' }
   }
 
   const fetchImpl = opts.fetch ?? globalThis.fetch
@@ -287,13 +297,33 @@ export async function fireWebhookDoorbell(
       // Never follow a redirect: a 3xx would carry the bearer to a host nobody vetted.
       redirect: 'manual',
     })
-    await recordReceipt(env, tenant, wake, res.ok ? 'posted' : 'failed', { http_status: res.status })
+    const outcome: ReceiptStatus = res.ok ? 'posted' : 'failed'
+    await recordReceipt(env, tenant, wake, outcome, { http_status: res.status })
+    return { outcome, http_status: res.status }
   } catch (err) {
-    const aborted = err instanceof Error && err.name === 'AbortError'
-    await recordReceipt(env, tenant, wake, 'failed', { reason: aborted ? 'timeout' : 'fetch_error' })
+    const reason = err instanceof Error && err.name === 'AbortError' ? 'timeout' : 'fetch_error'
+    await recordReceipt(env, tenant, wake, 'failed', { reason })
+    return { outcome: 'failed', reason }
   } finally {
     clearTimeout(timer)
   }
+}
+
+export async function fireWebhookDoorbell(
+  env: Env,
+  wake: WebhookDoorbellWake,
+  opts: DoorbellFireOpts = {},
+): Promise<void> {
+  await deliverDoorbell(env, wake, opts)
+}
+
+/** Human "Send test ping": same guarded path and receipt as a real wake, but awaited so the caller sees the status. */
+export async function sendDoorbellTestPing(
+  env: Env,
+  agentId: string,
+  opts: DoorbellFireOpts = {},
+): Promise<DoorbellDelivery> {
+  return deliverDoorbell(env, { type: DOORBELL_TEST_TYPE, agent_id: agentId }, opts)
 }
 
 /** Fail-open schedule. Must never throw to the send / task path. Off-flag: returns before any D1 read. */

@@ -293,6 +293,7 @@ import { makeMissionControlApp } from './mission-control-routes'
 import { makeElevationApp } from './elevation'
 import { makeAccountApp } from './account'
 import { makeOperatorsApp } from './operators'
+import { makeDoorbellsApp } from './doorbells'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
@@ -1635,6 +1636,7 @@ dashboardApp.route('/', makeElevationApp(shell))
 dashboardApp.route('/', makeAccountApp(shell))
 // Operators (W0.2): human UI over the existing delegated-operator writers; same-origin + real fresh web session.
 dashboardApp.route('/', makeOperatorsApp(shell))
+dashboardApp.route('/', makeDoorbellsApp(shell))
 
 // Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
 // post-setup edit surface for org_settings.im_bot_username (mupot#1420
@@ -4618,6 +4620,11 @@ export function shell(
           <a class="nav-link" href="/operators">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="7" r="2.6"/><path d="M4.6 16c.5-3 2.7-4.6 5.4-4.6s4.9 1.6 5.4 4.6"/></svg>
             <span class="nav-label">Operators</span>
+          </a>
+
+          <a class="nav-link" href="/doorbells">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3.5a4.5 4.5 0 0 0-4.5 4.5v3L4 13.5h12L14.5 11V8A4.5 4.5 0 0 0 10 3.5z"/><path d="M8.5 15.5a1.6 1.6 0 0 0 3 0"/></svg>
+            <span class="nav-label">Doorbells</span>
           </a>
 
           <a class="nav-link" href="/studio">

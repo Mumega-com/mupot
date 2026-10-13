@@ -26,13 +26,13 @@ type ToolFailure = Extract<ReturnType<typeof fail>, { ok: false }>
  * (src/operators/chokepoint.ts, action set_agent_webhook_doorbell: not delegable, refuse lane), so the
  * answer is the same one every other structural tool gives, never a second rule here. A doorbell redirects an
  * agent's wake signal to an external URL, which is why a delegation can never buy it.
- * `gate` is true for writes (set/clear); a read by a non-self agent is a plain 403.
+ * `gate` is passed for writes (set/clear) and asks the chokepoint from inside the tool's own block; a read by a non-self agent is a plain 403 (gate null).
  */
 async function resolveDoorbellTarget(
   auth: AuthContext,
   env: Env,
   agentArg: unknown,
-  gate: boolean,
+  gate: ((agent: { id: string; squad_id: string }) => ReturnType<typeof authorizeStructuralWrite>) | null,
 ): Promise<{ ok: true; agentId: string } | ToolFailure> {
   const requested = str(agentArg)
   const targetRef = requested ?? auth.boundAgentId
@@ -50,10 +50,7 @@ async function resolveDoorbellTarget(
   if (auth.boundAgentId) {
     if (auth.boundAgentId === resolved.value.id) return { ok: true, agentId: resolved.value.id }
     if (gate) {
-      const verdict = await authorizeStructuralWrite(env, auth, 'set_agent_webhook_doorbell', {
-        agentId: resolved.value.id,
-        squadId: resolved.value.squad_id,
-      })
+      const verdict = await gate(resolved.value)
       if (verdict.kind === 'refused') return fail(verdict.status, verdict.error, verdict.detail) as ToolFailure
     }
     return fail(403, 'forbidden', { need: 'self_or_squad_admin' }) as ToolFailure
@@ -84,7 +81,9 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
     const actor = auth.memberId ?? auth.userId
     if (!actor) return fail(403, 'unauthenticated')
 
-    const target = await resolveDoorbellTarget(auth, env, args.agent, true)
+    const target = await resolveDoorbellTarget(auth, env, args.agent, (agent) =>
+      authorizeStructuralWrite(env, auth, 'set_agent_webhook_doorbell', { agentId: agent.id, squadId: agent.squad_id }),
+    )
     if (!target.ok) return target
 
     if (args.clear === true) {
@@ -126,7 +125,7 @@ const toolGetAgentWebhookDoorbell: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const target = await resolveDoorbellTarget(auth, env, args.agent, false)
+    const target = await resolveDoorbellTarget(auth, env, args.agent, null)
     if (!target.ok) return target
 
     const doorbell = await getAgentWebhookDoorbell(env, target.agentId)

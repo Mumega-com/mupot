@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS agent_webhook_doorbell_receipts (
   id            TEXT PRIMARY KEY,
   tenant        TEXT NOT NULL,
   agent_id      TEXT NOT NULL,
-  event_type    TEXT NOT NULL CHECK (event_type IN ('mupot.inbox.wake', 'mupot.task.assigned')),
+  event_type    TEXT NOT NULL CHECK (event_type IN ('mupot.inbox.wake', 'mupot.task.assigned', 'mupot.doorbell.test')),
   ref_id        TEXT NOT NULL,
   outcome       TEXT NOT NULL CHECK (outcome IN ('posted', 'failed', 'skipped')),
   http_status   INTEGER,
