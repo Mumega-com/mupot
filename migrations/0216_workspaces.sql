@@ -117,17 +117,17 @@ BEGIN
 END;
 
 -- Creation cap, per member per project, INSIDE the inserting statement (so it holds under concurrency):
--- folder + thread rows 200, git_branch rows 1000. Reopening an existing workspace never inserts, so it
+-- folder + thread rows 200, git_branch rows 1000, counting UNARCHIVED rows only (archive path: follow-up issue). Reopening an existing workspace never inserts, so it
 -- is never refused by the cap.
 CREATE TRIGGER IF NOT EXISTS worktrees_creation_cap
 BEFORE INSERT ON worktrees
 FOR EACH ROW
 WHEN (NEW.kind = 'git_branch'
       AND (SELECT COUNT(*) FROM worktrees w WHERE w.tenant = NEW.tenant AND w.project_id = NEW.project_id
-              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind = 'git_branch') >= 1000)
+              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind = 'git_branch' AND w.archived_at IS NULL) >= 1000)
   OR (NEW.kind <> 'git_branch'
       AND (SELECT COUNT(*) FROM worktrees w WHERE w.tenant = NEW.tenant AND w.project_id = NEW.project_id
-              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind <> 'git_branch') >= 200)
+              AND w.created_by_member_id = NEW.created_by_member_id AND w.kind <> 'git_branch' AND w.archived_at IS NULL) >= 200)
 BEGIN
   SELECT RAISE(ABORT, 'worktree_cap_reached');
 END;

@@ -13,12 +13,13 @@ import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 import { applyAllMigrations, migrationFiles } from './helpers/migrations'
 import { membersApp } from '../src/members'
 import { TOOLS, invokeTool, mcpApp, advertisedTools } from '../src/mcp/index'
-import { handleOAuthAuthorize } from '../src/mcp/oauth-authorize'
+import { handleOAuthAuthorize, buildAuthContextFromProps } from '../src/mcp/oauth-authorize'
 import { loadHarness, upsertHarness } from '../src/members/harness'
 import { seatSelect } from '../src/members/seat-select'
 import { openWorktree, listWorktrees, normalizeBranch, normalizeSlug, normalizeThreadId } from '../src/workspaces/service'
 import { repoKeyFromUrl } from '../src/workspaces/repo-key'
 import type { AuthContext, Env } from '../src/types'
+import { resolveCapabilities } from '../src/auth/capability'
 
 const TENANT = 'mumega'
 const ORIGIN = 'https://pot.test'
@@ -100,10 +101,19 @@ async function rpc(env: Env, raw: string, name: string, args: Record<string, unk
 function harnessAuth(memberId: string, harnessId?: string | null, tokenId?: string): AuthContext {
   let hid: string | null
   if (harnessId === undefined) {
-    // a REAL harness row for this member (the door verifies it live)
+    // A REAL OAuth harness for this member, in the production shape: a directory consent token, a harness row
+    // keyed on THAT token's grant, and a context WITHOUT the token-harness marker (the OAuth door verifies the
+    // grant live). The impossible "OAuth row + token marker" fixture hid the closed-door P0 (gate r2).
     hid = `hx-${memberId}`
-    h.sqlite.exec(`INSERT OR IGNORE INTO harnesses (id, tenant, member_id, oauth_client_id) VALUES ('${hid}', '${TENANT}', '${memberId}', 'client-${memberId}')`)
-  } else hid = harnessId
+    const tok = `tok-hx-${memberId}`
+    h.sqlite.exec(`INSERT OR IGNORE INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('${tok}', '${memberId}', 'hash-${tok}', 'oauth:client-${memberId}', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+    h.sqlite.exec(`INSERT OR IGNORE INTO harnesses (id, tenant, member_id, oauth_client_id, credential_kind, grant_id) VALUES ('${hid}', '${TENANT}', '${memberId}', 'client-${memberId}#oauth:${tok}', 'oauth', 'oauth:${tok}')`)
+    return {
+      userId: memberId, email: null, role: 'member', tenant: TENANT, memberId, channel: 'directory',
+      capabilities: [], latentCapabilities: [], boundAgentId: null, harnessId: hid, tokenId: tok,
+    }
+  }
+  hid = harnessId
   return {
     userId: memberId, email: null, role: 'member', tenant: TENANT, memberId, channel: 'directory',
     capabilities: [], latentCapabilities: [], boundAgentId: null, harnessId: hid, harnessCredential: true,
@@ -115,6 +125,27 @@ function agentAuth(memberId: string, caps: Array<{ squad: string; cap: 'member' 
   return {
     userId: memberId, email: null, role: 'member', tenant: TENANT, memberId, channel: 'directory', boundAgentId: 'agent-x',
     capabilities: caps.map((c) => ({ member_id: memberId, scope_type: 'squad' as const, scope_id: c.squad, capability: c.cap })),
+  }
+}
+
+/** A REAL OAuth harness grant ("Me — auto per workspace"): harness row keyed on the consent token's grant,
+ *  a directory consent token, and the AuthContext production builds from the grant props (no marker). */
+async function oauthGrant(env: Env, memberId: string, clientId = 'client-chatgpt'): Promise<{ ctx: AuthContext; harnessId: string; tokenId: string }> {
+  const tokenId = `tok-oauth-${memberId}-${Math.random().toString(36).slice(2, 8)}`
+  h.sqlite.exec(`INSERT INTO member_tokens (id, member_id, token_hash, label, channel, created_at, tenant) VALUES ('${tokenId}', '${memberId}', 'hash-${tokenId}', 'oauth:${clientId}', 'directory', '2026-10-09T00:00:00.000Z', '${TENANT}')`)
+  const harness = await upsertHarness(env, memberId, clientId, 'ChatGPT', tokenId)
+  if (!harness) throw new Error('oauth harness fixture failed')
+  const ctx = await buildAuthContextFromProps(env, { memberId, tokenId, email: null, channel: 'directory', boundAgentId: null, harnessId: harness.id } as never)
+  if (!ctx) throw new Error('oauth grant ctx null')
+  return { ctx, harnessId: harness.id, tokenId }
+}
+
+/** A human's OWN session (their live grants as the session's capabilities): what a reader or writer lists with.
+ *  worktree_list is not on the harness door, so a harness session is never the listing principal. */
+async function humanCtx(env: Env, memberId: string): Promise<AuthContext> {
+  return {
+    userId: memberId, email: null, role: 'member', tenant: TENANT, memberId, channel: 'workspace',
+    capabilities: await resolveCapabilities(env, memberId),
   }
 }
 
@@ -304,8 +335,13 @@ describe('the harness door: worktree_open only, authorised by the human', () => 
     const env = envFor()
     const out = await invokeTool(harnessAuth(W), env, 'worktree_open', { project: 'P1', repo: REPO, branch: 'main' })
     expect(out.ok).toBe(true)
-    const denied = await invokeTool(harnessAuth(W), env, 'worktree_list', { project: 'P1' })
-    expect(denied).toMatchObject({ ok: false, error: 'harness_session_seat_required' })
+    // a TOKEN harness is stopped by the allow-list; an OAuth harness reaches the service and is refused there
+    const m = await mintHarness(env, W)
+    const tokenDenied = await invokeTool(harnessAuth(W, m.harnessId, m.tokenId), env, 'worktree_list', { project: 'P1' })
+    expect(tokenDenied).toMatchObject({ ok: false, error: 'harness_session_seat_required' })
+    const oauthDenied = await invokeTool(harnessAuth(W), env, 'worktree_list', { project: 'P1' })
+    expect(oauthDenied).toMatchObject({ ok: false })
+    expect(JSON.stringify(oauthDenied)).not.toContain('"worktrees"')
   })
 })
 
@@ -315,12 +351,12 @@ describe('visibility and isolation', () => {
     const env = envFor()
     await open(env, harnessAuth(W), { branch: 'a' })
     await open(env, harnessAuth(W), { branch: 'b' })
-    const asW = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
-    const asR = await listWorktrees(env, harnessAuth(R), { project: 'P1' })
+    const asW = await listWorktrees(env, await humanCtx(env, W), { project: 'P1' })
+    const asR = await listWorktrees(env, await humanCtx(env, R), { project: 'P1' })
     expect(asW.ok && asW.worktrees.map((w) => w.ref_name).sort()).toEqual(['a', 'b'])
     expect(asR.ok && asR.worktrees).toHaveLength(2)
-    expect(await listWorktrees(env, harnessAuth(X), { project: 'P1' })).toMatchObject({ ok: false, error: 'project_not_found' })
-    expect(await listWorktrees(env, harnessAuth(X), { project: 'mupot' })).toMatchObject({ ok: false, error: 'project_not_found' })
+    expect(await listWorktrees(env, await humanCtx(env, X), { project: 'P1' })).toMatchObject({ ok: false, error: 'project_not_found' })
+    expect(await listWorktrees(env, await humanCtx(env, X), { project: 'mupot' })).toMatchObject({ ok: false, error: 'project_not_found' })
   })
 
   it('another squad cannot open on, or list, a project it has no access to; ids are not a side channel', async () => {
@@ -330,7 +366,7 @@ describe('visibility and isolation', () => {
     const wrong = await openWorktree(env, harnessAuth(X), { project: 'P1', repo: REPO, branch: 'main' })
     expect(wrong).toMatchObject({ ok: false, error: 'project_not_found' })
     // X's own project lists none of P1's rows
-    const own = await listWorktrees(env, harnessAuth(X), { project: 'P2' })
+    const own = await listWorktrees(env, await humanCtx(env, X), { project: 'P2' })
     expect(own.ok && own.worktrees).toEqual([])
   })
 
@@ -338,7 +374,7 @@ describe('visibility and isolation', () => {
     const env = envFor()
     h.sqlite.exec(`INSERT INTO worktrees (id, tenant, project_id, kind, repo_key, harness_id, ref_kind, ref_name, created_by_member_id)
                    VALUES ('foreign-1', 'other-tenant', 'P1', 'git_branch', 'github:mumega-com/mupot', '', 'branch', 'main', '${W}')`)
-    const listed = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
+    const listed = await listWorktrees(env, await humanCtx(env, W), { project: 'P1' })
     expect(listed.ok && listed.worktrees).toEqual([])
     const mine = await open(env, harnessAuth(W))
     expect(mine.ok && mine.worktree.id).not.toBe('foreign-1')
@@ -352,9 +388,9 @@ describe('visibility and isolation', () => {
     if (!a.ok) throw new Error('open failed')
     h.sqlite.exec(`UPDATE worktrees SET archived_at = '2026-10-12T00:00:00Z' WHERE id = '${a.worktree.id}'`)
     expect(await open(env, harnessAuth(W))).toMatchObject({ ok: false, error: 'worktree_archived' })
-    const hidden = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
+    const hidden = await listWorktrees(env, await humanCtx(env, W), { project: 'P1' })
     expect(hidden.ok && hidden.worktrees).toEqual([])
-    const shown = await listWorktrees(env, harnessAuth(W), { project: 'P1', include_archived: true })
+    const shown = await listWorktrees(env, await humanCtx(env, W), { project: 'P1', include_archived: true })
     expect(shown.ok && shown.worktrees).toHaveLength(1)
   })
 })
@@ -636,7 +672,10 @@ describe('FIX 1: the human-authority branch is the VERIFIED harness door only', 
 
   it('the harness session still works (verified harness row), by OAuth harness and by token harness', async () => {
     const env = envFor()
-    expect(await open(env, harnessAuth(W))).toMatchObject({ ok: true })
+    // OAuth: the REAL production shape, built by buildAuthContextFromProps from a consent grant (no marker)
+    const g = await oauthGrant(env, W)
+    expect(g.ctx.harnessCredential).toBeFalsy()
+    expect(await open(env, g.ctx)).toMatchObject({ ok: true })
     const m = await mintHarness(env, W)
     expect(await open(env, harnessAuth(W, m.harnessId, m.tokenId), { branch: 'tok' })).toMatchObject({ ok: true })
   })
@@ -650,6 +689,24 @@ describe('FIX 1: the human-authority branch is the VERIFIED harness door only', 
     expect(await open(env, harnessAuth(W, mine.harnessId, 'some-other-token'))).toMatchObject({ ok: false, error: 'principal_required' })
     expect(await open(env, harnessAuth(W, mine.harnessId))).toMatchObject({ ok: false, error: 'principal_required' }) // token harness with no token
     expect(wtRows()).toBe(0)
+  })
+
+  it('an OAuth harness pointer must be THIS consent\'s grant: another grant\'s harness, another member\'s, or a fixture-shaped marker are refused', async () => {
+    const env = envFor()
+    const mine = await oauthGrant(env, W, 'client-a')
+    const other = await oauthGrant(env, W, 'client-b')
+    const theirs = await oauthGrant(env, R, 'client-c')
+    // my consent token pointing at my OTHER grant's harness: refused (grant_id is oauth:<other token>)
+    expect(await open(env, { ...mine.ctx, harnessId: other.harnessId })).toMatchObject({ ok: false, error: 'principal_required' })
+    // pointing at another member's harness: refused
+    expect(await open(env, { ...mine.ctx, harnessId: theirs.harnessId })).toMatchObject({ ok: false, error: 'principal_required' })
+    // an OAuth harness row presented with the TOKEN marker (the impossible fixture shape): refused
+    expect(await open(env, { ...mine.ctx, harnessCredential: true })).toMatchObject({ ok: false, error: 'principal_required' })
+    // a consent-bound session carrying a harness pointer never gets the human's grants
+    expect(await open(env, { ...mine.ctx, consentedByMemberId: W, capabilities: [] })).toMatchObject({ ok: false })
+    expect(wtRows()).toBe(0)
+    // and the genuine one works
+    expect(await open(env, mine.ctx)).toMatchObject({ ok: true })
   })
 
   it('a harness-flagged context that is ALSO agent-bound uses its own capabilities, never the human\'s', async () => {
@@ -685,10 +742,10 @@ describe('FIX 3: thread rows belong to their owner', () => {
     expect(t.ok).toBe(true)
     await open(env, harnessAuth(W))
     await openWorktree(env, harnessAuth(W), { project: 'P1', kind: 'folder', slug: 'shared-notes' })
-    const own = await listWorktrees(env, harnessAuth(W), { project: 'P1' })
+    const own = await listWorktrees(env, await humanCtx(env, W), { project: 'P1' })
     expect(own.ok && own.worktrees.map((x) => x.kind).sort()).toEqual(['folder', 'git_branch', 'thread'])
     for (const who of ['member-writer2', R]) {
-      const other = await listWorktrees(env, harnessAuth(who), { project: 'P1' })
+      const other = await listWorktrees(env, await humanCtx(env, who), { project: 'P1' })
       expect(other.ok && other.worktrees.map((x) => x.kind).sort(), who).toEqual(['folder', 'git_branch'])
       expect(JSON.stringify(other), who).not.toContain('secret-thread-1')
       expect(JSON.stringify(other), who).not.toContain('hx-' + W)
@@ -753,7 +810,7 @@ describe('FIX 4: creation caps and cursor pagination', () => {
     let cursor: string | null = null
     let pages = 0
     do {
-      const page: Awaited<ReturnType<typeof listWorktrees>> = await listWorktrees(env, a, { project: 'P1', limit: 3, ...(cursor ? { cursor } : {}) })
+      const page: Awaited<ReturnType<typeof listWorktrees>> = await listWorktrees(env, await humanCtx(env, W), { project: 'P1', limit: 3, ...(cursor ? { cursor } : {}) })
       if (!page.ok) throw new Error('list failed')
       expect(page.worktrees.length).toBeLessThanOrEqual(3)
       seen.push(...page.worktrees.map((x) => `${x.kind}:${x.ref_name}`))
@@ -769,8 +826,8 @@ describe('FIX 4: creation caps and cursor pagination', () => {
 
   it('bad limit and forged cursors are refused', async () => {
     const env = envFor()
-    for (const limit of [0, -1, 201, 1.5, '5']) expect(await listWorktrees(env, harnessAuth(W), { project: 'P1', limit })).toMatchObject({ ok: false, error: 'invalid_args' })
-    for (const cursor of ['x', '9|a|b', '1|2', 5, '%E0|a|b']) expect(await listWorktrees(env, harnessAuth(W), { project: 'P1', cursor })).toMatchObject({ ok: false, error: 'invalid_args' })
+    for (const limit of [0, -1, 201, 1.5, '5']) expect(await listWorktrees(env, await humanCtx(env, W), { project: 'P1', limit })).toMatchObject({ ok: false, error: 'invalid_args' })
+    for (const cursor of ['x', '9|a|b', '1|2', 5, '%E0|a|b']) expect(await listWorktrees(env, await humanCtx(env, W), { project: 'P1', cursor })).toMatchObject({ ok: false, error: 'invalid_args' })
   })
 })
 

@@ -102,18 +102,34 @@ interface Principal {
   harnessId: string | null
 }
 
-async function resolvePrincipal(env: Env, auth: AuthContext): Promise<Principal | null> {
+async function resolvePrincipal(env: Env, auth: AuthContext, opts: { harnessDoor: boolean }): Promise<Principal | null> {
   const memberId = auth.memberId
   if (!memberId) return null
 
   // THE HARNESS DOOR (the only place the human's grants stand in for the session's own).
-  if (isHarnessCredentialSession(auth) && !auth.boundAgentId) {
-    const harnessId = auth.harnessId
-    if (typeof harnessId !== 'string' || harnessId.length === 0) return null
-    const harness = await loadHarness(env, memberId, harnessId)
-    if (!harness) return null
-    // A token harness is valid only for the very credential that IS it.
-    if (harness.credential_kind === 'token' && harness.token_id !== auth.tokenId) return null
+  // Two harness shapes reach it, and each must PROVE the pointer belongs to this very credential:
+  //  - a token harness: the session carries the harness-credential marker AND the harness row's token_id
+  //    is the session's own token;
+  //  - an OAuth harness ("Me — auto per workspace" consent): an UNBOUND directory session, not consent-bound
+  //    to an agent, whose harness row is credential_kind 'oauth' and whose grant is THIS consent token
+  //    (grant_id = 'oauth:<tokenId>'), or a pre-0216 row keyed 'legacy:<id>' (one row per earlier consent).
+  // A plain directory session (no harness pointer) or a forged pointer to another credential's harness
+  // never gets here; it falls to the caller's own context below.
+  const harnessId = auth.harnessId
+  const maybeHarness = !auth.boundAgentId && !auth.consentedByMemberId && typeof harnessId === 'string' && harnessId.length > 0
+  const harness = maybeHarness ? await loadHarness(env, memberId, harnessId as string) : null
+  const tokenDoor = harness !== null && isHarnessCredentialSession(auth)
+    && harness.credential_kind === 'token' && harness.token_id === auth.tokenId
+  const oauthDoor = harness !== null && !isHarnessCredentialSession(auth) && auth.channel === 'directory'
+    && harness.credential_kind === 'oauth' && typeof auth.tokenId === 'string' && auth.tokenId.length > 0
+    && (harness.grant_id === `oauth:${auth.tokenId}` || (harness.grant_id ?? '').startsWith('legacy:'))
+  // A session that CLAIMS a harness (a pointer, or the token marker) but cannot prove it is refused outright,
+  // never downgraded to its own (empty) context, so a forged pointer reads the same as a revoked one.
+  if (!auth.boundAgentId && (maybeHarness || isHarnessCredentialSession(auth)) && !(harness && (tokenDoor || oauthDoor))) return null
+  // The harness door exists for worktree_open ONLY (design §4.1). Every other caller that is a harness session
+  // (OAuth or token) is refused here rather than handed the human's grants: worktree_list is not on the door.
+  if (!opts.harnessDoor && !auth.boundAgentId && (maybeHarness || isHarnessCredentialSession(auth))) return null
+  if (harness && (tokenDoor || oauthDoor)) {
     const member = await env.DB.prepare(
       `SELECT id FROM members WHERE id = ?1 AND status = 'active' AND tenant = ?2 LIMIT 1`,
     ).bind(memberId, env.TENANT_SLUG).first<{ id: string }>()
@@ -235,7 +251,7 @@ export async function openWorktree(env: Env, auth: AuthContext, args: OpenArgs):
     headSha = h
   }
 
-  const principal = await resolvePrincipal(env, auth)
+  const principal = await resolvePrincipal(env, auth, { harnessDoor: true })
   if (!principal) return { ok: false, error: 'principal_required' }
 
   // 404 for a project the principal cannot even see; 403 for one it can read but not write.
@@ -351,7 +367,7 @@ export async function listWorktrees(
     cursor = typeof args.cursor === 'string' ? decodeCursor(args.cursor) : null
     if (!cursor) return { ok: false, error: 'invalid_args', detail: 'cursor is not one this tool returned' }
   }
-  const principal = await resolvePrincipal(env, auth)
+  const principal = await resolvePrincipal(env, auth, { harnessDoor: false })
   if (!principal) return { ok: false, error: 'principal_required' }
   // READ gate = the existing project-read chokepoint; a project the principal cannot see is not found.
   const project = await findProject(env, projectRef, principal.authz)

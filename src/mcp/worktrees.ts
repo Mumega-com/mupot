@@ -26,7 +26,7 @@ function refusal(error: string, detail?: unknown): ToolOutcome {
     case 'harness_required':
       return fail(403, error, 'A thread workspace needs a verified harness on this connection.')
     case 'worktree_cap_reached':
-      return fail(409, error, 'Too many workspaces created by this member on this project; archive some or reuse existing ones.')
+      return fail(409, error, 'Too many open workspaces created by this member on this project; reuse an existing one (archiving arrives in a later wave).')
     case 'worktree_archived':
       return fail(409, error, detail)
     default:
