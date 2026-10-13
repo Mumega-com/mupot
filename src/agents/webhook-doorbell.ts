@@ -46,8 +46,14 @@ const MAX_WEBHOOK_URL_CHARS = 2048
 const MAX_BEARER_CHARS = 2048
 /** A shorter key is refused: last4 of a short key would reveal most of it. */
 export const MIN_BEARER_CHARS = 16
-/** At most one wake POST per agent per window; later wakes are receipted 'coalesced' (the routine peeks the whole inbox). */
-export const COALESCE_WINDOW_MS = 10_000
+/**
+ * Burst cap, not coalescing (gate r2 on #1890): every DISTINCT event rings, so a follow-up message or a task
+ * assigned right after a message wake is never stranded. Only (a) the same event ref inside the window and
+ * (b) more than WAKE_BURST_LIMIT attempts per agent inside the window are skipped ('coalesced'); the routine's
+ * own poll is the backstop for (b).
+ */
+export const COALESCE_WINDOW_MS = 60_000
+export const WAKE_BURST_LIMIT = 6
 /** Test pings per agent per window. */
 export const TEST_PING_LIMIT = 5
 export const TEST_PING_WINDOW_MS = 10 * 60_000
@@ -330,9 +336,8 @@ async function deliverDoorbell(
     }
     if (!claimedTest) return { outcome: 'rate_limited', reason: 'test_ping_rate_limited' }
   } else {
-    // Coalesce: claim the window with ONE atomic conditional INSERT. 0 rows = a wake already claimed/posted/failed
-    // inside the window, so this one is skipped (and receipted). Not claiming at all (DB error) also skips: a
-    // doorbell that cannot count must not flood.
+    // Claim with ONE atomic conditional INSERT: skip only a repeat of the same event ref, or a burst above the cap.
+    // Not claiming at all (DB error) also skips: a doorbell that cannot count must not flood.
     claimId = crypto.randomUUID()
     const ref = canonical.type === INBOX_WAKE_TYPE ? canonical.message_id : canonical.type === TASK_ASSIGNED_TYPE ? canonical.task_id : 'test'
     let claimed = false
@@ -342,12 +347,15 @@ async function deliverDoorbell(
            (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at)
          SELECT ?1, ?2, ?3, ?4, ?5, 'claimed', NULL, NULL, ?6
           WHERE NOT EXISTS (
-            SELECT 1 FROM agent_webhook_doorbell_receipts
-             WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
-               AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8)`,
+                  SELECT 1 FROM agent_webhook_doorbell_receipts
+                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?4 AND ref_id = ?5
+                     AND outcome IN ('claimed', 'posted') AND attempted_at > ?8)
+            AND (SELECT count(*) FROM agent_webhook_doorbell_receipts
+                  WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
+                    AND outcome IN ('claimed', 'posted', 'failed') AND attempted_at > ?8) < ?9`,
       ).bind(
         claimId, tenant, canonical.agent_id, canonical.type, ref, new Date().toISOString(),
-        DOORBELL_TEST_TYPE, isoAgo(COALESCE_WINDOW_MS),
+        DOORBELL_TEST_TYPE, isoAgo(COALESCE_WINDOW_MS), WAKE_BURST_LIMIT,
       ).run()
       claimed = (res.meta?.changes ?? 0) === 1
     } catch {

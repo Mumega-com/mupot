@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { sendAgentMessage } from '../src/agents/messages'
 import {
   COALESCE_WINDOW_MS,
+  WAKE_BURST_LIMIT,
   fireWebhookDoorbell,
   scheduleWebhookDoorbell,
   setAgentWebhookDoorbell,
@@ -90,34 +91,35 @@ describe('response handling', () => {
 })
 
 describe('coalescing (one POST per agent per 10s window)', () => {
-  it('a second wake inside the window is receipted coalesced and sends nothing; after the window it rings again', async () => {
-    await send('c1')
-    await send('c2')
-    expect(calls).toHaveLength(1)
-    expect(receipts().map((r) => `${r.outcome}:${r.reason ?? ''}`)).toEqual(['posted:', 'skipped:coalesced'])
+  it('every DISTINCT message rings (no stranded follow-ups); only a burst above the cap is skipped, then it rings again', async () => {
+    for (const rid of ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7']) await send(rid)
+    expect(calls).toHaveLength(WAKE_BURST_LIMIT)
+    expect(receipts().at(-1)).toMatchObject({ outcome: 'skipped', reason: 'coalesced' })
     h.sqlite.prepare('UPDATE agent_webhook_doorbell_receipts SET attempted_at = ?').run(new Date(Date.now() - COALESCE_WINDOW_MS - 1000).toISOString())
-    await send('c3')
-    expect(calls).toHaveLength(2)
+    await send('c8')
+    expect(calls).toHaveLength(WAKE_BURST_LIMIT + 1)
   })
 
-  it('task.assigned followed by the dispatch inbox.wake for the same task is ONE POST', async () => {
+  it('a task assigned right after a message wake still rings (gate r2: no stranded task)', async () => {
+    await send('m1')
     const { scheduleTaskAssignedDoorbell } = await import('../src/agents/webhook-doorbell')
     await scheduleTaskAssignedDoorbell(env, 'ag-1', 'task-1')
-    await send('dispatch-inbox:rcpt')
-    expect(calls).toHaveLength(1)
-    expect(calls[0].body).toEqual({ type: 'mupot.task.assigned', agent_id: 'ag-1', task_id: 'task-1' })
+    expect(calls.map((c) => c.body.type)).toEqual(['mupot.inbox.wake', 'mupot.task.assigned'])
   })
 
-  it('a broadcast to the same agent twice in the window is one POST', async () => {
-    for (const rid of ['b1', 'b2', 'b3']) await send(rid)
+  it('the SAME event ref twice in the window is one POST', async () => {
+    const wake = { type: 'mupot.task.assigned' as const, agent_id: 'ag-1', task_id: 'task-same' }
+    await fireWebhookDoorbell(env, wake)
+    await fireWebhookDoorbell(env, wake)
     expect(calls).toHaveLength(1)
   })
 
-  it('a failed POST still counts toward the window (no hammering a down webhook)', async () => {
+  it('a failed POST does not block the next distinct wake, but failures count toward the burst cap', async () => {
     globalThis.fetch = (async () => { throw new Error('down') }) as typeof fetch
-    await send('f1')
-    await send('f2')
-    expect(receipts().map((r) => r.outcome)).toEqual(['failed', 'skipped'])
+    for (let i = 0; i < WAKE_BURST_LIMIT + 1; i++) await send(`f${i}`)
+    const outcomes = receipts().map((r) => r.outcome)
+    expect(outcomes.slice(0, WAKE_BURST_LIMIT)).toEqual(Array(WAKE_BURST_LIMIT).fill('failed'))
+    expect(outcomes.at(-1)).toBe('skipped')
   })
 
   it('old receipts of the same agent are pruned when it rings (14-day retention)', async () => {
