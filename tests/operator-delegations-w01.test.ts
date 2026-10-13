@@ -223,6 +223,17 @@ describe('P2: overlapping delegations — the one that permits the act with the 
     expect(detail.delegations.map((d) => d.id)).toEqual([squadId])
   })
 
+  it('when two overlapping rows both permit the act, the one with the HIGHEST ceiling is the one recorded', async () => {
+    const squadMember = await delegate('squad', 'S2', 'member') // older, lower ceiling
+    const orgLead = await delegate('org', null, 'lead') // newer, higher ceiling
+    const out = await call(operator(), 'squad_member_add', { agent: 'agent-B', squad: 'S2', capability: 'member' })
+    expect(out.ok, JSON.stringify(out)).toBe(true)
+    const [r] = receipts('squad_member_add')
+    expect(r.delegation_id).toBe(orgLead)
+    expect(r.delegation_id).not.toBe(squadMember)
+    expect((JSON.parse(r.detail) as { ceiling_rank: number }).ceiling_rank).toBe(3) // lead
+  })
+
   it('an act above every overlapping row is still refused', async () => {
     await delegate('org', null, 'member')
     await delegate('squad', 'S2', 'lead')
