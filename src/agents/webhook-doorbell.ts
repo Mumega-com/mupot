@@ -506,7 +506,10 @@ async function deliverDoorbell(
         Authorization: `Bearer ${bearer}`,
         'content-type': 'application/json',
       },
-      body: JSON.stringify(canonical),
+      // The assignment occurrence is a pot-side dedupe key, not part of the wire contract the Bot parses.
+      body: JSON.stringify(canonical.type === TASK_ASSIGNED_TYPE
+        ? { type: canonical.type, agent_id: canonical.agent_id, task_id: canonical.task_id }
+        : canonical),
       signal: ac.signal,
       // Never follow a redirect: a 3xx would carry the bearer to a host nobody vetted.
       redirect: 'manual',

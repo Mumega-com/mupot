@@ -112,4 +112,16 @@ describe('REST task assignment doorbell', () => {
     expect(await receipts(1)).toBe(1)
     expect(bodies).toEqual([{ type: 'mupot.task.assigned', agent_id: 'ag', task_id: 't-held' }])
   })
+
+  it('a same-agent reassignment after a COUNTER-ONLY release (counter at the ceiling, no hold row) rings (#1892)', async () => {
+    h.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at)
+        VALUES ('t-stuck', 'sq', 't', 'b', 'done', 'blocked', 'ag', '${T0}', '${T0}');
+      INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, first_at, last_at) VALUES ('t-stuck', 3, 'ag', '${T0}', '${T0}');
+    `)
+    const res = await call('PATCH', '/t-stuck', { assignee_agent_id: 'ag' })
+    expect(res.status, await res.clone().text()).toBe(200)
+    expect(await receipts(1)).toBe(1)
+    expect(bodies).toEqual([{ type: 'mupot.task.assigned', agent_id: 'ag', task_id: 't-stuck' }])
+  })
 })
