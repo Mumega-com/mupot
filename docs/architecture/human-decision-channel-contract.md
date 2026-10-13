@@ -570,7 +570,7 @@ authorize-before-write ordering above.
 calling agent's own authority — exactly as if `human_origin` had been omitted, "no
 origin, or an origin that does not resolve, runs under the agent seat only" (Hadi,
 2026-09-16). Two cases instead refuse the WHOLE call: a non-agent-bound caller supplying
-`human_origin` at all (400 `human_origin_not_applicable`), and a replayed origin message
+`human_origin` at all (400 `human_origin_not_applicable`; since mupot#1889 also for any token not on the operator's `HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS` allowlist, a non-workspace channel, and OAuth connector, seat or harness-credential sessions), and a replayed origin message
 (409 `origin_replayed`). A genuine post-dry-run race on the task's own status (another
 verdict won concurrently) surfaces as the SAME `VerdictRaceError` → 409 `verdict_race`
 the non-origin path already produces — one shared outcome, not a second race code.

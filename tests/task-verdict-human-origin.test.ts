@@ -30,7 +30,7 @@ const ORIGIN = 'https://pot.test'
 const SQUAD = 'squad-1'
 const GATE = 'gate:outreach'
 
-// mupot#1889: the operator's HUMAN_ORIGIN_ATTESTOR_AGENT_IDS allowlist. seedAgent adds every agent it
+// mupot#1889: the operator's HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS allowlist. seedAgent adds every agent it
 // seeds (these fixtures model "the operator allowlisted this harness agent"); the #1889 tests remove
 // an agent to model an owned agent whose workspace token must NOT be able to attest. The env reads it
 // live through a getter, exactly as the helper reads the real var.
@@ -39,7 +39,7 @@ function makeEnv(harness: SqliteD1Harness): Env {
   return {
     TENANT_SLUG: TENANT,
     DB: harness.db,
-    get HUMAN_ORIGIN_ATTESTOR_AGENT_IDS() { return [...attestors].join(',') },
+    get HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS() { return [...attestors].join(',') },
   } as unknown as Env
 }
 
@@ -51,7 +51,7 @@ function seedBase(sqlite: SqliteD1Harness['sqlite']): void {
 }
 
 function seedAgent(sqlite: SqliteD1Harness['sqlite'], id: string, status: 'active' | 'paused' = 'active'): void {
-  attestors.add(id)
+  attestors.add(`tok-${id}`) // the allowlist holds TOKEN ids; harnessAuth uses tok-<agent>
   sqlite
     .prepare(
       `INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES (?, ?, ?, ?, 'member', 'test', ?)`,
@@ -142,6 +142,7 @@ function harnessAuth(agentId: string, capabilities: CapabilityGrant[] = BASELINE
     channel: 'workspace',
     capabilities,
     boundAgentId: agentId,
+    tokenId: `tok-${agentId}`,
   } as AuthContext
 }
 
@@ -1323,8 +1324,8 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
     // owned agent (Claude Code, Cursor, Custom GPT Actions), so shape alone proves nothing.
     it('owned agent NOT on the attestor allowlist (plain workspace token) is refused', async () => {
       seedAuthorizedOwner('agent-owned-not-listed', 'member-nl', 'task-nl')
-      attestors.delete('agent-owned-not-listed')
-      attestors.add('some-other-agent')
+      attestors.delete('tok-agent-owned-not-listed')
+      attestors.add('tok-some-other-agent')
       await expectRefusedClean(harnessAuth('agent-owned-not-listed'), 'task-nl')
     })
     it('empty / absent allowlist refuses every human_origin, even for the real harness shape', async () => {
@@ -1332,7 +1333,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       attestors.clear()
       await expectRefusedClean(harnessAuth('agent-empty'), 'task-empty')
       await expectRefusedClean(harnessAuth('agent-empty'), 'task-empty') // idempotent: still nothing written
-      delete (env as { HUMAN_ORIGIN_ATTESTOR_AGENT_IDS?: string }).HUMAN_ORIGIN_ATTESTOR_AGENT_IDS
+      delete (env as { HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS?: string }).HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS
     })
     it('allowlist parsing tolerates spaces and an empty entry', async () => {
       seedAuthorizedOwner('agent-ws', 'member-ws', 'task-ws')
@@ -1350,6 +1351,8 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
         .prepare(`INSERT INTO agent_member_bindings (tenant, agent_id, member_id, created_at) VALUES (?, ?, ?, datetime('now'))`)
         .run(TENANT, agentId, agentMemberId)
       const minted = await mintMemberToken(env, agentMemberId, `tok-${agentId}`, 'workspace', agentId)
+      // The allowlist holds the exact live token id; swap the agent's placeholder for the real minted id.
+      if (attestors.delete(`tok-${agentId}`)) attestors.add(minted.id)
       return minted.raw
     }
     async function postVerdict(raw: string, taskId: string): Promise<{ status: number; sc: Record<string, unknown>; text: string }> {
@@ -1369,7 +1372,7 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       seedMember(harness.sqlite, 'member-wire-no')
       setAgentOwner(harness.sqlite, 'agent-wire-no', 'member-wire-no')
       seedReviewTask(harness.sqlite, 'task-wire-no')
-      attestors.delete('agent-wire-no')
+      attestors.delete('tok-agent-wire-no')
       const okRaw = await bearerFor('agent-wire-ok', 'amem-ok')
       const noRaw = await bearerFor('agent-wire-no', 'amem-no')
 
@@ -1378,6 +1381,18 @@ describe('task_verdict human_origin — mupot#1424 harness-attested origin', () 
       const no = await postVerdict(noRaw, 'task-wire-no')
       expect(no.text).toContain('human_origin_not_applicable')
       const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'task-wire-no'`).first<{ n: number }>()
+      expect(n?.n).toBe(0)
+    })
+
+    it('a SECOND token minted for an allowlisted agent is refused (the allowlist binds the credential, not the agent)', async () => {
+      seedAuthorizedOwner('agent-two-tok', 'member-two-tok', 'task-two-tok')
+      const listedRaw = await bearerFor('agent-two-tok', 'amem-two')
+      void listedRaw
+      // a later mint for the same agent identity (e.g. installed in Claude Code): same agent, same shape
+      const extra = await mintMemberToken(env, 'amem-two', 'tok-extra', 'workspace', 'agent-two-tok')
+      const res = await postVerdict(extra.raw, 'task-two-tok')
+      expect(res.text).toContain('human_origin_not_applicable')
+      const n = await env.DB.prepare(`SELECT COUNT(*) AS n FROM task_verdicts WHERE task_id = 'task-two-tok'`).first<{ n: number }>()
       expect(n?.n).toBe(0)
     })
 
