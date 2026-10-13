@@ -83,8 +83,8 @@ export interface Env {
   // without this, a non-owner tenant with an internal_adapter posthog binding would read the
   // operator's own PostHog project and emit it under its own tenant's observations.
   OWNER_TENANT_SLUG?: string
-  // mupot#1889: comma-separated agent ids (agents.id) allowed to carry task_verdict `human_origin`
-  // (harness-attested human decisions, e.g. the KayHermes gateway's agent). Empty/absent = refuse
+  // mupot#1889: comma-separated TOKEN ids (member_tokens.id) allowed to carry task_verdict `human_origin`
+  // (harness-attested human decisions, e.g. the KayHermes gateway's own workspace token). Empty/absent = refuse
   // every human_origin. Read only via src/im/origin-attestors.ts.
   HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS?: string
   BRAND: string
