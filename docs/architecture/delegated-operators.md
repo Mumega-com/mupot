@@ -67,15 +67,52 @@ Nothing is cached. The delegation row, the delegator's membership status, the de
 role plane) on the delegation scope, and both ranks on the target are read on every call. Revocation, a demoted or
 suspended delegator, or a revoked delegator seat bite on the next request.
 
+## Overlapping delegations
+
+An agent can hold several live delegations that cover the same act (an org/member row and a squad/lead row, say). The
+chokepoint judges the act under EVERY live covering delegation whose delegator is still admin and uses the one that PERMITS
+it with the highest ceiling (ties go to the oldest). The oldest row never shadows a newer, more permissive one. The receipt's
+`delegation_id` is the one used; `detail.considered_delegation_ids` lists every candidate. If none permits, the refusal is
+reported under the most permissive candidate. For `project_squad_set` the ATTACH delegation is chosen the same way (highest
+`max_grant` among the live non-project delegations covering the squad) and the ceiling is the lower of the two `max_grant`s.
+
+## Target identity
+
+A seat member's agent is resolved by the chokepoint from `agent_member_bindings` WHATEVER the member's status, so a suspended
+seat cannot make the target's standing vanish from the guard (the active-only `resolveBoundAgentForMember` returned null for a
+suspended seat and skipped it). An act that changes what an existing agent holds and names no agent is refused fail-closed
+(`target_identity_required`). A target holding ANY `gate_grants` row (as the agent or as its seat member) is top standing: gate
+authority is not a rank, so no delegate can add, remove or move it. After the gate, a site that resolves the references again
+compares them with `delegatedTargetDrift` and refuses `target_changed` on a mismatch; `move_agent_squad` additionally binds the
+gate's source squad into the write itself (the first statement of its batch aborts and rolls the batch back unless the agent
+still sits in that squad, `source_squad_changed`).
+
 ## Receipts
 
 Every delegated structural write writes `operator_delegation_receipts` BEFORE the write: agent, the agent's seat member,
-delegator, delegation id, action, surface (`mcp`|`http`), target scope, ceiling, and `outcome = 'attempted'`. The site closes
-it after the write: `applied` when it landed, `refused` when a later check refused it. A covered act that the chokepoint
-itself refuses (ceiling, target standing, slug, attached squad) leaves an `outcome = 'refused'` row. A crash between the
-write and the close leaves `attempted`, which honestly means "authorised, outcome unknown". The only legal UPDATE is
-`attempted -> applied|refused`; no deletes; no foreign keys (the record outlives agent, member and delegation). The existing
-`membership_receipts` rows for `squad_member_add/remove` still record the agent as actor.
+delegator, delegation id, action, surface (`mcp`|`http`), target scope, ceiling, `detail.delegations` (every delegation that
+took part, with its delegator and role `covering` or `attach_squad`) and `outcome = 'attempted'`. A site closes it after the
+write (`applied` when it landed, `refused` when the write was refused or changed nothing, for example an `unchanged` add).
+Closing is also STRUCTURAL: the MCP dispatcher and the org, projects and members HTTP apps call
+`settleOpenDelegatedReceipts` after every call, which moves any receipt still `attempted` to `applied` (2xx) or `refused`
+(4xx). A 5xx or a throw is left `attempted` on purpose, which honestly means "authorised, outcome unknown". A covered act that
+the chokepoint itself refuses (ceiling, target standing, slug, attached squad) leaves an `outcome = 'refused'` row. The only
+legal UPDATE is `attempted -> applied|refused`; no deletes; no foreign keys (the record outlives agent, member and
+delegation). The existing `membership_receipts` rows for `squad_member_add/remove` still record the agent as actor.
+
+## Revoking
+
+The original delegator can always withdraw their delegation, even after being demoted (`operator_revoke` has the
+`authenticated` floor; `revokeDelegation` enforces "human, and the delegator or admin over the scope"). Any agent-bound caller
+is refused by the chokepoint before an argument is read.
+
+## Other doors that create structure
+
+`addon_activate`, `addon_setup` and `POST /api/addons/:key/activate` ask the chokepoint for `activate_addon` (activation
+materializes a department and squads through `activateDepartment`): not delegable, the agent keeps its pre-W0 capability
+lane. `seedSquadPack` and `seedOutreachLoop` (human dashboard / admin routes) ask for `create_squad` and refuse every agent.
+The caller census matches a writer by NAME anywhere in the source, so an aliased import or a default-injected reference
+(`deps.createSquad ?? createSquad`) cannot hide a caller.
 
 ## Flag semantics
 
