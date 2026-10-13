@@ -15,7 +15,7 @@ import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
 import type { AuthContext, Env } from '../types'
-import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
+import { canOnSquadAuth } from '../auth/capability'
 import { checkWebSession } from '../secure-moments/enrol-mint'
 import {
   clearAgentWebhookDoorbell,
@@ -35,11 +35,13 @@ type ShellFn = (
 
 type AppEnv = { Bindings: Env; Variables: { auth: AuthContext } }
 
-/** Admin over this squad right now (org admin covers every squad). Re-checked by every POST. */
+/**
+ * Admin over this squad right now: the SAME predicate as the MCP tools (canOnSquadAuth). A home (personal) squad grants
+ * no standing to org/department/role planes, so an org admin cannot set, clear or test another member's personal agent.
+ * Re-checked by every POST and by the page.
+ */
 async function canAdminSquad(env: Env, auth: AuthContext, squadId: string): Promise<boolean> {
-  const floor = capabilityRank('admin')
-  if ((await actorRankOnScopeFor(env, auth, 'org', null)) >= floor) return true
-  return (await actorRankOnScopeFor(env, auth, 'squad', squadId)) >= floor
+  return canOnSquadAuth(env, auth, squadId, 'admin')
 }
 
 async function loadAgentSquad(env: Env, agentId: string): Promise<{ id: string; squad_id: string } | null> {
@@ -47,6 +49,24 @@ async function loadAgentSquad(env: Env, agentId: string): Promise<{ id: string; 
     .bind(agentId)
     .first<{ id: string; squad_id: string }>()
   return row ?? null
+}
+
+/** Plain-language reading of a delivery outcome for the Save / Send test ping UI. */
+export function doorbellMessage(d: { outcome: string; http_status?: number; reason?: string }): string {
+  if (d.outcome === 'no_doorbell') return 'No doorbell is saved for this agent yet.'
+  if (d.outcome === 'disabled') return 'Doorbells are switched off for this pot (WEBHOOK_DOORBELL).'
+  if (d.outcome === 'rate_limited') return 'Too many test pings; wait a few minutes and try again.'
+  if (d.reason === 'timeout') return 'No answer within 3s.'
+  if (d.outcome === 'skipped') return `Not sent (${d.reason ?? 'skipped'}).`
+  const code = d.http_status
+  if (code !== undefined) {
+    if (code >= 200 && code < 300) return `Delivered (HTTP ${code}). Grok accepted the ping.`
+    if (code === 401 || code === 403) return `Grok rejected the key (HTTP ${code}). Re-enter the sender key from the routine panel.`
+    if (code === 404) return 'URL not found (HTTP 404). Copy it again from the routine panel.'
+    if (code >= 300 && code < 400) return `URL redirects (HTTP ${code}). Paste the final URL.`
+    return `Grok answered HTTP ${code}.`
+  }
+  return `Could not reach the URL (${d.reason ?? 'error'}).`
 }
 
 function formatWhen(iso: string): string {
@@ -80,7 +100,7 @@ function doorbellScript(): Html {
           try {
             var r = await post('/doorbells/set', { agent_id: agent.value, webhook_url: url.value, bearer: key.value });
             key.value = '';
-            if (r.ok) { window.location.reload(); return; }
+            if (r.ok) { window.location.href = '/doorbells?saved=' + encodeURIComponent(agent.value); return; }
             if (r.data.error === 'reauth_required') reauthLink();
             else say('Could not save (' + (r.data.error || r.status) + (r.data.detail ? ': ' + r.data.detail : '') + ').');
           } catch (e) { say('Network error — try again.'); }
@@ -97,8 +117,7 @@ function doorbellScript(): Html {
           var btn = ev.currentTarget; btn.disabled = true; say('sending test ping…');
           try {
             var r = await post('/doorbells/' + encodeURIComponent(btn.getAttribute('data-db-test')) + '/test');
-            if (r.ok && r.data.http_status) say('Test ping: HTTP ' + r.data.http_status + ' (' + r.data.outcome + ').');
-            else if (r.ok) say('Test ping not delivered (' + (r.data.reason || r.data.outcome) + ').');
+            if (r.ok) say(r.data.message || ('Test ping: ' + r.data.outcome));
             else say('Test ping refused (' + (r.data.error || r.status) + ').');
           } catch (e) { say('Network error — try again.'); }
           btn.disabled = false;
@@ -107,7 +126,7 @@ function doorbellScript(): Html {
     </script>`)
 }
 
-async function pageBody(env: Env, auth: AuthContext): Promise<Html> {
+async function pageBody(env: Env, auth: AuthContext, savedAgentId: string | null): Promise<Html> {
   const enabled = webhookDoorbellEnabled(env)
   const visible = await loadAllAgents(env, auth)
   const manageable: typeof visible = []
@@ -165,7 +184,7 @@ async function pageBody(env: Env, auth: AuthContext): Promise<Html> {
     })}
     ${sectionPanel({ title: 'Register a doorbell', body: form })}
     ${sectionPanel({ title: 'Agents', body: list })}
-    <div class="status-line" id="db-status"></div>
+    <div class="status-line" id="db-status">${savedAgentId ? 'Saved. Now press "Send test ping" on the agent below to check Grok accepts it.' : ''}</div>
     ${doorbellScript()}
   `
 }
@@ -174,7 +193,7 @@ export function makeDoorbellsApp(shell: ShellFn) {
   const app = new Hono<AppEnv>()
 
   app.get('/doorbells', async (c) => {
-    const body = await pageBody(c.env, c.get('auth'))
+    const body = await pageBody(c.env, c.get('auth'), c.req.query('saved') ?? null)
     return c.html(shell(c.env, 'Doorbells', body))
   })
 
@@ -235,7 +254,7 @@ export function makeDoorbellsApp(shell: ShellFn) {
     const g = await guard(c, c.req.param('agentId'), false)
     if (!g.ok) return c.json({ error: g.error }, g.status)
     const delivery = await sendDoorbellTestPing(c.env, g.agentId)
-    return c.json({ agent_id: g.agentId, ...delivery })
+    return c.json({ agent_id: g.agentId, ...delivery, message: doorbellMessage(delivery) })
   })
 
   return app

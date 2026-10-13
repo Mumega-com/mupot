@@ -1263,7 +1263,7 @@ const toolTaskCreate: ToolSpec = {
 
     // Doorbell (mupot#1882): an assigned agent with a doorbell is rung; a backlog-only create (dispatch:false) never wakes.
     if (args.dispatch !== false) {
-      scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
+      await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
     }
     return done({ task })
   },
@@ -2100,9 +2100,10 @@ const toolTaskUpdate: ToolSpec = {
     // with org-admin / squad-admin assigning the task to an agent (even the agent it already names: an
     // agent can self-assign, so "no change" proves nothing) lifts the hold, resets the counter and
     // stamps the release epoch (a no-op for the hold itself unless held).
+    let liftsHold = false
     if (assigningAgent && await canReleaseExecutionHold(env, auth, existing.squad_id)) {
-      await releaseExecutionHold(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
-        reason: 'human reassign via task_update', via: 'human_reassign' })
+      liftsHold = (await releaseExecutionHold(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
+        reason: 'human reassign via task_update', via: 'human_reassign' })) === 'released'
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
@@ -2110,9 +2111,9 @@ const toolTaskUpdate: ToolSpec = {
 
     const actor = memberActor(auth.memberId as string)
     await emitTaskEvent(env, 'task.updated', next, actor)
-    // Doorbell (mupot#1882): ring the NEW assignee only when the assignee actually changed.
-    if (assigningAgent && next.assignee_agent_id !== existing.assignee_agent_id) {
-      scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil })
+    // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold.
+    if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
+      await scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil })
     }
     let gateWake: GateWakeOutcome | undefined
 
@@ -2704,7 +2705,7 @@ const toolTaskDispatch: ToolSpec = {
     required: ['task_id'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const taskId = str(args.task_id)
     if (!taskId) return fail(400, 'invalid_args', 'task_id required')
     // validateArgs (the shared dispatcher gate) does not enforce inputSchema `enum` — a
@@ -2910,6 +2911,10 @@ const toolTaskDispatch: ToolSpec = {
       ).bind(message, env.TENANT_SLUG, receiptId).run()
       return fail(500, 'dispatch_failed', { receipt_id: receiptId })
     }
+
+    // Doorbell (mupot#1882): a (re-)dispatch tells the assignee to start. The bus path may ALSO ring it through the
+    // inbox bridge (inbox.wake); the per-agent coalescing window turns the pair into one POST.
+    await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
 
     // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
     // previously added a second, ad-hoc sendAgentMessage write here, believing
@@ -3516,7 +3521,7 @@ const toolFlightDispatch: ToolSpec = {
     required: ['squad_id', 'goal', 'meta_json', 'signals_json'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     if (!auth.boundAgentId) return fail(409, 'agent_binding_required')
     const boundAgent = await loadAgent(env, auth.boundAgentId)
     if (!boundAgent) return fail(409, 'agent_binding_invalid')
@@ -3823,6 +3828,7 @@ const toolFlightDispatch: ToolSpec = {
           reason: 'flight_dispatch delivers to the flight\'s own bound agent, which the caller already had to be',
         },
         {
+          waitUntil: ctx.waitUntil,
           // The sender is synthetic ('mupot-flights') and is not a member of any
           // project, so the primitive's sender/recipient membership check would
           // refuse every project-attributed flight. Authorization already happened
@@ -4552,7 +4558,7 @@ const toolRouterTick: ToolSpec = {
     required: ['squad_id'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const squadId = str(args.squad_id)
     if (!squadId) return fail(400, 'invalid_args', 'squad_id required')
     // The generic schema seam intentionally preserves historical optional-null
@@ -4572,7 +4578,7 @@ const toolRouterTick: ToolSpec = {
     if (!auth.memberId) return fail(403, 'forbidden')
 
     const limit = typeof args.limit === 'number' ? args.limit : undefined
-    const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId })
+    const result = await runRouterTick(env, decision, { squadId, dryRun, limit }, { memberId: auth.memberId }, { waitUntil: ctx.waitUntil })
     if (!dryRun) return done(result)
     return done({
       ...result,
@@ -4763,7 +4769,7 @@ const toolBroadcast: ToolSpec = {
     required: ['body'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const fromAgent = auth.boundAgentId
     if (!fromAgent) return fail(403, 'not_agent_bound', 'broadcast requires an agent-bound token (member_tokens.agent_id)')
 
@@ -4821,7 +4827,7 @@ const toolBroadcast: ToolSpec = {
       }, {
         system: true,
         reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',
-      })
+      }, { waitUntil: ctx.waitUntil })
       if (res.ok) {
         deliveries.push({
           to: target.id,

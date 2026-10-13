@@ -22,8 +22,8 @@
 -- SECRET PATTERN (house vault, not D1 plaintext)
 --
 -- The doorbell bearer is AES-GCM-256 under CONNECTOR_MASTER_KEY (Worker
--- secret), HKDF info `mupot_doorbell_v1`, salt = agent_id. Same primitive as
--- connectors (src/connectors/crypto.ts encryptDomainSecret). D1 stores only
+-- secret), HKDF info `mupot_connector_agent_doorbell_v1`, salt = agent_id, AAD
+-- `doorbell:<agent_id>`. Same primitive as connectors (src/connectors/crypto.ts encryptConnectorSecret). D1 stores only
 -- ciphertext + last4. Get/list/logs never see the bearer. Fail-closed on set
 -- if the master key is missing. This is not a new Worker secret name — one
 -- pot-level key, domain-separated info string (VaultDomain 'agent_doorbell').
@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS agent_webhook_doorbell_receipts (
   agent_id      TEXT NOT NULL,
   event_type    TEXT NOT NULL CHECK (event_type IN ('mupot.inbox.wake', 'mupot.task.assigned', 'mupot.doorbell.test')),
   ref_id        TEXT NOT NULL,
-  outcome       TEXT NOT NULL CHECK (outcome IN ('posted', 'failed', 'skipped')),
+  -- 'claimed' is the coalescing window row, finalized in place to posted/failed/skipped after the POST
+  outcome       TEXT NOT NULL CHECK (outcome IN ('claimed', 'posted', 'failed', 'skipped')),
   http_status   INTEGER,
   reason        TEXT,
   attempted_at  TEXT NOT NULL

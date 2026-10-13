@@ -190,7 +190,7 @@ describe('test ping and clear', () => {
     setReauth('mem-s1', stale()) // test needs only a real session, not a fresh one
     const res = await post(env, cookie, '/doorbells/agent-A/test')
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ agent_id: 'agent-A', outcome: 'posted', http_status: 202 })
+    expect(await res.json()).toMatchObject({ agent_id: 'agent-A', outcome: 'posted', http_status: 202, message: expect.stringContaining('Delivered') })
     expect(fetched).toHaveLength(1)
     expect(JSON.parse(String(fetched[0].init.body))).toEqual({ type: 'mupot.doorbell.test', agent_id: 'agent-A' })
     expect((fetched[0].init.headers as Record<string, string>).Authorization).toBe(`Bearer ${KEY}`)
@@ -220,7 +220,7 @@ describe('test ping and clear', () => {
     await post(env, cookie, '/doorbells/set', SET)
     globalThis.fetch = (async () => new Response('nope', { status: 500 })) as typeof fetch
     const bad = await post(env, cookie, '/doorbells/agent-A/test')
-    expect(await bad.json()).toEqual({ agent_id: 'agent-A', outcome: 'failed', http_status: 500 })
+    expect(await bad.json()).toMatchObject({ agent_id: 'agent-A', outcome: 'failed', http_status: 500 })
   })
 
   it('clear removes the row with a real (even stale) session; another squad admin cannot', async () => {
@@ -231,5 +231,82 @@ describe('test ping and clear', () => {
     setReauth('mem-s1', stale())
     expect((await post(env, cookie, '/doorbells/agent-A/clear')).status).toBe(200)
     expect(stored()).toHaveLength(0)
+  })
+})
+
+describe('home (personal) squad agents are not manageable by an org admin', () => {
+  beforeEach(() => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name, kind) VALUES ('S-home', 'D1', 'home-hadi', 'Hadi home', 'home');
+      INSERT INTO agents (id, squad_id, slug, name, role, model, status) VALUES ('agent-H', 'S-home', 'agent-h', 'Personal H', 'member', 'test', 'active');
+    `)
+  })
+
+  it('set / clear / test by an org admin on a home-squad agent are all 403, nothing stored or sent', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    setReauth('mem-admin', freshNow())
+    const set = await post(env, cookie, '/doorbells/set', { ...SET, agent_id: 'agent-H' })
+    expect(set.status).toBe(403)
+    expect(await set.json()).toEqual({ error: 'forbidden' })
+    harness.sqlite.prepare(
+      "INSERT INTO agent_webhook_doorbells (tenant, agent_id, webhook_url, auth_ciphertext, auth_last4, created_by_member_id, updated_at) VALUES (?, 'agent-H', 'https://hook.example/h', 'x', '0000', 'someone', '2026-10-13T00:00:00.000Z')",
+    ).run(TENANT)
+    expect((await post(env, cookie, '/doorbells/agent-H/test')).status).toBe(403)
+    expect((await post(env, cookie, '/doorbells/agent-H/clear')).status).toBe(403)
+    expect(fetched).toHaveLength(0)
+    expect(harness.sqlite.prepare("SELECT count(*) AS n FROM agent_webhook_doorbells WHERE agent_id = 'agent-H'").get()).toEqual({ n: 1 })
+  })
+
+  it('the page does not list the personal agent for an org admin', async () => {
+    const { env, cookie } = await login('admin@x.test')
+    const body = await (await dashboardApp.request('/doorbells', { headers: { cookie } }, env)).text()
+    expect(body).toContain('Agent A')
+    expect(body).not.toContain('Personal H')
+  })
+})
+
+describe('messages, nudge, limits', () => {
+  it('maps outcomes to plain language', async () => {
+    const { doorbellMessage } = await import('../src/dashboard/doorbells')
+    expect(doorbellMessage({ outcome: 'failed', http_status: 401 })).toContain('Grok rejected the key')
+    expect(doorbellMessage({ outcome: 'failed', http_status: 403 })).toContain('Grok rejected the key')
+    expect(doorbellMessage({ outcome: 'failed', http_status: 404 })).toContain('Copy it again from the routine panel')
+    expect(doorbellMessage({ outcome: 'failed', http_status: 302 })).toContain('Paste the final URL')
+    expect(doorbellMessage({ outcome: 'failed', reason: 'timeout' })).toBe('No answer within 3s.')
+    expect(doorbellMessage({ outcome: 'posted', http_status: 200 })).toContain('Delivered')
+  })
+
+  it('after Save the page nudges to send a test ping', async () => {
+    const { env, cookie } = await login('s1@x.test')
+    const body = await (await dashboardApp.request('/doorbells?saved=agent-A', { headers: { cookie } }, env)).text()
+    expect(body).toContain('Send test ping')
+    expect(body).toContain('Saved. Now press')
+  })
+
+  it('a 404 from the routine URL is reported as such on the test ping', async () => {
+    const { env, cookie } = await login('s1@x.test')
+    setReauth('mem-s1', freshNow())
+    await post(env, cookie, '/doorbells/set', SET)
+    globalThis.fetch = (async () => new Response('x', { status: 404 })) as typeof fetch
+    const res = await post(env, cookie, '/doorbells/agent-A/test')
+    expect((await res.json() as { message: string }).message).toContain('URL not found')
+  })
+
+  it('test pings are limited to 5 per 10 minutes per agent; the 6th sends nothing', async () => {
+    const { env, cookie } = await login('s1@x.test')
+    setReauth('mem-s1', freshNow())
+    await post(env, cookie, '/doorbells/set', SET)
+    for (let i = 0; i < 5; i++) expect(await (await post(env, cookie, '/doorbells/agent-A/test')).json()).toMatchObject({ outcome: 'posted' })
+    const sixth = await (await post(env, cookie, '/doorbells/agent-A/test')).json()
+    expect(sixth).toMatchObject({ outcome: 'rate_limited' })
+    expect(fetched).toHaveLength(5)
+  })
+
+  it('refuses a short key through the dashboard too', async () => {
+    const { env, cookie } = await login('s1@x.test')
+    setReauth('mem-s1', freshNow())
+    const res = await post(env, cookie, '/doorbells/set', { ...SET, bearer: 'tooshort' })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: 'invalid_bearer' })
   })
 })

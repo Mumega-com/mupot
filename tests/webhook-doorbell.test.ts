@@ -202,13 +202,19 @@ describe('Grok Bot webhook doorbell', () => {
     expect(agentAdminSet.status).toBe(403)
     expect(agentAdminSet.error).toBe('operator_principal_required')
 
+    // a human never registers a doorbell over MCP (no fresh session on a bearer token): dashboard only
     const adminSet = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'set_agent_webhook_doorbell', {
       agent: 'grokbot-staff',
       webhook_url: 'https://webhook.example/staff',
       bearer: DOORBELL_BEARER,
     }, 'https://pot.example')
-    expect(adminSet.ok).toBe(true)
-    expect((adminSet.result as { agent_id: string }).agent_id).toBe(AGENT_B)
+    expect(adminSet.ok).toBe(false)
+    expect(adminSet.status).toBe(403)
+    expect(adminSet.error).toBe('dashboard_only')
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbells').get()).toEqual({ n: 0 })
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_B, webhookUrl: 'https://webhook.example/staff', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
 
     const adminGet = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'get_agent_webhook_doorbell', {
       agent: AGENT_B,
@@ -423,26 +429,33 @@ describe('Grok Bot webhook doorbell', () => {
     })
     assertNoSecretLeak(JSON.stringify(view))
   })
-  it('squad admin of the agent squad may set; squad admin of another squad may not', async () => {
+  it('squad admin of the agent squad may read and clear; squad admin of another squad may not', async () => {
     harness.sqlite.exec(`
       INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', '${DEPT_ID}', 'squad-b', 'Squad Beta');
     `)
-    const own = await invokeTool(humanAdminAuth({ type: 'squad', id: SQUAD_ID }), env, 'set_agent_webhook_doorbell', {
-      agent: AGENT_B, webhook_url: 'https://webhook.example/staff', bearer: DOORBELL_BEARER,
-    }, 'https://pot.example')
-    expect(own.ok).toBe(true)
-    const other = await invokeTool(humanAdminAuth({ type: 'squad', id: 'squad-b' }), env, 'set_agent_webhook_doorbell', {
-      agent: AGENT_B, webhook_url: 'https://webhook.example/staff2', bearer: DOORBELL_BEARER,
-    }, 'https://pot.example')
-    expect(other.ok).toBe(false)
-    expect(other.status).toBe(403)
-    const otherClear = await invokeTool(humanAdminAuth({ type: 'squad', id: 'squad-b' }), env, 'set_agent_webhook_doorbell', {
-      agent: AGENT_B, clear: true,
-    }, 'https://pot.example')
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_B, webhookUrl: 'https://webhook.example/staff', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    const own = humanAdminAuth({ type: 'squad', id: SQUAD_ID })
+    const other = humanAdminAuth({ type: 'squad', id: 'squad-b' })
+    expect((await invokeTool(own, env, 'get_agent_webhook_doorbell', { agent: AGENT_B }, 'https://pot.example')).ok).toBe(true)
+    for (const call of [
+      { agent: AGENT_B },
+    ]) {
+      expect((await invokeTool(other, env, 'get_agent_webhook_doorbell', call, 'https://pot.example')).status).toBe(403)
+    }
+    const otherClear = await invokeTool(other, env, 'set_agent_webhook_doorbell', { agent: AGENT_B, clear: true }, 'https://pot.example')
     expect(otherClear.ok).toBe(false)
     expect(otherClear.status).toBe(403)
-    const row = harness.sqlite.prepare('SELECT webhook_url FROM agent_webhook_doorbells WHERE agent_id = ?').get(AGENT_B) as { webhook_url: string }
-    expect(row.webhook_url).toBe('https://webhook.example/staff')
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbells').get()).toEqual({ n: 1 })
+    expect((await invokeTool(own, env, 'set_agent_webhook_doorbell', { agent: AGENT_B, clear: true }, 'https://pot.example')).ok).toBe(true)
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbells').get()).toEqual({ n: 0 })
+  })
+
+  it('refuses a bearer shorter than 16 characters (last4 would expose most of it)', async () => {
+    const out = await invokeTool(auth(), env, 'set_agent_webhook_doorbell', { webhook_url: 'https://webhook.example/x', bearer: 'short-key-1234' }, 'https://pot.example')
+    expect(out.ok).toBe(false)
+    expect(out.error).toBe('invalid_bearer')
   })
 
   it('flag off: set is refused and a send makes no POST and no receipt', async () => {

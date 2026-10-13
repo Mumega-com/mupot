@@ -716,7 +716,7 @@ tasksApp.post('/', async (c) => {
 
   // Doorbell (mupot#1882): ring the assignee's webhook unless this is a backlog-only create.
   if (body.dispatch !== false) {
-    scheduleTaskAssignedDoorbell(c.env, task.assignee_agent_id, task.id, { waitUntil: waitUntilFromContext(c) })
+    await scheduleTaskAssignedDoorbell(c.env, task.assignee_agent_id, task.id, { waitUntil: waitUntilFromContext(c) })
   }
 
   // Dispatch: wake the assignee in execute mode. We require an assignee — there is
@@ -1215,9 +1215,10 @@ tasksApp.patch('/:id', async (c) => {
     throw error
   }
 
+  let liftsHold = false
   if (assigningAgent && await canReleaseExecutionHold(c.env, auth, existing.squad_id)) {
-    await releaseExecutionHold(c.env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
-      reason: 'human reassign via PATCH /tasks/:id', via: 'human_reassign' })
+    liftsHold = (await releaseExecutionHold(c.env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
+      reason: 'human reassign via PATCH /tasks/:id', via: 'human_reassign' })) === 'released'
   }
 
   // A stale update must never reach the external mirror. The mirror remains
@@ -1232,9 +1233,9 @@ tasksApp.patch('/:id', async (c) => {
     next,
     auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   )
-  // Doorbell (mupot#1882): ring the NEW assignee only when the assignee actually changed.
-  if (assigningAgent && next.assignee_agent_id !== existing.assignee_agent_id) {
-    scheduleTaskAssignedDoorbell(c.env, next.assignee_agent_id, next.id, { waitUntil: waitUntilFromContext(c) })
+  // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold (the agent is being told to resume).
+  if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
+    await scheduleTaskAssignedDoorbell(c.env, next.assignee_agent_id, next.id, { waitUntil: waitUntilFromContext(c) })
   }
 
   // mupot#1592 NEW-1 — REST parity with the MCP task_update hook: freezes a

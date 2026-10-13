@@ -81,6 +81,12 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
     const actor = auth.memberId ?? auth.userId
     if (!actor) return fail(403, 'unauthenticated')
 
+    // A human registers a doorbell on the dashboard (fresh session, key typed into a form), never through a bearer
+    // token: a token has no re-auth freshness. Clearing only removes authority, so a human may still clear here.
+    if (args.clear !== true && !auth.boundAgentId) {
+      return fail(403, 'dashboard_only', 'a person registers a doorbell on the dashboard (/doorbells); an agent may set its own')
+    }
+
     const target = await resolveDoorbellTarget(auth, env, args.agent, (agent) =>
       authorizeStructuralWrite(env, auth, 'set_agent_webhook_doorbell', { agentId: agent.id, squadId: agent.squad_id }),
     )

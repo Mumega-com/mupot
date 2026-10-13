@@ -662,7 +662,7 @@ export async function sendAgentMessage(
     // 33rd dispatch statement and overflows that shared budget. Routine dispatch
     // has its own wake; this doorbell is for agent/human send.
     if (!opts.routineRunFence) {
-      scheduleWebhookDoorbell(
+      await scheduleWebhookDoorbell(
         env,
         { type: INBOX_WAKE_TYPE, agent_id: input.toAgent, seq, message_id: id, kind },
         { fetch: opts.fetch, waitUntil: opts.waitUntil },

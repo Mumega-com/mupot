@@ -1,3 +1,4 @@
+import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { createBus } from '../bus'
 import type { ExecutionScopeDecision } from '../auth/execution-scope'
 import { nowSqlUtc } from '../auth/token-lifecycle'
@@ -60,6 +61,7 @@ export async function runRouterTick(
   decision: RouterDecision,
   input: RouterTickInput,
   authority: RouterClaimAuthority,
+  opts: { waitUntil?: (p: Promise<unknown>) => void } = {},
 ): Promise<RouterTickResult> {
   if (decision.squadId !== input.squadId || decision.tenant !== env.TENANT_SLUG) {
     throw new Error('router_scope_mismatch')
@@ -243,6 +245,8 @@ export async function runRouterTick(
       ts: now,
     }
     await createBus(env).emit(wake)
+    // Doorbell (mupot#1882): an auto-assigned task rings the assignee's webhook doorbell (flag-gated, fail-open).
+    await scheduleTaskAssignedDoorbell(env, candidate.id, task.id, { waitUntil: opts.waitUntil })
     assigned += 1
     decisions.push({ task_id: task.id, outcome: 'assigned', agent_id: candidate.id })
   }

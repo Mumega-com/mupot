@@ -93,4 +93,23 @@ describe('REST task assignment doorbell', () => {
     expect(bodies).toHaveLength(1)
     expect(bodies[0]).toMatchObject({ type: 'mupot.task.assigned', agent_id: 'ag' })
   })
+
+  it('a same-agent reassignment that lifts an execution hold rings; the same PATCH with no hold does not', async () => {
+    h.sqlite.exec(`
+      INSERT INTO tasks (id, squad_id, title, body, done_when, status, assignee_agent_id, created_at, updated_at)
+        VALUES ('t-held', 'sq', 't', 'b', 'done', 'blocked', 'ag', '${T0}', '${T0}'),
+               ('t-free', 'sq', 't', 'b', 'done', 'open', 'ag', '${T0}', '${T0}');
+      INSERT INTO execution_holds (task_id, escalation_id, agent_id, refused_count, reason, held_at)
+        VALUES ('t-held', 'esc', 'ag', 3, 'x', '${T0}');
+      INSERT INTO task_execution_attempts (task_id, refused_count, last_agent_id, first_at, last_at) VALUES ('t-held', 3, 'ag', '${T0}', '${T0}');
+    `)
+    const free = await call('PATCH', '/t-free', { assignee_agent_id: 'ag' })
+    expect(free.status, await free.clone().text()).toBe(200)
+    await new Promise((r) => setTimeout(r, 150))
+    expect(bodies).toEqual([])
+    const held = await call('PATCH', '/t-held', { assignee_agent_id: 'ag' })
+    expect(held.status, await held.clone().text()).toBe(200)
+    expect(await receipts(1)).toBe(1)
+    expect(bodies).toEqual([{ type: 'mupot.task.assigned', agent_id: 'ag', task_id: 't-held' }])
+  })
 })

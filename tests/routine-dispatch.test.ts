@@ -1391,3 +1391,43 @@ describe('routine dispatch respects execution_pauses', () => {
     })
   })
 })
+
+describe('Grok Bot doorbell exclusion for routine-fenced envelopes (D1 statement budget)', () => {
+  it('a routine-fenced send makes NO doorbell lookup, POST or receipt; the same send unfenced rings once', async () => {
+    const harness = makeHarness()
+    const { setAgentWebhookDoorbell } = await import('../src/agents/webhook-doorbell')
+    const env = { ...envFor(harness), WEBHOOK_DOORBELL: '1', CONNECTOR_MASTER_KEY: 'd'.repeat(64) } as Env
+    harness.sqlite.exec(`
+      INSERT INTO flights (id, tenant, agent, goal, status, budget_micro_usd, meta, cost_metered, created_at, project_id)
+        VALUES ('cf-1', 'tenant-a', 'agent-preferred', 'g', 'running', 100, '{}', 1, 1, 'project-1');
+      UPDATE routine_runs SET status = 'observing', flight_id = 'cf-1' WHERE id = 'run-1';
+    `)
+    const set = await setAgentWebhookDoorbell(env, {
+      agentId: 'agent-preferred', webhookUrl: 'https://hook.example/r', bearer: 'routine-test-bearer-0001', createdByMemberId: 'm',
+    })
+    expect(set.ok).toBe(true)
+    const calls: string[] = []
+    const fetchImpl = (async (u: unknown) => { calls.push(String(u)); return new Response('ok') }) as typeof fetch
+    const prepared: string[] = []
+    const spying = { ...env, DB: { prepare: (sql: string) => { prepared.push(sql); return harness.db.prepare(sql) }, batch: harness.db.batch.bind(harness.db) } } as unknown as Env
+    const fenced = await sendAgentMessage(spying, {
+      fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'do it', kind: 'request',
+      requestId: 'routine-run:run-1', projectId: 'project-1',
+    }, { system: true, reason: 'test' }, {
+      systemProjectAttribution: true,
+      routineRunFence: { runId: 'run-1', projectId: 'project-1', agentId: 'agent-preferred' },
+      fetch: fetchImpl,
+    })
+    expect(fenced).toMatchObject({ ok: true })
+    expect(calls).toEqual([])
+    expect(prepared.filter((q) => q.includes('agent_webhook_doorbell'))).toEqual([])
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbell_receipts').get()).toEqual({ n: 0 })
+
+    const plain = await sendAgentMessage(env, {
+      fromAgent: 'mupot-routines', fromMember: 'system:routines', toAgent: 'agent-preferred', body: 'again', kind: 'request',
+      requestId: 'plain-1', projectId: 'project-1',
+    }, { system: true, reason: 'test' }, { systemProjectAttribution: true, fetch: fetchImpl })
+    expect(plain).toMatchObject({ ok: true })
+    expect(calls).toEqual(['https://hook.example/r'])
+  })
+})
