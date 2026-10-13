@@ -142,6 +142,21 @@ describe('agent addressed by slug (dispatch bridge uses the fleet row id)', () =
     expect(calls).toHaveLength(0)
   })
 
+  it('an agent whose SLUG equals another agent\'s id never receives that agent\'s wakes (gate r2 on #1890)', async () => {
+    // ag-2 has no doorbell. ag-evil's slug is shaped like ag-2's id and has its own doorbell.
+    h.sqlite.exec("INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-evil', 'sq', 'ag-2', 'Evil', 'active')")
+    await setAgentWebhookDoorbell(env, { agentId: 'ag-evil', webhookUrl: 'https://attacker.example/x', bearer: BEARER, createdByMemberId: 'm1' })
+    await fireWebhookDoorbell(env, { type: 'mupot.task.assigned', agent_id: 'ag-2', task_id: 't-x' })
+    expect(calls).toHaveLength(0)
+  })
+
+  it('an exact id wins over a colliding slug when both have doorbells', async () => {
+    h.sqlite.exec("INSERT INTO agents (id, squad_id, slug, name, status) VALUES ('ag-evil', 'sq', 'ag-1', 'Evil', 'active')")
+    await setAgentWebhookDoorbell(env, { agentId: 'ag-evil', webhookUrl: 'https://attacker.example/x', bearer: BEARER, createdByMemberId: 'm1' })
+    await fireWebhookDoorbell(env, { type: 'mupot.task.assigned', agent_id: 'ag-1', task_id: 't-y' })
+    expect(calls.map((c) => c.url)).toEqual(['https://hook.example/ceo'])
+  })
+
   it('schedule is a no-op with the flag off', async () => {
     await scheduleWebhookDoorbell({ ...env, WEBHOOK_DOORBELL: undefined } as unknown as Env, { type: 'mupot.task.assigned', agent_id: 'ag-1', task_id: 't' })
     expect(calls).toHaveLength(0)
@@ -166,5 +181,14 @@ describe('router_tick auto-assign rings the assignee (mupot#1882)', () => {
     expect(r.assigned).toBe(1)
     expect(calls).toHaveLength(1)
     expect(calls[0].body).toEqual({ type: 'mupot.task.assigned', agent_id: 'ag-1', task_id: 'task-r' })
+  })
+})
+
+describe('test ping rate limit is atomic (gate r2 on #1890)', () => {
+  it('12 parallel test pings send at most 5', async () => {
+    const { sendDoorbellTestPing } = await import('../src/agents/webhook-doorbell')
+    const results = await Promise.all(Array.from({ length: 12 }, () => sendDoorbellTestPing(env, 'ag-1')))
+    expect(calls.length).toBeLessThanOrEqual(5)
+    expect(results.filter((r) => r.outcome === 'rate_limited').length).toBeGreaterThanOrEqual(7)
   })
 })

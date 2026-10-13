@@ -271,17 +271,22 @@ async function deliverDoorbell(
   if (!tenant) return { outcome: 'no_doorbell' }
 
   // The agent may arrive as agents.id OR as its fleet-row slug (the dispatch bridge delivers to the fleet row's
-  // agent_id): resolve to the canonical agents.id, a slug only when it names exactly ONE agent.
+  // agent_id). Resolve to ONE canonical agents.id FIRST: an exact id always wins, and a slug is used only when no
+  // agent has that id and the slug names exactly one agent. Only then look the doorbell up by exact id, so an
+  // agent whose slug is shaped like another agent's id can never receive that agent's wakes (gate r2 on #1890).
+  const resolved = await env.DB.prepare(
+    `SELECT COALESCE(
+       (SELECT a.id FROM agents a WHERE a.id = ?1),
+       (SELECT a.id FROM agents a WHERE a.slug = ?1
+         AND (SELECT count(*) FROM agents b WHERE b.slug = ?1) = 1)
+     ) AS id`,
+  ).bind(wake.agent_id).first<{ id: string | null }>()
+  if (!resolved?.id) return { outcome: 'no_doorbell' }
   const row = await env.DB.prepare(
     `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext
        FROM agent_webhook_doorbells d
-      WHERE d.tenant = ?1
-        AND (d.agent_id = ?2
-             OR d.agent_id = (SELECT a.id FROM agents a
-                               WHERE a.slug = ?2
-                                 AND (SELECT count(*) FROM agents b WHERE b.slug = ?2) = 1))
-      LIMIT 1`,
-  ).bind(tenant, wake.agent_id).first<{ agent_id: string; webhook_url: string; auth_ciphertext: string }>()
+      WHERE d.tenant = ?1 AND d.agent_id = ?2`,
+  ).bind(tenant, resolved.id).first<{ agent_id: string; webhook_url: string; auth_ciphertext: string }>()
   if (!row) return { outcome: 'no_doorbell' }
   // From here on the canonical id is the identity: receipts, AAD/salt and the payload all use it.
   const canonical: WebhookDoorbellWake = { ...wake, agent_id: row.agent_id }
@@ -301,12 +306,29 @@ async function deliverDoorbell(
 
   let claimId: string | null = null
   if (kind === 'test') {
-    // Test pings are rate limited per agent; they neither open nor are blocked by the wake coalescing window.
-    const recent = await env.DB.prepare(
-      `SELECT count(*) AS n FROM agent_webhook_doorbell_receipts
-        WHERE tenant = ?1 AND agent_id = ?2 AND event_type = ?3 AND attempted_at > ?4`,
-    ).bind(tenant, canonical.agent_id, DOORBELL_TEST_TYPE, isoAgo(TEST_PING_WINDOW_MS)).first<{ n: number }>()
-    if ((recent?.n ?? 0) >= TEST_PING_LIMIT) return { outcome: 'rate_limited', reason: 'test_ping_rate_limited' }
+    // Test pings are rate limited per agent with ONE atomic conditional INSERT of a 'claimed' row, so parallel
+    // pings cannot all pass a read-then-post count (gate r2 on #1890). The claimed row is later updated in place
+    // to its final outcome, so every test row in the window counts.
+    // They neither open nor are blocked by the wake coalescing window.
+    claimId = crypto.randomUUID()
+    let claimedTest = false
+    try {
+      const res = await env.DB.prepare(
+        `INSERT INTO agent_webhook_doorbell_receipts
+           (id, tenant, agent_id, event_type, ref_id, outcome, http_status, reason, attempted_at)
+         SELECT ?1, ?2, ?3, ?4, 'test', 'claimed', NULL, NULL, ?5
+          WHERE (SELECT count(*) FROM agent_webhook_doorbell_receipts
+                  WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?4
+                    AND attempted_at > ?6) < ?7`,
+      ).bind(
+        claimId, tenant, canonical.agent_id, DOORBELL_TEST_TYPE, new Date().toISOString(),
+        isoAgo(TEST_PING_WINDOW_MS), TEST_PING_LIMIT,
+      ).run()
+      claimedTest = (res.meta?.changes ?? 0) === 1
+    } catch {
+      return { outcome: 'skipped', reason: 'receipt_unavailable' }
+    }
+    if (!claimedTest) return { outcome: 'rate_limited', reason: 'test_ping_rate_limited' }
   } else {
     // Coalesce: claim the window with ONE atomic conditional INSERT. 0 rows = a wake already claimed/posted/failed
     // inside the window, so this one is skipped (and receipted). Not claiming at all (DB error) also skips: a
