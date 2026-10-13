@@ -31,6 +31,11 @@ export const INBOX_WAKE_TYPE = 'mupot.inbox.wake'
 export const TASK_ASSIGNED_TYPE = 'mupot.task.assigned'
 export const DOORBELL_TEST_TYPE = 'mupot.doorbell.test'
 
+/** Doorbell correlation shared by a dispatch's task.assigned ring and the inbox.wake of its bridge letter. */
+export function dispatchDoorbellCorrelation(receiptId: string): string {
+  return `dispatch:${receiptId}`
+}
+
 /** Opt-in flag (`"1"` or `"true"`; unset = off). Off: no set, no POST, no DB read on the send path. */
 export function webhookDoorbellEnabled(env: Env): boolean {
   const v = env.WEBHOOK_DOORBELL?.trim().toLowerCase()
@@ -64,7 +69,7 @@ const AWAIT_CEILING_MS = DOORBELL_TIMEOUT_MS + 1000
 
 export type WebhookDoorbellWake =
   | { type: typeof INBOX_WAKE_TYPE; agent_id: string; seq: number; message_id: string; kind: string }
-  | { type: typeof TASK_ASSIGNED_TYPE; agent_id: string; task_id: string }
+  | { type: typeof TASK_ASSIGNED_TYPE; agent_id: string; task_id: string; assignment?: string }
   | { type: typeof DOORBELL_TEST_TYPE; agent_id: string }
 
 export type PublicWebhookDoorbell = {
@@ -82,9 +87,31 @@ export type DoorbellSetFailure =
   | { ok: false; error: 'no_tenant' }
   | { ok: false; error: 'webhook_doorbell_disabled' }
 
+/** ctx.waitUntil, threaded to any send that may ring a doorbell so the POST outlives the response instead of being awaited. */
+export type DoorbellWaitUntil = (promise: Promise<unknown>) => void
+
 type DoorbellFireOpts = {
   fetch?: typeof fetch
   waitUntil?: (promise: Promise<unknown>) => void
+  /**
+   * Shared correlation of two wakes that announce the SAME event (task_dispatch's task.assigned and the inbox.wake
+   * for its bridge letter share `dispatch:<receiptId>`). It replaces the receipt ref, so whichever rings second
+   * is coalesced with the first instead of ringing the Bot twice.
+   */
+  correlation?: string
+  /**
+   * Recipients known (from ONE resolveDoorbellRecipients query for a fan-out) to have a doorbell. When present, an
+   * agent outside the set returns before any D1 statement: no existence check, no claim.
+   */
+  recipients?: ReadonlySet<string>
+}
+
+/** The receipt / dedupe ref of a wake: the shared correlation, else the event's own id (task wakes add their assignment occurrence). */
+function wakeRef(wake: WebhookDoorbellWake, correlation?: string): string {
+  if (correlation) return correlation
+  if (wake.type === INBOX_WAKE_TYPE) return wake.message_id
+  if (wake.type === TASK_ASSIGNED_TYPE) return wake.assignment ? `${wake.task_id}#${wake.assignment}` : wake.task_id
+  return 'test'
 }
 
 type ReceiptStatus = 'posted' | 'failed' | 'skipped'
@@ -96,9 +123,9 @@ async function recordReceipt(
   wake: WebhookDoorbellWake,
   status: ReceiptStatus,
   detail: { http_status?: number; reason?: string },
+  ref: string,
 ): Promise<void> {
   // Safe fields only. Never webhook_url, never Authorization, never the bearer.
-  const ref = wake.type === INBOX_WAKE_TYPE ? wake.message_id : wake.type === TASK_ASSIGNED_TYPE ? wake.task_id : 'test'
   const line = {
     event_type: wake.type,
     agent_id: wake.agent_id,
@@ -248,10 +275,70 @@ export async function getAgentWebhookDoorbell(
 export async function clearAgentWebhookDoorbell(env: Env, agentId: string): Promise<boolean> {
   const tenant = requireTenant(env)
   if (!tenant) return false
-  const result = await env.DB.prepare(
-    `DELETE FROM agent_webhook_doorbells WHERE tenant = ?1 AND agent_id = ?2`,
-  ).bind(tenant, agentId).run()
-  return (result.meta?.changes ?? 0) > 0
+  // One batch: the mapping and the agent's receipts go together (a cleared doorbell leaves no receipt trail
+  // behind; the receipts carry the ref ids of its wakes and have no reader once the doorbell is gone).
+  const [result] = await env.DB.batch([
+    env.DB.prepare(`DELETE FROM agent_webhook_doorbells WHERE tenant = ?1 AND agent_id = ?2`).bind(tenant, agentId),
+    env.DB.prepare(`DELETE FROM agent_webhook_doorbell_receipts WHERE tenant = ?1 AND agent_id = ?2`).bind(tenant, agentId),
+  ])
+  return (result?.meta?.changes ?? 0) > 0
+}
+
+/** Every doorbell of this tenant in ONE query (the dashboard list), keyed by agent id. Never returns a secret. */
+export async function listAgentWebhookDoorbells(env: Env): Promise<Map<string, PublicWebhookDoorbell>> {
+  const out = new Map<string, PublicWebhookDoorbell>()
+  const tenant = requireTenant(env)
+  if (!tenant) return out
+  const res = await env.DB.prepare(
+    `SELECT agent_id, webhook_url, auth_last4, updated_at FROM agent_webhook_doorbells WHERE tenant = ?1`,
+  ).bind(tenant).all<{ agent_id: string; webhook_url: string; auth_last4: string; updated_at: string }>()
+  for (const row of res.results ?? []) {
+    out.set(row.agent_id, {
+      configured: true,
+      agent_id: row.agent_id,
+      webhook_url: redactWebhookUrl(row.webhook_url),
+      auth_last4: row.auth_last4,
+      updated_at: row.updated_at,
+    })
+  }
+  return out
+}
+
+/** D1 caps bound parameters per statement; each id is bound twice (as id and as slug). */
+const RECIPIENT_CHUNK = 40
+
+/**
+ * Which of these recipients (agents.id or fleet slug, exactly as a send would address them) have a doorbell?
+ * ONE IN-list query per chunk of 40, so a fan-out (broadcast) pays one statement instead of one per recipient.
+ * Flag off or no master key -> empty set with ZERO statements. An over-inclusive answer (a slug that names two
+ * agents) is harmless: the delivery path re-resolves canonically before it POSTs.
+ */
+export async function resolveDoorbellRecipients(env: Env, toAgents: readonly string[]): Promise<Set<string>> {
+  const found = new Set<string>()
+  if (!webhookDoorbellEnabled(env) || toAgents.length === 0) return found
+  if (typeof env.CONNECTOR_MASTER_KEY !== 'string' || env.CONNECTOR_MASTER_KEY.length === 0) return found
+  const tenant = requireTenant(env)
+  if (!tenant) return found
+  const unique = [...new Set(toAgents)]
+  try {
+    for (let i = 0; i < unique.length; i += RECIPIENT_CHUNK) {
+      const chunk = unique.slice(i, i + RECIPIENT_CHUNK)
+      const marks = chunk.map((_, n) => `?${n + 2}`).join(', ')
+      const res = await env.DB.prepare(
+        `SELECT d.agent_id AS agent_id, a.slug AS slug
+           FROM agent_webhook_doorbells d
+           JOIN agents a ON a.id = d.agent_id
+          WHERE d.tenant = ?1 AND (d.agent_id IN (${marks}) OR a.slug IN (${marks}))`,
+      ).bind(tenant, ...chunk).all<{ agent_id: string; slug: string }>()
+      const hits = new Set<string>()
+      for (const row of res.results ?? []) { hits.add(row.agent_id); hits.add(row.slug) }
+      for (const id of chunk) if (hits.has(id)) found.add(id)
+    }
+  } catch {
+    // Fail open for the CALLER's send, but never lose wakes: on a lookup error treat every recipient as a candidate.
+    for (const id of unique) found.add(id)
+  }
+  return found
 }
 
 export type DoorbellDelivery = {
@@ -263,6 +350,16 @@ export type DoorbellDelivery = {
 
 function isoAgo(ms: number): string {
   return new Date(Date.now() - ms).toISOString()
+}
+
+async function pruneReceipts(env: Env, tenant: string, agentId: string): Promise<void> {
+  try {
+    await env.DB.prepare(
+      'DELETE FROM agent_webhook_doorbell_receipts WHERE tenant = ?1 AND agent_id = ?2 AND attempted_at < ?3',
+    ).bind(tenant, agentId, isoAgo(RECEIPT_RETENTION_MS)).run()
+  } catch {
+    // retention is best-effort
+  }
 }
 
 /** One delivery attempt: resolve, guard, coalesce, decrypt, POST (no redirects, short timeout), receipt. Never throws. */
@@ -280,33 +377,31 @@ async function deliverDoorbell(
   // agent_id). Resolve to ONE canonical agents.id FIRST: an exact id always wins, and a slug is used only when no
   // agent has that id and the slug names exactly one agent. Only then look the doorbell up by exact id, so an
   // agent whose slug is shaped like another agent's id can never receive that agent's wakes (gate r2 on #1890).
-  const resolved = await env.DB.prepare(
-    `SELECT COALESCE(
-       (SELECT a.id FROM agents a WHERE a.id = ?1),
-       (SELECT a.id FROM agents a WHERE a.slug = ?1
-         AND (SELECT count(*) FROM agents b WHERE b.slug = ?1) = 1)
-     ) AS id`,
-  ).bind(wake.agent_id).first<{ id: string | null }>()
-  if (!resolved?.id) return { outcome: 'no_doorbell' }
+  // ONE statement (the existence check for the whole send path): resolve to the canonical id, then join the row.
   const row = await env.DB.prepare(
     `SELECT d.agent_id AS agent_id, d.webhook_url AS webhook_url, d.auth_ciphertext AS auth_ciphertext
        FROM agent_webhook_doorbells d
-      WHERE d.tenant = ?1 AND d.agent_id = ?2`,
-  ).bind(tenant, resolved.id).first<{ agent_id: string; webhook_url: string; auth_ciphertext: string }>()
+      WHERE d.tenant = ?1
+        AND d.agent_id = COALESCE(
+          (SELECT a.id FROM agents a WHERE a.id = ?2),
+          (SELECT a.id FROM agents a WHERE a.slug = ?2
+            AND (SELECT count(*) FROM agents b WHERE b.slug = ?2) = 1))`,
+  ).bind(tenant, wake.agent_id).first<{ agent_id: string; webhook_url: string; auth_ciphertext: string }>()
   if (!row) return { outcome: 'no_doorbell' }
   // From here on the canonical id is the identity: receipts, AAD/salt and the payload all use it.
   const canonical: WebhookDoorbellWake = { ...wake, agent_id: row.agent_id }
+  const ref = wakeRef(canonical, opts.correlation)
 
   // Re-assert the guard at fire time: a row written before a rule tightened must not be trusted.
   const url = validateHttpsWebhookUrl(row.webhook_url)
   if (!url.ok) {
-    await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'invalid_url' })
+    await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'invalid_url' }, ref)
     return { outcome: 'skipped', reason: 'invalid_url' }
   }
 
   const master = requireMasterKey(env)
   if (!master) {
-    await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'crypto_unavailable' })
+    await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'crypto_unavailable' }, ref)
     return { outcome: 'skipped', reason: 'crypto_unavailable' }
   }
 
@@ -339,7 +434,6 @@ async function deliverDoorbell(
     // Claim with ONE atomic conditional INSERT: skip only a repeat of the same event ref, or a burst above the cap.
     // Not claiming at all (DB error) also skips: a doorbell that cannot count must not flood.
     claimId = crypto.randomUUID()
-    const ref = canonical.type === INBOX_WAKE_TYPE ? canonical.message_id : canonical.type === TASK_ASSIGNED_TYPE ? canonical.task_id : 'test'
     let claimed = false
     try {
       const res = await env.DB.prepare(
@@ -348,7 +442,7 @@ async function deliverDoorbell(
          SELECT ?1, ?2, ?3, ?4, ?5, 'claimed', NULL, NULL, ?6
           WHERE NOT EXISTS (
                   SELECT 1 FROM agent_webhook_doorbell_receipts
-                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type = ?4 AND ref_id = ?5
+                   WHERE tenant = ?2 AND agent_id = ?3 AND ref_id = ?5
                      AND outcome IN ('claimed', 'posted') AND attempted_at > ?8)
             AND (SELECT count(*) FROM agent_webhook_doorbell_receipts
                   WHERE tenant = ?2 AND agent_id = ?3 AND event_type <> ?7
@@ -359,29 +453,24 @@ async function deliverDoorbell(
       ).run()
       claimed = (res.meta?.changes ?? 0) === 1
     } catch {
-      await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'receipt_unavailable' })
+      await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'receipt_unavailable' }, ref)
       return { outcome: 'skipped', reason: 'receipt_unavailable' }
     }
     if (!claimed) {
-      await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'coalesced' })
+      await recordReceipt(env, tenant, canonical, 'skipped', { reason: 'coalesced' }, ref)
       return { outcome: 'skipped', reason: 'coalesced' }
     }
-    // Retention: prune this agent's old receipts when it rings (no cron slot needed; bounded by the agent index).
-    try {
-      await env.DB.prepare(
-        'DELETE FROM agent_webhook_doorbell_receipts WHERE tenant = ?1 AND agent_id = ?2 AND attempted_at < ?3',
-      ).bind(tenant, canonical.agent_id, isoAgo(RECEIPT_RETENTION_MS)).run()
-    } catch {
-      // retention is best-effort
-    }
   }
+  // Retention: prune this agent's old receipts when it rings (wake OR test ping; no cron slot needed; bounded by
+  // the agent index). Test pings are in the retention too: a ping-only agent used to grow without bound.
+  await pruneReceipts(env, tenant, canonical.agent_id)
 
   const finish = async (
     status: ReceiptStatus,
     detail: { http_status?: number; reason?: string },
   ): Promise<void> => {
     if (claimId === null) {
-      await recordReceipt(env, tenant, canonical, status, detail)
+      await recordReceipt(env, tenant, canonical, status, detail, ref)
       return
     }
     // Finalize the claimed row in place (same id), so the window row IS the attempt's receipt.
@@ -468,6 +557,8 @@ export async function scheduleWebhookDoorbell(
     if (!webhookDoorbellEnabled(env)) return
     // No master key -> cannot decrypt; skip the D1 lookup entirely.
     if (typeof env.CONNECTOR_MASTER_KEY !== 'string' || env.CONNECTOR_MASTER_KEY.length === 0) return
+    // A fan-out pre-resolved who has a doorbell (one IN-list query): everyone else costs zero statements here.
+    if (opts.recipients && !opts.recipients.has(wake.agent_id)) return
     const run = deliverDoorbell(env, wake, opts).then(() => undefined, () => undefined)
     if (opts.waitUntil) {
       opts.waitUntil(run)
@@ -485,15 +576,25 @@ export async function scheduleWebhookDoorbell(
   }
 }
 
-/** Task assigned to an agent: ring its doorbell (mupot#1882). Same fail-open, flag-gated path as the inbox wake. */
+/**
+ * Task assigned to an agent: ring its doorbell (mupot#1882). Same fail-open, flag-gated path as the inbox wake.
+ * `assignment` names THIS assignment occurrence (the task's updated_at stamp, a dispatch receipt id, ...): the
+ * dedupe ref is task_id + assignment, so an A->B->A reassignment or an explicit redispatch inside the window is
+ * a new event and rings, while the same occurrence reported by two doors still coalesces.
+ */
 export async function scheduleTaskAssignedDoorbell(
   env: Env,
   agentId: string | null | undefined,
   taskId: string,
-  opts: DoorbellFireOpts = {},
+  opts: DoorbellFireOpts & { assignment?: string } = {},
 ): Promise<void> {
   if (!agentId) return
-  await scheduleWebhookDoorbell(env, { type: TASK_ASSIGNED_TYPE, agent_id: agentId, task_id: taskId }, opts)
+  const { assignment, ...fire } = opts
+  await scheduleWebhookDoorbell(
+    env,
+    { type: TASK_ASSIGNED_TYPE, agent_id: agentId, task_id: taskId, ...(assignment ? { assignment } : {}) },
+    fire,
+  )
 }
 
 /** ctx.waitUntil from a Hono context; `c.executionCtx` throws outside a Worker request (tests), so guard it. */

@@ -505,8 +505,8 @@ const routineProposalSubmit: ToolSpec = {
     },
     required: ['version', 'run_id', 'project_id', 'situation_digest', 'summary', 'action'], additionalProperties: false,
   },
-  async run(auth, env, args) {
-    const result = await submitRoutineProposal(env, routinePrincipal(auth), args)
+  async run(auth, env, args, ctx) {
+    const result = await submitRoutineProposal(env, routinePrincipal(auth), args, { waitUntil: ctx.waitUntil })
     return result.ok ? done(result) : sourceFailure(result.error)
   },
 }

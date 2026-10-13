@@ -9,6 +9,7 @@
 import type { Env } from '../types'
 import { signControlRequest, signSquadControlRequest, ControlRequestError } from './control-request'
 import { sendAgentMessage } from '../agents/messages'
+import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { listSquadMemberIds } from './registry'
 
 export interface ControlPrincipal {
@@ -28,6 +29,7 @@ export async function emitControlRequest(
   env: Env,
   input: { agent_id: string; verb: string },
   principal: ControlPrincipal,
+  opts: { waitUntil?: DoorbellWaitUntil } = {},
 ): Promise<EmitResult> {
   // Fail-closed: without the signing key or a target consumer there is no safe action.
   if (!env.FLEET_PANEL_SK) return { ok: false, reason: 'unconfigured', detail: 'FLEET_PANEL_SK not set' }
@@ -55,7 +57,7 @@ export async function emitControlRequest(
   }, {
     system: true,
     reason: 'target is env.FLEET_CONSUMER_AGENT, a fixed operator-configured binding, never attacker input',
-  })
+  }, { waitUntil: opts.waitUntil })
   const seq = send.ok ? send.seq : null
 
   // Audit row (best-effort — the signed request is the source of truth; a logging failure must
@@ -104,6 +106,7 @@ export async function emitSquadControlRequest(
   env: Env,
   input: { squad_id: string; verb: string },
   principal: ControlPrincipal,
+  opts: { waitUntil?: DoorbellWaitUntil } = {},
 ): Promise<EmitSquadResult> {
   if (!env.FLEET_PANEL_SK) return { ok: false, reason: 'unconfigured', detail: 'FLEET_PANEL_SK not set' }
   if (!env.FLEET_CONSUMER_AGENT) return { ok: false, reason: 'unconfigured', detail: 'FLEET_CONSUMER_AGENT not set' }
@@ -135,7 +138,7 @@ export async function emitSquadControlRequest(
   }, {
     system: true,
     reason: 'target is env.FLEET_CONSUMER_AGENT, a fixed operator-configured binding, never attacker input',
-  })
+  }, { waitUntil: opts.waitUntil })
   const seq = send.ok ? send.seq : null
 
   // Audit row — same ledger as the single-agent path (fleet_control_log), distinguished by a

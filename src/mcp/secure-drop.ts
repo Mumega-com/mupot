@@ -55,7 +55,7 @@ const toolHostKeyRegister: ToolSpec = {
     required: ['public_key'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const who = await agentCaller(auth, env)
     if (!who.ok) return who.out
     const key = await parseHostPublicKey(args.public_key)
@@ -69,7 +69,7 @@ const toolHostKeyRegister: ToolSpec = {
     // A new or rotated key tells the agent's governors (the stolen-token re-key signal). An unchanged key says nothing.
     const notice = r.unchanged
       ? { governors: 0, delivered: 0 }
-      : await notifyGovernorsOfHostKey(env, { agent: who.agent, byMemberId: who.memberId, fingerprint: r.fingerprint, rotated: r.rotated, keyId: r.id })
+      : await notifyGovernorsOfHostKey(env, { agent: who.agent, byMemberId: who.memberId, fingerprint: r.fingerprint, rotated: r.rotated, keyId: r.id }, ctx.waitUntil)
     return done({
       ok: true,
       agent_id: who.agent.id,

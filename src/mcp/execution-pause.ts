@@ -22,7 +22,8 @@
 // (INSERT ... SELECT ... WHERE changes() = 1), so an idempotent repeat writes no second audit row.
 
 import type { AuthContext } from '../types'
-import { releaseExecutionHold } from '../agents/execution-brakes'
+import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
+import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { canReleaseExecutionHold } from '../agents/execution-release-policy'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
@@ -193,7 +194,7 @@ export const toolExecutionRelease: ToolSpec = {
     required: ['task_id', 'reason'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     if (auth.boundAgentId) return fail(403, 'operator_principal_required')
     if (!auth.memberId) return fail(403, 'forbidden', { need: 'member_identity' })
     const taskId = str(args.task_id)
@@ -202,12 +203,21 @@ export const toolExecutionRelease: ToolSpec = {
     if (!reason) return fail(400, 'invalid_args', 'reason required')
     if (reason.length > REASON_MAX) return fail(400, 'invalid_reason', `reason must be 1-${REASON_MAX} characters`)
 
-    const task = await env.DB.prepare(`SELECT id, squad_id FROM tasks WHERE id = ?1`).bind(taskId).first<{ id: string; squad_id: string }>()
+    const task = await env.DB.prepare(`SELECT id, squad_id, assignee_agent_id FROM tasks WHERE id = ?1`)
+      .bind(taskId).first<{ id: string; squad_id: string; assignee_agent_id: string | null }>()
     if (!task) return fail(404, 'not_found')
     if (!(await canReleaseExecutionHold(env, auth, task.squad_id))) return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
 
-    const outcome = await releaseExecutionHold(env, { taskId: task.id, memberId: auth.memberId, reason, via: 'execution_release' })
-    return done({ status: outcome, task_id: task.id })
+    const released = await releaseExecutionHoldDetailed(env, { taskId: task.id, memberId: auth.memberId, reason, via: 'execution_release' })
+    // Doorbell (#1892): lifting a hold or clearing a stuck counter tells the assignee it may run again. The release
+    // epoch stamp is the occurrence, so a second release later is a new event.
+    if (released.liftedAnything) {
+      await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, {
+        waitUntil: ctx.waitUntil,
+        assignment: `release:${crypto.randomUUID()}`,
+      })
+    }
+    return done({ status: released.outcome, task_id: task.id })
   },
 }
 

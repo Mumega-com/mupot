@@ -165,10 +165,29 @@ export type ReleaseOutcome = 'released' | 'not_held'
  * binding) - this function does not take an agent. One batch, anchored on the released row's
  * release_id: the audit entry and the counter reset only land if THIS call released the hold.
  */
+export type ReleaseDetail = {
+  outcome: ReleaseOutcome
+  /** An at/over-ceiling refusal counter was cleared (a counter-only release reports `not_held` as its outcome). */
+  clearedCounter: boolean
+  /** The release actually changed something an agent could act on: a hold lifted OR a stuck counter cleared. */
+  liftedAnything: boolean
+}
+
 export async function releaseExecutionHold(
   env: Env,
   input: { taskId: string; memberId: string; reason: string; via: 'execution_release' | 'human_reassign' },
 ): Promise<ReleaseOutcome> {
+  return (await releaseExecutionHoldDetailed(env, input)).outcome
+}
+
+/**
+ * releaseExecutionHold plus what else the batch did. A counter-only release (no hold row, refused_count at/over the
+ * ceiling) answers `not_held` yet un-sticks the task, so the doorbell callers need `liftedAnything`, not the outcome.
+ */
+export async function releaseExecutionHoldDetailed(
+  env: Env,
+  input: { taskId: string; memberId: string; reason: string; via: 'execution_release' | 'human_reassign' },
+): Promise<ReleaseDetail> {
   const now = new Date().toISOString()
   const releaseId = crypto.randomUUID()
   const results = await env.DB.batch([
@@ -232,5 +251,8 @@ export async function releaseExecutionHold(
        ON CONFLICT (task_id) DO UPDATE SET last_at = excluded.last_at`,
     ).bind(input.taskId, now),
   ])
-  return (results[0]?.meta as { changes?: number } | undefined)?.changes === 1 ? 'released' : 'not_held'
+  // results[4] is the at/over-ceiling counter DELETE (index of the batch statement above the release epoch upsert).
+  const clearedCounter = ((results[4]?.meta as { changes?: number } | undefined)?.changes ?? 0) > 0
+  const outcome: ReleaseOutcome = (results[0]?.meta as { changes?: number } | undefined)?.changes === 1 ? 'released' : 'not_held'
+  return { outcome, clearedCounter, liftedAnything: outcome === 'released' || clearedCounter }
 }

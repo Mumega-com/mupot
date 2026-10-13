@@ -3,6 +3,7 @@ import { createBus } from '../bus'
 import { getFleetAgentLiveness } from '../fleet/registry'
 import { sendAgentMessage } from './messages'
 import { isExecutionPaused } from './execution-brakes'
+import type { DoorbellWaitUntil } from './webhook-doorbell'
 
 const WAKE_ROUTER_SENDER = 'mupot-wake-router'
 const DO_ORIGIN = 'https://agent'
@@ -13,6 +14,8 @@ export interface WakeRouteInput {
   reason: string
   context?: string
   maxActions?: number
+  /** ctx.waitUntil of the hosting request: the doorbell POST of the fallback inbox send outlives the response. */
+  waitUntil?: DoorbellWaitUntil
 }
 
 export type WakeRouteResult =
@@ -55,7 +58,7 @@ async function deliverWakeEnvelope(
     }, {
       system: true,
       reason: 'wake target is resolved server-side from the canonical agent and fleet registry',
-    })
+    }, { waitUntil: input.waitUntil })
   } catch {
     return { ok: false, reason: 'wake_failed' }
   }

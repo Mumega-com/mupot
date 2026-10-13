@@ -12,6 +12,7 @@
 import type { AuthContext, Env } from '../types'
 import { createBus } from '../bus'
 import { sendAgentMessage } from '../agents/messages'
+import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { resolveAgentRef } from '../org/resolve'
 import { listFleetAgentRuntimeView, type FleetAgentRuntimeView } from '../fleet/registry'
 import { resolveAccessibleSquadIds } from '../projects/readable-squads'
@@ -225,7 +226,12 @@ export interface FleetActor {
 }
 
 /** Direct wake: durable inbox ping + agent.wake Queue event (no SOS bus). */
-export async function wakeFleetAgent(env: Env, agent: string, by: FleetActor): Promise<boolean> {
+export async function wakeFleetAgent(
+  env: Env,
+  agent: string,
+  by: FleetActor,
+  waitUntil?: DoorbellWaitUntil,
+): Promise<boolean> {
   const from = resolveFleetSender(env)
   if (!from) return false
 
@@ -248,6 +254,7 @@ export async function wakeFleetAgent(env: Env, agent: string, by: FleetActor): P
       system: true,
       reason: 'target resolved server-side via resolveAgentRef for an org-admin dashboard action',
     },
+    { waitUntil },
   )
   if (!send.ok) return false
 
@@ -278,6 +285,7 @@ export async function requestFleetControl(
   agent: string,
   action: string,
   by: FleetActor,
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<{ ok: boolean; request_id?: string; error?: string }> {
   if (!CONTROL_ACTIONS.has(action)) return { ok: false, error: 'unknown_action' }
   const from = resolveFleetSender(env)
@@ -303,6 +311,7 @@ export async function requestFleetControl(
       system: true,
       reason: 'ops target is env.FLEET_OPS_AGENT resolved server-side, never attacker-controlled id alone',
     },
+    { waitUntil },
   )
   return send.ok ? { ok: true, request_id: requestId } : { ok: false, error: send.reason }
 }

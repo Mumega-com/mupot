@@ -22,6 +22,7 @@
 // another pot. The wake action is performed by the browser POSTing to the
 // RBAC-gated /api/agents/:id/wake endpoint owned by the agents component.
 
+import { waitUntilFromContext } from '../agents/webhook-doorbell'
 import { Hono, type Context } from 'hono'
 import { csrf } from 'hono/csrf'
 import { html, raw } from 'hono/html'
@@ -1707,8 +1708,8 @@ dashboardApp.post('/fleet/host-control', async (c) => {
   }
   const principal = { memberId: auth.memberId ?? auth.userId, boundAgentId: auth.boundAgentId ?? null }
   const res = squad_id
-    ? await emitSquadControlRequest(c.env, { squad_id, verb }, principal)
-    : await emitControlRequest(c.env, { agent_id, verb }, principal)
+    ? await emitSquadControlRequest(c.env, { squad_id, verb }, principal, { waitUntil: waitUntilFromContext(c) })
+    : await emitControlRequest(c.env, { agent_id, verb }, principal, { waitUntil: waitUntilFromContext(c) })
   return c.redirect(`/fleet?hc=${encodeURIComponent(res.ok ? 'ok' : res.reason)}`)
 })
 
@@ -1731,7 +1732,7 @@ dashboardApp.post('/fleet/wake', async (c) => {
     memberId,
     boundAgentId: auth.boundAgentId ?? null,
     label: auth.email ?? 'admin',
-  })
+  }, waitUntilFromContext(c))
   return c.json(ok ? { ok: true } : { error: 'send_failed' }, ok ? 200 : 502)
 })
 
@@ -1756,7 +1757,7 @@ dashboardApp.post('/fleet/control', async (c) => {
     memberId,
     boundAgentId: auth.boundAgentId ?? null,
     label: auth.email ?? 'admin',
-  })
+  }, waitUntilFromContext(c))
   return c.json(r, r.ok ? 200 : 400)
 })
 

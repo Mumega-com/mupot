@@ -1,6 +1,7 @@
 import { ROUTINE_ACTOR, routineMessageDeliveredExistsSql, runningActionExistsSql } from './running-action'
 import type { D1Result } from '@cloudflare/workers-types'
 import { sendAgentMessage } from '../agents/messages'
+import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { TASK_SELECT_COLUMNS } from '../tasks/ranking'
 import { canonicalJson, canonicalJsonDigest, sha256Hex } from '../lib/canonical-json'
 import { loadProjectSituation } from '../projects/situation'
@@ -423,6 +424,7 @@ export async function notifyHumanWait(
   run: RunContext,
   action: ActionRow,
   reason: 'review' | 'answer',
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<NotifyHumanWaitOutcome> {
   if (!run.assigned_agent_id) return { delivered: false, reason: 'no_recipient' }
   const decision: HumanWaitDecision | null = reason === 'review'
@@ -468,6 +470,7 @@ export async function notifyHumanWait(
       }, {
         systemProjectAttribution: true,
         requireActiveRecipientProjectAccess: true,
+        waitUntil,
       })
       return delivery.ok ? { delivered: true } : { delivered: false, reason: 'delivery_refused' }
     } catch {
@@ -490,6 +493,7 @@ export async function notifyHumanWait(
     }, {
       systemProjectAttribution: true,
       requireActiveRecipientProjectAccess: true,
+      waitUntil,
     })
     return delivery.ok ? { delivered: true } : { delivered: false, reason: 'delivery_refused' }
   } catch {
@@ -893,6 +897,7 @@ async function waitForHuman(
   run: RunContext,
   action: ActionRow,
   reason: 'review' | 'answer',
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<RoutineActionResult> {
   const now = new Date().toISOString()
   const waitReceipt = crypto.randomUUID()
@@ -963,7 +968,7 @@ async function waitForHuman(
   if (outcomes.some(outcome => !wrote(outcome))) {
     const raced = await loadAction(env, run.id, action.action_key)
     if (raced?.status === 'waiting') {
-      const outcome = await notifyHumanWait(env, run, raced, reason)
+      const outcome = await notifyHumanWait(env, run, raced, reason, waitUntil)
       return {
         ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
         duplicate: true, ...notificationFields(outcome),
@@ -971,7 +976,7 @@ async function waitForHuman(
     }
     return { ok: false, error: 'receipt_failed' }
   }
-  const outcome = await notifyHumanWait(env, run, action, reason)
+  const outcome = await notifyHumanWait(env, run, action, reason, waitUntil)
   return {
     ok: true, status: 'waiting', reason, run_id: run.id, action_key: action.action_key,
     duplicate: false, ...notificationFields(outcome),
@@ -1040,12 +1045,13 @@ async function replayWaitingAction(
   env: Env,
   run: RunContext,
   action: ActionRow,
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<RoutineActionResult> {
   if (run.waiting_reason === 'review' && await approvedGate(env, action)) {
     return executeRoutineAction(env, run.id, action.action_key)
   }
   const reason = run.waiting_reason === 'answer' ? 'answer' : 'review'
-  const outcome = await notifyHumanWait(env, run, action, reason)
+  const outcome = await notifyHumanWait(env, run, action, reason, waitUntil)
   return {
     ok: true,
     status: 'waiting',
@@ -2123,6 +2129,7 @@ export async function submitRoutineProposal(
   env: Env,
   principal: RoutinePrincipal,
   rawProposal: unknown,
+  opts: { waitUntil?: DoorbellWaitUntil } = {},
 ): Promise<RoutineProposalResult> {
   const parsed = parseRoutineProposal(rawProposal)
   if (!parsed.ok) return { ok: false, error: 'invalid_proposal' }
@@ -2166,7 +2173,7 @@ export async function submitRoutineProposal(
       return replayResult
     }
     if (replay.status === 'waiting') {
-      return replayWaitingAction(env, run, replay)
+      return replayWaitingAction(env, run, replay, opts.waitUntil)
     }
     if (replay.status === 'running') return executeRoutineAction(env, run.id, replay.action_key)
   }
@@ -2184,7 +2191,7 @@ export async function submitRoutineProposal(
   const reservedResult = storedActionResult(run, action, true)
   if (reservedResult) return reservedResult
   if (action.status === 'waiting') {
-    return replayWaitingAction(env, run, action)
+    return replayWaitingAction(env, run, action, opts.waitUntil)
   }
   if (proposal.action.kind === 'no_action') {
     const result = await executeRoutineAction(env, run.id, proposal.action.key)
@@ -2206,11 +2213,11 @@ export async function submitRoutineProposal(
     || proposal.action.kind === 'request_review'
     || proposal.action.kind === 'project_access'
   ) {
-    const result = await waitForHuman(env, run, action, 'review')
+    const result = await waitForHuman(env, run, action, 'review', opts.waitUntil)
     return result.ok ? { ...result, duplicate } : result
   }
   if (proposal.action.kind === 'ask_human') {
-    const result = await waitForHuman(env, run, action, 'answer')
+    const result = await waitForHuman(env, run, action, 'answer', opts.waitUntil)
     return result.ok ? { ...result, duplicate } : result
   }
   const result = await executeRoutineAction(env, run.id, proposal.action.key)

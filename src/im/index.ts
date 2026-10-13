@@ -53,6 +53,7 @@ import {
 } from '../brain/directive'
 import { timingSafeEqual } from '../lib/crypto'
 import { routeAgentWake } from '../agents/wake-routing'
+import { waitUntilFromContext, type DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { canonicalJsonDigest } from '../lib/canonical-json'
 import { redeemTelegramProjectInvite } from '../members/project-invites'
 import { provisionHomeForMember } from '../members/service'
@@ -298,6 +299,8 @@ const IM_TASK_DONE_WHEN =
   'A task result or linked artifact provides evidence that the requested IM task is complete.'
 
 export interface HandleImMessageOptions {
+  /** ctx.waitUntil of the hosting request (webhook only): a doorbell POST outlives the reply instead of being awaited. */
+  waitUntil?: DoorbellWaitUntil
   /** True only when the transport can prove Telegram forwarded-message metadata. */
   forwarded?: boolean
   /** Set only by the authenticated webhook after reserving the envelope. */
@@ -404,7 +407,7 @@ export async function handleImMessage(
       return statusReply(env, member, intent.ref)
 
     case 'wake':
-      return wakeReply(env, member, grants, intent.ref)
+      return wakeReply(env, member, grants, intent.ref, options.waitUntil)
 
     case 'fleet':
       return fleetReply(env, member, grants, intent.verb, intent.ref, options)
@@ -518,6 +521,7 @@ async function wakeReply(
   member: Member,
   grants: CapabilityGrant[],
   ref: string,
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<string> {
   const agent = await resolveAgent(env, ref)
   if (agent === 'ambiguous') return `More than one agent matches "${ref}". Be more specific.`
@@ -532,6 +536,7 @@ async function wakeReply(
     agent,
     byMemberId: member.id,
     reason: 'im.wake',
+    waitUntil,
   })
   if (!routed.ok && routed.reason === 'paused') return `${agent.name} is under an execution pause; wake refused.`
   if (!routed.ok) return `Tried to wake ${agent.name} but it didn't run. Try again shortly.`
@@ -596,6 +601,7 @@ async function fleetReply(
     env,
     { agent_id: agent.agent_id, verb },
     { memberId: member.id, boundAgentId: null },
+    { waitUntil: options.waitUntil },
   )
   if (!res.ok) {
     if (res.reason === 'unconfigured') return 'Fleet control is not configured here yet.'
@@ -1337,6 +1343,7 @@ imApp.post('/webhook', async (c) => {
     forwarded: Object.values(forwarding).some(Boolean),
     telegram: identity,
     displayName: telegramDisplayName(update.message?.from),
+    waitUntil: waitUntilFromContext(c),
   })
   // Resolved AFTER handleImMessage so a `/start <code>` that just redeemed an
   // invite in THIS call reports its own new bound state, not a pre-handling

@@ -19,7 +19,7 @@ import { canOnSquadAuth } from '../auth/capability'
 import { checkWebSession } from '../secure-moments/enrol-mint'
 import {
   clearAgentWebhookDoorbell,
-  getAgentWebhookDoorbell,
+  listAgentWebhookDoorbells,
   sendDoorbellTestPing,
   setAgentWebhookDoorbell,
   webhookDoorbellEnabled,
@@ -128,12 +128,27 @@ function doorbellScript(): Html {
 
 async function pageBody(env: Env, auth: AuthContext, savedAgentId: string | null): Promise<Html> {
   const enabled = webhookDoorbellEnabled(env)
-  const visible = await loadAllAgents(env, auth)
+  // ONE query for every doorbell row of the pot (never one lookup per agent).
+  const bells = await listAgentWebhookDoorbells(env)
+  // Flag off: nothing can be registered, so the per-agent authz loop is pointless. It runs only when a row is left
+  // behind to be removed, and then only over THOSE agents (typically none: zero statements beyond the one above).
+  const visible = enabled || bells.size > 0 ? await loadAllAgents(env, auth) : []
+  // Squad admin authz once per SQUAD, not once per agent.
+  const squadAdmin = new Map<string, Promise<boolean>>()
+  const canAdminCached = (squadId: string): Promise<boolean> => {
+    let hit = squadAdmin.get(squadId)
+    if (!hit) {
+      hit = canAdminSquad(env, auth, squadId)
+      squadAdmin.set(squadId, hit)
+    }
+    return hit
+  }
   const manageable: typeof visible = []
-  for (const a of visible) if (await canAdminSquad(env, auth, a.squad_id)) manageable.push(a)
+  for (const a of enabled ? visible : visible.filter((v) => bells.has(v.id))) {
+    if (await canAdminCached(a.squad_id)) manageable.push(a)
+  }
 
-  const rows = []
-  for (const a of manageable) rows.push({ agent: a, bell: await getAgentWebhookDoorbell(env, a.id) })
+  const rows = manageable.map((a) => ({ agent: a, bell: bells.get(a.id) ?? null }))
 
   const form = !enabled
     ? emptyState({

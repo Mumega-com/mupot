@@ -205,7 +205,7 @@ import { toolTeamBootstrap, toolTeamBootstrapRelease } from './team-bootstrap'
 import { ARCHIVE_TOOLS } from './archive'
 import { INCIDENT_REVERT_TOOLS } from './incident-revert'
 import { EXECUTION_PAUSE_TOOLS } from './execution-pause'
-import { releaseExecutionHold } from '../agents/execution-brakes'
+import { releaseExecutionHoldDetailed } from '../agents/execution-brakes'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { dispatchBrakesClearSql, diagnoseDispatchBrake } from '../agents/execution-brake-sql'
 import { TASK_NOT_ARCHIVED_SQL, isTaskArchived, isSquadArchived } from '../hygiene/filters'
@@ -217,7 +217,11 @@ import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
-import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
+import {
+  dispatchDoorbellCorrelation,
+  resolveDoorbellRecipients,
+  scheduleTaskAssignedDoorbell,
+} from '../agents/webhook-doorbell'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
 import { SECURE_DROP_TOOLS } from './secure-drop'
@@ -1263,7 +1267,7 @@ const toolTaskCreate: ToolSpec = {
 
     // Doorbell (mupot#1882): an assigned agent with a doorbell is rung; a backlog-only create (dispatch:false) never wakes.
     if (args.dispatch !== false) {
-      await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
+      await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil, assignment: task.updated_at })
     }
     return done({ task })
   },
@@ -2102,8 +2106,9 @@ const toolTaskUpdate: ToolSpec = {
     // stamps the release epoch (a no-op for the hold itself unless held).
     let liftsHold = false
     if (assigningAgent && await canReleaseExecutionHold(env, auth, existing.squad_id)) {
-      liftsHold = (await releaseExecutionHold(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
-        reason: 'human reassign via task_update', via: 'human_reassign' })) === 'released'
+      // liftedAnything, not outcome === 'released': a counter-only release answers not_held yet un-sticks the task.
+      liftsHold = (await releaseExecutionHoldDetailed(env, { taskId: existing.id, memberId: releaseActorMemberId(auth) as string, // canReleaseExecutionHold above guarantees non-null
+        reason: 'human reassign via task_update', via: 'human_reassign' })).liftedAnything
     }
     next.github_issue_url = await mirrorTaskUpdate(env, next, {
       statusChanged: existing.status !== next.status,
@@ -2113,7 +2118,7 @@ const toolTaskUpdate: ToolSpec = {
     await emitTaskEvent(env, 'task.updated', next, actor)
     // Doorbell (mupot#1882): ring the assignee when it changed, or when a same-agent reassignment lifted an execution hold.
     if (assigningAgent && (next.assignee_agent_id !== existing.assignee_agent_id || liftsHold)) {
-      await scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil })
+      await scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil, assignment: next.updated_at })
     }
     let gateWake: GateWakeOutcome | undefined
 
@@ -2914,7 +2919,13 @@ const toolTaskDispatch: ToolSpec = {
 
     // Doorbell (mupot#1882): a (re-)dispatch tells the assignee to start. The bus path may ALSO ring it through the
     // inbox bridge (inbox.wake); the per-agent coalescing window turns the pair into one POST.
-    await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
+    // `correlation` is shared with the inbox.wake of this dispatch's bridge letter (deliverDispatchToInbox), so an
+    // inbox-backed receiver is rung once. `assignment` is the receipt: every explicit redispatch is a new event.
+    await scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, {
+      waitUntil: ctx.waitUntil,
+      assignment: receiptId,
+      correlation: dispatchDoorbellCorrelation(receiptId),
+    })
 
     // NOTE (mupot#76e25fc2 / FLIGHT-07B, reverted after gate BLOCK): this handler
     // previously added a second, ad-hoc sendAgentMessage write here, believing
@@ -4486,7 +4497,7 @@ const toolWakeAgent: ToolSpec = {
     required: ['agent_id'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const agentId = str(args.agent_id)
     if (!agentId) return fail(400, 'invalid_args', 'agent_id required')
 
@@ -4522,6 +4533,7 @@ const toolWakeAgent: ToolSpec = {
       reason,
       context,
       maxActions,
+      waitUntil: ctx.waitUntil,
     })
     if (!routed.ok) return routed.reason === 'paused' ? fail(409, 'execution_paused') : fail(409, 'wake_failed')
     if (routed.route === 'agent_do') return done({ agent_id: agent.id, runtime: routed.runtime })
@@ -4815,6 +4827,9 @@ const toolBroadcast: ToolSpec = {
 
     const deliveries: Array<{ to: string; slug: string; id: string; seq: number; duplicate: boolean; request_id: string | null }> = []
     const failures: Array<{ to: string; slug: string; error: string; detail?: string }> = []
+    // Doorbell fan-out budget: who has a doorbell is answered ONCE here (one IN-list query; zero when the flag is
+    // off), so only those recipients run the claim/POST path. Everyone else costs no doorbell statement at all.
+    const doorbellRecipients = await resolveDoorbellRecipients(env, targets.map((t) => t.id))
     for (const target of targets) {
       const recipientRequestId = requestId ? await broadcastRecipientRequestId(requestId, target.id) : undefined
       const res = await sendAgentMessage(env, {
@@ -4827,7 +4842,7 @@ const toolBroadcast: ToolSpec = {
       }, {
         system: true,
         reason: 'target is drawn from resolveScopedSquad(...), an already squad-scoped set (>=member) — never resolveAgentRef on attacker input',
-      }, { waitUntil: ctx.waitUntil })
+      }, { waitUntil: ctx.waitUntil, doorbellRecipients })
       if (res.ok) {
         deliveries.push({
           to: target.id,

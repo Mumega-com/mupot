@@ -22,7 +22,7 @@ const toolVerifyAgentConnection: ToolSpec = {
     required: ['receipt_id', 'challenge'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const receiptId = str(args.receipt_id)
     const challenge = str(args.challenge)
     if (!receiptId || !challenge) return fail(400, 'invalid_verification_input')
@@ -48,6 +48,9 @@ const toolVerifyAgentConnection: ToolSpec = {
         agentId: auth.boundAgentId,
       },
       { receiptId, challenge },
+      new Date(),
+      {},
+      { waitUntil: ctx.waitUntil },
     )
     if (outcome.status === 'messaging_verified') return done(outcome)
 

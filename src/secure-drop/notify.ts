@@ -9,6 +9,7 @@
 // delivery failure must not undo it (the result reports how many governors were reached, including zero).
 import type { Env } from '../types'
 import { sendAgentMessage } from '../agents/messages'
+import type { DoorbellWaitUntil } from '../agents/webhook-doorbell'
 import { createBus } from '../bus'
 import { groupFingerprint } from './keys'
 import type { AgentRow } from './authority'
@@ -46,6 +47,7 @@ async function governorInboxes(env: Env, agent: AgentRow): Promise<{ members: st
 export async function notifyGovernorsOfHostKey(
   env: Env,
   input: { agent: AgentRow; byMemberId: string | null; fingerprint: string; rotated: boolean; keyId: string },
+  waitUntil?: DoorbellWaitUntil,
 ): Promise<GovernorNotice> {
   const fp = groupFingerprint(input.fingerprint)
   const what = input.rotated ? 'ROTATED' : 'registered'
@@ -82,7 +84,7 @@ export async function notifyGovernorsOfHostKey(
         kind: 'message',
         body,
         requestId: `host-key:${input.keyId}:${toAgent}`.slice(0, 128),
-      }, { system: true, reason: 'secure-drop host key change notice to the inbox of an agent owned by a governor of the re-keyed agent' })
+      }, { system: true, reason: 'secure-drop host key change notice to the inbox of an agent owned by a governor of the re-keyed agent' }, { waitUntil })
       if (sent.ok) delivered += 1
     }
   } catch {
