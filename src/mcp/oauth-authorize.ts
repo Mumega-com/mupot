@@ -23,6 +23,7 @@
 // the block above buildAuthContextFromProps and above handleOAuthAuthorize's
 // /oauth/consent branch for the full design).
 
+import { SELECT_SEARCH_SCRIPT } from '../dashboard/select-search'
 import type { Env, AuthContext, Capability, CapabilityGrant, CapabilityScopeType, ConnectionChannel } from '../types'
 import { resolveCapabilities, canOnSquad, hasCapabilityOnDynamicScope, capabilityRank, loadSquadScope } from '../auth/capability'
 import { bootstrapSelf, type BootstrapSelfFailure } from '../members/bootstrap-self'
@@ -1038,6 +1039,7 @@ ${mintPanel}
   })
 })()
 </script>
+<script>${SELECT_SEARCH_SCRIPT}</script>
 </body>
 </html>`
 

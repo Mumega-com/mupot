@@ -32,6 +32,7 @@
 // org_settings and instruct the owner to run `wrangler secret put …` for the
 // actual credential. No token ever rides the request body into storage.
 
+import { SELECT_SEARCH_SCRIPT } from './select-search'
 import { Hono } from 'hono'
 import { html, raw } from 'hono/html'
 import type { HtmlEscapedString } from 'hono/utils/html'
@@ -639,6 +640,7 @@ function wizardShell(brand: string, title: string, body: HtmlEscapedString | Pro
         }
       })();
     </script>
+    <script>${raw(SELECT_SEARCH_SCRIPT)}</script>
   </body>
 </html>`
 }

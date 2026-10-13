@@ -170,7 +170,7 @@ function operatorsScript(): Html {
 
 async function createFormBody(env: Env, auth: AuthContext): Promise<Html> {
   const [agents, scopes] = await Promise.all([loadAllAgents(env, auth), loadDelegableScopes(env, auth)])
-  const active = agents.filter((a) => a.status === 'active')
+  const active = agents.filter((a) => a.status === 'active').sort((x, y) => x.name.localeCompare(y.name))
   if (scopes.length === 0) {
     return emptyState({
       title: 'No scope you can delegate over',
@@ -184,7 +184,7 @@ async function createFormBody(env: Env, auth: AuthContext): Promise<Html> {
     <p class="ui-sub">Let one agent organise structure (squads, projects, memberships) inside one scope, never above the level you choose. It takes effect on the agent's next request and you can revoke it at any time.</p>
     <label class="ui-sub" for="op-agent" style="display:block;margin-top:8px;">Agent</label>
     <select id="op-agent">
-      ${active.map((a) => html`<option value="${a.id}">${a.name} (${a.squad_name})</option>`)}
+      ${active.map((a) => html`<option value="${a.id}">${a.name} · ${a.slug} · ${a.squad_name} · ${a.id.slice(0, 8)}</option>`)}
     </select>
     <label class="ui-sub" for="op-scope" style="display:block;margin-top:8px;">Scope</label>
     <select id="op-scope">

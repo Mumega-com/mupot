@@ -181,6 +181,7 @@ import {
   statusDot as uiStatusDot,
 } from './ui'
 import type { Html } from './ui'
+import { SELECT_SEARCH_SCRIPT } from './select-search'
 import type { ApprovalItem, PublishableItem, ApprovalsQueue } from './approvals'
 import { loadObservatory, agentGradient } from './observatory'
 import { kanbanApp, loadKanbanData, kanbanBoardBody } from './kanban-routes'
@@ -4909,6 +4910,7 @@ export function shell(
       })();
     </script>
     ${copilotShellEmbed()}
+    <script>${raw(SELECT_SEARCH_SCRIPT)}</script>
   </body>
 </html>`
 }
