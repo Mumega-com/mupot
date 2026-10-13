@@ -58,6 +58,11 @@ POT_SELF_SERVE_CHECKOUT_ENABLED = "false"  # mupot#1518: anonymous pot checkout 
                                   # workers/inkwell-api's own request-code sender — one Resend key
                                   # can serve both workers. Secret RESEND_API_KEY is set via
                                   # `wrangler secret put RESEND_API_KEY` — see below, NOT here.
+# HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS = ""  # non-secret, comma-separated member_tokens.id values allowed to carry
+                                  # task_verdict `human_origin` (a harness-attested human decision, e.g. the
+                                  # Telegram gateway agent). Empty/unset = EVERY human_origin is refused. A
+                                  # workspace token is NOT proof of a harness: list only agents whose
+                                  # runtime stamps the origin itself, never a coding/chat session (#1889).
 # secrets (NOT here): OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, GITHUB_TOKEN, AI_GATEWAY_TOKEN.
 # BUS_URL / BUS_TOKEN are SOS compat-shim leftovers — do NOT put them here; active fleet
 # routes never call the Redis bus (docs/architecture/sos-coordination-compat.md).

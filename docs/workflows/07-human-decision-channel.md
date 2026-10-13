@@ -27,7 +27,7 @@ relaying a message the human sent it over Telegram.
    (full, or an 8+ hex-char prefix) or the stamp is refused (`task_not_named`).
 2. `resolveHarnessAttestedOrigin` (`src/im/origin-verdict.ts:667`), called from
    the `task_verdict` `run()` in `src/mcp/index.ts`, only when `auth.boundAgentId` is set (non-agent-bound callers
-   supplying `human_origin` get a hard `400 human_origin_not_applicable`).
+   supplying `human_origin` get a hard `400 human_origin_not_applicable`; since mupot#1889 also for any token not on the operator's `HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS` allowlist, a non-workspace channel, and OAuth connector, seat or harness-credential sessions).
 3. `dryRunAuthorize` — **read-only**, checks every conjunct in order (agent owned by a
    member; owner active; origin is well-formed, private-chat-shaped
    (`user_id === chat_id`), and fresh — within 10 minutes past / 60 seconds future of the

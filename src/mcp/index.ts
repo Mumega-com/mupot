@@ -37,6 +37,7 @@ import type {
 import { resolveCapabilities, hasCapability, hasWorkspaceAdmin, holdsCapabilityFloor, capabilityRank, canOnSquad, canOnSquadAuth, loadSquadScope, brandSquadScope, type SquadScopeLike } from '../auth/capability'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc, touchTokenLastUsed } from '../auth/token-lifecycle'
 import { evaluateVerdictGates, canViewTaskReceipts } from '../tasks/index'
+import { isHumanOriginAttestorToken } from '../im/origin-attestors'
 import { resolveHarnessAttestedOrigin, type HumanOriginResolution } from '../im/origin-verdict'
 import {
   persistGateWakeNotice,
@@ -2433,8 +2434,10 @@ const toolTaskVerdict: ToolSpec = {
     ' human_origin verdict per resolved MEMBER per 30 seconds (origin_rate_limited otherwise; keyed on the' +
     ' member, not the calling agent — owning several agents does not raise this budget). Any conjunct' +
     ' false falls back to the calling agent\'s own authority, unchanged from omitting human_origin — see the' +
-    ' human_origin field on the response. A non-agent-bound caller supplying human_origin gets' +
-    ' 400 human_origin_not_applicable; a replayed origin message gets 409 origin_replayed (the whole call' +
+    ' human_origin field on the response. A caller that is not an allowlisted harness credential (not' +
+    ' agent-bound; a token not on the operator\'s HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS; a non-workspace channel;' +
+    ' an OAuth connector, seat or harness-credential session) gets 400 human_origin_not_applicable; a' +
+    ' replayed origin message gets 409 origin_replayed (the whole call' +
     ' refused in both cases, no fallback). For an agent-bound caller, the outcome is ALWAYS visible in the' +
     ' response: human_origin: {applied:false, reason:"<conjunct>"} when one was supplied and refused,' +
     ' human_origin: {applied:false, reason:"absent"} when none was supplied at all — never silently omitted' +
@@ -2497,7 +2500,25 @@ const toolTaskVerdict: ToolSpec = {
     // it directly rather than calling writeVerdict a second time.
     let originFailure: HumanOriginResolution | null = null
     if (args.human_origin !== undefined) {
-      if (!auth.boundAgentId) {
+      // mupot#1889: human_origin is the HARNESS'S attestation, so only a real harness
+      // runtime may carry it. A workspace token (what mint_agent_token issues) has the same
+      // shape for the KayHermes gateway and for any prompt-injectable Claude Code / Cursor /
+      // Custom GPT session, and one agent may hold several tokens, so neither shape nor agent can
+      // decide: the exact live token (auth.tokenId, re-read from member_tokens) must be on the
+      // operator's HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS allowlist (empty = refuse all), AND be agent-bound
+      // non-directory. Also refused for every
+      // session where the "agent" is a chat model reading untrusted content or the
+      // origin cannot be harness-stamped: OAuth connector sessions (directory channel,
+      // consentedByMemberId set), seat sessions (seatBinding) and harness-credential
+      // sessions. Hard refusal, never a fallback, same as the unbound case.
+      if (
+        !auth.boundAgentId ||
+        !isHumanOriginAttestorToken(env, auth.tokenId) ||
+        auth.channel !== 'workspace' || // allowlist: unknown/missing channel fails closed; mint_agent_token issues 'workspace' (members/service.ts)
+        auth.consentedByMemberId ||
+        auth.seatBinding ||
+        auth.harnessCredential
+      ) {
         return fail(400, 'human_origin_not_applicable')
       }
       try {
