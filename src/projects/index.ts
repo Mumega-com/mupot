@@ -3,6 +3,7 @@ import { csrf } from 'hono/csrf'
 import type { AuthContext, CapabilityGrant, Env, Project, ProjectStatus } from '../types'
 import { requireAuth } from '../auth'
 import { isOrgAdmin, resolveCapabilities, sessionMemberId } from '../auth/capability'
+import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { canonicalFlightMetaSql } from '../flight/meta-sql'
 import { listProjectActivity, listProjectEvidence, type ProjectProjectionCursor } from './projections'
 import {
@@ -541,8 +542,24 @@ projectsApp.get('/:id/squads', async (c) => {
 })
 
 projectsApp.put('/:id/squads/:squadId', async (c) => {
+  // The ONE structural chokepoint — the HTTP twin of MCP project_squad_set (same act, same rule).
+  const gate = await authorizeStructuralWrite(
+    c.env,
+    c.get('auth'),
+    'project_squad_set',
+    async () => {
+      const raw = await jsonObject(c)
+      const level = raw?.access_level
+      if (level !== 'read' && level !== 'write' && level !== 'admin') {
+        return { kind: 'refused' as const, status: 400 as const, error: 'invalid_access_level' }
+      }
+      return { projectId: c.req.param('id'), squadId: c.req.param('squadId'), projectAccessLevel: level }
+    },
+    { surface: 'http' },
+  )
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (gate.kind !== 'delegated' && !access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const body = await jsonObject(c)
   if (!body) return c.json({ error: 'invalid_json' }, 400)
   const result = await upsertProjectSquadAccess(c.env, c.req.param('id'), c.req.param('squadId'), body.access_level)
@@ -551,8 +568,16 @@ projectsApp.put('/:id/squads/:squadId', async (c) => {
 })
 
 projectsApp.delete('/:id/squads/:squadId', async (c) => {
+  const gate = await authorizeStructuralWrite(
+    c.env,
+    c.get('auth'),
+    'project_squad_remove',
+    { projectId: c.req.param('id'), squadId: c.req.param('squadId') },
+    { surface: 'http' },
+  )
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   const access = await projectReadAccess(c.env, c.get('auth'))
-  if (!access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
+  if (gate.kind !== 'delegated' && !access.workspaceAdmin) return c.json({ error: 'forbidden', need: 'admin' }, 403)
   const projectId = c.req.param('id')
   const squadId = c.req.param('squadId')
   if (!await getProject(c.env, projectId)) return c.json({ error: 'project_not_found' }, 404)

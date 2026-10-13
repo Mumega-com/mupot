@@ -108,6 +108,8 @@ type AppEnv = {
   Variables: {
     auth: AuthContext
     inviteBody?: ParsedInvite
+    /** Set by requireAdminOrDelegated when a live delegation, not the caller's own grants, authorised the act. */
+    structuralVerdict?: StructuralVerdict
   }
 }
 
@@ -213,6 +215,44 @@ export const INVITER_ACTIVE_MEMBER_SQL = (idParam: string, tenantParam: string):
   `id = ${idParam} AND status = 'active' AND (tenant = ${tenantParam} OR tenant IS NULL)`
 
 // ── app ──────────────────────────────────────────────────────────────────────
+
+import {
+  authorizeStructuralWrite,
+  structuralRefusalBody,
+  type StructuralAction,
+  type StructuralTarget,
+  type StructuralRefusal,
+  type StructuralVerdict,
+} from '../operators/chokepoint'
+
+/**
+ * requireCapability(orgScope, 'admin') plus the ONE structural chokepoint (mumega-com#1386, closes #1357).
+ * requireCapability reads auth.capabilities and never looks at boundAgentId, so an org-admin AGENT passed every route
+ * below that MCP refuses outright. Now a bound agent is asked of the chokepoint first: refused unless a live delegation
+ * covers the act (delegable routes only, flag on); everyone else falls through to the unchanged capability gate.
+ */
+function requireAdminOrDelegated(
+  action: StructuralAction | ((c: Context<AppEnv>) => Promise<StructuralAction>),
+  target?: (c: Context<AppEnv>) => Promise<StructuralTarget | StructuralRefusal>,
+): MiddlewareHandler<AppEnv> {
+  return async (c, next) => {
+    const resolvedAction = typeof action === 'function' ? await action(c) : action
+    const verdict = await authorizeStructuralWrite(
+      c.env,
+      c.get('auth'),
+      resolvedAction,
+      target ? () => target(c) : {},
+      { surface: 'http' },
+    )
+    if (verdict.kind === 'refused') return c.json(structuralRefusalBody(verdict), verdict.status)
+    if (verdict.kind === 'delegated') {
+      c.set('structuralVerdict', verdict)
+      await next()
+      return
+    }
+    return requireCapability(orgScope, 'admin')(c, next)
+  }
+}
 
 export const membersApp = new Hono<AppEnv>()
 
@@ -926,6 +966,10 @@ const parseInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
 
 const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
   const body = c.get('inviteBody')
+  if (body?.kind === 'project') {
+    const projectVerdict = await authorizeStructuralWrite(c.env, c.get('auth'), 'create_invite', {}, { surface: 'http' })
+    if (projectVerdict.kind === 'refused') return c.json(structuralRefusalBody(projectVerdict), projectVerdict.status)
+  }
   // Project invite authorization is enforced by createProjectInvite against both
   // the legacy role plane and the caller's live/resolved squad grants. Keeping it
   // in the service prevents a non-HTTP caller from bypassing the same ceiling.
@@ -933,6 +977,9 @@ const authorizeInvite: MiddlewareHandler<AppEnv> = async (c, next) => {
     await next()
     return
   }
+  // A bound agent never creates an invite (it confers standing on a person): the one chokepoint refuses it first.
+  const verdict = await authorizeStructuralWrite(c.env, c.get('auth'), 'create_invite', {}, { surface: 'http' })
+  if (verdict.kind === 'refused') return c.json(structuralRefusalBody(verdict), verdict.status)
   return requireCapability(inviteScope, 'admin')(c, next)
 }
 
@@ -1254,7 +1301,7 @@ async function targetRankCeiling(
   return null
 }
 
-membersApp.patch('/members/:id', requireCapability(orgScope, 'admin'), async (c) => {
+membersApp.patch('/members/:id', requireAdminOrDelegated('suspend_member'), async (c) => {
   const id = c.req.param('id')
 
   let body: PatchMemberBody
@@ -1350,7 +1397,7 @@ interface MintTokenBody {
   non_expiring?: unknown
 }
 
-membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), async (c) => {
+membersApp.post('/members/:id/tokens', requireAdminOrDelegated('mint_member_token'), async (c) => {
   const memberId = c.req.param('id')
 
   // mupot#1411 N1 round 4 (Athena, 2026-09-15): pre-existing, same #1330 F2
@@ -1434,7 +1481,7 @@ membersApp.post('/members/:id/tokens', requireCapability(orgScope, 'admin'), asy
 
 membersApp.delete(
   '/members/:id/tokens/:tid',
-  requireCapability(orgScope, 'admin'),
+  requireAdminOrDelegated('revoke_member_token'),
   async (c) => {
     const memberId = c.req.param('id')
     const tokenId = c.req.param('tid')
@@ -1480,7 +1527,7 @@ const requireAdminOrSelfForTelegramUnbind: MiddlewareHandler<AppEnv> = async (c,
     await next()
     return
   }
-  return requireCapability(orgScope, 'admin')(c, next)
+  return requireAdminOrDelegated('unbind_member_telegram')(c, next)
 }
 
 membersApp.delete(
@@ -1559,6 +1606,44 @@ membersApp.delete(
 
 // ── capabilities (grant / revoke) ─────────────────────────────────────────────
 
+/** Grant vs revoke is a body field; Hono caches the parsed body, so the handler's own c.req.json() still works. */
+async function capabilityAction(c: Context<AppEnv>): Promise<StructuralAction> {
+  try {
+    const raw = (await c.req.json()) as { action?: unknown }
+    return raw.action === 'revoke' ? 'member_capability_revoke' : 'member_capability_grant'
+  } catch {
+    return 'member_capability_grant'
+  }
+}
+
+/** What a delegated agent's capability write touches. Only a squad-scoped write to an AGENT seat can ever be
+ *  delegated; a human target or an org/department scope is refused by the chokepoint (or here) outright. */
+async function capabilityTarget(c: Context<AppEnv>): Promise<StructuralTarget | StructuralRefusal> {
+  const memberId = c.req.param('id') ?? '' // Context is untyped by path here; the route always carries :id
+  let raw: { scope_type?: unknown; scope_id?: unknown; capability?: unknown; action?: unknown }
+  try {
+    raw = (await c.req.json()) as typeof raw
+  } catch {
+    return { kind: 'refused', status: 400, error: 'invalid_json' }
+  }
+  if (raw.scope_type !== 'squad') return { kind: 'refused', status: 403, error: 'outside_delegation_scope' }
+  if (typeof raw.scope_id !== 'string' || raw.scope_id.trim().length === 0) {
+    return { kind: 'refused', status: 400, error: 'invalid_scope_id' }
+  }
+  const bound = await resolveBoundAgentForMember(c.env, memberId)
+  const capability = raw.action === 'revoke' ? null : isCapability(raw.capability) ? raw.capability : null
+  if (raw.action !== 'revoke' && capability === null) return { kind: 'refused', status: 400, error: 'invalid_capability' }
+  return {
+    memberId,
+    agentId: bound?.agentId,
+    squadId: raw.scope_id.trim(),
+    capability,
+    detail: { via: 'http' },
+  }
+}
+
+const capabilityWriteGate = requireAdminOrDelegated(capabilityAction, capabilityTarget)
+
 interface CapabilityBody {
   action?: unknown // 'grant' | 'revoke'
   scope_type?: unknown
@@ -1566,7 +1651,7 @@ interface CapabilityBody {
   capability?: unknown
 }
 
-membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'), async (c) => {
+membersApp.post('/members/:id/capabilities', capabilityWriteGate, async (c) => {
   const memberId = c.req.param('id')
 
   // mupot#1411 P1 round 5 (kasra-review adversarial addendum, 2026-09-15):
@@ -1627,8 +1712,14 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
     }
   }
 
-  const ceiling = await targetRankCeiling(c, memberId)
-  if (ceiling) return ceiling
+  // A delegated agent's standing, scope, target and ceiling were all decided by the chokepoint (the target is an agent
+  // seat, never a human, so the human rank ceiling below has nothing to say and the agent's own thin grants must not
+  // veto what its delegator authorised).
+  const delegatedWrite = c.get('structuralVerdict')?.kind === 'delegated'
+  if (!delegatedWrite) {
+    const ceiling = await targetRankCeiling(c, memberId)
+    if (ceiling) return ceiling
+  }
 
   const boundAgent = await resolveBoundAgentForMember(c.env, memberId)
   if (boundAgent && scopeType !== 'squad') {
@@ -1682,7 +1773,7 @@ membersApp.post('/members/:id/capabilities', requireCapability(orgScope, 'admin'
 
   // CEILING: cannot grant above your own rank on the target scope (an org-admin
   // must not grant org 'owner'). P1 fix.
-  if (capabilityRank(capability) > (await actorMaxRankOnScope(c, scopeType, scopeId))) {
+  if (!delegatedWrite && capabilityRank(capability) > (await actorMaxRankOnScope(c, scopeType, scopeId))) {
     return c.json({ error: 'forbidden', reason: 'cannot_grant_above_own_rank' }, 403)
   }
 

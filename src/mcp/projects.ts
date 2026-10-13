@@ -38,6 +38,7 @@ import { resolveVisibleTaskScope } from '../tasks/visibility'
 import { listPresence } from '../registry/service'
 import { listProjectBindings } from '../projects/providers/bindings'
 import { memberOrElevatedAgent, withElevationReceipt } from './elevated-principal'
+import { authorizeStructuralWrite } from '../operators/chokepoint'
 import { done, fail, memberCanOnSquadAuth, str, type ToolOutcome, type ToolSpec } from './index'
 import { getProjectWikiGraph, WikiClientError, WikiRequestError } from '../projects/wiki-client'
 
@@ -694,7 +695,21 @@ const toolProjectSquadSet: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const denied = requireWorkspaceAdmin(auth)
+    // The ONE structural chokepoint (W0): a bound agent needs a live delegation covering this project (flag on); every
+    // other caller keeps the workspace-admin gate below, unchanged.
+    const gate = await authorizeStructuralWrite(env, auth, 'project_squad_set', async () => {
+      const p = str(args.project_id)
+      const q = str(args.squad_id)
+      if (!p) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_project_id' }
+      if (!q) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_squad_id' }
+      const level = args.access_level
+      if (level !== 'read' && level !== 'write' && level !== 'admin') {
+        return { kind: 'refused' as const, status: 400 as const, error: 'invalid_access_level' }
+      }
+      return { projectId: p, squadId: q, projectAccessLevel: level }
+    })
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
+    const denied = gate.kind === 'delegated' ? null : requireWorkspaceAdmin(auth)
     if (denied) return denied
     const projectId = str(args.project_id)
     const squadId = str(args.squad_id)
@@ -722,7 +737,15 @@ const toolProjectSquadRemove: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const denied = requireWorkspaceAdmin(auth)
+    const gate = await authorizeStructuralWrite(env, auth, 'project_squad_remove', async () => {
+      const p = str(args.project_id)
+      const q = str(args.squad_id)
+      if (!p) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_project_id' }
+      if (!q) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_squad_id' }
+      return { projectId: p, squadId: q }
+    })
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
+    const denied = gate.kind === 'delegated' ? null : requireWorkspaceAdmin(auth)
     if (denied) return denied
     const projectId = str(args.project_id)
     const squadId = str(args.squad_id)

@@ -40,6 +40,7 @@ import { orgAdminForbiddenPayload, ORG_ADMIN_REFUSAL_LINKS } from '../auth/refus
 // Shared org-chart creation path (also used by the dashboard). Validation + the
 // UNIQUE conflict mapping live here so both surfaces stay in lockstep.
 import { createDepartment, createSquad, createAgent } from './service'
+import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { resolveAgentMemberBinding } from '../members/service'
 import {
   setAgentSquadAccess,
@@ -155,6 +156,8 @@ interface CreateDepartmentBody {
 orgApp.post('/departments', async (c) => {
   // Creating a department is an org-wide admin action.
   const auth = c.get('auth')
+  const gate = await authorizeStructuralWrite(c.env, auth, 'create_department', {}, { surface: 'http' })
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   if (!isOrgAdmin(auth)) {
     const refusal = orgAdminForbiddenPayload('Creating a department', auth, ORG_ADMIN_REFUSAL_LINKS)
     if (!auth.memberId) return c.json(refusal, 403)
@@ -208,8 +211,18 @@ orgApp.post('/departments/:id/squads', async (c) => {
   const dept = await getById<Department>(c.env, 'departments', departmentId)
   if (!dept) return c.json({ error: 'department_not_found' }, 404)
 
+  // The ONE structural chokepoint: a bound agent needs a live delegation over this department (W0, flag on).
+  const gate = await authorizeStructuralWrite(
+    c.env,
+    c.get('auth'),
+    'create_squad',
+    { departmentId, detail: { via: 'http' } },
+    { surface: 'http' },
+  )
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
+
   // Creating a squad in a department requires admin+ on THAT department.
-  if (!(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin'))) {
+  if (gate.kind !== 'delegated' && !(await canOnDepartment(c.env, c.get('auth'), departmentId, 'admin'))) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
 
@@ -267,8 +280,17 @@ orgApp.post('/squads/:id/agents', async (c) => {
   const squad = await getById<Squad>(c.env, 'squads', squadId)
   if (!squad) return c.json({ error: 'squad_not_found' }, 404)
 
+  const gate = await authorizeStructuralWrite(
+    c.env,
+    c.get('auth'),
+    'create_agent',
+    { squadId, detail: { via: 'http' } },
+    { surface: 'http' },
+  )
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
+
   // Creating an agent in a squad requires lead+ on THAT squad (dept grants inherit).
-  if (!(await canOnSquad(c.env, c.get('auth'), squadId, 'lead'))) {
+  if (gate.kind !== 'delegated' && !(await canOnSquad(c.env, c.get('auth'), squadId, 'lead'))) {
     return c.json({ error: 'forbidden', need: 'lead' }, 403)
   }
 
@@ -295,10 +317,27 @@ interface CreateMembershipBody {
 
 orgApp.post('/agents/:id/memberships', async (c) => {
   const auth = c.get('auth')
-  if (auth.boundAgentId) {
-    return c.json({ error: 'operator_principal_required' }, 403)
-  }
   const agentId = c.req.param('id')
+  // The ONE structural chokepoint (same act as MCP grant_agent_capability / squad_member_add).
+  const gate = await authorizeStructuralWrite(
+    c.env,
+    auth,
+    'grant_agent_capability',
+    async () => {
+      let raw: CreateMembershipBody
+      try {
+        raw = (await c.req.json()) as CreateMembershipBody
+      } catch {
+        return { kind: 'refused' as const, status: 400 as const, error: 'invalid_json' }
+      }
+      if (!isNonEmptyString(raw.squad_id)) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_squad_id' }
+      const cap = raw.capability === undefined ? 'member' : raw.capability
+      if (!isAccessCapability(cap)) return { kind: 'refused' as const, status: 400 as const, error: 'invalid_capability' }
+      return { squadId: raw.squad_id, agentId, capability: cap, detail: { via: 'http' } }
+    },
+    { surface: 'http' },
+  )
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   const agent = await getById<Agent>(c.env, 'agents', agentId)
   if (!agent) return c.json({ error: 'agent_not_found' }, 404)
 
@@ -315,7 +354,7 @@ orgApp.post('/agents/:id/memberships', async (c) => {
 
   // Delegating agent authority into a squad requires admin on
   // the TARGET squad (dept grants inherit). Gated after the target squad resolves.
-  if (!(await canOnSquad(c.env, c.get('auth'), squad.id, 'admin'))) {
+  if (gate.kind !== 'delegated' && !(await canOnSquad(c.env, c.get('auth'), squad.id, 'admin'))) {
     return c.json({ error: 'forbidden', need: 'admin' }, 403)
   }
 
@@ -324,7 +363,8 @@ orgApp.post('/agents/:id/memberships', async (c) => {
     return c.json({ error: 'invalid_capability' }, 400)
   }
 
-  if (!isOrgAdmin(auth)) {
+  // A delegated agent's ceiling (max_grant, delegator's and its own live rank) was decided by the chokepoint.
+  if (gate.kind !== 'delegated' && !isOrgAdmin(auth)) {
     if (!auth.memberId) return c.json({ error: 'forbidden' }, 403)
     const grants = auth.capabilities ?? (await resolveCapabilities(c.env, auth.memberId))
     if (!hasCapability(grants, 'squad', brandSquadScope(squad), capability)) {

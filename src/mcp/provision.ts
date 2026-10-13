@@ -31,7 +31,7 @@
 //                        through Jev with a decline-on-low-confidence gate. Adds
 //                        no authorization of its own.
 
-import type { Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
+import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, BusEvent, Squad } from '../types'
 import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
 import {
   createDepartment,
@@ -89,6 +89,12 @@ import {
 import { mcpEndpoint, requiredCanonicalOrigin, wakeContractForAgent } from '../dashboard/connect'
 import { createBus } from '../bus'
 import { resolveDepartmentRef, resolveSquadRef, resolveAgentRef } from '../org/resolve'
+import {
+  authorizeStructuralWrite,
+  type StructuralAction,
+  type StructuralRefusal,
+  type StructuralTargetThunk,
+} from '../operators/chokepoint'
 import { listAgentTokensQuery, revokeTokenOwnershipQuery } from './token-queries'
 import { isValidEd25519PublicX, registerAgentPublicKey } from '../fleet/agent-keys'
 import {
@@ -113,7 +119,6 @@ import {
 } from './index'
 import {
   hasElevatedAction,
-  boundAgentHasAnyLiveGrantForAction,
   resolveScopeDepartmentId as resolveElevationSquadDepartmentId,
   elevationRemedyMessage,
   elevationHint,
@@ -312,6 +317,28 @@ function resolveFail(reason: 'not_found' | 'ambiguous', notFoundCode: string) {
   return fail(404, notFoundCode)
 }
 
+function structuralFail(r: StructuralRefusal) {
+  return fail(r.status, r.error, r.detail)
+}
+
+/** Resolve-refusal for a chokepoint thunk: same codes the tools themselves return for an unresolvable reference. */
+function thunkRefusal(
+  status: 400 | 404 | 409,
+  error: string,
+): StructuralRefusal {
+  return { kind: 'refused', status, error }
+}
+
+/** The inline bound-agent refusal every structural tool used to carry by hand. Now the ONE chokepoint answers it (src/operators/chokepoint.ts), for MCP and HTTP alike. */
+async function structuralGate(
+  env: Env,
+  auth: AuthContext,
+  action: StructuralAction,
+  target: StructuralTargetThunk | Record<string, never> = {},
+) {
+  return authorizeStructuralWrite(env, auth, action, target)
+}
+
 // Map the shared CreateResult error code to an MCP fail() with the right status.
 // slug_taken → 409 conflict; every other validation code → 400 invalid_args.
 function createErrorToFail(error: string) {
@@ -357,6 +384,8 @@ const toolCreateDepartment: ToolSpec = {
     // A department is org-structure and stays an org-admin act. Squad creation
     // keeps its elevation path, because that one is DEPARTMENT-scoped and so is
     // actually bounded to the department the approver named.
+    const deptGate = await structuralGate(env, auth, 'create_department')
+    if (deptGate.kind === 'refused') return structuralFail(deptGate)
     const grants = auth.capabilities ?? []
     if (!hasCapability(grants, 'org', null, 'admin')) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
@@ -398,6 +427,14 @@ const toolCreateSquad: ToolSpec = {
     const deptRef = str(args.department)
     if (!deptRef) return fail(400, 'invalid_args', 'department required')
 
+    const squadGate = await structuralGate(env, auth, 'create_squad', async () => {
+      const r = await resolveDepartmentRef(env, deptRef)
+      if (!r.ok) return thunkRefusal(r.reason === 'ambiguous' ? 409 : 404, r.reason === 'ambiguous' ? 'ambiguous_slug' : 'department_not_found')
+      return { departmentId: r.value.id, detail: { slug: str(args.slug) } }
+    })
+    if (squadGate.kind === 'refused') return structuralFail(squadGate)
+    const squadDelegated = squadGate.kind === 'delegated'
+
     const deptResult = await resolveDepartmentRef(env, deptRef)
     if (!deptResult.ok) return resolveFail(deptResult.reason, 'department_not_found')
     const dept = deptResult.value
@@ -414,7 +451,7 @@ const toolCreateSquad: ToolSpec = {
     // so a slug_taken refusal (or an adopt:true override) can report "created
     // by member X under elevation receipt Y" rather than just naming the actor.
     let createdViaElevationGrant: string | undefined
-    if (!hasCapability(grants, 'department', dept.id, 'admin')) {
+    if (!squadDelegated && !hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await hasElevatedAction(env, auth, 'action:project_lifecycle', 'department', dept.id, {
         toolName: 'create_squad',
         detail: { department_id: dept.id, slug: args.slug },
@@ -493,6 +530,13 @@ const toolCreateAgent: ToolSpec = {
     const squadRef = str(args.squad)
     if (!squadRef) return fail(400, 'invalid_args', 'squad required')
 
+    const agentGate = await structuralGate(env, auth, 'create_agent', async () => {
+      const r = await resolveSquadRef(env, squadRef)
+      if (!r.ok) return thunkRefusal(r.reason === 'ambiguous' ? 409 : 404, r.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
+      return { squadId: r.value.id, detail: { slug: str(args.slug) } }
+    })
+    if (agentGate.kind === 'refused') return structuralFail(agentGate)
+
     const squadResult = await resolveSquadRef(env, squadRef)
     if (!squadResult.ok) return resolveFail(squadResult.reason, 'squad_not_found')
     const squad = squadResult.value
@@ -506,7 +550,7 @@ const toolCreateAgent: ToolSpec = {
 
     // Gate: lead on the squad (org/department admin inherit down via memberCanOnSquad).
     const grants = auth.capabilities ?? []
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'lead'))) {
+    if (agentGate.kind !== 'delegated' && !(await memberCanOnSquad(env, grants, squad.id, 'lead'))) {
       return fail(403, 'forbidden', { need: 'lead', scope: 'squad' })
     }
 
@@ -654,11 +698,9 @@ export const toolMintAgentToken: ToolSpec = {
     // stranger to it — a human already vetted this exact session for this
     // exact action — so it proceeds to a scope-specific check below, once
     // the target agent (and therefore its squad) is known.
-    let mayBeElevated = false
-    if (auth.boundAgentId) {
-      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:mint_token')
-      if (!mayBeElevated) return fail(403, 'operator_principal_required')
-    }
+    const mintGate = await structuralGate(env, auth, 'mint_agent_token')
+    if (mintGate.kind === 'refused') return structuralFail(mintGate)
+    const mayBeElevated = mintGate.kind === 'agent_legacy'
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -975,7 +1017,8 @@ const toolListAgentTokens: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'list_agent_tokens')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1034,7 +1077,8 @@ const toolRevokeAgentToken: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'revoke_agent_token')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const agentRef = str(args.agent)
     const tokenId = str(args.token_id)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
@@ -1166,7 +1210,8 @@ const toolListAgentSessions: ToolSpec = {
     if (!hasWorkspaceAdmin(auth) && !holdsCapabilityFloor(auth, 'admin')) {
       return fail(403, 'forbidden', { need: 'admin' })
     }
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'list_agent_sessions')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const agentRef = agentArg
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1201,7 +1246,8 @@ const toolRevokeAgentSession: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, _ctx) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'revoke_agent_session')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const agentRef = str(args.agent)
     const sessionId = str(args.session_id)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
@@ -1306,7 +1352,8 @@ const toolProvisionAgentConnection: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'provision_agent_connection')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const requestId = str(args.request_id)
     const existingRef = str(args.existing_agent)
     const newAgent = args.new_agent
@@ -1432,11 +1479,23 @@ export const toolGrantAgentCapability: ToolSpec = {
     // mint_agent_token above (step 4, mumega-com#1173). A bound-agent
     // session with ZERO live grants for action:manage_access gets the exact
     // same unconditional refusal, before any arg is resolved.
-    let mayBeElevated = false
-    if (auth.boundAgentId) {
-      mayBeElevated = await boundAgentHasAnyLiveGrantForAction(env, auth, 'action:manage_access')
-      if (!mayBeElevated) return fail(403, 'operator_principal_required')
-    }
+    // The ONE chokepoint (src/operators/chokepoint.ts): a bound agent is refused unless a live delegation covers this
+    // squad inside its ceiling (W0, flag on) or a live manage_access elevation still opens the old lane.
+    const grantGate = await structuralGate(env, auth, 'grant_agent_capability', async () => {
+      const agentRefT = str(args.agent)
+      const squadRefT = str(args.squad)
+      const capT = str(args.capability)
+      if (!agentRefT || !squadRefT) return thunkRefusal(400, 'invalid_args')
+      if (!capT || !GRANTABLE_AGENT_CAPABILITIES.has(capT as Capability)) return thunkRefusal(400, 'invalid_capability')
+      const a = await resolveAgentRef(env, agentRefT)
+      if (!a.ok) return thunkRefusal(a.reason === 'ambiguous' ? 409 : 404, a.reason === 'ambiguous' ? 'ambiguous_slug' : 'agent_not_found')
+      const sq = await resolveSquadRef(env, squadRefT)
+      if (!sq.ok) return thunkRefusal(sq.reason === 'ambiguous' ? 409 : 404, sq.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
+      return { squadId: sq.value.id, agentId: a.value.id, capability: capT as Capability }
+    })
+    if (grantGate.kind === 'refused') return structuralFail(grantGate)
+    const grantDelegated = grantGate.kind === 'delegated'
+    const mayBeElevated = grantGate.kind === 'agent_legacy'
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -1466,7 +1525,7 @@ export const toolGrantAgentCapability: ToolSpec = {
 
     const grants = auth.capabilities ?? []
     let elevatedGrant: ElevationGrantRecord | null = null
-    if (!(await memberCanOnSquad(env, grants, squad, 'admin'))) {
+    if (!grantDelegated && !(await memberCanOnSquad(env, grants, squad, 'admin'))) {
       if (!mayBeElevated) return fail(403, 'forbidden', { need: 'admin', scope: 'squad', hint: elevationHint('grant_agent_capability') })
       const squadDepartmentId = await resolveElevationSquadDepartmentId(env, 'squad', squad.id)
       const elevated = await hasElevatedAction(env, auth, 'action:manage_access', 'squad', squad.id, {
@@ -1527,7 +1586,9 @@ export const toolGrantAgentCapability: ToolSpec = {
           "an elevated session may grant at most 'member' — a standing lead/admin outlives the elevation and must be granted by standing authority",
         )
       }
-    } else if (!callerCanGrantAgentCapability(grants, squad, capability)) {
+    } else if (!grantDelegated && !callerCanGrantAgentCapability(grants, squad, capability)) {
+      // A delegated call skips this: its ceiling (max_grant, the delegator's and the agent's live rank) was already
+      // enforced by the chokepoint, and the agent's own standing is exactly what a delegation stands in for.
       return fail(403, 'cannot_grant_above_own_rank')
     }
 
@@ -1635,7 +1696,8 @@ const toolRegisterAgentKey: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'register_agent_key')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -1961,7 +2023,8 @@ const toolUpdateAgent: ToolSpec = {
     // carries, unchanged from before this fix.
     const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id
     if (auth.boundAgentId && !isSelf) {
-      return fail(403, 'operator_principal_required')
+      const updateGate = await structuralGate(env, auth, 'update_agent')
+      return updateGate.kind === 'refused' ? structuralFail(updateGate) : fail(403, 'operator_principal_required')
     }
 
     if (isSelf) {
@@ -2184,7 +2247,19 @@ export const toolMoveAgentSquad: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const moveGate = await structuralGate(env, auth, 'move_agent_squad', async () => {
+      const aRef = str(args.agent)
+      const sRef = str(args.to_squad)
+      if (!aRef || !sRef) return thunkRefusal(400, 'invalid_args')
+      if (!isAgentAccessCapability(args.capability)) return thunkRefusal(400, 'invalid_capability')
+      const a = await resolveAgentRef(env, aRef)
+      if (!a.ok) return thunkRefusal(a.reason === 'ambiguous' ? 409 : 404, a.reason === 'ambiguous' ? 'ambiguous_slug' : 'agent_not_found')
+      const sq = await resolveSquadRef(env, sRef)
+      if (!sq.ok) return thunkRefusal(sq.reason === 'ambiguous' ? 409 : 404, sq.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
+      return { agentId: a.value.id, fromSquadId: a.value.squad_id, squadId: sq.value.id, capability: args.capability }
+    })
+    if (moveGate.kind === 'refused') return structuralFail(moveGate)
+    const moveDelegated = moveGate.kind === 'delegated'
 
     // TENANT WALL (Athena HARD-BLOCK 2): this Worker's D1 is the pot. Squads
     // have no tenant column. Revalidate the CALLER against env.TENANT_SLUG —
@@ -2231,7 +2306,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     // Yank: admin on the agent's CURRENT home. memberCanOnSquadAuth sees both
     // planes (legacy role + grants); org admin inherits down. No separate
     // hasWorkspaceAdmin disjunct — same R3 reasoning as update_agent.
-    if (!(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
+    if (!moveDelegated && !(await memberCanOnSquadAuth(env, auth, agent.squad_id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'from' })
     }
 
@@ -2241,7 +2316,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     // is a distinct 403 (cannot_grant_above_own_rank) from a lead-on-to
     // requesting member (forbidden / side:to). See the block comment above.
     const actorDestinationRank = await actorRankOnScopeFor(env, auth, 'squad', destRow.id)
-    if (capabilityRank(capability) > actorDestinationRank) {
+    if (!moveDelegated && capabilityRank(capability) > actorDestinationRank) {
       return fail(403, 'cannot_grant_above_own_rank', {
         capability,
         scope: 'squad',
@@ -2250,7 +2325,7 @@ export const toolMoveAgentSquad: ToolSpec = {
     }
 
     // Plant: admin on to_squad. One-sided admin on the old home is not enough.
-    if (!(await memberCanOnSquadAuth(env, auth, destRow.id, 'admin'))) {
+    if (!moveDelegated && !(await memberCanOnSquadAuth(env, auth, destRow.id, 'admin'))) {
       return fail(403, 'forbidden', { need: 'admin', scope: 'squad', side: 'to' })
     }
 
@@ -2452,7 +2527,8 @@ const toolUpdateSquad: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await structuralGate(env, auth, 'update_squad')
+    if (gate.kind === 'refused') return structuralFail(gate)
     const squadRef = str(args.squad)
     if (!squadRef) return fail(400, 'invalid_args', 'squad required')
 
@@ -2568,6 +2644,8 @@ export const toolDeactivateAgent: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    const deactivateGate = await structuralGate(env, auth, 'deactivate_agent')
+    if (deactivateGate.kind === 'refused') return structuralFail(deactivateGate)
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
 
@@ -2721,7 +2799,19 @@ const toolSquadMemberAdd: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const addGate = await structuralGate(env, auth, 'squad_member_add', async () => {
+      const aRef = str(args.agent)
+      const sRef = str(args.squad)
+      const cap = str(args.capability)
+      if (!aRef || !sRef) return thunkRefusal(400, 'invalid_args')
+      if (!cap || !GRANTABLE_SQUAD_MEMBER_CAPABILITIES.has(cap as Capability)) return thunkRefusal(400, 'invalid_capability')
+      const a = await resolveAgentRef(env, aRef)
+      if (!a.ok) return thunkRefusal(a.reason === 'ambiguous' ? 409 : 404, a.reason === 'ambiguous' ? 'ambiguous_slug' : 'agent_not_found')
+      const sq = await resolveSquadRef(env, sRef)
+      if (!sq.ok) return thunkRefusal(sq.reason === 'ambiguous' ? 409 : 404, sq.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
+      return { squadId: sq.value.id, agentId: a.value.id, capability: cap as Capability }
+    })
+    if (addGate.kind === 'refused') return structuralFail(addGate)
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -2745,6 +2835,7 @@ const toolSquadMemberAdd: ToolSpec = {
       agentId: agentResult.value.id,
       squad: squadResult.value,
       capability,
+      delegated: addGate.kind === 'delegated' ? addGate : undefined,
     })
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 
@@ -2780,7 +2871,17 @@ const toolSquadMemberRemove: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const removeGate = await structuralGate(env, auth, 'squad_member_remove', async () => {
+      const aRef = str(args.agent)
+      const sRef = str(args.squad)
+      if (!aRef || !sRef) return thunkRefusal(400, 'invalid_args')
+      const a = await resolveAgentRef(env, aRef)
+      if (!a.ok) return thunkRefusal(a.reason === 'ambiguous' ? 409 : 404, a.reason === 'ambiguous' ? 'ambiguous_slug' : 'agent_not_found')
+      const sq = await resolveSquadRef(env, sRef)
+      if (!sq.ok) return thunkRefusal(sq.reason === 'ambiguous' ? 409 : 404, sq.reason === 'ambiguous' ? 'ambiguous_slug' : 'squad_not_found')
+      return { squadId: sq.value.id, agentId: a.value.id }
+    })
+    if (removeGate.kind === 'refused') return structuralFail(removeGate)
     const agentRef = str(args.agent)
     if (!agentRef) return fail(400, 'invalid_args', 'agent required')
     const squadRef = str(args.squad)
@@ -2796,6 +2897,7 @@ const toolSquadMemberRemove: ToolSpec = {
       auth,
       agentId: agentResult.value.id,
       squad: squadResult.value,
+      delegated: removeGate.kind === 'delegated' ? removeGate : undefined,
     })
     if (!outcome.ok) return membershipWriteFail(outcome.error)
 

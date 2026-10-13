@@ -13,6 +13,7 @@
 // a token minted for another tenant can never touch this pot. Mutations are RBAC
 // gated. The GitHub token is read from env only — it is never echoed or logged.
 
+import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHold } from '../agents/execution-brakes'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { Hono } from 'hono'
@@ -1942,6 +1943,10 @@ interface GrantBody {
 
 gatesApp.post('/grants', async (c) => {
   const auth = c.get('auth')
+  // The ONE structural chokepoint (W0): gate authority is never an agent's to hand out, delegated or not. isOrgAdmin()
+  // alone admitted an org-admin agent here, while the MCP twin's own rule is the opposite (#1357 class).
+  const gate = await authorizeStructuralWrite(c.env, auth, 'grant_gate_capability', {}, { surface: 'http' })
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   if (!isOrgAdmin(auth)) {
     return c.json(orgAdminForbiddenPayload('Managing gate capability grants', auth, ORG_ADMIN_REFUSAL_LINKS, 'owner_or_admin'), 403)
   }
@@ -1974,6 +1979,8 @@ gatesApp.post('/grants', async (c) => {
 
 gatesApp.delete('/grants', async (c) => {
   const auth = c.get('auth')
+  const gate = await authorizeStructuralWrite(c.env, auth, 'revoke_gate_capability', {}, { surface: 'http' })
+  if (gate.kind === 'refused') return c.json(structuralRefusalBody(gate), gate.status)
   if (!isOrgAdmin(auth)) {
     return c.json(orgAdminForbiddenPayload('Managing gate capability grants', auth, ORG_ADMIN_REFUSAL_LINKS, 'owner_or_admin'), 403)
   }

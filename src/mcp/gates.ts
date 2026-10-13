@@ -12,6 +12,7 @@ import {
   revokeGateCapability,
   type GatePrincipalType,
 } from '../gates/grants'
+import { authorizeStructuralWrite } from '../operators/chokepoint'
 import { type ToolSpec, fail, done, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -41,6 +42,9 @@ const toolGrantGateCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // Gate authority is never an agent's to hand out, delegated or not: the chokepoint refuses every bound agent.
+    const gate = await authorizeStructuralWrite(env, auth, 'grant_gate_capability', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     const denied = requireOrgAdmin(auth)
     if (denied) return denied
     const by = grantedBy(auth)
@@ -84,6 +88,8 @@ const toolRevokeGateCapability: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    const gate = await authorizeStructuralWrite(env, auth, 'revoke_gate_capability', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     const denied = requireOrgAdmin(auth)
     if (denied) return denied
 

@@ -1,0 +1,503 @@
+// mupot — THE structural-write chokepoint (Operators + Admission W0, mumega-com#1386).
+//
+// WHY ONE FUNCTION. Before W0 every structural tool carried its own `if (auth.boundAgentId) return fail(403,
+// 'operator_principal_required')`, the HTTP twins carried a different rule (or none), and an org-admin agent was
+// refused on MCP while the same act over HTTP went through requireCapability, which ignores boundAgentId (#1357).
+// Same act, two surfaces, opposite answers. Every structural write, on both doors, now asks THIS function whether
+// the caller is an agent and, if so, what that agent may do.
+//
+// WHAT IT DECIDES. Only the AGENT-BOUND half. A non-agent caller gets `{ kind: 'principal' }` and the site keeps its
+// own capability checks, unchanged. For an agent-bound caller the answer is one of:
+//   - refused          operator_principal_required (no delegation / not delegable), outside_delegation_scope,
+//                      requires_human_approval (above the ceiling, machine-readable), or a flat hard refusal.
+//   - agent_legacy     the pre-W0 lane for THIS action is still open (a live human-approved elevation grant, or the
+//                      caller's own capability grants where MCP always allowed that) — the site runs its old logic.
+//   - delegated        a live delegation covers the target, the delegator human STILL holds admin over the
+//                      delegation scope right now, and the act is inside the ceiling. The authority is fully
+//                      decided here, an authorization receipt (agent + delegator + delegation id) is already
+//                      written, and the site must NOT re-derive standing from the agent's own grants.
+//
+// RE-DERIVED PER REQUEST. Nothing here caches. The delegation row, the delegator's membership, the delegator's
+// live rank on the delegation scope and on the target, and the agent's own live rank are all read on every call, so
+// a revocation or a delegator demotion bites on the very next request.
+//
+// WHAT A DELEGATION CAN NEVER BUY (not delegable, whatever rows exist): admin/owner grants, gate_grants, minting
+// or revealing a token or credential, any act on a human member or the delegator, any act on the agent ITSELF,
+// changing a delegation, money / deploy / publish. These are `delegable: false` in STRUCTURAL_ACTIONS, and the
+// self/human target rules below apply to every delegated act regardless.
+
+import type { AuthContext, Capability, Env } from '../types'
+import { boundAgentHasAnyLiveGrantForAction } from '../auth/elevation'
+import { capabilityRank, currentMemberRankOnScope } from '../auth/capability'
+import {
+  capabilityScopeForDelegation,
+  delegatedOperatorsEnabled,
+  listLiveDelegationsForAgent,
+  memberIsAgentSeat,
+  type DelegationRow,
+} from './delegations'
+
+/** Every act that writes org structure, standing authority or credentials. The registry is the ratchet's source. */
+export type StructuralAction =
+  // delegable under a live delegation
+  | 'create_squad'
+  | 'create_agent'
+  | 'squad_member_add'
+  | 'squad_member_remove'
+  | 'grant_agent_capability'
+  | 'move_agent_squad'
+  | 'project_squad_set'
+  | 'project_squad_remove'
+  | 'member_capability_grant'
+  | 'member_capability_revoke'
+  // never delegable: an agent gets its pre-W0 lane or a refusal
+  | 'create_department'
+  | 'update_squad'
+  | 'update_agent'
+  | 'deactivate_agent'
+  | 'mint_agent_token'
+  | 'list_agent_tokens'
+  | 'revoke_agent_token'
+  | 'list_agent_sessions'
+  | 'revoke_agent_session'
+  | 'provision_agent_connection'
+  | 'register_agent_key'
+  | 'grant_gate_capability'
+  | 'revoke_gate_capability'
+  | 'team_bootstrap'
+  | 'team_bootstrap_release'
+  | 'mint_member_token'
+  | 'revoke_member_token'
+  | 'suspend_member'
+  | 'unbind_member_telegram'
+  | 'create_invite'
+  // changing or even reading who may act for whom is a human act: an agent never creates, extends, revokes or lists
+  // delegations, its own or anyone's
+  | 'manage_delegations'
+
+export interface StructuralPolicy {
+  /** A live delegation can authorise this act (flag on). */
+  readonly delegable: boolean
+  /**
+   * What an agent-bound caller with no covering delegation gets:
+   *  - 'refuse':     operator_principal_required, always.
+   *  - 'capability': the caller's own capability grants decide (the pre-W0 MCP behaviour for create_*, project_squad_*,
+   *                  deactivate_agent, ...). With the flag ON a DELEGABLE act closes this lane — delegation replaces it.
+   */
+  readonly agentLane: 'refuse' | 'capability'
+  /** A human-approved elevation action that still opens the pre-W0 lane for a live session. */
+  readonly elevationAction?: string
+}
+
+export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPolicy>> = {
+  create_squad: { delegable: true, agentLane: 'capability', elevationAction: 'action:project_lifecycle' },
+  create_agent: { delegable: true, agentLane: 'capability' },
+  squad_member_add: { delegable: true, agentLane: 'refuse' },
+  squad_member_remove: { delegable: true, agentLane: 'refuse' },
+  grant_agent_capability: { delegable: true, agentLane: 'refuse', elevationAction: 'action:manage_access' },
+  move_agent_squad: { delegable: true, agentLane: 'refuse' },
+  project_squad_set: { delegable: true, agentLane: 'capability' },
+  project_squad_remove: { delegable: true, agentLane: 'capability' },
+  member_capability_grant: { delegable: true, agentLane: 'refuse' },
+  member_capability_revoke: { delegable: true, agentLane: 'refuse' },
+
+  create_department: { delegable: false, agentLane: 'capability' },
+  update_squad: { delegable: false, agentLane: 'refuse' },
+  update_agent: { delegable: false, agentLane: 'refuse' },
+  deactivate_agent: { delegable: false, agentLane: 'capability' },
+  mint_agent_token: { delegable: false, agentLane: 'refuse', elevationAction: 'action:mint_token' },
+  list_agent_tokens: { delegable: false, agentLane: 'refuse' },
+  revoke_agent_token: { delegable: false, agentLane: 'refuse' },
+  list_agent_sessions: { delegable: false, agentLane: 'refuse' },
+  revoke_agent_session: { delegable: false, agentLane: 'refuse' },
+  provision_agent_connection: { delegable: false, agentLane: 'refuse' },
+  register_agent_key: { delegable: false, agentLane: 'refuse' },
+  // Gate authority is never an agent's to hand out, delegation or not. Before W0 an org-admin agent could reach these
+  // on MCP through its own capability grants; W0 closes that unconditionally (the one flag-independent tightening
+  // besides the HTTP doors, called out in the PR).
+  grant_gate_capability: { delegable: false, agentLane: 'refuse' },
+  revoke_gate_capability: { delegable: false, agentLane: 'refuse' },
+  team_bootstrap: { delegable: false, agentLane: 'refuse' },
+  team_bootstrap_release: { delegable: false, agentLane: 'refuse' },
+  mint_member_token: { delegable: false, agentLane: 'refuse' },
+  revoke_member_token: { delegable: false, agentLane: 'refuse' },
+  suspend_member: { delegable: false, agentLane: 'refuse' },
+  unbind_member_telegram: { delegable: false, agentLane: 'refuse' },
+  create_invite: { delegable: false, agentLane: 'refuse' },
+  manage_delegations: { delegable: false, agentLane: 'refuse' },
+}
+
+/** MCP tool name -> the action it must ask the chokepoint about. The ratchet test walks this against the source. */
+export const STRUCTURAL_MCP_TOOLS: Readonly<Record<string, StructuralAction>> = {
+  create_department: 'create_department',
+  create_squad: 'create_squad',
+  create_agent: 'create_agent',
+  update_squad: 'update_squad',
+  update_agent: 'update_agent',
+  deactivate_agent: 'deactivate_agent',
+  mint_agent_token: 'mint_agent_token',
+  list_agent_tokens: 'list_agent_tokens',
+  revoke_agent_token: 'revoke_agent_token',
+  list_agent_sessions: 'list_agent_sessions',
+  revoke_agent_session: 'revoke_agent_session',
+  provision_agent_connection: 'provision_agent_connection',
+  register_agent_key: 'register_agent_key',
+  grant_agent_capability: 'grant_agent_capability',
+  move_agent_squad: 'move_agent_squad',
+  squad_member_add: 'squad_member_add',
+  squad_member_remove: 'squad_member_remove',
+  project_squad_set: 'project_squad_set',
+  project_squad_remove: 'project_squad_remove',
+  grant_gate_capability: 'grant_gate_capability',
+  revoke_gate_capability: 'revoke_gate_capability',
+  team_bootstrap: 'team_bootstrap',
+  team_bootstrap_release: 'team_bootstrap_release',
+  operator_delegate: 'manage_delegations',
+  operator_revoke: 'manage_delegations',
+  operator_list: 'manage_delegations',
+}
+
+export type StructuralStatus = 400 | 403 | 404 | 409
+
+export interface StructuralRefusal {
+  kind: 'refused'
+  status: StructuralStatus
+  error: string
+  detail?: Record<string, unknown>
+}
+
+export type ProjectAccessLevel = 'read' | 'write' | 'admin'
+
+/** What the act touches. Every field is optional; an action reads only the ones it needs. */
+export interface StructuralTarget {
+  squadId?: string
+  /** move_agent_squad: the agent's current squad. */
+  fromSquadId?: string
+  departmentId?: string
+  projectId?: string
+  agentId?: string
+  memberId?: string
+  /** The rank the act confers; null/undefined = the act confers none. */
+  capability?: Capability | null
+  projectAccessLevel?: ProjectAccessLevel
+  /** Free-form, ends up in the receipt. Never put a secret in here. */
+  detail?: Record<string, unknown>
+}
+
+export type StructuralTargetThunk = () => Promise<StructuralTarget | StructuralRefusal>
+
+export interface DelegatedAuthorization {
+  kind: 'delegated'
+  delegation: DelegationRow
+  /** min(max_grant, delegator live rank, agent live rank) on the target, as a capabilityRank number. */
+  ceilingRank: number
+  receiptId: string
+}
+
+export type StructuralVerdict =
+  | { kind: 'principal' }
+  | { kind: 'agent_legacy' }
+  | DelegatedAuthorization
+  | StructuralRefusal
+
+export interface StructuralOptions {
+  surface?: 'mcp' | 'http'
+}
+
+function refuse(status: StructuralStatus, error: string, detail?: Record<string, unknown>): StructuralRefusal {
+  return { kind: 'refused', status, error, detail }
+}
+
+function isRefusal(v: StructuralTarget | StructuralRefusal): v is StructuralRefusal {
+  return (v as StructuralRefusal).kind === 'refused'
+}
+
+function requiresHumanApproval(
+  action: StructuralAction,
+  reason: string,
+  delegation: DelegationRow,
+  extra: Record<string, unknown>,
+): StructuralRefusal {
+  return refuse(403, 'requires_human_approval', {
+    requires_human_approval: true,
+    act: action,
+    reason,
+    delegation_id: delegation.id,
+    ...extra,
+  })
+}
+
+interface SquadFacts {
+  id: string
+  department_id: string
+  kind: string
+}
+
+async function loadSquad(env: Env, squadId: string): Promise<SquadFacts | null> {
+  const row = await env.DB.prepare('SELECT id, department_id, kind FROM squads WHERE id = ?1 LIMIT 1')
+    .bind(squadId)
+    .first<SquadFacts>()
+  return row ?? null
+}
+
+/** The delegator must be a live, active HUMAN holding admin over the delegation's own scope RIGHT NOW. */
+async function delegatorIsLive(env: Env, d: DelegationRow): Promise<boolean> {
+  const member = await env.DB.prepare(
+    "SELECT status FROM members WHERE id = ?1 AND (tenant = ?2 OR tenant IS NULL) LIMIT 1",
+  )
+    .bind(d.delegator_member_id, env.TENANT_SLUG)
+    .first<{ status: string }>()
+  if (!member || member.status !== 'active') return false
+  if (await memberIsAgentSeat(env, d.delegator_member_id)) return false
+  const cap = capabilityScopeForDelegation(d.scope_type, d.scope_id)
+  const rank = await currentMemberRankOnScope(env, d.delegator_member_id, cap.type, cap.id)
+  return rank >= capabilityRank('admin')
+}
+
+type Element =
+  | { type: 'squad'; squad: SquadFacts }
+  | { type: 'department'; id: string }
+  | { type: 'project'; id: string }
+
+async function delegationCovers(env: Env, d: DelegationRow, el: Element): Promise<boolean> {
+  if (d.scope_type === 'org') return true
+  if (el.type === 'department') return d.scope_type === 'department' && d.scope_id === el.id
+  if (el.type === 'project') return d.scope_type === 'project' && d.scope_id === el.id
+  // squad element
+  if (d.scope_type === 'squad') return d.scope_id === el.squad.id
+  if (d.scope_type === 'department') return d.scope_id === el.squad.department_id
+  // project scope covers the squads linked to that project
+  const edge = await env.DB.prepare(
+    'SELECT 1 AS one FROM project_squad_access WHERE project_id = ?1 AND squad_id = ?2 LIMIT 1',
+  )
+    .bind(d.scope_id, el.squad.id)
+    .first<{ one: number }>()
+  return edge != null
+}
+
+/** The target agent's standing on a squad across BOTH planes (memberships and the capabilities row of its seat). */
+async function agentStandingOnSquad(env: Env, agentId: string, squadId: string): Promise<number> {
+  const [m, c] = await Promise.all([
+    env.DB.prepare('SELECT capability FROM memberships WHERE agent_id = ?1 AND squad_id = ?2 LIMIT 1')
+      .bind(agentId, squadId)
+      .first<{ capability: Capability }>(),
+    env.DB.prepare(
+      `SELECT c.capability FROM capabilities c
+         JOIN agent_member_bindings b ON b.member_id = c.member_id AND b.tenant = ?3
+        WHERE b.agent_id = ?1 AND c.scope_type = 'squad' AND c.scope_id = ?2 LIMIT 1`,
+    )
+      .bind(agentId, squadId, env.TENANT_SLUG)
+      .first<{ capability: Capability }>(),
+  ])
+  return Math.max(m ? capabilityRank(m.capability) : 0, c ? capabilityRank(c.capability) : 0)
+}
+
+const LEVEL_TO_CAPABILITY: Record<ProjectAccessLevel, Capability> = {
+  read: 'observer',
+  write: 'member',
+  admin: 'admin',
+}
+
+async function evaluateDelegated(
+  env: Env,
+  auth: AuthContext,
+  action: StructuralAction,
+  target: StructuralTarget,
+  delegations: DelegationRow[],
+  surface: 'mcp' | 'http',
+): Promise<DelegatedAuthorization | StructuralRefusal> {
+  // ── acts that are refused for an agent whatever delegation exists ───────────────────────────────────────────
+  if (
+    (target.agentId && target.agentId === auth.boundAgentId)
+    || (target.memberId && auth.memberId && target.memberId === auth.memberId)
+  ) {
+    return refuse(403, 'cannot_act_on_self', { act: action })
+  }
+  if (target.memberId && !(await memberIsAgentSeat(env, target.memberId))) {
+    // A grant/revoke aimed at a human member (including the delegator) is never an agent's to make.
+    return refuse(403, 'human_target_forbidden', { act: action })
+  }
+
+  // ── what the act touches ────────────────────────────────────────────────────────────────────────────────────
+  const elements: Element[] = []
+  const squadIds: string[] = []
+  if (target.departmentId) {
+    const dep = await env.DB.prepare('SELECT kind FROM departments WHERE id = ?1 LIMIT 1')
+      .bind(target.departmentId)
+      .first<{ kind: string }>()
+    if (!dep) return refuse(404, 'department_not_found')
+    if (dep.kind === 'home') return refuse(403, 'home_scope_not_grantable')
+    elements.push({ type: 'department', id: target.departmentId })
+  }
+  if (target.projectId) elements.push({ type: 'project', id: target.projectId })
+  for (const id of [target.squadId, target.fromSquadId]) {
+    if (!id || squadIds.includes(id)) continue
+    squadIds.push(id)
+  }
+  for (const id of squadIds) {
+    const sq = await loadSquad(env, id)
+    if (!sq) return refuse(404, 'squad_not_found')
+    if (sq.kind === 'home') return refuse(403, 'home_scope_not_grantable')
+    // A project edge is authorised by the PROJECT being in scope; the squad it names is the thing being attached to
+    // that project (it may well be outside the delegation), so it is checked for existence and home-ness only.
+    if (action === 'project_squad_set' || action === 'project_squad_remove') continue
+    elements.push({ type: 'squad', squad: sq })
+  }
+  if (elements.length === 0) return refuse(403, 'outside_delegation_scope', { act: action })
+
+  // ── one live delegation must cover EVERY element, and its delegator must still be admin ────────────────────
+  let covering: DelegationRow | null = null
+  let sawCovering = false
+  for (const d of delegations) {
+    let all = true
+    for (const el of elements) {
+      if (!(await delegationCovers(env, d, el))) {
+        all = false
+        break
+      }
+    }
+    if (!all) continue
+    sawCovering = true
+    if (await delegatorIsLive(env, d)) {
+      covering = d
+      break
+    }
+  }
+  if (!covering) {
+    return sawCovering
+      ? refuse(403, 'delegator_authority_lost', { act: action })
+      : refuse(403, 'outside_delegation_scope', { act: action })
+  }
+
+  // ── the ceiling: min(max_grant, delegator's live rank, agent's own live rank) ───────────────────────────────
+  let confers: Capability | null = target.capability ?? null
+  if (target.projectAccessLevel) confers = LEVEL_TO_CAPABILITY[target.projectAccessLevel]
+  const maxGrantRank = capabilityRank(covering.max_grant)
+  const evidence: Record<string, unknown> = { max_grant: covering.max_grant }
+  let ceilingRank = maxGrantRank
+  let binding: 'above_max_grant' | 'above_delegator_rank' | 'above_agent_rank' = 'above_max_grant'
+  // Only an act that CONFERS a rank on a squad is bounded by the two humans'-and-agent's own standing; creating
+  // structure (create_squad / create_agent) confers nothing the agent could not already create inside the scope,
+  // and a project edge is bounded by max_grant alone (a project has no capability scope of its own).
+  if (confers && target.squadId && !target.projectAccessLevel) {
+    const delegatorRank = await currentMemberRankOnScope(env, covering.delegator_member_id, 'squad', target.squadId)
+    const agentRank = auth.memberId
+      ? await currentMemberRankOnScope(env, auth.memberId, 'squad', target.squadId)
+      : 0
+    evidence.delegator_rank = delegatorRank
+    evidence.agent_rank = agentRank
+    if (delegatorRank < ceilingRank) {
+      ceilingRank = delegatorRank
+      binding = 'above_delegator_rank'
+    }
+    if (agentRank < ceilingRank) {
+      ceilingRank = agentRank
+      binding = 'above_agent_rank'
+    }
+  }
+  evidence.ceiling_rank = ceilingRank
+  if (confers && capabilityRank(confers) > ceilingRank) {
+    return requiresHumanApproval(action, binding, covering, {
+      requested: { capability: confers },
+      ...evidence,
+    })
+  }
+  // An existing standing ABOVE the ceiling is not the agent's to overwrite, remove or move.
+  if (target.agentId && (action === 'squad_member_add' || action === 'squad_member_remove' || action === 'grant_agent_capability' || action === 'member_capability_grant' || action === 'member_capability_revoke' || action === 'move_agent_squad')) {
+    const standingSquads = action === 'move_agent_squad' ? [target.fromSquadId, target.squadId] : [target.squadId]
+    for (const sid of standingSquads) {
+      if (!sid) continue
+      const standing = await agentStandingOnSquad(env, target.agentId, sid)
+      if (standing > capabilityRank(covering.max_grant)) {
+        return requiresHumanApproval(action, 'target_outranks_delegation', covering, {
+          target_standing_rank: standing,
+          ...evidence,
+        })
+      }
+    }
+  }
+
+  // ── authorization receipt, BEFORE the write: agent + delegator + delegation id ──────────────────────────────
+  const receiptId = crypto.randomUUID()
+  const scopeTypeForReceipt = target.squadId ? 'squad' : target.departmentId ? 'department' : target.projectId ? 'project' : null
+  const scopeIdForReceipt = target.squadId ?? target.departmentId ?? target.projectId ?? null
+  await env.DB.prepare(
+    `INSERT INTO operator_delegation_receipts
+       (id, tenant, delegation_id, agent_id, delegator_member_id, action, surface,
+        target_scope_type, target_scope_id, detail)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+  )
+    .bind(
+      receiptId,
+      env.TENANT_SLUG,
+      covering.id,
+      auth.boundAgentId as string, // a bound-agent caller is the only path into this function
+      covering.delegator_member_id,
+      action,
+      surface,
+      scopeTypeForReceipt,
+      scopeIdForReceipt,
+      JSON.stringify({
+        agent_member_id: auth.memberId ?? null,
+        target_agent_id: target.agentId ?? null,
+        target_member_id: target.memberId ?? null,
+        from_squad_id: target.fromSquadId ?? null,
+        capability: confers,
+        ceiling_rank: ceilingRank,
+        ...(target.detail ?? {}),
+      }),
+    )
+    .run()
+  return { kind: 'delegated', delegation: covering, ceilingRank, receiptId }
+}
+
+/**
+ * THE chokepoint. Call it from every structural write on MCP and HTTP, as the FIRST statement that reads `auth`.
+ * `target` may be a thunk: it is invoked only when a live delegation could apply, so an agent with no delegation is
+ * refused before any caller-supplied reference is resolved (no existence oracle).
+ */
+export async function authorizeStructuralWrite(
+  env: Env,
+  auth: AuthContext,
+  action: StructuralAction,
+  target: StructuralTarget | StructuralTargetThunk,
+  options: StructuralOptions = {},
+): Promise<StructuralVerdict> {
+  if (!auth.boundAgentId) return { kind: 'principal' }
+  const policy = STRUCTURAL_ACTIONS[action]
+  const surface = options.surface ?? 'mcp'
+  if (auth.tenant !== env.TENANT_SLUG) return refuse(403, 'forbidden', { reason: 'tenant_scope' })
+
+  const flagOn = delegatedOperatorsEnabled(env)
+  let sawDelegation = false
+  if (flagOn && policy.delegable) {
+    const delegations = await listLiveDelegationsForAgent(env, auth.boundAgentId)
+    sawDelegation = delegations.length > 0
+    if (sawDelegation) {
+      const resolved = typeof target === 'function' ? await target() : target
+      if (isRefusal(resolved)) return resolved
+      const verdict = await evaluateDelegated(env, auth, action, resolved, delegations, surface)
+      if (verdict.kind === 'delegated') return verdict
+      // A refusal that is about the CEILING or a hard rule must not silently fall to a lane that was not asked for.
+      if (verdict.error !== 'outside_delegation_scope') return verdict
+      // Outside every delegation: only a live elevation lane may still apply.
+      if (policy.elevationAction && (await boundAgentHasAnyLiveGrantForAction(env, auth, policy.elevationAction))) {
+        return { kind: 'agent_legacy' }
+      }
+      return verdict
+    }
+  }
+
+  if (policy.elevationAction && (await boundAgentHasAnyLiveGrantForAction(env, auth, policy.elevationAction))) {
+    return { kind: 'agent_legacy' }
+  }
+  if (policy.agentLane === 'capability' && !(flagOn && policy.delegable)) {
+    return { kind: 'agent_legacy' }
+  }
+  return refuse(403, 'operator_principal_required')
+}
+
+/** HTTP shape of a refusal: the error code plus any detail keys, flat (the existing route convention). */
+export function structuralRefusalBody(r: StructuralRefusal): Record<string, unknown> {
+  return { error: r.error, ...(r.detail ?? {}) }
+}

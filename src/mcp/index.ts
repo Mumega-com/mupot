@@ -192,6 +192,8 @@ import {
 import { hasRegisteredDeliverySurface, resolveDispatchDeliveryMode } from '../bus/consumer'
 import { agentKeyFingerprint, loadActiveAgentKey } from '../fleet/agent-keys'
 import { PROVISION_TOOLS } from './provision'
+import { OPERATOR_TOOLS } from './operators'
+import { agentHasLiveDelegation, delegatedOperatorsEnabled } from '../operators/delegations'
 import { toolAgentLifecycle } from './agent-lifecycle'
 import { BOOTSTRAP_TOOLS } from './bootstrap'
 import { SEAT_SELECT_TOOLS } from './seat-select'
@@ -6994,6 +6996,7 @@ export const TOOLS: ToolSpec[] = [
   ...AGENT_CONNECTION_TOOLS,
   ...PROJECT_TOOLS,
   ...PROVISION_TOOLS,
+  ...OPERATOR_TOOLS,
   toolTeamBootstrap,
   toolTeamBootstrapRelease,
   ...ARCHIVE_TOOLS,
@@ -7213,6 +7216,23 @@ const ELEVATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
   'unarchive_row',
 ])
 
+// Operators + Admission W0 (mumega-com#1386): the DELEGABLE structural tools. A bound agent holding a live
+// delegation (flag on) may pass the AAGATE floor for these, because its own standing is usually below spec.min — the
+// delegation, not the agent's grants, is what authorises it. Like the elevation set above, membership here grants
+// NOTHING: each tool's handler asks authorizeStructuralWrite (src/operators/chokepoint.ts), which re-derives the
+// delegation, the delegator's live admin, the target scope and the rank ceiling on every call and refuses on its own.
+// Keep in step with STRUCTURAL_ACTIONS (delegable: true); tests/operator-chokepoint-ratchet.test.ts pins the pair.
+export const DELEGATION_FLOOR_BYPASS_TOOLS: ReadonlySet<string> = new Set([
+  'create_squad',
+  'create_agent',
+  'squad_member_add',
+  'squad_member_remove',
+  'grant_agent_capability',
+  'move_agent_squad',
+  'project_squad_set',
+  'project_squad_remove',
+])
+
 export async function invokeTool(
   auth: AuthContext,
   env: Env,
@@ -7300,7 +7320,15 @@ export async function invokeTool(
       auth.boundAgentId != null &&
       ELEVATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
       (await boundAgentHasAnyLiveElevationGrant(env, auth))
-    if (!mayBeElevated) {
+    // W0: a live delegation may also reach past the floor for the delegable tools (flag on). Same shape as the
+    // elevation bypass: one extra read, only for a bound agent on a named tool, and the handler decides.
+    const mayBeDelegated =
+      !mayBeElevated &&
+      auth.boundAgentId != null &&
+      DELEGATION_FLOOR_BYPASS_TOOLS.has(spec.name) &&
+      delegatedOperatorsEnabled(env) &&
+      (await agentHasLiveDelegation(env, auth.boundAgentId))
+    if (!mayBeElevated && !mayBeDelegated) {
       const hint = elevationHint(spec.name)
       return { ...fail(403, 'forbidden', hint ? { need: spec.min, hint } : { need: spec.min }), tool: spec.name }
     }

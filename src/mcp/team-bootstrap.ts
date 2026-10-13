@@ -14,6 +14,7 @@
 // written.
 
 import type { Agent, AuthContext, Env } from '../types'
+import { authorizeStructuralWrite } from '../operators/chokepoint'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 import {
   teamBootstrap,
@@ -178,8 +179,9 @@ export const toolTeamBootstrap: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth: AuthContext, env: Env, args) {
-    // Grant tool — never as an agent (mint_agent_token/update_squad's own rule).
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    // Grant tool — never as an agent (mint_agent_token/update_squad's own rule); the one chokepoint answers it.
+    const gate = await authorizeStructuralWrite(env, auth, 'team_bootstrap', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     // AAGATE (spec.min='admin') already floors this at the invokeTool chokepoint;
     // this re-derives the PRECISE org-admin check the way every sibling
     // provision.ts tool does (never trust the floor alone for a sensitive act).
@@ -307,7 +309,8 @@ export const toolTeamBootstrapRelease: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth: AuthContext, env: Env, args) {
-    if (auth.boundAgentId) return fail(403, 'operator_principal_required')
+    const gate = await authorizeStructuralWrite(env, auth, 'team_bootstrap_release', {})
+    if (gate.kind === 'refused') return fail(gate.status, gate.error, gate.detail)
     if (!hasWorkspaceAdmin(auth)) return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
 
     const slugBase = str(args.slug_base)

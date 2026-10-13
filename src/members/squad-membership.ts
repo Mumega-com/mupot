@@ -7,6 +7,7 @@ import {
   type AgentAccessCapability,
 } from './agent-access'
 import { resolveAgentMemberBinding } from './service'
+import type { DelegatedAuthorization } from '../operators/chokepoint'
 
 export const GRANTABLE_SQUAD_MEMBER_CAPABILITIES: ReadonlySet<Capability> = new Set([
   'observer',
@@ -136,6 +137,12 @@ export async function addSquadMember(input: {
   agentId: string
   squad: SquadMembershipTarget
   capability: AgentAccessCapability
+  /**
+   * Set ONLY from an `authorizeStructuralWrite` verdict of kind 'delegated' (src/operators/chokepoint.ts). That verdict
+   * already decided standing, scope, self/human targets and the rank ceiling for a delegated agent, so the
+   * grants-based predicate below (which the agent's own thin grants could never satisfy) is skipped.
+   */
+  delegated?: DelegatedAuthorization
 }): Promise<
   | { ok: true; receiptId: string; result: 'created' | 'updated' | 'unchanged'; memberId: string }
   | { ok: false; error: SquadMembershipMutationError }
@@ -144,13 +151,15 @@ export async function addSquadMember(input: {
   // createHomeForMember. Refused BEFORE the rank-ceiling checks below —
   // absolute, not "unless you outrank the target".
   if (input.squad.kind === 'home') return { ok: false, error: 'home_squad_immutable' }
-  const authorized = await authorizeSquadMembershipWrite({
-    env: input.env,
-    auth: input.auth,
-    targetAgentId: input.agentId,
-    squad: input.squad,
-    requestedCapability: input.capability,
-  })
+  const authorized = input.delegated
+    ? ({ ok: true } as const)
+    : await authorizeSquadMembershipWrite({
+        env: input.env,
+        auth: input.auth,
+        targetAgentId: input.agentId,
+        squad: input.squad,
+        requestedCapability: input.capability,
+      })
   if (!authorized.ok) return authorized
 
   const binding = await resolveAgentMemberBinding(input.env, input.agentId)
@@ -215,6 +224,8 @@ export async function removeSquadMember(input: {
   auth: AuthContext
   agentId: string
   squad: SquadMembershipTarget
+  /** See addSquadMember: only ever a 'delegated' chokepoint verdict. */
+  delegated?: DelegatedAuthorization
 }): Promise<
   | { ok: true; receiptId: string; result: 'removed' | 'unchanged' }
   | { ok: false; error: SquadMembershipMutationError }
@@ -223,13 +234,15 @@ export async function removeSquadMember(input: {
   // writer of a home capability row is createHomeForMember, on either side
   // of the verb.
   if (input.squad.kind === 'home') return { ok: false, error: 'home_squad_immutable' }
-  const authorized = await authorizeSquadMembershipWrite({
-    env: input.env,
-    auth: input.auth,
-    targetAgentId: input.agentId,
-    squad: input.squad,
-    requestedCapability: null,
-  })
+  const authorized = input.delegated
+    ? ({ ok: true } as const)
+    : await authorizeSquadMembershipWrite({
+        env: input.env,
+        auth: input.auth,
+        targetAgentId: input.agentId,
+        squad: input.squad,
+        requestedCapability: null,
+      })
   if (!authorized.ok) return authorized
 
   const binding = await resolveAgentMemberBinding(input.env, input.agentId)
