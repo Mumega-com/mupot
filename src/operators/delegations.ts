@@ -10,6 +10,7 @@ import type { AuthContext, Env } from '../types'
 import {
   actorRankOnScopeFor,
   capabilityRank,
+  hasWorkspaceAdmin,
   sessionMemberId,
 } from '../auth/capability'
 
@@ -296,3 +297,26 @@ export async function listDelegations(
   return rows.results ?? []
 }
 
+
+/**
+ * The delegations a caller may SEE: a workspace admin sees all; anyone else sees the ones they made or hold admin over the
+ * scope of. A plain member must not be able to enumerate who may act for whom. The ONE copy of this predicate: the
+ * operator_list MCP tool and the dashboard Operators page both call it.
+ */
+export async function listVisibleDelegations(
+  env: Env,
+  auth: AuthContext,
+  filter: { agentId?: string; includeRevoked?: boolean },
+): Promise<DelegationRow[]> {
+  const all = await listDelegations(env, filter)
+  const visible: DelegationRow[] = []
+  for (const d of all) {
+    if (hasWorkspaceAdmin(auth) || d.delegator_member_id === auth.memberId) {
+      visible.push(d)
+      continue
+    }
+    const cap = capabilityScopeForDelegation(d.scope_type, d.scope_id)
+    if ((await actorRankOnScopeFor(env, auth, cap.type, cap.id)) >= capabilityRank('admin')) visible.push(d)
+  }
+  return visible
+}

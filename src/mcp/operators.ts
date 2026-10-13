@@ -7,16 +7,14 @@
 
 import { authorizeStructuralWrite } from '../operators/chokepoint'
 import {
-  capabilityScopeForDelegation,
   createDelegation,
   delegatedOperatorsEnabled,
-  listDelegations,
+  listVisibleDelegations,
   revokeDelegation,
   type DelegationError,
 } from '../operators/delegations'
 import { resolveAgentRef } from '../org/resolve'
-import { actorRankOnScopeFor, capabilityRank } from '../auth/capability'
-import { done, fail, hasWorkspaceAdmin, str, type ToolSpec } from './index'
+import { done, fail, str, type ToolSpec } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 
@@ -131,18 +129,7 @@ const toolOperatorList: ToolSpec = {
       if (!agent.ok) return fail(404, 'agent_not_found')
       agentId = agent.value.id
     }
-    const all = await listDelegations(env, { agentId, includeRevoked: args.include_revoked === true })
-    // Visible to a workspace admin, or filtered to the delegations the caller made or administers the scope of: a plain
-    // member must not be able to enumerate who may act for whom.
-    const delegations = []
-    for (const d of all) {
-      if (hasWorkspaceAdmin(auth) || d.delegator_member_id === auth.memberId) {
-        delegations.push(d)
-        continue
-      }
-      const cap = capabilityScopeForDelegation(d.scope_type, d.scope_id)
-      if ((await actorRankOnScopeFor(env, auth, cap.type, cap.id)) >= capabilityRank('admin')) delegations.push(d)
-    }
+    const delegations = await listVisibleDelegations(env, auth, { agentId, includeRevoked: args.include_revoked === true })
     return done({ delegations, count: delegations.length })
   },
 }
