@@ -53,6 +53,23 @@ function adminAuth(overrides: Partial<AuthContext> = {}): AuthContext {
   })
 }
 
+/** A human (not agent-bound) admin; `scope` picks org-wide or one squad. */
+function humanAdminAuth(scope: { type: 'org' } | { type: 'squad'; id: string }): AuthContext {
+  return {
+    userId: OTHER_MEMBER_ID,
+    memberId: OTHER_MEMBER_ID,
+    email: null,
+    role: 'member',
+    tenant: TENANT,
+    channel: 'workspace',
+    capabilities: [
+      scope.type === 'org'
+        ? { member_id: OTHER_MEMBER_ID, scope_type: 'org', scope_id: null, capability: 'admin' }
+        : { member_id: OTHER_MEMBER_ID, scope_type: 'squad', scope_id: scope.id, capability: 'admin' },
+    ],
+  }
+}
+
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('${DEPT_ID}', 'dept-a', 'Department A');
@@ -105,6 +122,7 @@ describe('Grok Bot webhook doorbell', () => {
       DB: harness.db,
       BUS: { send: async () => {} },
       CONNECTOR_MASTER_KEY: TEST_MASTER_KEY,
+      WEBHOOK_DOORBELL: '1',
     } as unknown as Env
   })
 
@@ -158,7 +176,7 @@ describe('Grok Bot webhook doorbell', () => {
     expect(raw.webhook_url).toContain('should-not-leak')
   })
 
-  it('member cannot set or get another agent; admin can', async () => {
+  it('member cannot set or get another agent; a human admin can', async () => {
     const deniedSet = await invokeTool(auth(), env, 'set_agent_webhook_doorbell', {
       agent: AGENT_B,
       webhook_url: 'https://webhook.example/staff',
@@ -173,7 +191,17 @@ describe('Grok Bot webhook doorbell', () => {
     expect(deniedGet.ok).toBe(false)
     expect(deniedGet.status).toBe(403)
 
-    const adminSet = await invokeTool(adminAuth(), env, 'set_agent_webhook_doorbell', {
+    // an org-admin AGENT (agent-bound, no delegation) is refused through the W0 chokepoint
+    const agentAdminSet = await invokeTool(adminAuth(), env, 'set_agent_webhook_doorbell', {
+      agent: 'grokbot-staff',
+      webhook_url: 'https://webhook.example/staff',
+      bearer: DOORBELL_BEARER,
+    }, 'https://pot.example')
+    expect(agentAdminSet.ok).toBe(false)
+    expect(agentAdminSet.status).toBe(403)
+    expect(agentAdminSet.error).toBe('operator_principal_required')
+
+    const adminSet = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'set_agent_webhook_doorbell', {
       agent: 'grokbot-staff',
       webhook_url: 'https://webhook.example/staff',
       bearer: DOORBELL_BEARER,
@@ -181,7 +209,7 @@ describe('Grok Bot webhook doorbell', () => {
     expect(adminSet.ok).toBe(true)
     expect((adminSet.result as { agent_id: string }).agent_id).toBe(AGENT_B)
 
-    const adminGet = await invokeTool(adminAuth(), env, 'get_agent_webhook_doorbell', {
+    const adminGet = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'get_agent_webhook_doorbell', {
       agent: AGENT_B,
     }, 'https://pot.example')
     expect(adminGet.ok).toBe(true)
@@ -393,5 +421,173 @@ describe('Grok Bot webhook doorbell', () => {
       auth_last4: '-XYZ',
     })
     assertNoSecretLeak(JSON.stringify(view))
+  })
+  it('squad admin of the agent squad may set; squad admin of another squad may not', async () => {
+    harness.sqlite.exec(`
+      INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-b', '${DEPT_ID}', 'squad-b', 'Squad Beta');
+    `)
+    const own = await invokeTool(humanAdminAuth({ type: 'squad', id: SQUAD_ID }), env, 'set_agent_webhook_doorbell', {
+      agent: AGENT_B, webhook_url: 'https://webhook.example/staff', bearer: DOORBELL_BEARER,
+    }, 'https://pot.example')
+    expect(own.ok).toBe(true)
+    const other = await invokeTool(humanAdminAuth({ type: 'squad', id: 'squad-b' }), env, 'set_agent_webhook_doorbell', {
+      agent: AGENT_B, webhook_url: 'https://webhook.example/staff2', bearer: DOORBELL_BEARER,
+    }, 'https://pot.example')
+    expect(other.ok).toBe(false)
+    expect(other.status).toBe(403)
+    const otherClear = await invokeTool(humanAdminAuth({ type: 'squad', id: 'squad-b' }), env, 'set_agent_webhook_doorbell', {
+      agent: AGENT_B, clear: true,
+    }, 'https://pot.example')
+    expect(otherClear.ok).toBe(false)
+    expect(otherClear.status).toBe(403)
+    const row = harness.sqlite.prepare('SELECT webhook_url FROM agent_webhook_doorbells WHERE agent_id = ?').get(AGENT_B) as { webhook_url: string }
+    expect(row.webhook_url).toBe('https://webhook.example/staff')
+  })
+
+  it('flag off: set is refused and a send makes no POST and no receipt', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A, webhookUrl: 'https://webhook.example/ceo', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    const off = { ...env, WEBHOOK_DOORBELL: undefined } as unknown as Env
+    const refused = await invokeTool(auth(), off, 'set_agent_webhook_doorbell', {
+      webhook_url: 'https://webhook.example/ceo', bearer: DOORBELL_BEARER,
+    }, 'https://pot.example')
+    expect(refused.ok).toBe(false)
+    expect(refused.error).toBe('webhook_doorbell_disabled')
+    let calls = 0
+    const res = await sendAgentMessage(off, {
+      fromAgent: AGENT_B, fromMember: MEMBER_ID, toAgent: AGENT_A, body: 'x', kind: 'message', requestId: 'rid-off',
+    }, AUTHZ, { fetch: (async () => { calls += 1; return new Response('ok') }) as typeof fetch })
+    expect(res.ok).toBe(true)
+    expect(calls).toBe(0)
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbell_receipts').get()).toEqual({ n: 0 })
+  })
+
+  it.each([
+    'https://localhost/x', 'https://127.0.0.1/x', 'https://10.0.0.5/x', 'https://192.168.1.1/x',
+    'https://169.254.169.254/latest', 'https://[::1]/x', 'https://[fd00::1]/x', 'https://[::ffff:10.0.0.1]/x',
+    'https://metadata.google.internal/x', 'https://svc.internal/x', 'https://webhook.example:8443/x',
+    'https://user:pw@webhook.example/x',
+  ])('set refuses %s', async (url) => {
+    const out = await invokeTool(auth(), env, 'set_agent_webhook_doorbell', { webhook_url: url, bearer: DOORBELL_BEARER }, 'https://pot.example')
+    expect(out.ok).toBe(false)
+    expect(out.error).toBe('invalid_webhook_url')
+    expect(harness.sqlite.prepare('SELECT count(*) AS n FROM agent_webhook_doorbells').get()).toEqual({ n: 0 })
+  })
+
+  it('fire time re-checks the guard: a stored private URL is skipped, never fetched', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A, webhookUrl: 'https://webhook.example/ceo', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    harness.sqlite.prepare('UPDATE agent_webhook_doorbells SET webhook_url = ? WHERE agent_id = ?').run('https://169.254.169.254/latest', AGENT_A)
+    let calls = 0
+    const pending: Promise<unknown>[] = []
+    await sendAgentMessage(env, {
+      fromAgent: AGENT_B, fromMember: MEMBER_ID, toAgent: AGENT_A, body: 'x', kind: 'message', requestId: 'rid-ssrf',
+    }, AUTHZ, { fetch: (async () => { calls += 1; return new Response('ok') }) as typeof fetch, waitUntil: (p) => { pending.push(p) } })
+    await Promise.all(pending)
+    expect(calls).toBe(0)
+    expect(harness.sqlite.prepare('SELECT outcome, reason FROM agent_webhook_doorbell_receipts').all()).toEqual([
+      { outcome: 'skipped', reason: 'invalid_url' },
+    ])
+  })
+
+  it('never follows redirects; a 3xx is a failed receipt; receipts hold status only', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A, webhookUrl: DOORBELL_URL, bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    const inits: RequestInit[] = []
+    const pending: Promise<unknown>[] = []
+    const logs = collectLogs()
+    await sendAgentMessage(env, {
+      fromAgent: AGENT_B, fromMember: MEMBER_ID, toAgent: AGENT_A, body: 'x', kind: 'message', requestId: 'rid-redir',
+    }, AUTHZ, {
+      fetch: (async (_u: string, init?: RequestInit) => { inits.push(init ?? {}); return new Response(null, { status: 302, headers: { location: 'https://169.254.169.254/' } }) }) as unknown as typeof fetch,
+      waitUntil: (p) => { pending.push(p) },
+    })
+    await Promise.all(pending)
+    logs.restore()
+    expect(inits).toHaveLength(1)
+    expect(inits[0].redirect).toBe('manual')
+    const rows = harness.sqlite.prepare('SELECT * FROM agent_webhook_doorbell_receipts').all() as Array<Record<string, unknown>>
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ outcome: 'failed', http_status: 302, event_type: 'mupot.inbox.wake', agent_id: AGENT_A })
+    assertNoSecretLeak(JSON.stringify(rows))
+  })
+
+  it('a landed send writes a posted receipt', async () => {
+    await setAgentWebhookDoorbell(env, {
+      agentId: AGENT_A, webhookUrl: DOORBELL_URL, bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+    })
+    const pending: Promise<unknown>[] = []
+    await sendAgentMessage(env, {
+      fromAgent: AGENT_B, fromMember: MEMBER_ID, toAgent: AGENT_A, body: 'x', kind: 'message', requestId: 'rid-ok',
+    }, AUTHZ, { fetch: (async () => new Response('ok', { status: 200 })) as typeof fetch, waitUntil: (p) => { pending.push(p) } })
+    await Promise.all(pending)
+    expect(harness.sqlite.prepare('SELECT outcome, http_status FROM agent_webhook_doorbell_receipts').all()).toEqual([
+      { outcome: 'posted', http_status: 200 },
+    ])
+  })
+
+  describe('task assignment doorbell (mupot#1882)', () => {
+    async function ring(args: Record<string, unknown>, toolAuth = humanAdminAuth({ type: 'org' })) {
+      await setAgentWebhookDoorbell(env, {
+        agentId: AGENT_B, webhookUrl: 'https://webhook.example/staff', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+      })
+      const bodies: unknown[] = []
+      const pending: Promise<unknown>[] = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return new Response('ok', { status: 200 })
+      }) as typeof fetch
+      try {
+        const out = await invokeTool(toolAuth, env, 'task_create', {
+          squad_id: SQUAD_ID, title: 'T', done_when: 'the task passes review checks', assignee_agent_id: AGENT_B, ...args,
+        }, { origin: 'https://pot.example', transport: 'mcp', waitUntil: (p: Promise<unknown>) => { pending.push(p) } })
+        await Promise.all(pending)
+        return { out, bodies }
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    }
+
+    it('task_create to an agent with a doorbell posts mupot.task.assigned with task_id', async () => {
+      const { out, bodies } = await ring({})
+      expect(out.ok).toBe(true)
+      const taskId = (out.result as { task: { id: string } }).task.id
+      expect(bodies).toEqual([{ type: 'mupot.task.assigned', agent_id: AGENT_B, task_id: taskId }])
+    })
+
+    it('a backlog-only create (dispatch:false) does not ring', async () => {
+      const { out, bodies } = await ring({ dispatch: false })
+      expect(out.ok).toBe(true)
+      expect(bodies).toEqual([])
+    })
+
+    it('task_update ringing only on a real assignee change', async () => {
+      await setAgentWebhookDoorbell(env, {
+        agentId: AGENT_B, webhookUrl: 'https://webhook.example/staff', bearer: DOORBELL_BEARER, createdByMemberId: MEMBER_ID,
+      })
+      const created = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'task_create', {
+        squad_id: SQUAD_ID, title: 'T2', done_when: 'the task passes review checks', dispatch: false,
+      }, 'https://pot.example')
+      const taskId = (created.result as { task: { id: string } }).task.id
+      const bodies: unknown[] = []
+      const pending: Promise<unknown>[] = []
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async (_u: unknown, init?: RequestInit) => { bodies.push(JSON.parse(String(init?.body))); return new Response('ok') }) as typeof fetch
+      try {
+        const ctx = { origin: 'https://pot.example', transport: 'mcp' as const, waitUntil: (p: Promise<unknown>) => { pending.push(p) } }
+        const a = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'task_update', { task_id: taskId, assignee_agent_id: AGENT_B }, ctx)
+        expect(a.ok).toBe(true)
+        const same = await invokeTool(humanAdminAuth({ type: 'org' }), env, 'task_update', { task_id: taskId, assignee_agent_id: AGENT_B }, ctx)
+        expect(same.ok).toBe(true)
+        await Promise.all(pending)
+      } finally {
+        globalThis.fetch = realFetch
+      }
+      expect(bodies).toEqual([{ type: 'mupot.task.assigned', agent_id: AGENT_B, task_id: taskId }])
+    })
   })
 })

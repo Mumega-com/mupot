@@ -7,20 +7,32 @@
 
 import type { AuthContext, Env } from '../types'
 import { resolveAgentRef } from '../org/resolve'
+import { authorizeStructuralWrite } from '../operators/chokepoint'
 import {
   clearAgentWebhookDoorbell,
   getAgentWebhookDoorbell,
   setAgentWebhookDoorbell,
 } from '../agents/webhook-doorbell'
-import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
+import { type ToolSpec, fail, done, str, memberCanOnSquadAuth } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
 type ToolFailure = Extract<ReturnType<typeof fail>, { ok: false }>
 
+/**
+ * Who may touch an agent's doorbell (set / clear / get):
+ *   - the AGENT ITSELF (agent-bound caller whose resolved target is its own row), or
+ *   - a NON-agent-bound member holding admin on the target agent's SQUAD (org admin covers every squad).
+ * An agent-bound caller aiming at ANOTHER agent is refused through the W0 chokepoint
+ * (src/operators/chokepoint.ts, action set_agent_webhook_doorbell: not delegable, refuse lane), so the
+ * answer is the same one every other structural tool gives, never a second rule here. A doorbell redirects an
+ * agent's wake signal to an external URL, which is why a delegation can never buy it.
+ * `gate` is true for writes (set/clear); a read by a non-self agent is a plain 403.
+ */
 async function resolveDoorbellTarget(
   auth: AuthContext,
   env: Env,
   agentArg: unknown,
+  gate: boolean,
 ): Promise<{ ok: true; agentId: string } | ToolFailure> {
   const requested = str(agentArg)
   const targetRef = requested ?? auth.boundAgentId
@@ -35,16 +47,27 @@ async function resolveDoorbellTarget(
       : fail(404, 'agent_not_found')) as ToolFailure
   }
 
-  const self = auth.boundAgentId === resolved.value.id
-  if (!self && !hasWorkspaceAdmin(auth)) {
-    return fail(403, 'forbidden', { need: 'self_or_org_admin' }) as ToolFailure
+  if (auth.boundAgentId) {
+    if (auth.boundAgentId === resolved.value.id) return { ok: true, agentId: resolved.value.id }
+    if (gate) {
+      const verdict = await authorizeStructuralWrite(env, auth, 'set_agent_webhook_doorbell', {
+        agentId: resolved.value.id,
+        squadId: resolved.value.squad_id,
+      })
+      if (verdict.kind === 'refused') return fail(verdict.status, verdict.error, verdict.detail) as ToolFailure
+    }
+    return fail(403, 'forbidden', { need: 'self_or_squad_admin' }) as ToolFailure
+  }
+
+  if (!(await memberCanOnSquadAuth(env, auth, resolved.value.squad_id, 'admin'))) {
+    return fail(403, 'forbidden', { need: 'self_or_squad_admin' }) as ToolFailure
   }
   return { ok: true, agentId: resolved.value.id }
 }
 
 const toolSetAgentWebhookDoorbell: ToolSpec = {
   name: 'set_agent_webhook_doorbell',
-  scope: 'self (own agent) or org-admin (any agent) — register or clear an outbound inbox-wake webhook',
+  scope: "self (own agent) or admin of the agent's squad — register or clear an outbound wake webhook (flag WEBHOOK_DOORBELL)",
   min: 'authenticated',
   args: '{ agent?: string, webhook_url?: string, bearer?: string, clear?: boolean }',
   inputSchema: {
@@ -61,7 +84,7 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
     const actor = auth.memberId ?? auth.userId
     if (!actor) return fail(403, 'unauthenticated')
 
-    const target = await resolveDoorbellTarget(auth, env, args.agent)
+    const target = await resolveDoorbellTarget(auth, env, args.agent, true)
     if (!target.ok) return target
 
     if (args.clear === true) {
@@ -84,6 +107,7 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
       if (result.error === 'doorbell_crypto_unavailable') {
         return fail(503, result.error, 'CONNECTOR_MASTER_KEY Worker secret is required to store a doorbell bearer')
       }
+      if (result.error === 'webhook_doorbell_disabled') return fail(403, result.error, 'set WEBHOOK_DOORBELL=1 to enable')
       if (result.error === 'no_tenant') return fail(500, result.error)
       return fail(400, result.error, result.detail)
     }
@@ -93,7 +117,7 @@ const toolSetAgentWebhookDoorbell: ToolSpec = {
 
 const toolGetAgentWebhookDoorbell: ToolSpec = {
   name: 'get_agent_webhook_doorbell',
-  scope: 'self (own agent) or org-admin (any agent) — read doorbell URL + last4, never the bearer',
+  scope: "self (own agent) or admin of the agent's squad — read doorbell URL + last4, never the bearer",
   min: 'authenticated',
   args: '{ agent?: string }',
   inputSchema: {
@@ -102,7 +126,7 @@ const toolGetAgentWebhookDoorbell: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    const target = await resolveDoorbellTarget(auth, env, args.agent)
+    const target = await resolveDoorbellTarget(auth, env, args.agent, false)
     if (!target.ok) return target
 
     const doorbell = await getAgentWebhookDoorbell(env, target.agentId)

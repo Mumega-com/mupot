@@ -15,6 +15,7 @@
 
 import { authorizeStructuralWrite, structuralRefusalBody } from '../operators/chokepoint'
 import { releaseExecutionHold } from '../agents/execution-brakes'
+import { scheduleTaskAssignedDoorbell, waitUntilFromContext } from '../agents/webhook-doorbell'
 import { canReleaseExecutionHold, decideReassignOverHold, releaseActorMemberId } from '../agents/execution-release-policy'
 import { Hono } from 'hono'
 import { csrf } from 'hono/csrf'
@@ -713,6 +714,11 @@ tasksApp.post('/', async (c) => {
     return c.json(mapped.body, mapped.status)
   }
 
+  // Doorbell (mupot#1882): ring the assignee's webhook unless this is a backlog-only create.
+  if (body.dispatch !== false) {
+    scheduleTaskAssignedDoorbell(c.env, task.assignee_agent_id, task.id, { waitUntil: waitUntilFromContext(c) })
+  }
+
   // Dispatch: wake the assignee in execute mode. We require an assignee — there is
   // no "wake the whole squad to fight over one task". The assignee was already
   // validated as assignable on THIS task squad (resolveTaskAssignee →
@@ -1226,6 +1232,10 @@ tasksApp.patch('/:id', async (c) => {
     next,
     auth.memberId ? { kind: 'member', id: auth.memberId } : undefined,
   )
+  // Doorbell (mupot#1882): ring the NEW assignee only when the assignee actually changed.
+  if (assigningAgent && next.assignee_agent_id !== existing.assignee_agent_id) {
+    scheduleTaskAssignedDoorbell(c.env, next.assignee_agent_id, next.id, { waitUntil: waitUntilFromContext(c) })
+  }
 
   // mupot#1592 NEW-1 — REST parity with the MCP task_update hook: freezes a
   // gate:office task's publish payload the moment it enters review (ordinary

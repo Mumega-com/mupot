@@ -25,7 +25,7 @@ import { receiverNotStoppedSql } from '../fleet/registry'
 import { dispatchBrakesClearSql, diagnoseDispatchBrake, executionPausedAtSql, executionPausedSql } from './execution-brake-sql'
 import { TOKEN_LIVE_PREDICATE } from '../auth/token-lifecycle'
 import { evaluateReplyExpectation, type ReplyBasis } from './reply-expectation'
-import { scheduleWebhookDoorbell } from './webhook-doorbell'
+import { INBOX_WAKE_TYPE, scheduleWebhookDoorbell } from './webhook-doorbell'
 
 // ── tunables ────────────────────────────────────────────────────────────────────────────
 export const MAX_BODY_CHARS = 8000
@@ -664,7 +664,7 @@ export async function sendAgentMessage(
     if (!opts.routineRunFence) {
       scheduleWebhookDoorbell(
         env,
-        { agent_id: input.toAgent, seq, message_id: id, kind },
+        { type: INBOX_WAKE_TYPE, agent_id: input.toAgent, seq, message_id: id, kind },
         { fetch: opts.fetch, waitUntil: opts.waitUntil },
       )
     }

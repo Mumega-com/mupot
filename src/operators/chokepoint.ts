@@ -74,6 +74,8 @@ export type StructuralAction =
   | 'suspend_member'
   | 'unbind_member_telegram'
   | 'create_invite'
+  // points an agent's wake signal at an external URL with a bearer: the agent itself may (self lane, in the tool), nobody else's agent may
+  | 'set_agent_webhook_doorbell'
   // changing or even reading who may act for whom is a human act: an agent never creates, extends, revokes or lists
   // delegations, its own or anyone's
   | 'manage_delegations'
@@ -147,6 +149,7 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   suspend_member: { delegable: false, agentLane: 'refuse' },
   unbind_member_telegram: { delegable: false, agentLane: 'refuse' },
   create_invite: { delegable: false, agentLane: 'refuse' },
+  set_agent_webhook_doorbell: { delegable: false, agentLane: 'refuse' },
   manage_delegations: { delegable: false, agentLane: 'refuse' },
   // project_create attaches the creator's own squad edge; project_start (planned -> active) provisions a department, squad,
   // agent, an admin edge and grants. Neither is delegable: an agent keeps exactly its pre-W0 lane (flag on or off).
@@ -185,6 +188,7 @@ export const STRUCTURAL_MCP_TOOLS: Readonly<Record<string, StructuralAction>> = 
   revoke_gate_capability: 'revoke_gate_capability',
   team_bootstrap: 'team_bootstrap',
   team_bootstrap_release: 'team_bootstrap_release',
+  set_agent_webhook_doorbell: 'set_agent_webhook_doorbell',
   operator_delegate: 'manage_delegations',
   operator_revoke: 'manage_delegations',
   operator_list: 'manage_delegations',

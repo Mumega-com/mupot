@@ -29,16 +29,9 @@ import { verifyAndReadSignedInbox } from '../fleet/signed-inbox'
 import { resolveBoundSeat, resolveInboxSeatArg } from './inbox-seat'
 import { activeSeatEventGrant, authorizeSeatDelivery, isSeatEventsEnabled } from './seat-events'
 
-const MAX_BODY_BYTES = 8192
+import { waitUntilFromContext } from './webhook-doorbell'
 
-function waitUntilFrom(c: Context<{ Bindings: Env }>): ((p: Promise<unknown>) => void) | undefined {
-  try {
-    const ctx = c.executionCtx
-    return ctx ? (p: Promise<unknown>) => ctx.waitUntil(p) : undefined
-  } catch {
-    return undefined
-  }
-}
+const MAX_BODY_BYTES = 8192
 
 // ── inbox stream (SSE) ────────────────────────────────────────────────────────────────────
 // The durable inbox is pull-only; this endpoint is the push side of #706. It is a thin SSE
@@ -397,7 +390,7 @@ inboxApp.post('/send', async (c) => {
       targetSeat,
     },
     { isAdmin, grants },
-    { waitUntil: waitUntilFrom(c) },
+    { waitUntil: waitUntilFromContext(c) },
   )
   if (!res.ok) {
     // Never forward a raw DB error string to the client (leak-guard, matches the MCP path).

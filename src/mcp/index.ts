@@ -217,6 +217,7 @@ import { GATE_GRANT_TOOLS } from './gates'
 import { LOOP_TOOLS } from './loops'
 import { SECRET_ENV_TOOLS } from './secret-env'
 import { WEBHOOK_DOORBELL_TOOLS } from './webhook-doorbell'
+import { scheduleTaskAssignedDoorbell } from '../agents/webhook-doorbell'
 import { PRESENCE_TOOLS } from './presence'
 import { SEED_TOOLS } from './seed'
 import { SECURE_DROP_TOOLS } from './secure-drop'
@@ -1107,7 +1108,7 @@ const toolTaskCreate: ToolSpec = {
     required: ['title', 'done_when'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const title = str(args.title)
     if (!title) return fail(400, 'invalid_args', 'title required')
 
@@ -1260,6 +1261,10 @@ const toolTaskCreate: ToolSpec = {
       throw error
     }
 
+    // Doorbell (mupot#1882): an assigned agent with a doorbell is rung; a backlog-only create (dispatch:false) never wakes.
+    if (args.dispatch !== false) {
+      scheduleTaskAssignedDoorbell(env, task.assignee_agent_id, task.id, { waitUntil: ctx.waitUntil })
+    }
     return done({ task })
   },
 }
@@ -1617,7 +1622,7 @@ const toolTaskUpdate: ToolSpec = {
     required: ['task_id'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     const taskRef = str(args.task_id)
     if (!taskRef) return fail(400, 'invalid_args', 'task_id required')
     const taskRes = await getTask(env, taskRef)
@@ -2105,6 +2110,10 @@ const toolTaskUpdate: ToolSpec = {
 
     const actor = memberActor(auth.memberId as string)
     await emitTaskEvent(env, 'task.updated', next, actor)
+    // Doorbell (mupot#1882): ring the NEW assignee only when the assignee actually changed.
+    if (assigningAgent && next.assignee_agent_id !== existing.assignee_agent_id) {
+      scheduleTaskAssignedDoorbell(env, next.assignee_agent_id, next.id, { waitUntil: ctx.waitUntil })
+    }
     let gateWake: GateWakeOutcome | undefined
 
     // Review-wake (S### — wake the gate owner instead of waiting for a hand
