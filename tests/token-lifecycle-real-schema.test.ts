@@ -321,6 +321,7 @@ describe('every bearer door consumes the shared predicate', () => {
     { fingerprint: '213bb53402c3', why: 'the expiry SWEEP itself (token-lifecycle.ts) — it exists to find tokens BY their expiry, so the live-only predicate would make it return nothing.' },
     { fingerprint: '05aee212eb22', why: "cross-DB bootstrap writes the CHILD pot's token plane via D1 REST; not a parent bearer door; the child has no shared-predicate surface yet (pots/service.ts readFullSeedIdentityState, admin-token existence check, provisionSovereignPot's idempotent-retry gate, mupot#1507 P0-2)." },
     { fingerprint: 'bba50cbd88a9', why: "cross-DB bootstrap writes the CHILD pot's token plane via D1 REST; not a parent bearer door; the child has no shared-predicate surface yet (pots/service.ts readFullSeedIdentityState, lead-agent seed-seat token existence check, same gate as fingerprint 05aee212eb22 immediately above)." },
+    { fingerprint: '9f569882be3c', why: "workspaces W1 reuseRevokedHarness (members/harness.ts): looks for a REVOKED consent token by design (the inverse of the live predicate) to adopt that grant's harness. Grants no access: the adopting UPDATE is re-checked by trigger harnesses_grant_immutable (old token revoked, new token live and the same member's)." },
   ]
 
   it('EVERY SELECT over member_tokens in src/ consumes the shared predicate or is fingerprint-exempt', () => {
