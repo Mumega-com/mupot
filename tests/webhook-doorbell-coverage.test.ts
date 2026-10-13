@@ -79,6 +79,16 @@ describe('delivery without a waitUntil (cron, queue consumer, routine actions...
   })
 })
 
+describe('response handling', () => {
+  it('releases the response body without reading it', async () => {
+    let cancelled = 0
+    globalThis.fetch = (async () => ({ ok: true, status: 200, body: { cancel: async () => { cancelled += 1 } } })) as unknown as typeof fetch
+    await send('body-1')
+    expect(cancelled).toBe(1)
+    expect(receipts()).toEqual([{ event_type: 'mupot.inbox.wake', outcome: 'posted', http_status: 200, reason: null }])
+  })
+})
+
 describe('coalescing (one POST per agent per 10s window)', () => {
   it('a second wake inside the window is receipted coalesced and sends nothing; after the window it rings again', async () => {
     await send('c1')
