@@ -161,6 +161,14 @@ describe('review-thread fixes (Kasra, pre-merge)', () => {
     // GitHub on a non-default port is not GitHub: refused, never folded into the real repo's key
     expect(repoKeyFromUrl('https://github.com:8443/org/repo')).toBeNull()
     expect(repoKeyFromUrl('https://github.com/org/repo')).toBe('github:org/repo')
+    // default port must match the scheme; parser-normalised spellings cannot hide a port
+    expect(repoKeyFromUrl('https://github.com:22/org/repo')).toBeNull()
+    expect(repoKeyFromUrl('ssh://git@github.com:443/org/repo')).toBeNull()
+    expect(repoKeyFromUrl('https:/github.com:8443/org/repo')).toBeNull()
+    expect(repoKeyFromUrl('https://github.com:443/org/repo')).toBe('github:org/repo')
+    expect(repoKeyFromUrl('git@github.com:org/repo.git')).toBe('github:org/repo')
+    // percent-encoding is settled fully
+    expect(repoKeyFromUrl('https://git.example.test/Team%2541/Repo')).toBe(repoKeyFromUrl('https://git.example.test/TeamA/Repo'))
   })
 
   it('deleting a project removes its workspace records (team_bootstrap_release path stays open)', async () => {

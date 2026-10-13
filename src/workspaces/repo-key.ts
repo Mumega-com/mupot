@@ -29,8 +29,16 @@ export function repoKeyFromUrl(repoUrl: string | null | undefined): string | nul
   if (id.kind === 'github') {
     // A GitHub hostname on a non-default port is not GitHub's endpoint: refuse it rather than fold it into the
     // github:owner/repo identity of the real repository (review thread, 2026-10-13).
-    const port = /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]*@)?[^/:]+:(\d+)/i.exec(raw)?.[1]
-    if (port && !['443', '80', '22'].includes(String(Number(port)))) return null
+    // Read the port the way the URL parser does (it normalises backslashes, missing slashes and whitespace),
+    // and accept only the default port OF THAT SCHEME: https 443, http 80, ssh/git+ssh 22. An scp-style
+    // `git@github.com:owner/repo` has no port. Anything else is a different endpoint: refused.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw) && !/^[^/@\s]+@[^:/\s]+:(?!\/\/)/.test(raw)) {
+      let parsed: URL
+      try { parsed = new URL(raw) } catch { return null }
+      const scheme = parsed.protocol.toLowerCase()
+      const defaults: Record<string, string> = { 'https:': '443', 'http:': '80', 'ssh:': '22', 'git+ssh:': '22' }
+      if (parsed.port !== '' && defaults[scheme] !== String(Number(parsed.port))) return null
+    }
     return id.repo === null ? null : `github:${id.owner}/${id.repo}`
   }
   if (id.kind !== 'url') return null // github-unsure / url-unsure: not one repository
@@ -47,8 +55,15 @@ export function repoKeyFromUrl(repoUrl: string | null | undefined): string | nul
   if (host === '') return null
   const segments: string[] = []
   for (const piece of url.pathname.replace(/\\/g, '/').split('/')) {
-    let decoded: string
-    try { decoded = decodeURIComponent(piece) } catch { return null }
+    // Settle percent-encoding fully (bounded), so `%2541` and `A` spell the same segment.
+    let decoded = piece
+    for (let i = 0; i < 4; i++) {
+      let next: string
+      try { next = decodeURIComponent(decoded) } catch { return null }
+      if (next === decoded) break
+      decoded = next
+      if (i === 3) return null // still changing: refuse rather than guess
+    }
     for (const part of decoded.replace(/\\/g, '/').split('/')) {
       if (part !== '' && part !== '.') segments.push(part)
     }
