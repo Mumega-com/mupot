@@ -105,7 +105,7 @@ function level(h: SqliteD1Harness, agent: string, memberId: string, squad: strin
 const rava = (h: SqliteD1Harness, squad = 'sq-core') => level(h, 'rava', 'm-rava', squad)
 
 function receipts(h: SqliteD1Harness): Array<Record<string, unknown>> {
-  return h.sqlite.prepare('SELECT * FROM agent_access_receipts ORDER BY created_at, id').all() as Array<Record<string, unknown>>
+  return h.sqlite.prepare('SELECT * FROM agent_access_receipts ORDER BY created_at, rowid').all() as Array<Record<string, unknown>>
 }
 
 function seedRava(h: SqliteD1Harness, capability: AgentAccessCapability, squad = 'sq-core'): void {
