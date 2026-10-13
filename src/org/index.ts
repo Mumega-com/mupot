@@ -233,6 +233,17 @@ orgApp.post('/departments/:id/squads', async (c) => {
     return c.json({ error: 'invalid_json' }, 400)
   }
 
+  // Under delegation a squad slug must not collide with ANY existing squad (same rule the MCP door applies in the
+  // chokepoint; here the body is only known after the gate).
+  if (gate.kind === 'delegated' && typeof body.slug === 'string' && body.slug.trim().length > 0) {
+    const dupe = await c.env.DB.prepare('SELECT 1 AS one FROM squads WHERE slug = ?1 LIMIT 1')
+      .bind(body.slug.trim().toLowerCase()).first<{ one: number }>()
+    if (dupe) {
+      await finishDelegatedReceipt(c.env, gate, false)
+      return c.json({ error: 'squad_slug_taken' }, 409)
+    }
+  }
+
   // Same boundary fix as departments (re-gate condition 2026-08-12): construct
   // from known fields; kind is internal-only.
   const auth = c.get('auth')

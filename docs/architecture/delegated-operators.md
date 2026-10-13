@@ -105,3 +105,7 @@ Who may delegate, and who may be a delegator, uses the fail-closed union: bound 
 `member_tokens` row welded to an agent. The TARGET rule ("an act on a human member is refused") still uses the binding
 table alone (a wrong "agent" answer there would be the unsafe one). It was NOT verified against production data that no
 human row carries a legacy binding; the union makes the creation side over-refuse rather than under-refuse.
+
+## Production data check (2026-10-13)
+
+`agent_member_bindings` was checked read-only in production: 84 rows, and none belongs to a member with a human login identity or a passkey. The stricter `memberLooksAgentBound` union (used for the delegator and creator checks) is therefore a conservative choice, not a workaround for bad data.

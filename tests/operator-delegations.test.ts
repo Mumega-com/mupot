@@ -29,6 +29,7 @@ const { membersApp } = await import('../src/members')
 const { orgApp } = await import('../src/org')
 const { gatesApp } = await import('../src/tasks')
 const { projectsApp } = await import('../src/projects')
+const { TOUCHES_TARGET_STANDING } = await import('../src/operators/chokepoint')
 const { createDelegation, revokeDelegation } = await import('../src/operators/delegations')
 
 const TENANT = 'tenant-a'
@@ -733,6 +734,37 @@ describe('gate round 1 fixes', () => {
     // the HTTP twins agree
     const h = await http(membersApp, a, 'POST', '/members/seat-agent-B/capabilities', { action: 'revoke', scope_type: 'squad', scope_id: 'S3' })
     expect(h.body.error).toBe('requires_human_approval')
+  })
+
+  it('r2 P1: the HTTP memberships route (grant_agent_membership) checks GLOBAL target standing too', async () => {
+    await delegate('org', null, 'lead')
+    const a = operator()
+    // an admin membership on S1 held by agent-B: a lead-capped delegate may not demote it over HTTP
+    harness.sqlite.prepare("INSERT INTO memberships (id, agent_id, squad_id, capability) VALUES ('m-B-S1', 'agent-B', 'S1', 'admin')").run()
+    const demote = await http(orgApp, a, 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'member' })
+    expect(demote.body).toMatchObject({ error: 'requires_human_approval', act: 'grant_agent_membership' })
+    expect(membership('agent-B', 'S1')).toBe('admin')
+    harness.sqlite.prepare("DELETE FROM memberships WHERE id = 'm-B-S1'").run()
+    // an org-admin target over HTTP
+    addCap('seat-agent-B', 'admin', 'org', null)
+    const orgAdmin = await http(orgApp, a, 'POST', '/agents/agent-B/memberships', { squad_id: 'S1', capability: 'member' })
+    expect(orgAdmin.body).toMatchObject({ error: 'requires_human_approval', act: 'grant_agent_membership' })
+    expect(membership('agent-B', 'S1')).toBeNull()
+  })
+
+  it('r2 P2: create_squad under delegation refuses a slug that already exists in ANY department (resolve DoS)', async () => {
+    await delegate('org', null, 'lead')
+    const a = operator()
+    const existing = rows<{ slug: string }>("SELECT slug FROM squads WHERE id = 'S1'")[0].slug
+    const r = refusal(await call(a, 'create_squad', { department: 'D2', slug: existing, name: 'dupe' }))
+    expect(r.error).toBe('squad_slug_taken')
+    expect(rows<{ n: number }>(`SELECT COUNT(*) AS n FROM squads WHERE slug = '${existing}'`)[0].n).toBe(1)
+  })
+
+  it('r2: every delegable act whose target is an existing agent is in TOUCHES_TARGET_STANDING (a rename cannot drop the guard)', () => {
+    for (const act of ['squad_member_add', 'squad_member_remove', 'grant_agent_capability', 'grant_agent_membership', 'member_capability_grant', 'member_capability_revoke', 'move_agent_squad'] as const) {
+      expect(TOUCHES_TARGET_STANDING.has(act), act).toBe(true)
+    }
   })
 
   it('P2: create_agent CONFERS member standing: it meets the ceiling and refuses a colliding slug (MCP and HTTP)', async () => {

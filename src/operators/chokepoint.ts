@@ -97,6 +97,15 @@ export interface StructuralPolicy {
   readonly elevationAction?: string
 }
 
+/** Delegated acts that change what an EXISTING agent holds or where it sits. Each one checks the target's GLOBAL
+ *  standing against max_grant. Kept as one named set (not an inline list) so a renamed or new act cannot silently
+ *  drop out of the guard: gate r2 found the HTTP memberships route renamed to grant_agent_membership and unguarded.
+ *  A ratchet test pins that every delegable act carrying an agent target is a member. */
+export const TOUCHES_TARGET_STANDING: ReadonlySet<StructuralAction> = new Set<StructuralAction>([
+  'squad_member_add', 'squad_member_remove', 'grant_agent_capability', 'grant_agent_membership',
+  'member_capability_grant', 'member_capability_revoke', 'move_agent_squad',
+])
+
 export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPolicy>> = {
   create_squad: { delegable: true, agentLane: 'capability', elevationAction: 'action:project_lifecycle' },
   create_agent: { delegable: true, agentLane: 'capability' },
@@ -522,6 +531,15 @@ async function evaluateDelegated(
     }), confers)
   }
 
+  // A squad created under delegation must not collide with ANY existing squad slug (squad slugs are only unique per
+  // department, so a duplicate makes squad-by-slug resolution ambiguous for every human: a resolve DoS, gate r2).
+  if (action === 'create_squad' && typeof target.slug === 'string' && target.slug.length > 0) {
+    const dupe = await env.DB.prepare('SELECT 1 AS one FROM squads WHERE slug = ?1 LIMIT 1')
+      .bind(target.slug.trim().toLowerCase())
+      .first<{ one: number }>()
+    if (dupe) return refusedWith(refuse(409, 'squad_slug_taken', { act: action }), confers)
+  }
+
   // An agent created under delegation must not collide with ANY existing agent slug in the tenant: a duplicate makes
   // slug resolution ambiguous for every human who names it (a denial of service on resolve).
   if (action === 'create_agent' && typeof target.slug === 'string') {
@@ -532,11 +550,7 @@ async function evaluateDelegated(
   }
 
   // A target whose standing ANYWHERE is above max_grant is not the agent's to touch at all.
-  if (
-    target.agentId
-    && (action === 'squad_member_add' || action === 'squad_member_remove' || action === 'grant_agent_capability'
-      || action === 'member_capability_grant' || action === 'member_capability_revoke' || action === 'move_agent_squad')
-  ) {
+  if (target.agentId && TOUCHES_TARGET_STANDING.has(action)) {
     const standing = await agentStandingGlobal(env, target.agentId)
     if (standing > capabilityRank(ceilingMaxGrant)) {
       return refusedWith(requiresHumanApproval(action, 'target_outranks_delegation', covering, {

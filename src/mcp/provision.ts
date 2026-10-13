@@ -431,7 +431,7 @@ const toolCreateSquad: ToolSpec = {
     const squadGate = await structuralGate(env, auth, 'create_squad', async () => {
       const r = await resolveDepartmentRef(env, deptRef)
       if (!r.ok) return thunkRefusal(r.reason === 'ambiguous' ? 409 : 404, r.reason === 'ambiguous' ? 'ambiguous_slug' : 'department_not_found')
-      return { departmentId: r.value.id, detail: { slug: str(args.slug) } }
+      return { departmentId: r.value.id, slug: str(args.slug) ?? undefined, detail: { slug: str(args.slug) } }
     })
     if (squadGate.kind === 'refused') return structuralFail(squadGate)
     const squadDelegated = squadGate.kind === 'delegated'
