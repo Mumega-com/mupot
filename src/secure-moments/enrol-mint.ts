@@ -5,7 +5,7 @@
 // skip the step-up the session itself would have needed).
 import type { AuthContext, Env } from '../types'
 import { memberIsActiveHuman } from '../access/identity'
-import { hasRecentReauth, loadWebSessionByHash } from '../auth/web-sessions'
+import { hasRecentReauth, loadWebSessionByHash, type WebSessionRecord } from '../auth/web-sessions'
 import { enrolUrl, secureMomentsStatus } from './config'
 import { mintEnrolmentToken } from './store'
 
@@ -21,6 +21,26 @@ export async function checkEnrolmentSession(
   env: Env, auth: AuthContext, nowMs: number = Date.now(),
 ): Promise<{ ok: true; memberId: string; identityId: string } | EnrolmentSessionRefusal> {
   if (secureMomentsStatus(env).state !== 'on') return { ok: false, status: 404, error: 'not_enabled' }
+  const checked = await checkWebSession(env, auth, { fresh: true }, nowMs)
+  if (!checked.ok) return checked
+  const { session } = checked
+  // The new proof inherits this session's login identity (an elevation decided with it binds a session to that identity).
+  const identity = await env.DB.prepare(
+    `SELECT id FROM human_login_identities WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
+  ).bind(session.login_identity_id, env.TENANT_SLUG, checked.memberId).first<{ id: string }>()
+  if (!identity) return { ok: false, status: 409, error: 'session_identity_unavailable' }
+  return { ok: true, memberId: checked.memberId, identityId: identity.id }
+}
+
+/**
+ * The shared web-session core under checkEnrolmentSession, with no feature-flag gate and no login-identity lookup: a real
+ * dashboard web session (never a bearer / agent / OAuth caller) whose member is an active human, still live, and, when
+ * `fresh` is set, re-authenticated within RECENT_REAUTH_WINDOW_MS. Reused by dashboard writes that need the same bar
+ * without being passkey enrolment (delegated-operator creation, W0.2). The order of refusals is the original one.
+ */
+export async function checkWebSession(
+  env: Env, auth: AuthContext, opts: { fresh: boolean }, nowMs: number = Date.now(),
+): Promise<{ ok: true; memberId: string; session: WebSessionRecord } | EnrolmentSessionRefusal> {
   // A bearer token / agent / OAuth caller has no web session: only a signed-in human in a browser can enrol.
   if (!auth.webSessionIdHash || !auth.webSessionMemberId || !auth.memberId || auth.webSessionMemberId !== auth.memberId) {
     return { ok: false, status: 403, error: 'not_a_web_session' }
@@ -30,13 +50,8 @@ export async function checkEnrolmentSession(
   if (!session || session.revoked_at !== null || session.member_id !== auth.memberId) {
     return { ok: false, status: 403, error: 'not_a_web_session' }
   }
-  if (!hasRecentReauth(session, nowMs)) return { ok: false, status: 403, error: 'reauth_required' }
-  // The new proof inherits this session's login identity (an elevation decided with it binds a session to that identity).
-  const identity = await env.DB.prepare(
-    `SELECT id FROM human_login_identities WHERE id = ?1 AND tenant = ?2 AND member_id = ?3 AND revoked_at IS NULL`,
-  ).bind(session.login_identity_id, env.TENANT_SLUG, auth.memberId).first<{ id: string }>()
-  if (!identity) return { ok: false, status: 409, error: 'session_identity_unavailable' }
-  return { ok: true, memberId: auth.memberId, identityId: identity.id }
+  if (opts.fresh && !hasRecentReauth(session, nowMs)) return { ok: false, status: 403, error: 'reauth_required' }
+  return { ok: true, memberId: auth.memberId, session }
 }
 
 export async function mintEnrolmentLink(env: Env, auth: AuthContext, nowMs: number = Date.now()): Promise<MintEnrolmentResult> {

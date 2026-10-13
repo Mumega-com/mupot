@@ -291,6 +291,7 @@ import '../departments/modules/web-ops' // side-effect: register WebOpsModule (A
 import { makeMissionControlApp } from './mission-control-routes'
 import { makeElevationApp } from './elevation'
 import { makeAccountApp } from './account'
+import { makeOperatorsApp } from './operators'
 import { makeImSettingsApp } from './im-settings'
 export { controlTowerBody, potFleetBody } from './mission-control-views'
 import { getAuthContext, loadStudioData, studioPageHtml, dispatchStudioFlight, isSafeRepoUrl } from './studio'
@@ -1631,6 +1632,8 @@ dashboardApp.route('/', makeElevationApp(shell))
 // /api/members/members/:id/telegram routes — see src/dashboard/account.ts's
 // module header for the full authorization argument.
 dashboardApp.route('/', makeAccountApp(shell))
+// Operators (W0.2): human UI over the existing delegated-operator writers; same-origin + real fresh web session.
+dashboardApp.route('/', makeOperatorsApp(shell))
 
 // Mount IM Settings Sub-app: GET/POST /admin/im-settings — owner-only,
 // post-setup edit surface for org_settings.im_bot_username (mupot#1420
@@ -4609,6 +4612,11 @@ export function shell(
           <a class="nav-link" href="/elevation">
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><path d="M10 3v11"/><path d="M6 10l4 4 4-4"/><rect x="4" y="15.5" width="12" height="2" rx="1"/></svg>
             <span class="nav-label">Elevation</span>
+          </a>
+
+          <a class="nav-link" href="/operators">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="10" cy="7" r="2.6"/><path d="M4.6 16c.5-3 2.7-4.6 5.4-4.6s4.9 1.6 5.4 4.6"/></svg>
+            <span class="nav-label">Operators</span>
           </a>
 
           <a class="nav-link" href="/studio">
