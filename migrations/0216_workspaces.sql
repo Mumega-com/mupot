@@ -82,7 +82,7 @@ END;
 CREATE TABLE IF NOT EXISTS worktrees (
   id                   TEXT PRIMARY KEY,
   tenant               TEXT NOT NULL,
-  project_id           TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+  project_id           TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, -- a released or deleted project takes its workspace records with it (team_bootstrap_release deletes orphan projects)
   kind                 TEXT NOT NULL CHECK (kind IN ('git_branch', 'folder', 'thread')),
   repo_key             TEXT NOT NULL DEFAULT '' CHECK (length(repo_key) <= 512),
   harness_id           TEXT NOT NULL DEFAULT '',

@@ -158,6 +158,17 @@ describe('review-thread fixes (Kasra, pre-merge)', () => {
     expect(repoKeyFromUrl('https://git.example.com:9443/team/repo.git')).toBe('url:git.example.com:9443/team/repo')
     expect(repoKeyFromUrl('https://git.example.com:443/team/repo.git')).toBe('url:git.example.com/team/repo')
     expect(repoKeyFromUrl('https://git.example.com/team/repo.git')).toBe('url:git.example.com/team/repo')
+    // GitHub on a non-default port is not GitHub: refused, never folded into the real repo's key
+    expect(repoKeyFromUrl('https://github.com:8443/org/repo')).toBeNull()
+    expect(repoKeyFromUrl('https://github.com/org/repo')).toBe('github:org/repo')
+  })
+
+  it('deleting a project removes its workspace records (team_bootstrap_release path stays open)', async () => {
+    const env = envFor()
+    expect(await open(env, harnessAuth(W))).toMatchObject({ ok: true })
+    h.sqlite.prepare("DELETE FROM project_squad_access WHERE project_id = (SELECT id FROM projects WHERE slug = 'P1' OR id = 'P1' LIMIT 1)").run()
+    h.sqlite.prepare("DELETE FROM projects WHERE slug = 'P1' OR id = 'P1'").run()
+    expect(wtRows()).toBe(0)
   })
 })
 

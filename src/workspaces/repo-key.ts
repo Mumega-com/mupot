@@ -26,7 +26,13 @@ export function repoKeyFromUrl(repoUrl: string | null | undefined): string | nul
 
   const id = repoIdentity(raw)
   if (!id) return null
-  if (id.kind === 'github') return id.repo === null ? null : `github:${id.owner}/${id.repo}`
+  if (id.kind === 'github') {
+    // A GitHub hostname on a non-default port is not GitHub's endpoint: refuse it rather than fold it into the
+    // github:owner/repo identity of the real repository (review thread, 2026-10-13).
+    const port = /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]*@)?[^/:]+:(\d+)/i.exec(raw)?.[1]
+    if (port && !['443', '80', '22'].includes(String(Number(port)))) return null
+    return id.repo === null ? null : `github:${id.owner}/${id.repo}`
+  }
   if (id.kind !== 'url') return null // github-unsure / url-unsure: not one repository
 
   // Non-GitHub: re-derive host + path from the raw URL, preserving path case.
