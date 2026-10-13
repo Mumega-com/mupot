@@ -8,8 +8,10 @@ These entries summarize selected merged work; exact heads, tests, deployments an
 residual findings remain on the cited PRs. A merge is not a stable-release verdict.
 
 - **Secure moments (2026-10-12): human decisions and secrets from any channel.**
-  Every change below is flag-gated and merged on two review lenses at the exact SHA
-  plus exact-SHA CI. Each was canaried on a real device.
+  Each wave merged on two review lenses at the exact SHA plus exact-SHA CI. W1–W4.2 are
+  behind flags (`SECURE_MOMENTS`, `SECURE_DROP`, `MCP_URL_ELICITATION`, `TELEGRAM_MINIAPP`,
+  `TELEGRAM_MINIAPP_PIN_WINDOW`); W5's `seed_draft` is always available. Real-device and
+  real-client canary receipts are recorded on the tracking tasks, not in this file.
   - W1 (#1859, #1862) one-time decision links on a dedicated secure host, decided with a
     WebAuthn passkey (ES256, user verification). One shared decision core and one guarded
     consume. A login-identity revoke chokepoint (#1864).
@@ -17,14 +19,14 @@ residual findings remain on the cited PRs. A merge is not a stable-release verdi
     mupot stores ciphertext only; `secure-drop.mjs` pulls the secret to a 0600 file.
   - W3 (#1866, #1869) MCP URL-mode elicitation (2026-07-28 and 2025-11-25 clients) with a
     plain-link fallback. A cancelled or declined prompt re-issues a plain link (W3.1).
-    Canaried on Claude Code, Codex, ChatGPT and claude.ai.
   - W4 (#1868) Telegram Mini App adapter: Ed25519-verified initData, a dedicated
     worker-held bot, a biometric-unlocked rotating device secret. W4.1 (#1870)
     "Approve with passkey in your browser" for clients without biometrics, with a
     ceremony window that protects the human link. W4.2 (#1872, flag off) a PIN fallback
     and a user-chosen trusted-device window (0 to 7 days, hard cap), both of which stop
     at the PIN lockout.
-  - W5: attach a project from any channel. `seed_draft`, then a secure-page approval.
+  - W5: attach a project from any channel. `seed_draft` drafts the seed,
+    `seed_attach_request` files it, and the human approves on the secure page.
   Migrations 0212–0215. Follow-ups: #1860, #1861, #1865, #1867, #1871, #1873.
 - **Autonomy brakes and recovery:** dry-run-default router, execution pause and per-task
   retry ceiling (#1807); task-dispatch/envelope/custody fences and release policy

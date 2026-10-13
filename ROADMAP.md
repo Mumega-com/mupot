@@ -53,8 +53,8 @@ CHANGELOG; this lists what the re-scope below builds on.
 - Secure moments W1–W5 plus W3.1, W4.1 and W4.2 (#1859–#1872, migrations 0212–0215):
   passkey decision links, sealed secret drops, MCP URL elicitation with a plain-link
   fallback, and the Telegram Mini App (biometric, browser passkey, PIN/trusted window).
-  Canaried on Hadi's devices 2026-10-12. Every flag except W3 (canary windows only)
-  and W4.2 (off) is live.
+  Production flag state is not recorded in this repo (deploy config is out of tree);
+  read live `/health` and the deploy record.
 - Loop brakes: dry-run-default `router_tick`, execution pause, per-task retry ceiling
   (#1807); task-dispatch, inbox-envelope and runtime-custody fences with one release
   policy (#1811); follow-up fixes (#1813, #1815, #1823). Audited incident recovery tool
@@ -76,8 +76,9 @@ CHANGELOG; this lists what the re-scope below builds on.
 
 ### After v0.31.0
 
-**In flight (2026-10-13): Operators + Admission**, the core of `v0.32.0` "Agents as
-themselves" (design: harness seats and worktrees, private design PR; tracked privately):
+**In flight (2026-10-13): Operators + Admission**, proposed for `v0.32.0` "Agents as
+themselves". The v0.32.0 release contract and its gates are unchanged until amended by
+PR. Design: harness seats and worktrees, private design PR; tracked privately.
 - W0 delegated operators: one structural-write chokepoint for MCP and HTTP. Designated
   agents may organise squads and agents within a ceiling (≤ lead); anything above needs a
   human secure-moment tap. Closes the MCP/HTTP inconsistency #1357.
