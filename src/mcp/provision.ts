@@ -35,6 +35,7 @@ import type { AuthContext, Capability, CapabilityGrant, ConnectionChannel, Env, 
 import { brandSquadScope, capabilityRank, hasCapability, isOrgAdmin, holdsCapabilityFloor, exceedsTargetRankCeiling, actorRankOnScopeFor } from '../auth/capability'
 import {
   createDepartment,
+  updateDepartment,
   createSquad,
   createAgent,
   findAgentsByName,
@@ -173,6 +174,7 @@ async function emitProvisioned(
     | 'agent_updated'
     | 'agent_moved'
     | 'squad_updated'
+    | 'department_updated'
     | 'membership'
     | 'membership_removed'
     | 'agent_session_revoked',
@@ -184,6 +186,8 @@ async function emitProvisioned(
     capability?: Capability
     receipt_id?: string
     reason?: string
+    // Set when the act ran under a bounded elevation rather than standing admin.
+    elevation_grant_id?: string
     // A profile correction keeps no history on the row (agents has no
     // updated_at), so the field-level before/after must ride on the event or
     // the change is unreversible from the trail.
@@ -204,6 +208,7 @@ async function emitProvisioned(
     capability?: Capability
     receipt_id?: string
     reason?: string
+    elevation_grant_id?: string
     changed?: Record<string, { from: unknown; to: unknown }>
     self_report?: boolean
   }> = {
@@ -220,6 +225,7 @@ async function emitProvisioned(
       ...(extra.capability ? { capability: extra.capability } : {}),
       ...(extra.receipt_id ? { receipt_id: extra.receipt_id } : {}),
       ...(extra.reason ? { reason: extra.reason } : {}),
+      ...(extra.elevation_grant_id ? { elevation_grant_id: extra.elevation_grant_id } : {}),
       ...(extra.changed ? { changed: extra.changed } : {}),
       ...(extra.self_report ? { self_report: extra.self_report } : {}),
     },
@@ -358,6 +364,22 @@ export function callerCanGrantAgentCapability(
   return hasCapability(grants, 'squad', brandSquadScope(squad), capability)
 }
 
+// ── action:org_structure consumer ─────────────────────────────────────────────
+// ONE call site for the elevation lane that create_department / update_department / update_squad share, so the
+// attached-seat refusal below cannot be forgotten on one of them. An ATTACHED thread acts for the attaching human
+// under an admission ceiling and is already refused request_elevation (attached_seat_cannot_elevate); a grant row
+// bound to its credential must not open org structure either, whatever put it there.
+async function orgStructureElevation(
+  env: Env,
+  auth: AuthContext,
+  scopeType: 'org' | 'department' | 'squad',
+  scopeId: string | null,
+  opts: { toolName: string; detail: unknown; squadDepartmentId?: string | null },
+) {
+  if (attachedAuthority(auth)) return { granted: false as const, reason: 'not_agent_session' as const }
+  return hasElevatedAction(env, auth, 'action:org_structure', scopeType, scopeId, opts)
+}
+
 // ── create_department ───────────────────────────────────────────────────────────
 // The zero-state root: lets an org-admin build the org from nothing in-band (a
 // department is the parent scope create_squad needs). Gate: admin on org scope.
@@ -373,31 +395,100 @@ const toolCreateDepartment: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
-    // Gate: org admin. NO elevation path, deliberately.
+    // Gate: standing org admin, OR a live action:org_structure elevation granted at ORG scope.
     //
-    // An earlier revision wired action:project_lifecycle here. It was wrong, and
-    // an adversarial pass measured why: project_create is workspace-gated, so
-    // that action must be granted at ORG scope to authorize a project at all —
-    // and hasElevatedAction treats an org-scoped grant as covering every scope.
-    // So the one grant that let a squad lead make its own project ALSO let it
-    // create departments org-wide, and squads inside departments it has nothing
-    // to do with. Against "make their own agents and project, nothing outside of
-    // it", creating org structure is outside of it.
-    //
-    // A department is org-structure and stays an org-admin act. Squad creation
-    // keeps its elevation path, because that one is DEPARTMENT-scoped and so is
-    // actually bounded to the department the approver named.
+    // History: an earlier revision wired action:project_lifecycle here and was wrong, because project_create is
+    // workspace-gated so that action had to be granted at ORG scope, and an org-scoped grant covers every scope: the
+    // one grant that let a squad lead make its own project also created departments org-wide. The fix then was no
+    // elevation path at all. org_structure is a SEPARATE key, so an approver who ticks "Create/update departments and
+    // squads" at org scope has said exactly that and nothing about projects, tokens or access. A department/squad-
+    // scoped org_structure grant does NOT match here (hasElevatedAction needs an org-scope grant for scope 'org').
     const deptGate = await structuralGate(env, auth, 'create_department')
     if (deptGate.kind === 'refused') return structuralFail(deptGate)
     const grants = auth.capabilities ?? []
+    let elevationGrantId: string | undefined
     if (!hasCapability(grants, 'org', null, 'admin')) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'org' })
+      const elevated = await orgStructureElevation(env, auth, 'org', null, {
+        toolName: 'create_department',
+        detail: { slug: args.slug },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'org',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevationGrantId = elevated.grant.id
     }
 
     const result = await createDepartment(env, { slug: args.slug, name: args.name })
     if (!result.ok) return createErrorToFail(result.error)
-    await emitProvisioned(env, auth.memberId as string, 'department', result.value.id)
+    await emitProvisioned(env, auth.memberId as string, 'department', result.value.id, {
+      elevation_grant_id: elevationGrantId,
+    })
     return done({ department: result.value })
+  },
+}
+
+// ── update_department ───────────────────────────────────────────────────────────
+// Rename a WORK department. Name only: the departments table has no description or status column, so those fields are
+// not offered (adding them needs a migration and, for status, archive plumbing for departments; there is no delete).
+// Human lane: admin on the department (org admin inherits). Agent lane: action:org_structure elevation granted on that
+// department or at org scope; an agent's standing grants never open this (structuralGate refuses it).
+const toolUpdateDepartment: ToolSpec = {
+  name: 'update_department',
+  scope: 'department',
+  min: 'admin',
+  args: '{ department: string (id|slug), name: string, reason?: string }',
+  inputSchema: {
+    type: 'object',
+    properties: { department: STRING_SCHEMA, name: STRING_SCHEMA, reason: STRING_SCHEMA },
+    required: ['department', 'name'],
+    additionalProperties: false,
+  },
+  async run(auth, env, args) {
+    const gate = await structuralGate(env, auth, 'update_department')
+    if (gate.kind === 'refused') return structuralFail(gate)
+    const deptRef = str(args.department)
+    if (!deptRef) return fail(400, 'invalid_args', 'department required')
+
+    const deptResult = await resolveDepartmentRef(env, deptRef)
+    if (!deptResult.ok) return resolveFail(deptResult.reason, 'department_not_found')
+    const dept = deptResult.value
+    if (dept.kind !== 'work') return fail(403, 'forbidden', { reason: 'home_department' })
+
+    const grants = auth.capabilities ?? []
+    let elevationGrantId: string | undefined
+    if (!hasCapability(grants, 'department', dept.id, 'admin')) {
+      const elevated = await orgStructureElevation(env, auth, 'department', dept.id, {
+        toolName: 'update_department',
+        detail: { department_id: dept.id },
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'department',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevationGrantId = elevated.grant.id
+    }
+
+    const result = await updateDepartment(env, dept.id, { name: args.name })
+    if (!result.ok) {
+      if (result.error === 'not_found') return fail(404, 'department_not_found', { department: deptRef })
+      if (result.error === 'home_department') return fail(403, 'forbidden', { reason: 'home_department' })
+      return fail(400, 'invalid_args', { reason: result.error })
+    }
+    await emitProvisioned(env, auth.memberId as string, 'department_updated', dept.id, {
+      changed: { name: { from: result.before.name, to: result.after.name } },
+      reason: str(args.reason) || undefined,
+      elevation_grant_id: elevationGrantId,
+    })
+    return done({ department: { id: dept.id, name: result.after.name }, changed: { name: { from: result.before.name, to: result.after.name } } })
   },
 }
 
@@ -2561,8 +2652,25 @@ const toolUpdateSquad: ToolSpec = {
     // the agent's squad". An org/department admin grant inherits down via
     // memberCanOnSquad, same as every other tool in this file.
     const grants = auth.capabilities ?? []
+    // Or a live action:org_structure elevation on this squad, its department, or the org. Never a home squad: the
+    // elevation lane is for work structure, and a member's home is theirs alone.
+    let elevationGrantId: string | undefined
     if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
-      return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      if (squad.kind !== 'work') return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+      const elevated = await orgStructureElevation(env, auth, 'squad', squad.id, {
+        toolName: 'update_squad',
+        detail: { squad_id: squad.id },
+        squadDepartmentId: squad.department_id,
+      })
+      if (!elevated.granted) {
+        return fail(403, 'forbidden', {
+          need: 'admin',
+          scope: 'squad',
+          elevation_denied: elevated.reason,
+          remedy: elevationRemedyMessage(elevated.reason),
+        })
+      }
+      elevationGrantId = elevated.grant.id
     }
 
     const PATCHABLE = ['slug', 'budget_cap_cents', 'budget_window'] as const
@@ -2635,6 +2743,7 @@ const toolUpdateSquad: ToolSpec = {
       squad_id: squad.id,
       changed,
       reason: str(args.reason) || undefined,
+      elevation_grant_id: elevationGrantId,
     })
 
     return done({ squad: after, changed })
@@ -2974,6 +3083,7 @@ const toolSquadMemberList: ToolSpec = {
 
 export const PROVISION_TOOLS: ToolSpec[] = [
   toolCreateDepartment,
+  toolUpdateDepartment,
   toolCreateSquad,
   toolCreateAgent,
   toolResolveAgent,

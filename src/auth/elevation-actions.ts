@@ -88,6 +88,20 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Created/updated records can be edited or removed by standing authority after expiry.',
   },
+  // Org STRUCTURE (departments and squads) gets its OWN key, not a widening of
+  // action:project_lifecycle: that grant is approved under the label "Create/update
+  // squads" and a live grant must never acquire department power it was not
+  // approved for. create_department is org-scope only (an org-scoped grant covers
+  // every scope, so the approver chooses that knowingly); update_squad and
+  // update_department accept a grant on the squad/department itself.
+  'action:org_structure': {
+    key: 'action:org_structure',
+    enforced: true,
+    label: 'Create/update departments and squads',
+    description: 'Create a department (org scope only), rename a department, or update a squad (slug, budget) inside the scope you have been granted. Never archives or deletes.',
+    effect: 'reversible',
+    effectNote: 'Created/renamed departments and updated squads can be edited again by standing authority after expiry.',
+  },
   'action:workspace_project': {
     key: 'action:workspace_project',
     enforced: true,

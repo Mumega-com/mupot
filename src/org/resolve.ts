@@ -42,8 +42,8 @@ async function resolveByIdThenSlug<T extends { id: string }>(
   return { ok: true, value: rows[0] }
 }
 
-export function resolveDepartmentRef(env: Env, ref: string): Promise<ResolveResult<{ id: string }>> {
-  return resolveByIdThenSlug(env, 'id', 'departments', ref)
+export function resolveDepartmentRef(env: Env, ref: string): Promise<ResolveResult<{ id: string; kind: OrgKind }>> {
+  return resolveByIdThenSlug(env, 'id, kind', 'departments', ref)
 }
 
 // `kind` is included (not just id/department_id) so the resolved row is

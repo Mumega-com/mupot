@@ -149,7 +149,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
     'routine_update', 'runner_record', 'secret_env_request', 'secure_drop_ack', 'secure_drop_pull', 'secure_drop_revoke', 'set_agent_inbox_consumer',
     'set_agent_webhook_doorbell', 'squad_member_remove', 'supabase_mutate', 'task_dispatch_lease_reset', 'task_dispatch_runtime_receipt',
     'task_incident_revert', 'task_submit_result', 'task_update', 'task_verdict', 'task_verdict_reverse', 'team_bootstrap_release',
-    'update_agent', 'update_squad',
+    'update_agent', 'update_department', 'update_squad',
   ]
   const ALL_OPEN_WORLD = [
     'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',

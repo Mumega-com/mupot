@@ -57,6 +57,7 @@ export type StructuralAction =
   // activating an addon materializes its department (and squads) through activateDepartment: structural, never delegable
   | 'activate_addon'
   | 'update_squad'
+  | 'update_department'
   | 'update_agent'
   | 'deactivate_agent'
   | 'mint_agent_token'
@@ -126,9 +127,10 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   member_capability_grant: { delegable: true, agentLane: 'refuse' },
   member_capability_revoke: { delegable: true, agentLane: 'refuse' },
 
-  create_department: { delegable: false, agentLane: 'capability' },
+  create_department: { delegable: false, agentLane: 'capability', elevationAction: 'action:org_structure' },
   activate_addon: { delegable: false, agentLane: 'capability' },
-  update_squad: { delegable: false, agentLane: 'refuse' },
+  update_squad: { delegable: false, agentLane: 'refuse', elevationAction: 'action:org_structure' },
+  update_department: { delegable: false, agentLane: 'refuse', elevationAction: 'action:org_structure' },
   update_agent: { delegable: false, agentLane: 'refuse' },
   deactivate_agent: { delegable: false, agentLane: 'capability' },
   mint_agent_token: { delegable: false, agentLane: 'refuse', elevationAction: 'action:mint_token' },
@@ -168,6 +170,7 @@ export const STRUCTURAL_MCP_TOOLS: Readonly<Record<string, StructuralAction>> = 
   create_squad: 'create_squad',
   create_agent: 'create_agent',
   update_squad: 'update_squad',
+  update_department: 'update_department',
   update_agent: 'update_agent',
   deactivate_agent: 'deactivate_agent',
   mint_agent_token: 'mint_agent_token',
