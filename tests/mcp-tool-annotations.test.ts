@@ -153,7 +153,7 @@ describe('full-table pin: every readOnly / destructive / openWorld label is expl
   ]
   const ALL_OPEN_WORLD = [
     'addon_setup', 'agent_lifecycle', 'cursor_dispatch', 'cursor_run_status', 'moment_miniapp_link', 'office.health',
-    'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki',
+    'office.publish_post', 'office.reconcile_stalled_publish', 'pot_list', 'pot_provision', 'project_wiki', 'request_elevation', 'seed_attach_request',
     'supabase_connect', 'supabase_mutate', 'supabase_query', 'supabase_schema', 'task_create',
     'task_submit_result', 'task_update', 'wake_agent',
   ]
