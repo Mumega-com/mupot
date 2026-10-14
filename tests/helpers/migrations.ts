@@ -66,44 +66,62 @@ export function applyAllMigrationsUncached(sqlite: ExecutableSqlite): void {
 }
 
 /**
- * The DDL of the finished chain, captured once per process.
- *
- * Replaying 77 migrations costs ~405ms; replaying the resulting DDL costs ~59ms, and a
- * per-test `makeDb()` pays that on every single test. The speedup is only sound because
- * the finished chain leaves ZERO rows behind — every INSERT in the chain is inside a
- * temp-table-and-rename rebuild whose result is dropped. That is a property of today's
- * migrations, not a law, so `tests/helpers-migrations.test.ts` pins all three legs:
- * identical `sqlite_master`, identical per-column `table_info`, and zero surviving rows.
- * If a migration ever seeds data, that test goes red before this cache can silently
- * hand tests a schema-only database.
+ * Capture the finished real chain, never a handwritten or partial schema.
+ * DDL-only reuse is valid only while migrations leave no application rows.
+ * Fail before any application test if that invariant changes; seed support then
+ * needs an explicit implementation, not a silent schema-only approximation.
  */
-let cachedDdl: string[] | null = null
-
-function captureDdl(sqlite: ExecutableSqlite): string[] {
-  // rowid order preserves creation order, so triggers/indexes replay after their tables.
-  // `sqlite_%` names are SQLite's own (e.g. sqlite_sequence) and are re-created implicitly;
-  // replaying them raises "object name reserved for internal use".
-  return sqlite
-    .prepare(
-      `SELECT sql FROM sqlite_master
-        WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
-        ORDER BY rowid`,
-    )
-    .all()
-    .map((row) => `${String(row.sql)};`)
+export function captureMigrationSnapshot(sqlite: ExecutableSqlite): string[] {
+  const tables = sqlite.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+  ).all()
+  for (const row of tables) {
+    const table = String(row.name)
+    const quoted = table.replace(/"/g, '""')
+    const count = Number(sqlite.prepare(`SELECT COUNT(*) AS count FROM "${quoted}"`).all()[0]?.count)
+    if (count !== 0) throw new Error(`migration snapshot cannot discard seeded rows in ${table}`)
+  }
+  // Preserve creation order so indexes/triggers follow the tables they reference.
+  const ddl = sqlite.prepare(
+    `SELECT sql FROM sqlite_master
+      WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid`,
+  ).all().map(row => `${String(row.sql)};`)
+  if (ddl.length === 0) throw new Error('migration snapshot schema is empty')
+  return ddl
 }
 
-/** Build the production schema. Use this — nothing else. */
+let cachedSnapshotSql: string | null = null
+
+/** Supply the immutable snapshot built by this Vitest invocation's global setup. */
+export function useMigrationSnapshot(ddl: unknown): void {
+  if (!Array.isArray(ddl) || ddl.length === 0 || ddl.some(sql => typeof sql !== 'string' || !sql.trim())) {
+    throw new Error('invalid migration schema snapshot')
+  }
+  cachedSnapshotSql = ddl.join('\n')
+}
+
+/** Build the production schema in this test's private database. */
 export function applyAllMigrations(sqlite: ExecutableSqlite): void {
-  if (cachedDdl === null) {
+  if (cachedSnapshotSql === null) {
+    // Outside the configured runner (or after explicit reset), still build the
+    // whole real chain. Dedicated tests exercise this path independently.
     applyAllMigrationsUncached(sqlite)
-    cachedDdl = captureDdl(sqlite)
+    useMigrationSnapshot(captureMigrationSnapshot(sqlite))
     return
   }
-  for (const statement of cachedDdl) sqlite.exec(statement)
+  // Atomic restore, compatible with a caller's existing transaction. Failure
+  // cannot leave a partially constructed schema or an open transaction behind.
+  sqlite.exec('SAVEPOINT mupot_migration_snapshot')
+  try {
+    sqlite.exec(cachedSnapshotSql)
+    sqlite.exec('RELEASE mupot_migration_snapshot')
+  } catch (error) {
+    sqlite.exec('ROLLBACK TO mupot_migration_snapshot; RELEASE mupot_migration_snapshot')
+    throw error
+  }
 }
 
-/** Test-only: force the next `applyAllMigrations` to walk the real chain again. */
+/** Test-only: force the next call to walk the real chain instead of its snapshot. */
 export function resetMigrationCache(): void {
-  cachedDdl = null
+  cachedSnapshotSql = null
 }

@@ -23,6 +23,8 @@ import { defineConfig, configDefaults } from 'vitest/config'
 // default Node ESM runner, so it is excluded here and CI runs it as its own step.
 export default defineConfig({
   test: {
+    globalSetup: ['./tests/helpers/migration-global-setup.ts'],
+    setupFiles: ['./tests/helpers/migration-worker-setup.ts'],
     exclude: [
       ...configDefaults.exclude,
       'fleet-runtime/**',

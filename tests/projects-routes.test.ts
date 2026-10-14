@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -22,9 +23,11 @@ const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): SqliteD1Harness {
   const includeRoutineMigrations = options.includeRoutineMigrations !== false
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    if (
-      !includeRoutineMigrations
+  if (includeRoutineMigrations) {
+    applyAllMigrations(harness.sqlite)
+  } else {
+    for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
+      if (
       // 0158 rebuilds routine_run_actions (FP-01 Slice 2, mupot#1443: widens
       // its kind CHECK to admit 'project_access') and depends on 0073's table
       // existing, so it belongs in the SAME "routine tables absent" exclusion
@@ -33,11 +36,12 @@ function makeHarness(options: { includeRoutineMigrations?: boolean } = {}): Sqli
       // degrade-to-empty path this test is actually about.
       // 0172 (mupot#1540) likewise references routine_runs (its tasks.status triggers and
       // backfill leave routine control flights to their routine), so it joins this group.
-      && (file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_') || file.startsWith('0172_') || file.startsWith('0207_'))
-    ) {
-      continue
+        file.startsWith('0073_') || file.startsWith('0074_') || file.startsWith('0158_') || file.startsWith('0172_') || file.startsWith('0207_')
+      ) {
+        continue
+      }
+      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
     }
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
   }
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');

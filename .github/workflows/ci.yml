@@ -8,7 +8,10 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # The required `build` check is the aggregate below. Keep the non-default-Vitest
+  # checks here so they remain one fail-closed lane rather than being silently dropped
+  # while the default suite is sharded.
+  build-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,8 +69,6 @@ jobs:
         run: npm run typecheck
       - name: Install Playwright browser for integration tests
         run: npx playwright install --with-deps chromium
-      - name: Test
-        run: npm test
       # The deployed COMPOSITION — src/index.ts with its OAuthProvider wrapper — executed
       # inside real workerd, not Node. This is the suite that would have caught the
       # /auth/login 500 (#699): every other test imports pieces below the wrapper, so the
@@ -101,6 +102,85 @@ jobs:
           for migration in migrations/*.sql; do
             sqlite3 "$tmp_db" < "$migration"
           done
+
+  unit-tests:
+    name: Unit tests (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Install Playwright browser for integration tests
+        run: npx playwright install --with-deps chromium
+      - name: Test shard ${{ matrix.shard }}/4
+        run: npm test -- --shard=${{ matrix.shard }}/4 --reporter=default --reporter=json --reporter=blob --outputFile.json=tmp/vitest-results/shard-${{ matrix.shard }}.json --outputFile.blob=tmp/vitest-blob/shard-${{ matrix.shard }}.json
+      - name: Upload shard JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-json-shard-${{ matrix.shard }}
+          path: tmp/vitest-results/shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+      - name: Upload shard blob report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-blob-shard-${{ matrix.shard }}
+          path: tmp/vitest-blob/shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+
+  # Branch protection continues to require this exact job id/name. It cannot pass if
+  # either the retained build checks or any shard failed, was cancelled, or was skipped.
+  build:
+    name: build
+    if: ${{ always() }}
+    needs: [build-checks, unit-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Require all build prerequisites
+        run: |
+          if [ "${{ needs.build-checks.result }}" != "success" ] || [ "${{ needs.unit-tests.result }}" != "success" ]; then
+            echo "build-checks=${{ needs.build-checks.result }} unit-tests=${{ needs.unit-tests.result }}" >&2
+            exit 1
+          fi
+      - name: Discover the complete default Vitest file set
+        run: npx vitest list --filesOnly --json=tmp/vitest-expected-files.json
+      - name: Download shard blob reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vitest-blob-shard-*
+          path: tmp/vitest-blob
+          merge-multiple: true
+      - name: Require exactly four shard blob reports
+        shell: bash
+        run: |
+          actual="$(find tmp/vitest-blob -maxdepth 1 -type f -printf '%f\n' | sort)"
+          expected="$(printf 'shard-%s.json\n' 1 2 3 4)"
+          test "$actual" = "$expected"
+      - name: Merge shard reports
+        run: npx vitest --merge-reports=tmp/vitest-blob --reporter=json --outputFile=tmp/vitest-results.json
+      - name: Summarize merged results
+        run: node scripts/ci-vitest-summary.mjs tmp/vitest-results.json tmp/vitest-expected-files.json
+      - name: Upload merged Vitest results and expected manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-merged-json
+          path: |
+            tmp/vitest-results.json
+            tmp/vitest-expected-files.json
+          if-no-files-found: error
 
   plugin:
     runs-on: ubuntu-latest
@@ -405,7 +485,7 @@ jobs:
       # with no tests of its own is the shape these guards exist to reject. Each case is a
       # mutation that was reproduced against the script before it shipped.
       - name: Migration-numbering self-tests
-        run: node --test tests/migration-numbering.test.mjs
+        run: node --test tests/migration-numbering.test.mjs tests/ci-vitest-summary.test.mjs
       # #729: a migration numbered at or below the merge-target head merges green and NEVER
       # RUNS — wrangler applies only files above the applied head. Twelve open PRs were
       # blocked on this on 2026-08-06 (slot 0076 alone had four claimants), and it already

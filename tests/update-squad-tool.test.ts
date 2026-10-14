@@ -10,8 +10,6 @@
 // pattern as tests/agent-messages.test.ts) rather than through the JSON-RPC seam —
 // faithful to the production write path without hand-rolling a SQL-routing mock.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 // Enter the module graph via mcp/index (TOOLS), not mcp/provision directly.
 // provision.ts imports memberCanOnSquad back from index.ts (a real, working
@@ -22,14 +20,8 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { TOOLS, invokeTool } from '../src/mcp/index'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql'))
-    .sort()
-}
 
 const CTX = { origin: 'https://pot.test' }
 const toolUpdateSquad = TOOLS.find((t) => t.name === 'update_squad')!
@@ -49,9 +41,7 @@ describe('update_squad — mupot#611 item 1', () => {
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
       INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-a', 'dept-1', 'sqa', 'Squad A');
@@ -192,9 +182,7 @@ describe('update_agent — budget fields wired through the MCP tool (mupot#611 i
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
       INSERT INTO squads (id, department_id, slug, name) VALUES ('sq-a', 'dept-1', 'sqa', 'Squad A');
@@ -246,9 +234,7 @@ describe('update_squad — slug field (mupot#1495)', () => {
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
       INSERT INTO squads (id, department_id, slug, name) VALUES

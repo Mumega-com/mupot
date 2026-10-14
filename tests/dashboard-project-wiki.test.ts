@@ -6,11 +6,10 @@
 // double (tests/helpers/fake-internal-wiki.ts) wired via env.INKWELL_SVC —
 // same wiring the dept-executor connector resolution uses in production.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import { encryptConnectorSecret } from '../src/connectors/crypto'
 import { FakeInternalWiki } from './helpers/fake-internal-wiki'
 import { projectCardTopicSlug } from '../src/dashboard/project-wiki'
@@ -38,7 +37,6 @@ const MASTER_KEY = '33'.repeat(32)
 const TENANT = 'pot-a'
 const CONNECTOR_ID = 'connector-inkwell-wiki'
 const SECRET = 'wiki-pot-secret-xyz'
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 // The card slug is keyed on project.id (P1-1) — 'visible-child' is used as
 // BOTH the project's id and, in most fixtures, as a stand-in slug value, so
 // every test below computes the expected topic slug from this constant
@@ -59,9 +57,7 @@ const PROJECT_ID = 'visible-child'
  */
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A'), ('dept-b', 'dept-b', 'Department B');
     INSERT INTO squads (id, department_id, slug, name, kind) VALUES

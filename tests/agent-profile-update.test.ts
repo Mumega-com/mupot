@@ -1,22 +1,13 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createAgent, deleteAgent, getAgentProfile, updateAgentProfile } from '../src/org/service'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 // updateAgentProfile — the repair path for registry drift. Real SQLite, ALL
 // migrations applied in order, so these exercise the production write against the
 // actual `agents` schema (which notably has NO updated_at column — 0049 rebuilt
 // the table without one; a write that assumed it would fail only at runtime).
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql'))
-    .sort()
-}
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`
@@ -34,9 +25,7 @@ describe('updateAgentProfile — registry drift repair', () => {
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     seed(harness.sqlite)
     env = { DB: harness.db } as unknown as Env
 

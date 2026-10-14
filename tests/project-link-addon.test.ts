@@ -1,5 +1,3 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   createSignedProjectEnvelope,
@@ -19,16 +17,14 @@ import {
 import { ProjectLinkAddon } from '../src/addons/project-link/manifest'
 import { activateAddon, configureAddon, disableAddon, installAddon } from '../src/addons/service'
 import type { Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const NOW = '2026-07-18T22:30:00.000Z'
 const signingKeys = new Map<string, string>()
 
 function migrate(harness: SqliteD1Harness) {
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
 }
 
 function seed(harness: SqliteD1Harness, pot: string) {
