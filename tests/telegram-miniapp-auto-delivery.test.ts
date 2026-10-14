@@ -129,6 +129,23 @@ describe('request_elevation delivers to Telegram by itself', () => {
     expect((await fileElevation()).telegram).toBe('not_bound')
     expect(calls).toHaveLength(0)
   })
+  it('an ownerless agent: the tenant\'s SINGLE human org admin is addressed; two human org admins or only an agent-welded admin address nobody', async () => {
+    const calls = stubBot()
+    setOwner(null)
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-o', 'mem-owner', 'org', NULL, 'owner')`)
+    // an agent-welded member holding org admin is NOT a human and must never be counted or addressed
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-ag', 'mem-agent', 'org', NULL, 'admin')`)
+    const one = await fileElevation()
+    expect(one.telegram).toBe('sent')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].body.chat_id).toBe(String(TG.owner))
+    // a SECOND human org admin makes the target ambiguous: nobody is addressed, no fan-out
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-p2', 'mem-plain', 'org', NULL, 'admin')`)
+    harness.sqlite.exec('DELETE FROM tg_miniapp_deliveries')
+    calls.length = 0
+    expect((await fileElevation()).telegram).toBe('not_bound')
+    expect(calls).toHaveLength(0)
+  })
   it('an owner who has no authority over the decision is not sent the button (authority is not widened)', async () => {
     const calls = stubBot()
     setOwner('mem-plain')

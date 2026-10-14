@@ -31,14 +31,31 @@ export interface AutoDeliveryOpts {
   waitUntil?: (promise: Promise<unknown>) => void
 }
 
-/** The ONE human a moment is addressed to, or null. Never a population. */
+/** The ONE human a moment is addressed to, or null. Never a population. Order: the filing agent's owner column; else a human
+ *  requester; else (most agents have no owner yet) the tenant's SINGLE active human org owner/admin. Two or more human org admins
+ *  is ambiguous and addresses NOBODY (a reported 'not_bound', never a fan-out). A member welded to an agent is never a human. */
 async function decidingHuman(env: Env, requesterAgentId: string | null, requesterMemberId: string | null): Promise<string | null> {
+  let candidate: string | null = null
   if (requesterAgentId) {
     const row = await env.DB.prepare('SELECT owner_member_id FROM agents WHERE id = ?1 LIMIT 1').bind(requesterAgentId)
       .first<{ owner_member_id: string | null }>()
-    if (row?.owner_member_id) return row.owner_member_id
+    if (row?.owner_member_id) candidate = row.owner_member_id
   }
-  return requesterMemberId
+  if (!candidate) candidate = requesterMemberId
+  if (candidate) {
+    const welded = await env.DB.prepare('SELECT 1 AS w FROM agent_member_bindings WHERE member_id = ?1 LIMIT 1').bind(candidate)
+      .first<{ w: number }>()
+    if (!welded) return candidate
+  }
+  const admins = await env.DB.prepare(
+    `SELECT DISTINCT c.member_id AS id FROM capabilities c
+       JOIN members m ON m.id = c.member_id AND m.status = 'active'
+      WHERE c.scope_type = 'org' AND c.capability IN ('owner', 'admin')
+        AND NOT EXISTS (SELECT 1 FROM agent_member_bindings b WHERE b.member_id = c.member_id)
+      LIMIT 3`,
+  ).all<{ id: string }>()
+  const humans = admins.results ?? []
+  return humans.length === 1 ? humans[0].id : null
 }
 
 async function deliver(env: Env, momentId: string, requesterMemberId: string | null, opts: AutoDeliveryOpts): Promise<MomentTelegramStatus> {
