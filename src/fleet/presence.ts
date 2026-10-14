@@ -34,6 +34,10 @@ export const SEVEN_AXIS_HARNESSES = [
   'prime',
   'hermes',
   'grok-cli',
+  // chat apps: DISPLAY labels only (never a runtime, never routing): a chat can SAY what it is instead of 'unknown'
+  'chatgpt',
+  'claude-ai',
+  'grok-chat',
   'unknown',
 ] as const
 

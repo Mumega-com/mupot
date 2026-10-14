@@ -44,8 +44,14 @@ export type BootSelfReport =
   | { outcome: 'refused_signed_attach_required'; belief: FleetBelief | null; detail: string }
   /** Claimed a runtime outside the vocabulary — told which words exist. */
   | { outcome: 'refused_unknown_runtime'; belief: FleetBelief | null; detail: string }
+  | { outcome: 'refused_bad_model'; belief: FleetBelief | null; detail: string }
 
 export const MODEL_RE = /^[A-Za-z0-9_./@-]{1,128}$/
+
+/** Map free text to the MODEL_RE charset: runs of other characters become one '-', trimmed, capped at 128. Empty -> ''. */
+export function sanitizeModelLabel(raw: string): string {
+  return raw.normalize('NFC').replace(/[^A-Za-z0-9_./@-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 128)
+}
 
 export async function readFleetBelief(env: Env, agentId: string): Promise<FleetBelief | null> {
   return env.DB.prepare(
@@ -79,8 +85,12 @@ export async function selfReportAtBoot(
       detail: `runtime: must be one of ${runtimeVocabulary()}`,
     }
   }
-  if (wantsModel && (typeof claim.model !== 'string' || !MODEL_RE.test(claim.model))) {
-    return { outcome: 'refused_unknown_runtime', belief, detail: 'model: 1-128 chars of [A-Za-z0-9_./@-]' }
+  // A model name is a LABEL, never a decision input: sanitize it ('GPT 6 (Thinking)' -> 'GPT-6-Thinking') instead of refusing
+  // the whole report for punctuation. Only a non-string or an empty result is refused, and it is not named a runtime problem.
+  let modelLabel: string | null = null
+  if (wantsModel) {
+    modelLabel = typeof claim.model === 'string' ? sanitizeModelLabel(claim.model) : null
+    if (!modelLabel) return { outcome: 'refused_bad_model', belief, detail: 'model: a non-empty string (letters, digits, _ . / @ - are kept; other characters are dropped)' }
   }
 
   if (await hasRegisteredKey(env, agentId)) {
@@ -95,7 +105,7 @@ export async function selfReportAtBoot(
   }
 
   const runtime = wantsRuntime ? (claim.runtime as string) : null
-  const model = wantsModel ? (claim.model as string) : null
+  const model = wantsModel ? modelLabel : null
 
   const changed: string[] = []
   if (runtime !== null && runtime !== (belief?.runtime ?? '')) changed.push('runtime')

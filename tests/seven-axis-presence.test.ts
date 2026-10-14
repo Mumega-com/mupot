@@ -324,6 +324,8 @@ describe('7-axis normalizers and Cursor Cloud seat injection', () => {
   it('parses only the exact Codex CLI harness spelling', () => {
     expect(parseSevenAxisCheckin({ harness: 'codex-cli' }).harness).toBe('codex-cli')
     expect(parseSevenAxisCheckin({ harness: 'codex' }).harness).toBeNull()
+    // chat apps can SAY what they are (display label only; never a runtime)
+    for (const h of ['chatgpt', 'claude-ai', 'grok-chat']) expect(parseSevenAxisCheckin({ harness: h }).harness).toBe(h)
     expect(parseSevenAxisCheckin({ harness: 'Codex-CLI' }).harness).toBeNull()
     expect(parseSevenAxisCheckin({ harness: ' codex-cli ' }).harness).toBeNull()
     expect(parseSevenAxisCheckin({ harness: 'unrecognized-harness' }).harness).toBeNull()

@@ -5671,7 +5671,7 @@ const toolCheckIn: ToolSpec = {
   name: 'check_in',
   scope: 'self (member-token presence)',
   min: 'authenticated',
-  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
+  args: '{ seat?: string, harness?: "cursor-ide"|"cursor-cloud"|"antigravity-cli"|"claude-code"|"codex-cli"|"prime"|"hermes"|"grok-cli"|"chatgpt"|"claude-ai"|"grok-chat"|"unknown", machine?: string, model?: string, provider?: string, effort?: "low"|"medium"|"high"|"extended-thinking-64k", flight_id?: string, source?: string, label?: string, name?: string, presence_mode?: "poll"|"resident", poll_interval_sec?: number }',
   inputSchema: {
     type: 'object',
     properties: {

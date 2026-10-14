@@ -126,6 +126,17 @@ describe('it cannot become a way around signed attach', () => {
   })
 })
 
+describe('graceful labels: a model name is sanitized, never refused for punctuation', () => {
+  it("'GPT 6 (Thinking)' is recorded as 'GPT-6-Thinking'; an unusable model is refused as a MODEL problem, not a runtime one", async () => {
+    const ok = await boot({ runtime: 'pi', model: 'GPT 6 (Thinking)' })
+    expect(ok.registry?.outcome).toBe('recorded')
+    expect(storedRuntime().model).toBe('GPT-6-Thinking')
+    const bad = await boot({ model: '!!!' })
+    expect(bad.registry?.outcome).toBe('refused_bad_model')
+    expect(storedRuntime().model).toBe('GPT-6-Thinking') // unchanged
+  })
+})
+
 describe('refusals teach instead of silencing', () => {
   it('an unknown runtime is refused WITH the vocabulary, and changes nothing', async () => {
     const r = await boot({ runtime: 'definitely-not-a-harness' })
