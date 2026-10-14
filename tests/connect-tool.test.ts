@@ -594,6 +594,8 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     expect(onBody.error.data.detail).toContain(`mint_agent_token { agent: "${AGENT.id}" }`)
     const off = makeEnv({ channel: 'directory', grants: [] })
     const offBody = (await (await callConnect(off, AGENT.id)).json()) as { error: { data: { detail: string } } }
+    expect(onBody.error.data.detail).toContain('seat_required') // a CLI session is told it has no seat and takes the token door
+    expect(onBody.error.data.detail).toContain('/admin/agent-token')
     expect(offBody.error.data.detail).not.toContain('seat_attach')
     expect(offBody.error.data.detail).toContain('mint_agent_token')
   })
