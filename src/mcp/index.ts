@@ -5846,6 +5846,8 @@ const toolCheckIn: ToolSpec = {
       // KV unavailable — match /api/fleet/checkin and prefer recording presence.
     }
 
+    // W2: an attached thread is not the agent's host; its check_in never writes the agent's presence (the router reads it as 'online').
+    if (attachedAuthority(auth)) return done({ ...echo, debounced: false, presence_recorded: false })
     await recordCheckin(env, id, {
       source: args.source ?? axis.harness,
       label: seatLabel || args.label,
@@ -7458,7 +7460,7 @@ export async function invokeTool(
 
   // mupot#1794 W4 (gate P2): a confined harness-token session writes no presence under the human —
   // the token is shared, so any holder could otherwise mint presence rows in the human's name.
-  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
+  if (outcome.ok && !ctx.sideEffectFree && (spec.shouldTouchPresence?.(args) ?? true) && auth.memberId && !isHarnessCredentialSession(auth) && !attachedAuthority(auth) && spec.name !== 'check_in' && spec.name !== 'boot_context') {
     // Zero-Touch Living Presence: automatically bump presence for active tool callers.
     const touchPromise = (async () => {
       const id = await loadMemberIdentity(env, auth)

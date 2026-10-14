@@ -362,7 +362,7 @@ export function prepareAutoSeatReclaim(env: Env, harnessId: string, liveCap: num
   return [
     // W2: attached threads idle for ATTACH_IDLE_DAYS are detached FIRST (unpinned), so a pool full of forgotten pinned
     // threads frees itself; the LRU victim below may then be one of them. Flag off => this statement is not even built.
-    ...(seatAttachEnabled(env) ? [prepareIdleAttachmentSweep(env, harnessId, nowIso)] : []),
+    ...(seatAttachEnabled(env) ? [prepareIdleAttachmentSweep(env, harnessId, nowIso, liveCap)] : []),
     env.DB.prepare(
       `UPDATE agent_seats SET retired_at = ?3
         WHERE id = (${victims} ORDER BY COALESCE(s.last_used_at, s.created_at) ASC, s.created_at ASC LIMIT 1)

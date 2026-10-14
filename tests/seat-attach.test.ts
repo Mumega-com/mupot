@@ -1082,6 +1082,29 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     await invokeTool(att, env, 'inbox', { peek: true }, 'https://pot.test')
     await invokeTool(att, env, 'inbox_lease', {}, 'https://pot.test')
     expect(lastReported()).toBe('2026-01-01 00:00:00')
+    // the generic 'ordinary presence' path + a plain check_in must not create presence rows for the agent (the router reads them as 'online')
+    const presenceRows = () => n(`SELECT COUNT(*) AS n FROM presence WHERE member_id = 'mem-agent-rava'`)
+    await invokeTool(att, env, 'check_in', {}, 'https://pot.test')
+    await invokeTool(att, env, 'task_create', { title: 'presence probe', done_when: 'a checkable done condition', squad_id: 'squad-core', dispatch: false }, 'https://pot.test')
+    expect(presenceRows()).toBe(0)
+    // host telemetry: an attached chat cannot overwrite the host's capacity snapshot
+    const cap = await invokeTool(att, env, 'harness_capacity_report', { harness: 'orca', host_key: 'h', observed_at: Date.now(), live_terminals: 1, agent_sessions: 1, busy_recent: 0, orphaned_terminals: 0, workers_active: 0, workers_release_unknown: 0, worktrees_with_live: 0 }, 'https://pot.test')
+    expect(JSON.stringify(cap)).toContain('attached_seat_not_agent_host')
+  })
+
+  it('idle sweep only detaches when the auto pool is full (a persistent connection survives while slots are free)', async () => {
+    const env = envFor(h)
+    const { prepareIdleAttachmentSweep } = await import('../src/members/seat-attach')
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    h.sqlite.exec(`DROP TRIGGER agent_seat_attachments_immutable`) // fixture only: age the row
+    h.sqlite.exec(`UPDATE agent_seat_attachments SET created_at = '2020-01-01T00:00:00.000Z', last_used_at = '2020-01-01T00:00:00.000Z'`)
+    const harnessId = (h.sqlite.prepare(`SELECT harness_id AS id FROM agent_seat_attachments LIMIT 1`).get() as { id: string }).id
+    const now = new Date().toISOString()
+    await prepareIdleAttachmentSweep(env, harnessId, now, 1000).run() // free slots: nothing is swept
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(1)
+    await prepareIdleAttachmentSweep(env, harnessId, now, 0).run() // pool "full": the idle one is detached
+    expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE detached_at IS NULL`)).toBe(0)
   })
 
 })

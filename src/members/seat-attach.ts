@@ -634,12 +634,17 @@ export async function renameThread(
 
 /** Statement for the auto-pool reclaim batch: detach attachments idle for ATTACH_IDLE_DAYS on this harness, so a pool full
  *  of forgotten pinned threads frees itself. Binds: 1 tenant, 2 harness, 3 now (ISO). Conditional: 0 rows is correct. */
-export function prepareIdleAttachmentSweep(env: Env, harnessId: string, nowIso: string): D1PreparedStatement {
+export function prepareIdleAttachmentSweep(env: Env, harnessId: string, nowIso: string, liveCap: number): D1PreparedStatement {
+  // Only when the auto pool is FULL (same predicate as the reclaim statement): a persistent connection is never swept while
+  // the app still has free thread slots.
   return env.DB.prepare(
     `UPDATE agent_seat_attachments SET detached_at = ?3, detach_reason = 'idle_expired'
       WHERE tenant = ?1 AND harness_id = ?2 AND detached_at IS NULL
-        AND julianday(COALESCE(last_used_at, created_at)) < julianday(?3) - ${ATTACH_IDLE_DAYS}`,
-  ).bind(env.TENANT_SLUG, harnessId, nowIso)
+        AND julianday(COALESCE(last_used_at, created_at)) < julianday(?3) - ${ATTACH_IDLE_DAYS}
+        AND (SELECT COUNT(*) FROM agent_seats ls JOIN agents la ON la.id = ls.agent_id
+              WHERE ls.tenant = ?1 AND ls.harness_id = ?2 AND ls.source = 'auto' AND ls.retired_at IS NULL
+                AND la.status IN ('active', 'paused')) >= ?4`,
+  ).bind(env.TENANT_SLUG, harnessId, nowIso, liveCap)
 }
 
 /** The default name of a connection (seat) from what the server knows: the app's registered name + the seat's own label. */

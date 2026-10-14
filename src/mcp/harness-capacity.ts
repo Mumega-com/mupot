@@ -1,5 +1,6 @@
 // src/mcp/harness-capacity.ts — mupot#1765 (epic #1590): harness capacity report/list tools.
 
+import { attachedAuthority } from '../auth/attached-ceiling'
 import { type ToolSpec, fail, done, str } from './index'
 import {
   COUNT_FIELDS, HARNESSES, listCapacity, parseCapacityArgs, toView, upsertCapacity,
@@ -30,6 +31,8 @@ export const toolHarnessCapacityReport: ToolSpec = {
     // The reporter identity is the authenticated bound agent. NEVER an argument.
     const reporter = auth.boundAgentId
     if (!reporter) return fail(403, 'forbidden: agent-bound caller required')
+    // W2: host telemetry. An attached chat is not the agent's host and must not overwrite its capacity snapshot.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
     const parsed = parseCapacityArgs(args, Date.now())
     if (!parsed.ok) return fail(400, parsed.error)
     const now = Date.now()
