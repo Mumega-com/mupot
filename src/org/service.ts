@@ -2011,3 +2011,18 @@ export async function deleteAgent(
   if (!writes[1]?.meta.changes) return { ok: false, error: 'not_found' }
   return { ok: true }
 }
+
+
+/**
+ * Compare-and-swap a squad's budget cap: write `next` ONLY if the cap still equals the value the caller observed (null means
+ * 'no cap'). Returns false when it changed in between, so two overlapping elevated updates can never end in a raise. NO authz
+ * inside (the MCP tool gates before calling and validates that `next` is a positive integer lower than `observed`).
+ */
+export async function lowerSquadBudgetCap(env: Env, squadId: string, observed: number | null, next: number): Promise<boolean> {
+  const res = await env.DB.prepare(
+    'UPDATE squads SET budget_cap_cents = ?1 WHERE id = ?2 AND ((?3 IS NULL AND budget_cap_cents IS NULL) OR budget_cap_cents = ?3)',
+  )
+    .bind(next, squadId, observed)
+    .run()
+  return res.meta.changes > 0
+}

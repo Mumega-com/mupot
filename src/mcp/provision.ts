@@ -42,6 +42,7 @@ import {
   getAgentProfile,
   updateAgentProfile,
   updateUnitConfig,
+  lowerSquadBudgetCap,
   moveAgentSquad,
   listMoveGrantImpact,
 } from '../org/service'
@@ -383,7 +384,11 @@ async function orgStructureElevation(
   const { action, ...rest } = opts
   // recordUsage:false: authorization alone writes NO elevation_usage_log row. The caller logs ONE itemized row AFTER the write
   // succeeds (recordOrgStructureUsage), so a refused or failed attempt never appears as an applied use (bot P1, Opus P1-2).
-  return hasElevatedAction(env, auth, action ?? ORG_STRUCTURE_ACTION, scopeType, scopeId, { ...rest, recordUsage: false })
+  // Two literal call sites (not a variable): the enforcement ratchet scans hasElevatedAction call sites for string literals.
+  if (action === ORG_DEPARTMENT_CREATE_ACTION) {
+    return hasElevatedAction(env, auth, 'action:org_department_create', scopeType, scopeId, { ...rest, recordUsage: false })
+  }
+  return hasElevatedAction(env, auth, 'action:org_structure', scopeType, scopeId, { ...rest, recordUsage: false })
 }
 
 async function recordOrgStructureUsage(
@@ -2789,12 +2794,8 @@ const toolUpdateSquad: ToolSpec = {
       if (!(typeof next === 'number' && Number.isInteger(next) && next > 0)) {
         return fail(400, 'invalid_args', { reason: 'budget_cap_cents must be a positive integer for an elevated agent' })
       }
-      const cas = await env.DB.prepare(
-        'UPDATE squads SET budget_cap_cents = ?1 WHERE id = ?2 AND ((?3 IS NULL AND budget_cap_cents IS NULL) OR budget_cap_cents = ?3)',
-      )
-        .bind(next, squad.id, before.budget_cap_cents)
-        .run()
-      if (!cas.meta.changes) {
+      const swapped = await lowerSquadBudgetCap(env, squad.id, before.budget_cap_cents, next)
+      if (!swapped) {
         return fail(409, 'conflict', { reason: 'budget_changed_concurrently', remedy: 'The squad budget changed while this call ran; re-read it and retry.' })
       }
       delete writePatch.budget_cap_cents

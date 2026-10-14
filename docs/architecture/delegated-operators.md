@@ -118,18 +118,20 @@ The caller census matches a writer by NAME anywhere in the source, so an aliased
 
 | Act | Human org admin | Agent | Delegated operator (flag on) |
 |---|---|---|---|
-| `create_department` | yes (standing org admin) | only under a live `action:org_structure` elevation granted at ORG scope (or a standing org-admin grant, the pre-existing lane) | no, not delegable |
-| `update_department` (rename; work departments only) | yes (department admin, org admin inherits) | only under a live `action:org_structure` elevation granted on that department or at org scope; a standing grant never opens it | no, not delegable |
-| `update_squad` (slug, budget) | yes (squad admin, inherited) | only under a live `action:org_structure` elevation granted on that squad, its department, or org; a standing grant never opens it | no, not delegable |
+| `create_department` | yes (standing org admin) | only under a live **`action:org_department_create`** elevation granted at ORG scope (or a standing org-admin agent grant, the pre-existing lane). **Irreversible**: no tool deletes or archives a department. | no, not delegable |
+| `update_department` (rename; work departments only) | yes (department admin, org admin inherits) | only under a live `action:org_structure` elevation granted on that department or at org scope; standing authority never opens it for an agent | no, not delegable |
+| `update_squad` (slug, budget) | yes (squad admin, inherited) | only under a live `action:org_structure` elevation granted on that squad, its department, or org; standing authority never opens it for an agent. An elevated agent may only **lower** the budget cap to a positive value (no raise, no clear, no 0, no window change), written as a compare-and-swap | no, not delegable |
 | `create_squad` | yes | `action:project_lifecycle` on the department, or a capability grant | yes, inside the delegation |
 
-The agent path is the existing elevation mechanism, not a new one: the agent calls `request_elevation` with
-`action:org_structure` and a scope, a human approves it at the secure moment, and the grant is a time window (multi-use
-until it expires or is revoked; every use is written to `elevation_usage_log`). Approving it grants no standing capability.
-It is reversible (everything it can do, a standing admin can undo) and is not a step-up action. It never reaches a home
-department or home squad, never archives or deletes (there is no delete path), and a slug rename into a name that
-`team_bootstrap` has reserved still needs standing department admin. An ATTACHED seat thread is refused `request_elevation`
-and refused these three tools even if a grant row exists for its credential.
+The agent path is the existing elevation mechanism, not a new one: the agent calls `request_elevation` with the action and a
+scope, a human approves it at the secure moment, and the grant is a time window (multi-use until it expires or is revoked).
+**One itemized `elevation_usage_log` row is written per SUCCESSFUL write** (after it commits); a refused or failed attempt writes
+none. Approving grants no standing capability. `action:org_structure` is reversible (a standing admin can undo everything it
+does) and is not a step-up action; `action:org_department_create` is classified irreversible so the approval screen does not
+call the created department undoable. Neither reaches a home department or home squad, neither archives or deletes, and a slug
+rename into a name that `team_bootstrap` has reserved still needs standing department admin (a bound agent never satisfies that
+with standing authority). An ATTACHED seat thread is refused `request_elevation` and refused these three tools up front, even
+when its ceiling-clamped grants include org admin and even if a grant row exists for its credential.
 
 ## Flag semantics
 
