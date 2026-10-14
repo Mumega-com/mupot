@@ -12,7 +12,7 @@ export interface IssuedLink {
 
 export async function issueMomentLink(
   env: Env,
-  input: { kind: MomentKind; subjectId: string; requesterAgentId: string | null; subjectExpiresAtIso: string },
+  input: { kind: MomentKind; subjectId: string; requesterAgentId: string | null; subjectExpiresAtIso: string; noRotate?: boolean },
 ): Promise<IssuedLink | null> {
   if (secureMomentsStatus(env).state !== 'on') return null
   try {

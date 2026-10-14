@@ -260,8 +260,10 @@ export async function ensureAdmission(
     // link the winner returned (bot review P2).
     if (!inserted && pending.status === 'pending') return { ok: true, state: 'pending', admission: pending, approveUrl: null, alreadyPending: true }
   }
+  // noRotate: two concurrent recoveries (or a recovery racing the first mint) must never rotate each other's link; the loser
+  // simply gets no link and the human uses the winner's (or asks again).
   const link = pending.expires_at
-    ? await issueMomentLink(env, { kind: 'seat_admit', subjectId: pending.id, requesterAgentId: p.requesterAgentId ?? null, subjectExpiresAtIso: pending.expires_at })
+    ? await issueMomentLink(env, { kind: 'seat_admit', subjectId: pending.id, requesterAgentId: p.requesterAgentId ?? null, subjectExpiresAtIso: pending.expires_at, noRotate: true })
     : null
   return { ok: true, state: 'pending', admission: pending, approveUrl: link?.url ?? null, alreadyPending: false }
 }

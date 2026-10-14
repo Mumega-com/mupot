@@ -1434,6 +1434,21 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(ok.status).toBe(200)
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
   })
+  it('noRotate: createMoment never rotates the token of a live pending moment (concurrent recovery cannot kill the winner\'s link)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const first = await attach(env, g, 'conv-a', 'rava')
+    const { createMoment } = await import('../src/secure-moments/store')
+    const admId = String(first.sc.admission_id)
+    const hashBefore = one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h
+    const future = new Date(Date.now() + 3600_000).toISOString()
+    expect(await createMoment(env, { kind: 'seat_admit', subjectId: admId, requesterAgentId: null, subjectExpiresAtIso: future, noRotate: true })).toBeNull()
+    expect(one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h).toBe(hashBefore)
+    // control: without noRotate the same call DOES rotate (this is the behaviour the recovery path must not use)
+    expect(await createMoment(env, { kind: 'seat_admit', subjectId: admId, requesterAgentId: null, subjectExpiresAtIso: future })).not.toBeNull()
+    expect(one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h).not.toBe(hashBefore)
+  })
   it('a repeat ask with a LIVE pending moment never mints or rotates a link', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
