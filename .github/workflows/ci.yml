@@ -163,6 +163,7 @@ jobs:
           path: tmp/vitest-blob
           merge-multiple: true
       - name: Require exactly four shard blob reports
+        shell: bash
         run: |
           actual="$(find tmp/vitest-blob -maxdepth 1 -type f -printf '%f\n' | sort)"
           expected="$(printf 'shard-%s.json\n' 1 2 3 4)"
