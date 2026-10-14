@@ -145,7 +145,10 @@ async function decideMoment(e: Env, url: string, a: SoftAuthenticator, decision:
   const ch = (await (await hit(`${path}/challenge`, e, { method: 'POST', json: { decision, csrf, ...(ceiling ? { ceiling } : {}) } })).json()) as J
   const credential = await a.assert({ rpId: HOST, origin: ORIGIN, challenge: ch.publicKey?.challenge ?? '' })
   const res = await hit(`${path}/decide`, e, { method: 'POST', json: { decision, csrf, credential, ...(decideCeiling ? { ceiling: decideCeiling } : {}) } })
-  return { status: res.status, body: (await res.json()) as J }
+  const raw = await res.text()
+  let body: J = {} as J
+  try { body = JSON.parse(raw) as J } catch { /* a 500 is plain text */ }
+  return { status: res.status, body }
 }
 
 beforeEach(() => {
@@ -1381,7 +1384,7 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_admit'`)).toBe(0)
   })
-  it('post-merge review: the decision sequence runs under waitUntil (a consumed moment cannot strand a pending admission)', async () => {
+  it('post-merge review: the decision sequence is registered with waitUntil (request-lifetime only; durability is the recovery test below)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
     await boot(env, g, 'conv-a')
@@ -1409,6 +1412,53 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(JSON.stringify(await invokeTool(att, env, 'inbox_dead_letters', {}, 'https://pot.test'))).toContain('attached_seat_peek_only')
   })
 
+  it('split-write recovery: a consumed moment + pending admission (promotion failed) is recovered by the next seat_attach, which mints ONE fresh link', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const first = await attach(env, g, 'conv-a', 'rava')
+    const key = await enrolPasskey(env, HUMAN, `${HUMAN}@example.test`)
+    // inject a failure ONLY in the promotion write (after the gate consumed the one-time moment)
+    h.sqlite.exec(`CREATE TRIGGER zz_fail_promote BEFORE UPDATE ON agent_seat_admissions WHEN NEW.status = 'live' BEGIN SELECT RAISE(ABORT, 'injected_promotion_failure'); END`)
+    const res = await decideMoment(env, String(first.sc.approve_url), key, 'approve')
+    expect(res.status).toBe(500)
+    h.sqlite.exec(`DROP TRIGGER zz_fail_promote`)
+    expect(one<{ status: string }>(`SELECT status FROM secure_moments WHERE kind = 'seat_admit'`)?.status).toBe('consumed')
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
+    // the stranded state is recoverable: a repeat ask finds NO live moment and mints one fresh link
+    const again = await attach(env, g, 'conv-a', 'rava')
+    expect(String(again.sc.approve_url ?? '')).toContain('/m/')
+    expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit' AND status = 'pending'`)).toBe(1)
+    // and the fresh link actually completes the admission
+    const ok = await decideMoment(env, String(again.sc.approve_url), key, 'approve')
+    expect(ok.status).toBe(200)
+    expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('live')
+  })
+  it('noRotate: createMoment never rotates the token of a live pending moment (concurrent recovery cannot kill the winner\'s link)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const first = await attach(env, g, 'conv-a', 'rava')
+    const { createMoment } = await import('../src/secure-moments/store')
+    const admId = String(first.sc.admission_id)
+    const hashBefore = one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h
+    const future = new Date(Date.now() + 3600_000).toISOString()
+    expect(await createMoment(env, { kind: 'seat_admit', subjectId: admId, requesterAgentId: null, subjectExpiresAtIso: future, noRotate: true })).toBeNull()
+    expect(one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h).toBe(hashBefore)
+    // control: without noRotate the same call DOES rotate (this is the behaviour the recovery path must not use)
+    expect(await createMoment(env, { kind: 'seat_admit', subjectId: admId, requesterAgentId: null, subjectExpiresAtIso: future })).not.toBeNull()
+    expect(one<{ h: string }>(`SELECT link_token_sha256 AS h FROM secure_moments WHERE kind = 'seat_admit'`)?.h).not.toBe(hashBefore)
+  })
+  it('a repeat ask with a LIVE pending moment never mints or rotates a link', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const first = await attach(env, g, 'conv-a', 'rava')
+    const again = await attach(env, g, 'conv-a', 'rava')
+    expect(String(first.sc.approve_url)).toContain('/m/')
+    expect(again.sc.approve_url ?? null).toBeNull()
+    expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit'`)).toBe(1)
+  })
   it('the seat_attach tool\'s own seat.attached guard: refused with zero writes (the library refuses the same way: defence in depth)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)

@@ -47,6 +47,8 @@ export interface CreateMomentInput {
   requesterAgentId: string | null
   /** The underlying request's own expiry; the moment never outlives it nor MOMENT_MAX_TTL_MS. */
   subjectExpiresAtIso: string
+  /** When a live pending moment already exists for this subject, return null instead of rotating its token. */
+  noRotate?: boolean
 }
 
 /**
@@ -76,6 +78,7 @@ export async function createMoment(env: Env, input: CreateMomentInput, nowMs: nu
      ON CONFLICT DO NOTHING`,
   ).bind(id, tenant, input.kind, input.subjectId, input.requesterAgentId, hash, nowIso, expiresAt).run()
   if (ins.meta.changes === 1) return { id, token, expiresAt }
+  if (input.noRotate) return null // a live pending moment exists: never rotate the token someone may be holding
   // The partial UNIQUE index refused: a live pending moment exists. Rotate its token in one guarded UPDATE.
   const rot = await env.DB.prepare(
     `UPDATE secure_moments SET link_token_sha256 = ?5, expires_at = ?6
