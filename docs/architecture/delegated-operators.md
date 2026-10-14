@@ -130,8 +130,45 @@ none. Approving grants no standing capability. `action:org_structure` is reversi
 does) and is not a step-up action; `action:org_department_create` is classified irreversible so the approval screen does not
 call the created department undoable. Neither reaches a home department or home squad, neither archives or deletes, and a slug
 rename into a name that `team_bootstrap` has reserved still needs standing department admin (a bound agent never satisfies that
-with standing authority). An ATTACHED seat thread is refused `request_elevation` and refused these three tools up front, even
-when its ceiling-clamped grants include org admin and even if a grant row exists for its credential.
+with standing authority). An ATTACHED seat thread is refused `create_department` always, and refused `update_department` /
+`update_squad` unless it holds a live **sudo** grant (next section), even when its ceiling-clamped grants include org admin.
+
+### sudo for attached chats
+
+The product shape: "I am working with this chat; when I need my access I sudo, do my work, then the agent continues as it was."
+An attached chat (W2 `seat_attach`) acts with min(human's live standing, the agent's own grants, the admission ceiling) and holds
+no admin of its own. Its one way up is `request_elevation`, per action, never blanket:
+
+- **What it may ask for.** Only the actions in `ATTACHED_SUDO_ACTIONS` (`src/auth/attached-ceiling.ts`): today **`action:org_structure`**
+  alone (rename a work department, update a squad: reversible, lowers a budget cap only). Everything else is refused with
+  `attached_seat_cannot_elevate` (`mint_token`, `manage_access`, `register_key`, `deploy`, `migrate`, `secrets`,
+  `org_department_create`, `routine_archive`, `home_access`, every gate power). The list is one exported const, enforced at three
+  points (the request, the decision, every use in `hasElevatedAction`), so adding a key is a reviewed one-line change that must be
+  reversible, must not mint or widen authority, and must be wired to a tool safe for an attached chat.
+- **Whose session.** The request binds to the attachment's OWN agent session, the same resolution every elevation uses: the session
+  is keyed on the attachment's own credential (`agent_seat_attachments.seat_token_id`, a token minted for that one attachment).
+  A second chat attached to the same agent, the agent's own session and the human's plain seat do not inherit the grant.
+- **Who approves.** Only the human who attached the chat. On the secure moment (`/m`) and the dashboard / Access page that is a
+  passkey / fresh-reauth step-up. KNOWN GAP (follow-up filed): the Telegram mini-app decides with a device tap and does not
+  yet enforce the step-up for attached-origin requests; the approver check itself holds there. Another org admin is refused
+  (approve and deny), is not shown the request on the dashboard (not even in the "outside your authority" count), and
+  the Telegram button goes to the attaching human, not the agent's owner. The attaching human is DERIVED on every read from the
+  session's credential (`loadAttachmentOriginOfSession`), never a stored claim on the request row, so there is nothing to
+  forge and no migration. Only that human (or expiry) can close the request: no other admin can deny it.
+- **How far.** The ceiling is the approver rule: the scope must be one where the attaching human holds admin (checked at the
+  decision, re-checked live at every use together with the approving web session). Sudo lends the human's own admin on that exact
+  scope for that exact act; it never exceeds what the human could do by hand, and the agent's own grants are untouched. A ceiling
+  `member` chat gets no more outside the granted scope and act than it had.
+- **Use.** `update_department` / `update_squad` accept the attached chat only with a live grant bound to ITS attachment session
+  that matches the exact target (squad, its department, or org). Without one the refusal is `attached_thread_without_matching_sudo_grant`
+  and names the exact `request_elevation` call (action, scope, resolved id) and says "your human approves with their passkey". Each
+  successful write logs one usage row AFTER the write and the audit event carries `attachment_id` and the attaching human.
+- **When it ends.** With the grant's own window, or at once when the chat detaches, the admission is revoked, the idle sweep
+  detaches it or the seat retires: `hasElevatedAction` re-reads the attachment through `findLiveAttachment` on every use (a held
+  AuthContext is refused too), and a re-attach is a new attachment with a new credential, so nothing carries over.
+- **What stays refused WITH a live grant.** Every host-state door (`presence_*`, fleet, inbox consume/lease/ack, capacity, usage,
+  doorbell, host keys, `update_agent`'s self lane, gate edges, `check_in` presence modes) and `create_department`. Sudo opens the
+  one allow-listed act and nothing else (`tests/attached-sudo.test.ts`).
 
 ## Flag semantics
 

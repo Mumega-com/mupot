@@ -24,7 +24,7 @@ import { keyRequests, applySeed } from '../seeds/apply'
 import { renderRequest } from '../seeds/render'
 import type { SeedRequest, SeedV1 } from '../seeds/contract'
 import {
-  canDecideElevation, decideElevationRequest, findElevationDecisionRefusal, loadElevationRequestById,
+  canDecideElevationRequest, deciderMemberIdOf, decideElevationRequest, requestIsFromAttachedChat, findElevationDecisionRefusal, loadElevationRequestById,
   type DecideElevationInput, type DecideElevationResult, type ElevationRequestRecord,
 } from '../auth/elevation'
 import { revokeWebSession } from '../auth/web-sessions'
@@ -204,11 +204,13 @@ export function elevationIsLive(req: ElevationRequestRecord, nowMs: number): boo
 
 /** Does this member hold the authority to decide THIS request (scope-local, the existing predicate). */
 export async function mayDecideElevation(env: Env, auth: AuthContext, req: ElevationRequestRecord): Promise<boolean> {
-  return canDecideElevation(env, auth, auth.capabilities, req.requested_scope_type, req.requested_scope_id)
+  // canDecideElevationRequest = the scope predicate PLUS "a request from an attached chat is decided by the human who attached it".
+  return canDecideElevationRequest(env, auth, auth.capabilities, req, deciderMemberIdOf(auth))
 }
 
 export async function elevationViewInner(env: Env, req: ElevationRequestRecord): Promise<string> {
   const agent = await agentName(env, req.agent_id)
+  const fromChat = await requestIsFromAttachedChat(env, req)
   const actions = parseActions(req)
   const boxes = actions.map((a) => {
     const def = ELEVATION_ACTIONS[a]
@@ -219,7 +221,7 @@ export async function elevationViewInner(env: Env, req: ElevationRequestRecord):
   const durations = ELEVATION_DURATION_PRESETS_MINUTES.filter((m) => m <= req.requested_duration_minutes)
     .map((m) => `<option value="${m}"${m === req.requested_duration_minutes ? ' selected' : ''}>${m} minutes</option>`).join('')
   return `<dl><dt>Agent</dt><dd>${agent ? escapeHtml(agent) : '<span class="muted">unknown</span>'} (<code>${escapeHtml(req.agent_id)}</code>)</dd>
-<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
+${fromChat ? `<dt>Requested from</dt><dd><strong>a CHAT attached to ${agent ? escapeHtml(agent) : 'this agent'}</strong> (sudo: only you, who attached it, can approve)</dd>` : ''}<dt>Scope</dt><dd>${escapeHtml(req.requested_scope_type)} <code>${escapeHtml(req.requested_scope_id || 'org-wide')}</code> (cannot be widened or changed here)</dd>
 <dt>Decide by</dt><dd>${escapeHtml(req.decision_expires_at)}</dd></dl>
 <h2>Actions (untick to narrow)</h2><ul style="list-style:none;padding-left:0">${boxes}</ul>
 <h2>Duration (you can only shorten)</h2><select name="duration_minutes">${durations}</select>

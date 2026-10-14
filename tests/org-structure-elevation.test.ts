@@ -474,7 +474,9 @@ describe('delegated operators and attached seats stay out', () => {
     // baseline: the SAME credential, not attached, is allowed
     expect((await createDept('ops')).ok, 'baseline').toBe(true)
     const before = deptCount()
-    const req = await invokeTool(attached, env, 'request_elevation', { actions: ['action:org_structure'], scope_type: 'org', duration_minutes: 15, reason: 'x' }, ORIGIN)
+    // sudo for attached chats (tests/attached-sudo.test.ts): ONLY the allow-listed reversible act may be requested; the
+    // irreversible one stays refused. (The org_structure request itself is allowed and binds to the attachment's session.)
+    const req = await invokeTool(attached, env, 'request_elevation', { actions: ['action:org_department_create'], scope_type: 'org', duration_minutes: 15, reason: 'x' }, ORIGIN)
     expect(JSON.stringify(req)).toContain('attached_seat_cannot_elevate')
     expect((await createDept('ops-attached', attached)).ok).toBe(false)
     expect((await renameDept(DEPT_A, 'Hijacked', attached)).ok).toBe(false)

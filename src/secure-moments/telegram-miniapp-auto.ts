@@ -13,6 +13,8 @@
 import type { Env } from '../types'
 import { buildAuth } from '../access/identity'
 import { mayDecideElevation, mayDecideSeed } from '../access/decision-core'
+import { loadAgentSessionById } from '../auth/agent-sessions'
+import { loadAttachmentOriginOfSession } from '../auth/elevation'
 import { loadMoment, momentIsLive } from './store'
 import { telegramMiniappStatus } from './telegram-miniapp-config'
 import { sendMiniappButton, type FetchFn } from './telegram-miniapp-send'
@@ -91,8 +93,17 @@ async function deliver(env: Env, momentId: string, requesterMemberId: string | n
   const subject = await loadLiveSubject(env, m, nowMs)
   if (!subject) return 'failed'
   const requesterAgentId = subject.kind === 'elevation' ? subject.req.agent_id : subject.row.requester_agent_id
-  // A seed's requester member is a fallback only when the filer is a human (privateChatOf below refuses an agent-welded one).
-  const target = await decidingHuman(env, requesterAgentId, subject.kind === 'seed_attach' ? subject.row.requester_member_id : requesterMemberId)
+  // A request from an ATTACHED chat is the attaching human's alone to decide (findElevationDecisionRefusal), so that human, not
+  // the agent's owner, is the one who must get the button. A dead attachment has no deciding human: nothing is sent.
+  let target: string | null
+  if (subject.kind === 'elevation') {
+    const session = await loadAgentSessionById(env, subject.req.tenant, subject.req.agent_session_id)
+    const origin = session ? await loadAttachmentOriginOfSession(env, subject.req.tenant, session.credential_id) : null
+    target = origin ? (origin.live ? origin.humanMemberId : null) : await decidingHuman(env, requesterAgentId, requesterMemberId)
+  } else {
+    // A seed's requester member is a fallback only when the filer is a human (privateChatOf below refuses an agent-welded one).
+    target = await decidingHuman(env, requesterAgentId, subject.row.requester_member_id)
+  }
   if (!target || (m.decider_member_id !== null && m.decider_member_id !== target)) return 'not_bound'
   const chatId = await privateChatOf(env, target)
   if (!chatId) return 'not_bound'
