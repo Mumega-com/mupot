@@ -443,6 +443,75 @@ describe('delegated operators and attached seats stay out', () => {
   })
 })
 
+describe('one grant never opens the standing-admin path elsewhere (adversarial P1-A)', () => {
+  const standingOn = (scopeType: 'squad' | 'department', scopeId: string) => ({
+    capabilities: [{ member_id: AGENT_MEMBER, scope_type: scopeType, scope_id: scopeId, capability: 'admin' }],
+  } as unknown as Partial<AuthContext>)
+
+  it('standing admin on squad A2 + a grant on B1 cannot update A2 (and the grant works on B1, with a usage row)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_B1, 60, T0)
+    const a2 = await updateSquad(SQUAD_A2, { budget_cap_cents: 5 }, agentAuth(standingOn('squad', SQUAD_A2)))
+    expect(a2.ok, JSON.stringify(a2)).toBe(false)
+    expect(squadRow(SQUAD_A2)?.budget_cap_cents).toBeNull()
+    const b1 = await updateSquad(SQUAD_B1, { budget_cap_cents: 5 }, agentAuth(standingOn('squad', SQUAD_A2)))
+    expect(b1.ok, JSON.stringify(b1)).toBe(true)
+    expect(squadRow(SQUAD_B1)?.budget_cap_cents).toBe(5)
+  })
+
+  it('standing admin on department B + a grant on squad A1 cannot rename department B', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    const out = await renameDept(DEPT_B, 'Hijacked', agentAuth(standingOn('department', DEPT_B)))
+    expect(out.ok, JSON.stringify(out)).toBe(false)
+    expect(deptName(DEPT_B)).not.toBe('Hijacked')
+  })
+
+  it('standing admin on the HOME squad + a grant on A1 cannot update the home squad', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    const out = await updateSquad(SQUAD_HOME, { budget_cap_cents: 5 }, agentAuth(standingOn('squad', SQUAD_HOME)))
+    expect(out.ok, JSON.stringify(out)).toBe(false)
+    expect(squadRow(SQUAD_HOME)?.budget_cap_cents).toBeNull()
+  })
+
+  it('an ATTACHED seat with standing caps and a grant row on B1 cannot update A2', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_B1, 60, T0)
+    const attached = agentAuth({
+      capabilities: [{ member_id: AGENT_MEMBER, scope_type: 'squad', scope_id: SQUAD_A2, capability: 'admin' }],
+      seatBinding: {
+        seatId: 'seat-1', label: 'seat-1', harnessId: 'h-1', grantTokenId: TOKEN_ID, humanMemberId: ADMIN_HUMAN, source: 'handle',
+        attached: { agentId: AGENT_ID, ceiling: 'full' },
+      },
+    } as unknown as Partial<AuthContext>)
+    expect((await updateSquad(SQUAD_A2, { budget_cap_cents: 5 }, attached)).ok).toBe(false)
+    expect(squadRow(SQUAD_A2)?.budget_cap_cents).toBeNull()
+  })
+})
+
+describe('an elevated agent may only LOWER a squad budget (adversarial P1-B)', () => {
+  it('can set a first cap and lower it; cannot raise it, clear it, or change the window', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 1000 })).ok, 'first cap').toBe(true)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 400 })).ok, 'lower').toBe(true)
+    for (const patch of [{ budget_cap_cents: 900 }, { budget_cap_cents: null }, { budget_window: 'day' }]) {
+      const out = await updateSquad(SQUAD_A1, patch)
+      expect(out.ok, JSON.stringify(patch)).toBe(false)
+      expect(JSON.stringify(out)).toMatch(/budget_(raise|window)_standing_admin_only/)
+    }
+    expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBe(400)
+  })
+
+  it('a human admin still raises, clears and changes the window freely', async () => {
+    await invokeTool(humanAdminAuth(), env, 'update_squad', { squad: SQUAD_A1, budget_cap_cents: 300 }, ORIGIN)
+    expect((await invokeTool(humanAdminAuth(), env, 'update_squad', { squad: SQUAD_A1, budget_cap_cents: 900 }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(humanAdminAuth(), env, 'update_squad', { squad: SQUAD_A1, budget_cap_cents: null }, ORIGIN)).ok).toBe(true)
+    expect((await invokeTool(humanAdminAuth(), env, 'update_squad', { squad: SQUAD_A1, budget_window: 'day' }, ORIGIN)).ok).toBe(true)
+  })
+})
+
 describe('human admin lane is unchanged', () => {
   it('an org-admin human creates and renames departments and updates squads with no elevation', async () => {
     const h = humanAdminAuth()

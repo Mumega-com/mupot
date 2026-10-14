@@ -461,7 +461,10 @@ const toolUpdateDepartment: ToolSpec = {
 
     const grants = auth.capabilities ?? []
     let elevationGrantId: string | undefined
-    if (!hasCapability(grants, 'department', dept.id, 'admin')) {
+    // A bound AGENT never opens this tool with standing admin (agentLane 'refuse'): its grant must match THIS department. Without
+    // this, one grant on an unrelated scope returned agent_legacy from the chokepoint and the agent's standing admin then opened
+    // every other department, unlogged (adversarial P1-A). Humans keep the standing path.
+    if (auth.boundAgentId != null || !hasCapability(grants, 'department', dept.id, 'admin')) {
       const elevated = await orgStructureElevation(env, auth, 'department', dept.id, {
         toolName: 'update_department',
         detail: { department_id: dept.id },
@@ -2655,8 +2658,11 @@ const toolUpdateSquad: ToolSpec = {
     // Or a live action:org_structure elevation on this squad, its department, or the org. Never a home squad: the
     // elevation lane is for work structure, and a member's home is theirs alone.
     let elevationGrantId: string | undefined
-    if (!(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
-      if (squad.kind !== 'work') return fail(403, 'forbidden', { need: 'admin', scope: 'squad' })
+    // Same rule as update_department: a bound agent must hold a grant matching THIS squad (squad, its department, or org);
+    // standing admin never opens it, so the home-squad guard, the attached-seat refusal and usage logging below cannot be
+    // skipped by holding some unrelated grant.
+    if (auth.boundAgentId != null || !(await memberCanOnSquad(env, grants, squad.id, 'admin'))) {
+      if (squad.kind !== 'work') return fail(403, 'forbidden', { need: 'admin', scope: 'squad', reason: 'home_squad' })
       const elevated = await orgStructureElevation(env, auth, 'squad', squad.id, {
         toolName: 'update_squad',
         detail: { squad_id: squad.id },
@@ -2715,6 +2721,22 @@ const toolUpdateSquad: ToolSpec = {
       .bind(squad.id)
       .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
     if (!before) return fail(404, 'squad_not_found', { squad: squadRef })
+
+    // An elevated AGENT may only LOWER a squad's budget (budget_cap_cents caps real objective spending). Raising or clearing
+    // the cap, or changing the window, stays with a standing human admin (adversarial P1-B).
+    if (elevationGrantId) {
+      if ('budget_window' in patch) {
+        return fail(403, 'forbidden', { reason: 'budget_window_standing_admin_only', remedy: 'A human admin changes a squad budget window; an elevated agent may only lower the cap.' })
+      }
+      if ('budget_cap_cents' in patch) {
+        const next = patch.budget_cap_cents
+        const cur = before.budget_cap_cents
+        const raises = next === null ? cur !== null : typeof next === 'number' && cur !== null && next > cur
+        if (raises) {
+          return fail(403, 'forbidden', { reason: 'budget_raise_standing_admin_only', remedy: 'An elevated agent may only lower a squad budget cap, never raise or clear it; ask a human admin.' })
+        }
+      }
+    }
 
     const result = await updateUnitConfig(env, 'squad', squad.id, patch)
     if (!result.ok) {

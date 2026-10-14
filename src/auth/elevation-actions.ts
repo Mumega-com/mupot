@@ -98,7 +98,7 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     key: 'action:org_structure',
     enforced: true,
     label: 'Create/update departments and squads',
-    description: 'Create a department (org scope only), rename a department, or update a squad (slug, budget) inside the scope you have been granted. Never archives or deletes.',
+    description: 'Create a department (org scope only), rename a department, or update a squad (slug, and LOWER its budget cap) inside the scope you have been granted. Cannot raise or clear a budget, never archives or deletes.',
     effect: 'reversible',
     effectNote: 'Created/renamed departments and updated squads can be edited again by standing authority after expiry.',
   },
