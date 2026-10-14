@@ -46,6 +46,7 @@ import {
 } from './elevation-actions'
 import { assertBatchWritten } from '../lib/receipt'
 import { attachedAuthority, isAttachedSudoAction } from './attached-ceiling'
+import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from './token-lifecycle'
 
 export const REQUEST_DECISION_WINDOW_MS = 10 * 60 * 1000 // 10 minutes — design v1 "user code" window
 
@@ -460,12 +461,17 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
   try {
     const row = await env.DB.prepare(
       `SELECT att.id AS attachment_id, att.human_member_id AS human_member_id, att.agent_id AS agent_id,
-              CASE WHEN att.detached_at IS NULL AND adm.status = 'live' THEN 1 ELSE 0 END AS live
+              CASE WHEN att.detached_at IS NULL AND adm.status = 'live'
+                    AND EXISTS (SELECT 1 FROM agent_seats s WHERE s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL)
+                    AND EXISTS (SELECT 1 FROM agents a WHERE a.id = att.agent_id AND a.status = 'active')
+                    AND EXISTS (SELECT 1 FROM member_tokens t WHERE t.id = att.seat_token_id AND t.tenant = att.tenant
+                                  AND ${TOKEN_LIVE_PREDICATE('?3')})
+                   THEN 1 ELSE 0 END AS live
          FROM agent_seat_attachments att
          LEFT JOIN agent_seat_admissions adm ON adm.id = att.admission_id AND adm.tenant = att.tenant
         WHERE att.tenant = ?1 AND att.seat_token_id = ?2
         LIMIT 1`,
-    ).bind(tenant, credentialId).first<{ attachment_id: string; human_member_id: string; agent_id: string; live: number }>()
+    ).bind(tenant, credentialId, nowSqlUtc()).first<{ attachment_id: string; human_member_id: string; agent_id: string; live: number }>()
     return row ? { attachmentId: row.attachment_id, humanMemberId: row.human_member_id, agentId: row.agent_id, live: row.live === 1 } : null
   } catch (err) {
     // A pot that never applied the seat-attach migration has no attachments, so no session can have an origin.

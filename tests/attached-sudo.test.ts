@@ -693,3 +693,57 @@ describe('sudo for attached chats: what stays refused WITH a live grant', () => 
     expect(res).toMatchObject({ ok: true })
   })
 })
+
+describe('sudo for attached chats: review fixes (#1913 gate round 1)', () => {
+  const BOT = '123456789'
+  const BOT_TOKEN = `${BOT}:AAEhqMY-dedicated-miniapp-test-token`
+
+  it('the no-grant refusal hands back ids of WORK targets only: a home squad and an unknown name get the same placeholder', async () => {
+    const w = await world()
+    h.sqlite.exec("UPDATE squads SET kind = 'home' WHERE id = 'squad-other'")
+    const home = text(await updateSquad(w, 'squad-other'))
+    const unknown = text(await updateSquad(w, 'no-such-squad-anywhere'))
+    const work = text(await updateSquad(w, 'squad-core'))
+    expect(home).not.toContain('squad-other')
+    expect(home).toContain('<the squad id>')
+    expect(unknown).toContain('<the squad id>')
+    expect(work).toContain('"scope_id":"squad-core"')
+  })
+
+  it('a seat retired after the request was filed can no longer be approved (decide-time liveness = use-time liveness)', async () => {
+    const w = await world()
+    const r = await ask(w)
+    h.sqlite.exec("UPDATE agent_seats SET retired_at = '2026-10-14 00:00:00'")
+    const hash = await liveWebSession(w, HUMAN)
+    const res = await decideElevationRequest(w.env, {
+      tenant: TENANT, requestId: reqIdOf(r), decision: 'approve', selectedActions: [SUDO], decidedByMemberId: HUMAN,
+      decidedByCapabilities: await resolveCapabilities(w.env, HUMAN), decidedByWebSessionHash: hash, recentReauthOk: true,
+    })
+    expect(res.ok).toBe(false)
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
+  })
+
+  it('Telegram delivery for an attached chat goes to the ATTACHING human, not the agent owner (they differ here)', async () => {
+    const w = await world()
+    Object.assign(w.env, { TELEGRAM_MINIAPP: '1', TELEGRAM_MINIAPP_BOT_ID: BOT, TELEGRAM_MINIAPP_BOT_TOKEN: BOT_TOKEN })
+    h.sqlite.exec(`
+      UPDATE agents SET owner_member_id = '${HUMAN2}' WHERE id = 'agent-rava';
+      UPDATE members SET telegram_chat_id = '2002' WHERE id = '${HUMAN2}';
+      UPDATE members SET telegram_chat_id = '1001' WHERE id = '${HUMAN}';
+      UPDATE members SET telegram_chat_id = '3003' WHERE id = '${HUMAN3}';
+    `)
+    const chats: string[] = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+      chats.push(String((JSON.parse(String(init?.body)) as { chat_id: string }).chat_id))
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { status: 200 })
+    }) as typeof fetch
+    try {
+      const r = await ask(w)
+      expect(r.ok, text(r)).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(chats).toEqual(['1001']) // the attaching human only; never the owner (2002) or another org admin (3003)
+  })
+})

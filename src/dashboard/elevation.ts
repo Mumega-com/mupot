@@ -275,11 +275,11 @@ async function splitByOperatorScope<T>(
   const indexByKey = new Map<string, number>()
   for (const row of rows) {
     const { scopeType, scopeId } = scopeOf(row)
-    const ok = ctx.memberId
-      ? (await operatorIsAdminOnScope(env, auth, ctx.capabilities, scopeType, scopeId)) && (alsoOk ? await alsoOk(row) : true)
-      : false
-    if (ok) {
-      visible.push(row)
+    const adminHere = ctx.memberId ? await operatorIsAdminOnScope(env, auth, ctx.capabilities, scopeType, scopeId) : false
+    if (adminHere) {
+      if (!alsoOk || (await alsoOk(row))) visible.push(row)
+      // An admin of the scope who is not this request's attaching human is neither shown the request nor told it exists:
+      // "outside your authority" would be false (they ARE admin here), and the request is not theirs to decide.
       continue
     }
     const key = `${scopeType}:${scopeId}`

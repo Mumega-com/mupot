@@ -410,7 +410,9 @@ export async function attachedSudoRefusal(env: Env, tool: 'update_squad' | 'upda
   let resolvedId: string | null = null
   if (refStr) {
     const r = isSquad ? await resolveSquadRef(env, refStr) : await resolveDepartmentRef(env, refStr)
-    if (r.ok) resolvedId = r.value.id
+    // Only a WORK target's id is handed back: a home squad/department or an unknown name gets the same placeholder, so the
+    // refusal (reachable with zero grants) cannot be used to look up hidden ids or probe which names exist.
+    if (r.ok && r.value.kind === 'work') resolvedId = r.value.id
   }
   const scopeType = isSquad ? 'squad' : 'department'
   const request = {
