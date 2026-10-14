@@ -230,7 +230,16 @@ export async function ensureAdmission(
 
   // via 'tool'. A repeat ask while one is already pending NEVER mints or rotates a link: the human already has one (or can
   // decide it on the Connections page), and a rotated link would silently kill the one they are holding.
-  if (open && open.status === 'pending') return { ok: true, state: 'pending', admission: open, approveUrl: null, alreadyPending: true }
+  // A repeat ask while a LIVE approval link exists never mints or rotates (that would kill the link in the human's hands).
+  // But a pending admission with NO live pending moment is stranded: the first mint failed, the link expired, or a decision
+  // consumed the one-time moment and the admission write did not land (split write; waitUntil is not transactional). The
+  // unique index covers pending moments only, so minting a fresh link here is safe and is the recovery path.
+  if (open && open.status === 'pending') {
+    const liveMoment = await env.DB.prepare(
+      `SELECT 1 AS ok FROM secure_moments WHERE tenant = ?1 AND kind = 'seat_admit' AND subject_id = ?2 AND status = 'pending' AND expires_at > ?3 LIMIT 1`,
+    ).bind(env.TENANT_SLUG, open.id, nowIso).first<{ ok: number }>()
+    if (liveMoment) return { ok: true, state: 'pending', admission: open, approveUrl: null, alreadyPending: true }
+  }
   let pending = open
   if (!pending) {
     const id = crypto.randomUUID()
@@ -376,8 +385,10 @@ export async function decideSeatAdmission(
     return { status: 403, title: 'Not allowed', message: 'This passkey belongs to a member who may not decide this request.', tone: 'bad' }
   }
   const nowIso = new Date(nowMs).toISOString()
-  // The gate consumes the one-time moment, then a write follows: run the whole sequence under waitUntil so an interrupted
-  // request cannot leave the moment closed with the admission still pending (bot review P2).
+  // The gate consumes the one-time moment, then a write follows. waitUntil only extends the request's lifetime: it is NOT
+  // transactional, so a failed promotion can still leave a consumed moment with the admission pending. That state is
+  // recoverable: the next seat_attach finds no live moment and mints a fresh link (see ensureAdmission), and the human can
+  // also decide it on the Connections page.
   return durablyLocal(input.waitUntil, async (): Promise<Outcome> => {
     if (decision === 'deny') {
       if (!(await input.gate())) return CLOSED
