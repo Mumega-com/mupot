@@ -124,7 +124,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
   peers: RO('SELECT presence/fleet only (index.ts:5027)'),
   check_in: ADD('recordCheckin INSERT presence ON CONFLICT UPDATE + SESSIONS.put + fleet upsert (fleet/presence.ts:213; index.ts:5194,5268)'),
   end_agent_session: MUT('revokeAgentSessionByCredential revokes the caller session (index.ts:5313)'),
-  request_elevation: ADD('createElevationRequest INSERT elevation_requests (auth/elevation.ts:202)'),
+  request_elevation: ADDX('createElevationRequest INSERT elevation_requests (auth/elevation.ts:202); then, when TELEGRAM_MINIAPP is on, reserves a tg_miniapp_deliveries row and POSTs Bot API sendMessage to the deciding human\'s bound private chat (secure-moments/telegram-miniapp-auto.ts); best effort, additive'),
   elevation_status: RO('SELECT elevation requests/grants only (index.ts:5421)'),
   status: RO('SELECTs + AgentDO /status read of storage only (index.ts:5588; agents/agent-do.ts:417); opening the DO runs an idempotent CREATE TABLE IF NOT EXISTS schema init (agent-do.ts:95), not state'),
   fleet_agent_get: RO('readFleetAgentRow SELECT only (index.ts:5612; fleet/registry.ts:625)'),
@@ -226,7 +226,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
 
   moment_miniapp_link: ADDX('reserves a tg_miniapp_deliveries row, then POSTs Bot API sendMessage (api.telegram.org) to the target member\'s bound private chat and marks the row sent/failed; not destructive (mcp/telegram-miniapp.ts, secure-moments/telegram-miniapp-launch.ts, telegram-miniapp-send.ts)'),
   seed_draft: RO('pure: draftSeed builds text and runs the validator; no D1, KV or fetch, presence bump suppressed (mcp/seed.ts, seeds/draft.ts)'),
-  seed_attach_request: ADD('INSERT seed_attach_requests (pending, single-use, 24h, per-requester cap); applies nothing and grants nothing; a human decides on the Access approve page (mcp/seed.ts, access/seed-request.ts)'),
+  seed_attach_request: ADDX('INSERT seed_attach_requests (pending, single-use, 24h, per-requester cap); when TELEGRAM_MINIAPP is on also reserves a tg_miniapp_deliveries row and POSTs Bot API sendMessage to the deciding human (telegram-miniapp-auto.ts); applies nothing and grants nothing; a human decides on the Access approve page (mcp/seed.ts, access/seed-request.ts)'),
 
   // ── secure drops (W2) ──────────────────────────────────────────────────────────────────────
   host_key_register: MUT('registerHostKey batch: INSERT host_keys + on rotation UPDATE host_keys revoked_at, UPDATE secure_drops (open/ready -> expired, ciphertext cleared), UPDATE secure_moments + INSERT mutation_audit_entries (secure-drop/store.ts)'),
