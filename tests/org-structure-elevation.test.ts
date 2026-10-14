@@ -162,6 +162,18 @@ function deptCount(): number {
   return (harness.sqlite.prepare("SELECT COUNT(*) AS n FROM departments WHERE kind = 'work'").get() as { n: number }).n
 }
 
+/** The refusal must be the ELEVATION door saying no (no_matching_grant), not a crash that happens to read as ok:false. */
+function expectNoMatchingGrant(out: Awaited<ReturnType<typeof invokeTool>>): void {
+  expect(out.ok).toBe(false)
+  expect(JSON.stringify(out)).toContain('no_matching_grant')
+}
+
+/** No live grant for the action at all: the floor / structural gate refuses before any handler runs. */
+function expectRefused(out: Awaited<ReturnType<typeof invokeTool>>): void {
+  expect(out.ok).toBe(false)
+  expect(JSON.stringify(out)).toMatch(/forbidden|operator_principal_required/)
+}
+
 const T0 = Date.parse('2026-10-14T12:00:00.000Z')
 
 beforeEach(() => {
@@ -225,6 +237,27 @@ describe('un-elevated agent cannot', () => {
   })
 })
 
+describe('an agent with STANDING admin is not a path around the lane', () => {
+  const standingAdmin = () => agentAuth({
+    capabilities: [{ member_id: AGENT_MEMBER, scope_type: 'org', scope_id: null, capability: 'admin' }],
+  } as unknown as Partial<AuthContext>)
+
+  it('update_squad and update_department refuse a standing-admin agent with operator_principal_required (agents must not act as standing admins here)', async () => {
+    await checkIn()
+    for (const out of [await updateSquad(SQUAD_A1, { budget_cap_cents: 5 }, standingAdmin()), await renameDept(DEPT_A, 'X', standingAdmin())]) {
+      expect(out.ok).toBe(false)
+      expect(JSON.stringify(out)).toContain('operator_principal_required')
+    }
+    expect(deptName(DEPT_A)).toBe('Dept A')
+    expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBeNull()
+  })
+
+  it('create_department keeps its pre-existing capability lane for a standing org-admin agent (unchanged, reported as a residual)', async () => {
+    await checkIn()
+    expect((await createDept('legacy-lane', standingAdmin())).ok).toBe(true)
+  })
+})
+
 describe('elevated agent CAN, inside its granted scope', () => {
   it('create_department with an ORG-scope grant, and the grant stays usable for the next step (time window, not single-use)', async () => {
     const sessionId = await checkIn()
@@ -279,10 +312,10 @@ describe('wrong scope is refused', () => {
     await approve(sessionId, 'squad', SQUAD_A2, 60, T0)
     expect((await updateSquad(SQUAD_A2)).ok, 'baseline: the granted squad works').toBe(true)
     const before = deptCount()
-    expect((await updateSquad(SQUAD_A1)).ok).toBe(false)
-    expect((await updateSquad(SQUAD_B1)).ok).toBe(false)
-    expect((await renameDept(DEPT_A)).ok).toBe(false)
-    expect((await createDept()).ok).toBe(false)
+    expectNoMatchingGrant(await updateSquad(SQUAD_A1))
+    expectNoMatchingGrant(await updateSquad(SQUAD_B1))
+    expectNoMatchingGrant(await renameDept(DEPT_A))
+    expectNoMatchingGrant(await createDept())
     expect(deptCount()).toBe(before)
     expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBeNull()
     expect(squadRow(SQUAD_B1)?.budget_cap_cents).toBeNull()
@@ -294,9 +327,9 @@ describe('wrong scope is refused', () => {
     await approve(sessionId, 'department', DEPT_A, 60, T0)
     expect((await renameDept(DEPT_A)).ok, 'baseline').toBe(true)
     const before = deptCount()
-    expect((await renameDept(DEPT_B)).ok).toBe(false)
-    expect((await updateSquad(SQUAD_B1)).ok).toBe(false)
-    expect((await createDept()).ok).toBe(false)
+    expectNoMatchingGrant(await renameDept(DEPT_B))
+    expectNoMatchingGrant(await updateSquad(SQUAD_B1))
+    expectNoMatchingGrant(await createDept())
     expect(deptCount()).toBe(before)
     expect(deptName(DEPT_B)).toBe('Dept B')
   })
@@ -305,9 +338,9 @@ describe('wrong scope is refused', () => {
     const sessionId = await checkIn()
     await approve(sessionId, 'org', '', 60, T0, ['action:project_lifecycle'])
     const before = deptCount()
-    expect((await createDept()).ok).toBe(false)
-    expect((await renameDept(DEPT_A)).ok).toBe(false)
-    expect((await updateSquad(SQUAD_A1)).ok).toBe(false)
+    expectRefused(await createDept())
+    expectRefused(await renameDept(DEPT_A))
+    expectRefused(await updateSquad(SQUAD_A1))
     expect(deptCount()).toBe(before)
   })
 
@@ -315,7 +348,9 @@ describe('wrong scope is refused', () => {
     const sessionId = await checkIn()
     await approve(sessionId, 'org', '', 60, T0)
     expect((await renameDept(DEPT_A)).ok, 'baseline').toBe(true)
-    expect((await renameDept(DEPT_HOME)).ok).toBe(false)
+    const homeDept = await renameDept(DEPT_HOME)
+    expect(homeDept.ok).toBe(false)
+    expect(JSON.stringify(homeDept)).toContain('home_department')
     expect((await updateSquad(SQUAD_HOME)).ok).toBe(false)
     expect(deptName(DEPT_HOME)).toBe('Home Dept')
     expect(squadRow(SQUAD_HOME)?.budget_cap_cents).toBeNull()
@@ -340,9 +375,9 @@ describe('time-box and revocation', () => {
     vi.setSystemTime(T0 + 16 * 60 * 1000)
     // keep the agent session itself live so this proves GRANT expiry, not session expiry
     await checkIn()
-    expect((await createDept('ops-late')).ok).toBe(false)
-    expect((await renameDept(DEPT_A)).ok).toBe(false)
-    expect((await updateSquad(SQUAD_A1)).ok).toBe(false)
+    expectRefused(await createDept('ops-late'))
+    expectRefused(await renameDept(DEPT_A))
+    expectRefused(await updateSquad(SQUAD_A1))
   })
 
   it('a revoked grant opens nothing', async () => {
@@ -350,9 +385,9 @@ describe('time-box and revocation', () => {
     await approve(sessionId, 'org', '', 60, T0)
     expect((await createDept('ops')).ok, 'baseline').toBe(true)
     harness.sqlite.exec(`UPDATE elevation_grants SET revoked_at = '${new Date(T0 + 1000).toISOString()}', revoke_reason = 'test'`)
-    expect((await createDept('ops-after')).ok).toBe(false)
-    expect((await renameDept(DEPT_A)).ok).toBe(false)
-    expect((await updateSquad(SQUAD_A1)).ok).toBe(false)
+    expectRefused(await createDept('ops-after'))
+    expectRefused(await renameDept(DEPT_A))
+    expectRefused(await updateSquad(SQUAD_A1))
   })
 })
 
