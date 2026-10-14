@@ -578,6 +578,32 @@ describe('sudo for attached chats: it ends with the attachment, and with its clo
     expect(squadCap('squad-core')).toBeNull()
   })
 
+  it('detach alone (token-revoke cleanup trigger dropped) still ends sudo: the attachment row, not the token, is the authority', async () => {
+    const w = await world()
+    await sudo(w)
+    const stale = await w.att()
+    h.sqlite.exec(`DROP TRIGGER agent_seat_attachments_revoke_token`)
+    await detachAttachment(w.env, { attachmentId: attId(), humanMemberId: HUMAN })
+    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE id = ? AND revoked_at IS NULL`, one<{ t: string }>(`SELECT seat_token_id AS t FROM agent_seat_attachments`)!.t)).toBe(1) // token still live: only detached_at ended it
+    expect((await w.att()).seatBinding?.attached).toBeUndefined()
+    expect(await hasElevatedAction(w.env, stale, SUDO, 'squad', 'squad-core', { recordUsage: false })).toEqual({ granted: false, reason: 'attachment_ended' })
+    expect((await updateSquad(w, 'squad-core', stale)).ok).toBe(false)
+    expect(squadCap('squad-core')).toBeNull()
+  })
+
+  it('the decide transaction itself refuses a request whose attachment already ended (and closes it), even for the attaching human', async () => {
+    const w = await world()
+    const r = await ask(w)
+    await detachAttachment(w.env, { attachmentId: attId(), humanMemberId: HUMAN })
+    const hash = await liveWebSession(w, HUMAN)
+    const res = await decideElevationRequest(w.env, {
+      tenant: TENANT, requestId: reqIdOf(r), decision: 'approve', selectedActions: [SUDO], decidedByMemberId: HUMAN,
+      decidedByCapabilities: await resolveCapabilities(w.env, HUMAN), decidedByWebSessionHash: hash, recentReauthOk: true,
+    })
+    expect(res).toMatchObject({ ok: false, reason: 'agent_session_ended' })
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
+  })
+
   it('re-attaching later is a NEW attachment (new credential, new session): the old grant is not inherited', async () => {
     const w = await world()
     await sudo(w)
