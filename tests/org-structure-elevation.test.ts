@@ -512,6 +512,28 @@ describe('an elevated agent may only LOWER a squad budget (adversarial P1-B)', (
   })
 })
 
+describe('refusals teach the exact request (onboarding smoothness)', () => {
+  it('a floor refusal names request_elevation, the action key AND the scope each tool needs', async () => {
+    await checkIn()
+    const dept = JSON.stringify(await createDept('x1'))
+    expect(dept).toContain('action:org_structure')
+    expect(dept).toContain('scope_type \\"org\\"')
+    const ren = JSON.stringify(await renameDept(DEPT_A, 'X'))
+    expect(ren).toContain('action:org_structure')
+    expect(ren).toContain('scope_type \\"department\\"')
+    const sq = JSON.stringify(await updateSquad(SQUAD_A2, { budget_cap_cents: 5 }))
+    expect(sq).toContain('action:org_structure')
+    expect(sq).toContain('scope_type \\"squad\\"')
+  })
+  it('a handler refusal under a wrong-scope grant carries a copy-paste request_elevation block with the resolved id', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_B1, 60, T0)
+    const out = JSON.stringify(await renameDept(DEPT_A, 'X'))
+    expect(out).toContain('request_elevation')
+    expect(out).toContain(DEPT_A)
+  })
+})
+
 describe('human admin lane is unchanged', () => {
   it('an org-admin human creates and renames departments and updates squads with no elevation', async () => {
     const h = humanAdminAuth()

@@ -1139,8 +1139,18 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
 export function elevationHint(toolName: string): string | undefined {
   const action = ELEVATION_ACTION_BY_TOOL[toolName]
   if (!action) return undefined
-  return `an admin can approve a time-boxed elevation instead: call request_elevation with actions ["${action}"]`
+  const base = `an admin can approve a time-boxed elevation instead: call request_elevation with actions ["${action}"]`
+  const scope = ELEVATION_SCOPE_HINT_BY_TOOL[toolName]
+  return scope ? `${base} and ${scope}` : base
 }
+
+/** The scope half of the copy-paste request, for the tools whose grant scope is not obvious (an agent has no tool that
+ *  lists department ids, so the hint names what scope_id must be). Display only. */
+const ELEVATION_SCOPE_HINT_BY_TOOL: Readonly<Record<string, string>> = Object.freeze({
+  create_department: 'scope_type "org" (an ORG-scope grant is required; scope_id is empty)',
+  update_department: 'scope_type "department" with scope_id = that department\'s id (or scope_type "org")',
+  update_squad: 'scope_type "squad" with scope_id = that squad\'s id (or its department\'s id, or scope_type "org")',
+})
 
 export function elevationRemedyMessage(reason: ElevatedActionDenyReason): string {
   return ELEVATION_DENY_REMEDY[reason]

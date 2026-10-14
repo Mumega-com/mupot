@@ -418,6 +418,7 @@ const toolCreateDepartment: ToolSpec = {
           scope: 'org',
           elevation_denied: elevated.reason,
           remedy: elevationRemedyMessage(elevated.reason),
+          request_elevation: { actions: ['action:org_structure'], scope_type: 'org', note: 'create_department needs an ORG-scope grant; a department or squad grant does not match' },
         })
       }
       elevationGrantId = elevated.grant.id
@@ -475,6 +476,7 @@ const toolUpdateDepartment: ToolSpec = {
           scope: 'department',
           elevation_denied: elevated.reason,
           remedy: elevationRemedyMessage(elevated.reason),
+          request_elevation: { actions: ['action:org_structure'], scope_type: 'department', scope_id: dept.id, note: 'or scope_type org; scope_id is the resolved id, not a slug' },
         })
       }
       elevationGrantId = elevated.grant.id
@@ -2674,6 +2676,7 @@ const toolUpdateSquad: ToolSpec = {
           scope: 'squad',
           elevation_denied: elevated.reason,
           remedy: elevationRemedyMessage(elevated.reason),
+          request_elevation: { actions: ['action:org_structure'], scope_type: 'squad', scope_id: squad.id, note: 'or its department id, or org; scope_id is the resolved id, not a slug' },
         })
       }
       elevationGrantId = elevated.grant.id
