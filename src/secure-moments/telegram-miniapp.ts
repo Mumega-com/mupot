@@ -24,7 +24,7 @@ import {
   closedSeedOutcome, decideElevation, decideSeed, elevationIsLive, elevationViewInner, mayDecideElevation, mayDecideSeed,
   seedViewInner, type HumanProof, type Outcome, type WaitUntil,
 } from '../access/decision-core'
-import { loadElevationRequestById, type ElevationRequestRecord } from '../auth/elevation'
+import { loadElevationRequestById, requestIsFromAttachedChat, type ElevationRequestRecord } from '../auth/elevation'
 import { ELEVATION_ACTIONS, SENSITIVE_STEP_UP_ACTIONS } from '../auth/elevation-actions'
 import { reserveRotation } from './rotate'
 import { reissueMomentLink } from './issue'
@@ -229,6 +229,7 @@ function readParams(m: MomentRow, body: JsonBody): Params | null {
   return { decision, actions, duration }
 }
 
+export const ATTACHED_PASSKEY_MESSAGE = 'This request comes from a chat attached to an agent, so it is approved with a passkey, not from Telegram. Open the approval link in your browser.'
 export const PASSKEY_REQUIRED_MESSAGE = 'Granting a sensitive action needs a passkey, which is stronger than Telegram. Untick the sensitive actions here, or open this request on a browser with a passkey.'
 
 /**
@@ -257,6 +258,13 @@ export function telegramPolicyRefusal(kind: MomentRow['kind'], p: Params): strin
     if (passkeyOnly(a)) return PASSKEY_REQUIRED_MESSAGE
   }
   return null
+}
+
+/** sudo for attached chats: a request from an ATTACHED chat is approved only with a passkey-class proof, never over Telegram
+ *  (a deny is fine). Returns the refusal message or null. Runs next to telegramPolicyRefusal at challenge AND decide. */
+export async function attachedOriginRefusal(env: Env, req: ElevationRequestRecord, decision: 'approve' | 'deny'): Promise<string | null> {
+  if (decision !== 'approve') return null
+  return (await requestIsFromAttachedChat(env, req)) ? ATTACHED_PASSKEY_MESSAGE : null
 }
 
 /** sha256 hex of the canonical decision: the digest the nonce is bound to (member and Telegram user included). */
@@ -331,7 +339,8 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
       approveLabel = 'Approve selected'
       try {
         const parsed: unknown = JSON.parse(subject.req.requested_actions_json)
-        sensitive = Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && passkeyOnly(x)) : []
+        const fromChat = await requestIsFromAttachedChat(c.env, subject.req)
+        sensitive = Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && (fromChat || passkeyOnly(x))) : []
       } catch {
         sensitive = []
       }
@@ -354,6 +363,8 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (!p) return fail(c, 400, 'Invalid decision parameters.', 'Bad request')
     const policy = telegramPolicyRefusal(l.d.m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
+    const attachedRefusal = l.d.subject.kind === 'elevation' ? await attachedOriginRefusal(c.env, l.d.subject.req, p.decision) : null
+    if (attachedRefusal) return fail(c, 403, attachedRefusal, 'Use a passkey')
     if (!(await memberHasActiveDevice(c.env, a.id.memberId, a.id.telegramUserId, { allowPinMode: pinWindowOn(c.env) }))) {
       return fail(c, 409, 'This device is not set up for decisions yet. Set up this phone from My Account (Telegram device) on the dashboard, or use Approve with passkey in your browser.', 'Set up this device', { needs_enrol: true })
     }
@@ -375,6 +386,8 @@ export function mountTelegramMiniapp(app: Hono<AppEnv>): void {
     if (!p) return fail(c, 400, 'Invalid decision parameters.', 'Bad request')
     const policy = telegramPolicyRefusal(m.kind, p)
     if (policy) return fail(c, 403, policy, 'Use a passkey')
+    const attachedRefusal = l.d.subject.kind === 'elevation' ? await attachedOriginRefusal(c.env, l.d.subject.req, p.decision) : null
+    if (attachedRefusal) return fail(c, 403, attachedRefusal, 'Use a passkey')
     const nonce = g.body.nonce
     if (typeof nonce !== 'string' || !TOKEN_RE.test(nonce)) return fail(c, 400, 'Missing nonce.', 'Bad request')
     // 1. The step-up FIRST (read-only): the biometric-unlocked device secret of exactly this member and Telegram user, on a

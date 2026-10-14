@@ -35,7 +35,10 @@ import { ATTACHED_SUDO_ACTIONS } from '../src/auth/attached-ceiling'
 import {
   canDecideElevationRequest, createElevationRequest, decideElevationRequest, hasElevatedAction, loadElevationRequestById,
 } from '../src/auth/elevation'
-import { mayDecideElevation } from '../src/access/decision-core'
+import { decideElevation, mayDecideElevation } from '../src/access/decision-core'
+import { attachedOriginRefusal, ATTACHED_PASSKEY_MESSAGE } from '../src/secure-moments/telegram-miniapp'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createWebSession } from '../src/auth/web-sessions'
 import { resolveCapabilities } from '../src/auth/capability'
 import { pendingRequestsBody } from '../src/dashboard/elevation'
@@ -745,5 +748,53 @@ describe('sudo for attached chats: review fixes (#1913 gate round 1)', () => {
       globalThis.fetch = realFetch
     }
     expect(chats).toEqual(['1001']) // the attaching human only; never the owner (2002) or another org admin (3003)
+  })
+})
+
+describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)', () => {
+  it('A: an attached chat\'s request cannot be APPROVED over Telegram (core backstop); nothing is granted, the gate never runs, the request stays open; a DENY over Telegram is allowed', async () => {
+    const w = await world()
+    const r = await ask(w)
+    const human = { memberId: HUMAN, userId: HUMAN, role: 'member', tenant: TENANT, capabilities: await resolveCapabilities(w.env, HUMAN) } as unknown as AuthContext
+    const gate = vi.fn(async () => true)
+    const mint = vi.fn(async () => { throw new Error('must not mint a session for a refused approval') })
+    const base = { id: reqIdOf(r), durationMinutes: 15, mintSession: mint, gate, auth: human, proof: { memberId: HUMAN, via: 'telegram_miniapp' as const, evidence: {} } }
+    const approve = await decideElevation(w.env, { ...base, decision: 'approve', selectedActions: [SUDO] })
+    expect(approve.status).toBe(403)
+    expect(approve.title).toBe('Use a passkey')
+    expect(gate).not.toHaveBeenCalled()
+    expect(mint).not.toHaveBeenCalled()
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
+    expect(one<{ status: string }>(`SELECT status FROM elevation_requests WHERE id = ?`, reqIdOf(r))!.status).toBe('pending')
+  })
+
+  it('A: attachedOriginRefusal refuses an attached-origin APPROVE and allows a DENY; an ordinary agent request is not affected', async () => {
+    const w = await world()
+    const r = await ask(w)
+    const req = (await loadElevationRequestById(w.env, TENANT, reqIdOf(r)))!
+    expect(await attachedOriginRefusal(w.env, req, 'approve')).toBe(ATTACHED_PASSKEY_MESSAGE)
+    expect(await attachedOriginRefusal(w.env, req, 'deny')).toBeNull()
+    // a request whose session is not an attachment's (here: no such session) is untouched by the rule
+    expect(await attachedOriginRefusal(w.env, { ...req, agent_session_id: 'no-such-session' }, 'approve')).toBeNull()
+  })
+
+  it('A (wiring ratchet): the challenge AND decide Telegram routes both call attachedOriginRefusal (source-level, because a signed-initData route harness is not built here)', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'secure-moments', 'telegram-miniapp.ts'), 'utf8')
+    expect((src.match(/await attachedOriginRefusal\(/g) ?? []).length).toBe(2)
+  })
+
+  it('B: a request cannot be approved while the agent\'s welded member is suspended, and reactivating it later does not resurrect an approval', async () => {
+    const w = await world()
+    const r = await ask(w)
+    h.sqlite.exec(`UPDATE members SET status = 'suspended' WHERE id = (SELECT member_id FROM agent_member_bindings WHERE agent_id = 'agent-rava')`)
+    const hash = await liveWebSession(w, HUMAN)
+    const res = await decideElevationRequest(w.env, {
+      tenant: TENANT, requestId: reqIdOf(r), decision: 'approve', selectedActions: [SUDO], decidedByMemberId: HUMAN,
+      decidedByCapabilities: await resolveCapabilities(w.env, HUMAN), decidedByWebSessionHash: hash, recentReauthOk: true,
+    })
+    expect(res.ok).toBe(false)
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
+    h.sqlite.exec(`UPDATE members SET status = 'active' WHERE id = (SELECT member_id FROM agent_member_bindings WHERE agent_id = 'agent-rava')`)
+    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0) // reactivation resurrects nothing: there was never a grant
   })
 })

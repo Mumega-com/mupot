@@ -283,6 +283,12 @@ export async function decideElevation(
   const pre = await loadElevationRequestById(env, env.TENANT_SLUG, id)
   if (!pre || !(await mayDecideElevation(env, input.auth, pre))) return NOT_FOUND_OUTCOME
   if (!elevationIsLive(pre, Date.now())) return CLOSED
+  // sudo for attached chats: an APPROVE of a request from an attached chat needs a genuine passkey-class proof. Telegram's
+  // device secret is attested only by the Telegram client and its channel proof is not a fresh passkey/reauth, so it may
+  // DENY but never approve one (the channel adapters refuse earlier; this is the shared-core backstop).
+  if (decision === 'approve' && proof.via === 'telegram_miniapp' && (await requestIsFromAttachedChat(env, pre))) {
+    return { status: 403, title: 'Use a passkey', message: 'A request from an attached chat is approved with a passkey, not from Telegram. Open the approval link in your browser.', tone: 'warn' }
+  }
 
   // Every refusable check, BEFORE the gate, through the very function decideElevationRequest runs. The session
   // hash is a placeholder here (the real one does not exist yet and no refusal reads it).
