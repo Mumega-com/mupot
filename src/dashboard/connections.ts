@@ -99,7 +99,10 @@ async function connectionsPageBody(env: Env, auth: AuthContext): Promise<Html> {
   const memberId = auth.memberId
   if (!memberId) return emptyState({ title: 'Sign in', detail: 'Connections are shown to a signed-in member.' })
   const enabled = seatAttachEnabled(env)
-  const { harnesses, admissions, bound } = await loadConnections(env, memberId)
+  // Flag off => never touch the 0220 tables (the page is always linked, and code may deploy before the migration).
+  const { harnesses, admissions, bound } = enabled
+    ? await loadConnections(env, memberId)
+    : { harnesses: [], admissions: [], bound: [] }
   const agents = enabled ? await listAttachableAgents(env, memberId) : []
 
   const pending = admissions.filter((a) => a.status === 'pending')

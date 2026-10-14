@@ -1031,6 +1031,11 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     expect(JSON.stringify(edge)).toContain('attached_seat_no_gate_authority')
     const elev = await invokeTool(att, env, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-core', duration_minutes: 15, reason: 'x' }, 'https://pot.test')
     expect(JSON.stringify(elev)).toContain('attached_seat_cannot_elevate')
+    // the doorbell self lane: an attached thread is not the agent, so it cannot point the agent's wake bearer at its own URL
+    const bell = await invokeTool(att, { ...env, WEBHOOK_DOORBELL: '1' } as Env, 'set_agent_webhook_doorbell', { webhook_url: 'https://hooks.example.test/wake', bearer: 'x'.repeat(24) }, 'https://pot.test')
+    expect(JSON.stringify(bell)).toContain('"ok":false')
+    expect(JSON.stringify(bell)).toContain('"status":403')
+    expect(n(`SELECT COUNT(*) AS n FROM agent_webhook_doorbells`)).toBe(0)
   })
 
 })
