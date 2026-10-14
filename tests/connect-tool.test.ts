@@ -596,6 +596,11 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     const offBody = (await (await callConnect(off, AGENT.id)).json()) as { error: { data: { detail: string } } }
     expect(onBody.error.data.detail).toContain('seat_required') // a CLI session is told it has no seat and takes the token door
     expect(onBody.error.data.detail).toContain('/admin/agent-token')
+    // Review fixes (#1911): the sentence is whole, no unbuilt Telegram promise, and a seatless session is not told it has a seat.
+    expect(onBody.error.data.detail).toContain('grants by construction.')
+    expect(onBody.error.data.detail).not.toMatch(/telegram/i)
+    expect(onBody.error.data.detail).toContain('needs a SEAT first')
+    expect(onBody.error.data.detail).not.toContain('this session has a seat')
     expect(offBody.error.data.detail).not.toContain('seat_attach')
     expect(offBody.error.data.detail).toContain('mint_agent_token')
   })

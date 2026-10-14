@@ -6954,17 +6954,20 @@ const toolConnect: ToolSpec = {
             'This session is on the DIRECTORY channel (the public OAuth door used by ChatGPT/Claude connectors),',
             'which carries NO standing capabilities by design — a member who holds admin or owner elsewhere does',
             'not inherit those here. Requesting a squad grant will NOT fix this; the directory door discards',
+            'grants by construction.',
+            // Door A (W2): only a session that HAS a seat can seat_attach (seat_required otherwise), so say which case this is.
             ...(seatAttachEnabled(env)
-              ? [`TWO DOORS: (A) a CHAT that already has a seat (a ChatGPT conversation, or a client that sends X-Mupot-Seat / _meta["mupot/seat"]): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey (the link also goes to their Telegram when it is set up) and this chat then acts as the agent, up to the access level they choose; no token, nothing to save. A Claude Code or other CLI session has no seat by default (seat_attach answers seat_required): it takes (B). (B) a fixed CLI/daemon agent (e.g. Claude Code in a project directory): a workspace-channel token your human mints on /admin/agent-token (shown once, saved by them on the host, read from an env var in .mcp.json, never pasted into chat). For B:`]
+              ? [auth.seatBinding
+                  ? `DOOR A (this session has a seat): call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey and this chat then acts as the agent, up to the access level they choose; no token, nothing to save.`
+                  : `DOOR A needs a SEAT first: a ChatGPT conversation has one automatically; Claude (web) calls seat_select and sends the handle in _meta["mupot/seat"]; a client that can set headers sends X-Mupot-Seat. Once it has a seat, call seat_attach { agent: "${agentRef.id}" } and your human approves once with their passkey. Without a seat, seat_attach answers seat_required (the case for a Claude Code / CLI session, which should use DOOR B).`]
               : []),
-            `Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
             // Render the ID, never the slug. mint_agent_token resolves through the same
             // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
             // `ambiguous_slug` — turning a reference the caller had already resolved
             // unambiguously (they may have passed the id) back into a dead end, which is
             // the exact failure this refusal exists to remove. Not hypothetical: six
             // hadi/codex agent records share slugs today. (codex gate, #681.)
-            `squad to run mint_agent_token { agent: "${agentRef.id}" }, then connect with that bearer.`,
+            `${seatAttachEnabled(env) ? 'DOOR B (a fixed CLI/daemon agent, e.g. Claude Code in a project directory): ' : ''}use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s squad to run mint_agent_token { agent: "${agentRef.id}" } (or mint it on /admin/agent-token: shown once, saved by them on the host, read from an env var in .mcp.json, never pasted into chat), then connect with that bearer.`,
             `Open ${enrollHref} to choose or coin a seat key.`,
           ].join(' '),
           need: 'workspace-channel token',
@@ -7039,7 +7042,9 @@ const toolConnect: ToolSpec = {
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
       binding: durable ? 'durable' : 'session_local',
       next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
-        ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}: from a chat that has a seat, call seat_attach { agent: "${agentRef.id}" } (your human approves once with their passkey); a Claude Code / CLI session has no seat and uses a workspace token your human mints on /admin/agent-token instead. Call orient {} for your basin-drop.`
+        ? (auth.seatBinding
+            ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. Call orient {} for your basin-drop.`
+            : `You are now hot for READING (this claim is session-local: the directory door grants no write authority). This session has no seat, so seat_attach would answer seat_required. A ChatGPT conversation gets a seat automatically; Claude (web) uses seat_select; a Claude Code / CLI session uses a workspace token your human mints on /admin/agent-token. Call orient {} for your basin-drop.`)
         : 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
