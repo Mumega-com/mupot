@@ -1200,6 +1200,8 @@ const toolListAgentSessions: ToolSpec = {
     if (wantsSelf) {
       if (agentArg) return fail(400, 'invalid_args', 'self and agent are mutually exclusive')
       if (!auth.boundAgentId) return fail(403, 'not_agent_session', 'self needs an agent-bound token')
+      // W2: an attached thread is not one of the agent's host sessions; it must not read the host's session ids/seat labels.
+      if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
       const own = await resolveAgentRef(env, auth.boundAgentId)
       if (!own.ok) return fail(404, 'agent_not_found')
       const ownRows = await listAgentSessions(env, env.TENANT_SLUG, own.value.id)

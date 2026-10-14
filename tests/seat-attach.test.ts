@@ -1089,7 +1089,7 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     await invokeTool(att, env, 'task_create', { title: 'presence probe', done_when: 'a checkable done condition', squad_id: 'squad-core', dispatch: false }, 'https://pot.test')
     expect(presenceRows()).toBe(0)
     // module-registry presence marks the agent live to routing; usage is host telemetry; the inbox is the host's mail
-    for (const [tool, a] of [['presence_register', { adapter: 'x' }], ['presence_heartbeat', {}], ['presence_deregister', {}], ['report_run_usage', { run_id: 'r1', model: 'm', input: 1, output: 1 }]] as Array<[string, Record<string, unknown>]>) {
+    for (const [tool, a] of [['presence_register', { adapter: 'x' }], ['presence_heartbeat', {}], ['presence_deregister', {}], ['report_run_usage', { run_id: 'r1', model: 'm', input: 1, output: 1 }], ['list_agent_sessions', {}]] as Array<[string, Record<string, unknown>]>) {
       expect(JSON.stringify(await invokeTool(att, env, tool, a, 'https://pot.test'))).toContain('attached_seat_not_agent_host')
     }
     expect(n(`SELECT COUNT(*) AS n FROM module_registry`)).toBe(0)

@@ -243,9 +243,13 @@ export async function ensureAdmission(
                 WHERE tenant = ?2 AND human_member_id = ?4 AND status = 'pending' AND expires_at > ?7) < ?9
        ON CONFLICT DO NOTHING`,
     ).bind(id, env.TENANT_SLUG, p.agentId, p.humanMemberId, p.harnessId, p.seatId, nowIso, expiresAt, ADMISSION_MAX_PENDING_PER_HUMAN).run()
-    pending = res.meta.changes === 1 ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
+    const inserted = res.meta.changes === 1
+    pending = inserted ? await loadAdmission(env, id) : await findOpenAdmission(env, p.agentId, p.humanMemberId, p.harnessId)
     if (!pending) return { ok: false, error: 'too_many_pending_admissions' }
     if (pending.status === 'live') return { ok: true, state: 'live', admission: pending }
+    // Lost a concurrent first-ask race: the winner mints the one link. Minting here would rotate it and silently kill the
+    // link the winner returned (bot review P2).
+    if (!inserted && pending.status === 'pending') return { ok: true, state: 'pending', admission: pending, approveUrl: null, alreadyPending: true }
   }
   const link = pending.expires_at
     ? await issueMomentLink(env, { kind: 'seat_admit', subjectId: pending.id, requesterAgentId: p.requesterAgentId ?? null, subjectExpiresAtIso: pending.expires_at })
