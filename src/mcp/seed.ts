@@ -24,6 +24,7 @@ import { createSeedRequest, SEED_REQUEST_TTL_MS } from '../access/seed-request'
 import { approveUrl, accessApproveStatus } from '../access/config'
 import { secureMomentsStatus } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
+import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { draftSeed, DRAFT_PLATFORMS, type DraftInput } from '../seeds/draft'
 import { type ToolSpec, fail, done } from './index'
 
@@ -101,7 +102,7 @@ const toolSeedAttach: ToolSpec = {
 // way for any bearer (agent or human) to complete the request over MCP. Docs: access-approve-page.md.
 const toolSeedAttachRequest: ToolSpec = {
   name: 'seed_attach_request',
-  scope: 'file a pending request to attach a mupot.seed/v1; returns approve_url for a human to open (decides nothing, grants nothing)',
+  scope: 'file a pending request to attach a mupot.seed/v1; returns approve_url for a human to open (decides nothing, grants nothing). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'member',
   args: '{ seed: string (YAML or JSON) }',
   inputSchema: {
@@ -110,7 +111,7 @@ const toolSeedAttachRequest: ToolSpec = {
     required: ['seed'],
     additionalProperties: false,
   },
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     if (!auth.memberId) return fail(403, 'forbidden', 'a member principal is required to file a request')
     // Check the flags/config BEFORE writing anything: a request nobody can approve is noise. Either human-proof
     // channel being usable is enough (secure moments are independent of the Access approve page).
@@ -135,10 +136,15 @@ const toolSeedAttachRequest: ToolSpec = {
       kind: 'seed_attach', subjectId: created.id, requesterAgentId: auth.boundAgentId ?? null, subjectExpiresAtIso: created.expiresAt,
     })
     const accessUrl = approveUrl(env, 'seed', created.id)
+    // The human sees it in Telegram without a second tool call (best effort; the link below stays the fallback).
+    const telegram = moment
+      ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: auth.memberId }, { waitUntil: ctx.waitUntil })
+      : 'disabled'
     return done({
       ok: true,
       request_id: created.id,
       approve_url: moment?.url ?? accessUrl,
+      telegram,
       ...(moment && accessUrl ? { access_approve_url: accessUrl } : {}),
       expires_at: created.expiresAt,
       ttl_seconds: SEED_REQUEST_TTL_MS / 1000,

@@ -237,6 +237,7 @@ import { telegramMiniappFlag } from '../secure-moments/telegram-miniapp-config'
 import { approveUrl, accessApproveEnabled } from '../access/config'
 import { secureMomentsEnabled } from '../secure-moments/config'
 import { issueMomentLink } from '../secure-moments/issue'
+import { deliverMomentToTelegram } from '../secure-moments/telegram-miniapp-auto'
 import { WORKFLOW_CIRCUIT_TOOLS } from './workflow-circuits'
 import { OFFICE_TOOLS } from './office'
 import { OFFICE_GATE_OWNER, officeTaskContentLocked, freezeOfficeTaskOnReviewEntry } from '../addons/office/freeze'
@@ -5936,7 +5937,7 @@ const toolEndAgentSession: ToolSpec = {
 // fails closed with 'not_agent_session' for those).
 const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
-  scope: 'self (exact current agent session)',
+  scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'authenticated',
   args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
   inputSchema: {
@@ -5952,7 +5953,7 @@ const toolRequestElevation: ToolSpec = {
     additionalProperties: false,
   },
   shouldTouchPresence: () => false,
-  async run(auth, env, args) {
+  async run(auth, env, args, ctx) {
     // W2: elevation grants are not clamped to an admission ceiling, so an attached thread must not request one (it would
     // mint agent-level authority that outlives the attachment). A human elevates the agent from its own seat.
     if (attachedAuthority(auth)) return fail(403, 'attached_seat_cannot_elevate')
@@ -5998,6 +5999,10 @@ const toolRequestElevation: ToolSpec = {
     })
     const accessLink = approveUrl(env, 'elevation', result.request.id)
     const elevationLink = moment?.url ?? accessLink
+    // The agent need not know a second tool exists: the deciding human gets the Mini App button in Telegram now (best effort).
+    const telegram = moment
+      ? await deliverMomentToTelegram(env, { momentId: moment.momentId, requesterMemberId: null }, { waitUntil: ctx.waitUntil })
+      : 'disabled'
 
     return done({
       request: {
@@ -6012,6 +6017,8 @@ const toolRequestElevation: ToolSpec = {
         decision_expires_at: result.request.decision_expires_at,
       },
       note: 'Pending human approval. No authority is granted yet — poll elevation_status or wait for it to be reflected on your next call.',
+      // sent|not_bound|disabled|failed|rate_limited: whether the Telegram Mini App button reached the deciding human. The link below stays the fallback.
+      telegram,
       // Present only when a human-proof channel is enabled: the link a human opens to decide (secure moment
       // first, else the Access approve page). This tool decides nothing.
       ...(elevationLink ? { approve_url: elevationLink } : {}),

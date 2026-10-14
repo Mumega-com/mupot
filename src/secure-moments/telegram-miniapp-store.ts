@@ -418,3 +418,44 @@ export async function finishDelivery(
     `UPDATE tg_miniapp_deliveries SET status = ?3, error = ?4, telegram_message_id = ?5 WHERE id = ?1 AND tenant = ?2 AND status = 'reserved'`,
   ).bind(id, env.TENANT_SLUG, outcome.status, outcome.error, outcome.messageId).run()
 }
+
+/** A reserved row older than this no longer blocks a re-send (the worker that reserved it died before finishing). */
+export const TG_DELIVERY_RESERVED_STALE_MS = 60 * 1000
+
+/**
+ * The AUTOMATIC delivery's slot: exactly one send per (moment, member). One statement, so the dedupe and the per-member cap
+ * both hold under concurrency. A row already `sent` (or `reserved` and still fresh) for this moment and member blocks a second
+ * message, so a repeated tool call or a rotated link (same moment id) never double-sends; a `failed` row does not, so a later
+ * call can retry (the per-member cap still bounds it). Returns the new slot, or why there is none.
+ */
+// One requesting agent may auto-notify a human at most this many times per window, so a single noisy or hostile agent cannot use
+// up the human's whole allowance (and block other agents' approvals or the human's own device-setup message). The plain approve_url
+// is still returned either way.
+export const TG_DELIVERY_MAX_PER_REQUESTER = 3
+
+export async function reserveMomentDeliveryOnce(
+  env: Env,
+  input: { momentId: string; memberId: string; requestedBy: string },
+  nowMs: number = Date.now(),
+): Promise<{ state: 'reserved'; id: string; createdAt: string } | { state: 'duplicate' } | { state: 'rate_limited' }> {
+  const id = crypto.randomUUID()
+  const createdAt = new Date(nowMs).toISOString()
+  const staleBefore = new Date(nowMs - TG_DELIVERY_RESERVED_STALE_MS).toISOString()
+  const r = await env.DB.prepare(
+    `INSERT INTO tg_miniapp_deliveries (id, tenant, kind, subject_id, member_id, requested_by, status, error, telegram_message_id, created_at)
+     SELECT ?1, ?2, 'moment', ?3, ?4, ?5, 'reserved', NULL, NULL, ?6
+      WHERE NOT EXISTS (SELECT 1 FROM tg_miniapp_deliveries
+                         WHERE tenant = ?2 AND kind = 'moment' AND subject_id = ?3 AND member_id = ?4
+                           AND (status = 'sent' OR (status = 'reserved' AND created_at > ?7)))
+        AND (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND member_id = ?4 AND created_at > ?8) < ?9
+        AND (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND kind = 'moment' AND requested_by = ?5 AND created_at > ?8) < ?10`,
+  ).bind(id, env.TENANT_SLUG, input.momentId, input.memberId, input.requestedBy, createdAt, staleBefore,
+    new Date(nowMs - TG_DELIVERY_WINDOW_MS).toISOString(), TG_DELIVERY_MAX_PER_WINDOW, TG_DELIVERY_MAX_PER_REQUESTER).run()
+  if (r.meta.changes === 1) return { state: 'reserved', id, createdAt }
+  const dup = await env.DB.prepare(
+    `SELECT 1 AS x FROM tg_miniapp_deliveries
+      WHERE tenant = ?1 AND kind = 'moment' AND subject_id = ?2 AND member_id = ?3
+        AND (status = 'sent' OR (status = 'reserved' AND created_at > ?4)) LIMIT 1`,
+  ).bind(env.TENANT_SLUG, input.momentId, input.memberId, staleBefore).first<{ x: number }>()
+  return dup ? { state: 'duplicate' } : { state: 'rate_limited' }
+}
