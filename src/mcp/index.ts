@@ -4941,6 +4941,8 @@ const toolInbox: ToolSpec = {
     }
     if (args.peek !== undefined && typeof args.peek !== 'boolean')
       return fail(400, 'invalid_args', 'peek must be a boolean')
+    // W2: attached threads read the inbox without consuming it (see inbox_lease).
+    if (attachedAuthority(auth) && args.peek !== true) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot consume it')
     if (args.seat !== undefined && typeof args.seat !== 'string')
       return fail(400, 'invalid_args', 'seat must be a string')
     let sinceSeq: number | undefined
@@ -5066,6 +5068,8 @@ const toolInboxLease: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
+    // W2: an attached thread is not the agent's host: it must not consume, lease or ack mail meant for the host runtime.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot lease or ack it')
     const agent = auth.boundAgentId
     if (!agent) {
       return fail(403, 'not_agent_bound', {
@@ -5161,6 +5165,8 @@ const toolInboxLeaseReconcile: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args, ctx) {
+    // W2: an attached thread is not the agent's host: it must not consume, lease or ack mail meant for the host runtime.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot lease or ack it')
     const agent = auth.boundAgentId
     if (!agent) {
       return fail(403, 'not_agent_bound', {
@@ -5209,6 +5215,8 @@ const toolInboxLeaseAck: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: an attached thread is not the agent's host: it must not consume, lease or ack mail meant for the host runtime.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot lease or ack it')
     const agent = auth.boundAgentId
     if (!agent) return fail(403, 'not_agent_bound', 'inbox_lease_ack requires an agent-bound token')
     if (typeof args.attempt_id !== 'string')
@@ -5278,6 +5286,8 @@ const toolInboxAck: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: an attached thread is not the agent's host: it must not consume, lease or ack mail meant for the host runtime.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_peek_only', 'an attached thread may read the agent inbox with peek:true but cannot lease or ack it')
     const agent = auth.boundAgentId
     if (!agent) return fail(403, 'not_agent_bound', 'inbox_ack requires an agent-bound token (member_tokens.agent_id)')
     if (!Array.isArray(args.ids) || args.ids.some((id) => typeof id !== 'string'))
@@ -6523,7 +6533,7 @@ const toolBootContext: ToolSpec = {
   async run(auth, env, args, ctx) {
     // mupot#1794 W4 (gate P2): boot_context is allowlisted for a confined harness session as a READ;
     // it must not write presence under the human with a caller-chosen seat label.
-    if (auth.memberId && !ctx?.sideEffectFree && !isHarnessCredentialSession(auth)) {
+    if (auth.memberId && !ctx?.sideEffectFree && !isHarnessCredentialSession(auth) && !attachedAuthority(auth)) {
       const seatLabel = (str(args.seat) || str(args.label) || ctx?.seat || '').trim()
       const bootTouch = (async () => {
         const id = await loadMemberIdentity(env, auth)

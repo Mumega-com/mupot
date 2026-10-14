@@ -68,6 +68,7 @@ import { publishRosterPush } from '../registry/realtime'
 import { holdsCapabilityFloor } from '../auth/capability'
 import { listOwnAgentPresence } from '../fleet/presence'
 import { readAccess, readableProject } from './projects'
+import { attachedAuthority } from '../auth/attached-ceiling'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
 
 const STRING_SCHEMA = { type: 'string' }
@@ -107,6 +108,8 @@ const toolPresenceRegister: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: module-registry presence marks the AGENT live to routing/dispatch; an attached thread is not the agent's host.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
     const identity = callerIdentity(auth)
     if (!identity) return fail(403, 'not_member_bound', 'presence_register requires a member-token principal')
 
@@ -179,6 +182,8 @@ const toolPresenceHeartbeat: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: module-registry presence marks the AGENT live to routing/dispatch; an attached thread is not the agent's host.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
     const identity = callerIdentity(auth)
     if (!identity) return fail(403, 'not_member_bound', 'presence_heartbeat requires a member-token principal')
 
@@ -257,6 +262,8 @@ const toolPresenceDeregister: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: module-registry presence marks the AGENT live to routing/dispatch; an attached thread is not the agent's host.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
     const identity = callerIdentity(auth)
     if (!identity) return fail(403, 'not_member_bound', 'presence_deregister requires a member-token principal')
 

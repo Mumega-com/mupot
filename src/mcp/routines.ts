@@ -1,3 +1,4 @@
+import { attachedAuthority } from '../auth/attached-ceiling'
 import { listNeedsYou } from '../attention/service'
 import { priceUsage } from '../economy/prices'
 import { answerRoutineRun, cancelRoutineRun, submitRoutineProposal } from '../routines/actions'
@@ -542,6 +543,8 @@ const reportRunUsage: ToolSpec = {
   // 1250/380 at dispatch, cost 0 at landing, and a dashboard rendering the constants as
   // measured usage.
   async run(auth, env, args) {
+    // W2: run usage is host telemetry; an attached thread is not the agent's host.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_not_agent_host')
     if (!validId(args.run_id)) return fail(404, 'run_not_found')
     const run = await getRoutineRun(env, routinePrincipal(auth), args.run_id)
     if (!run) return fail(404, 'run_not_found')

@@ -1085,8 +1085,21 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     // the generic 'ordinary presence' path + a plain check_in must not create presence rows for the agent (the router reads them as 'online')
     const presenceRows = () => n(`SELECT COUNT(*) AS n FROM presence WHERE member_id = 'mem-agent-rava'`)
     await invokeTool(att, env, 'check_in', {}, 'https://pot.test')
+    await invokeTool(att, env, 'boot_context', {}, 'https://pot.test') // boot_context does its own presence touch
     await invokeTool(att, env, 'task_create', { title: 'presence probe', done_when: 'a checkable done condition', squad_id: 'squad-core', dispatch: false }, 'https://pot.test')
     expect(presenceRows()).toBe(0)
+    // module-registry presence marks the agent live to routing; usage is host telemetry; the inbox is the host's mail
+    for (const [tool, a] of [['presence_register', { adapter: 'x' }], ['presence_heartbeat', {}], ['presence_deregister', {}], ['report_run_usage', { run_id: 'r1', model: 'm', input: 1, output: 1 }]] as Array<[string, Record<string, unknown>]>) {
+      expect(JSON.stringify(await invokeTool(att, env, tool, a, 'https://pot.test'))).toContain('attached_seat_not_agent_host')
+    }
+    expect(n(`SELECT COUNT(*) AS n FROM module_registry`)).toBe(0)
+    h.sqlite.exec(`INSERT INTO agent_messages (id, tenant, to_agent, from_agent, from_member, kind, body) VALUES ('m-host', '${TENANT}', 'agent-rava', 'agent-x', 'mem-x', 'message', 'for the host')`)
+    for (const [tool, a] of [['inbox', { limit: 5 }], ['inbox_lease', {}], ['inbox_lease_reconcile', { attempt_id: 'x' }], ['inbox_lease_ack', { attempt_id: 'x' }], ['inbox_ack', { ids: ['m-host'] }]] as Array<[string, Record<string, unknown>]>) {
+      expect(JSON.stringify(await invokeTool(att, env, tool, a, 'https://pot.test'))).toContain('attached_seat_peek_only')
+    }
+    expect((h.sqlite.prepare(`SELECT read_at FROM agent_messages WHERE id = 'm-host'`).get() as { read_at: string | null } | undefined)?.read_at ?? null).toBeNull()
+    const peek = await invokeTool(att, env, 'inbox', { peek: true }, 'https://pot.test')
+    expect(JSON.stringify(peek)).not.toContain('attached_seat_peek_only')
     // host telemetry: an attached chat cannot overwrite the host's capacity snapshot
     const cap = await invokeTool(att, env, 'harness_capacity_report', { harness: 'orca', host_key: 'h', observed_at: Date.now(), live_terminals: 1, agent_sessions: 1, busy_recent: 0, orphaned_terminals: 0, workers_active: 0, workers_release_unknown: 0, worktrees_with_live: 0 }, 'https://pot.test')
     expect(JSON.stringify(cap)).toContain('attached_seat_not_agent_host')
