@@ -906,8 +906,10 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     expect(verdictRefusal(r2)).toContain('human_origin_not_applicable')
     // control: the SAME call from a plain agent-bound session is NOT refused as not_applicable (it reaches origin resolution)
     const { invokeTool } = await import('../src/mcp/index')
-    const bound: AuthContext = { userId: 'agent:agent-rava', email: null, role: 'member', tenant: TENANT, memberId: 'mem-agent-rava', capabilities: [{ member_id: 'mem-agent-rava', scope_type: 'squad', scope_id: 'squad-core', capability: 'member' }], boundAgentId: 'agent-rava' } as AuthContext
-    const ctl = await invokeTool(bound, env, 'task_verdict', { task_id: 'task-origin-1', verdict: 'approved', human_origin: originFor('task-origin-1') }, 'https://pot.test')
+    // mupot#1889: a plain agent session reaches origin resolution only as an ALLOWLISTED harness credential
+    // (workspace channel + token id on HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS); the seat sessions above are refused regardless.
+    const bound: AuthContext = { userId: 'agent:agent-rava', email: null, role: 'member', tenant: TENANT, memberId: 'mem-agent-rava', capabilities: [{ member_id: 'mem-agent-rava', scope_type: 'squad', scope_id: 'squad-core', capability: 'member' }], boundAgentId: 'agent-rava', channel: 'workspace', tokenId: 'tok-agent-rava' } as AuthContext
+    const ctl = await invokeTool(bound, { ...env, HUMAN_ORIGIN_ATTESTOR_TOKEN_IDS: 'tok-agent-rava' } as Env, 'task_verdict', { task_id: 'task-origin-1', verdict: 'approved', human_origin: originFor('task-origin-1') }, 'https://pot.test')
     expect(JSON.stringify(ctl)).not.toContain('human_origin_not_applicable')
   })
 
