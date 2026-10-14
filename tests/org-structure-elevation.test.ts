@@ -365,6 +365,19 @@ describe('wrong scope is refused', () => {
     expect(reserved.ok).toBe(false)
     expect(JSON.stringify(reserved)).toContain('slug_reserved_by_team_bootstrap')
   })
+
+  it('a grant + STANDING department admin still cannot rename into a reserved name (a bound agent never passes it with standing authority)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    harness.sqlite.exec(`INSERT INTO projects (id, slug, name) VALUES ('prj-y', 'taken-prj', 'Taken')`)
+    const standingDeptAdmin = agentAuth({
+      capabilities: [{ member_id: AGENT_MEMBER, scope_type: 'department', scope_id: DEPT_A, capability: 'admin' }],
+    } as unknown as Partial<AuthContext>)
+    const out = await updateSquad(SQUAD_A1, { slug: 'taken-sqd' }, standingDeptAdmin)
+    expect(out.ok, JSON.stringify(out)).toBe(false)
+    expect(JSON.stringify(out)).toContain('slug_reserved_by_team_bootstrap')
+    expect(squadRow(SQUAD_A1)?.slug).not.toBe('taken-sqd')
+  })
 })
 
 describe('time-box and revocation', () => {
@@ -496,7 +509,7 @@ describe('an elevated agent may only LOWER a squad budget (adversarial P1-B)', (
     await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
     expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 1000 })).ok, 'first cap').toBe(true)
     expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 400 })).ok, 'lower').toBe(true)
-    for (const patch of [{ budget_cap_cents: 900 }, { budget_cap_cents: null }, { budget_window: 'day' }]) {
+    for (const patch of [{ budget_cap_cents: 900 }, { budget_cap_cents: null }, { budget_cap_cents: 0 }, { budget_cap_cents: -5 }, { budget_window: 'day' }]) {
       const out = await updateSquad(SQUAD_A1, patch)
       expect(out.ok, JSON.stringify(patch)).toBe(false)
       expect(JSON.stringify(out)).toMatch(/budget_(raise|window)_standing_admin_only/)

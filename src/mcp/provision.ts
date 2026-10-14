@@ -2706,7 +2706,9 @@ const toolUpdateSquad: ToolSpec = {
       const newSlug = str(patch.slug)
       const reservedSlugBase = newSlug ? slugBaseFromSquadSlug(newSlug) : null
       if (reservedSlugBase && (await isSlugBaseReserved(env, env.TENANT_SLUG, reservedSlugBase))) {
-        if (!hasCapability(grants, 'department', squad.department_id, 'admin')) {
+        // A bound agent never satisfies this with STANDING authority either (it would let a squad-scoped grant plus standing
+        // department admin rename into a reserved name, a way back in when delegation is on); humans keep the standing path.
+        if (auth.boundAgentId != null || !hasCapability(grants, 'department', squad.department_id, 'admin')) {
           return fail(403, 'forbidden', {
             need: 'admin',
             scope: 'department',
@@ -2734,7 +2736,10 @@ const toolUpdateSquad: ToolSpec = {
       if ('budget_cap_cents' in patch) {
         const next = patch.budget_cap_cents
         const cur = before.budget_cap_cents
-        const raises = next === null ? cur !== null : typeof next === 'number' && cur !== null && next > cur
+        // 0 (or negative) means 'no cap' to every consumer (isEnforceableCap needs cap > 0; objectives treat <= 0 as unlimited), so
+        // lowering to 0 is CLEARING the cap and is refused like null.
+        const clears = next === null || (typeof next === 'number' && next <= 0)
+        const raises = clears ? cur !== null && cur > 0 : typeof next === 'number' && cur !== null && next > cur
         if (raises) {
           return fail(403, 'forbidden', { reason: 'budget_raise_standing_admin_only', remedy: 'An elevated agent may only lower a squad budget cap, never raise or clear it; ask a human admin.' })
         }
