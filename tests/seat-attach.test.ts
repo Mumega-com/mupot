@@ -479,6 +479,35 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     expect(receiptOf(b).effective_capabilities).toMatchObject({ highest: 'member' })
   })
 
+  it('an attached seat gets NO scope that only the human holds (min(human, agent, ceiling) per scope, gate r2 P1)', async () => {
+    const env = envFor(h)
+    h.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-h-org', '${HUMAN}', 'org', NULL, 'owner'), ('cap-h-other', '${HUMAN}', 'squad', 'squad-other', 'lead')`)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const b = await boot(env, g, 'conv-a')
+    const caps = b.sc.capabilities as Array<{ scope_type: string; scope_id: string | null }>
+    expect(caps.some((c) => c.scope_type === 'squad' && c.scope_id === 'squad-other')).toBe(false)
+    expect(caps.some((c) => c.scope_type === 'org')).toBe(false)
+    // control: the auto seat of the same human (no attachment) DOES get the human's scopes (that is its whole authority)
+    await boot(env, g, 'conv-auto')
+    const a = await boot(env, g, 'conv-auto')
+    const acaps = a.sc.capabilities as Array<{ scope_type: string; scope_id: string | null }>
+    expect(acaps.some((c) => c.scope_type === 'squad' && c.scope_id === 'squad-other')).toBe(true)
+  })
+
+  it('an attached thread cannot overwrite the agent registry through boot_context runtime/model claims', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    const before = JSON.stringify(h.sqlite.prepare(`SELECT model FROM agents WHERE id = 'agent-rava'`).all()) + JSON.stringify(h.sqlite.prepare(`SELECT * FROM fleet_agents WHERE agent_id = 'agent-rava'`).all())
+    const r = await rpc(env, g.ctx, 'boot_context', { runtime: 'claude-code', model: 'evil-model' }, { meta: thread('conv-a') })
+    expect(r.status).toBe(200)
+    expect(r.sc.bound_agent_id).toBe('agent-rava')
+    const after = JSON.stringify(h.sqlite.prepare(`SELECT model FROM agents WHERE id = 'agent-rava'`).all()) + JSON.stringify(h.sqlite.prepare(`SELECT * FROM fleet_agents WHERE agent_id = 'agent-rava'`).all())
+    expect(after).toBe(before)
+    expect(after).not.toContain('evil')
+  })
+
   it('an attached seat holds NO gate authority even when the agent (member and agent principal) and the org escape would pass', async () => {
     const env = envFor(h)
     h.sqlite.exec(`

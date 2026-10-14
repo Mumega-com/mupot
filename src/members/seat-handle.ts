@@ -150,8 +150,8 @@ export async function resolveSeatCapabilities(
   const consider = async (g: CapabilityGrant, fromAgent: boolean): Promise<void> => {
     const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
     // An ATTACHED seat's admission ceiling replaces the flat 'member' cap ONLY on scopes the agent itself holds (member
-    // default, lead, or `full` = the agent's own standing). A scope only the human holds stays at member, and the human's
-    // live standing always caps. Gates are not capabilities and are never included (see attached-ceiling.ts).
+    // default, lead, or `full` = the agent's own standing); the human's live standing always caps. An attached seat gets no
+    // scope the agent does not hold. Gates are not capabilities and are never included (see attached-ceiling.ts).
     const agentCap = ceilingCap === null ? Number.POSITIVE_INFINITY : capabilityRank(ceilingCap)
     const rank = fromAgent
       ? Math.min(humanRank, capabilityRank(g.capability), p.ceiling ? agentCap : memberRank)
@@ -165,7 +165,9 @@ export async function resolveSeatCapabilities(
       merged.set(key, { member_id: p.agentMemberId, scope_type: g.scope_type, scope_id: g.scope_id, capability: cap })
     }
   }
-  for (const g of humanGrants) await consider(g, false)
+  // An ATTACHED seat acts AS the agent: authority = min(human, agent, ceiling) per scope, so a scope only the human holds
+  // yields NOTHING (gate r2 P1, mupot#1897). A throwaway auto seat has no grants of its own: the human's scopes ARE its authority.
+  if (!p.ceiling) for (const g of humanGrants) await consider(g, false)
   for (const g of agentGrants) await consider(g, true)
   return [...merged.values()]
 }

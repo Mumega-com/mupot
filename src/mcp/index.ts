@@ -6550,9 +6550,11 @@ const toolBootContext: ToolSpec = {
     // to ask. Same reasoning as available_doors — the response that always succeeds is
     // where a fact has to be said, or it is not said at all.
     const selfReport = isMinted
+      // An ATTACHED thread is not the agent's runtime: it never claims runtime/model (it would overwrite the host's
+      // fleet_agents/agents.model rows; bot review P1 on #1887). It still READS the registry belief.
       // sideEffectFree (profile): never claim runtime/model — the profile refuses them, and
       // this drops them even if a caller reaches here another way. An empty claim only READS.
-      ? await reportSelfAtBoot(env, auth.boundAgentId as string, ctx?.sideEffectFree ? {} : { runtime: args.runtime, model: args.model })
+      ? await reportSelfAtBoot(env, auth.boundAgentId as string, ctx?.sideEffectFree || attachedAuthority(auth) ? {} : { runtime: args.runtime, model: args.model })
       : null
     const identityStatus: 'minted' | 'unminted' = isMinted ? 'minted' : 'unminted'
 
