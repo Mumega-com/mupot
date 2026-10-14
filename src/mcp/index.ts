@@ -5323,6 +5323,8 @@ const toolInboxDeadLetters: ToolSpec = {
     additionalProperties: false,
   },
   async run(auth, env, args) {
+    // W2: dead letters carry mail for the host and other seats; an attached thread must not read outside its connection.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_peek_only', 'an attached thread cannot read the agent dead letters')
     if (args.scope !== undefined && args.scope !== 'self' && args.scope !== 'pot')
       return fail(400, 'invalid_args', 'scope must be "self" or "pot"')
     let limit: number | undefined
