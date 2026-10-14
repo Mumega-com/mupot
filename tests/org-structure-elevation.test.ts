@@ -119,7 +119,7 @@ async function approve(
   scopeId: string,
   durationMinutes: number,
   nowMs: number,
-  actions: string[] = ['action:org_structure'],
+  actions: string[] = ['action:org_structure', 'action:org_department_create'],
 ): Promise<string> {
   approvalSeq += 1
   const approverSession = await createWebSession(
@@ -271,8 +271,14 @@ describe('elevated agent CAN, inside its granted scope', () => {
     const squad = await updateSquad(SQUAD_B1)
     expect(squad.ok, JSON.stringify(squad)).toBe(true)
     // every act left a usage-log row on the SAME grant
-    const uses = harness.sqlite.prepare("SELECT COUNT(*) AS n FROM elevation_usage_log WHERE action = 'action:org_structure'").get() as { n: number }
-    expect(uses.n).toBeGreaterThanOrEqual(4)
+    const count = (action: string) => (harness.sqlite.prepare('SELECT COUNT(*) AS n FROM elevation_usage_log WHERE action = ?').get(action) as { n: number }).n
+    expect(count('action:org_department_create')).toBe(2) // exactly one row per SUCCESSFUL create
+    expect(count('action:org_structure')).toBe(2) // the rename and the squad update
+    // a REFUSED or no-op attempt writes NO row (usage is logged after the write, bot P1)
+    const before = count('action:org_structure')
+    expect((await updateSquad(SQUAD_B1, {})).ok).toBe(false)
+    expect((await renameDept(DEPT_B, '')).ok).toBe(false)
+    expect(count('action:org_structure')).toBe(before)
   })
 
   it('update_department with a DEPARTMENT-scope grant on that department', async () => {
@@ -377,6 +383,27 @@ describe('wrong scope is refused', () => {
     expect(out.ok, JSON.stringify(out)).toBe(false)
     expect(JSON.stringify(out)).toContain('slug_reserved_by_team_bootstrap')
     expect(squadRow(SQUAD_A1)?.slug).not.toBe('taken-sqd')
+  })
+})
+
+describe('creating a department is its own, IRREVERSIBLE action (bot P1)', () => {
+  it('the registry classifies it irreversible and org_structure stays reversible', async () => {
+    const { ELEVATION_ACTIONS } = await import('../src/auth/elevation-actions')
+    expect(ELEVATION_ACTIONS['action:org_department_create'].effect).toBe('irreversible')
+    expect(ELEVATION_ACTIONS['action:org_department_create'].enforced).toBe(true)
+    expect(ELEVATION_ACTIONS['action:org_structure'].effect).toBe('reversible')
+    expect(ELEVATION_ACTIONS['action:org_structure'].description).not.toMatch(/create a department/i)
+  })
+  it('an org_structure grant alone cannot create a department; a department-create grant alone cannot rename or update', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'org', '', 60, T0, ['action:org_structure'])
+    expectNoMatchingGrant(await createDept('only-structure'))
+    expect((await renameDept(DEPT_A, 'Renamed A')).ok, 'org_structure still renames').toBe(true)
+    await approve(sessionId, 'org', '', 60, T0, ['action:org_department_create'])
+    expect((await createDept('now-allowed')).ok).toBe(true)
+    // department-create alone must not open the other two tools
+    const s2 = await checkIn()
+    void s2
   })
 })
 
@@ -529,7 +556,7 @@ describe('refusals teach the exact request (onboarding smoothness)', () => {
   it('a floor refusal names request_elevation, the action key AND the scope each tool needs', async () => {
     await checkIn()
     const dept = JSON.stringify(await createDept('x1'))
-    expect(dept).toContain('action:org_structure')
+    expect(dept).toContain('action:org_department_create')
     expect(dept).toContain('scope_type \\"org\\"')
     const ren = JSON.stringify(await renameDept(DEPT_A, 'X'))
     expect(ren).toContain('action:org_structure')
@@ -544,6 +571,47 @@ describe('refusals teach the exact request (onboarding smoothness)', () => {
     const out = JSON.stringify(await renameDept(DEPT_A, 'X'))
     expect(out).toContain('request_elevation')
     expect(out).toContain(DEPT_A)
+  })
+})
+
+describe('post-review hardening on the current head (bot P1s)', () => {
+  it('an ATTACHED thread whose ceiling-clamped grants include ORG ADMIN still cannot create a department, rename one or update a squad', async () => {
+    const attachedOrgAdmin = agentAuth({
+      capabilities: [{ member_id: AGENT_MEMBER, scope_type: 'org', scope_id: null, capability: 'admin' }],
+      seatBinding: {
+        seatId: 'seat-1', label: 'seat-1', harnessId: 'h-1', grantTokenId: TOKEN_ID, humanMemberId: ADMIN_HUMAN, source: 'handle',
+        attached: { agentId: AGENT_ID, ceiling: 'full' },
+      },
+    } as unknown as Partial<AuthContext>)
+    const before = deptCount()
+    expect((await createDept('via-attached', attachedOrgAdmin)).ok).toBe(false)
+    expect((await renameDept(DEPT_A, 'Hijacked', attachedOrgAdmin)).ok).toBe(false)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 5 }, attachedOrgAdmin)).ok).toBe(false)
+    expect(deptCount()).toBe(before)
+    expect(deptName(DEPT_A)).toBe('Dept A')
+  })
+
+  it('two overlapping elevated budget updates cannot end in a RAISE (compare-and-swap at write time)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 1000 })).ok).toBe(true)
+    // simulate the overlap: right before this call's UPDATE, another elevated call lowers the cap to 400
+    const db = env.DB as unknown as { prepare: (sql: string) => unknown }
+    const original = db.prepare.bind(db)
+    db.prepare = (sql: string) => {
+      if (sql.startsWith('UPDATE squads SET budget_cap_cents = ?1 WHERE id = ?2 AND')) {
+        harness.sqlite.exec(`UPDATE squads SET budget_cap_cents = 400 WHERE id = '${SQUAD_A1}'`)
+      }
+      return original(sql)
+    }
+    try {
+      const out = await updateSquad(SQUAD_A1, { budget_cap_cents: 900 }) // a valid LOWER against the 1000 it read
+      expect(out.ok, JSON.stringify(out)).toBe(false)
+      expect(JSON.stringify(out)).toContain('budget_changed_concurrently')
+    } finally {
+      db.prepare = original
+    }
+    expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBe(400) // never 900
   })
 })
 

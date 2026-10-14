@@ -2779,11 +2779,33 @@ const toolUpdateSquad: ToolSpec = {
       }
     }
 
-    const result = await updateUnitConfig(env, 'squad', squad.id, patch)
-    if (!result.ok) {
-      if (result.error === 'not_found') return fail(404, 'squad_not_found', { squad: squadRef })
-      if (result.error === 'slug_taken') return fail(409, 'slug_taken')
-      return fail(400, 'invalid_args', { reason: result.error })
+    const changedKeys = Object.keys(patch)
+    const writePatch: UnitConfigPatch = { ...patch }
+    // The 'only lower' rule must hold at WRITE time, not just against the value read above: two overlapping elevated updates
+    // could both read 1000 and then write 400 and 900 (the second RAISES the live cap). So an elevated budget change is a
+    // compare-and-swap against the value this call observed, and a lost race is a conflict, never a silent raise (bot P1).
+    if (elevationGrantId && 'budget_cap_cents' in patch) {
+      const next = patch.budget_cap_cents
+      if (!(typeof next === 'number' && Number.isInteger(next) && next > 0)) {
+        return fail(400, 'invalid_args', { reason: 'budget_cap_cents must be a positive integer for an elevated agent' })
+      }
+      const cas = await env.DB.prepare(
+        'UPDATE squads SET budget_cap_cents = ?1 WHERE id = ?2 AND ((?3 IS NULL AND budget_cap_cents IS NULL) OR budget_cap_cents = ?3)',
+      )
+        .bind(next, squad.id, before.budget_cap_cents)
+        .run()
+      if (!cas.meta.changes) {
+        return fail(409, 'conflict', { reason: 'budget_changed_concurrently', remedy: 'The squad budget changed while this call ran; re-read it and retry.' })
+      }
+      delete writePatch.budget_cap_cents
+    }
+    if (Object.keys(writePatch).length) {
+      const result = await updateUnitConfig(env, 'squad', squad.id, writePatch)
+      if (!result.ok) {
+        if (result.error === 'not_found') return fail(404, 'squad_not_found', { squad: squadRef })
+        if (result.error === 'slug_taken') return fail(409, 'slug_taken')
+        return fail(400, 'invalid_args', { reason: result.error })
+      }
     }
 
     const after = await env.DB.prepare(
@@ -2793,7 +2815,7 @@ const toolUpdateSquad: ToolSpec = {
       .first<{ slug: string; budget_cap_cents: number | null; budget_window: string }>()
 
     const changed: Record<string, { from: unknown; to: unknown }> = {}
-    for (const key of Object.keys(patch)) {
+    for (const key of changedKeys) {
       changed[key] = {
         from: (before as unknown as Record<string, unknown>)[key] ?? null,
         to: (after as unknown as Record<string, unknown> | null)?.[key] ?? null,
