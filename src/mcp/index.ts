@@ -5935,6 +5935,9 @@ const toolRequestElevation: ToolSpec = {
   },
   shouldTouchPresence: () => false,
   async run(auth, env, args) {
+    // W2: elevation grants are not clamped to an admission ceiling, so an attached thread must not request one (it would
+    // mint agent-level authority that outlives the attachment). A human elevates the agent from its own seat.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_cannot_elevate')
     const sessionContext = resolveAgentSessionContext(auth)
     if (!sessionContext.ok) return fail(403, sessionContext.reason)
 

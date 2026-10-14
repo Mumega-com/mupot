@@ -21,6 +21,7 @@ import {
   purgeExpiredDrops, registerHostKey, revokeDrop,
 } from '../secure-drop/store'
 import { type ToolSpec, type ToolOutcome, fail, done } from './index'
+import { attachedAuthority } from '../auth/attached-ceiling'
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const CONTROL_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
@@ -38,6 +39,8 @@ async function agentCaller(auth: AuthContext, env: Env): Promise<{ ok: true; age
   const off = secureDropRefusal(env)
   if (off) return { ok: false, out: off }
   if (!auth.boundAgentId) return { ok: false, out: fail(403, 'agent_bound_required', 'only an agent-bound token may call this tool; a host key belongs to the agent itself') }
+  // W2: a thread attached to an agent is not the agent's host: it must never rotate the agent's host key or ack its sealed drops.
+  if (attachedAuthority(auth)) return { ok: false, out: fail(403, 'attached_seat_not_agent_host', 'an attached thread cannot act as the agent\'s host') }
   const agent = await loadAgent(env, auth.boundAgentId)
   if (!agent) return { ok: false, out: fail(403, 'agent_not_found') }
   if (agent.status !== 'active') return { ok: false, out: fail(403, 'agent_not_active') }

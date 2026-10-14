@@ -1015,6 +1015,24 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     const own = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-z', codexThreadId: null } })
     expect(resolveGatePrincipal(own)?.type).toBe('agent') // a plain seat is unchanged
   })
+  it('DOOR 5 verdict + elevation: an attached thread at FULL with org admin on both sides is refused approve_gate_edge and request_elevation', async () => {
+    const env = envFor(h)
+    const { invokeTool } = await import('../src/mcp/index')
+    h.sqlite.exec(`
+      INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('org-h5', '${HUMAN}', 'org', NULL, 'admin'), ('org-r5', 'mem-agent-rava', 'org', NULL, 'admin');
+    `)
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    h.sqlite.exec(`DROP TRIGGER agent_seat_admissions_immutable`)
+    h.sqlite.exec(`UPDATE agent_seat_admissions SET ceiling = 'full'`)
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(att.seatBinding?.attached?.ceiling).toBe('full')
+    const edge = await invokeTool(att, env, 'approve_gate_edge', { circuit_id: 'c1', edge_id: 'e1' }, 'https://pot.test')
+    expect(JSON.stringify(edge)).toContain('attached_seat_no_gate_authority')
+    const elev = await invokeTool(att, env, 'request_elevation', { actions: ['action:project_status'], scope_type: 'squad', scope_id: 'squad-core', duration_minutes: 15, reason: 'x' }, 'https://pot.test')
+    expect(JSON.stringify(elev)).toContain('attached_seat_cannot_elevate')
+  })
+
 })
 
 // ════════════════════════════════════════════════════════════════════════════

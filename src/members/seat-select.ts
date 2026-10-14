@@ -38,7 +38,7 @@
 // action='bootstrap_self' (the once-per-member rule) is untouched and unreachable from here, and
 // findExistingBootstrap keeps answering only for real bootstrap_self rows.
 
-import { prepareIdleAttachmentSweep } from './seat-attach'
+import { prepareIdleAttachmentSweep, seatAttachEnabled } from './seat-attach'
 import type { D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env, AuthContext } from '../types'
 import { assertBatchWritten, type D1WriteLike } from '../lib/receipt'
@@ -354,12 +354,15 @@ export function prepareAutoSeatReclaim(env: Env, harnessId: string, liveCap: num
                    AND a.status IN ('active', 'paused')`
   // W2: a seat with a LIVE attachment to an existing agent is PINNED. It still counts toward the pool (the cap
   // trigger counts it) but is never the reclaim victim; only the human's detach / an admission revoke unpins it.
-  const victims = `${live} AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments pin WHERE pin.seat_id = s.id AND pin.detached_at IS NULL)`
+  // Flag off => no read of agent_seat_attachments at all, so code can deploy before migration 0220 is applied.
+  const victims = seatAttachEnabled(env)
+    ? `${live} AND NOT EXISTS (SELECT 1 FROM agent_seat_attachments pin WHERE pin.seat_id = s.id AND pin.detached_at IS NULL)`
+    : live
   const retired = `SELECT agent_id FROM agent_seats WHERE tenant = ?1 AND harness_id = ?2 AND source = 'auto' AND retired_at = ?3`
   return [
     // W2: attached threads idle for ATTACH_IDLE_DAYS are detached FIRST (unpinned), so a pool full of forgotten pinned
-    // threads frees itself; the LRU victim below may then be one of them.
-    prepareIdleAttachmentSweep(env, harnessId, nowIso),
+    // threads frees itself; the LRU victim below may then be one of them. Flag off => this statement is not even built.
+    ...(seatAttachEnabled(env) ? [prepareIdleAttachmentSweep(env, harnessId, nowIso)] : []),
     env.DB.prepare(
       `UPDATE agent_seats SET retired_at = ?3
         WHERE id = (${victims} ORDER BY COALESCE(s.last_used_at, s.created_at) ASC, s.created_at ASC LIMIT 1)

@@ -30,6 +30,7 @@ import {
 import '../addons/workflow-circuits/manifest'
 import type { AuthContext } from '../types'
 import { type ToolSpec, fail, done, str, hasWorkspaceAdmin } from './index'
+import { attachedAuthority } from '../auth/attached-ceiling'
 
 const STRING_SCHEMA = { type: 'string' }
 
@@ -200,6 +201,9 @@ const toolApproveGateEdge: ToolSpec = {
   },
   async run(auth, env, args) {
     if (!auth.memberId) return fail(403, 'forbidden', { need: 'member identity' })
+    // W2: this IS a verdict signal. An attached thread never holds gate authority, at any ceiling (org-admin rank
+    // alone must not reach it): refuse before any rank check.
+    if (attachedAuthority(auth)) return fail(403, 'attached_seat_no_gate_authority')
     const circuitId = str(args.circuit_id)
     const edgeId = str(args.edge_id)
     if (!circuitId) return fail(400, 'invalid_args', 'circuit_id required')
