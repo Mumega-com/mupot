@@ -581,6 +581,23 @@ describe('connect MCP tool (#128 — self-name-to-bind)', () => {
     expect(body.error.data.detail).not.toMatch(new RegExp(`mint_agent_token \\{ agent: "${AGENT.slug}"`))
   })
 
+  // Onboarding: since W2 there are TWO doors out of the directory dead end. A chat attaches (one passkey approval, no token);
+  // a headless runtime uses a securely delivered workspace token. The refusal must name BOTH, by agent ID (a duplicated slug
+  // must not send the caller back into ambiguous_slug), and only advertise seat_attach when the feature is on.
+  it('directory refusal names both doors by agent id when SEAT_ATTACH is on, and only the token door when it is off', async () => {
+    const on = makeEnv({ channel: 'directory', grants: [] })
+    ;(on as unknown as Record<string, string>).SEAT_ATTACH = '1'
+    ;(on as unknown as Record<string, string>).SEAT_AUTO_ENROLL = '1'
+    const onBody = (await (await callConnect(on, AGENT.id)).json()) as { error: { data: { detail: string } } }
+    expect(onBody.error.data.detail).toContain(`seat_attach { agent: "${AGENT.id}" }`)
+    expect(onBody.error.data.detail).toMatch(/passkey/)
+    expect(onBody.error.data.detail).toContain(`mint_agent_token { agent: "${AGENT.id}" }`)
+    const off = makeEnv({ channel: 'directory', grants: [] })
+    const offBody = (await (await callConnect(off, AGENT.id)).json()) as { error: { data: { detail: string } } }
+    expect(offBody.error.data.detail).not.toContain('seat_attach')
+    expect(offBody.error.data.detail).toContain('mint_agent_token')
+  })
+
   it('workspace channel with no grants → still the ordinary no_squad_access refusal', async () => {
     // Negative control: the #678 branch must be scoped to the directory channel ONLY.
     // Without this, a fix that returned the new reason unconditionally would look identical.

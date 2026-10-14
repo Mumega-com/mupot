@@ -6954,7 +6954,10 @@ const toolConnect: ToolSpec = {
             'This session is on the DIRECTORY channel (the public OAuth door used by ChatGPT/Claude connectors),',
             'which carries NO standing capabilities by design — a member who holds admin or owner elsewhere does',
             'not inherit those here. Requesting a squad grant will NOT fix this; the directory door discards',
-            `grants by construction. Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
+            ...(seatAttachEnabled(env)
+              ? [`TWO DOORS: (A) a CHAT: call seat_attach { agent: "${agentRef.id}" }; your human approves ONCE with their passkey (the link also goes to their Telegram when it is set up) and this chat then acts as the agent, up to the access level they choose; no token, nothing to save. (B) a HEADLESS runtime (a CLI/daemon): use a workspace token, delivered securely to the host and never pasted into chat. For B:`]
+              : []),
+            `Use a WORKSPACE-channel token instead: ask an admin on agent "${agentRef.slug}"'s`,
             // Render the ID, never the slug. mint_agent_token resolves through the same
             // resolveAgentRef contract as connect, so a DUPLICATED slug would come back
             // `ambiguous_slug` — turning a reference the caller had already resolved
@@ -7035,7 +7038,9 @@ const toolConnect: ToolSpec = {
       connection_status: 'hot',
       claimed_agent: { id: agentRef.id, slug: agentRef.slug, name: agentRef.name },
       binding: durable ? 'durable' : 'session_local',
-      next_step: 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
+      next_step: auth.channel === 'directory' && !auth.boundAgentId && seatAttachEnabled(env)
+        ? `You are now hot for READING (this claim is session-local: the directory door grants no write authority). To ACT as ${agentRef.slug}, call seat_attach { agent: "${agentRef.id}" }: your human approves once with their passkey and this chat then acts as the agent. A headless runtime uses a securely delivered workspace token instead. Call orient {} for your basin-drop.`
+        : 'You are now hot. Call orient {} (or rely on this packet) for your full basin-drop.',
       packet: data,
       brief: renderBrief(data),
     })
