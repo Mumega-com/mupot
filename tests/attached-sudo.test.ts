@@ -752,7 +752,7 @@ describe('sudo for attached chats: review fixes (#1913 gate round 1)', () => {
 })
 
 describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)', () => {
-  it('A: an attached chat\'s request cannot be APPROVED over Telegram (core backstop); nothing is granted, the gate never runs, the request stays open; a DENY over Telegram is allowed', async () => {
+  it('A: an attached chat\'s request cannot be APPROVED over Telegram (core backstop); nothing is granted, the gate never runs, the request stays open; an unlisted channel is refused the same way', async () => {
     const w = await world()
     const r = await ask(w)
     const human = { memberId: HUMAN, userId: HUMAN, role: 'member', tenant: TENANT, capabilities: await resolveCapabilities(w.env, HUMAN) } as unknown as AuthContext
@@ -766,6 +766,9 @@ describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)
     expect(mint).not.toHaveBeenCalled()
     expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
     expect(one<{ status: string }>(`SELECT status FROM elevation_requests WHERE id = ?`, reqIdOf(r))!.status).toBe('pending')
+    // a channel that is not on the passkey-class allow-list is refused the same way (an unknown future channel gets no approval power)
+    const future = await decideElevation(w.env, { ...base, decision: 'approve', selectedActions: [SUDO], proof: { memberId: HUMAN, via: 'slack_future' as unknown as 'webauthn', evidence: {} } })
+    expect(future.status).toBe(403)
   })
 
   it('A: attachedOriginRefusal refuses an attached-origin APPROVE and allows a DENY; an ordinary agent request is not affected', async () => {
@@ -781,6 +784,7 @@ describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)
   it('A (wiring ratchet): the challenge AND decide Telegram routes both call attachedOriginRefusal (source-level, because a signed-initData route harness is not built here)', () => {
     const src = readFileSync(join(__dirname, '..', 'src', 'secure-moments', 'telegram-miniapp.ts'), 'utf8')
     expect((src.match(/await attachedOriginRefusal\(/g) ?? []).length).toBe(2)
+    expect((src.match(/if \(attachedRefusal\) return fail\(c, 403, attachedRefusal, 'Use a passkey'\)/g) ?? []).length).toBe(2) // and each one actually returns
   })
 
   it('B: a request cannot be approved while the agent\'s welded member is suspended, and reactivating it later does not resurrect an approval', async () => {
@@ -792,9 +796,36 @@ describe('sudo for attached chats: step-up + liveness follow-ups (#1915 A and B)
       tenant: TENANT, requestId: reqIdOf(r), decision: 'approve', selectedActions: [SUDO], decidedByMemberId: HUMAN,
       decidedByCapabilities: await resolveCapabilities(w.env, HUMAN), decidedByWebSessionHash: hash, recentReauthOk: true,
     })
-    expect(res.ok).toBe(false)
+    expect(res).toMatchObject({ ok: false, reason: 'agent_session_ended' })
     expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
     h.sqlite.exec(`UPDATE members SET status = 'active' WHERE id = (SELECT member_id FROM agent_member_bindings WHERE agent_id = 'agent-rava')`)
-    expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0) // reactivation resurrects nothing: there was never a grant
+    expect(one<{ status: string }>(`SELECT status FROM elevation_requests WHERE id = ?`, reqIdOf(r))!.status).not.toBe('approved') // reactivation resurrects nothing
   })
+})
+
+describe('sudo for attached chats: decide-time liveness mirrors use-time (each mirrored condition broken in turn)', () => {
+  // seat member, admission harness and harness owner are immutable by trigger (agent_seat_immutable etc.), so a request cannot meet them
+  // broken in production; the SQL mirrors them anyway (defence in depth) and they are deliberately not prestated here.
+  const BREAKS: Array<[string, (member: string) => string]> = [
+    ['seat retired', () => `UPDATE agent_seats SET retired_at = '2026-10-14 00:00:00'`],
+    ['agent inactive', () => `UPDATE agents SET status = 'inactive' WHERE id = 'agent-rava'`],
+    ['seat token not directory channel', () => `UPDATE member_tokens SET channel = 'workspace' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],
+    ['seat token not for this agent', () => `UPDATE member_tokens SET agent_id = NULL WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],
+    ['seat token revoked', () => `UPDATE member_tokens SET revoked_at = '2026-10-14 00:00:00' WHERE id = (SELECT seat_token_id FROM agent_seat_attachments LIMIT 1)`],
+  ]
+  for (const [name, sql] of BREAKS) {
+    it(`${name}: a pending request cannot be approved and no grant is written`, async () => {
+      const w = await world()
+      const r = await ask(w)
+      h.sqlite.exec('PRAGMA foreign_keys = OFF')
+      try { h.sqlite.exec(sql(HUMAN2)) } finally { h.sqlite.exec('PRAGMA foreign_keys = ON') }
+      const hash = await liveWebSession(w, HUMAN)
+      const res = await decideElevationRequest(w.env, {
+        tenant: TENANT, requestId: reqIdOf(r), decision: 'approve', selectedActions: [SUDO], decidedByMemberId: HUMAN,
+        decidedByCapabilities: await resolveCapabilities(w.env, HUMAN), decidedByWebSessionHash: hash, recentReauthOk: true,
+      })
+      expect(res, name).toMatchObject({ ok: false })
+      expect(n(`SELECT COUNT(*) AS n FROM elevation_grants`)).toBe(0)
+    })
+  }
 })

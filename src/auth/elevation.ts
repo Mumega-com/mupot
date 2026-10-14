@@ -442,7 +442,7 @@ async function decidedByHasElevationAuthority(
 }
 
 // NOTE: the `live` CASE below mirrors findLiveAttachment (src/members/seat-attach.ts) minus the human's own grant token, which a
-// decision surface does not hold; tests/attached-sudo.test.ts pins the two against each other on every row they can disagree on.
+// decision surface does not hold; tests/attached-sudo.test.ts breaks each mirrored condition in turn and asserts the decision is refused (the table-driven 'liveness' test).
 // ── "sudo for attached chats": the attachment a session belongs to ──────────────────────────────────────────────────
 // An ATTACHED chat (W2 seat_attach) acts with its OWN credential, a member_tokens row created for exactly that one
 // attachment (agent_seat_attachments.seat_token_id; its raw secret is discarded at attach time, nothing can present it
@@ -472,7 +472,9 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
                                  WHERE a.id = att.agent_id AND a.status = 'active')
                     AND adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id
                     AND EXISTS (SELECT 1 FROM harnesses hr WHERE hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id)
-                    AND EXISTS (SELECT 1 FROM member_tokens t WHERE t.id = att.seat_token_id AND t.tenant = att.tenant
+                    AND EXISTS (SELECT 1 FROM member_tokens t
+                                 JOIN agent_member_bindings tb ON tb.tenant = att.tenant AND tb.agent_id = att.agent_id AND tb.member_id = t.member_id
+                                 WHERE t.id = att.seat_token_id AND t.tenant = att.tenant AND t.agent_id = att.agent_id AND t.channel = 'directory'
                                   AND ${TOKEN_LIVE_PREDICATE('?3')})
                    THEN 1 ELSE 0 END AS live
          FROM agent_seat_attachments att
