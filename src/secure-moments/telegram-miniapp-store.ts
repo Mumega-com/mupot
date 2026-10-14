@@ -428,6 +428,11 @@ export const TG_DELIVERY_RESERVED_STALE_MS = 60 * 1000
  * message, so a repeated tool call or a rotated link (same moment id) never double-sends; a `failed` row does not, so a later
  * call can retry (the per-member cap still bounds it). Returns the new slot, or why there is none.
  */
+// One requesting agent may auto-notify a human at most this many times per window, so a single noisy or hostile agent cannot use
+// up the human's whole allowance (and block other agents' approvals or the human's own device-setup message). The plain approve_url
+// is still returned either way.
+export const TG_DELIVERY_MAX_PER_REQUESTER = 3
+
 export async function reserveMomentDeliveryOnce(
   env: Env,
   input: { momentId: string; memberId: string; requestedBy: string },
@@ -442,9 +447,10 @@ export async function reserveMomentDeliveryOnce(
       WHERE NOT EXISTS (SELECT 1 FROM tg_miniapp_deliveries
                          WHERE tenant = ?2 AND kind = 'moment' AND subject_id = ?3 AND member_id = ?4
                            AND (status = 'sent' OR (status = 'reserved' AND created_at > ?7)))
-        AND (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND member_id = ?4 AND created_at > ?8) < ?9`,
+        AND (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND member_id = ?4 AND created_at > ?8) < ?9
+        AND (SELECT COUNT(*) FROM tg_miniapp_deliveries WHERE tenant = ?2 AND kind = 'moment' AND requested_by = ?5 AND created_at > ?8) < ?10`,
   ).bind(id, env.TENANT_SLUG, input.momentId, input.memberId, input.requestedBy, createdAt, staleBefore,
-    new Date(nowMs - TG_DELIVERY_WINDOW_MS).toISOString(), TG_DELIVERY_MAX_PER_WINDOW).run()
+    new Date(nowMs - TG_DELIVERY_WINDOW_MS).toISOString(), TG_DELIVERY_MAX_PER_WINDOW, TG_DELIVERY_MAX_PER_REQUESTER).run()
   if (r.meta.changes === 1) return { state: 'reserved', id, createdAt }
   const dup = await env.DB.prepare(
     `SELECT 1 AS x FROM tg_miniapp_deliveries

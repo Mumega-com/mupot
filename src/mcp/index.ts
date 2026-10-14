@@ -5937,7 +5937,7 @@ const toolEndAgentSession: ToolSpec = {
 // fails closed with 'not_agent_session' for those).
 const toolRequestElevation: ToolSpec = {
   name: 'request_elevation',
-  scope: 'self (exact current agent session)',
+  scope: 'self (exact current agent session). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'authenticated',
   args: '{ actions: string[], scope_type: "org"|"department"|"squad", scope_id?: string, duration_minutes: number, reason: string }',
   inputSchema: {

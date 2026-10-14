@@ -102,7 +102,7 @@ const toolSeedAttach: ToolSpec = {
 // way for any bearer (agent or human) to complete the request over MCP. Docs: access-approve-page.md.
 const toolSeedAttachRequest: ToolSpec = {
   name: 'seed_attach_request',
-  scope: 'file a pending request to attach a mupot.seed/v1; returns approve_url for a human to open (decides nothing, grants nothing)',
+  scope: 'file a pending request to attach a mupot.seed/v1; returns approve_url for a human to open (decides nothing, grants nothing). The reply includes `telegram`: "sent" = your human already has a Review-and-decide button in Telegram: tell them to check Telegram and do NOT paste the link or call moment_miniapp_link; "pending" = it is still being delivered, give it a moment; "not_bound" / "disabled" / "failed" / "rate_limited" = give them approve_url.',
   min: 'member',
   args: '{ seed: string (YAML or JSON) }',
   inputSchema: {

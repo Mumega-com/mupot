@@ -146,6 +146,56 @@ describe('request_elevation delivers to Telegram by itself', () => {
     expect((await fileElevation()).telegram).toBe('not_bound')
     expect(calls).toHaveLength(0)
   })
+  it('a welded (agent) owner or requester falls through to the admin fallback; it is never addressed itself', async () => {
+    const calls = stubBot()
+    setOwner('mem-agent') // the agent's OWN welded member as 'owner'
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-o', 'mem-owner', 'org', NULL, 'owner')`)
+    expect((await fileElevation()).telegram).toBe('sent')
+    expect(calls[0].body.chat_id).toBe(String(TG.owner))
+  })
+  it('two human org admins is ambiguous UNLESS only one has a bound Telegram chat (that one is reachable); the org setting approvals_member_id wins when set', async () => {
+    const calls = stubBot()
+    setOwner(null)
+    harness.sqlite.exec(`INSERT INTO capabilities (id, member_id, scope_type, scope_id, capability) VALUES ('cap-o', 'mem-owner', 'org', NULL, 'owner'), ('cap-p2', 'mem-plain', 'org', NULL, 'admin')`)
+    harness.sqlite.exec("UPDATE members SET telegram_chat_id = NULL WHERE id = 'mem-plain'")
+    expect((await fileElevation()).telegram).toBe('sent') // only mem-owner is reachable
+    expect(calls[0].body.chat_id).toBe(String(TG.owner))
+    // both reachable again: ambiguous, nobody
+    harness.sqlite.prepare("UPDATE members SET telegram_chat_id = ? WHERE id = 'mem-plain'").run(String(TG.plain))
+    harness.sqlite.exec('DELETE FROM tg_miniapp_deliveries')
+    calls.length = 0
+    expect((await fileElevation()).telegram).toBe('not_bound')
+    expect(calls).toHaveLength(0)
+    // an org admin names the approver explicitly: that human is addressed
+    harness.sqlite.exec(`INSERT INTO org_settings (key, value) VALUES ('approvals_member_id', 'mem-plain')`)
+    harness.sqlite.exec('DELETE FROM tg_miniapp_deliveries')
+    expect((await fileElevation()).telegram).toBe('sent')
+    expect(calls[0].body.chat_id).toBe(String(TG.plain))
+  })
+  it('the message names the agent, the action label, the scope and duration, never the agent\'s free-text reason, and warns about first-time device setup', async () => {
+    const calls = stubBot()
+    await fileElevation()
+    const text = String(calls[0].body.text)
+    expect(text).toContain('agent agent-x')
+    expect(text).toMatch(/passkey/i)
+    expect(text).toMatch(/My Account/)
+    expect(text).not.toMatch(/fingerprint or face/i)
+    expect(text.length).toBeLessThan(901)
+  })
+  it('one requesting agent cannot use up the human\'s Telegram allowance: past 3 per window it is rate_limited while the link is still returned', async () => {
+    const calls = stubBot()
+    const statuses: string[] = []
+    for (let i = 0; i < 5; i += 1) {
+      harness.sqlite.exec('DELETE FROM elevation_requests')
+      harness.sqlite.exec("DELETE FROM secure_moments")
+      const f = await fileElevation()
+      expect(f.approve_url).toBeTruthy()
+      statuses.push(String(f.telegram))
+    }
+    expect(statuses.slice(0, 3)).toEqual(['sent', 'sent', 'sent'])
+    expect(statuses.slice(3)).toEqual(['rate_limited', 'rate_limited'])
+    expect(calls).toHaveLength(3)
+  })
   it('an owner who has no authority over the decision is not sent the button (authority is not widened)', async () => {
     const calls = stubBot()
     setOwner('mem-plain')
@@ -168,11 +218,11 @@ describe('request_elevation delivers to Telegram by itself', () => {
     expect(f.approve_url).toBeTruthy()
     expect(harness.sqlite.prepare('SELECT status FROM tg_miniapp_deliveries').get()).toMatchObject({ status: 'failed' })
   })
-  it('a Telegram that never answers is bounded: the tool answers failed within the default timeout and still returns the link', async () => {
+  it('a Telegram that never answers is bounded: the tool answers pending within the default timeout and still returns the link', async () => {
     stubBot('hang')
     const t0 = Date.now()
     const f = await fileElevation()
-    expect(f.telegram).toBe('failed')
+    expect(f.telegram).toBe('pending')
     expect(f.approve_url).toBeTruthy()
     expect(Date.now() - t0).toBeLessThan(9000)
   }, 15000)
@@ -188,7 +238,7 @@ describe('request_elevation delivers to Telegram by itself', () => {
 })
 
 describe('the bound and the best-effort contract', () => {
-  it('times out to failed without throwing, and hands the work to waitUntil', async () => {
+  it('times out to pending without throwing, and hands the work to waitUntil', async () => {
     stubBot('hang')
     const f = await (async () => { stubBot('ok'); return fileElevation() })()
     harness.sqlite.exec('DELETE FROM tg_miniapp_deliveries')
@@ -196,7 +246,7 @@ describe('the bound and the best-effort contract', () => {
     const handed: Promise<unknown>[] = []
     const t0 = Date.now()
     const s = await deliverMomentToTelegram(env, { momentId: f.momentId, requesterMemberId: null }, { timeoutMs: 150, waitUntil: (p) => { handed.push(p) } })
-    expect(s).toBe('failed')
+    expect(s).toBe('pending')
     expect(Date.now() - t0).toBeLessThan(2000)
     expect(handed).toHaveLength(1)
   })
