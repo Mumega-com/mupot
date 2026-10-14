@@ -12,7 +12,7 @@ export const ENROLMENT_TTL_MS = 10 * 60 * 1000
 export const CHALLENGE_MAX_OUTSTANDING_PER_MOMENT = 20
 export const PASSKEY_MAX_PER_MEMBER = 10
 
-export type MomentKind = 'seed_attach' | 'elevation' | 'credential'
+export type MomentKind = 'seed_attach' | 'elevation' | 'credential' | 'seat_admit'
 
 export interface MomentRow {
   id: string

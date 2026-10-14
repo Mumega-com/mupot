@@ -14,7 +14,7 @@ import type { AuthContext, Env } from '../src/types'
 const TENANT = 'mumega'
 const HUMAN = 'member-human-1'
 const ORIGIN = 'https://pot.test'
-const MARKERS = ['__harness__', 'harness-option', 'p-harness', 'seat_select', 'Me — auto per workspace']
+const MARKERS = ['__harness__', 'harness-option', 'p-harness', 'seat_select', 'Me — auto per workspace', 'How will this app connect?', 'Many chats']
 
 let h: SqliteD1Harness
 beforeEach(() => {

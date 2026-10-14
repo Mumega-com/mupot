@@ -349,6 +349,9 @@ export interface Env {
   // Workspaces W1: strict '1' turns on worktree_open / worktree_list and grant-keyed OAuth harnesses.
   // Anything else (including unset, the default) is a total no-op: no tool advertised, no read, no write.
   WORKSPACES?: string
+  // W2 (harness seats -> existing agents): strict '1' (AND SEAT_AUTO_ENROLL '1') turns on seat_attach, the
+  // dashboard Connections attach/admit actions and the per-request attachment resolve. Unset = total no-op.
+  SEAT_ATTACH?: string
   SEAT_MAX_PER_MEMBER?: string
   // mupot#1794 W2: LIFETIME bound on agent_seats rows per member, retired/inactive included
   // (migration 0199 trigger; default 64, clamped 1..4096). Atomic and fail-closed.
@@ -781,9 +784,13 @@ export interface AuthContext {
    * turned the human's grant into the seat agent's context. Server-derived on every request;
    * resolveAuth deletes any such field arriving in the internal header blob.
    */
-  seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string; source: 'handle' | 'auto:openai_session' | 'auto:codex_thread' }
+  seatBinding?: { seatId: string; label: string; harnessId: string; grantTokenId: string; humanMemberId: string; source: 'handle' | 'auto:openai_session' | 'auto:codex_thread'
+    /** W2 (SEAT_ATTACH): set ONLY by buildSeatContext when this thread is attached to an existing agent. A seat acting
+     *  as an attached agent holds NO gate authority (callerHoldsGateCapability refuses it). `agentId` is the attached
+     *  agent; `seatAgentId` is the thread's own seat agent it would otherwise be. */
+    attached?: { attachmentId: string; admissionId: string; agentId: string; seatAgentId: string; ceiling: 'member' | 'lead' | 'full' } }
   /** mupot#1794 W2: what the request presented (booleans only) — receipt input, never authority. */
-  seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string }
+  seatInputs?: { handleRejected: boolean; hints: { openai_session: boolean; openai_subject: boolean; codex_thread_id: boolean }; autoSeatRefused?: string; attachRefused?: string }
   webSessionIdHash?: string | null
   webSessionMemberId?: string
 }

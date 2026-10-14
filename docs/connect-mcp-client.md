@@ -244,6 +244,41 @@ agent's name is a label, never authority.
 Choosing an existing agent on the consent screen still works exactly as before, and an existing
 agent-bound connection is untouched.
 
+### Attach a thread to an existing agent (`SEAT_ATTACH`)
+
+> Needs `SEAT_ATTACH=1` **and** `SEAT_AUTO_ENROLL=1`. Off, none of this exists (the tool is not advertised).
+
+The consent screen asks first: **How will this app connect?** *Many chats: each chat picks its agent*
+(ChatGPT, Claude, Cursor, Grok; suggested for those apps) or *One agent: this whole app is one agent*
+(Muse, a single bot). Nothing is pre-selected. A one-agent connection is not switched in place: the
+Connections page shows **Switch to many chats**, which tells you to reconnect and pick the first option.
+
+A thread that should act as an agent you already have (Rava, hadi-admin) calls
+`seat_attach { agent }` from its seat session:
+
+1. The agent name is resolved only among agents on squads **you** administer (anything else reads as
+   not found). Pool-managed seat agents are never attachable.
+2. First time for that **agent + you + app**: a *pending admission* is filed and a one-time
+   secure-moment link is returned. You tap your passkey; nothing attaches before that. The thread then
+   calls `seat_attach` again and attaches immediately. Every later thread from the same app attaches
+   immediately.
+3. At the passkey tap you choose a **level**: *Member* (default), *Lead*, or *Full* (the agent's own standing).
+   The thread's access is min(your live access, the agent's own grants, the level) per scope. Whatever the
+   level it never holds the agent's approval gates or surface grants, never uses a delegation another person
+   gave the agent, and `human_origin` verdicts are refused for every seat session. Changing a level means
+   revoking the admission and admitting again. The next request acts as that agent. `identity_receipt` shows
+   `binding_source: attached_seat`, the `attachment` and its `admission_id`.
+4. The admission is checked on **every** request in one place. Revoke it, detach the thread, or lose
+   admin on the agent's squad and the thread is back on its own seat agent on its next request.
+5. An attached seat is pinned: the auto pool never reclaims it.
+
+The dashboard **Connections** page lists each app's threads and the agent each one is acting as; you can
+attach (dropdown), move, detach, approve/deny pending admissions and revoke admissions there (attach and
+approve need a fresh sign-in; detach, deny and revoke work any time, flag on or off). Every connection has a
+name (your own label, else the app's name plus the thread label); it shows on `identity_receipt.connection` and in
+`boot_context.next_step` as "acting as <agent> via <connection>". A name is a label only. An attached thread unused for
+30 days is detached automatically when its app has no free thread slots.
+
 ## Shared environments (env-secret tokens, CI, Cursor, Grok bots)
 
 > Needs `SEAT_AUTO_ENROLL=1` on the pot. The shared-credential warning below also needs

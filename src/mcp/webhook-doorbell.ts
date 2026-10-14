@@ -5,6 +5,7 @@
 //
 // Companion: src/agents/webhook-doorbell.ts, docs/plugins/grokbot-webhook-spine.md.
 
+import { attachedAuthority } from '../auth/attached-ceiling'
 import type { AuthContext, Env } from '../types'
 import { resolveAgentRef } from '../org/resolve'
 import { authorizeStructuralWrite } from '../operators/chokepoint'
@@ -48,7 +49,8 @@ async function resolveDoorbellTarget(
   }
 
   if (auth.boundAgentId) {
-    if (auth.boundAgentId === resolved.value.id) return { ok: true, agentId: resolved.value.id }
+    // W2: an attached thread is not the agent itself — the self lane would let it point the agent's wake bearer at its own URL.
+    if (auth.boundAgentId === resolved.value.id && !attachedAuthority(auth)) return { ok: true, agentId: resolved.value.id }
     if (gate) {
       const verdict = await gate(resolved.value)
       if (verdict.kind === 'refused') return fail(verdict.status, verdict.error, verdict.detail) as ToolFailure

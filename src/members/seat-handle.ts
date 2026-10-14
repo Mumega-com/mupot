@@ -41,6 +41,8 @@ import { capabilityRank, resolveCapabilities, canOnSquad } from '../auth/capabil
 import { humanMaxRankOnScope } from '../mcp/oauth-authorize'
 import { TOKEN_LIVE_PREDICATE, nowSqlUtc } from '../auth/token-lifecycle'
 import { seatAutoEnrollEnabled } from './harness'
+import { ceilingCapability, type AttachCeiling } from '../auth/attached-ceiling'
+import { findLiveAttachment, seatAttachEnabled, touchAttachment } from './seat-attach'
 import { sha256Hex } from './service'
 
 /** Live handles per seat. seat_select evicts the least-recently-used one at the cap, so it bounds
@@ -136,17 +138,24 @@ export async function prepareSeatHandleIssue(
  */
 export async function resolveSeatCapabilities(
   env: Env,
-  p: { humanMemberId: string; agentId: string; agentSquadId: string; agentMemberId: string },
+  p: { humanMemberId: string; agentId: string; agentSquadId: string; agentMemberId: string; ceiling?: AttachCeiling },
 ): Promise<CapabilityGrant[]> {
   const humanGrants = await resolveCapabilities(env, p.humanMemberId)
   if (!(await canOnSquad(env, humanGrants, p.agentSquadId, 'admin'))) return []
   const agentGrants = await resolveCapabilities(env, p.agentMemberId)
 
   const memberRank = capabilityRank(SEAT_CEILING)
+  const ceilingCap = p.ceiling ? ceilingCapability(p.ceiling) : 'member'
   const merged = new Map<string, CapabilityGrant>()
   const consider = async (g: CapabilityGrant, fromAgent: boolean): Promise<void> => {
     const humanRank = await humanMaxRankOnScope(env, humanGrants, g.scope_type, g.scope_id)
-    const rank = Math.min(humanRank, memberRank, fromAgent ? capabilityRank(g.capability) : memberRank)
+    // An ATTACHED seat's admission ceiling replaces the flat 'member' cap ONLY on scopes the agent itself holds (member
+    // default, lead, or `full` = the agent's own standing); the human's live standing always caps. An attached seat gets no
+    // scope the agent does not hold. Gates are not capabilities and are never included (see attached-ceiling.ts).
+    const agentCap = ceilingCap === null ? Number.POSITIVE_INFINITY : capabilityRank(ceilingCap)
+    const rank = fromAgent
+      ? Math.min(humanRank, capabilityRank(g.capability), p.ceiling ? agentCap : memberRank)
+      : Math.min(humanRank, memberRank)
     if (rank <= 0) return // the human holds nothing here (or the value is unknown): dropped, never defaulted
     const cap = RANK_ASC.find((c) => capabilityRank(c) === rank)
     if (!cap) return
@@ -156,7 +165,9 @@ export async function resolveSeatCapabilities(
       merged.set(key, { member_id: p.agentMemberId, scope_type: g.scope_type, scope_id: g.scope_id, capability: cap })
     }
   }
-  for (const g of humanGrants) await consider(g, false)
+  // An ATTACHED seat acts AS the agent: authority = min(human, agent, ceiling) per scope, so a scope only the human holds
+  // yields NOTHING (gate r2 P1, mupot#1897). A throwaway auto seat has no grants of its own: the human's scopes ARE its authority.
+  if (!p.ceiling) for (const g of humanGrants) await consider(g, false)
   for (const g of agentGrants) await consider(g, true)
   return [...merged.values()]
 }
@@ -303,6 +314,54 @@ export async function buildSeatContext(
   hints: HarnessHints,
   source: SeatBindingSource,
 ): Promise<AuthContext | null> {
+  // W2 (SEAT_ATTACH): the thread may be ATTACHED to an existing agent. The admission check lives in ONE place
+  // (findLiveAttachment); here its row simply replaces the seat agent's identity. Any failure to resolve a live
+  // attachment (revoked admission, detached, agent paused, zero capabilities) serves the thread's own seat agent.
+  let attachRefused: string | undefined
+  if (seatAttachEnabled(env)) {
+    try {
+      const att = await findLiveAttachment(env, human, row.seat_id)
+      if (att) {
+        const attCaps = await resolveSeatCapabilities(env, {
+          humanMemberId: human.memberId,
+          agentId: att.agent_id,
+          agentSquadId: att.agent_squad_id,
+          agentMemberId: att.agent_member_id,
+          ceiling: att.ceiling,
+        })
+        if (attCaps.length > 0) {
+          await touchAttachment(env, att, Date.now())
+          return {
+            userId: att.agent_member_id,
+            email: att.agent_email,
+            role: 'member',
+            tenant: env.TENANT_SLUG,
+            memberId: att.agent_member_id,
+            channel: 'directory',
+            capabilities: attCaps,
+            latentCapabilities: attCaps,
+            boundAgentId: att.agent_id,
+            consentedByMemberId: human.memberId,
+            tokenId: att.seat_token_id,
+            harnessId: att.harness_id,
+            seatBinding: {
+              seatId: row.seat_id,
+              label: row.seat_label,
+              harnessId: att.harness_id,
+              grantTokenId: human.tokenId,
+              humanMemberId: human.memberId,
+              source,
+              attached: { attachmentId: att.attachment_id, admissionId: att.admission_id, agentId: att.agent_id, seatAgentId: att.seat_agent_id, ceiling: att.ceiling },
+            },
+            seatInputs: { handleRejected: false, hints },
+          }
+        }
+        attachRefused = 'no_capabilities'
+      }
+    } catch {
+      attachRefused = 'error'
+    }
+  }
   const capabilities = await resolveSeatCapabilities(env, {
     humanMemberId: human.memberId,
     agentId: row.agent_id,
@@ -333,7 +392,7 @@ export async function buildSeatContext(
       humanMemberId: human.memberId,
       source,
     },
-    seatInputs: { handleRejected: false, hints },
+    seatInputs: { handleRejected: false, hints, ...(attachRefused ? { attachRefused } : {}) },
   }
 }
 
