@@ -64,6 +64,7 @@ import {
   stageAgentTokenReplacement,
   sha256Hex,
 } from '../members/service'
+import { attachedAuthority } from '../auth/attached-ceiling'
 import { resolveAgentTokenExpiry } from '../auth/token-lifecycle'
 import {
   createCredentialClaim,
@@ -2027,7 +2028,9 @@ const toolUpdateAgent: ToolSpec = {
     // agent-bound caller — targeting a DIFFERENT agent's row — hits the same
     // operator-principal refusal every sibling credential/capability tool
     // carries, unchanged from before this fix.
-    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id
+    // W2: an ATTACHED thread shares the agent's boundAgentId but is not the agent: it gets no self lane (it would rewrite
+    // agents.model/purpose/skills, which feed routing) and falls to the structural gate like any other non-self caller.
+    const isSelf = auth.boundAgentId != null && auth.boundAgentId === agent.id && !attachedAuthority(auth)
     if (auth.boundAgentId && !isSelf) {
       const updateGate = await structuralGate(env, auth, 'update_agent')
       return updateGate.kind === 'refused' ? structuralFail(updateGate) : fail(403, 'operator_principal_required')

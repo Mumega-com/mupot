@@ -1065,6 +1065,15 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     expect(JSON.stringify(bell)).toContain('"ok":false')
     expect(JSON.stringify(bell)).toContain('"status":403')
     expect(n(`SELECT COUNT(*) AS n FROM agent_webhook_doorbells`)).toBe(0)
+    // the registry self lane: an attached thread must not rewrite the agent's own row (model/purpose/skills feed routing)
+    const upd = await invokeTool(att, env, 'update_agent', { agent: 'agent-rava', purpose: 'hijacked purpose' }, 'https://pot.test')
+    expect(JSON.stringify(upd)).toContain('"ok":false')
+    expect(h.sqlite.prepare(`SELECT purpose FROM agents WHERE id = 'agent-rava'`).get()).not.toMatchObject({ purpose: 'hijacked purpose' })
+    // fleet presence: an attached thread cannot register/clear the agent's poll presence
+    const poll = await invokeTool(att, env, 'check_in', { presence_mode: 'poll', poll_interval_sec: 30 }, 'https://pot.test')
+    expect(JSON.stringify(poll)).toContain('attached_seat_cannot_set_presence_mode')
+    const resid = await invokeTool(att, env, 'check_in', { presence_mode: 'resident' }, 'https://pot.test')
+    expect(JSON.stringify(resid)).toContain('attached_seat_cannot_set_presence_mode')
   })
 
 })

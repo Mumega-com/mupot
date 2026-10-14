@@ -5716,6 +5716,8 @@ const toolCheckIn: ToolSpec = {
       if (!auth.boundAgentId) {
         return fail(400, 'invalid_args', 'presence_mode: poll requires an agent-bound credential')
       }
+      // W2: an attached thread is not the agent's runtime; it must not write the agent's fleet presence row.
+      if (attachedAuthority(auth)) return fail(403, 'attached_seat_cannot_set_presence_mode')
       const pollIntervalSec = clampPollIntervalSec(args.poll_interval_sec)
       const ttlSec = pollPresenceTtlSec(pollIntervalSec)
       const result = await upsertPollFleetPresence(env, {
@@ -5731,6 +5733,7 @@ const toolCheckIn: ToolSpec = {
         ? { presence_stopped_by_operator: true }
         : { presence_mode: 'poll', poll_interval_sec: pollIntervalSec, presence_ttl_sec: ttlSec }
     } else if (args.presence_mode === RESIDENT_PRESENCE_MODE) {
+      if (attachedAuthority(auth)) return fail(403, 'attached_seat_cannot_set_presence_mode')
       // mupot#1494 round 2 (P2-g) — explicit de-registration: clear any prior poll-mode
       // registration so this row falls back to ordinary resident rules (global TTL,
       // runtime && live), exactly as if it had never poll-registered.
@@ -5743,7 +5746,7 @@ const toolCheckIn: ToolSpec = {
       // Not (re-)establishing this call — still slide the TTL window forward if this agent is
       // ALREADY poll-registered from an earlier check_in (cheap: touchPollFleetPresence's WHERE
       // clause makes this a no-op for every other agent, including every resident one).
-      await touchPollFleetPresence(env, auth.boundAgentId)
+      if (!attachedAuthority(auth)) await touchPollFleetPresence(env, auth.boundAgentId)
     }
 
     // S2 (mumega-com#1351): persist fleet_agents.runtime for a seat-bound session from the harness
