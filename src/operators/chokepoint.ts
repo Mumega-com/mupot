@@ -764,6 +764,27 @@ function clampDelegationsForAttached(auth: AuthContext, all: DelegationRow[]): D
 }
 
 /**
+ * The ONE answer to: "may this caller use STANDING authority for this act, or must it hold a grant matching the target?"
+ *
+ * authorizeStructuralWrite opens the agent lane when the agent holds ANY live grant for the act's elevation action
+ * (scope-agnostic, it cannot see the target). A handler that then checks the agent's standing capability FIRST turns a grant
+ * on unrelated scope Y into permission to act on every scope X the agent already administers: no usage-log row, none of the
+ * elevated-path guards (no-self-grant, member cap, ceiling). So a BOUND AGENT must go through the scope-matched elevation
+ * check whenever the act has an elevation door that the standing lane is not independently open for:
+ *  - agentLane 'refuse': the standing lane is never open for an agent, so the only way in is the grant;
+ *  - agentLane 'capability' on a delegable act with DELEGATED_OPERATORS on: delegation replaced the capability lane, so
+ *    only a delegation or a grant opens it (flag off, the pre-W0 capability lane stays, exactly as before).
+ * Humans (no bound agent) keep the standing path. Every handler for an act with an elevationAction and agentLane 'refuse'
+ * MUST consult this; tests/elevation-standing-bypass.test.ts pins that by source scan.
+ */
+export function agentMustHoldMatchingGrant(env: Env, auth: AuthContext, action: StructuralAction): boolean {
+  if (!auth.boundAgentId) return false
+  const policy = STRUCTURAL_ACTIONS[action]
+  if (!policy.elevationAction) return false
+  return policy.agentLane === 'refuse' || (policy.delegable && delegatedOperatorsEnabled(env))
+}
+
+/**
  * THE chokepoint. Call it from every structural write on MCP and HTTP, as the FIRST statement that reads `auth`.
  * `target` may be a thunk: it is invoked only when a live delegation could apply, so an agent with no delegation is
  * refused before any caller-supplied reference is resolved (no existence oracle).
