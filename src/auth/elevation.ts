@@ -1123,7 +1123,7 @@ const ELEVATION_ACTION_BY_TOOL: Readonly<Record<string, string>> = Object.freeze
   grant_agent_capability: 'action:manage_access',
   mint_agent_token: 'action:mint_token',
   create_squad: 'action:project_lifecycle',
-  create_department: 'action:org_structure',
+  create_department: 'action:org_department_create',
   update_department: 'action:org_structure',
   update_squad: 'action:org_structure',
   routine_enable: 'action:routine_policy',

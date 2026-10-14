@@ -127,7 +127,7 @@ export const STRUCTURAL_ACTIONS: Readonly<Record<StructuralAction, StructuralPol
   member_capability_grant: { delegable: true, agentLane: 'refuse' },
   member_capability_revoke: { delegable: true, agentLane: 'refuse' },
 
-  create_department: { delegable: false, agentLane: 'capability', elevationAction: 'action:org_structure' },
+  create_department: { delegable: false, agentLane: 'capability', elevationAction: 'action:org_department_create' },
   activate_addon: { delegable: false, agentLane: 'capability' },
   update_squad: { delegable: false, agentLane: 'refuse', elevationAction: 'action:org_structure' },
   update_department: { delegable: false, agentLane: 'refuse', elevationAction: 'action:org_structure' },
