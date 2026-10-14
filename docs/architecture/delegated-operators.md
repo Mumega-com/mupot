@@ -114,6 +114,23 @@ lane. `seedSquadPack` and `seedOutreachLoop` (human dashboard / admin routes) as
 The caller census matches a writer by NAME anywhere in the source, so an aliased import or a default-injected reference
 (`deps.createSquad ?? createSquad`) cannot hide a caller.
 
+## Fixing departments and squads: who can do what
+
+| Act | Human org admin | Agent | Delegated operator (flag on) |
+|---|---|---|---|
+| `create_department` | yes (standing org admin) | only under a live `action:org_structure` elevation granted at ORG scope (or a standing org-admin grant, the pre-existing lane) | no, not delegable |
+| `update_department` (rename; work departments only) | yes (department admin, org admin inherits) | only under a live `action:org_structure` elevation granted on that department or at org scope; a standing grant never opens it | no, not delegable |
+| `update_squad` (slug, budget) | yes (squad admin, inherited) | only under a live `action:org_structure` elevation granted on that squad, its department, or org; a standing grant never opens it | no, not delegable |
+| `create_squad` | yes | `action:project_lifecycle` on the department, or a capability grant | yes, inside the delegation |
+
+The agent path is the existing elevation mechanism, not a new one: the agent calls `request_elevation` with
+`action:org_structure` and a scope, a human approves it at the secure moment, and the grant is a time window (multi-use
+until it expires or is revoked; every use is written to `elevation_usage_log`). Approving it grants no standing capability.
+It is reversible (everything it can do, a standing admin can undo) and is not a step-up action. It never reaches a home
+department or home squad, never archives or deletes (there is no delete path), and a slug rename into a name that
+`team_bootstrap` has reserved still needs standing department admin. An ATTACHED seat thread is refused `request_elevation`
+and refused these three tools even if a grant row exists for its credential.
+
 ## Flag semantics
 
 - Off: MCP is unchanged. The HTTP doors now apply the same chokepoint: an org-admin agent is refused over HTTP exactly as
