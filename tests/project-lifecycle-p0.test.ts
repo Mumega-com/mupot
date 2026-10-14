@@ -1,9 +1,8 @@
 // Attack-path tests for the 11 P0 lifecycle fixes on the integration branch.
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import {
   evaluateProjectCircuitBreaker,
   defaultCircuitBreakerDeps,
@@ -54,16 +53,13 @@ vi.mock('../src/auth', () => ({
 
 const { projectsApp } = await import('../src/projects')
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'pot-a'
 const BOUNDARY = '2026-07-01T00:00:00.000Z'
 const NOW = '2026-07-23T12:00:00.000Z'
 
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-a', 'dept-a', 'Department A');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-a', 'dept-a', 'squad-a', 'Squad A');

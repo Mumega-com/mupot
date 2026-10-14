@@ -61,23 +61,15 @@
 // production dispatch seam: capability floor -> schema validation -> run()),
 // same pattern as tests/boot-self-report.test.ts.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
 import { ADMIN_PATCHABLE_FIELDS, SELF_FORBIDDEN_FIELDS, SELF_PATCHABLE_FIELDS } from '../src/mcp/provision'
 import { createAgent } from '../src/org/service'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const ORIGIN = 'https://pot.test'
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((name) => name.endsWith('.sql'))
-    .sort()
-}
 
 interface AuthOpts {
   boundAgentId?: string | null
@@ -126,9 +118,7 @@ describe('update_agent — self lane (mupot#1288, reworked post-gate PR #1289)',
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
       INSERT INTO squads (id, department_id, slug, name) VALUES ('${squadId}', 'dept-1', 'sqa', 'Squad A');

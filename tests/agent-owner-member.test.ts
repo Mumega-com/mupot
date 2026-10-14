@@ -10,23 +10,17 @@
 // migrations, tool invoked via `invokeTool` (the real dispatch seam), same
 // pattern as tests/agent-self-update.test.ts.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { invokeTool } from '../src/mcp/index'
 import { ADMIN_PATCHABLE_FIELDS, SELF_FORBIDDEN_FIELDS, SELF_PATCHABLE_FIELDS } from '../src/mcp/provision'
 import { createAgent } from '../src/org/service'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const ORIGIN = 'https://pot.test'
 const TENANT = 'test'
 const squadId = 'sq-a'
-
-function allMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()
-}
 
 interface AuthOpts {
   boundAgentId?: string | null
@@ -62,9 +56,7 @@ describe('update_agent — owner_member_id (mupot#1424, migration 0155)', () => 
 
   beforeEach(async () => {
     harness = createSqliteD1()
-    for (const file of allMigrations()) {
-      harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    }
+    applyAllMigrations(harness.sqlite)
     harness.sqlite.exec(`
       INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Dept One');
       INSERT INTO squads (id, department_id, slug, name) VALUES ('${squadId}', 'dept-1', 'sqa', 'Squad A');

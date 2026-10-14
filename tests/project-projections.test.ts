@@ -4,23 +4,28 @@ import { describe, expect, it, vi } from 'vitest'
 import { listProjectActivity, listProjectEvidence, sanitizeProjectDetail } from '../src/projects/projections'
 import type { Env } from '../src/types'
 import { createSqliteD1 } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
 function harness(options: { includeKeysetMigration?: boolean } = {}) {
   const fixture = createSqliteD1()
   const includeKeysetMigration = options.includeKeysetMigration ?? true
-  for (const file of readdirSync(MIGRATIONS_DIR)
-    .filter((name) => {
-      if (!name.endsWith('.sql')) return false
-      // Pre-keyset path: skip 0059+ (project_id attribution columns + later rebuilds).
-      // mupot#1647: 0173 (tasks_archive_state) stays in — the activity task rows now exclude
-      // archived tasks and that migration shipped long before this simulated window.
-      if (!includeKeysetMigration && name >= '0059_' && !name.startsWith('0173_')) return false
-      return true
-    })
-    .sort()) {
-    fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+  if (includeKeysetMigration) {
+    applyAllMigrations(fixture.sqlite)
+  } else {
+    for (const file of readdirSync(MIGRATIONS_DIR)
+      .filter((name) => {
+        if (!name.endsWith('.sql')) return false
+        // Pre-keyset path: skip 0059+ (project_id attribution columns + later rebuilds).
+        // mupot#1647: 0173 (tasks_archive_state) stays in — the activity task rows now exclude
+        // archived tasks and that migration shipped long before this simulated window.
+        if (name >= '0059_' && !name.startsWith('0173_')) return false
+        return true
+      })
+      .sort()) {
+      fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
+    }
   }
   // Projection fixtures insert historical rows directly; authorization-trigger behavior is
   // covered by the project-link service tests.

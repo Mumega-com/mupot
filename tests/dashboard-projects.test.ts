@@ -1,7 +1,6 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
@@ -37,13 +36,9 @@ const {
 const { dashboardApp, dashboardBuiltInGetRoutes } = await import('../src/dashboard')
 const { projectsApp } = await import('../src/projects')
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
 function makeHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES
       ('dept-a', 'dept-a', 'Department A'),
@@ -461,12 +456,22 @@ describe('project dashboard renderers', () => {
     }))]
     const auth = actor({ memberId: 'member-a', capabilities: grants })
 
-    await expect(loadProjectsPage(env, auth)).resolves.toBeDefined()
-    await expect(loadProjectDetail(env, auth, 'visible-child')).resolves.toBeDefined()
+    await expect(loadProjectsPage(env, auth)).resolves.toMatchObject({
+      visibleProjectCount: 1,
+      nodes: [{ project: { id: 'root' }, children: [{ id: 'visible-child' }] }],
+    })
+    await expect(loadProjectDetail(env, auth, 'visible-child')).resolves.toMatchObject({
+      project: { id: 'visible-child' },
+      aggregates: { directTasks: 1, directSquads: 1, directFlights: 1 },
+    })
     as(auth)
     await expect(dashboardApp.fetch(new Request('https://pot.test/send?project_id=visible-child'), env)).resolves.toHaveProperty('status', 200)
     await expect(dashboardApp.fetch(new Request('https://pot.test/flights?project_id=visible-child'), env)).resolves.toHaveProperty('status', 200)
-    await expect(loadProjectsPage(env, actor({ role: 'owner' }))).resolves.toBeDefined()
+    await expect(loadProjectsPage(env, actor({ role: 'owner' }))).resolves.toMatchObject({
+      visibleProjectCount: 100,
+      capped: true,
+      canManage: true,
+    })
     expect(Math.max(...observed)).toBeLessThanOrEqual(100)
   })
 

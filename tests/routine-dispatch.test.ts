@@ -1,5 +1,3 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { D1Database, D1PreparedStatement } from '@cloudflare/workers-types'
 import type { Env } from '../src/types'
@@ -17,17 +15,15 @@ import { loadProjectSituation } from '../src/projects/situation'
 import { loadOpsHealth } from '../src/dashboard/health'
 import { loadListMetrics, type ProjectAccess } from '../src/dashboard/projects'
 import { loadTaskStatusCounts } from '../src/dashboard/operator-counts'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
-const MIGRATIONS_DIR = join(import.meta.dirname, '..', 'migrations')
 const NOW = new Date('2026-07-19T16:00:00.000Z')
 
 function makeHarness(options: { budgetMicroUsd?: number } = {}): SqliteD1Harness {
   const harness = createSqliteD1()
   const budgetMicroUsd = options.budgetMicroUsd ?? 100000
-  for (const file of readdirSync(MIGRATIONS_DIR).filter(name => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'delivery', 'Delivery');
     INSERT INTO squads (id, department_id, slug, name) VALUES ('squad-1', 'dept-1', 'core', 'Core');

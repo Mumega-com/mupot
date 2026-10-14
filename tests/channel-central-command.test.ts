@@ -21,26 +21,11 @@
 //    tests below — that fence is an unrelated reachability policy, #845-B.)
 
 import { beforeEach, afterEach, describe, expect, it } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 import type { Env } from '../src/types'
 import { readAgentInbox } from '../src/agents/messages'
 import { sha256Hex } from '../src/lib/canonical-json'
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
-
-function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
-  const failures: string[] = []
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()) {
-    try {
-      sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-    } catch (error) {
-      failures.push(`${file}: ${String(error)}`)
-    }
-  }
-  if (failures.length > 0) throw new Error(`migrations did not apply cleanly:\n${failures.join('\n')}`)
-}
 
 describe('central-command ingress (mumega-com#722)', () => {
   let harness: SqliteD1Harness

@@ -4,12 +4,13 @@
 // would succeed if authorizeSquadMembershipWrite dropped that check.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { invokeTool } from '../src/mcp'
 import { authorizeSquadMembershipWrite } from '../src/members/squad-membership'
 import { deleteAgent } from '../src/org/service'
 import type { AuthContext, CapabilityGrant, Env } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
@@ -23,21 +24,6 @@ const CALLER_AGENT_ID = 'agent-hadi'
 const OPERATOR_MEMBER_ID = 'member-operator'
 const AGENT_MEMBER_ID = 'member-kasra'
 const HADI_MEMBER_ID = 'member-hadi'
-
-function applyAllMigrations(sqlite: SqliteD1Harness['sqlite']): void {
-  const files = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
-  for (const file of files) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8')
-    try {
-      sqlite.exec(sql)
-    } catch (err) {
-      const msg = String(err)
-      if (!/already exists|duplicate column|no such (function|module)|near "PRAGMA"/i.test(msg)) {
-        throw new Error(`migration ${file}: ${msg}`)
-      }
-    }
-  }
-}
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
   sqlite.exec(`

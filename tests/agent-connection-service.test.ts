@@ -1,6 +1,4 @@
 import { createHash } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   provisionAgentConnection,
@@ -11,8 +9,8 @@ import { mcpApp } from '../src/mcp'
 import { deleteAgent } from '../src/org/service'
 import type { Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'tenant-a'
 const NOW = new Date('2026-07-24T12:00:00.000Z')
 const OWNER = {
@@ -20,12 +18,6 @@ const OWNER = {
   id: 'owner-1',
   grants: [],
   legacyOrgRole: 'owner' as const,
-}
-
-function applyMigrations(sqlite: SqliteD1Harness['sqlite']): void {
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
 }
 
 function seed(sqlite: SqliteD1Harness['sqlite']): void {
@@ -170,7 +162,7 @@ describe('agent connection provisioning', () => {
 
   beforeEach(() => {
     harness = createSqliteD1()
-    applyMigrations(harness.sqlite)
+    applyAllMigrations(harness.sqlite)
     seed(harness.sqlite)
     env = {
       DB: harness.db,

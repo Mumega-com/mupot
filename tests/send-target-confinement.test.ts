@@ -5,20 +5,15 @@
 // channel_capability_grants UNION query, the real squads.department_id inheritance lookup, and
 // the real project_squad_access join, not a hand-rolled stand-in for them.
 
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { sendToRef, type SendTargetAuthz } from '../src/agents/messages'
 import type { Env, CapabilityGrant } from '../src/types'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1 } from './helpers/sqlite-d1'
-
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 
 function migratedDb() {
   const fixture = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    fixture.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(fixture.sqlite)
   fixture.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept', 'dept', 'Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES

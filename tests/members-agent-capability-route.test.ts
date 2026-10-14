@@ -1,8 +1,7 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthContext, Env } from '../src/types'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
+import { applyAllMigrations } from './helpers/migrations'
 
 const authState = vi.hoisted(() => ({ current: null as AuthContext | null }))
 
@@ -22,7 +21,6 @@ vi.mock('../src/auth', () => ({
 
 const { membersApp } = await import('../src/members')
 
-const MIGRATIONS_DIR = join(__dirname, '..', 'migrations')
 const TENANT = 'tenant-a'
 const AGENT_ID = 'agent-1'
 const MEMBER_ID = 'member-1'
@@ -31,9 +29,7 @@ const TARGET_SQUAD_ID = 'squad-target'
 
 function createHarness(): SqliteD1Harness {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   harness.sqlite.exec(`
     INSERT INTO departments (id, slug, name) VALUES ('dept-1', 'dept', 'Department');
     INSERT INTO squads (id, department_id, slug, name) VALUES

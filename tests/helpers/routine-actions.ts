@@ -1,14 +1,11 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
 import { vi } from 'vitest'
 import { canonicalJsonDigest } from '../../src/lib/canonical-json'
 import { loadProjectSituation } from '../../src/projects/situation'
 import type { RoutinePrincipal } from '../../src/routines/access'
 import type { RoutineProposal, RoutineProposalAction } from '../../src/routines/proposal'
 import type { Env, Project } from '../../src/types'
+import { applyAllMigrations } from './migrations'
 import { createSqliteD1, type SqliteD1Harness } from './sqlite-d1'
-
-const MIGRATIONS_DIR = join(import.meta.dirname, '..', '..', 'migrations')
 
 export interface ReadyRoutineFixture {
   harness: SqliteD1Harness
@@ -22,9 +19,7 @@ export async function makeReadyRoutineFixture(
   executionMode: 'propose' | 'execute_internal' = 'execute_internal',
 ): Promise<ReadyRoutineFixture> {
   const harness = createSqliteD1()
-  for (const file of readdirSync(MIGRATIONS_DIR).filter(name => name.endsWith('.sql')).sort()) {
-    harness.sqlite.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'))
-  }
+  applyAllMigrations(harness.sqlite)
   const policy = JSON.stringify({
     execution_mode: executionMode,
     overlap_policy: 'skip',

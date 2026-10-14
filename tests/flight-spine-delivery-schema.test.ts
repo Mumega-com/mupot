@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { applyAllMigrations, resetMigrationCache } from './helpers/migrations'
+import { applyAllMigrations } from './helpers/migrations'
 import { createSqliteD1, type SqliteD1Harness } from './helpers/sqlite-d1'
 
 const TENANT = 'tenant-flight-3'
@@ -335,7 +335,6 @@ function reserveAndConsumeRecovery(
 }
 
 beforeEach(() => {
-  resetMigrationCache()
   harness = createSqliteD1()
   applyAllMigrations(harness.sqlite)
   seedBase()
