@@ -265,4 +265,5 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:register_key',
   'action:mint_token',
   'action:routine_archive', // irreversible
+  'action:org_department_create', // irreversible: no tool deletes or archives a department
 ])

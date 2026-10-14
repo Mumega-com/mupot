@@ -204,6 +204,8 @@ describe('action:org_structure is a real, requestable, reversible elevation acti
     expect(ELEVATION_ACTIONS['action:org_structure'].effect).toBe('reversible')
     expect(REQUESTABLE_ELEVATION_ACTION_KEYS).toContain('action:org_structure')
     expect(SENSITIVE_STEP_UP_ACTIONS.has('action:org_structure')).toBe(false)
+    // irreversible creation needs a FRESH reauthentication at approval, like the other irreversible actions
+    expect(SENSITIVE_STEP_UP_ACTIONS.has('action:org_department_create')).toBe(true)
   })
 
   it('the agent holds no standing admin, so every success below is attributable to the grant', async () => {
@@ -612,6 +614,22 @@ describe('post-review hardening on the current head (bot P1s)', () => {
       db.prepare = original
     }
     expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBe(400) // never 900
+  })
+})
+
+describe('an elevated budget change is its own call (round-3 lens P2-A)', () => {
+  it('a cap change together with a slug is refused BEFORE anything is written (no partial commit without a usage row)', async () => {
+    const sessionId = await checkIn()
+    await approve(sessionId, 'squad', SQUAD_A1, 60, T0)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 1000 })).ok).toBe(true)
+    const out = await updateSquad(SQUAD_A1, { budget_cap_cents: 400, slug: 'a1-new-sqd' })
+    expect(out.ok, JSON.stringify(out)).toBe(false)
+    expect(JSON.stringify(out)).toContain('send_budget_cap_alone')
+    expect(squadRow(SQUAD_A1)?.budget_cap_cents).toBe(1000)
+    expect(squadRow(SQUAD_A1)?.slug).not.toBe('a1-new-sqd')
+    // a slug-only change and a cap-only change are each fine
+    expect((await updateSquad(SQUAD_A1, { slug: 'a1-new-sqd' })).ok).toBe(true)
+    expect((await updateSquad(SQUAD_A1, { budget_cap_cents: 400 })).ok).toBe(true)
   })
 })
 

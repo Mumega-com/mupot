@@ -2790,6 +2790,11 @@ const toolUpdateSquad: ToolSpec = {
     // could both read 1000 and then write 400 and 900 (the second RAISES the live cap). So an elevated budget change is a
     // compare-and-swap against the value this call observed, and a lost race is a conflict, never a silent raise (bot P1).
     if (elevationGrantId && 'budget_cap_cents' in patch) {
+      // A budget change is its own call: the compare-and-swap below and a slug write cannot be one transaction, and a slug
+      // failure after a committed cap change would leave an elevated write with no usage row (round-3 lens P2-A).
+      if (changedKeys.length > 1) {
+        return fail(400, 'invalid_args', { reason: 'send_budget_cap_alone', remedy: 'An elevated agent changes the budget cap in its own call, not together with other fields.' })
+      }
       const next = patch.budget_cap_cents
       if (!(typeof next === 'number' && Number.isInteger(next) && next > 0)) {
         return fail(400, 'invalid_args', { reason: 'budget_cap_cents must be a positive integer for an elevated agent' })
