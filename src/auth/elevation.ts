@@ -441,6 +441,8 @@ async function decidedByHasElevationAuthority(
   )
 }
 
+// NOTE: the `live` CASE below mirrors findLiveAttachment (src/members/seat-attach.ts) minus the human's own grant token, which a
+// decision surface does not hold; tests/attached-sudo.test.ts breaks each mirrored condition in turn and asserts the decision is refused (the table-driven 'liveness' test).
 // ── "sudo for attached chats": the attachment a session belongs to ──────────────────────────────────────────────────
 // An ATTACHED chat (W2 seat_attach) acts with its OWN credential, a member_tokens row created for exactly that one
 // attachment (agent_seat_attachments.seat_token_id; its raw secret is discarded at attach time, nothing can present it
@@ -462,9 +464,17 @@ export async function loadAttachmentOriginOfSession(env: Env, tenant: string, cr
     const row = await env.DB.prepare(
       `SELECT att.id AS attachment_id, att.human_member_id AS human_member_id, att.agent_id AS agent_id,
               CASE WHEN att.detached_at IS NULL AND adm.status = 'live'
-                    AND EXISTS (SELECT 1 FROM agent_seats s WHERE s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL)
-                    AND EXISTS (SELECT 1 FROM agents a WHERE a.id = att.agent_id AND a.status = 'active')
-                    AND EXISTS (SELECT 1 FROM member_tokens t WHERE t.id = att.seat_token_id AND t.tenant = att.tenant
+                    AND EXISTS (SELECT 1 FROM agent_seats s WHERE s.id = att.seat_id AND s.tenant = att.tenant AND s.retired_at IS NULL
+                                  AND s.member_id = att.human_member_id AND s.harness_id = att.harness_id)
+                    AND EXISTS (SELECT 1 FROM agents a
+                                  JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = a.id
+                                  JOIN members am ON am.id = b.member_id AND am.tenant = att.tenant AND am.status = 'active'
+                                 WHERE a.id = att.agent_id AND a.status = 'active')
+                    AND adm.agent_id = att.agent_id AND adm.human_member_id = att.human_member_id AND adm.harness_id = att.harness_id
+                    AND EXISTS (SELECT 1 FROM harnesses hr WHERE hr.id = att.harness_id AND hr.tenant = att.tenant AND hr.member_id = att.human_member_id)
+                    AND EXISTS (SELECT 1 FROM member_tokens t
+                                 JOIN agent_member_bindings tb ON tb.tenant = att.tenant AND tb.agent_id = att.agent_id AND tb.member_id = t.member_id
+                                 WHERE t.id = att.seat_token_id AND t.tenant = att.tenant AND t.agent_id = att.agent_id AND t.channel = 'directory'
                                   AND ${TOKEN_LIVE_PREDICATE('?3')})
                    THEN 1 ELSE 0 END AS live
          FROM agent_seat_attachments att
