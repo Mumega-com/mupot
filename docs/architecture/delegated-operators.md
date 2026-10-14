@@ -148,11 +148,13 @@ no admin of its own. Its one way up is `request_elevation`, per action, never bl
 - **Whose session.** The request binds to the attachment's OWN agent session, the same resolution every elevation uses: the session
   is keyed on the attachment's own credential (`agent_seat_attachments.seat_token_id`, a token minted for that one attachment).
   A second chat attached to the same agent, the agent's own session and the human's plain seat do not inherit the grant.
-- **Who approves.** Only the human who attached the chat, with their passkey (the secure moment, or the dashboard / Access page with
-  a fresh reauth: an attached chat's request is always a step-up decision, even though `org_structure` is not itself "sensitive").
-  Another org admin is refused (approve and deny), the request is not listed to them, and the Telegram mini-app obeys the same
-  predicate. The attaching human is DERIVED on every read from the session's credential (`loadAttachmentOriginOfSession`), never a
-  stored claim on the request row, so there is nothing to forge and no migration.
+- **Who approves.** Only the human who attached the chat. On the secure moment (`/m`) and the dashboard / Access page that is a
+  passkey / fresh-reauth step-up. KNOWN GAP (follow-up filed): the Telegram mini-app decides with a device tap and does not
+  yet enforce the step-up for attached-origin requests; the approver check itself holds there. Another org admin is refused
+  (approve and deny), is not shown the request on the dashboard (not even in the "outside your authority" count), and
+  the Telegram button goes to the attaching human, not the agent's owner. The attaching human is DERIVED on every read from the
+  session's credential (`loadAttachmentOriginOfSession`), never a stored claim on the request row, so there is nothing to
+  forge and no migration. Only that human (or expiry) can close the request: no other admin can deny it.
 - **How far.** The ceiling is the approver rule: the scope must be one where the attaching human holds admin (checked at the
   decision, re-checked live at every use together with the approving web session). Sudo lends the human's own admin on that exact
   scope for that exact act; it never exceeds what the human could do by hand, and the agent's own grants are untouched. A ceiling
