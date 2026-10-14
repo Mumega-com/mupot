@@ -1459,6 +1459,20 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(again.sc.approve_url ?? null).toBeNull()
     expect(n(`SELECT COUNT(*) AS n FROM secure_moments WHERE kind = 'seat_admit'`)).toBe(1)
   })
+  it('prose never claims a member clamp: the attach note and boot_context say the ceiling is member/lead/full and point at effective_capabilities', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    const done = await admitAndAttach(env, g, 'conv-a')
+    void done
+    const b = await boot(env, g, 'conv-a')
+    const next = String(b.sc.next_step ?? '')
+    expect(next).toContain('effective_capabilities')
+    expect(next).not.toContain('clamped to member level')
+    const again = await attach(env, g, 'conv-b', 'rava')
+    expect(String(again.sc.note ?? '')).not.toContain('at most member-level')
+    expect(String(again.sc.note ?? '')).toContain('effective_capabilities')
+  })
+
   it('the seat_attach tool\'s own seat.attached guard: refused with zero writes (the library refuses the same way: defence in depth)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)
