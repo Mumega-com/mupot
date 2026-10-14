@@ -1074,6 +1074,14 @@ describe('authority doors: an attached seat never inherits what the agent IS', (
     expect(JSON.stringify(poll)).toContain('attached_seat_cannot_set_presence_mode')
     const resid = await invokeTool(att, env, 'check_in', { presence_mode: 'resident' }, 'https://pot.test')
     expect(JSON.stringify(resid)).toContain('attached_seat_cannot_set_presence_mode')
+    // an attached thread's ordinary activity must not refresh the agent HOST's poll heartbeat (dispatch would see an offline host as live)
+    h.sqlite.exec(`INSERT OR REPLACE INTO fleet_agents (agent_id, tenant, runtime, status, reported_by, presence_mode, presence_ttl_sec, last_reported_at, updated_at)
+      VALUES ('agent-rava', '${TENANT}', 'claude-code', 'running', 'agent-rava', 'poll', 90, '2026-01-01 00:00:00', '2026-01-01 00:00:00')`)
+    const lastReported = () => (h.sqlite.prepare(`SELECT last_reported_at AS t FROM fleet_agents WHERE agent_id = 'agent-rava'`).get() as { t: string }).t
+    await invokeTool(att, env, 'task_list', {}, 'https://pot.test')
+    await invokeTool(att, env, 'inbox', { peek: true }, 'https://pot.test')
+    await invokeTool(att, env, 'inbox_lease', {}, 'https://pot.test')
+    expect(lastReported()).toBe('2026-01-01 00:00:00')
   })
 
 })

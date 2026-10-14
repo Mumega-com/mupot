@@ -1382,7 +1382,8 @@ const toolTaskList: ToolSpec = {
     // mupot#1494 round 3 (P2-c) — touch AFTER every read/write above has succeeded, not
     // merely after the tool-layer 400/403/404 refusals: this is the LAST thing on the success
     // path, so a refusal at ANY layer (tool or service) leaves last_reported_at untouched.
-    if (!ctx?.sideEffectFree) await touchPollFleetPresence(env, auth.boundAgentId)
+    // W2: an attached thread's activity is not the agent host's heartbeat (it would keep an offline host looking live to dispatch).
+    if (!ctx?.sideEffectFree && !attachedAuthority(auth)) await touchPollFleetPresence(env, auth.boundAgentId)
 
     return done({
       squad_id: squadRes.squad.id,
@@ -4976,7 +4977,7 @@ const toolInbox: ToolSpec = {
     // consumer_fenced, or a service-layer 400) — that is a refusal too, and must leave
     // last_reported_at untouched exactly like a tool-layer refusal does. Last thing on the
     // success path only.
-    await touchPollFleetPresence(env, agent)
+    if (!attachedAuthority(auth)) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat
     // `complete` is surfaced deliberately: a caller must be able to know it was
     // handed everything WITHOUT comparing a length against a cap it has to know.
     return done({
@@ -5123,7 +5124,7 @@ const toolInboxLease: ToolSpec = {
     // WITHIN leaseAgentInbox's attempt-id branch (a SERVICE-layer refusal) after the touch had
     // already run — a trivially repeatable no-op call held the agent 'live' forever. Last
     // thing on the success path only, regardless of which layer would have refused.
-    await touchPollFleetPresence(env, agent)
+    if (!attachedAuthority(auth)) await touchPollFleetPresence(env, agent) // W2: attached activity is not the host's heartbeat
     if ('state' in res) return done({
       tenant: res.tenant,
       agent_id: res.agent_id,
