@@ -369,15 +369,34 @@ export function callerCanGrantAgentCapability(
 // attached-seat refusal below cannot be forgotten on one of them. An ATTACHED thread acts for the attaching human
 // under an admission ceiling and is already refused request_elevation (attached_seat_cannot_elevate); a grant row
 // bound to its credential must not open org structure either, whatever put it there.
+const ORG_STRUCTURE_ACTION = 'action:org_structure'
+const ORG_DEPARTMENT_CREATE_ACTION = 'action:org_department_create'
+
 async function orgStructureElevation(
   env: Env,
   auth: AuthContext,
   scopeType: 'org' | 'department' | 'squad',
   scopeId: string | null,
-  opts: { toolName: string; detail: unknown; squadDepartmentId?: string | null },
+  opts: { toolName: string; detail: unknown; squadDepartmentId?: string | null; action?: string },
 ) {
   if (attachedAuthority(auth)) return { granted: false as const, reason: 'not_agent_session' as const }
-  return hasElevatedAction(env, auth, 'action:org_structure', scopeType, scopeId, opts)
+  const { action, ...rest } = opts
+  // recordUsage:false: authorization alone writes NO elevation_usage_log row. The caller logs ONE itemized row AFTER the write
+  // succeeds (recordOrgStructureUsage), so a refused or failed attempt never appears as an applied use (bot P1, Opus P1-2).
+  return hasElevatedAction(env, auth, action ?? ORG_STRUCTURE_ACTION, scopeType, scopeId, { ...rest, recordUsage: false })
+}
+
+async function recordOrgStructureUsage(
+  env: Env,
+  grant: ElevationGrantRecord | undefined,
+  action: string,
+  toolName: string,
+  detail: unknown,
+): Promise<void> {
+  if (!grant) return
+  // Not wrapped in try/catch on purpose (same rule as mint_agent_token): if the audit row cannot be written the tool call
+  // fails even though the write committed, rather than report success with no trail.
+  await recordElevationUsage(env, env.TENANT_SLUG, grant.id, grant.agent_session_id, action, toolName, detail, Date.now())
 }
 
 // ── create_department ───────────────────────────────────────────────────────────
@@ -403,14 +422,19 @@ const toolCreateDepartment: ToolSpec = {
     // elevation path at all. org_structure is a SEPARATE key, so an approver who ticks "Create/update departments and
     // squads" at org scope has said exactly that and nothing about projects, tokens or access. A department/squad-
     // scoped org_structure grant does NOT match here (hasElevatedAction needs an org-scope grant for scope 'org').
+    // An attached thread never creates departments, even when its ceiling-clamped grants include org admin (bot P1): refuse
+    // BEFORE the standing-capability lane below, which would otherwise skip the only attached-seat refusal.
+    if (attachedAuthority(auth)) return fail(403, 'forbidden', { reason: 'attached_seat_no_org_structure' })
     const deptGate = await structuralGate(env, auth, 'create_department')
     if (deptGate.kind === 'refused') return structuralFail(deptGate)
     const grants = auth.capabilities ?? []
     let elevationGrantId: string | undefined
+    let elevatedGrant: ElevationGrantRecord | undefined
     if (!hasCapability(grants, 'org', null, 'admin')) {
       const elevated = await orgStructureElevation(env, auth, 'org', null, {
         toolName: 'create_department',
         detail: { slug: args.slug },
+        action: ORG_DEPARTMENT_CREATE_ACTION,
       })
       if (!elevated.granted) {
         return fail(403, 'forbidden', {
