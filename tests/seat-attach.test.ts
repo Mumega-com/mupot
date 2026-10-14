@@ -641,7 +641,7 @@ describe('authority: the clamp, the gates, the live re-check', () => {
     const rs = await Promise.all([1, 2, 3].map(() => attachSeatToAgent(env, { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'tool' })))
     expect(rs.filter((r) => r.ok && r.status === 'attached').length).toBeGreaterThanOrEqual(1)
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ? AND detached_at IS NULL`, seatB)).toBe(1)
-    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'attach:rava'`)).toBe(2) // one per live attachment: no orphan token from the losers
+    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label LIKE 'attach:rava:%'`)).toBe(2) // one per live attachment: no orphan token from the losers
   })
 })
 
@@ -669,7 +669,7 @@ describe('findLiveAttachment: every conjunct is load-bearing (forged / drifted r
   })
   it('the attachment\'s own server-held token revoked resolves nothing', async () => {
     const { live } = await setup()
-    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-10-13 00:00:00' WHERE label = 'attach:rava'`)
+    h.sqlite.exec(`UPDATE member_tokens SET revoked_at = '2026-10-13 00:00:00' WHERE label LIKE 'attach:rava:%'`)
     expect(await live()).toBeNull()
   })
   it('an admission whose harness or human does not match the attachment resolves nothing (forged row)', async () => {
@@ -1246,7 +1246,7 @@ describe('pool exhaustion: idle attached threads are unpinned; thread labels', (
     expect(typeof s2.boundAgentId).toBe('string')
     expect(s2.seatInputs?.autoSeatRefused).toBeUndefined()
     expect(one(`SELECT detach_reason FROM agent_seat_attachments`)).toEqual({ detach_reason: 'idle_expired' })
-    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'attach:rava' AND revoked_at IS NOT NULL`)).toBe(1)
+    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label LIKE 'attach:rava:%' AND revoked_at IS NOT NULL`)).toBe(1)
     expect((await boot(env, g, 'k1')).sc.bound_agent_id).not.toBe('agent-rava')
   })
   it('an attached thread idle for LESS than 30 days is not swept', async () => {
@@ -1325,7 +1325,7 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     const r = await attachSeatToAgent(racing(env, `UPDATE agents SET status = 'inactive' WHERE id = 'agent-rava'`), { humanMemberId: HUMAN, seatId: seatB, agentRef: 'agent-rava', via: 'tool' })
     expect(r).toEqual({ ok: false, error: 'attach_refused' })
     expect(n(`SELECT COUNT(*) AS n FROM agent_seat_attachments WHERE seat_id = ?`, seatB)).toBe(0)
-    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label = 'attach:rava'`)).toBe(1) // no orphan token
+    expect(n(`SELECT COUNT(*) AS n FROM member_tokens WHERE label LIKE 'attach:rava:%'`)).toBe(1) // no orphan token
   })
   it('the admission being revoked between the checks and the write refuses the attach (admission live in the INSERT)', async () => {
     const env = envFor(h)
@@ -1381,6 +1381,34 @@ describe('mutation survivors from round 1: every guard in the attach / promote w
     expect(one<{ status: string }>(`SELECT status FROM agent_seat_admissions`)?.status).toBe('pending')
     expect(n(`SELECT COUNT(*) AS n FROM agent_audit WHERE action = 'seat_admit'`)).toBe(0)
   })
+  it('post-merge review: the decision sequence runs under waitUntil (a consumed moment cannot strand a pending admission)', async () => {
+    const env = envFor(h)
+    const g = await grant(env, HUMAN)
+    await boot(env, g, 'conv-a')
+    const pend = await attach(env, g, 'conv-a', 'rava')
+    const { loadAdmission, decideSeatAdmission } = await import('../src/members/seat-attach')
+    const adm = (await loadAdmission(env, String(pend.sc.admission_id)))!
+    for (const decision of ['deny', 'approve'] as const) {
+      const registered: Promise<unknown>[] = []
+      await decideSeatAdmission(env, { adm, decision, proof: { memberId: HUMAN, via: 'webauthn', evidence: {} }, gate: async () => false, waitUntil: (p) => { registered.push(p) } }, Date.now())
+      expect(registered.length, decision).toBe(1)
+    }
+  })
+
+  it('post-merge review: every attached thread gets its OWN inbox seat label; dead letters are refused to attached threads', async () => {
+    const env = envFor(h)
+    const { invokeTool } = await import('../src/mcp/index')
+    const g = await grant(env, HUMAN)
+    await admitAndAttach(env, g, 'conv-a')
+    await attach(env, g, 'conv-b', 'rava') // admission is live now: attaches immediately
+    const labels = (h.sqlite.prepare(`SELECT t.label AS label FROM agent_seat_attachments a JOIN member_tokens t ON t.id = a.seat_token_id WHERE a.detached_at IS NULL`).all() as Array<{ label: string }>).map((r) => r.label)
+    expect(labels.length).toBe(2)
+    expect(new Set(labels).size).toBe(2)
+    for (const l of labels) expect(l.startsWith('attach:rava')).toBe(true)
+    const att = await applySeatForRequest(env, g.ctx, { hints: NO_HINTS, autoKeys: { openaiSession: 'conv-a', codexThreadId: null } })
+    expect(JSON.stringify(await invokeTool(att, env, 'inbox_dead_letters', {}, 'https://pot.test'))).toContain('attached_seat_peek_only')
+  })
+
   it('the seat_attach tool\'s own seat.attached guard: refused with zero writes (the library refuses the same way: defence in depth)', async () => {
     const env = envFor(h)
     const g = await grant(env, HUMAN)

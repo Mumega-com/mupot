@@ -354,6 +354,14 @@ export async function admissionView(env: Env, adm: AdmissionRow): Promise<{ agen
   return { agentName: a?.name ?? adm.agent_id, agentSlug: a?.slug ?? '', harnessName: h?.client_name ?? '', harnessKind: h?.kind ?? '', seatLabel: s?.label_basename ?? null }
 }
 
+// Same contract as durably() in access/decision-core (not imported: that module pulls the whole MCP tool graph into this
+// leaf and creates an import cycle). Run `fn` to completion even if the client goes away; the caller still awaits it.
+function durablyLocal<T>(waitUntil: WaitUntil | undefined, fn: () => Promise<T>): Promise<T> {
+  const p = fn()
+  if (waitUntil) waitUntil(p.then(() => undefined, () => undefined))
+  return p
+}
+
 /**
  * The passkey-verified human decides an admission. Every refusable check runs BEFORE the one-time gate (a refusal
  * never burns the link). Only the admission's own human may decide it: a passkey of any other member is refused.
@@ -368,25 +376,29 @@ export async function decideSeatAdmission(
     return { status: 403, title: 'Not allowed', message: 'This passkey belongs to a member who may not decide this request.', tone: 'bad' }
   }
   const nowIso = new Date(nowMs).toISOString()
-  if (decision === 'deny') {
+  // The gate consumes the one-time moment, then a write follows: run the whole sequence under waitUntil so an interrupted
+  // request cannot leave the moment closed with the admission still pending (bot review P2).
+  return durablyLocal(input.waitUntil, async (): Promise<Outcome> => {
+    if (decision === 'deny') {
+      if (!(await input.gate())) return CLOSED
+      const r = await env.DB.prepare(
+        `UPDATE agent_seat_admissions SET status = 'denied', decided_at = ?2, decided_by_member_id = ?3, decided_via = 'webauthn'
+          WHERE id = ?1 AND tenant = ?4 AND human_member_id = ?3 AND status = 'pending'`,
+      ).bind(adm.id, nowIso, proof.memberId, env.TENANT_SLUG).run()
+      return r.meta.changes === 1
+        ? { status: 200, title: 'Denied', message: 'The thread was not admitted. Nothing was attached.', tone: 'ok' }
+        : CLOSED
+    }
+    const refusal = await admissionRefusal(env, adm)
+    if (refusal) {
+      return { status: 409, title: 'Cannot admit', message: `This admission can no longer be granted (${refusal}). Nothing was changed.`, tone: 'warn' }
+    }
     if (!(await input.gate())) return CLOSED
-    const r = await env.DB.prepare(
-      `UPDATE agent_seat_admissions SET status = 'denied', decided_at = ?2, decided_by_member_id = ?3, decided_via = 'webauthn'
-        WHERE id = ?1 AND tenant = ?4 AND human_member_id = ?3 AND status = 'pending'`,
-    ).bind(adm.id, nowIso, proof.memberId, env.TENANT_SLUG).run()
-    return r.meta.changes === 1
-      ? { status: 200, title: 'Denied', message: 'The thread was not admitted. Nothing was attached.', tone: 'ok' }
+    const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member')
+    return landed
+      ? { status: 200, title: 'Admitted', message: `Threads from this app can now attach to that agent (ceiling: ${input.ceiling ?? 'member'}). Ask the thread to call seat_attach again: it attaches immediately.`, tone: 'ok' }
       : CLOSED
-  }
-  const refusal = await admissionRefusal(env, adm)
-  if (refusal) {
-    return { status: 409, title: 'Cannot admit', message: `This admission can no longer be granted (${refusal}). Nothing was changed.`, tone: 'warn' }
-  }
-  if (!(await input.gate())) return CLOSED
-  const landed = await promoteAdmission(env, adm, proof.memberId, 'webauthn', nowIso, input.ceiling ?? 'member')
-  return landed
-    ? { status: 200, title: 'Admitted', message: `Threads from this app can now attach to that agent (ceiling: ${input.ceiling ?? 'member'}). Ask the thread to call seat_attach again: it attaches immediately.`, tone: 'ok' }
-    : CLOSED
+  })
 }
 
 // ── the per-request chokepoint ───────────────────────────────────────────────
@@ -576,7 +588,7 @@ export async function attachSeatToAgent(
      SELECT ?1, b.member_id, ?2, ?3, 'directory', datetime('now'), b.agent_id, ?4
        FROM agent_seat_attachments att JOIN agent_member_bindings b ON b.tenant = att.tenant AND b.agent_id = att.agent_id
       WHERE att.id = ?5 AND att.seat_token_id = ?1`,
-  ).bind(tokenId, tokenHash, `attach:${agent.slug}`.slice(0, 120), env.TENANT_SLUG, attachmentId))
+  ).bind(tokenId, tokenHash, `attach:${agent.slug}`.slice(0, 100) + `:${seat.id.slice(-12)}`, env.TENANT_SLUG, attachmentId))
   statements.push(auditInsert(env, agent.id, p.humanMemberId, 'seat_attach',
     { attachment_id: attachmentId, seat_id: seat.id, admission_id: admission.admission.id, harness_id: seat.harness_id, human_member_id: p.humanMemberId },
     'EXISTS (SELECT 1 FROM agent_seat_attachments WHERE id = ?6)', [attachmentId]))
