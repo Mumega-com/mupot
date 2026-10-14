@@ -114,6 +114,25 @@ lane. `seedSquadPack` and `seedOutreachLoop` (human dashboard / admin routes) as
 The caller census matches a writer by NAME anywhere in the source, so an aliased import or a default-injected reference
 (`deps.createSquad ?? createSquad`) cannot hide a caller.
 
+## Fixing departments and squads: who can do what
+
+| Act | Human org admin | Agent | Delegated operator (flag on) |
+|---|---|---|---|
+| `create_department` | yes (standing org admin) | only under a live **`action:org_department_create`** elevation granted at ORG scope (or a standing org-admin agent grant, the pre-existing lane). **Irreversible**: no tool deletes or archives a department. | no, not delegable |
+| `update_department` (rename; work departments only) | yes (department admin, org admin inherits) | only under a live `action:org_structure` elevation granted on that department or at org scope; standing authority never opens it for an agent | no, not delegable |
+| `update_squad` (slug, budget) | yes (squad admin, inherited) | only under a live `action:org_structure` elevation granted on that squad, its department, or org; standing authority never opens it for an agent. An elevated agent may only **lower** the budget cap to a positive value (no raise, no clear, no 0, no window change), written as a compare-and-swap | no, not delegable |
+| `create_squad` | yes | `action:project_lifecycle` on the department, or a capability grant | yes, inside the delegation |
+
+The agent path is the existing elevation mechanism, not a new one: the agent calls `request_elevation` with the action and a
+scope, a human approves it at the secure moment, and the grant is a time window (multi-use until it expires or is revoked).
+**One itemized `elevation_usage_log` row is written per SUCCESSFUL write** (after it commits); a refused or failed attempt writes
+none. Approving grants no standing capability. `action:org_structure` is reversible (a standing admin can undo everything it
+does) and is not a step-up action; `action:org_department_create` is classified irreversible so the approval screen does not
+call the created department undoable. Neither reaches a home department or home squad, neither archives or deletes, and a slug
+rename into a name that `team_bootstrap` has reserved still needs standing department admin (a bound agent never satisfies that
+with standing authority). An ATTACHED seat thread is refused `request_elevation` and refused these three tools up front, even
+when its ceiling-clamped grants include org admin and even if a grant row exists for its credential.
+
 ## Flag semantics
 
 - Off: MCP is unchanged. The HTTP doors now apply the same chokepoint: an org-admin agent is refused over HTTP exactly as

@@ -105,6 +105,34 @@ export interface DepartmentInput {
   name?: unknown
 }
 
+export type UpdateDepartmentResult =
+  | { ok: true; before: { name: string }; after: { name: string } }
+  | { ok: false; error: 'not_found' | 'invalid_name' | 'home_department' }
+
+/**
+ * Rename a WORK department. NO authz inside (same doctrine as createDepartment: the MCP tool gates before calling).
+ * Name only: departments carry no description or status column today, and there is NO delete path here by design.
+ * A kind='home' department is a member's private room and is never renamed through this path.
+ */
+export async function updateDepartment(
+  env: Env,
+  id: string,
+  patch: { name?: unknown },
+): Promise<UpdateDepartmentResult> {
+  if (!isNonEmptyString(patch.name)) return { ok: false, error: 'invalid_name' }
+  const name = patch.name.trim()
+  const before = await env.DB.prepare('SELECT name, kind FROM departments WHERE id = ?1')
+    .bind(id)
+    .first<{ name: string; kind: OrgKind }>()
+  if (!before) return { ok: false, error: 'not_found' }
+  if (before.kind !== 'work') return { ok: false, error: 'home_department' }
+  const res = await env.DB.prepare("UPDATE departments SET name = ?1 WHERE id = ?2 AND kind = 'work'")
+    .bind(name, id)
+    .run()
+  if (!res.meta.changes) return { ok: false, error: 'not_found' }
+  return { ok: true, before: { name: before.name }, after: { name } }
+}
+
 export async function createDepartment(
   env: Env,
   input: DepartmentInput,
@@ -1982,4 +2010,19 @@ export async function deleteAgent(
   ])
   if (!writes[1]?.meta.changes) return { ok: false, error: 'not_found' }
   return { ok: true }
+}
+
+
+/**
+ * Compare-and-swap a squad's budget cap: write `next` ONLY if the cap still equals the value the caller observed (null means
+ * 'no cap'). Returns false when it changed in between, so two overlapping elevated updates can never end in a raise. NO authz
+ * inside (the MCP tool gates before calling and validates that `next` is a positive integer lower than `observed`).
+ */
+export async function lowerSquadBudgetCap(env: Env, squadId: string, observed: number | null, next: number): Promise<boolean> {
+  const res = await env.DB.prepare(
+    'UPDATE squads SET budget_cap_cents = ?1 WHERE id = ?2 AND ((?3 IS NULL AND budget_cap_cents IS NULL) OR budget_cap_cents = ?3)',
+  )
+    .bind(next, squadId, observed)
+    .run()
+  return res.meta.changes > 0
 }

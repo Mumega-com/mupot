@@ -151,6 +151,7 @@ export const TOOL_ANNOTATION_ROWS: Readonly<Record<string, AnnotationRow>> = {
 
   // ── org / agents / tokens ──────────────────────────────────────────────────────────────────
   create_department: ADD('INSERT departments (org/service.ts:141)'),
+  update_department: MUT('updateDepartment UPDATE departments.name (org/service.ts, work departments only)'),
   create_squad: ADD('INSERT squads (org/service.ts:270)'),
   create_agent: ADD('createAgent batch INSERT (org/service.ts:959)'),
   resolve_agent: RO('findAgentsByName SELECT only (org/service.ts:1064)'),

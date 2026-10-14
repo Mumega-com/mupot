@@ -88,6 +88,26 @@ export const ELEVATION_ACTIONS: Readonly<Record<string, ElevationActionDef>> = O
     effect: 'reversible',
     effectNote: 'Created/updated records can be edited or removed by standing authority after expiry.',
   },
+  // Org STRUCTURE gets its OWN keys, not a widening of action:project_lifecycle: that grant is approved under the label
+  // "Create/update squads" and a live grant must never acquire department power it was not approved for.
+  // Creating a department is its OWN, IRREVERSIBLE action (below): there is no delete/archive path for departments, so a
+  // department created under an elevation outlives it and the approval screen must not call it undoable (bot P1).
+  'action:org_department_create': {
+    key: 'action:org_department_create',
+    enforced: true,
+    label: 'Create a department (cannot be undone)',
+    description: 'Create one or more departments. Org scope only (a department or squad grant does not match). There is no delete path: a department created here stays until standing authority removes it by hand.',
+    effect: 'irreversible',
+    effectNote: 'Created departments are never removed automatically and no tool deletes or archives a department; standing authority must clean up by hand.',
+  },
+  'action:org_structure': {
+    key: 'action:org_structure',
+    enforced: true,
+    label: 'Create/update departments and squads',
+    description: 'Rename a work department, or update a squad (slug, and LOWER its budget cap) inside the scope you have been granted. Cannot raise or clear a budget, never archives or deletes, never creates a department.',
+    effect: 'reversible',
+    effectNote: 'Renamed departments and updated squads can be edited again by standing authority after expiry.',
+  },
   'action:workspace_project': {
     key: 'action:workspace_project',
     enforced: true,
@@ -245,4 +265,5 @@ export const SENSITIVE_STEP_UP_ACTIONS: ReadonlySet<string> = new Set([
   'action:register_key',
   'action:mint_token',
   'action:routine_archive', // irreversible
+  'action:org_department_create', // irreversible: no tool deletes or archives a department
 ])
